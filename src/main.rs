@@ -8,11 +8,13 @@ use std::process::{Command as ProcessCommand, Stdio};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::path::{Path as FsPath, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use anyhow::Context as _;
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::extract::multipart::{MultipartError, MultipartRejection};
+use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -79,14 +81,28 @@ const MANAGE_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 /// every pane or sending unchanged terminal frames over the network.
 const STREAM_OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(150);
 const STREAM_OUTPUT_READ_TIMEOUT: Duration = Duration::from_millis(100);
-const GATEWAY_API_VERSION: &str = "1.1.0";
+const GATEWAY_API_VERSION: &str = "1.2.0";
 const GATEWAY_API_MAJOR: u64 = 1;
 const HERDR_PROTOCOL_MIN: u64 = 17;
 const HERDR_PROTOCOL_MAX: u64 = 17;
 const MAX_REQUEST_BODY_BYTES: usize = 128 * 1024;
+const UPLOADS_DIR: &str = "uploads";
+/// Ceiling on one upload body, enforced by the framework's body limit so an
+/// oversized request is cut off mid-stream instead of being buffered first.
+const MAX_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
+/// The client's own file name is only ever echoed back, never used to build a
+/// path, so this is a display cap rather than a safety one.
+const MAX_UPLOAD_NAME_CHARS: usize = 120;
+/// Uploads are a handoff to a local agent, not storage: whatever the agent was
+/// going to do with a file, it has done long before this.
+const UPLOAD_RETENTION: Duration = Duration::from_secs(48 * 60 * 60);
+const UPLOAD_GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// How much of a file is inspected before calling it plain text.
+const UPLOAD_TEXT_SNIFF_BYTES: usize = 8 * 1024;
 const API_CAPABILITIES: &[&str] = &[
     "agent_lifecycle_notifications",
     "device_revocation",
+    "file_uploads",
     "one_time_pairing_codes",
     "pane_output_ansi",
     "pane_shortcuts",
@@ -729,6 +745,7 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         devices: Arc::new(Mutex::new(read_devices().unwrap_or_default())),
     };
     spawn_agent_notification_watchers(state.clone());
+    spawn_upload_gc();
 
     let app = Router::new()
         .route("/docs", get(docs))
@@ -818,6 +835,12 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         .route(
             "/api/sessions/{session_id}/panes/{pane_id}/send-keys",
             post(send_keys),
+        )
+        // A route-level limit is applied inside the router-wide one, so uploads
+        // get their own ceiling while every JSON route keeps the small one.
+        .route(
+            "/api/uploads",
+            post(upload_file).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
         )
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .layer(middleware::from_fn(security_headers))
@@ -2997,6 +3020,347 @@ async fn send_keys(
     .await
 }
 
+/// A file type the gateway is willing to store, with the extension and MIME
+/// type derived from the bytes themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UploadKind {
+    extension: &'static str,
+    mime: &'static str,
+}
+
+/// Accept a file from the phone, park it in the gateway's own upload directory
+/// and hand back a local path. The app then sends that path to an agent as
+/// ordinary text, so the agent reads the file straight off this machine.
+///
+/// The stored name is generated here and the extension comes from the sniffed
+/// content, so nothing the client sends reaches the filesystem.
+async fn upload_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    multipart: Result<Multipart, MultipartRejection>,
+) -> ApiResult<Json<Value>> {
+    // Taking the rejection by hand keeps authorization ahead of body parsing,
+    // and keeps every failure in the same JSON error shape as the other routes.
+    require_device(&state, &headers)?;
+    let mut multipart = multipart.map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_multipart",
+            "expected a multipart/form-data body with a file field",
+        )
+    })?;
+
+    let mut upload = None;
+    while let Some(field) = multipart.next_field().await.map_err(upload_body_error)? {
+        if field.name() != Some("file") {
+            continue;
+        }
+        let client_name = field.file_name().map(str::to_owned);
+        let bytes = field.bytes().await.map_err(upload_body_error)?;
+        upload = Some((client_name, bytes));
+        break;
+    }
+
+    let Some((client_name, bytes)) = upload else {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "missing_file",
+            "expected a multipart/form-data body with a file field",
+        ));
+    };
+    let Some(client_name) = client_name else {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "missing_filename",
+            "the file field must carry a filename",
+        ));
+    };
+    if bytes.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "empty_file",
+            "the file field is empty",
+        ));
+    }
+
+    // Executable formats are checked first: several of them (`#!`, `MZ`) are
+    // also perfectly good plain text and would otherwise pass the allow-list.
+    if looks_executable(&bytes) {
+        return Err(api_error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "executable_rejected",
+            "executables and scripts are not accepted",
+        ));
+    }
+    let Some(kind) = sniff_upload_kind(&bytes) else {
+        return Err(api_error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_file_type",
+            "only png, jpeg, gif, webp, heic, pdf, and plain text files are accepted",
+        ));
+    };
+
+    let dir = ensure_uploads_dir().map_err(|err| {
+        eprintln!("failed to prepare the upload directory: {err:#}");
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "upload_failed",
+            "failed to store the upload",
+        )
+    })?;
+    let path = dir.join(stored_upload_name(kind));
+    write_upload_file(&path, &bytes).map_err(|err| {
+        eprintln!("failed to write upload {}: {err:#}", path.display());
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "upload_failed",
+            "failed to store the upload",
+        )
+    })?;
+
+    Ok(Json(json!({
+        "path": path.to_string_lossy(),
+        "name": sanitize_upload_name(&client_name),
+        "size": bytes.len(),
+        "mime": kind.mime
+    })))
+}
+
+/// The body limit is enforced by the framework while the body streams, so an
+/// oversized upload surfaces here as a length-limit error rather than as a
+/// fully buffered file the gateway then has to measure.
+fn upload_body_error(err: MultipartError) -> (StatusCode, Json<Value>) {
+    if err.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        return api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "upload_too_large",
+            "the upload must be at most 25 MiB",
+        );
+    }
+    api_error(
+        StatusCode::BAD_REQUEST,
+        "invalid_multipart",
+        "expected a multipart/form-data body with a file field",
+    )
+}
+
+/// Reject anything the host could be talked into running, whatever the file is
+/// called. Extensions are not consulted: only the leading bytes are.
+fn looks_executable(bytes: &[u8]) -> bool {
+    /// Mach-O thin and fat binaries, in both byte orders. `cafebabe` also
+    /// covers Java class files, which is no loss here.
+    const MACH_O_MAGICS: [[u8; 4]; 6] = [
+        [0xfe, 0xed, 0xfa, 0xce],
+        [0xfe, 0xed, 0xfa, 0xcf],
+        [0xce, 0xfa, 0xed, 0xfe],
+        [0xcf, 0xfa, 0xed, 0xfe],
+        [0xca, 0xfe, 0xba, 0xbe],
+        [0xbe, 0xba, 0xfe, 0xca],
+    ];
+
+    bytes.starts_with(b"#!")
+        || bytes.starts_with(b"MZ")
+        || bytes.starts_with(b"\x7fELF")
+        || MACH_O_MAGICS
+            .iter()
+            .any(|magic| bytes.starts_with(magic.as_slice()))
+}
+
+/// Decide what a file is from its content. The client's extension is never
+/// consulted, so a `.png` holding something else is stored as what it is, or
+/// refused.
+fn sniff_upload_kind(bytes: &[u8]) -> Option<UploadKind> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some(UploadKind {
+            extension: "png",
+            mime: "image/png",
+        });
+    }
+    if bytes.starts_with(b"\xff\xd8\xff") {
+        return Some(UploadKind {
+            extension: "jpg",
+            mime: "image/jpeg",
+        });
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some(UploadKind {
+            extension: "gif",
+            mime: "image/gif",
+        });
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return Some(UploadKind {
+            extension: "webp",
+            mime: "image/webp",
+        });
+    }
+    if is_heic(bytes) {
+        return Some(UploadKind {
+            extension: "heic",
+            mime: "image/heic",
+        });
+    }
+    if bytes.starts_with(b"%PDF") {
+        return Some(UploadKind {
+            extension: "pdf",
+            mime: "application/pdf",
+        });
+    }
+    if looks_like_text(bytes) {
+        return Some(UploadKind {
+            extension: "txt",
+            mime: "text/plain",
+        });
+    }
+    None
+}
+
+/// HEIC is an ISO base media file: a `ftyp` box whose brand names the flavour.
+fn is_heic(bytes: &[u8]) -> bool {
+    const HEIC_BRANDS: [&[u8; 4]; 10] = [
+        b"heic", b"heix", b"heim", b"heis", b"hevc", b"hevx", b"hevm", b"hevs", b"mif1", b"msf1",
+    ];
+
+    bytes.len() >= 12
+        && &bytes[4..8] == b"ftyp"
+        && HEIC_BRANDS.iter().any(|brand| &bytes[8..12] == *brand)
+}
+
+/// txt, md, log, json and csv share no magic number, so plain text is decided
+/// by what its opening bytes are not: a NUL, or any other control byte that a
+/// document would never contain. Bytes above ASCII are left alone so a log in
+/// UTF-8, GBK, or Latin-1 is still text.
+fn looks_like_text(bytes: &[u8]) -> bool {
+    // Tab, newline, carriage return, form feed, and the escape that opens an
+    // ANSI colour sequence all belong in a real log file.
+    const TEXT_CONTROLS: [u8; 5] = [b'\t', b'\n', b'\r', 0x0c, 0x1b];
+
+    let head = &bytes[..bytes.len().min(UPLOAD_TEXT_SNIFF_BYTES)];
+    !head.is_empty()
+        && head
+            .iter()
+            .all(|byte| *byte >= 0x20 || TEXT_CONTROLS.contains(byte))
+}
+
+/// The name on disk is generated here in full: a random stem plus the
+/// extension the content earned. A client name can therefore never traverse,
+/// collide, or smuggle in a second extension.
+fn stored_upload_name(kind: UploadKind) -> String {
+    format!("{}.{}", uuid::Uuid::new_v4(), kind.extension)
+}
+
+/// Reduce the client's file name to something safe to show. It is echoed back
+/// so the app can label the attachment; it never touches the filesystem.
+fn sanitize_upload_name(raw: &str) -> String {
+    let base = raw
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .replace(|c: char| c.is_control(), "");
+    let base = base.trim();
+    if base.is_empty() || base.chars().all(|c| c == '.') {
+        return String::from("upload");
+    }
+    base.chars().take(MAX_UPLOAD_NAME_CHARS).collect()
+}
+
+fn uploads_dir() -> anyhow::Result<PathBuf> {
+    Ok(state_dir()?.join(UPLOADS_DIR))
+}
+
+/// Uploads live beside the gateway's other state, in their own directory so a
+/// sweep can never reach a token file.
+fn ensure_uploads_dir() -> anyhow::Result<PathBuf> {
+    let dir = uploads_dir()?;
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("failed to create upload dir {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("failed to lock down upload dir {}", dir.display()))?;
+    }
+    Ok(dir)
+}
+
+fn write_upload_file(path: &FsPath, bytes: &[u8]) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        std::io::Write::write_all(&mut file, bytes)?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)?;
+        Ok(())
+    }
+}
+
+/// Sweep old uploads at startup and every hour after that. A phone that
+/// uploads a screenshot and loses interest should not leave it on the host.
+fn spawn_upload_gc() {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(UPLOAD_GC_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            // The first tick completes immediately, which is the startup sweep.
+            ticker.tick().await;
+            let Ok(dir) = uploads_dir() else {
+                continue;
+            };
+            if let Err(err) = purge_expired_uploads(&dir, SystemTime::now()) {
+                eprintln!("failed to sweep old uploads: {err:#}");
+            }
+        }
+    });
+}
+
+/// Delete every stored upload older than the retention window. Returns how many
+/// files were removed.
+fn purge_expired_uploads(dir: &FsPath, now: SystemTime) -> anyhow::Result<usize> {
+    if !dir.exists() {
+        return Ok(0);
+    }
+    let mut removed = 0;
+    for entry in std::fs::read_dir(dir)
+        .with_context(|| format!("failed to read upload dir {}", dir.display()))?
+    {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if !metadata.is_file() {
+            continue;
+        }
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        if !upload_expired(modified, now) {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => removed += 1,
+            Err(err) => eprintln!("failed to remove {}: {err}", entry.path().display()),
+        }
+    }
+    Ok(removed)
+}
+
+/// A file whose timestamp sits in the future is left alone rather than deleted:
+/// a clock change should not destroy an upload the user just made.
+fn upload_expired(modified: SystemTime, now: SystemTime) -> bool {
+    now.duration_since(modified)
+        .map(|age| age >= UPLOAD_RETENTION)
+        .unwrap_or(false)
+}
+
 async fn call_session_method(
     config: &Config,
     session_id: &str,
@@ -3891,6 +4255,14 @@ fn openapi_spec() -> Value {
                     "responses": ok_response()
                 }
             },
+            "/api/uploads": {
+                "post": {
+                    "summary": "Upload one image or document and get back a local path for an agent to read",
+                    "description": "The file type is decided by sniffing the content, not by the filename. Executables and scripts are refused. The stored name is generated by the gateway; the returned name is only the sanitised client name. Uploads are deleted after 48 hours.",
+                    "requestBody": multipart_file_body(),
+                    "responses": upload_responses()
+                }
+            },
             "/api/sessions": { "get": simple_endpoint("List configured Herdr sessions") },
             "/api/sessions/{sessionId}/events": {
                 "get": {
@@ -4093,6 +4465,37 @@ fn query_param(name: &str, description: &str) -> Value {
         "description": description,
         "schema": { "type": "string" }
     })
+}
+
+fn multipart_file_body() -> Value {
+    json!({
+        "required": true,
+        "content": {
+            "multipart/form-data": {
+                "schema": {
+                    "type": "object",
+                    "required": ["file"],
+                    "properties": { "file": { "type": "string", "format": "binary" } }
+                }
+            }
+        }
+    })
+}
+
+fn upload_responses() -> Value {
+    let mut responses = ok_response();
+    responses["200"] = json!({
+        "description": "Stored upload",
+        "content": { "application/json": { "schema": object_schema(
+            &[("path", "string"), ("name", "string"), ("size", "integer"), ("mime", "string")],
+            &["path", "name", "size", "mime"],
+        ) } }
+    });
+    responses["400"] = json!({ "description": "Malformed multipart body, or no usable file field" });
+    responses["413"] = json!({ "description": "Upload is larger than 25 MiB" });
+    responses["415"] =
+        json!({ "description": "Content is an executable or script, or not an accepted file type" });
+    responses
 }
 
 fn json_body(schema: Value) -> Value {
@@ -4646,6 +5049,193 @@ mod tests {
         assert_eq!(statuses.get("w1:p2").map(String::as_str), Some("idle"));
     }
 
+    fn png_bytes() -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(b"IHDR and the rest of a real file");
+        bytes
+    }
+
+    #[test]
+    fn uploads_are_typed_by_content_not_by_name() {
+        assert_eq!(sniff_upload_kind(&png_bytes()).unwrap().mime, "image/png");
+        assert_eq!(
+            sniff_upload_kind(b"\xff\xd8\xff\xe0\x00\x10JFIF").unwrap().mime,
+            "image/jpeg"
+        );
+        assert_eq!(sniff_upload_kind(b"GIF89a....").unwrap().extension, "gif");
+        assert_eq!(sniff_upload_kind(b"GIF87a....").unwrap().extension, "gif");
+        assert_eq!(
+            sniff_upload_kind(b"RIFF\x24\x00\x00\x00WEBPVP8 ").unwrap().mime,
+            "image/webp"
+        );
+        assert_eq!(
+            sniff_upload_kind(b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00")
+                .unwrap()
+                .mime,
+            "image/heic"
+        );
+        assert_eq!(
+            sniff_upload_kind(b"\x00\x00\x00\x18ftypmif1\x00\x00\x00\x00")
+                .unwrap()
+                .extension,
+            "heic"
+        );
+        assert_eq!(
+            sniff_upload_kind(b"%PDF-1.7\n1 0 obj").unwrap().mime,
+            "application/pdf"
+        );
+        assert_eq!(
+            sniff_upload_kind(b"# notes\n\nplain, with no magic number\n")
+                .unwrap()
+                .mime,
+            "text/plain"
+        );
+        assert_eq!(
+            sniff_upload_kind(b"{\"a\":1}").unwrap().extension,
+            "txt",
+            "json and csv are stored as the text they are"
+        );
+    }
+
+    #[test]
+    fn a_truncated_or_binary_upload_is_not_mistaken_for_a_known_type() {
+        // Half a signature is not a match. Anything binary enough to carry a
+        // NUL byte then fails the text branch too and is refused outright.
+        assert_ne!(
+            sniff_upload_kind(b"\x89PN").map(|kind| kind.extension),
+            Some("png")
+        );
+        assert!(sniff_upload_kind(b"\x89PNG\r\n\x1a").is_none());
+        assert!(sniff_upload_kind(b"RIFF\x24\x00\x00\x00WEB").is_none());
+        assert!(sniff_upload_kind(b"\x00\x00\x00\x18ftyp").is_none());
+        // An ISO base media file that is not a HEIC flavour.
+        assert!(sniff_upload_kind(b"\x00\x00\x00\x18ftypqt  \x00\x00\x00\x00").is_none());
+        assert!(sniff_upload_kind(b"\x1f\x8b\x08\x00\x00\x00\x00\x00").is_none());
+        assert!(sniff_upload_kind(b"").is_none());
+    }
+
+    #[test]
+    fn text_detection_only_inspects_the_opening_bytes() {
+        let mut late_nul = vec![b'a'; UPLOAD_TEXT_SNIFF_BYTES + 16];
+        late_nul[UPLOAD_TEXT_SNIFF_BYTES + 4] = 0;
+        assert!(looks_like_text(&late_nul));
+
+        let mut early_nul = vec![b'a'; UPLOAD_TEXT_SNIFF_BYTES + 16];
+        early_nul[16] = 0;
+        assert!(!looks_like_text(&early_nul));
+
+        // Tabs, newlines and ANSI escapes belong in a log; other control bytes
+        // mean the file is binary, whatever it was called.
+        assert!(looks_like_text(b"col\tcol\r\n1,2\n\x1b[32mgreen\x1b[0m\n"));
+        assert!(!looks_like_text(b"almost text\x1a"));
+        // Non-ASCII bytes are left alone so a GBK or Latin-1 log still counts.
+        assert!(looks_like_text("日志：启动完成\n".as_bytes()));
+        assert!(looks_like_text(b"caf\xe9 latin-1\n"));
+    }
+
+    #[test]
+    fn executables_and_scripts_are_refused_whatever_they_are_called() {
+        assert!(looks_executable(b"MZ\x90\x00\x03"));
+        assert!(looks_executable(b"\x7fELF\x02\x01\x01"));
+        assert!(looks_executable(b"\xfe\xed\xfa\xce\x00"));
+        assert!(looks_executable(b"\xfe\xed\xfa\xcf\x00"));
+        assert!(looks_executable(b"\xce\xfa\xed\xfe\x00"));
+        assert!(looks_executable(b"\xcf\xfa\xed\xfe\x00"));
+        assert!(looks_executable(b"\xca\xfe\xba\xbe\x00"));
+        assert!(looks_executable(b"\xbe\xba\xfe\xca\x00"));
+        assert!(looks_executable(b"#!/bin/sh\nrm -rf /\n"));
+        assert!(looks_executable(b"#!"));
+
+        // A shebang script is otherwise perfect plain text, which is exactly
+        // why the executable check has to run before the allow-list.
+        assert_eq!(
+            sniff_upload_kind(b"#!/bin/sh\nrm -rf /\n").unwrap().mime,
+            "text/plain"
+        );
+
+        assert!(!looks_executable(&png_bytes()));
+        assert!(!looks_executable(b"%PDF-1.7"));
+        assert!(!looks_executable(b"# a markdown file\n"));
+        assert!(!looks_executable(b"M"));
+    }
+
+    #[test]
+    fn a_client_file_name_is_only_ever_echoed_back_after_scrubbing() {
+        assert_eq!(sanitize_upload_name("../../evil.png"), "evil.png");
+        assert_eq!(sanitize_upload_name("..\\..\\evil.png"), "evil.png");
+        assert_eq!(sanitize_upload_name("/etc/passwd"), "passwd");
+        assert_eq!(sanitize_upload_name("shot\r\n.png"), "shot.png");
+        assert_eq!(sanitize_upload_name("bell\x07.txt"), "bell.txt");
+        assert_eq!(sanitize_upload_name("  spaced.png  "), "spaced.png");
+        assert_eq!(sanitize_upload_name(""), "upload");
+        assert_eq!(sanitize_upload_name("   "), "upload");
+        assert_eq!(sanitize_upload_name(".."), "upload");
+        assert_eq!(sanitize_upload_name("../.."), "upload");
+        assert_eq!(sanitize_upload_name("photo.png"), "photo.png");
+
+        let long = format!("{}.png", "n".repeat(400));
+        assert_eq!(
+            sanitize_upload_name(&long).chars().count(),
+            MAX_UPLOAD_NAME_CHARS
+        );
+
+        // A multi-byte name must not be cut mid-character.
+        let wide = "截图".repeat(200);
+        assert!(sanitize_upload_name(&wide).chars().count() <= MAX_UPLOAD_NAME_CHARS);
+    }
+
+    #[test]
+    fn the_stored_name_comes_from_the_sniffed_type_and_nothing_else() {
+        let kind = sniff_upload_kind(&png_bytes()).unwrap();
+        let first = stored_upload_name(kind);
+        let second = stored_upload_name(kind);
+        assert!(first.ends_with(".png"));
+        assert_ne!(first, second, "each upload gets its own name");
+        assert!(!first.contains('/') && !first.contains('\\') && !first.contains(".."));
+        assert_eq!(first.len(), "00000000-0000-0000-0000-000000000000.png".len());
+    }
+
+    #[test]
+    fn uploads_expire_after_the_retention_window_but_survive_a_clock_jump() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        assert!(!upload_expired(now - Duration::from_secs(47 * 3600), now));
+        assert!(upload_expired(now - UPLOAD_RETENTION, now));
+        assert!(upload_expired(now - Duration::from_secs(49 * 3600), now));
+        // A timestamp in the future means the clock moved, not that the file is
+        // old; deleting it would lose an upload the user just made.
+        assert!(!upload_expired(now + Duration::from_secs(3600), now));
+    }
+
+    #[test]
+    fn the_sweep_removes_only_files_past_the_retention_window() {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-uploads-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = SystemTime::now();
+
+        let fresh = dir.join("fresh.png");
+        std::fs::write(&fresh, b"fresh").unwrap();
+        let stale = dir.join("stale.png");
+        std::fs::write(&stale, b"stale").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(now - UPLOAD_RETENTION - Duration::from_secs(60))
+            .unwrap();
+
+        assert_eq!(purge_expired_uploads(&dir, now).unwrap(), 1);
+        assert!(fresh.exists());
+        assert!(!stale.exists());
+
+        // A missing directory is not an error: nothing has been uploaded yet.
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(purge_expired_uploads(&dir, now).unwrap(), 0);
+    }
+
     #[test]
     fn openapi_spec_contains_docs_routes_and_auth() {
         let spec = openapi_spec();
@@ -4663,6 +5253,11 @@ mod tests {
         assert!(spec["paths"]["/api/devices/push-token"]["delete"].is_object());
         assert!(spec["paths"]["/api/sessions/{sessionId}/workspaces/{workspaceId}"].is_object());
         assert!(spec["paths"]["/api/sessions/{sessionId}/agents/{target}/send"].is_object());
+        assert!(spec["paths"]["/api/uploads"]["post"]["requestBody"]["content"]
+            ["multipart/form-data"]
+            .is_object());
+        assert!(spec["paths"]["/api/uploads"]["post"]["responses"]["413"].is_object());
+        assert!(spec["paths"]["/api/uploads"]["post"]["responses"]["415"].is_object());
         assert_eq!(
             spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/output"]["get"]["parameters"]
                 [4]["name"],
