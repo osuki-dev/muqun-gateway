@@ -9,7 +9,7 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::os::unix::process::CommandExt;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context as _;
 use axum::body::Body;
@@ -76,6 +76,39 @@ const MAX_WORKSPACE_LABEL_CHARS: usize = 120;
 /// Long enough for an agent TUI to finish handling a pasted prompt, short
 /// enough that the submit still feels like part of the same action.
 const SUBMIT_KEYPRESS_DELAY: Duration = Duration::from_millis(150);
+/// How often the pane is re-read while waiting for it to stop redrawing. A
+/// prompt that names an image file makes Claude Code read and encode that file
+/// and then rewrite its own input line into `[Image #N]`, and an Enter that
+/// lands inside that window is swallowed outright. The window was measured at
+/// under a second for one small image and at over three seconds for three large
+/// ones off a cold page cache, so no fixed delay can cover it. A still screen is
+/// only ever a hint about when to try: the staging arrives in bursts with quiet
+/// gaps longer than this interval, so a pane can look still and not be.
+const SUBMIT_SETTLE_INTERVAL: Duration = Duration::from_millis(150);
+/// How long Herdr is watched for the agent to react to an Enter before that
+/// Enter is written off. A real submission showed up in about half a second on
+/// a live pane.
+const SUBMIT_VERIFY_WINDOW: Duration = Duration::from_millis(700);
+/// How often the agent's state is asked for inside that window.
+const SUBMIT_VERIFY_INTERVAL: Duration = Duration::from_millis(150);
+/// A beat between an Enter that went nowhere and the next one, so a burst of
+/// staging work has room to finish instead of being sampled at the poll rate.
+const SUBMIT_RETRY_INTERVAL: Duration = Duration::from_millis(450);
+/// How many Enters one prompt is worth when Herdr can say whether the agent
+/// took the last one. Every attempt after the first is fired at a pane that has
+/// demonstrably not accepted its predecessor, so none of them can be the stray
+/// keystroke that answers a permission menu, and the budget can afford to cover
+/// a slow staging window.
+const SUBMIT_MAX_ATTEMPTS: u32 = 6;
+/// The same budget for a pane Herdr lists no agent for. There the only evidence
+/// is that the screen moved, and the screen moves on its own, so a submit that
+/// cannot be checked properly keeps pressing Enter as few times as possible.
+const SUBMIT_BLIND_MAX_ATTEMPTS: u32 = 3;
+/// How long such a pane is given to react before it is read back.
+const SUBMIT_VERIFY_DELAY: Duration = Duration::from_millis(300);
+/// Wall-clock ceiling on the whole settle-send-verify sequence, so a pane that
+/// never stops redrawing cannot leave a background task polling Herdr forever.
+const SUBMIT_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often each agent pane is checked for a permission menu. An approval
 /// blocks the agent outright, so the phone should hear about one in about the
 /// time it takes to glance at the screen; the cost is one `pane.read` per agent
@@ -3268,16 +3301,169 @@ async fn submit_agent_prompt(
 /// Best-effort by design: a pane that vanished between the two calls must not
 /// turn a delivered prompt into an error. An agent target is its pane id, which
 /// is what the key press needs.
+///
+/// The beat cannot be a fixed one, because a prompt that names an image file
+/// keeps the agent busy staging it for as long as reading and encoding that
+/// file takes, and every Enter sent before that finishes is discarded. So the
+/// keystroke is sent at a pane that has stopped redrawing and is then checked
+/// against Herdr's own reading of the agent, the same shape the approvals
+/// confirm uses.
 fn schedule_submit_keypress(session: SessionConfig, pane_id: String) {
     tokio::spawn(async move {
-        tokio::time::sleep(SUBMIT_KEYPRESS_DELAY).await;
-        let _ = herdr_call(
-            &session,
+        submit_keypress(&session, &pane_id).await;
+    });
+}
+
+/// Send the Enter that submits a prompt, and keep sending it until the agent
+/// shows that one landed.
+///
+/// The screen cannot answer "did it submit". Staging an image repaints the pane
+/// constantly without submitting anything, so "the text changed" says yes to a
+/// prompt still sitting in the input box; measured against a live pane, that
+/// false positive is what stopped the retry from ever running. What does
+/// discriminate is Herdr's `state_change_seq`: it does not move at all for the
+/// whole staging window, and a real submission advances it as the agent leaves
+/// idle. So the settled screen only decides *when* to press Enter, and the
+/// sequence decides whether it worked.
+async fn submit_keypress(session: &SessionConfig, pane_id: &str) {
+    tokio::time::sleep(SUBMIT_KEYPRESS_DELAY).await;
+    let deadline = Instant::now() + SUBMIT_SETTLE_TIMEOUT;
+    // A send is addressed to a pane, and a pane need not be running an agent
+    // Herdr knows about, so the sequence is what this hopes for rather than what
+    // it requires.
+    let baseline = agent_state_change_seq(session, pane_id).await;
+    if baseline.is_none() {
+        eprintln!(
+            "agent submit for pane {pane_id}: Herdr lists no agent state for it, \
+             falling back to watching the screen"
+        );
+    }
+    let attempts = if baseline.is_some() {
+        SUBMIT_MAX_ATTEMPTS
+    } else {
+        SUBMIT_BLIND_MAX_ATTEMPTS
+    };
+    let mut previous: Option<String> = None;
+    for attempt in 0..attempts {
+        let Some(settled) = settled_pane_text(session, pane_id, &mut previous, deadline).await
+        else {
+            eprintln!("agent submit for pane {pane_id} gave up: the pane never settled");
+            return;
+        };
+        if let Err(err) = herdr_call(
+            session,
             "pane.send_keys",
             json!({ "pane_id": pane_id, "keys": ["Enter"] }),
         )
-        .await;
-    });
+        .await
+        {
+            eprintln!(
+                "agent submit for pane {pane_id} failed to send Enter: {}",
+                err.message()
+            );
+            return;
+        }
+        match baseline {
+            Some(baseline) => {
+                if agent_state_advanced(session, pane_id, baseline, deadline).await {
+                    return;
+                }
+            }
+            None => {
+                tokio::time::sleep(SUBMIT_VERIFY_DELAY).await;
+                let Ok(after) = read_pane_visible_text(session, pane_id).await else {
+                    eprintln!(
+                        "agent submit for pane {pane_id} gave up: the pane could not be verified"
+                    );
+                    return;
+                };
+                // All this says is that something moved. It is the weakest of
+                // the two answers, which is why the blind budget is small.
+                if after != settled {
+                    return;
+                }
+                previous = Some(after);
+            }
+        }
+        if attempt + 1 < attempts {
+            tokio::time::sleep(SUBMIT_RETRY_INTERVAL).await;
+        }
+    }
+    eprintln!(
+        "agent submit for pane {pane_id} gave up: the agent did not take the Enter \
+         in {attempts} attempts"
+    );
+}
+
+/// Herdr's own count of how many times this pane's agent has changed state.
+///
+/// `None` means Herdr lists no agent for the pane, which a send to a plain shell
+/// pane legitimately is, or that it could not be asked.
+async fn agent_state_change_seq(session: &SessionConfig, pane_id: &str) -> Option<u64> {
+    let value = match herdr_request(session, "agent.list", json!({})).await {
+        Ok(value) => value,
+        Err(err) => {
+            eprintln!("Herdr request agent.list failed: {err:#}");
+            return None;
+        }
+    };
+    value
+        .pointer("/result/agents")?
+        .as_array()?
+        .iter()
+        .find(|agent| agent.get("pane_id").and_then(Value::as_str) == Some(pane_id))?
+        .get("state_change_seq")?
+        .as_u64()
+}
+
+/// Watch the agent for a beat and say whether it moved off the sequence it was
+/// on before the Enter, which is the one reading that means the prompt went in.
+async fn agent_state_advanced(
+    session: &SessionConfig,
+    pane_id: &str,
+    baseline: u64,
+    deadline: Instant,
+) -> bool {
+    let until = Instant::now() + SUBMIT_VERIFY_WINDOW;
+    loop {
+        tokio::time::sleep(SUBMIT_VERIFY_INTERVAL).await;
+        if agent_state_change_seq(session, pane_id)
+            .await
+            .is_some_and(|seq| seq > baseline)
+        {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= until || now >= deadline {
+            return false;
+        }
+    }
+}
+
+/// Read the pane until two consecutive reads come back identical, and hand back
+/// that text. `previous` carries the last reading across attempts so a pane that
+/// was already still is not waited on twice.
+///
+/// `None` means the pane was still moving at the deadline, or could not be read
+/// at all -- either way there is nothing safe to press Enter against.
+async fn settled_pane_text(
+    session: &SessionConfig,
+    pane_id: &str,
+    previous: &mut Option<String>,
+    deadline: Instant,
+) -> Option<String> {
+    loop {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        // The read failure is already logged one level down.
+        let text = read_pane_visible_text(session, pane_id).await.ok()?;
+        if previous.as_deref() == Some(text.as_str()) {
+            return Some(text);
+        }
+        *previous = Some(text);
+        tokio::time::sleep(SUBMIT_SETTLE_INTERVAL).await;
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -4258,23 +4444,12 @@ async fn send_pane_keys(session: &SessionConfig, pane_id: &str, keys: &[String])
     })
 }
 
-/// Read a pane's agent and whatever menu it is drawing.
+/// What a pane is drawing right now, as plain text.
 ///
-/// `visible` rather than the transcript source the parts endpoint reads: a menu
-/// is what is on the screen now, and the scrollback of an answered one is not a
-/// pending approval.
-async fn read_pane_approval(
-    session: &SessionConfig,
-    pane_id: &str,
-) -> ApiResult<(Option<String>, Option<approvals::Approval>)> {
-    let agent = herdr_request(session, "pane.get", json!({ "pane_id": pane_id }))
-        .await
-        .ok()
-        .and_then(|response| {
-            let pane = response.pointer("/result/pane").unwrap_or(&response);
-            pane.get("agent").and_then(Value::as_str).map(str::to_owned)
-        })
-        .filter(|agent| !agent.is_empty());
+/// `visible` rather than the transcript source the parts endpoint reads: both
+/// callers care about the current screen, and the scrollback of an answered menu
+/// or an already-submitted prompt would only mislead them.
+async fn read_pane_visible_text(session: &SessionConfig, pane_id: &str) -> ApiResult<String> {
     let read = herdr_request(
         session,
         "pane.read",
@@ -4294,7 +4469,23 @@ async fn read_pane_approval(
             "Herdr is unavailable",
         )
     })?;
-    let text = pane_read_text(&read).unwrap_or_default();
+    Ok(pane_read_text(&read).unwrap_or_default())
+}
+
+/// Read a pane's agent and whatever menu it is drawing.
+async fn read_pane_approval(
+    session: &SessionConfig,
+    pane_id: &str,
+) -> ApiResult<(Option<String>, Option<approvals::Approval>)> {
+    let agent = herdr_request(session, "pane.get", json!({ "pane_id": pane_id }))
+        .await
+        .ok()
+        .and_then(|response| {
+            let pane = response.pointer("/result/pane").unwrap_or(&response);
+            pane.get("agent").and_then(Value::as_str).map(str::to_owned)
+        })
+        .filter(|agent| !agent.is_empty());
+    let text = read_pane_visible_text(session, pane_id).await?;
     Ok((agent, approvals::detect(&text)))
 }
 
@@ -8567,5 +8758,240 @@ mod tests {
         // A workspace with no worktree contributes nothing, and "/" is refused
         // by the same guard the asset roots use.
         assert!(!found.iter().any(|path| path == "/"));
+    }
+
+    /// A Herdr socket that answers from a script.
+    ///
+    /// Every gateway request is its own short-lived connection, so this accepts
+    /// in a loop and answers one line per connection. `pane.read` walks the
+    /// scripted screens and then repeats the last one forever, which is what
+    /// lets a test say "and from here on the pane holds still".
+    ///
+    /// `agent.list` is scripted by how many Enters have arrived rather than by
+    /// call count, because that is the real relationship: the agent's state
+    /// sequence moves when a keystroke is finally taken, not after some number
+    /// of polls.
+    struct FakeHerdr {
+        socket_path: PathBuf,
+        calls: Arc<Mutex<Vec<Value>>>,
+    }
+
+    /// Seq the fake agent sits on until it accepts an Enter. Arbitrary, but not
+    /// zero, so "advanced past the baseline" cannot pass by accident.
+    const FAKE_AGENT_SEQ: u64 = 100;
+
+    impl FakeHerdr {
+        /// `advance_after` is the number of Enters it takes for the agent's
+        /// state sequence to move; `None` makes `agent.list` come back empty,
+        /// which is a pane running no agent Herdr knows.
+        fn start(screens: Vec<&str>, advance_after: Option<usize>) -> Self {
+            let socket_path = std::env::temp_dir().join(format!(
+                "herdr-submit-{}.sock",
+                uuid::Uuid::new_v4().simple()
+            ));
+            let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+            let calls: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&calls);
+            let screens: Vec<String> = screens.into_iter().map(str::to_owned).collect();
+            tokio::spawn(async move {
+                let mut reads = 0usize;
+                let mut enters = 0usize;
+                while let Ok((stream, _)) = listener.accept().await {
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        continue;
+                    }
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    let method = request["method"].as_str().unwrap_or_default().to_owned();
+                    let result = match method.as_str() {
+                        "pane.read" => {
+                            let screen = screens
+                                .get(reads)
+                                .or_else(|| screens.last())
+                                .cloned()
+                                .unwrap_or_default();
+                            reads += 1;
+                            json!({ "read": { "text": screen, "revision": reads } })
+                        }
+                        "agent.list" => {
+                            let agents = match advance_after {
+                                None => json!([]),
+                                Some(threshold) => {
+                                    let seq = FAKE_AGENT_SEQ + u64::from(enters >= threshold);
+                                    json!([
+                                        { "pane_id": "wZ:p9", "state_change_seq": 1 },
+                                        {
+                                            "pane_id": "w1:p1",
+                                            "agent": "claude",
+                                            "agent_status": "idle",
+                                            "state_change_seq": seq
+                                        }
+                                    ])
+                                }
+                            };
+                            json!({ "agents": agents })
+                        }
+                        "pane.send_keys" => {
+                            enters += 1;
+                            json!({ "ok": true })
+                        }
+                        _ => json!({ "ok": true }),
+                    };
+                    recorded.lock().unwrap().push(request.clone());
+                    let response = json!({ "id": request["id"], "result": result }).to_string();
+                    let mut stream = reader.into_inner();
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    stream.write_all(b"\n").await.unwrap();
+                    stream.flush().await.unwrap();
+                }
+            });
+            Self { socket_path, calls }
+        }
+
+        fn session(&self) -> SessionConfig {
+            SessionConfig {
+                id: "default".into(),
+                label: "Default".into(),
+                socket_path: self.socket_path.to_string_lossy().into_owned(),
+            }
+        }
+
+        /// The call order with the state polling filtered out, so a test can say
+        /// what happened to the pane without counting how many times the agent
+        /// was asked about.
+        fn pane_methods(&self) -> Vec<String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|call| call["method"].as_str().unwrap_or_default().to_owned())
+                .filter(|method| method != "agent.list")
+                .collect()
+        }
+
+        fn enters(&self) -> Vec<Value> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| call["method"] == "pane.send_keys")
+                .cloned()
+                .collect()
+        }
+    }
+
+    impl Drop for FakeHerdr {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_enter_the_agent_took_is_not_repeated() {
+        let herdr = FakeHerdr::start(
+            // The screen keeps moving after the Enter and then keeps moving
+            // again, which on its own proves nothing either way.
+            vec![
+                "> review this",
+                "> review this",
+                "reviewing...",
+                "reviewing",
+            ],
+            Some(1),
+        );
+
+        submit_keypress(&herdr.session(), "w1:p1").await;
+
+        let enters = herdr.enters();
+        assert_eq!(enters.len(), 1);
+        assert_eq!(enters[0]["params"]["pane_id"], "w1:p1");
+        assert_eq!(enters[0]["params"]["keys"], json!(["Enter"]));
+    }
+
+    #[tokio::test]
+    async fn enter_waits_for_the_pane_to_stop_redrawing() {
+        // The middle screens are Claude Code staging an image: the input line is
+        // rewritten while the file is read, and an Enter in there is swallowed.
+        let herdr = FakeHerdr::start(
+            vec![
+                "> look at /tmp/a.jpg",
+                "> look at /tmp/a.jpg (reading)",
+                "> look at [Image #1]",
+                "> look at [Image #1]",
+                "analyzing image...",
+            ],
+            Some(1),
+        );
+
+        submit_keypress(&herdr.session(), "w1:p1").await;
+
+        assert_eq!(herdr.enters().len(), 1);
+        assert_eq!(
+            herdr.pane_methods(),
+            vec![
+                "pane.read",
+                "pane.read",
+                "pane.read",
+                "pane.read",
+                "pane.send_keys"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_screen_that_moved_without_submitting_does_not_pass_for_a_submission() {
+        // The exact false positive that broke the first version of this: three
+        // large images stage in bursts, so the pane looks still, then different,
+        // then still again, while the prompt never leaves the input box. Only
+        // the agent's state sequence knows, and here it moves on the third
+        // Enter.
+        let herdr = FakeHerdr::start(
+            vec![
+                "> look at [Image #1]",
+                "> look at [Image #1]",
+                "> look at [Image #1] [Image #2]",
+                "> look at [Image #1] [Image #2] [Image #3]",
+            ],
+            Some(3),
+        );
+
+        submit_keypress(&herdr.session(), "w1:p1").await;
+
+        assert_eq!(herdr.enters().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn enters_stop_at_the_budget_when_the_agent_never_takes_one() {
+        let herdr = FakeHerdr::start(vec!["> review this"], Some(usize::MAX));
+
+        submit_keypress(&herdr.session(), "w1:p1").await;
+
+        assert_eq!(herdr.enters().len(), SUBMIT_MAX_ATTEMPTS as usize);
+    }
+
+    #[tokio::test]
+    async fn a_pane_herdr_lists_no_agent_for_falls_back_to_watching_the_screen() {
+        let herdr = FakeHerdr::start(
+            vec!["$ ls", "$ ls", "Cargo.toml  src", "Cargo.toml  src"],
+            None,
+        );
+
+        submit_keypress(&herdr.session(), "w1:p1").await;
+
+        assert_eq!(herdr.enters().len(), 1);
+        assert_eq!(
+            herdr.pane_methods(),
+            vec!["pane.read", "pane.read", "pane.send_keys", "pane.read"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blind_submit_presses_enter_no_more_than_the_small_budget() {
+        let herdr = FakeHerdr::start(vec!["$ ls"], None);
+
+        submit_keypress(&herdr.session(), "w1:p1").await;
+
+        assert_eq!(herdr.enters().len(), SUBMIT_BLIND_MAX_ATTEMPTS as usize);
     }
 }
