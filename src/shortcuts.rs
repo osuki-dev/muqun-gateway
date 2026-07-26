@@ -9,6 +9,11 @@
 //! Everything here is taken from what the programs themselves advertise in
 //! their own footers and help output, not guessed.
 //!
+//! The slash-command tables themselves live in `composer.rs`, one per agent,
+//! pinned by a snapshot. This endpoint and the pane's composer descriptor
+//! answer out of the same table: two lists of the same agent's commands that
+//! could disagree would be one list too many.
+//!
 //! # Adding an agent
 //!
 //! The tables below are only the defaults that ship with the gateway. They are
@@ -39,8 +44,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 /// Bumped whenever the tables below change, so a client can cache a response
-/// and know when to drop it.
-pub const KEYMAP_VERSION: u32 = 3;
+/// and know when to drop it. 4 moved the slash-command tables into
+/// `composer.rs`, so this endpoint and the pane composer descriptor answer out
+/// of one table, and added the opencode profile.
+pub const KEYMAP_VERSION: u32 = 4;
 
 /// Overlay file, read from the gateway's config directory on every request.
 /// Re-read rather than cached so an edit takes effect on the next pane switch
@@ -150,16 +157,9 @@ pub struct Shortcut {
     pub description: &'static str,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
-pub struct SlashCommand {
-    /// The literal text to send, including the leading slash.
-    pub command: &'static str,
-    pub description: &'static str,
-    /// What may follow the command, e.g. "[instructions]". `null` means it runs
-    /// exactly as written, so a client can send it on a single tap; anything
-    /// else should land in the composer first so the argument can be typed.
-    pub argument_hint: Option<&'static str>,
-}
+/// The shape of a built-in command here and in the composer descriptor is the
+/// same shape, because it is the same table.
+use crate::composer::BuiltinCommand as SlashCommand;
 
 const fn key(label: &'static str, key: &'static str, description: &'static str) -> Shortcut {
     Shortcut {
@@ -169,25 +169,11 @@ const fn key(label: &'static str, key: &'static str, description: &'static str) 
     }
 }
 
-const fn cmd(command: &'static str, description: &'static str) -> SlashCommand {
+const fn cmd(name: &'static str, description: &'static str) -> SlashCommand {
     SlashCommand {
-        command,
+        name,
         description,
-        argument_hint: None,
-    }
-}
-
-/// A command that accepts something after it. `hint` is shown to the user, not
-/// sent, so it should read the way the agent's own help writes it.
-const fn cmd_with(
-    command: &'static str,
-    description: &'static str,
-    hint: &'static str,
-) -> SlashCommand {
-    SlashCommand {
-        command,
-        description,
-        argument_hint: Some(hint),
+        args_hint: None,
     }
 }
 
@@ -252,7 +238,6 @@ const EDITOR_COMMANDS: &[SlashCommand] = &[
 /// Caps on what discovery will read, so a stray directory cannot turn one API
 /// call into thousands of file reads.
 const MAX_DISCOVERED_COMMANDS: usize = 64;
-const MAX_DESCRIPTION_CHARS: usize = 160;
 /// Front matter is at the head of the file, so nothing is lost by refusing to
 /// read further. Without a cap, a command directory containing a large file --
 /// or a symlink to `/dev/zero` -- turns one request into an unbounded read.
@@ -283,66 +268,12 @@ const CLAUDE_KEYS: &[Shortcut] = &[
     key("⌃L", "ctrl+l", "Clear screen"),
 ];
 
-// The complete built-in set, with names taken from the shipped Claude Code
-// binary (2.1.x) rather than a chosen subset. `claude --help` does not list
-// slash commands and there is no non-interactive way to ask for them, so the
-// list is maintained here; custom commands still come from disk on top of it.
-const CLAUDE_COMMANDS: &[SlashCommand] = &[
-    cmd_with("/add-dir", "Add a working directory", "[path]"),
-    cmd("/agents", "Manage agents"),
-    cmd("/bug", "Report a bug to Anthropic"),
-    cmd("/clear", "Start a new conversation"),
-    cmd_with("/compact", "Compact the conversation", "[instructions]"),
-    cmd("/config", "Open settings"),
-    cmd("/context", "Show context usage"),
-    cmd("/cost", "Show token cost"),
-    cmd("/doctor", "Diagnose the installation"),
-    cmd("/export", "Export the conversation"),
-    cmd("/help", "Show help"),
-    cmd("/hooks", "Manage hooks"),
-    cmd("/ide", "Connect to an IDE"),
-    cmd("/init", "Create an AGENTS.md"),
-    cmd("/login", "Log in"),
-    cmd("/logout", "Log out"),
-    cmd("/mcp", "Manage MCP servers"),
-    cmd("/memory", "Edit memory files"),
-    cmd_with("/model", "Switch model", "[model]"),
-    cmd("/output-style", "Change the output style"),
-    cmd("/permissions", "Manage tool permissions"),
-    cmd("/pr-comments", "Fetch pull request comments"),
-    cmd("/privacy-settings", "Privacy settings"),
-    cmd("/release-notes", "Show release notes"),
-    cmd("/reload-skills", "Reload skills"),
-    cmd("/resume", "Resume a past conversation"),
-    cmd_with("/review", "Review the current changes", "[target]"),
-    cmd("/rewind", "Rewind to a checkpoint"),
-    cmd("/status", "Show session status"),
-    cmd("/statusline", "Configure the status line"),
-    cmd("/terminal-setup", "Configure the terminal"),
-    cmd("/usage", "Show usage limits"),
-    cmd("/vim", "Toggle vim mode"),
-];
-
 /// From Codex's footer: "Esc to cancel · Tab to amend · ctrl+e to explain".
 const CODEX_KEYS: &[Shortcut] = &[
     key("⇧TAB", "shift+tab", "Cycle approval mode"),
     key("⌃E", "ctrl+e", "Explain"),
     key("⌃R", "ctrl+r", "Transcript"),
     key("⌃L", "ctrl+l", "Clear screen"),
-];
-
-const CODEX_COMMANDS: &[SlashCommand] = &[
-    cmd("/approvals", "Change the approval mode"),
-    cmd("/compact", "Compact the conversation"),
-    cmd("/diff", "Show the working tree diff"),
-    cmd("/init", "Write an AGENTS.md"),
-    cmd("/mcp", "Manage MCP servers"),
-    cmd_with("/mention", "Mention a file", "[file]"),
-    cmd("/model", "Switch model"),
-    cmd("/new", "Start a new conversation"),
-    cmd("/review", "Review the current changes"),
-    cmd("/status", "Show session status"),
-    cmd("/quit", "Quit Codex"),
 ];
 
 /// From Qoder CLI's collapsed rows, marked "… +24 rows (Ctrl+O)".
@@ -353,11 +284,18 @@ const QODER_KEYS: &[Shortcut] = &[
     key("⌃L", "ctrl+l", "Clear screen"),
 ];
 
-const QODER_COMMANDS: &[SlashCommand] = &[
-    cmd("/clear", "Start a new conversation"),
-    cmd("/compact", "Compact the conversation"),
-    cmd("/model", "Switch model"),
-    cmd("/status", "Show session status"),
+/// From opencode 1.18.0's own keybind defaults (`agent_cycle_reverse`,
+/// `command_list`, `variant_cycle`, `session_rename`, `session_background`) and
+/// its leader key, which is `ctrl+x`. The leader-prefixed bindings need two
+/// keystrokes and are not what a phone row is for; these are the ones that are
+/// one key on their own.
+const OPENCODE_KEYS: &[Shortcut] = &[
+    key("⇧TAB", "shift+tab", "Cycle agent"),
+    key("⌃P", "ctrl+p", "List commands"),
+    key("⌃T", "ctrl+t", "Cycle model variant"),
+    key("⌃R", "ctrl+r", "Rename session"),
+    key("⌃B", "ctrl+b", "Background subagents"),
+    key("⌃X", "ctrl+x", "Leader key"),
 ];
 
 struct Profile {
@@ -366,7 +304,10 @@ struct Profile {
     /// substring: "Claude Code" and "claude-code" both resolve to "claude".
     agent_match: &'static [&'static str],
     keys: &'static [Shortcut],
-    commands: &'static [SlashCommand],
+    /// Which `composer.rs` table lists this agent's slash commands. The id
+    /// differs from the profile's own where Herdr's agent name does
+    /// ("qodercli" runs Qoder CLI), so it is named rather than assumed.
+    commands: &'static str,
 }
 
 const AGENT_PROFILES: &[Profile] = &[
@@ -374,21 +315,35 @@ const AGENT_PROFILES: &[Profile] = &[
         id: "claude",
         agent_match: &["claude"],
         keys: CLAUDE_KEYS,
-        commands: CLAUDE_COMMANDS,
+        commands: "claude",
     },
     Profile {
         id: "codex",
         agent_match: &["codex"],
         keys: CODEX_KEYS,
-        commands: CODEX_COMMANDS,
+        commands: "codex",
+    },
+    Profile {
+        id: "opencode",
+        agent_match: &["opencode", "open-code"],
+        keys: OPENCODE_KEYS,
+        commands: "opencode",
     },
     Profile {
         id: "qodercli",
         agent_match: &["qoder"],
         keys: QODER_KEYS,
-        commands: QODER_COMMANDS,
+        commands: "qoder",
     },
 ];
+
+/// The built-in commands of a profile, from the one table that has them.
+fn profile_commands(profile: Option<&Profile>) -> &'static [SlashCommand] {
+    profile
+        .and_then(|profile| crate::composer::table_with_id(profile.commands))
+        .map(|table| table.commands)
+        .unwrap_or(&[])
+}
 
 /// Programs that take over the whole screen, recognised from the pane title.
 /// An editor is not an agent, so the agent field never names it.
@@ -455,10 +410,14 @@ fn resolve_with(
                 (
                     id.clone(),
                     base.map(|profile| profile.keys).unwrap_or(SHELL),
-                    base.map(|profile| profile.commands).unwrap_or(&[]),
+                    profile_commands(base),
                 )
             }
-            (None, Some(profile)) => (profile.id.to_owned(), profile.keys, profile.commands),
+            (None, Some(profile)) => (
+                profile.id.to_owned(),
+                profile.keys,
+                profile_commands(Some(profile)),
+            ),
             (None, None) if pane_title.is_some_and(is_editor_title) => {
                 ("editor".to_owned(), EDITOR, EDITOR_COMMANDS)
             }
@@ -635,7 +594,7 @@ fn merge_commands(
     let mut out: Vec<ResolvedCommand> = Vec::new();
 
     for entry in builtin {
-        let name = entry.command.to_owned();
+        let name = entry.name.to_owned();
         if let Some(index) = discovered.iter().position(|found| found.command == name) {
             out.push(discovered.remove(index));
             continue;
@@ -643,7 +602,7 @@ fn merge_commands(
         out.push(ResolvedCommand {
             command: name,
             description: entry.description.to_owned(),
-            argument_hint: entry.argument_hint.map(str::to_owned),
+            argument_hint: entry.args_hint.map(str::to_owned),
             source: "builtin",
         });
     }
@@ -782,29 +741,12 @@ fn collect_markdown_commands(dir: &Path, source: &'static str, out: &mut Vec<Res
 }
 
 /// Reads `description:` and `argument-hint:` out of a command file's YAML front
-/// matter. Deliberately not a YAML parser: these are two flat string keys, and
-/// pulling in a parser to read them would be the larger risk.
+/// matter, with the same reader the composer's workspace discovery uses.
 fn front_matter(text: &str) -> (String, Option<String>) {
-    let mut description = String::new();
-    let mut hint = None;
-    let Some(rest) = text.strip_prefix("---") else {
-        return (description, hint);
-    };
-    for line in rest.lines() {
-        let trimmed = line.trim();
-        if trimmed == "---" {
-            break;
-        }
-        if let Some(value) = trimmed.strip_prefix("description:") {
-            description = unquote(value);
-        } else if let Some(value) = trimmed.strip_prefix("argument-hint:") {
-            let value = unquote(value);
-            if !value.is_empty() {
-                hint = Some(value);
-            }
-        }
-    }
-    (description, hint)
+    (
+        crate::composer::field(text, "description").unwrap_or_default(),
+        crate::composer::field(text, "argument-hint"),
+    )
 }
 
 /// A slash command is typed into a live agent, so it may only be a name.
@@ -833,15 +775,10 @@ fn valid_key_name(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '_')
 }
 
+/// Anything read off disk or out of a config file is drawn into a client's UI,
+/// so it is stripped and capped the same way the composer's is.
 fn unquote(value: &str) -> String {
-    value
-        .trim()
-        .trim_matches(|c| c == '"' || c == '\'')
-        .trim()
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(MAX_DESCRIPTION_CHARS)
-        .collect()
+    crate::composer::sanitize(value)
 }
 
 fn collect_qoder_commands(path: &Path, out: &mut Vec<ResolvedCommand>) {
@@ -1048,11 +985,13 @@ mod tests {
             .find(|entry| entry["command"] == "/compact")
             .unwrap();
         assert_eq!(compact["argument_hint"], "[instructions]");
-        let clear = commands
+        // And one that runs exactly as typed, which is what lets a client send
+        // it on a single tap instead of opening the composer.
+        let help = commands
             .iter()
-            .find(|entry| entry["command"] == "/clear")
+            .find(|entry| entry["command"] == "/help")
             .unwrap();
-        assert!(clear["argument_hint"].is_null());
+        assert!(help["argument_hint"].is_null());
     }
 
     #[test]

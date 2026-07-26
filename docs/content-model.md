@@ -25,8 +25,9 @@ model, not new protocols.
 
 ```json
 {
-  "schema_version": "1.2.0",
-  "capabilities": { "parts": true, "assets": true, "image_upload": true },
+  "schema_version": "1.3.0",
+  "capabilities": { "parts": true, "assets": true, "image_upload": true,
+                    "composer": true },
   "data": { }
 }
 ```
@@ -36,14 +37,27 @@ reads it once. 1.0.0 shipped assets with `parts: false`; 1.1.0 added the parts
 endpoint and flipped that flag, and changed nothing about the 1.0.0 payloads.
 1.2.0 adds the Codex and opencode dictionaries: more panes answer
 `parts: "dictionary"` where they used to answer `parts: "text"`, and again no
-payload changed shape. The gateway's own `apiVersion` stays 1.4.0 — no route,
-and no field of any route, moved.
+payload changed shape. 1.3.0 adds the composer capabilities — a `composer`
+object on the pane descriptor and the file search endpoint — and again changes
+no existing payload: a 1.2.0 client reads a 1.3.0 response unchanged and simply
+does not see the new field. The gateway's own `apiVersion` stays 1.4.0 — no
+route, and no field of any route, moved.
 
 `capabilities` is also exposed per pane (agent kind detection may vary):
 
 ```json
 { "pane_id": "wM:p1", "agent": "claude-code", "parts": "dictionary",
-  "image_input": "file-path" }
+  "image_input": "file-path",
+  "composer": {
+    "version": 1, "table": "claude", "captured_from": "claude 2.1.220",
+    "file_mentions": true,
+    "slash_commands": [
+      { "name": "/compact", "description": "Free up context by summarizing…",
+        "args_hint": "[instructions]", "source": "builtin" },
+      { "name": "/ship-release", "description": "Cut and publish a release",
+        "args_hint": null, "source": "workspace" }
+    ]
+  } }
 ```
 
 ## Part
@@ -127,6 +141,45 @@ agent upgrades therefore loses structure and cannot lose content. The fixture
 snapshots in `tests/fixtures/` pin each dictionary's output so that drift shows
 up as a reviewable diff; re-pin with `UPDATE_PART_SNAPSHOTS=1 cargo test`.
 
+## Composer capabilities (v1.3)
+
+The app's composer offers slash commands and `@` file mentions without knowing
+any agent by name, because the pane's descriptor says what this agent takes.
+`src/composer.rs` is one versioned table per agent kind, keyed the same way the
+dictionaries are, and `composer` is **absent entirely** for an agent with no
+table — a client can tell "this gateway knows nothing about this agent" from
+"this agent understands no slash commands", which a `null` would not allow.
+
+| table | read off | commands |
+|---|---|---|
+| `claude` | Claude Code 2.1.220, the shipped binary's own command definitions | 34 |
+| `codex` | `SlashCommand` at `rust-v0.145.0`, cross-checked against the installed binary | 44 |
+| `opencode` | opencode 1.18.0, the palette entries that register a slash name | 28 |
+| `qoder` | Qoder CLI 1.1.5, the shipped binary's own command definitions | 37 |
+
+Nothing in those tables is remembered or inferred: no agent prints its slash
+commands to `--help`, so each was read out of the program actually installed on
+the machine. Debug-only, removed and platform-specific commands are left out —
+the table is what a phone should offer on a tap, not the agent's full surface.
+The tables are snapshot-pinned in `tests/fixtures/*-commands.json` (re-pin with
+`UPDATE_COMMAND_SNAPSHOTS=1 cargo test`), and a drift check fails if a table is
+keyed on a name no Herdr detection manifest reports, exactly as the dictionaries
+are checked. The same tables answer `GET .../shortcuts`: two lists of one
+agent's commands that could disagree would be one list too many.
+
+**Workspace commands** (`source: "workspace"`) are read from the pane's own
+workspace root, read-only: a skill directory holding a `SKILL.md` whose front
+matter names and describes it (`.claude/skills`, `.agents/skills`,
+`.codex/skills`, `.opencode/skills`, `.qoder/skills`) and a directory of one
+markdown file per command (`.claude/commands`, `.opencode/command`,
+`.qoder/commands`). Which directories are looked at is the agent's own list, so
+a Codex pane is not offered a Claude skill it cannot run. Discovery is under the
+same fence as the assets API — every directory and every file canonicalizes
+inside the root, so a symlinked skill directory pointing at another checkout is
+skipped — and it is capped at 64 commands and 64 KiB per file. A workspace
+command shadows a builtin of the same name: the file is what the agent actually
+reads.
+
 ## Asset
 
 Anything the agent produced that exists as a file and the user may want to see.
@@ -157,6 +210,16 @@ will stream something renderable.
   `data.pane` carries the per-pane capability descriptor above, with
   `parts: "text"` when no dictionary covers the pane. The raw ANSI endpoints
   remain forever (fallback path).
+- `GET /api/sessions/{sid}/panes/{pid}/files?query=&limit=` — fuzzy path search
+  for `@` mentions. Paths only: a relative path, its name, and a `kind` guessed
+  from the name, never contents and never an absolute path. The only directory
+  searched is the pane's own cwd as Herdr reports it, canonicalized, which is
+  the same fence the asset API is gated on; symlinks are not followed, and dot,
+  dependency and build directories are skipped, so nothing outside the root can
+  be named. Limit defaults to 20 and caps at 50. A pane with no workspace — the
+  filesystem root, the home directory, a pane Herdr does not list — answers with
+  an empty list and `root: null` rather than an error, so this cannot be used to
+  probe the host.
 - SSE additions: `asset.created`, `parts.updated` events on the existing stream.
 
 ## Rollout slices
@@ -175,7 +238,11 @@ will stream something renderable.
    Gemini CLI, Copilot CLI and Cursor Agent are the remaining ones, and are
    waiting on captured output — the manifests carry state-detection patterns,
    not transcript glyphs, so a table cannot be written from them alone.
-4. **v2 — native protocol adapters** (opencode server, codex app-server) feed
+4. **v1.3 — composer capabilities.** A slash-command table per agent kind, the
+   workspace's own skills and commands discovered under the asset fence, and
+   the `@` file search endpoint. Additive: the pane descriptor gains a field and
+   one endpoint appears, and no existing payload changed shape.
+5. **v2 — native protocol adapters** (opencode server, codex app-server) feed
    the same parts; approvals arrive as a new part type behind a minor bump.
 
 ## Non-goals (v1)
