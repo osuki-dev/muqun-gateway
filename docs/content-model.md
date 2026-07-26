@@ -25,11 +25,15 @@ model, not new protocols.
 
 ```json
 {
-  "schema_version": "1.0.0",
+  "schema_version": "1.1.0",
   "capabilities": { "parts": true, "assets": true, "image_upload": true },
   "data": { }
 }
 ```
+
+One version covers the whole content model, assets and parts alike: a client
+reads it once. 1.0.0 shipped assets with `parts: false`; 1.1.0 adds the parts
+endpoint and flips that flag, and changed nothing about the 1.0.0 payloads.
 
 `capabilities` is also exposed per pane (agent kind detection may vary):
 
@@ -66,6 +70,45 @@ Example:
   "fallback_text": "⏺ Bash(cargo test)\n  ⎿ test result: ok. 60 passed" }
 ```
 
+### Marker dictionaries (implemented in v1.1)
+
+`src/parts.rs` is one block state machine plus a per-agent glyph table. Adding an
+agent is a new table, never a new part type and never a change to this document's
+wire format.
+
+| | block | result | quote | prompt | status |
+|---|---|---|---|---|---|
+| Claude Code | `⏺` | `⎿` | — | `❯` | `✻ ✽ ✳ ✢ ∗ ·` |
+| Qoder CLI | `▪ ●` | `└` | `│` | — | — |
+
+A glyph only marks when it opens the line and is followed by a space, so a box
+rule or a bullet inside somebody's output is not read as structure. What the
+machine does with them:
+
+- A **block** line whose remainder parses as `Tool(input)` is a `tool-block`;
+  anything else on a block line ("Update Todos", a sentence) is `text`. The name
+  must be one identifier immediately followed by `(`, which is what keeps
+  `Background command "…" completed (exit code 0)` out of the tool set.
+- **Result** groups under a block are the tool's `result`. `status` is read off
+  the first result line (`Error…`, `✗`) because the terminal never carried an
+  exit code; a block with no result yet is `running`.
+- A result group that is mostly **checkboxes** (`☐ ☑ ☒`) becomes a `todo`, and
+  one that is mostly **climbing line numbers** becomes a `diff` beside its block.
+  Requiring the numbers to climb, and to be followed by gutter padding rather
+  than by a word, is what keeps `13 warnings` and `2026-07-21` out of diffs.
+- An **ellipsis** anywhere in a block sets `truncated`: the agent said this is
+  not all of it.
+- A **quote** line is reasoning drawn as a tree; it degrades to `text` rather
+  than inventing a type outside the closed set.
+- Everything else merges into `text`.
+
+Two invariants are tested rather than intended. Every part carries
+`fallback_text`, the source lines verbatim; and every non-blank source line lands
+in exactly one part's `fallback_text`, in order. A dictionary that drifts when an
+agent upgrades therefore loses structure and cannot lose content. The fixture
+snapshots in `tests/fixtures/` pin each dictionary's output so that drift shows
+up as a reviewable diff; re-pin with `UPDATE_PART_SNAPSHOTS=1 cargo test`.
+
 ## Asset
 
 Anything the agent produced that exists as a file and the user may want to see.
@@ -91,7 +134,11 @@ will stream something renderable.
   canonicalize inside a session workspace root (no symlink escape), size-capped,
   kind re-sniffed on read. 404 outside roots, 415 for kinds with no preview.
 - `GET /api/sessions/{sid}/panes/{pid}/parts?lines=` — the normalized
-  transcript. The raw ANSI endpoints remain forever (fallback path).
+  transcript, read from the pane's own `recent-unwrapped` text (the dictionaries
+  key off line starts, so an unwrapped read is the only sensible source).
+  `data.pane` carries the per-pane capability descriptor above, with
+  `parts: "text"` when no dictionary covers the pane. The raw ANSI endpoints
+  remain forever (fallback path).
 - SSE additions: `asset.created`, `parts.updated` events on the existing stream.
 
 ## Rollout slices
@@ -99,8 +146,9 @@ will stream something renderable.
 1. **v1.0 — assets first** (no dictionaries needed): asset listing + content
    endpoints + `asset-ref` inline detection for paths printed in output. App
    ships the Artifacts entry + markdown/image/text viewers.
-2. **v1.1 — parts for Claude + Qoder** via marker dictionaries (prototype
-   already validated: 85% / 64% typed coverage, tool blocks reconstruct).
+2. **v1.1 — parts for Claude + Qoder** via marker dictionaries. Gateway side
+   shipped: dictionaries, the parts endpoint, and fixture snapshots pinned per
+   agent version. App side renders the parts with the fallback path one tap away.
 3. **v1.2 — remaining mainstream dictionaries** (Herdr's agent-detection
    manifests are the ecosystem-maintained pattern source to mirror).
 4. **v2 — native protocol adapters** (opencode server, codex app-server) feed
