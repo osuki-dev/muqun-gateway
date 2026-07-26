@@ -233,7 +233,10 @@ Routes:
 - `GET /api/sessions/default/events`
   (optional `?types=` filter; optional `?stream_pane=<paneId>` inlines that
   pane's current output into its `pane.updated` events as `data.output`, so a
-  client paints on arrival with no follow-up read)
+  client paints on arrival with no follow-up read; the gateway's own
+  `asset.created` events ride the same stream)
+- `GET /api/sessions/default/assets?since=&limit=&path=`
+- `GET /api/assets/:assetId/content`
 - `GET /api/sessions/default/snapshot`
 - `GET /api/sessions/default/workspaces`
 - `POST /api/sessions/default/workspaces`
@@ -271,6 +274,51 @@ type is decided by sniffing the content, so everything else is refused with
 `415`, executables and scripts included, and the client's filename is only
 echoed back and never reaches the filesystem. The body is capped at 25 MiB, and
 stored uploads are deleted 48 hours after they were written.
+
+### Assets
+
+`GET /api/sessions/default/assets` lists the files a session's workspaces
+produced recently, newest first, and `GET /api/assets/:assetId/content` streams
+one of them back. Both speak the unified content model (`docs/content-model.md`)
+and answer in its versioned envelope:
+
+```json
+{
+  "schema_version": "1.0.0",
+  "capabilities": { "parts": false, "assets": true, "image_upload": true },
+  "data": { "assets": [ { "id": "as_…", "path": "/Users/…/report.md",
+    "name": "report.md", "kind": "markdown", "mime": "text/markdown; charset=utf-8",
+    "size": 6180, "modified_unix_ms": 1785100000000,
+    "origin": { "session_id": "default", "workspace_id": "wM", "pane_id": "wM:p1",
+      "root": "/Users/…" }, "previewable": true } ] }
+}
+```
+
+`since` is Unix milliseconds, the same unit as `modified_unix_ms`, and returns
+only files modified strictly after it. `limit` runs from 1 to 200 and defaults
+to 50. `path=<absolute path>` resolves one exact file instead, for a path the
+user tapped in terminal output; it takes precedence over `since` and `limit`,
+and answers with that one asset or with none.
+
+Two feeds keep the list current. Herdr's `worktree.*` events, which the gateway
+already subscribes to, carry the checkout's root path and its workspace but no
+file information -- protocol 17 has no per-file event -- so each one is taken as
+a "this root just changed" trigger and the files come from scanning exactly that
+root at that moment. Newly seen files are announced on the events stream as
+`asset.created`, carrying one asset in the same envelope, and obeying the same
+`types=` allow-list under that name. Everything else, a cold start included,
+comes from an mtime scan of the session's workspace roots, which are the panes'
+working directories. The scan is shallow and budgeted, and skips dot
+directories, dependency directories, and build output.
+
+`kind` is sniffed from the file's own bytes -- `image`, `markdown`, `text`,
+`pdf`, or `binary` -- and `previewable` is false only for `binary`. The content
+endpoint sniffs again on read, so a file that changed under a stale listing is
+still served as what it now is. A path must canonicalize to a regular file
+inside a workspace root the session currently has: a symlink pointing out of the
+root, a traversal, and an unknown id all answer `404`, and no answer
+distinguishes them. Assets over 10 MiB answer `413`, and a binary asset answers
+`415` with its metadata and no body. Nothing about this API writes.
 
 The gateway registers Muqun Expo push tokens and watches Herdr agent lifecycle
 events in the background. It sends a notification when an agent becomes

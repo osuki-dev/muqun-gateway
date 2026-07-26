@@ -18,7 +18,7 @@ use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::response::{Html, Response};
+use axum::response::{Html, IntoResponse as _, Response};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use base64::Engine as _;
@@ -81,7 +81,7 @@ const MANAGE_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 /// every pane or sending unchanged terminal frames over the network.
 const STREAM_OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(150);
 const STREAM_OUTPUT_READ_TIMEOUT: Duration = Duration::from_millis(100);
-const GATEWAY_API_VERSION: &str = "1.2.0";
+const GATEWAY_API_VERSION: &str = "1.3.0";
 const GATEWAY_API_MAJOR: u64 = 1;
 const HERDR_PROTOCOL_MIN: u64 = 17;
 const HERDR_PROTOCOL_MAX: u64 = 17;
@@ -97,8 +97,53 @@ const MAX_UPLOAD_NAME_CHARS: usize = 120;
 /// going to do with a file, it has done long before this.
 const UPLOAD_RETENTION: Duration = Duration::from_secs(48 * 60 * 60);
 const UPLOAD_GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// Version of the unified content model this gateway speaks. Declared on every
+/// asset envelope so a client renders what it knows and falls back for the
+/// rest; additive changes bump the minor.
+const CONTENT_SCHEMA_VERSION: &str = "1.0.0";
+/// A phone previews artifacts, it does not download archives. Anything larger
+/// is refused rather than streamed, so one request can never tie up the host.
+const MAX_ASSET_CONTENT_BYTES: u64 = 10 * 1024 * 1024;
+const ASSET_CONTENT_CHUNK_BYTES: usize = 64 * 1024;
+/// Enough of a file's head to decide what it is. The same bytes settle both the
+/// magic-number check and the "is this text" question.
+const ASSET_SNIFF_BYTES: usize = 8 * 1024;
+/// A workspace scan is a preview mechanism, not an indexer: it stays shallow,
+/// stops at a fixed budget, and never descends into a dependency or build
+/// directory. Depth 1 is the root's own children.
+const ASSET_SCAN_MAX_DEPTH: usize = 4;
+const ASSET_SCAN_MAX_ENTRIES: usize = 20_000;
+const ASSET_SCAN_MAX_FILES: usize = 4_000;
+const ASSET_LIST_DEFAULT_LIMIT: usize = 50;
+const ASSET_LIST_MAX_LIMIT: usize = 200;
+/// The index is a rolling window of what the workspaces produced recently;
+/// the oldest entries are dropped so a long-lived gateway cannot grow without
+/// end.
+const MAX_INDEXED_ASSETS: usize = 4_000;
+/// A worktree event re-scans that root, but only files written around the event
+/// are announced: the first scan of an old checkout is not "just created".
+const ASSET_EVENT_MAX_AGE_MS: u128 = 10 * 60 * 1000;
+const MAX_ASSET_EVENTS_PER_WORKTREE: usize = 20;
+/// Directories holding dependencies, build output, or vendored code. None of it
+/// is something an agent just produced for the user to look at, and all of it
+/// is big enough to swamp a scan. Names starting with a dot are skipped
+/// separately, which covers `.git`, `.venv`, `.next`, and friends.
+const ASSET_SKIP_DIRS: &[&str] = &[
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "out",
+    "vendor",
+    "Pods",
+    "DerivedData",
+    "__pycache__",
+    "venv",
+    "coverage",
+];
 const API_CAPABILITIES: &[&str] = &[
     "agent_lifecycle_notifications",
+    "assets",
     "device_revocation",
     "file_uploads",
     "one_time_pairing_codes",
@@ -289,6 +334,7 @@ struct AppState {
     pairing_requests: Arc<Mutex<VecDeque<u128>>>,
     push_tokens: Arc<Mutex<Vec<PushTokenRecord>>>,
     devices: Arc<Mutex<Vec<DeviceRecord>>>,
+    assets: Arc<Mutex<AssetIndex>>,
 }
 
 #[derive(Deserialize)]
@@ -741,6 +787,7 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         pairing_requests: Arc::new(Mutex::new(VecDeque::new())),
         push_tokens: Arc::new(Mutex::new(read_push_tokens().unwrap_or_default())),
         devices: Arc::new(Mutex::new(read_devices().unwrap_or_default())),
+        assets: Arc::new(Mutex::new(AssetIndex::default())),
     };
     spawn_agent_notification_watchers(state.clone());
     spawn_upload_gc();
@@ -834,6 +881,8 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
             "/api/sessions/{session_id}/panes/{pane_id}/send-keys",
             post(send_keys),
         )
+        .route("/api/sessions/{session_id}/assets", get(session_assets))
+        .route("/api/assets/{asset_id}/content", get(asset_content))
         // A route-level limit is applied inside the router-wide one, so uploads
         // get their own ceiling while every JSON route keeps the small one.
         .route(
@@ -2277,6 +2326,13 @@ async fn events(
             _ => "ansi".into(),
         },
     };
+    // `asset.created` is a gateway event on the same stream, so it obeys the
+    // same allow-list as the Herdr ones: a client that filtered down to output
+    // updates is not woken for artifacts it never asked about.
+    let asset_events = wanted
+        .as_ref()
+        .is_none_or(|set| set.contains("asset_created"));
+    let assets = state.assets.clone();
     let stream = async_stream::stream! {
         match herdr_event_stream(&session).await {
             Ok(mut reader) => {
@@ -2316,6 +2372,29 @@ async fn events(
                                         data.to_owned()
                                     };
                                     yield Ok(Event::default().event("herdr").data(payload));
+                                }
+                                // A worktree event is consumed whether or not
+                                // the client asked to see it: the asset index
+                                // is fed by the same stream that filters.
+                                if let Some(root) = worktree_event_root(&session_id, data) {
+                                    let created = ingest_roots(assets.clone(), vec![root]).await;
+                                    if asset_events {
+                                        let now = now_unix_ms();
+                                        for entry in created
+                                            .into_iter()
+                                            .filter(|entry| now.saturating_sub(entry.modified_unix_ms) <= ASSET_EVENT_MAX_AGE_MS)
+                                            .take(MAX_ASSET_EVENTS_PER_WORKTREE)
+                                        {
+                                            let asset_type = sniff_asset_type(&read_asset_head(&entry.path), &entry.name);
+                                            yield Ok(Event::default()
+                                                .event("asset.created")
+                                                .data(asset_created_payload(&entry, asset_type)));
+                                        }
+                                    }
+                                } else if let Some(removed) = worktree_event_removed_root(data) {
+                                    if let Ok(mut index) = assets.lock() {
+                                        index.forget_under(&removed);
+                                    }
                                 }
                             }
                             }
@@ -3356,6 +3435,849 @@ fn upload_expired(modified: SystemTime, now: SystemTime) -> bool {
         .unwrap_or(false)
 }
 
+// ---------------------------------------------------------------------------
+// Assets: the file half of the unified content model.
+//
+// An asset is a file a session's workspaces produced that the user may want to
+// look at on the phone. Two feeds keep the index current, in this order:
+//
+// 1. Herdr's `worktree.*` events, which the gateway already subscribes to.
+//    They carry the checkout's root path (and its workspace), never the files
+//    written inside it -- protocol 17 has no per-file event -- so what they
+//    give is a precise "this root just changed" trigger, and the files come
+//    from scanning exactly that root at that moment.
+// 2. An mtime scan of the session's workspace roots, which is what a cold start
+//    or a plain listing uses, and what makes the endpoint work on a session
+//    that never touched a worktree.
+//
+// Reading a file is gated on one rule and one rule only: the path canonicalizes
+// to a regular file inside a root the session currently has.
+// ---------------------------------------------------------------------------
+
+/// What a file is, decided from its bytes. The client picks a viewer from this,
+/// so it is derived again on every read rather than trusted from a listing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssetKind {
+    Image,
+    Markdown,
+    Text,
+    Pdf,
+    Binary,
+}
+
+impl AssetKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            AssetKind::Image => "image",
+            AssetKind::Markdown => "markdown",
+            AssetKind::Text => "text",
+            AssetKind::Pdf => "pdf",
+            AssetKind::Binary => "binary",
+        }
+    }
+
+    /// Binary is the one kind with nothing to show, so it is the one kind the
+    /// content endpoint refuses instead of streaming.
+    fn previewable(self) -> bool {
+        !matches!(self, AssetKind::Binary)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AssetType {
+    kind: AssetKind,
+    mime: &'static str,
+}
+
+/// A directory a session works in, and the Herdr identifiers that explain where
+/// it came from.
+#[derive(Debug, Clone)]
+struct AssetRoot {
+    path: PathBuf,
+    session_id: String,
+    workspace_id: Option<String>,
+    pane_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct AssetEntry {
+    id: String,
+    path: PathBuf,
+    name: String,
+    size: u64,
+    modified_unix_ms: u128,
+    root: PathBuf,
+    session_id: String,
+    workspace_id: Option<String>,
+    pane_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ScannedFile {
+    path: PathBuf,
+    name: String,
+    size: u64,
+    modified_unix_ms: u128,
+}
+
+/// Everything the gateway knows about produced files, keyed by asset id. The
+/// id is derived from the path, so the same file rediscovered by a later scan
+/// -- or by a different root -- lands on the same entry instead of a duplicate.
+#[derive(Debug, Default)]
+struct AssetIndex {
+    entries: HashMap<String, AssetEntry>,
+    roots: HashMap<String, Vec<AssetRoot>>,
+}
+
+impl AssetIndex {
+    /// Fold one scanned file in. Answers whether this path had not been seen
+    /// before, which is what makes an `asset.created` event honest.
+    fn upsert(&mut self, entry: AssetEntry) -> bool {
+        match self.entries.get_mut(&entry.id) {
+            Some(existing) => {
+                existing.size = entry.size;
+                existing.modified_unix_ms = entry.modified_unix_ms;
+                existing.name = entry.name;
+                // Workspace roots nest: `~/.ws` and `~/.ws/api` both see the
+                // same file. The deeper root is the one that actually produced
+                // it, so it wins the attribution.
+                if entry.root.as_os_str().len() > existing.root.as_os_str().len() {
+                    existing.root = entry.root;
+                    existing.session_id = entry.session_id;
+                    existing.workspace_id = entry.workspace_id;
+                    existing.pane_id = entry.pane_id;
+                }
+                false
+            }
+            None => {
+                self.entries.insert(entry.id.clone(), entry);
+                true
+            }
+        }
+    }
+
+    fn get(&self, id: &str) -> Option<AssetEntry> {
+        self.entries.get(id).cloned()
+    }
+
+    fn remember_roots(&mut self, session_id: &str, roots: Vec<AssetRoot>) {
+        self.roots.insert(session_id.to_owned(), roots);
+    }
+
+    fn known_roots(&self, session_id: &str) -> Vec<AssetRoot> {
+        self.roots.get(session_id).cloned().unwrap_or_default()
+    }
+
+    /// Newest first, with the path as the tie-break so two files written in the
+    /// same millisecond still order the same way on every call.
+    fn session_assets(
+        &self,
+        session_id: &str,
+        since_unix_ms: Option<u128>,
+        limit: usize,
+    ) -> Vec<AssetEntry> {
+        let mut entries: Vec<AssetEntry> = self
+            .entries
+            .values()
+            .filter(|entry| entry.session_id == session_id)
+            .filter(|entry| match since_unix_ms {
+                Some(since) => entry.modified_unix_ms > since,
+                None => true,
+            })
+            .cloned()
+            .collect();
+        entries.sort_by(|left, right| {
+            right
+                .modified_unix_ms
+                .cmp(&left.modified_unix_ms)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        entries.truncate(limit);
+        entries
+    }
+
+    /// A removed worktree takes its files with it: keeping them would hand out
+    /// ids that can only ever 404.
+    fn forget_under(&mut self, root: &FsPath) {
+        self.entries
+            .retain(|_, entry| !entry.path.starts_with(root));
+    }
+
+    /// Keep the index a rolling window over what was produced recently.
+    fn prune(&mut self) {
+        if self.entries.len() <= MAX_INDEXED_ASSETS {
+            return;
+        }
+        let mut ordered: Vec<(String, u128)> = self
+            .entries
+            .iter()
+            .map(|(id, entry)| (id.clone(), entry.modified_unix_ms))
+            .collect();
+        ordered.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        for (id, _) in ordered.into_iter().skip(MAX_INDEXED_ASSETS) {
+            self.entries.remove(&id);
+        }
+    }
+}
+
+/// Opaque to the client, stable for the gateway: the same file keeps its id
+/// across scans and across restarts, and the id itself carries no path a caller
+/// could bend into something else.
+fn asset_id(path: &FsPath) -> String {
+    use sha2::{Digest as _, Sha256};
+    let digest = Sha256::digest(path.to_string_lossy().as_bytes());
+    let mut id = String::from("as_");
+    for byte in digest.iter().take(12) {
+        id.push_str(&format!("{byte:02x}"));
+    }
+    id
+}
+
+fn system_time_unix_ms(time: Option<SystemTime>) -> u128 {
+    time.and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
+}
+
+/// Decide what a file is from its first bytes. Images and PDFs are recognised
+/// by magic number; everything else has to look like text before it can be one
+/// of the text kinds, and only then does the extension get a say -- it decides
+/// markdown from plain text and nothing else, so a `.md` full of binary is
+/// still binary.
+fn sniff_asset_type(bytes: &[u8], name: &str) -> AssetType {
+    if let Some(image) = sniff_upload_kind(bytes) {
+        return AssetType {
+            kind: AssetKind::Image,
+            mime: image.mime,
+        };
+    }
+    if bytes.starts_with(b"%PDF-") {
+        return AssetType {
+            kind: AssetKind::Pdf,
+            mime: "application/pdf",
+        };
+    }
+    if !looks_textual(bytes) {
+        return AssetType {
+            kind: AssetKind::Binary,
+            mime: "application/octet-stream",
+        };
+    }
+    if has_markdown_extension(name) {
+        return AssetType {
+            kind: AssetKind::Markdown,
+            mime: "text/markdown; charset=utf-8",
+        };
+    }
+    AssetType {
+        kind: AssetKind::Text,
+        mime: "text/plain; charset=utf-8",
+    }
+}
+
+fn has_markdown_extension(name: &str) -> bool {
+    name.rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .is_some_and(|extension| matches!(extension.as_str(), "md" | "markdown" | "mdx"))
+}
+
+/// Text is UTF-8 without NUL bytes and without a crowd of control characters.
+/// The probe is a prefix of the file, so a multi-byte character cut in half at
+/// the end is not held against it; an invalid sequence anywhere else is.
+fn looks_textual(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return true;
+    }
+    if bytes.contains(&0) {
+        return false;
+    }
+    let valid_up_to = match std::str::from_utf8(bytes) {
+        Ok(_) => bytes.len(),
+        Err(err) if err.error_len().is_none() => err.valid_up_to(),
+        Err(_) => return false,
+    };
+    let text = &bytes[..valid_up_to];
+    if text.is_empty() {
+        return false;
+    }
+    let control = text
+        .iter()
+        .filter(|byte| **byte < 0x20 && !matches!(**byte, b'\t' | b'\n' | b'\r' | 0x0c))
+        .count();
+    control * 20 <= text.len()
+}
+
+/// A pane sitting at the filesystem root, or straight in the home directory, is
+/// not a workspace: scanning from there would sweep the whole machine.
+fn is_scannable_root(path: &FsPath) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+    if path.components().count() < 3 {
+        return false;
+    }
+    if dirs::home_dir().is_some_and(|home| path == home) {
+        return false;
+    }
+    true
+}
+
+/// Herdr does not report a "workspace root" as such. What it does report, for
+/// every pane, is the directory that pane runs in -- which is where an agent
+/// working in that pane writes its output.
+fn pane_list_roots(session_id: &str, response: &Value) -> Vec<AssetRoot> {
+    let mut roots: Vec<AssetRoot> = Vec::new();
+    let Some(panes) = response.pointer("/result/panes").and_then(Value::as_array) else {
+        return roots;
+    };
+    for pane in panes {
+        let Some(cwd) = pane
+            .get("cwd")
+            .and_then(Value::as_str)
+            .or_else(|| pane.get("foreground_cwd").and_then(Value::as_str))
+        else {
+            continue;
+        };
+        let path = PathBuf::from(cwd);
+        if !is_scannable_root(&path) {
+            continue;
+        }
+        if roots.iter().any(|root| root.path == path) {
+            continue;
+        }
+        roots.push(AssetRoot {
+            path,
+            session_id: session_id.to_owned(),
+            workspace_id: pane
+                .get("workspace_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            pane_id: pane
+                .get("pane_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        });
+    }
+    roots
+}
+
+/// Herdr's `worktree.*` events carry the checkout root and its workspace, not
+/// the files written inside it. Treated as a trigger rather than as content,
+/// they are still the precise signal the asset index wants: scan this root, now.
+fn worktree_event_root(session_id: &str, line: &str) -> Option<AssetRoot> {
+    let value = serde_json::from_str::<Value>(line).ok()?;
+    let event = value.get("event").and_then(Value::as_str)?;
+    if !matches!(event, "worktree_created" | "worktree_opened") {
+        return None;
+    }
+    let path = PathBuf::from(
+        value
+            .pointer("/data/worktree/path")
+            .and_then(Value::as_str)?,
+    );
+    if !is_scannable_root(&path) {
+        return None;
+    }
+    Some(AssetRoot {
+        path,
+        session_id: session_id.to_owned(),
+        workspace_id: value
+            .pointer("/data/workspace/workspace_id")
+            .and_then(Value::as_str)
+            .or_else(|| value.pointer("/data/workspace_id").and_then(Value::as_str))
+            .map(str::to_owned),
+        pane_id: None,
+    })
+}
+
+fn worktree_event_removed_root(line: &str) -> Option<PathBuf> {
+    let value = serde_json::from_str::<Value>(line).ok()?;
+    if value.get("event").and_then(Value::as_str)? != "worktree_removed" {
+        return None;
+    }
+    Some(PathBuf::from(
+        value
+            .pointer("/data/worktree/path")
+            .and_then(Value::as_str)?,
+    ))
+}
+
+/// Walk one root for files worth showing. Shallow, budgeted, and blind to
+/// dependency directories, dot directories, and symlinks -- a link is how a
+/// scan would leave the root, so it is never followed.
+fn scan_workspace_root(root: &FsPath, max_depth: usize, max_files: usize) -> Vec<ScannedFile> {
+    let mut files: Vec<ScannedFile> = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    let mut visited = 0usize;
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(listing) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in listing.flatten() {
+            visited += 1;
+            if visited > ASSET_SCAN_MAX_ENTRIES || files.len() >= max_files {
+                return files;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                if depth + 1 >= max_depth || ASSET_SKIP_DIRS.contains(&name.as_str()) {
+                    continue;
+                }
+                stack.push((entry.path(), depth + 1));
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            files.push(ScannedFile {
+                path: entry.path(),
+                name,
+                size: metadata.len(),
+                modified_unix_ms: system_time_unix_ms(metadata.modified().ok()),
+            });
+        }
+    }
+    files
+}
+
+/// Scan one root and fold the result into the index. Answers with the entries
+/// that were not there before, newest first.
+fn ingest_root(index: &Mutex<AssetIndex>, root: &AssetRoot) -> Vec<AssetEntry> {
+    let Ok(canonical) = std::fs::canonicalize(&root.path) else {
+        return Vec::new();
+    };
+    let files = scan_workspace_root(&canonical, ASSET_SCAN_MAX_DEPTH, ASSET_SCAN_MAX_FILES);
+    let Ok(mut index) = index.lock() else {
+        eprintln!(
+            "asset index lock failed while scanning {}",
+            canonical.display()
+        );
+        return Vec::new();
+    };
+    let mut created: Vec<AssetEntry> = Vec::new();
+    for file in files {
+        let entry = AssetEntry {
+            id: asset_id(&file.path),
+            path: file.path,
+            name: file.name,
+            size: file.size,
+            modified_unix_ms: file.modified_unix_ms,
+            root: canonical.clone(),
+            session_id: root.session_id.clone(),
+            workspace_id: root.workspace_id.clone(),
+            pane_id: root.pane_id.clone(),
+        };
+        if index.upsert(entry.clone()) {
+            created.push(entry);
+        }
+    }
+    index.prune();
+    created.sort_by_key(|entry| std::cmp::Reverse(entry.modified_unix_ms));
+    created
+}
+
+/// Scanning is blocking filesystem work, so it runs off the async runtime.
+async fn ingest_roots(index: Arc<Mutex<AssetIndex>>, roots: Vec<AssetRoot>) -> Vec<AssetEntry> {
+    tokio::task::spawn_blocking(move || {
+        let mut created = Vec::new();
+        for root in &roots {
+            created.extend(ingest_root(&index, root));
+        }
+        created
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// Herdr is the source of truth for where a session works, but a listing still
+/// has to answer when the socket is down, so the last known roots are kept.
+async fn session_asset_roots(state: &AppState, session: &SessionConfig) -> Vec<AssetRoot> {
+    let fresh = match herdr_request(session, "pane.list", json!({})).await {
+        Ok(value) => pane_list_roots(&session.id, &value),
+        Err(err) => {
+            eprintln!("asset roots: pane.list failed: {err:#}");
+            Vec::new()
+        }
+    };
+    if fresh.is_empty() {
+        return match state.assets.lock() {
+            Ok(index) => index.known_roots(&session.id),
+            Err(_) => Vec::new(),
+        };
+    }
+    if let Ok(mut index) = state.assets.lock() {
+        index.remember_roots(&session.id, fresh.clone());
+    }
+    fresh
+}
+
+fn canonical_roots(roots: &[AssetRoot]) -> Vec<PathBuf> {
+    roots
+        .iter()
+        .filter_map(|root| std::fs::canonicalize(&root.path).ok())
+        .collect()
+}
+
+/// The one gate on reading a file. Whatever an id claimed, the path has to
+/// canonicalize to a regular file inside a root the session currently has.
+/// Canonicalizing first is what closes symlink escapes: a link inside a root
+/// that points outside it resolves to the outside path, and fails here.
+fn resolve_asset_path(path: &FsPath, roots: &[PathBuf]) -> Option<PathBuf> {
+    let canonical = std::fs::canonicalize(path).ok()?;
+    if !canonical.is_file() {
+        return None;
+    }
+    roots
+        .iter()
+        .any(|root| canonical != *root && canonical.starts_with(root))
+        .then_some(canonical)
+}
+
+/// Resolve one exact path into an asset. The app needs this because a file
+/// path printed in a terminal has to map to the file it names -- matching by
+/// name against the listing would land on the wrong one. The path is held to
+/// the same fence as every other read, and anything that fails it answers "no
+/// match" rather than an error, so this cannot be used to probe the host.
+///
+/// A scan is not involved, so a file deeper or more obscure than the scan
+/// bothers with still resolves: the user pointed at it.
+fn asset_entry_for_path(raw: &str, roots: &[AssetRoot]) -> Option<AssetEntry> {
+    let path = std::fs::canonicalize(raw).ok()?;
+    if !path.is_file() {
+        return None;
+    }
+    // Workspace roots nest, so the deepest containing root owns the file.
+    let (owner, root) = roots
+        .iter()
+        .filter_map(|root| {
+            std::fs::canonicalize(&root.path)
+                .ok()
+                .map(|canonical| (root, canonical))
+        })
+        .filter(|(_, canonical)| path != *canonical && path.starts_with(canonical))
+        .max_by_key(|(_, canonical)| canonical.as_os_str().len())?;
+    let metadata = std::fs::metadata(&path).ok()?;
+    Some(AssetEntry {
+        id: asset_id(&path),
+        name: path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string(),
+        path,
+        size: metadata.len(),
+        modified_unix_ms: system_time_unix_ms(metadata.modified().ok()),
+        root,
+        session_id: owner.session_id.clone(),
+        workspace_id: owner.workspace_id.clone(),
+        pane_id: owner.pane_id.clone(),
+    })
+}
+
+/// Read only as much of a file as it takes to type it.
+fn read_asset_head(path: &FsPath) -> Vec<u8> {
+    use std::io::Read as _;
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut head = Vec::new();
+    if file
+        .take(ASSET_SNIFF_BYTES as u64)
+        .read_to_end(&mut head)
+        .is_err()
+    {
+        return Vec::new();
+    }
+    head
+}
+
+fn asset_json(entry: &AssetEntry, asset_type: AssetType) -> Value {
+    json!({
+        "id": entry.id,
+        "path": entry.path.to_string_lossy(),
+        "name": entry.name,
+        "kind": asset_type.kind.as_str(),
+        "mime": asset_type.mime,
+        "size": entry.size,
+        "modified_unix_ms": entry.modified_unix_ms,
+        "origin": {
+            "session_id": entry.session_id,
+            "workspace_id": entry.workspace_id,
+            "pane_id": entry.pane_id,
+            "root": entry.root.to_string_lossy(),
+        },
+        "previewable": asset_type.kind.previewable(),
+    })
+}
+
+/// The versioned envelope every content-model response carries.
+fn content_envelope(data: Value) -> Value {
+    json!({
+        "schema_version": CONTENT_SCHEMA_VERSION,
+        "capabilities": { "parts": false, "assets": true, "image_upload": true },
+        "data": data,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct AssetsQuery {
+    /// Unix milliseconds, matching every `modified_unix_ms` on the wire; only
+    /// files modified strictly after this are returned, so a client can poll
+    /// for what is new without re-reading the list.
+    #[serde(default)]
+    since: Option<u64>,
+    #[serde(default)]
+    limit: Option<usize>,
+    /// One absolute path to resolve exactly, for a file path the user tapped in
+    /// terminal output. Takes precedence over `since` and `limit`, and answers
+    /// with either the one asset or none.
+    #[serde(default)]
+    path: Option<String>,
+}
+
+/// List what a session's workspaces produced recently, newest first.
+async fn session_assets(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Query(query): Query<AssetsQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let session = find_session(&state.config, &session_id)?.clone();
+    let roots = session_asset_roots(&state, &session).await;
+
+    // An exact path lookup asks about one file, so it neither waits for a scan
+    // nor pages: it answers with that file or with nothing.
+    if let Some(wanted) = query.path.clone() {
+        let lookup_roots = roots.clone();
+        let entry = tokio::task::spawn_blocking(move || {
+            let entry = asset_entry_for_path(&wanted, &lookup_roots)?;
+            let asset_type = sniff_asset_type(&read_asset_head(&entry.path), &entry.name);
+            Some((entry, asset_type))
+        })
+        .await
+        .unwrap_or_default();
+        let assets = match entry {
+            Some((entry, asset_type)) => {
+                // Remember it, so the id the client just received resolves at
+                // the content endpoint even if no scan would have found it.
+                lock_assets(&state)?.upsert(entry.clone());
+                vec![asset_json(&entry, asset_type)]
+            }
+            None => Vec::new(),
+        };
+        return Ok(Json(content_envelope(json!({
+            "session_id": session_id,
+            "assets": assets,
+            "path": query.path,
+        }))));
+    }
+
+    ingest_roots(state.assets.clone(), roots.clone()).await;
+
+    let limit = query
+        .limit
+        .unwrap_or(ASSET_LIST_DEFAULT_LIMIT)
+        .clamp(1, ASSET_LIST_MAX_LIMIT);
+    let since = query.since.map(u128::from);
+    let entries = lock_assets(&state)?.session_assets(&session_id, since, limit);
+    // Only the page about to be returned is sniffed: metadata came from the
+    // scan, and reading a handful of file heads is cheap where reading every
+    // file in the workspace would not be.
+    let assets = tokio::task::spawn_blocking(move || {
+        entries
+            .into_iter()
+            .map(|entry| {
+                let asset_type = sniff_asset_type(&read_asset_head(&entry.path), &entry.name);
+                asset_json(&entry, asset_type)
+            })
+            .collect::<Vec<Value>>()
+    })
+    .await
+    .unwrap_or_default();
+
+    Ok(Json(content_envelope(json!({
+        "session_id": session_id,
+        "assets": assets,
+        "limit": limit,
+        "since": since.map(|since| since as u64),
+        "roots": roots
+            .iter()
+            .map(|root| root.path.to_string_lossy())
+            .collect::<Vec<_>>(),
+    }))))
+}
+
+/// Stream one asset back, read-only.
+async fn asset_content(
+    State(state): State<AppState>,
+    Path(asset_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    require_device(&state, &headers)?;
+
+    let mut entry = lock_assets(&state)?.get(&asset_id);
+    if entry.is_none() {
+        // Cold start: the app may hold an id from before a restart, so rebuild
+        // the index from the live sessions once before answering.
+        for session in state.config.sessions.clone() {
+            let roots = session_asset_roots(&state, &session).await;
+            ingest_roots(state.assets.clone(), roots).await;
+        }
+        entry = lock_assets(&state)?.get(&asset_id);
+    }
+    let Some(entry) = entry else {
+        return Err(asset_not_found());
+    };
+
+    // Roots are resolved again rather than trusted from the index: what is
+    // inside a workspace now is what decides, not what was when it was scanned.
+    let session = find_session(&state.config, &entry.session_id)
+        .map_err(|_| asset_not_found())?
+        .clone();
+    let roots = canonical_roots(&session_asset_roots(&state, &session).await);
+    let entry_path = entry.path.clone();
+    let Some(path) = tokio::task::spawn_blocking(move || resolve_asset_path(&entry_path, &roots))
+        .await
+        .unwrap_or_default()
+    else {
+        return Err(asset_not_found());
+    };
+
+    let metadata = std::fs::metadata(&path).map_err(|_| asset_not_found())?;
+    if metadata.len() > MAX_ASSET_CONTENT_BYTES {
+        return Err(api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "asset_too_large",
+            "the asset is larger than 10 MiB",
+        ));
+    }
+
+    let sniff_path = path.clone();
+    let name = entry.name.clone();
+    let asset_type =
+        tokio::task::spawn_blocking(move || sniff_asset_type(&read_asset_head(&sniff_path), &name))
+            .await
+            .map_err(|_| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "asset_read_failed",
+                    "failed to read the asset",
+                )
+            })?;
+
+    let mut entry = entry;
+    entry.size = metadata.len();
+    entry.modified_unix_ms = system_time_unix_ms(metadata.modified().ok());
+    if !asset_type.kind.previewable() {
+        return Ok((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Json(json!({
+                "error": {
+                    "code": "asset_not_previewable",
+                    "message": "this asset has no preview; only its metadata is returned",
+                },
+                "asset": asset_json(&entry, asset_type),
+            })),
+        )
+            .into_response());
+    }
+
+    let file = tokio::fs::File::open(&path).await.map_err(|err| {
+        eprintln!("failed to open asset {}: {err}", path.display());
+        asset_not_found()
+    })?;
+    let stream = async_stream::stream! {
+        let mut file = file;
+        let mut buffer = vec![0u8; ASSET_CONTENT_CHUNK_BYTES];
+        loop {
+            match tokio::io::AsyncReadExt::read(&mut file, &mut buffer).await {
+                Ok(0) => break,
+                Ok(read) => yield Ok::<_, std::io::Error>(
+                    axum::body::Bytes::copy_from_slice(&buffer[..read]),
+                ),
+                Err(err) => {
+                    yield Err(err);
+                    break;
+                }
+            }
+        }
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", asset_type.mime)
+        .header("content-length", metadata.len())
+        .header(
+            "content-disposition",
+            format!("inline; filename=\"{}\"", header_safe_name(&entry.name)),
+        )
+        .header("x-asset-kind", asset_type.kind.as_str())
+        .header("x-content-schema-version", CONTENT_SCHEMA_VERSION)
+        .body(Body::from_stream(stream))
+        .map_err(|err| {
+            eprintln!("failed to build asset response: {err}");
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "asset_read_failed",
+                "failed to read the asset",
+            )
+        })
+}
+
+/// One answer for "no such asset" and for "that path is not inside a workspace
+/// root": a caller must not be able to tell the two apart and map the host.
+fn asset_not_found() -> (StatusCode, Json<Value>) {
+    api_error(
+        StatusCode::NOT_FOUND,
+        "asset_not_found",
+        "asset not found in a session workspace",
+    )
+}
+
+fn lock_assets(state: &AppState) -> ApiResult<std::sync::MutexGuard<'_, AssetIndex>> {
+    state.assets.lock().map_err(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "asset_lock_failed",
+            "failed to lock the asset index",
+        )
+    })
+}
+
+/// A file name only ever reaches a header after being reduced to characters
+/// that cannot end a quoted string or start a new header line.
+fn header_safe_name(name: &str) -> String {
+    let safe: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ' '))
+        .take(MAX_UPLOAD_NAME_CHARS)
+        .collect();
+    let safe = safe.trim().to_string();
+    if safe.is_empty() {
+        return String::from("asset");
+    }
+    safe
+}
+
+/// The SSE payload for a newly produced file, in the same versioned envelope
+/// the asset endpoints answer with.
+fn asset_created_payload(entry: &AssetEntry, asset_type: AssetType) -> String {
+    content_envelope(json!({ "asset": asset_json(entry, asset_type) })).to_string()
+}
+
 async fn call_session_method(
     config: &Config,
     session_id: &str,
@@ -4258,13 +5180,35 @@ fn openapi_spec() -> Value {
                     "responses": upload_responses()
                 }
             },
+            "/api/sessions/{sessionId}/assets": {
+                "get": {
+                    "summary": "List files this session's workspaces produced recently, newest first",
+                    "description": "Unified content model, schema version 1.0.0. The response is the versioned envelope: schema_version, capabilities, and data, with the assets under data.assets. Assets are fed by the Herdr worktree events the gateway subscribes to, and by an mtime scan of the session's workspace roots, which is what a cold start uses. The scan is shallow, budgeted, and skips dot directories, dependency directories, and build output.",
+                    "parameters": [
+                        path_param("sessionId"),
+                        query_param("since", "Unix milliseconds, the same unit as modified_unix_ms; only files modified strictly after this are returned"),
+                        query_param("limit", "How many assets to return, 1 to 200, default 50"),
+                        query_param("path", "Resolve one absolute path exactly, for a file path tapped in terminal output. Takes precedence over since and limit. Answers with one asset, or with none when the path does not canonicalize to a file inside a workspace root -- a fenced-out path is a miss, not an error")
+                    ],
+                    "responses": assets_responses()
+                }
+            },
+            "/api/assets/{assetId}/content": {
+                "get": {
+                    "summary": "Stream one asset's bytes, read-only",
+                    "description": "The path must canonicalize to a regular file inside a workspace root the session currently has, so a symlink out of the root, a traversal, and an unknown id are all a 404. The kind is sniffed again from the bytes on every read; a binary asset answers 415 with its metadata and no body. Assets larger than 10 MiB are refused with 413.",
+                    "parameters": [path_param("assetId")],
+                    "responses": asset_content_responses()
+                }
+            },
             "/api/sessions": { "get": simple_endpoint("List configured Herdr sessions") },
             "/api/sessions/{sessionId}/events": {
                 "get": {
                     "summary": "Stream Herdr lifecycle events as Server-Sent Events",
+                    "description": "Herdr events arrive as SSE `herdr` events. The gateway adds its own `asset.created` event, carrying one asset in the content-model envelope, when a Herdr worktree event reveals newly produced files. It obeys the same `types=` allow-list, under the name `asset.created`.",
                     "parameters": [path_param("sessionId")],
                     "responses": {
-                        "200": { "description": "SSE stream of Herdr event JSON lines" },
+                        "200": { "description": "SSE stream of Herdr event JSON lines, plus gateway asset.created events" },
                         "401": { "description": "Missing or invalid authorization" },
                         "403": { "description": "Invalid token" }
                     }
@@ -4493,6 +5437,81 @@ fn upload_responses() -> Value {
     responses
 }
 
+fn asset_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["id", "path", "name", "kind", "mime", "size", "modified_unix_ms", "origin", "previewable"],
+        "properties": {
+            "id": { "type": "string" },
+            "path": { "type": "string" },
+            "name": { "type": "string" },
+            "kind": { "type": "string", "enum": ["image", "markdown", "text", "pdf", "binary"] },
+            "mime": { "type": "string" },
+            "size": { "type": "integer" },
+            "modified_unix_ms": { "type": "integer" },
+            "origin": object_schema(
+                &[("session_id", "string"), ("workspace_id", "string"), ("pane_id", "string"), ("root", "string")],
+                &["session_id"],
+            ),
+            "previewable": { "type": "boolean" }
+        }
+    })
+}
+
+fn content_envelope_schema(data: Value) -> Value {
+    json!({
+        "type": "object",
+        "required": ["schema_version", "capabilities", "data"],
+        "properties": {
+            "schema_version": { "type": "string", "const": CONTENT_SCHEMA_VERSION },
+            "capabilities": object_schema(
+                &[("parts", "boolean"), ("assets", "boolean"), ("image_upload", "boolean")],
+                &["parts", "assets", "image_upload"],
+            ),
+            "data": data
+        }
+    })
+}
+
+fn assets_responses() -> Value {
+    let mut responses = ok_response();
+    responses["200"] = json!({
+        "description": "Recent assets, newest first",
+        "content": { "application/json": { "schema": content_envelope_schema(json!({
+            "type": "object",
+            "required": ["session_id", "assets"],
+            "properties": {
+                "session_id": { "type": "string" },
+                "assets": { "type": "array", "items": asset_schema() },
+                "limit": { "type": "integer" },
+                "since": { "type": ["integer", "null"], "description": "Unix milliseconds, echoed back" },
+                "path": { "type": ["string", "null"], "description": "The requested exact path, echoed back on a path lookup" },
+                "roots": { "type": "array", "items": { "type": "string" } }
+            }
+        })) } }
+    });
+    responses["404"] = json!({ "description": "Unknown session" });
+    responses
+}
+
+fn asset_content_responses() -> Value {
+    let mut responses = ok_response();
+    responses["200"] = json!({
+        "description": "The asset's bytes, with the sniffed type in content-type and x-asset-kind",
+        "content": { "*/*": { "schema": { "type": "string", "format": "binary" } } }
+    });
+    responses["404"] = json!({ "description": "Unknown asset, or a path that does not resolve inside a session workspace root" });
+    responses["413"] = json!({ "description": "The asset is larger than 10 MiB" });
+    responses["415"] = json!({
+        "description": "Binary asset: metadata only, no preview",
+        "content": { "application/json": { "schema": {
+            "type": "object",
+            "properties": { "error": { "type": "object" }, "asset": asset_schema() }
+        } } }
+    });
+    responses
+}
+
 fn json_body(schema: Value) -> Value {
     json!({
         "required": true,
@@ -4565,6 +5584,7 @@ mod tests {
             pairing_requests: Arc::new(Mutex::new(VecDeque::new())),
             push_tokens: Arc::new(Mutex::new(Vec::new())),
             devices: Arc::new(Mutex::new(devices)),
+            assets: Arc::new(Mutex::new(AssetIndex::default())),
         }
     }
 
@@ -5203,6 +6223,440 @@ mod tests {
         assert_eq!(purge_expired_uploads(&dir, now).unwrap(), 0);
     }
 
+    fn asset_test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-assets-{name}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // The temp dir is itself a symlink on macOS, so the fixture is
+        // canonicalized once here: every check downstream compares canonical
+        // paths, and a test must not be the one place that does not.
+        std::fs::canonicalize(&dir).unwrap()
+    }
+
+    fn test_asset_entry(path: &FsPath, root: &FsPath, modified_unix_ms: u128) -> AssetEntry {
+        AssetEntry {
+            id: asset_id(path),
+            path: path.to_path_buf(),
+            name: path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string(),
+            size: 1,
+            modified_unix_ms,
+            root: root.to_path_buf(),
+            session_id: "default".into(),
+            workspace_id: Some("wA".into()),
+            pane_id: Some("wA:p1".into()),
+        }
+    }
+
+    #[test]
+    fn asset_reads_are_fenced_inside_the_workspace_roots() {
+        let root = asset_test_dir("fence");
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(workspace.join("docs")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(workspace.join("docs/report.md"), b"# report\n").unwrap();
+        std::fs::write(outside.join("secret.txt"), b"secret\n").unwrap();
+        let roots = vec![workspace.clone()];
+
+        assert!(resolve_asset_path(&workspace.join("docs/report.md"), &roots).is_some());
+
+        // Traversal out of the root, whatever shape it arrives in.
+        assert!(
+            resolve_asset_path(&workspace.join("docs/../../outside/secret.txt"), &roots).is_none()
+        );
+        assert!(resolve_asset_path(&outside.join("secret.txt"), &roots).is_none());
+        assert!(resolve_asset_path(FsPath::new("/etc/hosts"), &roots).is_none());
+
+        // A sibling whose name merely starts with the root's is not inside it.
+        let neighbour = root.join("workspace-notes");
+        std::fs::create_dir_all(&neighbour).unwrap();
+        std::fs::write(neighbour.join("note.txt"), b"note\n").unwrap();
+        assert!(resolve_asset_path(&neighbour.join("note.txt"), &roots).is_none());
+
+        // A directory is not an asset, and neither is the root itself.
+        assert!(resolve_asset_path(&workspace, &roots).is_none());
+        assert!(resolve_asset_path(&workspace.join("docs"), &roots).is_none());
+        assert!(resolve_asset_path(&workspace.join("missing.md"), &roots).is_none());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_out_of_a_workspace_root_cannot_be_read_or_scanned() {
+        let root = asset_test_dir("symlink");
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"secret\n").unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.txt"), workspace.join("escape.txt"))
+            .unwrap();
+        std::os::unix::fs::symlink(&outside, workspace.join("escape-dir")).unwrap();
+        std::fs::write(workspace.join("own.txt"), b"mine\n").unwrap();
+        let roots = vec![workspace.clone()];
+
+        // The link resolves to where it points, which is outside the root.
+        assert!(resolve_asset_path(&workspace.join("escape.txt"), &roots).is_none());
+        assert!(resolve_asset_path(&workspace.join("escape-dir/secret.txt"), &roots).is_none());
+        assert!(resolve_asset_path(&workspace.join("own.txt"), &roots).is_some());
+
+        // The scan never offers such a path in the first place.
+        let names: Vec<String> = scan_workspace_root(&workspace, ASSET_SCAN_MAX_DEPTH, 100)
+            .into_iter()
+            .map(|file| file.name)
+            .collect();
+        assert_eq!(names, vec![String::from("own.txt")]);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn asset_kind_comes_from_the_bytes_and_the_extension_only_splits_the_text_kinds() {
+        assert_eq!(
+            sniff_asset_type(&png_bytes(), "screenshot.png").kind,
+            AssetKind::Image
+        );
+        // A name that lies about the content does not change what it is.
+        assert_eq!(
+            sniff_asset_type(&png_bytes(), "screenshot.md").kind,
+            AssetKind::Image
+        );
+        assert_eq!(
+            sniff_asset_type(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n", "report.pdf").kind,
+            AssetKind::Pdf
+        );
+        assert_eq!(
+            sniff_asset_type(b"# Title\n\nbody\n", "notes.md").kind,
+            AssetKind::Markdown
+        );
+        assert_eq!(
+            sniff_asset_type(b"# Title\n\nbody\n", "notes.MARKDOWN").kind,
+            AssetKind::Markdown
+        );
+        assert_eq!(
+            sniff_asset_type(b"# Title\n\nbody\n", "notes.txt").kind,
+            AssetKind::Text
+        );
+        assert_eq!(
+            sniff_asset_type("日本語とemoji 🎈\n".as_bytes(), "notes").kind,
+            AssetKind::Text
+        );
+        // A markdown extension over bytes that are not text is still binary.
+        assert_eq!(
+            sniff_asset_type(b"\x00\x01\x02binary\x00", "notes.md").kind,
+            AssetKind::Binary
+        );
+        assert_eq!(
+            sniff_asset_type(&[0xff, 0xfe, 0xfd, 0xfc], "blob.bin").kind,
+            AssetKind::Binary
+        );
+        assert_eq!(sniff_asset_type(b"", "empty.txt").kind, AssetKind::Text);
+
+        assert!(AssetKind::Markdown.previewable());
+        assert!(AssetKind::Image.previewable());
+        assert!(AssetKind::Pdf.previewable());
+        assert!(!AssetKind::Binary.previewable());
+
+        // A UTF-8 character cut in half by the sniff window is a truncation,
+        // not a binary file.
+        let mut truncated = "héllo".as_bytes().to_vec();
+        truncated.pop();
+        assert!(looks_textual(&truncated));
+        assert!(!looks_textual(b"text\x00text"));
+    }
+
+    #[test]
+    fn a_scan_stays_shallow_and_skips_heavy_directories() {
+        let root = asset_test_dir("scan");
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        std::fs::create_dir_all(root.join("target/debug")).unwrap();
+        std::fs::create_dir_all(root.join(".git/objects")).unwrap();
+        std::fs::create_dir_all(root.join("a/b/c/d/e")).unwrap();
+        std::fs::write(root.join("report.md"), b"# report\n").unwrap();
+        std::fs::write(root.join(".hidden"), b"hidden\n").unwrap();
+        std::fs::write(root.join("node_modules/pkg/index.js"), b"module\n").unwrap();
+        std::fs::write(root.join("target/debug/binary"), b"binary\n").unwrap();
+        std::fs::write(root.join(".git/objects/blob"), b"blob\n").unwrap();
+        std::fs::write(root.join("a/b/c/deep.txt"), b"deep\n").unwrap();
+        std::fs::write(root.join("a/b/c/d/e/too-deep.txt"), b"too deep\n").unwrap();
+
+        let mut names: Vec<String> = scan_workspace_root(&root, ASSET_SCAN_MAX_DEPTH, 100)
+            .into_iter()
+            .map(|file| file.name)
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![String::from("deep.txt"), String::from("report.md")]
+        );
+
+        // The file budget is a hard stop, not a suggestion.
+        assert_eq!(scan_workspace_root(&root, ASSET_SCAN_MAX_DEPTH, 1).len(), 1);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_index_dedupes_by_path_and_answers_newest_first() {
+        let root = asset_test_dir("index");
+        let nested = root.join("nested");
+        let mut index = AssetIndex::default();
+
+        let old = root.join("old.txt");
+        let new = root.join("new.txt");
+        assert!(index.upsert(test_asset_entry(&old, &root, 1_000)));
+        assert!(index.upsert(test_asset_entry(&new, &root, 2_000)));
+        // The same file seen again by a later scan updates it in place.
+        let mut rescanned = test_asset_entry(&old, &root, 3_000);
+        rescanned.size = 4_096;
+        assert!(!index.upsert(rescanned));
+        assert_eq!(index.entries.len(), 2);
+
+        let listed = index.session_assets("default", None, 10);
+        assert_eq!(
+            listed
+                .iter()
+                .map(|entry| entry.name.clone())
+                .collect::<Vec<_>>(),
+            vec![String::from("old.txt"), String::from("new.txt")]
+        );
+        assert_eq!(listed[0].size, 4_096);
+        assert_eq!(listed[0].modified_unix_ms, 3_000);
+
+        // `since` is exclusive, and `limit` cuts the newest page.
+        assert_eq!(index.session_assets("default", Some(2_000), 10).len(), 1);
+        assert_eq!(index.session_assets("default", Some(3_000), 10).len(), 0);
+        assert_eq!(index.session_assets("default", None, 1).len(), 1);
+        assert_eq!(index.session_assets("other", None, 10).len(), 0);
+
+        // Nested roots see the same file; the deeper one owns it.
+        let shared = nested.join("shared.txt");
+        assert!(index.upsert(test_asset_entry(&shared, &root, 4_000)));
+        let mut deeper = test_asset_entry(&shared, &nested, 4_000);
+        deeper.workspace_id = Some("wB".into());
+        assert!(!index.upsert(deeper));
+        let owned = index.get(&asset_id(&shared)).unwrap();
+        assert_eq!(owned.root, nested);
+        assert_eq!(owned.workspace_id.as_deref(), Some("wB"));
+        // A shallower root does not take it back.
+        let mut shallower = test_asset_entry(&shared, &root, 5_000);
+        shallower.workspace_id = Some("wA".into());
+        assert!(!index.upsert(shallower));
+        assert_eq!(index.get(&asset_id(&shared)).unwrap().root, nested);
+
+        // A removed worktree takes its files with it.
+        index.forget_under(&nested);
+        assert!(index.get(&asset_id(&shared)).is_none());
+        assert_eq!(index.entries.len(), 2);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn an_exact_path_lookup_answers_one_asset_or_none_and_never_leaves_the_roots() {
+        let base = asset_test_dir("lookup");
+        let workspace = base.join("workspace");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(workspace.join("a/b/c/d/e/f")).unwrap();
+        std::fs::create_dir_all(workspace.join("node_modules/pkg")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let report = workspace.join("report.md");
+        std::fs::write(&report, b"# report\n").unwrap();
+        // Deeper than the scan goes, and inside a directory the scan skips: the
+        // user pointed at these, so an exact lookup still resolves them.
+        let deep = workspace.join("a/b/c/d/e/f/deep.txt");
+        std::fs::write(&deep, b"deep\n").unwrap();
+        let skipped = workspace.join("node_modules/pkg/index.js");
+        std::fs::write(&skipped, b"module\n").unwrap();
+        let secret = outside.join("secret.txt");
+        std::fs::write(&secret, b"secret\n").unwrap();
+        let roots = vec![AssetRoot {
+            path: workspace.clone(),
+            session_id: "default".into(),
+            workspace_id: Some("wA".into()),
+            pane_id: Some("wA:p1".into()),
+        }];
+
+        let found = asset_entry_for_path(&report.to_string_lossy(), &roots).unwrap();
+        assert_eq!(found.path, report);
+        assert_eq!(found.id, asset_id(&report));
+        assert_eq!(found.name, "report.md");
+        assert_eq!(found.workspace_id.as_deref(), Some("wA"));
+        assert!(asset_entry_for_path(&deep.to_string_lossy(), &roots).is_some());
+        assert!(asset_entry_for_path(&skipped.to_string_lossy(), &roots).is_some());
+
+        // The fence still holds, and a fenced-out path is simply a miss.
+        assert!(asset_entry_for_path(&secret.to_string_lossy(), &roots).is_none());
+        assert!(asset_entry_for_path(
+            &workspace.join("../outside/secret.txt").to_string_lossy(),
+            &roots
+        )
+        .is_none());
+        assert!(asset_entry_for_path("/etc/hosts", &roots).is_none());
+        assert!(asset_entry_for_path(&workspace.to_string_lossy(), &roots).is_none());
+        assert!(asset_entry_for_path(&workspace.join("a").to_string_lossy(), &roots).is_none());
+        assert!(
+            asset_entry_for_path(&workspace.join("gone.md").to_string_lossy(), &roots).is_none()
+        );
+        assert!(asset_entry_for_path("report.md", &roots).is_none());
+        assert!(asset_entry_for_path(&report.to_string_lossy(), &[]).is_none());
+
+        // Nested roots: the deepest one owns the file it contains.
+        let nested = AssetRoot {
+            path: workspace.join("a"),
+            session_id: "default".into(),
+            workspace_id: Some("wB".into()),
+            pane_id: Some("wB:p1".into()),
+        };
+        let mut both = roots.clone();
+        both.push(nested);
+        let owned = asset_entry_for_path(&deep.to_string_lossy(), &both).unwrap();
+        assert_eq!(owned.workspace_id.as_deref(), Some("wB"));
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn asset_ids_are_stable_per_path_and_carry_no_path() {
+        let first = asset_id(FsPath::new("/tmp/workspace/report.md"));
+        assert_eq!(first, asset_id(FsPath::new("/tmp/workspace/report.md")));
+        assert_ne!(first, asset_id(FsPath::new("/tmp/workspace/report2.md")));
+        assert!(first.starts_with("as_"));
+        assert!(!first.contains("report"));
+        assert!(first[3..].chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn workspace_roots_come_from_pane_cwds_and_never_widen_to_the_whole_machine() {
+        let home = dirs::home_dir().unwrap();
+        let response = json!({
+            "result": { "panes": [
+                { "pane_id": "wA:p1", "workspace_id": "wA", "cwd": "/Users/okk/.repos/muqun" },
+                // A second pane in the same directory is the same root.
+                { "pane_id": "wA:p2", "workspace_id": "wA", "cwd": "/Users/okk/.repos/muqun" },
+                { "pane_id": "wB:p1", "workspace_id": "wB", "foreground_cwd": "/Users/okk/.ws/api" },
+                { "pane_id": "wC:p1", "workspace_id": "wC", "cwd": "/" },
+                { "pane_id": "wD:p1", "workspace_id": "wD", "cwd": home.to_string_lossy() },
+                { "pane_id": "wE:p1", "workspace_id": "wE" }
+            ] }
+        });
+        let roots = pane_list_roots("default", &response);
+        assert_eq!(
+            roots
+                .iter()
+                .map(|root| root.path.to_string_lossy().to_string())
+                .collect::<Vec<_>>(),
+            vec![
+                String::from("/Users/okk/.repos/muqun"),
+                String::from("/Users/okk/.ws/api")
+            ]
+        );
+        assert_eq!(roots[0].pane_id.as_deref(), Some("wA:p1"));
+        assert_eq!(roots[1].workspace_id.as_deref(), Some("wB"));
+        assert!(pane_list_roots("default", &json!({ "result": {} })).is_empty());
+    }
+
+    #[test]
+    fn worktree_events_name_a_root_to_scan_and_never_a_file() {
+        // The payload Herdr actually sends on protocol 17: the worktree's
+        // checkout path and its workspace, with no file information at all.
+        let created = json!({
+            "event": "worktree_created",
+            "data": {
+                "type": "worktree_created",
+                "workspace": { "workspace_id": "wM", "number": 3, "label": "muqun" },
+                "worktree": {
+                    "path": "/Users/okk/.repos/muqun/.claude/worktrees/agent-a4463",
+                    "branch": "wip/live-activity",
+                    "is_bare": false,
+                    "is_detached": false,
+                    "is_prunable": false,
+                    "is_linked_worktree": true,
+                    "label": "muqun"
+                }
+            }
+        })
+        .to_string();
+        let root = worktree_event_root("default", &created).unwrap();
+        assert_eq!(
+            root.path,
+            PathBuf::from("/Users/okk/.repos/muqun/.claude/worktrees/agent-a4463")
+        );
+        assert_eq!(root.workspace_id.as_deref(), Some("wM"));
+        assert_eq!(root.session_id, "default");
+
+        let opened = json!({
+            "event": "worktree_opened",
+            "data": { "type": "worktree_opened", "already_open": false,
+                "workspace": { "workspace_id": "wZ" },
+                "worktree": { "path": "/Users/okk/.repos/muqun", "label": "muqun" } }
+        })
+        .to_string();
+        assert_eq!(
+            worktree_event_root("default", &opened).unwrap().path,
+            PathBuf::from("/Users/okk/.repos/muqun")
+        );
+
+        let removed = json!({
+            "event": "worktree_removed",
+            "data": { "type": "worktree_removed", "forced": false, "workspace_id": "wZ",
+                "worktree": { "path": "/Users/okk/.repos/muqun/.claude/worktrees/gone" } }
+        })
+        .to_string();
+        assert_eq!(
+            worktree_event_removed_root(&removed).unwrap(),
+            PathBuf::from("/Users/okk/.repos/muqun/.claude/worktrees/gone")
+        );
+        assert!(worktree_event_root("default", &removed).is_none());
+
+        // Everything else on the stream leaves the index alone.
+        assert!(worktree_event_root("default", r#"{"event":"pane_updated","data":{}}"#).is_none());
+        assert!(worktree_event_root("default", "not json").is_none());
+        assert!(worktree_event_removed_root(r#"{"event":"pane_updated","data":{}}"#).is_none());
+    }
+
+    #[test]
+    fn an_asset_envelope_is_versioned_and_declares_capabilities() {
+        let root = PathBuf::from("/tmp/workspace");
+        let entry = test_asset_entry(&root.join("report.md"), &root, 1_785_100_000_000);
+        let envelope: Value = serde_json::from_str(&asset_created_payload(
+            &entry,
+            sniff_asset_type(b"# report\n", "report.md"),
+        ))
+        .unwrap();
+        assert_eq!(envelope["schema_version"], CONTENT_SCHEMA_VERSION);
+        assert_eq!(envelope["capabilities"]["assets"], true);
+        let asset = &envelope["data"]["asset"];
+        assert_eq!(asset["id"], entry.id);
+        assert_eq!(asset["kind"], "markdown");
+        assert_eq!(asset["mime"], "text/markdown; charset=utf-8");
+        assert_eq!(asset["previewable"], true);
+        assert_eq!(asset["origin"]["session_id"], "default");
+        assert_eq!(asset["origin"]["workspace_id"], "wA");
+        assert_eq!(asset["origin"]["pane_id"], "wA:p1");
+        assert_eq!(asset["modified_unix_ms"], 1_785_100_000_000_u64);
+    }
+
+    #[test]
+    fn an_asset_file_name_cannot_break_out_of_a_response_header() {
+        assert_eq!(header_safe_name("report.md"), "report.md");
+        assert_eq!(
+            header_safe_name("re\"port\r\nX-Evil: 1.md"),
+            "reportX-Evil 1.md"
+        );
+        assert_eq!(header_safe_name("../../etc/passwd"), "....etcpasswd");
+        assert_eq!(header_safe_name("图片.png"), ".png");
+        assert_eq!(header_safe_name("\u{202e}"), "asset");
+    }
+
     #[test]
     fn openapi_spec_contains_docs_routes_and_auth() {
         let spec = openapi_spec();
@@ -5223,6 +6677,18 @@ mod tests {
         assert!(spec["paths"]["/api/uploads"]["post"]["requestBody"]["content"]
             ["multipart/form-data"]
             .is_object());
+        assert!(spec["paths"]["/api/sessions/{sessionId}/assets"]["get"].is_object());
+        assert_eq!(
+            spec["paths"]["/api/sessions/{sessionId}/assets"]["get"]["responses"]["200"]["content"]
+                ["application/json"]["schema"]["properties"]["schema_version"]["const"],
+            CONTENT_SCHEMA_VERSION
+        );
+        assert!(
+            spec["paths"]["/api/assets/{assetId}/content"]["get"]["responses"]["415"].is_object()
+        );
+        assert!(
+            spec["paths"]["/api/assets/{assetId}/content"]["get"]["responses"]["413"].is_object()
+        );
         assert!(spec["paths"]["/api/uploads"]["post"]["responses"]["413"].is_object());
         assert!(spec["paths"]["/api/uploads"]["post"]["responses"]["415"].is_object());
         assert_eq!(
