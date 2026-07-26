@@ -1,0 +1,14 @@
+➜  approvals-lab git:(main) ✗ export ANTHROPIC_BASE_URL=http://127.0.0.1:24999 ANTHROPIC_API_KEY=sk-ant-mock ANTHROPIC_MODEL=claude-opus-5; claude --permission-mode default
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Detected a custom API key in your environment
+
+  ANTHROPIC_API_KEY: sk-ant-...sk-ant-mock
+
+  Do you want to use this API key?
+
+    1. Yes
+  ❯ 2. No (recommended)
+
+  Enter to confirm · Esc to cancel
+
