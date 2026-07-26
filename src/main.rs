@@ -1,6 +1,6 @@
 #![recursion_limit = "256"]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{stdout, Write as _};
 use std::net::SocketAddr;
 use std::process::{Command as ProcessCommand, Stdio};
@@ -40,6 +40,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio_stream::Stream;
 
 mod shortcuts;
+mod tasks;
 
 #[cfg(unix)]
 use tokio::net::UnixStream;
@@ -65,6 +66,10 @@ const MAX_PAIRING_CODE_ATTEMPTS: u8 = 8;
 const PAIRING_RATE_LIMIT_WINDOW_MS: u128 = 10 * 60 * 1000;
 const MAX_PAIRING_REQUESTS_PER_WINDOW: usize = 6;
 const MAX_SEND_KEYS: usize = 32;
+const MAX_WORKSPACE_LABEL_CHARS: usize = 120;
+/// Long enough for an agent TUI to finish handling a pasted prompt, short
+/// enough that the submit still feels like part of the same action.
+const SUBMIT_KEYPRESS_DELAY: Duration = Duration::from_millis(150);
 const MAX_PUSH_TOKENS: usize = 64;
 const MAX_DEVICES: usize = 32;
 const MAX_DEVICE_NAME_CHARS: usize = 80;
@@ -81,7 +86,7 @@ const MANAGE_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 /// every pane or sending unchanged terminal frames over the network.
 const STREAM_OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(150);
 const STREAM_OUTPUT_READ_TIMEOUT: Duration = Duration::from_millis(100);
-const GATEWAY_API_VERSION: &str = "1.3.0";
+const GATEWAY_API_VERSION: &str = "1.4.0";
 const GATEWAY_API_MAJOR: u64 = 1;
 const HERDR_PROTOCOL_MIN: u64 = 17;
 const HERDR_PROTOCOL_MAX: u64 = 17;
@@ -142,6 +147,7 @@ const ASSET_SKIP_DIRS: &[&str] = &[
     "coverage",
 ];
 const API_CAPABILITIES: &[&str] = &[
+    "agent_catalog",
     "agent_lifecycle_notifications",
     "assets",
     "device_revocation",
@@ -153,6 +159,7 @@ const API_CAPABILITIES: &[&str] = &[
     "per_device_tokens",
     "push_notifications",
     "push_token_revocation",
+    "tasks",
     "terminal_input",
 ];
 
@@ -202,6 +209,12 @@ struct Config {
     /// used by the local `manage` UI; paired devices get their own tokens.
     token_hash: String,
     sessions: Vec<SessionConfig>,
+    /// Herdr agent kind -> the executable `GET /api/agents/catalog` looks for on
+    /// `PATH`. Only needed when a kind's binary is named something else on this
+    /// machine; absent, every kind probes for its own name. Optional and
+    /// omitted when empty, so an existing `config.json` keeps working untouched.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    agent_commands: BTreeMap<String, String>,
 }
 
 impl Config {
@@ -488,6 +501,7 @@ fn setup(public_url: Option<String>, port: u16, socket_path: Option<String>) -> 
             label: "Default".into(),
             socket_path,
         }],
+        agent_commands: BTreeMap::new(),
     };
 
     let path = config_dir.join(CONFIG_FILE);
@@ -838,6 +852,8 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
             patch(rename_tab).delete(close_tab),
         )
         .route("/api/keymaps", get(keymaps))
+        .route("/api/agents/catalog", get(agents_catalog))
+        .route("/api/sessions/{session_id}/tasks", post(create_task))
         .route("/api/sessions/{session_id}/panes", get(panes))
         .route(
             "/api/sessions/{session_id}/panes/{pane_id}",
@@ -2954,35 +2970,674 @@ async fn send_agent(
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
     validate_text(&body.text)?;
-    let result = call_session_method(
-        &state.config,
-        &session_id,
+    let session = find_session(&state.config, &session_id)?;
+    let result = submit_agent_prompt(session, &target, &body.text)
+        .await
+        .map_err(|err| err.into_api_error("agent.prompt"))?;
+    schedule_submit_keypress(session.clone(), target);
+    Ok(Json(result))
+}
+
+/// Send a prompt to an agent and make sure it is actually submitted.
+///
+/// Shared by `POST .../agents/{target}/send` and by task dispatch, because the
+/// second half of it -- the separate Enter -- is not an optional flourish, and a
+/// second copy of it would drift.
+async fn submit_agent_prompt(
+    session: &SessionConfig,
+    target: &str,
+    text: &str,
+) -> Result<Value, HerdrCallError> {
+    herdr_call(
+        session,
         "agent.prompt",
-        json!({ "target": target, "text": body.text }),
+        json!({ "target": target, "text": text }),
     )
-    .await?;
-    // Belt and braces for a paste-vs-keypress race in agent TUIs: when the
-    // prompt text and its newline arrive in one PTY write, Claude Code's input
-    // treats the newline as pasted content and leaves the prompt sitting in its
-    // input box unsubmitted (reproduced on camera, muqun card #571). A short
-    // beat later, a separate Enter keystroke submits it. When the prompt DID
-    // submit, the input box is empty and an Enter there is a no-op, so this is
-    // idempotent. Best-effort by design: a pane that vanished between the two
-    // calls must not turn a delivered prompt into an error. The target of the
-    // agent send is the pane id, which is what the key press needs.
-    let config = state.config.clone();
-    let pane_id = target.clone();
+    .await
+}
+
+/// Belt and braces for a paste-vs-keypress race in agent TUIs: when the prompt
+/// text and its newline arrive in one PTY write, Claude Code's input treats the
+/// newline as pasted content and leaves the prompt sitting in its input box
+/// unsubmitted (reproduced on camera, muqun card #571). A short beat later, a
+/// separate Enter keystroke submits it. When the prompt DID submit, the input
+/// box is empty and an Enter there is a no-op, so this is idempotent.
+/// Best-effort by design: a pane that vanished between the two calls must not
+/// turn a delivered prompt into an error. An agent target is its pane id, which
+/// is what the key press needs.
+fn schedule_submit_keypress(session: SessionConfig, pane_id: String) {
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        let _ = call_session_method(
-            &config,
-            &session_id,
+        tokio::time::sleep(SUBMIT_KEYPRESS_DELAY).await;
+        let _ = herdr_call(
+            &session,
             "pane.send_keys",
             json!({ "pane_id": pane_id, "keys": ["Enter"] }),
         )
         .await;
     });
-    Ok(result)
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateTaskBody {
+    /// Absolute path of the repo to work in. Has to be one this session already
+    /// has open, or inside one.
+    repo_path: String,
+    /// Branch to work on. Present means "give this task its own checkout";
+    /// absent means "work in the repo as it is".
+    branch_name: Option<String>,
+    /// Herdr agent kind, as listed by `GET /api/agents/catalog`.
+    agent: String,
+    /// First thing to say to the agent, once it is up and interactive.
+    prompt: Option<String>,
+    workspace_label: Option<String>,
+    /// Extra arguments for the agent's own command line.
+    agent_args: Option<Vec<String>>,
+    /// How long to wait for the agent to become interactive.
+    startup_timeout_ms: Option<u64>,
+}
+
+/// What the phone can start a task with: every kind the gateway knows, and
+/// whether its executable is actually on this machine's `PATH`.
+///
+/// Not session-scoped: which binaries are installed is a property of the host,
+/// not of a Herdr session, and the picker is drawn before a session is chosen.
+async fn agents_catalog(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let agents = tasks::agent_catalog(&state.config.agent_commands);
+    Ok(Json(json!({
+        "agents": agents,
+        "default_startup_timeout_ms": tasks::DEFAULT_AGENT_START_TIMEOUT_MS
+    })))
+}
+
+/// Start a new piece of work: optionally a fresh checkout, a workspace to hold
+/// it, an agent running in it, and the first prompt already typed.
+///
+/// # Why the answer can be a 207
+///
+/// This is four things happening in a row on someone else's machine, requested
+/// from a phone. "It failed" tells the user nothing about whether they now have
+/// a checkout, and the wrong guess makes them either abandon real work or
+/// create a second copy of it. So every step is recorded, and a run that got
+/// part of the way answers 207 with the same body a full success would have,
+/// plus the failed step. Nothing was created at all is still a plain error.
+///
+/// # What gets rolled back, and what does not
+///
+/// Only a checkout this request created, and only while it is still useless --
+/// that is, when the workspace to work in could not be made. Once there is a
+/// pane sitting in the new checkout, the user has something they can use, and
+/// deleting a fresh branch because `claude` happened not to be installed would
+/// destroy more than it tidies. A checkout that was already there is never
+/// touched.
+async fn create_task(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<CreateTaskBody>,
+) -> ApiResult<Response> {
+    require_device(&state, &headers)?;
+    let session = find_session(&state.config, &session_id)?.clone();
+
+    if !tasks::is_known_agent_kind(&body.agent, &state.config.agent_commands) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "unknown_agent",
+            "agent is not one this gateway offers; see GET /api/agents/catalog",
+        ));
+    }
+    if let Some(prompt) = body.prompt.as_deref() {
+        validate_text(prompt)?;
+    }
+    if let Some(label) = body.workspace_label.as_deref() {
+        if label.chars().count() > MAX_WORKSPACE_LABEL_CHARS || label.chars().any(char::is_control)
+        {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_label",
+                "workspace_label must be at most 120 printable characters",
+            ));
+        }
+    }
+    let timeout_ms = match body.startup_timeout_ms {
+        None => tasks::DEFAULT_AGENT_START_TIMEOUT_MS,
+        Some(value)
+            if (tasks::MIN_AGENT_START_TIMEOUT_MS..=tasks::MAX_AGENT_START_TIMEOUT_MS)
+                .contains(&value) =>
+        {
+            value
+        }
+        Some(_) => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_timeout",
+                "startup_timeout_ms must be between 3001 and 300000",
+            ))
+        }
+    };
+    if let Some(branch) = body.branch_name.as_deref() {
+        tasks::validate_branch_name(branch).map_err(|err| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_branch_name",
+                err.message(),
+            )
+        })?;
+    }
+
+    // The fence. A path the session does not already have is not a path the
+    // phone gets to run git in, whatever it claims about itself.
+    let roots = task_repo_roots(&state, &session).await;
+    let repo_path = tasks::resolve_repo_path(&body.repo_path, &roots).ok_or_else(|| {
+        api_error(
+            StatusCode::FORBIDDEN,
+            "repo_not_allowed",
+            "repo_path must be a directory inside a workspace this session has open",
+        )
+    })?;
+    if body.branch_name.is_some() && !tasks::is_git_checkout(&repo_path) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "not_a_git_checkout",
+            "repo_path is not a git checkout, so a branch cannot be made in it",
+        ));
+    }
+
+    let mut steps = tasks::StepLog::new();
+    let label = body
+        .workspace_label
+        .clone()
+        .or_else(|| body.branch_name.clone());
+
+    let place = match body.branch_name.as_deref() {
+        Some(branch) => {
+            match prepare_worktree(&session, &repo_path, branch, label.as_deref(), &mut steps).await
+            {
+                Ok(place) => place,
+                Err(err) => return Ok(task_failure(err, &steps)),
+            }
+        }
+        None => match prepare_workspace(&session, &repo_path, label.as_deref(), &mut steps).await {
+            Ok(place) => place,
+            Err(err) => return Ok(task_failure(err, &steps)),
+        },
+    };
+
+    // From here on the user has somewhere to work, so nothing else is fatal and
+    // nothing else is rolled back.
+    let mut payload = json!({
+        "workspace_id": place.workspace_id,
+        "pane_id": place.pane_id,
+        "worktree_path": place.worktree_path,
+        "branch": body.branch_name,
+        "agent": body.agent,
+        "reused_worktree": place.reused,
+        "agent_started": false,
+        "prompt_submitted": false
+    });
+
+    let mut agent_params = serde_json::Map::new();
+    agent_params.insert(
+        "name".into(),
+        json!(label.as_deref().unwrap_or(body.agent.as_str())),
+    );
+    agent_params.insert("kind".into(), json!(body.agent));
+    agent_params.insert("pane_id".into(), json!(place.pane_id));
+    agent_params.insert("timeout_ms".into(), json!(timeout_ms));
+    if let Some(args) = body.agent_args.as_ref() {
+        agent_params.insert("args".into(), json!(args));
+    }
+    match herdr_call(&session, "agent.start", Value::Object(agent_params)).await {
+        Ok(value) => {
+            steps.ok(
+                "agent",
+                json!({
+                    "kind": body.agent,
+                    "pane_id": place.pane_id,
+                    "argv": value.pointer("/result/argv").cloned()
+                }),
+            );
+            payload["agent_started"] = json!(true);
+        }
+        Err(err) => {
+            steps.failed("agent", err.code(), &err.message());
+            return Ok(task_partial(payload, &steps));
+        }
+    }
+
+    match body.prompt.as_deref() {
+        None => steps.skipped("prompt", "no prompt was given"),
+        Some(prompt) => match submit_agent_prompt(&session, &place.pane_id, prompt).await {
+            Ok(_) => {
+                schedule_submit_keypress(session.clone(), place.pane_id.clone());
+                steps.ok("prompt", json!({ "bytes": prompt.len() }));
+                payload["prompt_submitted"] = json!(true);
+            }
+            Err(err) => steps.failed("prompt", err.code(), &err.message()),
+        },
+    }
+
+    Ok(task_partial(payload, &steps))
+}
+
+/// Where the task will be worked on, however it got there.
+struct TaskPlace {
+    workspace_id: String,
+    pane_id: String,
+    worktree_path: Option<String>,
+    reused: bool,
+}
+
+/// The no-branch case: a workspace on the repo as it stands.
+async fn prepare_workspace(
+    session: &SessionConfig,
+    repo_path: &FsPath,
+    label: Option<&str>,
+    steps: &mut tasks::StepLog,
+) -> Result<TaskPlace, HerdrCallError> {
+    steps.skipped("worktree", "no branch_name was given");
+    let mut params = serde_json::Map::new();
+    params.insert("cwd".into(), json!(repo_path.to_string_lossy()));
+    params.insert("focus".into(), json!(false));
+    insert_opt(&mut params, "label", label);
+    let value = match herdr_call(session, "workspace.create", Value::Object(params)).await {
+        Ok(value) => value,
+        Err(err) => {
+            steps.failed("workspace", err.code(), &err.message());
+            return Err(err);
+        }
+    };
+    let place = workspace_place(&value, None, false).ok_or_else(|| {
+        let err = HerdrCallError::malformed("workspace.create");
+        steps.failed("workspace", err.code(), &err.message());
+        err
+    })?;
+    steps.ok(
+        "workspace",
+        json!({ "workspace_id": place.workspace_id, "pane_id": place.pane_id }),
+    );
+    Ok(place)
+}
+
+/// The branch case.
+///
+/// Herdr's `worktree.create` makes the checkout *and* the workspace and pane in
+/// one response, so there is no moment where a checkout exists with nothing
+/// attached to it. Before creating anything it asks what checkouts the repo
+/// already has: a phone that retried after losing its answer gets the existing
+/// one back rather than a git error about the branch being checked out
+/// elsewhere. A Herdr too old for these methods falls back to running git here.
+async fn prepare_worktree(
+    session: &SessionConfig,
+    repo_path: &FsPath,
+    branch: &str,
+    label: Option<&str>,
+    steps: &mut tasks::StepLog,
+) -> Result<TaskPlace, HerdrCallError> {
+    let cwd = repo_path.to_string_lossy().into_owned();
+
+    let existing = herdr_call(session, "worktree.list", json!({ "cwd": cwd }))
+        .await
+        .ok()
+        .and_then(|value| worktree_for_branch(&value, branch));
+
+    if let Some(path) = existing {
+        let mut params = serde_json::Map::new();
+        params.insert("cwd".into(), json!(cwd));
+        params.insert("branch".into(), json!(branch));
+        params.insert("focus".into(), json!(false));
+        insert_opt(&mut params, "label", label);
+        match herdr_call(session, "worktree.open", Value::Object(params)).await {
+            Ok(value) => {
+                if let Some(place) = workspace_place(&value, Some(path.clone()), true) {
+                    steps.ok(
+                        "worktree",
+                        json!({ "path": path, "branch": branch, "reused": true }),
+                    );
+                    steps.ok(
+                        "workspace",
+                        json!({ "workspace_id": place.workspace_id, "pane_id": place.pane_id }),
+                    );
+                    return Ok(place);
+                }
+            }
+            // Reuse is an optimisation, not a contract. If opening the existing
+            // checkout fails, fall through and let the create path report a
+            // real error rather than masking it with this one.
+            Err(err) => eprintln!("task: worktree.open for {branch} failed: {}", err.message()),
+        }
+    }
+
+    let mut params = serde_json::Map::new();
+    params.insert("cwd".into(), json!(cwd));
+    params.insert("branch".into(), json!(branch));
+    params.insert("focus".into(), json!(false));
+    insert_opt(&mut params, "label", label);
+    match herdr_call(session, "worktree.create", Value::Object(params)).await {
+        Ok(value) => {
+            let path = value
+                .pointer("/result/worktree/path")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let place = workspace_place(&value, path.clone(), false).ok_or_else(|| {
+                let err = HerdrCallError::malformed("worktree.create");
+                steps.failed("worktree", err.code(), &err.message());
+                err
+            })?;
+            steps.ok(
+                "worktree",
+                json!({ "path": path, "branch": branch, "reused": false }),
+            );
+            steps.ok(
+                "workspace",
+                json!({ "workspace_id": place.workspace_id, "pane_id": place.pane_id }),
+            );
+            Ok(place)
+        }
+        Err(HerdrCallError::Herdr { error, .. }) if tasks::is_unknown_method_error(&error) => {
+            prepare_worktree_with_git(session, repo_path, branch, label, steps).await
+        }
+        Err(err) => {
+            steps.failed("worktree", err.code(), &err.message());
+            Err(err)
+        }
+    }
+}
+
+/// The fallback for a Herdr without `worktree.*`: run git here, then ask for a
+/// workspace on the result. This is the only path that can leave a checkout
+/// with nothing attached, so it is the only one that rolls back.
+async fn prepare_worktree_with_git(
+    session: &SessionConfig,
+    repo_path: &FsPath,
+    branch: &str,
+    label: Option<&str>,
+    steps: &mut tasks::StepLog,
+) -> Result<TaskPlace, HerdrCallError> {
+    let repo = repo_path.to_owned();
+    let branch_name = branch.to_owned();
+    let target = tasks::default_worktree_path(&repo, &branch_name).ok_or_else(|| {
+        let err = HerdrCallError::Unavailable("repo_path has no parent directory".into());
+        steps.failed("worktree", err.code(), &err.message());
+        err
+    })?;
+
+    let outcome = {
+        let repo = repo.clone();
+        let branch_name = branch_name.clone();
+        let target = target.clone();
+        tokio::task::spawn_blocking(move || tasks::git_worktree_add(&repo, &target, &branch_name))
+            .await
+    };
+    let added = match outcome {
+        Ok(Ok(added)) => added,
+        Ok(Err(err)) => {
+            let err = HerdrCallError::Unavailable(err.to_string());
+            steps.failed("worktree", "worktree_create_failed", &err.message());
+            return Err(err);
+        }
+        Err(err) => {
+            let err = HerdrCallError::Unavailable(format!("git task panicked: {err}"));
+            steps.failed("worktree", "worktree_create_failed", &err.message());
+            return Err(err);
+        }
+    };
+    let path = added.path.to_string_lossy().into_owned();
+    steps.ok(
+        "worktree",
+        json!({ "path": path, "branch": branch, "reused": !added.created }),
+    );
+
+    let mut params = serde_json::Map::new();
+    params.insert("cwd".into(), json!(path));
+    params.insert("focus".into(), json!(false));
+    insert_opt(&mut params, "label", label);
+    let created = match herdr_call(session, "workspace.create", Value::Object(params)).await {
+        // Herdr's own refusal is the useful message here, so it is kept rather
+        // than flattened into "something went wrong".
+        Err(err) => Err(err),
+        Ok(value) => workspace_place(&value, Some(path.clone()), !added.created)
+            .ok_or_else(|| HerdrCallError::malformed("workspace.create")),
+    };
+
+    match created {
+        Ok(place) => {
+            steps.ok(
+                "workspace",
+                json!({ "workspace_id": place.workspace_id, "pane_id": place.pane_id }),
+            );
+            Ok(place)
+        }
+        Err(err) => {
+            steps.failed("workspace", err.code(), &err.message());
+            // A checkout with no workspace is the one genuinely useless state,
+            // and only ours to undo when this request is what made it.
+            if added.created {
+                let repo = repo.clone();
+                let target = added.path.clone();
+                let removed =
+                    tokio::task::spawn_blocking(move || tasks::git_worktree_remove(&repo, &target))
+                        .await;
+                match removed {
+                    Ok(Ok(())) => steps.rolled_back("worktree", json!({ "path": path })),
+                    Ok(Err(remove_err)) => {
+                        steps.failed("rollback", "rollback_failed", &remove_err.to_string())
+                    }
+                    Err(join_err) => {
+                        steps.failed("rollback", "rollback_failed", &join_err.to_string())
+                    }
+                }
+            } else {
+                steps.skipped("rollback", "the checkout was already there");
+            }
+            Err(err)
+        }
+    }
+}
+
+/// Herdr answers `workspace.create`, `worktree.create` and `worktree.open` with
+/// the same workspace/tab/root_pane trio, so one reader covers all three.
+fn workspace_place(
+    value: &Value,
+    worktree_path: Option<String>,
+    reused: bool,
+) -> Option<TaskPlace> {
+    Some(TaskPlace {
+        workspace_id: value
+            .pointer("/result/workspace/workspace_id")
+            .and_then(Value::as_str)?
+            .to_owned(),
+        pane_id: value
+            .pointer("/result/root_pane/pane_id")
+            .and_then(Value::as_str)?
+            .to_owned(),
+        worktree_path: value
+            .pointer("/result/worktree/path")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or(worktree_path),
+        reused,
+    })
+}
+
+/// The path of an existing checkout of `branch` in a `worktree.list` answer.
+fn worktree_for_branch(value: &Value, branch: &str) -> Option<String> {
+    value
+        .pointer("/result/worktrees")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|worktree| {
+            worktree
+                .get("branch")
+                .and_then(Value::as_str)
+                .map(|name| name.strip_prefix("refs/heads/").unwrap_or(name))
+                == Some(branch)
+        })
+        .and_then(|worktree| worktree.get("path").and_then(Value::as_str))
+        .map(str::to_owned)
+}
+
+/// Nothing usable was created: an ordinary error, with the steps attached so
+/// the client can still see how far it got.
+fn task_failure(err: HerdrCallError, steps: &tasks::StepLog) -> Response {
+    // Herdr refusing is the user's request being wrong -- a path it does not
+    // recognise, a branch already checked out somewhere it will not touch.
+    // Anything else is the gateway or the socket failing, which is not.
+    let status = match err {
+        HerdrCallError::Herdr { .. } => StatusCode::BAD_REQUEST,
+        _ => StatusCode::BAD_GATEWAY,
+    };
+    (
+        status,
+        Json(json!({
+            "error": { "code": err.code(), "message": err.message() },
+            "steps": steps.value()
+        })),
+    )
+        .into_response()
+}
+
+/// Something usable was created. 207 when a later step failed, so a client can
+/// tell "your agent is running" from "your checkout is waiting for you".
+fn task_partial(mut payload: Value, steps: &tasks::StepLog) -> Response {
+    payload["steps"] = steps.value();
+    let status = if steps.has_failure() {
+        StatusCode::MULTI_STATUS
+    } else {
+        StatusCode::OK
+    };
+    (status, Json(payload)).into_response()
+}
+
+/// Directories a task is allowed to start in.
+///
+/// Herdr does not report "repos this session has" as such, so this is assembled
+/// from what it does report: the repo root and checkout path of every workspace
+/// that is a git checkout, plus the working directory of every pane. The repo
+/// root matters because a pane is usually somewhere inside the repo rather than
+/// at its top, and branching from the top is the normal request.
+async fn task_repo_roots(state: &AppState, session: &SessionConfig) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut push = |path: PathBuf| {
+        if !is_scannable_root(&path) {
+            return;
+        }
+        let Ok(canonical) = std::fs::canonicalize(&path) else {
+            return;
+        };
+        if !roots.contains(&canonical) {
+            roots.push(canonical);
+        }
+    };
+
+    match herdr_request(session, "workspace.list", json!({})).await {
+        Ok(value) => {
+            if let Some(workspaces) = value
+                .pointer("/result/workspaces")
+                .and_then(Value::as_array)
+            {
+                for workspace in workspaces {
+                    for key in ["repo_root", "checkout_path"] {
+                        if let Some(path) = workspace
+                            .pointer(&format!("/worktree/{key}"))
+                            .and_then(Value::as_str)
+                        {
+                            push(PathBuf::from(path));
+                        }
+                    }
+                }
+            }
+        }
+        Err(err) => eprintln!("task roots: workspace.list failed: {err:#}"),
+    }
+
+    for root in session_asset_roots(state, session).await {
+        push(root.path);
+    }
+    roots
+}
+
+/// A Herdr call that separates "the socket did not answer" from "Herdr said no",
+/// which the plain [`call_session_method`] deliberately does not: it hands the
+/// whole envelope, error and all, straight to the client. Orchestrating several
+/// calls needs to know which one refused and why.
+#[derive(Debug)]
+enum HerdrCallError {
+    Unavailable(String),
+    Herdr {
+        method: String,
+        error: Value,
+    },
+    /// Herdr answered successfully but not with the shape the schema promises,
+    /// which is a bug somewhere rather than a user error.
+    Malformed(String),
+}
+
+impl HerdrCallError {
+    fn malformed(method: &str) -> Self {
+        Self::Malformed(method.to_owned())
+    }
+
+    fn code(&self) -> &str {
+        match self {
+            Self::Unavailable(_) => "herdr_unavailable",
+            Self::Herdr { error, .. } => error
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or("herdr_error"),
+            Self::Malformed(_) => "invalid_herdr_response",
+        }
+    }
+
+    fn message(&self) -> String {
+        match self {
+            Self::Unavailable(detail) => detail.clone(),
+            Self::Herdr { method, error } => {
+                let message = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Herdr refused the request");
+                format!("{method}: {message}")
+            }
+            Self::Malformed(method) => {
+                format!("{method} did not answer with the expected fields")
+            }
+        }
+    }
+
+    fn into_api_error(self, method: &str) -> (StatusCode, Json<Value>) {
+        let status = match self {
+            Self::Herdr { .. } => StatusCode::BAD_REQUEST,
+            _ => StatusCode::BAD_GATEWAY,
+        };
+        let code = self.code().to_owned();
+        let message = self.message();
+        eprintln!("Herdr request {method} failed: {message}");
+        api_error(status, &code, &message)
+    }
+}
+
+async fn herdr_call(
+    session: &SessionConfig,
+    method: &str,
+    params: Value,
+) -> Result<Value, HerdrCallError> {
+    let value = herdr_request(session, method, params)
+        .await
+        .map_err(|err| {
+            eprintln!("Herdr request {method} failed: {err:#}");
+            HerdrCallError::Unavailable("Herdr is unavailable".into())
+        })?;
+    if let Some(error) = value.get("error") {
+        return Err(HerdrCallError::Herdr {
+            method: method.to_owned(),
+            error: error.clone(),
+        });
+    }
+    Ok(value)
 }
 
 async fn pane_output(
@@ -5297,6 +5952,34 @@ fn openapi_spec() -> Value {
                 }
             },
             "/api/keymaps": { "get": session_endpoint("Agent keymap coverage") },
+            "/api/agents/catalog": {
+                "get": {
+                    "summary": "Agent kinds a task can be started with, and whether each one is installed",
+                    "description": "Herdr resolves an agent kind to its canonical executable itself, so this is a picker feed rather than a launch table: `available` is a PATH probe for that executable on this host, and false is a hint, not a veto. Not session-scoped, because which binaries are installed is a property of the machine. `command` is remapped by `agent_commands` in the gateway's config.json for a host whose binary is named something else.",
+                    "responses": agents_catalog_responses()
+                }
+            },
+            "/api/sessions/{sessionId}/tasks": {
+                "post": {
+                    "summary": "Start a new task: a checkout, a workspace, an agent, and the first prompt",
+                    "description": "With `branch_name`, the task gets its own git worktree; without it, the task runs in the repo as it stands. `repo_path` must be, or be inside, a workspace this session already has open -- anything else is 403, and a symlink out of one resolves to the outside path and fails there too. `branch_name` is held to letters, digits, dot, underscore, dash and slash, with `..`, a leading dash, and dot-leading segments refused, so it can only ever be a ref and never an argument. The agent is started with Herdr's `agent.start`, which waits for it to become interactive before the prompt is sent. Asking twice for the same branch reuses the existing checkout rather than making a second one.",
+                    "parameters": [path_param("sessionId")],
+                    "requestBody": json_body(json!({
+                        "type": "object",
+                        "required": ["repo_path", "agent"],
+                        "properties": {
+                            "repo_path": { "type": "string", "description": "Absolute path, inside a workspace this session has open" },
+                            "branch_name": { "type": "string", "description": "Branch for a dedicated worktree; omit to work in the repo as it stands" },
+                            "agent": { "type": "string", "description": "Agent kind from GET /api/agents/catalog" },
+                            "prompt": { "type": "string", "description": "Sent once the agent is interactive" },
+                            "workspace_label": { "type": "string" },
+                            "agent_args": { "type": "array", "items": { "type": "string" } },
+                            "startup_timeout_ms": { "type": "integer", "description": "How long to wait for the agent to become interactive, 3001 to 300000, default 30000" }
+                        }
+                    })),
+                    "responses": task_responses()
+                }
+            },
             "/api/sessions/{sessionId}/panes/{paneId}/shortcuts": {
                 "get": resource_endpoint("Key row and slash commands for a pane", "paneId")
             },
@@ -5350,6 +6033,87 @@ fn openapi_spec() -> Value {
             }
         }
     })
+}
+
+fn task_steps_schema() -> Value {
+    json!({
+        "type": "array",
+        "description": "What happened, in order: worktree, workspace, agent, prompt, and rollback if one was needed. Present on success and on a partial run alike, so a client never has to guess how far a request got.",
+        "items": {
+            "type": "object",
+            "required": ["step", "status"],
+            "properties": {
+                "step": { "type": "string", "enum": ["worktree", "workspace", "agent", "prompt", "rollback"] },
+                "status": { "type": "string", "enum": ["ok", "skipped", "failed", "rolled_back"] },
+                "detail": { "type": "object" },
+                "reason": { "type": "string" },
+                "error": object_schema(&[("code", "string"), ("message", "string")], &["code", "message"])
+            }
+        }
+    })
+}
+
+fn task_result_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["workspace_id", "pane_id", "agent", "agent_started", "prompt_submitted", "steps"],
+        "properties": {
+            "workspace_id": { "type": "string" },
+            "pane_id": { "type": "string", "description": "Where the agent runs; also the target for the agent endpoints" },
+            "worktree_path": { "type": ["string", "null"], "description": "Absent when no branch_name was given" },
+            "branch": { "type": ["string", "null"] },
+            "agent": { "type": "string" },
+            "reused_worktree": { "type": "boolean", "description": "True when the branch already had a checkout, which is what makes a retry safe" },
+            "agent_started": { "type": "boolean" },
+            "prompt_submitted": { "type": "boolean" },
+            "steps": task_steps_schema()
+        }
+    })
+}
+
+fn task_responses() -> Value {
+    let mut responses = ok_response();
+    responses["200"] = json!({
+        "description": "Every step succeeded",
+        "content": { "application/json": { "schema": task_result_schema() } }
+    });
+    responses["207"] = json!({
+        "description": "Somewhere to work was created, but a later step failed -- the agent did not come up, or the prompt did not land. The body is the same shape as a 200; the failed step names what went wrong. Nothing is rolled back here: the checkout and pane are usable.",
+        "content": { "application/json": { "schema": task_result_schema() } }
+    });
+    responses["400"] = json!({
+        "description": "Unknown agent kind, malformed branch name, repo_path that is not a git checkout, or Herdr refusing the request. Nothing was created; a worktree this request made and could not attach a workspace to is removed again."
+    });
+    responses["403"] = json!({ "description": "repo_path is not inside a workspace this session has open" });
+    responses["404"] = json!({ "description": "Unknown session" });
+    responses["502"] = json!({ "description": "Herdr is unavailable, or answered without the fields its schema promises" });
+    responses
+}
+
+fn agents_catalog_responses() -> Value {
+    let mut responses = ok_response();
+    responses["200"] = json!({
+        "description": "Agent kinds, sorted, with PATH availability",
+        "content": { "application/json": { "schema": json!({
+            "type": "object",
+            "required": ["agents", "default_startup_timeout_ms"],
+            "properties": {
+                "agents": { "type": "array", "items": json!({
+                    "type": "object",
+                    "required": ["kind", "command", "available", "source"],
+                    "properties": {
+                        "kind": { "type": "string" },
+                        "command": { "type": "string" },
+                        "available": { "type": "boolean" },
+                        "path": { "type": ["string", "null"] },
+                        "source": { "type": "string", "enum": ["builtin", "config"] }
+                    }
+                }) },
+                "default_startup_timeout_ms": { "type": "integer" }
+            }
+        }) } }
+    });
+    responses
 }
 
 fn simple_endpoint(summary: &str) -> Value {
@@ -5562,6 +6326,7 @@ mod tests {
                 label: "Default".into(),
                 socket_path: "/tmp/herdr.sock".into(),
             }],
+            agent_commands: BTreeMap::new(),
         }
     }
 
@@ -6696,5 +7461,253 @@ mod tests {
                 [4]["name"],
             "format"
         );
+
+        // Task dispatch, including the partial answer, which a client that only
+        // handles 200 and "error" would silently mishandle.
+        let tasks = &spec["paths"]["/api/sessions/{sessionId}/tasks"]["post"];
+        assert!(tasks.is_object());
+        assert!(tasks["responses"]["207"].is_object());
+        assert!(tasks["responses"]["403"].is_object());
+        assert_eq!(
+            tasks["requestBody"]["content"]["application/json"]["schema"]["required"],
+            json!(["repo_path", "agent"])
+        );
+        assert!(spec["paths"]["/api/agents/catalog"]["get"].is_object());
+    }
+
+    #[test]
+    fn the_api_version_and_capabilities_announce_task_dispatch() {
+        // A minor bump: the routes are additive, so an older client keeps
+        // working, and a newer one can gate on the capability rather than on
+        // probing for a 404.
+        assert!(GATEWAY_API_VERSION.starts_with("1.4."));
+        assert_eq!(GATEWAY_API_MAJOR, 1);
+        assert!(API_CAPABILITIES.contains(&"tasks"));
+        assert!(API_CAPABILITIES.contains(&"agent_catalog"));
+    }
+
+    #[test]
+    fn a_config_without_agent_commands_still_loads_and_round_trips_unchanged() {
+        // Every gateway already in the field has a config.json written before
+        // this field existed. Reading one must not fail, and rewriting one must
+        // not add noise to it.
+        let existing = json!({
+            "server_id": "s1",
+            "label": "mac",
+            "listen": "127.0.0.1:23847",
+            "public_url": "https://example.ts.net",
+            "token_hash": "abc",
+            "sessions": [{ "id": "default", "label": "Default", "socket_path": "/tmp/h.sock" }]
+        });
+        let config: Config = serde_json::from_value(existing.clone()).unwrap();
+        assert!(config.agent_commands.is_empty());
+        assert_eq!(serde_json::to_value(&config).unwrap(), existing);
+
+        let with_override = json!({
+            "server_id": "s1",
+            "label": "mac",
+            "listen": "127.0.0.1:23847",
+            "public_url": "https://example.ts.net",
+            "token_hash": "abc",
+            "sessions": [{ "id": "default", "label": "Default", "socket_path": "/tmp/h.sock" }],
+            "agent_commands": { "claude": "claude-canary" }
+        });
+        let config: Config = serde_json::from_value(with_override).unwrap();
+        assert_eq!(
+            config.agent_commands.get("claude").map(String::as_str),
+            Some("claude-canary")
+        );
+    }
+
+    /// Protocol 17 answers `workspace.create`, `worktree.create` and
+    /// `worktree.open` with the same workspace/tab/root_pane trio.
+    fn worktree_created_response() -> Value {
+        json!({
+            "id": "1",
+            "result": {
+                "type": "worktree_created",
+                "workspace": { "workspace_id": "ws-9", "number": 2, "label": "task/594",
+                               "focused": false, "pane_count": 1, "tab_count": 1,
+                               "active_tab_id": "tab-9", "agent_status": "unknown" },
+                "tab": { "tab_id": "tab-9" },
+                "root_pane": { "pane_id": "pane-9", "terminal_id": "t-9", "workspace_id": "ws-9",
+                               "tab_id": "tab-9", "focused": false, "agent_status": "unknown",
+                               "revision": 1 },
+                "worktree": { "path": "/Users/dev/code/muqun-task-594", "branch": "task/594",
+                              "is_bare": false, "is_detached": false, "is_prunable": false,
+                              "is_linked_worktree": true, "label": "task/594" }
+            }
+        })
+    }
+
+    #[test]
+    fn a_created_place_is_read_out_of_the_protocol_17_response() {
+        let place = workspace_place(&worktree_created_response(), None, false).unwrap();
+        assert_eq!(place.workspace_id, "ws-9");
+        assert_eq!(place.pane_id, "pane-9");
+        assert_eq!(
+            place.worktree_path.as_deref(),
+            Some("/Users/dev/code/muqun-task-594")
+        );
+        assert!(!place.reused);
+
+        // workspace.create carries no worktree, so the caller's own path, if it
+        // has one, is what fills the field.
+        let created = json!({
+            "id": "1",
+            "result": {
+                "type": "workspace_created",
+                "workspace": { "workspace_id": "ws-1" },
+                "tab": { "tab_id": "tab-1" },
+                "root_pane": { "pane_id": "pane-1" }
+            }
+        });
+        let place = workspace_place(&created, None, false).unwrap();
+        assert_eq!(place.pane_id, "pane-1");
+        assert_eq!(place.worktree_path, None);
+        let place = workspace_place(&created, Some("/tmp/wt".into()), true).unwrap();
+        assert_eq!(place.worktree_path.as_deref(), Some("/tmp/wt"));
+        assert!(place.reused);
+
+        // A response missing the pane is not silently treated as a success:
+        // there would be nowhere to start the agent.
+        let no_pane = json!({ "id": "1", "result": { "workspace": { "workspace_id": "ws-1" } } });
+        assert!(workspace_place(&no_pane, None, false).is_none());
+        let herdr_error = json!({ "id": "1", "error": { "code": "not_found", "message": "no" } });
+        assert!(workspace_place(&herdr_error, None, false).is_none());
+    }
+
+    #[test]
+    fn an_existing_checkout_of_the_branch_is_found_before_another_one_is_made() {
+        let listing = json!({
+            "id": "1",
+            "result": {
+                "type": "worktree_list",
+                "source": { "repo_key": "k", "repo_name": "muqun", "repo_root": "/repo",
+                            "source_checkout_path": "/repo" },
+                "worktrees": [
+                    { "path": "/repo", "branch": "refs/heads/main", "is_bare": false,
+                      "is_detached": false, "is_prunable": false, "is_linked_worktree": false,
+                      "label": "main" },
+                    { "path": "/repo-task-594", "branch": "task/594", "is_bare": false,
+                      "is_detached": false, "is_prunable": false, "is_linked_worktree": true,
+                      "label": "task/594" },
+                    { "path": "/repo-detached", "branch": null, "is_bare": false,
+                      "is_detached": true, "is_prunable": false, "is_linked_worktree": true,
+                      "label": "detached" }
+                ]
+            }
+        });
+        // Herdr reports refs either way round, and both have to match.
+        assert_eq!(
+            worktree_for_branch(&listing, "task/594").as_deref(),
+            Some("/repo-task-594")
+        );
+        assert_eq!(
+            worktree_for_branch(&listing, "main").as_deref(),
+            Some("/repo")
+        );
+        assert_eq!(worktree_for_branch(&listing, "nope"), None);
+        // A detached checkout has no branch and must never be matched by one.
+        assert_eq!(worktree_for_branch(&listing, ""), None);
+        assert_eq!(worktree_for_branch(&json!({}), "main"), None);
+    }
+
+    #[test]
+    fn a_run_that_got_part_of_the_way_answers_207_with_the_same_body() {
+        let payload = json!({ "workspace_id": "ws-1", "pane_id": "pane-1" });
+
+        let mut steps = tasks::StepLog::new();
+        steps.ok("worktree", json!({ "path": "/tmp/wt" }));
+        steps.ok("workspace", json!({ "workspace_id": "ws-1" }));
+        steps.ok("agent", json!({ "kind": "claude" }));
+        steps.skipped("prompt", "no prompt was given");
+        assert_eq!(
+            task_partial(payload.clone(), &steps).status(),
+            StatusCode::OK,
+            "a skipped step is not a failure"
+        );
+
+        steps.failed("prompt", "herdr_error", "pane vanished");
+        assert_eq!(
+            task_partial(payload, &steps).status(),
+            StatusCode::MULTI_STATUS
+        );
+    }
+
+    #[test]
+    fn nothing_created_is_an_error_whose_status_says_whose_fault_it_was() {
+        let steps = tasks::StepLog::new();
+        // Herdr refusing is the request being wrong.
+        let refused = HerdrCallError::Herdr {
+            method: "worktree.create".into(),
+            error: json!({ "code": "not_a_repo", "message": "not a git repository" }),
+        };
+        assert_eq!(refused.code(), "not_a_repo");
+        assert!(refused.message().contains("worktree.create"));
+        assert_eq!(
+            task_failure(refused, &steps).status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        // The socket being down, or Herdr answering off-schema, is not.
+        assert_eq!(
+            task_failure(
+                HerdrCallError::Unavailable("Herdr is unavailable".into()),
+                &steps
+            )
+            .status(),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            task_failure(HerdrCallError::malformed("workspace.create"), &steps).status(),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            HerdrCallError::malformed("workspace.create").code(),
+            "invalid_herdr_response"
+        );
+    }
+
+    #[test]
+    fn repo_roots_come_from_the_repos_this_session_has_and_never_widen_to_the_machine() {
+        // The gathering half of task_repo_roots, which is the part that decides
+        // what the fence lets through. A workspace names its repo root as well
+        // as its checkout, which is why a pane sitting deep inside a repo still
+        // lets the repo's top level be branched from.
+        let workspaces = json!({
+            "id": "1",
+            "result": { "type": "workspace_list", "workspaces": [
+                { "workspace_id": "ws-1", "worktree": {
+                    "repo_key": "k", "repo_name": "muqun",
+                    "repo_root": "/Users/dev/code/muqun",
+                    "checkout_path": "/Users/dev/code/muqun-task",
+                    "is_linked_worktree": true } },
+                { "workspace_id": "ws-2" },
+                { "workspace_id": "ws-3", "worktree": {
+                    "repo_key": "k2", "repo_name": "home", "repo_root": "/",
+                    "checkout_path": "/", "is_linked_worktree": false } }
+            ] }
+        });
+        let mut found: Vec<String> = Vec::new();
+        for workspace in workspaces["result"]["workspaces"].as_array().unwrap() {
+            for key in ["repo_root", "checkout_path"] {
+                if let Some(path) = workspace
+                    .pointer(&format!("/worktree/{key}"))
+                    .and_then(Value::as_str)
+                {
+                    if is_scannable_root(FsPath::new(path)) {
+                        found.push(path.to_owned());
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            found,
+            vec!["/Users/dev/code/muqun", "/Users/dev/code/muqun-task"]
+        );
+        // A workspace with no worktree contributes nothing, and "/" is refused
+        // by the same guard the asset roots use.
+        assert!(!found.iter().any(|path| path == "/"));
     }
 }

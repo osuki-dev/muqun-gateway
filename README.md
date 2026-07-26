@@ -261,6 +261,8 @@ Routes:
 - `GET /api/sessions/default/panes/:paneId/output?source=recent-unwrapped&lines=200`
 - `POST /api/sessions/default/panes/:paneId/send-text`
 - `POST /api/sessions/default/panes/:paneId/send-keys`
+- `GET /api/agents/catalog`
+- `POST /api/sessions/default/tasks`
 - `POST /api/uploads`
 
 `POST /api/uploads` takes a `multipart/form-data` body with a single `file`
@@ -274,6 +276,65 @@ type is decided by sniffing the content, so everything else is refused with
 `415`, executables and scripts included, and the client's filename is only
 echoed back and never reaches the filesystem. The body is capped at 25 MiB, and
 stored uploads are deleted 48 hours after they were written.
+
+### Starting a task
+
+`POST /api/sessions/default/tasks` is how the app starts a new piece of work
+rather than joining one already running: pick a repo, name a branch, choose an
+agent, and send the first prompt.
+
+```json
+{
+  "repo_path": "/Users/dev/code/muqun",
+  "branch_name": "task/594",
+  "agent": "claude",
+  "prompt": "Read AGENTS.md and start on card 594.",
+  "workspace_label": "card 594"
+}
+```
+
+With `branch_name`, the task gets its own git worktree; without it the task runs
+in the repo as it stands. Herdr does the work: `worktree.create` makes the
+checkout and its workspace, tab and root pane in one call, and `agent.start`
+launches the agent and waits for it to become interactive before the prompt is
+sent. Asking twice for the same branch reuses the existing checkout instead of
+making a second one, so a retry from a phone that lost its connection converges.
+
+The answer names where the work is, and what happened:
+
+```json
+{
+  "workspace_id": "wD", "pane_id": "wD:p1",
+  "worktree_path": "/Users/dev/code/muqun-task-594",
+  "branch": "task/594", "agent": "claude",
+  "reused_worktree": false, "agent_started": true, "prompt_submitted": true,
+  "steps": [ { "step": "worktree", "status": "ok", "detail": { } } ]
+}
+```
+
+A run that got part of the way answers `207` with the same body plus the failed
+step, because "it failed" does not tell the user whether they now have a
+checkout, and the wrong guess makes them either abandon real work or create a
+second copy of it. Nothing is rolled back at that point: a pane sitting in a
+fresh checkout is usable. The one case that is rolled back is a checkout this
+request created that could not be given a workspace, which is useless on its own.
+
+Two things are the gateway's own, not Herdr's. `repo_path` has to be, or be
+inside, a workspace this session already has open -- anything else is `403`, and
+a symlink out of one resolves to the outside path and fails there too.
+`branch_name` is held to letters, digits, dot, underscore, dash and slash, with
+`..`, a leading dash, and dot-leading segments refused, so the one field that
+reaches `git` as an identifier can only ever be a ref and never an argument.
+
+`GET /api/agents/catalog` feeds the agent picker: every kind the gateway offers,
+the executable it maps to, and whether that executable is on this host's `PATH`.
+Herdr resolves a kind to its canonical executable itself, so `available: false`
+is a hint rather than a veto. Add `agent_commands` to `config.json` for a host
+whose binary is named something else:
+
+```json
+{ "agent_commands": { "claude": "claude-canary" } }
+```
 
 ### Assets
 
