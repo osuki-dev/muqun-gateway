@@ -1,0 +1,117 @@
+{
+  "messages": [
+    {
+      "info": {
+        "id": "msg_f9f28a8130011RIAo46L3RNTje",
+        "sessionID": "ses_060d7580affePCIILyS0REzupf",
+        "role": "user",
+        "time": {
+          "created": 1785081669651
+        },
+        "summary": {
+          "diffs": []
+        },
+        "agent": "osuki",
+        "model": {
+          "providerID": "opencode",
+          "modelID": "ling-3.0-flash-free"
+        }
+      },
+      "parts": [
+        {
+          "id": "prt_f9f28a8150019sU7zIVVZr8IcF",
+          "sessionID": "ses_060d7580affePCIILyS0REzupf",
+          "messageID": "msg_f9f28a8130011RIAo46L3RNTje",
+          "type": "text",
+          "text": "Run the shell command: echo native-approval-probe"
+        }
+      ]
+    },
+    {
+      "info": {
+        "id": "msg_f9f28a93b00151LnEhNKcYTlK6",
+        "sessionID": "ses_060d7580affePCIILyS0REzupf",
+        "role": "assistant",
+        "time": {
+          "created": 1785081669947
+        },
+        "parentID": "msg_f9f28a8130011RIAo46L3RNTje",
+        "modelID": "ling-3.0-flash-free",
+        "providerID": "opencode",
+        "mode": "osuki",
+        "agent": "osuki",
+        "path": {
+          "cwd": "/Users/okk/.repos/herdr-gateway-wt-native",
+          "root": "/Users/okk/.repos/herdr-gateway-wt-native"
+        },
+        "cost": 0,
+        "tokens": {
+          "input": 0,
+          "output": 0,
+          "reasoning": 0,
+          "cache": {
+            "read": 0,
+            "write": 0
+          }
+        }
+      },
+      "parts": [
+        {
+          "id": "prt_f9f28af03001U0BsPh5t0jsU4q",
+          "sessionID": "ses_060d7580affePCIILyS0REzupf",
+          "messageID": "msg_f9f28a93b00151LnEhNKcYTlK6",
+          "type": "step-start",
+          "snapshot": "eeb4aa3bff9514a3acf56694a6b7b90eb393a84f"
+        },
+        {
+          "id": "prt_f9f28af04001W7lIlW1UVdPTGf",
+          "sessionID": "ses_060d7580affePCIILyS0REzupf",
+          "messageID": "msg_f9f28a93b00151LnEhNKcYTlK6",
+          "type": "reasoning",
+          "text": "The user wants me to run a simple shell command: `echo native-approval-probe`. This is straightforward - no need for complex orchestration. Let me also check what's going on in this repo to understand context, since the command seems related to the repo name \"herdr-gateway-wt-native\".",
+          "time": {
+            "start": 1785081671428,
+            "end": 1785081671879
+          }
+        },
+        {
+          "id": "prt_f9f28b0c8001bGnuncqJouXibe",
+          "sessionID": "ses_060d7580affePCIILyS0REzupf",
+          "messageID": "msg_f9f28a93b00151LnEhNKcYTlK6",
+          "type": "tool",
+          "callID": "call_c18cc28321094dadbce61641",
+          "tool": "bash",
+          "state": {
+            "status": "running",
+            "input": {
+              "command": "echo native-approval-probe"
+            },
+            "time": {
+              "start": 1785081671893
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "pending_permissions": [
+    {
+      "id": "per_f9f28b0d4001QKMLkVCekhlekI",
+      "sessionID": "ses_060d7580affePCIILyS0REzupf",
+      "permission": "bash",
+      "patterns": [
+        "echo native-approval-probe"
+      ],
+      "metadata": {
+        "command": "echo native-approval-probe"
+      },
+      "always": [
+        "echo *"
+      ],
+      "tool": {
+        "messageID": "msg_f9f28a93b00151LnEhNKcYTlK6",
+        "callID": "call_c18cc28321094dadbce61641"
+      }
+    }
+  ]
+}

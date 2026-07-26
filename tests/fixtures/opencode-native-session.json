@@ -1,0 +1,955 @@
+{
+  "messages": [
+    {
+      "info": {
+        "id": "msg_f9f27aa26001SDJIYqtw9DeXTD",
+        "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+        "role": "user",
+        "time": {
+          "created": 1785081604646
+        },
+        "summary": {
+          "diffs": []
+        },
+        "agent": "osuki",
+        "model": {
+          "providerID": "opencode",
+          "modelID": "ling-3.0-flash-free"
+        }
+      },
+      "parts": [
+        {
+          "id": "prt_f9f27aa2b0014PBarKhz27ebqY",
+          "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+          "messageID": "msg_f9f27aa26001SDJIYqtw9DeXTD",
+          "type": "text",
+          "text": "Use your todo tool to plan three steps, then run `wc -l Cargo.toml` with bash, then read the first 20 lines of Cargo.toml, then create a file /tmp/native-probe.txt containing the word hello, then edit that file to say hello world. Finally summarise in two sentences."
+        }
+      ]
+    },
+    {
+      "info": {
+        "id": "msg_f9f27ab7e001zNsdDffAXZ3Hh8",
+        "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+        "role": "assistant",
+        "time": {
+          "created": 1785081604990,
+          "completed": 1785081608446
+        },
+        "parentID": "msg_f9f27aa26001SDJIYqtw9DeXTD",
+        "modelID": "ling-3.0-flash-free",
+        "providerID": "opencode",
+        "mode": "osuki",
+        "agent": "osuki",
+        "path": {
+          "cwd": "/Users/okk/.repos/herdr-gateway-wt-native",
+          "root": "/Users/okk/.repos/herdr-gateway-wt-native"
+        },
+        "cost": 0,
+        "tokens": {
+          "total": 10540,
+          "input": 10319,
+          "output": 133,
+          "reasoning": 88,
+          "cache": {
+            "read": 0,
+            "write": 0
+          }
+        },
+        "finish": "tool-calls"
+      },
+      "parts": [
+        {
+          "id": "prt_f9f27b69e001t0FM4hr5mfyiIH",
+          "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+          "messageID": "msg_f9f27ab7e001zNsdDffAXZ3Hh8",
+          "type": "step-start",
+          "snapshot": "eeb4aa3bff9514a3acf56694a6b7b90eb393a84f"
+        },
+        {
+          "id": "prt_f9f27b6a00013aF2H8T0iekJJX",
+          "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+          "messageID": "msg_f9f27ab7e001zNsdDffAXZ3Hh8",
+          "type": "reasoning",
+          "text": "The user wants me to:\n1. Use the todo tool to plan three steps\n2. Run `wc -l Cargo.toml` with bash\n3. Read the first 20 lines of Cargo.toml\n4. Create a file /tmp/native-probe.txt containing the word hello\n5. Edit that file to say hello world\n6. Summarize in two sentences\n\nLet me start by creating the todo list and then proceed with the tasks.",
+          "time": {
+            "start": 1785081607840,
+            "end": 1785081608091
+          }
+        },
+        {
+          "id": "prt_f9f27b79d001kMR5OccwObkSH5",
+          "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+          "messageID": "msg_f9f27ab7e001zNsdDffAXZ3Hh8",
+          "type": "tool",
+          "callID": "call_d47cd85a5f1f4e2d9d6204bf",
+          "tool": "todowrite",
+          "state": {
+            "status": "completed",
+            "input": {
+              "todos": [
+                {
+                  "content": "Plan three steps using the todo tool",
+                  "priority": "high",
+                  "status": "in_progress"
+                },
+                {
+                  "content": "Run `wc -l Cargo.toml` and read first 20 lines of Cargo.toml",
+                  "priority": "medium",
+                  "status": "pending"
+                },
+                {
+                  "content": "Create /tmp/native-probe.txt with 'hello', then edit it to 'hello world', then summarize",
+                  "priority": "medium",
+                  "status": "pending"
+                }
+              ]
+            },
+            "output": "[\n  {\n    \"content\": \"Plan three steps using the todo tool\",\n    \"status\": \"in_progress\",\n    \"priority\": \"high\"\n  },\n  {\n    \"content\": \"Run `wc -l Cargo.toml` and read first 20 lines of Cargo.toml\",\n    \"status\": \"pending\",\n    \"priority\": \"medium\"\n  },\n  {\n    \"content\": \"Create /tmp/native-probe.txt with 'hello', then edit it to 'hello world', then summarize\",\n    \"status\": \"pending\",\n    \"priority\": \"medium\"\n  }\n]",
+            "title": "3 todos",
+            "metadata": {
+              "todos": [
+                {
+                  "content": "Plan three steps using the todo tool",
+                  "status": "in_progress",
+                  "priority": "high"
+                },
+                {
+                  "content": "Run `wc -l Cargo.toml` and read first 20 lines of Cargo.toml",
+                  "status": "pending",
+                  "priority": "medium"
+                },
+                {
+                  "content": "Create /tmp/native-probe.txt with 'hello', then edit it to 'hello world', then summarize",
+                  "status": "pending",
+                  "priority": "medium"
+                }
+              ],
+              "truncated": false
+            },
+            "time": {
+              "start": 1785081608327,
+              "end": 1785081608329
+            }
+          }
+        },
+        {
+          "id": "prt_f9f27b8d4001Bz1ViIlUEV6XQx",
+          "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+          "messageID": "msg_f9f27ab7e001zNsdDffAXZ3Hh8",
+          "type": "step-finish",
+          "reason": "tool-calls",
+          "snapshot": "eeb4aa3bff9514a3acf56694a6b7b90eb393a84f",
+          "cost": 0,
+          "tokens": {
+            "total": 10540,
+            "input": 10319,
+            "output": 133,
+            "reasoning": 88,
+            "cache": {
+              "read": 0,
+              "write": 0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "info": {
+        "id": "msg_f9f27b900001AvJ75km2oBqI9Q",
+        "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+        "role": "assistant",
+        "time": {
+          "created": 1785081608448,
+          "completed": 1785081610831
+        },
+        "parentID": "msg_f9f27aa26001SDJIYqtw9DeXTD",
+        "modelID": "ling-3.0-flash-free",
+        "providerID": "opencode",
+        "mode": "osuki",
+        "agent": "osuki",
+        "path": {
+          "cwd": "/Users/okk/.repos/herdr-gateway-wt-native",
+          "root": "/Users/okk/.repos/herdr-gateway-wt-native"
+        },
+        "cost": 0,
+        "tokens": {
+          "total": 10869,
+          "input": 10701,
+          "output": 117,
+          "reasoning": 51,
+          "cache": {
+            "read": 0,
+            "write": 0
+          }
+        },
+        "finish": "tool-calls"
+      },
+      "parts": [
+        {
+          "id": "prt_f9f27c062001CzU1D6BLgeoZ8K",
+          "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+          "messageID": "msg_f9f27b900001AvJ75km2oBqI9Q",
+          "type": "step-start",
+          "snapshot": "eeb4aa3bff9514a3acf56694a6b7b90eb393a84f"
+        },
+        {
+          "id": "prt_f9f27c0640018m1R4CaMwG7fg2",
+          "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+          "messageID": "msg_f9f27b900001AvJ75km2oBqI9Q",
+          "type": "reasoning",
+          "text": "The first todo is done - I planned three steps. Now I need to mark it complete and proceed with the next two tasks. Let me run the bash command and read Cargo.toml in parallel, since they're independent.",
+          "time": {
+            "start": 1785081610340,
+            "end": 1785081610483
+          }
+        },
+        {
+          "id": "prt_f9f27c0f4001xevXE0Og1n5AG9",
+          "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+          "messageID": "msg_f9f27b900001AvJ75km2oBqI9Q",
+          "type": "tool",
+          "callID": "call_6748a02c105847fa88fe8c34",
+          "tool": "todowrite",
+          "state": {
+            "status": "completed",
+            "input": {
+              "todos": [
+                {
+                  "content": "Plan three steps using the todo tool",
+                  "priority": "high",
+                  "status": "completed"
+                },
+                {
+                  "content": "Run `wc -l Cargo.toml` and read first 20 lines of Cargo.toml",
+                  "priority": "medium",
+                  "status": "in_progress"
+                },
+                {
+                  "content": "Create /tmp/native-probe.txt with 'hello', then edit it to 'hello world', then summarize",
+                  "priority": "medium",
+                  "status": "pending"
+                }
+              ]
+            },
+            "output": "[\n  {\n    \"content\": \"Plan three steps using the todo tool\",\n    \"status\": \"completed\",\n    \"priority\": \"high\"\n  },\n  {\n    \"content\": \"Run `wc -l Cargo.toml` and read first 20 lines of Cargo.toml\",\n    \"status\": \"in_progress\",\n    \"priority\": \"medium\"\n  },\n  {\n    \"content\": \"Create /tmp/native-probe.txt with 'hello', then edit it to 'hello world', then summarize\",\n    \"status\": \"pending\",\n    \"priority\": \"medium\"\n  }\n]",
+            "title": "2 todos",
+            "metadata": {
+              "todos": [
+                {
+                  "content": "Plan three steps using the todo tool",
+                  "status": "completed",
+                  "priority": "high"
+                },
+                {
+                  "content": "Run `wc -l Cargo.toml` and read first 20 lines of Cargo.toml",
+                  "status": "in_progress",
+                  "priority": "medium"
+                },
+                {
+                  "content": "Create /tmp/native-probe.txt with 'hello', then edit it to 'hello world', then summarize",
+                  "status": "pending",
+                  "priority": "medium"
+                }
+              ],
+              "truncated": false
+            },
+            "time": {
+              "start": 1785081610702,
+              "end": 1785081610703
+            }
+          }
+        },
+        {
+          "id": "prt_f9f27c22b001KjIRHdDhCUIdnL",
+          "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+          "messageID": "msg_f9f27b900001AvJ75km2oBqI9Q",
+          "type": "step-finish",
+          "reason": "tool-calls",
+          "snapshot": "eeb4aa3bff9514a3acf56694a6b7b90eb393a84f",
+          "cost": 0,
+          "tokens": {
+            "total": 10869,
+            "input": 10701,
+            "output": 117,
+            "reasoning": 51,
+            "cache": {
+              "read": 0,
+              "write": 0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "info": {
+        "id": "msg_f9f27c2510010T8VDx0jVSMzTv",
+        "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+        "role": "assistant",
+        "time": {
+          "created": 1785081610833,
+          "completed": 1785081612532
+        },
+        "parentID": "msg_f9f27aa26001SDJIYqtw9DeXTD",
+        "modelID": "ling-3.0-flash-free",
+        "providerID": "opencode",
+        "mode": "osuki",
+        "agent": "osuki",
+        "path": {
+          "cwd": "/Users/okk/.repos/herdr-gateway-wt-native",
+          "root": "/Users/okk/.repos/herdr-gateway-wt-native"
+        },
+        "cost": 0,
+        "tokens": {
+          "total": 11152,
+          "input": 278,
+          "output": 86,
+          "reasoning": 36,
+          "cache": {
+            "read": 10752,
+            "write": 0
+          }
+        },
+        "finish": "tool-calls"
+      },
+      "parts": [
+        {
+          "id": "prt_f9f27c704001SoW6troKuDbvE8",
+          "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+          "messageID": "msg_f9f27c2510010T8VDx0jVSMzTv",
+          "type": "step-start",
+          "snapshot": "eeb4aa3bff9514a3acf56694a6b7b90eb393a84f"
+        },
+        {
+          "id": "prt_f9f27c7060012zV3cDrfAFfmOi",
+          "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+          "messageID": "msg_f9f27c2510010T8VDx0jVSMzTv",
+          "type": "reasoning",
+          "text": "Now I need to run `wc -l Cargo.toml` and read the first 20 lines of Cargo.toml. These are independent operations so I can run them in parallel.",
+          "time": {
+            "start": 1785081612038,
+            "end": 1785081612215
+          }
+        },
+        {
+          "id": "prt_f9f27c7b9001EchMNIrQWtRyRN",
+          "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+          "messageID": "msg_f9f27c2510010T8VDx0jVSMzTv",
+          "type": "tool",
+          "callID": "call_17178b81dffa4c359bd02535",
+          "tool": "bash",
+          "state": {
+            "status": "completed",
+            "input": {
+              "command": "wc -l Cargo.toml",
+              "workdir": "/Users/okk/.repos/herdr-gateway-wt-native"
+            },
+            "output": "      28 Cargo.toml\n",
+            "title": "wc -l Cargo.toml",
+            "metadata": {
+              "output": "      28 Cargo.toml\n",
+              "exit": 0,
+              "truncated": false
+            },
+            "time": {
+              "start": 1785081612271,
+              "end": 1785081612273
+            }
+          }
+        },
+        {
+          "id": "prt_f9f27c8170012rMj98nnJZKwRm",
+          "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+          "messageID": "msg_f9f27c2510010T8VDx0jVSMzTv",
+          "type": "tool",
+          "callID": "call_5e49d4f08ef4495f8c8f606d",
+          "tool": "read",
+          "state": {
+            "status": "completed",
+            "input": {
+              "filePath": "/Users/okk/.repos/herdr-gateway-wt-native/Cargo.toml",
+              "limit": 20
+            },
+            "output": "<path>/Users/okk/.repos/herdr-gateway-wt-native/Cargo.toml</path>\n<type>file</type>\n<content>\n1: [package]\n2: name = \"herdr-gateway\"\n3: version = \"0.5.0\"\n4: edition = \"2021\"\n5: license = \"MIT\"\n6: description = \"Token-protected mobile gateway for Herdr, the terminal workspace manager for AI coding agents.\"\n7: repository = \"https://github.com/BANG88/herdr-gateway\"\n8: readme = \"README.md\"\n9: keywords = [\"herdr\", \"terminal\", \"gateway\", \"tailscale\", \"cli\"]\n10: categories = [\"command-line-utilities\"]\n11: \n12: [dependencies]\n13: anyhow = \"1.0.103\"\n14: async-stream = \"0.3.6\"\n15: axum = { version = \"0.8.9\", features = [\"multipart\"] }\n16: base64 = \"0.22.1\"\n17: clap = { version = \"4.6.2\", features = [\"derive\"] }\n18: crossterm = \"0.29.0\"\n19: dirs = \"6.0.0\"\n20: libc = \"0.2.178\"\n\n(Showing lines 1-20 of 28. Use offset=21 to continue.)\n</content>",
+            "title": "Cargo.toml",
+            "metadata": {
+              "preview": "[package]\nname = \"herdr-gateway\"\nversion = \"0.5.0\"\nedition = \"2021\"\nlicense = \"MIT\"\ndescription = \"Token-protected mobile gateway for Herdr, the terminal workspace manager for AI coding agents.\"\nrepository = \"https://github.com/BANG88/herdr-gateway\"\nreadme = \"README.md\"\nkeywords = [\"herdr\", \"terminal\", \"gateway\", \"tailscale\", \"cli\"]\ncategories = [\"command-line-utilities\"]\n\n[dependencies]\nanyhow = \"1.0.103\"\nasync-stream = \"0.3.6\"\naxum = { version = \"0.8.9\", features = [\"multipart\"] }\nbase64 = \"0.22.1\"\nclap = { version = \"4.6.2\", features = [\"derive\"] }\ncrossterm = \"0.29.0\"\ndirs = \"6.0.0\"\nlibc = \"0.2.178\"",
+              "truncated": true,
+              "loaded": [],
+              "display": {
+                "type": "file",
+                "path": "/Users/okk/.repos/herdr-gateway-wt-native/Cargo.toml",
+                "text": "[package]\nname = \"herdr-gateway\"\nversion = \"0.5.0\"\nedition = \"2021\"\nlicense = \"MIT\"\ndescription = \"Token-protected mobile gateway for Herdr, the terminal workspace manager for AI coding agents.\"\nrepository = \"https://github.com/BANG88/herdr-gateway\"\nreadme = \"README.md\"\nkeywords = [\"herdr\", \"terminal\", \"gateway\", \"tailscale\", \"cli\"]\ncategories = [\"command-line-utilities\"]\n\n[dependencies]\nanyhow = \"1.0.103\"\nasync-stream = \"0.3.6\"\naxum = { version = \"0.8.9\", features = [\"multipart\"] }\nbase64 = \"0.22.1\"\nclap = { version = \"4.6.2\", features = [\"derive\"] }\ncrossterm = \"0.29.0\"\ndirs = \"6.0.0\"\nlibc = \"0.2.178\"",
+                "lineStart": 1,
+                "lineEnd": 20,
+                "totalLines": 28,
+                "truncated": true
+              }
+            },
+            "time": {
+              "start": 1785081612442,
+              "end": 1785081612447
+            }
+          }
+        },
+        {
+          "id": "prt_f9f27c8cd001wVCBf2DjusaJjR",
+          "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+          "messageID": "msg_f9f27c2510010T8VDx0jVSMzTv",
+          "type": "step-finish",
+          "reason": "tool-calls",
+          "snapshot": "eeb4aa3bff9514a3acf56694a6b7b90eb393a84f",
+          "cost": 0,
+          "tokens": {
+            "total": 11152,
+            "input": 278,
+            "output": 86,
+            "reasoning": 36,
+            "cache": {
+              "read": 10752,
+              "write": 0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "info": {
+        "id": "msg_f9f27c8f6001wRjovIVi7nLirD",
+        "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+        "role": "assistant",
+        "time": {
+          "created": 1785081612534,
+          "completed": 1785081614383
+        },
+        "parentID": "msg_f9f27aa26001SDJIYqtw9DeXTD",
+        "modelID": "ling-3.0-flash-free",
+        "providerID": "opencode",
+        "mode": "osuki",
+        "agent": "osuki",
+        "path": {
+          "cwd": "/Users/okk/.repos/herdr-gateway-wt-native",
+          "root": "/Users/okk/.repos/herdr-gateway-wt-native"
+        },
+        "cost": 0,
+        "tokens": {
+          "total": 11734,
+          "input": 1036,
+          "output": 130,
+          "reasoning": 72,
+          "cache": {
+            "read": 10496,
+            "write": 0
+          }
+        },
+        "finish": "tool-calls"
+      },
+      "parts": [
+        {
+          "id": "prt_f9f27cdbe0019Kxf78Z6tlud8f",
+          "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+          "messageID": "msg_f9f27c8f6001wRjovIVi7nLirD",
+          "type": "step-start",
+          "snapshot": "eeb4aa3bff9514a3acf56694a6b7b90eb393a84f"
+        },
+        {
+          "id": "prt_f9f27cdbf001dtRgm0NVuMbkMW",
+          "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+          "messageID": "msg_f9f27c8f6001wRjovIVi7nLirD",
+          "type": "reasoning",
+          "text": "Good, I've completed the second todo. Now I need to:\n1. Mark the second todo as completed\n2. Mark the third todo as in_progress\n3. Create /tmp/native-probe.txt with \"hello\"\n4. Edit it to say \"hello world\"\n5. Summarize in two sentences\n\nLet me first create the file, then edit it.",
+          "time": {
+            "start": 1785081613759,
+            "end": 1785081614005
+          }
+        },
+        {
+          "id": "prt_f9f27ceb6001dEkwhComVVJbQN",
+          "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+          "messageID": "msg_f9f27c8f6001wRjovIVi7nLirD",
+          "type": "tool",
+          "callID": "call_21d3142f28924f6c99fa965d",
+          "tool": "todowrite",
+          "state": {
+            "status": "completed",
+            "input": {
+              "todos": [
+                {
+                  "content": "Plan three steps using the todo tool",
+                  "priority": "high",
+                  "status": "completed"
+                },
+                {
+                  "content": "Run `wc -l Cargo.toml` and read first 20 lines of Cargo.toml",
+                  "priority": "medium",
+                  "status": "completed"
+                },
+                {
+                  "content": "Create /tmp/native-probe.txt with 'hello', then edit it to 'hello world', then summarize",
+                  "priority": "medium",
+                  "status": "in_progress"
+                }
+              ]
+            },
+            "output": "[\n  {\n    \"content\": \"Plan three steps using the todo tool\",\n    \"status\": \"completed\",\n    \"priority\": \"high\"\n  },\n  {\n    \"content\": \"Run `wc -l Cargo.toml` and read first 20 lines of Cargo.toml\",\n    \"status\": \"completed\",\n    \"priority\": \"medium\"\n  },\n  {\n    \"content\": \"Create /tmp/native-probe.txt with 'hello', then edit it to 'hello world', then summarize\",\n    \"status\": \"in_progress\",\n    \"priority\": \"medium\"\n  }\n]",
+            "title": "1 todos",
+            "metadata": {
+              "todos": [
+                {
+                  "content": "Plan three steps using the todo tool",
+                  "status": "completed",
+                  "priority": "high"
+                },
+                {
+                  "content": "Run `wc -l Cargo.toml` and read first 20 lines of Cargo.toml",
+                  "status": "completed",
+                  "priority": "medium"
+                },
+                {
+                  "content": "Create /tmp/native-probe.txt with 'hello', then edit it to 'hello world', then summarize",
+                  "status": "in_progress",
+                  "priority": "medium"
+                }
+              ],
+              "truncated": false
+            },
+            "time": {
+              "start": 1785081614278,
+              "end": 1785081614279
+            }
+          }
+        },
+        {
+          "id": "prt_f9f27d007001pQ1AIVCrFk8UL6",
+          "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+          "messageID": "msg_f9f27c8f6001wRjovIVi7nLirD",
+          "type": "step-finish",
+          "reason": "tool-calls",
+          "snapshot": "eeb4aa3bff9514a3acf56694a6b7b90eb393a84f",
+          "cost": 0,
+          "tokens": {
+            "total": 11734,
+            "input": 1036,
+            "output": 130,
+            "reasoning": 72,
+            "cache": {
+              "read": 10496,
+              "write": 0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "info": {
+        "id": "msg_f9f27d031001aRH3yaaxblDC5V",
+        "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+        "role": "assistant",
+        "time": {
+          "created": 1785081614385,
+          "completed": 1785081616084
+        },
+        "parentID": "msg_f9f27aa26001SDJIYqtw9DeXTD",
+        "modelID": "ling-3.0-flash-free",
+        "providerID": "opencode",
+        "mode": "osuki",
+        "agent": "osuki",
+        "path": {
+          "cwd": "/Users/okk/.repos/herdr-gateway-wt-native",
+          "root": "/Users/okk/.repos/herdr-gateway-wt-native"
+        },
+        "cost": 0,
+        "tokens": {
+          "total": 11998,
+          "input": 375,
+          "output": 45,
+          "reasoning": 58,
+          "cache": {
+            "read": 11520,
+            "write": 0
+          }
+        },
+        "finish": "tool-calls"
+      },
+      "parts": [
+        {
+          "id": "prt_f9f27d5b8001tJemLjGEooL55e",
+          "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+          "messageID": "msg_f9f27d031001aRH3yaaxblDC5V",
+          "type": "step-start",
+          "snapshot": "eeb4aa3bff9514a3acf56694a6b7b90eb393a84f"
+        },
+        {
+          "id": "prt_f9f27d5b9001ztFS5AMd0jbZs0",
+          "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+          "messageID": "msg_f9f27d031001aRH3yaaxblDC5V",
+          "type": "reasoning",
+          "text": "Now I need to create /tmp/native-probe.txt with \"hello\". I should use bash to create the file, then edit it. Let me first write the file using bash (since Write tool could work too, but bash with echo is simpler for a temp file).",
+          "time": {
+            "start": 1785081615801,
+            "end": 1785081615951
+          }
+        },
+        {
+          "id": "prt_f9f27d650001Rgp3TLIqn0fZAO",
+          "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+          "messageID": "msg_f9f27d031001aRH3yaaxblDC5V",
+          "type": "tool",
+          "callID": "call_ec5dce584d894c48a6af1472",
+          "tool": "bash",
+          "state": {
+            "status": "completed",
+            "input": {
+              "command": "echo \"hello\" > /tmp/native-probe.txt",
+              "workdir": "/Users/okk/.repos/herdr-gateway-wt-native"
+            },
+            "output": "(no output)",
+            "title": "echo \"hello\" > /tmp/native-probe.txt",
+            "metadata": {
+              "output": "(no output)",
+              "exit": 0,
+              "truncated": false
+            },
+            "time": {
+              "start": 1785081615973,
+              "end": 1785081615979
+            }
+          }
+        },
+        {
+          "id": "prt_f9f27d6b2001e5mZSBi0h9P8Bx",
+          "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+          "messageID": "msg_f9f27d031001aRH3yaaxblDC5V",
+          "type": "step-finish",
+          "reason": "tool-calls",
+          "snapshot": "eeb4aa3bff9514a3acf56694a6b7b90eb393a84f",
+          "cost": 0,
+          "tokens": {
+            "total": 11998,
+            "input": 375,
+            "output": 45,
+            "reasoning": 58,
+            "cache": {
+              "read": 11520,
+              "write": 0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "info": {
+        "id": "msg_f9f27d6d5001XlScLAHccnm0V9",
+        "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+        "role": "assistant",
+        "time": {
+          "created": 1785081616085,
+          "completed": 1785081618426
+        },
+        "parentID": "msg_f9f27aa26001SDJIYqtw9DeXTD",
+        "modelID": "ling-3.0-flash-free",
+        "providerID": "opencode",
+        "mode": "osuki",
+        "agent": "osuki",
+        "path": {
+          "cwd": "/Users/okk/.repos/herdr-gateway-wt-native",
+          "root": "/Users/okk/.repos/herdr-gateway-wt-native"
+        },
+        "cost": 0,
+        "tokens": {
+          "total": 12091,
+          "input": 180,
+          "output": 34,
+          "reasoning": 37,
+          "cache": {
+            "read": 11840,
+            "write": 0
+          }
+        },
+        "finish": "tool-calls"
+      },
+      "parts": [
+        {
+          "id": "prt_f9f27dc7d0012ga6Qh5r6ymETA",
+          "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+          "messageID": "msg_f9f27d6d5001XlScLAHccnm0V9",
+          "type": "step-start",
+          "snapshot": "eeb4aa3bff9514a3acf56694a6b7b90eb393a84f"
+        },
+        {
+          "id": "prt_f9f27dc7e0013tbsIto087KLOX",
+          "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+          "messageID": "msg_f9f27d6d5001XlScLAHccnm0V9",
+          "type": "reasoning",
+          "text": "File created with \"hello\". Now I need to edit it to say \"hello world\". Let me use the edit tool for this, and also verify the file content first.",
+          "time": {
+            "start": 1785081617534,
+            "end": 1785081617655
+          }
+        },
+        {
+          "id": "prt_f9f27dcf9001mv4Sz2V04LBQ36",
+          "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+          "messageID": "msg_f9f27d6d5001XlScLAHccnm0V9",
+          "type": "tool",
+          "callID": "call_111660bc0a0641acae797f41",
+          "tool": "edit",
+          "state": {
+            "status": "completed",
+            "input": {
+              "filePath": "/tmp/native-probe.txt",
+              "newString": "hello world",
+              "oldString": "hello"
+            },
+            "output": "Edit applied successfully.",
+            "title": "../../../../tmp/native-probe.txt",
+            "metadata": {
+              "diagnostics": {},
+              "diff": "Index: /tmp/native-probe.txt\n===================================================================\n--- /tmp/native-probe.txt\n+++ /tmp/native-probe.txt\n@@ -1,1 +1,1 @@\n-hello\n+hello world\n",
+              "filediff": {
+                "file": "/tmp/native-probe.txt",
+                "patch": "Index: /tmp/native-probe.txt\n===================================================================\n--- /tmp/native-probe.txt\n+++ /tmp/native-probe.txt\n@@ -1,1 +1,1 @@\n-hello\n+hello world\n",
+                "additions": 1,
+                "deletions": 1
+              },
+              "truncated": false
+            },
+            "time": {
+              "start": 1785081617704,
+              "end": 1785081617705
+            }
+          }
+        },
+        {
+          "id": "prt_f9f27dfd4001Y2YOh5AfZ07v31",
+          "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+          "messageID": "msg_f9f27d6d5001XlScLAHccnm0V9",
+          "type": "step-finish",
+          "reason": "tool-calls",
+          "snapshot": "eeb4aa3bff9514a3acf56694a6b7b90eb393a84f",
+          "cost": 0,
+          "tokens": {
+            "total": 12091,
+            "input": 180,
+            "output": 34,
+            "reasoning": 37,
+            "cache": {
+              "read": 11840,
+              "write": 0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "info": {
+        "id": "msg_f9f27dffb001ac1wIfdlf38GdK",
+        "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+        "role": "assistant",
+        "time": {
+          "created": 1785081618427,
+          "completed": 1785081620051
+        },
+        "parentID": "msg_f9f27aa26001SDJIYqtw9DeXTD",
+        "modelID": "ling-3.0-flash-free",
+        "providerID": "opencode",
+        "mode": "osuki",
+        "agent": "osuki",
+        "path": {
+          "cwd": "/Users/okk/.repos/herdr-gateway-wt-native",
+          "root": "/Users/okk/.repos/herdr-gateway-wt-native"
+        },
+        "cost": 0,
+        "tokens": {
+          "total": 12254,
+          "input": 82,
+          "output": 117,
+          "reasoning": 23,
+          "cache": {
+            "read": 12032,
+            "write": 0
+          }
+        },
+        "finish": "tool-calls"
+      },
+      "parts": [
+        {
+          "id": "prt_f9f27e4dc001LAc5G2fjSkBD7q",
+          "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+          "messageID": "msg_f9f27dffb001ac1wIfdlf38GdK",
+          "type": "step-start",
+          "snapshot": "eeb4aa3bff9514a3acf56694a6b7b90eb393a84f"
+        },
+        {
+          "id": "prt_f9f27e4dd001IvVk9TTqk8CB9X",
+          "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+          "messageID": "msg_f9f27dffb001ac1wIfdlf38GdK",
+          "type": "reasoning",
+          "text": "All tasks are done. Let me mark the third todo as completed and summarize in two sentences.",
+          "time": {
+            "start": 1785081619677,
+            "end": 1785081619730
+          }
+        },
+        {
+          "id": "prt_f9f27e513001kEvFO6gZFSzuT1",
+          "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+          "messageID": "msg_f9f27dffb001ac1wIfdlf38GdK",
+          "type": "tool",
+          "callID": "call_8505d0b6035048ecb1063d2e",
+          "tool": "todowrite",
+          "state": {
+            "status": "completed",
+            "input": {
+              "todos": [
+                {
+                  "content": "Plan three steps using the todo tool",
+                  "priority": "high",
+                  "status": "completed"
+                },
+                {
+                  "content": "Run `wc -l Cargo.toml` and read first 20 lines of Cargo.toml",
+                  "priority": "medium",
+                  "status": "completed"
+                },
+                {
+                  "content": "Create /tmp/native-probe.txt with 'hello', then edit it to 'hello world', then summarize",
+                  "priority": "medium",
+                  "status": "completed"
+                }
+              ]
+            },
+            "output": "[\n  {\n    \"content\": \"Plan three steps using the todo tool\",\n    \"status\": \"completed\",\n    \"priority\": \"high\"\n  },\n  {\n    \"content\": \"Run `wc -l Cargo.toml` and read first 20 lines of Cargo.toml\",\n    \"status\": \"completed\",\n    \"priority\": \"medium\"\n  },\n  {\n    \"content\": \"Create /tmp/native-probe.txt with 'hello', then edit it to 'hello world', then summarize\",\n    \"status\": \"completed\",\n    \"priority\": \"medium\"\n  }\n]",
+            "title": "0 todos",
+            "metadata": {
+              "todos": [
+                {
+                  "content": "Plan three steps using the todo tool",
+                  "status": "completed",
+                  "priority": "high"
+                },
+                {
+                  "content": "Run `wc -l Cargo.toml` and read first 20 lines of Cargo.toml",
+                  "status": "completed",
+                  "priority": "medium"
+                },
+                {
+                  "content": "Create /tmp/native-probe.txt with 'hello', then edit it to 'hello world', then summarize",
+                  "status": "completed",
+                  "priority": "medium"
+                }
+              ],
+              "truncated": false
+            },
+            "time": {
+              "start": 1785081619937,
+              "end": 1785081619938
+            }
+          }
+        },
+        {
+          "id": "prt_f9f27e631001P4FJslkktN7aqN",
+          "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+          "messageID": "msg_f9f27dffb001ac1wIfdlf38GdK",
+          "type": "step-finish",
+          "reason": "tool-calls",
+          "snapshot": "eeb4aa3bff9514a3acf56694a6b7b90eb393a84f",
+          "cost": 0,
+          "tokens": {
+            "total": 12254,
+            "input": 82,
+            "output": 117,
+            "reasoning": 23,
+            "cache": {
+              "read": 12032,
+              "write": 0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "info": {
+        "id": "msg_f9f27e65400138ghGlt6KzY7yd",
+        "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+        "role": "assistant",
+        "time": {
+          "created": 1785081620052,
+          "completed": 1785081622173
+        },
+        "parentID": "msg_f9f27aa26001SDJIYqtw9DeXTD",
+        "modelID": "ling-3.0-flash-free",
+        "providerID": "opencode",
+        "mode": "osuki",
+        "agent": "osuki",
+        "path": {
+          "cwd": "/Users/okk/.repos/herdr-gateway-wt-native",
+          "root": "/Users/okk/.repos/herdr-gateway-wt-native"
+        },
+        "cost": 0,
+        "tokens": {
+          "total": 12570,
+          "input": 1406,
+          "output": 82,
+          "reasoning": 74,
+          "cache": {
+            "read": 11008,
+            "write": 0
+          }
+        },
+        "finish": "stop"
+      },
+      "parts": [
+        {
+          "id": "prt_f9f27ebfe0013PBYgV9I6yPw1K",
+          "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+          "messageID": "msg_f9f27e65400138ghGlt6KzY7yd",
+          "type": "step-start",
+          "snapshot": "eeb4aa3bff9514a3acf56694a6b7b90eb393a84f"
+        },
+        {
+          "id": "prt_f9f27ec00001ukCm3hI3HZt3Qw",
+          "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+          "messageID": "msg_f9f27e65400138ghGlt6KzY7yd",
+          "type": "reasoning",
+          "text": "All tasks are complete. Let me summarize:\n1. Planned three steps using the todo tool.\n2. Ran `wc -l Cargo.toml` (28 lines) and read the first 20 lines of Cargo.toml.\n3. Created /tmp/native-probe.txt with \"hello\", then edited it to \"hello world\".\n\nNow I need to summarise in two sentences.",
+          "time": {
+            "start": 1785081621504,
+            "end": 1785081621789
+          }
+        },
+        {
+          "id": "prt_f9f27ed1e001zqwWPqQHtn1jeD",
+          "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+          "messageID": "msg_f9f27e65400138ghGlt6KzY7yd",
+          "type": "text",
+          "text": "All three steps are complete. Cargo.toml has 28 lines and defines the `herdr-gateway` Rust package (v0.5.0, MIT license, command-line utilities). The file `/tmp/native-probe.txt` was created with \"hello\" then edited in-place to read \"hello world\".",
+          "time": {
+            "start": 1785081621790,
+            "end": 1785081622099
+          }
+        },
+        {
+          "id": "prt_f9f27ee7b001aNCZEGTjOiPGsk",
+          "sessionID": "ses_060d88d97ffeIt3sY6uANk6EWZ",
+          "messageID": "msg_f9f27e65400138ghGlt6KzY7yd",
+          "type": "step-finish",
+          "reason": "stop",
+          "snapshot": "eeb4aa3bff9514a3acf56694a6b7b90eb393a84f",
+          "cost": 0,
+          "tokens": {
+            "total": 12570,
+            "input": 1406,
+            "output": 82,
+            "reasoning": 74,
+            "cache": {
+              "read": 11008,
+              "write": 0
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "pending_permissions": []
+}

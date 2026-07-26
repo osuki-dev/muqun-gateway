@@ -120,8 +120,10 @@ impl Decision {
 
     /// A label safe to put in a push notification: derived from the decision,
     /// never from the agent's text, so nothing from the terminal leaves the
-    /// host in a notification payload.
-    fn public_label(self, index: u32) -> String {
+    /// host in a notification payload. The native adapters label an `approval`
+    /// part's answers with it for the same reason -- a protocol's own wording
+    /// for "always" embeds the pattern it would save.
+    pub fn public_label(self, index: u32) -> String {
         match self {
             Decision::Allow => "Approve".into(),
             Decision::AllowAlways => "Approve and don't ask again".into(),

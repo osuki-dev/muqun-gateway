@@ -346,8 +346,9 @@ and answer in its versioned envelope:
 
 ```json
 {
-  "schema_version": "1.1.0",
-  "capabilities": { "parts": true, "assets": true, "image_upload": true },
+  "schema_version": "1.4.0",
+  "capabilities": { "parts": true, "assets": true, "image_upload": true,
+    "composer": true },
   "data": { "assets": [ { "id": "as_…", "path": "/Users/…/report.md",
     "name": "report.md", "kind": "markdown", "mime": "text/markdown; charset=utf-8",
     "size": 6180, "modified_unix_ms": 1785100000000,
@@ -395,7 +396,7 @@ wrapped in the same envelope:
   "data": {
     "pane_id": "wM:p1", "source": "recent-unwrapped", "lines": 400,
     "pane": { "pane_id": "wM:p1", "agent": "claude", "parts": "dictionary",
-      "dictionary": "claude", "image_input": "file-path" },
+      "dictionary": "claude", "native": null, "image_input": "file-path" },
     "parts": [ { "type": "tool-block", "tool": "Bash", "input": "cargo test",
       "result": ["test result: ok. 71 passed"], "status": "ok",
       "truncated": false, "range": { "start": 12, "end": 13 },
@@ -404,16 +405,37 @@ wrapped in the same envelope:
 }
 ```
 
-Which agent is in the pane decides how it is read: Claude Code and Qoder CLI have
-marker dictionaries today (`docs/content-model.md` documents the glyph tables and
-the rules). A pane running no agent, or an agent no dictionary covers yet, is not
-an error -- it answers with `text` parts and says so in `data.pane.parts`.
+Which agent is in the pane decides how it is read, and `data.pane.parts` says
+which of three sources answered. `native`: the agent runs a protocol of its own
+and the gateway was pointed at it, so exit codes, patches, checklists and pending
+permissions arrive as data. `dictionary`: the pane's text read through a marker
+table -- Claude Code, Qoder CLI, Codex and opencode today (`docs/content-model.md`
+documents the glyph tables and the rules). `text`: no table covers this pane, so
+everything degraded to prose, which is an answer and not an error.
+
+The one native adapter today is opencode's server API. Point the gateway at it
+with `HERDR_GATEWAY_OPENCODE_URL=http://127.0.0.1:<port>` (the port `opencode
+serve` printed, or the one the TUI's own server is on) and opencode panes whose
+workspace that server knows are read through the protocol instead of the screen.
+It is configuration rather than discovery on purpose: nothing here scans the host
+for ports. Every step of the read may fail -- no endpoint, nothing listening, no
+session in this pane's workspace -- and every failure falls back to the marker
+dictionary, so an adapter can add structure to a pane and can never take one
+away.
+
+A native read also carries approvals in the transcript, as the `approval` part
+type v1.4 added to the closed set, and the approval endpoints answer such a pane
+from the protocol: the reply names the agent's own request id, so no keystrokes
+are sent and a menu that moved between the read and the answer cannot be answered
+by accident.
 
 Every part carries `fallback_text`, the source lines verbatim, and every
 non-blank line of the read lands in exactly one part, in order, with a `range`
-that does not overlap its neighbours. So a part type a client does not know still
-renders, and a dictionary that drifts when an agent upgrades loses structure and
-cannot lose content. The raw output endpoint is unchanged and stays the fallback
+that does not overlap its neighbours -- on the native path too, where the adapter
+renders the transcript the spans index into, which is the parts' `fallback_text`
+joined by newlines. So a part type a client does not know still renders, and a
+source that drifts when an agent upgrades loses structure and cannot lose
+content. The raw output endpoint is unchanged and stays the fallback
 path forever.
 
 The gateway registers Muqun Expo push tokens and watches Herdr agent lifecycle
