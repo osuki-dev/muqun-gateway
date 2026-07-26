@@ -1,0 +1,20 @@
+
+⏺ Write(notes.md)
+  ⎿  Wrote 2 lines to notes.md
+      1 hello
+      2 world
+
+⏺ Let me fetch a page.
+
+⏺ Fetch(https://example.com/)
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Fetch
+
+   url: "https://example.com/", prompt: "summarize"
+   Claude wants to fetch content from example.com
+
+ Do you want to allow Claude to fetch this content?
+ ❯ 1. Yes
+   2. Yes, and don't ask again for example.com
+   3. No, and tell Claude what to do differently (esc)

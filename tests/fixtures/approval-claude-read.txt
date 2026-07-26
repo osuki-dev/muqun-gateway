@@ -1,0 +1,31 @@
+│             ▐▛███▜▌             │ What's new                                                                                                             │
+│            ▝▜█████▛▘            │ Bug fixes and reliability improvements                                                                                 │
+│              ▘▘ ▝▝              │ Added Claude Opus 5 (`claude-opus-5`), now the default Opus model — 1M context, fast mode at $10/$50 per Mtok          │
+│                                 │ Added `sandbox.network.strictAllowlist` setting to deny non-allowlisted hosts for sandboxed commands without prompting │
+│   Opus 5 · API Usage Billing    │ /release-notes for more                                                                                                │
+│   /…/scratchpad/approvals-lab   │                                                                                                                        │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+
+ ⚠ Both claude.ai and ANTHROPIC_API_KEY set · auth may not work as expected
+   · to use claude.ai: Unset the ANTHROPIC_API_KEY environment variable, or claude /logout then say "No" to the API key approval before login.
+   · to use ANTHROPIC_API_KEY: claude /logout to sign out of claude.ai.
+
+❯ check the size
+
+⏺ Now let me read a file outside the project.
+
+  Reading 1 file… (ctrl+o to expand)
+  ⎿  /etc/hosts
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Read file
+
+  Read(/etc/hosts)
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, allow reading from etc/ during this session
+   3. No
+
+ Esc to cancel · Tab to amend

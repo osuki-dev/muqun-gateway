@@ -39,6 +39,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio_stream::Stream;
 
+mod approvals;
 mod parts;
 mod shortcuts;
 mod tasks;
@@ -75,6 +76,17 @@ const MAX_WORKSPACE_LABEL_CHARS: usize = 120;
 /// Long enough for an agent TUI to finish handling a pasted prompt, short
 /// enough that the submit still feels like part of the same action.
 const SUBMIT_KEYPRESS_DELAY: Duration = Duration::from_millis(150);
+/// How often each agent pane is checked for a permission menu. An approval
+/// blocks the agent outright, so the phone should hear about one in about the
+/// time it takes to glance at the screen; the cost is one `pane.read` per agent
+/// pane per tick.
+const APPROVAL_POLL_INTERVAL: Duration = Duration::from_millis(1500);
+/// A permission menu is a screenful. Reading more only slows the poll down.
+const APPROVAL_READ_LINES: u32 = 60;
+/// Approval events are published from a background watcher and fanned out to
+/// whatever event streams happen to be open. A slow client falls behind rather
+/// than holding the watcher up.
+const APPROVAL_EVENT_CAPACITY: usize = 64;
 const MAX_PUSH_TOKENS: usize = 64;
 const MAX_DEVICES: usize = 32;
 const MAX_DEVICE_NAME_CHARS: usize = 80;
@@ -159,6 +171,7 @@ const API_CAPABILITIES: &[&str] = &[
     "device_revocation",
     "file_uploads",
     "one_time_pairing_codes",
+    "pane_approvals",
     "pane_output_ansi",
     "pane_parts",
     "pane_shortcuts",
@@ -355,6 +368,7 @@ struct AppState {
     push_tokens: Arc<Mutex<Vec<PushTokenRecord>>>,
     devices: Arc<Mutex<Vec<DeviceRecord>>>,
     assets: Arc<Mutex<AssetIndex>>,
+    approval_events: tokio::sync::broadcast::Sender<ApprovalEvent>,
 }
 
 #[derive(Deserialize)]
@@ -372,6 +386,27 @@ struct SendTextBody {
 #[derive(Deserialize)]
 struct SendKeysBody {
     keys: Vec<String>,
+}
+
+/// How a client answers a pending approval: by option number, or by what the
+/// answer means. `fingerprint` is optimistic concurrency -- send back the one
+/// the approval was read with and a menu that changed underneath rejects the
+/// answer instead of taking it.
+#[derive(Deserialize)]
+struct AnswerApprovalBody {
+    #[serde(default)]
+    option: Option<u32>,
+    #[serde(default)]
+    decision: Option<String>,
+    #[serde(default)]
+    fingerprint: Option<String>,
+}
+
+/// One published approval transition, fanned out to open event streams.
+#[derive(Clone, Debug)]
+struct ApprovalEvent {
+    name: &'static str,
+    payload: String,
 }
 
 #[derive(Deserialize)]
@@ -809,8 +844,10 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         push_tokens: Arc::new(Mutex::new(read_push_tokens().unwrap_or_default())),
         devices: Arc::new(Mutex::new(read_devices().unwrap_or_default())),
         assets: Arc::new(Mutex::new(AssetIndex::default())),
+        approval_events: tokio::sync::broadcast::channel(APPROVAL_EVENT_CAPACITY).0,
     };
     spawn_agent_notification_watchers(state.clone());
+    spawn_approval_watchers(state.clone());
     spawn_upload_gc();
 
     let app = Router::new()
@@ -899,6 +936,10 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         .route(
             "/api/sessions/{session_id}/panes/{pane_id}/parts",
             get(pane_parts),
+        )
+        .route(
+            "/api/sessions/{session_id}/panes/{pane_id}/approval",
+            get(pane_approval).post(answer_pane_approval),
         )
         .route(
             "/api/sessions/{session_id}/panes/{pane_id}/send-text",
@@ -2359,6 +2400,14 @@ async fn events(
     let asset_events = wanted
         .as_ref()
         .is_none_or(|set| set.contains("asset_created"));
+    // Approval transitions are published by the pane watcher, not by Herdr, and
+    // obey the same allow-list. A client that asked for nothing else still gets
+    // told when an agent is blocked, because that is the one thing it cannot
+    // discover by watching output go by.
+    let approval_events = wanted.as_ref().is_none_or(|set| {
+        set.contains("approval_pending") || set.contains("approval_resolved")
+    });
+    let mut approvals_rx = state.approval_events.subscribe();
     let assets = state.assets.clone();
     let stream = async_stream::stream! {
         match herdr_event_stream(&session).await {
@@ -2443,6 +2492,21 @@ async fn events(
                                 }
                             }
                         },
+                        approval = approvals_rx.recv(), if approval_events => {
+                            match approval {
+                                Ok(approval) => {
+                                    let wanted_name = normalize_event_name(approval.name);
+                                    if wanted.as_ref().is_none_or(|set| set.contains(&wanted_name)) {
+                                        yield Ok(Event::default().event(approval.name).data(approval.payload));
+                                    }
+                                }
+                                // A client that fell behind has missed
+                                // transitions; it re-reads the pane's approval
+                                // rather than being told a stale one.
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                            }
+                        },
                     }
                 }
             }
@@ -2453,6 +2517,191 @@ async fn events(
         }
     };
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
+}
+
+fn spawn_approval_watchers(state: AppState) {
+    for session in state.config.sessions.clone() {
+        let state = state.clone();
+        tokio::spawn(async move {
+            watch_pane_approvals(state, session).await;
+        });
+    }
+}
+
+/// Watch every agent pane in a session for a permission menu appearing or
+/// going away.
+///
+/// Herdr has no event for this -- a menu is drawn output, not a state change it
+/// reports -- so the gateway polls. Only panes Herdr says are running an agent
+/// are read, which is what keeps the poll to a handful of reads however many
+/// shells the user has open.
+async fn watch_pane_approvals(state: AppState, session: SessionConfig) {
+    // pane id -> fingerprint of the menu that pane is blocked on.
+    let mut pending: HashMap<String, String> = HashMap::new();
+    let mut ticker = tokio::time::interval(APPROVAL_POLL_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        let Ok(response) = herdr_request(&session, "pane.list", json!({})).await else {
+            continue;
+        };
+        let panes = response
+            .pointer("/result/panes")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        let mut seen: Vec<String> = Vec::new();
+        for pane in &panes {
+            let Some(pane_id) = pane.get("pane_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let agent = pane
+                .get("agent")
+                .and_then(Value::as_str)
+                .filter(|agent| !agent.is_empty());
+            let Some(agent) = agent else { continue };
+            seen.push(pane_id.to_owned());
+
+            let Ok(read) = herdr_request(
+                &session,
+                "pane.read",
+                json!({
+                    "pane_id": pane_id,
+                    "source": "visible",
+                    "lines": APPROVAL_READ_LINES,
+                    "format": "text"
+                }),
+            )
+            .await
+            else {
+                continue;
+            };
+            let text = pane_read_text(&read).unwrap_or_default();
+            match approvals::detect(&text) {
+                Some(approval) => {
+                    if pending.get(pane_id) == Some(&approval.fingerprint) {
+                        continue;
+                    }
+                    // A different menu in the same pane is the old one resolved
+                    // and a new one asked, in that order.
+                    if let Some(previous) = pending.remove(pane_id) {
+                        publish_approval(&state, "approval.resolved", &session.id, pane_id, agent, Some(&previous), None);
+                    }
+                    pending.insert(pane_id.to_owned(), approval.fingerprint.clone());
+                    publish_approval(
+                        &state,
+                        "approval.pending",
+                        &session.id,
+                        pane_id,
+                        agent,
+                        None,
+                        Some(&approval),
+                    );
+                    deliver_agent_notification(
+                        &state,
+                        approval_notification(
+                            &state.config.server_id,
+                            &current_server_label(&state.config.label),
+                            &session.id,
+                            pane_id,
+                            agent,
+                            &approval,
+                        ),
+                    )
+                    .await;
+                }
+                None => {
+                    if let Some(previous) = pending.remove(pane_id) {
+                        publish_approval(&state, "approval.resolved", &session.id, pane_id, agent, Some(&previous), None);
+                    }
+                }
+            }
+        }
+
+        // A pane that closed while blocked is a resolved approval too: whatever
+        // the client was showing is no longer answerable.
+        let vanished: Vec<String> = pending
+            .keys()
+            .filter(|pane_id| !seen.contains(pane_id))
+            .cloned()
+            .collect();
+        for pane_id in vanished {
+            let previous = pending.remove(&pane_id);
+            publish_approval(
+                &state,
+                "approval.resolved",
+                &session.id,
+                &pane_id,
+                "",
+                previous.as_deref(),
+                None,
+            );
+        }
+    }
+}
+
+fn publish_approval(
+    state: &AppState,
+    name: &'static str,
+    session_id: &str,
+    pane_id: &str,
+    agent: &str,
+    fingerprint: Option<&str>,
+    approval: Option<&approvals::Approval>,
+) {
+    let agent = (!agent.is_empty()).then_some(agent);
+    let mut data = approval_data(session_id, pane_id, agent, approval);
+    if let (Some(object), Some(fingerprint)) = (data.as_object_mut(), fingerprint) {
+        object.insert("fingerprint".into(), json!(fingerprint));
+    }
+    // The same versioned envelope the endpoint answers with, so a client parses
+    // an event and a response with one code path.
+    let payload = content_envelope(data).to_string();
+    let _ = state.approval_events.send(ApprovalEvent { name, payload });
+}
+
+/// The push a pending approval sends.
+///
+/// Content-free by construction: the title carries the server the user named,
+/// the body carries the agent's name, and the data carries ids and the option
+/// *decisions* -- never the agent's own wording, which routinely quotes a
+/// command or a path.
+fn approval_notification(
+    server_id: &str,
+    server_label: &str,
+    session_id: &str,
+    pane_id: &str,
+    agent: &str,
+    approval: &approvals::Approval,
+) -> AgentPushNotification {
+    let server = server_label.trim();
+    let title = if server.is_empty() {
+        "Approval needed".to_string()
+    } else {
+        format!("Approval needed · {}", truncate(server, 32))
+    };
+    let agent = if agent.trim().is_empty() {
+        "Agent"
+    } else {
+        agent.trim()
+    };
+    let mut data = serde_json::Map::new();
+    data.insert("type".into(), json!("approval.pending"));
+    data.insert("url".into(), json!(format!("/servers/{server_id}")));
+    data.insert("server_id".into(), json!(server_id));
+    data.insert("session_id".into(), json!(session_id));
+    data.insert("pane_id".into(), json!(pane_id));
+    // The notification category the client registered its approve/deny actions
+    // under, plus which of those actions this particular menu offers.
+    data.insert("categoryId".into(), json!("approval"));
+    data.insert("fingerprint".into(), json!(approval.fingerprint));
+    data.insert("options".into(), json!(approval.push_options()));
+    AgentPushNotification {
+        title,
+        body: format!("{agent} is waiting for your approval."),
+        data,
+    }
 }
 
 fn spawn_agent_notification_watchers(state: AppState) {
@@ -3832,6 +4081,241 @@ async fn pane_shortcuts(
         .filter(|value| !value.is_empty());
 
     Ok(Json(shortcuts::resolve(agent, title, cwd)))
+}
+
+/// Whether the pane is blocked on a permission menu, and what it is asking.
+///
+/// Deliberately its own endpoint rather than a part. `docs/content-model.md`
+/// keeps the part set closed and gives approvals a part type only in v2; until
+/// then this carries the same information without spending the closed set on
+/// it, and without a client having to poll the transcript to learn that the
+/// agent is waiting.
+async fn pane_approval(
+    State(state): State<AppState>,
+    Path((session_id, pane_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let session = find_session(&state.config, &session_id)?.clone();
+    let (agent, approval) = read_pane_approval(&session, &pane_id).await?;
+    Ok(Json(content_envelope(approval_data(
+        &session_id,
+        &pane_id,
+        agent.as_deref(),
+        approval.as_ref(),
+    ))))
+}
+
+/// Answer the menu the pane is blocked on.
+///
+/// The answer is named by option number or by decision (`allow`,
+/// `allow_always`, `deny`), never by keystroke: which keys move an agent's
+/// cursor is exactly the detail a client should not have to know, and having to
+/// know it is what makes raw `send-keys` the fallback path rather than the one
+/// a client reaches for.
+async fn answer_pane_approval(
+    State(state): State<AppState>,
+    Path((session_id, pane_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<AnswerApprovalBody>,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let session = find_session(&state.config, &session_id)?.clone();
+    let (agent, pending) = read_pane_approval(&session, &pane_id).await?;
+    let Some(pending) = pending else {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "approval_not_pending",
+            "the pane is not waiting on an approval",
+        ));
+    };
+    // The phone may be acting on a notification from a minute ago. A
+    // fingerprint mismatch means the agent has moved on to a different
+    // question, and answering that one blind is exactly what must not happen.
+    if let Some(expected) = body.fingerprint.as_deref() {
+        if expected != pending.fingerprint {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "approval_changed",
+                "the pane is waiting on a different approval",
+            ));
+        }
+    }
+
+    let index = match (body.option, body.decision.as_deref()) {
+        (Some(index), _) => index,
+        (None, Some(name)) => {
+            let decision = match name {
+                "allow" => approvals::Decision::Allow,
+                "allow_always" => approvals::Decision::AllowAlways,
+                "deny" => approvals::Decision::Deny,
+                _ => {
+                    return Err(api_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_decision",
+                        "decision must be allow, allow_always, or deny",
+                    ))
+                }
+            };
+            pending
+                .option_for(decision)
+                .map(|option| option.index)
+                .ok_or_else(|| {
+                    api_error(
+                        StatusCode::CONFLICT,
+                        "decision_unavailable",
+                        "this approval offers no option with that meaning",
+                    )
+                })?
+        }
+        (None, None) => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_answer",
+                "answer with an option number or a decision",
+            ))
+        }
+    };
+    let answered = pending
+        .option(index)
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_option",
+                "this approval has no option with that number",
+            )
+        })?
+        .clone();
+    let keys = pending.keys_for(index).ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_option",
+            "this approval has no option with that number",
+        )
+    })?;
+
+    send_pane_keys(&session, &pane_id, &keys).await?;
+
+    // Some menus act on the digit; some want it confirmed afterwards. From out
+    // here the two look identical, so the confirm is deferred and only sent
+    // when the same menu is demonstrably still standing -- the lesson from
+    // following a pasted prompt with Enter, where the two raced.
+    let mut sent = keys;
+    tokio::time::sleep(SUBMIT_KEYPRESS_DELAY).await;
+    let mut after = read_pane_approval(&session, &pane_id)
+        .await
+        .map(|(_, approval)| approval)
+        .unwrap_or_default();
+    if after
+        .as_ref()
+        .is_some_and(|approval| approval.fingerprint == pending.fingerprint)
+    {
+        send_pane_keys(&session, &pane_id, &["Enter".to_string()]).await?;
+        sent.push("Enter".into());
+        tokio::time::sleep(SUBMIT_KEYPRESS_DELAY).await;
+        after = read_pane_approval(&session, &pane_id)
+            .await
+            .map(|(_, approval)| approval)
+            .unwrap_or_default();
+    }
+    let resolved = after
+        .as_ref()
+        .is_none_or(|approval| approval.fingerprint != pending.fingerprint);
+
+    let mut data = approval_data(&session_id, &pane_id, agent.as_deref(), after.as_ref());
+    if let Some(object) = data.as_object_mut() {
+        object.insert("resolved".into(), json!(resolved));
+        object.insert("sent_keys".into(), json!(sent));
+        object.insert(
+            "answered".into(),
+            json!({
+                "fingerprint": pending.fingerprint,
+                "index": answered.index,
+                "decision": answered.decision.as_str(),
+            }),
+        );
+    }
+    Ok(Json(content_envelope(data)))
+}
+
+async fn send_pane_keys(session: &SessionConfig, pane_id: &str, keys: &[String]) -> ApiResult<Value> {
+    herdr_request(
+        session,
+        "pane.send_keys",
+        json!({ "pane_id": pane_id, "keys": keys }),
+    )
+    .await
+    .map_err(|err| {
+        eprintln!("Herdr request pane.send_keys failed: {err:#}");
+        api_error(
+            StatusCode::BAD_GATEWAY,
+            "herdr_unavailable",
+            "Herdr is unavailable",
+        )
+    })
+}
+
+/// Read a pane's agent and whatever menu it is drawing.
+///
+/// `visible` rather than the transcript source the parts endpoint reads: a menu
+/// is what is on the screen now, and the scrollback of an answered one is not a
+/// pending approval.
+async fn read_pane_approval(
+    session: &SessionConfig,
+    pane_id: &str,
+) -> ApiResult<(Option<String>, Option<approvals::Approval>)> {
+    let agent = herdr_request(session, "pane.get", json!({ "pane_id": pane_id }))
+        .await
+        .ok()
+        .and_then(|response| {
+            let pane = response.pointer("/result/pane").unwrap_or(&response);
+            pane.get("agent").and_then(Value::as_str).map(str::to_owned)
+        })
+        .filter(|agent| !agent.is_empty());
+    let read = herdr_request(
+        session,
+        "pane.read",
+        json!({
+            "pane_id": pane_id,
+            "source": "visible",
+            "lines": APPROVAL_READ_LINES,
+            "format": "text"
+        }),
+    )
+    .await
+    .map_err(|err| {
+        eprintln!("Herdr request pane.read failed: {err:#}");
+        api_error(
+            StatusCode::BAD_GATEWAY,
+            "herdr_unavailable",
+            "Herdr is unavailable",
+        )
+    })?;
+    let text = pane_read_text(&read).unwrap_or_default();
+    Ok((agent, approvals::detect(&text)))
+}
+
+/// The payload both the endpoint and the SSE events carry.
+fn approval_data(
+    session_id: &str,
+    pane_id: &str,
+    agent: Option<&str>,
+    approval: Option<&approvals::Approval>,
+) -> Value {
+    json!({
+        "session_id": session_id,
+        "pane_id": pane_id,
+        "state": if approval.is_some() { "pending" } else { "idle" },
+        "approval": approval.map(approvals::Approval::to_json),
+        // Per-pane capability, in the same shape the parts endpoint answers
+        // with: "menu" means the approval was read off what the agent drew, and
+        // a client that dislikes the reading still has raw send-keys.
+        "pane": {
+            "pane_id": pane_id,
+            "agent": agent,
+            "approvals": "menu",
+        },
+    })
 }
 
 async fn send_text(
@@ -6119,6 +6603,29 @@ fn openapi_spec() -> Value {
                     "responses": parts_responses()
                 }
             },
+            "/api/sessions/{sessionId}/panes/{paneId}/approval": {
+                "get": {
+                    "summary": "Read whether the pane is blocked on an approval, and what it asks",
+                    "description": "Agents ask for permission by drawing a numbered menu and blocking. This reads that menu off the pane's visible screen: the question, the answers, which one the cursor is on, what each answer means (allow, allow_always, deny), and the lines the agent drew around the request. data.state is pending or idle, and data.approval is null when idle. The fingerprint identifies this question with these answers; send it back on POST and an approval that changed underneath is rejected rather than answered blind. Approvals are not parts: docs/content-model.md keeps the part set closed and gives approvals a part type only in v2, so until then they ride their own endpoint and their own SSE events (approval.pending, approval.resolved).",
+                    "parameters": [path_param("sessionId"), path_param("paneId")],
+                    "responses": approval_responses()
+                },
+                "post": {
+                    "summary": "Answer the approval the pane is blocked on",
+                    "description": "Answer by option number or by decision (allow, allow_always, deny); the gateway turns it into the keystrokes that agent's menu wants, and confirms with Enter only when the same menu is still standing afterwards. 409 when the pane is not waiting, or when the pending approval is not the one the fingerprint names. Raw send-keys remains the fallback for a menu no client understands.",
+                    "parameters": [path_param("sessionId"), path_param("paneId")],
+                    "requestBody": json_body(json!({
+                        "type": "object",
+                        "description": "Give option or decision; fingerprint is optional optimistic concurrency.",
+                        "properties": {
+                            "option": { "type": "integer", "description": "The option number the agent printed" },
+                            "decision": { "type": "string", "enum": ["allow", "allow_always", "deny"] },
+                            "fingerprint": { "type": "string" }
+                        }
+                    })),
+                    "responses": approval_responses()
+                }
+            },
             "/api/sessions/{sessionId}/panes/{paneId}/send-text": {
                 "post": {
                     "summary": "Send text to a pane",
@@ -6438,6 +6945,72 @@ fn parts_responses() -> Value {
     responses
 }
 
+fn approval_responses() -> Value {
+    let mut responses = ok_response();
+    responses["200"] = json!({
+        "description": "The pane's approval state, in the content-model envelope",
+        "content": { "application/json": { "schema": content_envelope_schema(json!({
+            "type": "object",
+            "required": ["session_id", "pane_id", "state", "approval", "pane"],
+            "properties": {
+                "session_id": { "type": "string" },
+                "pane_id": { "type": "string" },
+                "state": { "type": "string", "enum": ["pending", "idle"] },
+                "pane": {
+                    "type": "object",
+                    "required": ["pane_id", "approvals"],
+                    "properties": {
+                        "pane_id": { "type": "string" },
+                        "agent": { "type": ["string", "null"] },
+                        "approvals": { "type": "string", "enum": ["menu"], "description": "How the approval was obtained: menu means it was read off what the agent drew" }
+                    }
+                },
+                "approval": {
+                    "type": ["object", "null"],
+                    "required": ["fingerprint", "prompt", "options"],
+                    "properties": {
+                        "fingerprint": { "type": "string", "description": "Stable identity of this question with these answers" },
+                        "prompt": { "type": "string", "description": "The question, verbatim" },
+                        "tool": { "type": ["string", "null"], "description": "The tool the request is about, when the agent named one" },
+                        "context": { "type": "array", "items": { "type": "string" }, "description": "The lines the agent drew around the question, verbatim and capped" },
+                        "hint": { "type": ["string", "null"], "description": "The agent's own key-hint footer" },
+                        "range": object_schema(&[("start", "integer"), ("end", "integer")], &["start", "end"]),
+                        "options": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "required": ["index", "label", "selected", "decision"],
+                                "properties": {
+                                    "index": { "type": "integer", "description": "The number the agent printed, which is what POST takes" },
+                                    "label": { "type": "string", "description": "The answer verbatim" },
+                                    "selected": { "type": "boolean", "description": "Where the agent's cursor is" },
+                                    "decision": { "type": "string", "enum": ["allow", "allow_always", "deny", "other"] }
+                                }
+                            }
+                        }
+                    }
+                },
+                "resolved": { "type": "boolean", "description": "POST only: whether the menu was gone after answering" },
+                "sent_keys": { "type": "array", "items": { "type": "string" }, "description": "POST only: the keys the gateway sent, including a deferred Enter when one was needed" },
+                "answered": {
+                    "type": "object",
+                    "description": "POST only: which option was taken",
+                    "properties": {
+                        "fingerprint": { "type": "string" },
+                        "index": { "type": "integer" },
+                        "decision": { "type": "string" }
+                    }
+                }
+            }
+        })) } }
+    });
+    responses["404"] = json!({ "description": "Unknown session" });
+    responses["409"] = json!({ "description": "The pane is not waiting on an approval, or it is waiting on a different one" });
+    responses["502"] =
+        json!({ "description": "Herdr is unavailable, or the pane could not be read" });
+    responses
+}
+
 fn asset_content_responses() -> Value {
     let mut responses = ok_response();
     responses["200"] = json!({
@@ -6530,6 +7103,7 @@ mod tests {
             push_tokens: Arc::new(Mutex::new(Vec::new())),
             devices: Arc::new(Mutex::new(devices)),
             assets: Arc::new(Mutex::new(AssetIndex::default())),
+            approval_events: tokio::sync::broadcast::channel(APPROVAL_EVENT_CAPACITY).0,
         }
     }
 
@@ -6989,6 +7563,75 @@ mod tests {
         assert_eq!(notification.body, "codex finished running.");
         assert_eq!(notification.data["type"], "agent.completed");
         assert_eq!(notification.data["pane_id"], "w1:p2");
+    }
+
+    #[test]
+    fn an_approval_push_says_that_something_needs_answering_and_never_what() {
+        // The whole privacy rule for notifications, asserted end to end on a
+        // real menu: the agent quoted the command in its own option label, and
+        // none of it may reach Expo.
+        let approval = approvals::detect(include_str!(
+            "../tests/fixtures/approval-claude-bash.txt"
+        ))
+        .expect("the fixture is a pending approval");
+        let notification = approval_notification(
+            "server-1",
+            "Studio",
+            "default",
+            "wM:p1",
+            "claude",
+            &approval,
+        );
+        assert_eq!(notification.title, "Approval needed · Studio");
+        assert_eq!(notification.body, "claude is waiting for your approval.");
+        assert_eq!(notification.data["type"], "approval.pending");
+        assert_eq!(notification.data["pane_id"], "wM:p1");
+        // The category the client registered its approve/deny actions under,
+        // and which of them this menu offers.
+        assert_eq!(notification.data["categoryId"], "approval");
+        assert_eq!(notification.data["options"][0]["decision"], "allow");
+        assert_eq!(notification.data["options"][2]["decision"], "deny");
+        assert_eq!(notification.data["fingerprint"], approval.fingerprint);
+        let rendered = Value::Object(notification.data).to_string();
+        assert!(!rendered.contains("npm"), "the command must not travel");
+        assert!(!rendered.contains("Do you want"), "nor the question");
+    }
+
+    #[test]
+    fn the_approval_payload_carries_the_pane_and_answers_in_the_content_envelope() {
+        let approval = approvals::detect(include_str!(
+            "../tests/fixtures/approval-claude-bash.txt"
+        ))
+        .unwrap();
+        let pending = content_envelope(approval_data(
+            "default",
+            "wM:p1",
+            Some("claude"),
+            Some(&approval),
+        ));
+        assert_eq!(pending["schema_version"], CONTENT_SCHEMA_VERSION);
+        assert_eq!(pending["data"]["state"], "pending");
+        assert_eq!(pending["data"]["pane"]["approvals"], "menu");
+        assert_eq!(pending["data"]["approval"]["options"][2]["decision"], "deny");
+
+        // An idle pane is answered with the same shape and a null approval, so
+        // a client has one code path rather than two.
+        let idle = content_envelope(approval_data("default", "wM:p1", Some("claude"), None));
+        assert_eq!(idle["data"]["state"], "idle");
+        assert!(idle["data"]["approval"].is_null());
+        assert_eq!(idle["data"]["pane"]["approvals"], "menu");
+    }
+
+    #[test]
+    fn approvals_are_announced_as_a_capability_and_documented() {
+        // Additive: the routes and events are new, so a client gates on the
+        // capability rather than probing for a 404.
+        assert!(API_CAPABILITIES.contains(&"pane_approvals"));
+        let spec = openapi_spec();
+        let approval = &spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/approval"];
+        assert!(approval["get"].is_object());
+        assert!(approval["post"]["requestBody"].is_object());
+        assert!(approval["post"]["responses"]["409"].is_object());
     }
 
     #[test]
