@@ -25,15 +25,19 @@ model, not new protocols.
 
 ```json
 {
-  "schema_version": "1.1.0",
+  "schema_version": "1.2.0",
   "capabilities": { "parts": true, "assets": true, "image_upload": true },
   "data": { }
 }
 ```
 
 One version covers the whole content model, assets and parts alike: a client
-reads it once. 1.0.0 shipped assets with `parts: false`; 1.1.0 adds the parts
-endpoint and flips that flag, and changed nothing about the 1.0.0 payloads.
+reads it once. 1.0.0 shipped assets with `parts: false`; 1.1.0 added the parts
+endpoint and flipped that flag, and changed nothing about the 1.0.0 payloads.
+1.2.0 adds the Codex and opencode dictionaries: more panes answer
+`parts: "dictionary"` where they used to answer `parts: "text"`, and again no
+payload changed shape. The gateway's own `apiVersion` stays 1.4.0 — no route,
+and no field of any route, moved.
 
 `capabilities` is also exposed per pane (agent kind detection may vary):
 
@@ -70,16 +74,18 @@ Example:
   "fallback_text": "⏺ Bash(cargo test)\n  ⎿ test result: ok. 60 passed" }
 ```
 
-### Marker dictionaries (implemented in v1.1)
+### Marker dictionaries (v1.1; Codex and opencode added in v1.2)
 
 `src/parts.rs` is one block state machine plus a per-agent glyph table. Adding an
 agent is a new table, never a new part type and never a change to this document's
 wire format.
 
-| | block | result | quote | prompt | status |
-|---|---|---|---|---|---|
-| Claude Code | `⏺` | `⎿` | — | `❯` | `✻ ✽ ✳ ✢ ∗ ·` |
-| Qoder CLI | `▪ ●` | `└` | `│` | — | — |
+| | block | call | result | quote | prompt | status |
+|---|---|---|---|---|---|---|
+| Claude Code | `⏺` | — | `⎿` | — | `❯` | `✻ ✽ ✳ ✢ ∗ ·` |
+| Qoder CLI | `▪ ●` | — | `└` | `│` | — | — |
+| Codex CLI | `• ⚠` | — | `└` | `│` | `›` | `◦` |
+| opencode | — | `→` | `↳` | `+` | `┃` | — |
 
 A glyph only marks when it opens the line and is followed by a space, so a box
 rule or a bullet inside somebody's output is not read as structure. What the
@@ -89,6 +95,18 @@ machine does with them:
   anything else on a block line ("Update Todos", a sentence) is `text`. The name
   must be one identifier immediately followed by `(`, which is what keeps
   `Background command "…" completed (exit code 0)` out of the tool set.
+- Agents that write `Ran cargo test` instead of `Bash(cargo test)` list those
+  head words in the dictionary (Codex: `Ran`, `Explored`). A verb head is only
+  promoted to a tool when the block actually produced a result group, so a
+  sentence that opens with the same word stays prose.
+- A **call** glyph is a block opener that is a tool call by construction, for
+  agents that give tool calls a glyph of their own (opencode's `→`): the first
+  word is the tool and the rest is the input. Such an agent prints the outcome
+  on the call line, so a call block with no result group is `ok` rather than
+  `running`.
+- A **prompt** is normally one marker line with its wrapping indented under it.
+  opencode instead draws a gutter — the marker repeated on every row of the
+  message — which the dictionary says so, and the run becomes one `prompt`.
 - **Result** groups under a block are the tool's `result`. `status` is read off
   the first result line (`Error…`, `✗`) because the terminal never carried an
   exit code; a block with no result yet is `running`.
@@ -149,8 +167,14 @@ will stream something renderable.
 2. **v1.1 — parts for Claude + Qoder** via marker dictionaries. Gateway side
    shipped: dictionaries, the parts endpoint, and fixture snapshots pinned per
    agent version. App side renders the parts with the fallback path one tap away.
-3. **v1.2 — remaining mainstream dictionaries** (Herdr's agent-detection
-   manifests are the ecosystem-maintained pattern source to mirror).
+3. **v1.2 — mainstream dictionaries.** Codex and opencode shipped, each pinned
+   to a fixture captured from a live pane. Herdr's agent-detection manifests
+   (`~/.local/state/herdr/agent-detection/`) are the ecosystem-maintained agent
+   list this tracks, and a test fails if a dictionary is keyed on a name no
+   manifest reports; it also prints the manifests with no dictionary yet.
+   Gemini CLI, Copilot CLI and Cursor Agent are the remaining ones, and are
+   waiting on captured output — the manifests carry state-detection patterns,
+   not transcript glyphs, so a table cannot be written from them alone.
 4. **v2 — native protocol adapters** (opencode server, codex app-server) feed
    the same parts; approvals arrive as a new part type behind a minor bump.
 

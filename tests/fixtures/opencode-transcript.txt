@@ -1,0 +1,62 @@
+
+     + Thought: 480ms
+
+     → Read kit
+
+     + Thought: 471ms
+
+     → Read kit/packages
+
+     + Thought: 572ms
+
+     → Read kit/packages/ui
+     → Read kit/packages/ui/src
+
+     + Thought: 257ms
+
+     → Read kit/packages/ui/src/components
+     → Read kit/packages/ui/src/index.ts
+     ↳ Loaded kit/AGENTS.md
+
+     + Thought: 508ms
+
+     packages/ui/src/components/ 下目前有 59 个组件：
+
+     基础/布局： stack, surface, divider, responsive-container, responsive-grid, text, icon, image
+
+     按钮/交互： button, pressable-card, spinner, haptics
+
+     输入： input, textarea, select, checkbox, radio-group, toggle, otp-input, date-input, search-input, stepper,
+     field-group
+
+     反馈/展示： alert, badge, tag, toast, tooltip, skeleton, loading-view, empty-state, error-view, progress-bar,
+     segmented-progress-bar, stat-row, metric-card, timeline, data-row, data-table
+
+     导航： tabs, segmented-control, top-bar, toolbar, pagination, menu
+
+     模态/浮层： dialog, modal, bottom-sheet, action-sheet, sheet-list-item
+
+     列表： list-item, section, avatar, avatar-group, card
+
+     键盘： keyboard-avoiding-view, keyboard-aware-scroll-view, keyboard-sticky-view, keyboard-toolbar
+
+     需要看某个组件的具体实现吗？
+
+     ▣  Build · DeepSeek V4 Flash Free · 20.7s
+
+  ┃
+  ┃  kit 组件呢有哪些？ 是否完整了
+  ┃
+
+     + Thought: 1.1s
+
+     → Read kit/packages/kit-community
+
+     + Thought: 60ms
+
+  ┃
+  ┃
+  ┃
+  ┃  Build · DeepSeek V4 Flash Free OpenCode Zen · max
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   /Users/okk/.osuki                                                                     16.4K (8%)  ctrl+p commands

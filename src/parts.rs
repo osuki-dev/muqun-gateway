@@ -32,6 +32,11 @@ enum Marker {
     /// Opens a block: a tool call when the rest of the line parses as
     /// `Tool(input)`, otherwise a paragraph of the agent's own prose.
     Block,
+    /// Opens a block that is always a tool call: the first word names the tool
+    /// and the rest is its input. An agent that gives tool calls their own glyph
+    /// needs no other signal, and it prints the outcome on the call line itself,
+    /// so such a block has finished rather than being in flight.
+    Call,
     /// Opens a result group under the block above it.
     Result,
     /// A continued quote or reasoning line, e.g. Qoder's thinking tree.
@@ -45,18 +50,43 @@ enum Marker {
 /// One agent family's line-start markers.
 ///
 /// Only the glyphs differ between agents; the block grammar does not. Every
-/// field is a set because agents rotate spinner frames and print more than one
-/// kind of block opener.
+/// glyph field is a set because agents rotate spinner frames and print more than
+/// one kind of block opener.
 pub struct Dictionary {
     /// Stable id on the wire, so a client can tell which dictionary produced a
     /// transcript without the wire format naming an agent-specific construct.
     pub id: &'static str,
     block: &'static [char],
+    /// Block openers that are tool calls by construction; see [`Marker::Call`].
+    call: &'static [char],
     result: &'static [char],
     quote: &'static [char],
     prompt: &'static [char],
     status: &'static [char],
+    /// Head words that name a tool on an ordinary [`Marker::Block`] line, for
+    /// agents that write `Ran cargo test` where Claude writes `Bash(cargo
+    /// test)`. Only consulted when the block actually produced a result group,
+    /// which is what keeps a sentence that opens with the same word as prose.
+    verbs: &'static [&'static str],
+    /// Whether the user's message is drawn as a gutter -- the prompt marker
+    /// repeated on every line at one indent -- rather than as a single marker
+    /// line with its wrapping indented under it.
+    prompt_gutter: bool,
 }
+
+/// The fields every dictionary leaves empty unless the agent needs them, so a
+/// new table lists only the glyphs that agent actually draws.
+const EMPTY: Dictionary = Dictionary {
+    id: "",
+    block: &[],
+    call: &[],
+    result: &[],
+    quote: &[],
+    prompt: &[],
+    status: &[],
+    verbs: &[],
+    prompt_gutter: false,
+};
 
 /// Claude Code. `⏺` opens a block, `⎿` opens each result group under it, `❯` is
 /// the user's line, and the spinner frames rotate through a handful of glyphs.
@@ -64,9 +94,9 @@ const CLAUDE: Dictionary = Dictionary {
     id: "claude",
     block: &['⏺'],
     result: &['⎿'],
-    quote: &[],
     prompt: &['❯'],
     status: &['✻', '✽', '✳', '✢', '∗', '·'],
+    ..EMPTY
 };
 
 /// Qoder CLI. `▪` opens a block and `●` opens a background-task notice; `└`
@@ -78,14 +108,66 @@ const QODER: Dictionary = Dictionary {
     block: &['▪', '●'],
     result: &['└'],
     quote: &['│'],
-    prompt: &[],
-    status: &[],
+    ..EMPTY
+};
+
+/// OpenAI Codex CLI. `•` opens a block -- prose, or a tool call written as a
+/// verb -- `⚠` opens a startup notice drawn the same way, `└` opens the result,
+/// and `›` is the user's line. `│` continues a command that carried a newline,
+/// and is also how Codex draws the sides of its `/status` box; both are chrome
+/// around text, which is what the quote marker means.
+///
+/// `Ran` and `Explored` are the only heads promoted to tool calls. Codex writes
+/// its prose in the first person, so the risk is small, and the result-group
+/// requirement removes the rest of it.
+///
+/// The status glyph is `◦`, not `•`: Herdr's `codex.toml` detection manifest
+/// matches the live line as `^[•◦]\s+Working \(…esc to interrupt\)`, and `•` is
+/// already the block opener. A `• Working (…)` line therefore lands as text --
+/// the head names no tool -- which costs a status part and no content.
+const CODEX: Dictionary = Dictionary {
+    id: "codex",
+    block: &['•', '⚠'],
+    result: &['└'],
+    quote: &['│'],
+    prompt: &['›'],
+    status: &['◦'],
+    verbs: &["Ran", "Explored"],
+    ..EMPTY
+};
+
+/// opencode. `→` opens a tool call and nothing else, so it is a call glyph: the
+/// first word is the tool and the rest is its input. opencode prints the outcome
+/// on that same line, which is why a call block with no result group is done
+/// rather than running. `↳` opens the occasional note under one, `+` opens a
+/// reasoning line (`+ Thought: 480ms`), and `┃` is the gutter opencode draws
+/// down the left of the user's message and of its own editor box.
+///
+/// No status glyph: opencode's `▣ Build · … · 20.7s` footer is drawn inside that
+/// gutter rather than at the margin, and the margin is what tells a status line
+/// apart from a bullet in somebody's output. It degrades to text.
+const OPENCODE: Dictionary = Dictionary {
+    id: "opencode",
+    call: &['→'],
+    result: &['↳'],
+    quote: &['+'],
+    prompt: &['┃'],
+    prompt_gutter: true,
+    ..EMPTY
 };
 
 /// Matched as a substring against the agent name Herdr reports, the same
 /// discipline `shortcuts.rs` uses: "Claude Code", "claude-code" and "claude" all
-/// resolve to one dictionary, and "qodercli" to the other.
-const DICTIONARIES: &[(&[&str], &Dictionary)] = &[(&["claude"], &CLAUDE), (&["qoder"], &QODER)];
+/// resolve to one dictionary, and "qodercli" to the other. The aliases mirror
+/// the `id` and `aliases` of Herdr's agent-detection manifests
+/// (`~/.local/state/herdr/agent-detection/`), which is the ecosystem-maintained
+/// list this table tracks.
+const DICTIONARIES: &[(&[&str], &Dictionary)] = &[
+    (&["claude"], &CLAUDE),
+    (&["qoder"], &QODER),
+    (&["codex"], &CODEX),
+    (&["opencode", "open-code"], &OPENCODE),
+];
 
 /// Which dictionary, if any, normalizes this agent's output.
 ///
@@ -257,8 +339,10 @@ pub fn normalize(text: &str, dictionary: Option<&Dictionary>) -> Vec<Part> {
             continue;
         }
         index = match rows[index].marker {
-            Some(Marker::Block) => read_block(&rows, index, &mut parts),
-            Some(Marker::Prompt) => read_prompt(&rows, index, &mut parts),
+            Some(Marker::Block) | Some(Marker::Call) => {
+                read_block(&rows, index, dictionary, &mut parts)
+            }
+            Some(Marker::Prompt) => read_prompt(&rows, index, dictionary, &mut parts),
             Some(Marker::Status) => {
                 parts.push(status_part(&rows, index));
                 index + 1
@@ -301,6 +385,8 @@ fn classify<'a>(raw: &'a str, dictionary: &Dictionary) -> Row<'a> {
     let marker = first.filter(|_| standalone).and_then(|glyph| {
         if dictionary.block.contains(&glyph) {
             Some(Marker::Block)
+        } else if dictionary.call.contains(&glyph) {
+            Some(Marker::Call)
         } else if dictionary.result.contains(&glyph) {
             Some(Marker::Result)
         } else if dictionary.quote.contains(&glyph) {
@@ -381,10 +467,17 @@ fn body_lines(rows: &[Row], indices: &[usize]) -> Vec<String> {
     };
     let padding = shared_indent(rows, tail);
     let mut lines = vec![strip_marker(rows[head].raw).to_owned()];
-    lines.extend(
-        tail.iter()
-            .map(|&index| dedent(rows[index].raw, padding).to_owned()),
-    );
+    lines.extend(tail.iter().map(|&index| {
+        let line = dedent(rows[index].raw, padding);
+        // A quote glyph continuing a head is the agent's own gutter -- Codex
+        // draws one down the left of a command that carried a newline -- so it
+        // is chrome here just as it is around prose.
+        match rows[index].marker {
+            Some(Marker::Quote) => strip_marker(line),
+            _ => line,
+        }
+        .to_owned()
+    }));
     lines
 }
 
@@ -396,9 +489,9 @@ struct Group {
 /// Read a block: the marker line, whatever continues it, and every result group
 /// underneath. Tool blocks and prose blocks share this shape, which is why one
 /// reader serves both.
-fn read_block(rows: &[Row], start: usize, out: &mut Vec<Part>) -> usize {
+fn read_block(rows: &[Row], start: usize, dictionary: &Dictionary, out: &mut Vec<Part>) -> usize {
     let base = rows[start].indent;
-    let tool = parse_tool_head(strip_marker(rows[start].raw));
+    let call = rows[start].marker == Some(Marker::Call);
     let mut head: Vec<usize> = vec![start];
     let mut groups: Vec<Group> = Vec::new();
     let mut index = start + 1;
@@ -434,6 +527,18 @@ fn read_block(rows: &[Row], start: usize, out: &mut Vec<Part>) -> usize {
     // one splits off, so a part's rows stay contiguous and reading the parts in
     // order reads the transcript in order. A plain group that trails a split is
     // its own text part rather than jumping back into the block above it.
+    // Which of the three head shapes named a tool is only decidable now: the
+    // verb form is trusted only when the block produced a result group.
+    let head_text = strip_marker(rows[start].raw);
+    let tool = parse_tool_head(head_text).or_else(|| {
+        let verb = !groups.is_empty()
+            && dictionary
+                .verbs
+                .iter()
+                .any(|&verb| heads_with(head_text, verb));
+        (call || verb).then(|| word_tool_head(head_text)).flatten()
+    });
+
     // The file a split-out diff belongs to is whatever the tool was called with.
     let edited = tool.as_ref().map(|head| head.input.clone());
     let mut tool = tool;
@@ -466,7 +571,7 @@ fn read_block(rows: &[Row], start: usize, out: &mut Vec<Part>) -> usize {
                 &base_rows,
                 head_tool,
                 &mut result,
-                groups.is_empty(),
+                groups.is_empty() && !call,
             ));
         }
         split.push(Part {
@@ -483,7 +588,7 @@ fn read_block(rows: &[Row], start: usize, out: &mut Vec<Part>) -> usize {
             &base_rows,
             tool,
             &mut result,
-            groups.is_empty(),
+            groups.is_empty() && !call,
         ));
     }
     // Built base-first within the loop; source order is by first row.
@@ -500,7 +605,7 @@ fn block_part(
     base_rows: &[usize],
     tool: Option<ToolHead>,
     result: &mut Vec<String>,
-    no_groups: bool,
+    unanswered: bool,
 ) -> Part {
     let fallback_text = raw_text(rows, base_rows);
     let truncated = fallback_text.contains('…');
@@ -524,7 +629,7 @@ fn block_part(
             Body::ToolBlock {
                 tool: head_tool.name,
                 input,
-                status: tool_status(&result, no_groups),
+                status: tool_status(&result, unanswered),
                 result,
                 truncated,
             }
@@ -548,23 +653,53 @@ fn block_part(
 /// The user's own line, and the lines of a message that wrapped onto more of
 /// them. A result group under a prompt belongs to the command it ran, not to
 /// what the user typed, so it is left for the caller to read as text.
-fn read_prompt(rows: &[Row], start: usize, out: &mut Vec<Part>) -> usize {
+fn read_prompt(rows: &[Row], start: usize, dictionary: &Dictionary, out: &mut Vec<Part>) -> usize {
     let base = rows[start].indent;
     let mut used = vec![start];
     let mut index = start + 1;
-    while let Some(next) = next_continuation(rows, index, base) {
-        if rows[next].marker == Some(Marker::Result) {
-            break;
+    let text = if dictionary.prompt_gutter {
+        // Every row of the message repeats the marker at one indent, so the run
+        // ends at the first row that does not -- there is no indented wrapping
+        // to look for, and a blank row is the end of the widget rather than a
+        // paragraph break inside it.
+        while index < rows.len()
+            && rows[index].marker == Some(Marker::Prompt)
+            && rows[index].indent == base
+        {
+            used.push(index);
+            index += 1;
         }
-        used.extend(index..next);
-        used.push(next);
-        index = next + 1;
-    }
+        let lines: Vec<&str> = used
+            .iter()
+            .map(|&row| strip_marker(rows[row].raw))
+            .collect();
+        // The gutter is drawn a row taller than the message on both sides.
+        let body = lines
+            .iter()
+            .position(|line| !line.is_empty())
+            .map(|first| {
+                let last = lines
+                    .iter()
+                    .rposition(|line| !line.is_empty())
+                    .unwrap_or(first);
+                &lines[first..=last]
+            })
+            .unwrap_or(&[]);
+        body.join("\n")
+    } else {
+        while let Some(next) = next_continuation(rows, index, base) {
+            if rows[next].marker == Some(Marker::Result) {
+                break;
+            }
+            used.extend(index..next);
+            used.push(next);
+            index = next + 1;
+        }
+        body_lines(rows, &used).join("\n")
+    };
     let end = *used.last().unwrap_or(&start);
     out.push(Part {
-        body: Body::Prompt {
-            text: body_lines(rows, &used).join("\n"),
-        },
+        body: Body::Prompt { text },
         fallback_text: raw_text(rows, &used),
         start,
         end,
@@ -694,10 +829,49 @@ fn parse_tool_head(head: &str) -> Option<ToolHead> {
     })
 }
 
+/// Whether the head opens with exactly this word. `Ran cargo test` heads with
+/// `Ran`; `Rank the files` does not, and neither does a head that is the word
+/// alone with nothing after it in an agent that always prints an argument --
+/// that case is left to the caller, since `Explored` legitimately stands alone.
+fn heads_with(head: &str, verb: &str) -> bool {
+    head.strip_prefix(verb)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+}
+
+/// A head written as `Verb argument` rather than as `Tool(argument)`: the first
+/// word is the tool and the rest is its input. The name is held to the same
+/// shape [`parse_tool_head`] holds `Tool(` to, so a head that opens with prose
+/// -- or with a path, or with a glyph -- still reads as text.
+fn word_tool_head(head: &str) -> Option<ToolHead> {
+    let (name, input) = match head.find(char::is_whitespace) {
+        Some(split) => (&head[..split], head[split..].trim_start()),
+        None => (head, ""),
+    };
+    if name.is_empty() || name.len() > 40 {
+        return None;
+    }
+    if !name.starts_with(|glyph: char| glyph.is_ascii_alphabetic()) {
+        return None;
+    }
+    if !name
+        .chars()
+        .all(|glyph| glyph.is_ascii_alphanumeric() || matches!(glyph, '_' | '-' | '.'))
+    {
+        return None;
+    }
+    Some(ToolHead {
+        name: name.to_owned(),
+        input: input.to_owned(),
+        // Nothing here is closed by a paren, so the trailing-paren repair that
+        // `Tool(` needs must not run.
+        closed: true,
+    })
+}
+
 /// Read the outcome off the result, since the terminal never carried an exit
 /// code. A block still waiting for its first result line is running.
-fn tool_status(result: &[String], no_groups: bool) -> ToolStatus {
-    if no_groups {
+fn tool_status(result: &[String], unanswered: bool) -> ToolStatus {
+    if unanswered {
         return ToolStatus::Running;
     }
     let first = result.iter().find(|line| !line.trim().is_empty());
@@ -847,6 +1021,20 @@ mod tests {
     const CLAUDE_SNAPSHOT: &str = include_str!("../tests/fixtures/claude-parts.json");
     const QODER_FIXTURE: &str = include_str!("../tests/fixtures/qoder-transcript.txt");
     const QODER_SNAPSHOT: &str = include_str!("../tests/fixtures/qoder-parts.json");
+    const CODEX_FIXTURE: &str = include_str!("../tests/fixtures/codex-transcript.txt");
+    const CODEX_SNAPSHOT: &str = include_str!("../tests/fixtures/codex-parts.json");
+    const OPENCODE_FIXTURE: &str = include_str!("../tests/fixtures/opencode-transcript.txt");
+    const OPENCODE_SNAPSHOT: &str = include_str!("../tests/fixtures/opencode-parts.json");
+
+    /// Every fixture, with the agent name Herdr reports for the pane it came
+    /// from. The two invariants are asserted across all of them, so a new
+    /// dictionary is covered by them the moment its fixture lands here.
+    const FIXTURES: &[(&str, &str)] = &[
+        (CLAUDE_FIXTURE, "claude"),
+        (QODER_FIXTURE, "qodercli"),
+        (CODEX_FIXTURE, "codex"),
+        (OPENCODE_FIXTURE, "opencode"),
+    ];
 
     fn claude(text: &str) -> Vec<Part> {
         normalize(text, dictionary_for(Some("claude")))
@@ -854,6 +1042,14 @@ mod tests {
 
     fn qoder(text: &str) -> Vec<Part> {
         normalize(text, dictionary_for(Some("qodercli")))
+    }
+
+    fn codex(text: &str) -> Vec<Part> {
+        normalize(text, dictionary_for(Some("codex")))
+    }
+
+    fn opencode(text: &str) -> Vec<Part> {
+        normalize(text, dictionary_for(Some("opencode")))
     }
 
     fn kinds(parts: &[Part]) -> Vec<&'static str> {
@@ -865,9 +1061,40 @@ mod tests {
         assert_eq!(dictionary_for(Some("claude")).unwrap().id, "claude");
         assert_eq!(dictionary_for(Some("Claude Code")).unwrap().id, "claude");
         assert_eq!(dictionary_for(Some("qodercli")).unwrap().id, "qoder");
-        assert!(dictionary_for(Some("opencode")).is_none());
+        // The names Herdr reports for the v1.2 additions, and the aliases its
+        // own detection manifests list beside them.
+        assert_eq!(dictionary_for(Some("codex")).unwrap().id, "codex");
+        assert_eq!(dictionary_for(Some("OpenAI Codex")).unwrap().id, "codex");
+        assert_eq!(dictionary_for(Some("opencode")).unwrap().id, "opencode");
+        assert_eq!(dictionary_for(Some("open-code")).unwrap().id, "opencode");
+        assert_eq!(
+            dictionary_for(Some("herdr:opencode")).unwrap().id,
+            "opencode"
+        );
+        // Still an answer we support: an agent nobody has written a table for.
+        assert!(dictionary_for(Some("aider")).is_none());
         assert!(dictionary_for(Some("")).is_none());
         assert!(dictionary_for(None).is_none());
+    }
+
+    /// The dictionary ids are what a client sees, so two tables may not claim
+    /// one id and no table may be reachable only through another's alias.
+    #[test]
+    fn every_dictionary_has_its_own_id_and_is_reachable_by_every_alias() {
+        let mut ids: Vec<&str> = DICTIONARIES.iter().map(|(_, table)| table.id).collect();
+        let count = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), count, "two dictionaries share an id");
+        for (aliases, table) in DICTIONARIES {
+            for alias in *aliases {
+                assert_eq!(
+                    dictionary_for(Some(alias)).map(|found| found.id),
+                    Some(table.id),
+                    "{alias} is shadowed by an earlier dictionary"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1142,46 +1369,266 @@ mod tests {
     }
 
     #[test]
+    fn a_codex_verb_head_with_a_result_is_a_tool_and_without_one_is_prose() {
+        // Codex writes `Ran cargo test` where Claude writes `Bash(cargo test)`.
+        let parts = codex(concat!(
+            "\u{2022} Ran pwd && ls\n",
+            "  \u{2514} /Users/okk/.osuki\n",
+            "    admin\n",
+            "    \u{2026} +15 lines (ctrl + t to view transcript)\n",
+        ));
+        assert_eq!(kinds(&parts), ["tool-block"]);
+        let value = parts[0].to_json();
+        assert_eq!(value["tool"], "Ran");
+        assert_eq!(value["input"], "pwd && ls");
+        assert_eq!(value["result"][0], "/Users/okk/.osuki");
+        assert_eq!(value["status"], "ok");
+        assert_eq!(value["truncated"], true);
+        // The same word opening a sentence is prose: no result group, no tool.
+        // This is what keeps Codex's first-person narration out of the tool set.
+        assert_eq!(
+            kinds(&codex("\u{2022} Ran into a wall on the way there\n")),
+            ["text"]
+        );
+        // And a head that is not a verb the table knows stays prose even when a
+        // result does follow it.
+        let notice = codex("\u{2022} Model changed to gpt-5.3-codex-spark\n  \u{2514} done\n");
+        assert_eq!(kinds(&notice), ["text"]);
+    }
+
+    #[test]
+    fn a_codex_command_that_wrapped_keeps_its_gutter_out_of_the_input() {
+        let parts = codex(concat!(
+            "\u{2022} Ran cd /srv/api && (bun run dev > /tmp/dev.log 2>&1 &) ; pid=$!; kill $pid\n",
+            "  \u{2502} >/dev/null 2>&1 || true; sleep 1; tail -n 80 /tmp/dev.log\n",
+            "  \u{2514} (no output)\n",
+        ));
+        assert_eq!(kinds(&parts), ["tool-block"]);
+        let value = parts[0].to_json();
+        assert_eq!(
+            value["input"],
+            concat!(
+                "cd /srv/api && (bun run dev > /tmp/dev.log 2>&1 &) ; pid=$!; kill $pid\n",
+                ">/dev/null 2>&1 || true; sleep 1; tail -n 80 /tmp/dev.log"
+            )
+        );
+        assert_eq!(value["result"][0], "(no output)");
+    }
+
+    #[test]
+    fn a_codex_startup_warning_is_one_text_part_with_its_wrapping() {
+        let parts = codex(concat!(
+            "\u{26a0} MCP client for `shopify-storefront` failed to start: MCP startup failed:\n",
+            "  message error Transport channel closed, when send initialized notification\n",
+        ));
+        assert_eq!(kinds(&parts), ["text"]);
+        assert_eq!(
+            parts[0].to_json()["markdown"],
+            concat!(
+                "MCP client for `shopify-storefront` failed to start: MCP startup failed:\n",
+                "message error Transport channel closed, when send initialized notification"
+            )
+        );
+    }
+
+    #[test]
+    fn a_codex_status_box_keeps_its_rows_as_one_text_part() {
+        // `/status` draws a box whose sides are the same glyph a wrapped command
+        // continues with. Both are chrome around text.
+        let parts = codex(concat!(
+            "\u{256d}\u{2500}\u{2500}\u{2500}\u{256e}\n",
+            "\u{2502}  Model:      gpt-5.3-codex-spark\n",
+            "\u{2502}  Directory:  ~/.osuki\n",
+            "\u{2570}\u{2500}\u{2500}\u{2500}\u{256f}\n",
+        ));
+        assert_eq!(kinds(&parts), ["text"]);
+        let markdown = parts[0].to_json();
+        let markdown = markdown["markdown"].as_str().unwrap();
+        assert!(
+            markdown.contains("Model:      gpt-5.3-codex-spark"),
+            "{markdown}"
+        );
+        assert!(!markdown.contains("\u{2502}  Model"), "{markdown}");
+    }
+
+    #[test]
+    fn a_codex_prompt_is_the_users_line_and_the_working_line_is_status() {
+        let parts = codex(
+            "\u{203a} \u{770b}\u{770b} kit-pro \u{662f}\u{5426}\u{80fd}\u{591f}\u{8fd0}\u{884c}\n",
+        );
+        assert_eq!(kinds(&parts), ["prompt"]);
+        assert_eq!(
+            parts[0].to_json()["text"],
+            "\u{770b}\u{770b} kit-pro \u{662f}\u{5426}\u{80fd}\u{591f}\u{8fd0}\u{884c}"
+        );
+        // Herdr's codex manifest matches the live line as `[•◦] Working (…)`.
+        // `◦` is the status glyph here; `•` is already the block opener, so that
+        // spelling degrades to text rather than being read as a tool.
+        let spinning = codex("\u{25e6} Working (12s \u{b7} esc to interrupt)\n");
+        assert_eq!(kinds(&spinning), ["status"]);
+        assert_eq!(
+            spinning[0].to_json()["text"],
+            "Working (12s \u{b7} esc to interrupt)"
+        );
+        assert_eq!(
+            kinds(&codex("\u{2022} Working (12s \u{b7} esc to interrupt)\n")),
+            ["text"]
+        );
+    }
+
+    #[test]
+    fn an_opencode_call_glyph_names_the_tool_and_needs_no_result_group() {
+        // opencode gives tool calls their own glyph and prints the outcome on
+        // that line, so the block is finished rather than in flight.
+        let parts = opencode(concat!(
+            "     \u{2192} Read kit/packages/ui/src/index.ts\n",
+            "     \u{2192} Grep --glob **/*.tsx button\n",
+        ));
+        assert_eq!(kinds(&parts), ["tool-block", "tool-block"]);
+        let value = parts[0].to_json();
+        assert_eq!(value["tool"], "Read");
+        assert_eq!(value["input"], "kit/packages/ui/src/index.ts");
+        assert_eq!(value["status"], "ok");
+        assert_eq!(value["result"].as_array().unwrap().len(), 0);
+        assert_eq!(parts[1].to_json()["tool"], "Grep");
+        // Claude's blocks are unaffected: no result there still means running.
+        assert_eq!(
+            claude("\u{23fa} Bash(sleep 30)\n")[0].to_json()["status"],
+            "running"
+        );
+    }
+
+    #[test]
+    fn an_opencode_gutter_is_one_prompt_and_not_a_prompt_per_row() {
+        let parts = opencode(concat!(
+            "  \u{2503}\n",
+            "  \u{2503}  kit \u{7ec4}\u{4ef6}\u{5462}\u{6709}\u{54ea}\u{4e9b}？\n",
+            "  \u{2503}  \u{662f}\u{5426}\u{5b8c}\u{6574}\u{4e86}\n",
+            "  \u{2503}\n",
+        ));
+        assert_eq!(kinds(&parts), ["prompt"]);
+        assert_eq!(
+            parts[0].to_json()["text"],
+            "kit \u{7ec4}\u{4ef6}\u{5462}\u{6709}\u{54ea}\u{4e9b}？\n\u{662f}\u{5426}\u{5b8c}\u{6574}\u{4e86}"
+        );
+        // The gutter rows the widget drew are still somebody's fallback.
+        assert_eq!(parts[0].fallback_text().lines().count(), 4);
+        // Claude's prompt is one marker line with its wrapping indented under
+        // it, and two of them stay two prompts.
+        assert_eq!(
+            kinds(&claude("\u{276f} first\n\u{276f} second\n")),
+            ["prompt", "prompt"]
+        );
+    }
+
+    #[test]
+    fn an_opencode_thought_and_note_line_degrade_to_text() {
+        assert_eq!(kinds(&opencode("     + Thought: 480ms\n")), ["text"]);
+        assert_eq!(
+            opencode("     + Thought: 480ms\n")[0].to_json()["markdown"],
+            "Thought: 480ms"
+        );
+        let note = opencode("     \u{21b3} Loaded kit/AGENTS.md\n");
+        assert_eq!(kinds(&note), ["text"]);
+        assert_eq!(note[0].to_json()["markdown"], "Loaded kit/AGENTS.md");
+    }
+
+    #[test]
     fn part_spans_are_ordered_and_never_overlap() {
-        for (text, agent) in [(CLAUDE_FIXTURE, "claude"), (QODER_FIXTURE, "qodercli")] {
-            let parts = normalize(text, dictionary_for(Some(agent)));
-            let mut previous = None;
-            for part in &parts {
-                assert!(part.start <= part.end, "{agent}");
-                if let Some(previous) = previous {
-                    assert!(part.start > previous, "{agent} span runs backwards");
-                }
-                // A span covers exactly the lines the part carries, so a client
-                // can map a terminal row to the part that owns it.
-                assert_eq!(
-                    part.fallback_text().lines().count(),
-                    part.end - part.start + 1,
-                    "{agent} span does not match its own lines"
-                );
-                previous = Some(part.end);
-            }
+        for &(text, agent) in FIXTURES {
+            assert_spans(text, agent);
         }
+    }
+
+    /// A part's span names the source rows it owns, and its `fallback_text` is
+    /// those rows byte for byte. Both halves matter: the span is how a client
+    /// maps a terminal row to a part, and the verbatim text is what it renders
+    /// when it does not know the part's type.
+    fn assert_spans(text: &str, agent: &str) {
+        let source: Vec<&str> = text.lines().collect();
+        let parts = normalize(text, dictionary_for(Some(agent)));
+        let mut previous = None;
+        for part in &parts {
+            assert!(part.start <= part.end, "{agent}");
+            assert!(part.end < source.len(), "{agent} span runs past the source");
+            if let Some(previous) = previous {
+                assert!(part.start > previous, "{agent} span runs backwards");
+            }
+            assert_eq!(
+                part.fallback_text(),
+                source[part.start..=part.end].join("\n"),
+                "{agent} fallback_text is not its own source rows verbatim"
+            );
+            previous = Some(part.end);
+        }
+    }
+
+    /// The same two invariants against whatever a live pane is showing right
+    /// now, rather than against a fixture captured once. Point
+    /// `PARTS_LIVE_TRANSCRIPTS` at a directory of `<agent>.txt` files -- a
+    /// `recent-unwrapped` read per pane, saved verbatim -- and re-run. Unset,
+    /// which is the normal case and every CI run, the check is skipped: it
+    /// exists to be pointed at a real machine, not to gate the build on one.
+    #[test]
+    fn a_live_pane_read_holds_both_invariants() {
+        let Some(dir) = std::env::var_os("PARTS_LIVE_TRANSCRIPTS") else {
+            return;
+        };
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir)
+            .expect("live transcript directory")
+            .flatten()
+        {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("txt") {
+                continue;
+            }
+            let agent = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .expect("agent name from file stem")
+                .to_owned();
+            let text = std::fs::read_to_string(&path).expect("live transcript");
+            assert_spans(&text, &agent);
+            assert_covers_every_line(&text, &agent);
+            let parts = normalize(&text, dictionary_for(Some(&agent)));
+            eprintln!(
+                "{agent}: {} rows -> {} parts, {} typed",
+                text.lines().count(),
+                parts.len(),
+                parts.iter().filter(|part| part.kind() != "text").count()
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "PARTS_LIVE_TRANSCRIPTS held no .txt reads");
+    }
+
+    fn assert_covers_every_line(text: &str, agent: &str) {
+        let parts = normalize(text, dictionary_for(Some(agent)));
+        let source: Vec<&str> = text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+        let covered: Vec<&str> = parts
+            .iter()
+            .flat_map(|part| part.fallback_text().lines())
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+        assert_eq!(covered, source, "{agent} lost or reordered a line");
     }
 
     #[test]
     fn every_non_blank_source_line_lands_in_exactly_one_fallback_text() {
         // The contract's floor: structure may be missed, content may not be.
-        for (text, agent) in [
-            (CLAUDE_FIXTURE, "claude"),
-            (QODER_FIXTURE, "qodercli"),
-            (CLAUDE_FIXTURE, "opencode"),
-        ] {
-            let parts = normalize(text, dictionary_for(Some(agent)));
-            let source: Vec<&str> = text
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .collect();
-            let covered: Vec<&str> = parts
-                .iter()
-                .flat_map(|part| part.fallback_text().lines())
-                .filter(|line| !line.trim().is_empty())
-                .collect();
-            assert_eq!(covered, source, "{agent} lost or reordered a line");
+        // Every fixture is also read through the wrong dictionary and through no
+        // dictionary at all, because the floor has to hold for a table that has
+        // drifted as much as for one that fits.
+        let wrong: Vec<(&str, &str)> = FIXTURES
+            .iter()
+            .flat_map(|&(text, _)| [(text, "qodercli"), (text, "codex"), (text, "aider")])
+            .collect();
+        for &(text, agent) in FIXTURES.iter().chain(wrong.iter()) {
+            assert_covers_every_line(text, agent);
         }
     }
 
@@ -1223,11 +1670,26 @@ mod tests {
     }
 
     #[test]
+    fn the_codex_fixture_normalizes_to_its_pinned_snapshot() {
+        assert_snapshot("codex-parts.json", "codex", CODEX_FIXTURE, CODEX_SNAPSHOT);
+    }
+
+    #[test]
+    fn the_opencode_fixture_normalizes_to_its_pinned_snapshot() {
+        assert_snapshot(
+            "opencode-parts.json",
+            "opencode",
+            OPENCODE_FIXTURE,
+            OPENCODE_SNAPSHOT,
+        );
+    }
+
+    #[test]
     fn the_fixtures_cover_every_part_type_the_dictionaries_can_produce() {
-        let mut seen: Vec<&str> = normalize(CLAUDE_FIXTURE, dictionary_for(Some("claude")))
+        let mut seen: Vec<&str> = FIXTURES
             .iter()
-            .chain(normalize(QODER_FIXTURE, dictionary_for(Some("qodercli"))).iter())
-            .map(Part::kind)
+            .flat_map(|&(text, agent)| normalize(text, dictionary_for(Some(agent))))
+            .map(|part| part.kind())
             .collect();
         seen.sort_unstable();
         seen.dedup();
@@ -1235,5 +1697,87 @@ mod tests {
             seen,
             ["diff", "prompt", "status", "text", "todo", "tool-block"]
         );
+    }
+
+    /// Herdr keeps the ecosystem's agent list as detection manifests it updates
+    /// out of band (bundled, remote-refreshed, and locally overridable). This
+    /// table tracks that list, so the drift worth catching is a dictionary keyed
+    /// on a name Herdr does not know -- that pane would never reach us.
+    ///
+    /// The manifests live on the machine Herdr runs on, so the check is skipped
+    /// where they are absent rather than making the build depend on them. The
+    /// other direction -- a manifest with no dictionary yet -- is the roadmap,
+    /// not a failure, so it is reported and not asserted. Run with
+    /// `cargo test -- --nocapture` to read it.
+    #[test]
+    fn no_dictionary_is_keyed_on_an_agent_herdr_does_not_know() {
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        let root = std::path::Path::new(&home).join(".local/state/herdr/agent-detection/remote");
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            eprintln!("herdr manifests not on this machine; drift check skipped");
+            return;
+        };
+        // `id = "codex"` and `aliases = ["open-code", …]`, which is all of the
+        // manifest this check needs and the reason it reads no TOML crate.
+        let mut known: Vec<String> = Vec::new();
+        for entry in entries.flatten() {
+            let Ok(text) = std::fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            // The agent's own `id` and `aliases` head the file; every `id`
+            // below the first `[[rules]]` names a detection rule instead.
+            for line in text.lines().take_while(|line| !line.starts_with("[[")) {
+                let Some((key, value)) = line.split_once('=') else {
+                    continue;
+                };
+                if !matches!(key.trim(), "id" | "aliases") {
+                    continue;
+                }
+                known.extend(
+                    value
+                        .split('"')
+                        .skip(1)
+                        .step_by(2)
+                        .map(|name| name.to_ascii_lowercase()),
+                );
+            }
+        }
+        if known.is_empty() {
+            eprintln!("herdr manifests unreadable; drift check skipped");
+            return;
+        }
+        for (aliases, table) in DICTIONARIES {
+            for alias in *aliases {
+                assert!(
+                    known.iter().any(|name| name.contains(alias)),
+                    "dictionary {} is keyed on {alias}, which no herdr manifest reports",
+                    table.id
+                );
+            }
+        }
+        let uncovered: Vec<&String> = known
+            .iter()
+            .filter(|name| dictionary_for(Some(name)).is_none())
+            .collect();
+        eprintln!("herdr agents with no dictionary yet: {uncovered:?}");
+    }
+
+    /// Each dictionary has to buy its keep: a table that types nothing is a
+    /// table that has drifted, and the fixture is the only place that shows it.
+    /// The floor is deliberately well under what the fixtures type today, so
+    /// that ordinary transcript variation does not fail the build.
+    #[test]
+    fn every_dictionary_types_a_real_share_of_its_own_fixture() {
+        for &(text, agent) in FIXTURES {
+            let parts = normalize(text, dictionary_for(Some(agent)));
+            let typed = parts.iter().filter(|part| part.kind() != "text").count();
+            assert!(
+                typed * 4 >= parts.len(),
+                "{agent} typed only {typed} of {} parts",
+                parts.len()
+            );
+        }
     }
 }
