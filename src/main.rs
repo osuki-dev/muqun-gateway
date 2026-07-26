@@ -41,6 +41,7 @@ use tokio_stream::Stream;
 
 mod approvals;
 mod composer;
+mod native;
 mod parts;
 mod shortcuts;
 mod tasks;
@@ -162,8 +163,12 @@ const UPLOAD_GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// changes no payload's shape. 1.3.0 adds the composer capabilities: a pane's
 /// descriptor may now carry `composer`, and the file search endpoint answers in
 /// the same envelope. Both are additions -- a 1.2.0 client reads every 1.3.0
-/// payload unchanged and simply does not see the new field.
-const CONTENT_SCHEMA_VERSION: &str = "1.3.0";
+/// payload unchanged and simply does not see the new field. 1.4.0 is the v2
+/// slice: native protocol adapters feed the same parts, so a pane may answer
+/// `parts: "native"` -- a third value of an enum that already had two -- and the
+/// closed part set gains `approval`, which an old client renders through
+/// `fallback_text` like any type it does not know. Again nothing existing moved.
+const CONTENT_SCHEMA_VERSION: &str = "1.4.0";
 /// A phone previews artifacts, it does not download archives. Anything larger
 /// is refused rather than streamed, so one request can never tie up the host.
 const MAX_ASSET_CONTENT_BYTES: u64 = 10 * 1024 * 1024;
@@ -216,6 +221,7 @@ const API_CAPABILITIES: &[&str] = &[
     "pane_file_search",
     "pane_output_ansi",
     "pane_parts",
+    "pane_parts_native",
     "pane_shortcuts",
     "configurable_agent_profiles",
     "per_device_tokens",
@@ -2450,9 +2456,9 @@ async fn events(
     // obey the same allow-list. A client that asked for nothing else still gets
     // told when an agent is blocked, because that is the one thing it cannot
     // discover by watching output go by.
-    let approval_events = wanted.as_ref().is_none_or(|set| {
-        set.contains("approval_pending") || set.contains("approval_resolved")
-    });
+    let approval_events = wanted
+        .as_ref()
+        .is_none_or(|set| set.contains("approval_pending") || set.contains("approval_resolved"));
     let mut approvals_rx = state.approval_events.subscribe();
     let assets = state.assets.clone();
     let stream = async_stream::stream! {
@@ -2632,7 +2638,15 @@ async fn watch_pane_approvals(state: AppState, session: SessionConfig) {
                     // A different menu in the same pane is the old one resolved
                     // and a new one asked, in that order.
                     if let Some(previous) = pending.remove(pane_id) {
-                        publish_approval(&state, "approval.resolved", &session.id, pane_id, agent, Some(&previous), None);
+                        publish_approval(
+                            &state,
+                            "approval.resolved",
+                            &session.id,
+                            pane_id,
+                            agent,
+                            Some(&previous),
+                            None,
+                        );
                     }
                     pending.insert(pane_id.to_owned(), approval.fingerprint.clone());
                     publish_approval(
@@ -2659,7 +2673,15 @@ async fn watch_pane_approvals(state: AppState, session: SessionConfig) {
                 }
                 None => {
                     if let Some(previous) = pending.remove(pane_id) {
-                        publish_approval(&state, "approval.resolved", &session.id, pane_id, agent, Some(&previous), None);
+                        publish_approval(
+                            &state,
+                            "approval.resolved",
+                            &session.id,
+                            pane_id,
+                            agent,
+                            Some(&previous),
+                            None,
+                        );
                     }
                 }
             }
@@ -2697,7 +2719,7 @@ fn publish_approval(
     approval: Option<&approvals::Approval>,
 ) {
     let agent = (!agent.is_empty()).then_some(agent);
-    let mut data = approval_data(session_id, pane_id, agent, approval);
+    let mut data = approval_data(session_id, pane_id, agent, approval, "menu");
     if let (Some(object), Some(fingerprint)) = (data.as_object_mut(), fingerprint) {
         object.insert("fingerprint".into(), json!(fingerprint));
     }
@@ -4177,32 +4199,9 @@ async fn pane_parts(
         .unwrap_or(PARTS_DEFAULT_LINES)
         .clamp(1, MAX_OUTPUT_LINES);
 
-    // Which agent is in the pane decides which dictionary reads it. Herdr
-    // reports it on the pane itself, the same field the key row resolves from.
-    // A pane.get that fails is not fatal here: no agent means text parts, which
-    // is exactly what an unreachable pane.get should degrade to.
-    let pane = herdr_request(&session, "pane.get", json!({ "pane_id": pane_id }))
-        .await
-        .ok();
-    let pane = pane
-        .as_ref()
-        .map(|response| response.pointer("/result/pane").unwrap_or(response));
-    let agent = pane
-        .and_then(|pane| pane.get("agent").and_then(Value::as_str))
-        .filter(|agent| !agent.is_empty())
-        .map(str::to_owned);
-    // The pane's own working directory is its workspace root, and it is where
-    // this pane's workspace commands and skills are read from -- under the same
-    // fence as the assets API: canonical, and never the whole machine.
-    let root = pane
-        .and_then(|pane| {
-            pane.get("cwd")
-                .and_then(Value::as_str)
-                .or_else(|| pane.get("foreground_cwd").and_then(Value::as_str))
-        })
-        .map(PathBuf::from)
-        .filter(|path| is_scannable_root(path))
-        .and_then(|path| std::fs::canonicalize(path).ok());
+    // Which agent is in the pane decides which source reads it, and the pane's
+    // own working directory is the fence every workspace read is under.
+    let (agent, root) = pane_agent_and_root(&session, &pane_id).await;
 
     // `recent_unwrapped` is the only source worth normalizing: the dictionaries
     // key off line starts, and it is the one source where a long line is one
@@ -4232,7 +4231,23 @@ async fn pane_parts(
         .find_map(|pointer| read.pointer(pointer).and_then(Value::as_u64));
 
     let dictionary = parts::dictionary_for(agent.as_deref());
-    let normalized = parts::normalize_json(&text, dictionary);
+
+    // A native protocol, where the agent runs one and the operator pointed the
+    // gateway at it, is a better source than the screen: it carries exit codes,
+    // patches, checklists and pending permissions as data rather than as glyphs
+    // a table has to guess at. It is also never required -- every failure below
+    // falls through to the dictionary, so an adapter can add structure to a
+    // pane and can never take one away.
+    let native = match native::adapter_for(agent.as_deref()) {
+        Some(adapter) => {
+            native::read(adapter, root.as_deref(), native::DEFAULT_MESSAGE_LIMIT).await
+        }
+        None => None,
+    };
+    let normalized = match &native {
+        Some(read) => read.parts.clone(),
+        None => parts::normalize_json(&text, dictionary),
+    };
 
     // Reading a workspace's own skills and commands is blocking filesystem
     // work, so it runs off the async runtime like every other scan here.
@@ -4246,17 +4261,70 @@ async fn pane_parts(
     Ok(Json(content_envelope(json!({
         "session_id": session_id,
         "pane_id": pane_id,
-        "source": "recent-unwrapped",
+        // Which source answered. `recent-unwrapped` is the pane's own text;
+        // an adapter's id says the parts came from that agent's protocol and
+        // that `range` spans the adapter's rendering rather than terminal rows.
+        "source": match &native {
+            Some(_) => "native",
+            None => "recent-unwrapped",
+        },
         "lines": lines,
         "revision": revision,
-        "pane": pane_capabilities(&pane_id, agent.as_deref(), dictionary, composer),
+        "pane": pane_capabilities(
+            &pane_id,
+            agent.as_deref(),
+            dictionary,
+            native.as_ref(),
+            composer,
+        ),
         "parts": normalized,
     }))))
 }
 
+/// What Herdr says is running in a pane, and the workspace root that pane is
+/// fenced to.
+///
+/// A `pane.get` that fails is not fatal to any caller: no agent means text
+/// parts and no native source, which is exactly what an unreachable `pane.get`
+/// should degrade to. The root is canonicalized and held to the same
+/// `is_scannable_root` rule the assets and file-search APIs use, so a pane
+/// sitting at `/` or in a home directory names no root at all.
+async fn pane_agent_and_root(
+    session: &SessionConfig,
+    pane_id: &str,
+) -> (Option<String>, Option<PathBuf>) {
+    let pane = herdr_request(session, "pane.get", json!({ "pane_id": pane_id }))
+        .await
+        .ok();
+    let pane = pane
+        .as_ref()
+        .map(|response| response.pointer("/result/pane").unwrap_or(response));
+    let agent = pane
+        .and_then(|pane| pane.get("agent").and_then(Value::as_str))
+        .filter(|agent| !agent.is_empty())
+        .map(str::to_owned);
+    let root = pane
+        .and_then(|pane| {
+            pane.get("cwd")
+                .and_then(Value::as_str)
+                .or_else(|| pane.get("foreground_cwd").and_then(Value::as_str))
+        })
+        .map(PathBuf::from)
+        .filter(|path| is_scannable_root(path))
+        .and_then(|path| std::fs::canonicalize(path).ok());
+    (agent, root)
+}
+
 /// The per-pane capability descriptor, because agent detection varies pane to
-/// pane: `dictionary` means the parts are typed, `text` means this pane fell
-/// back to prose and a client should not wait for tool blocks.
+/// pane: `native` means the agent's own protocol answered, `dictionary` means
+/// the parts were read off the screen, and `text` means this pane fell back to
+/// prose and a client should not wait for tool blocks.
+///
+/// `native` is a third value of an existing enum, not a new concept: the parts
+/// under it are the same closed set in the same envelope. What it does tell a
+/// client is which coordinate system `range` is in -- terminal rows for a
+/// dictionary read, rows of the adapter's own rendering for a native one, which
+/// a client rebuilds by joining the parts' `fallback_text`.
 ///
 /// `composer` is absent rather than null for an agent with no command table, so
 /// a client can tell "this gateway knows nothing about this agent" from "this
@@ -4265,13 +4333,26 @@ fn pane_capabilities(
     pane_id: &str,
     agent: Option<&str>,
     dictionary: Option<&'static parts::Dictionary>,
+    native: Option<&native::NativeRead>,
     composer: Option<Value>,
 ) -> Value {
     let mut capabilities = json!({
         "pane_id": pane_id,
         "agent": agent,
-        "parts": if dictionary.is_some() { "dictionary" } else { "text" },
+        "parts": match (native.is_some(), dictionary.is_some()) {
+            (true, _) => "native",
+            (false, true) => "dictionary",
+            (false, false) => "text",
+        },
         "dictionary": dictionary.map(|dictionary| dictionary.id),
+        // Absent unless a protocol actually answered, the same discipline
+        // `composer` is under: a client must not have to tell "the adapter
+        // could have read this pane" from "the adapter did".
+        "native": native.map(|read| json!({
+            "protocol": native::adapter_for(agent).map(|adapter| adapter.protocol),
+            "version": read.version,
+            "session": read.session,
+        })),
         "image_input": "file-path",
     });
     if let (Some(object), Some(composer)) = (capabilities.as_object_mut(), composer) {
@@ -4407,13 +4488,76 @@ async fn pane_approval(
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
     let session = find_session(&state.config, &session_id)?.clone();
+
+    // An agent that reports its approvals is believed over the screen: a menu
+    // read off a terminal can only ever be the last frame drawn, and a protocol
+    // says outright whether it is still waiting and on which request.
+    let (agent, root) = pane_agent_and_root(&session, &pane_id).await;
+    if let Some(adapter) = native::adapter_for(agent.as_deref()) {
+        // Only when an endpoint is configured: an adapter with nothing behind
+        // it must leave the pane on the drawn-menu path rather than answering
+        // "idle" for a pane that is in fact blocked.
+        if native::endpoint(adapter).is_some() {
+            let pending = native::pending(adapter, root.as_deref()).await;
+            return Ok(Json(content_envelope(native_approval_data(
+                &session_id,
+                &pane_id,
+                agent.as_deref(),
+                pending.as_ref(),
+            ))));
+        }
+    }
+
     let (agent, approval) = read_pane_approval(&session, &pane_id).await?;
     Ok(Json(content_envelope(approval_data(
         &session_id,
         &pane_id,
         agent.as_deref(),
         approval.as_ref(),
+        "menu",
     ))))
+}
+
+/// The same payload for a pane whose agent reports its approvals.
+///
+/// One shape, two sources: `approval` carries the request the client answers,
+/// and only the fields a protocol can honestly fill in. There is no cursor, so
+/// no option is `selected`; the identity is the agent's own request id rather
+/// than a fingerprint of the drawn text, because the agent guarantees it.
+fn native_approval_data(
+    session_id: &str,
+    pane_id: &str,
+    agent: Option<&str>,
+    pending: Option<&native::NativeApproval>,
+) -> Value {
+    json!({
+        "session_id": session_id,
+        "pane_id": pane_id,
+        "state": if pending.is_some() { "pending" } else { "idle" },
+        "approval": pending.map(|pending| {
+            let request = &pending.request;
+            json!({
+                "approval_id": request.id,
+                "prompt": request.prompt,
+                "tool": request.tool,
+                "context": request.context,
+                "options": request
+                    .options
+                    .iter()
+                    .map(|option| json!({
+                        "index": option.index,
+                        "label": option.label,
+                        "decision": option.decision,
+                    }))
+                    .collect::<Vec<Value>>(),
+            })
+        }),
+        "pane": {
+            "pane_id": pane_id,
+            "agent": agent,
+            "approvals": "protocol",
+        },
+    })
 }
 
 /// Answer the menu the pane is blocked on.
@@ -4431,6 +4575,16 @@ async fn answer_pane_approval(
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
     let session = find_session(&state.config, &session_id)?.clone();
+
+    // An agent that reports its approvals is answered through its protocol
+    // rather than through its keyboard. Naming the request by id is what makes
+    // that strictly safer: there is no cursor to walk, and a request that was
+    // resolved between the read and the answer is refused by the agent instead
+    // of being answered blind by whatever the menu was redrawn into.
+    if let Some(answered) = answer_native_approval(&session, &session_id, &pane_id, &body).await? {
+        return Ok(Json(answered));
+    }
+
     let (agent, pending) = read_pane_approval(&session, &pane_id).await?;
     let Some(pending) = pending else {
         return Err(api_error(
@@ -4532,7 +4686,13 @@ async fn answer_pane_approval(
         .as_ref()
         .is_none_or(|approval| approval.fingerprint != pending.fingerprint);
 
-    let mut data = approval_data(&session_id, &pane_id, agent.as_deref(), after.as_ref());
+    let mut data = approval_data(
+        &session_id,
+        &pane_id,
+        agent.as_deref(),
+        after.as_ref(),
+        "menu",
+    );
     if let Some(object) = data.as_object_mut() {
         object.insert("resolved".into(), json!(resolved));
         object.insert("sent_keys".into(), json!(sent));
@@ -4548,7 +4708,106 @@ async fn answer_pane_approval(
     Ok(Json(content_envelope(data)))
 }
 
-async fn send_pane_keys(session: &SessionConfig, pane_id: &str, keys: &[String]) -> ApiResult<Value> {
+/// Answer a pane's approval through the agent's own protocol, when it has one.
+///
+/// `Ok(None)` means this pane has no native source -- no adapter, no configured
+/// endpoint, or nothing pending there -- and the caller falls through to the
+/// drawn-menu path. Nothing here can make a pane unanswerable.
+async fn answer_native_approval(
+    session: &SessionConfig,
+    session_id: &str,
+    pane_id: &str,
+    body: &AnswerApprovalBody,
+) -> ApiResult<Option<Value>> {
+    let (agent, root) = pane_agent_and_root(session, pane_id).await;
+    let Some(adapter) = native::adapter_for(agent.as_deref()) else {
+        return Ok(None);
+    };
+    if native::endpoint(adapter).is_none() {
+        return Ok(None);
+    }
+    // Past this point the protocol is the authority, and a pane it says is not
+    // waiting is not answered by keystroke either: the menu still on the screen
+    // is the last frame of one that has already been resolved.
+    let Some(pending) = native::pending(adapter, root.as_deref()).await else {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "approval_not_pending",
+            "the pane is not waiting on an approval",
+        ));
+    };
+
+    // A protocol names its answers, so an option number is read off the part
+    // the client was shown rather than off a cursor the agent moved.
+    let decision = match (body.decision.as_deref(), body.option) {
+        (Some(name), _) => decision_named(name)?,
+        (None, Some(index)) => pending
+            .request
+            .options
+            .iter()
+            .find(|option| option.index == index)
+            .map(|option| decision_named(option.decision))
+            .transpose()?
+            .ok_or_else(|| {
+                api_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_option",
+                    "this approval has no option with that number",
+                )
+            })?,
+        (None, None) => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_answer",
+                "answer with an option number or a decision",
+            ))
+        }
+    };
+    let accepted = native::answer(&pending, decision).await.unwrap_or(false);
+    if !accepted {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "approval_changed",
+            "the agent no longer has that request pending",
+        ));
+    }
+
+    let mut data = approval_data(session_id, pane_id, agent.as_deref(), None, "protocol");
+    if let Some(object) = data.as_object_mut() {
+        object.insert("resolved".into(), json!(true));
+        // No keystrokes were sent, and saying so is how a client can tell the
+        // two paths apart without the wire naming either agent's protocol.
+        object.insert("sent_keys".into(), json!([] as [String; 0]));
+        object.insert(
+            "answered".into(),
+            json!({
+                "approval_id": pending.request.id,
+                "decision": decision.as_str(),
+            }),
+        );
+    }
+    Ok(Some(content_envelope(data)))
+}
+
+/// The decision a client named, or a 400.
+fn decision_named(name: &str) -> ApiResult<approvals::Decision> {
+    match name {
+        "allow" => Ok(approvals::Decision::Allow),
+        "allow_always" => Ok(approvals::Decision::AllowAlways),
+        "deny" => Ok(approvals::Decision::Deny),
+        _ => Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_decision",
+            "decision must be allow, allow_always, or deny",
+        )),
+    }
+}
+
+async fn send_pane_keys(
+    session: &SessionConfig,
+    pane_id: &str,
+    keys: &[String],
+) -> ApiResult<Value> {
     herdr_request(
         session,
         "pane.send_keys",
@@ -4616,6 +4875,7 @@ fn approval_data(
     pane_id: &str,
     agent: Option<&str>,
     approval: Option<&approvals::Approval>,
+    source: &str,
 ) -> Value {
     json!({
         "session_id": session_id,
@@ -4623,12 +4883,14 @@ fn approval_data(
         "state": if approval.is_some() { "pending" } else { "idle" },
         "approval": approval.map(approvals::Approval::to_json),
         // Per-pane capability, in the same shape the parts endpoint answers
-        // with: "menu" means the approval was read off what the agent drew, and
+        // with. "menu" means the approval was read off what the agent drew, and
         // a client that dislikes the reading still has raw send-keys.
+        // "protocol" means the agent reported it and was answered by name, so
+        // there is no cursor to race and no keystroke was sent.
         "pane": {
             "pane_id": pane_id,
             "agent": agent,
-            "approvals": "menu",
+            "approvals": source,
         },
     })
 }
@@ -6916,7 +7178,7 @@ fn openapi_spec() -> Value {
             "/api/sessions/{sessionId}/panes/{paneId}/parts": {
                 "get": {
                     "summary": "Read the pane's transcript normalized into content-model parts",
-                    "description": "Unified content model, schema version 1.3.0. Same envelope as the asset endpoints: schema_version, capabilities, and data, with the ordered parts under data.parts. The text is the pane's own recent-unwrapped read, run through the marker dictionary of whichever agent Herdr reports on the pane -- Claude Code, Qoder, Codex and opencode today. Every part carries fallback_text, the source lines verbatim, so an unknown type still renders and a dictionary that drifts loses structure and never loses content. A pane running no agent, or an agent with no dictionary, is answered with text parts rather than with an error; data.pane.parts says which happened. data.pane.composer carries the slash commands this agent understands and whether @ file mentions make sense, and is absent entirely for an agent the gateway has no table for. The raw output endpoint is unchanged and remains the fallback path.",
+                    "description": "Unified content model, schema version 1.4.0. Same envelope as the asset endpoints: schema_version, capabilities, and data, with the ordered parts under data.parts. Two sources can answer, and data.pane.parts says which did. native: the agent runs a protocol the gateway was pointed at (opencode's server API today), so a tool's exit code, the patch an edit produced, the checklist a todo write submitted and any pending permission arrive as data; range then spans the adapter's own rendering, which is the parts' fallback_text joined by newlines. dictionary: the pane's recent-unwrapped text read through the marker table of whichever agent Herdr reports -- Claude Code, Qoder, Codex and opencode. text: no table covers this pane, so everything degraded to prose, which is an answer and not an error. Whichever source answered, every part carries fallback_text verbatim, so an unknown type still renders and a source that drifts loses structure and never loses content. data.pane.composer carries the slash commands this agent understands and whether @ file mentions make sense, and is absent entirely for an agent the gateway has no table for. The raw output endpoint is unchanged and remains the fallback path.",
                     "parameters": [
                         path_param("sessionId"),
                         path_param("paneId"),
@@ -7223,7 +7485,7 @@ fn part_schema() -> Value {
         "properties": {
             "type": {
                 "type": "string",
-                "enum": ["text", "tool-block", "diff", "todo", "table", "status", "prompt", "asset-ref"],
+                "enum": ["text", "tool-block", "diff", "todo", "table", "status", "prompt", "asset-ref", "approval"],
                 "description": "Closed set. A client that does not know a value renders fallback_text; new types arrive on a minor bump"
             },
             "fallback_text": { "type": "string", "description": "The source lines verbatim" },
@@ -7242,7 +7504,15 @@ fn part_schema() -> Value {
                 "items": object_schema(&[("text", "string"), ("done", "boolean")], &["text", "done"])
             },
             "text": { "type": "string", "description": "status and prompt: the line's content" },
-            "spinner": { "type": "boolean", "description": "status: the line is one of the agent's animated frames" }
+            "spinner": { "type": "boolean", "description": "status: the line is one of the agent's animated frames" },
+            "approval_id": { "type": "string", "description": "approval: what POST .../approval answers. Only a source that reports approval state can raise one; a pane read through a marker dictionary carries its menu on the approvals endpoint instead" },
+            "prompt": { "type": "string", "description": "approval: the question, written by the gateway from the protocol's own action name and never quoted out of a terminal" },
+            "context": { "type": "array", "items": { "type": "string" }, "description": "approval: what is being asked for -- the command, the path, the host -- verbatim from the protocol" },
+            "options": {
+                "type": "array",
+                "description": "approval: the answers, labelled by the gateway so an agent's own wording (which routinely embeds the command) never travels",
+                "items": object_schema(&[("index", "integer"), ("label", "string"), ("decision", "string")], &["index", "label", "decision"])
+            }
         }
     })
 }
@@ -7311,7 +7581,7 @@ fn parts_responses() -> Value {
             "properties": {
                 "session_id": { "type": "string" },
                 "pane_id": { "type": "string" },
-                "source": { "type": "string", "description": "Always recent-unwrapped: the dictionaries key off line starts" },
+                "source": { "type": "string", "enum": ["recent-unwrapped", "native"], "description": "recent-unwrapped: the pane's own text, which is what the dictionaries key off. native: the agent's own protocol answered, and range spans the adapter's rendering -- which is the parts' fallback_text joined by newlines -- rather than terminal rows" },
                 "lines": { "type": "integer", "description": "How many lines were read, echoed back" },
                 "revision": { "type": ["integer", "null"], "description": "Herdr's pane revision for this read, when it reported one" },
                 "pane": {
@@ -7320,8 +7590,17 @@ fn parts_responses() -> Value {
                     "properties": {
                         "pane_id": { "type": "string" },
                         "agent": { "type": ["string", "null"], "description": "What Herdr reports is running in the pane" },
-                        "parts": { "type": "string", "enum": ["dictionary", "text"], "description": "dictionary: typed parts. text: no dictionary covers this pane, everything degraded to prose" },
+                        "parts": { "type": "string", "enum": ["native", "dictionary", "text"], "description": "native: the agent's own protocol answered. dictionary: typed parts read off the screen. text: no dictionary covers this pane, everything degraded to prose" },
                         "dictionary": { "type": ["string", "null"], "description": "Which dictionary normalized it, for cache keys and bug reports" },
+                        "native": {
+                            "type": ["object", "null"],
+                            "description": "Null unless a protocol actually answered, so a client cannot mistake 'an adapter could have read this pane' for 'an adapter did'",
+                            "properties": {
+                                "protocol": { "type": ["string", "null"], "description": "What the agent's own release calls it, for bug reports" },
+                                "version": { "type": ["string", "null"], "description": "The version the agent's server reported" },
+                                "session": { "type": ["string", "null"], "description": "The agent's own session identity, so a client can tell one native read from the next" }
+                            }
+                        },
                         "image_input": { "type": "string", "description": "How an image reaches this agent; file-path means upload first, then send the path" },
                         "composer": composer_schema()
                     }
@@ -7961,17 +8240,11 @@ mod tests {
         // The whole privacy rule for notifications, asserted end to end on a
         // real menu: the agent quoted the command in its own option label, and
         // none of it may reach Expo.
-        let approval = approvals::detect(include_str!(
-            "../tests/fixtures/approval-claude-bash.txt"
-        ))
-        .expect("the fixture is a pending approval");
+        let approval =
+            approvals::detect(include_str!("../tests/fixtures/approval-claude-bash.txt"))
+                .expect("the fixture is a pending approval");
         let notification = approval_notification(
-            "server-1",
-            "Studio",
-            "default",
-            "wM:p1",
-            "claude",
-            &approval,
+            "server-1", "Studio", "default", "wM:p1", "claude", &approval,
         );
         assert_eq!(notification.title, "Approval needed · Studio");
         assert_eq!(notification.body, "claude is waiting for your approval.");
@@ -7990,11 +8263,9 @@ mod tests {
 
     #[test]
     fn the_approval_payload_carries_the_pane_and_answers_in_the_content_envelope() {
-        let approval = approvals::detect(include_str!(
-            "../tests/fixtures/approval-claude-bash.txt"
-        ))
-        .unwrap();
-        let pending = content_envelope(approval_data(
+        let approval =
+            approvals::detect(include_str!("../tests/fixtures/approval-claude-bash.txt")).unwrap();
+        let pending = content_envelope(approval_data_menu(
             "default",
             "wM:p1",
             Some("claude"),
@@ -8003,11 +8274,14 @@ mod tests {
         assert_eq!(pending["schema_version"], CONTENT_SCHEMA_VERSION);
         assert_eq!(pending["data"]["state"], "pending");
         assert_eq!(pending["data"]["pane"]["approvals"], "menu");
-        assert_eq!(pending["data"]["approval"]["options"][2]["decision"], "deny");
+        assert_eq!(
+            pending["data"]["approval"]["options"][2]["decision"],
+            "deny"
+        );
 
         // An idle pane is answered with the same shape and a null approval, so
         // a client has one code path rather than two.
-        let idle = content_envelope(approval_data("default", "wM:p1", Some("claude"), None));
+        let idle = content_envelope(approval_data_menu("default", "wM:p1", Some("claude"), None));
         assert_eq!(idle["data"]["state"], "idle");
         assert!(idle["data"]["approval"].is_null());
         assert_eq!(idle["data"]["pane"]["approvals"], "menu");
@@ -8636,11 +8910,95 @@ mod tests {
         // One envelope and one version across the content model: a client reads
         // the version once and knows both endpoints answer it.
         let envelope = content_envelope(json!({}));
-        assert_eq!(envelope["schema_version"], "1.3.0");
+        assert_eq!(envelope["schema_version"], "1.4.0");
         assert_eq!(envelope["capabilities"]["parts"], true);
         assert_eq!(envelope["capabilities"]["assets"], true);
         assert_eq!(envelope["capabilities"]["image_upload"], true);
         assert_eq!(envelope["capabilities"]["composer"], true);
+    }
+
+    /// A native adapter answers `parts: "native"`, and only when it actually
+    /// answered. The distinction matters: an operator who has not pointed the
+    /// gateway at an opencode server still gets the dictionary, and a client
+    /// must be able to tell "could have" from "did".
+    #[test]
+    fn a_pane_says_native_only_when_a_protocol_actually_answered() {
+        let read = native::NativeRead {
+            parts: Vec::new(),
+            session: Some("ses_1".into()),
+            version: Some("1.18.0".into()),
+        };
+        let native_pane = pane_capabilities(
+            "wA:p1",
+            Some("opencode"),
+            parts::dictionary_for(Some("opencode")),
+            Some(&read),
+            None,
+        );
+        assert_eq!(native_pane["parts"], "native");
+        assert_eq!(native_pane["native"]["protocol"], "opencode-server");
+        assert_eq!(native_pane["native"]["version"], "1.18.0");
+        assert_eq!(native_pane["native"]["session"], "ses_1");
+        // The dictionary is still named, because it is still what answers when
+        // the server is not up.
+        assert_eq!(native_pane["dictionary"], "opencode");
+
+        // Same agent, no endpoint reached: the pane falls back and says so.
+        let fallback = pane_capabilities(
+            "wA:p1",
+            Some("opencode"),
+            parts::dictionary_for(Some("opencode")),
+            None,
+            None,
+        );
+        assert_eq!(fallback["parts"], "dictionary");
+        assert_eq!(fallback["native"], Value::Null);
+    }
+
+    /// One shape for both sources: the approval endpoints answer the same keys
+    /// whether the request was read off a menu or reported by a protocol, and
+    /// `pane.approvals` is the only thing that says which.
+    #[test]
+    fn a_reported_approval_answers_in_the_same_shape_a_drawn_one_does() {
+        let pending = native::NativeApproval {
+            adapter: &native::OPENCODE,
+            base: "http://127.0.0.1:1".into(),
+            session: "ses_1".into(),
+            request: parts::ApprovalRequest {
+                id: "per_1".into(),
+                prompt: "Allow bash?".into(),
+                tool: Some("bash".into()),
+                context: vec!["echo hi".into()],
+                options: vec![parts::ApprovalChoice {
+                    index: 1,
+                    label: "Approve".into(),
+                    decision: "allow",
+                }],
+            },
+        };
+        let data = native_approval_data("default", "wM:p1", Some("opencode"), Some(&pending));
+        assert_eq!(data["state"], "pending");
+        assert_eq!(data["approval"]["approval_id"], "per_1");
+        assert_eq!(data["approval"]["options"][0]["decision"], "allow");
+        // The label is the gateway's own, so the command in `context` is the
+        // only agent-authored text on this payload.
+        assert_eq!(data["approval"]["options"][0]["label"], "Approve");
+        assert_eq!(data["pane"]["approvals"], "protocol");
+
+        let idle = native_approval_data("default", "wM:p1", Some("opencode"), None);
+        assert_eq!(idle["state"], "idle");
+        assert_eq!(idle["approval"], Value::Null);
+        assert_eq!(idle["pane"]["approvals"], "protocol");
+    }
+
+    /// The drawn-menu spelling, which is what every existing assertion means.
+    fn approval_data_menu(
+        session_id: &str,
+        pane_id: &str,
+        agent: Option<&str>,
+        approval: Option<&approvals::Approval>,
+    ) -> Value {
+        approval_data(session_id, pane_id, agent, approval, "menu")
     }
 
     #[test]
@@ -8649,6 +9007,7 @@ mod tests {
             "wA:p1",
             Some("Claude Code"),
             parts::dictionary_for(Some("claude")),
+            None,
             composer::descriptor(Some("Claude Code"), None),
         );
         assert_eq!(known["parts"], "dictionary");
@@ -8666,6 +9025,7 @@ mod tests {
             "wA:p2",
             Some("aider"),
             parts::dictionary_for(Some("aider")),
+            None,
             composer::descriptor(Some("aider"), None),
         );
         assert_eq!(unknown["parts"], "text");
@@ -8760,6 +9120,30 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&json!("tool-block")));
+        // v2's one addition to the closed set. It has to be in the spec's enum
+        // or a client has no way to learn the type exists without meeting one.
+        assert!(part["properties"]["type"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("approval")));
+        assert!(part["properties"]["approval_id"].is_object());
+        assert_eq!(
+            part["properties"]["options"]["items"]["required"],
+            json!(["index", "label", "decision"])
+        );
+        // Which source answered is a value of an enum that already had two.
+        let pane = &parts["responses"]["200"]["content"]["application/json"]["schema"]
+            ["properties"]["data"]["properties"]["pane"]["properties"];
+        assert_eq!(
+            pane["parts"]["enum"],
+            json!(["native", "dictionary", "text"])
+        );
+        assert!(pane["native"].is_object());
+        assert_eq!(
+            parts["responses"]["200"]["content"]["application/json"]["schema"]["properties"]
+                ["data"]["properties"]["source"]["enum"],
+            json!(["recent-unwrapped", "native"])
+        );
         // The composer descriptor rides on the pane, and its source vocabulary
         // is closed the same way the part types are.
         let composer = &parts["responses"]["200"]["content"]["application/json"]["schema"]

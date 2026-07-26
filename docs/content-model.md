@@ -1,4 +1,4 @@
-# Unified Content Model (RFC, v1 draft)
+# Unified Content Model (RFC, v2 draft)
 
 The gateway normalizes every agent's output and every artifact it produces into
 one versioned schema. The app couples to this schema only: **adding a new agent
@@ -25,7 +25,7 @@ model, not new protocols.
 
 ```json
 {
-  "schema_version": "1.3.0",
+  "schema_version": "1.4.0",
   "capabilities": { "parts": true, "assets": true, "image_upload": true,
                     "composer": true },
   "data": { }
@@ -40,13 +40,17 @@ endpoint and flipped that flag, and changed nothing about the 1.0.0 payloads.
 payload changed shape. 1.3.0 adds the composer capabilities — a `composer`
 object on the pane descriptor and the file search endpoint — and again changes
 no existing payload: a 1.2.0 client reads a 1.3.0 response unchanged and simply
-does not see the new field. The gateway's own `apiVersion` stays 1.4.0 — no
-route, and no field of any route, moved.
+does not see the new field. 1.4.0 is the v2 slice: native protocol adapters, so
+a pane may answer `parts: "native"` — a third value of an enum that already had
+two — and the closed part set gains `approval`, which an older client renders
+through `fallback_text` exactly as rule 1 promises. The gateway's own
+`apiVersion` stays 1.4.0 — no route, and no field of any route, moved.
 
 `capabilities` is also exposed per pane (agent kind detection may vary):
 
 ```json
 { "pane_id": "wM:p1", "agent": "claude-code", "parts": "dictionary",
+  "native": null,
   "image_input": "file-path",
   "composer": {
     "version": 1, "table": "claude", "captured_from": "claude 2.1.220",
@@ -77,6 +81,7 @@ client can correlate with the raw terminal view).
 | `status` | `text, spinner: bool` | transient agent state line |
 | `prompt` | `text` | the input line content |
 | `asset-ref` | `asset_id` | inline reference to an Asset (image, file) |
+| `approval` | `approval_id, prompt, tool?, context: string[], options: [{index, label, decision}]` | v1.4: a request the agent is blocked on |
 
 Example:
 
@@ -140,6 +145,102 @@ in exactly one part's `fallback_text`, in order. A dictionary that drifts when a
 agent upgrades therefore loses structure and cannot lose content. The fixture
 snapshots in `tests/fixtures/` pin each dictionary's output so that drift shows
 up as a reviewable diff; re-pin with `UPDATE_PART_SNAPSHOTS=1 cargo test`.
+
+## Native protocol adapters (v1.4)
+
+Some agents leave more behind than a screen. opencode runs an HTTP server beside
+its TUI, and Codex speaks a JSON-RPC app-server. Where one of those answers,
+reading it beats reading the terminal: a tool's **exit code**, the **patch** an
+edit produced, the **checklist** a todo write submitted and any **pending
+permission** arrive as data rather than as glyphs a table has to infer from.
+
+`src/native.rs` is one adapter per protocol, keyed the same way the dictionaries
+and the composer tables are. What it emits is the same closed part set through
+the same `Part` type — an adapter has no way to invent a type, because it builds
+parts through `parts::Assembler` and the assembler only knows the set in the
+table above.
+
+| adapter | protocol | read off |
+|---|---|---|
+| `opencode` | opencode server API (`GET /doc` OpenAPI 3.1) | opencode 1.18.0's own server, live |
+| `codex` | app-server JSON-RPC (`codex app-server generate-json-schema`) | not wired yet |
+
+The mapping, and where each piece comes from:
+
+| opencode | part | source of truth |
+|---|---|---|
+| `text` on a user message | `prompt` | `Message.info.role` |
+| `text`, `reasoning` | `text` | reasoning has no type in the closed set, so it degrades exactly as a drawn thinking tree does |
+| `tool` | `tool-block` | `ToolPart.tool`, `ToolState.title` for the input, `ToolState.output` for the result |
+| `tool` status | `ok` / `error` / `running` | `ToolState.status`, and `metadata.exit` where a shell tool reported one |
+| `tool` with `metadata.todos` | `todo` | the payload's shape, not the tool's name |
+| `tool` with `metadata.filediff` | `diff` beside its block | `filediff.file` and `filediff.patch` |
+| `PermissionRequest` | `approval` | `GET /permission`, filtered to the pane's session |
+| `step-start`, `step-finish`, `snapshot`, `agent`, `compaction`, `retry` | — | opencode's own renderer state; no text a user reads |
+
+### The invariants on a path with no terminal
+
+Both hard rules are stated in terms of source rows, and a protocol has none. The
+adapter therefore **renders** each part into lines and makes that rendering the
+source: `parts::Assembler` appends the lines to one transcript, pins the part's
+span to the rows they landed on, and sets `fallback_text` to those rows verbatim.
+Byte fidelity and per-line coverage then hold *by construction*, and the same
+two tests check an adapter that check a dictionary. The rendering deliberately
+imitates what the dictionaries read back — `Tool(input)` over indented results,
+`☐`/`☑` for a checklist — so a client showing `fallback_text` cannot tell which
+source answered.
+
+`range` is the one thing that means something different: for a dictionary read
+it is terminal rows, for a native read it is rows of that rendering, which a
+client reconstructs by joining the parts' `fallback_text` with newlines.
+`data.pane.parts` says which, and `data.source` says it again on the payload.
+
+### Detection, and why it is configuration
+
+`data.pane.parts` is `"native"` only when a protocol actually answered.
+Discovery is a configured endpoint (`HERDR_GATEWAY_OPENCODE_URL`) plus a probe
+of `GET /global/health`, not a port scan: opencode binds an ephemeral port by
+default and publishes it nowhere the gateway may read, and guessing at ports on
+the host is exactly the kind of probing the rest of this gateway refuses to do.
+Every step may fail — no endpoint, nothing listening, no session in this pane's
+workspace — and every failure falls through to the dictionary. **A native
+adapter can add structure to a pane and can never take one away**, which is what
+makes it safe to ship before every agent has one.
+
+## The `approval` part (v1.4)
+
+Approvals shipped in v1.1 as their own endpoint precisely because the part set
+was closed and spending a type on them was a v2 decision. v1.4 spends it, under
+the same rules as every other addition: closed set, mandatory `fallback_text`,
+minor bump.
+
+```json
+{ "type": "approval", "approval_id": "per_f9f2…",
+  "prompt": "Allow bash?", "tool": "bash",
+  "context": ["echo native-approval-probe"],
+  "options": [ { "index": 1, "label": "Approve", "decision": "allow" },
+               { "index": 2, "label": "Approve and don't ask again", "decision": "allow_always" },
+               { "index": 3, "label": "Deny", "decision": "deny" } ],
+  "fallback_text": "Allow bash?\n  echo native-approval-probe\n1. Approve\n2. Approve and don't ask again\n3. Deny" }
+```
+
+Three things are deliberate. The **decision vocabulary is the one the drawn-menu
+detector already speaks**, so a client dispatches on one set of words whichever
+source raised the request. The **labels are the gateway's own**, never the
+agent's — an agent's wording for "always" routinely embeds the command it would
+save (`don't ask again for: npm install *`), which is the same reason push
+payloads carry no agent text. And the **`fallback_text` is the menu the agent
+would have drawn**, so a client that has never heard of the type still shows the
+user the question and the answers.
+
+It is emitted **where an agent exposes approval state**, which today means the
+native path. A pane read through a marker dictionary keeps its menu on
+`GET/POST .../approval`: the menu is already transcript rows there, and the
+approval endpoint carries the cursor position and the fingerprint that a drawn
+menu needs and a protocol does not. The approval endpoints are native-aware too
+— for a pane with a live adapter they answer from the protocol and reply by
+request id, so answering sends **no keystrokes** and cannot land on the wrong
+row because the menu moved between the read and the answer.
 
 ## Composer capabilities (v1.3)
 
@@ -242,8 +343,14 @@ will stream something renderable.
    workspace's own skills and commands discovered under the asset fence, and
    the `@` file search endpoint. Additive: the pane descriptor gains a field and
    one endpoint appears, and no existing payload changed shape.
-5. **v2 — native protocol adapters** (opencode server, codex app-server) feed
-   the same parts; approvals arrive as a new part type behind a minor bump.
+5. **v1.4 / v2 — native protocol adapters.** The opencode server adapter ships,
+   pinned to a session captured off opencode 1.18.0's own server, and the
+   `approval` part type lands with it. Codex's app-server is the next one: its
+   protocol is generated locally (`codex app-server generate-json-schema`, codex
+   0.145.0), so the table above can be written from the schema rather than from
+   captured output — but it is stdio JSON-RPC per process rather than one HTTP
+   server per host, so attaching to the app-server a pane is already talking to
+   is an open question the opencode adapter did not have to answer.
 
 ## Non-goals (v1)
 

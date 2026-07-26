@@ -1,0 +1,283 @@
+[
+  {
+    "fallback_text": "Use your todo tool to plan three steps, then run `wc -l Cargo.toml` with bash, then read the first 20 lines of Cargo.toml, then create a file /tmp/native-probe.txt containing the word hello, then edit that file to say hello world. Finally summarise in two sentences.",
+    "range": {
+      "end": 0,
+      "start": 0
+    },
+    "text": "Use your todo tool to plan three steps, then run `wc -l Cargo.toml` with bash, then read the first 20 lines of Cargo.toml, then create a file /tmp/native-probe.txt containing the word hello, then edit that file to say hello world. Finally summarise in two sentences.",
+    "type": "prompt"
+  },
+  {
+    "fallback_text": "The user wants me to:\n1. Use the todo tool to plan three steps\n2. Run `wc -l Cargo.toml` with bash\n3. Read the first 20 lines of Cargo.toml\n4. Create a file /tmp/native-probe.txt containing the word hello\n5. Edit that file to say hello world\n6. Summarize in two sentences\n\nLet me start by creating the todo list and then proceed with the tasks.",
+    "markdown": "The user wants me to:\n1. Use the todo tool to plan three steps\n2. Run `wc -l Cargo.toml` with bash\n3. Read the first 20 lines of Cargo.toml\n4. Create a file /tmp/native-probe.txt containing the word hello\n5. Edit that file to say hello world\n6. Summarize in two sentences\n\nLet me start by creating the todo list and then proceed with the tasks.",
+    "range": {
+      "end": 10,
+      "start": 2
+    },
+    "type": "text"
+  },
+  {
+    "fallback_text": "☐ Plan three steps using the todo tool\n☐ Run `wc -l Cargo.toml` and read first 20 lines of Cargo.toml\n☐ Create /tmp/native-probe.txt with 'hello', then edit it to 'hello world', then summarize",
+    "items": [
+      {
+        "done": false,
+        "text": "Plan three steps using the todo tool"
+      },
+      {
+        "done": false,
+        "text": "Run `wc -l Cargo.toml` and read first 20 lines of Cargo.toml"
+      },
+      {
+        "done": false,
+        "text": "Create /tmp/native-probe.txt with 'hello', then edit it to 'hello world', then summarize"
+      }
+    ],
+    "range": {
+      "end": 14,
+      "start": 12
+    },
+    "type": "todo"
+  },
+  {
+    "fallback_text": "The first todo is done - I planned three steps. Now I need to mark it complete and proceed with the next two tasks. Let me run the bash command and read Cargo.toml in parallel, since they're independent.",
+    "markdown": "The first todo is done - I planned three steps. Now I need to mark it complete and proceed with the next two tasks. Let me run the bash command and read Cargo.toml in parallel, since they're independent.",
+    "range": {
+      "end": 16,
+      "start": 16
+    },
+    "type": "text"
+  },
+  {
+    "fallback_text": "☑ Plan three steps using the todo tool\n☐ Run `wc -l Cargo.toml` and read first 20 lines of Cargo.toml\n☐ Create /tmp/native-probe.txt with 'hello', then edit it to 'hello world', then summarize",
+    "items": [
+      {
+        "done": true,
+        "text": "Plan three steps using the todo tool"
+      },
+      {
+        "done": false,
+        "text": "Run `wc -l Cargo.toml` and read first 20 lines of Cargo.toml"
+      },
+      {
+        "done": false,
+        "text": "Create /tmp/native-probe.txt with 'hello', then edit it to 'hello world', then summarize"
+      }
+    ],
+    "range": {
+      "end": 20,
+      "start": 18
+    },
+    "type": "todo"
+  },
+  {
+    "fallback_text": "Now I need to run `wc -l Cargo.toml` and read the first 20 lines of Cargo.toml. These are independent operations so I can run them in parallel.",
+    "markdown": "Now I need to run `wc -l Cargo.toml` and read the first 20 lines of Cargo.toml. These are independent operations so I can run them in parallel.",
+    "range": {
+      "end": 22,
+      "start": 22
+    },
+    "type": "text"
+  },
+  {
+    "fallback_text": "bash(wc -l Cargo.toml)\n        28 Cargo.toml",
+    "input": "wc -l Cargo.toml",
+    "range": {
+      "end": 25,
+      "start": 24
+    },
+    "result": [
+      "      28 Cargo.toml"
+    ],
+    "status": "ok",
+    "tool": "bash",
+    "truncated": false,
+    "type": "tool-block"
+  },
+  {
+    "fallback_text": "read(Cargo.toml)\n  <path>/Users/okk/.repos/herdr-gateway-wt-native/Cargo.toml</path>\n  <type>file</type>\n  <content>\n  1: [package]\n  2: name = \"herdr-gateway\"\n  3: version = \"0.5.0\"\n  4: edition = \"2021\"\n  5: license = \"MIT\"\n  6: description = \"Token-protected mobile gateway for Herdr, the terminal workspace manager for AI coding agents.\"\n  7: repository = \"https://github.com/BANG88/herdr-gateway\"\n  8: readme = \"README.md\"\n  9: keywords = [\"herdr\", \"terminal\", \"gateway\", \"tailscale\", \"cli\"]\n  10: categories = [\"command-line-utilities\"]\n  11: \n  12: [dependencies]\n  13: anyhow = \"1.0.103\"\n  14: async-stream = \"0.3.6\"\n  15: axum = { version = \"0.8.9\", features = [\"multipart\"] }\n  16: base64 = \"0.22.1\"\n  17: clap = { version = \"4.6.2\", features = [\"derive\"] }\n  18: crossterm = \"0.29.0\"\n  19: dirs = \"6.0.0\"\n  20: libc = \"0.2.178\"\n  \n  (Showing lines 1-20 of 28. Use offset=21 to continue.)\n  </content>",
+    "input": "Cargo.toml",
+    "range": {
+      "end": 53,
+      "start": 27
+    },
+    "result": [
+      "<path>/Users/okk/.repos/herdr-gateway-wt-native/Cargo.toml</path>",
+      "<type>file</type>",
+      "<content>",
+      "1: [package]",
+      "2: name = \"herdr-gateway\"",
+      "3: version = \"0.5.0\"",
+      "4: edition = \"2021\"",
+      "5: license = \"MIT\"",
+      "6: description = \"Token-protected mobile gateway for Herdr, the terminal workspace manager for AI coding agents.\"",
+      "7: repository = \"https://github.com/BANG88/herdr-gateway\"",
+      "8: readme = \"README.md\"",
+      "9: keywords = [\"herdr\", \"terminal\", \"gateway\", \"tailscale\", \"cli\"]",
+      "10: categories = [\"command-line-utilities\"]",
+      "11: ",
+      "12: [dependencies]",
+      "13: anyhow = \"1.0.103\"",
+      "14: async-stream = \"0.3.6\"",
+      "15: axum = { version = \"0.8.9\", features = [\"multipart\"] }",
+      "16: base64 = \"0.22.1\"",
+      "17: clap = { version = \"4.6.2\", features = [\"derive\"] }",
+      "18: crossterm = \"0.29.0\"",
+      "19: dirs = \"6.0.0\"",
+      "20: libc = \"0.2.178\"",
+      "",
+      "(Showing lines 1-20 of 28. Use offset=21 to continue.)",
+      "</content>"
+    ],
+    "status": "ok",
+    "tool": "read",
+    "truncated": true,
+    "type": "tool-block"
+  },
+  {
+    "fallback_text": "Good, I've completed the second todo. Now I need to:\n1. Mark the second todo as completed\n2. Mark the third todo as in_progress\n3. Create /tmp/native-probe.txt with \"hello\"\n4. Edit it to say \"hello world\"\n5. Summarize in two sentences\n\nLet me first create the file, then edit it.",
+    "markdown": "Good, I've completed the second todo. Now I need to:\n1. Mark the second todo as completed\n2. Mark the third todo as in_progress\n3. Create /tmp/native-probe.txt with \"hello\"\n4. Edit it to say \"hello world\"\n5. Summarize in two sentences\n\nLet me first create the file, then edit it.",
+    "range": {
+      "end": 62,
+      "start": 55
+    },
+    "type": "text"
+  },
+  {
+    "fallback_text": "☑ Plan three steps using the todo tool\n☑ Run `wc -l Cargo.toml` and read first 20 lines of Cargo.toml\n☐ Create /tmp/native-probe.txt with 'hello', then edit it to 'hello world', then summarize",
+    "items": [
+      {
+        "done": true,
+        "text": "Plan three steps using the todo tool"
+      },
+      {
+        "done": true,
+        "text": "Run `wc -l Cargo.toml` and read first 20 lines of Cargo.toml"
+      },
+      {
+        "done": false,
+        "text": "Create /tmp/native-probe.txt with 'hello', then edit it to 'hello world', then summarize"
+      }
+    ],
+    "range": {
+      "end": 66,
+      "start": 64
+    },
+    "type": "todo"
+  },
+  {
+    "fallback_text": "Now I need to create /tmp/native-probe.txt with \"hello\". I should use bash to create the file, then edit it. Let me first write the file using bash (since Write tool could work too, but bash with echo is simpler for a temp file).",
+    "markdown": "Now I need to create /tmp/native-probe.txt with \"hello\". I should use bash to create the file, then edit it. Let me first write the file using bash (since Write tool could work too, but bash with echo is simpler for a temp file).",
+    "range": {
+      "end": 68,
+      "start": 68
+    },
+    "type": "text"
+  },
+  {
+    "fallback_text": "bash(echo \"hello\" > /tmp/native-probe.txt)\n  (no output)",
+    "input": "echo \"hello\" > /tmp/native-probe.txt",
+    "range": {
+      "end": 71,
+      "start": 70
+    },
+    "result": [
+      "(no output)"
+    ],
+    "status": "ok",
+    "tool": "bash",
+    "truncated": false,
+    "type": "tool-block"
+  },
+  {
+    "fallback_text": "File created with \"hello\". Now I need to edit it to say \"hello world\". Let me use the edit tool for this, and also verify the file content first.",
+    "markdown": "File created with \"hello\". Now I need to edit it to say \"hello world\". Let me use the edit tool for this, and also verify the file content first.",
+    "range": {
+      "end": 73,
+      "start": 73
+    },
+    "type": "text"
+  },
+  {
+    "fallback_text": "edit(../../../../tmp/native-probe.txt)\n  Edit applied successfully.",
+    "input": "../../../../tmp/native-probe.txt",
+    "range": {
+      "end": 76,
+      "start": 75
+    },
+    "result": [
+      "Edit applied successfully."
+    ],
+    "status": "ok",
+    "tool": "edit",
+    "truncated": false,
+    "type": "tool-block"
+  },
+  {
+    "fallback_text": "Index: /tmp/native-probe.txt\n===================================================================\n--- /tmp/native-probe.txt\n+++ /tmp/native-probe.txt\n@@ -1,1 +1,1 @@\n-hello\n+hello world",
+    "file": "/tmp/native-probe.txt",
+    "hunks": [
+      "Index: /tmp/native-probe.txt",
+      "===================================================================",
+      "--- /tmp/native-probe.txt",
+      "+++ /tmp/native-probe.txt",
+      "@@ -1,1 +1,1 @@",
+      "-hello",
+      "+hello world"
+    ],
+    "range": {
+      "end": 84,
+      "start": 78
+    },
+    "type": "diff"
+  },
+  {
+    "fallback_text": "All tasks are done. Let me mark the third todo as completed and summarize in two sentences.",
+    "markdown": "All tasks are done. Let me mark the third todo as completed and summarize in two sentences.",
+    "range": {
+      "end": 86,
+      "start": 86
+    },
+    "type": "text"
+  },
+  {
+    "fallback_text": "☑ Plan three steps using the todo tool\n☑ Run `wc -l Cargo.toml` and read first 20 lines of Cargo.toml\n☑ Create /tmp/native-probe.txt with 'hello', then edit it to 'hello world', then summarize",
+    "items": [
+      {
+        "done": true,
+        "text": "Plan three steps using the todo tool"
+      },
+      {
+        "done": true,
+        "text": "Run `wc -l Cargo.toml` and read first 20 lines of Cargo.toml"
+      },
+      {
+        "done": true,
+        "text": "Create /tmp/native-probe.txt with 'hello', then edit it to 'hello world', then summarize"
+      }
+    ],
+    "range": {
+      "end": 90,
+      "start": 88
+    },
+    "type": "todo"
+  },
+  {
+    "fallback_text": "All tasks are complete. Let me summarize:\n1. Planned three steps using the todo tool.\n2. Ran `wc -l Cargo.toml` (28 lines) and read the first 20 lines of Cargo.toml.\n3. Created /tmp/native-probe.txt with \"hello\", then edited it to \"hello world\".\n\nNow I need to summarise in two sentences.",
+    "markdown": "All tasks are complete. Let me summarize:\n1. Planned three steps using the todo tool.\n2. Ran `wc -l Cargo.toml` (28 lines) and read the first 20 lines of Cargo.toml.\n3. Created /tmp/native-probe.txt with \"hello\", then edited it to \"hello world\".\n\nNow I need to summarise in two sentences.",
+    "range": {
+      "end": 97,
+      "start": 92
+    },
+    "type": "text"
+  },
+  {
+    "fallback_text": "All three steps are complete. Cargo.toml has 28 lines and defines the `herdr-gateway` Rust package (v0.5.0, MIT license, command-line utilities). The file `/tmp/native-probe.txt` was created with \"hello\" then edited in-place to read \"hello world\".",
+    "markdown": "All three steps are complete. Cargo.toml has 28 lines and defines the `herdr-gateway` Rust package (v0.5.0, MIT license, command-line utilities). The file `/tmp/native-probe.txt` was created with \"hello\" then edited in-place to read \"hello world\".",
+    "range": {
+      "end": 99,
+      "start": 99
+    },
+    "type": "text"
+  }
+]

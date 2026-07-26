@@ -191,10 +191,51 @@ pub struct TodoItem {
     done: bool,
 }
 
+impl TodoItem {
+    pub fn new(text: impl Into<String>, done: bool) -> Self {
+        TodoItem {
+            text: text.into(),
+            done,
+        }
+    }
+}
+
+/// One answer offered by an `approval` part.
+///
+/// `decision` is the closed vocabulary `approvals.rs` already reads off a drawn
+/// menu (`allow`, `allow_always`, `deny`, `other`), so a client dispatches on
+/// one set of words whichever source raised the request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalChoice {
+    pub index: u32,
+    pub label: String,
+    pub decision: &'static str,
+}
+
+/// A permission request an agent is blocked on, carried inside the transcript.
+///
+/// Only a source that *reports* approval state can fill this in; a marker
+/// dictionary reads a drawn menu off the screen instead, and that keeps riding
+/// the approvals endpoint (see `docs/content-model.md`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalRequest {
+    /// The id to answer with. Opaque to the client and to this module.
+    pub id: String,
+    /// The question. Written by the gateway from the protocol's own action
+    /// name, never quoted out of a terminal.
+    pub prompt: String,
+    /// The action or tool the request is about, as the protocol named it.
+    pub tool: Option<String>,
+    /// What is being asked for -- the command, the path, the host -- verbatim
+    /// from the protocol.
+    pub context: Vec<String>,
+    pub options: Vec<ApprovalChoice>,
+}
+
 /// A tool block's outcome, decided from its result rather than from any exit
 /// code: the terminal never carried one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ToolStatus {
+pub enum ToolStatus {
     Ok,
     Error,
     Running,
@@ -239,6 +280,12 @@ enum Body {
     Prompt {
         text: String,
     },
+    /// v2 (schema 1.4.0). A closed-set addition: an old client does not know
+    /// the type and renders `fallback_text`, which is the request drawn as the
+    /// numbered menu it would have seen on the terminal anyway.
+    Approval {
+        request: ApprovalRequest,
+    },
 }
 
 /// One normalized part, plus the source rows it came from.
@@ -267,6 +314,7 @@ impl Part {
             Body::Todo { .. } => "todo",
             Body::Status { .. } => "status",
             Body::Prompt { .. } => "prompt",
+            Body::Approval { .. } => "approval",
         }
     }
 
@@ -310,6 +358,22 @@ impl Part {
                 "spinner": spinner,
             }),
             Body::Prompt { text } => json!({ "type": "prompt", "text": text }),
+            Body::Approval { request } => json!({
+                "type": "approval",
+                "approval_id": request.id,
+                "prompt": request.prompt,
+                "tool": request.tool,
+                "context": request.context,
+                "options": request
+                    .options
+                    .iter()
+                    .map(|option| json!({
+                        "index": option.index,
+                        "label": option.label,
+                        "decision": option.decision,
+                    }))
+                    .collect::<Vec<Value>>(),
+            }),
         };
         let map = value.as_object_mut().expect("part serializes to an object");
         map.insert("fallback_text".into(), json!(self.fallback_text));
@@ -318,6 +382,134 @@ impl Part {
             json!({ "start": self.start, "end": self.end }),
         );
         value
+    }
+}
+
+/// Builds parts from a source that is not a terminal.
+///
+/// A native protocol hands structure over directly, so there are no source rows
+/// to span and no drawn lines to fall back to -- and both invariants in this
+/// module's header are stated in exactly those terms. Rather than exempt the
+/// native path from them, an adapter *renders* each part into lines and this
+/// type makes that rendering the source: the lines go into one transcript, the
+/// part's span is pinned to the rows they landed on, and its `fallback_text` is
+/// those rows verbatim. Both invariants then hold by construction, and the same
+/// tests that check a dictionary check an adapter unchanged.
+///
+/// The rendering is deliberately the shape the dictionaries read back off a
+/// terminal -- `Tool(input)` over indented results, `☐`/`☑` for a checklist --
+/// so a client showing `fallback_text` cannot tell which source answered.
+#[derive(Default)]
+pub struct Assembler {
+    lines: Vec<String>,
+    parts: Vec<Part>,
+}
+
+impl Assembler {
+    pub fn new() -> Self {
+        Assembler::default()
+    }
+
+    /// Append a part and the rows it renders to. A part that renders to nothing
+    /// is dropped rather than pinned to an empty span.
+    fn push(&mut self, body: Body, rendered: Vec<String>) {
+        if rendered.iter().all(|line| line.trim().is_empty()) {
+            return;
+        }
+        // One blank row between parts, so the transcript a client would see if
+        // it pasted every `fallback_text` together reads the way a pane does.
+        // Blank rows belong to no part, which is what the coverage invariant
+        // says about a terminal read too.
+        if !self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        let start = self.lines.len();
+        self.lines.extend(rendered);
+        let end = self.lines.len() - 1;
+        self.parts.push(Part {
+            body,
+            fallback_text: self.lines[start..=end].join("\n"),
+            start,
+            end,
+        });
+    }
+
+    pub fn text(&mut self, markdown: &str) {
+        let markdown = markdown.trim_end().to_owned();
+        let rendered = markdown.lines().map(str::to_owned).collect();
+        self.push(Body::Text { markdown }, rendered);
+    }
+
+    pub fn prompt(&mut self, text: &str) {
+        let text = text.trim_end().to_owned();
+        let rendered = text.lines().map(str::to_owned).collect();
+        self.push(Body::Prompt { text }, rendered);
+    }
+
+    pub fn tool_block(
+        &mut self,
+        tool: &str,
+        input: &str,
+        result: Vec<String>,
+        status: ToolStatus,
+        truncated: bool,
+    ) {
+        let mut rendered: Vec<String> = format!("{tool}({input})")
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        rendered.extend(result.iter().map(|line| format!("  {line}")));
+        self.push(
+            Body::ToolBlock {
+                tool: tool.to_owned(),
+                input: input.to_owned(),
+                result,
+                status,
+                truncated,
+            },
+            rendered,
+        );
+    }
+
+    pub fn diff(&mut self, file: Option<String>, hunks: Vec<String>) {
+        let rendered = hunks.clone();
+        self.push(Body::Diff { file, hunks }, rendered);
+    }
+
+    pub fn todo(&mut self, items: Vec<TodoItem>) {
+        let rendered = items
+            .iter()
+            .map(|item| {
+                let box_glyph = if item.done { '☑' } else { '☐' };
+                format!("{box_glyph} {}", item.text)
+            })
+            .collect();
+        self.push(Body::Todo { items }, rendered);
+    }
+
+    /// A pending permission request. Rendered as the numbered menu an agent
+    /// would have drawn, so a client that does not know the type still shows
+    /// the user what is being asked and what the answers are.
+    pub fn approval(&mut self, request: ApprovalRequest) {
+        let mut rendered = vec![request.prompt.clone()];
+        rendered.extend(request.context.iter().map(|line| format!("  {line}")));
+        rendered.extend(
+            request
+                .options
+                .iter()
+                .map(|option| format!("{}. {}", option.index, option.label)),
+        );
+        self.push(Body::Approval { request }, rendered);
+    }
+
+    /// The rows every part was pinned to. The native path's answer to "the raw
+    /// terminal view", and what the invariant tests read.
+    pub fn transcript(&self) -> String {
+        self.lines.join("\n")
+    }
+
+    pub fn finish(self) -> Vec<Part> {
+        self.parts
     }
 }
 
