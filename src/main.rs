@@ -39,6 +39,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio_stream::Stream;
 
+mod parts;
 mod shortcuts;
 
 #[cfg(unix)]
@@ -57,6 +58,10 @@ const DEFAULT_PORT: u16 = 23847;
 // ceiling on a single read, and 1000 ran out after a few screens of an agent
 // transcript.
 const MAX_OUTPUT_LINES: u32 = 5000;
+/// Normalizing costs more than streaming text does, and a phone opens on the
+/// last screen or two, so the parts endpoint asks for less than the raw one by
+/// default. A client that wants the whole scrollback still says so.
+const PARTS_DEFAULT_LINES: u32 = 400;
 const MAX_SEND_TEXT_BYTES: usize = 64 * 1024;
 const PAIRING_CODE_CHARACTER_COUNT: usize = 8;
 const PAIRING_CODE_LENGTH: usize = PAIRING_CODE_CHARACTER_COUNT + 1;
@@ -81,7 +86,7 @@ const MANAGE_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 /// every pane or sending unchanged terminal frames over the network.
 const STREAM_OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(150);
 const STREAM_OUTPUT_READ_TIMEOUT: Duration = Duration::from_millis(100);
-const GATEWAY_API_VERSION: &str = "1.3.0";
+const GATEWAY_API_VERSION: &str = "1.4.0";
 const GATEWAY_API_MAJOR: u64 = 1;
 const HERDR_PROTOCOL_MIN: u64 = 17;
 const HERDR_PROTOCOL_MAX: u64 = 17;
@@ -98,9 +103,10 @@ const MAX_UPLOAD_NAME_CHARS: usize = 120;
 const UPLOAD_RETENTION: Duration = Duration::from_secs(48 * 60 * 60);
 const UPLOAD_GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// Version of the unified content model this gateway speaks. Declared on every
-/// asset envelope so a client renders what it knows and falls back for the
-/// rest; additive changes bump the minor.
-const CONTENT_SCHEMA_VERSION: &str = "1.0.0";
+/// content envelope so a client renders what it knows and falls back for the
+/// rest; additive changes bump the minor. 1.1.0 adds the parts endpoint, which
+/// is why `capabilities.parts` is now true: nothing in 1.0.0 changed shape.
+const CONTENT_SCHEMA_VERSION: &str = "1.1.0";
 /// A phone previews artifacts, it does not download archives. Anything larger
 /// is refused rather than streamed, so one request can never tie up the host.
 const MAX_ASSET_CONTENT_BYTES: u64 = 10 * 1024 * 1024;
@@ -148,6 +154,7 @@ const API_CAPABILITIES: &[&str] = &[
     "file_uploads",
     "one_time_pairing_codes",
     "pane_output_ansi",
+    "pane_parts",
     "pane_shortcuts",
     "configurable_agent_profiles",
     "per_device_tokens",
@@ -872,6 +879,10 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         .route(
             "/api/sessions/{session_id}/panes/{pane_id}/output",
             get(pane_output),
+        )
+        .route(
+            "/api/sessions/{session_id}/panes/{pane_id}/parts",
+            get(pane_parts),
         )
         .route(
             "/api/sessions/{session_id}/panes/{pane_id}/send-text",
@@ -3026,6 +3037,95 @@ async fn pane_output(
     call_session_method(&state.config, &session_id, "pane.read", params).await
 }
 
+#[derive(Debug, Deserialize)]
+struct PartsQuery {
+    #[serde(default)]
+    lines: Option<u32>,
+}
+
+/// The normalized transcript: the same text the raw output endpoint serves, read
+/// through the marker dictionary of whichever agent is in the pane.
+///
+/// Additive on purpose. The raw ANSI endpoints stay forever, so a client that
+/// dislikes what a dictionary made of a pane is one tap from the terminal view,
+/// and a pane running no agent -- or one no dictionary covers yet -- is answered
+/// with text parts rather than with an error.
+async fn pane_parts(
+    State(state): State<AppState>,
+    Path((session_id, pane_id)): Path<(String, String)>,
+    Query(query): Query<PartsQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let session = find_session(&state.config, &session_id)?.clone();
+    let lines = query
+        .lines
+        .unwrap_or(PARTS_DEFAULT_LINES)
+        .clamp(1, MAX_OUTPUT_LINES);
+
+    // Which agent is in the pane decides which dictionary reads it. Herdr
+    // reports it on the pane itself, the same field the key row resolves from.
+    // A pane.get that fails is not fatal here: no agent means text parts, which
+    // is exactly what an unreachable pane.get should degrade to.
+    let agent = herdr_request(&session, "pane.get", json!({ "pane_id": pane_id }))
+        .await
+        .ok()
+        .and_then(|response| {
+            let pane = response.pointer("/result/pane").unwrap_or(&response);
+            pane.get("agent").and_then(Value::as_str).map(str::to_owned)
+        })
+        .filter(|agent| !agent.is_empty());
+
+    // `recent_unwrapped` is the only source worth normalizing: the dictionaries
+    // key off line starts, and it is the one source where a long line is one
+    // line rather than however many the pane happens to be wide.
+    let read = herdr_request(
+        &session,
+        "pane.read",
+        json!({
+            "pane_id": pane_id,
+            "source": "recent_unwrapped",
+            "lines": lines,
+            "format": "text"
+        }),
+    )
+    .await
+    .map_err(|err| {
+        eprintln!("Herdr request pane.read failed: {err:#}");
+        api_error(
+            StatusCode::BAD_GATEWAY,
+            "herdr_unavailable",
+            "Herdr is unavailable",
+        )
+    })?;
+    let text = pane_read_text(&read).unwrap_or_default();
+    let revision = ["/result/read/revision", "/result/revision"]
+        .into_iter()
+        .find_map(|pointer| read.pointer(pointer).and_then(Value::as_u64));
+
+    let dictionary = parts::dictionary_for(agent.as_deref());
+    let normalized = parts::normalize_json(&text, dictionary);
+
+    Ok(Json(content_envelope(json!({
+        "session_id": session_id,
+        "pane_id": pane_id,
+        "source": "recent-unwrapped",
+        "lines": lines,
+        "revision": revision,
+        // Per-pane capabilities, because agent detection varies pane to pane:
+        // "dictionary" means the parts are typed, "text" means this pane fell
+        // back to prose and a client should not wait for tool blocks.
+        "pane": {
+            "pane_id": pane_id,
+            "agent": agent,
+            "parts": if dictionary.is_some() { "dictionary" } else { "text" },
+            "dictionary": dictionary.map(|dictionary| dictionary.id),
+            "image_input": "file-path",
+        },
+        "parts": normalized,
+    }))))
+}
+
 /// Which agents have a key row and command list, and where to add one. Lets a
 /// client tell "this agent has no profile yet" from "the gateway is old".
 async fn keymaps(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
@@ -4026,7 +4126,7 @@ fn asset_json(entry: &AssetEntry, asset_type: AssetType) -> Value {
 fn content_envelope(data: Value) -> Value {
     json!({
         "schema_version": CONTENT_SCHEMA_VERSION,
-        "capabilities": { "parts": false, "assets": true, "image_upload": true },
+        "capabilities": { "parts": true, "assets": true, "image_upload": true },
         "data": data,
     })
 }
@@ -5324,6 +5424,18 @@ fn openapi_spec() -> Value {
                     "responses": ok_response()
                 }
             },
+            "/api/sessions/{sessionId}/panes/{paneId}/parts": {
+                "get": {
+                    "summary": "Read the pane's transcript normalized into content-model parts",
+                    "description": "Unified content model, schema version 1.1.0. Same envelope as the asset endpoints: schema_version, capabilities, and data, with the ordered parts under data.parts. The text is the pane's own recent-unwrapped read, run through the marker dictionary of whichever agent Herdr reports on the pane -- Claude Code and Qoder today. Every part carries fallback_text, the source lines verbatim, so an unknown type still renders and a dictionary that drifts loses structure and never loses content. A pane running no agent, or an agent with no dictionary, is answered with text parts rather than with an error; data.pane.parts says which happened. The raw output endpoint is unchanged and remains the fallback path.",
+                    "parameters": [
+                        path_param("sessionId"),
+                        path_param("paneId"),
+                        query_param("lines", "How many lines of scrollback to normalize, 1 to 5000, default 400")
+                    ],
+                    "responses": parts_responses()
+                }
+            },
             "/api/sessions/{sessionId}/panes/{paneId}/send-text": {
                 "post": {
                     "summary": "Send text to a pane",
@@ -5491,6 +5603,74 @@ fn assets_responses() -> Value {
         })) } }
     });
     responses["404"] = json!({ "description": "Unknown session" });
+    responses
+}
+
+/// One part on the wire. Deliberately loose about the payload and strict about
+/// the two fields the contract rests on: `type`, so a client can dispatch, and
+/// `fallback_text`, so it can render whatever it could not dispatch on.
+fn part_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["type", "fallback_text"],
+        "properties": {
+            "type": {
+                "type": "string",
+                "enum": ["text", "tool-block", "diff", "todo", "table", "status", "prompt", "asset-ref"],
+                "description": "Closed set. A client that does not know a value renders fallback_text; new types arrive on a minor bump"
+            },
+            "fallback_text": { "type": "string", "description": "The source lines verbatim" },
+            "range": object_schema(&[("start", "integer"), ("end", "integer")], &["start", "end"]),
+            "markdown": { "type": "string", "description": "text: prose, rendered best-effort" },
+            "tool": { "type": "string", "description": "tool-block: the tool the agent named" },
+            "input": { "type": "string", "description": "tool-block: what it was called with" },
+            "result": { "type": "array", "items": { "type": "string" }, "description": "tool-block: the result lines" },
+            "status": { "type": "string", "enum": ["ok", "error", "running"], "description": "tool-block: read off the first result line; running means no result yet" },
+            "truncated": { "type": "boolean", "description": "tool-block: the agent printed an ellipsis, so this is not all of it" },
+            "file": { "type": ["string", "null"], "description": "diff: the file the block edited, when the tool named one" },
+            "hunks": { "type": "array", "items": { "type": "string" }, "description": "diff: the numbered source lines" },
+            "items": {
+                "type": "array",
+                "description": "todo: the checklist",
+                "items": object_schema(&[("text", "string"), ("done", "boolean")], &["text", "done"])
+            },
+            "text": { "type": "string", "description": "status and prompt: the line's content" },
+            "spinner": { "type": "boolean", "description": "status: the line is one of the agent's animated frames" }
+        }
+    })
+}
+
+fn parts_responses() -> Value {
+    let mut responses = ok_response();
+    responses["200"] = json!({
+        "description": "The pane's transcript as ordered parts",
+        "content": { "application/json": { "schema": content_envelope_schema(json!({
+            "type": "object",
+            "required": ["session_id", "pane_id", "parts", "pane"],
+            "properties": {
+                "session_id": { "type": "string" },
+                "pane_id": { "type": "string" },
+                "source": { "type": "string", "description": "Always recent-unwrapped: the dictionaries key off line starts" },
+                "lines": { "type": "integer", "description": "How many lines were read, echoed back" },
+                "revision": { "type": ["integer", "null"], "description": "Herdr's pane revision for this read, when it reported one" },
+                "pane": {
+                    "type": "object",
+                    "required": ["pane_id", "parts", "image_input"],
+                    "properties": {
+                        "pane_id": { "type": "string" },
+                        "agent": { "type": ["string", "null"], "description": "What Herdr reports is running in the pane" },
+                        "parts": { "type": "string", "enum": ["dictionary", "text"], "description": "dictionary: typed parts. text: no dictionary covers this pane, everything degraded to prose" },
+                        "dictionary": { "type": ["string", "null"], "description": "Which dictionary normalized it, for cache keys and bug reports" },
+                        "image_input": { "type": "string", "description": "How an image reaches this agent; file-path means upload first, then send the path" }
+                    }
+                },
+                "parts": { "type": "array", "items": part_schema() }
+            }
+        })) } }
+    });
+    responses["404"] = json!({ "description": "Unknown session" });
+    responses["502"] =
+        json!({ "description": "Herdr is unavailable, or the pane could not be read" });
     responses
 }
 
@@ -6646,6 +6826,17 @@ mod tests {
     }
 
     #[test]
+    fn the_content_envelope_declares_parts_at_the_version_that_added_them() {
+        // One envelope and one version across the content model: a client reads
+        // the version once and knows both endpoints answer it.
+        let envelope = content_envelope(json!({}));
+        assert_eq!(envelope["schema_version"], "1.1.0");
+        assert_eq!(envelope["capabilities"]["parts"], true);
+        assert_eq!(envelope["capabilities"]["assets"], true);
+        assert_eq!(envelope["capabilities"]["image_upload"], true);
+    }
+
+    #[test]
     fn an_asset_file_name_cannot_break_out_of_a_response_header() {
         assert_eq!(header_safe_name("report.md"), "report.md");
         assert_eq!(
@@ -6678,6 +6869,18 @@ mod tests {
             ["multipart/form-data"]
             .is_object());
         assert!(spec["paths"]["/api/sessions/{sessionId}/assets"]["get"].is_object());
+        let parts = &spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/parts"]["get"];
+        assert!(parts.is_object());
+        assert_eq!(parts["parameters"][2]["name"], "lines");
+        let part = &parts["responses"]["200"]["content"]["application/json"]["schema"]
+            ["properties"]["data"]["properties"]["parts"]["items"];
+        // A client dispatches on `type` and falls back on `fallback_text`, so
+        // the spec has to require exactly those two of every part.
+        assert_eq!(part["required"], json!(["type", "fallback_text"]));
+        assert!(part["properties"]["type"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("tool-block")));
         assert_eq!(
             spec["paths"]["/api/sessions/{sessionId}/assets"]["get"]["responses"]["200"]["content"]
                 ["application/json"]["schema"]["properties"]["schema_version"]["const"],

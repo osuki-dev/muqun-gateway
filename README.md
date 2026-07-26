@@ -259,6 +259,7 @@ Routes:
 - `POST /api/sessions/default/agents/:target/focus`
 - `POST /api/sessions/default/agents/:target/send`
 - `GET /api/sessions/default/panes/:paneId/output?source=recent-unwrapped&lines=200`
+- `GET /api/sessions/default/panes/:paneId/parts?lines=400`
 - `POST /api/sessions/default/panes/:paneId/send-text`
 - `POST /api/sessions/default/panes/:paneId/send-keys`
 - `POST /api/uploads`
@@ -284,8 +285,8 @@ and answer in its versioned envelope:
 
 ```json
 {
-  "schema_version": "1.0.0",
-  "capabilities": { "parts": false, "assets": true, "image_upload": true },
+  "schema_version": "1.1.0",
+  "capabilities": { "parts": true, "assets": true, "image_upload": true },
   "data": { "assets": [ { "id": "as_…", "path": "/Users/…/report.md",
     "name": "report.md", "kind": "markdown", "mime": "text/markdown; charset=utf-8",
     "size": 6180, "modified_unix_ms": 1785100000000,
@@ -319,6 +320,40 @@ inside a workspace root the session currently has: a symlink pointing out of the
 root, a traversal, and an unknown id all answer `404`, and no answer
 distinguishes them. Assets over 10 MiB answer `413`, and a binary asset answers
 `415` with its metadata and no body. Nothing about this API writes.
+
+### Parts
+
+`GET /api/sessions/default/panes/:paneId/parts` answers the same pane text the
+output endpoint serves, normalized into the content model's ordered parts and
+wrapped in the same envelope:
+
+```json
+{
+  "schema_version": "1.1.0",
+  "capabilities": { "parts": true, "assets": true, "image_upload": true },
+  "data": {
+    "pane_id": "wM:p1", "source": "recent-unwrapped", "lines": 400,
+    "pane": { "pane_id": "wM:p1", "agent": "claude", "parts": "dictionary",
+      "dictionary": "claude", "image_input": "file-path" },
+    "parts": [ { "type": "tool-block", "tool": "Bash", "input": "cargo test",
+      "result": ["test result: ok. 71 passed"], "status": "ok",
+      "truncated": false, "range": { "start": 12, "end": 13 },
+      "fallback_text": "⏺ Bash(cargo test)\n  ⎿  test result: ok. 71 passed" } ]
+  }
+}
+```
+
+Which agent is in the pane decides how it is read: Claude Code and Qoder CLI have
+marker dictionaries today (`docs/content-model.md` documents the glyph tables and
+the rules). A pane running no agent, or an agent no dictionary covers yet, is not
+an error -- it answers with `text` parts and says so in `data.pane.parts`.
+
+Every part carries `fallback_text`, the source lines verbatim, and every
+non-blank line of the read lands in exactly one part, in order, with a `range`
+that does not overlap its neighbours. So a part type a client does not know still
+renders, and a dictionary that drifts when an agent upgrades loses structure and
+cannot lose content. The raw output endpoint is unchanged and stays the fallback
+path forever.
 
 The gateway registers Muqun Expo push tokens and watches Herdr agent lifecycle
 events in the background. It sends a notification when an agent becomes
