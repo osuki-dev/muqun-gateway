@@ -1,0 +1,291 @@
+[
+  {
+    "fallback_text": "     + Thought: 480ms",
+    "markdown": "Thought: 480ms",
+    "range": {
+      "end": 1,
+      "start": 1
+    },
+    "type": "text"
+  },
+  {
+    "fallback_text": "     → Read kit",
+    "input": "kit",
+    "range": {
+      "end": 3,
+      "start": 3
+    },
+    "result": [],
+    "status": "ok",
+    "tool": "Read",
+    "truncated": false,
+    "type": "tool-block"
+  },
+  {
+    "fallback_text": "     + Thought: 471ms",
+    "markdown": "Thought: 471ms",
+    "range": {
+      "end": 5,
+      "start": 5
+    },
+    "type": "text"
+  },
+  {
+    "fallback_text": "     → Read kit/packages",
+    "input": "kit/packages",
+    "range": {
+      "end": 7,
+      "start": 7
+    },
+    "result": [],
+    "status": "ok",
+    "tool": "Read",
+    "truncated": false,
+    "type": "tool-block"
+  },
+  {
+    "fallback_text": "     + Thought: 572ms",
+    "markdown": "Thought: 572ms",
+    "range": {
+      "end": 9,
+      "start": 9
+    },
+    "type": "text"
+  },
+  {
+    "fallback_text": "     → Read kit/packages/ui",
+    "input": "kit/packages/ui",
+    "range": {
+      "end": 11,
+      "start": 11
+    },
+    "result": [],
+    "status": "ok",
+    "tool": "Read",
+    "truncated": false,
+    "type": "tool-block"
+  },
+  {
+    "fallback_text": "     → Read kit/packages/ui/src",
+    "input": "kit/packages/ui/src",
+    "range": {
+      "end": 12,
+      "start": 12
+    },
+    "result": [],
+    "status": "ok",
+    "tool": "Read",
+    "truncated": false,
+    "type": "tool-block"
+  },
+  {
+    "fallback_text": "     + Thought: 257ms",
+    "markdown": "Thought: 257ms",
+    "range": {
+      "end": 14,
+      "start": 14
+    },
+    "type": "text"
+  },
+  {
+    "fallback_text": "     → Read kit/packages/ui/src/components",
+    "input": "kit/packages/ui/src/components",
+    "range": {
+      "end": 16,
+      "start": 16
+    },
+    "result": [],
+    "status": "ok",
+    "tool": "Read",
+    "truncated": false,
+    "type": "tool-block"
+  },
+  {
+    "fallback_text": "     → Read kit/packages/ui/src/index.ts",
+    "input": "kit/packages/ui/src/index.ts",
+    "range": {
+      "end": 17,
+      "start": 17
+    },
+    "result": [],
+    "status": "ok",
+    "tool": "Read",
+    "truncated": false,
+    "type": "tool-block"
+  },
+  {
+    "fallback_text": "     ↳ Loaded kit/AGENTS.md",
+    "markdown": "Loaded kit/AGENTS.md",
+    "range": {
+      "end": 18,
+      "start": 18
+    },
+    "type": "text"
+  },
+  {
+    "fallback_text": "     + Thought: 508ms",
+    "markdown": "Thought: 508ms",
+    "range": {
+      "end": 20,
+      "start": 20
+    },
+    "type": "text"
+  },
+  {
+    "fallback_text": "     packages/ui/src/components/ 下目前有 59 个组件：",
+    "markdown": "packages/ui/src/components/ 下目前有 59 个组件：",
+    "range": {
+      "end": 22,
+      "start": 22
+    },
+    "type": "text"
+  },
+  {
+    "fallback_text": "     基础/布局： stack, surface, divider, responsive-container, responsive-grid, text, icon, image",
+    "markdown": "基础/布局： stack, surface, divider, responsive-container, responsive-grid, text, icon, image",
+    "range": {
+      "end": 24,
+      "start": 24
+    },
+    "type": "text"
+  },
+  {
+    "fallback_text": "     按钮/交互： button, pressable-card, spinner, haptics",
+    "markdown": "按钮/交互： button, pressable-card, spinner, haptics",
+    "range": {
+      "end": 26,
+      "start": 26
+    },
+    "type": "text"
+  },
+  {
+    "fallback_text": "     输入： input, textarea, select, checkbox, radio-group, toggle, otp-input, date-input, search-input, stepper,\n     field-group",
+    "markdown": "输入： input, textarea, select, checkbox, radio-group, toggle, otp-input, date-input, search-input, stepper,\nfield-group",
+    "range": {
+      "end": 29,
+      "start": 28
+    },
+    "type": "text"
+  },
+  {
+    "fallback_text": "     反馈/展示： alert, badge, tag, toast, tooltip, skeleton, loading-view, empty-state, error-view, progress-bar,\n     segmented-progress-bar, stat-row, metric-card, timeline, data-row, data-table",
+    "markdown": "反馈/展示： alert, badge, tag, toast, tooltip, skeleton, loading-view, empty-state, error-view, progress-bar,\nsegmented-progress-bar, stat-row, metric-card, timeline, data-row, data-table",
+    "range": {
+      "end": 32,
+      "start": 31
+    },
+    "type": "text"
+  },
+  {
+    "fallback_text": "     导航： tabs, segmented-control, top-bar, toolbar, pagination, menu",
+    "markdown": "导航： tabs, segmented-control, top-bar, toolbar, pagination, menu",
+    "range": {
+      "end": 34,
+      "start": 34
+    },
+    "type": "text"
+  },
+  {
+    "fallback_text": "     模态/浮层： dialog, modal, bottom-sheet, action-sheet, sheet-list-item",
+    "markdown": "模态/浮层： dialog, modal, bottom-sheet, action-sheet, sheet-list-item",
+    "range": {
+      "end": 36,
+      "start": 36
+    },
+    "type": "text"
+  },
+  {
+    "fallback_text": "     列表： list-item, section, avatar, avatar-group, card",
+    "markdown": "列表： list-item, section, avatar, avatar-group, card",
+    "range": {
+      "end": 38,
+      "start": 38
+    },
+    "type": "text"
+  },
+  {
+    "fallback_text": "     键盘： keyboard-avoiding-view, keyboard-aware-scroll-view, keyboard-sticky-view, keyboard-toolbar",
+    "markdown": "键盘： keyboard-avoiding-view, keyboard-aware-scroll-view, keyboard-sticky-view, keyboard-toolbar",
+    "range": {
+      "end": 40,
+      "start": 40
+    },
+    "type": "text"
+  },
+  {
+    "fallback_text": "     需要看某个组件的具体实现吗？",
+    "markdown": "需要看某个组件的具体实现吗？",
+    "range": {
+      "end": 42,
+      "start": 42
+    },
+    "type": "text"
+  },
+  {
+    "fallback_text": "     ▣  Build · DeepSeek V4 Flash Free · 20.7s",
+    "markdown": "▣  Build · DeepSeek V4 Flash Free · 20.7s",
+    "range": {
+      "end": 44,
+      "start": 44
+    },
+    "type": "text"
+  },
+  {
+    "fallback_text": "  ┃\n  ┃  kit 组件呢有哪些？ 是否完整了\n  ┃",
+    "range": {
+      "end": 48,
+      "start": 46
+    },
+    "text": "kit 组件呢有哪些？ 是否完整了",
+    "type": "prompt"
+  },
+  {
+    "fallback_text": "     + Thought: 1.1s",
+    "markdown": "Thought: 1.1s",
+    "range": {
+      "end": 50,
+      "start": 50
+    },
+    "type": "text"
+  },
+  {
+    "fallback_text": "     → Read kit/packages/kit-community",
+    "input": "kit/packages/kit-community",
+    "range": {
+      "end": 52,
+      "start": 52
+    },
+    "result": [],
+    "status": "ok",
+    "tool": "Read",
+    "truncated": false,
+    "type": "tool-block"
+  },
+  {
+    "fallback_text": "     + Thought: 60ms",
+    "markdown": "Thought: 60ms",
+    "range": {
+      "end": 54,
+      "start": 54
+    },
+    "type": "text"
+  },
+  {
+    "fallback_text": "  ┃\n  ┃\n  ┃\n  ┃  Build · DeepSeek V4 Flash Free OpenCode Zen · max",
+    "range": {
+      "end": 59,
+      "start": 56
+    },
+    "text": "Build · DeepSeek V4 Flash Free OpenCode Zen · max",
+    "type": "prompt"
+  },
+  {
+    "fallback_text": "  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n   /Users/okk/.osuki                                                                     16.4K (8%)  ctrl+p commands",
+    "markdown": "╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n /Users/okk/.osuki                                                                     16.4K (8%)  ctrl+p commands",
+    "range": {
+      "end": 61,
+      "start": 60
+    },
+    "type": "text"
+  }
+]

@@ -7,8 +7,8 @@ use std::process::{Command as ProcessCommand, Stdio};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::sync::{Arc, Mutex};
 use std::path::{Path as FsPath, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use anyhow::Context as _;
@@ -109,9 +109,12 @@ const UPLOAD_RETENTION: Duration = Duration::from_secs(48 * 60 * 60);
 const UPLOAD_GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// Version of the unified content model this gateway speaks. Declared on every
 /// content envelope so a client renders what it knows and falls back for the
-/// rest; additive changes bump the minor. 1.1.0 adds the parts endpoint, which
+/// rest; additive changes bump the minor. 1.1.0 added the parts endpoint, which
 /// is why `capabilities.parts` is now true: nothing in 1.0.0 changed shape.
-const CONTENT_SCHEMA_VERSION: &str = "1.1.0";
+/// 1.2.0 adds the Codex and opencode marker dictionaries -- more panes answer
+/// `parts: "dictionary"` where they used to answer `parts: "text"` -- and again
+/// changes no payload's shape.
+const CONTENT_SCHEMA_VERSION: &str = "1.2.0";
 /// A phone previews artifacts, it does not download archives. Anything larger
 /// is refused rather than streamed, so one request can never tie up the host.
 const MAX_ASSET_CONTENT_BYTES: u64 = 10 * 1024 * 1024;
@@ -6110,7 +6113,7 @@ fn openapi_spec() -> Value {
             "/api/sessions/{sessionId}/panes/{paneId}/parts": {
                 "get": {
                     "summary": "Read the pane's transcript normalized into content-model parts",
-                    "description": "Unified content model, schema version 1.1.0. Same envelope as the asset endpoints: schema_version, capabilities, and data, with the ordered parts under data.parts. The text is the pane's own recent-unwrapped read, run through the marker dictionary of whichever agent Herdr reports on the pane -- Claude Code and Qoder today. Every part carries fallback_text, the source lines verbatim, so an unknown type still renders and a dictionary that drifts loses structure and never loses content. A pane running no agent, or an agent with no dictionary, is answered with text parts rather than with an error; data.pane.parts says which happened. The raw output endpoint is unchanged and remains the fallback path.",
+                    "description": "Unified content model, schema version 1.2.0. Same envelope as the asset endpoints: schema_version, capabilities, and data, with the ordered parts under data.parts. The text is the pane's own recent-unwrapped read, run through the marker dictionary of whichever agent Herdr reports on the pane -- Claude Code, Qoder, Codex and opencode today. Every part carries fallback_text, the source lines verbatim, so an unknown type still renders and a dictionary that drifts loses structure and never loses content. A pane running no agent, or an agent with no dictionary, is answered with text parts rather than with an error; data.pane.parts says which happened. The raw output endpoint is unchanged and remains the fallback path.",
                     "parameters": [
                         path_param("sessionId"),
                         path_param("paneId"),
@@ -6196,7 +6199,8 @@ fn task_responses() -> Value {
     responses["400"] = json!({
         "description": "Unknown agent kind, malformed branch name, repo_path that is not a git checkout, or Herdr refusing the request. Nothing was created; a worktree this request made and could not attach a workspace to is removed again."
     });
-    responses["403"] = json!({ "description": "repo_path is not inside a workspace this session has open" });
+    responses["403"] =
+        json!({ "description": "repo_path is not inside a workspace this session has open" });
     responses["404"] = json!({ "description": "Unknown session" });
     responses["502"] = json!({ "description": "Herdr is unavailable, or answered without the fields its schema promises" });
     responses
@@ -6306,10 +6310,10 @@ fn upload_responses() -> Value {
             &["path", "name", "size", "mime"],
         ) } }
     });
-    responses["400"] = json!({ "description": "Malformed multipart body, or no usable file field" });
+    responses["400"] =
+        json!({ "description": "Malformed multipart body, or no usable file field" });
     responses["413"] = json!({ "description": "Upload is larger than 25 MiB" });
-    responses["415"] =
-        json!({ "description": "Content is an executable or script, or not an accepted image type" });
+    responses["415"] = json!({ "description": "Content is an executable or script, or not an accepted image type" });
     responses
 }
 
@@ -7019,13 +7023,17 @@ mod tests {
     fn uploads_are_typed_by_content_not_by_name() {
         assert_eq!(sniff_upload_kind(&png_bytes()).unwrap().mime, "image/png");
         assert_eq!(
-            sniff_upload_kind(b"\xff\xd8\xff\xe0\x00\x10JFIF").unwrap().mime,
+            sniff_upload_kind(b"\xff\xd8\xff\xe0\x00\x10JFIF")
+                .unwrap()
+                .mime,
             "image/jpeg"
         );
         assert_eq!(sniff_upload_kind(b"GIF89a....").unwrap().extension, "gif");
         assert_eq!(sniff_upload_kind(b"GIF87a....").unwrap().extension, "gif");
         assert_eq!(
-            sniff_upload_kind(b"RIFF\x24\x00\x00\x00WEBPVP8 ").unwrap().mime,
+            sniff_upload_kind(b"RIFF\x24\x00\x00\x00WEBPVP8 ")
+                .unwrap()
+                .mime,
             "image/webp"
         );
         assert_eq!(
@@ -7124,7 +7132,10 @@ mod tests {
         assert!(first.ends_with(".png"));
         assert_ne!(first, second, "each upload gets its own name");
         assert!(!first.contains('/') && !first.contains('\\') && !first.contains(".."));
-        assert_eq!(first.len(), "00000000-0000-0000-0000-000000000000.png".len());
+        assert_eq!(
+            first.len(),
+            "00000000-0000-0000-0000-000000000000.png".len()
+        );
     }
 
     #[test]
@@ -7595,7 +7606,7 @@ mod tests {
         // One envelope and one version across the content model: a client reads
         // the version once and knows both endpoints answer it.
         let envelope = content_envelope(json!({}));
-        assert_eq!(envelope["schema_version"], "1.1.0");
+        assert_eq!(envelope["schema_version"], "1.2.0");
         assert_eq!(envelope["capabilities"]["parts"], true);
         assert_eq!(envelope["capabilities"]["assets"], true);
         assert_eq!(envelope["capabilities"]["image_upload"], true);
@@ -7630,9 +7641,10 @@ mod tests {
         assert!(spec["paths"]["/api/devices/push-token"]["delete"].is_object());
         assert!(spec["paths"]["/api/sessions/{sessionId}/workspaces/{workspaceId}"].is_object());
         assert!(spec["paths"]["/api/sessions/{sessionId}/agents/{target}/send"].is_object());
-        assert!(spec["paths"]["/api/uploads"]["post"]["requestBody"]["content"]
-            ["multipart/form-data"]
-            .is_object());
+        assert!(
+            spec["paths"]["/api/uploads"]["post"]["requestBody"]["content"]["multipart/form-data"]
+                .is_object()
+        );
         assert!(spec["paths"]["/api/sessions/{sessionId}/assets"]["get"].is_object());
         let parts = &spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/parts"]["get"];
         assert!(parts.is_object());
