@@ -1,0 +1,209 @@
+{
+  "agent_match": [
+    "qoder"
+  ],
+  "captured_from": "qodercli 1.1.5",
+  "commands": [
+    {
+      "args_hint": "[directory]",
+      "description": "Add a directory to the workspace context",
+      "name": "/add-dir"
+    },
+    {
+      "args_hint": null,
+      "description": "Manage agents",
+      "name": "/agents"
+    },
+    {
+      "args_hint": null,
+      "description": "Create a new session branch from the current conversation",
+      "name": "/branch"
+    },
+    {
+      "args_hint": "<question>",
+      "description": "Ask a quick side question without interrupting the conversation",
+      "name": "/btw"
+    },
+    {
+      "args_hint": null,
+      "description": "Clear the screen and start a new conversation",
+      "name": "/clear"
+    },
+    {
+      "args_hint": null,
+      "description": "Reload and list all available slash commands",
+      "name": "/commands"
+    },
+    {
+      "args_hint": null,
+      "description": "Generate a commit message and commit changes",
+      "name": "/commit"
+    },
+    {
+      "args_hint": null,
+      "description": "Compress the context by replacing it with a summary",
+      "name": "/compact"
+    },
+    {
+      "args_hint": null,
+      "description": "View and modify CLI configuration",
+      "name": "/config"
+    },
+    {
+      "args_hint": null,
+      "description": "Visualize current context window usage",
+      "name": "/context"
+    },
+    {
+      "args_hint": "[N]",
+      "description": "Copy the last assistant response to the clipboard",
+      "name": "/copy"
+    },
+    {
+      "args_hint": null,
+      "description": "Show uncommitted git changes",
+      "name": "/diff"
+    },
+    {
+      "args_hint": "[auto|low|medium|high|max|off]",
+      "description": "Set reasoning effort for the current model",
+      "name": "/effort"
+    },
+    {
+      "args_hint": "[filename]",
+      "description": "Export the current conversation to a file or clipboard",
+      "name": "/export"
+    },
+    {
+      "args_hint": "[on|off]",
+      "description": "Toggle fast mode for the current model",
+      "name": "/fast"
+    },
+    {
+      "args_hint": "<set|status|clear|pause|resume|take>",
+      "description": "Manage persistent goals for the current session",
+      "name": "/goal"
+    },
+    {
+      "args_hint": null,
+      "description": "Show help for this prompt",
+      "name": "/help"
+    },
+    {
+      "args_hint": null,
+      "description": "Manage hooks",
+      "name": "/hooks"
+    },
+    {
+      "args_hint": null,
+      "description": "Analyze the project and create a tailored context file",
+      "name": "/init"
+    },
+    {
+      "args_hint": null,
+      "description": "Sign in to your account",
+      "name": "/login"
+    },
+    {
+      "args_hint": null,
+      "description": "Sign out and clear cached credentials",
+      "name": "/logout"
+    },
+    {
+      "args_hint": null,
+      "description": "Configure and manage MCP servers",
+      "name": "/mcp"
+    },
+    {
+      "args_hint": null,
+      "description": "Commands for interacting with memory",
+      "name": "/memory"
+    },
+    {
+      "args_hint": null,
+      "description": "Set or manage model configuration",
+      "name": "/model"
+    },
+    {
+      "args_hint": null,
+      "description": "Start a new conversation",
+      "name": "/new"
+    },
+    {
+      "args_hint": null,
+      "description": "Manage permissions",
+      "name": "/permissions"
+    },
+    {
+      "args_hint": null,
+      "description": "Toggle Plan Mode",
+      "name": "/plan"
+    },
+    {
+      "args_hint": null,
+      "description": "Manage plugins",
+      "name": "/plugins"
+    },
+    {
+      "args_hint": null,
+      "description": "Show release notes for recent CLI versions",
+      "name": "/release-notes"
+    },
+    {
+      "args_hint": null,
+      "description": "Set a custom title for the current session",
+      "name": "/rename"
+    },
+    {
+      "args_hint": null,
+      "description": "Resume a session by identifier, or open the session browser",
+      "name": "/resume"
+    },
+    {
+      "args_hint": null,
+      "description": "Review code changes and find actionable issues",
+      "name": "/review"
+    },
+    {
+      "args_hint": null,
+      "description": "Manage agent skills",
+      "name": "/skills"
+    },
+    {
+      "args_hint": null,
+      "description": "Show session status",
+      "name": "/status"
+    },
+    {
+      "args_hint": null,
+      "description": "Change the theme",
+      "name": "/theme"
+    },
+    {
+      "args_hint": null,
+      "description": "Show usage statistics for the current billing period",
+      "name": "/usage"
+    },
+    {
+      "args_hint": null,
+      "description": "Toggle vim mode on/off for this session",
+      "name": "/vim"
+    }
+  ],
+  "file_mentions": true,
+  "id": "qoder",
+  "workspace": [
+    {
+      "layout": "skills",
+      "path": ".qoder/skills"
+    },
+    {
+      "layout": "skills",
+      "path": ".agents/skills"
+    },
+    {
+      "layout": "commands",
+      "path": ".qoder/commands"
+    }
+  ]
+}

@@ -40,6 +40,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio_stream::Stream;
 
 mod approvals;
+mod composer;
 mod parts;
 mod shortcuts;
 mod tasks;
@@ -158,8 +159,11 @@ const UPLOAD_GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// is why `capabilities.parts` is now true: nothing in 1.0.0 changed shape.
 /// 1.2.0 adds the Codex and opencode marker dictionaries -- more panes answer
 /// `parts: "dictionary"` where they used to answer `parts: "text"` -- and again
-/// changes no payload's shape.
-const CONTENT_SCHEMA_VERSION: &str = "1.2.0";
+/// changes no payload's shape. 1.3.0 adds the composer capabilities: a pane's
+/// descriptor may now carry `composer`, and the file search endpoint answers in
+/// the same envelope. Both are additions -- a 1.2.0 client reads every 1.3.0
+/// payload unchanged and simply does not see the new field.
+const CONTENT_SCHEMA_VERSION: &str = "1.3.0";
 /// A phone previews artifacts, it does not download archives. Anything larger
 /// is refused rather than streamed, so one request can never tie up the host.
 const MAX_ASSET_CONTENT_BYTES: u64 = 10 * 1024 * 1024;
@@ -208,6 +212,8 @@ const API_CAPABILITIES: &[&str] = &[
     "file_uploads",
     "one_time_pairing_codes",
     "pane_approvals",
+    "pane_composer",
+    "pane_file_search",
     "pane_output_ansi",
     "pane_parts",
     "pane_shortcuts",
@@ -972,6 +978,10 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         .route(
             "/api/sessions/{session_id}/panes/{pane_id}/parts",
             get(pane_parts),
+        )
+        .route(
+            "/api/sessions/{session_id}/panes/{pane_id}/files",
+            get(pane_files),
         )
         .route(
             "/api/sessions/{session_id}/panes/{pane_id}/approval",
@@ -4136,6 +4146,17 @@ struct PartsQuery {
     lines: Option<u32>,
 }
 
+#[derive(Debug, Deserialize)]
+struct FileSearchQuery {
+    /// What the user typed after the `@`. Absent or empty is not an error: it
+    /// answers with the shallowest files in the workspace, which is what a
+    /// picker should show before anything has been typed.
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
 /// The normalized transcript: the same text the raw output endpoint serves, read
 /// through the marker dictionary of whichever agent is in the pane.
 ///
@@ -4160,14 +4181,28 @@ async fn pane_parts(
     // reports it on the pane itself, the same field the key row resolves from.
     // A pane.get that fails is not fatal here: no agent means text parts, which
     // is exactly what an unreachable pane.get should degrade to.
-    let agent = herdr_request(&session, "pane.get", json!({ "pane_id": pane_id }))
+    let pane = herdr_request(&session, "pane.get", json!({ "pane_id": pane_id }))
         .await
-        .ok()
-        .and_then(|response| {
-            let pane = response.pointer("/result/pane").unwrap_or(&response);
-            pane.get("agent").and_then(Value::as_str).map(str::to_owned)
+        .ok();
+    let pane = pane
+        .as_ref()
+        .map(|response| response.pointer("/result/pane").unwrap_or(response));
+    let agent = pane
+        .and_then(|pane| pane.get("agent").and_then(Value::as_str))
+        .filter(|agent| !agent.is_empty())
+        .map(str::to_owned);
+    // The pane's own working directory is its workspace root, and it is where
+    // this pane's workspace commands and skills are read from -- under the same
+    // fence as the assets API: canonical, and never the whole machine.
+    let root = pane
+        .and_then(|pane| {
+            pane.get("cwd")
+                .and_then(Value::as_str)
+                .or_else(|| pane.get("foreground_cwd").and_then(Value::as_str))
         })
-        .filter(|agent| !agent.is_empty());
+        .map(PathBuf::from)
+        .filter(|path| is_scannable_root(path))
+        .and_then(|path| std::fs::canonicalize(path).ok());
 
     // `recent_unwrapped` is the only source worth normalizing: the dictionaries
     // key off line starts, and it is the one source where a long line is one
@@ -4199,23 +4234,109 @@ async fn pane_parts(
     let dictionary = parts::dictionary_for(agent.as_deref());
     let normalized = parts::normalize_json(&text, dictionary);
 
+    // Reading a workspace's own skills and commands is blocking filesystem
+    // work, so it runs off the async runtime like every other scan here.
+    let composer = {
+        let agent = agent.clone();
+        tokio::task::spawn_blocking(move || composer::descriptor(agent.as_deref(), root.as_deref()))
+            .await
+            .unwrap_or_default()
+    };
+
     Ok(Json(content_envelope(json!({
         "session_id": session_id,
         "pane_id": pane_id,
         "source": "recent-unwrapped",
         "lines": lines,
         "revision": revision,
-        // Per-pane capabilities, because agent detection varies pane to pane:
-        // "dictionary" means the parts are typed, "text" means this pane fell
-        // back to prose and a client should not wait for tool blocks.
-        "pane": {
-            "pane_id": pane_id,
-            "agent": agent,
-            "parts": if dictionary.is_some() { "dictionary" } else { "text" },
-            "dictionary": dictionary.map(|dictionary| dictionary.id),
-            "image_input": "file-path",
-        },
+        "pane": pane_capabilities(&pane_id, agent.as_deref(), dictionary, composer),
         "parts": normalized,
+    }))))
+}
+
+/// The per-pane capability descriptor, because agent detection varies pane to
+/// pane: `dictionary` means the parts are typed, `text` means this pane fell
+/// back to prose and a client should not wait for tool blocks.
+///
+/// `composer` is absent rather than null for an agent with no command table, so
+/// a client can tell "this gateway knows nothing about this agent" from "this
+/// agent understands no slash commands".
+fn pane_capabilities(
+    pane_id: &str,
+    agent: Option<&str>,
+    dictionary: Option<&'static parts::Dictionary>,
+    composer: Option<Value>,
+) -> Value {
+    let mut capabilities = json!({
+        "pane_id": pane_id,
+        "agent": agent,
+        "parts": if dictionary.is_some() { "dictionary" } else { "text" },
+        "dictionary": dictionary.map(|dictionary| dictionary.id),
+        "image_input": "file-path",
+    });
+    if let (Some(object), Some(composer)) = (capabilities.as_object_mut(), composer) {
+        object.insert("composer".to_owned(), composer);
+    }
+    capabilities
+}
+
+/// Fuzzy path search inside one pane's workspace, for the composer's `@` file
+/// mentions.
+///
+/// Fenced exactly like the asset API: the only directory this can look in is
+/// the pane's own working directory as Herdr reports it, canonicalized, and
+/// every answer is a path relative to it. A pane whose cwd is not a workspace
+/// -- the filesystem root, the home directory, a pane Herdr does not report --
+/// is a miss rather than an error, the same way a fenced-out asset path is: it
+/// must not be usable to probe the host.
+///
+/// Paths only. No contents, no sizes, no absolute paths. Reading a file is what
+/// `GET /api/assets/{id}/content` is for, and it has its own fence.
+async fn pane_files(
+    State(state): State<AppState>,
+    Path((session_id, pane_id)): Path<(String, String)>,
+    Query(query): Query<FileSearchQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let session = find_session(&state.config, &session_id)?.clone();
+    let limit = query
+        .limit
+        .unwrap_or(composer::FILE_SEARCH_DEFAULT_LIMIT)
+        .clamp(1, composer::FILE_SEARCH_MAX_LIMIT);
+    let needle = query.query.clone().unwrap_or_default();
+
+    // The roots come from the same place the asset listing's do -- the pane
+    // cwds Herdr reports -- so this endpoint cannot reach a directory the
+    // assets API would refuse.
+    let roots = session_asset_roots(&state, &session).await;
+    let root = roots
+        .iter()
+        .find(|root| root.pane_id.as_deref() == Some(pane_id.as_str()))
+        .and_then(|root| std::fs::canonicalize(&root.path).ok());
+
+    let files = match root.clone() {
+        Some(root) => {
+            let needle = needle.clone();
+            tokio::task::spawn_blocking(move || composer::search_files(&root, &needle, limit))
+                .await
+                .unwrap_or_default()
+        }
+        None => Vec::new(),
+    };
+
+    Ok(Json(content_envelope(json!({
+        "session_id": session_id,
+        "pane_id": pane_id,
+        "query": needle,
+        "limit": limit,
+        // The directory every path below is relative to, or null when this pane
+        // has no workspace the gateway will look in.
+        "root": root.map(|root| root.to_string_lossy().to_string()),
+        "files": files
+            .into_iter()
+            .map(|hit| json!({ "path": hit.path, "name": hit.name, "kind": hit.kind }))
+            .collect::<Vec<Value>>(),
     }))))
 }
 
@@ -5459,7 +5580,14 @@ fn asset_json(entry: &AssetEntry, asset_type: AssetType) -> Value {
 fn content_envelope(data: Value) -> Value {
     json!({
         "schema_version": CONTENT_SCHEMA_VERSION,
-        "capabilities": { "parts": true, "assets": true, "image_upload": true },
+        "capabilities": {
+            "parts": true,
+            "assets": true,
+            "image_upload": true,
+            // Slash-command catalogue and `@` file search. A pane's own
+            // descriptor still says whether this particular agent has a table.
+            "composer": true,
+        },
         "data": data,
     })
 }
@@ -6788,13 +6916,26 @@ fn openapi_spec() -> Value {
             "/api/sessions/{sessionId}/panes/{paneId}/parts": {
                 "get": {
                     "summary": "Read the pane's transcript normalized into content-model parts",
-                    "description": "Unified content model, schema version 1.2.0. Same envelope as the asset endpoints: schema_version, capabilities, and data, with the ordered parts under data.parts. The text is the pane's own recent-unwrapped read, run through the marker dictionary of whichever agent Herdr reports on the pane -- Claude Code, Qoder, Codex and opencode today. Every part carries fallback_text, the source lines verbatim, so an unknown type still renders and a dictionary that drifts loses structure and never loses content. A pane running no agent, or an agent with no dictionary, is answered with text parts rather than with an error; data.pane.parts says which happened. The raw output endpoint is unchanged and remains the fallback path.",
+                    "description": "Unified content model, schema version 1.3.0. Same envelope as the asset endpoints: schema_version, capabilities, and data, with the ordered parts under data.parts. The text is the pane's own recent-unwrapped read, run through the marker dictionary of whichever agent Herdr reports on the pane -- Claude Code, Qoder, Codex and opencode today. Every part carries fallback_text, the source lines verbatim, so an unknown type still renders and a dictionary that drifts loses structure and never loses content. A pane running no agent, or an agent with no dictionary, is answered with text parts rather than with an error; data.pane.parts says which happened. data.pane.composer carries the slash commands this agent understands and whether @ file mentions make sense, and is absent entirely for an agent the gateway has no table for. The raw output endpoint is unchanged and remains the fallback path.",
                     "parameters": [
                         path_param("sessionId"),
                         path_param("paneId"),
                         query_param("lines", "How many lines of scrollback to normalize, 1 to 5000, default 400")
                     ],
                     "responses": parts_responses()
+                }
+            },
+            "/api/sessions/{sessionId}/panes/{paneId}/files": {
+                "get": {
+                    "summary": "Fuzzy path search inside the pane's workspace, for @ file mentions",
+                    "description": "Answers paths only -- no contents, no sizes, no absolute paths. The only directory searched is the pane's own working directory as Herdr reports it, canonicalized, which is the same fence the asset API is gated on; a pane sitting at the filesystem root or straight in the home directory has no workspace and answers with an empty list rather than an error, so this cannot be used to probe the host. Symlinks are never followed, and dot, dependency and build directories are skipped, so nothing outside the root can be named. The query is a fuzzy subsequence match over the relative path, ranked so that the file name beats the directories above it; an empty query answers with the shallowest files, which is what a picker shows before anything is typed. kind is decided from the name alone because nothing is read -- the asset content endpoint sniffs the bytes again when a file is actually opened.",
+                    "parameters": [
+                        path_param("sessionId"),
+                        path_param("paneId"),
+                        query_param("query", "What the user typed after the @; empty or absent lists the shallowest files"),
+                        query_param("limit", "How many matches to return, 1 to 50, default 20")
+                    ],
+                    "responses": file_search_responses()
                 }
             },
             "/api/sessions/{sessionId}/panes/{paneId}/approval": {
@@ -7043,8 +7184,8 @@ fn content_envelope_schema(data: Value) -> Value {
         "properties": {
             "schema_version": { "type": "string", "const": CONTENT_SCHEMA_VERSION },
             "capabilities": object_schema(
-                &[("parts", "boolean"), ("assets", "boolean"), ("image_upload", "boolean")],
-                &["parts", "assets", "image_upload"],
+                &[("parts", "boolean"), ("assets", "boolean"), ("image_upload", "boolean"), ("composer", "boolean")],
+                &["parts", "assets", "image_upload", "composer"],
             ),
             "data": data
         }
@@ -7106,6 +7247,60 @@ fn part_schema() -> Value {
     })
 }
 
+/// What a pane's composer can offer. Absent from `data.pane` entirely when the
+/// gateway has no command table for the agent, which is how a client tells "no
+/// table" from "no commands".
+fn composer_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Absent for an agent the gateway has no table for",
+        "required": ["version", "table", "slash_commands", "file_mentions"],
+        "properties": {
+            "version": { "type": "integer", "description": "Bumped whenever a builtin table changes, so a client can cache this" },
+            "table": { "type": "string", "description": "Which table answered, the same id the part dictionaries use" },
+            "captured_from": { "type": "string", "description": "The agent release the builtin table was read off" },
+            "file_mentions": { "type": "boolean", "description": "Whether @ in the composer means 'mention a file' to this agent" },
+            "slash_commands": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["name", "description", "source"],
+                    "properties": {
+                        "name": { "type": "string", "description": "The literal text to send, leading slash included" },
+                        "description": { "type": "string" },
+                        "args_hint": { "type": ["string", "null"], "description": "What may follow the command; null means it runs exactly as typed, so a client may send it on one tap" },
+                        "source": { "type": "string", "enum": ["builtin", "workspace"], "description": "builtin: the gateway's table for this agent. workspace: a skill or command file found in the pane's workspace, which wins over a builtin of the same name" }
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn file_search_responses() -> Value {
+    let mut responses = ok_response();
+    responses["200"] = json!({
+        "description": "Fuzzy path matches inside the pane's workspace, best first",
+        "content": { "application/json": { "schema": content_envelope_schema(json!({
+            "type": "object",
+            "required": ["session_id", "pane_id", "files", "root"],
+            "properties": {
+                "session_id": { "type": "string" },
+                "pane_id": { "type": "string" },
+                "query": { "type": "string", "description": "The query, echoed back" },
+                "limit": { "type": "integer", "description": "The clamped limit, echoed back" },
+                "root": { "type": ["string", "null"], "description": "The workspace directory every path is relative to, or null when this pane has none the gateway will look in" },
+                "files": {
+                    "type": "array",
+                    "items": object_schema(&[("path", "string"), ("name", "string"), ("kind", "string")], &["path", "name", "kind"])
+                }
+            }
+        })) } }
+    });
+    responses["404"] = json!({ "description": "Unknown session" });
+    responses
+}
+
 fn parts_responses() -> Value {
     let mut responses = ok_response();
     responses["200"] = json!({
@@ -7127,7 +7322,8 @@ fn parts_responses() -> Value {
                         "agent": { "type": ["string", "null"], "description": "What Herdr reports is running in the pane" },
                         "parts": { "type": "string", "enum": ["dictionary", "text"], "description": "dictionary: typed parts. text: no dictionary covers this pane, everything degraded to prose" },
                         "dictionary": { "type": ["string", "null"], "description": "Which dictionary normalized it, for cache keys and bug reports" },
-                        "image_input": { "type": "string", "description": "How an image reaches this agent; file-path means upload first, then send the path" }
+                        "image_input": { "type": "string", "description": "How an image reaches this agent; file-path means upload first, then send the path" },
+                        "composer": composer_schema()
                     }
                 },
                 "parts": { "type": "array", "items": part_schema() }
@@ -8440,10 +8636,82 @@ mod tests {
         // One envelope and one version across the content model: a client reads
         // the version once and knows both endpoints answer it.
         let envelope = content_envelope(json!({}));
-        assert_eq!(envelope["schema_version"], "1.2.0");
+        assert_eq!(envelope["schema_version"], "1.3.0");
         assert_eq!(envelope["capabilities"]["parts"], true);
         assert_eq!(envelope["capabilities"]["assets"], true);
         assert_eq!(envelope["capabilities"]["image_upload"], true);
+        assert_eq!(envelope["capabilities"]["composer"], true);
+    }
+
+    #[test]
+    fn a_pane_carries_a_composer_descriptor_only_for_an_agent_with_a_table() {
+        let known = pane_capabilities(
+            "wA:p1",
+            Some("Claude Code"),
+            parts::dictionary_for(Some("claude")),
+            composer::descriptor(Some("Claude Code"), None),
+        );
+        assert_eq!(known["parts"], "dictionary");
+        assert_eq!(known["composer"]["table"], "claude");
+        assert_eq!(known["composer"]["file_mentions"], true);
+        assert!(known["composer"]["slash_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["name"] == "/compact" && entry["source"] == "builtin"));
+
+        // An agent with no table carries no key at all -- not a null, which a
+        // client would have to tell apart from "no commands".
+        let unknown = pane_capabilities(
+            "wA:p2",
+            Some("aider"),
+            parts::dictionary_for(Some("aider")),
+            composer::descriptor(Some("aider"), None),
+        );
+        assert_eq!(unknown["parts"], "text");
+        assert!(unknown.as_object().unwrap().get("composer").is_none());
+    }
+
+    /// The file search can only ever look in a root the asset API would also
+    /// serve, because it takes its root from the same place: the pane cwds
+    /// Herdr reports, filtered by the same "this is not the whole machine"
+    /// rule. A pane id that is not in that list has no root to search.
+    #[test]
+    fn file_search_takes_its_root_from_the_panes_the_session_actually_has() {
+        let roots = pane_list_roots(
+            "default",
+            &json!({ "result": { "panes": [
+                { "pane_id": "wA:p1", "cwd": "/Users/dev/src/project", "workspace_id": "wA" },
+                { "pane_id": "wA:p2", "cwd": "/" }
+            ] } }),
+        );
+        let root_for = |pane: &str| {
+            roots
+                .iter()
+                .find(|root| root.pane_id.as_deref() == Some(pane))
+                .map(|root| root.path.clone())
+        };
+        assert_eq!(
+            root_for("wA:p1"),
+            Some(PathBuf::from("/Users/dev/src/project"))
+        );
+        // The pane sitting at the filesystem root never became a root, so the
+        // search has nothing to look in rather than the whole machine.
+        assert_eq!(root_for("wA:p2"), None);
+        assert_eq!(root_for("wB:p9"), None);
+    }
+
+    #[test]
+    fn a_file_search_limit_is_clamped_whatever_the_client_asks_for() {
+        let clamp = |limit: Option<usize>| {
+            limit
+                .unwrap_or(composer::FILE_SEARCH_DEFAULT_LIMIT)
+                .clamp(1, composer::FILE_SEARCH_MAX_LIMIT)
+        };
+        assert_eq!(clamp(None), 20);
+        assert_eq!(clamp(Some(0)), 1);
+        assert_eq!(clamp(Some(5)), 5);
+        assert_eq!(clamp(Some(10_000)), 50);
     }
 
     #[test]
@@ -8492,6 +8760,23 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&json!("tool-block")));
+        // The composer descriptor rides on the pane, and its source vocabulary
+        // is closed the same way the part types are.
+        let composer = &parts["responses"]["200"]["content"]["application/json"]["schema"]
+            ["properties"]["data"]["properties"]["pane"]["properties"]["composer"];
+        assert_eq!(
+            composer["properties"]["slash_commands"]["items"]["properties"]["source"]["enum"],
+            json!(["builtin", "workspace"])
+        );
+        let files = &spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/files"]["get"];
+        assert!(files.is_object());
+        assert_eq!(files["parameters"][2]["name"], "query");
+        assert_eq!(files["parameters"][3]["name"], "limit");
+        assert_eq!(
+            files["responses"]["200"]["content"]["application/json"]["schema"]["properties"]
+                ["schema_version"]["const"],
+            CONTENT_SCHEMA_VERSION
+        );
         assert_eq!(
             spec["paths"]["/api/sessions/{sessionId}/assets"]["get"]["responses"]["200"]["content"]
                 ["application/json"]["schema"]["properties"]["schema_version"]["const"],

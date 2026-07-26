@@ -1,0 +1,240 @@
+{
+  "agent_match": [
+    "codex"
+  ],
+  "captured_from": "codex-cli 0.145.0",
+  "commands": [
+    {
+      "args_hint": null,
+      "description": "Switch the active agent thread",
+      "name": "/agent"
+    },
+    {
+      "args_hint": null,
+      "description": "Continue this session in the Desktop app",
+      "name": "/app"
+    },
+    {
+      "args_hint": null,
+      "description": "Approve one retry of a recent auto-review denial",
+      "name": "/approve"
+    },
+    {
+      "args_hint": null,
+      "description": "Manage apps",
+      "name": "/apps"
+    },
+    {
+      "args_hint": null,
+      "description": "Archive this session and exit",
+      "name": "/archive"
+    },
+    {
+      "args_hint": null,
+      "description": "Clear the terminal and start a new chat",
+      "name": "/clear"
+    },
+    {
+      "args_hint": null,
+      "description": "Summarize conversation to prevent hitting the context limit",
+      "name": "/compact"
+    },
+    {
+      "args_hint": null,
+      "description": "Copy last response as markdown",
+      "name": "/copy"
+    },
+    {
+      "args_hint": null,
+      "description": "Permanently delete this session and exit",
+      "name": "/delete"
+    },
+    {
+      "args_hint": null,
+      "description": "Show git diff (including untracked files)",
+      "name": "/diff"
+    },
+    {
+      "args_hint": null,
+      "description": "Toggle experimental features",
+      "name": "/experimental"
+    },
+    {
+      "args_hint": null,
+      "description": "Fork the current chat",
+      "name": "/fork"
+    },
+    {
+      "args_hint": "[objective|clear]",
+      "description": "Set or view the goal for a long-running task",
+      "name": "/goal"
+    },
+    {
+      "args_hint": null,
+      "description": "View and manage lifecycle hooks",
+      "name": "/hooks"
+    },
+    {
+      "args_hint": null,
+      "description": "Include current selection, open files, and other context from your IDE",
+      "name": "/ide"
+    },
+    {
+      "args_hint": null,
+      "description": "Import setup, this project, and recent chats from Claude Code",
+      "name": "/import"
+    },
+    {
+      "args_hint": null,
+      "description": "Create an AGENTS.md file with instructions for Codex",
+      "name": "/init"
+    },
+    {
+      "args_hint": null,
+      "description": "Remap TUI shortcuts",
+      "name": "/keymap"
+    },
+    {
+      "args_hint": null,
+      "description": "Log out of Codex",
+      "name": "/logout"
+    },
+    {
+      "args_hint": "[verbose]",
+      "description": "List configured MCP tools; use /mcp verbose for details",
+      "name": "/mcp"
+    },
+    {
+      "args_hint": null,
+      "description": "Configure memory use and generation",
+      "name": "/memories"
+    },
+    {
+      "args_hint": "[file]",
+      "description": "Mention a file",
+      "name": "/mention"
+    },
+    {
+      "args_hint": null,
+      "description": "Choose what model and reasoning effort to use",
+      "name": "/model"
+    },
+    {
+      "args_hint": null,
+      "description": "Start a new chat during a conversation",
+      "name": "/new"
+    },
+    {
+      "args_hint": null,
+      "description": "Choose what Codex is allowed to do",
+      "name": "/permissions"
+    },
+    {
+      "args_hint": null,
+      "description": "Choose a communication style for Codex",
+      "name": "/personality"
+    },
+    {
+      "args_hint": "[pet]",
+      "description": "Choose or hide the terminal pet",
+      "name": "/pets"
+    },
+    {
+      "args_hint": null,
+      "description": "Switch to Plan mode",
+      "name": "/plan"
+    },
+    {
+      "args_hint": null,
+      "description": "Browse plugins",
+      "name": "/plugins"
+    },
+    {
+      "args_hint": null,
+      "description": "List background terminals",
+      "name": "/ps"
+    },
+    {
+      "args_hint": null,
+      "description": "Exit Codex",
+      "name": "/quit"
+    },
+    {
+      "args_hint": null,
+      "description": "Toggle raw scrollback mode for copy-friendly selection",
+      "name": "/raw"
+    },
+    {
+      "args_hint": "[title]",
+      "description": "Rename the current thread",
+      "name": "/rename"
+    },
+    {
+      "args_hint": "[conversation id or search term]",
+      "description": "Resume a saved chat",
+      "name": "/resume"
+    },
+    {
+      "args_hint": "[instructions]",
+      "description": "Review my current changes and find issues",
+      "name": "/review"
+    },
+    {
+      "args_hint": "[question]",
+      "description": "Start a side conversation in an ephemeral fork",
+      "name": "/side"
+    },
+    {
+      "args_hint": null,
+      "description": "Use skills to improve how Codex performs tasks",
+      "name": "/skills"
+    },
+    {
+      "args_hint": null,
+      "description": "Show current session configuration and token usage",
+      "name": "/status"
+    },
+    {
+      "args_hint": null,
+      "description": "Configure which items appear in the status line",
+      "name": "/statusline"
+    },
+    {
+      "args_hint": null,
+      "description": "Stop all background terminals",
+      "name": "/stop"
+    },
+    {
+      "args_hint": null,
+      "description": "Choose a syntax highlighting theme",
+      "name": "/theme"
+    },
+    {
+      "args_hint": null,
+      "description": "Configure which items appear in the terminal title",
+      "name": "/title"
+    },
+    {
+      "args_hint": null,
+      "description": "View account usage or use a usage limit reset",
+      "name": "/usage"
+    },
+    {
+      "args_hint": null,
+      "description": "Toggle Vim mode for the composer",
+      "name": "/vim"
+    }
+  ],
+  "file_mentions": true,
+  "id": "codex",
+  "workspace": [
+    {
+      "layout": "skills",
+      "path": ".codex/skills"
+    },
+    {
+      "layout": "skills",
+      "path": ".agents/skills"
+    }
+  ]
+}

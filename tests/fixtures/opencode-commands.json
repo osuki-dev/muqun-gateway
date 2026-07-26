@@ -1,0 +1,169 @@
+{
+  "agent_match": [
+    "opencode",
+    "open-code"
+  ],
+  "captured_from": "opencode 1.18.0",
+  "commands": [
+    {
+      "args_hint": null,
+      "description": "Switch agent",
+      "name": "/agents"
+    },
+    {
+      "args_hint": null,
+      "description": "Compact the session into a summary",
+      "name": "/compact"
+    },
+    {
+      "args_hint": null,
+      "description": "Add a provider and its API key",
+      "name": "/connect"
+    },
+    {
+      "args_hint": null,
+      "description": "Copy the session transcript",
+      "name": "/copy"
+    },
+    {
+      "args_hint": null,
+      "description": "Open the diff viewer",
+      "name": "/diff"
+    },
+    {
+      "args_hint": null,
+      "description": "Compose the message in your external editor",
+      "name": "/editor"
+    },
+    {
+      "args_hint": null,
+      "description": "Close opencode",
+      "name": "/exit"
+    },
+    {
+      "args_hint": null,
+      "description": "Export the session transcript",
+      "name": "/export"
+    },
+    {
+      "args_hint": null,
+      "description": "Fork the session",
+      "name": "/fork"
+    },
+    {
+      "args_hint": null,
+      "description": "Open the help dialog",
+      "name": "/help"
+    },
+    {
+      "args_hint": null,
+      "description": "Toggle MCP servers",
+      "name": "/mcps"
+    },
+    {
+      "args_hint": null,
+      "description": "Switch model",
+      "name": "/models"
+    },
+    {
+      "args_hint": null,
+      "description": "Move the session",
+      "name": "/move"
+    },
+    {
+      "args_hint": null,
+      "description": "Start a new session",
+      "name": "/new"
+    },
+    {
+      "args_hint": null,
+      "description": "Redo the message that was undone",
+      "name": "/redo"
+    },
+    {
+      "args_hint": "[title]",
+      "description": "Rename the session",
+      "name": "/rename"
+    },
+    {
+      "args_hint": null,
+      "description": "List and switch sessions",
+      "name": "/sessions"
+    },
+    {
+      "args_hint": null,
+      "description": "Share the session",
+      "name": "/share"
+    },
+    {
+      "args_hint": null,
+      "description": "Browse available skills",
+      "name": "/skills"
+    },
+    {
+      "args_hint": null,
+      "description": "View status",
+      "name": "/status"
+    },
+    {
+      "args_hint": null,
+      "description": "Switch theme",
+      "name": "/themes"
+    },
+    {
+      "args_hint": null,
+      "description": "Toggle visibility of reasoning blocks",
+      "name": "/thinking"
+    },
+    {
+      "args_hint": null,
+      "description": "Jump to a message in the session",
+      "name": "/timeline"
+    },
+    {
+      "args_hint": null,
+      "description": "Toggle message timestamps",
+      "name": "/timestamps"
+    },
+    {
+      "args_hint": null,
+      "description": "Undo the previous message",
+      "name": "/undo"
+    },
+    {
+      "args_hint": null,
+      "description": "Stop sharing the session",
+      "name": "/unshare"
+    },
+    {
+      "args_hint": null,
+      "description": "Switch model variant",
+      "name": "/variants"
+    },
+    {
+      "args_hint": null,
+      "description": "Manage workspaces",
+      "name": "/workspaces"
+    }
+  ],
+  "file_mentions": true,
+  "id": "opencode",
+  "workspace": [
+    {
+      "layout": "skills",
+      "path": ".opencode/skills"
+    },
+    {
+      "layout": "skills",
+      "path": ".opencode/skill"
+    },
+    {
+      "layout": "skills",
+      "path": ".agents/skills"
+    },
+    {
+      "layout": "commands",
+      "path": ".opencode/command"
+    }
+  ]
+}

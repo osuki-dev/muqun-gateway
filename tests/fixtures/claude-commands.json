@@ -1,0 +1,194 @@
+{
+  "agent_match": [
+    "claude"
+  ],
+  "captured_from": "claude 2.1.220",
+  "commands": [
+    {
+      "args_hint": "<path>",
+      "description": "Add a new working directory",
+      "name": "/add-dir"
+    },
+    {
+      "args_hint": "[report]",
+      "description": "Report a bug or share your conversation",
+      "name": "/bug"
+    },
+    {
+      "args_hint": "[name]",
+      "description": "Start a new session with empty context; previous session stays on disk",
+      "name": "/clear"
+    },
+    {
+      "args_hint": "[instructions]",
+      "description": "Free up context by summarizing the conversation so far",
+      "name": "/compact"
+    },
+    {
+      "args_hint": "[key=value]",
+      "description": "Open settings",
+      "name": "/config"
+    },
+    {
+      "args_hint": "[all]",
+      "description": "Visualize current context usage as a colored grid",
+      "name": "/context"
+    },
+    {
+      "args_hint": null,
+      "description": "View uncommitted changes and per-turn diffs",
+      "name": "/diff"
+    },
+    {
+      "args_hint": null,
+      "description": "Diagnose the Claude Code installation",
+      "name": "/doctor"
+    },
+    {
+      "args_hint": "[filename]",
+      "description": "Export the current conversation to a file or clipboard",
+      "name": "/export"
+    },
+    {
+      "args_hint": null,
+      "description": "Show help and available commands",
+      "name": "/help"
+    },
+    {
+      "args_hint": null,
+      "description": "View hook configurations for tool events",
+      "name": "/hooks"
+    },
+    {
+      "args_hint": "[open]",
+      "description": "Manage IDE integrations and show status",
+      "name": "/ide"
+    },
+    {
+      "args_hint": null,
+      "description": "Initialize a new CLAUDE.md file for this project",
+      "name": "/init"
+    },
+    {
+      "args_hint": null,
+      "description": "Sign in with your Anthropic account",
+      "name": "/login"
+    },
+    {
+      "args_hint": null,
+      "description": "Sign out from your Anthropic account",
+      "name": "/logout"
+    },
+    {
+      "args_hint": "[reconnect|enable|disable]",
+      "description": "Manage MCP servers",
+      "name": "/mcp"
+    },
+    {
+      "args_hint": null,
+      "description": "Open a memory file in your editor",
+      "name": "/memory"
+    },
+    {
+      "args_hint": "[model]",
+      "description": "Set the AI model for Claude Code",
+      "name": "/model"
+    },
+    {
+      "args_hint": null,
+      "description": "Change the output style",
+      "name": "/output-style"
+    },
+    {
+      "args_hint": null,
+      "description": "Manage allow and deny tool permission rules",
+      "name": "/permissions"
+    },
+    {
+      "args_hint": null,
+      "description": "Enable plan mode or view the current session plan",
+      "name": "/plan"
+    },
+    {
+      "args_hint": null,
+      "description": "View and update your privacy settings",
+      "name": "/privacy-settings"
+    },
+    {
+      "args_hint": null,
+      "description": "Show release notes",
+      "name": "/release-notes"
+    },
+    {
+      "args_hint": null,
+      "description": "Pick up skills added or changed on disk",
+      "name": "/reload-skills"
+    },
+    {
+      "args_hint": "[conversation id or search term]",
+      "description": "Resume a previous conversation",
+      "name": "/resume"
+    },
+    {
+      "args_hint": "[pr number]",
+      "description": "Review a GitHub pull request; for your working diff use /code-review",
+      "name": "/review"
+    },
+    {
+      "args_hint": null,
+      "description": "Rewind the conversation to a checkpoint",
+      "name": "/rewind"
+    },
+    {
+      "args_hint": null,
+      "description": "List available skills",
+      "name": "/skills"
+    },
+    {
+      "args_hint": null,
+      "description": "Show Claude Code status: version, model, account, tools",
+      "name": "/status"
+    },
+    {
+      "args_hint": null,
+      "description": "Configure the status line",
+      "name": "/statusline"
+    },
+    {
+      "args_hint": null,
+      "description": "Configure the terminal key bindings",
+      "name": "/terminal-setup"
+    },
+    {
+      "args_hint": null,
+      "description": "Change the theme",
+      "name": "/theme"
+    },
+    {
+      "args_hint": null,
+      "description": "Show session cost, plan usage, and activity stats",
+      "name": "/usage"
+    },
+    {
+      "args_hint": null,
+      "description": "Toggle vim mode",
+      "name": "/vim"
+    }
+  ],
+  "file_mentions": true,
+  "id": "claude",
+  "workspace": [
+    {
+      "layout": "skills",
+      "path": ".claude/skills"
+    },
+    {
+      "layout": "skills",
+      "path": ".agents/skills"
+    },
+    {
+      "layout": "commands",
+      "path": ".claude/commands"
+    }
+  ]
+}
