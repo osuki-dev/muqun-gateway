@@ -2875,13 +2875,35 @@ async fn send_agent(
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
     validate_text(&body.text)?;
-    call_session_method(
+    let result = call_session_method(
         &state.config,
         &session_id,
         "agent.prompt",
         json!({ "target": target, "text": body.text }),
     )
-    .await
+    .await?;
+    // Belt and braces for a paste-vs-keypress race in agent TUIs: when the
+    // prompt text and its newline arrive in one PTY write, Claude Code's input
+    // treats the newline as pasted content and leaves the prompt sitting in its
+    // input box unsubmitted (reproduced on camera, muqun card #571). A short
+    // beat later, a separate Enter keystroke submits it. When the prompt DID
+    // submit, the input box is empty and an Enter there is a no-op, so this is
+    // idempotent. Best-effort by design: a pane that vanished between the two
+    // calls must not turn a delivered prompt into an error. The target of the
+    // agent send is the pane id, which is what the key press needs.
+    let config = state.config.clone();
+    let pane_id = target.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let _ = call_session_method(
+            &config,
+            &session_id,
+            "pane.send_keys",
+            json!({ "pane_id": pane_id, "keys": ["Enter"] }),
+        )
+        .await;
+    });
+    Ok(result)
 }
 
 async fn pane_output(
