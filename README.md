@@ -443,9 +443,15 @@ Worth knowing before you rely on it:
 - It can only keep what it watched. Nothing a pane printed before the gateway
   first read it is recoverable, because nobody kept it.
 - A repainting screen is a rectangle, not a stream, so rows are placed by
-  matching the incoming screen against the end of the buffer. A screen redrawn
-  into something unrelated replaces the screen it followed rather than stacking
-  on it.
+  matching the incoming screen against the end of the buffer. Where a burst of
+  output moved the screen further than one read can follow, the read is kept
+  whole on top of the one it followed.
+- Rows read as ANSI and rows read as plain text are kept apart, because they are
+  not the same rows. The pane's reported offset is the deeper of the two, so a
+  pane watched as ANSI can promise a plain-text reader more than that read will
+  return until something has read it as text. Herdr's own metric already
+  overstates in the same direction, and a client that stops believing it once a
+  page returns nothing new pays at most one wasted request.
 - Panes Herdr reports real scrollback for are not recorded, not spliced and not
   amended. They are answered exactly as they were before.
 - Bounds: 5000 rows and 2 MiB per pane and read shape, 48 buffers, 24 MiB in

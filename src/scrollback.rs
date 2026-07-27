@@ -41,17 +41,22 @@
 //! what was there, is what makes the stale half of a repaint go away: the
 //! newest rendering of a row is the true one.
 //!
-//! Agreement is scored rather than demanded. Requiring every row to match would
-//! make one turning spinner look like a full redraw, and the no-overlap case
-//! appends a whole screen; at 150ms that is how a buffer explodes. An overlap is
-//! believed when [`MATCH_THRESHOLD`] of its rows agree -- exactly, below
-//! [`MIN_MATCH_ROWS`], where a ratio means nothing. The spinner then places at
-//! full overlap: the screen changed, nothing scrolled, the buffer does not grow.
+//! Agreement is scored rather than demanded. This is the whole difference
+//! between a buffer and a leak: requiring every row to match would make one
+//! turning spinner look like a screen with nothing in common, and a screen with
+//! nothing in common is kept whole -- sixty-five rows, six times a second. An
+//! overlap is believed when [`MATCH_THRESHOLD`] of its rows agree, or outright
+//! below [`MIN_MATCH_ROWS`] where a ratio means nothing. The spinner then places
+//! at full overlap: the screen changed, nothing scrolled, the buffer does not
+//! grow.
 //!
-//! Where nothing agrees the screen was redrawn into something else. Then, and
-//! only then, the previous screen is dropped and the new one takes its place --
-//! so growth stays tied to rows that demonstrably scrolled away, and the history
-//! above the screen is never what pays for a redraw.
+//! Where nothing agrees, the screen moved further than it can be followed --
+//! output arrived faster than the poll, and the two screens are consecutive
+//! rather than overlapping. Then the read is kept whole, on top of the screen it
+//! followed, because that is what the pane showed and dropping it would throw
+//! away the very rows this exists to keep. Measured against a real Claude pane
+//! over ten minutes, that is 14 of 1416 reads: it is what a burst of output
+//! looks like, not what a spinner looks like.
 //!
 //! On exact matches this is the same placement `mergeTerminalWindow` makes,
 //! which is the point: the two ends of the same pane must not disagree about
@@ -135,8 +140,8 @@ fn rows_agree(held: &[u64], incoming: &[u64], overlap: usize) -> bool {
 /// Where this read sits against the end of what is held: how many held rows the
 /// read re-sends.
 ///
-/// `None` where nothing agrees -- the screen was redrawn into something else and
-/// the caller has to decide what to do with the screen it replaced.
+/// `None` where nothing agrees -- the screen moved further than one read can be
+/// followed, and nothing held is being re-sent.
 fn placement(held: &[u64], incoming: &[u64]) -> Option<usize> {
     let widest = held.len().min(incoming.len()).min(MAX_OVERLAP);
     (1..=widest)
@@ -149,8 +154,6 @@ struct PaneBuffer {
     lines: VecDeque<String>,
     hashes: VecDeque<u64>,
     bytes: usize,
-    /// Rows of the most recent read: where history ends and the screen begins.
-    screen: usize,
     /// When this buffer was last fed, on the store's own clock.
     touched: u64,
 }
@@ -193,7 +196,6 @@ impl PaneBuffer {
         while self.bytes > MAX_PANE_BYTES && self.lines.len() > 1 {
             self.drop_front(1);
         }
-        self.screen = self.screen.min(self.lines.len());
     }
 
     fn tail(&self, rows: usize) -> Vec<u64> {
@@ -267,21 +269,17 @@ impl ScrollbackStore {
         let before = buffer.bytes;
         buffer.touched = clock;
 
-        let screen = incoming.len();
         if !buffer.lines.is_empty() {
             let incoming_hashes: Vec<u64> = incoming.iter().map(|line| line_hash(line)).collect();
             let held = buffer.tail(MAX_OVERLAP);
-            // Nothing agreed, so the screen became something else. Dropping the
-            // screen it replaced -- and only that, never the history above it --
-            // is what keeps growth tied to rows that actually scrolled away.
-            let discard = placement(&held, &incoming_hashes).unwrap_or(buffer.screen);
+            // Nothing agreed: the screen moved further than one read can be
+            // followed, so nothing held is re-sent and nothing is dropped.
+            let discard = placement(&held, &incoming_hashes).unwrap_or(0);
             buffer.drop_back(discard.min(buffer.lines.len()));
         }
         for line in incoming {
             buffer.push(line);
         }
-
-        buffer.screen = screen;
         buffer.trim();
         self.total_bytes = self.total_bytes + buffer.bytes - before;
         self.evict();
@@ -307,6 +305,15 @@ impl ScrollbackStore {
     }
 
     /// How many rows are held for this pane, across every read shape.
+    ///
+    /// The deepest shape wins, and it can therefore promise the reader more than
+    /// a *different* shape would hand back -- a pane watched as ANSI has a deep
+    /// ANSI buffer and an empty text one until something reads it as text. That
+    /// is the same direction Herdr's own metric already overstates in, and the
+    /// app has stopped believing the metric once a page comes back no longer
+    /// than the last (card #646): the cost is one wasted pull, not a wrong
+    /// screen. Reporting the shallowest instead would suppress the affordance on
+    /// the shape that does have the history, which is the worse of the two.
     pub fn depth(&self, session_id: &str, pane_id: &str) -> usize {
         let prefix = format!("{}/", pane_key(session_id, pane_id));
         self.buffers
@@ -529,23 +536,28 @@ mod tests {
     }
 
     #[test]
-    fn a_screen_redrawn_into_something_else_replaces_rather_than_appends() {
+    fn a_screen_that_shares_nothing_is_kept_on_top_of_the_one_it_followed() {
+        // Output arriving faster than the poll: the two reads are consecutive
+        // content, not two renderings of the same content, and dropping the
+        // first would throw away exactly what this exists to keep.
         let mut store = ScrollbackStore::default();
         store.record("k", &screen(&["old 1", "old 2", "old 3", "old 4"]));
         store.record("k", &screen(&["new 1", "new 2", "new 3", "new 4"]));
-        assert_eq!(store.window("k", 20).unwrap(), "new 1\nnew 2\nnew 3\nnew 4");
+        assert_eq!(
+            store.window("k", 20).unwrap(),
+            "old 1\nold 2\nold 3\nold 4\nnew 1\nnew 2\nnew 3\nnew 4"
+        );
     }
 
     #[test]
-    fn history_survives_a_redraw_of_the_screen_above_it() {
+    fn history_survives_a_burst_that_outran_the_poll() {
         let mut store = ScrollbackStore::default();
         store.record("k", &screen(&["1", "2", "3", "4"]));
         // Scrolls by two, so 1 and 2 become history.
         store.record("k", &screen(&["3", "4", "5", "6"]));
-        // Then the screen is replaced outright. What already scrolled off is
-        // not the screen's to take with it.
+        // Then the screen jumps past what can be followed.
         store.record("k", &screen(&["x", "y", "z", "w"]));
-        assert_eq!(store.window("k", 20).unwrap(), "1\n2\nx\ny\nz\nw");
+        assert_eq!(store.window("k", 20).unwrap(), "1\n2\n3\n4\n5\n6\nx\ny\nz\nw");
     }
 
     #[test]
