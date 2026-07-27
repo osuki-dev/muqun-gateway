@@ -34,6 +34,7 @@
 use serde_json::Value;
 
 use crate::approvals::Decision;
+use crate::i18n::{self, Locale};
 use crate::parts::{ApprovalChoice, ApprovalRequest, Assembler, Part, TodoItem, ToolStatus};
 
 /// How many result lines a tool block keeps. A native `read` returns a whole
@@ -124,7 +125,15 @@ pub struct NativeRead {
 /// Both are taken as `Value` rather than as typed structs because the mapping
 /// only ever reads a handful of fields, and a protocol that grows a field must
 /// not stop the gateway.
-pub fn opencode_normalize(messages: &Value, pending: &[Value]) -> (Vec<Part>, String) {
+///
+/// `locale` reaches only the answer labels on an `approval` part, which are the
+/// gateway's own words. Everything else a part carries is the agent's, and the
+/// agent's words are forwarded in whatever language it wrote them.
+pub fn opencode_normalize(
+    messages: &Value,
+    pending: &[Value],
+    locale: Locale,
+) -> (Vec<Part>, String) {
     let mut out = Assembler::new();
     for message in messages.as_array().into_iter().flatten() {
         let user = message.pointer("/info/role").and_then(Value::as_str) == Some("user");
@@ -138,7 +147,7 @@ pub fn opencode_normalize(messages: &Value, pending: &[Value]) -> (Vec<Part>, St
         }
     }
     for request in pending {
-        if let Some(approval) = opencode_approval(request) {
+        if let Some(approval) = opencode_approval(request, locale) {
             out.approval(approval);
         }
     }
@@ -331,8 +340,10 @@ fn file_diff(metadata: &Value) -> Option<(Option<String>, String)> {
 /// /session/{id}/permissions/{id}` takes `once`, `always` or `reject`, and
 /// nothing else. Their labels are written here rather than quoted from the
 /// agent, the same rule the push payloads follow -- an agent's own wording
-/// routinely embeds the command it is asking about.
-fn opencode_approval(request: &Value) -> Option<ApprovalRequest> {
+/// routinely embeds the command it is asking about. Being the gateway's own
+/// words is also what makes them safe to translate; the `decision` beside each
+/// one is protocol vocabulary and stays English in every locale.
+fn opencode_approval(request: &Value, locale: Locale) -> Option<ApprovalRequest> {
     let id = request.get("id").and_then(Value::as_str)?.to_owned();
     let action = request
         .get("permission")
@@ -358,14 +369,17 @@ fn opencode_approval(request: &Value) -> Option<ApprovalRequest> {
             let index = position as u32 + 1;
             ApprovalChoice {
                 index,
-                label: decision.public_label(index),
+                label: decision.public_label(locale, index),
                 decision: decision.as_str(),
             }
         })
         .collect();
     Some(ApprovalRequest {
         id,
-        prompt: format!("Allow {action}?"),
+        // The one sentence on this part the gateway wrote rather than quoted.
+        // `action` is the protocol's own name for the tool and stays put; only
+        // the sentence around it moves.
+        prompt: i18n::t_slots(locale, "Allow {action}?", &[("action", action)]),
         tool: Some(action.to_owned()),
         context: resources,
         options,
@@ -402,7 +416,11 @@ pub struct NativeApproval {
 }
 
 /// The pending request for this pane, if the agent reports one.
-pub async fn pending(adapter: &Adapter, root: Option<&std::path::Path>) -> Option<NativeApproval> {
+pub async fn pending(
+    adapter: &Adapter,
+    root: Option<&std::path::Path>,
+    locale: Locale,
+) -> Option<NativeApproval> {
     let base = endpoint(adapter)?;
     let root = root?;
     if adapter.id != "opencode" {
@@ -416,7 +434,7 @@ pub async fn pending(adapter: &Adapter, root: Option<&std::path::Path>) -> Optio
         .as_array()?
         .iter()
         .find(|request| request.get("sessionID").and_then(Value::as_str) == Some(&session))
-        .and_then(opencode_approval)?;
+        .and_then(|request| opencode_approval(request, locale))?;
     Some(NativeApproval {
         adapter: &OPENCODE,
         base,
@@ -503,11 +521,12 @@ pub async fn read(
     adapter: &Adapter,
     root: Option<&std::path::Path>,
     limit: usize,
+    locale: Locale,
 ) -> Option<NativeRead> {
     let base = endpoint(adapter)?;
     let root = root?;
     match adapter.id {
-        "opencode" => opencode_read(client(), &base, root, limit).await,
+        "opencode" => opencode_read(client(), &base, root, limit, locale).await,
         _ => None,
     }
 }
@@ -523,6 +542,7 @@ pub async fn opencode_read(
     base: &str,
     root: &std::path::Path,
     limit: usize,
+    locale: Locale,
 ) -> Option<NativeRead> {
     let health: Value = get(client, base, "/global/health", &[]).await?;
     if health.get("healthy").and_then(Value::as_bool) != Some(true) {
@@ -562,7 +582,7 @@ pub async fn opencode_read(
     // client rebuilds it by joining the parts' `fallback_text`, which is the
     // same thing byte for byte. That equality is what the invariant tests
     // assert, so it is a fact about the format rather than a convention.
-    let (parts, _) = opencode_normalize(&messages, &pending);
+    let (parts, _) = opencode_normalize(&messages, &pending, locale);
     Some(NativeRead {
         parts: parts.iter().map(Part::to_json).collect(),
         session: Some(session),
@@ -624,13 +644,21 @@ mod tests {
     const TRANSCRIPT: &str = include_str!("../tests/fixtures/opencode-transcript.txt");
 
     fn read(fixture: &str) -> (Vec<Part>, String) {
+        read_in(fixture, Locale::En)
+    }
+
+    fn read_in(fixture: &str, locale: Locale) -> (Vec<Part>, String) {
         let value: Value = serde_json::from_str(fixture).expect("fixture parses");
         let pending: Vec<Value> = value
             .get("pending_permissions")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        opencode_normalize(value.get("messages").unwrap_or(&Value::Null), &pending)
+        opencode_normalize(
+            value.get("messages").unwrap_or(&Value::Null),
+            &pending,
+            locale,
+        )
     }
 
     fn kinds(parts: &[Part]) -> Vec<&'static str> {
@@ -692,7 +720,7 @@ mod tests {
             "state": { "status": "completed", "title": "false", "output": "",
                        "metadata": { "exit": 1, "output": "" } }
         }] }] });
-        let (parts, _) = opencode_normalize(failed.get("messages").unwrap(), &[]);
+        let (parts, _) = opencode_normalize(failed.get("messages").unwrap(), &[], Locale::En);
         assert_eq!(parts[0].to_json()["status"], "error");
     }
 
@@ -800,6 +828,35 @@ mod tests {
     }
 
     #[test]
+    fn an_approval_part_answers_in_the_language_the_request_asked_for() {
+        // The labels and the prompt are the gateway's own words, so they move;
+        // the decisions are the protocol's vocabulary and the context is the
+        // agent's own command, so neither does.
+        let (parts, _) = read_in(APPROVAL, Locale::ZhTw);
+        let approval = parts
+            .iter()
+            .map(Part::to_json)
+            .find(|part| part["type"] == "approval")
+            .unwrap();
+        let labels: Vec<&str> = approval["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|option| option["label"].as_str())
+            .collect();
+        assert_eq!(labels, ["核准", "核准，且不再詢問", "拒絕"]);
+        assert_eq!(approval["prompt"], "允許 bash？");
+        let decisions: Vec<&str> = approval["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|option| option["decision"].as_str())
+            .collect();
+        assert_eq!(decisions, ["allow", "allow_always", "deny"]);
+        assert_eq!(approval["context"][0], "echo native-approval-probe");
+    }
+
+    #[test]
     fn a_tool_still_running_is_running_and_a_blocked_one_is_too() {
         let (parts, _) = read(APPROVAL);
         let blocked = parts
@@ -824,7 +881,7 @@ mod tests {
             { "type": "tool", "tool": "mystery",
               "state": { "status": "running", "input": { "shape": "unknown" } } }
         ] }]);
-        let (parts, _) = opencode_normalize(&value, &[]);
+        let (parts, _) = opencode_normalize(&value, &[], Locale::En);
         let rendered: Vec<Value> = parts.iter().map(Part::to_json).collect();
         assert_eq!(rendered[0]["input"], "echo hi");
         assert_eq!(rendered[1]["input"], "src/main.rs");
@@ -847,7 +904,7 @@ mod tests {
             "state": { "status": "completed", "title": "big.txt", "output": long,
                        "metadata": {} }
         }] }]);
-        let (parts, _) = opencode_normalize(&value, &[]);
+        let (parts, _) = opencode_normalize(&value, &[], Locale::En);
         let block = parts[0].to_json();
         assert_eq!(block["result"].as_array().unwrap().len(), MAX_RESULT_LINES);
         assert_eq!(block["truncated"], true);
@@ -864,7 +921,7 @@ mod tests {
             { "type": "agent", "name": "build" },
             { "type": "text", "text": "done" }
         ] }]);
-        let (parts, _) = opencode_normalize(&value, &[]);
+        let (parts, _) = opencode_normalize(&value, &[], Locale::En);
         assert_eq!(kinds(&parts), ["text"]);
     }
 
@@ -874,7 +931,7 @@ mod tests {
             { "type": "text", "text": "<system>rules</system>", "synthetic": true },
             { "type": "text", "text": "real question" }
         ] }]);
-        let (parts, _) = opencode_normalize(&value, &[]);
+        let (parts, _) = opencode_normalize(&value, &[], Locale::En);
         assert_eq!(kinds(&parts), ["prompt"]);
         assert_eq!(parts[0].to_json()["text"], "real question");
     }
@@ -932,11 +989,11 @@ mod tests {
 
     #[test]
     fn an_empty_session_is_an_empty_read_and_not_an_error() {
-        let (parts, transcript) = opencode_normalize(&json!([]), &[]);
+        let (parts, transcript) = opencode_normalize(&json!([]), &[], Locale::En);
         assert!(parts.is_empty());
         assert!(transcript.is_empty());
         // A protocol that grew a shape nobody here knows degrades the same way.
-        let (parts, _) = opencode_normalize(&json!("not an array"), &[]);
+        let (parts, _) = opencode_normalize(&json!("not an array"), &[], Locale::En);
         assert!(parts.is_empty());
     }
 

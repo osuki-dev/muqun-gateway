@@ -219,6 +219,29 @@ Authorization: Bearer <device_token>
 that is how a device gets its token. `GET /api/pair/pending` takes the admin
 token instead of a device token.
 
+### Language
+
+Text a person reads is answered in the caller's language; everything a client
+dispatches on is not. Send one exact code — `en` or `zh-TW` — as
+
+```
+X-Muqun-Locale: zh-TW
+Accept-Language: zh-TW
+```
+
+`X-Muqun-Locale` is read first, then `Accept-Language` (weighted lists from a
+browser are understood), then `en`. Anything absent, unknown or malformed is
+answered in English rather than refused. `zh-Hant`, `zh-HK` and `zh-MO` are
+served Traditional Chinese; `zh-Hans`, `zh-CN` and `zh-SG` deliberately are not,
+because Traditional is a worse answer than English for a Simplified reader.
+
+Only the `message` of an error moves. Its `code`, the `decision` names
+(`allow`, `allow_always`, `deny`, `other`), field names and route paths are the
+same bytes in every locale, and text an agent itself wrote is never translated.
+Push notifications carry the language the device sent when it registered its
+token — `locale` on `POST /api/devices/push-token`, optional and additive —
+because the watcher that raises them has no request to read a header from.
+
 Routes:
 
 - `GET /health`
