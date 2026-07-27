@@ -44,6 +44,7 @@ mod composer;
 mod i18n;
 mod native;
 mod parts;
+mod scrollback;
 mod shortcuts;
 mod tasks;
 
@@ -520,7 +521,20 @@ struct AppState {
     push_tokens: Arc<Mutex<Vec<PushTokenRecord>>>,
     devices: Arc<Mutex<Vec<DeviceRecord>>>,
     assets: Arc<Mutex<AssetIndex>>,
+    /// What panes with no scrollback of their own showed while the gateway was
+    /// watching. Memory only, and only for those panes; see `scrollback`.
+    scrollback: Arc<Mutex<scrollback::ScrollbackStore>>,
     approval_events: tokio::sync::broadcast::Sender<ApprovalEvent>,
+}
+
+/// The scrollback store, or nothing if a previous holder panicked while it was
+/// locked.
+///
+/// A poisoned buffer is not worth failing a read over: the pane's own answer
+/// from Herdr is still correct, only shorter. Every caller treats `None` as
+/// "this gateway keeps no history", which is exactly what release/0.5.0 did.
+fn lock_scrollback(state: &AppState) -> Option<std::sync::MutexGuard<'_, scrollback::ScrollbackStore>> {
+    state.scrollback.lock().ok()
 }
 
 #[derive(Deserialize)]
@@ -996,6 +1010,7 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         push_tokens: Arc::new(Mutex::new(read_push_tokens().unwrap_or_default())),
         devices: Arc::new(Mutex::new(read_devices().unwrap_or_default())),
         assets: Arc::new(Mutex::new(AssetIndex::default())),
+        scrollback: Arc::new(Mutex::new(scrollback::ScrollbackStore::default())),
         approval_events: tokio::sync::broadcast::channel(APPROVAL_EVENT_CAPACITY).0,
     };
     spawn_agent_notification_watchers(state.clone());
@@ -2350,7 +2365,22 @@ async fn snapshot(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
-    call_session_method(&state.config, &session_id, "session.snapshot", json!({})).await
+    let answer = call_session_method(&state.config, &session_id, "session.snapshot", json!({})).await;
+    Ok(Json(note_and_amend_panes(&state, &session_id, answer?.0)))
+}
+
+/// Let the scrollback store read a Herdr answer, and answer back for whatever
+/// it holds.
+///
+/// Every pane entity the gateway hands out goes through here, because the
+/// reader's pull-for-earlier is gated on the pane's `scroll`, not on its output.
+/// Panes Herdr reports real scrollback for come out of this untouched.
+fn note_and_amend_panes(state: &AppState, session_id: &str, mut value: Value) -> Value {
+    if let Some(mut store) = lock_scrollback(state) {
+        store.observe(session_id, &value);
+        store.amend(session_id, &mut value);
+    }
+    value
 }
 
 async fn workspaces(
@@ -2368,7 +2398,8 @@ async fn panes(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
-    call_session_method(&state.config, &session_id, "pane.list", json!({})).await
+    let answer = call_session_method(&state.config, &session_id, "pane.list", json!({})).await;
+    Ok(Json(note_and_amend_panes(&state, &session_id, answer?.0)))
 }
 
 async fn agents(
@@ -2532,6 +2563,39 @@ async fn enrich_pane_update(
     serde_json::to_string(&value).ok()
 }
 
+/// Fold a streamed frame into what the gateway keeps for that pane.
+///
+/// Only for panes Herdr reports no scrollback for; everything else is left
+/// exactly as it was, unrecorded. The key carries the source and format because
+/// rows read as ANSI and rows read as plain text are different rows.
+fn keep_stream_frame(
+    store: &Arc<Mutex<scrollback::ScrollbackStore>>,
+    session_id: &str,
+    pane_id: &str,
+    opts: &StreamOutputOpts,
+    output: &str,
+) {
+    if output.is_empty() {
+        return;
+    }
+    let Ok(mut store) = store.lock() else { return };
+    if !store.keeps(session_id, pane_id) {
+        return;
+    }
+    let key = scrollback::read_key(session_id, pane_id, &opts.source, &opts.format);
+    store.record(&key, output);
+}
+
+/// The output an enriched `pane.updated` carries, so the same frame that
+/// reaches the reader also reaches the buffer.
+fn enriched_pane_output(payload: &str) -> Option<String> {
+    serde_json::from_str::<Value>(payload)
+        .ok()?
+        .pointer("/data/output")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
 /// Normalises a filter token to the underscore form Herdr tags events with, so
 /// a client may ask for either `pane.updated` or `pane_updated`.
 fn normalize_event_name(value: &str) -> String {
@@ -2593,6 +2657,7 @@ async fn events(
         .is_none_or(|set| set.contains("approval_pending") || set.contains("approval_resolved"));
     let mut approvals_rx = state.approval_events.subscribe();
     let assets = state.assets.clone();
+    let scrollback_store = state.scrollback.clone();
     let stream = async_stream::stream! {
         match herdr_event_stream(&session).await {
             Ok(mut reader) => {
@@ -2631,6 +2696,15 @@ async fn events(
                                     } else {
                                         data.to_owned()
                                     };
+                                    // An enriched update is a second source of
+                                    // fresh output for the watched pane. Feeding
+                                    // only the tick would drop frames on a pane
+                                    // busy enough to beat it.
+                                    if let Some(pane_id) = stream_opts.pane.as_deref() {
+                                        if let Some(output) = enriched_pane_output(&payload) {
+                                            keep_stream_frame(&scrollback_store, &session_id, pane_id, &stream_opts, &output);
+                                        }
+                                    }
                                     yield Ok(Event::default().event("herdr").data(payload));
                                 }
                                 // A worktree event is consumed whether or not
@@ -2669,6 +2743,12 @@ async fn events(
                                 if last_stream_output.as_deref() != Some(frame.output.as_str()) {
                                     last_stream_output = Some(frame.output.clone());
                                     if let Some(pane_id) = stream_opts.pane.as_deref() {
+                                        // The frame the reader is watching is
+                                        // also the only chance to keep it: for a
+                                        // pane Herdr holds no scrollback for,
+                                        // this tick is where its history comes
+                                        // from, and it was being dropped.
+                                        keep_stream_frame(&scrollback_store, &session_id, pane_id, &stream_opts, &frame.output);
                                         if let Some(payload) = stream_pane_update_payload(&frame, pane_id) {
                                             yield Ok(Event::default().event("herdr").data(payload));
                                         }
@@ -2729,6 +2809,14 @@ async fn watch_pane_approvals(state: AppState, session: SessionConfig) {
         let Ok(response) = herdr_request(&session, "pane.list", json!({})).await else {
             continue;
         };
+        // This listing is already being fetched, and it is the only place that
+        // says which panes Herdr keeps no scrollback for. Reading it here means
+        // the buffer knows what to keep before the reader ever opens the pane,
+        // and costs Herdr nothing extra.
+        if let Some(mut store) = lock_scrollback(&state) {
+            store.observe(&session.id, &response);
+        }
+
         let panes = response
             .pointer("/result/panes")
             .and_then(Value::as_array)
@@ -3254,13 +3342,14 @@ async fn pane(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
-    call_session_method(
+    let answer = call_session_method(
         &state.config,
         &session_id,
         "pane.get",
         json!({ "pane_id": pane_id }),
     )
-    .await
+    .await;
+    Ok(Json(note_and_amend_panes(&state, &session_id, answer?.0)))
 }
 
 async fn focus_pane(
@@ -4298,7 +4387,32 @@ async fn pane_output(
         "lines": lines,
         "format": format
     });
-    call_session_method(&state.config, &session_id, "pane.read", params).await
+    let mut answer = call_session_method(&state.config, &session_id, "pane.read", params)
+        .await?
+        .0;
+
+    // Herdr answered with everything it has. For a pane it keeps nothing above
+    // the viewport for, everything it has is one screen -- and this is the read
+    // that both feeds what the gateway kept and hands it back.
+    if let Some(text) = pane_read_text(&answer) {
+        let key = scrollback::read_key(&session_id, &pane_id, herdr_source, &format);
+        let served = {
+            let Some(mut store) = lock_scrollback(&state) else {
+                return Ok(Json(answer));
+            };
+            if !store.keeps(&session_id, &pane_id) {
+                return Ok(Json(answer));
+            }
+            store.record(&key, &text);
+            store.window(&key, lines as usize)
+        };
+        if let Some(served) = served {
+            if served.len() > text.len() {
+                scrollback::replace_read_text(&mut answer, &served);
+            }
+        }
+    }
+    Ok(Json(answer))
 }
 
 #[derive(Debug, Deserialize)]
@@ -4364,7 +4478,23 @@ async fn pane_parts(
             "Herdr is unavailable",
         )
     })?;
-    let text = pane_read_text(&read).unwrap_or_default();
+    let herdr_text = pane_read_text(&read).unwrap_or_default();
+    // The transcript reads the same pane through a different endpoint, so it
+    // has to be given the same rows: two views that disagree about where
+    // history ends is the bug this whole thing is trying not to introduce.
+    let text = {
+        let key = scrollback::read_key(&session_id, &pane_id, "recent_unwrapped", "text");
+        match lock_scrollback(&state) {
+            Some(mut store) if store.keeps(&session_id, &pane_id) => {
+                store.record(&key, &herdr_text);
+                store
+                    .window(&key, lines as usize)
+                    .filter(|served| served.len() > herdr_text.len())
+                    .unwrap_or(herdr_text)
+            }
+            _ => herdr_text,
+        }
+    };
     let revision = ["/result/read/revision", "/result/revision"]
         .into_iter()
         .find_map(|pointer| read.pointer(pointer).and_then(Value::as_u64));
@@ -8018,6 +8148,7 @@ mod tests {
             push_tokens: Arc::new(Mutex::new(Vec::new())),
             devices: Arc::new(Mutex::new(devices)),
             assets: Arc::new(Mutex::new(AssetIndex::default())),
+            scrollback: Arc::new(Mutex::new(scrollback::ScrollbackStore::default())),
             approval_events: tokio::sync::broadcast::channel(APPROVAL_EVENT_CAPACITY).0,
         }
     }
@@ -10292,6 +10423,120 @@ mod tests {
         submit_keypress(&herdr.session(), "w1:p1").await;
 
         assert_eq!(herdr.enters().len(), SUBMIT_MAX_ATTEMPTS as usize);
+    }
+
+    /// A pane that repaints a four-row screen, scrolling one row per read: the
+    /// shape of the pane in card #646, small enough to assert on exactly.
+    fn repainting_screens() -> Vec<String> {
+        (0..4)
+            .map(|top| {
+                (top..top + 4)
+                    .map(|row| format!("row {row}"))
+                    .collect::<Vec<String>>()
+                    .join("\n")
+            })
+            .collect()
+    }
+
+    fn output_state(herdr: &FakeHerdr) -> AppState {
+        let mut state = test_state("admin", vec![test_device("d1", "token")]);
+        state.config.sessions[0].socket_path = herdr.session().socket_path;
+        state
+    }
+
+    async fn read_output(state: &AppState, lines: u32) -> String {
+        let response = pane_output(
+            State(state.clone()),
+            Path(("default".into(), "wM:p1".into())),
+            Query(OutputQuery {
+                source: Some("recent-unwrapped".into()),
+                lines: Some(lines),
+                format: Some("text".into()),
+            }),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap();
+        pane_read_text(&response.0).unwrap_or_default()
+    }
+
+    /// The whole point, end to end: Herdr keeps one screen, the gateway watched
+    /// four, and the reader can ask for all four.
+    #[tokio::test]
+    async fn a_zero_backlog_pane_hands_back_more_than_herdr_kept() {
+        let screens = repainting_screens();
+        let herdr = FakeHerdr::start(screens.iter().map(String::as_str).collect(), None);
+        let state = output_state(&herdr);
+        state.scrollback.lock().unwrap().observe(
+            "default",
+            &json!({ "pane_id": "wM:p1", "scroll": { "max_offset_from_bottom": 0, "viewport_rows": 4 } }),
+        );
+
+        for _ in 0..4 {
+            read_output(&state, 240).await;
+        }
+        let served = read_output(&state, 240).await;
+
+        // Herdr's own answer is the last screen alone.
+        assert_eq!(screens.last().unwrap(), "row 3\nrow 4\nrow 5\nrow 6");
+        assert_eq!(served, "row 0\nrow 1\nrow 2\nrow 3\nrow 4\nrow 5\nrow 6");
+    }
+
+    /// And having kept them, it says so where the reader's affordance looks --
+    /// on the pane, not on the output.
+    #[tokio::test]
+    async fn the_pane_listing_reports_what_was_kept() {
+        let screens = repainting_screens();
+        let herdr = FakeHerdr::start(screens.iter().map(String::as_str).collect(), None);
+        let state = output_state(&herdr);
+        let pane = json!({ "pane_id": "wM:p1", "scroll": { "max_offset_from_bottom": 0, "viewport_rows": 4 } });
+        state.scrollback.lock().unwrap().observe("default", &pane);
+
+        for _ in 0..4 {
+            read_output(&state, 240).await;
+        }
+        let listing = note_and_amend_panes(&state, "default", json!({ "result": { "panes": [pane] } }));
+
+        // Seven rows kept, four of them on screen: three to reach back for.
+        assert_eq!(
+            listing.pointer("/result/panes/0/scroll/max_offset_from_bottom"),
+            Some(&json!(3))
+        );
+    }
+
+    /// The panes that already worked have to keep working exactly as they did.
+    #[tokio::test]
+    async fn a_pane_with_scrollback_is_answered_as_herdr_answered_it() {
+        let screens = repainting_screens();
+        let herdr = FakeHerdr::start(screens.iter().map(String::as_str).collect(), None);
+        let state = output_state(&herdr);
+        state.scrollback.lock().unwrap().observe(
+            "default",
+            &json!({ "pane_id": "wM:p1", "scroll": { "max_offset_from_bottom": 908, "viewport_rows": 4 } }),
+        );
+
+        for _ in 0..4 {
+            read_output(&state, 240).await;
+        }
+        let served = read_output(&state, 240).await;
+
+        assert_eq!(served, screens.last().unwrap().as_str());
+    }
+
+    /// And so does a pane nobody has reported on: not knowing is a reason to
+    /// stay out of the way.
+    #[tokio::test]
+    async fn an_unreported_pane_is_never_buffered() {
+        let screens = repainting_screens();
+        let herdr = FakeHerdr::start(screens.iter().map(String::as_str).collect(), None);
+        let state = output_state(&herdr);
+
+        for _ in 0..4 {
+            read_output(&state, 240).await;
+        }
+        let served = read_output(&state, 240).await;
+
+        assert_eq!(served, screens.last().unwrap().as_str());
     }
 
     #[tokio::test]
