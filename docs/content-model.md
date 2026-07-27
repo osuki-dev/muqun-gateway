@@ -299,9 +299,14 @@ will stream something renderable.
 
 ### Endpoints (additive)
 
-- `GET /api/sessions/{sid}/assets?since=&limit=` — recent artifacts, newest
-  first. Fed by the herdr `worktree.*` events the gateway already subscribes
-  to; falls back to an mtime scan of workspace roots.
+- `GET /api/sessions/{sid}/assets?since=&limit=&kind=` — recent artifacts,
+  newest first. Fed by the herdr `worktree.*` events the gateway already
+  subscribes to; falls back to an mtime scan of workspace roots. `kind=` is a
+  comma-separated allow-list of the kinds above, applied while the listing is
+  walked rather than to a page already cut, so `kind=image&limit=50` is the 50
+  newest images and not the images among the 50 newest files. Absent or empty
+  filters nothing; an unknown kind matches nothing; the applied list comes back
+  as `data.kind`.
 - `GET /api/assets/{id}/content` — streams the file. Read-only. Path must
   canonicalize inside a session workspace root (no symlink escape), size-capped,
   kind re-sniffed on read. 404 outside roots, 415 for kinds with no preview.

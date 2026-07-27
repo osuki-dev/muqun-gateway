@@ -5384,13 +5384,29 @@ impl AssetIndex {
         self.roots.get(session_id).cloned().unwrap_or_default()
     }
 
-    /// Newest first, with the path as the tie-break so two files written in the
-    /// same millisecond still order the same way on every call.
+    /// Newest first, cut to one page.
     fn session_assets(
         &self,
         session_id: &str,
         since_unix_ms: Option<u128>,
         limit: usize,
+    ) -> Vec<AssetEntry> {
+        let mut entries = self.session_assets_ordered(session_id, since_unix_ms);
+        entries.truncate(limit);
+        entries
+    }
+
+    /// The same ordering with nothing dropped -- newest first, with the path as
+    /// the tie-break so two files written in the same millisecond still order
+    /// the same way on every call.
+    ///
+    /// The caller that wants this rather than a page is the one that has to
+    /// look past the page to fill it: a `kind` filter cannot be answered from
+    /// the index, because what a file is comes from its bytes.
+    fn session_assets_ordered(
+        &self,
+        session_id: &str,
+        since_unix_ms: Option<u128>,
     ) -> Vec<AssetEntry> {
         let mut entries: Vec<AssetEntry> = self
             .entries
@@ -5408,7 +5424,6 @@ impl AssetIndex {
                 .cmp(&left.modified_unix_ms)
                 .then_with(|| left.path.cmp(&right.path))
         });
-        entries.truncate(limit);
         entries
     }
 
@@ -5863,11 +5878,62 @@ struct AssetsQuery {
     since: Option<u64>,
     #[serde(default)]
     limit: Option<usize>,
+    /// Comma-separated allow-list of asset kinds, e.g. `markdown,pdf`. Absent
+    /// or empty means every kind, so an old client is unaffected.
+    #[serde(default)]
+    kind: Option<String>,
     /// One absolute path to resolve exactly, for a file path the user tapped in
     /// terminal output. Takes precedence over `since` and `limit`, and answers
     /// with either the one asset or none.
     #[serde(default)]
     path: Option<String>,
+}
+
+/// The `kind=` allow-list, normalized.
+///
+/// Comma-separated rather than one kind per request because a client's filters
+/// do not map one to one onto the taxonomy -- a "documents" filter is markdown
+/// and pdf -- and asking for both at once keeps "newest first" one ordering
+/// instead of two lists the client has to merge and re-cut.
+///
+/// The values are the same strings an asset carries as its `kind`, so what can
+/// be asked for is exactly what can be read back. A value that is not one of
+/// them matches nothing, the way an unknown name in the events `types=`
+/// allow-list matches nothing: the request is answered rather than refused, and
+/// the applied list is echoed back so a client can see what it asked for.
+fn asset_kind_filter(kind: Option<&str>) -> Vec<String> {
+    kind.unwrap_or_default()
+        .split(',')
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+/// Build one page of assets, newest first, sniffing each candidate as it goes.
+///
+/// The kinds allow-list is applied while walking rather than to a page already
+/// cut, which is the whole point of it: `kind=image&limit=50` answers with the
+/// 50 newest images, not with the images among the 50 newest files. A session
+/// whose agent is editing source code writes source files faster than it writes
+/// artifacts, so the second reading returns an empty list on a workspace that
+/// is full of images.
+///
+/// Sniffing is the cost here, so a candidate is read once and the walk stops
+/// the moment the page is full. Without a filter the candidates are already the
+/// page, which is the old work and the old cost exactly.
+fn asset_page(entries: Vec<AssetEntry>, kinds: &[String], limit: usize) -> Vec<Value> {
+    let mut page: Vec<Value> = Vec::new();
+    for entry in entries {
+        if page.len() >= limit {
+            break;
+        }
+        let asset_type = sniff_asset_type(&read_asset_head(&entry.path), &entry.name);
+        if !kinds.is_empty() && !kinds.iter().any(|kind| kind == asset_type.kind.as_str()) {
+            continue;
+        }
+        page.push(asset_json(&entry, asset_type));
+    }
+    page
 }
 
 /// List what a session's workspaces produced recently, newest first.
@@ -5915,27 +5981,36 @@ async fn session_assets(
         .unwrap_or(ASSET_LIST_DEFAULT_LIMIT)
         .clamp(1, ASSET_LIST_MAX_LIMIT);
     let since = query.since.map(u128::from);
-    let entries = lock_assets(&state)?.session_assets(&session_id, since, limit);
-    // Only the page about to be returned is sniffed: metadata came from the
-    // scan, and reading a handful of file heads is cheap where reading every
-    // file in the workspace would not be.
-    let assets = tokio::task::spawn_blocking(move || {
-        entries
-            .into_iter()
-            .map(|entry| {
-                let asset_type = sniff_asset_type(&read_asset_head(&entry.path), &entry.name);
-                asset_json(&entry, asset_type)
-            })
-            .collect::<Vec<Value>>()
-    })
-    .await
-    .unwrap_or_default();
+    let kinds = asset_kind_filter(query.kind.as_deref());
+    // Unfiltered, the index cuts the page and only that page is sniffed:
+    // metadata came from the scan, and reading a handful of file heads is cheap
+    // where reading every file in the workspace would not be. A `kind` filter
+    // has to be given the whole session in order instead, because the index
+    // does not know what a file is -- its bytes do -- and the page has to be
+    // filled from the newest matches rather than from whatever the newest
+    // handful of files happened to be.
+    let entries = {
+        let index = lock_assets(&state)?;
+        if kinds.is_empty() {
+            index.session_assets(&session_id, since, limit)
+        } else {
+            index.session_assets_ordered(&session_id, since)
+        }
+    };
+    let filter = kinds.clone();
+    let assets = tokio::task::spawn_blocking(move || asset_page(entries, &filter, limit))
+        .await
+        .unwrap_or_default();
 
     Ok(Json(content_envelope(json!({
         "session_id": session_id,
         "assets": assets,
         "limit": limit,
         "since": since.map(|since| since as u64),
+        // The allow-list that was actually applied, empty when there was none.
+        // Always present, so a client can tell a gateway that understands
+        // `kind=` from an older one that ignored it.
+        "kind": kinds,
         "roots": roots
             .iter()
             .map(|root| root.path.to_string_lossy())
@@ -7011,6 +7086,7 @@ fn openapi_spec() -> Value {
                         path_param("sessionId"),
                         query_param("since", "Unix milliseconds, the same unit as modified_unix_ms; only files modified strictly after this are returned"),
                         query_param("limit", "How many assets to return, 1 to 200, default 50"),
+                        query_param("kind", "Comma-separated allow-list of kinds -- image, markdown, text, pdf, binary -- filtered during the scan, so kind=image&limit=50 answers with the 50 newest images rather than the images among the 50 newest files. Absent or empty means every kind; a value outside the taxonomy matches nothing rather than erroring. The applied list is echoed back as data.kind"),
                         query_param("path", "Resolve one absolute path exactly, for a file path tapped in terminal output. Takes precedence over since and limit. Answers with one asset, or with none when the path does not canonicalize to a file inside a workspace root -- a fenced-out path is a miss, not an error")
                     ],
                     "responses": assets_responses()
@@ -8716,6 +8792,191 @@ mod tests {
         index.forget_under(&nested);
         assert!(index.get(&asset_id(&shared)).is_none());
         assert_eq!(index.entries.len(), 2);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_kind_allow_list_is_normalized_and_an_absent_one_filters_nothing() {
+        assert!(asset_kind_filter(None).is_empty());
+        assert!(asset_kind_filter(Some("")).is_empty());
+        // A trailing comma is a client's join, not a kind.
+        assert!(asset_kind_filter(Some(",, ,")).is_empty());
+        assert_eq!(
+            asset_kind_filter(Some("image")),
+            vec![String::from("image")]
+        );
+        assert_eq!(
+            asset_kind_filter(Some(" Markdown , PDF ")),
+            vec![String::from("markdown"), String::from("pdf")]
+        );
+        // A kind outside the taxonomy is carried as asked and simply matches
+        // nothing, the way an unknown name in the events allow-list does.
+        assert_eq!(
+            asset_kind_filter(Some("document")),
+            vec![String::from("document")]
+        );
+    }
+
+    /// The listing's own state, pointed at a socket that is not there: no roots
+    /// come back and none are remembered, so nothing rescans and the entries
+    /// under test stay as they were put in. Their mtimes are what the ordering
+    /// is asserted on, which a run of files written in the same millisecond
+    /// could not give.
+    fn asset_listing_state(root: &FsPath, entries: Vec<AssetEntry>) -> AppState {
+        let mut state = test_state("admin", vec![test_device("d1", "token")]);
+        state.config.sessions[0].socket_path =
+            root.join("herdr.sock").to_string_lossy().to_string();
+        {
+            let mut index = state.assets.lock().unwrap();
+            for entry in entries {
+                index.upsert(entry);
+            }
+        }
+        state
+    }
+
+    fn asset_listing_query(kind: Option<&str>, limit: usize) -> AssetsQuery {
+        AssetsQuery {
+            since: None,
+            limit: Some(limit),
+            kind: kind.map(str::to_owned),
+            path: None,
+        }
+    }
+
+    async fn listed_asset_names(state: &AppState, kind: Option<&str>, limit: usize) -> Vec<String> {
+        let response = session_assets(
+            State(state.clone()),
+            Path("default".into()),
+            Query(asset_listing_query(kind, limit)),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap();
+        response.0["data"]["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|asset| asset["name"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_kind_filter_answers_the_newest_of_that_kind_not_the_kind_among_the_newest() {
+        // The shape that made the filter necessary: an agent editing source code
+        // writes files faster than it writes artifacts, so the image and the
+        // documents sit well behind the newest page.
+        let root = asset_test_dir("kind-listing");
+        std::fs::write(root.join("chart.png"), png_bytes()).unwrap();
+        std::fs::write(root.join("notes.md"), b"# notes\n").unwrap();
+        std::fs::write(root.join("report.pdf"), b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n").unwrap();
+        for index in 0..3 {
+            std::fs::write(root.join(format!("mod{index}.rs")), b"fn main() {}\n").unwrap();
+        }
+        let state = asset_listing_state(
+            &root,
+            vec![
+                test_asset_entry(&root.join("chart.png"), &root, 1_000),
+                test_asset_entry(&root.join("notes.md"), &root, 2_000),
+                test_asset_entry(&root.join("report.pdf"), &root, 3_000),
+                test_asset_entry(&root.join("mod0.rs"), &root, 4_000),
+                test_asset_entry(&root.join("mod1.rs"), &root, 5_000),
+                test_asset_entry(&root.join("mod2.rs"), &root, 6_000),
+            ],
+        );
+
+        // No kind is the old answer exactly: the newest files, whatever they are.
+        assert_eq!(
+            listed_asset_names(&state, None, 3).await,
+            vec![
+                String::from("mod2.rs"),
+                String::from("mod1.rs"),
+                String::from("mod0.rs")
+            ]
+        );
+        assert_eq!(listed_asset_names(&state, Some(""), 3).await.len(), 3);
+
+        // The image is the fourth-oldest file of six, so a page of three would
+        // never have shown it. Filtering during the scan is what finds it.
+        assert_eq!(
+            listed_asset_names(&state, Some("image"), 3).await,
+            vec![String::from("chart.png")]
+        );
+        // One request for a client filter that spans two kinds, still newest
+        // first across both.
+        assert_eq!(
+            listed_asset_names(&state, Some("markdown,pdf"), 3).await,
+            vec![String::from("report.pdf"), String::from("notes.md")]
+        );
+        // The page is still cut to the limit, and cut from the matches.
+        assert_eq!(
+            listed_asset_names(&state, Some("text"), 2).await,
+            vec![String::from("mod2.rs"), String::from("mod1.rs")]
+        );
+        // A kind the gateway does not have matches nothing rather than erroring
+        // or quietly widening back to everything.
+        assert!(listed_asset_names(&state, Some("document"), 3)
+            .await
+            .is_empty());
+
+        // The applied allow-list comes back, so a client can tell this gateway
+        // from one old enough to have ignored the parameter.
+        let response = session_assets(
+            State(state.clone()),
+            Path("default".into()),
+            Query(asset_listing_query(Some("Image"), 3)),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.0["data"]["kind"], json!(["image"]));
+        assert_eq!(response.0["data"]["assets"][0]["kind"], "image");
+        let unfiltered = session_assets(
+            State(state.clone()),
+            Path("default".into()),
+            Query(asset_listing_query(None, 3)),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(unfiltered.0["data"]["kind"], json!([]));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_page_is_filled_from_the_matches_and_sniffs_no_further_than_it_has_to() {
+        let root = asset_test_dir("kind-page");
+        std::fs::write(root.join("a.png"), png_bytes()).unwrap();
+        std::fs::write(root.join("b.png"), png_bytes()).unwrap();
+        std::fs::write(root.join("c.txt"), b"plain\n").unwrap();
+        let ordered = vec![
+            test_asset_entry(&root.join("a.png"), &root, 3_000),
+            test_asset_entry(&root.join("b.png"), &root, 2_000),
+            test_asset_entry(&root.join("c.txt"), &root, 1_000),
+        ];
+
+        let names = |page: Vec<Value>| -> Vec<String> {
+            page.iter()
+                .map(|asset| asset["name"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        assert_eq!(
+            names(asset_page(ordered.clone(), &[], 2)),
+            vec![String::from("a.png"), String::from("b.png")]
+        );
+        assert_eq!(
+            names(asset_page(ordered.clone(), &[String::from("image")], 1)),
+            vec![String::from("a.png")]
+        );
+        // A name that lies is not what the filter goes on: the kind is the one
+        // sniffed from the bytes, the same one the asset carries on the wire.
+        std::fs::write(root.join("a.png"), b"not an image at all\n").unwrap();
+        assert_eq!(
+            names(asset_page(ordered, &[String::from("image")], 2)),
+            vec![String::from("b.png")]
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }
