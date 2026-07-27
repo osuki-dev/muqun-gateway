@@ -418,6 +418,45 @@ root, a traversal, and an unknown id all answer `404`, and no answer
 distinguishes them. Assets over 10 MiB answer `413`, and a binary asset answers
 `415` with its metadata and no body. Nothing about this API writes.
 
+### Scrollback for panes that have none
+
+Herdr keeps scrollback for programs that print and let the text roll off the
+top. It keeps none for programs that repaint an alternate screen -- an agent
+running under a wrapper, `opencode`, `nvim` -- and reports
+`scroll.max_offset_from_bottom: 0` for those panes. Asking such a pane for 2000
+lines answers with the one screen it has, every time, so a client can never
+page back through it.
+
+For those panes, and only those, the gateway keeps what it saw. Every read it
+already makes -- the 150 ms poll behind `?stream_pane=`, an enriched
+`pane.updated`, and the `output` and `parts` endpoints themselves -- is folded
+into a per-pane row buffer. A later `lines=` larger than Herdr's window is
+answered from it, and the pane's own `scroll.max_offset_from_bottom` reports
+what the buffer can deliver, so an unchanged client discovers the history
+through the field it already reads.
+
+Worth knowing before you rely on it:
+
+- **It is memory only. Restarting the gateway loses every buffer.** Terminal
+  contents are deliberately not written to disk, for the same reason push
+  notifications never carry them.
+- It can only keep what it watched. Nothing a pane printed before the gateway
+  first read it is recoverable, because nobody kept it.
+- A repainting screen is a rectangle, not a stream, so rows are placed by
+  matching the incoming screen against the end of the buffer. Where a burst of
+  output moved the screen further than one read can follow, the read is kept
+  whole on top of the one it followed.
+- Rows read as ANSI and rows read as plain text are kept apart, because they are
+  not the same rows. The pane's reported offset is the deeper of the two, so a
+  pane watched as ANSI can promise a plain-text reader more than that read will
+  return until something has read it as text. Herdr's own metric already
+  overstates in the same direction, and a client that stops believing it once a
+  page returns nothing new pays at most one wasted request.
+- Panes Herdr reports real scrollback for are not recorded, not spliced and not
+  amended. They are answered exactly as they were before.
+- Bounds: 5000 rows and 2 MiB per pane and read shape, 48 buffers, 24 MiB in
+  total. The least recently fed buffer is dropped whole when a ceiling is hit.
+
 ### Parts
 
 `GET /api/sessions/default/panes/:paneId/parts` answers the same pane text the
