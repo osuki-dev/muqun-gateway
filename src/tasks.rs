@@ -54,6 +54,8 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::i18n::{self, Locale};
+
 /// Herdr's supported agent kinds, in the order `herdr agent start --kind`
 /// lists them. A kind is also its canonical executable name, which is what
 /// makes a `PATH` probe a meaningful availability check.
@@ -199,7 +201,13 @@ pub enum BranchNameError {
 }
 
 impl BranchNameError {
-    pub fn message(self) -> &'static str {
+    /// The English sentence this refusal is, which is also the key its
+    /// translations are filed under.
+    ///
+    /// It is kept separate from [`BranchNameError::message`] so the catalog has
+    /// one obvious place to look these up from, and so a locale with no entry
+    /// for a rule still says the rule rather than saying nothing.
+    fn english(self) -> &'static str {
         match self {
             Self::Empty => "branch_name must not be empty",
             Self::TooLong => "branch_name must be at most 200 characters",
@@ -213,6 +221,15 @@ impl BranchNameError {
             }
             Self::LockSuffix => "branch_name must not end with .lock",
         }
+    }
+
+    /// The refusal as the person who typed the branch name reads it.
+    ///
+    /// `branch_name` itself never moves: it is the request field the client has
+    /// to correct, so naming it in Chinese would name a field that does not
+    /// exist. Only the sentence around it is translated.
+    pub fn message(self, locale: Locale) -> String {
+        i18n::t(locale, self.english()).to_owned()
     }
 }
 
@@ -562,6 +579,34 @@ mod tests {
         assert_eq!(
             validate_branch_name(&"a".repeat(MAX_BRANCH_NAME_CHARS + 1)),
             Err(BranchNameError::TooLong)
+        );
+    }
+
+    /// Every rule reads as an instruction in either language, and the field it
+    /// instructs the client to fix keeps its name.
+    #[test]
+    fn a_refused_branch_name_explains_itself_in_the_readers_language() {
+        for error in [
+            BranchNameError::Empty,
+            BranchNameError::TooLong,
+            BranchNameError::IllegalCharacter,
+            BranchNameError::Traversal,
+            BranchNameError::LeadingDash,
+            BranchNameError::BadComponent,
+            BranchNameError::LockSuffix,
+        ] {
+            let english = error.message(Locale::En);
+            let chinese = error.message(Locale::ZhTw);
+            assert_eq!(english, error.english(), "English is its own translation");
+            assert_ne!(chinese, english, "{english:?} has no translation");
+            // `branch_name` is the request field the client has to correct, so
+            // it is named identically whichever language the sentence is in.
+            assert!(english.starts_with("branch_name "));
+            assert!(chinese.starts_with("branch_name "));
+        }
+        assert_eq!(
+            BranchNameError::Empty.message(Locale::ZhTw),
+            "branch_name 不得為空"
         );
     }
 

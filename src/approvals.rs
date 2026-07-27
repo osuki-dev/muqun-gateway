@@ -35,10 +35,12 @@
 //! What the wire carries is deliberately small: the question, the answers, the
 //! surrounding lines the agent drew, and a fingerprint. It never carries an
 //! agent-specific concept, and the push notification built from it (see
-//! [`Approval::push_options`]) carries no terminal content at all.
+//! [`push_options`]) carries no terminal content at all.
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+
+use crate::i18n::{self, Locale};
 
 /// How far back from the end of the pane a menu may start. A permission menu is
 /// a screenful at most; looking further only invites matching old output.
@@ -123,12 +125,20 @@ impl Decision {
     /// host in a notification payload. The native adapters label an `approval`
     /// part's answers with it for the same reason -- a protocol's own wording
     /// for "always" embeds the pattern it would save.
-    pub fn public_label(self, index: u32) -> String {
+    ///
+    /// Because the gateway wrote these four strings, the gateway may translate
+    /// them, and that is precisely what [`Decision::as_str`] above may never
+    /// do: the label is prose a person reads, the `as_str` value is vocabulary
+    /// a client dispatches on. They are separate functions for that reason and
+    /// only that reason.
+    pub fn public_label(self, locale: Locale, index: u32) -> String {
         match self {
-            Decision::Allow => "Approve".into(),
-            Decision::AllowAlways => "Approve and don't ask again".into(),
-            Decision::Deny => "Deny".into(),
-            Decision::Other => format!("Option {index}"),
+            Decision::Allow => i18n::t(locale, "Approve").to_owned(),
+            Decision::AllowAlways => i18n::t(locale, "Approve and don't ask again").to_owned(),
+            Decision::Deny => i18n::t(locale, "Deny").to_owned(),
+            Decision::Other => {
+                i18n::t_slots(locale, "Option {index}", &[("index", &index.to_string())])
+            }
         }
     }
 
@@ -190,6 +200,33 @@ pub struct ApprovalOption {
     pub decision: Decision,
 }
 
+/// One answer as a push notification is allowed to know it.
+///
+/// A push is built in a background watcher and worded once per language among
+/// the registered devices, so what the menu *offers* has to outlive the moment
+/// the wording is chosen. It is also the whole of what may travel: an index and
+/// a decision, neither of which the agent wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PushChoice {
+    pub index: u32,
+    pub decision: Decision,
+}
+
+/// The option summary a push notification may carry: indices and decisions
+/// only, with labels the gateway wrote itself, in the reader's language.
+pub fn push_options(choices: &[PushChoice], locale: Locale) -> Vec<Value> {
+    choices
+        .iter()
+        .map(|choice| {
+            json!({
+                "index": choice.index,
+                "decision": choice.decision.as_str(),
+                "label": choice.decision.public_label(locale, choice.index),
+            })
+        })
+        .collect()
+}
+
 /// A permission menu the agent is blocked on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Approval {
@@ -235,22 +272,20 @@ impl Approval {
         })
     }
 
-    /// The option summary a push notification may carry: indices and decisions
-    /// only, with labels the gateway wrote itself.
+    /// What this menu offers, with everything the agent wrote stripped off.
     ///
     /// The privacy rule for notifications is that they say *that* something
     /// needs an answer, never *what*. An agent's own wording routinely quotes a
     /// command or a path ("don't ask again for: npm install *"), so it is the
-    /// one thing that must not be forwarded.
-    pub fn push_options(&self) -> Vec<Value> {
+    /// one thing that must not be forwarded. An index and a decision carry no
+    /// terminal content, which is why a push may hold on to them long after the
+    /// `Approval` they came from has been dropped.
+    pub fn push_choices(&self) -> Vec<PushChoice> {
         self.options
             .iter()
-            .map(|option| {
-                json!({
-                    "index": option.index,
-                    "decision": option.decision.as_str(),
-                    "label": option.decision.public_label(option.index),
-                })
+            .map(|option| PushChoice {
+                index: option.index,
+                decision: option.decision,
             })
             .collect()
     }
@@ -841,7 +876,7 @@ mod tests {
         // The whole privacy rule for notifications lives in this assertion: the
         // agent quoted a command in its own label, and none of it may leave.
         let approval = detect(BASH).unwrap();
-        let options = approval.push_options();
+        let options = push_options(&approval.push_choices(), Locale::En);
         let rendered = serde_json::to_string(&options).unwrap();
         assert!(!rendered.contains("npm"));
         assert!(!rendered.contains("vitest"));
@@ -849,6 +884,42 @@ mod tests {
         assert_eq!(options[1]["label"], "Approve and don't ask again");
         assert_eq!(options[2]["label"], "Deny");
         assert_eq!(options[2]["index"], 3);
+    }
+
+    #[test]
+    fn a_translated_push_payload_still_quotes_none_of_the_terminal() {
+        // Translating the gateway's own four labels cannot weaken the rule
+        // above, because the rule is about whose words they are and not about
+        // which language they are in. The same fixture, the same command in the
+        // agent's own label, and the same nothing on the wire.
+        let approval = detect(BASH).unwrap();
+        let options = push_options(&approval.push_choices(), Locale::ZhTw);
+        let rendered = serde_json::to_string(&options).unwrap();
+        assert!(!rendered.contains("npm"));
+        assert!(!rendered.contains("vitest"));
+        assert_eq!(options[0]["label"], "核准");
+        assert_eq!(options[1]["label"], "核准，且不再詢問");
+        assert_eq!(options[2]["label"], "拒絕");
+    }
+
+    #[test]
+    fn the_decision_vocabulary_is_byte_identical_in_every_locale() {
+        // `decision` and `index` are what a client dispatches on; `label` is
+        // what a person reads. Only the second one has a language.
+        let approval = detect(BASH).unwrap();
+        let english = push_options(&approval.push_choices(), Locale::En);
+        let chinese = push_options(&approval.push_choices(), Locale::ZhTw);
+        assert_eq!(english.len(), chinese.len());
+        for (english, chinese) in english.iter().zip(&chinese) {
+            assert_eq!(english["decision"], chinese["decision"]);
+            assert_eq!(english["index"], chinese["index"]);
+            assert_ne!(english["label"], chinese["label"]);
+        }
+        assert_eq!(
+            Decision::Other.public_label(Locale::ZhTw, 7),
+            "選項 7",
+            "an index is a number in every language"
+        );
     }
 
     #[test]

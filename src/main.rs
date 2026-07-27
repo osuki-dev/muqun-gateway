@@ -41,10 +41,13 @@ use tokio_stream::Stream;
 
 mod approvals;
 mod composer;
+mod i18n;
 mod native;
 mod parts;
 mod shortcuts;
 mod tasks;
+
+use crate::i18n::Locale;
 
 #[cfg(unix)]
 use tokio::net::UnixStream;
@@ -363,7 +366,29 @@ struct PushTokenRecord {
     token: String,
     platform: String,
     device_name: Option<String>,
+    /// The language this device asked to be notified in, as the exact code the
+    /// app persists (`en` or `zh-TW`).
+    ///
+    /// A push is built in a watcher spawned at startup, where there is no
+    /// request and therefore no header to read, so the language has to have
+    /// been remembered from the last one there was. It is optional and
+    /// `#[serde(default)]` because a `push-tokens.json` written before this
+    /// field existed -- and a client too old to send it -- must keep working;
+    /// both simply get English.
+    #[serde(default)]
+    locale: Option<String>,
     updated_unix_ms: u128,
+}
+
+impl PushTokenRecord {
+    /// The language to write this device's pushes in. Anything unrecognized,
+    /// including nothing at all, is English.
+    fn locale(&self) -> Locale {
+        self.locale
+            .as_deref()
+            .and_then(Locale::from_code)
+            .unwrap_or_default()
+    }
 }
 
 /// One paired device. Each successful pairing mints a token that only this
@@ -387,6 +412,12 @@ struct RegisterPushTokenBody {
     token: String,
     platform: String,
     device_name: Option<String>,
+    /// The language this device wants its notifications in. Additive and
+    /// optional: an older client that does not send it registers exactly as it
+    /// always did, and the request locale is used instead, which for the app is
+    /// the same value it would have sent anyway.
+    #[serde(default)]
+    locale: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -401,11 +432,84 @@ struct SendPushNotificationBody {
     data: Option<serde_json::Map<String, Value>>,
 }
 
+/// A push after it has been put into words: exactly what one Expo message
+/// carries.
 #[derive(Debug, PartialEq, Eq)]
 struct AgentPushNotification {
     title: String,
     body: String,
     data: serde_json::Map<String, Value>,
+}
+
+/// What happened, in the only three ways this gateway ever raises a push.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentNotice {
+    ApprovalPending,
+    AgentBlocked,
+    AgentCompleted,
+}
+
+/// A push *before* it has been put into words.
+///
+/// The watchers that raise these are spawned at startup and run for the life of
+/// the process; there is no request in scope and therefore no header to read a
+/// language off. Choosing the words there would mean choosing one language for
+/// every phone. So the ingredients travel instead, and [`AgentPushNotice::render`]
+/// is called once per distinct locale among the registered devices -- each phone
+/// is notified in the language it registered with.
+///
+/// Everything held here is either locale-free or a name a person chose: the ids
+/// and urls in `data`, the server label the user typed, the agent's own name,
+/// and the answers as [`approvals::PushChoice`], which is an index and a
+/// decision and nothing the agent wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentPushNotice {
+    notice: AgentNotice,
+    /// The label the user gave this server. Never translated -- it is theirs.
+    server_label: String,
+    /// The agent's own name. `None` renders as the reader's word for an agent.
+    agent_name: Option<String>,
+    data: serde_json::Map<String, Value>,
+    /// Only an approval has these, and only ever as indices and decisions.
+    choices: Vec<approvals::PushChoice>,
+}
+
+impl AgentPushNotice {
+    fn render(&self, locale: Locale) -> AgentPushNotification {
+        let (heading, body) = match self.notice {
+            AgentNotice::ApprovalPending => {
+                ("Approval needed", "{name} is waiting for your approval.")
+            }
+            AgentNotice::AgentBlocked => ("Agent blocked", "{name} needs your input."),
+            AgentNotice::AgentCompleted => ("Agent done", "{name} finished running."),
+        };
+        // Title carries which server so a multi-server user knows where to
+        // look; body carries which agent and what happened. Only the server
+        // label (which the user set) and the agent name -- never terminal
+        // output or prompts.
+        let heading = i18n::t(locale, heading);
+        let title = if self.server_label.is_empty() {
+            heading.to_owned()
+        } else {
+            format!("{heading} · {}", truncate(&self.server_label, 32))
+        };
+        let agent = match &self.agent_name {
+            Some(name) => name.clone(),
+            None => i18n::t(locale, "Agent").to_owned(),
+        };
+        let mut data = self.data.clone();
+        if !self.choices.is_empty() {
+            data.insert(
+                "options".into(),
+                json!(approvals::push_options(&self.choices, locale)),
+            );
+        }
+        AgentPushNotification {
+            title,
+            body: i18n::t_slots(locale, body, &[("name", &agent)]),
+            data,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1011,12 +1115,25 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         )
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .layer(middleware::from_fn(security_headers))
+        .layer(middleware::from_fn(request_locale))
         .with_state(state);
 
     println!("herdr gateway listening on http://{addr}");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Put the caller's language in scope for the whole request.
+///
+/// This is the outermost layer because every route under it can refuse, and a
+/// refusal is the most common thing a person reads from this gateway. It reads
+/// the headers once and hands the answer to [`i18n::scope`]; nothing below has
+/// to remember to ask, and nothing below can ask for a locale the resolver
+/// would not have given it.
+async fn request_locale(request: Request<Body>, next: Next) -> Response {
+    let locale = Locale::from_headers(request.headers());
+    i18n::scope(locale, next.run(request)).await
 }
 
 async fn security_headers(request: Request<Body>, next: Next) -> Response {
@@ -1316,10 +1433,19 @@ async fn register_push_token(
             "failed to lock push token state",
         )
     })?;
+    // A body that names a language wins; a body that does not falls back to the
+    // headers this very request arrived with, which is the same answer for the
+    // app and a better one than English for anything else.
+    let locale = body
+        .locale
+        .as_deref()
+        .and_then(Locale::from_code)
+        .unwrap_or_else(|| Locale::from_headers(&headers));
     let record = PushTokenRecord {
         token: body.token,
         platform,
         device_name: body.device_name.filter(|value| !value.trim().is_empty()),
+        locale: Some(locale.as_str().to_owned()),
         updated_unix_ms: now_unix_ms(),
     };
     if let Some(existing) = tokens.iter_mut().find(|item| item.token == record.token) {
@@ -1393,11 +1519,17 @@ async fn send_test_notification(
             )
         })?
         .clone();
+    // The person waiting to see whether push works is the one holding the phone
+    // that made this call, so the defaults are written in that request's
+    // language. "Herdr Gateway" is the product's name and stays in Latin script
+    // in every locale, the same way the app leaves "Gateway" alone.
+    let locale = Locale::from_headers(&headers);
     let result = send_expo_push_notifications(
         &tokens,
         body.title.unwrap_or_else(|| "Herdr Gateway".into()),
-        body.body
-            .unwrap_or_else(|| "Muqun push notifications are connected.".into()),
+        body.body.unwrap_or_else(|| {
+            i18n::t(locale, "Muqun push notifications are connected.").to_owned()
+        }),
         body.data.unwrap_or_else(|| {
             let mut data = serde_json::Map::new();
             data.insert("url".into(), json!("/"));
@@ -2729,12 +2861,13 @@ fn publish_approval(
     let _ = state.approval_events.send(ApprovalEvent { name, payload });
 }
 
-/// The push a pending approval sends.
+/// The push a pending approval sends, before it is put into words.
 ///
 /// Content-free by construction: the title carries the server the user named,
 /// the body carries the agent's name, and the data carries ids and the option
 /// *decisions* -- never the agent's own wording, which routinely quotes a
-/// command or a path.
+/// command or a path. Which language the words end up in is decided per device
+/// at delivery; see [`AgentPushNotice`].
 fn approval_notification(
     server_id: &str,
     server_label: &str,
@@ -2742,18 +2875,7 @@ fn approval_notification(
     pane_id: &str,
     agent: &str,
     approval: &approvals::Approval,
-) -> AgentPushNotification {
-    let server = server_label.trim();
-    let title = if server.is_empty() {
-        "Approval needed".to_string()
-    } else {
-        format!("Approval needed · {}", truncate(server, 32))
-    };
-    let agent = if agent.trim().is_empty() {
-        "Agent"
-    } else {
-        agent.trim()
-    };
+) -> AgentPushNotice {
     let mut data = serde_json::Map::new();
     data.insert("type".into(), json!("approval.pending"));
     data.insert("url".into(), json!(format!("/servers/{server_id}")));
@@ -2764,11 +2886,14 @@ fn approval_notification(
     // under, plus which of those actions this particular menu offers.
     data.insert("categoryId".into(), json!("approval"));
     data.insert("fingerprint".into(), json!(approval.fingerprint));
-    data.insert("options".into(), json!(approval.push_options()));
-    AgentPushNotification {
-        title,
-        body: format!("{agent} is waiting for your approval."),
+    AgentPushNotice {
+        notice: AgentNotice::ApprovalPending,
+        server_label: server_label.trim().to_owned(),
+        agent_name: (!agent.trim().is_empty()).then(|| agent.trim().to_owned()),
         data,
+        // The answers travel as indices and decisions, and are worded at
+        // delivery time. `options` is set on the payload there.
+        choices: approval.push_choices(),
     }
 }
 
@@ -2847,7 +2972,7 @@ async fn poll_agent_notifications(
     server_id: &str,
     server_label: &str,
     session_id: &str,
-) -> Vec<AgentPushNotification> {
+) -> Vec<AgentPushNotice> {
     let Ok(value) = herdr_request(session, "agent.list", json!({})).await else {
         return Vec::new();
     };
@@ -2871,7 +2996,14 @@ async fn poll_agent_notifications(
         .collect()
 }
 
-async fn deliver_agent_notification(state: &AppState, notification: AgentPushNotification) {
+/// Send one notice to every registered device, each in its own language.
+///
+/// Devices are grouped by the locale they registered with and the notice is
+/// worded once per group, so a household with an English phone and a Chinese
+/// phone gets one Expo batch each rather than one batch in whichever language
+/// happened to be asked for last. In the ordinary case every device shares a
+/// locale and this is exactly the single request it always was.
+async fn deliver_agent_notification(state: &AppState, notice: AgentPushNotice) {
     let tokens = match state.push_tokens.lock() {
         Ok(tokens) => tokens.clone(),
         Err(_) => {
@@ -2879,15 +3011,22 @@ async fn deliver_agent_notification(state: &AppState, notification: AgentPushNot
             return;
         }
     };
-    if let Err(err) = send_expo_push_notifications(
-        &tokens,
-        notification.title,
-        notification.body,
-        notification.data,
-    )
-    .await
-    {
-        eprintln!("agent notification failed: {err:#}");
+    let mut by_locale: BTreeMap<Locale, Vec<PushTokenRecord>> = BTreeMap::new();
+    for token in tokens {
+        by_locale.entry(token.locale()).or_default().push(token);
+    }
+    for (locale, tokens) in by_locale {
+        let notification = notice.render(locale);
+        if let Err(err) = send_expo_push_notifications(
+            &tokens,
+            notification.title,
+            notification.body,
+            notification.data,
+        )
+        .await
+        {
+            eprintln!("agent notification failed: {err:#}");
+        }
     }
 }
 
@@ -2909,13 +3048,19 @@ async fn seed_agent_statuses(session: &SessionConfig) -> HashMap<String, String>
         .collect()
 }
 
+/// The push one agent status change raises, if it raises one at all.
+///
+/// It runs the transition bookkeeping, so it may be called exactly once per
+/// event -- which is the other reason it returns an unworded [`AgentPushNotice`]
+/// rather than finished text: the same change may have to be said in two
+/// languages, and saying it twice here would consume the transition twice.
 fn notification_for_agent_status_event(
     event: &Value,
     statuses: &mut HashMap<String, String>,
     server_id: &str,
     server_label: &str,
     session_id: &str,
-) -> Option<AgentPushNotification> {
+) -> Option<AgentPushNotice> {
     let data = event.get("data").unwrap_or(event);
     let event_type = event
         .get("event")
@@ -2932,27 +3077,19 @@ fn notification_for_agent_status_event(
         return None;
     }
 
-    let (event_type, status_label, message) = match (status.as_str(), previous.as_deref()) {
-        ("blocked", _) => ("agent.blocked", "Agent blocked", "needs your input."),
+    let (event_type, notice) = match (status.as_str(), previous.as_deref()) {
+        ("blocked", _) => ("agent.blocked", AgentNotice::AgentBlocked),
         ("idle" | "done" | "completed", Some("working")) => {
-            ("agent.completed", "Agent done", "finished running.")
+            ("agent.completed", AgentNotice::AgentCompleted)
         }
         _ => return None,
     };
     let agent_name = ["display_agent", "agent", "title"]
         .into_iter()
         .find_map(|key| data.get(key).and_then(Value::as_str))
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("Agent");
-    // Title carries which server so a multi-server user knows where to look;
-    // body carries which agent and what happened. Only the server label (which
-    // the user set) and the agent name -- never terminal output or prompts.
-    let server = server_label.trim();
-    let title = if server.is_empty() {
-        status_label.to_string()
-    } else {
-        format!("{status_label} · {}", truncate(server, 32))
-    };
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
     let mut notification_data = serde_json::Map::new();
     notification_data.insert("type".into(), json!(event_type));
     notification_data.insert("url".into(), json!(format!("/servers/{server_id}")));
@@ -2960,10 +3097,12 @@ fn notification_for_agent_status_event(
     notification_data.insert("session_id".into(), json!(session_id));
     notification_data.insert("pane_id".into(), json!(pane_id));
 
-    Some(AgentPushNotification {
-        title,
-        body: format!("{} {message}", agent_name.trim()),
+    Some(AgentPushNotice {
+        notice,
+        server_label: server_label.trim().to_owned(),
+        agent_name,
         data: notification_data,
+        choices: Vec::new(),
     })
 }
 
@@ -3604,7 +3743,7 @@ async fn create_task(
             api_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_branch_name",
-                err.message(),
+                &err.message(i18n::current()),
             )
         })?;
     }
@@ -4240,7 +4379,13 @@ async fn pane_parts(
     // pane and can never take one away.
     let native = match native::adapter_for(agent.as_deref()) {
         Some(adapter) => {
-            native::read(adapter, root.as_deref(), native::DEFAULT_MESSAGE_LIMIT).await
+            native::read(
+                adapter,
+                root.as_deref(),
+                native::DEFAULT_MESSAGE_LIMIT,
+                i18n::current(),
+            )
+            .await
         }
         None => None,
     };
@@ -4498,7 +4643,7 @@ async fn pane_approval(
         // it must leave the pane on the drawn-menu path rather than answering
         // "idle" for a pane that is in fact blocked.
         if native::endpoint(adapter).is_some() {
-            let pending = native::pending(adapter, root.as_deref()).await;
+            let pending = native::pending(adapter, root.as_deref(), i18n::current()).await;
             return Ok(Json(content_envelope(native_approval_data(
                 &session_id,
                 &pane_id,
@@ -4729,7 +4874,7 @@ async fn answer_native_approval(
     // Past this point the protocol is the authority, and a pane it says is not
     // waiting is not answered by keystroke either: the menu still on the screen
     // is the last frame of one that has already been resolved.
-    let Some(pending) = native::pending(adapter, root.as_deref()).await else {
+    let Some(pending) = native::pending(adapter, root.as_deref(), i18n::current()).await else {
         return Err(api_error(
             StatusCode::CONFLICT,
             "approval_not_pending",
@@ -6506,10 +6651,34 @@ fn find_session<'a>(config: &'a Config, session_id: &str) -> ApiResult<&'a Sessi
         })
 }
 
+/// Every refusal this gateway makes, in the language the request asked for.
+///
+/// `code` is the wire's vocabulary: a client dispatches on it, so it is the
+/// same bytes in every locale and is never looked up in the catalog. `message`
+/// is prose for a person, and is passed in as its own English text -- which is
+/// also the key it is translated by, so a message nobody has translated yet
+/// still reads correctly, just in English.
+///
+/// The locale is ambient rather than an argument because this constructor is
+/// reached from seventy-nine places, many of them helpers several calls below a
+/// handler that have no business knowing a request exists. See
+/// [`request_locale`] for the scope it is set in and [`i18n::current`] for what
+/// happens outside one.
 fn api_error(status: StatusCode, code: &str, message: &str) -> (StatusCode, Json<Value>) {
+    api_error_in(i18n::current(), status, code, message)
+}
+
+/// The same constructor with the language named outright, for the tests and for
+/// any caller that knows its reader better than the ambient scope does.
+fn api_error_in(
+    locale: Locale,
+    status: StatusCode,
+    code: &str,
+    message: &str,
+) -> (StatusCode, Json<Value>) {
     (
         status,
-        Json(json!({ "error": { "code": code, "message": message } })),
+        Json(json!({ "error": { "code": code, "message": i18n::t(locale, message) } })),
     )
 }
 
@@ -6938,7 +7107,7 @@ fn openapi_spec() -> Value {
         "info": {
             "title": "Herdr Gateway API",
             "version": env!("CARGO_PKG_VERSION"),
-            "description": "Token-protected mobile API for controlling a local Herdr server through the Herdr socket API."
+            "description": "Token-protected mobile API for controlling a local Herdr server through the Herdr socket API. Human-readable text is localized: send X-Muqun-Locale (or Accept-Language) with `en` or `zh-TW`. Error `code` values, decision names and other wire vocabulary are the same bytes in every locale."
         },
         "components": {
             "securitySchemes": {
@@ -6979,7 +7148,7 @@ fn openapi_spec() -> Value {
             "/api/devices/push-token": {
                 "post": {
                     "summary": "Register this Muqun device's Expo push token",
-                    "requestBody": json_body(object_schema(&[("token", "string"), ("platform", "string"), ("device_name", "string")], &["token", "platform"])),
+                    "requestBody": json_body(object_schema(&[("token", "string"), ("platform", "string"), ("device_name", "string"), ("locale", "string")], &["token", "platform"])),
                     "responses": ok_response()
                 },
                 "delete": {
@@ -7786,6 +7955,177 @@ mod tests {
         headers
     }
 
+    /// A paired device's headers with the app's locale header on them, which is
+    /// what every real request from the app carries.
+    fn locale_headers(token: &str, locale: &str) -> HeaderMap {
+        let mut headers = bearer_headers(token);
+        headers.insert(
+            axum::http::HeaderName::from_static(i18n::LOCALE_HEADER),
+            HeaderValue::from_str(locale).unwrap(),
+        );
+        headers
+    }
+
+    fn error_body(refusal: &(StatusCode, Json<Value>)) -> Value {
+        refusal.1 .0.clone()
+    }
+
+    /// The refusal a request reads is in the language it asked for, and the
+    /// `code` beside it is not.
+    ///
+    /// This goes through `require_device` rather than through `api_error`
+    /// directly because the interesting part is the *ambient* locale: no handler
+    /// and no helper on this path takes a `Locale` argument, and the answer
+    /// still changes language. That is the whole mechanism, asserted end to end.
+    #[tokio::test]
+    async fn a_refusal_is_written_in_the_language_the_request_asked_for() {
+        let state = test_state("admin-token", vec![test_device("device-1", "token-1")]);
+
+        let english = i18n::scope(Locale::En, async {
+            require_device(&state, &locale_headers("wrong", "en")).unwrap_err()
+        })
+        .await;
+        let chinese = i18n::scope(Locale::ZhTw, async {
+            require_device(&state, &locale_headers("wrong", "zh-TW")).unwrap_err()
+        })
+        .await;
+
+        assert_eq!(english.0, chinese.0, "the status is not prose");
+        let english = error_body(&english);
+        let chinese = error_body(&chinese);
+        assert_eq!(english["error"]["code"], "invalid_token");
+        assert_eq!(
+            english["error"]["code"], chinese["error"]["code"],
+            "a client dispatches on the code, so it has no language"
+        );
+        assert_eq!(english["error"]["message"], "invalid token");
+        assert_eq!(chinese["error"]["message"], "token 無效");
+    }
+
+    /// Outside a request there is no locale to read, and English is the answer
+    /// -- never a panic and never a missing message.
+    #[test]
+    fn a_refusal_built_outside_a_request_is_english() {
+        let state = test_state("admin-token", vec![test_device("device-1", "token-1")]);
+        let refusal = require_device(&state, &bearer_headers("wrong")).unwrap_err();
+        assert_eq!(error_body(&refusal)["error"]["message"], "invalid token");
+    }
+
+    /// The wire vocabulary is the contract; the prose is not.
+    #[test]
+    fn error_codes_are_byte_identical_across_locales() {
+        // One of each shape: a validation refusal, an auth refusal, a
+        // not-found, and one whose message quotes API vocabulary that must
+        // survive translation intact.
+        let cases = [
+            ("session_not_found", "session not found"),
+            ("invalid_platform", "platform must be ios or android"),
+            (
+                "invalid_decision",
+                "decision must be allow, allow_always, or deny",
+            ),
+            (
+                "invalid_source",
+                "source must be visible, recent, recent-unwrapped, or detection",
+            ),
+            (
+                "unknown_agent",
+                "agent is not one this gateway offers; see GET /api/agents/catalog",
+            ),
+        ];
+        for (code, message) in cases {
+            let english = api_error_in(Locale::En, StatusCode::BAD_REQUEST, code, message);
+            let chinese = api_error_in(Locale::ZhTw, StatusCode::BAD_REQUEST, code, message);
+            let english = error_body(&english);
+            let chinese = error_body(&chinese);
+            assert_eq!(english["error"]["code"], code);
+            assert_eq!(chinese["error"]["code"], code);
+            assert_eq!(english["error"]["message"], message);
+            assert_ne!(
+                chinese["error"]["message"], message,
+                "{code} has no translation"
+            );
+        }
+
+        // The literals inside a message are API vocabulary a client sends back,
+        // so only the sentence around them moves.
+        let chinese = error_body(&api_error_in(
+            Locale::ZhTw,
+            StatusCode::BAD_REQUEST,
+            "invalid_decision",
+            "decision must be allow, allow_always, or deny",
+        ));
+        let message = chinese["error"]["message"].as_str().unwrap();
+        for literal in ["decision", "allow", "allow_always", "deny"] {
+            assert!(message.contains(literal), "{literal} was translated away");
+        }
+        let chinese = error_body(&api_error_in(
+            Locale::ZhTw,
+            StatusCode::BAD_REQUEST,
+            "invalid_source",
+            "source must be visible, recent, recent-unwrapped, or detection",
+        ));
+        let message = chinese["error"]["message"].as_str().unwrap();
+        for literal in ["visible", "recent", "recent-unwrapped", "detection"] {
+            assert!(message.contains(literal), "{literal} was translated away");
+        }
+        let chinese = error_body(&api_error_in(
+            Locale::ZhTw,
+            StatusCode::BAD_REQUEST,
+            "unknown_agent",
+            "agent is not one this gateway offers; see GET /api/agents/catalog",
+        ));
+        assert!(chinese["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("GET /api/agents/catalog"));
+    }
+
+    /// A message nobody has translated is still a message.
+    #[test]
+    fn an_untranslated_refusal_falls_back_to_its_english() {
+        let refusal = api_error_in(
+            Locale::ZhTw,
+            StatusCode::BAD_GATEWAY,
+            "herdr_error",
+            "pane.read: Herdr refused the request",
+        );
+        assert_eq!(
+            error_body(&refusal)["error"]["message"],
+            "pane.read: Herdr refused the request"
+        );
+        assert_eq!(error_body(&refusal)["error"]["code"], "herdr_error");
+    }
+
+    /// A `push-tokens.json` written before the locale field existed still
+    /// loads, and the device it describes is notified in English.
+    #[test]
+    fn a_push_token_registered_before_locales_existed_still_loads() {
+        let old: Vec<PushTokenRecord> = serde_json::from_str(
+            r#"[{ "token": "ExponentPushToken[abc]", "platform": "ios",
+                  "device_name": "Phone", "updated_unix_ms": 1 }]"#,
+        )
+        .expect("the field is optional, so an older file is still a valid one");
+        assert_eq!(old[0].locale, None);
+        assert_eq!(old[0].locale(), Locale::En);
+
+        let current: Vec<PushTokenRecord> = serde_json::from_str(
+            r#"[{ "token": "ExponentPushToken[abc]", "platform": "ios",
+                  "device_name": "Phone", "locale": "zh-TW", "updated_unix_ms": 1 }]"#,
+        )
+        .unwrap();
+        assert_eq!(current[0].locale(), Locale::ZhTw);
+
+        // And a value that is not a locale this gateway serves is not an error
+        // either -- the device simply gets English.
+        let odd: Vec<PushTokenRecord> = serde_json::from_str(
+            r#"[{ "token": "ExponentPushToken[abc]", "platform": "ios",
+                  "locale": "zh-Hans", "updated_unix_ms": 1 }]"#,
+        )
+        .unwrap();
+        assert_eq!(odd[0].locale(), Locale::En);
+    }
+
     #[test]
     fn a_secret_directory_is_marked_never_to_be_committed() {
         let dir = std::env::temp_dir().join(format!("herdr-gitignore-{}", std::process::id()));
@@ -8188,7 +8528,7 @@ mod tests {
             }
         });
         let mut statuses = HashMap::new();
-        let notification = notification_for_agent_status_event(
+        let notice = notification_for_agent_status_event(
             &event,
             &mut statuses,
             "server-1",
@@ -8196,10 +8536,18 @@ mod tests {
             "default",
         )
         .unwrap();
+        let notification = notice.render(Locale::En);
         assert_eq!(notification.title, "Agent blocked · Studio");
         assert_eq!(notification.body, "Codex needs your input.");
         assert_eq!(notification.data["type"], "agent.blocked");
         assert_eq!(notification.data["url"], "/servers/server-1");
+        // The same transition, said to a phone that reads Chinese. The name the
+        // agent goes by is not translated -- it is a name.
+        let chinese = notice.render(Locale::ZhTw);
+        assert_eq!(chinese.title, "代理程式等待中 · Studio");
+        assert_eq!(chinese.body, "Codex 需要你的輸入。");
+        assert_eq!(chinese.data["type"], "agent.blocked");
+        assert_eq!(chinese.data["url"], "/servers/server-1");
         assert!(notification_for_agent_status_event(
             &event,
             &mut statuses,
@@ -8221,7 +8569,7 @@ mod tests {
                 "agent_status": "idle"
             }
         });
-        let notification = notification_for_agent_status_event(
+        let notice = notification_for_agent_status_event(
             &event,
             &mut statuses,
             "server-1",
@@ -8229,10 +8577,40 @@ mod tests {
             "default",
         )
         .unwrap();
+        let notification = notice.render(Locale::En);
         assert_eq!(notification.title, "Agent done · Studio");
         assert_eq!(notification.body, "codex finished running.");
         assert_eq!(notification.data["type"], "agent.completed");
         assert_eq!(notification.data["pane_id"], "w1:p2");
+        let chinese = notice.render(Locale::ZhTw);
+        assert_eq!(chinese.title, "代理程式已完成 · Studio");
+        assert_eq!(chinese.body, "codex 已執行完畢。");
+    }
+
+    /// The agent's name goes where the sentence wants it, not where the English
+    /// happened to put it.
+    ///
+    /// The old body was `format!("{name} {tail}")` over fragments like "needs
+    /// your input.", which fixes the name to the front of the sentence in every
+    /// language there will ever be. A whole format string per locale is what
+    /// makes the slot movable, and an agent that reports no name at all gets the
+    /// reader's own word for one rather than the English "Agent".
+    #[test]
+    fn a_push_names_the_agent_from_a_slot_and_not_from_a_concatenation() {
+        let event = json!({
+            "event": "pane.agent_status_changed",
+            "data": { "pane_id": "w1:p9", "agent": "   ", "agent_status": "blocked" }
+        });
+        let mut statuses = HashMap::new();
+        let notice =
+            notification_for_agent_status_event(&event, &mut statuses, "s", "", "default").unwrap();
+        assert_eq!(notice.agent_name, None);
+        // No server label, so the title is the heading on its own.
+        assert_eq!(notice.render(Locale::En).title, "Agent blocked");
+        assert_eq!(notice.render(Locale::En).body, "Agent needs your input.");
+        assert_eq!(notice.render(Locale::ZhTw).title, "代理程式等待中");
+        assert!(notice.render(Locale::ZhTw).body.ends_with("需要你的輸入。"));
+        assert!(notice.render(Locale::ZhTw).body.starts_with("代理程式"));
     }
 
     #[test]
@@ -8243,9 +8621,10 @@ mod tests {
         let approval =
             approvals::detect(include_str!("../tests/fixtures/approval-claude-bash.txt"))
                 .expect("the fixture is a pending approval");
-        let notification = approval_notification(
+        let notice = approval_notification(
             "server-1", "Studio", "default", "wM:p1", "claude", &approval,
         );
+        let notification = notice.render(Locale::En);
         assert_eq!(notification.title, "Approval needed · Studio");
         assert_eq!(notification.body, "claude is waiting for your approval.");
         assert_eq!(notification.data["type"], "approval.pending");
@@ -8257,6 +8636,21 @@ mod tests {
         assert_eq!(notification.data["options"][2]["decision"], "deny");
         assert_eq!(notification.data["fingerprint"], approval.fingerprint);
         let rendered = Value::Object(notification.data).to_string();
+        assert!(!rendered.contains("npm"), "the command must not travel");
+        assert!(!rendered.contains("Do you want"), "nor the question");
+
+        // Translating the four labels the gateway wrote for itself cannot
+        // weaken any of that: the words changed, whose words they are did not.
+        let chinese = notice.render(Locale::ZhTw);
+        assert_eq!(chinese.title, "需要核准 · Studio");
+        assert_eq!(chinese.body, "claude 正在等待你的核准。");
+        assert_eq!(chinese.data["options"][0]["label"], "核准");
+        assert_eq!(chinese.data["options"][2]["label"], "拒絕");
+        assert_eq!(
+            chinese.data["options"][0]["decision"], "allow",
+            "the decision is wire vocabulary and has no language"
+        );
+        let rendered = Value::Object(chinese.data).to_string();
         assert!(!rendered.contains("npm"), "the command must not travel");
         assert!(!rendered.contains("Do you want"), "nor the question");
     }

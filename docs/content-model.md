@@ -233,6 +233,16 @@ payloads carry no agent text. And the **`fallback_text` is the menu the agent
 would have drawn**, so a client that has never heard of the type still shows the
 user the question and the answers.
 
+Because `label` and `prompt` are the gateway's own words rather than the agent's,
+they are also the only fields here that have a **language**. The payload above is
+the `en` rendering; a request carrying `X-Muqun-Locale: zh-TW` gets the same
+shape with `"prompt": "允許 bash？"` and labels `核准`, `核准，且不再詢問`, `拒絕`.
+Nothing else moves: `decision`, `approval_id`, `tool` and `context` are wire
+vocabulary or the agent's own text, and `fallback_text` is rendered from whatever
+the labels resolved to, so it stays consistent with them. See `src/i18n.rs` for
+the resolution order and for why `zh-Hans` and `zh-CN` deliberately do not fold
+onto `zh-TW`.
+
 It is emitted **where an agent exposes approval state**, which today means the
 native path. A pane read through a marker dictionary keeps its menu on
 `GET/POST .../approval`: the menu is already transcript rows there, and the
