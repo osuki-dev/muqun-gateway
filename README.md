@@ -258,7 +258,7 @@ Routes:
   pane's current output into its `pane.updated` events as `data.output`, so a
   client paints on arrival with no follow-up read; the gateway's own
   `asset.created` events ride the same stream)
-- `GET /api/sessions/default/assets?since=&limit=&path=`
+- `GET /api/sessions/default/assets?since=&limit=&kind=&path=`
 - `GET /api/assets/:assetId/content`
 - `GET /api/sessions/default/snapshot`
 - `GET /api/sessions/default/workspaces`
@@ -385,6 +385,18 @@ only files modified strictly after it. `limit` runs from 1 to 200 and defaults
 to 50. `path=<absolute path>` resolves one exact file instead, for a path the
 user tapped in terminal output; it takes precedence over `since` and `limit`,
 and answers with that one asset or with none.
+
+`kind=` is a comma-separated allow-list of the kinds below -- `kind=markdown,pdf`
+for a client's "documents" filter -- applied while the listing is walked, before
+the page is cut. That is the difference between `kind=image&limit=50` meaning
+"the 50 newest images" and it meaning "the images among the 50 newest files": a
+session whose agent is editing source code writes source faster than it writes
+artifacts, and the second reading answers with nothing on a workspace that is
+full of them. Absent or empty filters nothing, so an old client is unaffected,
+and a value outside the taxonomy matches nothing rather than erroring, the way
+an unknown name in the events `types=` allow-list does. The list that was
+applied comes back as `data.kind` -- empty when there was none -- so a client
+can tell this gateway from one old enough to have ignored the parameter.
 
 Two feeds keep the list current. Herdr's `worktree.*` events, which the gateway
 already subscribes to, carry the checkout's root path and its workspace but no
