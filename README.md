@@ -668,6 +668,8 @@ Security defaults:
 - Pane output reads are capped at 1000 lines.
 - Pane and agent text sends are capped at 64 KiB.
 - Pane key sends are capped at 32 keys per request.
+- Task `agent_args` are capped at 32 entries of 512 characters and may not
+  carry control characters. They become the agent's own argv, never a shell.
 - Uploads are typed by magic number, never by filename: only image formats are
   accepted, and Mach-O and ELF binaries, Windows `MZ` images, and `#!` scripts
   are refused outright.

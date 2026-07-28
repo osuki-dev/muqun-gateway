@@ -79,6 +79,10 @@ const MAX_PAIRING_CODE_ATTEMPTS: u8 = 8;
 const PAIRING_RATE_LIMIT_WINDOW_MS: u128 = 10 * 60 * 1000;
 const MAX_PAIRING_REQUESTS_PER_WINDOW: usize = 6;
 const MAX_SEND_KEYS: usize = 32;
+/// The argv a task may add to the agent's own command line. Generous enough for
+/// any flag list a person types, bounded because everything a client sends is.
+const MAX_AGENT_ARGS: usize = 32;
+const MAX_AGENT_ARG_CHARS: usize = 512;
 const MAX_WORKSPACE_LABEL_CHARS: usize = 120;
 /// Long enough for an agent TUI to finish handling a pasted prompt, short
 /// enough that the submit still feels like part of the same action.
@@ -4123,6 +4127,9 @@ async fn create_task(
     if let Some(prompt) = body.prompt.as_deref() {
         validate_text(prompt)?;
     }
+    if let Some(args) = body.agent_args.as_deref() {
+        validate_agent_args(args)?;
+    }
     if let Some(label) = body.workspace_label.as_deref() {
         if label.chars().count() > MAX_WORKSPACE_LABEL_CHARS || label.chars().any(char::is_control)
         {
@@ -7536,6 +7543,48 @@ fn validate_text(text: &str) -> ApiResult<()> {
     Ok(())
 }
 
+/// The one client-supplied field that becomes the argv of a process on the
+/// host.
+///
+/// It is not an escalation and the bound is not pretending otherwise: a caller
+/// who can reach this endpoint holds a device token, and a device token can
+/// already type into the pane the agent is about to run in. Nor is it a shell
+/// -- Herdr starts an agent by argv and never through one, so nothing in here
+/// is parsed by anything but the agent's own option parser.
+///
+/// It is bounded because every other string a client sends this gateway is,
+/// and "the argument list of a program on your machine" is the wrong field to
+/// be the exception. Control characters go with it, for the same reason a
+/// device name cannot carry them: an argument list is echoed back in the task's
+/// step log, and a newline in one forges a line.
+fn validate_agent_args(args: &[String]) -> ApiResult<()> {
+    if args.len() > MAX_AGENT_ARGS {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "too_many_agent_args",
+            "agent_args must contain at most 32 entries",
+        ));
+    }
+    if args
+        .iter()
+        .any(|arg| arg.chars().count() > MAX_AGENT_ARG_CHARS)
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "agent_arg_too_long",
+            "each agent_args entry must be at most 512 characters",
+        ));
+    }
+    if args.iter().any(|arg| arg.chars().any(char::is_control)) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_agent_args",
+            "agent_args entries must not contain control characters",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_push_token(token: &str) -> ApiResult<()> {
     let valid_prefix =
         token.starts_with("ExponentPushToken[") || token.starts_with("ExpoPushToken[");
@@ -9406,6 +9455,38 @@ mod tests {
         let too_large = "x".repeat(MAX_SEND_TEXT_BYTES + 1);
         let err = validate_text(&too_large).unwrap_err();
         assert_eq!(err.0, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// The only field on this API that becomes argv for a process on the host.
+    /// A device token can already type into the pane, so this is a bound and
+    /// not a fence -- but it is the same bound every other client string is
+    /// under, and an argument list is not the field to leave unbounded.
+    #[test]
+    fn agent_args_are_bounded_like_every_other_client_string() {
+        assert!(validate_agent_args(&[]).is_ok());
+        assert!(validate_agent_args(&["--model".into(), "opus".into()]).is_ok());
+
+        let too_many = vec![String::from("-v"); MAX_AGENT_ARGS + 1];
+        assert_eq!(
+            validate_agent_args(&too_many).unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+
+        let too_long = vec!["x".repeat(MAX_AGENT_ARG_CHARS + 1)];
+        assert_eq!(
+            validate_agent_args(&too_long).unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+
+        // A newline in an argument forges a line of the step log it is echoed
+        // into, which is the same reason a device name cannot carry one.
+        assert_eq!(
+            validate_agent_args(&["--flag\nvalue".into()])
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(validate_agent_args(&["--flag\u{0}".into()]).is_err());
     }
 
     #[test]
