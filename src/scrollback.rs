@@ -839,6 +839,99 @@ pub fn replace_read_text(value: &mut Value, text: &str) {
 mod tests {
     use super::*;
 
+    /// Replay a captured pane through the store and measure what it kept.
+    ///
+    /// The evidence half of card #721's question: with the anchor, the furniture
+    /// rule and `already_held` in place, does the ring still duplicate a real
+    /// agent pane under real load? Point it at a capture and find out:
+    ///
+    /// ```text
+    /// HERDR_SCROLLBACK_REPLAY=/tmp/frames.jsonl cargo test replay -- --nocapture
+    /// ```
+    ///
+    /// The file is one JSON-encoded string per line, each the full text of one
+    /// `pane.read`. `scripts/capture-frames.sh` in the app repo makes one.
+    ///
+    /// Skipped when the variable is unset, because the capture is somebody's
+    /// terminal and does not belong in the repository.
+    #[test]
+    fn replay_a_captured_pane_and_report_duplication() {
+        let Ok(path) = std::env::var("HERDR_SCROLLBACK_REPLAY") else {
+            return;
+        };
+        let body = std::fs::read_to_string(&path).expect("replay capture");
+        let frames: Vec<String> = body
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str::<String>(line).expect("json string per line"))
+            .collect();
+
+        let mut store = ScrollbackStore::default();
+        for frame in &frames {
+            store.record("replay", frame);
+        }
+        let held = store.window("replay", MAX_PANE_LINES).unwrap_or_default();
+        let rows: Vec<&str> = held.lines().collect();
+
+        // Rows carrying something, and how often each of them was written down.
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for row in rows.iter().filter(|row| !row.trim().is_empty()) {
+            *counts.entry(row).or_default() += 1;
+        }
+        let substantial: usize = counts.values().sum();
+        let repeated: usize = counts.values().filter(|n| **n > 1).sum();
+        let worst = counts.values().copied().max().unwrap_or(0);
+
+        // The metric that actually matters: a run of four or more rows written
+        // down twice. A single row repeating is a transcript doing its job --
+        // `⎿  Allowed by auto mode classifier` genuinely appears many times --
+        // but four consecutive rows repeating verbatim is the buffer copying
+        // itself.
+        let mut duplicated_blocks = 0usize;
+        let mut duplicated_rows = 0usize;
+        let hashes: Vec<u64> = rows.iter().map(|row| line_hash(row)).collect();
+        let carries: Vec<bool> = rows.iter().map(|row| !row.trim().is_empty()).collect();
+        let mut at = 0usize;
+        while at + 8 <= hashes.len() {
+            let mut hit = 0usize;
+            for start in (at + 1)..hashes.len().saturating_sub(3) {
+                let mut run = 0usize;
+                while start + run < hashes.len()
+                    && at + run < start
+                    && hashes[at + run] == hashes[start + run]
+                {
+                    run += 1;
+                }
+                let carried = (0..run).filter(|step| carries[at + step]).count();
+                if run >= 4 && carried >= 4 {
+                    hit = run;
+                    break;
+                }
+            }
+            if hit > 0 {
+                duplicated_blocks += 1;
+                duplicated_rows += hit;
+                at += hit;
+            } else {
+                at += 1;
+            }
+        }
+
+        println!(
+            "replay {path}: {} frames -> {} rows held\n  \
+             substantial rows {substantial}, of which repeated at all {repeated} ({:.0}%), worst row x{worst}\n  \
+             duplicated blocks (>=4 rows) {duplicated_blocks} covering {duplicated_rows} rows",
+            frames.len(),
+            rows.len(),
+            if substantial == 0 { 0.0 } else { repeated as f64 * 100.0 / substantial as f64 },
+        );
+
+        assert_eq!(
+            duplicated_blocks, 0,
+            "the ring copied {duplicated_rows} rows of a real pane into its own history"
+        );
+    }
+
     /// The same rule, against a composer whose *last* row is the volatile one.
     ///
     /// Card #721. This is the shape a real Claude pane has -- the mode line with
