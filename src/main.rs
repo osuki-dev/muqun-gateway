@@ -7942,9 +7942,39 @@ fn write_secret_dir_gitignore(dir: &std::path::Path) {
     }
 }
 
+/// Narrow the directory the secrets sit in, not only the secrets.
+///
+/// The files have been 0600 for a while, so nothing in here was readable by
+/// another account. The directory was left at whatever the umask gave it,
+/// which on a normal machine is world-listable -- and a listing of it is the
+/// names of the paired devices' record file, the pairing file, and whether a
+/// gateway is configured on this account at all. Free to fix, and it removes
+/// the last thing a second account on a shared machine could learn.
+///
+/// A failure is reported and not fatal: a directory the owner has deliberately
+/// re-permissioned, or one on a filesystem with no modes at all, must not stop
+/// the gateway writing its own config.
+#[cfg(unix)]
+fn lock_down_secret_dir(dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let Ok(metadata) = std::fs::metadata(dir) else {
+        return;
+    };
+    if metadata.permissions().mode() & 0o077 == 0 {
+        return;
+    }
+    if let Err(err) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
+        eprintln!("could not restrict {}: {err}", dir.display());
+    }
+}
+
+#[cfg(not(unix))]
+fn lock_down_secret_dir(_dir: &std::path::Path) {}
+
 fn write_secret_file(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
     if let Some(dir) = path.parent() {
         write_secret_dir_gitignore(dir);
+        lock_down_secret_dir(dir);
     }
     #[cfg(unix)]
     {
@@ -9242,6 +9272,29 @@ mod tests {
         std::fs::write(&ignore, "mine\n").unwrap();
         write_secret_file(&secret, b"{}").unwrap();
         assert_eq!(std::fs::read_to_string(&ignore).unwrap(), "mine\n");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The files have been 0600 for a while. The directory around them was
+    /// left at the umask, and a world-listable directory still says which
+    /// devices' record file is there and that this account runs a gateway.
+    #[cfg(unix)]
+    #[test]
+    fn a_secret_directory_is_the_owners_alone() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!("herdr-secret-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let secret = dir.join("devices.json");
+        write_secret_file(&secret, b"[]").unwrap();
+
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "the directory is still readable");
+        let file = std::fs::metadata(&secret).unwrap().permissions().mode();
+        assert_eq!(file & 0o777, 0o600, "the secret is still readable");
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -649,7 +649,8 @@ Security defaults:
 - Each device gets its own token and can be revoked on its own.
 - Token verification uses a constant-time hash comparison against every candidate.
 - Device names are rejected if they contain control characters, so a pairing request cannot forge the manager panel with terminal escapes.
-- `config.json`, `pairing.json`, and `devices.json` are written with `0600` permissions.
+- `config.json`, `pairing.json`, and `devices.json` are written with `0600`
+  permissions, and the directory holding them is narrowed to `0700`.
 - `stop` only signals processes whose name matches the gateway.
 - Pairing requests are rate-limited and confirmation codes permit only eight attempts.
 - Confirmation codes are eight glyphs drawn uniformly from a 31-glyph alphabet:
