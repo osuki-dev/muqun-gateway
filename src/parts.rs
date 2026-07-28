@@ -623,8 +623,18 @@ fn strip_marker(raw: &str) -> &str {
 /// Remove `columns` of leading whitespace, keeping any indentation beyond it:
 /// the result lines of a block are padded to clear its marker, and the padding
 /// is chrome while the indentation inside them is content.
+///
+/// `columns` is a byte count measured on a *different* row -- the narrowest
+/// indentation the group shares -- so it is not a character boundary on this
+/// one. An agent that pads with a non-breaking space, which is what Claude
+/// does, puts two bytes where a plain space put one, and cutting the string at
+/// the other row's count lands inside a character. So the padding is inspected
+/// as bytes and the string is only ever cut after a run of ASCII spaces, which
+/// is a boundary by construction. Anything else is padding this cannot measure
+/// and falls to the trim, which is what the caller wanted from it anyway.
 fn dedent(raw: &str, columns: usize) -> &str {
-    if raw.len() >= columns && raw[..columns].bytes().all(|byte| byte == b' ') {
+    let bytes = raw.as_bytes();
+    if bytes.len() >= columns && bytes[..columns].iter().all(|byte| *byte == b' ') {
         &raw[columns..]
     } else {
         raw.trim_start()
@@ -1807,6 +1817,40 @@ mod tests {
             .filter(|line| !line.trim().is_empty())
             .collect();
         assert_eq!(covered, source, "{agent} lost or reordered a line");
+    }
+
+    /// The padding a group shares is counted on one row and cut off another, so
+    /// it is a byte offset into a string it was not measured on. A row padded
+    /// with anything wider than a byte -- a non-breaking space, which is what
+    /// Claude pads with, or an ideographic one -- used to make that cut land
+    /// inside a character and take the read down with it. A pane full of agent
+    /// output is the least trusted input this gateway has: it must not be able
+    /// to decide whether the endpoint that reads it answers.
+    #[test]
+    fn padding_wider_than_a_byte_is_not_a_crash() {
+        for text in [
+            "\u{a0}\u{a0}held\n   plain\n",
+            "\u{3000}held\n plain\n",
+            "\u{a0} mixed\n  plain\n",
+        ] {
+            for agent in [None, Some("claude"), Some("codex"), Some("opencode")] {
+                let parts = normalize(text, dictionary_for(agent));
+                assert!(!parts.is_empty(), "{agent:?} answered nothing for {text:?}");
+            }
+        }
+    }
+
+    /// The cut is only ever taken after a run of ASCII spaces, which is a
+    /// character boundary by construction; every other padding falls to the
+    /// trim. Both halves are the contract, so both are pinned.
+    #[test]
+    fn a_dedent_cuts_ascii_padding_and_trims_the_rest() {
+        assert_eq!(dedent("    four", 2), "  four");
+        assert_eq!(dedent("    four", 4), "four");
+        assert_eq!(dedent("  two", 4), "two");
+        // Wider padding than the count it is cut at: trimmed, not sliced.
+        assert_eq!(dedent("\u{a0}\u{a0}held", 3), "held");
+        assert_eq!(dedent("\u{3000}held", 1), "held");
     }
 
     #[test]

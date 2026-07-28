@@ -79,6 +79,10 @@ const MAX_PAIRING_CODE_ATTEMPTS: u8 = 8;
 const PAIRING_RATE_LIMIT_WINDOW_MS: u128 = 10 * 60 * 1000;
 const MAX_PAIRING_REQUESTS_PER_WINDOW: usize = 6;
 const MAX_SEND_KEYS: usize = 32;
+/// The argv a task may add to the agent's own command line. Generous enough for
+/// any flag list a person types, bounded because everything a client sends is.
+const MAX_AGENT_ARGS: usize = 32;
+const MAX_AGENT_ARG_CHARS: usize = 512;
 const MAX_WORKSPACE_LABEL_CHARS: usize = 120;
 /// Long enough for an agent TUI to finish handling a pasted prompt, short
 /// enough that the submit still feels like part of the same action.
@@ -1222,6 +1226,10 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
             post(upload_file).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
         )
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+        .layer(middleware::from_fn_with_state(
+            known_hosts(&state.config),
+            known_host,
+        ))
         .layer(middleware::from_fn(security_headers))
         .layer(middleware::from_fn(request_locale))
         .with_state(state);
@@ -1242,6 +1250,120 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
 async fn request_locale(request: Request<Body>, next: Next) -> Response {
     let locale = Locale::from_headers(request.headers());
     i18n::scope(locale, next.run(request)).await
+}
+
+/// Refuse a request that arrived under a name this gateway does not answer to.
+///
+/// The attack this closes is DNS rebinding, and it is the one thing a bearer
+/// token does not stop. A page the user opens serves itself from a name the
+/// attacker controls, that name is re-resolved to the gateway's address, and
+/// from then on the browser considers the page *same-origin with the gateway*.
+/// Same-origin means the same-origin policy is no longer in the way: no
+/// preflight, and the script reads every response. It has no device token, so
+/// the control routes still refuse it -- but the pairing routes are open by
+/// necessity, and from there it can read the machine's label, occupy the single
+/// pending-pairing slot for five minutes, burn the request budget for ten, and
+/// put a name it chose in front of whoever is watching the manager panel.
+///
+/// The tell is the `Host` header: it carries the attacker's own name, because
+/// that is the name the page was fetched from. The gateway knows which names
+/// are its own, so it can simply not answer to any other.
+///
+/// Deliberately generous, because refusing a request the owner meant is worse
+/// than the attack. An address literal always passes -- rebinding needs a name
+/// whose resolution can be flipped, and a page served from a bare IP is already
+/// same-origin with nothing but this gateway. `localhost` and any `.ts.net`
+/// name pass, since the tailnet's names are Tailscale's to hand out and not an
+/// attacker's. Everything else has to be the host of the configured public URL
+/// or of the listen address. A refusal says so in the log, because a name the
+/// owner reaches their own gateway by and this gateway has never been told
+/// about should be a line to read, not a mystery.
+async fn known_host(
+    State(known): State<Vec<String>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let host = request
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .or_else(|| request.uri().host().map(str::to_owned));
+    if let Some(host) = host.as_deref() {
+        if !host_is_known(host, &known) {
+            eprintln!(
+                "refused a request addressed to {host}: not a name this gateway answers to \
+                 (known: {})",
+                known.join(", ")
+            );
+            return api_error(
+                StatusCode::FORBIDDEN,
+                "unknown_host",
+                "this gateway does not answer to that host name",
+            )
+            .into_response();
+        }
+    }
+    next.run(request).await
+}
+
+/// The names configuration says this gateway is reached by.
+fn known_hosts(config: &Config) -> Vec<String> {
+    let mut hosts = vec![String::from("localhost")];
+    if let Some(host) = reqwest::Url::parse(&config.public_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+    {
+        hosts.push(host_name(&host));
+    }
+    hosts.push(host_name(&config.listen));
+    hosts.retain(|host| !host.is_empty());
+    hosts.sort();
+    hosts.dedup();
+    hosts
+}
+
+fn host_is_known(host: &str, known: &[String]) -> bool {
+    let name = host_name(host);
+    if name.is_empty() {
+        return true;
+    }
+    // Rebinding needs a name. An address is not one, and a page served from an
+    // address literal is same-origin with this gateway and nothing else.
+    if name.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    if name == "localhost" || name.ends_with(".localhost") {
+        return true;
+    }
+    // MagicDNS names live under a zone Tailscale hands out, not an attacker.
+    if name.ends_with(".ts.net") {
+        return true;
+    }
+    known.iter().any(|candidate| candidate == &name)
+}
+
+/// A `Host` header, or a `host:port` from configuration, reduced to the name.
+fn host_name(host: &str) -> String {
+    let host = host.trim();
+    // A bracketed IPv6 literal fences the colons of the address itself.
+    if let Some(rest) = host.strip_prefix('[') {
+        return rest
+            .split(']')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+    }
+    // An unbracketed address is not a legal `Host`, but reading one as a name
+    // with a port would cut `::1` down to `::`, so it is taken whole.
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return host.to_ascii_lowercase();
+    }
+    host.rsplit_once(':')
+        .filter(|(_, port)| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()))
+        .map_or(host, |(name, _)| name)
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
 }
 
 async fn security_headers(request: Request<Body>, next: Next) -> Response {
@@ -4004,6 +4126,9 @@ async fn create_task(
     }
     if let Some(prompt) = body.prompt.as_deref() {
         validate_text(prompt)?;
+    }
+    if let Some(args) = body.agent_args.as_deref() {
+        validate_agent_args(args)?;
     }
     if let Some(label) = body.workspace_label.as_deref() {
         if label.chars().count() > MAX_WORKSPACE_LABEL_CHARS || label.chars().any(char::is_control)
@@ -7418,6 +7543,48 @@ fn validate_text(text: &str) -> ApiResult<()> {
     Ok(())
 }
 
+/// The one client-supplied field that becomes the argv of a process on the
+/// host.
+///
+/// It is not an escalation and the bound is not pretending otherwise: a caller
+/// who can reach this endpoint holds a device token, and a device token can
+/// already type into the pane the agent is about to run in. Nor is it a shell
+/// -- Herdr starts an agent by argv and never through one, so nothing in here
+/// is parsed by anything but the agent's own option parser.
+///
+/// It is bounded because every other string a client sends this gateway is,
+/// and "the argument list of a program on your machine" is the wrong field to
+/// be the exception. Control characters go with it, for the same reason a
+/// device name cannot carry them: an argument list is echoed back in the task's
+/// step log, and a newline in one forges a line.
+fn validate_agent_args(args: &[String]) -> ApiResult<()> {
+    if args.len() > MAX_AGENT_ARGS {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "too_many_agent_args",
+            "agent_args must contain at most 32 entries",
+        ));
+    }
+    if args
+        .iter()
+        .any(|arg| arg.chars().count() > MAX_AGENT_ARG_CHARS)
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "agent_arg_too_long",
+            "each agent_args entry must be at most 512 characters",
+        ));
+    }
+    if args.iter().any(|arg| arg.chars().any(char::is_control)) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_agent_args",
+            "agent_args entries must not contain control characters",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_push_token(token: &str) -> ApiResult<()> {
     let valid_prefix =
         token.starts_with("ExponentPushToken[") || token.starts_with("ExpoPushToken[");
@@ -7775,9 +7942,39 @@ fn write_secret_dir_gitignore(dir: &std::path::Path) {
     }
 }
 
+/// Narrow the directory the secrets sit in, not only the secrets.
+///
+/// The files have been 0600 for a while, so nothing in here was readable by
+/// another account. The directory was left at whatever the umask gave it,
+/// which on a normal machine is world-listable -- and a listing of it is the
+/// names of the paired devices' record file, the pairing file, and whether a
+/// gateway is configured on this account at all. Free to fix, and it removes
+/// the last thing a second account on a shared machine could learn.
+///
+/// A failure is reported and not fatal: a directory the owner has deliberately
+/// re-permissioned, or one on a filesystem with no modes at all, must not stop
+/// the gateway writing its own config.
+#[cfg(unix)]
+fn lock_down_secret_dir(dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let Ok(metadata) = std::fs::metadata(dir) else {
+        return;
+    };
+    if metadata.permissions().mode() & 0o077 == 0 {
+        return;
+    }
+    if let Err(err) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
+        eprintln!("could not restrict {}: {err}", dir.display());
+    }
+}
+
+#[cfg(not(unix))]
+fn lock_down_secret_dir(_dir: &std::path::Path) {}
+
 fn write_secret_file(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
     if let Some(dir) = path.parent() {
         write_secret_dir_gitignore(dir);
+        lock_down_secret_dir(dir);
     }
     #[cfg(unix)]
     {
@@ -7874,14 +8071,65 @@ fn generate_token() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
+/// The glyphs a pairing code is drawn from: no `0`/`O` and no `1`/`I`/`L`, so a
+/// person reading one off a screen cannot mistype it into a different code.
+const PAIRING_CODE_ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
+
+/// Eight glyphs of this alphabet is a shade under forty bits, and that number
+/// is only true if every glyph is equally likely at every position. Two things
+/// were making it false.
+///
+/// Folding a byte with `%` biases the fold: 256 is not a multiple of 31, so the
+/// first eight glyphs came up a ninth more often than the other twenty-three.
+/// And a v4 UUID is not sixteen random bytes -- four bits of byte 6 say
+/// "version 4" and two of byte 8 say "RFC variant" -- so the position that
+/// happened to land on byte 6 could only ever produce sixteen of the
+/// thirty-one glyphs, costing that character most of its entropy.
+///
+/// Neither was reachable: eight wrong answers burn the code and six requests
+/// burn ten minutes, so nothing gets near enough guesses for a fraction of a
+/// bit to matter. It is fixed because the number the code is worth should be
+/// the number it says it is.
 fn generate_pairing_code() -> String {
-    const ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
-    let bytes = *uuid::Uuid::new_v4().as_bytes();
-    let characters: String = bytes[..PAIRING_CODE_CHARACTER_COUNT]
-        .iter()
-        .map(|byte| ALPHABET[usize::from(*byte) % ALPHABET.len()] as char)
-        .collect();
+    // The last whole multiple of the alphabet below 256. A byte at or above it
+    // would fold unevenly, so it is redrawn rather than folded.
+    let ceiling = (256 / PAIRING_CODE_ALPHABET.len()) * PAIRING_CODE_ALPHABET.len();
+    let mut source = RandomBytes::default();
+    let mut characters = String::with_capacity(PAIRING_CODE_CHARACTER_COUNT);
+    while characters.len() < PAIRING_CODE_CHARACTER_COUNT {
+        let byte = usize::from(source.next_byte());
+        if byte >= ceiling {
+            continue;
+        }
+        characters.push(PAIRING_CODE_ALPHABET[byte % PAIRING_CODE_ALPHABET.len()] as char);
+    }
     format!("{}-{}", &characters[..4], &characters[4..])
+}
+
+/// Random bytes from the CSPRNG behind `Uuid::new_v4`, minus the bytes of a v4
+/// UUID that are not random. Keeps the gateway's entropy on one source instead
+/// of adding a second dependency for eight characters.
+#[derive(Default)]
+struct RandomBytes {
+    buffer: Vec<u8>,
+}
+
+impl RandomBytes {
+    fn next_byte(&mut self) -> u8 {
+        if self.buffer.is_empty() {
+            let bytes = *uuid::Uuid::new_v4().as_bytes();
+            // Byte 6 carries the version nibble and byte 8 the variant bits.
+            // Neither is random, so neither is spent.
+            self.buffer = bytes
+                .into_iter()
+                .enumerate()
+                .filter(|(index, _)| !matches!(index, 6 | 8))
+                .map(|(_, byte)| byte)
+                .collect();
+        }
+        // The refill puts fourteen bytes here, so this is never the default.
+        self.buffer.pop().unwrap_or_default()
+    }
 }
 
 fn valid_pairing_code(code: &str) -> bool {
@@ -7890,7 +8138,7 @@ fn valid_pairing_code(code: &str) -> bool {
         && code
             .bytes()
             .enumerate()
-            .all(|(index, byte)| index == 4 || b"23456789ABCDEFGHJKMNPQRSTUVWXYZ".contains(&byte))
+            .all(|(index, byte)| index == 4 || PAIRING_CODE_ALPHABET.contains(&byte))
 }
 
 /// Device names are echoed into the manage UI's terminal box, so control
@@ -9028,6 +9276,29 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The files have been 0600 for a while. The directory around them was
+    /// left at the umask, and a world-listable directory still says which
+    /// devices' record file is there and that this account runs a gateway.
+    #[cfg(unix)]
+    #[test]
+    fn a_secret_directory_is_the_owners_alone() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!("herdr-secret-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let secret = dir.join("devices.json");
+        write_secret_file(&secret, b"[]").unwrap();
+
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "the directory is still readable");
+        let file = std::fs::metadata(&secret).unwrap().permissions().mode();
+        assert_eq!(file & 0o777, 0o600, "the secret is still readable");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn event_filter_matches_dot_and_underscore_and_reads_the_event_field() {
         assert_eq!(normalize_event_name("pane.updated"), "pane_updated");
@@ -9039,6 +9310,90 @@ mod tests {
         // A line the gateway cannot parse is forwarded rather than dropped, so a
         // filter never silently swallows an event shape we did not anticipate.
         assert_eq!(herdr_event_name("not json"), None);
+    }
+
+    /// The rebinding case, written as the header it arrives in. A page served
+    /// from a name the attacker owns keeps sending that name in `Host` even
+    /// after the name has been re-pointed at this machine, which is exactly
+    /// what makes the header worth reading.
+    #[test]
+    fn a_name_this_gateway_was_never_told_about_is_refused() {
+        let mut config = test_config("secret");
+        config.listen = "100.99.165.54:23847".into();
+        config.public_url = "http://mac-mini.example-tailnet.ts.net:23847".into();
+        let known = known_hosts(&config);
+
+        for good in [
+            "100.99.165.54:23847",
+            "100.99.165.54",
+            "mac-mini.example-tailnet.ts.net:23847",
+            "MAC-MINI.example-tailnet.TS.NET",
+            "localhost:23847",
+            "127.0.0.1:23847",
+            "[::1]:23847",
+            // A trailing dot is the same name spelled absolutely.
+            "mac-mini.example-tailnet.ts.net.",
+        ] {
+            assert!(host_is_known(good, &known), "{good} should be answered");
+        }
+
+        for bad in [
+            "rebind.attacker.example:23847",
+            "attacker.example",
+            "gateway.attacker.example",
+            // The suffix rules are suffixes of a label, not of a string.
+            "evil-ts.net",
+            "notlocalhost",
+            "ts.net.attacker.example",
+        ] {
+            assert!(!host_is_known(bad, &known), "{bad} should be refused");
+        }
+    }
+
+    /// Ellen's gateway answers on a bare Tailscale address, and a great many
+    /// installs will. An address literal has to pass, because rebinding needs a
+    /// name whose resolution can be flipped and an address has none.
+    #[test]
+    fn an_address_is_always_a_host_this_gateway_answers_to() {
+        let known = known_hosts(&test_config("secret"));
+        for address in [
+            "100.99.165.54:23847",
+            "192.168.1.20:23847",
+            "10.0.0.1",
+            "[fd7a:115c:a1e0::1]:23847",
+            "[::1]",
+        ] {
+            assert!(
+                host_is_known(address, &known),
+                "{address} should be answered"
+            );
+        }
+    }
+
+    #[test]
+    fn the_known_hosts_are_the_public_url_and_the_listen_address() {
+        let mut config = test_config("secret");
+        config.listen = "0.0.0.0:23847".into();
+        config.public_url = "https://desk.example-tailnet.ts.net".into();
+        assert_eq!(
+            known_hosts(&config),
+            vec![
+                String::from("0.0.0.0"),
+                String::from("desk.example-tailnet.ts.net"),
+                String::from("localhost"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_host_header_is_read_down_to_its_name() {
+        assert_eq!(host_name("Example.COM:23847"), "example.com");
+        assert_eq!(host_name("example.com"), "example.com");
+        assert_eq!(host_name("[::1]:23847"), "::1");
+        assert_eq!(host_name("::1"), "::1");
+        assert_eq!(host_name("example.com."), "example.com");
+        // Not a port, so not cut off.
+        assert_eq!(host_name("example.com:notaport"), "example.com:notaport");
     }
 
     #[test]
@@ -9155,6 +9510,38 @@ mod tests {
         assert_eq!(err.0, StatusCode::PAYLOAD_TOO_LARGE);
     }
 
+    /// The only field on this API that becomes argv for a process on the host.
+    /// A device token can already type into the pane, so this is a bound and
+    /// not a fence -- but it is the same bound every other client string is
+    /// under, and an argument list is not the field to leave unbounded.
+    #[test]
+    fn agent_args_are_bounded_like_every_other_client_string() {
+        assert!(validate_agent_args(&[]).is_ok());
+        assert!(validate_agent_args(&["--model".into(), "opus".into()]).is_ok());
+
+        let too_many = vec![String::from("-v"); MAX_AGENT_ARGS + 1];
+        assert_eq!(
+            validate_agent_args(&too_many).unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+
+        let too_long = vec!["x".repeat(MAX_AGENT_ARG_CHARS + 1)];
+        assert_eq!(
+            validate_agent_args(&too_long).unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+
+        // A newline in an argument forges a line of the step log it is echoed
+        // into, which is the same reason a device name cannot carry one.
+        assert_eq!(
+            validate_agent_args(&["--flag\nvalue".into()])
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(validate_agent_args(&["--flag\u{0}".into()]).is_err());
+    }
+
     #[test]
     fn pairing_code_uses_unambiguous_characters() {
         let code = generate_pairing_code();
@@ -9168,6 +9555,56 @@ mod tests {
         assert!(!code.contains('1'));
         assert!(!code.contains('I'));
         assert!(!code.contains('L'));
+    }
+
+    /// What the code is worth is what every position can hold and how evenly it
+    /// holds it. Both halves are asserted, because both were wrong: one
+    /// position could only reach sixteen of the thirty-one glyphs because it
+    /// was reading a UUID's version nibble, and every position leaned on the
+    /// first eight because a byte was folded with `%`.
+    ///
+    /// The bands are wide on purpose. Twenty thousand draws puts about 645 of
+    /// each glyph in each position and about 5161 overall; a tenth of that is
+    /// seven standard deviations, so the old bias (a ninth over, five of them)
+    /// fails and a fair generator does not flake.
+    #[test]
+    fn every_glyph_can_land_in_every_position_and_none_is_favoured() {
+        const DRAWS: usize = 20_000;
+        let mut counts =
+            vec![vec![0_usize; PAIRING_CODE_ALPHABET.len()]; PAIRING_CODE_CHARACTER_COUNT];
+        for _ in 0..DRAWS {
+            let code = generate_pairing_code();
+            assert!(valid_pairing_code(&code), "{code} is not a pairing code");
+            let glyphs: Vec<u8> = code.bytes().filter(|byte| *byte != b'-').collect();
+            for (position, glyph) in glyphs.iter().enumerate() {
+                let index = PAIRING_CODE_ALPHABET
+                    .iter()
+                    .position(|candidate| candidate == glyph)
+                    .expect("a code is drawn from the alphabet");
+                counts[position][index] += 1;
+            }
+        }
+
+        for (position, row) in counts.iter().enumerate() {
+            for (index, count) in row.iter().enumerate() {
+                assert!(
+                    *count > 0,
+                    "position {position} never produced {}",
+                    PAIRING_CODE_ALPHABET[index] as char
+                );
+            }
+        }
+
+        let total = DRAWS * PAIRING_CODE_CHARACTER_COUNT;
+        let expected = total / PAIRING_CODE_ALPHABET.len();
+        for index in 0..PAIRING_CODE_ALPHABET.len() {
+            let seen: usize = counts.iter().map(|row| row[index]).sum();
+            assert!(
+                seen * 10 > expected * 9 && seen * 10 < expected * 11,
+                "{} came up {seen} times against {expected} expected",
+                PAIRING_CODE_ALPHABET[index] as char
+            );
+        }
     }
 
     #[test]

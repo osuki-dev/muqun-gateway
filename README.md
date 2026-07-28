@@ -649,9 +649,18 @@ Security defaults:
 - Each device gets its own token and can be revoked on its own.
 - Token verification uses a constant-time hash comparison against every candidate.
 - Device names are rejected if they contain control characters, so a pairing request cannot forge the manager panel with terminal escapes.
-- `config.json`, `pairing.json`, and `devices.json` are written with `0600` permissions.
+- `config.json`, `pairing.json`, and `devices.json` are written with `0600`
+  permissions, and the directory holding them is narrowed to `0700`.
 - `stop` only signals processes whose name matches the gateway.
 - Pairing requests are rate-limited and confirmation codes permit only eight attempts.
+- Confirmation codes are eight glyphs drawn uniformly from a 31-glyph alphabet:
+  just under 40 bits, against 8 attempts per code and 6 codes per ten minutes.
+- Requests are refused unless the `Host` they arrive under is one the gateway
+  answers to: an address literal, `localhost`, a `.ts.net` MagicDNS name, or the
+  host of the configured public URL or listen address. This is what closes DNS
+  rebinding, where a page the user opens re-points a name the attacker owns at
+  the gateway and so becomes same-origin with it — the one attack a bearer token
+  does not stop by itself. A refused host is named in the log.
 - API responses disable caching and hide local backend error details.
 - Push registrations are capped and can be removed when notifications are disabled.
 - Pushes carry no terminal text unless `rich_agent_pushes` is turned on in `config.json`, which is off by default.
@@ -660,6 +669,8 @@ Security defaults:
 - Pane output reads are capped at 1000 lines.
 - Pane and agent text sends are capped at 64 KiB.
 - Pane key sends are capped at 32 keys per request.
+- Task `agent_args` are capped at 32 entries of 512 characters and may not
+  carry control characters. They become the agent's own argv, never a shell.
 - Uploads are typed by magic number, never by filename: only image formats are
   accepted, and Mach-O and ELF binaries, Windows `MZ` images, and `#!` scripts
   are refused outright.
