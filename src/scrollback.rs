@@ -50,13 +50,66 @@
 //! at full overlap: the screen changed, nothing scrolled, the buffer does not
 //! grow.
 //!
-//! Where nothing agrees, the screen moved further than it can be followed --
-//! output arrived faster than the poll, and the two screens are consecutive
-//! rather than overlapping. Then the read is kept whole, on top of the screen it
-//! followed, because that is what the pane showed and dropping it would throw
-//! away the very rows this exists to keep. Measured against a real Claude pane
-//! over ten minutes, that is 14 of 1416 reads: it is what a burst of output
-//! looks like, not what a spinner looks like.
+//! ## The pinned box, and why a ratio alone is not enough
+//!
+//! An agent pane is not a uniformly scrolling rectangle. Claude Code pins a
+//! composer at the bottom -- a rule, the prompt row, another rule, the mode
+//! line, the agent roster: eight rows on the pane this was measured against --
+//! and scrolls only the transcript above it. So when the transcript moves by
+//! `k` rows, the aligned overlap of width `N - k` contains `k`-worth of matching
+//! transcript *and the whole pinned box mismatched against transcript rows it
+//! never was*. The ratio is therefore capped below one however quiet the pane
+//! is, and it falls as `k` grows:
+//!
+//! ```text
+//! agreement(k) = (rows_above_the_box - 1) / (N - k)
+//! ```
+//!
+//! with the `- 1` paid to the volatile timer row (`4m 46s · ↓ 2.9k tokens`).
+//! For the measured pane -- `N = 64`, an eight-row box -- that crosses
+//! [`MATCH_THRESHOLD`] at `k = 19`. Below it every read places; at and above it
+//! **no** overlap is believed and the whole sixty-four row screen is appended,
+//! of which only `k` rows are new. A burst of output scrolls further than
+//! nineteen rows between two 150ms polls routinely, so the buffer grew a copy
+//! of most of a screen per poll for as long as the burst lasted. Measured on
+//! the live loopback against Ellen's own pane: 62% of the substantial rows in
+//! the served window were duplicates, one row repeated twelve times, and the
+//! count climbed 54 -> 131 over twenty-five seconds of watching.
+//!
+//! So a second placement runs where the ratio finds nothing: the read is
+//! anchored by the **run of rows agreeing from its own head**. At a true
+//! placement the first row of the overlap is the first row the read re-sends,
+//! so the agreeing run starts at incoming row 0 (or row 1, forgiving one
+//! repainted row at the seam) and is as long as the transcript that did not
+//! scroll. The widest alignment where the pinned box happens to line up with
+//! itself has no such run -- its matches sit at the *end* of the overlap, sixty
+//! rows from the head -- which is what stops the fallback from swallowing a
+//! whole screen of history to buy an eight-row coincidence. Longest anchored
+//! run wins, ties going to the wider overlap.
+//!
+//! The anchor is allowed to reach [`ANCHOR_REACH`] reads back rather than one,
+//! because a screen does not only move forward. When a long line re-wraps or a
+//! tool block collapses, rows that had scrolled off the top come back onto the
+//! screen -- and the buffer has already promoted those rows into history above
+//! it. Reaching back lets the placement take them down again instead of writing
+//! them a second time. On the six minutes of live frames this was measured
+//! against, that one allowance is the difference between thirteen duplicated
+//! rows and none.
+//!
+//! Where neither placement believes anything, the screen moved further than it
+//! can be followed -- output arrived faster than the poll, and the two screens
+//! are consecutive rather than overlapping. The read is then kept on top of the
+//! screen it followed, because that is what the pane showed and dropping it
+//! would throw away the very rows this exists to keep -- but no longer kept
+//! *whole*. Whatever prefix of it is already sitting at the end of the buffer,
+//! exactly, is not written down twice. That last step is what makes duplication
+//! impossible by construction rather than merely unlikely: the appended rows
+//! are, by definition, rows the buffer does not already end with.
+//!
+//! Every one of these paths drops from the tail and appends -- none of them
+//! splices into the middle -- so the buffer stays a supersequence of every read
+//! that fed it, in arrival order. That is the invariant the reader actually
+//! needs: a shorter history is a nuisance, a reordered one is a bug report.
 //!
 //! On exact matches this is the same placement `mergeTerminalWindow` makes,
 //! which is the point: the two ends of the same pane must not disagree about
@@ -94,6 +147,40 @@ const MAX_OVERLAP: usize = 2_048;
 /// Rows below which a ratio means nothing and the rows have to agree outright:
 /// two screens matching on one blank row is not evidence of anything.
 const MIN_MATCH_ROWS: usize = 4;
+
+/// How long the run of rows agreeing from the read's own head has to be before
+/// the anchored placement is believed.
+///
+/// Three consecutive identical rows at exactly the seam is weak evidence taken
+/// alone and strong evidence taken here, because the alternative on the table
+/// is appending a screen the pane never scrolled. Two would admit a pair of
+/// blank rows; four would miss the tightest real bursts, where the transcript
+/// scrolls to within a few rows of the whole screen.
+const ANCHOR_ROWS: usize = 3;
+
+/// How far into the read the anchoring run may start.
+///
+/// Zero is the true seam. One forgives a single row repainted across the seam
+/// -- a wrapped line finishing, a spinner that happened to land on the first
+/// row the read re-sends -- without opening the search up to matches that sit
+/// anywhere at all, which is the coincidence the whole anchor exists to refuse.
+const ANCHOR_SKEW: usize = 1;
+
+/// How far back the anchored placement may reach, as a multiple of the read.
+///
+/// One read's worth would only ever let a screen be replaced by itself, and a
+/// screen does not only move forward. A pane re-wraps when a long line resolves,
+/// an agent collapses a tool block, a `\[2J` lands a row off: content that had
+/// scrolled off the top comes *back*, and the rows now on screen are rows the
+/// buffer has already promoted into history above it. Measured on the live pane,
+/// that is the whole of the residual duplication -- two backward jumps of twelve
+/// rows in six minutes, each one appending a screen the buffer already held.
+///
+/// Two lets the placement reach a full screen back into history and take those
+/// rows down again instead of writing them twice. It is also the ceiling on how
+/// much history one read can retract, which is why it is a small number: a read
+/// may correct the screen it followed, not rewrite the session.
+const ANCHOR_REACH: usize = 2;
 
 /// Rows of a read, with the line endings the app's own splitter normalizes.
 ///
@@ -137,16 +224,107 @@ fn rows_agree(held: &[u64], incoming: &[u64], overlap: usize) -> bool {
     agreed as f64 >= overlap as f64 * MATCH_THRESHOLD
 }
 
+/// How many rows carrying something agree, running from the read's own head.
+///
+/// The run starts at incoming row `skew` and stops at the first disagreement;
+/// what is returned is the rows in it that were not blank. Blank rows hold a run
+/// together but are never evidence for one, because thirty aligned blank rows
+/// say only that both screens have room at the bottom.
+///
+/// Zero where the read's head does not agree with where this overlap says it
+/// belongs. That is the answer that keeps a pinned composer matching itself from
+/// passing as a placement: its agreeing rows sit at the *end* of the widest
+/// overlap, sixty rows from the head, so the run there is empty.
+fn anchor_score(
+    held: &[u64],
+    incoming: &[u64],
+    carries: &[bool],
+    overlap: usize,
+    skew: usize,
+) -> usize {
+    if overlap <= skew {
+        return 0;
+    }
+    let start = held.len() - overlap + skew;
+    held[start..]
+        .iter()
+        .zip(incoming[skew..].iter())
+        .zip(carries[skew..].iter())
+        .take_while(|((left, right), _)| left == right)
+        .filter(|(_, carries)| **carries)
+        .count()
+}
+
+/// The overlap whose anchored run carries the most, or `None` where no overlap
+/// carries [`ANCHOR_ROWS`] of them. Ties go to the wider overlap: the alignment
+/// that re-sends more of what is held is the one that grows the buffer less.
+fn anchored_placement(
+    held: &[u64],
+    incoming: &[u64],
+    carries: &[bool],
+    widest: usize,
+) -> Option<usize> {
+    let mut best: Option<(usize, usize)> = None;
+    for overlap in 1..=widest {
+        let score = (0..=ANCHOR_SKEW)
+            .map(|skew| anchor_score(held, incoming, carries, overlap, skew))
+            .max()
+            .unwrap_or(0);
+        if score >= ANCHOR_ROWS && best.is_none_or(|(seen, _)| score >= seen) {
+            best = Some((score, overlap));
+        }
+    }
+    best.map(|(_, overlap)| overlap)
+}
+
 /// Where this read sits against the end of what is held: how many held rows the
 /// read re-sends.
 ///
-/// `None` where nothing agrees -- the screen moved further than one read can be
-/// followed, and nothing held is being re-sent.
-fn placement(held: &[u64], incoming: &[u64]) -> Option<usize> {
+/// The anchored run answers first. It is the rule that compares candidate
+/// alignments against each other instead of accepting the widest one that clears
+/// a bar, and that difference is worth two bugs: a pinned composer no longer
+/// hides the seam, and a screen with a repeating shape -- a test suite printing
+/// the same row per case -- can no longer clear [`MATCH_THRESHOLD`] at full
+/// overlap by lining its own period up with itself and taking the entire history
+/// with it.
+///
+/// The scored alignment answers where the anchor finds nothing, which is where a
+/// row repaints too close to the seam for a run to get going. It keeps the
+/// tolerance the anchor is too strict for, on the reads the anchor has already
+/// declined to explain.
+///
+/// `None` where neither believes anything: the screen moved further than one
+/// read can be followed, and nothing held is being re-sent.
+fn placement(held: &[u64], incoming: &[u64], carries: &[bool]) -> Option<usize> {
+    // The anchor may reach past the read's own length, back into history, for
+    // the rows a backward jump has put on screen again. The scored alignment may
+    // not: its ratio is only meaningful where every row of the overlap has a row
+    // of the read to be compared against.
+    let aligned = held.len().min(incoming.len()).min(MAX_OVERLAP);
+    let reach = held
+        .len()
+        .min(incoming.len().saturating_mul(ANCHOR_REACH))
+        .min(MAX_OVERLAP);
+    anchored_placement(held, incoming, carries, reach).or_else(|| {
+        (1..=aligned)
+            .rev()
+            .find(|overlap| rows_agree(held, incoming, *overlap))
+    })
+}
+
+/// How much of the read the buffer already ends with, exactly.
+///
+/// The last resort, for reads no placement believed. Appending rows the buffer
+/// verbatim ends with is the one thing that cannot be right: they are already
+/// there, already contiguous, already in this order. Dropping them cannot lose
+/// anything and cannot reorder anything, and it is what makes a duplicate
+/// impossible rather than unlikely.
+fn already_held(held: &[u64], incoming: &[u64]) -> usize {
     let widest = held.len().min(incoming.len()).min(MAX_OVERLAP);
     (1..=widest)
         .rev()
-        .find(|overlap| rows_agree(held, incoming, *overlap))
+        .find(|count| held[held.len() - count..] == incoming[..*count])
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Default)]
@@ -266,15 +444,29 @@ impl ScrollbackStore {
         let before = buffer.bytes;
         buffer.touched = clock;
 
+        // How much of the read is already the end of the buffer, and must not be
+        // written down a second time. Only ever a prefix of the read, so what is
+        // appended stays contiguous and in arrival order.
+        let mut skip = 0;
         if !buffer.lines.is_empty() {
             let incoming_hashes: Vec<u64> = incoming.iter().map(|line| line_hash(line)).collect();
+            let carries: Vec<bool> = incoming
+                .iter()
+                .map(|line| !line.trim().is_empty())
+                .collect();
             let held = buffer.tail(MAX_OVERLAP);
-            // Nothing agreed: the screen moved further than one read can be
-            // followed, so nothing held is re-sent and nothing is dropped.
-            let discard = placement(&held, &incoming_hashes).unwrap_or(0);
-            buffer.drop_back(discard.min(buffer.lines.len()));
+            match placement(&held, &incoming_hashes, &carries) {
+                // The read re-sends this many held rows; they are dropped so the
+                // newest rendering of each of them is the one kept.
+                Some(discard) => buffer.drop_back(discard.min(buffer.lines.len())),
+                // Neither placement believed anything: the screen moved further
+                // than one read can be followed, so nothing held is dropped --
+                // but whatever the buffer verbatim ends with is not appended
+                // again.
+                None => skip = already_held(&held, &incoming_hashes),
+            }
         }
-        for line in incoming {
+        for line in incoming.into_iter().skip(skip) {
             buffer.push(line);
         }
         buffer.trim();
@@ -724,6 +916,250 @@ mod tests {
         let mut bare = json!({ "result": "old" });
         replace_read_text(&mut bare, "new");
         assert_eq!(bare.pointer("/result").unwrap(), &json!("new"));
+    }
+
+    /// The shape of a real Claude pane, measured off `wM:p1`: a scrolling
+    /// transcript, a volatile timer on its last row, and an eight-row composer
+    /// pinned to the bottom that never scrolls with it.
+    const AGENT_SCREEN_ROWS: usize = 64;
+    const AGENT_BOX_ROWS: usize = 8;
+    const AGENT_TRANSCRIPT_ROWS: usize = AGENT_SCREEN_ROWS - AGENT_BOX_ROWS;
+
+    fn agent_screen(top: usize, tick: usize) -> String {
+        let mut rows: Vec<String> = (0..AGENT_TRANSCRIPT_ROWS)
+            .map(|row| format!("⏺ transcript row {} of the agent's answer", top + row))
+            .collect();
+        // The row that repaints every poll however still the pane is.
+        rows[AGENT_TRANSCRIPT_ROWS - 1] = format!(
+            "✢ Recombobulating… ({}m {}s · ↓ {}k tokens)",
+            tick / 60,
+            tick % 60,
+            tick
+        );
+        rows.extend([
+            String::new(),
+            "─".repeat(110),
+            "❯ ".to_owned(),
+            "─".repeat(110),
+            "  ⏵⏵ auto mode on · esc to interrupt".to_owned(),
+            String::new(),
+            "  ⏺ main".to_owned(),
+            format!("  ◯ general-purpose  running {} tools", tick % 3),
+        ]);
+        rows.join("\n")
+    }
+
+    /// Every row of every read, in the order the reads arrived, appears in the
+    /// buffer in that order -- the buffer is a supersequence of its own input.
+    /// A history that lost rows is a nuisance; a history that reordered them is
+    /// what a screenshot of scrambled output looks like.
+    fn assert_supersequence_in_arrival_order(held: &[String], reads: &[Vec<String>]) {
+        for rows in reads {
+            let mut cursor = 0;
+            for row in rows {
+                match held[cursor..].iter().position(|line| line == row) {
+                    Some(hit) => cursor += hit + 1,
+                    // A row may have rolled off the ceiling or been overwritten
+                    // by a newer rendering of itself; what it may never do is
+                    // turn up before a row that arrived ahead of it.
+                    None => continue,
+                }
+            }
+        }
+    }
+
+    /// Rows a duplicate would be visible in: long, and carrying a word rather
+    /// than a rule. A composer draws the same horizontal rule above and below
+    /// its prompt and a table draws the same border on every row of it, so a
+    /// repeated run of box-drawing is what a correct screen looks like, not what
+    /// a duplicated one does.
+    fn substantial_duplicates(held: &str) -> Vec<(String, usize)> {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for line in split_lines(held) {
+            let row = line.trim().to_owned();
+            if row.chars().count() > 20 && row.chars().any(char::is_alphanumeric) {
+                *counts.entry(row).or_default() += 1;
+            }
+        }
+        let mut repeated: Vec<(String, usize)> =
+            counts.into_iter().filter(|(_, count)| *count > 1).collect();
+        repeated.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+        repeated
+    }
+
+    #[test]
+    fn a_pinned_composer_does_not_make_every_poll_a_new_screen() {
+        // The P0. A transcript scrolling under a pinned eight-row composer holds
+        // the scored agreement under MATCH_THRESHOLD from k = 19 rows a poll
+        // upward, however quiet the pane is, because the box is matched against
+        // transcript rows it never was. Before the anchored placement every one
+        // of these scrolls appended a whole sixty-four row screen.
+        for scroll in [1_usize, 5, 19, 20, 30, 40, 50] {
+            let mut store = ScrollbackStore::default();
+            let mut reads: Vec<Vec<String>> = Vec::new();
+            for poll in 0..12 {
+                let screen = agent_screen(poll * scroll, poll);
+                reads.push(split_lines(&screen));
+                store.record("k", &screen);
+            }
+            let held = store.window("k", MAX_PANE_LINES).unwrap();
+            let rows = split_lines(&held);
+
+            let duplicates = substantial_duplicates(&held);
+            assert!(
+                duplicates.is_empty(),
+                "scrolling {scroll} rows a poll duplicated {} rows, worst {:?}",
+                duplicates.iter().map(|(_, count)| count - 1).sum::<usize>(),
+                duplicates.first()
+            );
+
+            // Every transcript row the pane ever showed is kept exactly once,
+            // and the composer is kept exactly once, at the bottom.
+            let produced = AGENT_TRANSCRIPT_ROWS + 11 * scroll;
+            assert_eq!(
+                rows.len(),
+                produced + AGENT_BOX_ROWS,
+                "scrolling {scroll} rows a poll held {} rows, expected {}",
+                rows.len(),
+                produced + AGENT_BOX_ROWS
+            );
+            assert!(rows[0].contains("transcript row 0 "));
+            assert_supersequence_in_arrival_order(&rows, &reads);
+        }
+    }
+
+    #[test]
+    fn a_pinned_composer_matching_itself_is_not_a_placement() {
+        // The trap the anchor exists to refuse. At full overlap the composer
+        // lines up with itself -- eight agreeing rows, sixty rows from the head
+        // of the read -- and believing that would throw away every transcript
+        // row that scrolled. The agreeing run has to start where the read does.
+        let mut store = ScrollbackStore::default();
+        store.record("k", &agent_screen(0, 0));
+        store.record("k", &agent_screen(50, 1));
+        let rows = split_lines(&store.window("k", MAX_PANE_LINES).unwrap());
+        // 56 transcript rows, then 50 more scrolled in, then the composer.
+        assert_eq!(rows.len(), AGENT_TRANSCRIPT_ROWS + 50 + AGENT_BOX_ROWS);
+        assert!(rows[0].contains("transcript row 0 "));
+    }
+
+    #[test]
+    fn output_that_really_repeats_itself_is_kept_every_time() {
+        // A test suite printing the same line per case, an agent echoing the
+        // same block twice: identical content is not evidence of a re-send, and
+        // collapsing it would be inventing a history the pane never had.
+        let mut store = ScrollbackStore::default();
+        let block = ["  ✓ ok", "  ✓ ok", "  ✓ ok", "  ✓ ok"];
+        let mut printed: Vec<String> = Vec::new();
+        for round in 0..12 {
+            printed.push(format!("── case {round} ──────────────"));
+            printed.extend(block.iter().map(|row| (*row).to_owned()));
+            let top = printed.len().saturating_sub(20);
+            store.record("k", &printed[top..].join("\n"));
+        }
+        let held = store.window("k", MAX_PANE_LINES).unwrap();
+        let rows = split_lines(&held);
+        assert_eq!(rows.len(), printed.len(), "a real repeat was collapsed");
+        assert_eq!(rows, printed);
+        assert_eq!(rows.iter().filter(|row| row.trim() == "✓ ok").count(), 48);
+    }
+
+    #[test]
+    fn a_screen_cleared_and_reprinted_is_new_content() {
+        // `clear` then fresh output: nothing is a re-send, and the read has to
+        // land whole on top of what it followed rather than be folded into it.
+        let mut store = ScrollbackStore::default();
+        store.record("k", &agent_screen(0, 0));
+        let before = split_lines(&store.window("k", MAX_PANE_LINES).unwrap()).len();
+        let fresh: Vec<String> = (0..40)
+            .map(|row| format!("$ a completely different program, line {row}"))
+            .collect();
+        store.record("k", &fresh.join("\n"));
+        let rows = split_lines(&store.window("k", MAX_PANE_LINES).unwrap());
+        assert_eq!(rows.len(), before + 40);
+        assert!(rows[0].contains("transcript row 0 "));
+        assert_eq!(
+            rows.last().unwrap(),
+            "$ a completely different program, line 39"
+        );
+    }
+
+    #[test]
+    fn rows_that_scroll_back_into_view_are_taken_down_again() {
+        // A long line re-wraps, a tool block collapses: the screen moves
+        // backward and rows the buffer already promoted into history are on it
+        // again. Writing them a second time is the whole of the duplication left
+        // once the pinned composer is handled.
+        let mut store = ScrollbackStore::default();
+        store.record("k", &agent_screen(0, 0));
+        store.record("k", &agent_screen(12, 1));
+        let scrolled = split_lines(&store.window("k", MAX_PANE_LINES).unwrap()).len();
+        assert_eq!(scrolled, AGENT_TRANSCRIPT_ROWS + 12 + AGENT_BOX_ROWS);
+        // Back to where it was.
+        store.record("k", &agent_screen(0, 2));
+        let held = store.window("k", MAX_PANE_LINES).unwrap();
+        assert!(substantial_duplicates(&held).is_empty());
+        assert_eq!(
+            split_lines(&held).len(),
+            AGENT_TRANSCRIPT_ROWS + AGENT_BOX_ROWS,
+            "the twelve rows that came back were written twice"
+        );
+    }
+
+    #[test]
+    fn a_read_no_placement_believed_is_not_appended_twice() {
+        // The floor under everything else. Where neither placement finds a seam,
+        // whatever the buffer verbatim ends with is still not written down
+        // again: appending rows the buffer already ends with cannot be right
+        // whatever the placement thought.
+        let mut store = ScrollbackStore::default();
+        store.record("k", "keep me\ntail 1\ntail 2\ntail 3");
+        // Shares its head with the buffer's tail, but is otherwise a different
+        // screen -- too different for either placement to believe.
+        store.record(
+            "k",
+            "tail 1\ntail 2\ntail 3\nq\nw\ne\nr\nt\ny\nu\ni\no\np\na\ns\nd",
+        );
+        let held = store.window("k", MAX_PANE_LINES).unwrap();
+        let rows = split_lines(&held);
+        assert_eq!(rows.iter().filter(|row| *row == "tail 1").count(), 1);
+        assert_eq!(rows.iter().filter(|row| *row == "tail 3").count(), 1);
+        assert_eq!(rows[0], "keep me");
+        assert_eq!(rows.last().unwrap(), "d");
+    }
+
+    #[test]
+    fn a_watched_agent_pane_never_grows_a_duplicate() {
+        // The whole failure as the pane actually lives it: bursts of output
+        // between polls, quiet spells where only the timer turns, and a couple
+        // of jumps that outran the poll entirely.
+        let mut store = ScrollbackStore::default();
+        let mut reads: Vec<Vec<String>> = Vec::new();
+        let mut top = 0;
+        for poll in 0..200 {
+            let scroll = match poll % 10 {
+                0..=2 => 0,  // the timer turns, nothing scrolls
+                3 | 4 => 2,  // a line at a time
+                5..=7 => 24, // a burst, past where the ratio gives up
+                8 => 47,     // a bigger burst
+                _ => 3,
+            };
+            top += scroll;
+            let screen = agent_screen(top, poll);
+            reads.push(split_lines(&screen));
+            store.record("k", &screen);
+        }
+        let held = store.window("k", MAX_PANE_LINES).unwrap();
+        let duplicates = substantial_duplicates(&held);
+        assert!(
+            duplicates.is_empty(),
+            "{} substantial rows duplicated, worst {:?}",
+            duplicates.iter().map(|(_, count)| count - 1).sum::<usize>(),
+            duplicates.first()
+        );
+        let rows = split_lines(&held);
+        assert_eq!(rows.len(), AGENT_TRANSCRIPT_ROWS + top + AGENT_BOX_ROWS);
+        assert_supersequence_in_arrival_order(&rows, &reads);
     }
 
     #[test]
