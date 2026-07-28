@@ -327,6 +327,16 @@ fn already_held(held: &[u64], incoming: &[u64]) -> usize {
         .unwrap_or(0)
 }
 
+/// How many rows two frames end with in common.
+fn common_suffix(previous: &[u64], current: &[u64]) -> usize {
+    previous
+        .iter()
+        .rev()
+        .zip(current.iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count()
+}
+
 #[derive(Debug, Default)]
 struct PaneBuffer {
     lines: VecDeque<String>,
@@ -334,6 +344,12 @@ struct PaneBuffer {
     bytes: usize,
     /// When this buffer was last fed, on the store's own clock.
     touched: u64,
+    /// The frame this buffer last saw, by row hash. What two consecutive
+    /// frames end with identically is the pane's furniture rather than its
+    /// history -- an agent's composer box, a status line, a prompt -- and it
+    /// belongs at the bottom of the buffer once, not scattered through it
+    /// every time the screen jumped further than a read could follow.
+    last_frame: Vec<u64>,
 }
 
 impl PaneBuffer {
@@ -444,6 +460,31 @@ impl ScrollbackStore {
         let before = buffer.bytes;
         buffer.touched = clock;
 
+        // What this frame and the one before it end with identically is the
+        // pane's furniture, not its history: an agent's composer -- the rule,
+        // the prompt, the mode line -- is pinned to the bottom of the screen
+        // while the transcript scrolls above it. Left alone, a copy of it
+        // lands in the middle of the transcript every time the screen jumps
+        // further than a read can follow, and the reader scrolls back through
+        // their own conversation past prompt boxes that were never there.
+        // Capped at a third of a screen, so a pane that legitimately repaints
+        // the same tail keeps its history.
+        let frame: Vec<u64> = incoming.iter().map(|line| line_hash(line)).collect();
+        let furniture = common_suffix(&buffer.last_frame, &frame).min(frame.len() / 3);
+        if furniture > 0 {
+            let held = furniture.min(buffer.lines.len());
+            let ends_with_it = buffer
+                .hashes
+                .iter()
+                .rev()
+                .take(held)
+                .zip(buffer.last_frame.iter().rev())
+                .all(|(seen, before)| seen == before);
+            if ends_with_it {
+                buffer.drop_back(held);
+            }
+        }
+
         // How much of the read is already the end of the buffer, and must not be
         // written down a second time. Only ever a prefix of the read, so what is
         // appended stays contiguous and in arrival order.
@@ -470,6 +511,7 @@ impl ScrollbackStore {
             buffer.push(line);
         }
         buffer.trim();
+        buffer.last_frame = frame;
         self.total_bytes = self.total_bytes + buffer.bytes - before;
         self.evict();
     }
@@ -646,6 +688,44 @@ pub fn replace_read_text(value: &mut Value, text: &str) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// An agent pins a composer to the bottom of its screen and scrolls only
+    /// the transcript above it. The composer is furniture: it belongs at the
+    /// end of what the reader scrolls through, once, however many times the
+    /// screen jumped while they were away.
+    #[test]
+    fn pinned_furniture_is_kept_once() {
+        let mut store = ScrollbackStore::default();
+        let chrome = ["", "> ", "auto mode on"];
+        for round in 0..8 {
+            // Each frame jumps far enough that no placement is believable.
+            let body: Vec<String> = (0..40)
+                .map(|row| format!("line {} of round {round}", row + round * 40))
+                .collect();
+            let frame: Vec<String> = body
+                .into_iter()
+                .chain(chrome.iter().map(|line| (*line).to_owned()))
+                .collect();
+            store.record("pane", &frame.join("\n"));
+        }
+        let held = store.window("pane", 5_000).unwrap();
+        let lines: Vec<&str> = held.lines().collect();
+        assert_eq!(
+            lines.iter().filter(|line| **line == "auto mode on").count(),
+            1,
+            "the composer belongs at the bottom once, not once per jump"
+        );
+        assert_eq!(lines.last(), Some(&"auto mode on"));
+        // And the transcript itself survives whole.
+        assert!(lines
+            .iter()
+            .any(|line| line.starts_with("line 0 of round 0")));
+        assert!(lines
+            .iter()
+            .any(|line| line.starts_with("line 319 of round 7")));
+    }
+
     use super::*;
     use serde_json::json;
 
