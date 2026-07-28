@@ -533,7 +533,9 @@ struct AppState {
 /// A poisoned buffer is not worth failing a read over: the pane's own answer
 /// from Herdr is still correct, only shorter. Every caller treats `None` as
 /// "this gateway keeps no history", which is exactly what release/0.5.0 did.
-fn lock_scrollback(state: &AppState) -> Option<std::sync::MutexGuard<'_, scrollback::ScrollbackStore>> {
+fn lock_scrollback(
+    state: &AppState,
+) -> Option<std::sync::MutexGuard<'_, scrollback::ScrollbackStore>> {
     state.scrollback.lock().ok()
 }
 
@@ -2365,7 +2367,8 @@ async fn snapshot(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
-    let answer = call_session_method(&state.config, &session_id, "session.snapshot", json!({})).await;
+    let answer =
+        call_session_method(&state.config, &session_id, "session.snapshot", json!({})).await;
     Ok(Json(note_and_amend_panes(&state, &session_id, answer?.0)))
 }
 
@@ -5541,8 +5544,17 @@ fn upload_expired(modified: SystemTime, now: SystemTime) -> bool {
 //    or a plain listing uses, and what makes the endpoint work on a session
 //    that never touched a worktree.
 //
-// Reading a file is gated on one rule and one rule only: the path canonicalizes
-// to a regular file inside a root the session currently has.
+// Reading a file is gated on provenance. The first rule is the one that has
+// always applied: the path canonicalizes to a regular file inside a root the
+// session currently has. The second rule exists because a workspace closes
+// while the file it produced is still the thing the user wants to look at --
+// a removed worktree used to take a twelve-hour-old asset with it. So when the
+// roots no longer contain the path, an entry that *was* indexed while its root
+// was live is still served, and only ever by replaying its stored canonical
+// path: it is canonicalized again at read time and must come back byte-for-byte
+// equal, so a symlink swapped into the old location resolves elsewhere and
+// misses. Nothing that was never indexed becomes reachable by either rule, and
+// every failure of either is the same 404 as an unknown id.
 // ---------------------------------------------------------------------------
 
 /// What a file is, decided from its bytes. The client picks a viewer from this,
@@ -6051,6 +6063,29 @@ fn resolve_asset_path(path: &FsPath, roots: &[PathBuf]) -> Option<PathBuf> {
         .then_some(canonical)
 }
 
+/// What an id that is already in the index is allowed to read.
+///
+/// Root containment first, exactly as before: while the workspace that made the
+/// file is still open, nothing about this changed. What is new is the second
+/// answer, for the asset whose workspace has since closed -- a worktree removed
+/// after the agent finished, which used to 404 the file it produced.
+///
+/// That fallback replays the entry's own stored canonical path and nothing
+/// else. The path is canonicalized again and has to come back equal to what was
+/// stored: a symlink dropped where the file used to be canonicalizes to its
+/// target, which is a different path, and misses. A directory left in its place
+/// is not a regular file, and misses. The file being gone at all misses. Since
+/// the caller is an index lookup, a path that was never indexed has no entry to
+/// replay and never reaches here -- provenance is what is being served, not a
+/// filesystem.
+fn resolve_indexed_asset_path(stored: &FsPath, roots: &[PathBuf]) -> Option<PathBuf> {
+    if let Some(path) = resolve_asset_path(stored, roots) {
+        return Some(path);
+    }
+    let canonical = std::fs::canonicalize(stored).ok()?;
+    (canonical == stored && canonical.is_file()).then_some(canonical)
+}
+
 /// Resolve one exact path into an asset. The app needs this because a file
 /// path printed in a terminal has to map to the file it names -- matching by
 /// name against the listing would land on the wrong one. The path is held to
@@ -6316,15 +6351,18 @@ async fn asset_content(
     };
 
     // Roots are resolved again rather than trusted from the index: what is
-    // inside a workspace now is what decides, not what was when it was scanned.
+    // inside a workspace now is what decides. When it decides nothing -- the
+    // workspace closed -- the entry's own stored path answers instead, under
+    // the equality guard in `resolve_indexed_asset_path`.
     let session = find_session(&state.config, &entry.session_id)
         .map_err(|_| asset_not_found())?
         .clone();
     let roots = canonical_roots(&session_asset_roots(&state, &session).await);
     let entry_path = entry.path.clone();
-    let Some(path) = tokio::task::spawn_blocking(move || resolve_asset_path(&entry_path, &roots))
-        .await
-        .unwrap_or_default()
+    let Some(path) =
+        tokio::task::spawn_blocking(move || resolve_indexed_asset_path(&entry_path, &roots))
+            .await
+            .unwrap_or_default()
     else {
         return Err(asset_not_found());
     };
@@ -7394,7 +7432,7 @@ fn openapi_spec() -> Value {
             "/api/assets/{assetId}/content": {
                 "get": {
                     "summary": "Stream one asset's bytes, read-only",
-                    "description": "The path must canonicalize to a regular file inside a workspace root the session currently has, so a symlink out of the root, a traversal, and an unknown id are all a 404. The kind is sniffed again from the bytes on every read; a binary asset answers 415 with its metadata and no body. Assets larger than 10 MiB are refused with 413.",
+                    "description": "The path must canonicalize to a regular file inside a workspace root the session currently has, so a symlink out of the root, a traversal, and an unknown id are all a 404. An asset indexed while its root was a live workspace outlives that workspace: when the roots no longer contain it, the entry's stored canonical path is replayed and served only if it canonicalizes back to itself byte-for-byte, so a symlink swapped into the old location is the same 404. A path that was never indexed has no entry to replay. The kind is sniffed again from the bytes on every read; a binary asset answers 415 with its metadata and no body. Assets larger than 10 MiB are refused with 413.",
                     "parameters": [path_param("assetId")],
                     "responses": asset_content_responses()
                 }
@@ -9149,6 +9187,93 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    #[test]
+    fn an_indexed_asset_outlives_the_workspace_that_made_it() {
+        // The worktree an agent wrote into was removed hours later. The roots
+        // resolve to nothing now, which is the whole of what changed: the file
+        // is still there and still the thing the user tapped.
+        let root = asset_test_dir("provenance");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let report = workspace.join("report.md");
+        std::fs::write(&report, b"# report\n").unwrap();
+
+        // While the workspace is a root, nothing about the read changed.
+        let live = vec![workspace.clone()];
+        assert_eq!(
+            resolve_indexed_asset_path(&report, &live),
+            Some(report.clone())
+        );
+
+        // With no roots at all -- the workspace closed -- the stored path is
+        // replayed and answers the same bytes.
+        assert_eq!(
+            resolve_indexed_asset_path(&report, &[]),
+            Some(report.clone())
+        );
+
+        // A file that is gone is gone, roots or no roots.
+        let deleted = workspace.join("gone.md");
+        std::fs::write(&deleted, b"bye\n").unwrap();
+        std::fs::remove_file(&deleted).unwrap();
+        assert!(resolve_indexed_asset_path(&deleted, &[]).is_none());
+
+        // A directory left where the file was is not a file.
+        std::fs::create_dir_all(workspace.join("was-a-file")).unwrap();
+        assert!(resolve_indexed_asset_path(&workspace.join("was-a-file"), &[]).is_none());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_swapped_into_a_stored_asset_path_is_not_that_asset() {
+        // The attack the equality guard exists for: the workspace closes, the
+        // real file is replaced by a link to somewhere the gateway would never
+        // have indexed, and the old id is presented again.
+        let root = asset_test_dir("provenance-symlink");
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"secret\n").unwrap();
+        let stored = workspace.join("report.md");
+        std::fs::write(&stored, b"# report\n").unwrap();
+        assert!(resolve_indexed_asset_path(&stored, &[]).is_some());
+
+        std::fs::remove_file(&stored).unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.txt"), &stored).unwrap();
+
+        // The path canonicalizes to the link's target, which is not the path
+        // that was stored, so the replay refuses it -- and refuses it the same
+        // way an unknown id is refused.
+        assert!(resolve_indexed_asset_path(&stored, &[]).is_none());
+        assert!(resolve_indexed_asset_path(&stored, std::slice::from_ref(&workspace)).is_none());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_path_that_was_never_indexed_has_no_entry_to_replay() {
+        // The fallback is reached through an index lookup and nowhere else, so
+        // provenance is what it serves. A file the gateway never scanned has no
+        // entry, and the read stops at the lookup with the same 404 as a bad id.
+        let root = asset_test_dir("provenance-unindexed");
+        std::fs::create_dir_all(&root).unwrap();
+        let indexed = root.join("indexed.md");
+        let never = root.join("never-scanned.md");
+        std::fs::write(&indexed, b"# indexed\n").unwrap();
+        std::fs::write(&never, b"# private\n").unwrap();
+
+        let mut index = AssetIndex::default();
+        index.upsert(test_asset_entry(&indexed, &root, 1));
+
+        assert!(index.get(&asset_id(&indexed)).is_some());
+        assert!(index.get(&asset_id(&never)).is_none());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_symlink_out_of_a_workspace_root_cannot_be_read_or_scanned() {
@@ -10495,7 +10620,8 @@ mod tests {
         for _ in 0..4 {
             read_output(&state, 240).await;
         }
-        let listing = note_and_amend_panes(&state, "default", json!({ "result": { "panes": [pane] } }));
+        let listing =
+            note_and_amend_panes(&state, "default", json!({ "result": { "panes": [pane] } }));
 
         // Seven rows kept, four of them on screen: three to reach back for.
         assert_eq!(

@@ -418,6 +418,16 @@ root, a traversal, and an unknown id all answer `404`, and no answer
 distinguishes them. Assets over 10 MiB answer `413`, and a binary asset answers
 `415` with its metadata and no body. Nothing about this API writes.
 
+An asset outlives the workspace that made it. A worktree removed after the agent
+finished used to take with it every file it had produced, which is exactly when
+the user opens one. So when the roots no longer contain the path, an id that was
+indexed while its root was live is still served, by replaying the entry's stored
+canonical path and nothing else: it is canonicalized again on every read and has
+to come back byte-for-byte equal, so a symlink dropped where the file used to be
+resolves elsewhere and answers the same `404`. A path the gateway never indexed
+has no entry to replay and never becomes reachable, and the size cap and the
+indistinguishable `404` are unchanged.
+
 ### Scrollback for panes that have none
 
 Herdr keeps scrollback for programs that print and let the text roll off the

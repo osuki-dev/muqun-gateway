@@ -62,9 +62,9 @@
 //! which is the point: the two ends of the same pane must not disagree about
 //! where a row belongs.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use serde_json::Value;
@@ -236,10 +236,7 @@ impl ScrollbackStore {
     /// current without asking Herdr for anything new.
     pub fn observe(&mut self, session_id: &str, value: &Value) {
         visit_panes(value, &mut |pane_id, scroll| {
-            if let Some(maximum) = scroll
-                .get("max_offset_from_bottom")
-                .and_then(Value::as_f64)
-            {
+            if let Some(maximum) = scroll.get("max_offset_from_bottom").and_then(Value::as_f64) {
                 self.kept
                     .insert(pane_key(session_id, pane_id), maximum <= 0.0);
             }
@@ -358,10 +355,7 @@ impl ScrollbackStore {
         }
         visit_panes_mut(value, &mut |pane_id, scroll| {
             if let Some((_, offset)) = updates.iter().find(|(id, _)| id == pane_id) {
-                scroll.insert(
-                    "max_offset_from_bottom".into(),
-                    Value::from(*offset),
-                );
+                scroll.insert("max_offset_from_bottom".into(), Value::from(*offset));
             }
         });
     }
@@ -557,7 +551,10 @@ mod tests {
         store.record("k", &screen(&["3", "4", "5", "6"]));
         // Then the screen jumps past what can be followed.
         store.record("k", &screen(&["x", "y", "z", "w"]));
-        assert_eq!(store.window("k", 20).unwrap(), "1\n2\n3\n4\n5\n6\nx\ny\nz\nw");
+        assert_eq!(
+            store.window("k", 20).unwrap(),
+            "1\n2\n3\n4\n5\n6\nx\ny\nz\nw"
+        );
     }
 
     #[test]
@@ -583,7 +580,10 @@ mod tests {
         let rows = split_lines(&held);
         assert_eq!(rows.len(), MAX_PANE_LINES);
         assert_eq!(rows.last().unwrap(), &format!("row {}", total + 18));
-        assert_eq!(rows.first().unwrap(), &format!("row {}", total + 19 - MAX_PANE_LINES));
+        assert_eq!(
+            rows.first().unwrap(),
+            &format!("row {}", total + 19 - MAX_PANE_LINES)
+        );
     }
 
     #[test]
@@ -594,7 +594,9 @@ mod tests {
         }
         assert!(store.buffers.len() <= MAX_BUFFERS);
         assert!(store.window("pane-0", 10).is_none());
-        assert!(store.window(&format!("pane-{}", MAX_BUFFERS + 4), 10).is_some());
+        assert!(store
+            .window(&format!("pane-{}", MAX_BUFFERS + 4), 10)
+            .is_some());
     }
 
     #[test]
@@ -633,7 +635,11 @@ mod tests {
     #[test]
     fn the_pane_entity_answers_for_what_the_buffer_holds() {
         let mut store = ScrollbackStore::default();
-        scroll_a_screen(&mut store, &read_key("s", "p", "recent_unwrapped", "text"), 236);
+        scroll_a_screen(
+            &mut store,
+            &read_key("s", "p", "recent_unwrapped", "text"),
+            236,
+        );
         let mut value = json!({
             "result": {
                 "panes": [
@@ -644,7 +650,9 @@ mod tests {
         store.amend("s", &mut value);
         // 236 rows held, 65 of them on screen: 171 the reader can reach for.
         assert_eq!(
-            value.pointer("/result/panes/0/scroll/max_offset_from_bottom").unwrap(),
+            value
+                .pointer("/result/panes/0/scroll/max_offset_from_bottom")
+                .unwrap(),
             &json!(236 - 65)
         );
     }
@@ -652,7 +660,11 @@ mod tests {
     #[test]
     fn a_pane_with_real_scrollback_is_left_exactly_as_it_arrived() {
         let mut store = ScrollbackStore::default();
-        scroll_a_screen(&mut store, &read_key("s", "p", "recent_unwrapped", "text"), 300);
+        scroll_a_screen(
+            &mut store,
+            &read_key("s", "p", "recent_unwrapped", "text"),
+            300,
+        );
         let original = json!({
             "result": {
                 "panes": [
@@ -679,20 +691,28 @@ mod tests {
     fn ansi_and_text_reads_of_one_pane_do_not_splice_into_each_other() {
         let mut store = ScrollbackStore::default();
         store.record(&read_key("s", "p", "recent_unwrapped", "text"), "plain");
-        store.record(&read_key("s", "p", "recent_unwrapped", "ansi"), "\u{1b}[31mred");
+        store.record(
+            &read_key("s", "p", "recent_unwrapped", "ansi"),
+            "\u{1b}[31mred",
+        );
         assert_eq!(
-            store.window(&read_key("s", "p", "recent_unwrapped", "text"), 10).unwrap(),
+            store
+                .window(&read_key("s", "p", "recent_unwrapped", "text"), 10)
+                .unwrap(),
             "plain"
         );
         assert_eq!(
-            store.window(&read_key("s", "p", "recent_unwrapped", "ansi"), 10).unwrap(),
+            store
+                .window(&read_key("s", "p", "recent_unwrapped", "ansi"), 10)
+                .unwrap(),
             "\u{1b}[31mred"
         );
     }
 
     #[test]
     fn spliced_rows_go_back_where_herdr_put_them() {
-        let mut nested = json!({ "id": "1", "result": { "read": { "text": "old", "revision": 7 } } });
+        let mut nested =
+            json!({ "id": "1", "result": { "read": { "text": "old", "revision": 7 } } });
         replace_read_text(&mut nested, "new");
         assert_eq!(nested.pointer("/result/read/text").unwrap(), &json!("new"));
         assert_eq!(nested.pointer("/result/read/revision").unwrap(), &json!(7));
