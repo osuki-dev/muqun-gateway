@@ -1835,10 +1835,7 @@ mod tests {
         ] {
             for agent in [None, Some("claude"), Some("codex"), Some("opencode")] {
                 let parts = normalize(text, dictionary_for(agent));
-                assert!(
-                    !parts.is_empty(),
-                    "{agent:?} answered nothing for {text:?}"
-                );
+                assert!(!parts.is_empty(), "{agent:?} answered nothing for {text:?}");
             }
         }
     }

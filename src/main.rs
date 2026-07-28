@@ -7874,14 +7874,65 @@ fn generate_token() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
+/// The glyphs a pairing code is drawn from: no `0`/`O` and no `1`/`I`/`L`, so a
+/// person reading one off a screen cannot mistype it into a different code.
+const PAIRING_CODE_ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
+
+/// Eight glyphs of this alphabet is a shade under forty bits, and that number
+/// is only true if every glyph is equally likely at every position. Two things
+/// were making it false.
+///
+/// Folding a byte with `%` biases the fold: 256 is not a multiple of 31, so the
+/// first eight glyphs came up a ninth more often than the other twenty-three.
+/// And a v4 UUID is not sixteen random bytes -- four bits of byte 6 say
+/// "version 4" and two of byte 8 say "RFC variant" -- so the position that
+/// happened to land on byte 6 could only ever produce sixteen of the
+/// thirty-one glyphs, costing that character most of its entropy.
+///
+/// Neither was reachable: eight wrong answers burn the code and six requests
+/// burn ten minutes, so nothing gets near enough guesses for a fraction of a
+/// bit to matter. It is fixed because the number the code is worth should be
+/// the number it says it is.
 fn generate_pairing_code() -> String {
-    const ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
-    let bytes = *uuid::Uuid::new_v4().as_bytes();
-    let characters: String = bytes[..PAIRING_CODE_CHARACTER_COUNT]
-        .iter()
-        .map(|byte| ALPHABET[usize::from(*byte) % ALPHABET.len()] as char)
-        .collect();
+    // The last whole multiple of the alphabet below 256. A byte at or above it
+    // would fold unevenly, so it is redrawn rather than folded.
+    let ceiling = (256 / PAIRING_CODE_ALPHABET.len()) * PAIRING_CODE_ALPHABET.len();
+    let mut source = RandomBytes::default();
+    let mut characters = String::with_capacity(PAIRING_CODE_CHARACTER_COUNT);
+    while characters.len() < PAIRING_CODE_CHARACTER_COUNT {
+        let byte = usize::from(source.next_byte());
+        if byte >= ceiling {
+            continue;
+        }
+        characters.push(PAIRING_CODE_ALPHABET[byte % PAIRING_CODE_ALPHABET.len()] as char);
+    }
     format!("{}-{}", &characters[..4], &characters[4..])
+}
+
+/// Random bytes from the CSPRNG behind `Uuid::new_v4`, minus the bytes of a v4
+/// UUID that are not random. Keeps the gateway's entropy on one source instead
+/// of adding a second dependency for eight characters.
+#[derive(Default)]
+struct RandomBytes {
+    buffer: Vec<u8>,
+}
+
+impl RandomBytes {
+    fn next_byte(&mut self) -> u8 {
+        if self.buffer.is_empty() {
+            let bytes = *uuid::Uuid::new_v4().as_bytes();
+            // Byte 6 carries the version nibble and byte 8 the variant bits.
+            // Neither is random, so neither is spent.
+            self.buffer = bytes
+                .into_iter()
+                .enumerate()
+                .filter(|(index, _)| !matches!(index, 6 | 8))
+                .map(|(_, byte)| byte)
+                .collect();
+        }
+        // The refill puts fourteen bytes here, so this is never the default.
+        self.buffer.pop().unwrap_or_default()
+    }
 }
 
 fn valid_pairing_code(code: &str) -> bool {
@@ -7890,7 +7941,7 @@ fn valid_pairing_code(code: &str) -> bool {
         && code
             .bytes()
             .enumerate()
-            .all(|(index, byte)| index == 4 || b"23456789ABCDEFGHJKMNPQRSTUVWXYZ".contains(&byte))
+            .all(|(index, byte)| index == 4 || PAIRING_CODE_ALPHABET.contains(&byte))
 }
 
 /// Device names are echoed into the manage UI's terminal box, so control
@@ -9168,6 +9219,56 @@ mod tests {
         assert!(!code.contains('1'));
         assert!(!code.contains('I'));
         assert!(!code.contains('L'));
+    }
+
+    /// What the code is worth is what every position can hold and how evenly it
+    /// holds it. Both halves are asserted, because both were wrong: one
+    /// position could only reach sixteen of the thirty-one glyphs because it
+    /// was reading a UUID's version nibble, and every position leaned on the
+    /// first eight because a byte was folded with `%`.
+    ///
+    /// The bands are wide on purpose. Twenty thousand draws puts about 645 of
+    /// each glyph in each position and about 5161 overall; a tenth of that is
+    /// seven standard deviations, so the old bias (a ninth over, five of them)
+    /// fails and a fair generator does not flake.
+    #[test]
+    fn every_glyph_can_land_in_every_position_and_none_is_favoured() {
+        const DRAWS: usize = 20_000;
+        let mut counts =
+            vec![vec![0_usize; PAIRING_CODE_ALPHABET.len()]; PAIRING_CODE_CHARACTER_COUNT];
+        for _ in 0..DRAWS {
+            let code = generate_pairing_code();
+            assert!(valid_pairing_code(&code), "{code} is not a pairing code");
+            let glyphs: Vec<u8> = code.bytes().filter(|byte| *byte != b'-').collect();
+            for (position, glyph) in glyphs.iter().enumerate() {
+                let index = PAIRING_CODE_ALPHABET
+                    .iter()
+                    .position(|candidate| candidate == glyph)
+                    .expect("a code is drawn from the alphabet");
+                counts[position][index] += 1;
+            }
+        }
+
+        for (position, row) in counts.iter().enumerate() {
+            for (index, count) in row.iter().enumerate() {
+                assert!(
+                    *count > 0,
+                    "position {position} never produced {}",
+                    PAIRING_CODE_ALPHABET[index] as char
+                );
+            }
+        }
+
+        let total = DRAWS * PAIRING_CODE_CHARACTER_COUNT;
+        let expected = total / PAIRING_CODE_ALPHABET.len();
+        for index in 0..PAIRING_CODE_ALPHABET.len() {
+            let seen: usize = counts.iter().map(|row| row[index]).sum();
+            assert!(
+                seen * 10 > expected * 9 && seen * 10 < expected * 11,
+                "{} came up {seen} times against {expected} expected",
+                PAIRING_CODE_ALPHABET[index] as char
+            );
+        }
     }
 
     #[test]
