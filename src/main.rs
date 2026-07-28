@@ -115,6 +115,14 @@ const SUBMIT_MAX_ATTEMPTS: u32 = 6;
 /// is that the screen moved, and the screen moves on its own, so a submit that
 /// cannot be checked properly keeps pressing Enter as few times as possible.
 const SUBMIT_BLIND_MAX_ATTEMPTS: u32 = 3;
+
+/// How long a freshly spawned agent is given to become one Herdr can name, and
+/// how often the first prompt is offered to it meanwhile. Twelve attempts at
+/// three quarters of a second is nine seconds -- longer than any of the four
+/// agents takes to draw its first prompt on this hardware, and short enough
+/// that a spawn still answers inside a phone's patience.
+const SPAWN_PROMPT_ATTEMPTS: u32 = 12;
+const SPAWN_PROMPT_INTERVAL: Duration = Duration::from_millis(750);
 /// How long such a pane is given to react before it is read back.
 const SUBMIT_VERIFY_DELAY: Duration = Duration::from_millis(300);
 /// Wall-clock ceiling on the whole settle-send-verify sequence, so a pane that
@@ -1156,10 +1164,22 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
             get(session_agent_events),
         )
         .route("/api/sessions/{session_id}/tasks", post(create_task))
+        // Two spellings, one handler. The card said `agents/spawn` and the
+        // route said `spawn`, so New Task 404'd against every real gateway
+        // while both halves' tests passed against their own idea of the path.
+        // Serving both is cheaper than a flag day between an app in a store
+        // and a gateway a user updates when they feel like it.
         .route("/api/sessions/{session_id}/spawn", post(spawn_agent))
+        .route("/api/sessions/{session_id}/agents/spawn", post(spawn_agent))
         .route("/api/sessions/{session_id}/recent-cwds", get(recent_cwds))
         .route(
             "/api/sessions/{session_id}/panes/{pane_id}/interrupt",
+            post(interrupt_pane),
+        )
+        // The app names an agent by its pane; the route said pane and the
+        // client said agent. Same handler, same target, both spellings.
+        .route(
+            "/api/sessions/{session_id}/agents/{pane_id}/interrupt",
             post(interrupt_pane),
         )
         .route("/api/sessions/{session_id}/panes", get(panes))
@@ -4248,14 +4268,35 @@ async fn create_task(
 
     match body.prompt.as_deref() {
         None => steps.skipped("prompt", "no prompt was given"),
-        Some(prompt) => match submit_agent_prompt(&session, &place.pane_id, prompt).await {
-            Ok(_) => {
-                schedule_submit_keypress(session.clone(), place.pane_id.clone());
-                steps.ok("prompt", json!({ "bytes": prompt.len() }));
-                payload["prompt_submitted"] = json!(true);
+        Some(prompt) => {
+            // An agent that has just been launched is not a named agent yet --
+            // it is a program still deciding what it is, and Herdr only learns
+            // its name once it has drawn its first prompt. Waiting for that is
+            // the difference between a task that carries its instruction and
+            // one that lands on an empty prompt: the first attempt used to
+            // arrive before the agent existed and the whole spawn was reported
+            // as a failure, though the pane and the agent were both up.
+            let mut submitted = Err(HerdrCallError::Unavailable(
+                "the agent never became ready".to_owned(),
+            ));
+            for attempt in 0..SPAWN_PROMPT_ATTEMPTS {
+                if attempt > 0 {
+                    tokio::time::sleep(SPAWN_PROMPT_INTERVAL).await;
+                }
+                submitted = submit_agent_prompt(&session, &place.pane_id, prompt).await;
+                if submitted.is_ok() {
+                    break;
+                }
             }
-            Err(err) => steps.failed("prompt", err.code(), &err.message()),
-        },
+            match submitted {
+                Ok(_) => {
+                    schedule_submit_keypress(session.clone(), place.pane_id.clone());
+                    steps.ok("prompt", json!({ "bytes": prompt.len() }));
+                    payload["prompt_submitted"] = json!(true);
+                }
+                Err(err) => steps.failed("prompt", err.code(), &err.message()),
+            }
+        }
     }
 
     Ok(task_partial(payload, &steps))
@@ -4418,14 +4459,35 @@ async fn spawn_agent(
 
     match body.prompt.as_deref() {
         None => steps.skipped("prompt", "no prompt was given"),
-        Some(prompt) => match submit_agent_prompt(&session, &place.pane_id, prompt).await {
-            Ok(_) => {
-                schedule_submit_keypress(session.clone(), place.pane_id.clone());
-                steps.ok("prompt", json!({ "bytes": prompt.len() }));
-                payload["prompt_submitted"] = json!(true);
+        Some(prompt) => {
+            // An agent that has just been launched is not a named agent yet --
+            // it is a program still deciding what it is, and Herdr only learns
+            // its name once it has drawn its first prompt. Waiting for that is
+            // the difference between a task that carries its instruction and
+            // one that lands on an empty prompt: the first attempt used to
+            // arrive before the agent existed and the whole spawn was reported
+            // as a failure, though the pane and the agent were both up.
+            let mut submitted = Err(HerdrCallError::Unavailable(
+                "the agent never became ready".to_owned(),
+            ));
+            for attempt in 0..SPAWN_PROMPT_ATTEMPTS {
+                if attempt > 0 {
+                    tokio::time::sleep(SPAWN_PROMPT_INTERVAL).await;
+                }
+                submitted = submit_agent_prompt(&session, &place.pane_id, prompt).await;
+                if submitted.is_ok() {
+                    break;
+                }
             }
-            Err(err) => steps.failed("prompt", err.code(), &err.message()),
-        },
+            match submitted {
+                Ok(_) => {
+                    schedule_submit_keypress(session.clone(), place.pane_id.clone());
+                    steps.ok("prompt", json!({ "bytes": prompt.len() }));
+                    payload["prompt_submitted"] = json!(true);
+                }
+                Err(err) => steps.failed("prompt", err.code(), &err.message()),
+            }
+        }
     }
 
     Ok(task_partial(payload, &steps))
