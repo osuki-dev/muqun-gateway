@@ -39,6 +39,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio_stream::Stream;
 
+mod agent_events;
 mod approvals;
 mod composer;
 mod i18n;
@@ -142,7 +143,7 @@ const MANAGE_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 /// every pane or sending unchanged terminal frames over the network.
 const STREAM_OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(150);
 const STREAM_OUTPUT_READ_TIMEOUT: Duration = Duration::from_millis(100);
-const GATEWAY_API_VERSION: &str = "1.4.0";
+const GATEWAY_API_VERSION: &str = "1.5.0";
 const GATEWAY_API_MAJOR: u64 = 1;
 const HERDR_PROTOCOL_MIN: u64 = 17;
 const HERDR_PROTOCOL_MAX: u64 = 17;
@@ -215,6 +216,7 @@ const ASSET_SKIP_DIRS: &[&str] = &[
 ];
 const API_CAPABILITIES: &[&str] = &[
     "agent_catalog",
+    "agent_events",
     "agent_lifecycle_notifications",
     "assets",
     "device_revocation",
@@ -524,6 +526,10 @@ struct AppState {
     /// What panes with no scrollback of their own showed while the gateway was
     /// watching. Memory only, and only for those panes; see `scrollback`.
     scrollback: Arc<Mutex<scrollback::ScrollbackStore>>,
+    /// The agent status transitions this gateway saw, so a phone coming back
+    /// after a while can be told what happened. Memory only; see
+    /// `agent_events`.
+    agent_events: Arc<Mutex<agent_events::AgentEventLog>>,
     approval_events: tokio::sync::broadcast::Sender<ApprovalEvent>,
 }
 
@@ -1013,6 +1019,7 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         devices: Arc::new(Mutex::new(read_devices().unwrap_or_default())),
         assets: Arc::new(Mutex::new(AssetIndex::default())),
         scrollback: Arc::new(Mutex::new(scrollback::ScrollbackStore::default())),
+        agent_events: Arc::new(Mutex::new(agent_events::AgentEventLog::default())),
         approval_events: tokio::sync::broadcast::channel(APPROVAL_EVENT_CAPACITY).0,
     };
     spawn_agent_notification_watchers(state.clone());
@@ -1066,6 +1073,10 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         )
         .route("/api/keymaps", get(keymaps))
         .route("/api/agents/catalog", get(agents_catalog))
+        .route(
+            "/api/sessions/{session_id}/agent-events",
+            get(session_agent_events),
+        )
         .route("/api/sessions/{session_id}/tasks", post(create_task))
         .route("/api/sessions/{session_id}/panes", get(panes))
         .route(
@@ -3001,15 +3012,7 @@ async fn watch_agent_notifications(state: AppState, session: SessionConfig) {
     let mut statuses = seed_agent_statuses(&session).await;
 
     loop {
-        for notification in poll_agent_notifications(
-            &session,
-            &mut statuses,
-            &state.config.server_id,
-            &current_server_label(&state.config.label),
-            &session.id,
-        )
-        .await
-        {
+        for notification in poll_agent_notifications(&state, &session, &mut statuses).await {
             deliver_agent_notification(&state, notification).await;
         }
 
@@ -3026,12 +3029,11 @@ async fn watch_agent_notifications(state: AppState, session: SessionConfig) {
                             let Ok(event) = serde_json::from_str::<Value>(line.trim()) else {
                                 continue;
                             };
-                            if let Some(notification) = notification_for_agent_status_event(
+                            if let Some(notification) = absorb_agent_status_event(
+                                &state,
+                                &session.id,
                                 &event,
                                 &mut statuses,
-                                &state.config.server_id,
-                                &current_server_label(&state.config.label),
-                                &session.id,
                             ) {
                                 deliver_agent_notification(&state, notification).await;
                             }
@@ -3058,11 +3060,9 @@ async fn watch_agent_notifications(state: AppState, session: SessionConfig) {
 }
 
 async fn poll_agent_notifications(
+    state: &AppState,
     session: &SessionConfig,
     statuses: &mut HashMap<String, String>,
-    server_id: &str,
-    server_label: &str,
-    session_id: &str,
 ) -> Vec<AgentPushNotice> {
     let Ok(value) = herdr_request(session, "agent.list", json!({})).await else {
         return Vec::new();
@@ -3073,15 +3073,14 @@ async fn poll_agent_notifications(
         .into_iter()
         .flatten()
         .filter_map(|agent| {
-            notification_for_agent_status_event(
+            absorb_agent_status_event(
+                state,
+                &session.id,
                 &json!({
                     "event": "pane.agent_status_changed",
                     "data": agent
                 }),
                 statuses,
-                server_id,
-                server_label,
-                session_id,
             )
         })
         .collect()
@@ -3139,19 +3138,27 @@ async fn seed_agent_statuses(session: &SessionConfig) -> HashMap<String, String>
         .collect()
 }
 
-/// The push one agent status change raises, if it raises one at all.
+/// One agent status change, after the bookkeeping and before anyone decides
+/// what to do about it. Two things want it: the ring, which wants every one,
+/// and the pushes, which want the two that are worth waking a phone for.
+struct AgentTransition {
+    pane_id: String,
+    /// The agent's own name, when Herdr reported one.
+    agent: Option<String>,
+    from: Option<String>,
+    to: String,
+}
+
+/// Read one status event and consume the transition it represents.
 ///
-/// It runs the transition bookkeeping, so it may be called exactly once per
-/// event -- which is the other reason it returns an unworded [`AgentPushNotice`]
-/// rather than finished text: the same change may have to be said in two
-/// languages, and saying it twice here would consume the transition twice.
-fn notification_for_agent_status_event(
+/// This is the only place `statuses` is written, which is what makes "exactly
+/// once per event" a property of the code rather than a rule to remember: a
+/// caller that wants both a ring entry and a push calls this once and hands the
+/// answer to both.
+fn agent_status_transition(
     event: &Value,
     statuses: &mut HashMap<String, String>,
-    server_id: &str,
-    server_label: &str,
-    session_id: &str,
-) -> Option<AgentPushNotice> {
+) -> Option<AgentTransition> {
     let data = event.get("data").unwrap_or(event);
     let event_type = event
         .get("event")
@@ -3167,20 +3174,41 @@ fn notification_for_agent_status_event(
     if previous.as_deref() == Some(status.as_str()) {
         return None;
     }
+    Some(AgentTransition {
+        pane_id: pane_id.to_owned(),
+        agent: ["display_agent", "agent", "title"]
+            .into_iter()
+            .find_map(|key| data.get(key).and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
+        from: previous,
+        to: status,
+    })
+}
 
-    let (event_type, notice) = match (status.as_str(), previous.as_deref()) {
+/// The push one transition raises, if it raises one at all.
+///
+/// Most transitions raise none -- an agent starting to work is not news to
+/// someone who just asked it to. The two that do are the two a person is
+/// waiting on: it needs them, or it is finished. It returns an unworded
+/// [`AgentPushNotice`] rather than finished text because the same change may
+/// have to be said in two languages.
+fn notification_for_transition(
+    transition: &AgentTransition,
+    server_id: &str,
+    server_label: &str,
+    session_id: &str,
+) -> Option<AgentPushNotice> {
+    let pane_id = transition.pane_id.as_str();
+    let (event_type, notice) = match (transition.to.as_str(), transition.from.as_deref()) {
         ("blocked", _) => ("agent.blocked", AgentNotice::AgentBlocked),
         ("idle" | "done" | "completed", Some("working")) => {
             ("agent.completed", AgentNotice::AgentCompleted)
         }
         _ => return None,
     };
-    let agent_name = ["display_agent", "agent", "title"]
-        .into_iter()
-        .find_map(|key| data.get(key).and_then(Value::as_str))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned);
+    let agent_name = transition.agent.clone();
     let mut notification_data = serde_json::Map::new();
     notification_data.insert("type".into(), json!(event_type));
     notification_data.insert("url".into(), json!(format!("/servers/{server_id}")));
@@ -3195,6 +3223,55 @@ fn notification_for_agent_status_event(
         data: notification_data,
         choices: Vec::new(),
     })
+}
+
+/// Everything one status event causes, in one call: it is remembered, and then
+/// it may raise a push.
+///
+/// The ring records every transition and the push only ever names two of them,
+/// which is the point -- a phone that missed the doorbell can still be told
+/// that the agent worked for twenty minutes and then went idle.
+fn absorb_agent_status_event(
+    state: &AppState,
+    session_id: &str,
+    event: &Value,
+    statuses: &mut HashMap<String, String>,
+) -> Option<AgentPushNotice> {
+    let transition = agent_status_transition(event, statuses)?;
+    match state.agent_events.lock() {
+        Ok(mut log) => {
+            log.record(
+                session_id,
+                &transition.pane_id,
+                transition.agent.as_deref(),
+                transition.from.as_deref(),
+                &transition.to,
+                now_unix_ms(),
+            );
+        }
+        // Losing one line of a digest must not cost the push that goes with it.
+        Err(_) => eprintln!("agent event ring lock failed for session {session_id}"),
+    }
+    notification_for_transition(
+        &transition,
+        &state.config.server_id,
+        &current_server_label(&state.config.label),
+        session_id,
+    )
+}
+
+/// The two halves in one call, for tests that are about what a push says rather
+/// than about what the ring holds.
+#[cfg(test)]
+fn notification_for_agent_status_event(
+    event: &Value,
+    statuses: &mut HashMap<String, String>,
+    server_id: &str,
+    server_label: &str,
+    session_id: &str,
+) -> Option<AgentPushNotice> {
+    let transition = agent_status_transition(event, statuses)?;
+    notification_for_transition(&transition, server_id, server_label, session_id)
 }
 
 async fn create_workspace(
@@ -4704,6 +4781,53 @@ async fn pane_files(
 async fn keymaps(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
     Ok(Json(shortcuts::catalog()))
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentEventsQuery {
+    /// The highest `seq` the client already has. Absent means "everything you
+    /// still hold", which is what a phone opening a server cold asks for.
+    #[serde(default)]
+    since: Option<u64>,
+}
+
+/// What the agents in this session did recently, oldest first.
+///
+/// For the app's "while you were away" digest: a phone that was off the network
+/// for an hour has, at best, a stack of notifications it cannot order and, at
+/// worst, none at all. This answers with the transitions themselves, so the
+/// digest is built from what happened rather than from what was delivered.
+///
+/// Memory only and bounded, so `missed` is a real answer rather than an
+/// embarrassment: it says the ring rolled past the caller's `since`, and a
+/// client that knows its digest is partial can say so instead of implying a
+/// complete account.
+async fn session_agent_events(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Query(query): Query<AgentEventsQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    find_session(&state.config, &session_id)?;
+    let log = state.agent_events.lock().map_err(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "agent_events_lock_failed",
+            "failed to read recent agent activity",
+        )
+    })?;
+    let events = log.since(&session_id, query.since);
+    Ok(Json(json!({
+        "session_id": session_id,
+        "since": query.since,
+        "events": events.iter().map(agent_events::AgentEvent::to_json).collect::<Vec<_>>(),
+        // What to send as `since` next time, whether or not this answer was
+        // empty, so a client polling an idle session does not walk backwards.
+        "next_since": log.latest_seq(&session_id),
+        "missed": log.missed(&session_id, query.since),
+        "capacity": agent_events::RING_CAPACITY,
+    })))
 }
 
 /// The key row and slash commands for whatever this pane is running.
@@ -7450,6 +7574,17 @@ fn openapi_spec() -> Value {
                     }
                 }
             },
+            "/api/sessions/{sessionId}/agent-events": {
+                "get": {
+                    "summary": "Recent agent status transitions in this session, oldest first",
+                    "description": "An in-memory ring of the last 200 status transitions per session, for a client building a digest of what happened while it was away. Every transition is recorded, not only the two that raise a push, so a pane that worked and then went idle is visible even though only one notification was sent. Each event carries seq, pane_id, agent, from, to and unix_ms -- ids and statuses, never terminal output or an agent's own wording. Poll with since=<the highest seq already seen>; the answer's next_since is what to send next time, and missed is true when the ring has already dropped something after that point. Nothing is persisted: a restarted gateway answers with an empty list, because it was not watching.",
+                    "parameters": [
+                        path_param("sessionId"),
+                        query_param("since", "Only transitions with a higher seq are returned. Absent means everything still held")
+                    ],
+                    "responses": ok_response()
+                }
+            },
             "/api/sessions/{sessionId}/snapshot": { "get": session_endpoint("Return Herdr session.snapshot") },
             "/api/sessions/{sessionId}/workspaces": {
                 "get": session_endpoint("List Herdr workspaces"),
@@ -8187,6 +8322,7 @@ mod tests {
             devices: Arc::new(Mutex::new(devices)),
             assets: Arc::new(Mutex::new(AssetIndex::default())),
             scrollback: Arc::new(Mutex::new(scrollback::ScrollbackStore::default())),
+            agent_events: Arc::new(Mutex::new(agent_events::AgentEventLog::default())),
             approval_events: tokio::sync::broadcast::channel(APPROVAL_EVENT_CAPACITY).0,
         }
     }
@@ -8936,6 +9072,129 @@ mod tests {
         assert!(approval["get"].is_object());
         assert!(approval["post"]["requestBody"].is_object());
         assert!(approval["post"]["responses"]["409"].is_object());
+    }
+
+    fn status_event(pane_id: &str, agent: &str, status: &str) -> Value {
+        json!({
+            "event": "pane.agent_status_changed",
+            "data": { "pane_id": pane_id, "agent": agent, "agent_status": status }
+        })
+    }
+
+    #[test]
+    fn the_ring_records_every_transition_and_not_only_the_ones_worth_a_push() {
+        // The digest is the reason: "it worked for twenty minutes and then went
+        // idle" is the sentence a returning user wants, and only the last half
+        // of it ever rang a doorbell.
+        let state = test_state("admin", vec![test_device("d1", "token")]);
+        let mut statuses = HashMap::new();
+
+        let started = absorb_agent_status_event(
+            &state,
+            "default",
+            &status_event("w1:p1", "claude", "working"),
+            &mut statuses,
+        );
+        let finished = absorb_agent_status_event(
+            &state,
+            "default",
+            &status_event("w1:p1", "claude", "idle"),
+            &mut statuses,
+        );
+        // A repeat of the status the pane is already in is not a transition and
+        // must not appear twice in a digest.
+        let repeated = absorb_agent_status_event(
+            &state,
+            "default",
+            &status_event("w1:p1", "claude", "idle"),
+            &mut statuses,
+        );
+
+        assert!(started.is_none(), "starting work wakes nobody");
+        assert!(finished.is_some(), "finishing does");
+        assert!(repeated.is_none());
+
+        let log = state.agent_events.lock().unwrap();
+        let events = log.since("default", None);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].from, None);
+        assert_eq!(events[0].to, "working");
+        assert_eq!(events[1].from.as_deref(), Some("working"));
+        assert_eq!(events[1].to, "idle");
+        assert_eq!(events[1].agent.as_deref(), Some("claude"));
+        assert_eq!(log.latest_seq("default"), 2);
+    }
+
+    #[tokio::test]
+    async fn the_digest_endpoint_answers_what_is_new_and_where_to_resume_from() {
+        let state = test_state("admin", vec![test_device("d1", "token")]);
+        let mut statuses = HashMap::new();
+        for status in ["working", "blocked", "idle"] {
+            absorb_agent_status_event(
+                &state,
+                "default",
+                &status_event("w1:p1", "claude", status),
+                &mut statuses,
+            );
+        }
+
+        let answer = session_agent_events(
+            State(state.clone()),
+            Path("default".into()),
+            Query(AgentEventsQuery { since: None }),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(answer["events"].as_array().unwrap().len(), 3);
+        assert_eq!(answer["events"][0]["to"], "working");
+        assert_eq!(answer["events"][0]["from"], Value::Null);
+        assert_eq!(answer["next_since"], 3);
+        assert_eq!(answer["missed"], false);
+        assert_eq!(answer["capacity"], agent_events::RING_CAPACITY);
+
+        // Polling from where the last answer left off returns nothing and still
+        // says where to resume from, so an idle session does not walk backwards.
+        let resumed = session_agent_events(
+            State(state.clone()),
+            Path("default".into()),
+            Query(AgentEventsQuery { since: Some(3) }),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(resumed["events"].as_array().unwrap().len(), 0);
+        assert_eq!(resumed["next_since"], 3);
+        assert_eq!(resumed["missed"], false);
+
+        // Nothing here is readable without a paired device, and a session this
+        // gateway does not have is a 404 rather than an empty digest.
+        assert_eq!(
+            session_agent_events(
+                State(state.clone()),
+                Path("default".into()),
+                Query(AgentEventsQuery { since: None }),
+                bearer_headers("not-a-token"),
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            session_agent_events(
+                State(state),
+                Path("other".into()),
+                Query(AgentEventsQuery { since: None }),
+                bearer_headers("token"),
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[test]
@@ -10109,10 +10368,27 @@ mod tests {
         // A minor bump: the routes are additive, so an older client keeps
         // working, and a newer one can gate on the capability rather than on
         // probing for a 404.
-        assert!(GATEWAY_API_VERSION.starts_with("1.4."));
+        assert!(GATEWAY_API_VERSION.starts_with("1.5."));
         assert_eq!(GATEWAY_API_MAJOR, 1);
         assert!(API_CAPABILITIES.contains(&"tasks"));
         assert!(API_CAPABILITIES.contains(&"agent_catalog"));
+    }
+
+    #[test]
+    fn the_digest_endpoint_is_documented_and_announced() {
+        let spec = openapi_spec();
+        let events = &spec["paths"]["/api/sessions/{sessionId}/agent-events"]["get"];
+        assert!(events.is_object());
+        let names: Vec<&str> = events["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|parameter| parameter["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["sessionId", "since"]);
+        // A client must be able to tell a gateway that keeps this from one old
+        // enough to answer 404, without probing for the 404.
+        assert!(API_CAPABILITIES.contains(&"agent_events"));
     }
 
     #[test]

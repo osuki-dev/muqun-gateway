@@ -530,6 +530,36 @@ server and the body names the agent (e.g. `Agent blocked · <server>` /
 never terminal output or prompts. Duplicate status events are ignored; tapping a
 notification opens the matching server in Muqun.
 
+### While you were away
+
+`GET /api/sessions/default/agent-events` answers with the agent status
+transitions this gateway saw, oldest first, so a client returning to a server
+after a while can show what happened rather than only what is true now:
+
+```json
+{
+  "session_id": "default",
+  "since": 12,
+  "events": [ { "seq": 13, "pane_id": "w1:p1", "agent": "claude",
+    "from": "working", "to": "idle", "unix_ms": 1785100000000 } ],
+  "next_since": 13, "missed": false, "capacity": 200
+}
+```
+
+Every transition is recorded, not only the two that raise a push -- a pane that
+started working and then went idle is two lines here and one notification.
+`since` takes the highest `seq` already seen and returns only what is newer;
+`next_since` is what to send next time, whether or not the answer was empty, and
+`missed` is true when the ring has already dropped something after that point,
+because "nothing happened" and "more happened than I keep" are different
+answers.
+
+It is a ring of 200 per session, in memory, and nothing about it is written to
+disk. A restarted gateway answers with an empty list: it describes a session it
+was watching, and it was not watching. Each event carries ids, the agent's name
+and the two statuses -- never terminal output, a prompt, or an agent's own
+wording, which is the same rule the pushes are held to.
+
 ## Compatibility and API versions
 
 Herdr Gateway 0.5.0 requires Herdr 0.7.5 or newer and socket protocol 17.

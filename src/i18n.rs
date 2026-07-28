@@ -370,6 +370,7 @@ const ZH_TW: &[(&str, &str)] = &[
     ),
     ("failed to lock push token state", "無法鎖定推播 token 狀態"),
     ("failed to lock the asset index", "無法鎖定檔案索引"),
+    ("failed to read recent agent activity", "無法讀取最近的代理程式活動"),
     ("failed to read the asset", "無法讀取這個檔案"),
     (
         "failed to remove push notification registration",
@@ -534,6 +535,7 @@ const JA: &[(&str, &str)] = &[
     ("failed to lock pending pairing state", "保留中のペアリング状態をロックできませんでした"),
     ("failed to lock push token state", "プッシュトークンの状態をロックできませんでした"),
     ("failed to lock the asset index", "ファイルインデックスをロックできませんでした"),
+    ("failed to read recent agent activity", "最近のエージェントの動きを読み取れませんでした"),
     ("failed to read the asset", "ファイルを読み取れませんでした"),
     ("failed to remove push notification registration", "プッシュ通知の登録を削除できませんでした"),
     ("failed to revoke the device token", "デバイストークンを失効できませんでした"),
@@ -665,6 +667,7 @@ const KO: &[(&str, &str)] = &[
     ("failed to lock pending pairing state", "대기 중인 페어링 상태를 잠그지 못했습니다"),
     ("failed to lock push token state", "푸시 토큰 상태를 잠그지 못했습니다"),
     ("failed to lock the asset index", "파일 색인을 잠그지 못했습니다"),
+    ("failed to read recent agent activity", "최근 에이전트 활동을 읽지 못했습니다"),
     ("failed to read the asset", "파일을 읽지 못했습니다"),
     ("failed to remove push notification registration", "푸시 알림 등록을 삭제하지 못했습니다"),
     ("failed to revoke the device token", "기기 토큰을 폐기하지 못했습니다"),
@@ -815,6 +818,7 @@ const DE: &[(&str, &str)] = &[
     ),
     ("failed to lock push token state", "der Status des Push-Tokens konnte nicht gesperrt werden"),
     ("failed to lock the asset index", "der Dateiindex konnte nicht gesperrt werden"),
+    ("failed to read recent agent activity", "die letzten Agent-Aktivitäten konnten nicht gelesen werden"),
     ("failed to read the asset", "die Datei konnte nicht gelesen werden"),
     (
         "failed to remove push notification registration",
@@ -992,6 +996,7 @@ const FR: &[(&str, &str)] = &[
     ),
     ("failed to lock push token state", "impossible de verrouiller l’état du token push"),
     ("failed to lock the asset index", "impossible de verrouiller l’index des fichiers"),
+    ("failed to read recent agent activity", "impossible de lire l’activité récente des agents"),
     ("failed to read the asset", "impossible de lire le fichier"),
     (
         "failed to remove push notification registration",
@@ -1162,6 +1167,7 @@ const ES: &[(&str, &str)] = &[
     ),
     ("failed to lock push token state", "no se pudo bloquear el estado del token push"),
     ("failed to lock the asset index", "no se pudo bloquear el índice de archivos"),
+    ("failed to read recent agent activity", "no se pudo leer la actividad reciente de los agentes"),
     ("failed to read the asset", "no se pudo leer el archivo"),
     (
         "failed to remove push notification registration",
@@ -1329,6 +1335,7 @@ const PT: &[(&str, &str)] = &[
     ),
     ("failed to lock push token state", "não foi possível bloquear o estado do token de push"),
     ("failed to lock the asset index", "não foi possível bloquear o índice de ficheiros"),
+    ("failed to read recent agent activity", "não foi possível ler a atividade recente dos agentes"),
     ("failed to read the asset", "não foi possível ler o ficheiro"),
     (
         "failed to remove push notification registration",
