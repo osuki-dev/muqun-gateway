@@ -4451,6 +4451,19 @@ async fn spawn_place(
     steps: &mut tasks::StepLog,
 ) -> ApiResult<SpawnPlace> {
     let Some(tab_id) = tab_id else {
+        return spawn_in_new_tab(session, cwd, steps).await;
+    };
+    spawn_beside(session, tab_id, cwd, steps).await
+}
+
+/// A task that asked for no particular tab, and the fallback for one whose tab
+/// would not split.
+async fn spawn_in_new_tab(
+    session: &SessionConfig,
+    cwd: Option<&str>,
+    steps: &mut tasks::StepLog,
+) -> ApiResult<SpawnPlace> {
+    {
         let mut params = serde_json::Map::new();
         insert_opt(&mut params, "cwd", cwd);
         params.insert("focus".into(), json!(false));
@@ -4479,9 +4492,17 @@ async fn spawn_place(
             .and_then(Value::as_str)
             .map(str::to_owned);
         steps.ok("pane", json!({ "pane_id": pane_id, "tab_id": tab_id }));
-        return Ok(SpawnPlace { pane_id, tab_id });
-    };
+        Ok(SpawnPlace { pane_id, tab_id })
+    }
+}
 
+/// A task placed beside what the reader was already looking at.
+async fn spawn_beside(
+    session: &SessionConfig,
+    tab_id: &str,
+    cwd: Option<&str>,
+    steps: &mut tasks::StepLog,
+) -> ApiResult<SpawnPlace> {
     let host = pane_in_tab(session, tab_id).await.ok_or_else(|| {
         api_error(
             StatusCode::NOT_FOUND,
@@ -4494,12 +4515,23 @@ async fn spawn_place(
     params.insert("direction".into(), json!("down"));
     insert_opt(&mut params, "cwd", cwd);
     params.insert("focus".into(), json!(false));
-    let value = herdr_call(session, "pane.split", Value::Object(params))
-        .await
-        .map_err(|err| {
-            steps.failed("pane", err.code(), &err.message());
-            err.into_api_error("pane.split")
-        })?;
+    // A split that Ghostty refuses -- a tab already carrying as many panes as
+    // its layout will hold, which is the ordinary state of a tab someone works
+    // in -- must not lose the task. The tab was a preference, not the request:
+    // the request was "start this agent". So a refusal falls back to a tab of
+    // its own, recorded as such rather than passed off as the split that was
+    // asked for.
+    let split = herdr_call(session, "pane.split", Value::Object(params)).await;
+    let value = match split {
+        Ok(value) => value,
+        Err(err) => {
+            steps.skipped(
+                "split",
+                &format!("{} -- starting in a tab of its own instead", err.message()),
+            );
+            return spawn_in_new_tab(session, cwd, steps).await;
+        }
+    };
     let pane_id = created_pane_id(&value)
         .ok_or_else(|| {
             api_error(
