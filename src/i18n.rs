@@ -340,6 +340,7 @@ const ZH_TW: &[(&str, &str)] = &[
         "asset not found in a session workspace",
         "在這個工作階段的工作區中找不到該檔案",
     ),
+    ("cwd must be a directory inside a workspace this session has open", "cwd 必須是這個工作階段已開啟的工作區底下的目錄"),
     (
         "decision must be allow, allow_always, or deny",
         "decision 必須是 allow、allow_always 或 deny",
@@ -370,6 +371,7 @@ const ZH_TW: &[(&str, &str)] = &[
     ),
     ("failed to lock push token state", "無法鎖定推播 token 狀態"),
     ("failed to lock the asset index", "無法鎖定檔案索引"),
+    ("failed to read recent agent activity", "無法讀取最近的代理程式活動"),
     ("failed to read the asset", "無法讀取這個檔案"),
     (
         "failed to remove push notification registration",
@@ -421,6 +423,7 @@ const ZH_TW: &[(&str, &str)] = &[
         "startup_timeout_ms 必須介於 3001 與 300000 之間",
     ),
     ("text must be at most 65536 bytes", "text 最多 65536 個位元組"),
+    ("that tab has no pane to split", "這個分頁沒有可分割的面板"),
     (
         "the agent no longer has that request pending",
         "代理程式已不再等待這個請求",
@@ -513,6 +516,7 @@ const JA: &[(&str, &str)] = &[
     ("another pairing request is awaiting confirmation", "別のペアリング要求が確認待ちです"),
     ("answer with an option number or a decision", "選択肢の番号か決定のいずれかで回答してください"),
     ("asset not found in a session workspace", "セッションのワークスペースにそのファイルが見つかりません"),
+    ("cwd must be a directory inside a workspace this session has open", "cwd はこのセッションが開いているワークスペース内のディレクトリでなければなりません"),
     (
         "decision must be allow, allow_always, or deny",
         "decision は allow、allow_always、deny のいずれかにしてください",
@@ -534,6 +538,7 @@ const JA: &[(&str, &str)] = &[
     ("failed to lock pending pairing state", "保留中のペアリング状態をロックできませんでした"),
     ("failed to lock push token state", "プッシュトークンの状態をロックできませんでした"),
     ("failed to lock the asset index", "ファイルインデックスをロックできませんでした"),
+    ("failed to read recent agent activity", "最近のエージェントの動きを読み取れませんでした"),
     ("failed to read the asset", "ファイルを読み取れませんでした"),
     ("failed to remove push notification registration", "プッシュ通知の登録を削除できませんでした"),
     ("failed to revoke the device token", "デバイストークンを失効できませんでした"),
@@ -576,6 +581,7 @@ const JA: &[(&str, &str)] = &[
         "startup_timeout_ms は 3001 以上 300000 以下にしてください",
     ),
     ("text must be at most 65536 bytes", "text は 65536 バイト以内にしてください"),
+    ("that tab has no pane to split", "このタブには分割できるパネルがありません"),
     ("the agent no longer has that request pending", "エージェントはその要求をすでに待っていません"),
     ("the asset is larger than 10 MiB", "このファイルは 10 MiB を超えています"),
     ("the file field is empty", "file フィールドが空です"),
@@ -644,6 +650,7 @@ const KO: &[(&str, &str)] = &[
     ("another pairing request is awaiting confirmation", "다른 페어링 요청이 확인을 기다리고 있습니다"),
     ("answer with an option number or a decision", "옵션 번호나 결정으로 응답하세요"),
     ("asset not found in a session workspace", "세션 워크스페이스에서 해당 파일을 찾을 수 없습니다"),
+    ("cwd must be a directory inside a workspace this session has open", "cwd는 이 세션이 열어 둔 작업 공간 안의 디렉터리여야 합니다"),
     (
         "decision must be allow, allow_always, or deny",
         "decision은 allow, allow_always 또는 deny여야 합니다",
@@ -665,6 +672,7 @@ const KO: &[(&str, &str)] = &[
     ("failed to lock pending pairing state", "대기 중인 페어링 상태를 잠그지 못했습니다"),
     ("failed to lock push token state", "푸시 토큰 상태를 잠그지 못했습니다"),
     ("failed to lock the asset index", "파일 색인을 잠그지 못했습니다"),
+    ("failed to read recent agent activity", "최근 에이전트 활동을 읽지 못했습니다"),
     ("failed to read the asset", "파일을 읽지 못했습니다"),
     ("failed to remove push notification registration", "푸시 알림 등록을 삭제하지 못했습니다"),
     ("failed to revoke the device token", "기기 토큰을 폐기하지 못했습니다"),
@@ -707,6 +715,7 @@ const KO: &[(&str, &str)] = &[
         "startup_timeout_ms는 3001에서 300000 사이여야 합니다",
     ),
     ("text must be at most 65536 bytes", "text는 최대 65536바이트여야 합니다"),
+    ("that tab has no pane to split", "이 탭에는 분할할 패널이 없습니다"),
     ("the agent no longer has that request pending", "에이전트가 더 이상 그 요청을 기다리고 있지 않습니다"),
     ("the asset is larger than 10 MiB", "파일이 10 MiB를 넘습니다"),
     ("the file field is empty", "file 필드가 비어 있습니다"),
@@ -785,6 +794,7 @@ const DE: &[(&str, &str)] = &[
         "antworte mit einer Optionsnummer oder einer Entscheidung",
     ),
     ("asset not found in a session workspace", "Datei in keinem Workspace einer Session gefunden"),
+    ("cwd must be a directory inside a workspace this session has open", "cwd muss ein Verzeichnis in einem Workspace sein, den diese Sitzung geöffnet hat"),
     (
         "decision must be allow, allow_always, or deny",
         "decision muss allow, allow_always oder deny sein",
@@ -815,6 +825,7 @@ const DE: &[(&str, &str)] = &[
     ),
     ("failed to lock push token state", "der Status des Push-Tokens konnte nicht gesperrt werden"),
     ("failed to lock the asset index", "der Dateiindex konnte nicht gesperrt werden"),
+    ("failed to read recent agent activity", "die letzten Agent-Aktivitäten konnten nicht gelesen werden"),
     ("failed to read the asset", "die Datei konnte nicht gelesen werden"),
     (
         "failed to remove push notification registration",
@@ -866,6 +877,7 @@ const DE: &[(&str, &str)] = &[
         "startup_timeout_ms muss zwischen 3001 und 300000 liegen",
     ),
     ("text must be at most 65536 bytes", "text darf höchstens 65536 Bytes groß sein"),
+    ("that tab has no pane to split", "dieser Tab hat kein Panel, das geteilt werden könnte"),
     (
         "the agent no longer has that request pending",
         "beim Agenten steht diese Anfrage nicht mehr aus",
@@ -962,6 +974,7 @@ const FR: &[(&str, &str)] = &[
         "asset not found in a session workspace",
         "fichier introuvable dans un espace de travail de session",
     ),
+    ("cwd must be a directory inside a workspace this session has open", "cwd doit être un répertoire situé dans un espace de travail que cette session a ouvert"),
     (
         "decision must be allow, allow_always, or deny",
         "decision doit être allow, allow_always ou deny",
@@ -992,6 +1005,7 @@ const FR: &[(&str, &str)] = &[
     ),
     ("failed to lock push token state", "impossible de verrouiller l’état du token push"),
     ("failed to lock the asset index", "impossible de verrouiller l’index des fichiers"),
+    ("failed to read recent agent activity", "impossible de lire l’activité récente des agents"),
     ("failed to read the asset", "impossible de lire le fichier"),
     (
         "failed to remove push notification registration",
@@ -1046,6 +1060,7 @@ const FR: &[(&str, &str)] = &[
         "startup_timeout_ms doit être compris entre 3001 et 300000",
     ),
     ("text must be at most 65536 bytes", "text doit faire au plus 65536 octets"),
+    ("that tab has no pane to split", "cet onglet n’a aucun panneau à diviser"),
     ("the agent no longer has that request pending", "l’agent n’a plus cette demande en attente"),
     ("the asset is larger than 10 MiB", "le fichier dépasse 10 MiB"),
     ("the file field is empty", "le champ file est vide"),
@@ -1135,6 +1150,7 @@ const ES: &[(&str, &str)] = &[
         "asset not found in a session workspace",
         "el archivo no está en ningún espacio de trabajo de la sesión",
     ),
+    ("cwd must be a directory inside a workspace this session has open", "cwd debe ser un directorio dentro de un espacio de trabajo que esta sesión tenga abierto"),
     (
         "decision must be allow, allow_always, or deny",
         "decision debe ser allow, allow_always o deny",
@@ -1162,6 +1178,7 @@ const ES: &[(&str, &str)] = &[
     ),
     ("failed to lock push token state", "no se pudo bloquear el estado del token push"),
     ("failed to lock the asset index", "no se pudo bloquear el índice de archivos"),
+    ("failed to read recent agent activity", "no se pudo leer la actividad reciente de los agentes"),
     ("failed to read the asset", "no se pudo leer el archivo"),
     (
         "failed to remove push notification registration",
@@ -1210,6 +1227,7 @@ const ES: &[(&str, &str)] = &[
         "startup_timeout_ms debe estar entre 3001 y 300000",
     ),
     ("text must be at most 65536 bytes", "text debe tener 65536 bytes como máximo"),
+    ("that tab has no pane to split", "esta pestaña no tiene ningún panel que dividir"),
     (
         "the agent no longer has that request pending",
         "el agente ya no tiene esa solicitud pendiente",
@@ -1302,6 +1320,7 @@ const PT: &[(&str, &str)] = &[
         "asset not found in a session workspace",
         "ficheiro não encontrado num espaço de trabalho da sessão",
     ),
+    ("cwd must be a directory inside a workspace this session has open", "cwd tem de ser um diretório dentro de uma área de trabalho que esta sessão tenha aberta"),
     (
         "decision must be allow, allow_always, or deny",
         "decision tem de ser allow, allow_always ou deny",
@@ -1329,6 +1348,7 @@ const PT: &[(&str, &str)] = &[
     ),
     ("failed to lock push token state", "não foi possível bloquear o estado do token de push"),
     ("failed to lock the asset index", "não foi possível bloquear o índice de ficheiros"),
+    ("failed to read recent agent activity", "não foi possível ler a atividade recente dos agentes"),
     ("failed to read the asset", "não foi possível ler o ficheiro"),
     (
         "failed to remove push notification registration",
@@ -1380,6 +1400,7 @@ const PT: &[(&str, &str)] = &[
         "startup_timeout_ms tem de estar entre 3001 e 300000",
     ),
     ("text must be at most 65536 bytes", "text tem de ter no máximo 65536 bytes"),
+    ("that tab has no pane to split", "este separador não tem nenhum painel para dividir"),
     ("the agent no longer has that request pending", "o agente já não tem esse pedido pendente"),
     ("the asset is larger than 10 MiB", "o ficheiro é maior do que 10 MiB"),
     ("the file field is empty", "o campo file está vazio"),

@@ -141,7 +141,11 @@ pub struct CommandTable {
 /// not something to put on a phone.
 const CLAUDE_COMMANDS: &[BuiltinCommand] = &[
     cmd_with("/add-dir", "Add a new working directory", "<path>"),
-    cmd_with("/bug", "Report a bug or share your conversation", "[report]"),
+    cmd_with(
+        "/bug",
+        "Report a bug or share your conversation",
+        "[report]",
+    ),
     cmd_with(
         "/clear",
         "Start a new session with empty context; previous session stays on disk",
@@ -175,7 +179,10 @@ const CLAUDE_COMMANDS: &[BuiltinCommand] = &[
     cmd("/memory", "Open a memory file in your editor"),
     cmd_with("/model", "Set the AI model for Claude Code", "[model]"),
     cmd("/output-style", "Change the output style"),
-    cmd("/permissions", "Manage allow and deny tool permission rules"),
+    cmd(
+        "/permissions",
+        "Manage allow and deny tool permission rules",
+    ),
     cmd("/plan", "Enable plan mode or view the current session plan"),
     cmd("/privacy-settings", "View and update your privacy settings"),
     cmd("/release-notes", "Show release notes"),
@@ -192,11 +199,17 @@ const CLAUDE_COMMANDS: &[BuiltinCommand] = &[
     ),
     cmd("/rewind", "Rewind the conversation to a checkpoint"),
     cmd("/skills", "List available skills"),
-    cmd("/status", "Show Claude Code status: version, model, account, tools"),
+    cmd(
+        "/status",
+        "Show Claude Code status: version, model, account, tools",
+    ),
     cmd("/statusline", "Configure the status line"),
     cmd("/terminal-setup", "Configure the terminal key bindings"),
     cmd("/theme", "Change the theme"),
-    cmd("/usage", "Show session cost, plan usage, and activity stats"),
+    cmd(
+        "/usage",
+        "Show session cost, plan usage, and activity stats",
+    ),
     cmd("/vim", "Toggle vim mode"),
 ];
 
@@ -210,7 +223,10 @@ const CLAUDE_COMMANDS: &[BuiltinCommand] = &[
 const CODEX_COMMANDS: &[BuiltinCommand] = &[
     cmd("/agent", "Switch the active agent thread"),
     cmd("/app", "Continue this session in the Desktop app"),
-    cmd("/approve", "Approve one retry of a recent auto-review denial"),
+    cmd(
+        "/approve",
+        "Approve one retry of a recent auto-review denial",
+    ),
     cmd("/apps", "Manage apps"),
     cmd("/archive", "Archive this session and exit"),
     cmd("/clear", "Clear the terminal and start a new chat"),
@@ -237,7 +253,10 @@ const CODEX_COMMANDS: &[BuiltinCommand] = &[
         "/import",
         "Import setup, this project, and recent chats from Claude Code",
     ),
-    cmd("/init", "Create an AGENTS.md file with instructions for Codex"),
+    cmd(
+        "/init",
+        "Create an AGENTS.md file with instructions for Codex",
+    ),
     cmd("/keymap", "Remap TUI shortcuts"),
     cmd("/logout", "Log out of Codex"),
     cmd_with(
@@ -256,7 +275,10 @@ const CODEX_COMMANDS: &[BuiltinCommand] = &[
     cmd("/plugins", "Browse plugins"),
     cmd("/ps", "List background terminals"),
     cmd("/quit", "Exit Codex"),
-    cmd("/raw", "Toggle raw scrollback mode for copy-friendly selection"),
+    cmd(
+        "/raw",
+        "Toggle raw scrollback mode for copy-friendly selection",
+    ),
     cmd_with("/rename", "Rename the current thread", "[title]"),
     cmd_with(
         "/resume",
@@ -274,11 +296,20 @@ const CODEX_COMMANDS: &[BuiltinCommand] = &[
         "[question]",
     ),
     cmd("/skills", "Use skills to improve how Codex performs tasks"),
-    cmd("/status", "Show current session configuration and token usage"),
-    cmd("/statusline", "Configure which items appear in the status line"),
+    cmd(
+        "/status",
+        "Show current session configuration and token usage",
+    ),
+    cmd(
+        "/statusline",
+        "Configure which items appear in the status line",
+    ),
     cmd("/stop", "Stop all background terminals"),
     cmd("/theme", "Choose a syntax highlighting theme"),
-    cmd("/title", "Configure which items appear in the terminal title"),
+    cmd(
+        "/title",
+        "Configure which items appear in the terminal title",
+    ),
     cmd("/usage", "View account usage or use a usage limit reset"),
     cmd("/vim", "Toggle Vim mode for the composer"),
 ];
@@ -366,7 +397,11 @@ const QODER_COMMANDS: &[BuiltinCommand] = &[
         "Export the current conversation to a file or clipboard",
         "[filename]",
     ),
-    cmd_with("/fast", "Toggle fast mode for the current model", "[on|off]"),
+    cmd_with(
+        "/fast",
+        "Toggle fast mode for the current model",
+        "[on|off]",
+    ),
     cmd_with(
         "/goal",
         "Manage persistent goals for the current session",
@@ -387,7 +422,10 @@ const QODER_COMMANDS: &[BuiltinCommand] = &[
     cmd("/permissions", "Manage permissions"),
     cmd("/plan", "Toggle Plan Mode"),
     cmd("/plugins", "Manage plugins"),
-    cmd("/release-notes", "Show release notes for recent CLI versions"),
+    cmd(
+        "/release-notes",
+        "Show release notes for recent CLI versions",
+    ),
     cmd("/rename", "Set a custom title for the current session"),
     cmd(
         "/resume",
@@ -397,7 +435,10 @@ const QODER_COMMANDS: &[BuiltinCommand] = &[
     cmd("/skills", "Manage agent skills"),
     cmd("/status", "Show session status"),
     cmd("/theme", "Change the theme"),
-    cmd("/usage", "Show usage statistics for the current billing period"),
+    cmd(
+        "/usage",
+        "Show usage statistics for the current billing period",
+    ),
     cmd("/vim", "Toggle vim mode on/off for this session"),
 ];
 
@@ -1215,18 +1256,19 @@ mod tests {
         )
         .unwrap();
         std::fs::create_dir_all(outside.join("commands")).unwrap();
-        std::fs::write(outside.join("commands/leak.md"), "---\ndescription: no\n---\n").unwrap();
+        std::fs::write(
+            outside.join("commands/leak.md"),
+            "---\ndescription: no\n---\n",
+        )
+        .unwrap();
 
         // The whole skills directory is a link out of the repo.
         std::fs::create_dir_all(root.join(".claude")).unwrap();
         std::os::unix::fs::symlink(&outside, root.join(".claude/skills")).unwrap();
         // And one skill inside a real skills directory is a link out of it.
         std::fs::create_dir_all(root.join(".agents/skills")).unwrap();
-        std::os::unix::fs::symlink(
-            outside.join("secret"),
-            root.join(".agents/skills/borrowed"),
-        )
-        .unwrap();
+        std::os::unix::fs::symlink(outside.join("secret"), root.join(".agents/skills/borrowed"))
+            .unwrap();
         // And one command file is a link out of it.
         std::fs::create_dir_all(root.join(".claude/commands")).unwrap();
         std::os::unix::fs::symlink(
@@ -1293,7 +1335,11 @@ mod tests {
     #[test]
     fn front_matter_is_stripped_of_quoting_and_control_characters() {
         assert_eq!(
-            field("---\ndescription: \"line\u{1b}[2Kbreak\"\n---\n", "description").as_deref(),
+            field(
+                "---\ndescription: \"line\u{1b}[2Kbreak\"\n---\n",
+                "description"
+            )
+            .as_deref(),
             Some("line[2Kbreak")
         );
         assert!(field("no front matter\n", "description").is_none());

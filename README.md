@@ -360,6 +360,38 @@ whose binary is named something else:
 { "agent_commands": { "claude": "claude-canary" } }
 ```
 
+### Spawning and stopping
+
+`POST /api/sessions/default/spawn` is the light half of the same idea: run this
+agent, here, without describing a repository.
+
+```json
+{ "agent": "codex", "cwd": "/Users/dev/code/muqun", "prompt": "What broke?" }
+```
+
+The agent has to be one this gateway offers -- a Herdr kind or a profile named in
+`agents.json` -- and `cwd`, when given, has to be a directory this session
+already works in, which is the same fence `repo_path` is under and refuses the
+same way. With `tab_id` the new pane is split off whatever that tab has focused,
+so a second agent lands beside the first; without it the agent gets a tab of its
+own. The answer names the pane and says whether the agent came up and whether
+the prompt landed, and a `207` means the pane exists and something after it did
+not -- which is not the same as nothing having happened.
+
+`GET /api/sessions/default/recent-cwds` is the picker that feeds it: the
+distinct working directories of the panes that exist right now, each with the
+pane and workspace it came from and whether it is a git checkout. It is
+deliberately not a directory browser. The list a phone can choose from is
+exactly the list `cwd` will accept, and nothing here can be used to walk the
+host.
+
+`POST /api/sessions/default/panes/:paneId/interrupt` is Stop. It is sugar over
+send-keys, and it is worth an endpoint because the key is not the same on every
+agent: `ctrl+c` at a shell, `esc` in every agent this gateway has a profile for,
+and whatever `agents.json` says when it names one. The reply says which key was
+sent, and the same key is on the pane's shortcuts response as `interrupt`. It
+sends a keystroke and nothing else -- no signal, no kill.
+
 ### Assets
 
 `GET /api/sessions/default/assets` lists the files a session's workspaces
@@ -417,6 +449,16 @@ inside a workspace root the session currently has: a symlink pointing out of the
 root, a traversal, and an unknown id all answer `404`, and no answer
 distinguishes them. Assets over 10 MiB answer `413`, and a binary asset answers
 `415` with its metadata and no body. Nothing about this API writes.
+
+An asset outlives the workspace that made it. A worktree removed after the agent
+finished used to take with it every file it had produced, which is exactly when
+the user opens one. So when the roots no longer contain the path, an id that was
+indexed while its root was live is still served, by replaying the entry's stored
+canonical path and nothing else: it is canonicalized again on every read and has
+to come back byte-for-byte equal, so a symlink dropped where the file used to be
+resolves elsewhere and answers the same `404`. A path the gateway never indexed
+has no entry to replay and never becomes reachable, and the size cap and the
+indistinguishable `404` are unchanged.
 
 ### Scrollback for panes that have none
 
@@ -520,6 +562,61 @@ server and the body names the agent (e.g. `Agent blocked · <server>` /
 never terminal output or prompts. Duplicate status events are ignored; tapping a
 notification opens the matching server in Muqun.
 
+#### Putting the question in the push
+
+`rich_agent_pushes` in `config.json` is off, and its default will stay off:
+
+```json
+{ "rich_agent_pushes": true }
+```
+
+On, a blocked push carries the agent's own question -- up to 120 characters,
+verbatim -- and up to three of the answers it is offering, as the body and as
+`question` and `option_labels` in the payload. Off, the push says that something
+needs answering and never what, which is what every gateway does until someone
+changes this.
+
+The trade is worth stating plainly, because it is the owner's to make. "Claude
+is asking something" is not worth unlocking a phone for and `Run rm -rf build/?`
+is. But this is the one switch that puts terminal text on a lock screen, and
+that text travels through Expo's push service and then Apple's or Google's to
+get there; a question quoting a path, a hostname, or a snippet of a customer's
+data goes with it. It is a deliberate, per-machine choice, which is why it is a
+config file on the host rather than a toggle in the app. Nothing else this
+gateway notifies with is anything but ids, a name the user typed, and the
+agent's own name. A blocked pane with no readable menu falls back to the plain
+push rather than an empty quotation.
+
+### While you were away
+
+`GET /api/sessions/default/agent-events` answers with the agent status
+transitions this gateway saw, oldest first, so a client returning to a server
+after a while can show what happened rather than only what is true now:
+
+```json
+{
+  "session_id": "default",
+  "since": 12,
+  "events": [ { "seq": 13, "pane_id": "w1:p1", "agent": "claude",
+    "from": "working", "to": "idle", "unix_ms": 1785100000000 } ],
+  "next_since": 13, "missed": false, "capacity": 200
+}
+```
+
+Every transition is recorded, not only the two that raise a push -- a pane that
+started working and then went idle is two lines here and one notification.
+`since` takes the highest `seq` already seen and returns only what is newer;
+`next_since` is what to send next time, whether or not the answer was empty, and
+`missed` is true when the ring has already dropped something after that point,
+because "nothing happened" and "more happened than I keep" are different
+answers.
+
+It is a ring of 200 per session, in memory, and nothing about it is written to
+disk. A restarted gateway answers with an empty list: it describes a session it
+was watching, and it was not watching. Each event carries ids, the agent's name
+and the two statuses -- never terminal output, a prompt, or an agent's own
+wording, which is the same rule the pushes are held to.
+
 ## Compatibility and API versions
 
 Herdr Gateway 0.5.0 requires Herdr 0.7.5 or newer and socket protocol 17.
@@ -557,6 +654,9 @@ Security defaults:
 - Pairing requests are rate-limited and confirmation codes permit only eight attempts.
 - API responses disable caching and hide local backend error details.
 - Push registrations are capped and can be removed when notifications are disabled.
+- Pushes carry no terminal text unless `rich_agent_pushes` is turned on in `config.json`, which is off by default.
+- `spawn` runs an agent only in a directory this session already works in, and `recent-cwds` answers with those directories and nothing else, so neither is a way to reach the host's filesystem.
+- `interrupt` sends a keystroke, never a signal.
 - Pane output reads are capped at 1000 lines.
 - Pane and agent text sends are capped at 64 KiB.
 - Pane key sends are capped at 32 keys per request.

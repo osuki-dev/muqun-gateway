@@ -39,6 +39,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio_stream::Stream;
 
+mod agent_events;
 mod approvals;
 mod composer;
 mod i18n;
@@ -142,7 +143,7 @@ const MANAGE_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 /// every pane or sending unchanged terminal frames over the network.
 const STREAM_OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(150);
 const STREAM_OUTPUT_READ_TIMEOUT: Duration = Duration::from_millis(100);
-const GATEWAY_API_VERSION: &str = "1.4.0";
+const GATEWAY_API_VERSION: &str = "1.5.0";
 const GATEWAY_API_MAJOR: u64 = 1;
 const HERDR_PROTOCOL_MIN: u64 = 17;
 const HERDR_PROTOCOL_MAX: u64 = 17;
@@ -215,7 +216,9 @@ const ASSET_SKIP_DIRS: &[&str] = &[
 ];
 const API_CAPABILITIES: &[&str] = &[
     "agent_catalog",
+    "agent_events",
     "agent_lifecycle_notifications",
+    "agent_spawn",
     "assets",
     "device_revocation",
     "file_uploads",
@@ -223,6 +226,7 @@ const API_CAPABILITIES: &[&str] = &[
     "pane_approvals",
     "pane_composer",
     "pane_file_search",
+    "pane_interrupt",
     "pane_output_ansi",
     "pane_parts",
     "pane_parts_native",
@@ -231,6 +235,7 @@ const API_CAPABILITIES: &[&str] = &[
     "per_device_tokens",
     "push_notifications",
     "push_token_revocation",
+    "recent_cwds",
     "tasks",
     "terminal_input",
 ];
@@ -287,6 +292,26 @@ struct Config {
     /// omitted when empty, so an existing `config.json` keeps working untouched.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     agent_commands: BTreeMap<String, String>,
+    /// Put the agent's own question, and the answers it is offering, into a
+    /// blocked push.
+    ///
+    /// Off, and it has to stay off by default. Everything else this gateway
+    /// notifies with is locale-free or a name the user typed; this is the one
+    /// switch that puts terminal text on a lock screen, and it travels through
+    /// Expo's servers and Apple's or Google's to get there. It is worth having
+    /// because "Claude is asking something" is not worth unlocking a phone for
+    /// and "Run `rm -rf build/`?" is -- but that is the owner's trade to make,
+    /// on their own machine, deliberately.
+    ///
+    /// Omitted from a written config when false, so an existing `config.json`
+    /// round-trips untouched.
+    #[serde(default, skip_serializing_if = "is_false")]
+    rich_agent_pushes: bool,
+}
+
+/// `skip_serializing_if` for a flag whose absence is its default.
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl Config {
@@ -473,6 +498,46 @@ struct AgentPushNotice {
     data: serde_json::Map<String, Value>,
     /// Only an approval has these, and only ever as indices and decisions.
     choices: Vec<approvals::PushChoice>,
+    /// The agent's own words, present only when the owner of the machine turned
+    /// `rich_agent_pushes` on. The single exception to the rule above, and the
+    /// reason the flag exists rather than the behaviour.
+    detail: Option<PushDetail>,
+}
+
+/// What a blocked push says when the operator has opted into it: the question
+/// the agent asked, and the answers it is offering, both verbatim and both cut
+/// short.
+///
+/// Verbatim because a paraphrase of "Run `rm -rf build/`?" is not something to
+/// approve from a lock screen, and cut short because a notification is a
+/// glance: past a line or two the reader is opening the app anyway, which is
+/// the outcome this is trying to make unnecessary rather than the one it is
+/// trying to produce.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PushDetail {
+    question: String,
+    option_labels: Vec<String>,
+}
+
+/// A glance's worth of the agent's question.
+const MAX_PUSH_QUESTION_CHARS: usize = 120;
+/// Three answers is what a notification's action row shows; a menu with more
+/// is one the user opens the app for.
+const MAX_PUSH_OPTIONS: usize = 3;
+const MAX_PUSH_OPTION_CHARS: usize = 40;
+
+impl PushDetail {
+    fn from_approval(approval: &approvals::Approval) -> Self {
+        Self {
+            question: truncate(approval.prompt.trim(), MAX_PUSH_QUESTION_CHARS),
+            option_labels: approval
+                .options
+                .iter()
+                .take(MAX_PUSH_OPTIONS)
+                .map(|option| truncate(option.label.trim(), MAX_PUSH_OPTION_CHARS))
+                .collect(),
+        }
+    }
 }
 
 impl AgentPushNotice {
@@ -505,11 +570,21 @@ impl AgentPushNotice {
                 json!(approvals::push_options(&self.choices, locale)),
             );
         }
-        AgentPushNotification {
-            title,
-            body: i18n::t_slots(locale, body, &[("name", &agent)]),
-            data,
-        }
+        // The agent's own words are not translated and never will be: they are
+        // a quotation. When they are here at all, they are also the body -- the
+        // question is the whole reason the owner turned this on, and "{name}
+        // needs your input." above it would be a line saying nothing.
+        let body = match &self.detail {
+            Some(detail) => {
+                data.insert("question".into(), json!(detail.question));
+                if !detail.option_labels.is_empty() {
+                    data.insert("option_labels".into(), json!(detail.option_labels));
+                }
+                detail.question.clone()
+            }
+            None => i18n::t_slots(locale, body, &[("name", &agent)]),
+        };
+        AgentPushNotification { title, body, data }
     }
 }
 
@@ -524,6 +599,10 @@ struct AppState {
     /// What panes with no scrollback of their own showed while the gateway was
     /// watching. Memory only, and only for those panes; see `scrollback`.
     scrollback: Arc<Mutex<scrollback::ScrollbackStore>>,
+    /// The agent status transitions this gateway saw, so a phone coming back
+    /// after a while can be told what happened. Memory only; see
+    /// `agent_events`.
+    agent_events: Arc<Mutex<agent_events::AgentEventLog>>,
     approval_events: tokio::sync::broadcast::Sender<ApprovalEvent>,
 }
 
@@ -533,7 +612,9 @@ struct AppState {
 /// A poisoned buffer is not worth failing a read over: the pane's own answer
 /// from Herdr is still correct, only shorter. Every caller treats `None` as
 /// "this gateway keeps no history", which is exactly what release/0.5.0 did.
-fn lock_scrollback(state: &AppState) -> Option<std::sync::MutexGuard<'_, scrollback::ScrollbackStore>> {
+fn lock_scrollback(
+    state: &AppState,
+) -> Option<std::sync::MutexGuard<'_, scrollback::ScrollbackStore>> {
     state.scrollback.lock().ok()
 }
 
@@ -710,6 +791,7 @@ fn setup(public_url: Option<String>, port: u16, socket_path: Option<String>) -> 
             socket_path,
         }],
         agent_commands: BTreeMap::new(),
+        rich_agent_pushes: false,
     };
 
     let path = config_dir.join(CONFIG_FILE);
@@ -1011,6 +1093,7 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         devices: Arc::new(Mutex::new(read_devices().unwrap_or_default())),
         assets: Arc::new(Mutex::new(AssetIndex::default())),
         scrollback: Arc::new(Mutex::new(scrollback::ScrollbackStore::default())),
+        agent_events: Arc::new(Mutex::new(agent_events::AgentEventLog::default())),
         approval_events: tokio::sync::broadcast::channel(APPROVAL_EVENT_CAPACITY).0,
     };
     spawn_agent_notification_watchers(state.clone());
@@ -1064,7 +1147,17 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         )
         .route("/api/keymaps", get(keymaps))
         .route("/api/agents/catalog", get(agents_catalog))
+        .route(
+            "/api/sessions/{session_id}/agent-events",
+            get(session_agent_events),
+        )
         .route("/api/sessions/{session_id}/tasks", post(create_task))
+        .route("/api/sessions/{session_id}/spawn", post(spawn_agent))
+        .route("/api/sessions/{session_id}/recent-cwds", get(recent_cwds))
+        .route(
+            "/api/sessions/{session_id}/panes/{pane_id}/interrupt",
+            post(interrupt_pane),
+        )
         .route("/api/sessions/{session_id}/panes", get(panes))
         .route(
             "/api/sessions/{session_id}/panes/{pane_id}",
@@ -2365,7 +2458,8 @@ async fn snapshot(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
-    let answer = call_session_method(&state.config, &session_id, "session.snapshot", json!({})).await;
+    let answer =
+        call_session_method(&state.config, &session_id, "session.snapshot", json!({})).await;
     Ok(Json(note_and_amend_panes(&state, &session_id, answer?.0)))
 }
 
@@ -2982,6 +3076,10 @@ fn approval_notification(
         // The answers travel as indices and decisions, and are worded at
         // delivery time. `options` is set on the payload there.
         choices: approval.push_choices(),
+        // An approval push carries the fingerprint and the decisions, which is
+        // enough to answer from the lock screen. The question itself is put on
+        // the blocked push, and only when the owner asked for it.
+        detail: None,
     }
 }
 
@@ -2998,15 +3096,8 @@ async fn watch_agent_notifications(state: AppState, session: SessionConfig) {
     let mut statuses = seed_agent_statuses(&session).await;
 
     loop {
-        for notification in poll_agent_notifications(
-            &session,
-            &mut statuses,
-            &state.config.server_id,
-            &current_server_label(&state.config.label),
-            &session.id,
-        )
-        .await
-        {
+        for mut notification in poll_agent_notifications(&state, &session, &mut statuses).await {
+            enrich_blocked_notification(&state, &session, &mut notification).await;
             deliver_agent_notification(&state, notification).await;
         }
 
@@ -3023,13 +3114,14 @@ async fn watch_agent_notifications(state: AppState, session: SessionConfig) {
                             let Ok(event) = serde_json::from_str::<Value>(line.trim()) else {
                                 continue;
                             };
-                            if let Some(notification) = notification_for_agent_status_event(
+                            if let Some(mut notification) = absorb_agent_status_event(
+                                &state,
+                                &session.id,
                                 &event,
                                 &mut statuses,
-                                &state.config.server_id,
-                                &current_server_label(&state.config.label),
-                                &session.id,
                             ) {
+                                enrich_blocked_notification(&state, &session, &mut notification)
+                                    .await;
                                 deliver_agent_notification(&state, notification).await;
                             }
                         }
@@ -3055,11 +3147,9 @@ async fn watch_agent_notifications(state: AppState, session: SessionConfig) {
 }
 
 async fn poll_agent_notifications(
+    state: &AppState,
     session: &SessionConfig,
     statuses: &mut HashMap<String, String>,
-    server_id: &str,
-    server_label: &str,
-    session_id: &str,
 ) -> Vec<AgentPushNotice> {
     let Ok(value) = herdr_request(session, "agent.list", json!({})).await else {
         return Vec::new();
@@ -3070,15 +3160,14 @@ async fn poll_agent_notifications(
         .into_iter()
         .flatten()
         .filter_map(|agent| {
-            notification_for_agent_status_event(
+            absorb_agent_status_event(
+                state,
+                &session.id,
                 &json!({
                     "event": "pane.agent_status_changed",
                     "data": agent
                 }),
                 statuses,
-                server_id,
-                server_label,
-                session_id,
             )
         })
         .collect()
@@ -3136,19 +3225,27 @@ async fn seed_agent_statuses(session: &SessionConfig) -> HashMap<String, String>
         .collect()
 }
 
-/// The push one agent status change raises, if it raises one at all.
+/// One agent status change, after the bookkeeping and before anyone decides
+/// what to do about it. Two things want it: the ring, which wants every one,
+/// and the pushes, which want the two that are worth waking a phone for.
+struct AgentTransition {
+    pane_id: String,
+    /// The agent's own name, when Herdr reported one.
+    agent: Option<String>,
+    from: Option<String>,
+    to: String,
+}
+
+/// Read one status event and consume the transition it represents.
 ///
-/// It runs the transition bookkeeping, so it may be called exactly once per
-/// event -- which is the other reason it returns an unworded [`AgentPushNotice`]
-/// rather than finished text: the same change may have to be said in two
-/// languages, and saying it twice here would consume the transition twice.
-fn notification_for_agent_status_event(
+/// This is the only place `statuses` is written, which is what makes "exactly
+/// once per event" a property of the code rather than a rule to remember: a
+/// caller that wants both a ring entry and a push calls this once and hands the
+/// answer to both.
+fn agent_status_transition(
     event: &Value,
     statuses: &mut HashMap<String, String>,
-    server_id: &str,
-    server_label: &str,
-    session_id: &str,
-) -> Option<AgentPushNotice> {
+) -> Option<AgentTransition> {
     let data = event.get("data").unwrap_or(event);
     let event_type = event
         .get("event")
@@ -3164,20 +3261,41 @@ fn notification_for_agent_status_event(
     if previous.as_deref() == Some(status.as_str()) {
         return None;
     }
+    Some(AgentTransition {
+        pane_id: pane_id.to_owned(),
+        agent: ["display_agent", "agent", "title"]
+            .into_iter()
+            .find_map(|key| data.get(key).and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
+        from: previous,
+        to: status,
+    })
+}
 
-    let (event_type, notice) = match (status.as_str(), previous.as_deref()) {
+/// The push one transition raises, if it raises one at all.
+///
+/// Most transitions raise none -- an agent starting to work is not news to
+/// someone who just asked it to. The two that do are the two a person is
+/// waiting on: it needs them, or it is finished. It returns an unworded
+/// [`AgentPushNotice`] rather than finished text because the same change may
+/// have to be said in two languages.
+fn notification_for_transition(
+    transition: &AgentTransition,
+    server_id: &str,
+    server_label: &str,
+    session_id: &str,
+) -> Option<AgentPushNotice> {
+    let pane_id = transition.pane_id.as_str();
+    let (event_type, notice) = match (transition.to.as_str(), transition.from.as_deref()) {
         ("blocked", _) => ("agent.blocked", AgentNotice::AgentBlocked),
         ("idle" | "done" | "completed", Some("working")) => {
             ("agent.completed", AgentNotice::AgentCompleted)
         }
         _ => return None,
     };
-    let agent_name = ["display_agent", "agent", "title"]
-        .into_iter()
-        .find_map(|key| data.get(key).and_then(Value::as_str))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned);
+    let agent_name = transition.agent.clone();
     let mut notification_data = serde_json::Map::new();
     notification_data.insert("type".into(), json!(event_type));
     notification_data.insert("url".into(), json!(format!("/servers/{server_id}")));
@@ -3191,7 +3309,93 @@ fn notification_for_agent_status_event(
         agent_name,
         data: notification_data,
         choices: Vec::new(),
+        // Filled in afterwards, and only for a blocked pane on a gateway whose
+        // owner turned `rich_agent_pushes` on.
+        detail: None,
     })
+}
+
+/// Everything one status event causes, in one call: it is remembered, and then
+/// it may raise a push.
+///
+/// The ring records every transition and the push only ever names two of them,
+/// which is the point -- a phone that missed the doorbell can still be told
+/// that the agent worked for twenty minutes and then went idle.
+fn absorb_agent_status_event(
+    state: &AppState,
+    session_id: &str,
+    event: &Value,
+    statuses: &mut HashMap<String, String>,
+) -> Option<AgentPushNotice> {
+    let transition = agent_status_transition(event, statuses)?;
+    match state.agent_events.lock() {
+        Ok(mut log) => {
+            log.record(
+                session_id,
+                &transition.pane_id,
+                transition.agent.as_deref(),
+                transition.from.as_deref(),
+                &transition.to,
+                now_unix_ms(),
+            );
+        }
+        // Losing one line of a digest must not cost the push that goes with it.
+        Err(_) => eprintln!("agent event ring lock failed for session {session_id}"),
+    }
+    notification_for_transition(
+        &transition,
+        &state.config.server_id,
+        &current_server_label(&state.config.label),
+        session_id,
+    )
+}
+
+/// Put the agent's own question on a blocked push, if this gateway's owner
+/// asked for that.
+///
+/// The whole of what `rich_agent_pushes` does, in one place and behind one
+/// check, so that "off" is a property of the code path and not a habit. Off, it
+/// costs nothing: no pane is read, and the push is byte-for-byte the one this
+/// gateway has always sent.
+///
+/// On, it reads the pane the way the approvals endpoint does and quotes what it
+/// finds. A pane with no menu on it -- an agent blocked on something the
+/// gateway cannot read -- is left as the content-free push it already was,
+/// which is the right degradation: an empty question is worse than the generic
+/// sentence, not better.
+async fn enrich_blocked_notification(
+    state: &AppState,
+    session: &SessionConfig,
+    notice: &mut AgentPushNotice,
+) {
+    if !state.config.rich_agent_pushes || notice.notice != AgentNotice::AgentBlocked {
+        return;
+    }
+    let Some(pane_id) = notice
+        .data
+        .get("pane_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return;
+    };
+    if let Ok((_, Some(approval))) = read_pane_approval(session, &pane_id).await {
+        notice.detail = Some(PushDetail::from_approval(&approval));
+    }
+}
+
+/// The two halves in one call, for tests that are about what a push says rather
+/// than about what the ring holds.
+#[cfg(test)]
+fn notification_for_agent_status_event(
+    event: &Value,
+    statuses: &mut HashMap<String, String>,
+    server_id: &str,
+    server_label: &str,
+    session_id: &str,
+) -> Option<AgentPushNotice> {
+    let transition = agent_status_transition(event, statuses)?;
+    notification_for_transition(&transition, server_id, server_label, session_id)
 }
 
 async fn create_workspace(
@@ -3971,6 +4175,336 @@ async fn prepare_workspace(
     Ok(place)
 }
 
+#[derive(Debug, Deserialize)]
+struct SpawnBody {
+    /// A Herdr agent kind, or a profile `agents.json` names.
+    agent: String,
+    /// Where the agent runs. Held to the same fence as a task's `repo_path`:
+    /// a directory this session already works in, and nothing else. Absent
+    /// means wherever Herdr puts a new tab.
+    #[serde(default)]
+    cwd: Option<String>,
+    /// Put the agent beside what is already in this tab instead of in a tab of
+    /// its own.
+    #[serde(default)]
+    tab_id: Option<String>,
+    /// Typed and submitted once the agent is up.
+    #[serde(default)]
+    prompt: Option<String>,
+}
+
+/// Start an agent, from the phone, without describing a repository.
+///
+/// Task dispatch is the heavyweight door: it takes a repo, cuts a branch, makes
+/// a checkout, and is the right thing when the work is new. This is the other
+/// one -- "run codex here" -- which is what someone reaching for their phone in
+/// a queue actually wants, and which used to take three calls and a knowledge
+/// of which pane to split.
+///
+/// # What is checked before anything is created
+///
+/// The agent has to be one this gateway offers, and `cwd` has to be a directory
+/// the session already works in -- the same fence `repo_path` is under, for the
+/// same reason: a phone does not get to name a directory on the host and have
+/// something run in it.
+///
+/// # Why the answer can be a 207
+///
+/// The same reason task dispatch's can. Once the pane exists the user has
+/// somewhere to type, and "the agent did not come up" must not read as "nothing
+/// happened" -- they would spawn a second one.
+async fn spawn_agent(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<SpawnBody>,
+) -> ApiResult<Response> {
+    require_device(&state, &headers)?;
+    let session = find_session(&state.config, &session_id)?.clone();
+
+    if !tasks::is_known_agent_kind(&body.agent, &state.config.agent_commands)
+        && !shortcuts::is_known_agent(&body.agent)
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "unknown_agent",
+            "agent is not one this gateway offers; see GET /api/agents/catalog",
+        ));
+    }
+    if let Some(prompt) = body.prompt.as_deref() {
+        validate_text(prompt)?;
+    }
+
+    let cwd = match body.cwd.as_deref() {
+        None => None,
+        Some(raw) => {
+            let roots = task_repo_roots(&state, &session).await;
+            let path = tasks::resolve_repo_path(raw, &roots).ok_or_else(|| {
+                api_error(
+                    StatusCode::FORBIDDEN,
+                    "cwd_not_allowed",
+                    "cwd must be a directory inside a workspace this session has open",
+                )
+            })?;
+            Some(path.to_string_lossy().into_owned())
+        }
+    };
+
+    let mut steps = tasks::StepLog::new();
+    let place = spawn_place(&session, body.tab_id.as_deref(), cwd.as_deref(), &mut steps).await?;
+
+    let mut payload = json!({
+        "session_id": session_id,
+        "pane_id": place.pane_id,
+        "tab_id": place.tab_id,
+        "agent": body.agent,
+        "cwd": cwd,
+        "agent_started": false,
+        "prompt_submitted": false,
+    });
+
+    let mut params = serde_json::Map::new();
+    params.insert("name".into(), json!(body.agent));
+    params.insert("kind".into(), json!(body.agent));
+    params.insert("pane_id".into(), json!(place.pane_id));
+    params.insert(
+        "timeout_ms".into(),
+        json!(tasks::DEFAULT_AGENT_START_TIMEOUT_MS),
+    );
+    match herdr_call(&session, "agent.start", Value::Object(params)).await {
+        Ok(value) => {
+            steps.ok(
+                "agent",
+                json!({
+                    "kind": body.agent,
+                    "pane_id": place.pane_id,
+                    "argv": value.pointer("/result/argv").cloned()
+                }),
+            );
+            payload["agent_started"] = json!(true);
+        }
+        Err(err) => {
+            steps.failed("agent", err.code(), &err.message());
+            // The pane is real and the user can type in it, so this is a 207
+            // rather than an error that implies nothing was created.
+            return Ok(task_partial(payload, &steps));
+        }
+    }
+
+    match body.prompt.as_deref() {
+        None => steps.skipped("prompt", "no prompt was given"),
+        Some(prompt) => match submit_agent_prompt(&session, &place.pane_id, prompt).await {
+            Ok(_) => {
+                schedule_submit_keypress(session.clone(), place.pane_id.clone());
+                steps.ok("prompt", json!({ "bytes": prompt.len() }));
+                payload["prompt_submitted"] = json!(true);
+            }
+            Err(err) => steps.failed("prompt", err.code(), &err.message()),
+        },
+    }
+
+    Ok(task_partial(payload, &steps))
+}
+
+/// Where a spawned agent will run.
+struct SpawnPlace {
+    pane_id: String,
+    tab_id: Option<String>,
+}
+
+/// Make somewhere for the agent to run: a split of the named tab, or a tab of
+/// its own.
+///
+/// Splitting is what "run another agent on this" means -- the second agent
+/// lands beside the first, in view, rather than in a tab the user has to go
+/// find. A tab id naming nothing is refused before anything is created, because
+/// the alternative is silently spawning somewhere the caller did not ask for.
+async fn spawn_place(
+    session: &SessionConfig,
+    tab_id: Option<&str>,
+    cwd: Option<&str>,
+    steps: &mut tasks::StepLog,
+) -> ApiResult<SpawnPlace> {
+    let Some(tab_id) = tab_id else {
+        let mut params = serde_json::Map::new();
+        insert_opt(&mut params, "cwd", cwd);
+        params.insert("focus".into(), json!(false));
+        let value = herdr_call(session, "tab.create", Value::Object(params))
+            .await
+            .map_err(|err| {
+                steps.failed("pane", err.code(), &err.message());
+                err.into_api_error("tab.create")
+            })?;
+        let pane_id = created_pane_id(&value)
+            .or_else(|| {
+                value
+                    .pointer("/result/root_pane/pane_id")
+                    .and_then(Value::as_str)
+            })
+            .ok_or_else(|| {
+                api_error(
+                    StatusCode::BAD_GATEWAY,
+                    "herdr_malformed_response",
+                    "Herdr did not return the created pane id",
+                )
+            })?
+            .to_owned();
+        let tab_id = value
+            .pointer("/result/tab/tab_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        steps.ok("pane", json!({ "pane_id": pane_id, "tab_id": tab_id }));
+        return Ok(SpawnPlace { pane_id, tab_id });
+    };
+
+    let host = pane_in_tab(session, tab_id).await.ok_or_else(|| {
+        api_error(
+            StatusCode::NOT_FOUND,
+            "tab_not_found",
+            "that tab has no pane to split",
+        )
+    })?;
+    let mut params = serde_json::Map::new();
+    params.insert("pane_id".into(), json!(host));
+    params.insert("direction".into(), json!("down"));
+    insert_opt(&mut params, "cwd", cwd);
+    params.insert("focus".into(), json!(false));
+    let value = herdr_call(session, "pane.split", Value::Object(params))
+        .await
+        .map_err(|err| {
+            steps.failed("pane", err.code(), &err.message());
+            err.into_api_error("pane.split")
+        })?;
+    let pane_id = created_pane_id(&value)
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                "herdr_malformed_response",
+                "Herdr did not return the created pane id",
+            )
+        })?
+        .to_owned();
+    steps.ok(
+        "pane",
+        json!({ "pane_id": pane_id, "tab_id": tab_id, "split_from": host }),
+    );
+    Ok(SpawnPlace {
+        pane_id,
+        tab_id: Some(tab_id.to_owned()),
+    })
+}
+
+/// A pane to split in the named tab, preferring the one that has focus.
+async fn pane_in_tab(session: &SessionConfig, tab_id: &str) -> Option<String> {
+    let value = herdr_request(session, "pane.list", json!({})).await.ok()?;
+    pane_to_split(&value, tab_id)
+}
+
+/// Which pane of a `pane.list` a split should hang off, given the tab.
+///
+/// The focused one, because that is the one the user was looking at and the one
+/// a new pane should appear next to. A tab this session does not have answers
+/// with nothing, which is what makes an unknown `tab_id` a refusal rather than
+/// a spawn somewhere else.
+fn pane_to_split(response: &Value, tab_id: &str) -> Option<String> {
+    let panes = response
+        .pointer("/result/panes")
+        .and_then(Value::as_array)?;
+    let in_tab: Vec<&Value> = panes
+        .iter()
+        .filter(|pane| pane.get("tab_id").and_then(Value::as_str) == Some(tab_id))
+        .collect();
+    in_tab
+        .iter()
+        .find(|pane| pane.get("focused").and_then(Value::as_bool) == Some(true))
+        .or_else(|| in_tab.first())
+        .and_then(|pane| pane.get("pane_id").and_then(Value::as_str))
+        .map(str::to_owned)
+}
+
+/// The directories this session is already working in, for a spawn picker.
+///
+/// Deliberately not a directory browser. It answers with the distinct working
+/// directories of the panes Herdr reports right now and nothing else, so the
+/// list a phone can pick from is exactly the list `cwd` will accept -- and a
+/// phone cannot use it to walk the host's filesystem. `git` says which of them
+/// is a checkout, because "start an agent here" usually means a repo.
+async fn recent_cwds(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let session = find_session(&state.config, &session_id)?.clone();
+    let roots = session_asset_roots(&state, &session).await;
+
+    let cwds = tokio::task::spawn_blocking(move || {
+        roots
+            .into_iter()
+            .map(|root| {
+                json!({
+                    "path": root.path.to_string_lossy(),
+                    "name": root.path.file_name().unwrap_or_default().to_string_lossy(),
+                    "pane_id": root.pane_id,
+                    "workspace_id": root.workspace_id,
+                    "git": tasks::is_git_checkout(&root.path),
+                })
+            })
+            .collect::<Vec<Value>>()
+    })
+    .await
+    .unwrap_or_default();
+
+    Ok(Json(json!({ "session_id": session_id, "cwds": cwds })))
+}
+
+/// Stop whatever the agent in this pane is doing.
+///
+/// Sugar over send-keys, and the reason it is worth an endpoint is that the key
+/// is not the same on every agent: `ctrl+c` at a shell, `esc` in every agent
+/// this gateway has a profile for. A Stop button that guesses is wrong on most
+/// panes, and the gateway is the piece that already knows which agent is in
+/// this one.
+///
+/// It sends a keystroke and nothing else -- no signal, no kill. Whatever the
+/// agent does with `esc` is the agent's business.
+async fn interrupt_pane(
+    State(state): State<AppState>,
+    Path((session_id, pane_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let session = find_session(&state.config, &session_id)?.clone();
+    let pane = pane_get(&session, &pane_id).await?;
+    let agent = pane
+        .get("agent")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let title = pane
+        .get("terminal_title_stripped")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let key = shortcuts::interrupt_key(agent, title);
+
+    herdr_call(
+        &session,
+        "pane.send_keys",
+        json!({ "pane_id": pane_id, "keys": [key] }),
+    )
+    .await
+    .map_err(|err| err.into_api_error("pane.send_keys"))?;
+
+    Ok(Json(json!({
+        "session_id": session_id,
+        "pane_id": pane_id,
+        "agent": agent,
+        // Which key was actually sent, so a client can say what it did rather
+        // than claim a stop it cannot see the effect of.
+        "key": key,
+        "sent": true,
+    })))
+}
+
 /// The branch case.
 ///
 /// Herdr's `worktree.create` makes the checkout *and* the workspace and pane in
@@ -4703,6 +5237,73 @@ async fn keymaps(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
     Ok(Json(shortcuts::catalog()))
 }
 
+#[derive(Debug, Deserialize)]
+struct AgentEventsQuery {
+    /// The highest `seq` the client already has. Absent means "everything you
+    /// still hold", which is what a phone opening a server cold asks for.
+    #[serde(default)]
+    since: Option<u64>,
+}
+
+/// What the agents in this session did recently, oldest first.
+///
+/// For the app's "while you were away" digest: a phone that was off the network
+/// for an hour has, at best, a stack of notifications it cannot order and, at
+/// worst, none at all. This answers with the transitions themselves, so the
+/// digest is built from what happened rather than from what was delivered.
+///
+/// Memory only and bounded, so `missed` is a real answer rather than an
+/// embarrassment: it says the ring rolled past the caller's `since`, and a
+/// client that knows its digest is partial can say so instead of implying a
+/// complete account.
+async fn session_agent_events(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Query(query): Query<AgentEventsQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    find_session(&state.config, &session_id)?;
+    let log = state.agent_events.lock().map_err(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "agent_events_lock_failed",
+            "failed to read recent agent activity",
+        )
+    })?;
+    let events = log.since(&session_id, query.since);
+    Ok(Json(json!({
+        "session_id": session_id,
+        "since": query.since,
+        "events": events.iter().map(agent_events::AgentEvent::to_json).collect::<Vec<_>>(),
+        // What to send as `since` next time, whether or not this answer was
+        // empty, so a client polling an idle session does not walk backwards.
+        "next_since": log.latest_seq(&session_id),
+        "missed": log.missed(&session_id, query.since),
+        "capacity": agent_events::RING_CAPACITY,
+    })))
+}
+
+/// One pane as Herdr describes it, already unwrapped from the response
+/// envelope. A pane the socket cannot answer for is a 502 rather than a guess:
+/// every caller here is about to act on what this pane is running.
+async fn pane_get(session: &SessionConfig, pane_id: &str) -> ApiResult<Value> {
+    let response = herdr_request(session, "pane.get", json!({ "pane_id": pane_id }))
+        .await
+        .map_err(|err| {
+            eprintln!("Herdr request pane.get failed: {err:#}");
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                "herdr_unavailable",
+                "Herdr is unavailable",
+            )
+        })?;
+    Ok(response
+        .pointer("/result/pane")
+        .cloned()
+        .unwrap_or(response))
+}
+
 /// The key row and slash commands for whatever this pane is running.
 ///
 /// Resolving this here rather than in the client means a client picks up a new
@@ -4714,18 +5315,8 @@ async fn pane_shortcuts(
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
     let session = find_session(&state.config, &session_id)?.clone();
-
-    let pane = herdr_request(&session, "pane.get", json!({ "pane_id": pane_id }))
-        .await
-        .map_err(|err| {
-            eprintln!("Herdr request pane.get failed: {err:#}");
-            api_error(
-                StatusCode::BAD_GATEWAY,
-                "herdr_unavailable",
-                "Herdr is unavailable",
-            )
-        })?;
-    let pane = pane.pointer("/result/pane").unwrap_or(&pane);
+    let pane = pane_get(&session, &pane_id).await?;
+    let pane = &pane;
 
     // Herdr reports the agent on the pane itself when one is attached; the
     // stripped title is what is left of the terminal title, which is how a
@@ -5541,8 +6132,17 @@ fn upload_expired(modified: SystemTime, now: SystemTime) -> bool {
 //    or a plain listing uses, and what makes the endpoint work on a session
 //    that never touched a worktree.
 //
-// Reading a file is gated on one rule and one rule only: the path canonicalizes
-// to a regular file inside a root the session currently has.
+// Reading a file is gated on provenance. The first rule is the one that has
+// always applied: the path canonicalizes to a regular file inside a root the
+// session currently has. The second rule exists because a workspace closes
+// while the file it produced is still the thing the user wants to look at --
+// a removed worktree used to take a twelve-hour-old asset with it. So when the
+// roots no longer contain the path, an entry that *was* indexed while its root
+// was live is still served, and only ever by replaying its stored canonical
+// path: it is canonicalized again at read time and must come back byte-for-byte
+// equal, so a symlink swapped into the old location resolves elsewhere and
+// misses. Nothing that was never indexed becomes reachable by either rule, and
+// every failure of either is the same 404 as an unknown id.
 // ---------------------------------------------------------------------------
 
 /// What a file is, decided from its bytes. The client picks a viewer from this,
@@ -6051,6 +6651,29 @@ fn resolve_asset_path(path: &FsPath, roots: &[PathBuf]) -> Option<PathBuf> {
         .then_some(canonical)
 }
 
+/// What an id that is already in the index is allowed to read.
+///
+/// Root containment first, exactly as before: while the workspace that made the
+/// file is still open, nothing about this changed. What is new is the second
+/// answer, for the asset whose workspace has since closed -- a worktree removed
+/// after the agent finished, which used to 404 the file it produced.
+///
+/// That fallback replays the entry's own stored canonical path and nothing
+/// else. The path is canonicalized again and has to come back equal to what was
+/// stored: a symlink dropped where the file used to be canonicalizes to its
+/// target, which is a different path, and misses. A directory left in its place
+/// is not a regular file, and misses. The file being gone at all misses. Since
+/// the caller is an index lookup, a path that was never indexed has no entry to
+/// replay and never reaches here -- provenance is what is being served, not a
+/// filesystem.
+fn resolve_indexed_asset_path(stored: &FsPath, roots: &[PathBuf]) -> Option<PathBuf> {
+    if let Some(path) = resolve_asset_path(stored, roots) {
+        return Some(path);
+    }
+    let canonical = std::fs::canonicalize(stored).ok()?;
+    (canonical == stored && canonical.is_file()).then_some(canonical)
+}
+
 /// Resolve one exact path into an asset. The app needs this because a file
 /// path printed in a terminal has to map to the file it names -- matching by
 /// name against the listing would land on the wrong one. The path is held to
@@ -6316,15 +6939,18 @@ async fn asset_content(
     };
 
     // Roots are resolved again rather than trusted from the index: what is
-    // inside a workspace now is what decides, not what was when it was scanned.
+    // inside a workspace now is what decides. When it decides nothing -- the
+    // workspace closed -- the entry's own stored path answers instead, under
+    // the equality guard in `resolve_indexed_asset_path`.
     let session = find_session(&state.config, &entry.session_id)
         .map_err(|_| asset_not_found())?
         .clone();
     let roots = canonical_roots(&session_asset_roots(&state, &session).await);
     let entry_path = entry.path.clone();
-    let Some(path) = tokio::task::spawn_blocking(move || resolve_asset_path(&entry_path, &roots))
-        .await
-        .unwrap_or_default()
+    let Some(path) =
+        tokio::task::spawn_blocking(move || resolve_indexed_asset_path(&entry_path, &roots))
+            .await
+            .unwrap_or_default()
     else {
         return Err(asset_not_found());
     };
@@ -7394,7 +8020,7 @@ fn openapi_spec() -> Value {
             "/api/assets/{assetId}/content": {
                 "get": {
                     "summary": "Stream one asset's bytes, read-only",
-                    "description": "The path must canonicalize to a regular file inside a workspace root the session currently has, so a symlink out of the root, a traversal, and an unknown id are all a 404. The kind is sniffed again from the bytes on every read; a binary asset answers 415 with its metadata and no body. Assets larger than 10 MiB are refused with 413.",
+                    "description": "The path must canonicalize to a regular file inside a workspace root the session currently has, so a symlink out of the root, a traversal, and an unknown id are all a 404. An asset indexed while its root was a live workspace outlives that workspace: when the roots no longer contain it, the entry's stored canonical path is replayed and served only if it canonicalizes back to itself byte-for-byte, so a symlink swapped into the old location is the same 404. A path that was never indexed has no entry to replay. The kind is sniffed again from the bytes on every read; a binary asset answers 415 with its metadata and no body. Assets larger than 10 MiB are refused with 413.",
                     "parameters": [path_param("assetId")],
                     "responses": asset_content_responses()
                 }
@@ -7410,6 +8036,17 @@ fn openapi_spec() -> Value {
                         "401": { "description": "Missing or invalid authorization" },
                         "403": { "description": "Invalid token" }
                     }
+                }
+            },
+            "/api/sessions/{sessionId}/agent-events": {
+                "get": {
+                    "summary": "Recent agent status transitions in this session, oldest first",
+                    "description": "An in-memory ring of the last 200 status transitions per session, for a client building a digest of what happened while it was away. Every transition is recorded, not only the two that raise a push, so a pane that worked and then went idle is visible even though only one notification was sent. Each event carries seq, pane_id, agent, from, to and unix_ms -- ids and statuses, never terminal output or an agent's own wording. Poll with since=<the highest seq already seen>; the answer's next_since is what to send next time, and missed is true when the ring has already dropped something after that point. Nothing is persisted: a restarted gateway answers with an empty list, because it was not watching.",
+                    "parameters": [
+                        path_param("sessionId"),
+                        query_param("since", "Only transitions with a higher seq are returned. Absent means everything still held")
+                    ],
+                    "responses": ok_response()
                 }
             },
             "/api/sessions/{sessionId}/snapshot": { "get": session_endpoint("Return Herdr session.snapshot") },
@@ -7521,6 +8158,40 @@ fn openapi_spec() -> Value {
                         }
                     })),
                     "responses": task_responses()
+                }
+            },
+            "/api/sessions/{sessionId}/spawn": {
+                "post": {
+                    "summary": "Start an agent in a new pane, without describing a repository",
+                    "description": "The light half of task dispatch: run this agent, here. The agent must be one this gateway offers -- a Herdr kind or a profile in agents.json -- and cwd, when given, must be a directory this session already works in, exactly the fence repo_path is under; anything else is 403. With tab_id the pane is split off whatever that tab has focused, so a second agent lands beside the first; without it the agent gets a tab of its own. GET recent-cwds answers with the directories cwd will accept. The reply names the pane and says whether the agent came up and whether the prompt landed; a 207 means the pane exists and something after it did not, which is not the same as nothing having happened.",
+                    "parameters": [path_param("sessionId")],
+                    "requestBody": json_body(json!({
+                        "type": "object",
+                        "required": ["agent"],
+                        "properties": {
+                            "agent": { "type": "string", "description": "Agent kind from GET /api/agents/catalog, or a profile named in agents.json" },
+                            "cwd": { "type": "string", "description": "Absolute path, inside a workspace this session has open; omit to take Herdr's default" },
+                            "tab_id": { "type": "string", "description": "Split this tab's focused pane instead of opening a new tab" },
+                            "prompt": { "type": "string", "description": "Sent once the agent is interactive" }
+                        }
+                    })),
+                    "responses": task_responses()
+                }
+            },
+            "/api/sessions/{sessionId}/recent-cwds": {
+                "get": {
+                    "summary": "The distinct working directories of this session's panes",
+                    "description": "A picker for spawn, and deliberately not a directory browser: it answers with the cwds Herdr reports for the panes that exist right now, deduplicated and held to the same rule the asset scan uses, so the filesystem root and a bare home directory are not on it. Each entry carries path, name, the pane and workspace it came from, and git, which says whether the directory is a checkout. Nothing here can be used to walk the host.",
+                    "parameters": [path_param("sessionId")],
+                    "responses": ok_response()
+                }
+            },
+            "/api/sessions/{sessionId}/panes/{paneId}/interrupt": {
+                "post": {
+                    "summary": "Stop whatever the agent in this pane is doing",
+                    "description": "Sugar over send-keys, and worth an endpoint because the key is not the same on every agent: ctrl+c at a shell, esc in every agent this gateway has a profile for, and whatever agents.json says when it names one. A keystroke and nothing else -- no signal and no kill. The reply names the key that was sent, so a client can say what it did. The same key is on the pane's shortcuts response as `interrupt`.",
+                    "parameters": [path_param("sessionId"), path_param("paneId")],
+                    "responses": ok_response()
                 }
             },
             "/api/sessions/{sessionId}/panes/{paneId}/shortcuts": {
@@ -8125,6 +8796,7 @@ mod tests {
                 socket_path: "/tmp/herdr.sock".into(),
             }],
             agent_commands: BTreeMap::new(),
+            rich_agent_pushes: false,
         }
     }
 
@@ -8149,6 +8821,7 @@ mod tests {
             devices: Arc::new(Mutex::new(devices)),
             assets: Arc::new(Mutex::new(AssetIndex::default())),
             scrollback: Arc::new(Mutex::new(scrollback::ScrollbackStore::default())),
+            agent_events: Arc::new(Mutex::new(agent_events::AgentEventLog::default())),
             approval_events: tokio::sync::broadcast::channel(APPROVAL_EVENT_CAPACITY).0,
         }
     }
@@ -8900,6 +9573,129 @@ mod tests {
         assert!(approval["post"]["responses"]["409"].is_object());
     }
 
+    fn status_event(pane_id: &str, agent: &str, status: &str) -> Value {
+        json!({
+            "event": "pane.agent_status_changed",
+            "data": { "pane_id": pane_id, "agent": agent, "agent_status": status }
+        })
+    }
+
+    #[test]
+    fn the_ring_records_every_transition_and_not_only_the_ones_worth_a_push() {
+        // The digest is the reason: "it worked for twenty minutes and then went
+        // idle" is the sentence a returning user wants, and only the last half
+        // of it ever rang a doorbell.
+        let state = test_state("admin", vec![test_device("d1", "token")]);
+        let mut statuses = HashMap::new();
+
+        let started = absorb_agent_status_event(
+            &state,
+            "default",
+            &status_event("w1:p1", "claude", "working"),
+            &mut statuses,
+        );
+        let finished = absorb_agent_status_event(
+            &state,
+            "default",
+            &status_event("w1:p1", "claude", "idle"),
+            &mut statuses,
+        );
+        // A repeat of the status the pane is already in is not a transition and
+        // must not appear twice in a digest.
+        let repeated = absorb_agent_status_event(
+            &state,
+            "default",
+            &status_event("w1:p1", "claude", "idle"),
+            &mut statuses,
+        );
+
+        assert!(started.is_none(), "starting work wakes nobody");
+        assert!(finished.is_some(), "finishing does");
+        assert!(repeated.is_none());
+
+        let log = state.agent_events.lock().unwrap();
+        let events = log.since("default", None);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].from, None);
+        assert_eq!(events[0].to, "working");
+        assert_eq!(events[1].from.as_deref(), Some("working"));
+        assert_eq!(events[1].to, "idle");
+        assert_eq!(events[1].agent.as_deref(), Some("claude"));
+        assert_eq!(log.latest_seq("default"), 2);
+    }
+
+    #[tokio::test]
+    async fn the_digest_endpoint_answers_what_is_new_and_where_to_resume_from() {
+        let state = test_state("admin", vec![test_device("d1", "token")]);
+        let mut statuses = HashMap::new();
+        for status in ["working", "blocked", "idle"] {
+            absorb_agent_status_event(
+                &state,
+                "default",
+                &status_event("w1:p1", "claude", status),
+                &mut statuses,
+            );
+        }
+
+        let answer = session_agent_events(
+            State(state.clone()),
+            Path("default".into()),
+            Query(AgentEventsQuery { since: None }),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(answer["events"].as_array().unwrap().len(), 3);
+        assert_eq!(answer["events"][0]["to"], "working");
+        assert_eq!(answer["events"][0]["from"], Value::Null);
+        assert_eq!(answer["next_since"], 3);
+        assert_eq!(answer["missed"], false);
+        assert_eq!(answer["capacity"], agent_events::RING_CAPACITY);
+
+        // Polling from where the last answer left off returns nothing and still
+        // says where to resume from, so an idle session does not walk backwards.
+        let resumed = session_agent_events(
+            State(state.clone()),
+            Path("default".into()),
+            Query(AgentEventsQuery { since: Some(3) }),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(resumed["events"].as_array().unwrap().len(), 0);
+        assert_eq!(resumed["next_since"], 3);
+        assert_eq!(resumed["missed"], false);
+
+        // Nothing here is readable without a paired device, and a session this
+        // gateway does not have is a 404 rather than an empty digest.
+        assert_eq!(
+            session_agent_events(
+                State(state.clone()),
+                Path("default".into()),
+                Query(AgentEventsQuery { since: None }),
+                bearer_headers("not-a-token"),
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            session_agent_events(
+                State(state),
+                Path("other".into()),
+                Query(AgentEventsQuery { since: None }),
+                bearer_headers("token"),
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::NOT_FOUND
+        );
+    }
+
     #[test]
     fn first_idle_event_does_not_create_false_completion() {
         let mut statuses = HashMap::new();
@@ -9145,6 +9941,93 @@ mod tests {
         assert!(resolve_asset_path(&workspace, &roots).is_none());
         assert!(resolve_asset_path(&workspace.join("docs"), &roots).is_none());
         assert!(resolve_asset_path(&workspace.join("missing.md"), &roots).is_none());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn an_indexed_asset_outlives_the_workspace_that_made_it() {
+        // The worktree an agent wrote into was removed hours later. The roots
+        // resolve to nothing now, which is the whole of what changed: the file
+        // is still there and still the thing the user tapped.
+        let root = asset_test_dir("provenance");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let report = workspace.join("report.md");
+        std::fs::write(&report, b"# report\n").unwrap();
+
+        // While the workspace is a root, nothing about the read changed.
+        let live = vec![workspace.clone()];
+        assert_eq!(
+            resolve_indexed_asset_path(&report, &live),
+            Some(report.clone())
+        );
+
+        // With no roots at all -- the workspace closed -- the stored path is
+        // replayed and answers the same bytes.
+        assert_eq!(
+            resolve_indexed_asset_path(&report, &[]),
+            Some(report.clone())
+        );
+
+        // A file that is gone is gone, roots or no roots.
+        let deleted = workspace.join("gone.md");
+        std::fs::write(&deleted, b"bye\n").unwrap();
+        std::fs::remove_file(&deleted).unwrap();
+        assert!(resolve_indexed_asset_path(&deleted, &[]).is_none());
+
+        // A directory left where the file was is not a file.
+        std::fs::create_dir_all(workspace.join("was-a-file")).unwrap();
+        assert!(resolve_indexed_asset_path(&workspace.join("was-a-file"), &[]).is_none());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_swapped_into_a_stored_asset_path_is_not_that_asset() {
+        // The attack the equality guard exists for: the workspace closes, the
+        // real file is replaced by a link to somewhere the gateway would never
+        // have indexed, and the old id is presented again.
+        let root = asset_test_dir("provenance-symlink");
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"secret\n").unwrap();
+        let stored = workspace.join("report.md");
+        std::fs::write(&stored, b"# report\n").unwrap();
+        assert!(resolve_indexed_asset_path(&stored, &[]).is_some());
+
+        std::fs::remove_file(&stored).unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.txt"), &stored).unwrap();
+
+        // The path canonicalizes to the link's target, which is not the path
+        // that was stored, so the replay refuses it -- and refuses it the same
+        // way an unknown id is refused.
+        assert!(resolve_indexed_asset_path(&stored, &[]).is_none());
+        assert!(resolve_indexed_asset_path(&stored, std::slice::from_ref(&workspace)).is_none());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_path_that_was_never_indexed_has_no_entry_to_replay() {
+        // The fallback is reached through an index lookup and nowhere else, so
+        // provenance is what it serves. A file the gateway never scanned has no
+        // entry, and the read stops at the lookup with the same 404 as a bad id.
+        let root = asset_test_dir("provenance-unindexed");
+        std::fs::create_dir_all(&root).unwrap();
+        let indexed = root.join("indexed.md");
+        let never = root.join("never-scanned.md");
+        std::fs::write(&indexed, b"# indexed\n").unwrap();
+        std::fs::write(&never, b"# private\n").unwrap();
+
+        let mut index = AssetIndex::default();
+        index.upsert(test_asset_entry(&indexed, &root, 1));
+
+        assert!(index.get(&asset_id(&indexed)).is_some());
+        assert!(index.get(&asset_id(&never)).is_none());
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -9984,10 +10867,27 @@ mod tests {
         // A minor bump: the routes are additive, so an older client keeps
         // working, and a newer one can gate on the capability rather than on
         // probing for a 404.
-        assert!(GATEWAY_API_VERSION.starts_with("1.4."));
+        assert!(GATEWAY_API_VERSION.starts_with("1.5."));
         assert_eq!(GATEWAY_API_MAJOR, 1);
         assert!(API_CAPABILITIES.contains(&"tasks"));
         assert!(API_CAPABILITIES.contains(&"agent_catalog"));
+    }
+
+    #[test]
+    fn the_digest_endpoint_is_documented_and_announced() {
+        let spec = openapi_spec();
+        let events = &spec["paths"]["/api/sessions/{sessionId}/agent-events"]["get"];
+        assert!(events.is_object());
+        let names: Vec<&str> = events["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|parameter| parameter["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["sessionId", "since"]);
+        // A client must be able to tell a gateway that keeps this from one old
+        // enough to answer 404, without probing for the 404.
+        assert!(API_CAPABILITIES.contains(&"agent_events"));
     }
 
     #[test]
@@ -10213,6 +11113,297 @@ mod tests {
         // A workspace with no worktree contributes nothing, and "/" is refused
         // by the same guard the asset roots use.
         assert!(!found.iter().any(|path| path == "/"));
+    }
+
+    /// A state whose Herdr socket cannot answer, which is how a test reaches
+    /// the checks that happen before anything is created.
+    fn unreachable_state() -> AppState {
+        let mut state = test_state("admin", vec![test_device("d1", "token")]);
+        state.config.sessions[0].socket_path = std::env::temp_dir()
+            .join(format!("herdr-absent-{}.sock", uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned();
+        state
+    }
+
+    fn spawn_body(agent: &str, cwd: Option<&str>) -> SpawnBody {
+        SpawnBody {
+            agent: agent.to_owned(),
+            cwd: cwd.map(str::to_owned),
+            tab_id: None,
+            prompt: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_spawn_is_refused_before_anything_is_created() {
+        let state = unreachable_state();
+
+        // An agent this gateway does not offer, answered in the reader's own
+        // language and pointing at the list that would have said so.
+        let refusal = spawn_agent(
+            State(state.clone()),
+            Path("default".into()),
+            locale_headers("token", "zh-TW"),
+            Json(spawn_body("definitely-not-an-agent", None)),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refusal.0, StatusCode::BAD_REQUEST);
+        assert_eq!(error_body(&refusal)["error"]["code"], "unknown_agent");
+        assert!(error_body(&refusal)["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("GET /api/agents/catalog"));
+
+        // A real agent, but a directory this session does not work in. The
+        // socket is unreachable here, so the session has no roots at all --
+        // which is exactly the case that must refuse rather than fall open.
+        let refusal = spawn_agent(
+            State(state.clone()),
+            Path("default".into()),
+            bearer_headers("token"),
+            Json(spawn_body("claude", Some("/etc"))),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refusal.0, StatusCode::FORBIDDEN);
+        assert_eq!(error_body(&refusal)["error"]["code"], "cwd_not_allowed");
+
+        // And none of it is reachable without a paired device.
+        assert_eq!(
+            spawn_agent(
+                State(state),
+                Path("default".into()),
+                bearer_headers("not-a-token"),
+                Json(spawn_body("claude", None)),
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn a_split_hangs_off_the_focused_pane_of_the_tab_that_was_named() {
+        let panes = json!({
+            "result": { "panes": [
+                { "pane_id": "w1:p1", "tab_id": "t1", "focused": false },
+                { "pane_id": "w1:p2", "tab_id": "t1", "focused": true },
+                { "pane_id": "w2:p1", "tab_id": "t2", "focused": true }
+            ] }
+        });
+
+        // The focused pane, because that is the one the user was looking at.
+        assert_eq!(pane_to_split(&panes, "t1").as_deref(), Some("w1:p2"));
+        assert_eq!(pane_to_split(&panes, "t2").as_deref(), Some("w2:p1"));
+        // A tab this session does not have is nothing to split, which is what
+        // makes an unknown tab_id a refusal rather than a spawn elsewhere.
+        assert_eq!(pane_to_split(&panes, "t9"), None);
+        assert_eq!(pane_to_split(&json!({}), "t1"), None);
+
+        // No pane in the tab is focused: any of them will do, in Herdr's order.
+        let unfocused = json!({
+            "result": { "panes": [{ "pane_id": "w3:p1", "tab_id": "t3" }] }
+        });
+        assert_eq!(pane_to_split(&unfocused, "t3").as_deref(), Some("w3:p1"));
+    }
+
+    #[tokio::test]
+    async fn recent_cwds_lists_the_panes_directories_and_is_not_a_directory_browser() {
+        // The picker for spawn. It answers with what the panes are already in
+        // and nothing around it: a phone must not be able to walk the host from
+        // here, and the list it can pick from is exactly the list `cwd` takes.
+        let root = asset_test_dir("recent-cwds");
+        let repo = root.join("repo");
+        let plain = root.join("notes");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&plain).unwrap();
+
+        let state = unreachable_state();
+        state.assets.lock().unwrap().remember_roots(
+            "default",
+            vec![
+                AssetRoot {
+                    path: repo.clone(),
+                    session_id: "default".into(),
+                    workspace_id: Some("wA".into()),
+                    pane_id: Some("wA:p1".into()),
+                },
+                AssetRoot {
+                    path: plain.clone(),
+                    session_id: "default".into(),
+                    workspace_id: Some("wB".into()),
+                    pane_id: Some("wB:p1".into()),
+                },
+            ],
+        );
+
+        let answer = recent_cwds(
+            State(state.clone()),
+            Path("default".into()),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap()
+        .0;
+        let cwds = answer["cwds"].as_array().unwrap();
+        assert_eq!(cwds.len(), 2);
+        assert_eq!(cwds[0]["path"], repo.to_string_lossy().as_ref());
+        assert_eq!(cwds[0]["name"], "repo");
+        assert_eq!(cwds[0]["pane_id"], "wA:p1");
+        assert_eq!(cwds[0]["workspace_id"], "wA");
+        // Which of them is a checkout, because "start an agent here" usually
+        // means a repo.
+        assert_eq!(cwds[0]["git"], true);
+        assert_eq!(cwds[1]["git"], false);
+        // Nothing above or below what the panes are in.
+        assert!(!cwds
+            .iter()
+            .any(|entry| entry["path"] == root.to_string_lossy().as_ref()));
+
+        assert_eq!(
+            recent_cwds(
+                State(state),
+                Path("default".into()),
+                bearer_headers("not-a-token"),
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::FORBIDDEN
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_blocked_push_says_nothing_the_agent_wrote_until_the_owner_asks_it_to() {
+        let approval = approvals::detect(concat!(
+            "Bash command\n",
+            "\n",
+            "  rm -rf build/\n",
+            "\n",
+            "Do you want to proceed?\n",
+            "❯ 1. Yes\n",
+            "  2. Yes, and don't ask again for rm commands\n",
+            "  3. No, and tell Claude what to do differently (esc)\n",
+        ))
+        .expect("the fixture draws a menu");
+
+        let mut statuses = HashMap::new();
+        let notice = notification_for_agent_status_event(
+            &status_event("w1:p1", "claude", "blocked"),
+            &mut statuses,
+            "server-1",
+            "Studio",
+            "default",
+        )
+        .unwrap();
+
+        // The default, and what every gateway sends until someone changes it:
+        // that something needs answering, and never what.
+        let plain = notice.render(Locale::En);
+        assert_eq!(plain.title, "Agent blocked · Studio");
+        assert_eq!(plain.body, "claude needs your input.");
+        assert!(plain.data.get("question").is_none());
+        assert!(!plain.body.contains("rm -rf"));
+
+        // Opted in: the agent's own question, verbatim, plus the answers it is
+        // offering. Not translated, because it is a quotation.
+        let mut rich = notice.clone();
+        rich.detail = Some(PushDetail::from_approval(&approval));
+        let opted_in = rich.render(Locale::ZhTw);
+        assert_eq!(opted_in.title, "代理程式等待中 · Studio");
+        assert_eq!(opted_in.body, "Do you want to proceed?");
+        assert_eq!(opted_in.data["question"], "Do you want to proceed?");
+        let labels = opted_in.data["option_labels"].as_array().unwrap();
+        assert_eq!(labels.len(), 3);
+        assert_eq!(labels[0], "Yes");
+
+        // A question longer than a glance is cut, and a menu with more answers
+        // than a notification row shows is cut too.
+        let long = approvals::Approval {
+            prompt: "x".repeat(400),
+            options: (1..=6)
+                .map(|index| approvals::ApprovalOption {
+                    index,
+                    label: "y".repeat(80),
+                    selected: false,
+                    decision: approvals::Decision::Allow,
+                })
+                .collect(),
+            ..approval
+        };
+        let detail = PushDetail::from_approval(&long);
+        // Cut, and visibly cut: the ellipsis is how a reader knows there is
+        // more rather than believing they have read the whole question.
+        assert!(detail
+            .question
+            .starts_with(&"x".repeat(MAX_PUSH_QUESTION_CHARS)));
+        assert!(detail.question.ends_with("..."));
+        assert_eq!(detail.question.chars().count(), MAX_PUSH_QUESTION_CHARS + 3);
+        assert_eq!(detail.option_labels.len(), MAX_PUSH_OPTIONS);
+        assert_eq!(
+            detail.option_labels[0].chars().count(),
+            MAX_PUSH_OPTION_CHARS + 3
+        );
+    }
+
+    #[test]
+    fn rich_pushes_are_off_until_a_config_says_otherwise() {
+        // The one switch that puts terminal text on a lock screen. A config
+        // written before it existed must read as off, and a gateway that has
+        // not been told otherwise must not start saying more than it did.
+        let config = test_config("admin");
+        assert!(!config.rich_agent_pushes);
+
+        let existing = json!({
+            "server_id": "s1",
+            "label": "mac",
+            "listen": "127.0.0.1:23847",
+            "public_url": "https://example.ts.net",
+            "token_hash": "abc",
+            "sessions": [{ "id": "default", "label": "Default", "socket_path": "/tmp/h.sock" }]
+        });
+        let parsed: Config = serde_json::from_value(existing.clone()).unwrap();
+        assert!(!parsed.rich_agent_pushes);
+        // And writing it back does not add the key, so an untouched config file
+        // stays untouched.
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), existing);
+
+        let mut object = existing.as_object().cloned().unwrap();
+        object.insert("rich_agent_pushes".into(), json!(true));
+        let opted_in: Config = serde_json::from_value(Value::Object(object)).unwrap();
+        assert!(opted_in.rich_agent_pushes);
+        assert_eq!(
+            serde_json::to_value(&opted_in).unwrap()["rich_agent_pushes"],
+            json!(true)
+        );
+    }
+
+    #[test]
+    fn dispatch_and_stop_are_documented_and_announced() {
+        let spec = openapi_spec();
+        let spawn = &spec["paths"]["/api/sessions/{sessionId}/spawn"]["post"];
+        assert!(spawn.is_object());
+        assert_eq!(
+            spawn["requestBody"]["content"]["application/json"]["schema"]["required"],
+            json!(["agent"])
+        );
+        assert!(spawn["responses"]["207"].is_object());
+        assert!(spec["paths"]["/api/sessions/{sessionId}/recent-cwds"]["get"].is_object());
+        assert!(
+            spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/interrupt"]["post"].is_object()
+        );
+
+        for capability in ["agent_spawn", "recent_cwds", "pane_interrupt"] {
+            assert!(
+                API_CAPABILITIES.contains(&capability),
+                "{capability} is not announced"
+            );
+        }
     }
 
     /// A Herdr socket that answers from a script.
@@ -10495,7 +11686,8 @@ mod tests {
         for _ in 0..4 {
             read_output(&state, 240).await;
         }
-        let listing = note_and_amend_panes(&state, "default", json!({ "result": { "panes": [pane] } }));
+        let listing =
+            note_and_amend_panes(&state, "default", json!({ "result": { "panes": [pane] } }));
 
         // Seven rows kept, four of them on screen: three to reach back for.
         assert_eq!(
