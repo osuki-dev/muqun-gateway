@@ -652,6 +652,14 @@ Security defaults:
 - `config.json`, `pairing.json`, and `devices.json` are written with `0600` permissions.
 - `stop` only signals processes whose name matches the gateway.
 - Pairing requests are rate-limited and confirmation codes permit only eight attempts.
+- Confirmation codes are eight glyphs drawn uniformly from a 31-glyph alphabet:
+  just under 40 bits, against 8 attempts per code and 6 codes per ten minutes.
+- Requests are refused unless the `Host` they arrive under is one the gateway
+  answers to: an address literal, `localhost`, a `.ts.net` MagicDNS name, or the
+  host of the configured public URL or listen address. This is what closes DNS
+  rebinding, where a page the user opens re-points a name the attacker owns at
+  the gateway and so becomes same-origin with it — the one attack a bearer token
+  does not stop by itself. A refused host is named in the log.
 - API responses disable caching and hide local backend error details.
 - Push registrations are capped and can be removed when notifications are disabled.
 - Pushes carry no terminal text unless `rich_agent_pushes` is turned on in `config.json`, which is off by default.

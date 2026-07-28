@@ -1222,6 +1222,10 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
             post(upload_file).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
         )
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+        .layer(middleware::from_fn_with_state(
+            known_hosts(&state.config),
+            known_host,
+        ))
         .layer(middleware::from_fn(security_headers))
         .layer(middleware::from_fn(request_locale))
         .with_state(state);
@@ -1242,6 +1246,120 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
 async fn request_locale(request: Request<Body>, next: Next) -> Response {
     let locale = Locale::from_headers(request.headers());
     i18n::scope(locale, next.run(request)).await
+}
+
+/// Refuse a request that arrived under a name this gateway does not answer to.
+///
+/// The attack this closes is DNS rebinding, and it is the one thing a bearer
+/// token does not stop. A page the user opens serves itself from a name the
+/// attacker controls, that name is re-resolved to the gateway's address, and
+/// from then on the browser considers the page *same-origin with the gateway*.
+/// Same-origin means the same-origin policy is no longer in the way: no
+/// preflight, and the script reads every response. It has no device token, so
+/// the control routes still refuse it -- but the pairing routes are open by
+/// necessity, and from there it can read the machine's label, occupy the single
+/// pending-pairing slot for five minutes, burn the request budget for ten, and
+/// put a name it chose in front of whoever is watching the manager panel.
+///
+/// The tell is the `Host` header: it carries the attacker's own name, because
+/// that is the name the page was fetched from. The gateway knows which names
+/// are its own, so it can simply not answer to any other.
+///
+/// Deliberately generous, because refusing a request the owner meant is worse
+/// than the attack. An address literal always passes -- rebinding needs a name
+/// whose resolution can be flipped, and a page served from a bare IP is already
+/// same-origin with nothing but this gateway. `localhost` and any `.ts.net`
+/// name pass, since the tailnet's names are Tailscale's to hand out and not an
+/// attacker's. Everything else has to be the host of the configured public URL
+/// or of the listen address. A refusal says so in the log, because a name the
+/// owner reaches their own gateway by and this gateway has never been told
+/// about should be a line to read, not a mystery.
+async fn known_host(
+    State(known): State<Vec<String>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let host = request
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .or_else(|| request.uri().host().map(str::to_owned));
+    if let Some(host) = host.as_deref() {
+        if !host_is_known(host, &known) {
+            eprintln!(
+                "refused a request addressed to {host}: not a name this gateway answers to \
+                 (known: {})",
+                known.join(", ")
+            );
+            return api_error(
+                StatusCode::FORBIDDEN,
+                "unknown_host",
+                "this gateway does not answer to that host name",
+            )
+            .into_response();
+        }
+    }
+    next.run(request).await
+}
+
+/// The names configuration says this gateway is reached by.
+fn known_hosts(config: &Config) -> Vec<String> {
+    let mut hosts = vec![String::from("localhost")];
+    if let Some(host) = reqwest::Url::parse(&config.public_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+    {
+        hosts.push(host_name(&host));
+    }
+    hosts.push(host_name(&config.listen));
+    hosts.retain(|host| !host.is_empty());
+    hosts.sort();
+    hosts.dedup();
+    hosts
+}
+
+fn host_is_known(host: &str, known: &[String]) -> bool {
+    let name = host_name(host);
+    if name.is_empty() {
+        return true;
+    }
+    // Rebinding needs a name. An address is not one, and a page served from an
+    // address literal is same-origin with this gateway and nothing else.
+    if name.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    if name == "localhost" || name.ends_with(".localhost") {
+        return true;
+    }
+    // MagicDNS names live under a zone Tailscale hands out, not an attacker.
+    if name.ends_with(".ts.net") {
+        return true;
+    }
+    known.iter().any(|candidate| candidate == &name)
+}
+
+/// A `Host` header, or a `host:port` from configuration, reduced to the name.
+fn host_name(host: &str) -> String {
+    let host = host.trim();
+    // A bracketed IPv6 literal fences the colons of the address itself.
+    if let Some(rest) = host.strip_prefix('[') {
+        return rest
+            .split(']')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+    }
+    // An unbracketed address is not a legal `Host`, but reading one as a name
+    // with a port would cut `::1` down to `::`, so it is taken whole.
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return host.to_ascii_lowercase();
+    }
+    host.rsplit_once(':')
+        .filter(|(_, port)| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()))
+        .map_or(host, |(name, _)| name)
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
 }
 
 async fn security_headers(request: Request<Body>, next: Next) -> Response {
@@ -9090,6 +9208,90 @@ mod tests {
         // A line the gateway cannot parse is forwarded rather than dropped, so a
         // filter never silently swallows an event shape we did not anticipate.
         assert_eq!(herdr_event_name("not json"), None);
+    }
+
+    /// The rebinding case, written as the header it arrives in. A page served
+    /// from a name the attacker owns keeps sending that name in `Host` even
+    /// after the name has been re-pointed at this machine, which is exactly
+    /// what makes the header worth reading.
+    #[test]
+    fn a_name_this_gateway_was_never_told_about_is_refused() {
+        let mut config = test_config("secret");
+        config.listen = "100.99.165.54:23847".into();
+        config.public_url = "http://mac-mini.example-tailnet.ts.net:23847".into();
+        let known = known_hosts(&config);
+
+        for good in [
+            "100.99.165.54:23847",
+            "100.99.165.54",
+            "mac-mini.example-tailnet.ts.net:23847",
+            "MAC-MINI.example-tailnet.TS.NET",
+            "localhost:23847",
+            "127.0.0.1:23847",
+            "[::1]:23847",
+            // A trailing dot is the same name spelled absolutely.
+            "mac-mini.example-tailnet.ts.net.",
+        ] {
+            assert!(host_is_known(good, &known), "{good} should be answered");
+        }
+
+        for bad in [
+            "rebind.attacker.example:23847",
+            "attacker.example",
+            "gateway.attacker.example",
+            // The suffix rules are suffixes of a label, not of a string.
+            "evil-ts.net",
+            "notlocalhost",
+            "ts.net.attacker.example",
+        ] {
+            assert!(!host_is_known(bad, &known), "{bad} should be refused");
+        }
+    }
+
+    /// Ellen's gateway answers on a bare Tailscale address, and a great many
+    /// installs will. An address literal has to pass, because rebinding needs a
+    /// name whose resolution can be flipped and an address has none.
+    #[test]
+    fn an_address_is_always_a_host_this_gateway_answers_to() {
+        let known = known_hosts(&test_config("secret"));
+        for address in [
+            "100.99.165.54:23847",
+            "192.168.1.20:23847",
+            "10.0.0.1",
+            "[fd7a:115c:a1e0::1]:23847",
+            "[::1]",
+        ] {
+            assert!(
+                host_is_known(address, &known),
+                "{address} should be answered"
+            );
+        }
+    }
+
+    #[test]
+    fn the_known_hosts_are_the_public_url_and_the_listen_address() {
+        let mut config = test_config("secret");
+        config.listen = "0.0.0.0:23847".into();
+        config.public_url = "https://desk.example-tailnet.ts.net".into();
+        assert_eq!(
+            known_hosts(&config),
+            vec![
+                String::from("0.0.0.0"),
+                String::from("desk.example-tailnet.ts.net"),
+                String::from("localhost"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_host_header_is_read_down_to_its_name() {
+        assert_eq!(host_name("Example.COM:23847"), "example.com");
+        assert_eq!(host_name("example.com"), "example.com");
+        assert_eq!(host_name("[::1]:23847"), "::1");
+        assert_eq!(host_name("::1"), "::1");
+        assert_eq!(host_name("example.com."), "example.com");
+        // Not a port, so not cut off.
+        assert_eq!(host_name("example.com:notaport"), "example.com:notaport");
     }
 
     #[test]
