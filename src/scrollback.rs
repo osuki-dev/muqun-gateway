@@ -123,6 +123,10 @@ use std::hash::{Hash, Hasher};
 use serde_json::Value;
 
 /// Rows kept per pane and source, matching the ceiling on a single read.
+/// Whether the gateway keeps rows for panes Herdr reports no scrollback for.
+/// See `keeps` for why this is false in 1.2.0.
+pub const SCROLLBACK_ENABLED: bool = false;
+
 pub const MAX_PANE_LINES: usize = 5_000;
 
 /// Bytes kept per pane and source. A row carrying escape sequences has no
@@ -442,6 +446,29 @@ impl ScrollbackStore {
     /// A pane nobody has reported on yet answers `false`: not knowing is a
     /// reason to stay out of the way, not a reason to guess.
     pub fn keeps(&self, session_id: &str, pane_id: &str) -> bool {
+        // Off for 1.2.0 (Ellen, 2026-07-29). Keeping rows for a pane Herdr
+        // keeps none for is a nice thing to have; showing a reader their own
+        // conversation with pieces of it repeated is not, and the two arrived
+        // together. With this false the gateway hands back exactly what Herdr
+        // hands it: a pane that cannot scroll back simply does not, which is
+        // where every pane stood a week ago. The machinery and its tests stay
+        // here, and turning this on is how the next version resumes the
+        // argument -- with the anchor, the furniture rule, and a soak test
+        // against a pane under real load before it ships.
+        if !SCROLLBACK_ENABLED {
+            return false;
+        }
+
+        self.kept
+            .get(&pane_key(session_id, pane_id))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// What the observation rule alone says about this pane, with the feature
+    /// switch left out of it. The switch is a shipping decision; the rule is
+    /// the thing the tests are about.
+    pub fn observed_as_kept(&self, session_id: &str, pane_id: &str) -> bool {
         self.kept
             .get(&pane_key(session_id, pane_id))
             .copied()
@@ -885,12 +912,12 @@ mod tests {
                 }
             }),
         );
-        assert!(store.keeps("default", "wM:p1"));
-        assert!(!store.keeps("default", "wM:pT"));
+        assert!(store.observed_as_kept("default", "wM:p1"));
+        assert!(!store.observed_as_kept("default", "wM:pT"));
         // A pane nobody has reported on is not guessed at.
-        assert!(!store.keeps("default", "wN:p9"));
+        assert!(!store.observed_as_kept("default", "wN:p9"));
         // Nor is a pane on another session with the same id.
-        assert!(!store.keeps("other", "wM:p1"));
+        assert!(!store.observed_as_kept("other", "wM:p1"));
     }
 
     #[test]
@@ -899,9 +926,9 @@ mod tests {
         let zero = json!({ "pane_id": "p", "scroll": { "max_offset_from_bottom": 0, "viewport_rows": 65 } });
         let grown = json!({ "pane_id": "p", "scroll": { "max_offset_from_bottom": 40, "viewport_rows": 65 } });
         store.observe("s", &zero);
-        assert!(store.keeps("s", "p"));
+        assert!(store.observed_as_kept("s", "p"));
         store.observe("s", &grown);
-        assert!(!store.keeps("s", "p"));
+        assert!(!store.observed_as_kept("s", "p"));
     }
 
     #[test]
