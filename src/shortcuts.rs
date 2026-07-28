@@ -26,6 +26,7 @@
 //!   "opencode": {
 //!     "match": ["opencode"],
 //!     "keys": [{ "label": "⇧tab", "key": "shift+tab", "description": "Cycle mode" }],
+//!     "interrupt": "esc",
 //!     "commands": [{ "command": "/model", "description": "Switch model",
 //!                    "argumentHint": "[model]" }],
 //!     "commandDirs": [{ "path": "~/.opencode/commands", "format": "markdown",
@@ -46,8 +47,10 @@ use serde_json::{json, Value};
 /// Bumped whenever the tables below change, so a client can cache a response
 /// and know when to drop it. 4 moved the slash-command tables into
 /// `composer.rs`, so this endpoint and the pane composer descriptor answer out
-/// of one table, and added the opencode profile.
-pub const KEYMAP_VERSION: u32 = 4;
+/// of one table, and added the opencode profile. 5 adds `interrupt` to every
+/// profile and to this endpoint's answer: which key stops this particular
+/// agent, which is not `ctrl+c` on any of them.
+pub const KEYMAP_VERSION: u32 = 5;
 
 /// Overlay file, read from the gateway's config directory on every request.
 /// Re-read rather than cached so an edit takes effect on the next pane switch
@@ -97,6 +100,11 @@ struct AgentOverlay {
     r#match: Vec<String>,
     #[serde(default)]
     keys: Option<Vec<OverlayShortcut>>,
+    /// The key that stops this agent mid-answer, when it is not `esc`. The one
+    /// field here whose default is wrong loudly rather than quietly: a Stop
+    /// button that sends the wrong key looks broken.
+    #[serde(default)]
+    interrupt: Option<String>,
     #[serde(default)]
     commands: Option<Vec<OverlayCommand>>,
     /// Accepted as `commandDirs` or `command_dirs`: the file is hand-written,
@@ -298,6 +306,17 @@ const OPENCODE_KEYS: &[Shortcut] = &[
     key("⌃X", "ctrl+x", "Leader key"),
 ];
 
+/// What stops whatever is running, per profile.
+///
+/// `ctrl+c` is the shell's answer and the wrong one for an agent: in a TUI it
+/// is at best ignored and at worst kills the session the user was in the middle
+/// of. Every agent here says `esc` in its own footer -- Claude Code's "esc to
+/// interrupt", Codex's "Esc to cancel", opencode's `session_interrupt` -- so a
+/// Stop button that sends the same key everywhere is wrong on four agents out
+/// of four.
+pub const SHELL_INTERRUPT: &str = "ctrl+c";
+const AGENT_INTERRUPT: &str = "esc";
+
 struct Profile {
     id: &'static str,
     /// Matched against the agent name reported by Herdr, lowercased, as a
@@ -308,6 +327,8 @@ struct Profile {
     /// differs from the profile's own where Herdr's agent name does
     /// ("qodercli" runs Qoder CLI), so it is named rather than assumed.
     commands: &'static str,
+    /// The key that stops this agent mid-answer, from its own footer.
+    interrupt: &'static str,
 }
 
 const AGENT_PROFILES: &[Profile] = &[
@@ -316,24 +337,28 @@ const AGENT_PROFILES: &[Profile] = &[
         agent_match: &["claude"],
         keys: CLAUDE_KEYS,
         commands: "claude",
+        interrupt: AGENT_INTERRUPT,
     },
     Profile {
         id: "codex",
         agent_match: &["codex"],
         keys: CODEX_KEYS,
         commands: "codex",
+        interrupt: AGENT_INTERRUPT,
     },
     Profile {
         id: "opencode",
         agent_match: &["opencode", "open-code"],
         keys: OPENCODE_KEYS,
         commands: "opencode",
+        interrupt: AGENT_INTERRUPT,
     },
     Profile {
         id: "qodercli",
         agent_match: &["qoder"],
         keys: QODER_KEYS,
         commands: "qoder",
+        interrupt: AGENT_INTERRUPT,
     },
 ];
 
@@ -372,12 +397,29 @@ pub fn resolve(agent: Option<&str>, pane_title: Option<&str>, cwd: Option<&str>)
     resolve_with(agent, pane_title, cwd, &overlays)
 }
 
-fn resolve_with(
+/// Which profile answers for a pane, and everything that follows from it.
+///
+/// One selection, read by two callers: the key row and the Stop button. They
+/// disagreeing about which agent a pane is running would mean a client offering
+/// Claude's keys and the shell's interrupt on the same pane.
+struct Selection<'a> {
+    id: String,
+    keys: &'static [Shortcut],
+    commands: &'static [SlashCommand],
+    /// A `String` rather than a `&'static str` because `agents.json` can name
+    /// it, and a key a developer wrote is as real as one in the table.
+    interrupt: String,
+    overlay: Option<&'a AgentOverlay>,
+    /// True when `agents.json` named this profile, so it is obvious which edits
+    /// are taking effect.
+    configured: bool,
+}
+
+fn select_profile<'a>(
     agent: Option<&str>,
     pane_title: Option<&str>,
-    cwd: Option<&str>,
-    overlays: &HashMap<String, AgentOverlay>,
-) -> Value {
+    overlays: &'a HashMap<String, AgentOverlay>,
+) -> Selection<'a> {
     let agent_lower = agent.unwrap_or("").trim().to_ascii_lowercase();
 
     // The overlay file wins over the built-in table, so a developer can correct
@@ -401,7 +443,7 @@ fn resolve_with(
             .any(|needle| agent_lower.contains(needle))
     });
 
-    let (id, specific, builtin): (String, &[Shortcut], &[SlashCommand]) =
+    let (id, keys, commands, interrupt): (String, &[Shortcut], &[SlashCommand], &str) =
         match (&overlay_id, builtin_profile) {
             (Some(id), _) => {
                 // An overlay may extend a built-in profile of the same name, so
@@ -411,19 +453,64 @@ fn resolve_with(
                     id.clone(),
                     base.map(|profile| profile.keys).unwrap_or(SHELL),
                     profile_commands(base),
+                    // An overlay for an agent with no built-in profile is still
+                    // an agent, so it gets an agent's interrupt rather than the
+                    // shell's -- and can say otherwise with `interrupt`.
+                    base.map_or(AGENT_INTERRUPT, |profile| profile.interrupt),
                 )
             }
             (None, Some(profile)) => (
                 profile.id.to_owned(),
                 profile.keys,
                 profile_commands(Some(profile)),
+                profile.interrupt,
             ),
-            (None, None) if pane_title.is_some_and(is_editor_title) => {
-                ("editor".to_owned(), EDITOR, EDITOR_COMMANDS)
-            }
-            (None, None) => ("shell".to_owned(), SHELL, &[][..]),
+            (None, None) if pane_title.is_some_and(is_editor_title) => (
+                "editor".to_owned(),
+                EDITOR,
+                EDITOR_COMMANDS,
+                AGENT_INTERRUPT,
+            ),
+            (None, None) => ("shell".to_owned(), SHELL, &[][..], SHELL_INTERRUPT),
         };
+
     let overlay = overlay_id.as_ref().and_then(|id| overlays.get(id));
+    Selection {
+        id,
+        keys,
+        commands,
+        // Sanitised like any other key read off disk: it is sent verbatim to
+        // `pane.send_keys`, and a name Herdr refuses would make Stop a 400.
+        interrupt: overlay
+            .and_then(|entry| entry.interrupt.as_deref())
+            .filter(|key| valid_key_name(key))
+            .unwrap_or(interrupt)
+            .to_owned(),
+        overlay,
+        configured: overlay_id.is_some(),
+    }
+}
+
+/// The key that stops whatever this pane is running.
+///
+/// Resolved here rather than in a client for the same reason the key row is: it
+/// changes when an agent does, and the gateway is what a developer updates.
+pub fn interrupt_key(agent: Option<&str>, pane_title: Option<&str>) -> String {
+    let overlays = load_overlays(crate::config_dir);
+    select_profile(agent, pane_title, &overlays).interrupt
+}
+
+fn resolve_with(
+    agent: Option<&str>,
+    pane_title: Option<&str>,
+    cwd: Option<&str>,
+    overlays: &HashMap<String, AgentOverlay>,
+) -> Value {
+    let selection = select_profile(agent, pane_title, overlays);
+    let id = selection.id.clone();
+    let specific = selection.keys;
+    let builtin = selection.commands;
+    let overlay = selection.overlay;
 
     // Ordered by how often a thumb reaches for them, not by category. Answering
     // and interrupting come first because every pane needs them; then whatever
@@ -465,9 +552,13 @@ fn resolve_with(
         "agent": agent.unwrap_or_default(),
         // True when this profile came from `agents.json` rather than the
         // built-in table, so it is obvious which edits are taking effect.
-        "configured": overlay_id.is_some(),
+        "configured": selection.configured,
         "keys": keys,
         "commands": commands,
+        // The key a Stop button sends on this pane. Named here as well as on
+        // the interrupt endpoint so a client can label the button honestly
+        // without a second round trip.
+        "interrupt": selection.interrupt,
     })
 }
 
@@ -490,6 +581,32 @@ pub const HERDR_AGENTS: &[&str] = &[
     "cursor",
     "mastracode",
 ];
+
+/// Whether this gateway has any notion of the named agent at all.
+///
+/// The catalogue's own question, asked of one name: a kind Herdr integrates
+/// with, a profile in the built-in table, or an entry in `agents.json`. It is
+/// deliberately generous about the last of those -- someone who wrote a profile
+/// for an agent this build has never heard of has said, in the clearest way
+/// available, that it is one they want to run.
+pub fn is_known_agent(agent: &str) -> bool {
+    let name = agent.trim().to_ascii_lowercase();
+    if name.is_empty() {
+        return false;
+    }
+    if HERDR_AGENTS.contains(&name.as_str()) {
+        return true;
+    }
+    if AGENT_PROFILES
+        .iter()
+        .any(|profile| profile.agent_match.iter().any(|needle| name == *needle))
+    {
+        return true;
+    }
+    load_overlays(crate::config_dir)
+        .keys()
+        .any(|id| id.to_ascii_lowercase() == name)
+}
 
 /// The whole table at once: which agents have a profile, where each came from,
 /// and where to put an overlay. Answers "is my new agent supported yet" without
@@ -1047,6 +1164,85 @@ mod tests {
             assert_eq!(keys[1], "shift+enter");
             assert_eq!(keys.last().unwrap(), "alt+right");
         }
+    }
+
+    #[test]
+    fn stop_sends_the_key_this_particular_agent_stops_on() {
+        // The whole reason the interrupt endpoint exists: `ctrl+c` is right at a
+        // shell and wrong in every agent, where it is at best ignored and at
+        // worst kills the session the user was in the middle of.
+        let empty = HashMap::new();
+        for agent in ["claude", "Claude Code", "codex", "opencode", "qodercli"] {
+            assert_eq!(
+                select_profile(Some(agent), None, &empty).interrupt,
+                "esc",
+                "{agent}"
+            );
+        }
+        // A pane with no agent is a shell prompt, and a shell stops on ctrl+c.
+        assert_eq!(
+            select_profile(None, None, &empty).interrupt,
+            SHELL_INTERRUPT
+        );
+        assert_eq!(
+            select_profile(Some("some-new-agent"), None, &empty).interrupt,
+            SHELL_INTERRUPT
+        );
+        // An editor is not stopped with ctrl+c either.
+        assert_eq!(
+            select_profile(None, Some("/usr/bin/nvim ."), &empty).interrupt,
+            "esc"
+        );
+        // And the key row says the same thing the endpoint would send, so a
+        // client can label the button without a second round trip.
+        assert_eq!(resolve(Some("claude"), None, None)["interrupt"], "esc");
+        assert_eq!(
+            resolve(Some("some-new-agent"), None, None)["interrupt"],
+            SHELL_INTERRUPT
+        );
+    }
+
+    #[test]
+    fn a_config_file_can_correct_an_interrupt_key_but_not_invent_a_command() {
+        // An agent that stops on something else is one line of `agents.json`,
+        // the same way its keys and commands are.
+        let table = overlays(
+            r#"{"weird": {"match": ["weird"], "interrupt": "ctrl+d"},
+                "hostile": {"match": ["hostile"], "interrupt": "pkill -9 agent; echo"}}"#,
+        );
+        assert_eq!(
+            select_profile(Some("weird-agent"), None, &table).interrupt,
+            "ctrl+d"
+        );
+        // The key is sent verbatim to `pane.send_keys`, so it is sanitised like
+        // every other key read off disk and a bad one falls back to the default
+        // rather than travelling.
+        assert_eq!(
+            select_profile(Some("hostile-agent"), None, &table).interrupt,
+            "esc"
+        );
+        // An overlay for an agent with no built-in profile is still an agent.
+        assert_eq!(
+            select_profile(Some("weird-agent"), None, &table).id,
+            "weird"
+        );
+    }
+
+    #[test]
+    fn an_agent_is_known_when_herdr_integrates_with_it_or_a_profile_names_it() {
+        assert!(is_known_agent("claude"));
+        assert!(is_known_agent("Codex"));
+        assert!(is_known_agent("opencode"));
+        assert!(is_known_agent("qodercli"));
+        // Herdr's own list is wider than the profile table, and a kind with no
+        // key row still runs -- it just falls back to the shell keys.
+        assert!(is_known_agent("droid"));
+        // Nothing else, and nothing shaped like an argument.
+        assert!(!is_known_agent(""));
+        assert!(!is_known_agent("   "));
+        assert!(!is_known_agent("claude; rm -rf /"));
+        assert!(!is_known_agent("../../bin/sh"));
+        assert!(!is_known_agent("not-an-agent"));
     }
 
     #[test]
