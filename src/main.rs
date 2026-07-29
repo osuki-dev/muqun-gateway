@@ -12147,7 +12147,6 @@ mod tests {
         assert_eq!(herdr.enters().len(), 3);
     }
 
-    #[ignore = "the gateway keeps no rows while scrollback::SCROLLBACK_ENABLED is false (1.2.0)"]
     #[tokio::test]
     async fn enters_stop_at_the_budget_when_the_agent_never_takes_one() {
         let herdr = FakeHerdr::start(vec!["> review this"], Some(usize::MAX));
@@ -12194,7 +12193,6 @@ mod tests {
 
     /// The whole point, end to end: Herdr keeps one screen, the gateway watched
     /// four, and the reader can ask for all four.
-    #[ignore = "the gateway keeps no rows while scrollback::SCROLLBACK_ENABLED is false (1.2.0)"]
     #[tokio::test]
     async fn a_zero_backlog_pane_hands_back_more_than_herdr_kept() {
         let screens = repainting_screens();
@@ -12217,7 +12215,6 @@ mod tests {
 
     /// And having kept them, it says so where the reader's affordance looks --
     /// on the pane, not on the output.
-    #[ignore = "the gateway keeps no rows while scrollback::SCROLLBACK_ENABLED is false (1.2.0)"]
     #[tokio::test]
     async fn the_pane_listing_reports_what_was_kept() {
         let screens = repainting_screens();

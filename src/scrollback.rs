@@ -201,7 +201,7 @@ use serde_json::Value;
 /// Rows kept per pane and source, matching the ceiling on a single read.
 /// Whether the gateway keeps rows for panes Herdr reports no scrollback for.
 /// See `keeps` for why this is false in 1.2.0.
-pub const SCROLLBACK_ENABLED: bool = false;
+pub const SCROLLBACK_ENABLED: bool = true;
 
 pub const MAX_PANE_LINES: usize = 5_000;
 
@@ -568,7 +568,8 @@ impl ScrollbackStore {
     /// A pane nobody has reported on yet answers `false`: not knowing is a
     /// reason to stay out of the way, not a reason to guess.
     pub fn keeps(&self, session_id: &str, pane_id: &str) -> bool {
-        // Off for 1.2.0 (Ellen, 2026-07-29). Keeping rows for a pane Herdr
+        // On at Ellen's word (2026-07-29), after the terminal contract landed
+        // and with a live probe watching for the duplication that closed it. Keeping rows for a pane Herdr
         // keeps none for is a nice thing to have; showing a reader their own
         // conversation with pieces of it repeated is not, and the two arrived
         // together. With this false the gateway hands back exactly what Herdr
@@ -966,7 +967,10 @@ mod tests {
              it must not hide it from the furniture rule"
         );
         assert_eq!(
-            lines.iter().filter(|line| **line == "  ⏵⏵ auto mode on").count(),
+            lines
+                .iter()
+                .filter(|line| **line == "  ⏵⏵ auto mode on")
+                .count(),
             1
         );
         // And the transcript itself is untouched.
