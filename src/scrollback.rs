@@ -114,6 +114,82 @@
 //! On exact matches this is the same placement `mergeTerminalWindow` makes,
 //! which is the point: the two ends of the same pane must not disagree about
 //! where a row belongs.
+//!
+//! # The pane read/hold contract (card #721)
+//!
+//! This module is one half of a contract whose other half is
+//! `muqun/src/terminal/history.ts`. The full statement lives there, at the top
+//! of that file, because that is the end which has to reconcile *four* sources
+//! into one window. This is the part of it that binds the gateway.
+//!
+//! ## What the gateway is authoritative for
+//!
+//! **The rows it was given, in the order it was given them. Nothing else.**
+//!
+//! It is not authoritative for depth. It may hand back a window deeper than the
+//! read it just took -- that is the whole purpose of the ring -- but it may
+//! never be *assumed* to hand back one at least as deep as the reader already
+//! holds, because it has no way of knowing what that is. A gateway restart
+//! empties every buffer, and the answer that follows is one screen. If the app
+//! replaced its window with that, a reader would lose their history to a restart
+//! they never saw.
+//!
+//! So the app treats every HTTP answer as *placeable*, not authoritative, and
+//! nothing in this module may assume otherwise. That is the reason the
+//! reconciliation lives at the app end and this end simply tells the truth about
+//! what it has.
+//!
+//! ## The rules both halves keep, in the same words
+//!
+//! | | here | there |
+//! |---|---|---|
+//! | agreement threshold | [`MATCH_THRESHOLD`] | `SCREEN_MATCH_THRESHOLD` |
+//! | ratio floor | [`MIN_MATCH_ROWS`] | `SCREEN_MIN_MATCH_ROWS` |
+//! | anchored run | [`ANCHOR_ROWS`] | `SCREEN_ANCHOR_ROWS` |
+//! | seam skew | [`ANCHOR_SKEW`] | `SCREEN_ANCHOR_SKEW` |
+//! | backward reach | [`ANCHOR_REACH`] | `SCREEN_ANCHOR_REACH` |
+//! | furniture cap | [`FURNITURE_SHARE`] | `FURNITURE_SHARE` |
+//! | volatile allowance | [`FURNITURE_VOLATILE_ROWS`] | `FURNITURE_VOLATILE_ROWS` |
+//!
+//! A number that changes on one side and not the other is a bug, and the shape
+//! it takes is a row written down twice.
+//!
+//! ## The four invariants
+//!
+//! - **(a) supersequence, in arrival order.** Every path here drops from the
+//!   tail and appends; none splices. Stated above and still true.
+//! - **(b) depth is never reduced.** The gateway grows a buffer or trims it from
+//!   the *top* at [`MAX_PANE_LINES`]. It has no operation that shortens history
+//!   from the bottom, and must not grow one.
+//! - **(c) furniture is never history.** [`ScrollbackStore::record`] -- and see
+//!   the correction below, because this rule was not working.
+//! - **(d) identical adjacent blocks never accumulate.** `already_held` is the
+//!   floor here; the app collapses whatever gets past it.
+//!
+//! ## The correction card #721 made here
+//!
+//! The furniture rule was written against an exact common suffix, and on the
+//! very pane it was written for it therefore almost never fired.
+//!
+//! An agent's composer is not a still image. Its mode line carries a timer --
+//! `4m 46s · ↓ 2.9k tokens` -- that changes on **every** frame whether or not
+//! anything scrolled, and it sits *inside* the box rather than below it. An
+//! exact `common_suffix` walks up from the bottom, meets the clock, and stops:
+//! it reports one or two rows of furniture where there are eight. The rule that
+//! exists precisely to keep a composer out of a transcript was being defeated by
+//! the single most volatile row in that composer.
+//!
+//! Agreement is scored here now, for the same reason it is scored everywhere
+//! else in this file: a repainting rectangle cannot be asked to match exactly.
+//! [`FURNITURE_VOLATILE_ROWS`] rows may disagree outright, and past that
+//! [`MATCH_THRESHOLD`] applies -- the same shape the app uses, reached from the
+//! same measurement.
+//!
+//! The app also found, by soaking a live pane for an hour, that the *order*
+//! matters: the furniture is what hides the seam, so it has to come off before a
+//! placement is given up on. This module already had that right -- `record`
+//! strips before it places -- which is why that half of the bug showed up over
+//! there and not here.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -185,6 +261,26 @@ const ANCHOR_SKEW: usize = 1;
 /// much history one read can retract, which is why it is a small number: a read
 /// may correct the screen it followed, not rewrite the session.
 const ANCHOR_REACH: usize = 2;
+
+/// The most of a read that may be called furniture rather than history, as a
+/// divisor: a third. An agent's composer is eight rows of sixty-five, and a pane
+/// that legitimately repaints a long identical tail keeps its history.
+const FURNITURE_SHARE: usize = 3;
+
+/// How many rows of a composer may disagree outright before the run is refused.
+///
+/// One: the mode-line timer. It is the row that changes on every frame whether
+/// or not anything scrolled, and it is the reason an exact common suffix never
+/// recognised the box this rule was written to recognise. The app's
+/// `FURNITURE_VOLATILE_ROWS` is the same number for the same reason.
+const FURNITURE_VOLATILE_ROWS: usize = 1;
+
+/// How many rows carrying text a repeated tail must have before it is furniture.
+///
+/// Two. No matching rows is a pair of screens with room at the bottom, and one
+/// is a coincidence; a composer is a rule, a prompt and a mode line, and never
+/// fewer than two of them survive the clock sitting among them.
+const FURNITURE_MIN_ROWS: usize = 2;
 
 /// Rows of a read, with the line endings the app's own splitter normalizes.
 ///
@@ -331,14 +427,40 @@ fn already_held(held: &[u64], incoming: &[u64]) -> usize {
         .unwrap_or(0)
 }
 
-/// How many rows two frames end with in common.
-fn common_suffix(previous: &[u64], current: &[u64]) -> usize {
-    previous
-        .iter()
-        .rev()
-        .zip(current.iter().rev())
-        .take_while(|(a, b)| a == b)
-        .count()
+/// How many rows two frames end with in common, allowing for the ones a repaint
+/// changed without anything scrolling.
+///
+/// This used to be an exact `take_while`, and on an agent pane it therefore
+/// stopped at the first row of the composer -- the mode-line timer, which
+/// changes on every frame and sits *inside* the box. Eight rows of furniture
+/// were reported as one or two, and the rule that keeps a composer out of the
+/// transcript did not fire on the pane it was written for. See the header.
+///
+/// So the run is scored, exactly as `rows_agree` scores an overlap:
+/// [`FURNITURE_VOLATILE_ROWS`] rows may disagree outright -- the clock -- and
+/// beyond that [`MATCH_THRESHOLD`] of the run has to agree. The longest run
+/// satisfying both wins. `carries` says which rows of `current` hold text: a
+/// tail of blank rows is two screens with room at the bottom, not a composer,
+/// and dropping it would eat the transcript above it.
+fn common_suffix(previous: &[u64], current: &[u64], carries: &[bool]) -> usize {
+    let widest = previous.len().min(current.len());
+    let mut matched = 0usize;
+    let mut carried = 0usize;
+    let mut best = 0usize;
+    for rows in 1..=widest {
+        if previous[previous.len() - rows] == current[current.len() - rows] {
+            matched += 1;
+            if carries[current.len() - rows] {
+                carried += 1;
+            }
+        }
+        let missed = rows - matched;
+        let allowed = FURNITURE_VOLATILE_ROWS.max((rows as f64 * (1.0 - MATCH_THRESHOLD)) as usize);
+        if missed <= allowed && carried >= FURNITURE_MIN_ROWS {
+            best = rows;
+        }
+    }
+    best
 }
 
 #[derive(Debug, Default)]
@@ -497,7 +619,12 @@ impl ScrollbackStore {
         // Capped at a third of a screen, so a pane that legitimately repaints
         // the same tail keeps its history.
         let frame: Vec<u64> = incoming.iter().map(|line| line_hash(line)).collect();
-        let furniture = common_suffix(&buffer.last_frame, &frame).min(frame.len() / 3);
+        let carries: Vec<bool> = incoming
+            .iter()
+            .map(|line| !line.trim().is_empty())
+            .collect();
+        let furniture =
+            common_suffix(&buffer.last_frame, &frame, &carries).min(frame.len() / FURNITURE_SHARE);
         if furniture > 0 {
             let held = furniture.min(buffer.lines.len());
             let ends_with_it = buffer
@@ -517,13 +644,8 @@ impl ScrollbackStore {
         // appended stays contiguous and in arrival order.
         let mut skip = 0;
         if !buffer.lines.is_empty() {
-            let incoming_hashes: Vec<u64> = incoming.iter().map(|line| line_hash(line)).collect();
-            let carries: Vec<bool> = incoming
-                .iter()
-                .map(|line| !line.trim().is_empty())
-                .collect();
             let held = buffer.tail(MAX_OVERLAP);
-            match placement(&held, &incoming_hashes, &carries) {
+            match placement(&held, &frame, &carries) {
                 // The read re-sends this many held rows; they are dropped so the
                 // newest rendering of each of them is the one kept.
                 Some(discard) => buffer.drop_back(discard.min(buffer.lines.len())),
@@ -531,7 +653,7 @@ impl ScrollbackStore {
                 // than one read can be followed, so nothing held is dropped --
                 // but whatever the buffer verbatim ends with is not appended
                 // again.
-                None => skip = already_held(&held, &incoming_hashes),
+                None => skip = already_held(&held, &frame),
             }
         }
         for line in incoming.into_iter().skip(skip) {
@@ -716,6 +838,162 @@ pub fn replace_read_text(value: &mut Value, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Replay a captured pane through the store and measure what it kept.
+    ///
+    /// The evidence half of card #721's question: with the anchor, the furniture
+    /// rule and `already_held` in place, does the ring still duplicate a real
+    /// agent pane under real load? Point it at a capture and find out:
+    ///
+    /// ```text
+    /// HERDR_SCROLLBACK_REPLAY=/tmp/frames.jsonl cargo test replay -- --nocapture
+    /// ```
+    ///
+    /// The file is one JSON-encoded string per line, each the full text of one
+    /// `pane.read`. `scripts/capture-frames.sh` in the app repo makes one.
+    ///
+    /// Skipped when the variable is unset, because the capture is somebody's
+    /// terminal and does not belong in the repository.
+    #[test]
+    fn replay_a_captured_pane_and_report_duplication() {
+        let Ok(path) = std::env::var("HERDR_SCROLLBACK_REPLAY") else {
+            return;
+        };
+        let body = std::fs::read_to_string(&path).expect("replay capture");
+        let frames: Vec<String> = body
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str::<String>(line).expect("json string per line"))
+            .collect();
+
+        let mut store = ScrollbackStore::default();
+        for frame in &frames {
+            store.record("replay", frame);
+        }
+        let held = store.window("replay", MAX_PANE_LINES).unwrap_or_default();
+        let rows: Vec<&str> = held.lines().collect();
+
+        // Rows carrying something, and how often each of them was written down.
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for row in rows.iter().filter(|row| !row.trim().is_empty()) {
+            *counts.entry(row).or_default() += 1;
+        }
+        let substantial: usize = counts.values().sum();
+        let repeated: usize = counts.values().filter(|n| **n > 1).sum();
+        let worst = counts.values().copied().max().unwrap_or(0);
+
+        // The metric that actually matters: a run of four or more rows written
+        // down twice. A single row repeating is a transcript doing its job --
+        // `⎿  Allowed by auto mode classifier` genuinely appears many times --
+        // but four consecutive rows repeating verbatim is the buffer copying
+        // itself.
+        let mut duplicated_blocks = 0usize;
+        let mut duplicated_rows = 0usize;
+        let hashes: Vec<u64> = rows.iter().map(|row| line_hash(row)).collect();
+        let carries: Vec<bool> = rows.iter().map(|row| !row.trim().is_empty()).collect();
+        let mut at = 0usize;
+        while at + 8 <= hashes.len() {
+            let mut hit = 0usize;
+            for start in (at + 1)..hashes.len().saturating_sub(3) {
+                let mut run = 0usize;
+                while start + run < hashes.len()
+                    && at + run < start
+                    && hashes[at + run] == hashes[start + run]
+                {
+                    run += 1;
+                }
+                let carried = (0..run).filter(|step| carries[at + step]).count();
+                if run >= 4 && carried >= 4 {
+                    hit = run;
+                    break;
+                }
+            }
+            if hit > 0 {
+                duplicated_blocks += 1;
+                duplicated_rows += hit;
+                at += hit;
+            } else {
+                at += 1;
+            }
+        }
+
+        println!(
+            "replay {path}: {} frames -> {} rows held\n  \
+             substantial rows {substantial}, of which repeated at all {repeated} ({:.0}%), worst row x{worst}\n  \
+             duplicated blocks (>=4 rows) {duplicated_blocks} covering {duplicated_rows} rows",
+            frames.len(),
+            rows.len(),
+            if substantial == 0 { 0.0 } else { repeated as f64 * 100.0 / substantial as f64 },
+        );
+
+        assert_eq!(
+            duplicated_blocks, 0,
+            "the ring copied {duplicated_rows} rows of a real pane into its own history"
+        );
+    }
+
+    /// The same rule, against a composer whose *last* row is the volatile one.
+    ///
+    /// Card #721. This is the shape a real Claude pane has -- the mode line with
+    /// its `4m 46s · ↓ 2.9k tokens` clock is the bottom row of the box, not a
+    /// row above it -- and it is the shape the old exact `common_suffix` could
+    /// not see at all: the walk up from the bottom met the clock on its first
+    /// step and stopped, reporting zero rows of furniture. The rule that exists
+    /// to keep a composer out of a transcript did not fire on the pane it was
+    /// written for, and a copy of the box went into history on every jump.
+    #[test]
+    fn a_composer_is_furniture_even_with_a_clock_on_its_last_row() {
+        let mut store = ScrollbackStore::default();
+        for round in 0..8 {
+            let mut frame: Vec<String> = (0..40)
+                .map(|row| format!("line {} of round {round}", row + round * 40))
+                .collect();
+            frame.extend([
+                "─".repeat(60),
+                "❯ ".to_owned(),
+                "  ⏵⏵ auto mode on".to_owned(),
+                // The clock, on the bottom row, changing every single frame.
+                format!("  {}m {}s · ↓ {}k tokens", round, round * 7, round * 13),
+            ]);
+            store.record("pane", &frame.join("\n"));
+        }
+        let held = store.window("pane", 5_000).unwrap();
+        let lines: Vec<&str> = held.lines().collect();
+        assert_eq!(
+            lines.iter().filter(|line| **line == "❯ ").count(),
+            1,
+            "the composer belongs at the bottom once, and a ticking clock inside \
+             it must not hide it from the furniture rule"
+        );
+        assert_eq!(
+            lines.iter().filter(|line| **line == "  ⏵⏵ auto mode on").count(),
+            1
+        );
+        // And the transcript itself is untouched.
+        assert!(lines.contains(&"line 0 of round 0"));
+        assert!(lines.contains(&"line 319 of round 7"));
+    }
+
+    /// A pane repainting a long identical tail is not wearing furniture, and the
+    /// cap is what keeps the rule from eating its history.
+    #[test]
+    fn a_long_repainted_tail_is_history_not_furniture() {
+        let mut store = ScrollbackStore::default();
+        let tail: Vec<String> = (0..30).map(|row| format!("tail {row}")).collect();
+        for round in 0..4 {
+            let mut frame: Vec<String> = (0..10)
+                .map(|row| format!("head {} of round {round}", row + round * 10))
+                .collect();
+            frame.extend(tail.iter().cloned());
+            store.record("pane", &frame.join("\n"));
+        }
+        let held = store.window("pane", 5_000).unwrap();
+        let lines: Vec<&str> = held.lines().collect();
+        // A third of a forty-row read is thirteen rows, so the tail is never
+        // taken for chrome wholesale.
+        assert!(lines.contains(&"head 0 of round 0"));
+        assert!(lines.contains(&"head 39 of round 3"));
+    }
 
     /// An agent pins a composer to the bottom of its screen and scrolls only
     /// the transcript above it. The composer is furniture: it belongs at the

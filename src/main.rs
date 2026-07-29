@@ -5160,7 +5160,16 @@ async fn pane_output(
             store.window(&key, lines as usize)
         };
         if let Some(served) = served {
-            if served.len() > text.len() {
+            // Rows, not bytes. This was `served.len() > text.len()` -- a byte
+            // count -- which is a guess about shape dressed up as a comparison:
+            // a buffer holding strictly more rows than the read can still be
+            // *shorter* in bytes, because the rows it kept are the ones that
+            // scrolled off and those are routinely blank or short. The window
+            // was then silently dropped and the reader got one screen, which
+            // looks exactly like the ring not working. Card #721 deletes every
+            // length-as-shape test on both sides of this contract; this is the
+            // gateway's one.
+            if scrollback::split_lines(&served).len() > scrollback::split_lines(&text).len() {
                 scrollback::replace_read_text(&mut answer, &served);
             }
         }
