@@ -5,7 +5,7 @@
 # no matching binary is published (e.g. an untagged main checkout).
 set -eu
 
-REPO="BANG88/herdr-gateway"
+REPO="osuki-dev/herdr-gateway"
 VERSION="$(grep -m1 '^version' Cargo.toml | sed 's/[^"]*"\([^"]*\)".*/\1/')"
 
 os="$(uname -s)"

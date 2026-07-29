@@ -14,7 +14,7 @@ install** also configures it, starts it, and opens the pairing QR (macOS and
 Linux; Windows is not supported yet):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/BANG88/herdr-gateway/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/osuki-dev/herdr-gateway/main/install.sh | sh
 ```
 
 Herdr Gateway requires Herdr 0.7.5 or newer. The installer checks this before
@@ -32,7 +32,7 @@ a fallback if no release binary matches your OS/arch.
 If you prefer to do it by hand, install directly with Herdr's plugin installer:
 
 ```sh
-herdr plugin install BANG88/herdr-gateway
+herdr plugin install osuki-dev/herdr-gateway
 ```
 
 then configure once, start, and open the manager panel to view the QR code,
@@ -63,7 +63,7 @@ reinstalling a GitHub-managed plugin replaces its checkout in place. Re-run the
 same one command:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/BANG88/herdr-gateway/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/osuki-dev/herdr-gateway/main/install.sh | sh
 ```
 
 On a re-run the script updates the plugin and **reloads the binary for you**
@@ -75,13 +75,13 @@ actions can attach.
 Or reinstall directly (then restart it yourself, see below):
 
 ```sh
-herdr plugin install BANG88/herdr-gateway
+herdr plugin install osuki-dev/herdr-gateway
 ```
 
 Pin a specific version with `--ref`:
 
 ```sh
-herdr plugin install BANG88/herdr-gateway --ref v0.3.0
+herdr plugin install osuki-dev/herdr-gateway --ref v0.3.0
 ```
 
 After updating, restart the gateway so the new build takes over:

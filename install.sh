@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 # One-command install, update, and first-run setup for the Herdr Gateway plugin.
 #
-#   curl -fsSL https://raw.githubusercontent.com/BANG88/herdr-gateway/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/osuki-dev/herdr-gateway/main/install.sh | sh
 #
 # Herdr 0.7.5 installs plugins globally, so installation may run from any shell.
 # Setup/start and the pairing QR are driven through plugin actions and still
@@ -13,7 +13,7 @@
 # that would orphan devices you have already paired. macOS and Linux only.
 set -eu
 
-REPO="BANG88/herdr-gateway"
+REPO="osuki-dev/herdr-gateway"
 PLUGIN_ID="herdr.gateway"
 MIN_HERDR_VERSION="0.7.5"
 
