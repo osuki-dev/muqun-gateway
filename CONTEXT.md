@@ -76,9 +76,11 @@ through environment variables until `import-herdr-plugin` writes the migration
 marker. After that, direct CLI and plugin actions share standalone ownership.
 
 The public listener is normally localhost behind Tailscale Serve HTTPS or a
-Tailscale IPv4 address. HTTPS is preferred. Tailscale HTTP is protected by its
-WireGuard transport and ACLs; ordinary LAN HTTP is unencrypted. Device tokens
-grant terminal control and must be handled like SSH credentials.
+Tailscale IPv4 address. HTTPS is preferred. Application transport encryption is
+`required` by default and binds a per-device AES-GCM key to each newly paired
+device, so its bearer token is not sufficient by itself. `disabled` is an
+explicit token-only compatibility mode. Existing device records retain their
+pairing mode; changing the gateway setting governs newly paired devices.
 
 ## Verification
 

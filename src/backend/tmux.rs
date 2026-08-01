@@ -918,7 +918,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         let output = backend
             .read_pane(&ReadPane {
-                pane_id: split.id,
+                pane_id: split.id.clone(),
                 source: OutputSource::Visible,
                 format: OutputFormat::Text,
                 lines: 80,
@@ -926,6 +926,34 @@ mod tests {
             .await
             .unwrap();
         assert!(output.text.contains("gateway_contract_probe"));
+
+        backend.send_text(&split.id, "seq 1 800").await.unwrap();
+        backend
+            .send_keys(&split.id, &["Enter".to_owned()])
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let first_page = backend
+            .read_pane(&ReadPane {
+                pane_id: split.id.clone(),
+                source: OutputSource::RecentUnwrapped,
+                format: OutputFormat::Text,
+                lines: 240,
+            })
+            .await
+            .unwrap();
+        let third_page = backend
+            .read_pane(&ReadPane {
+                pane_id: split.id.clone(),
+                source: OutputSource::RecentUnwrapped,
+                format: OutputFormat::Text,
+                lines: 720,
+            })
+            .await
+            .unwrap();
+        assert_eq!(first_page.text.lines().count(), 240);
+        assert_eq!(third_page.text.lines().count(), 720);
+        assert!(third_page.text.ends_with(&first_page.text));
 
         backend.close_workspace(&workspace.id).await.unwrap();
     }

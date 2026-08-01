@@ -121,22 +121,22 @@ address.
 
 ## Transport security
 
-Device bearer tokens authorize full terminal control and must be treated like
-SSH credentials. HTTPS is the preferred transport. HTTP to a Tailscale address
-is still protected on the network by WireGuard, subject to tailnet ACLs; HTTP
-on an ordinary LAN is unencrypted and unsafe against observers. The protocol
-does not add bespoke payload encryption because TLS/WireGuard already provide
-authenticated transport, while application crypto would not independently
-solve bearer-token replay or endpoint compromise.
+`transport_encryption` is a gateway-level policy for newly paired devices. Its
+default, `required`, protects pairing and API bodies with AES-256-GCM. A QR
+bootstrap secret protects the confirmation-code exchange; only after the code
+is consumed does the gateway mint a distinct transport key for that device.
+HKDF derives direction-separated keys, request method/path are authenticated as
+AAD, timestamps bound acceptance, and successful request nonces enter a replay
+cache. A bearer token alone therefore cannot use an encrypted device record.
 
-Generating an asymmetric key pair during pairing would add proof of possession
-only if every request were signed with nonce/timestamp replay protection; a key
-pair alone does not encrypt traffic. A future hardening may negotiate a device
-public key and request signatures, with the private key kept in the platform
-keystore. That remains additive authentication and does not replace
-TLS/WireGuard. If end-to-end payload encryption becomes a requirement, use a
-reviewed transport protocol such as TLS or Noise rather than field-level custom
-crypto in the App and gateway.
+`disabled` is an explicit compatibility mode. Its QR carries no bootstrap key,
+new devices receive no transport key, and their bearer token is sufficient for
+API access. Existing device records retain the mode in which they paired.
+
+Application encryption hides credentials and payloads, but route names, query
+strings, sizes, timing, device id, and availability remain visible. It has no
+forward secrecy and cannot protect a compromised endpoint. HTTPS remains
+preferred; Tailscale WireGuard and ACLs remain valuable network boundaries.
 
 ## Adding another backend
 

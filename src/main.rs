@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context as _;
-use axum::body::Body;
+use axum::body::{to_bytes, Body};
 use axum::extract::multipart::{MultipartError, MultipartRejection};
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
@@ -50,6 +50,7 @@ mod parts;
 mod scrollback;
 mod shortcuts;
 mod tasks;
+mod transport;
 
 use authority::{hash_token, identify_device, DeviceRecord, PairingCodeError, PendingPairing};
 
@@ -282,6 +283,9 @@ enum Command {
         /// Terminal workspace backend. Existing installs default to Herdr.
         #[arg(long, value_enum, default_value_t = SetupBackend::Herdr)]
         backend: SetupBackend,
+        /// Application transport encryption for newly paired devices.
+        #[arg(long, value_enum)]
+        transport_encryption: Option<TransportEncryptionMode>,
     },
     Run {
         #[arg(long)]
@@ -346,6 +350,23 @@ enum SetupBackend {
     Tmux,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+enum TransportEncryptionMode {
+    #[default]
+    Required,
+    Disabled,
+}
+
+impl TransportEncryptionMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Required => "required",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
 impl From<SetupBackend> for BackendKind {
     fn from(value: SetupBackend) -> Self {
         match value {
@@ -364,6 +385,10 @@ struct Config {
     /// Hash of the admin token. The admin token lives in `pairing.json` and is
     /// used by the local `manage` UI; paired devices get their own tokens.
     token_hash: String,
+    /// Controls how newly paired devices authenticate their HTTP transport.
+    /// Existing encrypted device records keep working after this changes.
+    #[serde(default, skip_serializing_if = "is_required_transport")]
+    transport_encryption: TransportEncryptionMode,
     sessions: Vec<SessionConfig>,
     /// Agent kind -> the executable `GET /api/agents/catalog` looks for on
     /// `PATH`. Only needed when a kind's binary is named something else on this
@@ -386,6 +411,10 @@ struct Config {
     /// round-trips untouched.
     #[serde(default, skip_serializing_if = "is_false")]
     rich_agent_pushes: bool,
+}
+
+fn is_required_transport(mode: &TransportEncryptionMode) -> bool {
+    *mode == TransportEncryptionMode::Required
 }
 
 /// `skip_serializing_if` for a flag whose absence is its default.
@@ -419,6 +448,10 @@ struct PairingPayload {
     label: String,
     url: String,
     token: String,
+    /// QR-only bootstrap secret used to protect pairing before a device token
+    /// exists. Older pairing files are upgraded the next time setup runs.
+    #[serde(default)]
+    transport_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -760,7 +793,14 @@ async fn main() -> anyhow::Result<()> {
             port,
             socket_path,
             backend,
-        } => setup(public_url, port, socket_path, backend.into())?,
+            transport_encryption,
+        } => setup(
+            public_url,
+            port,
+            socket_path,
+            backend.into(),
+            transport_encryption,
+        )?,
         Command::Run { config } => run(config).await?,
         Command::Start => start_background()?,
         Command::Stop => stop_background()?,
@@ -784,6 +824,7 @@ fn setup(
     port: u16,
     socket_path: Option<String>,
     backend: BackendKind,
+    transport_encryption: Option<TransportEncryptionMode>,
 ) -> anyhow::Result<()> {
     ensure_backend_available(backend)?;
     let config_dir = config_dir()?;
@@ -835,6 +876,11 @@ fn setup(
             )
         }
     };
+    let transport_key = existing
+        .as_ref()
+        .map(|install| install.pairing.payload.transport_key.clone())
+        .filter(|value| transport::decode_key(value).is_ok_and(|key| key.len() == 32))
+        .unwrap_or_else(generate_token);
     let mut config = match existing {
         Some(install) => install.config,
         None => Config {
@@ -843,6 +889,7 @@ fn setup(
             listen: listen.clone(),
             public_url: public_url.clone(),
             token_hash,
+            transport_encryption: TransportEncryptionMode::Required,
             sessions: Vec::new(),
             agent_commands: BTreeMap::new(),
             rich_agent_pushes: false,
@@ -850,6 +897,9 @@ fn setup(
     };
     config.listen = listen;
     config.public_url = public_url.clone();
+    if let Some(mode) = transport_encryption {
+        config.transport_encryption = mode;
+    }
     upsert_backend_session(&mut config, backend, None, None, socket_path)?;
 
     let path = config_dir.join(CONFIG_FILE);
@@ -861,6 +911,7 @@ fn setup(
         label: config.label.clone(),
         url: public_url,
         token,
+        transport_key,
     };
     let pairing_path = config_dir.join(PAIRING_FILE);
     write_secret_file(
@@ -872,6 +923,15 @@ fn setup(
     println!("wrote config: {}", path.display());
     println!("wrote pairing file: {}", pairing_path.display());
     println!("public URL: {} ({url_source})", payload.url);
+    println!(
+        "transport encryption: {}",
+        config.transport_encryption.as_str()
+    );
+    if config.transport_encryption == TransportEncryptionMode::Disabled {
+        println!(
+            "warning: transport encryption is disabled; a leaked bearer token can call the API"
+        );
+    }
     if payload.url.contains("127.0.0.1") || payload.url.contains("localhost") {
         println!("warning: pairing URL is local-only; rerun setup after starting Tailscale or pass --public-url");
     } else if payload.url.starts_with("http://") {
@@ -1462,6 +1522,7 @@ fn stop_background_inner(verbose: bool) -> anyhow::Result<()> {
 }
 
 async fn run(config_path: Option<String>) -> anyhow::Result<()> {
+    ensure_pairing_transport_key()?;
     let config = load_config(config_path)?;
     let addr: SocketAddr = config
         .listen
@@ -1618,6 +1679,10 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         )
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .layer(middleware::from_fn_with_state(
+            state.clone(),
+            encrypted_transport,
+        ))
+        .layer(middleware::from_fn_with_state(
             known_hosts(&state.config),
             known_host,
         ))
@@ -1641,6 +1706,286 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
 async fn request_locale(request: Request<Body>, next: Next) -> Response {
     let locale = Locale::from_headers(request.headers());
     i18n::scope(locale, next.run(request)).await
+}
+
+const TRANSPORT_HEADER: &str = "x-muqun-transport";
+const TRANSPORT_DEVICE_HEADER: &str = "x-muqun-device";
+const TRANSPORT_ENVELOPE_HEADER: &str = "x-muqun-envelope";
+const TRANSPORT_PROOF_HEADER: &str = "x-muqun-internal-device-proof";
+
+#[derive(Serialize, Deserialize)]
+struct EncryptedRequestPayload {
+    token: String,
+    #[serde(default)]
+    content_type: Option<String>,
+    body: String,
+}
+
+#[derive(Serialize)]
+struct EncryptedResponsePayload {
+    status: u16,
+    headers: BTreeMap<String, String>,
+    body: String,
+}
+
+/// Decrypt an authenticated request before Axum extractors see it, then seal
+/// the complete response. Route names and byte counts remain HTTP metadata;
+/// credentials and application payloads do not.
+async fn encrypted_transport(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    if request
+        .headers()
+        .get(TRANSPORT_HEADER)
+        .and_then(|value| value.to_str().ok())
+        != Some("1")
+    {
+        return next.run(request).await;
+    }
+
+    match decrypt_transport_request(&state, request).await {
+        Ok((request, material, aad, request_nonce)) => {
+            let response = next.run(request).await;
+            encrypt_transport_response(response, &material, &aad, &request_nonce).await
+        }
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn decrypt_transport_request(
+    state: &AppState,
+    request: Request<Body>,
+) -> ApiResult<(Request<Body>, Vec<u8>, String, String)> {
+    let (mut parts, body) = request.into_parts();
+    let device_id = parts
+        .headers
+        .get(TRANSPORT_DEVICE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| value.len() <= 80)
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::UNAUTHORIZED,
+                "missing_transport_device",
+                "missing encrypted transport device",
+            )
+        })?;
+    let (token_hash, transport_key) = {
+        let devices = lock_devices(state)?;
+        let device = devices
+            .iter()
+            .find(|device| device.id == device_id)
+            .ok_or_else(|| api_error(StatusCode::FORBIDDEN, "invalid_token", "invalid token"))?;
+        let transport_key = device.transport_key.clone().ok_or_else(|| {
+            api_error(
+                StatusCode::UPGRADE_REQUIRED,
+                "device_repair_required",
+                "pair this device again to enable encrypted transport",
+            )
+        })?;
+        (device.token_hash.clone(), transport_key)
+    };
+    let material = transport::decode_key(&transport_key).map_err(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "transport_key_unavailable",
+            "encrypted transport is unavailable",
+        )
+    })?;
+    let aad = format!(
+        "{} {}",
+        parts.method,
+        parts
+            .uri
+            .path_and_query()
+            .map_or(parts.uri.path(), |value| value.as_str())
+    );
+    let body_bytes = to_bytes(body, MAX_UPLOAD_BYTES + MAX_REQUEST_BODY_BYTES)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_envelope",
+                "invalid encrypted request",
+            )
+        })?;
+    let envelope_bytes = match parts.headers.get(TRANSPORT_ENVELOPE_HEADER) {
+        Some(value) => transport::decode_key(value.to_str().unwrap_or_default()).map_err(|_| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_envelope",
+                "invalid encrypted request",
+            )
+        })?,
+        None => body_bytes.to_vec(),
+    };
+    let envelope: transport::Envelope = serde_json::from_slice(&envelope_bytes).map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_envelope",
+            "invalid encrypted request",
+        )
+    })?;
+    let plaintext = transport::open(
+        &material,
+        transport::Direction::Request,
+        aad.as_bytes(),
+        &envelope,
+        now_unix_ms(),
+    )
+    .map_err(|_| {
+        api_error(
+            StatusCode::FORBIDDEN,
+            "invalid_envelope",
+            "invalid encrypted request",
+        )
+    })?;
+    let payload: EncryptedRequestPayload = serde_json::from_slice(&plaintext).map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "invalid request",
+        )
+    })?;
+    if hash_token(&payload.token) != token_hash {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "invalid_token",
+            "invalid token",
+        ));
+    }
+    // Only authenticated envelopes enter the replay cache. Otherwise anyone
+    // who knows a device id could fill it with arbitrary nonces.
+    remember_transport_nonce(device_id, &envelope)?;
+    let body = transport::decode_key(&payload.body).map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "invalid request",
+        )
+    })?;
+    parts.headers.remove(TRANSPORT_HEADER);
+    parts.headers.remove(TRANSPORT_DEVICE_HEADER);
+    parts.headers.remove(TRANSPORT_ENVELOPE_HEADER);
+    parts.headers.insert(
+        axum::http::HeaderName::from_static(TRANSPORT_PROOF_HEADER),
+        HeaderValue::from_str(&transport_key).map_err(|_| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "transport_key_unavailable",
+                "encrypted transport is unavailable",
+            )
+        })?,
+    );
+    parts.headers.insert(
+        axum::http::header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {}", payload.token))
+            .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid_token", "invalid token"))?,
+    );
+    if let Some(content_type) = payload.content_type {
+        parts.headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_str(&content_type).map_err(|_| {
+                api_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_content_type",
+                    "invalid content type",
+                )
+            })?,
+        );
+    } else {
+        parts.headers.remove(axum::http::header::CONTENT_TYPE);
+    }
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    Ok((
+        Request::from_parts(parts, Body::from(body)),
+        material,
+        aad,
+        envelope.nonce,
+    ))
+}
+
+fn remember_transport_nonce(device_id: &str, envelope: &transport::Envelope) -> ApiResult<()> {
+    use std::sync::OnceLock;
+    static SEEN: OnceLock<Mutex<HashMap<String, u128>>> = OnceLock::new();
+    let mut seen = SEEN
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|_| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "replay_cache_failed",
+                "request failed",
+            )
+        })?;
+    let now = now_unix_ms();
+    seen.retain(|_, timestamp| now.abs_diff(*timestamp) <= transport::MAX_CLOCK_SKEW_MS);
+    let key = format!("{device_id}:{}", envelope.nonce);
+    if seen.insert(key, envelope.timestamp_ms).is_some() {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "replayed_request",
+            "request was already used",
+        ));
+    }
+    Ok(())
+}
+
+async fn encrypt_transport_response(
+    response: Response,
+    material: &[u8],
+    aad: &str,
+    request_nonce: &str,
+) -> Response {
+    let (parts, body) = response.into_parts();
+    let body = match to_bytes(body, MAX_UPLOAD_BYTES + MAX_REQUEST_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(_) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "response_too_large",
+                "failed to encrypt response",
+            )
+            .into_response()
+        }
+    };
+    let headers = parts
+        .headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_owned(), value.to_owned()))
+        })
+        .collect();
+    let payload = EncryptedResponsePayload {
+        status: parts.status.as_u16(),
+        headers,
+        body: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(body),
+    };
+    let plaintext = match serde_json::to_vec(&payload) {
+        Ok(value) => value,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let response_aad = format!("{aad}\n{request_nonce}");
+    let envelope = match transport::seal(
+        material,
+        transport::Direction::Response,
+        response_aad.as_bytes(),
+        &plaintext,
+        now_unix_ms(),
+    ) {
+        Ok(value) => value,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let mut response = Json(envelope).into_response();
+    response.headers_mut().insert(
+        axum::http::HeaderName::from_static(TRANSPORT_HEADER),
+        HeaderValue::from_static("1"),
+    );
+    response
 }
 
 /// Refuse a request that arrived under a name this gateway does not answer to.
@@ -1784,8 +2129,14 @@ async fn openapi_json() -> Json<Value> {
 
 async fn pair_request(
     State(state): State<AppState>,
-    Json(body): Json<PairRequestBody>,
-) -> ApiResult<Json<Value>> {
+    Json(wire): Json<Value>,
+) -> ApiResult<Response> {
+    let (body, request_nonce) = decode_pairing_body::<PairRequestBody>(
+        wire,
+        b"POST /api/pair/request",
+        transport::Direction::PairingRequest,
+    )?;
+    require_pairing_transport(state.config.transport_encryption, request_nonce.is_some())?;
     if !valid_request_id(&body.request_id) {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
@@ -1819,7 +2170,11 @@ async fn pair_request(
     if let Some(pending) = pending_pairing.as_ref() {
         if !authority::pairing_code_expired(pending, now, PAIRING_CODE_TTL_MS) {
             if pending.request_id == body.request_id {
-                return Ok(Json(pair_request_response(&state.config, &body.request_id)));
+                return pairing_response(
+                    pair_request_response(&state.config, &body.request_id),
+                    b"POST /api/pair/request",
+                    request_nonce.as_deref(),
+                );
             }
             return Err(api_error(
                 StatusCode::CONFLICT,
@@ -1847,7 +2202,11 @@ async fn pair_request(
         failed_attempts: 0,
     };
     *pending_pairing = Some(pending);
-    Ok(Json(pair_request_response(&state.config, &body.request_id)))
+    pairing_response(
+        pair_request_response(&state.config, &body.request_id),
+        b"POST /api/pair/request",
+        request_nonce.as_deref(),
+    )
 }
 
 fn record_pairing_request(state: &AppState, now_unix_ms: u128) -> ApiResult<()> {
@@ -1875,10 +2234,13 @@ fn record_pairing_request(state: &AppState, now_unix_ms: u128) -> ApiResult<()> 
     Ok(())
 }
 
-async fn pair_claim(
-    State(state): State<AppState>,
-    Json(body): Json<PairClaimBody>,
-) -> ApiResult<Json<Value>> {
+async fn pair_claim(State(state): State<AppState>, Json(wire): Json<Value>) -> ApiResult<Response> {
+    let (body, request_nonce) = decode_pairing_body::<PairClaimBody>(
+        wire,
+        b"POST /api/pair/claim",
+        transport::Direction::PairingRequest,
+    )?;
+    require_pairing_transport(state.config.transport_encryption, request_nonce.is_some())?;
     let (device_name, install_id) = {
         let mut pending = state.pending_pairing.lock().map_err(|_| {
             api_error(
@@ -1924,14 +2286,19 @@ async fn pair_claim(
     // Each device gets its own token so it can be revoked without disturbing
     // the others. The admin token in pairing.json is never handed out.
     let token = generate_token();
+    let device_transport_key = (state.config.transport_encryption
+        == TransportEncryptionMode::Required)
+        .then(generate_token);
     let record = DeviceRecord {
         id: uuid::Uuid::new_v4().to_string(),
         name: device_name,
         token_hash: hash_token(&token),
+        transport_key: device_transport_key.clone(),
         paired_unix_ms: now_unix_ms(),
         last_seen_unix_ms: now_unix_ms(),
         install_id: install_id.clone(),
     };
+    let device_id = record.id.clone();
     {
         let mut devices = lock_devices(&state)?;
         authority::enroll_device(&mut devices, record, MAX_DEVICES);
@@ -1945,13 +2312,144 @@ async fn pair_claim(
         })?;
     }
 
-    Ok(Json(json!({
+    let mut response_payload = json!({
         "kind": "herdr-gateway",
         "server_id": state.config.server_id,
         "label": state.config.label,
         "url": state.config.public_url,
-        "token": token
-    })))
+        "token": token,
+        "device_id": device_id
+    });
+    if let Some(device_transport_key) = device_transport_key {
+        response_payload["transport_key"] = Value::String(device_transport_key);
+        response_payload["transport"] = Value::String("muqun-aes-256-gcm-v1".into());
+    }
+    let response = pairing_response(
+        response_payload,
+        b"POST /api/pair/claim",
+        request_nonce.as_deref(),
+    )?;
+    if request_nonce.is_some() {
+        if let Err(err) = rotate_pairing_transport_key() {
+            // The device is already enrolled and the response is already sealed
+            // with the scanned key. Do not strand it by discarding that response.
+            // The manager will generate a fresh key on the next successful write.
+            eprintln!("warning: failed to rotate pairing transport key: {err:#}");
+        }
+    }
+    Ok(response)
+}
+
+fn pairing_transport_material() -> ApiResult<Vec<u8>> {
+    let pairing = read_pairing_file().map_err(|err| {
+        eprintln!("failed to read pairing transport key: {err:#}");
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "pairing_transport_unavailable",
+            "encrypted pairing is unavailable",
+        )
+    })?;
+    transport::decode_key(&pairing.payload.transport_key).map_err(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "pairing_transport_unavailable",
+            "encrypted pairing is unavailable",
+        )
+    })
+}
+
+fn require_pairing_transport(mode: TransportEncryptionMode, encrypted: bool) -> ApiResult<()> {
+    match (mode, encrypted) {
+        (TransportEncryptionMode::Required, false) => Err(api_error(
+            StatusCode::UPGRADE_REQUIRED,
+            "encrypted_pairing_required",
+            "scan the Gateway QR with a Muqun version that supports encrypted pairing",
+        )),
+        (TransportEncryptionMode::Disabled, true) => Err(api_error(
+            StatusCode::CONFLICT,
+            "encrypted_pairing_disabled",
+            "transport encryption is disabled on this gateway; scan its current QR code",
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn decode_pairing_body<T: serde::de::DeserializeOwned>(
+    wire: Value,
+    aad: &[u8],
+    direction: transport::Direction,
+) -> ApiResult<(T, Option<String>)> {
+    if wire.get("version").is_none() {
+        return serde_json::from_value(wire)
+            .map(|body| (body, None))
+            .map_err(|_| {
+                api_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "invalid request",
+                )
+            });
+    }
+    let envelope: transport::Envelope = serde_json::from_value(wire).map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_envelope",
+            "invalid encrypted request",
+        )
+    })?;
+    let plaintext = transport::open(
+        &pairing_transport_material()?,
+        direction,
+        aad,
+        &envelope,
+        now_unix_ms(),
+    )
+    .map_err(|_| {
+        api_error(
+            StatusCode::FORBIDDEN,
+            "invalid_envelope",
+            "invalid encrypted request",
+        )
+    })?;
+    let nonce = envelope.nonce;
+    serde_json::from_slice(&plaintext)
+        .map(|body| (body, Some(nonce)))
+        .map_err(|_| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "invalid request",
+            )
+        })
+}
+
+fn pairing_response(value: Value, aad: &[u8], request_nonce: Option<&str>) -> ApiResult<Response> {
+    let Some(request_nonce) = request_nonce else {
+        return Ok(Json(value).into_response());
+    };
+    let plaintext = serde_json::to_vec(&value).map_err(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "response_encoding_failed",
+            "failed to encode response",
+        )
+    })?;
+    let response_aad = [aad, b"\n", request_nonce.as_bytes()].concat();
+    let envelope = transport::seal(
+        &pairing_transport_material()?,
+        transport::Direction::PairingResponse,
+        &response_aad,
+        &plaintext,
+        now_unix_ms(),
+    )
+    .map_err(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "response_encryption_failed",
+            "failed to encrypt response",
+        )
+    })?;
+    Ok(Json(envelope).into_response())
 }
 
 fn pair_request_response(config: &Config, request_id: &str) -> Value {
@@ -2141,6 +2639,10 @@ fn status() -> anyhow::Result<()> {
     println!("label: {}", config.label);
     println!("listen: {}", config.listen);
     println!("public_url: {}", config.public_url);
+    println!(
+        "transport_encryption: {}",
+        config.transport_encryption.as_str()
+    );
     for session in config.sessions {
         let endpoint = backend_endpoint(&session);
         println!(
@@ -2158,6 +2660,7 @@ fn status() -> anyhow::Result<()> {
 }
 
 fn manage() -> anyhow::Result<()> {
+    ensure_pairing_transport_key()?;
     let _terminal = TerminalModeGuard::enter()?;
     let mut message = auto_upgrade_local_public_url()?.unwrap_or_else(|| String::from("ready"));
     let mut pending_pairing = fetch_pending_pairing().ok().flatten();
@@ -2250,6 +2753,10 @@ fn manage() -> anyhow::Result<()> {
                 update_public_url(&selection.url)?;
                 message = format!("auto url: {}", truncate(&selection.url, 36));
             }
+            "e" | "encryption" => {
+                message = toggle_transport_encryption()?;
+                show_qr = true;
+            }
             "h" | "herdr" => {
                 message = enable_managed_backend(BackendKind::Herdr)?;
             }
@@ -2296,6 +2803,26 @@ fn enable_managed_backend(backend: BackendKind) -> anyhow::Result<String> {
     let id = upsert_backend_session(&mut config, backend, None, None, None)?;
     write_config(&path, &config)?;
     Ok(format!("added {id}; restart gateway to apply"))
+}
+
+fn toggle_transport_encryption() -> anyhow::Result<String> {
+    let path = config_dir()?.join(CONFIG_FILE);
+    let mut config = load_config(None)?;
+    config.transport_encryption = match config.transport_encryption {
+        TransportEncryptionMode::Required => TransportEncryptionMode::Disabled,
+        TransportEncryptionMode::Disabled => TransportEncryptionMode::Required,
+    };
+    let mode = config.transport_encryption;
+    write_config(&path, &config)?;
+    let warning = if mode == TransportEncryptionMode::Disabled {
+        "; warning: leaked bearer tokens can call the API"
+    } else {
+        ""
+    };
+    Ok(format!(
+        "encryption {}{warning}; restart gateway to apply",
+        mode.as_str()
+    ))
 }
 
 fn remove_managed_backend(id: &str) -> anyhow::Result<String> {
@@ -2629,7 +3156,8 @@ fn print_manage_screen(
         String::from(""),
         String::from("keys   : [s] start  [t] stop  [p] pair  [x] revoke"),
         String::from("         [h] Herdr  [m] tmux  [f] default backend"),
-        String::from("         [d] remove [u] url   [a] auto  [r] refresh  [q] close"),
+        String::from("         [d] remove [u] url   [a] auto  [e] encryption"),
+        String::from("         [r] refresh [q] close"),
         format!("server : {server}"),
         format!("status : {status}"),
     ];
@@ -2637,6 +3165,16 @@ fn print_manage_screen(
     push_wrapped_field(&mut lines, "message", message, 64);
     lines.push(String::new());
     if let Some(config) = &config {
+        lines.push(format!(
+            "encryption: {}{}",
+            config.transport_encryption.as_str(),
+            if config.transport_encryption == TransportEncryptionMode::Disabled {
+                " (token-only; unsafe on public HTTP)"
+            } else {
+                ""
+            }
+        ));
+        lines.push(String::new());
         lines.push(format!("Terminal backends ({})", config.sessions.len()));
         for (index, session) in config.sessions.iter().enumerate() {
             let endpoint = backend_endpoint(session);
@@ -2700,6 +3238,7 @@ fn print_manage_screen(
             String::from("[x] revoke [r] refresh [q] close"),
             String::from("[h] Herdr  [m] tmux  [f] default"),
             String::from("[d] remove [u] URL   [a] auto"),
+            format!("[e] encryption: {}", config.transport_encryption.as_str()),
             String::from(""),
             format!("server: {}", truncate(&server, 26)),
             format!("status: {}", truncate(&status, 25)),
@@ -2723,7 +3262,12 @@ fn print_manage_screen(
         // Config is authoritative for the advertised URL and server id. Older
         // pairing files can retain a stale URL even though their admin token is
         // still valid; rendering from that file made `p` show the wrong server.
-        let encoded = pairing_qr_offer(&config.public_url, &config.server_id);
+        let encoded = pairing_qr_offer(
+            &config.public_url,
+            &config.server_id,
+            (config.transport_encryption == TransportEncryptionMode::Required)
+                .then_some(pairing.payload.transport_key.as_str()),
+        );
         let code = QrCode::with_error_correction_level(encoded.as_bytes(), EcLevel::L)?;
         let image = render_qr(&code);
         for line in image.lines() {
@@ -3048,12 +3592,17 @@ fn listen_for_explicit_public_url(public_url: &str, port: u16) -> String {
     }
 }
 
-fn pairing_qr_offer(url: &str, server_id: &str) -> String {
-    format!(
+fn pairing_qr_offer(url: &str, server_id: &str, transport_key: Option<&str>) -> String {
+    let mut offer = format!(
         "muqun://pair?u={}&s={}",
         url_component(url),
         url_component(server_id)
-    )
+    );
+    if let Some(transport_key) = transport_key {
+        offer.push_str("&k=");
+        offer.push_str(&url_component(transport_key));
+    }
+    offer
 }
 
 fn url_component(value: &str) -> String {
@@ -7911,6 +8460,23 @@ fn require_device(state: &AppState, headers: &HeaderMap) -> ApiResult<String> {
             "invalid token",
         ));
     };
+    if let Some(transport_key) = devices
+        .iter()
+        .find(|device| device.id == device_id)
+        .and_then(|device| device.transport_key.as_deref())
+    {
+        let proof = headers
+            .get(TRANSPORT_PROOF_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        if !authority::authenticates_admin(&hash_token(transport_key), proof) {
+            return Err(api_error(
+                StatusCode::FORBIDDEN,
+                "device_proof_required",
+                "encrypted device proof is required",
+            ));
+        }
+    }
     if authority::touch_device(
         &mut devices,
         &device_id,
@@ -8332,6 +8898,23 @@ fn read_pid() -> anyhow::Result<Option<u32>> {
 fn read_pairing_file() -> anyhow::Result<PairingFile> {
     let bytes = std::fs::read(config_dir()?.join(PAIRING_FILE))?;
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn ensure_pairing_transport_key() -> anyhow::Result<()> {
+    let path = config_dir()?.join(PAIRING_FILE);
+    let mut pairing: PairingFile = serde_json::from_slice(&std::fs::read(&path)?)?;
+    if transport::decode_key(&pairing.payload.transport_key).is_ok_and(|key| key.len() == 32) {
+        return Ok(());
+    }
+    pairing.payload.transport_key = generate_token();
+    write_secret_file(&path, &serde_json::to_vec_pretty(&pairing)?)
+}
+
+fn rotate_pairing_transport_key() -> anyhow::Result<()> {
+    let path = config_dir()?.join(PAIRING_FILE);
+    let mut pairing: PairingFile = serde_json::from_slice(&std::fs::read(&path)?)?;
+    pairing.payload.transport_key = generate_token();
+    write_secret_file(&path, &serde_json::to_vec_pretty(&pairing)?)
 }
 
 fn remove_pid_file() -> anyhow::Result<()> {
@@ -9536,6 +10119,7 @@ mod tests {
             listen: "127.0.0.1:23100".into(),
             public_url: "http://127.0.0.1:23100".into(),
             token_hash: hash_token(token),
+            transport_encryption: TransportEncryptionMode::Required,
             sessions: vec![SessionConfig {
                 id: "default".into(),
                 label: "Default".into(),
@@ -9552,6 +10136,7 @@ mod tests {
             id: id.into(),
             name: format!("device {id}"),
             token_hash: hash_token(token),
+            transport_key: None,
             paired_unix_ms: 1_000,
             // Fresh enough that require_device will not flush to disk.
             last_seen_unix_ms: now_unix_ms(),
@@ -9580,6 +10165,60 @@ mod tests {
             HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
         );
         headers
+    }
+
+    fn encrypted_test_request(device_id: &str, material: &[u8], token: &str) -> Request<Body> {
+        let payload = EncryptedRequestPayload {
+            token: token.into(),
+            content_type: Some("application/json".into()),
+            body: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"ok":true}"#),
+        };
+        let envelope = transport::seal(
+            material,
+            transport::Direction::Request,
+            b"POST /api/test",
+            &serde_json::to_vec(&payload).unwrap(),
+            now_unix_ms(),
+        )
+        .unwrap();
+        Request::builder()
+            .method("POST")
+            .uri("/api/test")
+            .header(TRANSPORT_HEADER, "1")
+            .header(TRANSPORT_DEVICE_HEADER, device_id)
+            .body(Body::from(serde_json::to_vec(&envelope).unwrap()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_stolen_bearer_token_is_not_a_device_transport_credential() {
+        let token = "device-token";
+        let transport_key = generate_token();
+        let material = transport::decode_key(&transport_key).unwrap();
+        let mut device = test_device("phone-1", token);
+        device.transport_key = Some(transport_key);
+        let state = test_state("admin-token", vec![device]);
+        assert!(require_device(&state, &bearer_headers(token)).is_err());
+
+        let stolen_token_material = base64::engine::general_purpose::STANDARD
+            .decode(hash_token(token))
+            .unwrap();
+        let rejected = decrypt_transport_request(
+            &state,
+            encrypted_test_request("phone-1", &stolen_token_material, token),
+        )
+        .await;
+        assert!(rejected.is_err());
+
+        let (request, _, _, _) =
+            decrypt_transport_request(&state, encrypted_test_request("phone-1", &material, token))
+                .await
+                .unwrap();
+        assert_eq!(bearer_token(request.headers()).unwrap(), token);
+        assert_eq!(
+            require_device(&state, request.headers()).unwrap(),
+            "phone-1"
+        );
     }
 
     /// A paired device's headers with the app's locale header on them, which is
@@ -10273,6 +10912,7 @@ mod tests {
             label: "machine".into(),
             url: "http://100.1.2.3:23100".into(),
             token: "secret".into(),
+            transport_key: "transport-secret".into(),
         };
         let value: Value = serde_json::from_str(&serde_json::to_string(&payload).unwrap()).unwrap();
         assert_eq!(value["kind"], "herdr-gateway");
@@ -10283,9 +10923,21 @@ mod tests {
     #[test]
     fn manager_qr_uses_the_current_config_fields() {
         assert_eq!(
-            pairing_qr_offer("http://100.1.2.3:23847", "server-1"),
+            pairing_qr_offer("http://100.1.2.3:23847", "server-1", Some("key_1")),
+            "muqun://pair?u=http%3A%2F%2F100.1.2.3%3A23847&s=server-1&k=key_1"
+        );
+        assert_eq!(
+            pairing_qr_offer("http://100.1.2.3:23847", "server-1", None),
             "muqun://pair?u=http%3A%2F%2F100.1.2.3%3A23847&s=server-1"
         );
+    }
+
+    #[test]
+    fn pairing_transport_policy_has_no_implicit_downgrade() {
+        assert!(require_pairing_transport(TransportEncryptionMode::Required, true).is_ok());
+        assert!(require_pairing_transport(TransportEncryptionMode::Required, false).is_err());
+        assert!(require_pairing_transport(TransportEncryptionMode::Disabled, false).is_ok());
+        assert!(require_pairing_transport(TransportEncryptionMode::Disabled, true).is_err());
     }
 
     #[test]
@@ -11982,6 +12634,7 @@ mod tests {
                 label: config.label.clone(),
                 url: config.public_url.clone(),
                 token: "admin-token".into(),
+                transport_key: "transport-key".into(),
             },
         };
         std::fs::write(dir.join(CONFIG_FILE), serde_json::to_vec(&config).unwrap()).unwrap();
@@ -12043,6 +12696,7 @@ mod tests {
                 label: plugin.label.clone(),
                 url: plugin.public_url.clone(),
                 token: "plugin-token".into(),
+                transport_key: "plugin-transport-key".into(),
             },
         };
         write_config(&source_config_dir.join(CONFIG_FILE), &plugin).unwrap();
@@ -12067,6 +12721,7 @@ mod tests {
                 label: standalone.label.clone(),
                 url: standalone.public_url.clone(),
                 token: "tmux-token".into(),
+                transport_key: "tmux-transport-key".into(),
             },
         };
         write_config(&target_config_dir.join(CONFIG_FILE), &standalone).unwrap();

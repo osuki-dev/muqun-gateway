@@ -2,7 +2,7 @@
 
 Rust terminal-backend gateway and Herdr plugin for Muqun.
 
-The gateway exposes one token-protected HTTP API for reading and controlling
+The gateway exposes one device-authenticated HTTP API for reading and controlling
 workspaces, tabs, panes, agents, and pane output. One process can talk to both
 Herdr's socket API and a local tmux server at the same time. The HTTP contract
 stays the same, so the
@@ -176,14 +176,27 @@ herdr plugin uninstall herdr.gateway
 
 ## Pairing
 
-The manager panel displays a QR code for Muqun. The QR code contains only the
-gateway URL and server ID:
+The manager panel displays a QR code for Muqun. With the default encrypted
+transport it contains the gateway URL, server ID, and a pairing-only bootstrap
+secret:
 
 ```text
-muqun://pair?u=<gateway_url>&s=<server_id>
+muqun://pair?u=<gateway_url>&s=<server_id>&k=<pairing_bootstrap_key>
 ```
 
-It does not contain the bearer token.
+It never contains a bearer token or a device transport key. The bootstrap key
+is rotated after a successful encrypted pairing.
+
+Transport encryption is `required` by default. It can be selected during setup
+or toggled with `e` in the manager (restart the gateway after toggling):
+
+```sh
+herdr-gateway setup --backend tmux --transport-encryption required
+herdr-gateway setup --backend tmux --transport-encryption disabled
+```
+
+`disabled` is token-only compatibility mode. Its QR omits `k`; anyone who gets
+the device bearer token can call the API, so do not use it on public HTTP.
 
 The gateway URL is configurable. During `setup`, Herdr Gateway chooses a default
 URL in this order:
@@ -224,7 +237,9 @@ Pairing flow:
 2. Muqun sends a pairing request with a request ID and device name.
 3. The manager panel hides the QR code and shows the device name plus a short confirmation code.
 4. Enter the confirmation code in Muqun.
-5. Muqun claims the pairing request and receives a token minted for that device.
+5. Muqun claims the pairing request. In `required` mode it receives both a
+   device token and a separate device transport key; neither is issued before
+   the confirmation code is successfully consumed.
 
 Pending pairing state is held in gateway process memory and is not written to
 disk.
@@ -232,13 +247,15 @@ disk.
 ## Devices and revocation
 
 Every successful pairing mints a token belonging to that one device, stored
-hashed in `devices.json`. Revoking a device cuts off only that device; the
-others keep working.
+hashed in `devices.json`. In `required` mode it also stores a per-device
+transport key. Revoking a device cuts off only that device; the others keep
+working.
 
 There are two kinds of credential, and they are not interchangeable:
 
-- **Device tokens** are the only thing that authorises a control route. They
-  exist on the paired device and are stored hashed on the server.
+- **Device tokens** identify an enrolled credential and are stored hashed on
+  the server. For encrypted devices they are insufficient without the matching
+  device id and transport key; in `disabled` mode they remain bearer tokens.
 - **The admin token** in `pairing.json` belongs to the local manager panel and
   authorises only pending-pairing reads and device revocation. It is never
   handed out to a device. Because it sits in plaintext on disk, it deliberately
@@ -267,11 +284,15 @@ GET /docs
 GET /openapi.json
 ```
 
-Control routes require a paired device's bearer token:
+In `disabled` compatibility mode, control routes use a bearer token:
 
 ```http
 Authorization: Bearer <device_token>
 ```
+
+In the default `required` mode, Muqun instead sends an AES-GCM envelope bound
+to the device id; the token is inside the authenticated ciphertext and is never
+sent as an HTTP bearer credential.
 
 `POST /api/pair/request` and `POST /api/pair/claim` are unauthenticated, since
 that is how a device gets its token. `GET /api/pair/pending` takes the admin
@@ -707,9 +728,10 @@ and eight failed attempts invalidate the pending code.
 Security defaults:
 
 - No raw Herdr API proxy is exposed.
-- Control routes require a paired device's bearer token.
+- Encrypted control routes require the paired device id, transport key, and
+  token; possession of the token alone is rejected.
 - The admin token cannot reach a control route, only the pending-pairing read.
-- QR pairing does not expose any token.
+- QR pairing exposes no bearer or device key; its bootstrap key is pairing-only.
 - Each device gets its own token and can be revoked on its own.
 - Token verification uses a constant-time hash comparison against every candidate.
 - Device names are rejected if they contain control characters, so a pairing request cannot forge the manager panel with terminal escapes.
@@ -745,19 +767,18 @@ Security defaults:
   oversized request is refused while it streams rather than after it is read.
 - Uploads are swept at startup and every hour, and deleted after 48 hours.
 
-Prefer Tailscale Serve HTTPS whenever it is available. Direct HTTP over a
-Tailscale IP remains supported for user-managed private networks, but HTTP does
-not provide transport encryption by itself; the security of that connection
-depends on the tailnet and its access controls.
+Prefer Tailscale Serve HTTPS whenever it is available. The default application
+transport additionally encrypts pairing and API payloads with AES-256-GCM,
+derives separate request and response keys, and rejects reused authenticated
+request nonces. Muqun keeps the per-device material in its encrypted secure
+storage record. HTTP metadata such as routes, query strings, sizes, timing, and
+device id remains visible, and endpoint compromise is out of scope; application
+encryption is defense in depth, not a replacement for HTTPS, WireGuard, or
+Tailscale ACLs.
 
-Muqun encrypts gateway credentials at rest with AES-256-GCM and keeps the key in
-the operating system's secure storage. No additional custom encryption is
-needed inside the API when the connection uses HTTPS or Tailscale's WireGuard
-transport. Custom payload crypto would duplicate those layers without fixing
-bearer-token replay. Plain HTTP on an ordinary Wi-Fi or LAN is not safe: anyone
-able to observe it can copy a device token and gain the same terminal access as
-that device. Treat a device token like an SSH credential and prefer Tailscale
-Serve HTTPS for normal deployments.
+When `transport_encryption` is `disabled`, plain HTTP exposes both payloads and
+bearer credentials to observers. Treat that mode as an explicit compatibility
+choice only.
 
 ## Publishing
 

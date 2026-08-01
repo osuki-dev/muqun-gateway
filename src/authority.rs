@@ -37,6 +37,10 @@ pub struct DeviceRecord {
     pub id: String,
     pub name: String,
     pub token_hash: String,
+    /// Independent AEAD key. A leaked bearer token alone cannot construct an
+    /// encrypted request for this device.
+    #[serde(default)]
+    pub transport_key: Option<String>,
     pub paired_unix_ms: u128,
     #[serde(default)]
     pub last_seen_unix_ms: u128,
@@ -163,6 +167,7 @@ mod tests {
             id: id.into(),
             name: id.into(),
             token_hash: hash_token(token),
+            transport_key: None,
             paired_unix_ms: 1,
             last_seen_unix_ms: 1,
             install_id: install_id.map(str::to_owned),
