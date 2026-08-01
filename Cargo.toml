@@ -3,10 +3,10 @@ name = "herdr-gateway"
 version = "0.5.0"
 edition = "2021"
 license = "MIT"
-description = "Token-protected mobile gateway for Herdr, the terminal workspace manager for AI coding agents."
+description = "Token-protected mobile gateway for Herdr and tmux terminal workspaces."
 repository = "https://github.com/osuki-dev/herdr-gateway"
 readme = "README.md"
-keywords = ["herdr", "terminal", "gateway", "tailscale", "cli"]
+keywords = ["terminal", "gateway", "tmux", "herdr", "tailscale"]
 categories = ["command-line-utilities"]
 
 [dependencies]
@@ -26,6 +26,6 @@ reqwest = { version = "0.12.24", default-features = false, features = ["json", "
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sha2 = "0.10.9"
-tokio = { version = "1.53.0", features = ["fs", "macros", "net", "rt-multi-thread", "io-util", "sync", "time"] }
+tokio = { version = "1.53.0", features = ["fs", "macros", "net", "process", "rt-multi-thread", "io-util", "sync", "time"] }
 tokio-stream = "0.1.18"
 uuid = { version = "1.24.0", features = ["v4"] }

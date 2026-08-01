@@ -1,8 +1,8 @@
 id = "herdr.gateway"
-name = "Herdr Gateway"
+name = "Muqun Gateway (Herdr integration)"
 version = "0.5.0"
 min_herdr_version = "0.7.5"
-description = "Expose a token-protected mobile gateway API for Herdr."
+description = "Run Muqun's token-protected terminal gateway with Herdr and tmux backends."
 platforms = ["linux", "macos"]
 
 # Downloads a prebuilt binary for this OS/arch (no Rust needed), and only
@@ -39,7 +39,7 @@ id = "manage"
 title = "Gateway Manager"
 placement = "popup"
 width = 92
-height = 34
+height = 40
 command = ["./target/release/herdr-gateway", "manage"]
 
 [[panes]]

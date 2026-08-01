@@ -591,6 +591,7 @@ impl ScrollbackStore {
     /// What the observation rule alone says about this pane, with the feature
     /// switch left out of it. The switch is a shipping decision; the rule is
     /// the thing the tests are about.
+    #[cfg(test)]
     pub fn observed_as_kept(&self, session_id: &str, pane_id: &str) -> bool {
         self.kept
             .get(&pane_key(session_id, pane_id))
@@ -1035,7 +1036,6 @@ mod tests {
             .any(|line| line.starts_with("line 319 of round 7")));
     }
 
-    use super::*;
     use serde_json::json;
 
     fn screen(rows: &[&str]) -> String {

@@ -8,6 +8,7 @@ use std::process::{Command as ProcessCommand, Stdio};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path as FsPath, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -22,7 +23,7 @@ use axum::response::{Html, IntoResponse as _, Response};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use base64::Engine as _;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use crossterm::cursor::MoveTo;
 use crossterm::event::{
     poll as poll_event, read as read_event, Event as TerminalEvent, KeyCode, KeyEventKind,
@@ -41,6 +42,7 @@ use tokio_stream::Stream;
 
 mod agent_events;
 mod approvals;
+mod backend;
 mod composer;
 mod i18n;
 mod native;
@@ -50,6 +52,13 @@ mod shortcuts;
 mod tasks;
 
 use crate::i18n::Locale;
+use backend::{
+    BackendError, BackendKind, CreateTab as BackendCreateTab,
+    CreateWorkspace as BackendCreateWorkspace, HerdrBackend, OutputFormat as BackendOutputFormat,
+    OutputSource as BackendOutputSource, PaneId as BackendPaneId, ReadPane as BackendReadPane,
+    SplitDirection as BackendSplitDirection, SplitPane as BackendSplitPane, TabId as BackendTabId,
+    TerminalBackend, TmuxBackend, WorkspaceId as BackendWorkspaceId,
+};
 
 #[cfg(unix)]
 use tokio::net::UnixStream;
@@ -60,6 +69,7 @@ const PUSH_TOKENS_FILE: &str = "push-tokens.json";
 const DEVICES_FILE: &str = "devices.json";
 const PID_FILE: &str = "gateway.pid";
 const LOG_FILE: &str = "gateway.log";
+const HERDR_PLUGIN_IMPORT_MARKER: &str = ".herdr-plugin-imported";
 // Deliberately outside the common-service range and outside the OS ephemeral
 // ranges (Linux 32768-60999, macOS 49152-65535) so setup rarely collides.
 const DEFAULT_PORT: u16 = 23847;
@@ -155,7 +165,7 @@ const MANAGE_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 /// every pane or sending unchanged terminal frames over the network.
 const STREAM_OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(150);
 const STREAM_OUTPUT_READ_TIMEOUT: Duration = Duration::from_millis(100);
-const GATEWAY_API_VERSION: &str = "1.5.0";
+const GATEWAY_API_VERSION: &str = "1.7.0";
 const GATEWAY_API_MAJOR: u64 = 1;
 const HERDR_PROTOCOL_MIN: u64 = 17;
 const HERDR_PROTOCOL_MAX: u64 = 17;
@@ -249,11 +259,13 @@ const API_CAPABILITIES: &[&str] = &[
     "push_token_revocation",
     "recent_cwds",
     "tasks",
+    "terminal_backends",
+    "multiple_terminal_backends",
     "terminal_input",
 ];
 
 #[derive(Parser)]
-#[command(name = "gateway", about = "Mobile gateway for Herdr")]
+#[command(name = "gateway", about = "Mobile gateway for terminal workspaces")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -268,6 +280,9 @@ enum Command {
         port: u16,
         #[arg(long)]
         socket_path: Option<String>,
+        /// Terminal workspace backend. Existing installs default to Herdr.
+        #[arg(long, value_enum, default_value_t = SetupBackend::Herdr)]
+        backend: SetupBackend,
     },
     Run {
         #[arg(long)]
@@ -277,6 +292,22 @@ enum Command {
     Stop,
     Status,
     Manage,
+    /// Add, remove, or inspect terminal backends in this gateway.
+    Backend {
+        #[command(subcommand)]
+        command: BackendCommand,
+    },
+    /// Adopt an existing Herdr plugin pairing into the standalone gateway.
+    ImportHerdrPlugin {
+        #[arg(long)]
+        config_dir: Option<PathBuf>,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[arg(long, hide = true)]
+        target_config_dir: Option<PathBuf>,
+        #[arg(long, hide = true)]
+        target_state_dir: Option<PathBuf>,
+    },
     /// List devices that hold a gateway token.
     Devices,
     /// Revoke one device's token, or every device token with --all.
@@ -286,6 +317,43 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum BackendCommand {
+    List,
+    Add {
+        #[arg(value_enum)]
+        backend: SetupBackend,
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long)]
+        socket_path: Option<String>,
+    },
+    Remove {
+        id: String,
+    },
+    /// Make one configured backend the first session returned to clients.
+    Default {
+        id: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SetupBackend {
+    Herdr,
+    Tmux,
+}
+
+impl From<SetupBackend> for BackendKind {
+    fn from(value: SetupBackend) -> Self {
+        match value {
+            SetupBackend::Herdr => Self::Herdr,
+            SetupBackend::Tmux => Self::Tmux,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -298,7 +366,7 @@ struct Config {
     /// used by the local `manage` UI; paired devices get their own tokens.
     token_hash: String,
     sessions: Vec<SessionConfig>,
-    /// Herdr agent kind -> the executable `GET /api/agents/catalog` looks for on
+    /// Agent kind -> the executable `GET /api/agents/catalog` looks for on
     /// `PATH`. Only needed when a kind's binary is named something else on this
     /// machine; absent, every kind probes for its own name. Optional and
     /// omitted when empty, so an existing `config.json` keeps working untouched.
@@ -340,6 +408,9 @@ struct SessionConfig {
     id: String,
     label: String,
     socket_path: String,
+    /// Omitted for every existing config, where Herdr remains the default.
+    #[serde(default, skip_serializing_if = "BackendKind::is_herdr")]
+    backend: BackendKind,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -725,19 +796,33 @@ async fn main() -> anyhow::Result<()> {
             public_url,
             port,
             socket_path,
-        } => setup(public_url, port, socket_path)?,
+            backend,
+        } => setup(public_url, port, socket_path, backend.into())?,
         Command::Run { config } => run(config).await?,
         Command::Start => start_background()?,
         Command::Stop => stop_background()?,
         Command::Status => status()?,
         Command::Manage => manage()?,
+        Command::Backend { command } => configure_backend(command)?,
+        Command::ImportHerdrPlugin {
+            config_dir,
+            state_dir,
+            target_config_dir,
+            target_state_dir,
+        } => import_herdr_plugin(config_dir, state_dir, target_config_dir, target_state_dir)?,
         Command::Devices => list_devices()?,
         Command::Revoke { device_id, all } => revoke_device(device_id, all)?,
     }
     Ok(())
 }
 
-fn setup(public_url: Option<String>, port: u16, socket_path: Option<String>) -> anyhow::Result<()> {
+fn setup(
+    public_url: Option<String>,
+    port: u16,
+    socket_path: Option<String>,
+    backend: BackendKind,
+) -> anyhow::Result<()> {
+    ensure_backend_available(backend)?;
     let config_dir = config_dir()?;
     std::fs::create_dir_all(&config_dir)
         .with_context(|| format!("failed to create config dir {}", config_dir.display()))?;
@@ -746,16 +831,16 @@ fn setup(public_url: Option<String>, port: u16, socket_path: Option<String>) -> 
     // or a retry) refreshes settings without minting a new server id or token --
     // that would orphan every already-paired device. Only a consistent config +
     // pairing pair is trusted; a half-written state falls back to a fresh mint.
-    let existing = load_existing_identity(
+    let existing = load_existing_install(
         &config_dir.join(CONFIG_FILE),
         &config_dir.join(PAIRING_FILE),
     );
 
     let (server_id, token, token_hash) = match &existing {
-        Some(id) => (
-            id.server_id.clone(),
-            id.token.clone(),
-            id.token_hash.clone(),
+        Some(install) => (
+            install.config.server_id.clone(),
+            install.pairing.payload.token.clone(),
+            install.config.token_hash.clone(),
         ),
         None => {
             let token = generate_token();
@@ -768,14 +853,14 @@ fn setup(public_url: Option<String>, port: u16, socket_path: Option<String>) -> 
     // the URL and listen address it already has (including one set from the
     // manage panel); only a fresh install auto-detects.
     let (public_url, listen, url_source) = match (public_url, &existing) {
-        (Some(url), _) => (
-            validate_public_url(&url)?,
-            format!("0.0.0.0:{port}"),
-            String::from("manual --public-url"),
-        ),
-        (None, Some(id)) => (
-            id.public_url.clone(),
-            id.listen.clone(),
+        (Some(url), _) => {
+            let url = validate_public_url(&url)?;
+            let listen = listen_for_explicit_public_url(&url, port);
+            (url, listen, String::from("manual --public-url"))
+        }
+        (None, Some(install)) => (
+            install.config.public_url.clone(),
+            install.config.listen.clone(),
             String::from("existing config"),
         ),
         (None, None) => {
@@ -787,28 +872,25 @@ fn setup(public_url: Option<String>, port: u16, socket_path: Option<String>) -> 
             )
         }
     };
-    let socket_path = socket_path
-        .or_else(|| std::env::var("HERDR_SOCKET_PATH").ok())
-        .unwrap_or_else(default_socket_path);
-
-    let config = Config {
-        server_id,
-        label: hostname_label(),
-        listen,
-        public_url: public_url.clone(),
-        token_hash,
-        sessions: vec![SessionConfig {
-            id: "default".into(),
-            label: "Default".into(),
-            socket_path,
-        }],
-        agent_commands: BTreeMap::new(),
-        rich_agent_pushes: false,
+    let mut config = match existing {
+        Some(install) => install.config,
+        None => Config {
+            server_id,
+            label: hostname_label(),
+            listen: listen.clone(),
+            public_url: public_url.clone(),
+            token_hash,
+            sessions: Vec::new(),
+            agent_commands: BTreeMap::new(),
+            rich_agent_pushes: false,
+        },
     };
+    config.listen = listen;
+    config.public_url = public_url.clone();
+    upsert_backend_session(&mut config, backend, None, None, socket_path)?;
 
     let path = config_dir.join(CONFIG_FILE);
-    write_secret_file(&path, &serde_json::to_vec_pretty(&config)?)
-        .with_context(|| format!("failed to write config {}", path.display()))?;
+    write_config(&path, &config)?;
 
     let payload = PairingPayload {
         kind: "herdr-gateway".into(),
@@ -829,27 +911,28 @@ fn setup(public_url: Option<String>, port: u16, socket_path: Option<String>) -> 
     println!("public URL: {} ({url_source})", payload.url);
     if payload.url.contains("127.0.0.1") || payload.url.contains("localhost") {
         println!("warning: pairing URL is local-only; rerun setup after starting Tailscale or pass --public-url");
+    } else if payload.url.starts_with("http://") {
+        let protection = transport_protection(&config);
+        if protection == "tailscale-wireguard" {
+            println!("security: HTTP is carried inside Tailscale WireGuard; Tailscale Serve HTTPS is still preferred");
+        } else {
+            println!("warning: HTTP exposes bearer tokens on the network; configure HTTPS or bind only to Tailscale");
+        }
     }
     println!("pairing identity is ready");
-    println!("open the Gateway Manager pane to scan the QR code");
+    println!("run `herdr-gateway manage` in any terminal to scan the QR code");
     Ok(())
 }
 
-/// The parts of a prior install that setup preserves so a rerun keeps devices
-/// paired. Pulled from both files: the server id and admin token hash live in
-/// the config, the raw admin token lives in the pairing file.
-struct ExistingIdentity {
-    server_id: String,
-    token: String,
-    token_hash: String,
-    public_url: String,
-    listen: String,
+struct ExistingInstall {
+    config: Config,
+    pairing: PairingFile,
 }
 
-fn load_existing_identity(
+fn load_existing_install(
     config_path: &std::path::Path,
     pairing_path: &std::path::Path,
-) -> Option<ExistingIdentity> {
+) -> Option<ExistingInstall> {
     let config: Config = serde_json::from_slice(&std::fs::read(config_path).ok()?).ok()?;
     let pairing: PairingFile = serde_json::from_slice(&std::fs::read(pairing_path).ok()?).ok()?;
     // A config whose pairing file points at a different server is inconsistent;
@@ -858,13 +941,346 @@ fn load_existing_identity(
     if pairing.payload.server_id != config.server_id {
         return None;
     }
-    Some(ExistingIdentity {
-        server_id: config.server_id,
-        token: pairing.payload.token,
-        token_hash: config.token_hash,
-        public_url: config.public_url,
-        listen: config.listen,
-    })
+    if hash_token(&pairing.payload.token) != config.token_hash {
+        return None;
+    }
+    Some(ExistingInstall { config, pairing })
+}
+
+fn ensure_backend_available(backend: BackendKind) -> anyhow::Result<()> {
+    if backend != BackendKind::Tmux {
+        return Ok(());
+    }
+    let output = ProcessCommand::new("tmux")
+        .arg("-V")
+        .output()
+        .context("tmux backend selected, but tmux was not found on PATH")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "tmux backend selected, but `tmux -V` failed"
+    );
+    Ok(())
+}
+
+fn default_backend_socket(backend: BackendKind) -> String {
+    match backend {
+        BackendKind::Herdr => std::env::var("HERDR_SOCKET_PATH")
+            .ok()
+            .unwrap_or_else(default_socket_path),
+        BackendKind::Tmux => String::new(),
+    }
+}
+
+fn default_backend_label(backend: BackendKind) -> &'static str {
+    match backend {
+        BackendKind::Herdr => "Herdr",
+        BackendKind::Tmux => "tmux",
+    }
+}
+
+fn validate_session_id(id: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !id.is_empty() && id.len() <= 64,
+        "backend id must be 1 to 64 bytes"
+    );
+    anyhow::ensure!(
+        id.bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')),
+        "backend id may contain only letters, numbers, '.', '-', and '_'"
+    );
+    Ok(())
+}
+
+fn next_backend_id(config: &Config, backend: BackendKind) -> String {
+    if config.sessions.is_empty() {
+        return String::from("default");
+    }
+    let base = backend.as_str();
+    if config.sessions.iter().all(|session| session.id != base) {
+        return base.to_owned();
+    }
+    (2..)
+        .map(|suffix| format!("{base}-{suffix}"))
+        .find(|candidate| {
+            config
+                .sessions
+                .iter()
+                .all(|session| session.id != *candidate)
+        })
+        .expect("an unused backend id exists")
+}
+
+fn upsert_backend_session(
+    config: &mut Config,
+    backend: BackendKind,
+    requested_id: Option<String>,
+    label: Option<String>,
+    socket_path: Option<String>,
+) -> anyhow::Result<String> {
+    ensure_backend_available(backend)?;
+    if let Some(session) = config.sessions.iter_mut().find(|session| {
+        session.backend == backend && requested_id.as_deref().is_none_or(|id| session.id == id)
+    }) {
+        if let Some(label) = label {
+            validate_label(&label)?;
+            session.label = label;
+        }
+        if let Some(socket_path) = socket_path {
+            session.socket_path = socket_path;
+        }
+        return Ok(session.id.clone());
+    }
+
+    let id = requested_id.unwrap_or_else(|| next_backend_id(config, backend));
+    validate_session_id(&id)?;
+    anyhow::ensure!(
+        config.sessions.iter().all(|session| session.id != id),
+        "backend id {id} already exists"
+    );
+    let label = label.unwrap_or_else(|| default_backend_label(backend).to_owned());
+    validate_label(&label)?;
+    config.sessions.push(SessionConfig {
+        id: id.clone(),
+        label,
+        socket_path: socket_path.unwrap_or_else(|| default_backend_socket(backend)),
+        backend,
+    });
+    Ok(id)
+}
+
+fn validate_label(label: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(!label.trim().is_empty(), "backend label cannot be empty");
+    anyhow::ensure!(
+        label.chars().count() <= MAX_WORKSPACE_LABEL_CHARS,
+        "backend label is too long"
+    );
+    anyhow::ensure!(
+        !label.chars().any(char::is_control),
+        "backend label cannot contain control characters"
+    );
+    Ok(())
+}
+
+fn write_config(path: &std::path::Path, config: &Config) -> anyhow::Result<()> {
+    write_secret_file(path, &serde_json::to_vec_pretty(config)?)
+        .with_context(|| format!("failed to write config {}", path.display()))
+}
+
+fn configure_backend(command: BackendCommand) -> anyhow::Result<()> {
+    let path = config_dir()?.join(CONFIG_FILE);
+    let mut config = load_config(None)?;
+    match command {
+        BackendCommand::List => {
+            for session in &config.sessions {
+                let endpoint = match session.backend {
+                    BackendKind::Tmux if session.socket_path.is_empty() => "default tmux server",
+                    _ => &session.socket_path,
+                };
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    session.id,
+                    session.backend.as_str(),
+                    session.label,
+                    endpoint
+                );
+            }
+            return Ok(());
+        }
+        BackendCommand::Add {
+            backend,
+            id,
+            label,
+            socket_path,
+        } => {
+            let id = upsert_backend_session(&mut config, backend.into(), id, label, socket_path)?;
+            write_config(&path, &config)?;
+            println!("backend {id} configured; restart the gateway to apply changes");
+        }
+        BackendCommand::Remove { id } => {
+            validate_session_id(&id)?;
+            anyhow::ensure!(config.sessions.len() > 1, "cannot remove the only backend");
+            let previous_len = config.sessions.len();
+            config.sessions.retain(|session| session.id != id);
+            anyhow::ensure!(
+                config.sessions.len() != previous_len,
+                "backend {id} not found"
+            );
+            write_config(&path, &config)?;
+            println!("backend {id} removed; restart the gateway to apply changes");
+        }
+        BackendCommand::Default { id } => {
+            make_backend_default(&mut config, &id)?;
+            write_config(&path, &config)?;
+            println!("backend {id} is now the default; restart the gateway to apply changes");
+        }
+    }
+    Ok(())
+}
+
+fn make_backend_default(config: &mut Config, id: &str) -> anyhow::Result<()> {
+    validate_session_id(id)?;
+    let position = config
+        .sessions
+        .iter()
+        .position(|session| session.id == id)
+        .with_context(|| format!("backend {id} not found"))?;
+    if position > 0 {
+        let session = config.sessions.remove(position);
+        config.sessions.insert(0, session);
+    }
+    Ok(())
+}
+
+fn import_herdr_plugin(
+    source_config_dir: Option<PathBuf>,
+    source_state_dir: Option<PathBuf>,
+    target_config_dir: Option<PathBuf>,
+    target_state_dir: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let source_config_dir = source_config_dir.unwrap_or(default_herdr_plugin_config_dir()?);
+    let source_state_dir = source_state_dir.unwrap_or(default_herdr_plugin_state_dir()?);
+    let source = load_existing_install(
+        &source_config_dir.join(CONFIG_FILE),
+        &source_config_dir.join(PAIRING_FILE),
+    )
+    .context("Herdr plugin config and pairing files are missing or inconsistent")?;
+    anyhow::ensure!(
+        source
+            .config
+            .sessions
+            .iter()
+            .any(|session| session.backend == BackendKind::Herdr),
+        "the source installation does not configure a Herdr backend"
+    );
+    let running = gateway_listener_pids(source.config.port()).unwrap_or_default();
+    anyhow::ensure!(
+        running.is_empty(),
+        "stop the running gateway before importing its pairing identity"
+    );
+
+    let target_config_dir = target_config_dir.unwrap_or(standalone_config_dir()?);
+    let target_state_dir = target_state_dir.unwrap_or(standalone_state_dir()?);
+    std::fs::create_dir_all(&target_config_dir)?;
+    std::fs::create_dir_all(&target_state_dir)?;
+    let target_config_path = target_config_dir.join(CONFIG_FILE);
+    let target_pairing_path = target_config_dir.join(PAIRING_FILE);
+    let target = if target_config_path.exists() || target_pairing_path.exists() {
+        Some(
+            load_existing_install(&target_config_path, &target_pairing_path).context(
+                "standalone config and pairing files are inconsistent; refusing to overwrite them",
+            )?,
+        )
+    } else {
+        None
+    };
+
+    let mut merged = source.config;
+    if let Some(target) = &target {
+        for session in &target.config.sessions {
+            if merged
+                .sessions
+                .iter()
+                .any(|existing| existing.backend == session.backend)
+            {
+                continue;
+            }
+            upsert_backend_session(
+                &mut merged,
+                session.backend,
+                None,
+                Some(session.label.clone()),
+                Some(session.socket_path.clone()),
+            )?;
+        }
+        for (kind, command) in &target.config.agent_commands {
+            merged
+                .agent_commands
+                .entry(kind.clone())
+                .or_insert_with(|| command.clone());
+        }
+        merged.rich_agent_pushes |= target.config.rich_agent_pushes;
+    }
+
+    backup_secret_file(&target_config_path)?;
+    backup_secret_file(&target_pairing_path)?;
+    write_config(&target_config_path, &merged)?;
+    write_secret_file(
+        &target_pairing_path,
+        &serde_json::to_vec_pretty(&source.pairing)?,
+    )?;
+
+    merge_plugin_state::<DeviceRecord, _>(
+        &source_state_dir.join(DEVICES_FILE),
+        &target_state_dir.join(DEVICES_FILE),
+        |left, right| left.id == right.id || left.token_hash == right.token_hash,
+    )?;
+    merge_plugin_state::<PushTokenRecord, _>(
+        &source_state_dir.join(PUSH_TOKENS_FILE),
+        &target_state_dir.join(PUSH_TOKENS_FILE),
+        |left, right| left.token == right.token,
+    )?;
+    write_secret_file(
+        &target_config_dir.join(HERDR_PLUGIN_IMPORT_MARKER),
+        source_config_dir.to_string_lossy().as_bytes(),
+    )?;
+
+    println!(
+        "imported Herdr plugin pairing into {}",
+        target_config_dir.display()
+    );
+    println!("preserved server id: {}", merged.server_id);
+    println!("configured backends:");
+    for session in &merged.sessions {
+        println!("  {} ({})", session.id, session.backend.as_str());
+    }
+    println!("source files were retained; run `herdr-gateway start` when ready");
+    Ok(())
+}
+
+fn backup_secret_file(path: &std::path::Path) -> anyhow::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("gateway-secret");
+    let backup = path.with_file_name(format!("{file_name}.before-herdr-import"));
+    if !backup.exists() {
+        write_secret_file(&backup, &std::fs::read(path)?)?;
+    }
+    Ok(())
+}
+
+fn merge_plugin_state<T, F>(
+    source_path: &std::path::Path,
+    target_path: &std::path::Path,
+    same: F,
+) -> anyhow::Result<()>
+where
+    T: Serialize + serde::de::DeserializeOwned,
+    F: Fn(&T, &T) -> bool,
+{
+    let mut source: Vec<T> = if source_path.exists() {
+        serde_json::from_slice(&std::fs::read(source_path)?)?
+    } else {
+        Vec::new()
+    };
+    let target: Vec<T> = if target_path.exists() {
+        serde_json::from_slice(&std::fs::read(target_path)?)?
+    } else {
+        Vec::new()
+    };
+    for value in target {
+        if !source.iter().any(|existing| same(existing, &value)) {
+            source.push(value);
+        }
+    }
+    backup_secret_file(target_path)?;
+    if !source.is_empty() || target_path.exists() || source_path.exists() {
+        write_secret_file(target_path, &serde_json::to_vec_pretty(&source)?)?;
+    }
+    Ok(())
 }
 
 fn auto_public_url(port: u16) -> PublicUrlSelection {
@@ -1254,7 +1670,7 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         .layer(middleware::from_fn(request_locale))
         .with_state(state);
 
-    println!("herdr gateway listening on http://{addr}");
+    println!("terminal gateway listening on http://{addr}");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
@@ -1808,7 +2224,15 @@ fn status() -> anyhow::Result<()> {
     println!("listen: {}", config.listen);
     println!("public_url: {}", config.public_url);
     for session in config.sessions {
-        println!("session {}: {}", session.id, session.socket_path);
+        let endpoint = match session.backend {
+            BackendKind::Tmux if session.socket_path.is_empty() => "default tmux server",
+            _ => &session.socket_path,
+        };
+        println!(
+            "session {}: backend={} endpoint={endpoint}",
+            session.id,
+            session.backend.as_str()
+        );
     }
     match read_pid()? {
         Some(pid) if process_running(pid) => println!("gateway: running pid {pid}"),
@@ -1911,6 +2335,24 @@ fn manage() -> anyhow::Result<()> {
                 update_public_url(&selection.url)?;
                 message = format!("auto url: {}", truncate(&selection.url, 36));
             }
+            "h" | "herdr" => {
+                message = enable_managed_backend(BackendKind::Herdr)?;
+            }
+            "m" | "tmux" => {
+                message = enable_managed_backend(BackendKind::Tmux)?;
+            }
+            "d" | "backend" => {
+                message = match prompt_remove_backend()? {
+                    Some(id) => remove_managed_backend(&id)?,
+                    None => String::from("backend unchanged"),
+                };
+            }
+            "f" | "default" => {
+                message = match prompt_default_backend()? {
+                    Some(id) => set_managed_default_backend(&id)?,
+                    None => String::from("default backend unchanged"),
+                };
+            }
             "q" | "quit" => break,
             other => message = format!("unknown command: {other}"),
         }
@@ -1920,6 +2362,145 @@ fn manage() -> anyhow::Result<()> {
         print_manage_screen(&message, pending_pairing.as_ref(), &devices, show_qr)?;
     }
     Ok(())
+}
+
+fn enable_managed_backend(backend: BackendKind) -> anyhow::Result<String> {
+    let path = config_dir()?.join(CONFIG_FILE);
+    let mut config = load_config(None)?;
+    if let Some(session) = config
+        .sessions
+        .iter()
+        .find(|session| session.backend == backend)
+    {
+        return Ok(format!(
+            "{} backend already configured as {}",
+            backend.as_str(),
+            session.id
+        ));
+    }
+    let id = upsert_backend_session(&mut config, backend, None, None, None)?;
+    write_config(&path, &config)?;
+    Ok(format!("added {id}; restart gateway to apply"))
+}
+
+fn remove_managed_backend(id: &str) -> anyhow::Result<String> {
+    validate_session_id(id)?;
+    let path = config_dir()?.join(CONFIG_FILE);
+    let mut config = load_config(None)?;
+    anyhow::ensure!(config.sessions.len() > 1, "cannot remove the only backend");
+    let previous_len = config.sessions.len();
+    config.sessions.retain(|session| session.id != id);
+    anyhow::ensure!(
+        config.sessions.len() != previous_len,
+        "backend {id} not found"
+    );
+    write_config(&path, &config)?;
+    Ok(format!("removed {id}; restart gateway to apply"))
+}
+
+fn set_managed_default_backend(id: &str) -> anyhow::Result<String> {
+    let path = config_dir()?.join(CONFIG_FILE);
+    let mut config = load_config(None)?;
+    make_backend_default(&mut config, id)?;
+    write_config(&path, &config)?;
+    Ok(format!("default is now {id}; restart gateway to apply"))
+}
+
+fn prompt_default_backend() -> anyhow::Result<Option<String>> {
+    let config = load_config(None)?;
+    prompt_backend_picker(&config.sessions, "Choose the default terminal backend")
+}
+
+fn prompt_remove_backend() -> anyhow::Result<Option<String>> {
+    let config = load_config(None)?;
+    if config.sessions.len() <= 1 {
+        return Ok(None);
+    }
+    let Some(id) = prompt_backend_picker(&config.sessions, "Remove a terminal backend")? else {
+        return Ok(None);
+    };
+    let session = config
+        .sessions
+        .iter()
+        .find(|session| session.id == id)
+        .context("selected backend disappeared")?;
+    Ok(confirm_remove_backend(session)?.then_some(id))
+}
+
+fn prompt_backend_picker(
+    sessions: &[SessionConfig],
+    title: &str,
+) -> anyhow::Result<Option<String>> {
+    if sessions.is_empty() {
+        return Ok(None);
+    }
+    let mut selected = 0_usize;
+    loop {
+        render_backend_picker(title, sessions, selected)?;
+        let TerminalEvent::Key(event) = read_event()? else {
+            continue;
+        };
+        if event.kind != KeyEventKind::Press {
+            continue;
+        }
+        match event.code {
+            KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(sessions.len() - 1),
+            KeyCode::Enter => return Ok(Some(sessions[selected].id.clone())),
+            KeyCode::Esc | KeyCode::Char('q') => return Ok(None),
+            _ => {}
+        }
+    }
+}
+
+fn render_backend_picker(
+    title: &str,
+    sessions: &[SessionConfig],
+    selected: usize,
+) -> anyhow::Result<()> {
+    execute!(stdout(), Clear(ClearType::All), MoveTo(0, 0))?;
+    let mut lines = vec![
+        title.to_owned(),
+        String::new(),
+        String::from("Up/Down or j/k selects | Enter continues | Esc cancels"),
+        String::new(),
+    ];
+    for (index, session) in sessions.iter().enumerate() {
+        lines.push(format!(
+            "{} {}   {}   {}",
+            if index == selected { ">" } else { " " },
+            session.id,
+            session.backend.as_str(),
+            truncate(&session.label, 30)
+        ));
+    }
+    write_centered_panel(&lines)
+}
+
+fn confirm_remove_backend(session: &SessionConfig) -> anyhow::Result<bool> {
+    loop {
+        execute!(stdout(), Clear(ClearType::All), MoveTo(0, 0))?;
+        write_centered_panel(&[
+            String::from("Remove terminal backend?"),
+            String::new(),
+            format!("{} ({})", session.label, session.backend.as_str()),
+            String::from("Existing terminal sessions are not deleted."),
+            String::from("The gateway must be restarted after this change."),
+            String::new(),
+            String::from("y remove | n or Esc cancel"),
+        ])?;
+        let TerminalEvent::Key(event) = read_event()? else {
+            continue;
+        };
+        if event.kind != KeyEventKind::Press {
+            continue;
+        }
+        match event.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => return Ok(true),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => return Ok(false),
+            _ => {}
+        }
+    }
 }
 
 fn prompt_public_url() -> anyhow::Result<Option<String>> {
@@ -2120,7 +2701,7 @@ fn print_manage_screen(
         .unwrap_or_else(|| "not configured".into());
     let url = config
         .as_ref()
-        .map(|config| truncate(&config.public_url, 44))
+        .map(|config| config.public_url.clone())
         .unwrap_or_else(|| "run setup first".into());
     let status = match read_pid()? {
         Some(pid) if process_running(pid) => format!("running ({pid})"),
@@ -2129,16 +2710,34 @@ fn print_manage_screen(
     };
 
     let mut lines = vec![
-        String::from("Herdr Gateway for Muqun"),
+        String::from("Muqun Terminal Gateway"),
         String::from(""),
         String::from("keys   : [s] start  [t] stop  [p] pair  [x] revoke"),
-        String::from("         [u] url    [a] auto  [r] refresh  [q] close"),
+        String::from("         [h] Herdr  [m] tmux  [f] default backend"),
+        String::from("         [d] remove [u] url   [a] auto  [r] refresh  [q] close"),
         format!("server : {server}"),
-        format!("url    : {url}"),
         format!("status : {status}"),
-        format!("message: {}", truncate(message, 58)),
-        String::from(""),
     ];
+    push_wrapped_field(&mut lines, "url    ", &url, 64);
+    push_wrapped_field(&mut lines, "message", message, 64);
+    lines.push(String::new());
+    if let Some(config) = &config {
+        lines.push(format!("Terminal backends ({})", config.sessions.len()));
+        for (index, session) in config.sessions.iter().enumerate() {
+            let endpoint = match session.backend {
+                BackendKind::Tmux if session.socket_path.is_empty() => "default server",
+                _ => session.socket_path.as_str(),
+            };
+            lines.push(format!(
+                "{} {}  {}  {}",
+                if index == 0 { "*" } else { " " },
+                session.id,
+                session.backend.as_str(),
+                truncate(endpoint, 38)
+            ));
+        }
+        lines.push(String::new());
+    }
 
     // A device mid-pairing takes priority: show its name + the code to enter.
     if let Some(pending) = pending_pairing {
@@ -2182,20 +2781,28 @@ fn print_manage_screen(
             write_centered_panel(&lines)?;
             return Ok(());
         }
-        let qr_controls = vec![
+        let mut qr_controls = vec![
             String::from("Muqun Gateway"),
             String::from(""),
-            String::from("[s] start   [t] stop"),
-            String::from("[p] pair    [x] revoke"),
-            String::from("[u] URL     [a] auto URL"),
-            String::from("[r] devices / refresh"),
-            String::from("[q/Esc] close"),
+            String::from("[s] start  [t] stop  [p] pair"),
+            String::from("[x] revoke [r] refresh [q] close"),
+            String::from("[h] Herdr  [m] tmux  [f] default"),
+            String::from("[d] remove [u] URL   [a] auto"),
             String::from(""),
-            format!("server: {}", truncate(&server, 18)),
-            format!("url: {}", truncate(&url, 21)),
-            format!("status: {}", truncate(&status, 18)),
-            format!("message: {}", truncate(message, 17)),
+            format!("server: {}", truncate(&server, 26)),
+            format!("status: {}", truncate(&status, 25)),
         ];
+        push_wrapped_field(&mut qr_controls, "url", &url, 34);
+        qr_controls.push(String::from("backends (* default):"));
+        for (index, session) in config.sessions.iter().enumerate() {
+            qr_controls.push(format!(
+                " {} {} ({})",
+                if index == 0 { "*" } else { " " },
+                truncate(&session.label, 17),
+                session.backend.as_str()
+            ));
+        }
+        push_wrapped_field(&mut qr_controls, "message", message, 34);
         let mut qr_lines = vec![
             String::from("Scan with Muqun"),
             String::from("Code appears after scan"),
@@ -2362,6 +2969,26 @@ fn truncate(value: &str, max_chars: usize) -> String {
     output
 }
 
+fn push_wrapped_field(lines: &mut Vec<String>, label: &str, value: &str, width: usize) {
+    let prefix = format!("{label}: ");
+    let continuation = " ".repeat(prefix.chars().count());
+    let first_width = width.saturating_sub(prefix.chars().count()).max(1);
+    let mut remaining = value.chars().peekable();
+    let mut first = true;
+    while remaining.peek().is_some() {
+        let chunk = remaining.by_ref().take(first_width).collect::<String>();
+        lines.push(format!(
+            "{}{}",
+            if first { &prefix } else { &continuation },
+            chunk
+        ));
+        first = false;
+    }
+    if first {
+        lines.push(prefix);
+    }
+}
+
 fn fetch_pending_pairing() -> anyhow::Result<Option<PendingPairing>> {
     let pairing = read_pairing_file()?;
     let config = load_config(None)?;
@@ -2490,6 +3117,25 @@ fn validate_public_url(value: &str) -> anyhow::Result<String> {
     Ok(value.trim_end_matches('/').to_string())
 }
 
+fn listen_for_explicit_public_url(public_url: &str, port: u16) -> String {
+    let host = reqwest::Url::parse(public_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned));
+    match host.as_deref() {
+        Some("localhost") => format!("127.0.0.1:{port}"),
+        Some(host) => match host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+        {
+            Ok(std::net::IpAddr::V4(ip)) if ip.is_loopback() => format!("{ip}:{port}"),
+            Ok(std::net::IpAddr::V6(ip)) if ip.is_loopback() => format!("[{ip}]:{port}"),
+            _ => format!("0.0.0.0:{port}"),
+        },
+        None => format!("0.0.0.0:{port}"),
+    }
+}
+
 fn pairing_qr_offer(url: &str, server_id: &str) -> String {
     format!(
         "muqun://pair?u={}&s={}",
@@ -2553,28 +3199,32 @@ async fn api_set_label(
 }
 
 async fn gateway_metadata(state: &AppState) -> ApiResult<Value> {
-    let session = find_session(&state.config, "default")?;
-    let herdr = match herdr_request(session, "ping", json!({})).await {
-        Ok(value) => {
-            let version = value.pointer("/result/version").and_then(Value::as_str);
-            let protocol = value.pointer("/result/protocol").and_then(Value::as_u64);
-            let compatible = protocol
-                .is_some_and(|value| (HERDR_PROTOCOL_MIN..=HERDR_PROTOCOL_MAX).contains(&value));
-            json!({
-                "connected": true,
-                "version": version,
-                "protocol": protocol,
-                "compatible": compatible,
-                "supportedProtocolMin": HERDR_PROTOCOL_MIN,
-                "supportedProtocolMax": HERDR_PROTOCOL_MAX,
-                "response": value
-            })
+    let primary = state.config.sessions.first().ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_GATEWAY,
+            "backend_unavailable",
+            "no terminal backend is configured",
+        )
+    })?;
+    let mut backends = Vec::with_capacity(state.config.sessions.len());
+    let mut primary_metadata = None;
+    let mut legacy_herdr = None;
+    for session in &state.config.sessions {
+        let (metadata, compatibility) = session_metadata(session).await;
+        let metadata = json!({
+            "sessionId": session.id,
+            "label": session.label,
+            "kind": session.backend,
+            "connected": metadata.get("connected").cloned().unwrap_or(json!(false)),
+            "version": metadata.get("version").cloned().unwrap_or(Value::Null),
+            "protocol": metadata.get("protocol").cloned().unwrap_or(Value::Null),
+        });
+        if session.id == primary.id {
+            primary_metadata = Some(metadata.clone());
+            legacy_herdr = Some(compatibility);
         }
-        Err(err) => {
-            eprintln!("Herdr metadata request failed: {err:#}");
-            json!({ "connected": false, "error": "Herdr is unavailable" })
-        }
-    };
+        backends.push(metadata);
+    }
     Ok(json!({
         "ok": true,
         "gatewayVersion": env!("CARGO_PKG_VERSION"),
@@ -2585,8 +3235,102 @@ async fn gateway_metadata(state: &AppState) -> ApiResult<Value> {
         "capabilities": API_CAPABILITIES,
         "serverId": state.config.server_id,
         "label": state.config.label,
-        "herdr": herdr
+        "transportSecurity": {
+            "protection": transport_protection(&state.config),
+            "applicationLayerEncryption": false,
+            "httpsRecommended": !state.config.public_url.starts_with("https://")
+        },
+        "backend": primary_metadata.unwrap_or(Value::Null),
+        "backends": backends,
+        "herdr": legacy_herdr.unwrap_or_else(|| json!({ "connected": false }))
     }))
+}
+
+fn transport_protection(config: &Config) -> &'static str {
+    if config.public_url.starts_with("https://") {
+        return "https";
+    }
+    let Ok(listen) = config.listen.parse::<SocketAddr>() else {
+        return "unknown";
+    };
+    if listen.ip().is_loopback() {
+        return "local-only";
+    }
+    match listen.ip() {
+        std::net::IpAddr::V4(ip) if is_tailscale_ipv4(ip) => "tailscale-wireguard",
+        _ => "unencrypted-http",
+    }
+}
+
+fn is_tailscale_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    octets[0] == 100 && (64..=127).contains(&octets[1])
+}
+
+async fn session_metadata(session: &SessionConfig) -> (Value, Value) {
+    match session.backend {
+        BackendKind::Herdr => match herdr_request(session, "ping", json!({})).await {
+            Ok(value) => {
+                let version = value.pointer("/result/version").and_then(Value::as_str);
+                let protocol = value.pointer("/result/protocol").and_then(Value::as_u64);
+                let compatible = protocol.is_some_and(|value| {
+                    (HERDR_PROTOCOL_MIN..=HERDR_PROTOCOL_MAX).contains(&value)
+                });
+                (
+                    json!({
+                        "kind": "herdr",
+                        "connected": true,
+                        "version": version,
+                        "protocol": protocol
+                    }),
+                    json!({
+                        "connected": true,
+                        "version": version,
+                        "protocol": protocol,
+                        "compatible": compatible,
+                        "supportedProtocolMin": HERDR_PROTOCOL_MIN,
+                        "supportedProtocolMax": HERDR_PROTOCOL_MAX,
+                        "response": value
+                    }),
+                )
+            }
+            Err(err) => {
+                eprintln!("Herdr metadata request failed: {err:#}");
+                (
+                    json!({ "connected": false }),
+                    json!({ "connected": false, "error": "Herdr is unavailable" }),
+                )
+            }
+        },
+        BackendKind::Tmux => match terminal_backend(session).metadata().await {
+            Ok(metadata) => (
+                json!({
+                    "kind": metadata.kind,
+                    "connected": true,
+                    "version": metadata.version,
+                    "protocol": metadata.protocol,
+                }),
+                // Keep the legacy compatibility object until every released
+                // app reads `backend`. Protocol 17 here means the gateway's
+                // compatibility contract, not tmux's private wire protocol.
+                json!({
+                    "connected": true,
+                    "version": metadata.version,
+                    "protocol": HERDR_PROTOCOL_MAX,
+                    "compatible": true,
+                    "supportedProtocolMin": HERDR_PROTOCOL_MIN,
+                    "supportedProtocolMax": HERDR_PROTOCOL_MAX,
+                }),
+            ),
+            Err(err) => {
+                eprintln!("tmux metadata request failed: {err}");
+                (
+                    json!({ "kind": "tmux", "connected": false }),
+                    json!({ "connected": false, "error": "Terminal backend is unavailable" }),
+                )
+            }
+        },
+    }
 }
 
 async fn sessions(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
@@ -2600,6 +3344,15 @@ async fn snapshot(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
+    let session = find_session(&state.config, &session_id)?;
+    if session.backend == BackendKind::Tmux {
+        let backend = terminal_backend(session);
+        let workspaces = backend.list_workspaces().await.map_err(backend_api_error)?;
+        let tabs = backend.list_tabs().await.map_err(backend_api_error)?;
+        let panes = backend.list_panes().await.map_err(backend_api_error)?;
+        let answer = backend::compat::snapshot(workspaces, tabs, panes);
+        return Ok(Json(note_and_amend_panes(&state, &session_id, answer)));
+    }
     let answer =
         call_session_method(&state.config, &session_id, "session.snapshot", json!({})).await;
     Ok(Json(note_and_amend_panes(&state, &session_id, answer?.0)))
@@ -2625,7 +3378,15 @@ async fn workspaces(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
-    call_session_method(&state.config, &session_id, "workspace.list", json!({})).await
+    let session = find_session(&state.config, &session_id)?;
+    if session.backend == BackendKind::Herdr {
+        return call_session_method(&state.config, &session_id, "workspace.list", json!({})).await;
+    }
+    let workspaces = terminal_backend(session)
+        .list_workspaces()
+        .await
+        .map_err(backend_api_error)?;
+    Ok(Json(backend::compat::workspace_list(workspaces)))
 }
 
 async fn panes(
@@ -2634,7 +3395,17 @@ async fn panes(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
-    let answer = call_session_method(&state.config, &session_id, "pane.list", json!({})).await;
+    let session = find_session(&state.config, &session_id)?;
+    let answer = if session.backend == BackendKind::Herdr {
+        call_session_method(&state.config, &session_id, "pane.list", json!({})).await
+    } else {
+        terminal_backend(session)
+            .list_panes()
+            .await
+            .map(backend::compat::pane_list)
+            .map(Json)
+            .map_err(backend_api_error)
+    };
     Ok(Json(note_and_amend_panes(&state, &session_id, answer?.0)))
 }
 
@@ -2644,7 +3415,15 @@ async fn agents(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
-    call_session_method(&state.config, &session_id, "agent.list", json!({})).await
+    let session = find_session(&state.config, &session_id)?;
+    if session.backend == BackendKind::Herdr {
+        return call_session_method(&state.config, &session_id, "agent.list", json!({})).await;
+    }
+    Ok(Json(
+        backend_agent_list(session)
+            .await
+            .map_err(backend_api_error)?,
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2848,15 +3627,15 @@ fn herdr_event_name(line: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+type GatewayEventStream =
+    Pin<Box<dyn Stream<Item = Result<Event, std::convert::Infallible>> + Send>>;
+
 async fn events(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
     Query(query): Query<EventsQuery>,
     headers: HeaderMap,
-) -> Result<
-    Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>,
-    (StatusCode, Json<Value>),
-> {
+) -> Result<Response, (StatusCode, Json<Value>)> {
     require_device(&state, &headers)?;
     let session = find_session(&state.config, &session_id)?.clone();
     let wanted: Option<std::collections::HashSet<String>> = query.types.as_ref().map(|value| {
@@ -2878,6 +3657,15 @@ async fn events(
             _ => "ansi".into(),
         },
     };
+    if session.backend == BackendKind::Tmux {
+        return Ok(tmux_event_response(
+            state,
+            session,
+            session_id,
+            wanted,
+            stream_opts,
+        ));
+    }
     // `asset.created` is a gateway event on the same stream, so it obeys the
     // same allow-list as the Herdr ones: a client that filtered down to output
     // updates is not woken for artifacts it never asked about.
@@ -3016,7 +3804,117 @@ async fn events(
             }
         }
     };
-    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
+    Ok(Sse::new(Box::pin(stream) as GatewayEventStream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response())
+}
+
+fn tmux_event_response(
+    state: AppState,
+    session: SessionConfig,
+    session_id: String,
+    wanted: Option<std::collections::HashSet<String>>,
+    stream_opts: StreamOutputOpts,
+) -> Response {
+    let approval_events = wanted
+        .as_ref()
+        .is_none_or(|set| set.contains("approval_pending") || set.contains("approval_resolved"));
+    let layout_events = wanted
+        .as_ref()
+        .is_none_or(|set| set.contains("layout_updated"));
+    let pane_events = wanted
+        .as_ref()
+        .is_none_or(|set| set.contains("pane_updated"));
+    let mut approvals_rx = state.approval_events.subscribe();
+    let scrollback_store = state.scrollback.clone();
+    let stream = async_stream::stream! {
+        let backend = terminal_backend(&session);
+        let mut topology_interval = tokio::time::interval(Duration::from_millis(500));
+        topology_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut output_interval = tokio::time::interval(STREAM_OUTPUT_POLL_INTERVAL);
+        output_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_topology: Option<String> = None;
+        let mut last_stream_output: Option<String> = None;
+        loop {
+            tokio::select! {
+                _ = topology_interval.tick() => {
+                    let topology = match (
+                        backend.list_workspaces().await,
+                        backend.list_tabs().await,
+                        backend.list_panes().await,
+                    ) {
+                        (Ok(workspaces), Ok(tabs), Ok(panes)) => {
+                            serde_json::to_string(&backend::compat::snapshot(workspaces, tabs, panes)).ok()
+                        }
+                        _ => None,
+                    };
+                    if let Some(topology) = topology {
+                        let changed = last_topology.as_ref().is_some_and(|last| last != &topology);
+                        last_topology = Some(topology);
+                        if changed && layout_events {
+                            let payload = json!({
+                                "event": "layout_updated",
+                                "data": { "backend": "tmux" }
+                            }).to_string();
+                            yield Ok(Event::default().event("herdr").data(payload));
+                        }
+                    }
+                }
+                _ = output_interval.tick(), if stream_opts.pane.is_some() && pane_events => {
+                    let pane_id = stream_opts.pane.as_deref().unwrap_or_default();
+                    let request = BackendReadPane {
+                        pane_id: BackendPaneId::new(pane_id),
+                        source: match stream_opts.source.as_str() {
+                            "visible" => BackendOutputSource::Visible,
+                            "recent" => BackendOutputSource::Recent,
+                            "detection" => BackendOutputSource::Detection,
+                            _ => BackendOutputSource::RecentUnwrapped,
+                        },
+                        format: if stream_opts.format == "text" {
+                            BackendOutputFormat::Text
+                        } else {
+                            BackendOutputFormat::Ansi
+                        },
+                        lines: stream_opts.lines,
+                    };
+                    if let Ok(output) = backend.read_pane(&request).await {
+                        if last_stream_output.as_deref() != Some(output.text.as_str()) {
+                            last_stream_output = Some(output.text.clone());
+                            keep_stream_frame(
+                                &scrollback_store,
+                                &session_id,
+                                pane_id,
+                                &stream_opts,
+                                &output.text,
+                            );
+                            let frame = StreamPaneFrame {
+                                revision: output.revision.unwrap_or_default(),
+                                output: output.text,
+                            };
+                            if let Some(payload) = stream_pane_update_payload(&frame, pane_id) {
+                                yield Ok(Event::default().event("herdr").data(payload));
+                            }
+                        }
+                    }
+                }
+                approval = approvals_rx.recv(), if approval_events => {
+                    match approval {
+                        Ok(approval) => {
+                            let wanted_name = normalize_event_name(approval.name);
+                            if wanted.as_ref().is_none_or(|set| set.contains(&wanted_name)) {
+                                yield Ok(Event::default().event(approval.name).data(approval.payload));
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
+        }
+    };
+    Sse::new(Box::pin(stream) as GatewayEventStream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response()
 }
 
 fn spawn_approval_watchers(state: AppState) {
@@ -3042,8 +3940,19 @@ async fn watch_pane_approvals(state: AppState, session: SessionConfig) {
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         ticker.tick().await;
-        let Ok(response) = herdr_request(&session, "pane.list", json!({})).await else {
-            continue;
+        let response = match session.backend {
+            BackendKind::Herdr => {
+                let Ok(response) = herdr_request(&session, "pane.list", json!({})).await else {
+                    continue;
+                };
+                response
+            }
+            BackendKind::Tmux => {
+                let Ok(panes) = terminal_backend(&session).list_panes().await else {
+                    continue;
+                };
+                backend::compat::pane_list(panes)
+            }
         };
         // This listing is already being fetched, and it is the only place that
         // says which panes Herdr keeps no scrollback for. Reading it here means
@@ -3071,21 +3980,9 @@ async fn watch_pane_approvals(state: AppState, session: SessionConfig) {
             let Some(agent) = agent else { continue };
             seen.push(pane_id.to_owned());
 
-            let Ok(read) = herdr_request(
-                &session,
-                "pane.read",
-                json!({
-                    "pane_id": pane_id,
-                    "source": "visible",
-                    "lines": APPROVAL_READ_LINES,
-                    "format": "text"
-                }),
-            )
-            .await
-            else {
+            let Ok(text) = read_pane_visible_text(&session, pane_id).await else {
                 continue;
             };
-            let text = pane_read_text(&read).unwrap_or_default();
             match approvals::detect(&text) {
                 Some(approval) => {
                     if pending.get(pane_id) == Some(&approval.fingerprint) {
@@ -3243,6 +4140,15 @@ async fn watch_agent_notifications(state: AppState, session: SessionConfig) {
             deliver_agent_notification(&state, notification).await;
         }
 
+        // tmux has no native agent-status event. The polling pass above still
+        // detects agent processes; output/activity inference is layered onto
+        // that source separately rather than pretending tmux speaks Herdr's
+        // event protocol.
+        if session.backend == BackendKind::Tmux {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        }
+
         match herdr_agent_event_stream(&session).await {
             Ok(mut reader) => {
                 let mut line = String::new();
@@ -3293,7 +4199,7 @@ async fn poll_agent_notifications(
     session: &SessionConfig,
     statuses: &mut HashMap<String, String>,
 ) -> Vec<AgentPushNotice> {
-    let Ok(value) = herdr_request(session, "agent.list", json!({})).await else {
+    let Ok(value) = backend_agent_list(session).await else {
         return Vec::new();
     };
     value
@@ -3350,7 +4256,7 @@ async fn deliver_agent_notification(state: &AppState, notice: AgentPushNotice) {
 }
 
 async fn seed_agent_statuses(session: &SessionConfig) -> HashMap<String, String> {
-    let Ok(value) = herdr_request(session, "agent.list", json!({})).await else {
+    let Ok(value) = backend_agent_list(session).await else {
         return HashMap::new();
     };
     value
@@ -3365,6 +4271,52 @@ async fn seed_agent_statuses(session: &SessionConfig) -> HashMap<String, String>
             ))
         })
         .collect()
+}
+
+async fn backend_agent_list(session: &SessionConfig) -> Result<Value, BackendError> {
+    match session.backend {
+        BackendKind::Herdr => herdr_request(session, "agent.list", json!({}))
+            .await
+            .map_err(|_| BackendError::Unavailable),
+        BackendKind::Tmux => {
+            let backend = terminal_backend(session);
+            let mut panes = backend.list_panes().await?;
+            for pane in panes.iter_mut().filter(|pane| pane.agent.is_some()) {
+                let output = backend
+                    .read_pane(&BackendReadPane {
+                        pane_id: pane.id.clone(),
+                        source: BackendOutputSource::Visible,
+                        format: BackendOutputFormat::Text,
+                        lines: APPROVAL_READ_LINES,
+                    })
+                    .await;
+                if let Ok(output) = output {
+                    pane.agent_status =
+                        infer_tmux_agent_status(pane.agent.as_deref(), &output.text);
+                }
+            }
+            Ok(backend::compat::agent_list(&panes))
+        }
+    }
+}
+
+fn infer_tmux_agent_status(agent: Option<&str>, visible: &str) -> backend::AgentStatus {
+    if approvals::detect(visible).is_some() {
+        return backend::AgentStatus::Blocked;
+    }
+    let Some(dictionary) = parts::dictionary_for(agent) else {
+        return backend::AgentStatus::Unknown;
+    };
+    let normalized = parts::normalize_json(visible, Some(dictionary));
+    match normalized
+        .last()
+        .and_then(|part| part.get("type"))
+        .and_then(Value::as_str)
+    {
+        Some("prompt") => backend::AgentStatus::Idle,
+        Some("status") | Some("tool-block") => backend::AgentStatus::Working,
+        _ => backend::AgentStatus::Unknown,
+    }
 }
 
 /// One agent status change, after the bookkeeping and before anyone decides
@@ -3547,6 +4499,35 @@ async fn create_workspace(
     Json(body): Json<CreateWorkspaceBody>,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
+    let session = find_session(&state.config, &session_id)?;
+    if session.backend == BackendKind::Tmux {
+        let backend = terminal_backend(session);
+        let workspace = backend
+            .create_workspace(&BackendCreateWorkspace {
+                cwd: body.cwd.map(PathBuf::from),
+                label: body.label,
+                focus: body.focus.unwrap_or(false),
+            })
+            .await
+            .map_err(backend_api_error)?;
+        let tab = backend
+            .list_tabs()
+            .await
+            .map_err(backend_api_error)?
+            .into_iter()
+            .find(|tab| tab.workspace_id == workspace.id)
+            .ok_or_else(|| backend_api_error(BackendError::InvalidResponse("created tab")))?;
+        let root_pane = backend
+            .list_panes()
+            .await
+            .map_err(backend_api_error)?
+            .into_iter()
+            .find(|pane| pane.tab_id == tab.id)
+            .ok_or_else(|| backend_api_error(BackendError::InvalidResponse("created pane")))?;
+        return Ok(Json(backend::compat::workspace_created(
+            workspace, tab, root_pane,
+        )));
+    }
     let mut params = serde_json::Map::new();
     insert_opt(&mut params, "cwd", body.cwd);
     insert_opt(&mut params, "label", body.label);
@@ -3566,6 +4547,14 @@ async fn focus_workspace(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
+    let session = find_session(&state.config, &session_id)?;
+    if session.backend == BackendKind::Tmux {
+        terminal_backend(session)
+            .focus_workspace(&BackendWorkspaceId::new(workspace_id))
+            .await
+            .map_err(backend_api_error)?;
+        return Ok(Json(backend::compat::command_ok("workspace_focused")));
+    }
     call_session_method(
         &state.config,
         &session_id,
@@ -3582,6 +4571,14 @@ async fn rename_workspace(
     Json(body): Json<RenameWorkspaceBody>,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
+    let session = find_session(&state.config, &session_id)?;
+    if session.backend == BackendKind::Tmux {
+        terminal_backend(session)
+            .rename_workspace(&BackendWorkspaceId::new(workspace_id), &body.label)
+            .await
+            .map_err(backend_api_error)?;
+        return Ok(Json(backend::compat::command_ok("workspace_renamed")));
+    }
     call_session_method(
         &state.config,
         &session_id,
@@ -3597,6 +4594,14 @@ async fn close_workspace(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
+    let session = find_session(&state.config, &session_id)?;
+    if session.backend == BackendKind::Tmux {
+        terminal_backend(session)
+            .close_workspace(&BackendWorkspaceId::new(workspace_id))
+            .await
+            .map_err(backend_api_error)?;
+        return Ok(Json(backend::compat::command_ok("workspace_closed")));
+    }
     call_session_method(
         &state.config,
         &session_id,
@@ -3612,7 +4617,15 @@ async fn tabs(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
-    call_session_method(&state.config, &session_id, "tab.list", json!({})).await
+    let session = find_session(&state.config, &session_id)?;
+    if session.backend == BackendKind::Herdr {
+        return call_session_method(&state.config, &session_id, "tab.list", json!({})).await;
+    }
+    let tabs = terminal_backend(session)
+        .list_tabs()
+        .await
+        .map_err(backend_api_error)?;
+    Ok(Json(backend::compat::tab_list(tabs)))
 }
 
 async fn create_tab(
@@ -3622,6 +4635,27 @@ async fn create_tab(
     Json(body): Json<CreateTabBody>,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
+    let session = find_session(&state.config, &session_id)?;
+    if session.backend == BackendKind::Tmux {
+        let backend = terminal_backend(session);
+        let tab = backend
+            .create_tab(&BackendCreateTab {
+                workspace_id: body.workspace_id.map(BackendWorkspaceId::new),
+                cwd: body.cwd.map(PathBuf::from),
+                label: body.label,
+                focus: body.focus.unwrap_or(false),
+            })
+            .await
+            .map_err(backend_api_error)?;
+        let root_pane = backend
+            .list_panes()
+            .await
+            .map_err(backend_api_error)?
+            .into_iter()
+            .find(|pane| pane.tab_id == tab.id)
+            .ok_or_else(|| backend_api_error(BackendError::InvalidResponse("created pane")))?;
+        return Ok(Json(backend::compat::tab_created(tab, root_pane)));
+    }
     let mut params = serde_json::Map::new();
     insert_opt(&mut params, "workspace_id", body.workspace_id);
     insert_opt(&mut params, "label", body.label);
@@ -3642,6 +4676,14 @@ async fn focus_tab(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
+    let session = find_session(&state.config, &session_id)?;
+    if session.backend == BackendKind::Tmux {
+        terminal_backend(session)
+            .focus_tab(&BackendTabId::new(tab_id))
+            .await
+            .map_err(backend_api_error)?;
+        return Ok(Json(backend::compat::command_ok("tab_focused")));
+    }
     call_session_method(
         &state.config,
         &session_id,
@@ -3658,6 +4700,14 @@ async fn rename_tab(
     Json(body): Json<RenameTabBody>,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
+    let session = find_session(&state.config, &session_id)?;
+    if session.backend == BackendKind::Tmux {
+        terminal_backend(session)
+            .rename_tab(&BackendTabId::new(tab_id), &body.label)
+            .await
+            .map_err(backend_api_error)?;
+        return Ok(Json(backend::compat::command_ok("tab_renamed")));
+    }
     call_session_method(
         &state.config,
         &session_id,
@@ -3673,6 +4723,14 @@ async fn close_tab(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
+    let session = find_session(&state.config, &session_id)?;
+    if session.backend == BackendKind::Tmux {
+        terminal_backend(session)
+            .close_tab(&BackendTabId::new(tab_id))
+            .await
+            .map_err(backend_api_error)?;
+        return Ok(Json(backend::compat::command_ok("tab_closed")));
+    }
     call_session_method(
         &state.config,
         &session_id,
@@ -3688,13 +4746,23 @@ async fn pane(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
-    let answer = call_session_method(
-        &state.config,
-        &session_id,
-        "pane.get",
-        json!({ "pane_id": pane_id }),
-    )
-    .await;
+    let session = find_session(&state.config, &session_id)?;
+    let answer = if session.backend == BackendKind::Herdr {
+        call_session_method(
+            &state.config,
+            &session_id,
+            "pane.get",
+            json!({ "pane_id": pane_id }),
+        )
+        .await
+    } else {
+        terminal_backend(session)
+            .get_pane(&BackendPaneId::new(pane_id))
+            .await
+            .map(backend::compat::pane_get)
+            .map(Json)
+            .map_err(backend_api_error)
+    };
     Ok(Json(note_and_amend_panes(&state, &session_id, answer?.0)))
 }
 
@@ -3704,6 +4772,14 @@ async fn focus_pane(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
+    let session = find_session(&state.config, &session_id)?;
+    if session.backend == BackendKind::Tmux {
+        terminal_backend(session)
+            .focus_pane(&BackendPaneId::new(pane_id))
+            .await
+            .map_err(backend_api_error)?;
+        return Ok(Json(backend::compat::command_ok("pane_focused")));
+    }
     call_session_method(
         &state.config,
         &session_id,
@@ -3720,6 +4796,14 @@ async fn rename_pane(
     Json(body): Json<RenamePaneBody>,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
+    let session = find_session(&state.config, &session_id)?;
+    if session.backend == BackendKind::Tmux {
+        terminal_backend(session)
+            .rename_pane(&BackendPaneId::new(pane_id), &body.label)
+            .await
+            .map_err(backend_api_error)?;
+        return Ok(Json(backend::compat::command_ok("pane_renamed")));
+    }
     call_session_method(
         &state.config,
         &session_id,
@@ -3735,6 +4819,14 @@ async fn close_pane(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
+    let session = find_session(&state.config, &session_id)?;
+    if session.backend == BackendKind::Tmux {
+        terminal_backend(session)
+            .close_pane(&BackendPaneId::new(pane_id))
+            .await
+            .map_err(backend_api_error)?;
+        return Ok(Json(backend::compat::command_ok("pane_closed")));
+    }
     call_session_method(
         &state.config,
         &session_id,
@@ -3757,6 +4849,49 @@ async fn split_pane(
             "invalid_direction",
             "direction must be right or down",
         ));
+    }
+    if body
+        .ratio
+        .is_some_and(|ratio| !(0.05..=0.95).contains(&ratio))
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_ratio",
+            "ratio must be between 0.05 and 0.95",
+        ));
+    }
+    let session = find_session(&state.config, &session_id)?;
+    if session.backend == BackendKind::Tmux {
+        let backend = terminal_backend(session);
+        let pane = backend
+            .split_pane(&BackendSplitPane {
+                pane_id: BackendPaneId::new(pane_id),
+                direction: match body.direction.as_str() {
+                    "right" => BackendSplitDirection::Right,
+                    "down" => BackendSplitDirection::Down,
+                    _ => unreachable!("direction was validated above"),
+                },
+                ratio: body.ratio,
+                cwd: body.cwd.map(PathBuf::from),
+            })
+            .await
+            .map_err(backend_api_error)?;
+        if let Some(text) = body
+            .command
+            .map(|parts| parts.join(" "))
+            .filter(|text| !text.trim().is_empty())
+        {
+            validate_text(&text)?;
+            backend
+                .send_text(&pane.id, &text)
+                .await
+                .map_err(backend_api_error)?;
+            backend
+                .send_keys(&pane.id, &["Enter".to_owned()])
+                .await
+                .map_err(backend_api_error)?;
+        }
+        return Ok(Json(backend::compat::pane_created(pane)));
     }
     let command = body
         .command
@@ -3812,7 +4947,7 @@ fn created_pane_id(value: &Value) -> Option<&str> {
 
 async fn zoom_pane(
     State(state): State<AppState>,
-    Path((session_id, pane_id)): Path<(String, String)>,
+    Path((session_id, _pane_id)): Path<(String, String)>,
     headers: HeaderMap,
     Json(body): Json<ZoomPaneBody>,
 ) -> ApiResult<Json<Value>> {
@@ -3825,13 +4960,13 @@ async fn zoom_pane(
             "mode must be on, off, or toggle",
         ));
     }
-    call_session_method(
-        &state.config,
-        &session_id,
-        "pane.zoom",
-        json!({ "pane_id": pane_id, "mode": mode }),
-    )
-    .await
+    find_session(&state.config, &session_id)?;
+    // Released Muqun builds POST `zoom:on` whenever a terminal view mounts.
+    // That request is view setup, not an explicit user command. Propagating it
+    // changed the user's tmux/Herdr layout merely by opening the app and raced
+    // stale snapshots into misleading target-not-found errors. Keep the route
+    // and response for wire compatibility, but observation is side-effect free.
+    Ok(Json(backend::compat::command_ok("pane_zoomed")))
 }
 
 async fn agent(
@@ -3840,6 +4975,24 @@ async fn agent(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
+    let session = find_session(&state.config, &session_id)?;
+    if session.backend == BackendKind::Tmux {
+        let pane = terminal_backend(session)
+            .get_pane(&BackendPaneId::new(&target))
+            .await
+            .map_err(backend_api_error)?;
+        let agents = backend::compat::agent_list(&[pane]);
+        let agent = agents.pointer("/result/agents/0").cloned().ok_or_else(|| {
+            api_error(
+                StatusCode::NOT_FOUND,
+                "agent_not_found",
+                "the pane is not running a recognized agent",
+            )
+        })?;
+        return Ok(Json(
+            json!({ "result": { "type": "agent", "agent": agent } }),
+        ));
+    }
     call_session_method(
         &state.config,
         &session_id,
@@ -3855,6 +5008,14 @@ async fn focus_agent(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
+    let session = find_session(&state.config, &session_id)?;
+    if session.backend == BackendKind::Tmux {
+        terminal_backend(session)
+            .focus_pane(&BackendPaneId::new(target))
+            .await
+            .map_err(backend_api_error)?;
+        return Ok(Json(backend::compat::command_ok("agent_focused")));
+    }
     call_session_method(
         &state.config,
         &session_id,
@@ -3890,12 +5051,89 @@ async fn submit_agent_prompt(
     target: &str,
     text: &str,
 ) -> Result<Value, HerdrCallError> {
+    if session.backend == BackendKind::Tmux {
+        return terminal_backend(session)
+            .send_text(&BackendPaneId::new(target), text)
+            .await
+            .map(|_| backend::compat::command_ok("agent_prompted"))
+            .map_err(|err| HerdrCallError::Unavailable(err.to_string()));
+    }
     herdr_call(
         session,
         "agent.prompt",
         json!({ "target": target, "text": text }),
     )
     .await
+}
+
+async fn start_backend_agent(
+    session: &SessionConfig,
+    pane_id: &str,
+    kind: &str,
+    command: &str,
+    args: &[String],
+    timeout_ms: u64,
+) -> Result<Value, HerdrCallError> {
+    if session.backend == BackendKind::Herdr {
+        let mut params = serde_json::Map::new();
+        params.insert("name".into(), json!(kind));
+        params.insert("kind".into(), json!(kind));
+        params.insert("pane_id".into(), json!(pane_id));
+        params.insert("timeout_ms".into(), json!(timeout_ms));
+        if !args.is_empty() {
+            params.insert("args".into(), json!(args));
+        }
+        return herdr_call(session, "agent.start", Value::Object(params)).await;
+    }
+
+    let executable = tasks::find_on_path(command).ok_or_else(|| {
+        HerdrCallError::Unavailable(format!("agent executable {command} was not found on PATH"))
+    })?;
+    let mut argv = vec![executable.to_string_lossy().into_owned()];
+    argv.extend(args.iter().cloned());
+    let command_line = argv
+        .iter()
+        .map(|argument| shell_word(argument))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let backend = terminal_backend(session);
+    let pane = BackendPaneId::new(pane_id);
+    backend
+        .send_text(&pane, &command_line)
+        .await
+        .map_err(|err| HerdrCallError::Unavailable(err.to_string()))?;
+    backend
+        .send_keys(&pane, &["Enter".to_owned()])
+        .await
+        .map_err(|err| HerdrCallError::Unavailable(err.to_string()))?;
+
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let executable_name = executable
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(command);
+    loop {
+        if let Ok(current) = backend.get_pane(&pane).await {
+            let recognized = current.agent.as_deref() == Some(kind)
+                || current.foreground_command.as_deref() == Some(executable_name);
+            if recognized {
+                return Ok(json!({ "result": { "argv": argv } }));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(HerdrCallError::Unavailable(format!(
+                "agent {kind} did not become visible in the tmux pane before timeout"
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Quote one argv value for the interactive shell already running in a tmux
+/// pane. No shell syntax is accepted from structure: every value is enclosed
+/// in single quotes and an embedded quote is closed, escaped, and reopened.
+fn shell_word(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 /// Belt and braces for a paste-vs-keypress race in agent TUIs: when the prompt
@@ -3956,13 +5194,20 @@ async fn submit_keypress(session: &SessionConfig, pane_id: &str) {
             eprintln!("agent submit for pane {pane_id} gave up: the pane never settled");
             return;
         };
-        if let Err(err) = herdr_call(
-            session,
-            "pane.send_keys",
-            json!({ "pane_id": pane_id, "keys": ["Enter"] }),
-        )
-        .await
-        {
+        let sent = match session.backend {
+            BackendKind::Herdr => herdr_call(
+                session,
+                "pane.send_keys",
+                json!({ "pane_id": pane_id, "keys": ["Enter"] }),
+            )
+            .await
+            .map(|_| ()),
+            BackendKind::Tmux => terminal_backend(session)
+                .send_keys(&BackendPaneId::new(pane_id), &["Enter".to_owned()])
+                .await
+                .map_err(|err| HerdrCallError::Unavailable(err.to_string())),
+        };
+        if let Err(err) = sent {
             eprintln!(
                 "agent submit for pane {pane_id} failed to send Enter: {}",
                 err.message()
@@ -4006,10 +5251,10 @@ async fn submit_keypress(session: &SessionConfig, pane_id: &str) {
 /// `None` means Herdr lists no agent for the pane, which a send to a plain shell
 /// pane legitimately is, or that it could not be asked.
 async fn agent_state_change_seq(session: &SessionConfig, pane_id: &str) -> Option<u64> {
-    let value = match herdr_request(session, "agent.list", json!({})).await {
+    let value = match backend_agent_list(session).await {
         Ok(value) => value,
         Err(err) => {
-            eprintln!("Herdr request agent.list failed: {err:#}");
+            eprintln!("terminal backend agent list failed: {err}");
             return None;
         }
     };
@@ -4237,18 +5482,17 @@ async fn create_task(
         "prompt_submitted": false
     });
 
-    let mut agent_params = serde_json::Map::new();
-    agent_params.insert(
-        "name".into(),
-        json!(label.as_deref().unwrap_or(body.agent.as_str())),
-    );
-    agent_params.insert("kind".into(), json!(body.agent));
-    agent_params.insert("pane_id".into(), json!(place.pane_id));
-    agent_params.insert("timeout_ms".into(), json!(timeout_ms));
-    if let Some(args) = body.agent_args.as_ref() {
-        agent_params.insert("args".into(), json!(args));
-    }
-    match herdr_call(&session, "agent.start", Value::Object(agent_params)).await {
+    let agent_command = tasks::agent_command(&body.agent, &state.config.agent_commands);
+    match start_backend_agent(
+        &session,
+        &place.pane_id,
+        &body.agent,
+        &agent_command,
+        body.agent_args.as_deref().unwrap_or_default(),
+        timeout_ms,
+    )
+    .await
+    {
         Ok(value) => {
             steps.ok(
                 "agent",
@@ -4318,6 +5562,35 @@ async fn prepare_workspace(
     steps: &mut tasks::StepLog,
 ) -> Result<TaskPlace, HerdrCallError> {
     steps.skipped("worktree", "no branch_name was given");
+    if session.backend == BackendKind::Tmux {
+        let backend = terminal_backend(session);
+        let workspace = backend
+            .create_workspace(&BackendCreateWorkspace {
+                cwd: Some(repo_path.to_owned()),
+                label: label.map(str::to_owned),
+                focus: false,
+            })
+            .await
+            .map_err(|err| HerdrCallError::Unavailable(err.to_string()))?;
+        let pane = backend
+            .list_panes()
+            .await
+            .map_err(|err| HerdrCallError::Unavailable(err.to_string()))?
+            .into_iter()
+            .find(|pane| pane.workspace_id == workspace.id)
+            .ok_or_else(|| HerdrCallError::malformed("tmux workspace create"))?;
+        let place = TaskPlace {
+            workspace_id: workspace.id.as_str().to_owned(),
+            pane_id: pane.id.as_str().to_owned(),
+            worktree_path: None,
+            reused: false,
+        };
+        steps.ok(
+            "workspace",
+            json!({ "workspace_id": place.workspace_id, "pane_id": place.pane_id }),
+        );
+        return Ok(place);
+    }
     let mut params = serde_json::Map::new();
     params.insert("cwd".into(), json!(repo_path.to_string_lossy()));
     params.insert("focus".into(), json!(false));
@@ -4429,15 +5702,17 @@ async fn spawn_agent(
         "prompt_submitted": false,
     });
 
-    let mut params = serde_json::Map::new();
-    params.insert("name".into(), json!(body.agent));
-    params.insert("kind".into(), json!(body.agent));
-    params.insert("pane_id".into(), json!(place.pane_id));
-    params.insert(
-        "timeout_ms".into(),
-        json!(tasks::DEFAULT_AGENT_START_TIMEOUT_MS),
-    );
-    match herdr_call(&session, "agent.start", Value::Object(params)).await {
+    let agent_command = tasks::agent_command(&body.agent, &state.config.agent_commands);
+    match start_backend_agent(
+        &session,
+        &place.pane_id,
+        &body.agent,
+        &agent_command,
+        &[],
+        tasks::DEFAULT_AGENT_START_TIMEOUT_MS,
+    )
+    .await
+    {
         Ok(value) => {
             steps.ok(
                 "agent",
@@ -4525,6 +5800,35 @@ async fn spawn_in_new_tab(
     cwd: Option<&str>,
     steps: &mut tasks::StepLog,
 ) -> ApiResult<SpawnPlace> {
+    if session.backend == BackendKind::Tmux {
+        let backend = terminal_backend(session);
+        let tab = backend
+            .create_tab(&BackendCreateTab {
+                workspace_id: None,
+                cwd: cwd.map(PathBuf::from),
+                label: None,
+                focus: false,
+            })
+            .await
+            .map_err(backend_api_error)?;
+        let pane_id = backend
+            .list_panes()
+            .await
+            .map_err(backend_api_error)?
+            .into_iter()
+            .find(|pane| pane.tab_id == tab.id)
+            .map(|pane| pane.id.as_str().to_owned())
+            .ok_or_else(|| {
+                api_error(
+                    StatusCode::BAD_GATEWAY,
+                    "backend_malformed_response",
+                    "terminal backend did not return the created pane",
+                )
+            })?;
+        let tab_id = Some(tab.id.as_str().to_owned());
+        steps.ok("pane", json!({ "pane_id": pane_id, "tab_id": tab_id }));
+        return Ok(SpawnPlace { pane_id, tab_id });
+    }
     {
         let mut params = serde_json::Map::new();
         insert_opt(&mut params, "cwd", cwd);
@@ -4572,6 +5876,36 @@ async fn spawn_beside(
             "that tab has no pane to split",
         )
     })?;
+    if session.backend == BackendKind::Tmux {
+        let pane = terminal_backend(session)
+            .split_pane(&BackendSplitPane {
+                pane_id: BackendPaneId::new(&host),
+                direction: BackendSplitDirection::Down,
+                ratio: None,
+                cwd: cwd.map(PathBuf::from),
+            })
+            .await;
+        return match pane {
+            Ok(pane) => {
+                let pane_id = pane.id.as_str().to_owned();
+                steps.ok(
+                    "pane",
+                    json!({ "pane_id": pane_id, "tab_id": tab_id, "split_from": host }),
+                );
+                Ok(SpawnPlace {
+                    pane_id,
+                    tab_id: Some(tab_id.to_owned()),
+                })
+            }
+            Err(err) => {
+                steps.skipped(
+                    "split",
+                    &format!("{err} -- starting in a tab of its own instead"),
+                );
+                spawn_in_new_tab(session, cwd, steps).await
+            }
+        };
+    }
     let mut params = serde_json::Map::new();
     params.insert("pane_id".into(), json!(host));
     params.insert("direction".into(), json!("down"));
@@ -4615,6 +5949,16 @@ async fn spawn_beside(
 
 /// A pane to split in the named tab, preferring the one that has focus.
 async fn pane_in_tab(session: &SessionConfig, tab_id: &str) -> Option<String> {
+    if session.backend == BackendKind::Tmux {
+        return terminal_backend(session)
+            .list_panes()
+            .await
+            .ok()?
+            .into_iter()
+            .filter(|pane| pane.tab_id.as_str() == tab_id)
+            .max_by_key(|pane| pane.focused)
+            .map(|pane| pane.id.as_str().to_owned());
+    }
     let value = herdr_request(session, "pane.list", json!({})).await.ok()?;
     pane_to_split(&value, tab_id)
 }
@@ -4705,13 +6049,7 @@ async fn interrupt_pane(
         .filter(|value| !value.is_empty());
     let key = shortcuts::interrupt_key(agent, title);
 
-    herdr_call(
-        &session,
-        "pane.send_keys",
-        json!({ "pane_id": pane_id, "keys": [key] }),
-    )
-    .await
-    .map_err(|err| err.into_api_error("pane.send_keys"))?;
+    send_pane_keys(&session, &pane_id, std::slice::from_ref(&key)).await?;
 
     Ok(Json(json!({
         "session_id": session_id,
@@ -4739,6 +6077,9 @@ async fn prepare_worktree(
     label: Option<&str>,
     steps: &mut tasks::StepLog,
 ) -> Result<TaskPlace, HerdrCallError> {
+    if session.backend == BackendKind::Tmux {
+        return prepare_worktree_with_git(session, repo_path, branch, label, steps).await;
+    }
     let cwd = repo_path.to_string_lossy().into_owned();
 
     let existing = herdr_call(session, "worktree.list", json!({ "cwd": cwd }))
@@ -4853,16 +6194,46 @@ async fn prepare_worktree_with_git(
         json!({ "path": path, "branch": branch, "reused": !added.created }),
     );
 
-    let mut params = serde_json::Map::new();
-    params.insert("cwd".into(), json!(path));
-    params.insert("focus".into(), json!(false));
-    insert_opt(&mut params, "label", label);
-    let created = match herdr_call(session, "workspace.create", Value::Object(params)).await {
-        // Herdr's own refusal is the useful message here, so it is kept rather
-        // than flattened into "something went wrong".
-        Err(err) => Err(err),
-        Ok(value) => workspace_place(&value, Some(path.clone()), !added.created)
-            .ok_or_else(|| HerdrCallError::malformed("workspace.create")),
+    let created = match session.backend {
+        BackendKind::Herdr => {
+            let mut params = serde_json::Map::new();
+            params.insert("cwd".into(), json!(path));
+            params.insert("focus".into(), json!(false));
+            insert_opt(&mut params, "label", label);
+            match herdr_call(session, "workspace.create", Value::Object(params)).await {
+                // Herdr's own refusal is the useful message here, so it is kept rather
+                // than flattened into "something went wrong".
+                Err(err) => Err(err),
+                Ok(value) => workspace_place(&value, Some(path.clone()), !added.created)
+                    .ok_or_else(|| HerdrCallError::malformed("workspace.create")),
+            }
+        }
+        BackendKind::Tmux => {
+            let backend = terminal_backend(session);
+            match backend
+                .create_workspace(&BackendCreateWorkspace {
+                    cwd: Some(PathBuf::from(&path)),
+                    label: label.map(str::to_owned),
+                    focus: false,
+                })
+                .await
+            {
+                Err(err) => Err(HerdrCallError::Unavailable(err.to_string())),
+                Ok(workspace) => backend
+                    .list_panes()
+                    .await
+                    .map_err(|err| HerdrCallError::Unavailable(err.to_string()))?
+                    .into_iter()
+                    .find(|pane| pane.workspace_id == workspace.id)
+                    .map(|pane| TaskPlace {
+                        workspace_id: workspace.id.as_str().to_owned(),
+                        pane_id: pane.id.as_str().to_owned(),
+                        worktree_path: Some(path.clone()),
+                        reused: !added.created,
+                    })
+                    .ok_or_else(|| HerdrCallError::malformed("tmux workspace create")),
+            }
+        }
     };
 
     match created {
@@ -4995,25 +6366,27 @@ async fn task_repo_roots(state: &AppState, session: &SessionConfig) -> Vec<PathB
         }
     };
 
-    match herdr_request(session, "workspace.list", json!({})).await {
-        Ok(value) => {
-            if let Some(workspaces) = value
-                .pointer("/result/workspaces")
-                .and_then(Value::as_array)
-            {
-                for workspace in workspaces {
-                    for key in ["repo_root", "checkout_path"] {
-                        if let Some(path) = workspace
-                            .pointer(&format!("/worktree/{key}"))
-                            .and_then(Value::as_str)
-                        {
-                            push(PathBuf::from(path));
+    if session.backend == BackendKind::Herdr {
+        match herdr_request(session, "workspace.list", json!({})).await {
+            Ok(value) => {
+                if let Some(workspaces) = value
+                    .pointer("/result/workspaces")
+                    .and_then(Value::as_array)
+                {
+                    for workspace in workspaces {
+                        for key in ["repo_root", "checkout_path"] {
+                            if let Some(path) = workspace
+                                .pointer(&format!("/worktree/{key}"))
+                                .and_then(Value::as_str)
+                            {
+                                push(PathBuf::from(path));
+                            }
                         }
                     }
                 }
             }
+            Err(err) => eprintln!("task roots: workspace.list failed: {err:#}"),
         }
-        Err(err) => eprintln!("task roots: workspace.list failed: {err:#}"),
     }
 
     for root in session_asset_roots(state, session).await {
@@ -5134,6 +6507,30 @@ async fn pane_output(
     } else {
         source.as_str()
     };
+    let session = find_session(&state.config, &session_id)?;
+    if session.backend == BackendKind::Tmux {
+        let request = BackendReadPane {
+            pane_id: BackendPaneId::new(pane_id.clone()),
+            source: match source.as_str() {
+                "visible" => BackendOutputSource::Visible,
+                "recent" => BackendOutputSource::Recent,
+                "recent-unwrapped" => BackendOutputSource::RecentUnwrapped,
+                "detection" => BackendOutputSource::Detection,
+                _ => unreachable!("source was validated above"),
+            },
+            format: match format.as_str() {
+                "text" => BackendOutputFormat::Text,
+                "ansi" => BackendOutputFormat::Ansi,
+                _ => unreachable!("format was validated above"),
+            },
+            lines,
+        };
+        let output = terminal_backend(session)
+            .read_pane(&request)
+            .await
+            .map_err(backend_api_error)?;
+        return Ok(Json(backend::compat::pane_read(output)));
+    }
     let params = json!({
         "pane_id": pane_id,
         "source": herdr_source,
@@ -5221,26 +6618,45 @@ async fn pane_parts(
     // `recent_unwrapped` is the only source worth normalizing: the dictionaries
     // key off line starts, and it is the one source where a long line is one
     // line rather than however many the pane happens to be wide.
-    let read = herdr_request(
-        &session,
-        "pane.read",
-        json!({
-            "pane_id": pane_id,
-            "source": "recent_unwrapped",
-            "lines": lines,
-            "format": "text"
-        }),
-    )
-    .await
-    .map_err(|err| {
-        eprintln!("Herdr request pane.read failed: {err:#}");
-        api_error(
-            StatusCode::BAD_GATEWAY,
-            "herdr_unavailable",
-            "Herdr is unavailable",
-        )
-    })?;
-    let herdr_text = pane_read_text(&read).unwrap_or_default();
+    let (backend_text, revision) = match session.backend {
+        BackendKind::Herdr => {
+            let read = herdr_request(
+                &session,
+                "pane.read",
+                json!({
+                    "pane_id": pane_id,
+                    "source": "recent_unwrapped",
+                    "lines": lines,
+                    "format": "text"
+                }),
+            )
+            .await
+            .map_err(|err| {
+                eprintln!("Herdr request pane.read failed: {err:#}");
+                api_error(
+                    StatusCode::BAD_GATEWAY,
+                    "herdr_unavailable",
+                    "Herdr is unavailable",
+                )
+            })?;
+            let revision = ["/result/read/revision", "/result/revision"]
+                .into_iter()
+                .find_map(|pointer| read.pointer(pointer).and_then(Value::as_u64));
+            (pane_read_text(&read).unwrap_or_default(), revision)
+        }
+        BackendKind::Tmux => {
+            let output = terminal_backend(&session)
+                .read_pane(&BackendReadPane {
+                    pane_id: BackendPaneId::new(&pane_id),
+                    source: BackendOutputSource::RecentUnwrapped,
+                    format: BackendOutputFormat::Text,
+                    lines,
+                })
+                .await
+                .map_err(backend_api_error)?;
+            (output.text, output.revision)
+        }
+    };
     // The transcript reads the same pane through a different endpoint, so it
     // has to be given the same rows: two views that disagree about where
     // history ends is the bug this whole thing is trying not to introduce.
@@ -5248,18 +6664,15 @@ async fn pane_parts(
         let key = scrollback::read_key(&session_id, &pane_id, "recent_unwrapped", "text");
         match lock_scrollback(&state) {
             Some(mut store) if store.keeps(&session_id, &pane_id) => {
-                store.record(&key, &herdr_text);
+                store.record(&key, &backend_text);
                 store
                     .window(&key, lines as usize)
-                    .filter(|served| served.len() > herdr_text.len())
-                    .unwrap_or(herdr_text)
+                    .filter(|served| served.len() > backend_text.len())
+                    .unwrap_or(backend_text)
             }
-            _ => herdr_text,
+            _ => backend_text,
         }
     };
-    let revision = ["/result/read/revision", "/result/revision"]
-        .into_iter()
-        .find_map(|pointer| read.pointer(pointer).and_then(Value::as_u64));
 
     let dictionary = parts::dictionary_for(agent.as_deref());
 
@@ -5330,6 +6743,19 @@ async fn pane_agent_and_root(
     session: &SessionConfig,
     pane_id: &str,
 ) -> (Option<String>, Option<PathBuf>) {
+    if session.backend == BackendKind::Tmux {
+        let Ok(pane) = terminal_backend(session)
+            .get_pane(&BackendPaneId::new(pane_id))
+            .await
+        else {
+            return (None, None);
+        };
+        let root = pane
+            .cwd
+            .filter(|path| is_scannable_root(path))
+            .and_then(|path| std::fs::canonicalize(path).ok());
+        return (pane.agent, root);
+    }
     let pane = herdr_request(session, "pane.get", json!({ "pane_id": pane_id }))
         .await
         .ok();
@@ -5516,6 +6942,16 @@ async fn session_agent_events(
 /// envelope. A pane the socket cannot answer for is a 502 rather than a guess:
 /// every caller here is about to act on what this pane is running.
 async fn pane_get(session: &SessionConfig, pane_id: &str) -> ApiResult<Value> {
+    if session.backend == BackendKind::Tmux {
+        let pane = terminal_backend(session)
+            .get_pane(&BackendPaneId::new(pane_id))
+            .await
+            .map_err(backend_api_error)?;
+        return Ok(backend::compat::pane_get(pane)
+            .pointer("/result/pane")
+            .cloned()
+            .unwrap_or_default());
+    }
     let response = herdr_request(session, "pane.get", json!({ "pane_id": pane_id }))
         .await
         .map_err(|err| {
@@ -5902,6 +7338,13 @@ async fn send_pane_keys(
     pane_id: &str,
     keys: &[String],
 ) -> ApiResult<Value> {
+    if session.backend == BackendKind::Tmux {
+        terminal_backend(session)
+            .send_keys(&BackendPaneId::new(pane_id), keys)
+            .await
+            .map_err(backend_api_error)?;
+        return Ok(backend::compat::command_ok("pane_keys_sent"));
+    }
     herdr_request(
         session,
         "pane.send_keys",
@@ -5924,6 +7367,18 @@ async fn send_pane_keys(
 /// callers care about the current screen, and the scrollback of an answered menu
 /// or an already-submitted prompt would only mislead them.
 async fn read_pane_visible_text(session: &SessionConfig, pane_id: &str) -> ApiResult<String> {
+    if session.backend == BackendKind::Tmux {
+        return terminal_backend(session)
+            .read_pane(&BackendReadPane {
+                pane_id: BackendPaneId::new(pane_id),
+                source: BackendOutputSource::Visible,
+                format: BackendOutputFormat::Text,
+                lines: APPROVAL_READ_LINES,
+            })
+            .await
+            .map(|output| output.text)
+            .map_err(backend_api_error);
+    }
     let read = herdr_request(
         session,
         "pane.read",
@@ -5951,13 +7406,10 @@ async fn read_pane_approval(
     session: &SessionConfig,
     pane_id: &str,
 ) -> ApiResult<(Option<String>, Option<approvals::Approval>)> {
-    let agent = herdr_request(session, "pane.get", json!({ "pane_id": pane_id }))
+    let agent = pane_get(session, pane_id)
         .await
         .ok()
-        .and_then(|response| {
-            let pane = response.pointer("/result/pane").unwrap_or(&response);
-            pane.get("agent").and_then(Value::as_str).map(str::to_owned)
-        })
+        .and_then(|pane| pane.get("agent").and_then(Value::as_str).map(str::to_owned))
         .filter(|agent| !agent.is_empty());
     let text = read_pane_visible_text(session, pane_id).await?;
     Ok((agent, approvals::detect(&text)))
@@ -5997,6 +7449,14 @@ async fn send_text(
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
     validate_text(&body.text)?;
+    let session = find_session(&state.config, &session_id)?;
+    if session.backend == BackendKind::Tmux {
+        terminal_backend(session)
+            .send_text(&BackendPaneId::new(pane_id), &body.text)
+            .await
+            .map_err(backend_api_error)?;
+        return Ok(Json(backend::compat::command_ok("pane_text_sent")));
+    }
     call_session_method(
         &state.config,
         &session_id,
@@ -6019,6 +7479,14 @@ async fn send_keys(
             "invalid_keys",
             "keys must contain 1 to 32 entries",
         ));
+    }
+    let session = find_session(&state.config, &session_id)?;
+    if session.backend == BackendKind::Tmux {
+        terminal_backend(session)
+            .send_keys(&BackendPaneId::new(pane_id), &body.keys)
+            .await
+            .map_err(backend_api_error)?;
+        return Ok(Json(backend::compat::command_ok("pane_keys_sent")));
     }
     call_session_method(
         &state.config,
@@ -6838,10 +8306,20 @@ async fn ingest_roots(index: Arc<Mutex<AssetIndex>>, roots: Vec<AssetRoot>) -> V
 /// Herdr is the source of truth for where a session works, but a listing still
 /// has to answer when the socket is down, so the last known roots are kept.
 async fn session_asset_roots(state: &AppState, session: &SessionConfig) -> Vec<AssetRoot> {
-    let fresh = match herdr_request(session, "pane.list", json!({})).await {
+    let response = match session.backend {
+        BackendKind::Herdr => herdr_request(session, "pane.list", json!({}))
+            .await
+            .map_err(|err| format!("{err:#}")),
+        BackendKind::Tmux => terminal_backend(session)
+            .list_panes()
+            .await
+            .map(backend::compat::pane_list)
+            .map_err(|err| err.to_string()),
+    };
+    let fresh = match response {
         Ok(value) => pane_list_roots(&session.id, &value),
         Err(err) => {
-            eprintln!("asset roots: pane.list failed: {err:#}");
+            eprintln!("asset roots: pane.list failed: {err}");
             Vec::new()
         }
     };
@@ -7303,6 +8781,39 @@ fn header_safe_name(name: &str) -> String {
 /// the asset endpoints answer with.
 fn asset_created_payload(entry: &AssetEntry, asset_type: AssetType) -> String {
     content_envelope(json!({ "asset": asset_json(entry, asset_type) })).to_string()
+}
+
+fn terminal_backend(session: &SessionConfig) -> Box<dyn TerminalBackend> {
+    match session.backend {
+        BackendKind::Herdr => Box::new(HerdrBackend::new(&session.socket_path)),
+        BackendKind::Tmux => Box::new(TmuxBackend::new(
+            (!session.socket_path.is_empty()).then(|| PathBuf::from(&session.socket_path)),
+        )),
+    }
+}
+
+fn backend_api_error(error: BackendError) -> (StatusCode, Json<Value>) {
+    let (status, code, message) = match &error {
+        BackendError::InvalidTarget(_) => (
+            StatusCode::NOT_FOUND,
+            "backend_target_not_found",
+            "terminal target not found",
+        ),
+        BackendError::Unavailable => (
+            StatusCode::BAD_GATEWAY,
+            "backend_unavailable",
+            "terminal backend is unavailable",
+        ),
+        BackendError::InvalidResponse(_) | BackendError::Refused { .. } => (
+            StatusCode::BAD_GATEWAY,
+            "backend_error",
+            "terminal backend request failed",
+        ),
+    };
+    // Adapter diagnostics may name a local socket or tmux target. Keep them in
+    // the host log and return only a stable, non-sensitive API error.
+    eprintln!("terminal backend request failed: {error}");
+    api_error(status, code, message)
 }
 
 async fn call_session_method(
@@ -7793,22 +9304,56 @@ fn load_config(config_path: Option<String>) -> anyhow::Result<Config> {
 }
 
 pub(crate) fn config_dir() -> anyhow::Result<std::path::PathBuf> {
-    if let Ok(path) = std::env::var("HERDR_PLUGIN_CONFIG_DIR") {
-        return Ok(path.into());
+    let standalone = standalone_config_dir()?;
+    if !standalone.join(HERDR_PLUGIN_IMPORT_MARKER).exists() {
+        if let Ok(path) = std::env::var("HERDR_PLUGIN_CONFIG_DIR") {
+            return Ok(path.into());
+        }
     }
+    Ok(standalone)
+}
+
+fn state_dir() -> anyhow::Result<std::path::PathBuf> {
+    let standalone_config = standalone_config_dir()?;
+    if !standalone_config.join(HERDR_PLUGIN_IMPORT_MARKER).exists() {
+        if let Ok(path) = std::env::var("HERDR_PLUGIN_STATE_DIR") {
+            return Ok(path.into());
+        }
+    }
+    standalone_state_dir()
+}
+
+fn standalone_config_dir() -> anyhow::Result<PathBuf> {
     Ok(dirs::config_dir()
         .context("failed to locate config directory")?
         .join("herdr-gateway"))
 }
 
-fn state_dir() -> anyhow::Result<std::path::PathBuf> {
-    if let Ok(path) = std::env::var("HERDR_PLUGIN_STATE_DIR") {
-        return Ok(path.into());
-    }
+fn standalone_state_dir() -> anyhow::Result<PathBuf> {
     Ok(dirs::data_dir()
         .or_else(dirs::config_dir)
         .context("failed to locate state directory")?
         .join("herdr-gateway"))
+}
+
+fn default_herdr_plugin_config_dir() -> anyhow::Result<PathBuf> {
+    if let Ok(path) = std::env::var("HERDR_PLUGIN_CONFIG_DIR") {
+        return Ok(path.into());
+    }
+    Ok(dirs::config_dir()
+        .context("failed to locate config directory")?
+        .join("herdr/plugins/config/herdr.gateway"))
+}
+
+fn default_herdr_plugin_state_dir() -> anyhow::Result<PathBuf> {
+    if let Ok(path) = std::env::var("HERDR_PLUGIN_STATE_DIR") {
+        return Ok(path.into());
+    }
+    Ok(dirs::state_dir()
+        .or_else(dirs::data_dir)
+        .or_else(dirs::config_dir)
+        .context("failed to locate state directory")?
+        .join("herdr/plugins/herdr.gateway"))
 }
 
 fn read_push_tokens() -> anyhow::Result<Vec<PushTokenRecord>> {
@@ -7869,17 +9414,21 @@ fn list_devices() -> anyhow::Result<()> {
 
 fn revoke_device(device_id: Option<String>, all: bool) -> anyhow::Result<()> {
     if all {
-        let mut devices = read_devices()?;
-        let count = devices.len();
-        devices.clear();
-        write_devices(&devices)?;
+        let devices = read_devices()?;
+        let mut count = 0_usize;
+        for device in devices {
+            count += usize::from(revoke_managed_device(&device.id)?);
+        }
         println!("revoked {count} device token(s)");
         return Ok(());
     }
     let Some(device_id) = device_id else {
         anyhow::bail!("pass a device id from `gateway devices`, or --all");
     };
-    if !revoke_device_by_id(&device_id)? {
+    // A running gateway owns the in-memory device list. Revoke through its
+    // narrow manager API so a later pairing write cannot resurrect a token
+    // removed only from disk. The helper falls back to disk when it is stopped.
+    if !revoke_managed_device(&device_id)? {
         anyhow::bail!("device {device_id} not found");
     }
     println!("revoked device {device_id}");
@@ -8011,6 +9560,7 @@ fn gateway_listener_pids(port: u16) -> anyhow::Result<Vec<u32>> {
 }
 
 /// Confirm a pid really belongs to the gateway before signalling it.
+#[cfg(target_os = "macos")]
 fn process_is_gateway(pid: u32) -> bool {
     ProcessCommand::new("ps")
         .args(["-p", &pid.to_string(), "-o", "comm="])
@@ -8287,9 +9837,9 @@ fn openapi_spec() -> Value {
     json!({
         "openapi": "3.1.0",
         "info": {
-            "title": "Herdr Gateway API",
+            "title": "Terminal Gateway API",
             "version": env!("CARGO_PKG_VERSION"),
-            "description": "Token-protected mobile API for controlling a local Herdr server through the Herdr socket API. Human-readable text is localized: send X-Muqun-Locale (or Accept-Language) with `en` or `zh-TW`. Error `code` values, decision names and other wire vocabulary are the same bytes in every locale."
+            "description": "Token-protected mobile API for controlling local terminal workspaces through a configured Herdr or tmux backend. Human-readable text is localized: send X-Muqun-Locale (or Accept-Language) with `en` or `zh-TW`. Error `code` values, decision names and other wire vocabulary are the same bytes in every locale."
         },
         "components": {
             "securitySchemes": {
@@ -8301,8 +9851,8 @@ fn openapi_spec() -> Value {
         },
         "security": [{ "bearerAuth": [] }],
         "paths": {
-            "/health": { "get": simple_endpoint("Gateway and Herdr health") },
-            "/api/meta": { "get": simple_endpoint("Gateway API and Herdr compatibility metadata") },
+            "/health": { "get": simple_endpoint("Gateway health") },
+            "/api/meta": { "get": simple_endpoint("Gateway API, backend, and legacy compatibility metadata") },
             "/api/pair/request": {
                 "post": {
                     "summary": "Request pairing from Muqun app",
@@ -8376,7 +9926,7 @@ fn openapi_spec() -> Value {
                     "responses": asset_content_responses()
                 }
             },
-            "/api/sessions": { "get": simple_endpoint("List configured Herdr sessions") },
+            "/api/sessions": { "get": simple_endpoint("List configured terminal backend sessions") },
             "/api/sessions/{sessionId}/events": {
                 "get": {
                     "summary": "Stream Herdr lifecycle events as Server-Sent Events",
@@ -8471,7 +10021,8 @@ fn openapi_spec() -> Value {
             },
             "/api/sessions/{sessionId}/panes/{paneId}/zoom": {
                 "post": {
-                    "summary": "Zoom a pane for a single-panel viewport",
+                    "summary": "Acknowledge the legacy app viewport request without changing backend zoom",
+                    "description": "Compatibility no-op. Released app builds call this when mounting a terminal; observing a pane must not mutate tmux or Herdr layout.",
                     "parameters": [path_param("sessionId"), path_param("paneId")],
                     "requestBody": json_body(json!({
                         "type": "object",
@@ -9111,7 +10662,7 @@ fn ok_response() -> Value {
         },
         "401": { "description": "Missing or invalid authorization" },
         "403": { "description": "Invalid token" },
-        "502": { "description": "Herdr socket unavailable or returned an error" }
+        "502": { "description": "Terminal backend unavailable or returned an error" }
     })
 }
 
@@ -9120,7 +10671,7 @@ const DOCS_HTML: &str = r#"<!doctype html>
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Herdr Gateway API Docs</title>
+    <title>Terminal Gateway API Docs</title>
   </head>
   <body>
     <script id="api-reference" data-url="/openapi.json"></script>
@@ -9134,6 +10685,13 @@ mod tests {
     use super::*;
     use axum::http::HeaderValue;
 
+    #[test]
+    fn tmux_agent_arguments_are_shell_quoted_as_single_words() {
+        assert_eq!(shell_word("plain"), "'plain'");
+        assert_eq!(shell_word("two words"), "'two words'");
+        assert_eq!(shell_word("a'b;$(touch nope)"), "'a'\\''b;$(touch nope)'");
+    }
+
     fn test_config(token: &str) -> Config {
         Config {
             server_id: "server-1".into(),
@@ -9145,6 +10703,7 @@ mod tests {
                 id: "default".into(),
                 label: "Default".into(),
                 socket_path: "/tmp/herdr.sock".into(),
+                backend: BackendKind::Herdr,
             }],
             agent_commands: BTreeMap::new(),
             rich_agent_pushes: false,
@@ -9522,6 +11081,26 @@ mod tests {
         let state = test_state("secret", vec![test_device("device-1", "device-token")]);
         let err = require_device(&state, &bearer_headers("secret")).unwrap_err();
         assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn app_mount_zoom_is_side_effect_free_for_both_backends() {
+        for backend in [BackendKind::Herdr, BackendKind::Tmux] {
+            let mut state = test_state("secret", vec![test_device("device-1", "device-token")]);
+            state.config.sessions[0].backend = backend;
+            state.config.sessions[0].socket_path = String::from("/definitely/not/a/socket");
+            let response = zoom_pane(
+                State(state),
+                Path((String::from("default"), String::from("missing-pane"))),
+                bearer_headers("device-token"),
+                Json(ZoomPaneBody {
+                    mode: Some(String::from("on")),
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.0["result"]["type"], "pane_zoomed");
+        }
     }
 
     #[test]
@@ -11407,10 +12986,12 @@ mod tests {
         // A minor bump: the routes are additive, so an older client keeps
         // working, and a newer one can gate on the capability rather than on
         // probing for a 404.
-        assert!(GATEWAY_API_VERSION.starts_with("1.5."));
+        assert!(GATEWAY_API_VERSION.starts_with("1.7."));
         assert_eq!(GATEWAY_API_MAJOR, 1);
         assert!(API_CAPABILITIES.contains(&"tasks"));
         assert!(API_CAPABILITIES.contains(&"agent_catalog"));
+        assert!(API_CAPABILITIES.contains(&"terminal_backends"));
+        assert!(API_CAPABILITIES.contains(&"multiple_terminal_backends"));
     }
 
     #[test]
@@ -11461,6 +13042,265 @@ mod tests {
             config.agent_commands.get("claude").map(String::as_str),
             Some("claude-canary")
         );
+    }
+
+    #[test]
+    fn a_tmux_session_is_explicit_while_old_sessions_stay_herdr() {
+        let old: SessionConfig = serde_json::from_value(json!({
+            "id": "default", "label": "Default", "socket_path": "/tmp/herdr.sock"
+        }))
+        .unwrap();
+        assert_eq!(old.backend, BackendKind::Herdr);
+        assert!(serde_json::to_value(&old).unwrap().get("backend").is_none());
+
+        let tmux = SessionConfig {
+            id: "default".into(),
+            label: "Default".into(),
+            socket_path: String::new(),
+            backend: BackendKind::Tmux,
+        };
+        assert_eq!(serde_json::to_value(tmux).unwrap()["backend"], "tmux");
+    }
+
+    #[test]
+    fn adding_a_backend_preserves_the_primary_session_and_is_idempotent() {
+        let mut config = test_config("token");
+        config.sessions[0] = SessionConfig {
+            id: "default".into(),
+            label: "tmux".into(),
+            socket_path: String::new(),
+            backend: BackendKind::Tmux,
+        };
+
+        let id = upsert_backend_session(
+            &mut config,
+            BackendKind::Herdr,
+            None,
+            None,
+            Some("/tmp/herdr.sock".into()),
+        )
+        .unwrap();
+        assert_eq!(id, "herdr");
+        assert_eq!(config.sessions[0].id, "default");
+        assert_eq!(config.sessions[1].backend, BackendKind::Herdr);
+
+        let id = upsert_backend_session(
+            &mut config,
+            BackendKind::Herdr,
+            None,
+            Some("Herdr local".into()),
+            Some("/tmp/new.sock".into()),
+        )
+        .unwrap();
+        assert_eq!(id, "herdr");
+        assert_eq!(config.sessions.len(), 2);
+        assert_eq!(config.sessions[1].label, "Herdr local");
+        assert_eq!(config.sessions[1].socket_path, "/tmp/new.sock");
+    }
+
+    #[test]
+    fn choosing_a_default_backend_only_reorders_sessions() {
+        let mut config = test_config("token");
+        config.sessions.push(SessionConfig {
+            id: "tmux".into(),
+            label: "Local tmux".into(),
+            socket_path: String::new(),
+            backend: BackendKind::Tmux,
+        });
+        make_backend_default(&mut config, "tmux").unwrap();
+        assert_eq!(config.sessions[0].id, "tmux");
+        assert_eq!(config.sessions[1].id, "default");
+        assert!(make_backend_default(&mut config, "missing").is_err());
+    }
+
+    #[test]
+    fn manager_fields_wrap_without_losing_url_or_message_text() {
+        let value = "http://osk.taila90692.ts.net:23847/a-long-path";
+        let mut lines = Vec::new();
+        push_wrapped_field(&mut lines, "url", value, 24);
+        let reconstructed = lines
+            .iter()
+            .enumerate()
+            .map(|(index, line)| {
+                if index == 0 {
+                    line.strip_prefix("url: ").unwrap()
+                } else {
+                    line.trim_start()
+                }
+            })
+            .collect::<String>();
+        assert_eq!(reconstructed, value);
+        assert!(lines.iter().all(|line| display_width(line) <= 24));
+    }
+
+    #[test]
+    fn backend_ids_and_labels_reject_terminal_control_input() {
+        assert!(validate_session_id("tmux-2").is_ok());
+        assert!(validate_session_id("../tmux").is_err());
+        assert!(validate_session_id("tmux\nforged").is_err());
+        assert!(validate_label("Local tmux").is_ok());
+        assert!(validate_label("tmux\x1b[2J").is_err());
+    }
+
+    #[test]
+    fn transport_metadata_distinguishes_tls_tailscale_and_plain_http() {
+        let mut config = test_config("token");
+        config.public_url = "https://host.tailnet.ts.net".into();
+        config.listen = "127.0.0.1:23847".into();
+        assert_eq!(transport_protection(&config), "https");
+
+        config.public_url = "http://host.tailnet.ts.net:23847".into();
+        config.listen = "100.118.124.50:23847".into();
+        assert_eq!(transport_protection(&config), "tailscale-wireguard");
+
+        config.listen = "0.0.0.0:23847".into();
+        assert_eq!(transport_protection(&config), "unencrypted-http");
+    }
+
+    #[test]
+    fn an_explicit_loopback_url_never_opens_the_listener_to_the_lan() {
+        assert_eq!(
+            listen_for_explicit_public_url("http://localhost:23847", 23847),
+            "127.0.0.1:23847"
+        );
+        assert_eq!(
+            listen_for_explicit_public_url("http://127.0.0.1:23847", 23847),
+            "127.0.0.1:23847"
+        );
+        assert_eq!(
+            listen_for_explicit_public_url("http://[::1]:23847", 23847),
+            "[::1]:23847"
+        );
+        assert_eq!(
+            listen_for_explicit_public_url("https://host.tailnet.ts.net", 23847),
+            "0.0.0.0:23847"
+        );
+    }
+
+    #[test]
+    fn an_existing_install_requires_one_consistent_pairing_identity() {
+        let dir =
+            std::env::temp_dir().join(format!("gateway-existing-install-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = test_config("admin-token");
+        let pairing = PairingFile {
+            payload: PairingPayload {
+                kind: "herdr-gateway".into(),
+                server_id: config.server_id.clone(),
+                label: config.label.clone(),
+                url: config.public_url.clone(),
+                token: "admin-token".into(),
+            },
+        };
+        std::fs::write(dir.join(CONFIG_FILE), serde_json::to_vec(&config).unwrap()).unwrap();
+        std::fs::write(
+            dir.join(PAIRING_FILE),
+            serde_json::to_vec(&pairing).unwrap(),
+        )
+        .unwrap();
+        assert!(load_existing_install(&dir.join(CONFIG_FILE), &dir.join(PAIRING_FILE)).is_some());
+
+        let mut stale = pairing;
+        stale.payload.token = "different-token".into();
+        std::fs::write(dir.join(PAIRING_FILE), serde_json::to_vec(&stale).unwrap()).unwrap();
+        assert!(load_existing_install(&dir.join(CONFIG_FILE), &dir.join(PAIRING_FILE)).is_none());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn imported_state_is_merged_without_duplicates() {
+        let dir = std::env::temp_dir().join(format!("gateway-state-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.json");
+        let target = dir.join("target.json");
+        std::fs::write(&source, br#"["one","two"]"#).unwrap();
+        std::fs::write(&target, br#"["two","three"]"#).unwrap();
+        merge_plugin_state::<String, _>(&source, &target, |left, right| left == right).unwrap();
+        let merged: Vec<String> = serde_json::from_slice(&std::fs::read(&target).unwrap()).unwrap();
+        assert_eq!(merged, vec!["one", "two", "three"]);
+        assert!(target
+            .with_file_name("target.json.before-herdr-import")
+            .exists());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn plugin_import_keeps_the_paired_identity_and_merges_tmux() {
+        let root = std::env::temp_dir().join(format!("gateway-import-{}", uuid::Uuid::new_v4()));
+        let source_config_dir = root.join("plugin-config");
+        let source_state_dir = root.join("plugin-state");
+        let target_config_dir = root.join("standalone-config");
+        let target_state_dir = root.join("standalone-state");
+        for dir in [
+            &source_config_dir,
+            &source_state_dir,
+            &target_config_dir,
+            &target_state_dir,
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        let mut plugin = test_config("plugin-token");
+        plugin.server_id = "paired-herdr".into();
+        plugin.listen = "127.0.0.1:31987".into();
+        plugin.public_url = "http://127.0.0.1:31987".into();
+        let plugin_pairing = PairingFile {
+            payload: PairingPayload {
+                kind: "herdr-gateway".into(),
+                server_id: plugin.server_id.clone(),
+                label: plugin.label.clone(),
+                url: plugin.public_url.clone(),
+                token: "plugin-token".into(),
+            },
+        };
+        write_config(&source_config_dir.join(CONFIG_FILE), &plugin).unwrap();
+        write_secret_file(
+            &source_config_dir.join(PAIRING_FILE),
+            &serde_json::to_vec(&plugin_pairing).unwrap(),
+        )
+        .unwrap();
+
+        let mut standalone = test_config("tmux-token");
+        standalone.server_id = "discarded-tmux-identity".into();
+        standalone.sessions[0] = SessionConfig {
+            id: "default".into(),
+            label: "tmux".into(),
+            socket_path: String::new(),
+            backend: BackendKind::Tmux,
+        };
+        let standalone_pairing = PairingFile {
+            payload: PairingPayload {
+                kind: "herdr-gateway".into(),
+                server_id: standalone.server_id.clone(),
+                label: standalone.label.clone(),
+                url: standalone.public_url.clone(),
+                token: "tmux-token".into(),
+            },
+        };
+        write_config(&target_config_dir.join(CONFIG_FILE), &standalone).unwrap();
+        write_secret_file(
+            &target_config_dir.join(PAIRING_FILE),
+            &serde_json::to_vec(&standalone_pairing).unwrap(),
+        )
+        .unwrap();
+
+        import_herdr_plugin(
+            Some(source_config_dir),
+            Some(source_state_dir),
+            Some(target_config_dir.clone()),
+            Some(target_state_dir),
+        )
+        .unwrap();
+
+        let merged: Config =
+            serde_json::from_slice(&std::fs::read(target_config_dir.join(CONFIG_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(merged.server_id, "paired-herdr");
+        assert_eq!(merged.sessions.len(), 2);
+        assert_eq!(merged.sessions[0].backend, BackendKind::Herdr);
+        assert_eq!(merged.sessions[1].backend, BackendKind::Tmux);
+        assert!(target_config_dir.join(HERDR_PLUGIN_IMPORT_MARKER).exists());
+        std::fs::remove_dir_all(root).ok();
     }
 
     /// Protocol 17 answers `workspace.create`, `worktree.create` and
@@ -12040,6 +13880,7 @@ mod tests {
                 id: "default".into(),
                 label: "Default".into(),
                 socket_path: self.socket_path.to_string_lossy().into_owned(),
+                backend: BackendKind::Herdr,
             }
         }
 

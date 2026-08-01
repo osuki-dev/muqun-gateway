@@ -8,9 +8,9 @@
 # need a running herdr session to attach to.
 #
 # On a first install it also configures, starts, and opens the pairing QR for
-# you. Re-running just updates the plugin to the latest and reloads the binary;
-# it does NOT re-run setup, because setup mints a fresh server id + token and
-# that would orphan devices you have already paired. macOS and Linux only.
+# you. Re-running updates the plugin, runs idempotent setup, and reloads the
+# binary while preserving the server identity, devices, and backend list.
+# macOS and Linux only.
 set -eu
 
 REPO="osuki-dev/herdr-gateway"

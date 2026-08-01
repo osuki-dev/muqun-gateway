@@ -1,11 +1,14 @@
-# Herdr Gateway
+# Terminal Gateway (currently `herdr-gateway`)
 
-Rust Herdr plugin and token-protected mobile gateway for Muqun.
+Rust terminal-backend gateway and Herdr plugin for Muqun.
 
-Herdr Gateway exposes a small HTTP API for reading Herdr workspaces, tabs, panes,
-agents, pane output, and sending pane input. It talks to the local Herdr socket
-API and is intended to be reached from trusted devices over a private network
-such as Tailscale.
+The gateway exposes one token-protected HTTP API for reading and controlling
+workspaces, tabs, panes, agents, and pane output. One process can talk to both
+Herdr's socket API and a local tmux server at the same time. The HTTP contract
+stays the same, so the
+Muqun app does not need a backend-specific implementation. The repository,
+binary, plugin id, and legacy response envelope retain their Herdr names until
+a separate compatibility-safe rename.
 
 ## Install
 
@@ -39,12 +42,17 @@ then configure once, start, and open the manager panel to view the QR code,
 approve pairing requests, and start or stop the gateway:
 
 ```sh
-herdr plugin action invoke herdr.gateway.setup   # first time only -- mints server id + token
+herdr plugin action invoke herdr.gateway.setup   # idempotent; keeps identity and pairings
 herdr plugin action invoke herdr.gateway.start
 herdr plugin pane open --plugin herdr.gateway --entrypoint manage
 ```
 
-In the manager panel, press `u` to edit the public gateway URL. Press `a` to
+The manager is also available outside Herdr with `herdr-gateway manage`; it is
+owned by the gateway, not by either terminal backend. Press `h` or `m` to add a
+Herdr or tmux backend, `f` to choose the default session, and `d` to remove one.
+Backend changes take effect after
+the gateway restarts and never close the underlying Herdr or tmux sessions.
+Press `u` to edit the public gateway URL. Press `a` to
 auto-detect it again. Saving the URL updates both the gateway config and the
 pairing QR code. Once a device is paired, the panel shows the paired-device list
 instead of the QR; press `p` to bring the QR back and pair another device. Press
@@ -67,8 +75,8 @@ curl -fsSL https://raw.githubusercontent.com/osuki-dev/herdr-gateway/main/instal
 ```
 
 On a re-run the script updates the plugin and **reloads the binary for you**
-(stop + start). It does **not** re-run setup, because setup mints a fresh server
-id and token -- skipping it keeps every device you have already paired.
+(stop + start). Setup is idempotent and keeps the server identity, tokens,
+devices, and backend list.
 Installation may run from any shell; keep a herdr session running so the reload
 actions can attach.
 
@@ -108,6 +116,56 @@ herdr plugin action invoke herdr.gateway.setup
 herdr plugin action invoke herdr.gateway.start
 herdr plugin pane open --plugin herdr.gateway --entrypoint manage
 ```
+
+### Use Herdr and tmux together
+
+tmux 3.x must be installed and visible on the gateway process's `PATH`. Build
+the binary, configure one backend, then add the other. Re-running `setup`
+upserts that backend without removing the existing one:
+
+```sh
+cargo build --release
+./target/release/herdr-gateway setup --backend tmux
+./target/release/herdr-gateway backend add herdr
+./target/release/herdr-gateway backend list
+./target/release/herdr-gateway start
+./target/release/herdr-gateway manage
+```
+
+By default the adapter uses the current user's normal tmux server. To target a
+specific tmux socket, pass its absolute path using the existing option:
+
+```sh
+./target/release/herdr-gateway setup --backend tmux --socket-path /absolute/path/to/tmux.sock
+```
+
+`backend add tmux` and `backend remove <id>` are also available. Existing config
+files without a `backend` field continue to mean Herdr. The first configured
+session remains the primary session for older Muqun builds; the API exposes all
+configured sessions and newer clients can offer a session selector.
+
+Choose which session older clients open first with:
+
+```sh
+./target/release/herdr-gateway backend default tmux
+```
+
+If Herdr Gateway is already installed as a plugin and paired with Muqun, migrate
+that identity before switching to the standalone process. Stop the plugin copy
+first so only one process owns the port:
+
+```sh
+herdr plugin action invoke herdr.gateway.stop
+./target/release/herdr-gateway import-herdr-plugin
+./target/release/herdr-gateway start
+./target/release/herdr-gateway manage
+```
+
+The import keeps Herdr as the first session, merges any standalone tmux session
+and paired devices, writes `*.before-herdr-import` backups, and leaves the
+plugin's source files untouched. After import, plugin actions and direct CLI
+commands resolve the same standalone config, so they cannot start competing
+gateway identities accidentally.
 
 If you previously installed the GitHub-managed plugin, uninstall it before
 linking a local checkout:
@@ -636,6 +694,12 @@ version. Calendar dates may be appended as release build metadata, but are not
 used to decide compatibility. Existing unversioned routes remain available for
 older Muqun releases.
 
+Opening a terminal in released Muqun builds sends a legacy `pane/zoom` request.
+The gateway acknowledges that route without forwarding it: connecting from the
+app must not change tmux or Herdr focus, splits, or zoom state. Other control
+routes still validate their target and return `backend_target_not_found` for a
+pane, tab, or workspace that was actually closed.
+
 Pairing confirmation codes expire after five minutes and are consumed atomically
 after the first successful claim. A consumed or expired code cannot be reused,
 and eight failed attempts invalidate the pending code.
@@ -685,6 +749,15 @@ Prefer Tailscale Serve HTTPS whenever it is available. Direct HTTP over a
 Tailscale IP remains supported for user-managed private networks, but HTTP does
 not provide transport encryption by itself; the security of that connection
 depends on the tailnet and its access controls.
+
+Muqun encrypts gateway credentials at rest with AES-256-GCM and keeps the key in
+the operating system's secure storage. No additional custom encryption is
+needed inside the API when the connection uses HTTPS or Tailscale's WireGuard
+transport. Custom payload crypto would duplicate those layers without fixing
+bearer-token replay. Plain HTTP on an ordinary Wi-Fi or LAN is not safe: anyone
+able to observe it can copy a device token and gain the same terminal access as
+that device. Treat a device token like an SSH credential and prefer Tailscale
+Serve HTTPS for normal deployments.
 
 ## Publishing
 
