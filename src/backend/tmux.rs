@@ -7,13 +7,15 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use super::{
-    AgentStatus, BackendError, BackendFuture, BackendKind, BackendMetadata, CreateTab,
-    CreateWorkspace, OutputFormat, OutputSource, Pane, PaneId, PaneOutput, ReadPane,
-    SplitDirection, SplitPane, Tab, TabId, TerminalBackend, Workspace, WorkspaceId,
+    Agent, AgentStatus, BackendActivity, BackendActivityStream, BackendError, BackendFuture,
+    BackendKind, BackendMetadata, CreateTab, CreateWorkspace, OutputFormat, OutputSource, Pane,
+    PaneId, PaneOutput, ReadPane, SplitDirection, SplitPane, StartAgent, StartedAgent, Tab, TabId,
+    TerminalBackend, Workspace, WorkspaceId,
 };
 
 const FIELD_SEPARATOR: char = '\u{1f}';
 
+#[derive(Clone)]
 pub struct TmuxBackend {
     binary: PathBuf,
     socket_path: Option<PathBuf>,
@@ -131,7 +133,44 @@ impl TerminalBackend for TmuxBackend {
                         .to_owned(),
                 ),
                 protocol: None,
+                compatibility_response: None,
             })
+        })
+    }
+
+    fn activity_stream(&self) -> BackendFuture<'_, BackendActivityStream> {
+        let backend = self.clone();
+        Box::pin(async move {
+            let activity = async_stream::stream! {
+                let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let mut previous = None;
+                loop {
+                    interval.tick().await;
+                    match (
+                        backend.list_workspaces().await,
+                        backend.list_tabs().await,
+                        backend.list_panes().await,
+                    ) {
+                        (Ok(workspaces), Ok(tabs), Ok(panes)) => {
+                            let fingerprint = format!("{workspaces:?}{tabs:?}{panes:?}");
+                            let changed = previous.as_ref().is_some_and(|last| last != &fingerprint);
+                            previous = Some(fingerprint);
+                            if changed {
+                                yield Ok(BackendActivity {
+                                    name: "layout_updated".into(),
+                                    payload: serde_json::json!({
+                                        "event": "layout_updated",
+                                        "data": { "backend": "tmux" }
+                                    }),
+                                });
+                            }
+                        }
+                        _ => yield Err(BackendError::Unavailable),
+                    }
+                }
+            };
+            Ok(Box::pin(activity) as BackendActivityStream)
         })
     }
 
@@ -150,10 +189,15 @@ impl TerminalBackend for TmuxBackend {
                 .map(|fields| {
                     Ok(Workspace {
                         id: WorkspaceId::new(&fields[0]),
+                        number: None,
                         label: fields[1].clone(),
                         focused: parse_u32(&fields[2], "session")? > 0,
                         tab_count: Some(parse_u32(&fields[3], "session")?),
                         active_tab_id: non_empty(&fields[4]).map(TabId::new),
+                        pane_count: None,
+                        agent_status: AgentStatus::Unknown,
+                        repo_root: None,
+                        checkout_path: None,
                     })
                 })
                 .collect()
@@ -215,6 +259,17 @@ impl TerminalBackend for TmuxBackend {
         })
     }
 
+    fn list_agents(&self) -> BackendFuture<'_, Vec<Agent>> {
+        Box::pin(async move {
+            Ok(self
+                .list_panes()
+                .await?
+                .into_iter()
+                .filter_map(agent_from_pane)
+                .collect())
+        })
+    }
+
     fn get_pane<'a>(&'a self, id: &'a PaneId) -> BackendFuture<'a, Pane> {
         Box::pin(async move {
             validate_tmux_id(id.as_str(), '%', "pane")?;
@@ -223,6 +278,13 @@ impl TerminalBackend for TmuxBackend {
                 .into_iter()
                 .find(|pane| pane.id == *id)
                 .ok_or(BackendError::InvalidTarget("pane"))
+        })
+    }
+
+    fn get_agent<'a>(&'a self, target: &'a str) -> BackendFuture<'a, Agent> {
+        Box::pin(async move {
+            let pane = self.get_pane(&PaneId::new(target)).await?;
+            agent_from_pane(pane).ok_or(BackendError::InvalidTarget("agent"))
         })
     }
 
@@ -479,6 +541,62 @@ impl TerminalBackend for TmuxBackend {
             Ok(())
         })
     }
+
+    fn focus_agent<'a>(&'a self, target: &'a str) -> BackendFuture<'a, ()> {
+        Box::pin(async move { self.focus_pane(&PaneId::new(target)).await })
+    }
+
+    fn prompt_agent<'a>(&'a self, target: &'a str, text: &'a str) -> BackendFuture<'a, ()> {
+        Box::pin(async move { self.send_text(&PaneId::new(target), text).await })
+    }
+
+    fn start_agent<'a>(&'a self, request: &'a StartAgent) -> BackendFuture<'a, StartedAgent> {
+        Box::pin(async move {
+            let executable = request
+                .executable
+                .as_ref()
+                .ok_or_else(|| BackendError::Refused {
+                    code: Some("agent_not_found".into()),
+                    message: format!("agent executable {} was not found on PATH", request.command),
+                })?;
+            let mut argv = vec![executable.to_string_lossy().into_owned()];
+            argv.extend(request.args.iter().cloned());
+            let command_line = argv
+                .iter()
+                .map(|argument| shell_word(argument))
+                .collect::<Vec<_>>()
+                .join(" ");
+            self.send_text(&request.pane_id, &command_line).await?;
+            self.send_keys(&request.pane_id, &["Enter".to_owned()])
+                .await?;
+
+            let deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_millis(request.timeout_ms);
+            let executable_name = executable
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(&request.command);
+            loop {
+                if let Ok(current) = self.get_pane(&request.pane_id).await {
+                    let recognized = current.agent.as_deref() == Some(request.kind.as_str())
+                        || current.foreground_command.as_deref() == Some(executable_name);
+                    if recognized {
+                        return Ok(StartedAgent { argv: Some(argv) });
+                    }
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(BackendError::Refused {
+                        code: Some("agent_start_timeout".into()),
+                        message: format!(
+                            "agent {} did not become visible before timeout",
+                            request.kind
+                        ),
+                    });
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        })
+    }
 }
 
 fn pane_from_fields(fields: Vec<String>) -> Result<Pane, BackendError> {
@@ -487,7 +605,9 @@ fn pane_from_fields(fields: Vec<String>) -> Result<Pane, BackendError> {
         workspace_id: WorkspaceId::new(&fields[0]),
         tab_id: TabId::new(&fields[1]),
         id: PaneId::new(&fields[2]),
+        terminal_id: Some(fields[2].clone()),
         label: non_empty(&fields[3]),
+        terminal_title: non_empty(&fields[3]),
         cwd: non_empty(&fields[4]).map(PathBuf::from),
         focused: parse_flag(&fields[5], "pane")?
             && parse_flag(&fields[6], "pane")?
@@ -498,8 +618,30 @@ fn pane_from_fields(fields: Vec<String>) -> Result<Pane, BackendError> {
         agent: detected_agent(command.as_deref()),
         foreground_command: command,
         agent_status: AgentStatus::Unknown,
-        has_scrollback: parse_u32(&fields[11], "pane")? > 0,
+        max_offset_from_bottom: Some(parse_u32(&fields[11], "pane")?),
+        viewport_rows: Some(parse_u32(&fields[9], "pane")?),
     })
+}
+
+fn agent_from_pane(pane: Pane) -> Option<Agent> {
+    let kind = pane.agent.clone()?;
+    Some(Agent {
+        target: pane.id.as_str().to_owned(),
+        pane_id: pane.id,
+        workspace_id: Some(pane.workspace_id),
+        tab_id: Some(pane.tab_id),
+        display_agent: Some(kind.clone()),
+        kind: Some(kind),
+        status: pane.agent_status,
+        state_change_seq: None,
+    })
+}
+
+/// Quote one argv value for the interactive shell running in a tmux pane.
+/// Values are data: they are always single-quoted and never interpreted as
+/// shell structure assembled by the adapter.
+fn shell_word(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn refused(stderr: &[u8]) -> BackendError {
@@ -623,6 +765,7 @@ fn detected_agent(command: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio_stream::StreamExt as _;
 
     #[test]
     fn parses_tmux_panes_into_backend_neutral_entities() {
@@ -649,7 +792,8 @@ mod tests {
         assert_eq!(pane.id.as_str(), "%9");
         assert_eq!(pane.agent.as_deref(), Some("claude"));
         assert_eq!(pane.cwd, Some(PathBuf::from("/work/project")));
-        assert!(pane.has_scrollback);
+        assert_eq!(pane.max_offset_from_bottom, Some(12));
+        assert_eq!(pane.viewport_rows, Some(41));
     }
 
     #[test]
@@ -685,6 +829,13 @@ mod tests {
     }
 
     #[test]
+    fn agent_arguments_are_shell_quoted_as_single_words() {
+        assert_eq!(shell_word("plain"), "'plain'");
+        assert_eq!(shell_word("two words"), "'two words'");
+        assert_eq!(shell_word("a'b;$(touch nope)"), "'a'\\''b;$(touch nope)'");
+    }
+
+    #[test]
     fn an_absent_tmux_server_is_an_empty_topology() {
         assert!(means_no_tmux_server(
             "no server running on /tmp/tmux-1000/default"
@@ -712,6 +863,11 @@ mod tests {
             std::env::temp_dir().join(format!("gateway-test-{}.sock", uuid::Uuid::new_v4()));
         let backend = TmuxBackend::new(Some(socket));
         assert!(backend.list_workspaces().await.unwrap().is_empty());
+        let mut activity = backend.activity_stream().await.unwrap();
+        let activity_change = tokio::spawn(async move {
+            tokio::time::timeout(std::time::Duration::from_secs(2), activity.next()).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let workspace = backend
             .create_workspace(&CreateWorkspace {
                 cwd: Some(std::env::temp_dir()),
@@ -720,6 +876,8 @@ mod tests {
             })
             .await
             .unwrap();
+        let event = activity_change.await.unwrap().unwrap().unwrap().unwrap();
+        assert_eq!(event.name, "layout_updated");
 
         let initial_pane = backend
             .list_panes()
@@ -745,6 +903,7 @@ mod tests {
                 direction: SplitDirection::Right,
                 ratio: Some(0.5),
                 cwd: Some(std::env::temp_dir()),
+                env: None,
             })
             .await
             .unwrap();

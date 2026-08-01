@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 
 use serde::{Deserialize, Serialize};
+use tokio_stream::Stream;
 
 macro_rules! opaque_id {
     ($name:ident) => {
@@ -59,15 +60,31 @@ pub struct BackendMetadata {
     pub kind: BackendKind,
     pub version: Option<String>,
     pub protocol: Option<u64>,
+    /// Native metadata retained only for the legacy compatibility envelope.
+    /// Terminal use cases must not inspect it.
+    pub compatibility_response: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BackendActivity {
+    /// Normalized underscore name used by gateway filters.
+    pub name: String,
+    /// Existing Herdr-compatible event envelope retained at the HTTP edge.
+    pub payload: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Workspace {
     pub id: WorkspaceId,
+    pub number: Option<u32>,
     pub label: String,
     pub focused: bool,
     pub active_tab_id: Option<TabId>,
     pub tab_count: Option<u32>,
+    pub pane_count: Option<u32>,
+    pub agent_status: AgentStatus,
+    pub repo_root: Option<PathBuf>,
+    pub checkout_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,9 +124,13 @@ impl AgentStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pane {
     pub id: PaneId,
+    /// Native terminal identifier when it differs from the pane identifier.
+    /// Herdr exposes both; tmux uses the pane id for both roles.
+    pub terminal_id: Option<String>,
     pub workspace_id: WorkspaceId,
     pub tab_id: TabId,
     pub label: Option<String>,
+    pub terminal_title: Option<String>,
     pub cwd: Option<PathBuf>,
     pub focused: bool,
     pub width: Option<u32>,
@@ -121,8 +142,57 @@ pub struct Pane {
     pub foreground_command: Option<String>,
     pub agent: Option<String>,
     pub agent_status: AgentStatus,
-    /// True when the backend itself retains output above the viewport.
-    pub has_scrollback: bool,
+    /// Display rows available above the current viewport.
+    pub max_offset_from_bottom: Option<u32>,
+    pub viewport_rows: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Agent {
+    pub target: String,
+    pub pane_id: PaneId,
+    pub workspace_id: Option<WorkspaceId>,
+    pub tab_id: Option<TabId>,
+    pub kind: Option<String>,
+    pub display_agent: Option<String>,
+    pub status: AgentStatus,
+    pub state_change_seq: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartAgent {
+    pub pane_id: PaneId,
+    pub kind: String,
+    pub command: String,
+    pub executable: Option<PathBuf>,
+    pub args: Vec<String>,
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartedAgent {
+    pub argv: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Worktree {
+    pub path: PathBuf,
+    pub branch: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeRequest {
+    pub cwd: PathBuf,
+    pub branch: String,
+    pub label: Option<String>,
+    pub focus: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreePlacement {
+    pub workspace_id: WorkspaceId,
+    pub pane_id: PaneId,
+    pub path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,11 +250,15 @@ pub struct SplitPane {
     pub direction: SplitDirection,
     pub ratio: Option<f64>,
     pub cwd: Option<PathBuf>,
+    /// Environment requested for the new pane. Backends that support native
+    /// pane environments apply it without routing through a shell.
+    pub env: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 #[derive(Debug)]
 pub enum BackendError {
     Unavailable,
+    Unsupported(&'static str),
     InvalidResponse(&'static str),
     InvalidTarget(&'static str),
     Refused {
@@ -197,6 +271,9 @@ impl fmt::Display for BackendError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unavailable => formatter.write_str("terminal backend is unavailable"),
+            Self::Unsupported(capability) => {
+                write!(formatter, "terminal backend does not support {capability}")
+            }
             Self::InvalidResponse(context) => {
                 write!(formatter, "terminal backend returned an invalid {context}")
             }
@@ -212,6 +289,8 @@ impl fmt::Display for BackendError {
 impl std::error::Error for BackendError {}
 
 pub type BackendFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, BackendError>> + Send + 'a>>;
+pub type BackendActivityStream =
+    Pin<Box<dyn Stream<Item = Result<BackendActivity, BackendError>> + Send>>;
 
 /// Backend-neutral port used by HTTP use cases and background workflows.
 ///
@@ -220,10 +299,13 @@ pub type BackendFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, BackendErr
 /// strings to callers.
 pub trait TerminalBackend: Send + Sync {
     fn metadata(&self) -> BackendFuture<'_, BackendMetadata>;
+    fn activity_stream(&self) -> BackendFuture<'_, BackendActivityStream>;
     fn list_workspaces(&self) -> BackendFuture<'_, Vec<Workspace>>;
     fn list_tabs(&self) -> BackendFuture<'_, Vec<Tab>>;
     fn list_panes(&self) -> BackendFuture<'_, Vec<Pane>>;
+    fn list_agents(&self) -> BackendFuture<'_, Vec<Agent>>;
     fn get_pane<'a>(&'a self, id: &'a PaneId) -> BackendFuture<'a, Pane>;
+    fn get_agent<'a>(&'a self, target: &'a str) -> BackendFuture<'a, Agent>;
     fn read_pane<'a>(&'a self, request: &'a ReadPane) -> BackendFuture<'a, PaneOutput>;
     fn create_workspace<'a>(&'a self, request: &'a CreateWorkspace)
         -> BackendFuture<'a, Workspace>;
@@ -241,6 +323,24 @@ pub trait TerminalBackend: Send + Sync {
     fn split_pane<'a>(&'a self, request: &'a SplitPane) -> BackendFuture<'a, Pane>;
     fn send_text<'a>(&'a self, id: &'a PaneId, text: &'a str) -> BackendFuture<'a, ()>;
     fn send_keys<'a>(&'a self, id: &'a PaneId, keys: &'a [String]) -> BackendFuture<'a, ()>;
+    fn focus_agent<'a>(&'a self, target: &'a str) -> BackendFuture<'a, ()>;
+    fn prompt_agent<'a>(&'a self, target: &'a str, text: &'a str) -> BackendFuture<'a, ()>;
+    fn start_agent<'a>(&'a self, request: &'a StartAgent) -> BackendFuture<'a, StartedAgent>;
+    fn list_worktrees<'a>(&'a self, _cwd: &'a PathBuf) -> BackendFuture<'a, Vec<Worktree>> {
+        Box::pin(async { Err(BackendError::Unsupported("worktrees")) })
+    }
+    fn open_worktree<'a>(
+        &'a self,
+        _request: &'a WorktreeRequest,
+    ) -> BackendFuture<'a, WorktreePlacement> {
+        Box::pin(async { Err(BackendError::Unsupported("worktrees")) })
+    }
+    fn create_worktree<'a>(
+        &'a self,
+        _request: &'a WorktreeRequest,
+    ) -> BackendFuture<'a, WorktreePlacement> {
+        Box::pin(async { Err(BackendError::Unsupported("worktrees")) })
+    }
 }
 
 #[cfg(test)]

@@ -37,11 +37,11 @@ use qrcode::render::unicode;
 use qrcode::{EcLevel, QrCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio_stream::Stream;
+use tokio_stream::{Stream, StreamExt as _};
 
 mod agent_events;
 mod approvals;
+mod authority;
 mod backend;
 mod composer;
 mod i18n;
@@ -51,17 +51,17 @@ mod scrollback;
 mod shortcuts;
 mod tasks;
 
+use authority::{hash_token, identify_device, DeviceRecord, PairingCodeError, PendingPairing};
+
 use crate::i18n::Locale;
 use backend::{
-    BackendError, BackendKind, CreateTab as BackendCreateTab,
-    CreateWorkspace as BackendCreateWorkspace, HerdrBackend, OutputFormat as BackendOutputFormat,
-    OutputSource as BackendOutputSource, PaneId as BackendPaneId, ReadPane as BackendReadPane,
-    SplitDirection as BackendSplitDirection, SplitPane as BackendSplitPane, TabId as BackendTabId,
-    TerminalBackend, TmuxBackend, WorkspaceId as BackendWorkspaceId,
+    AgentStatus as BackendAgentStatus, BackendError, BackendKind, BackendRegistry,
+    CreateTab as BackendCreateTab, CreateWorkspace as BackendCreateWorkspace,
+    OutputFormat as BackendOutputFormat, OutputSource as BackendOutputSource,
+    PaneId as BackendPaneId, ReadPane as BackendReadPane, SplitDirection as BackendSplitDirection,
+    SplitPane as BackendSplitPane, StartAgent as BackendStartAgent, TabId as BackendTabId,
+    TerminalBackend, WorkspaceId as BackendWorkspaceId, WorktreeRequest as BackendWorktreeRequest,
 };
-
-#[cfg(unix)]
-use tokio::net::UnixStream;
 
 const CONFIG_FILE: &str = "config.json";
 const PAIRING_FILE: &str = "pairing.json";
@@ -83,7 +83,6 @@ const MAX_OUTPUT_LINES: u32 = 5000;
 const PARTS_DEFAULT_LINES: u32 = 400;
 const MAX_SEND_TEXT_BYTES: usize = 64 * 1024;
 const PAIRING_CODE_CHARACTER_COUNT: usize = 8;
-const PAIRING_CODE_LENGTH: usize = PAIRING_CODE_CHARACTER_COUNT + 1;
 const PAIRING_CODE_TTL_MS: u128 = 5 * 60 * 1000;
 const MAX_PAIRING_CODE_ATTEMPTS: u8 = 8;
 const PAIRING_RATE_LIMIT_WINDOW_MS: u128 = 10 * 60 * 1000;
@@ -433,26 +432,6 @@ struct PublicUrlSelection {
     listen_host: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct PendingPairing {
-    request_id: String,
-    device_name: String,
-    #[serde(default)]
-    install_id: Option<String>,
-    code: String,
-    code_hash: String,
-    created_unix_ms: u128,
-    #[serde(default)]
-    failed_attempts: u8,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum PairingCodeError {
-    Missing,
-    Expired,
-    Invalid,
-}
-
 #[derive(Deserialize)]
 struct PairRequestBody {
     request_id: String,
@@ -498,22 +477,6 @@ impl PushTokenRecord {
             .and_then(Locale::from_code)
             .unwrap_or_default()
     }
-}
-
-/// One paired device. Each successful pairing mints a token that only this
-/// record can authenticate, so a single device can be revoked on its own.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct DeviceRecord {
-    id: String,
-    name: String,
-    token_hash: String,
-    paired_unix_ms: u128,
-    #[serde(default)]
-    last_seen_unix_ms: u128,
-    /// The client's stable install identifier, used to replace an earlier
-    /// record for the same device instead of piling up duplicates.
-    #[serde(default)]
-    install_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -948,34 +911,29 @@ fn load_existing_install(
 }
 
 fn ensure_backend_available(backend: BackendKind) -> anyhow::Result<()> {
-    if backend != BackendKind::Tmux {
-        return Ok(());
-    }
-    let output = ProcessCommand::new("tmux")
-        .arg("-V")
-        .output()
-        .context("tmux backend selected, but tmux was not found on PATH")?;
-    anyhow::ensure!(
-        output.status.success(),
-        "tmux backend selected, but `tmux -V` failed"
-    );
-    Ok(())
+    backend_registry().ensure_available(backend)
 }
 
 fn default_backend_socket(backend: BackendKind) -> String {
-    match backend {
-        BackendKind::Herdr => std::env::var("HERDR_SOCKET_PATH")
-            .ok()
-            .unwrap_or_else(default_socket_path),
-        BackendKind::Tmux => String::new(),
-    }
+    backend_registry().default_socket(backend)
 }
 
 fn default_backend_label(backend: BackendKind) -> &'static str {
-    match backend {
-        BackendKind::Herdr => "Herdr",
-        BackendKind::Tmux => "tmux",
-    }
+    backend_registry().default_label(backend)
+}
+
+fn backend_registry() -> BackendRegistry {
+    BackendRegistry::new(
+        std::env::var("HERDR_SOCKET_PATH")
+            .ok()
+            .unwrap_or_else(default_socket_path),
+    )
+}
+
+fn backend_endpoint(session: &SessionConfig) -> String {
+    backend_registry()
+        .endpoint(session.backend, &session.socket_path)
+        .into_owned()
 }
 
 fn validate_session_id(id: &str) -> anyhow::Result<()> {
@@ -1072,10 +1030,7 @@ fn configure_backend(command: BackendCommand) -> anyhow::Result<()> {
     match command {
         BackendCommand::List => {
             for session in &config.sessions {
-                let endpoint = match session.backend {
-                    BackendKind::Tmux if session.socket_path.is_empty() => "default tmux server",
-                    _ => &session.socket_path,
-                };
+                let endpoint = backend_endpoint(session);
                 println!(
                     "{}\t{}\t{}\t{}",
                     session.id,
@@ -1862,7 +1817,7 @@ async fn pair_request(
         )
     })?;
     if let Some(pending) = pending_pairing.as_ref() {
-        if !pairing_code_expired(pending, now) {
+        if !authority::pairing_code_expired(pending, now, PAIRING_CODE_TTL_MS) {
             if pending.request_id == body.request_id {
                 return Ok(Json(pair_request_response(&state.config, &body.request_id)));
             }
@@ -1938,25 +1893,31 @@ async fn pair_claim(
             .unwrap_or_else(|| "Muqun app".into());
         let install_id = pending.as_ref().and_then(|value| value.install_id.clone());
         let code = body.code.trim().to_ascii_uppercase();
-        consume_pairing_code(&mut pending, &body.request_id, &code, now_unix_ms()).map_err(
-            |error| match error {
-                PairingCodeError::Missing => api_error(
-                    StatusCode::FORBIDDEN,
-                    "pairing_not_requested",
-                    "no pending pairing request",
-                ),
-                PairingCodeError::Expired => api_error(
-                    StatusCode::GONE,
-                    "pairing_code_expired",
-                    "pairing code expired; request a new code",
-                ),
-                PairingCodeError::Invalid => api_error(
-                    StatusCode::FORBIDDEN,
-                    "invalid_pairing_code",
-                    "invalid pairing code",
-                ),
-            },
-        )?;
+        authority::consume_pairing_code(
+            &mut pending,
+            &body.request_id,
+            &code,
+            now_unix_ms(),
+            PAIRING_CODE_TTL_MS,
+            MAX_PAIRING_CODE_ATTEMPTS,
+        )
+        .map_err(|error| match error {
+            PairingCodeError::Missing => api_error(
+                StatusCode::FORBIDDEN,
+                "pairing_not_requested",
+                "no pending pairing request",
+            ),
+            PairingCodeError::Expired => api_error(
+                StatusCode::GONE,
+                "pairing_code_expired",
+                "pairing code expired; request a new code",
+            ),
+            PairingCodeError::Invalid => api_error(
+                StatusCode::FORBIDDEN,
+                "invalid_pairing_code",
+                "invalid pairing code",
+            ),
+        })?;
         (device_name, install_id)
     };
 
@@ -1973,17 +1934,7 @@ async fn pair_claim(
     };
     {
         let mut devices = lock_devices(&state)?;
-        // One record per install: replace an earlier pairing from the same
-        // device rather than accumulating duplicates.
-        if let Some(install_id) = install_id.as_deref() {
-            devices.retain(|device| device.install_id.as_deref() != Some(install_id));
-        }
-        devices.push(record);
-        devices.sort_by_key(|item| item.paired_unix_ms);
-        if devices.len() > MAX_DEVICES {
-            let excess = devices.len() - MAX_DEVICES;
-            devices.drain(..excess);
-        }
+        authority::enroll_device(&mut devices, record, MAX_DEVICES);
         write_devices(&devices).map_err(|err| {
             eprintln!("failed to write device tokens: {err:#}");
             api_error(
@@ -2013,38 +1964,6 @@ fn pair_request_response(config: &Config, request_id: &str) -> Value {
     })
 }
 
-fn consume_pairing_code(
-    pending: &mut Option<PendingPairing>,
-    request_id: &str,
-    code: &str,
-    now_unix_ms: u128,
-) -> Result<(), PairingCodeError> {
-    let Some(current) = pending.as_mut() else {
-        return Err(PairingCodeError::Missing);
-    };
-    if pairing_code_expired(current, now_unix_ms) {
-        *pending = None;
-        return Err(PairingCodeError::Expired);
-    }
-    let request_matches = constant_time_eq(request_id.as_bytes(), current.request_id.as_bytes());
-    let valid = valid_pairing_code(code)
-        && request_matches
-        && constant_time_eq(hash_token(code).as_bytes(), current.code_hash.as_bytes());
-    if !valid {
-        current.failed_attempts = current.failed_attempts.saturating_add(1);
-        if current.failed_attempts >= MAX_PAIRING_CODE_ATTEMPTS {
-            *pending = None;
-        }
-        return Err(PairingCodeError::Invalid);
-    }
-    *pending = None;
-    Ok(())
-}
-
-fn pairing_code_expired(pending: &PendingPairing, now_unix_ms: u128) -> bool {
-    now_unix_ms.saturating_sub(pending.created_unix_ms) >= PAIRING_CODE_TTL_MS
-}
-
 async fn pair_pending(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     // Read by the local manage UI, which holds the admin token: a device has no
     // token of its own until it has read this code and claimed the pairing.
@@ -2056,10 +1975,9 @@ async fn pair_pending(State(state): State<AppState>, headers: HeaderMap) -> ApiR
             "failed to lock pending pairing state",
         )
     })?;
-    if pending
-        .as_ref()
-        .is_some_and(|value| pairing_code_expired(value, now_unix_ms()))
-    {
+    if pending.as_ref().is_some_and(|value| {
+        authority::pairing_code_expired(value, now_unix_ms(), PAIRING_CODE_TTL_MS)
+    }) {
         *pending = None;
     }
     if let Some(pending) = pending.as_ref() {
@@ -2224,10 +2142,7 @@ fn status() -> anyhow::Result<()> {
     println!("listen: {}", config.listen);
     println!("public_url: {}", config.public_url);
     for session in config.sessions {
-        let endpoint = match session.backend {
-            BackendKind::Tmux if session.socket_path.is_empty() => "default tmux server",
-            _ => &session.socket_path,
-        };
+        let endpoint = backend_endpoint(&session);
         println!(
             "session {}: backend={} endpoint={endpoint}",
             session.id,
@@ -2724,16 +2639,13 @@ fn print_manage_screen(
     if let Some(config) = &config {
         lines.push(format!("Terminal backends ({})", config.sessions.len()));
         for (index, session) in config.sessions.iter().enumerate() {
-            let endpoint = match session.backend {
-                BackendKind::Tmux if session.socket_path.is_empty() => "default server",
-                _ => session.socket_path.as_str(),
-            };
+            let endpoint = backend_endpoint(session);
             lines.push(format!(
                 "{} {}  {}  {}",
                 if index == 0 { "*" } else { " " },
                 session.id,
                 session.backend.as_str(),
-                truncate(endpoint, 38)
+                truncate(&endpoint, 38)
             ));
         }
         lines.push(String::new());
@@ -3268,68 +3180,42 @@ fn is_tailscale_ipv4(ip: std::net::Ipv4Addr) -> bool {
 }
 
 async fn session_metadata(session: &SessionConfig) -> (Value, Value) {
-    match session.backend {
-        BackendKind::Herdr => match herdr_request(session, "ping", json!({})).await {
-            Ok(value) => {
-                let version = value.pointer("/result/version").and_then(Value::as_str);
-                let protocol = value.pointer("/result/protocol").and_then(Value::as_u64);
-                let compatible = protocol.is_some_and(|value| {
-                    (HERDR_PROTOCOL_MIN..=HERDR_PROTOCOL_MAX).contains(&value)
-                });
-                (
-                    json!({
-                        "kind": "herdr",
-                        "connected": true,
-                        "version": version,
-                        "protocol": protocol
-                    }),
-                    json!({
-                        "connected": true,
-                        "version": version,
-                        "protocol": protocol,
-                        "compatible": compatible,
-                        "supportedProtocolMin": HERDR_PROTOCOL_MIN,
-                        "supportedProtocolMax": HERDR_PROTOCOL_MAX,
-                        "response": value
-                    }),
-                )
+    match terminal_backend(session).metadata().await {
+        Ok(metadata) => {
+            let compatibility_protocol = metadata.protocol.unwrap_or(HERDR_PROTOCOL_MAX);
+            let compatible = metadata.kind == BackendKind::Tmux
+                || (HERDR_PROTOCOL_MIN..=HERDR_PROTOCOL_MAX).contains(&compatibility_protocol);
+            let mut compatibility = json!({
+                "connected": true,
+                "version": metadata.version,
+                "protocol": compatibility_protocol,
+                "compatible": compatible,
+                "supportedProtocolMin": HERDR_PROTOCOL_MIN,
+                "supportedProtocolMax": HERDR_PROTOCOL_MAX,
+            });
+            if let (Some(object), Some(response)) = (
+                compatibility.as_object_mut(),
+                metadata.compatibility_response,
+            ) {
+                object.insert("response".into(), response);
             }
-            Err(err) => {
-                eprintln!("Herdr metadata request failed: {err:#}");
-                (
-                    json!({ "connected": false }),
-                    json!({ "connected": false, "error": "Herdr is unavailable" }),
-                )
-            }
-        },
-        BackendKind::Tmux => match terminal_backend(session).metadata().await {
-            Ok(metadata) => (
+            (
                 json!({
                     "kind": metadata.kind,
                     "connected": true,
                     "version": metadata.version,
                     "protocol": metadata.protocol,
                 }),
-                // Keep the legacy compatibility object until every released
-                // app reads `backend`. Protocol 17 here means the gateway's
-                // compatibility contract, not tmux's private wire protocol.
-                json!({
-                    "connected": true,
-                    "version": metadata.version,
-                    "protocol": HERDR_PROTOCOL_MAX,
-                    "compatible": true,
-                    "supportedProtocolMin": HERDR_PROTOCOL_MIN,
-                    "supportedProtocolMax": HERDR_PROTOCOL_MAX,
-                }),
-            ),
-            Err(err) => {
-                eprintln!("tmux metadata request failed: {err}");
-                (
-                    json!({ "kind": "tmux", "connected": false }),
-                    json!({ "connected": false, "error": "Terminal backend is unavailable" }),
-                )
-            }
-        },
+                compatibility,
+            )
+        }
+        Err(err) => {
+            eprintln!("terminal metadata request failed: {err}");
+            (
+                json!({ "kind": session.backend, "connected": false }),
+                json!({ "connected": false, "error": "Terminal backend is unavailable" }),
+            )
+        }
     }
 }
 
@@ -3345,17 +3231,12 @@ async fn snapshot(
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
     let session = find_session(&state.config, &session_id)?;
-    if session.backend == BackendKind::Tmux {
-        let backend = terminal_backend(session);
-        let workspaces = backend.list_workspaces().await.map_err(backend_api_error)?;
-        let tabs = backend.list_tabs().await.map_err(backend_api_error)?;
-        let panes = backend.list_panes().await.map_err(backend_api_error)?;
-        let answer = backend::compat::snapshot(workspaces, tabs, panes);
-        return Ok(Json(note_and_amend_panes(&state, &session_id, answer)));
-    }
-    let answer =
-        call_session_method(&state.config, &session_id, "session.snapshot", json!({})).await;
-    Ok(Json(note_and_amend_panes(&state, &session_id, answer?.0)))
+    let backend = terminal_backend(session);
+    let workspaces = backend.list_workspaces().await.map_err(backend_api_error)?;
+    let tabs = backend.list_tabs().await.map_err(backend_api_error)?;
+    let panes = backend.list_panes().await.map_err(backend_api_error)?;
+    let answer = backend::compat::snapshot(workspaces, tabs, panes);
+    Ok(Json(note_and_amend_panes(&state, &session_id, answer)))
 }
 
 /// Let the scrollback store read a Herdr answer, and answer back for whatever
@@ -3379,9 +3260,6 @@ async fn workspaces(
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
     let session = find_session(&state.config, &session_id)?;
-    if session.backend == BackendKind::Herdr {
-        return call_session_method(&state.config, &session_id, "workspace.list", json!({})).await;
-    }
     let workspaces = terminal_backend(session)
         .list_workspaces()
         .await
@@ -3396,17 +3274,12 @@ async fn panes(
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
     let session = find_session(&state.config, &session_id)?;
-    let answer = if session.backend == BackendKind::Herdr {
-        call_session_method(&state.config, &session_id, "pane.list", json!({})).await
-    } else {
-        terminal_backend(session)
-            .list_panes()
-            .await
-            .map(backend::compat::pane_list)
-            .map(Json)
-            .map_err(backend_api_error)
-    };
-    Ok(Json(note_and_amend_panes(&state, &session_id, answer?.0)))
+    let answer = terminal_backend(session)
+        .list_panes()
+        .await
+        .map(backend::compat::pane_list)
+        .map_err(backend_api_error)?;
+    Ok(Json(note_and_amend_panes(&state, &session_id, answer)))
 }
 
 async fn agents(
@@ -3416,9 +3289,6 @@ async fn agents(
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
     let session = find_session(&state.config, &session_id)?;
-    if session.backend == BackendKind::Herdr {
-        return call_session_method(&state.config, &session_id, "agent.list", json!({})).await;
-    }
     Ok(Json(
         backend_agent_list(session)
             .await
@@ -3469,7 +3339,12 @@ fn pane_read_text(value: &Value) -> Option<String> {
     // Herdr nests the text under `result.read.text`; tolerate `result.text` and a
     // bare-string `result` too across versions. Missing all three means no inline
     // output and the client falls back to its own read.
-    for ptr in ["/result/read/text", "/result/text"] {
+    for ptr in [
+        "/result/read/output",
+        "/result/read/text",
+        "/result/output",
+        "/result/text",
+    ] {
         if let Some(text) = value.pointer(ptr).and_then(Value::as_str) {
             return Some(text.to_owned());
         }
@@ -3478,14 +3353,6 @@ fn pane_read_text(value: &Value) -> Option<String> {
         .pointer("/result")
         .and_then(Value::as_str)
         .map(str::to_owned)
-}
-
-fn stream_pane_frame(value: &Value) -> Option<StreamPaneFrame> {
-    let revision = ["/result/read/revision", "/result/revision"]
-        .into_iter()
-        .find_map(|pointer| value.pointer(pointer).and_then(Value::as_u64))?;
-    let output = pane_read_text(value)?;
-    Some(StreamPaneFrame { revision, output })
 }
 
 /// Convert one sampled frame into the enriched `pane_updated` payload consumed
@@ -3506,27 +3373,21 @@ fn stream_pane_update_payload(frame: &StreamPaneFrame, pane_id: &str) -> Option<
 }
 
 async fn poll_stream_pane_update(
-    session: &SessionConfig,
+    backend: &dyn TerminalBackend,
     opts: &StreamOutputOpts,
 ) -> Option<StreamPaneFrame> {
     let pane = opts.pane.as_deref()?;
     let read = tokio::time::timeout(
         STREAM_OUTPUT_READ_TIMEOUT,
-        herdr_request(
-            session,
-            "pane.read",
-            json!({
-                "pane_id": pane,
-                "source": opts.source,
-                "lines": opts.lines,
-                "format": opts.format,
-            }),
-        ),
+        backend.read_pane(&stream_read_request(pane, opts)),
     )
     .await
     .ok()?
     .ok()?;
-    stream_pane_frame(&read)
+    Some(StreamPaneFrame {
+        revision: read.revision.unwrap_or_default(),
+        output: read.text,
+    })
 }
 
 /// If `line` is a `pane.updated` for the streamed pane, read that pane's output
@@ -3535,7 +3396,7 @@ async fn poll_stream_pane_update(
 /// still has its revision and can fall back to a read).
 async fn enrich_pane_update(
     line: &str,
-    session: &SessionConfig,
+    backend: &dyn TerminalBackend,
     opts: &StreamOutputOpts,
 ) -> Option<String> {
     let pane = opts.pane.as_deref()?;
@@ -3556,26 +3417,34 @@ async fn enrich_pane_update(
     // client reads on its own.
     let read = tokio::time::timeout(
         Duration::from_secs(2),
-        herdr_request(
-            session,
-            "pane.read",
-            json!({
-                "pane_id": pane,
-                "source": opts.source,
-                "lines": opts.lines,
-                "format": opts.format,
-            }),
-        ),
+        backend.read_pane(&stream_read_request(pane, opts)),
     )
     .await
     .ok()?
     .ok()?;
-    let text = pane_read_text(&read)?;
     value
         .get_mut("data")
         .and_then(Value::as_object_mut)?
-        .insert("output".into(), Value::String(text));
+        .insert("output".into(), Value::String(read.text));
     serde_json::to_string(&value).ok()
+}
+
+fn stream_read_request(pane_id: &str, opts: &StreamOutputOpts) -> BackendReadPane {
+    BackendReadPane {
+        pane_id: BackendPaneId::new(pane_id),
+        source: match opts.source.as_str() {
+            "visible" => BackendOutputSource::Visible,
+            "recent" => BackendOutputSource::Recent,
+            "detection" => BackendOutputSource::Detection,
+            _ => BackendOutputSource::RecentUnwrapped,
+        },
+        format: if opts.format == "text" {
+            BackendOutputFormat::Text
+        } else {
+            BackendOutputFormat::Ansi
+        },
+        lines: opts.lines,
+    }
 }
 
 /// Fold a streamed frame into what the gateway keeps for that pane.
@@ -3590,15 +3459,8 @@ fn keep_stream_frame(
     opts: &StreamOutputOpts,
     output: &str,
 ) {
-    if output.is_empty() {
-        return;
-    }
     let Ok(mut store) = store.lock() else { return };
-    if !store.keeps(session_id, pane_id) {
-        return;
-    }
-    let key = scrollback::read_key(session_id, pane_id, &opts.source, &opts.format);
-    store.record(&key, output);
+    store.record_frame(session_id, pane_id, &opts.source, &opts.format, output);
 }
 
 /// The output an enriched `pane.updated` carries, so the same frame that
@@ -3615,16 +3477,6 @@ fn enriched_pane_output(payload: &str) -> Option<String> {
 /// a client may ask for either `pane.updated` or `pane_updated`.
 fn normalize_event_name(value: &str) -> String {
     value.trim().replace('.', "_")
-}
-
-/// The `event` field of a forwarded Herdr line, used to decide whether a
-/// subscribed client asked for it.
-fn herdr_event_name(line: &str) -> Option<String> {
-    serde_json::from_str::<Value>(line)
-        .ok()?
-        .get("event")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
 }
 
 type GatewayEventStream =
@@ -3657,15 +3509,6 @@ async fn events(
             _ => "ansi".into(),
         },
     };
-    if session.backend == BackendKind::Tmux {
-        return Ok(tmux_event_response(
-            state,
-            session,
-            session_id,
-            wanted,
-            stream_opts,
-        ));
-    }
     // `asset.created` is a gateway event on the same stream, so it obeys the
     // same allow-list as the Herdr ones: a client that filtered down to output
     // updates is not woken for artifacts it never asked about.
@@ -3679,224 +3522,82 @@ async fn events(
     let approval_events = wanted
         .as_ref()
         .is_none_or(|set| set.contains("approval_pending") || set.contains("approval_resolved"));
-    let mut approvals_rx = state.approval_events.subscribe();
-    let assets = state.assets.clone();
-    let scrollback_store = state.scrollback.clone();
-    let stream = async_stream::stream! {
-        match herdr_event_stream(&session).await {
-            Ok(mut reader) => {
-                let mut line = Vec::new();
-                let mut output_interval = tokio::time::interval(STREAM_OUTPUT_POLL_INTERVAL);
-                output_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                let mut last_stream_output: Option<String> = None;
-                loop {
-                    line.clear();
-                    tokio::select! {
-                        read = reader.read_until(b'\n', &mut line) => match read {
-                            Ok(0) => break,
-                            Ok(_) => {
-                            let data = String::from_utf8_lossy(&line);
-                            let data = data.trim();
-                            if !data.is_empty() {
-                                // Filter at the point of forwarding rather than
-                                // by unsubscribing: a subscribed event a client
-                                // did not ask for costs nothing here, but waking
-                                // the phone for it costs battery.
-                                let keep = match &wanted {
-                                    Some(set) => herdr_event_name(data)
-                                        .map(|name| set.contains(&name))
-                                        .unwrap_or(true),
-                                    None => true,
-                                };
-                                if keep {
-                                    // Fold the viewed pane's output into its
-                                    // update so the client paints on arrival,
-                                    // with no follow-up read hop. Everything
-                                    // else forwards untouched.
-                                    let payload = if stream_opts.pane.is_some() {
-                                        enrich_pane_update(data, &session, &stream_opts)
-                                            .await
-                                            .unwrap_or_else(|| data.to_owned())
-                                    } else {
-                                        data.to_owned()
-                                    };
-                                    // An enriched update is a second source of
-                                    // fresh output for the watched pane. Feeding
-                                    // only the tick would drop frames on a pane
-                                    // busy enough to beat it.
-                                    if let Some(pane_id) = stream_opts.pane.as_deref() {
-                                        if let Some(output) = enriched_pane_output(&payload) {
-                                            keep_stream_frame(&scrollback_store, &session_id, pane_id, &stream_opts, &output);
-                                        }
-                                    }
-                                    yield Ok(Event::default().event("herdr").data(payload));
-                                }
-                                // A worktree event is consumed whether or not
-                                // the client asked to see it: the asset index
-                                // is fed by the same stream that filters.
-                                if let Some(root) = worktree_event_root(&session_id, data) {
-                                    let created = ingest_roots(assets.clone(), vec![root]).await;
-                                    if asset_events {
-                                        let now = now_unix_ms();
-                                        for entry in created
-                                            .into_iter()
-                                            .filter(|entry| now.saturating_sub(entry.modified_unix_ms) <= ASSET_EVENT_MAX_AGE_MS)
-                                            .take(MAX_ASSET_EVENTS_PER_WORKTREE)
-                                        {
-                                            let asset_type = sniff_asset_type(&read_asset_head(&entry.path), &entry.name);
-                                            yield Ok(Event::default()
-                                                .event("asset.created")
-                                                .data(asset_created_payload(&entry, asset_type)));
-                                        }
-                                    }
-                                } else if let Some(removed) = worktree_event_removed_root(data) {
-                                    if let Ok(mut index) = assets.lock() {
-                                        index.forget_under(&removed);
-                                    }
-                                }
-                            }
-                            }
-                            Err(err) => {
-                            eprintln!("Herdr event stream read failed: {err:#}");
-                            yield Ok(Event::default().event("gateway.error").data("Herdr event stream unavailable"));
-                            break;
-                            }
-                        },
-                        _ = output_interval.tick(), if stream_opts.pane.is_some() => {
-                            if let Some(frame) = poll_stream_pane_update(&session, &stream_opts).await {
-                                if last_stream_output.as_deref() != Some(frame.output.as_str()) {
-                                    last_stream_output = Some(frame.output.clone());
-                                    if let Some(pane_id) = stream_opts.pane.as_deref() {
-                                        // The frame the reader is watching is
-                                        // also the only chance to keep it: for a
-                                        // pane Herdr holds no scrollback for,
-                                        // this tick is where its history comes
-                                        // from, and it was being dropped.
-                                        keep_stream_frame(&scrollback_store, &session_id, pane_id, &stream_opts, &frame.output);
-                                        if let Some(payload) = stream_pane_update_payload(&frame, pane_id) {
-                                            yield Ok(Event::default().event("herdr").data(payload));
-                                        }
-                                    }
-                                }
-                            }
-                        },
-                        approval = approvals_rx.recv(), if approval_events => {
-                            match approval {
-                                Ok(approval) => {
-                                    let wanted_name = normalize_event_name(approval.name);
-                                    if wanted.as_ref().is_none_or(|set| set.contains(&wanted_name)) {
-                                        yield Ok(Event::default().event(approval.name).data(approval.payload));
-                                    }
-                                }
-                                // A client that fell behind has missed
-                                // transitions; it re-reads the pane's approval
-                                // rather than being told a stale one.
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                            }
-                        },
-                    }
-                }
-            }
-            Err(err) => {
-                eprintln!("Herdr event stream connection failed: {err:#}");
-                yield Ok(Event::default().event("gateway.error").data("Herdr event stream unavailable"));
-            }
-        }
-    };
-    Ok(Sse::new(Box::pin(stream) as GatewayEventStream)
-        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
-        .into_response())
-}
-
-fn tmux_event_response(
-    state: AppState,
-    session: SessionConfig,
-    session_id: String,
-    wanted: Option<std::collections::HashSet<String>>,
-    stream_opts: StreamOutputOpts,
-) -> Response {
-    let approval_events = wanted
-        .as_ref()
-        .is_none_or(|set| set.contains("approval_pending") || set.contains("approval_resolved"));
-    let layout_events = wanted
-        .as_ref()
-        .is_none_or(|set| set.contains("layout_updated"));
     let pane_events = wanted
         .as_ref()
         .is_none_or(|set| set.contains("pane_updated"));
     let mut approvals_rx = state.approval_events.subscribe();
+    let assets = state.assets.clone();
     let scrollback_store = state.scrollback.clone();
+    let backend = terminal_backend(&session);
+    let mut activity = backend.activity_stream().await.map_err(backend_api_error)?;
     let stream = async_stream::stream! {
-        let backend = terminal_backend(&session);
-        let mut topology_interval = tokio::time::interval(Duration::from_millis(500));
-        topology_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut output_interval = tokio::time::interval(STREAM_OUTPUT_POLL_INTERVAL);
         output_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut last_topology: Option<String> = None;
         let mut last_stream_output: Option<String> = None;
         loop {
             tokio::select! {
-                _ = topology_interval.tick() => {
-                    let topology = match (
-                        backend.list_workspaces().await,
-                        backend.list_tabs().await,
-                        backend.list_panes().await,
-                    ) {
-                        (Ok(workspaces), Ok(tabs), Ok(panes)) => {
-                            serde_json::to_string(&backend::compat::snapshot(workspaces, tabs, panes)).ok()
-                        }
-                        _ => None,
-                    };
-                    if let Some(topology) = topology {
-                        let changed = last_topology.as_ref().is_some_and(|last| last != &topology);
-                        last_topology = Some(topology);
-                        if changed && layout_events {
-                            let payload = json!({
-                                "event": "layout_updated",
-                                "data": { "backend": "tmux" }
-                            }).to_string();
+                next = activity.next() => match next {
+                    Some(Ok(activity)) => {
+                        let data = activity.payload.to_string();
+                        let keep = wanted.as_ref().is_none_or(|set| {
+                            activity.name.is_empty() || set.contains(&activity.name)
+                        });
+                        if keep {
+                            let payload = if stream_opts.pane.is_some() {
+                                enrich_pane_update(&data, backend.as_ref(), &stream_opts)
+                                    .await
+                                    .unwrap_or_else(|| data.clone())
+                            } else {
+                                data.clone()
+                            };
+                            if let Some(pane_id) = stream_opts.pane.as_deref() {
+                                if let Some(output) = enriched_pane_output(&payload) {
+                                    keep_stream_frame(&scrollback_store, &session_id, pane_id, &stream_opts, &output);
+                                }
+                            }
                             yield Ok(Event::default().event("herdr").data(payload));
                         }
-                    }
-                }
-                _ = output_interval.tick(), if stream_opts.pane.is_some() && pane_events => {
-                    let pane_id = stream_opts.pane.as_deref().unwrap_or_default();
-                    let request = BackendReadPane {
-                        pane_id: BackendPaneId::new(pane_id),
-                        source: match stream_opts.source.as_str() {
-                            "visible" => BackendOutputSource::Visible,
-                            "recent" => BackendOutputSource::Recent,
-                            "detection" => BackendOutputSource::Detection,
-                            _ => BackendOutputSource::RecentUnwrapped,
-                        },
-                        format: if stream_opts.format == "text" {
-                            BackendOutputFormat::Text
-                        } else {
-                            BackendOutputFormat::Ansi
-                        },
-                        lines: stream_opts.lines,
-                    };
-                    if let Ok(output) = backend.read_pane(&request).await {
-                        if last_stream_output.as_deref() != Some(output.text.as_str()) {
-                            last_stream_output = Some(output.text.clone());
-                            keep_stream_frame(
-                                &scrollback_store,
-                                &session_id,
-                                pane_id,
-                                &stream_opts,
-                                &output.text,
-                            );
-                            let frame = StreamPaneFrame {
-                                revision: output.revision.unwrap_or_default(),
-                                output: output.text,
-                            };
-                            if let Some(payload) = stream_pane_update_payload(&frame, pane_id) {
-                                yield Ok(Event::default().event("herdr").data(payload));
+                        if let Some(root) = worktree_event_root(&session_id, &data) {
+                            let created = ingest_roots(assets.clone(), vec![root]).await;
+                            if asset_events {
+                                let now = now_unix_ms();
+                                for entry in created
+                                    .into_iter()
+                                    .filter(|entry| now.saturating_sub(entry.modified_unix_ms) <= ASSET_EVENT_MAX_AGE_MS)
+                                    .take(MAX_ASSET_EVENTS_PER_WORKTREE)
+                                {
+                                    let asset_type = sniff_asset_type(&read_asset_head(&entry.path), &entry.name);
+                                    yield Ok(Event::default()
+                                        .event("asset.created")
+                                        .data(asset_created_payload(&entry, asset_type)));
+                                }
+                            }
+                        } else if let Some(removed) = worktree_event_removed_root(&data) {
+                            if let Ok(mut index) = assets.lock() {
+                                index.forget_under(&removed);
                             }
                         }
                     }
-                }
+                    Some(Err(err)) => {
+                        eprintln!("terminal activity stream failed: {err}");
+                        yield Ok(Event::default().event("gateway.error").data("Terminal activity stream unavailable"));
+                        break;
+                    }
+                    None => break,
+                },
+                _ = output_interval.tick(), if stream_opts.pane.is_some() && pane_events => {
+                    if let Some(frame) = poll_stream_pane_update(backend.as_ref(), &stream_opts).await {
+                        if last_stream_output.as_deref() != Some(frame.output.as_str()) {
+                            last_stream_output = Some(frame.output.clone());
+                            if let Some(pane_id) = stream_opts.pane.as_deref() {
+                                keep_stream_frame(&scrollback_store, &session_id, pane_id, &stream_opts, &frame.output);
+                                if let Some(payload) = stream_pane_update_payload(&frame, pane_id) {
+                                    yield Ok(Event::default().event("herdr").data(payload));
+                                }
+                            }
+                        }
+                    }
+                },
                 approval = approvals_rx.recv(), if approval_events => {
                     match approval {
                         Ok(approval) => {
@@ -3908,13 +3609,13 @@ fn tmux_event_response(
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
-                }
+                },
             }
         }
     };
-    Sse::new(Box::pin(stream) as GatewayEventStream)
+    Ok(Sse::new(Box::pin(stream) as GatewayEventStream)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
-        .into_response()
+        .into_response())
 }
 
 fn spawn_approval_watchers(state: AppState) {
@@ -3940,43 +3641,21 @@ async fn watch_pane_approvals(state: AppState, session: SessionConfig) {
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         ticker.tick().await;
-        let response = match session.backend {
-            BackendKind::Herdr => {
-                let Ok(response) = herdr_request(&session, "pane.list", json!({})).await else {
-                    continue;
-                };
-                response
-            }
-            BackendKind::Tmux => {
-                let Ok(panes) = terminal_backend(&session).list_panes().await else {
-                    continue;
-                };
-                backend::compat::pane_list(panes)
-            }
+        let Ok(panes) = terminal_backend(&session).list_panes().await else {
+            continue;
         };
         // This listing is already being fetched, and it is the only place that
         // says which panes Herdr keeps no scrollback for. Reading it here means
         // the buffer knows what to keep before the reader ever opens the pane,
         // and costs Herdr nothing extra.
         if let Some(mut store) = lock_scrollback(&state) {
-            store.observe(&session.id, &response);
+            store.observe(&session.id, &backend::compat::pane_list(panes.clone()));
         }
-
-        let panes = response
-            .pointer("/result/panes")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
 
         let mut seen: Vec<String> = Vec::new();
         for pane in &panes {
-            let Some(pane_id) = pane.get("pane_id").and_then(Value::as_str) else {
-                continue;
-            };
-            let agent = pane
-                .get("agent")
-                .and_then(Value::as_str)
-                .filter(|agent| !agent.is_empty());
+            let pane_id = pane.id.as_str();
+            let agent = pane.agent.as_deref().filter(|agent| !agent.is_empty());
             let Some(agent) = agent else { continue };
             seen.push(pane_id.to_owned());
 
@@ -4135,59 +3814,40 @@ async fn watch_agent_notifications(state: AppState, session: SessionConfig) {
     let mut statuses = seed_agent_statuses(&session).await;
 
     loop {
-        for mut notification in poll_agent_notifications(&state, &session, &mut statuses).await {
-            enrich_blocked_notification(&state, &session, &mut notification).await;
-            deliver_agent_notification(&state, notification).await;
-        }
-
-        // tmux has no native agent-status event. The polling pass above still
-        // detects agent processes; output/activity inference is layered onto
-        // that source separately rather than pretending tmux speaks Herdr's
-        // event protocol.
-        if session.backend == BackendKind::Tmux {
+        let backend = terminal_backend(&session);
+        let Ok(mut activity) = backend.activity_stream().await else {
             tokio::time::sleep(Duration::from_secs(2)).await;
             continue;
-        }
-
-        match herdr_agent_event_stream(&session).await {
-            Ok(mut reader) => {
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    match tokio::time::timeout(Duration::from_secs(30), reader.read_line(&mut line))
-                        .await
-                    {
-                        Err(_) | Ok(Ok(0)) => break,
-                        Ok(Ok(_)) => {
-                            let Ok(event) = serde_json::from_str::<Value>(line.trim()) else {
-                                continue;
-                            };
-                            if let Some(mut notification) = absorb_agent_status_event(
-                                &state,
-                                &session.id,
-                                &event,
-                                &mut statuses,
-                            ) {
-                                enrich_blocked_notification(&state, &session, &mut notification)
-                                    .await;
-                                deliver_agent_notification(&state, notification).await;
-                            }
-                        }
-                        Ok(Err(err)) => {
-                            eprintln!(
-                                "Herdr event stream failed for session {}: {err}",
-                                session.id
-                            );
-                            break;
-                        }
+        };
+        let mut poll = tokio::time::interval(Duration::from_secs(2));
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = poll.tick() => {
+                    for mut notification in poll_agent_notifications(&state, &session, &mut statuses).await {
+                        enrich_blocked_notification(&state, &session, &mut notification).await;
+                        deliver_agent_notification(&state, notification).await;
                     }
                 }
-            }
-            Err(err) => {
-                eprintln!(
-                    "Herdr event subscription failed for session {}: {err:#}",
-                    session.id
-                );
+                next = activity.next() => match next {
+                    Some(Ok(event)) if event.name == "pane_agent_status_changed" => {
+                        if let Some(mut notification) = absorb_agent_status_event(
+                            &state,
+                            &session.id,
+                            &event.payload,
+                            &mut statuses,
+                        ) {
+                            enrich_blocked_notification(&state, &session, &mut notification).await;
+                            deliver_agent_notification(&state, notification).await;
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(err)) => {
+                        eprintln!("terminal activity failed for session {}: {err}", session.id);
+                        break;
+                    }
+                    None => break,
+                }
             }
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -4274,30 +3934,25 @@ async fn seed_agent_statuses(session: &SessionConfig) -> HashMap<String, String>
 }
 
 async fn backend_agent_list(session: &SessionConfig) -> Result<Value, BackendError> {
-    match session.backend {
-        BackendKind::Herdr => herdr_request(session, "agent.list", json!({}))
-            .await
-            .map_err(|_| BackendError::Unavailable),
-        BackendKind::Tmux => {
-            let backend = terminal_backend(session);
-            let mut panes = backend.list_panes().await?;
-            for pane in panes.iter_mut().filter(|pane| pane.agent.is_some()) {
-                let output = backend
-                    .read_pane(&BackendReadPane {
-                        pane_id: pane.id.clone(),
-                        source: BackendOutputSource::Visible,
-                        format: BackendOutputFormat::Text,
-                        lines: APPROVAL_READ_LINES,
-                    })
-                    .await;
-                if let Ok(output) = output {
-                    pane.agent_status =
-                        infer_tmux_agent_status(pane.agent.as_deref(), &output.text);
-                }
-            }
-            Ok(backend::compat::agent_list(&panes))
+    let terminal = terminal_backend(session);
+    let mut agents = terminal.list_agents().await?;
+    for agent in agents
+        .iter_mut()
+        .filter(|agent| agent.kind.is_some() && agent.status == BackendAgentStatus::Unknown)
+    {
+        let output = terminal
+            .read_pane(&BackendReadPane {
+                pane_id: agent.pane_id.clone(),
+                source: BackendOutputSource::Visible,
+                format: BackendOutputFormat::Text,
+                lines: APPROVAL_READ_LINES,
+            })
+            .await;
+        if let Ok(output) = output {
+            agent.status = infer_tmux_agent_status(agent.kind.as_deref(), &output.text);
         }
     }
+    Ok(backend::compat::agent_list(&agents))
 }
 
 fn infer_tmux_agent_status(agent: Option<&str>, visible: &str) -> backend::AgentStatus {
@@ -4500,45 +4155,32 @@ async fn create_workspace(
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
     let session = find_session(&state.config, &session_id)?;
-    if session.backend == BackendKind::Tmux {
-        let backend = terminal_backend(session);
-        let workspace = backend
-            .create_workspace(&BackendCreateWorkspace {
-                cwd: body.cwd.map(PathBuf::from),
-                label: body.label,
-                focus: body.focus.unwrap_or(false),
-            })
-            .await
-            .map_err(backend_api_error)?;
-        let tab = backend
-            .list_tabs()
-            .await
-            .map_err(backend_api_error)?
-            .into_iter()
-            .find(|tab| tab.workspace_id == workspace.id)
-            .ok_or_else(|| backend_api_error(BackendError::InvalidResponse("created tab")))?;
-        let root_pane = backend
-            .list_panes()
-            .await
-            .map_err(backend_api_error)?
-            .into_iter()
-            .find(|pane| pane.tab_id == tab.id)
-            .ok_or_else(|| backend_api_error(BackendError::InvalidResponse("created pane")))?;
-        return Ok(Json(backend::compat::workspace_created(
-            workspace, tab, root_pane,
-        )));
-    }
-    let mut params = serde_json::Map::new();
-    insert_opt(&mut params, "cwd", body.cwd);
-    insert_opt(&mut params, "label", body.label);
-    insert_opt(&mut params, "focus", body.focus);
-    call_session_method(
-        &state.config,
-        &session_id,
-        "workspace.create",
-        Value::Object(params),
-    )
-    .await
+    let backend = terminal_backend(session);
+    let workspace = backend
+        .create_workspace(&BackendCreateWorkspace {
+            cwd: body.cwd.map(PathBuf::from),
+            label: body.label,
+            focus: body.focus.unwrap_or(false),
+        })
+        .await
+        .map_err(backend_api_error)?;
+    let tab = backend
+        .list_tabs()
+        .await
+        .map_err(backend_api_error)?
+        .into_iter()
+        .find(|tab| tab.workspace_id == workspace.id)
+        .ok_or_else(|| backend_api_error(BackendError::InvalidResponse("created tab")))?;
+    let root_pane = backend
+        .list_panes()
+        .await
+        .map_err(backend_api_error)?
+        .into_iter()
+        .find(|pane| pane.tab_id == tab.id)
+        .ok_or_else(|| backend_api_error(BackendError::InvalidResponse("created pane")))?;
+    Ok(Json(backend::compat::workspace_created(
+        workspace, tab, root_pane,
+    )))
 }
 
 async fn focus_workspace(
@@ -4548,20 +4190,11 @@ async fn focus_workspace(
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
     let session = find_session(&state.config, &session_id)?;
-    if session.backend == BackendKind::Tmux {
-        terminal_backend(session)
-            .focus_workspace(&BackendWorkspaceId::new(workspace_id))
-            .await
-            .map_err(backend_api_error)?;
-        return Ok(Json(backend::compat::command_ok("workspace_focused")));
-    }
-    call_session_method(
-        &state.config,
-        &session_id,
-        "workspace.focus",
-        json!({ "workspace_id": workspace_id }),
-    )
-    .await
+    terminal_backend(session)
+        .focus_workspace(&BackendWorkspaceId::new(workspace_id))
+        .await
+        .map_err(backend_api_error)?;
+    Ok(Json(backend::compat::command_ok("workspace_focused")))
 }
 
 async fn rename_workspace(
@@ -4572,20 +4205,11 @@ async fn rename_workspace(
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
     let session = find_session(&state.config, &session_id)?;
-    if session.backend == BackendKind::Tmux {
-        terminal_backend(session)
-            .rename_workspace(&BackendWorkspaceId::new(workspace_id), &body.label)
-            .await
-            .map_err(backend_api_error)?;
-        return Ok(Json(backend::compat::command_ok("workspace_renamed")));
-    }
-    call_session_method(
-        &state.config,
-        &session_id,
-        "workspace.rename",
-        json!({ "workspace_id": workspace_id, "label": body.label }),
-    )
-    .await
+    terminal_backend(session)
+        .rename_workspace(&BackendWorkspaceId::new(workspace_id), &body.label)
+        .await
+        .map_err(backend_api_error)?;
+    Ok(Json(backend::compat::command_ok("workspace_renamed")))
 }
 
 async fn close_workspace(
@@ -4595,20 +4219,11 @@ async fn close_workspace(
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
     let session = find_session(&state.config, &session_id)?;
-    if session.backend == BackendKind::Tmux {
-        terminal_backend(session)
-            .close_workspace(&BackendWorkspaceId::new(workspace_id))
-            .await
-            .map_err(backend_api_error)?;
-        return Ok(Json(backend::compat::command_ok("workspace_closed")));
-    }
-    call_session_method(
-        &state.config,
-        &session_id,
-        "workspace.close",
-        json!({ "workspace_id": workspace_id }),
-    )
-    .await
+    terminal_backend(session)
+        .close_workspace(&BackendWorkspaceId::new(workspace_id))
+        .await
+        .map_err(backend_api_error)?;
+    Ok(Json(backend::compat::command_ok("workspace_closed")))
 }
 
 async fn tabs(
@@ -4618,9 +4233,6 @@ async fn tabs(
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
     let session = find_session(&state.config, &session_id)?;
-    if session.backend == BackendKind::Herdr {
-        return call_session_method(&state.config, &session_id, "tab.list", json!({})).await;
-    }
     let tabs = terminal_backend(session)
         .list_tabs()
         .await
@@ -4636,38 +4248,24 @@ async fn create_tab(
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
     let session = find_session(&state.config, &session_id)?;
-    if session.backend == BackendKind::Tmux {
-        let backend = terminal_backend(session);
-        let tab = backend
-            .create_tab(&BackendCreateTab {
-                workspace_id: body.workspace_id.map(BackendWorkspaceId::new),
-                cwd: body.cwd.map(PathBuf::from),
-                label: body.label,
-                focus: body.focus.unwrap_or(false),
-            })
-            .await
-            .map_err(backend_api_error)?;
-        let root_pane = backend
-            .list_panes()
-            .await
-            .map_err(backend_api_error)?
-            .into_iter()
-            .find(|pane| pane.tab_id == tab.id)
-            .ok_or_else(|| backend_api_error(BackendError::InvalidResponse("created pane")))?;
-        return Ok(Json(backend::compat::tab_created(tab, root_pane)));
-    }
-    let mut params = serde_json::Map::new();
-    insert_opt(&mut params, "workspace_id", body.workspace_id);
-    insert_opt(&mut params, "label", body.label);
-    insert_opt(&mut params, "cwd", body.cwd);
-    insert_opt(&mut params, "focus", body.focus);
-    call_session_method(
-        &state.config,
-        &session_id,
-        "tab.create",
-        Value::Object(params),
-    )
-    .await
+    let backend = terminal_backend(session);
+    let tab = backend
+        .create_tab(&BackendCreateTab {
+            workspace_id: body.workspace_id.map(BackendWorkspaceId::new),
+            cwd: body.cwd.map(PathBuf::from),
+            label: body.label,
+            focus: body.focus.unwrap_or(false),
+        })
+        .await
+        .map_err(backend_api_error)?;
+    let root_pane = backend
+        .list_panes()
+        .await
+        .map_err(backend_api_error)?
+        .into_iter()
+        .find(|pane| pane.tab_id == tab.id)
+        .ok_or_else(|| backend_api_error(BackendError::InvalidResponse("created pane")))?;
+    Ok(Json(backend::compat::tab_created(tab, root_pane)))
 }
 
 async fn focus_tab(
@@ -4677,20 +4275,11 @@ async fn focus_tab(
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
     let session = find_session(&state.config, &session_id)?;
-    if session.backend == BackendKind::Tmux {
-        terminal_backend(session)
-            .focus_tab(&BackendTabId::new(tab_id))
-            .await
-            .map_err(backend_api_error)?;
-        return Ok(Json(backend::compat::command_ok("tab_focused")));
-    }
-    call_session_method(
-        &state.config,
-        &session_id,
-        "tab.focus",
-        json!({ "tab_id": tab_id }),
-    )
-    .await
+    terminal_backend(session)
+        .focus_tab(&BackendTabId::new(tab_id))
+        .await
+        .map_err(backend_api_error)?;
+    Ok(Json(backend::compat::command_ok("tab_focused")))
 }
 
 async fn rename_tab(
@@ -4701,20 +4290,11 @@ async fn rename_tab(
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
     let session = find_session(&state.config, &session_id)?;
-    if session.backend == BackendKind::Tmux {
-        terminal_backend(session)
-            .rename_tab(&BackendTabId::new(tab_id), &body.label)
-            .await
-            .map_err(backend_api_error)?;
-        return Ok(Json(backend::compat::command_ok("tab_renamed")));
-    }
-    call_session_method(
-        &state.config,
-        &session_id,
-        "tab.rename",
-        json!({ "tab_id": tab_id, "label": body.label }),
-    )
-    .await
+    terminal_backend(session)
+        .rename_tab(&BackendTabId::new(tab_id), &body.label)
+        .await
+        .map_err(backend_api_error)?;
+    Ok(Json(backend::compat::command_ok("tab_renamed")))
 }
 
 async fn close_tab(
@@ -4724,20 +4304,11 @@ async fn close_tab(
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
     let session = find_session(&state.config, &session_id)?;
-    if session.backend == BackendKind::Tmux {
-        terminal_backend(session)
-            .close_tab(&BackendTabId::new(tab_id))
-            .await
-            .map_err(backend_api_error)?;
-        return Ok(Json(backend::compat::command_ok("tab_closed")));
-    }
-    call_session_method(
-        &state.config,
-        &session_id,
-        "tab.close",
-        json!({ "tab_id": tab_id }),
-    )
-    .await
+    terminal_backend(session)
+        .close_tab(&BackendTabId::new(tab_id))
+        .await
+        .map_err(backend_api_error)?;
+    Ok(Json(backend::compat::command_ok("tab_closed")))
 }
 
 async fn pane(
@@ -4747,23 +4318,12 @@ async fn pane(
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
     let session = find_session(&state.config, &session_id)?;
-    let answer = if session.backend == BackendKind::Herdr {
-        call_session_method(
-            &state.config,
-            &session_id,
-            "pane.get",
-            json!({ "pane_id": pane_id }),
-        )
+    let answer = terminal_backend(session)
+        .get_pane(&BackendPaneId::new(pane_id))
         .await
-    } else {
-        terminal_backend(session)
-            .get_pane(&BackendPaneId::new(pane_id))
-            .await
-            .map(backend::compat::pane_get)
-            .map(Json)
-            .map_err(backend_api_error)
-    };
-    Ok(Json(note_and_amend_panes(&state, &session_id, answer?.0)))
+        .map(backend::compat::pane_get)
+        .map_err(backend_api_error)?;
+    Ok(Json(note_and_amend_panes(&state, &session_id, answer)))
 }
 
 async fn focus_pane(
@@ -4773,20 +4333,11 @@ async fn focus_pane(
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
     let session = find_session(&state.config, &session_id)?;
-    if session.backend == BackendKind::Tmux {
-        terminal_backend(session)
-            .focus_pane(&BackendPaneId::new(pane_id))
-            .await
-            .map_err(backend_api_error)?;
-        return Ok(Json(backend::compat::command_ok("pane_focused")));
-    }
-    call_session_method(
-        &state.config,
-        &session_id,
-        "pane.focus",
-        json!({ "pane_id": pane_id }),
-    )
-    .await
+    terminal_backend(session)
+        .focus_pane(&BackendPaneId::new(pane_id))
+        .await
+        .map_err(backend_api_error)?;
+    Ok(Json(backend::compat::command_ok("pane_focused")))
 }
 
 async fn rename_pane(
@@ -4797,20 +4348,11 @@ async fn rename_pane(
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
     let session = find_session(&state.config, &session_id)?;
-    if session.backend == BackendKind::Tmux {
-        terminal_backend(session)
-            .rename_pane(&BackendPaneId::new(pane_id), &body.label)
-            .await
-            .map_err(backend_api_error)?;
-        return Ok(Json(backend::compat::command_ok("pane_renamed")));
-    }
-    call_session_method(
-        &state.config,
-        &session_id,
-        "pane.rename",
-        json!({ "pane_id": pane_id, "label": body.label }),
-    )
-    .await
+    terminal_backend(session)
+        .rename_pane(&BackendPaneId::new(pane_id), &body.label)
+        .await
+        .map_err(backend_api_error)?;
+    Ok(Json(backend::compat::command_ok("pane_renamed")))
 }
 
 async fn close_pane(
@@ -4820,20 +4362,11 @@ async fn close_pane(
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
     let session = find_session(&state.config, &session_id)?;
-    if session.backend == BackendKind::Tmux {
-        terminal_backend(session)
-            .close_pane(&BackendPaneId::new(pane_id))
-            .await
-            .map_err(backend_api_error)?;
-        return Ok(Json(backend::compat::command_ok("pane_closed")));
-    }
-    call_session_method(
-        &state.config,
-        &session_id,
-        "pane.close",
-        json!({ "pane_id": pane_id }),
-    )
-    .await
+    terminal_backend(session)
+        .close_pane(&BackendPaneId::new(pane_id))
+        .await
+        .map_err(backend_api_error)?;
+    Ok(Json(backend::compat::command_ok("pane_closed")))
 }
 
 async fn split_pane(
@@ -4861,38 +4394,6 @@ async fn split_pane(
         ));
     }
     let session = find_session(&state.config, &session_id)?;
-    if session.backend == BackendKind::Tmux {
-        let backend = terminal_backend(session);
-        let pane = backend
-            .split_pane(&BackendSplitPane {
-                pane_id: BackendPaneId::new(pane_id),
-                direction: match body.direction.as_str() {
-                    "right" => BackendSplitDirection::Right,
-                    "down" => BackendSplitDirection::Down,
-                    _ => unreachable!("direction was validated above"),
-                },
-                ratio: body.ratio,
-                cwd: body.cwd.map(PathBuf::from),
-            })
-            .await
-            .map_err(backend_api_error)?;
-        if let Some(text) = body
-            .command
-            .map(|parts| parts.join(" "))
-            .filter(|text| !text.trim().is_empty())
-        {
-            validate_text(&text)?;
-            backend
-                .send_text(&pane.id, &text)
-                .await
-                .map_err(backend_api_error)?;
-            backend
-                .send_keys(&pane.id, &["Enter".to_owned()])
-                .await
-                .map_err(backend_api_error)?;
-        }
-        return Ok(Json(backend::compat::pane_created(pane)));
-    }
     let command = body
         .command
         .map(|parts| parts.join(" "))
@@ -4900,49 +4401,32 @@ async fn split_pane(
     if let Some(text) = command.as_deref() {
         validate_text(text)?;
     }
-    let mut params = serde_json::Map::new();
-    params.insert("target_pane_id".into(), json!(pane_id));
-    params.insert("direction".into(), json!(body.direction));
-    insert_opt(&mut params, "ratio", body.ratio);
-    insert_opt(&mut params, "cwd", body.cwd);
-    insert_opt(&mut params, "env", body.env);
-    let result = call_session_method(
-        &state.config,
-        &session_id,
-        "pane.split",
-        Value::Object(params),
-    )
-    .await?;
+    let backend = terminal_backend(session);
+    let pane = backend
+        .split_pane(&BackendSplitPane {
+            pane_id: BackendPaneId::new(pane_id),
+            direction: match body.direction.as_str() {
+                "right" => BackendSplitDirection::Right,
+                "down" => BackendSplitDirection::Down,
+                _ => unreachable!("direction was validated above"),
+            },
+            ratio: body.ratio,
+            cwd: body.cwd.map(PathBuf::from),
+            env: body.env,
+        })
+        .await
+        .map_err(backend_api_error)?;
     if let Some(text) = command {
-        let created_pane_id = created_pane_id(&result).ok_or_else(|| {
-            api_error(
-                StatusCode::BAD_GATEWAY,
-                "invalid_split_response",
-                "Herdr did not return the created pane id",
-            )
-        })?;
-        let _ = call_session_method(
-            &state.config,
-            &session_id,
-            "pane.send_text",
-            json!({ "pane_id": created_pane_id, "text": text }),
-        )
-        .await?;
-        let _ = call_session_method(
-            &state.config,
-            &session_id,
-            "pane.send_keys",
-            json!({ "pane_id": created_pane_id, "keys": ["Enter"] }),
-        )
-        .await?;
+        backend
+            .send_text(&pane.id, &text)
+            .await
+            .map_err(backend_api_error)?;
+        backend
+            .send_keys(&pane.id, &["Enter".to_owned()])
+            .await
+            .map_err(backend_api_error)?;
     }
-    Ok(result)
-}
-
-fn created_pane_id(value: &Value) -> Option<&str> {
-    value
-        .pointer("/result/pane/pane_id")
-        .and_then(Value::as_str)
+    Ok(Json(backend::compat::pane_created(pane)))
 }
 
 async fn zoom_pane(
@@ -4976,30 +4460,11 @@ async fn agent(
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
     let session = find_session(&state.config, &session_id)?;
-    if session.backend == BackendKind::Tmux {
-        let pane = terminal_backend(session)
-            .get_pane(&BackendPaneId::new(&target))
-            .await
-            .map_err(backend_api_error)?;
-        let agents = backend::compat::agent_list(&[pane]);
-        let agent = agents.pointer("/result/agents/0").cloned().ok_or_else(|| {
-            api_error(
-                StatusCode::NOT_FOUND,
-                "agent_not_found",
-                "the pane is not running a recognized agent",
-            )
-        })?;
-        return Ok(Json(
-            json!({ "result": { "type": "agent", "agent": agent } }),
-        ));
-    }
-    call_session_method(
-        &state.config,
-        &session_id,
-        "agent.get",
-        json!({ "target": target }),
-    )
-    .await
+    let agent = terminal_backend(session)
+        .get_agent(&target)
+        .await
+        .map_err(backend_api_error)?;
+    Ok(Json(backend::compat::agent_get(agent)))
 }
 
 async fn focus_agent(
@@ -5009,20 +4474,11 @@ async fn focus_agent(
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
     let session = find_session(&state.config, &session_id)?;
-    if session.backend == BackendKind::Tmux {
-        terminal_backend(session)
-            .focus_pane(&BackendPaneId::new(target))
-            .await
-            .map_err(backend_api_error)?;
-        return Ok(Json(backend::compat::command_ok("agent_focused")));
-    }
-    call_session_method(
-        &state.config,
-        &session_id,
-        "agent.focus",
-        json!({ "target": target }),
-    )
-    .await
+    terminal_backend(session)
+        .focus_agent(&target)
+        .await
+        .map_err(backend_api_error)?;
+    Ok(Json(backend::compat::command_ok("agent_focused")))
 }
 
 async fn send_agent(
@@ -5051,19 +4507,11 @@ async fn submit_agent_prompt(
     target: &str,
     text: &str,
 ) -> Result<Value, HerdrCallError> {
-    if session.backend == BackendKind::Tmux {
-        return terminal_backend(session)
-            .send_text(&BackendPaneId::new(target), text)
-            .await
-            .map(|_| backend::compat::command_ok("agent_prompted"))
-            .map_err(|err| HerdrCallError::Unavailable(err.to_string()));
-    }
-    herdr_call(
-        session,
-        "agent.prompt",
-        json!({ "target": target, "text": text }),
-    )
-    .await
+    terminal_backend(session)
+        .prompt_agent(target, text)
+        .await
+        .map(|_| backend::compat::command_ok("agent_prompted"))
+        .map_err(|err| HerdrCallError::Unavailable(err.to_string()))
 }
 
 async fn start_backend_agent(
@@ -5074,66 +4522,18 @@ async fn start_backend_agent(
     args: &[String],
     timeout_ms: u64,
 ) -> Result<Value, HerdrCallError> {
-    if session.backend == BackendKind::Herdr {
-        let mut params = serde_json::Map::new();
-        params.insert("name".into(), json!(kind));
-        params.insert("kind".into(), json!(kind));
-        params.insert("pane_id".into(), json!(pane_id));
-        params.insert("timeout_ms".into(), json!(timeout_ms));
-        if !args.is_empty() {
-            params.insert("args".into(), json!(args));
-        }
-        return herdr_call(session, "agent.start", Value::Object(params)).await;
-    }
-
-    let executable = tasks::find_on_path(command).ok_or_else(|| {
-        HerdrCallError::Unavailable(format!("agent executable {command} was not found on PATH"))
-    })?;
-    let mut argv = vec![executable.to_string_lossy().into_owned()];
-    argv.extend(args.iter().cloned());
-    let command_line = argv
-        .iter()
-        .map(|argument| shell_word(argument))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let backend = terminal_backend(session);
-    let pane = BackendPaneId::new(pane_id);
-    backend
-        .send_text(&pane, &command_line)
+    let started = terminal_backend(session)
+        .start_agent(&BackendStartAgent {
+            pane_id: BackendPaneId::new(pane_id),
+            kind: kind.to_owned(),
+            command: command.to_owned(),
+            executable: tasks::find_on_path(command),
+            args: args.to_vec(),
+            timeout_ms,
+        })
         .await
         .map_err(|err| HerdrCallError::Unavailable(err.to_string()))?;
-    backend
-        .send_keys(&pane, &["Enter".to_owned()])
-        .await
-        .map_err(|err| HerdrCallError::Unavailable(err.to_string()))?;
-
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    let executable_name = executable
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(command);
-    loop {
-        if let Ok(current) = backend.get_pane(&pane).await {
-            let recognized = current.agent.as_deref() == Some(kind)
-                || current.foreground_command.as_deref() == Some(executable_name);
-            if recognized {
-                return Ok(json!({ "result": { "argv": argv } }));
-            }
-        }
-        if Instant::now() >= deadline {
-            return Err(HerdrCallError::Unavailable(format!(
-                "agent {kind} did not become visible in the tmux pane before timeout"
-            )));
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
-/// Quote one argv value for the interactive shell already running in a tmux
-/// pane. No shell syntax is accepted from structure: every value is enclosed
-/// in single quotes and an embedded quote is closed, escaped, and reopened.
-fn shell_word(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
+    Ok(json!({ "result": { "argv": started.argv } }))
 }
 
 /// Belt and braces for a paste-vs-keypress race in agent TUIs: when the prompt
@@ -5178,7 +4578,7 @@ async fn submit_keypress(session: &SessionConfig, pane_id: &str) {
     let baseline = agent_state_change_seq(session, pane_id).await;
     if baseline.is_none() {
         eprintln!(
-            "agent submit for pane {pane_id}: Herdr lists no agent state for it, \
+            "agent submit for pane {pane_id}: the terminal backend lists no agent state for it, \
              falling back to watching the screen"
         );
     }
@@ -5194,23 +4594,13 @@ async fn submit_keypress(session: &SessionConfig, pane_id: &str) {
             eprintln!("agent submit for pane {pane_id} gave up: the pane never settled");
             return;
         };
-        let sent = match session.backend {
-            BackendKind::Herdr => herdr_call(
-                session,
-                "pane.send_keys",
-                json!({ "pane_id": pane_id, "keys": ["Enter"] }),
-            )
-            .await
-            .map(|_| ()),
-            BackendKind::Tmux => terminal_backend(session)
-                .send_keys(&BackendPaneId::new(pane_id), &["Enter".to_owned()])
-                .await
-                .map_err(|err| HerdrCallError::Unavailable(err.to_string())),
-        };
+        let sent = terminal_backend(session)
+            .send_keys(&BackendPaneId::new(pane_id), &["Enter".to_owned()])
+            .await;
         if let Err(err) = sent {
             eprintln!(
                 "agent submit for pane {pane_id} failed to send Enter: {}",
-                err.message()
+                err
             );
             return;
         }
@@ -5246,10 +4636,10 @@ async fn submit_keypress(session: &SessionConfig, pane_id: &str) {
     );
 }
 
-/// Herdr's own count of how many times this pane's agent has changed state.
+/// The backend's count of how many times this pane's agent has changed state.
 ///
-/// `None` means Herdr lists no agent for the pane, which a send to a plain shell
-/// pane legitimately is, or that it could not be asked.
+/// `None` means the backend lists no agent for the pane, which a send to a plain
+/// shell pane legitimately is, or that it could not be asked.
 async fn agent_state_change_seq(session: &SessionConfig, pane_id: &str) -> Option<u64> {
     let value = match backend_agent_list(session).await {
         Ok(value) => value,
@@ -5562,51 +4952,35 @@ async fn prepare_workspace(
     steps: &mut tasks::StepLog,
 ) -> Result<TaskPlace, HerdrCallError> {
     steps.skipped("worktree", "no branch_name was given");
-    if session.backend == BackendKind::Tmux {
-        let backend = terminal_backend(session);
-        let workspace = backend
-            .create_workspace(&BackendCreateWorkspace {
-                cwd: Some(repo_path.to_owned()),
-                label: label.map(str::to_owned),
-                focus: false,
-            })
-            .await
-            .map_err(|err| HerdrCallError::Unavailable(err.to_string()))?;
-        let pane = backend
-            .list_panes()
-            .await
-            .map_err(|err| HerdrCallError::Unavailable(err.to_string()))?
-            .into_iter()
-            .find(|pane| pane.workspace_id == workspace.id)
-            .ok_or_else(|| HerdrCallError::malformed("tmux workspace create"))?;
-        let place = TaskPlace {
-            workspace_id: workspace.id.as_str().to_owned(),
-            pane_id: pane.id.as_str().to_owned(),
-            worktree_path: None,
-            reused: false,
-        };
-        steps.ok(
-            "workspace",
-            json!({ "workspace_id": place.workspace_id, "pane_id": place.pane_id }),
-        );
-        return Ok(place);
-    }
-    let mut params = serde_json::Map::new();
-    params.insert("cwd".into(), json!(repo_path.to_string_lossy()));
-    params.insert("focus".into(), json!(false));
-    insert_opt(&mut params, "label", label);
-    let value = match herdr_call(session, "workspace.create", Value::Object(params)).await {
-        Ok(value) => value,
+    let backend = terminal_backend(session);
+    let workspace = match backend
+        .create_workspace(&BackendCreateWorkspace {
+            cwd: Some(repo_path.to_owned()),
+            label: label.map(str::to_owned),
+            focus: false,
+        })
+        .await
+    {
+        Ok(workspace) => workspace,
         Err(err) => {
+            let err = HerdrCallError::Unavailable(err.to_string());
             steps.failed("workspace", err.code(), &err.message());
             return Err(err);
         }
     };
-    let place = workspace_place(&value, None, false).ok_or_else(|| {
-        let err = HerdrCallError::malformed("workspace.create");
-        steps.failed("workspace", err.code(), &err.message());
-        err
-    })?;
+    let pane = backend
+        .list_panes()
+        .await
+        .map_err(|err| HerdrCallError::Unavailable(err.to_string()))?
+        .into_iter()
+        .find(|pane| pane.workspace_id == workspace.id)
+        .ok_or_else(|| HerdrCallError::malformed("workspace.create"))?;
+    let place = TaskPlace {
+        workspace_id: workspace.id.as_str().to_owned(),
+        pane_id: pane.id.as_str().to_owned(),
+        worktree_path: None,
+        reused: false,
+    };
     steps.ok(
         "workspace",
         json!({ "workspace_id": place.workspace_id, "pane_id": place.pane_id }),
@@ -5800,66 +5174,33 @@ async fn spawn_in_new_tab(
     cwd: Option<&str>,
     steps: &mut tasks::StepLog,
 ) -> ApiResult<SpawnPlace> {
-    if session.backend == BackendKind::Tmux {
-        let backend = terminal_backend(session);
-        let tab = backend
-            .create_tab(&BackendCreateTab {
-                workspace_id: None,
-                cwd: cwd.map(PathBuf::from),
-                label: None,
-                focus: false,
-            })
-            .await
-            .map_err(backend_api_error)?;
-        let pane_id = backend
-            .list_panes()
-            .await
-            .map_err(backend_api_error)?
-            .into_iter()
-            .find(|pane| pane.tab_id == tab.id)
-            .map(|pane| pane.id.as_str().to_owned())
-            .ok_or_else(|| {
-                api_error(
-                    StatusCode::BAD_GATEWAY,
-                    "backend_malformed_response",
-                    "terminal backend did not return the created pane",
-                )
-            })?;
-        let tab_id = Some(tab.id.as_str().to_owned());
-        steps.ok("pane", json!({ "pane_id": pane_id, "tab_id": tab_id }));
-        return Ok(SpawnPlace { pane_id, tab_id });
-    }
-    {
-        let mut params = serde_json::Map::new();
-        insert_opt(&mut params, "cwd", cwd);
-        params.insert("focus".into(), json!(false));
-        let value = herdr_call(session, "tab.create", Value::Object(params))
-            .await
-            .map_err(|err| {
-                steps.failed("pane", err.code(), &err.message());
-                err.into_api_error("tab.create")
-            })?;
-        let pane_id = created_pane_id(&value)
-            .or_else(|| {
-                value
-                    .pointer("/result/root_pane/pane_id")
-                    .and_then(Value::as_str)
-            })
-            .ok_or_else(|| {
-                api_error(
-                    StatusCode::BAD_GATEWAY,
-                    "herdr_malformed_response",
-                    "Herdr did not return the created pane id",
-                )
-            })?
-            .to_owned();
-        let tab_id = value
-            .pointer("/result/tab/tab_id")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        steps.ok("pane", json!({ "pane_id": pane_id, "tab_id": tab_id }));
-        Ok(SpawnPlace { pane_id, tab_id })
-    }
+    let backend = terminal_backend(session);
+    let tab = backend
+        .create_tab(&BackendCreateTab {
+            workspace_id: None,
+            cwd: cwd.map(PathBuf::from),
+            label: None,
+            focus: false,
+        })
+        .await
+        .map_err(backend_api_error)?;
+    let pane_id = backend
+        .list_panes()
+        .await
+        .map_err(backend_api_error)?
+        .into_iter()
+        .find(|pane| pane.tab_id == tab.id)
+        .map(|pane| pane.id.as_str().to_owned())
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                "backend_malformed_response",
+                "terminal backend did not return the created pane",
+            )
+        })?;
+    let tab_id = Some(tab.id.as_str().to_owned());
+    steps.ok("pane", json!({ "pane_id": pane_id, "tab_id": tab_id }));
+    Ok(SpawnPlace { pane_id, tab_id })
 }
 
 /// A task placed beside what the reader was already looking at.
@@ -5876,67 +5217,32 @@ async fn spawn_beside(
             "that tab has no pane to split",
         )
     })?;
-    if session.backend == BackendKind::Tmux {
-        let pane = terminal_backend(session)
-            .split_pane(&BackendSplitPane {
-                pane_id: BackendPaneId::new(&host),
-                direction: BackendSplitDirection::Down,
-                ratio: None,
-                cwd: cwd.map(PathBuf::from),
-            })
-            .await;
-        return match pane {
-            Ok(pane) => {
-                let pane_id = pane.id.as_str().to_owned();
-                steps.ok(
-                    "pane",
-                    json!({ "pane_id": pane_id, "tab_id": tab_id, "split_from": host }),
-                );
-                Ok(SpawnPlace {
-                    pane_id,
-                    tab_id: Some(tab_id.to_owned()),
-                })
-            }
-            Err(err) => {
-                steps.skipped(
-                    "split",
-                    &format!("{err} -- starting in a tab of its own instead"),
-                );
-                spawn_in_new_tab(session, cwd, steps).await
-            }
-        };
-    }
-    let mut params = serde_json::Map::new();
-    params.insert("pane_id".into(), json!(host));
-    params.insert("direction".into(), json!("down"));
-    insert_opt(&mut params, "cwd", cwd);
-    params.insert("focus".into(), json!(false));
     // A split that Ghostty refuses -- a tab already carrying as many panes as
     // its layout will hold, which is the ordinary state of a tab someone works
     // in -- must not lose the task. The tab was a preference, not the request:
     // the request was "start this agent". So a refusal falls back to a tab of
     // its own, recorded as such rather than passed off as the split that was
     // asked for.
-    let split = herdr_call(session, "pane.split", Value::Object(params)).await;
-    let value = match split {
-        Ok(value) => value,
+    let split = terminal_backend(session)
+        .split_pane(&BackendSplitPane {
+            pane_id: BackendPaneId::new(&host),
+            direction: BackendSplitDirection::Down,
+            ratio: None,
+            cwd: cwd.map(PathBuf::from),
+            env: None,
+        })
+        .await;
+    let pane = match split {
+        Ok(pane) => pane,
         Err(err) => {
             steps.skipped(
                 "split",
-                &format!("{} -- starting in a tab of its own instead", err.message()),
+                &format!("{err} -- starting in a tab of its own instead"),
             );
             return spawn_in_new_tab(session, cwd, steps).await;
         }
     };
-    let pane_id = created_pane_id(&value)
-        .ok_or_else(|| {
-            api_error(
-                StatusCode::BAD_GATEWAY,
-                "herdr_malformed_response",
-                "Herdr did not return the created pane id",
-            )
-        })?
-        .to_owned();
+    let pane_id = pane.id.as_str().to_owned();
     steps.ok(
         "pane",
         json!({ "pane_id": pane_id, "tab_id": tab_id, "split_from": host }),
@@ -5949,40 +5255,14 @@ async fn spawn_beside(
 
 /// A pane to split in the named tab, preferring the one that has focus.
 async fn pane_in_tab(session: &SessionConfig, tab_id: &str) -> Option<String> {
-    if session.backend == BackendKind::Tmux {
-        return terminal_backend(session)
-            .list_panes()
-            .await
-            .ok()?
-            .into_iter()
-            .filter(|pane| pane.tab_id.as_str() == tab_id)
-            .max_by_key(|pane| pane.focused)
-            .map(|pane| pane.id.as_str().to_owned());
-    }
-    let value = herdr_request(session, "pane.list", json!({})).await.ok()?;
-    pane_to_split(&value, tab_id)
-}
-
-/// Which pane of a `pane.list` a split should hang off, given the tab.
-///
-/// The focused one, because that is the one the user was looking at and the one
-/// a new pane should appear next to. A tab this session does not have answers
-/// with nothing, which is what makes an unknown `tab_id` a refusal rather than
-/// a spawn somewhere else.
-fn pane_to_split(response: &Value, tab_id: &str) -> Option<String> {
-    let panes = response
-        .pointer("/result/panes")
-        .and_then(Value::as_array)?;
-    let in_tab: Vec<&Value> = panes
-        .iter()
-        .filter(|pane| pane.get("tab_id").and_then(Value::as_str) == Some(tab_id))
-        .collect();
-    in_tab
-        .iter()
-        .find(|pane| pane.get("focused").and_then(Value::as_bool) == Some(true))
-        .or_else(|| in_tab.first())
-        .and_then(|pane| pane.get("pane_id").and_then(Value::as_str))
-        .map(str::to_owned)
+    terminal_backend(session)
+        .list_panes()
+        .await
+        .ok()?
+        .into_iter()
+        .filter(|pane| pane.tab_id.as_str() == tab_id)
+        .max_by_key(|pane| pane.focused)
+        .map(|pane| pane.id.as_str().to_owned())
 }
 
 /// The directories this session is already working in, for a spawn picker.
@@ -6077,59 +5357,65 @@ async fn prepare_worktree(
     label: Option<&str>,
     steps: &mut tasks::StepLog,
 ) -> Result<TaskPlace, HerdrCallError> {
-    if session.backend == BackendKind::Tmux {
-        return prepare_worktree_with_git(session, repo_path, branch, label, steps).await;
-    }
-    let cwd = repo_path.to_string_lossy().into_owned();
-
-    let existing = herdr_call(session, "worktree.list", json!({ "cwd": cwd }))
+    let backend = terminal_backend(session);
+    let request = BackendWorktreeRequest {
+        cwd: repo_path.to_owned(),
+        branch: branch.to_owned(),
+        label: label.map(str::to_owned),
+        focus: false,
+    };
+    let existing = backend
+        .list_worktrees(&request.cwd)
         .await
         .ok()
-        .and_then(|value| worktree_for_branch(&value, branch));
+        .and_then(|worktrees| {
+            worktrees.into_iter().find(|worktree| {
+                worktree
+                    .branch
+                    .as_deref()
+                    .map(|name| name.strip_prefix("refs/heads/").unwrap_or(name))
+                    == Some(branch)
+            })
+        });
 
-    if let Some(path) = existing {
-        let mut params = serde_json::Map::new();
-        params.insert("cwd".into(), json!(cwd));
-        params.insert("branch".into(), json!(branch));
-        params.insert("focus".into(), json!(false));
-        insert_opt(&mut params, "label", label);
-        match herdr_call(session, "worktree.open", Value::Object(params)).await {
-            Ok(value) => {
-                if let Some(place) = workspace_place(&value, Some(path.clone()), true) {
-                    steps.ok(
-                        "worktree",
-                        json!({ "path": path, "branch": branch, "reused": true }),
-                    );
-                    steps.ok(
-                        "workspace",
-                        json!({ "workspace_id": place.workspace_id, "pane_id": place.pane_id }),
-                    );
-                    return Ok(place);
-                }
+    if let Some(worktree) = existing {
+        match backend.open_worktree(&request).await {
+            Ok(placement) => {
+                let path = worktree.path.to_string_lossy().into_owned();
+                let place = TaskPlace {
+                    workspace_id: placement.workspace_id.as_str().to_owned(),
+                    pane_id: placement.pane_id.as_str().to_owned(),
+                    worktree_path: Some(path.clone()),
+                    reused: true,
+                };
+                steps.ok(
+                    "worktree",
+                    json!({ "path": path, "branch": branch, "reused": true }),
+                );
+                steps.ok(
+                    "workspace",
+                    json!({ "workspace_id": place.workspace_id, "pane_id": place.pane_id }),
+                );
+                return Ok(place);
             }
             // Reuse is an optimisation, not a contract. If opening the existing
             // checkout fails, fall through and let the create path report a
             // real error rather than masking it with this one.
-            Err(err) => eprintln!("task: worktree.open for {branch} failed: {}", err.message()),
+            Err(err) => eprintln!("task: worktree open for {branch} failed: {err}"),
         }
     }
 
-    let mut params = serde_json::Map::new();
-    params.insert("cwd".into(), json!(cwd));
-    params.insert("branch".into(), json!(branch));
-    params.insert("focus".into(), json!(false));
-    insert_opt(&mut params, "label", label);
-    match herdr_call(session, "worktree.create", Value::Object(params)).await {
-        Ok(value) => {
-            let path = value
-                .pointer("/result/worktree/path")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            let place = workspace_place(&value, path.clone(), false).ok_or_else(|| {
-                let err = HerdrCallError::malformed("worktree.create");
-                steps.failed("worktree", err.code(), &err.message());
-                err
-            })?;
+    match backend.create_worktree(&request).await {
+        Ok(placement) => {
+            let path = placement
+                .path
+                .map(|path| path.to_string_lossy().into_owned());
+            let place = TaskPlace {
+                workspace_id: placement.workspace_id.as_str().to_owned(),
+                pane_id: placement.pane_id.as_str().to_owned(),
+                worktree_path: path.clone(),
+                reused: false,
+            };
             steps.ok(
                 "worktree",
                 json!({ "path": path, "branch": branch, "reused": false }),
@@ -6140,10 +5426,11 @@ async fn prepare_worktree(
             );
             Ok(place)
         }
-        Err(HerdrCallError::Herdr { error, .. }) if tasks::is_unknown_method_error(&error) => {
+        Err(BackendError::Unsupported(_)) => {
             prepare_worktree_with_git(session, repo_path, branch, label, steps).await
         }
         Err(err) => {
+            let err = backend_call_error("worktree.create", err);
             steps.failed("worktree", err.code(), &err.message());
             Err(err)
         }
@@ -6194,46 +5481,29 @@ async fn prepare_worktree_with_git(
         json!({ "path": path, "branch": branch, "reused": !added.created }),
     );
 
-    let created = match session.backend {
-        BackendKind::Herdr => {
-            let mut params = serde_json::Map::new();
-            params.insert("cwd".into(), json!(path));
-            params.insert("focus".into(), json!(false));
-            insert_opt(&mut params, "label", label);
-            match herdr_call(session, "workspace.create", Value::Object(params)).await {
-                // Herdr's own refusal is the useful message here, so it is kept rather
-                // than flattened into "something went wrong".
-                Err(err) => Err(err),
-                Ok(value) => workspace_place(&value, Some(path.clone()), !added.created)
-                    .ok_or_else(|| HerdrCallError::malformed("workspace.create")),
-            }
-        }
-        BackendKind::Tmux => {
-            let backend = terminal_backend(session);
-            match backend
-                .create_workspace(&BackendCreateWorkspace {
-                    cwd: Some(PathBuf::from(&path)),
-                    label: label.map(str::to_owned),
-                    focus: false,
-                })
-                .await
-            {
-                Err(err) => Err(HerdrCallError::Unavailable(err.to_string())),
-                Ok(workspace) => backend
-                    .list_panes()
-                    .await
-                    .map_err(|err| HerdrCallError::Unavailable(err.to_string()))?
-                    .into_iter()
-                    .find(|pane| pane.workspace_id == workspace.id)
-                    .map(|pane| TaskPlace {
-                        workspace_id: workspace.id.as_str().to_owned(),
-                        pane_id: pane.id.as_str().to_owned(),
-                        worktree_path: Some(path.clone()),
-                        reused: !added.created,
-                    })
-                    .ok_or_else(|| HerdrCallError::malformed("tmux workspace create")),
-            }
-        }
+    let backend = terminal_backend(session);
+    let created = match backend
+        .create_workspace(&BackendCreateWorkspace {
+            cwd: Some(PathBuf::from(&path)),
+            label: label.map(str::to_owned),
+            focus: false,
+        })
+        .await
+    {
+        Err(err) => Err(HerdrCallError::Unavailable(err.to_string())),
+        Ok(workspace) => backend
+            .list_panes()
+            .await
+            .map_err(|err| HerdrCallError::Unavailable(err.to_string()))?
+            .into_iter()
+            .find(|pane| pane.workspace_id == workspace.id)
+            .map(|pane| TaskPlace {
+                workspace_id: workspace.id.as_str().to_owned(),
+                pane_id: pane.id.as_str().to_owned(),
+                worktree_path: Some(path.clone()),
+                reused: !added.created,
+            })
+            .ok_or_else(|| HerdrCallError::malformed("workspace.create")),
     };
 
     match created {
@@ -6269,48 +5539,6 @@ async fn prepare_worktree_with_git(
             Err(err)
         }
     }
-}
-
-/// Herdr answers `workspace.create`, `worktree.create` and `worktree.open` with
-/// the same workspace/tab/root_pane trio, so one reader covers all three.
-fn workspace_place(
-    value: &Value,
-    worktree_path: Option<String>,
-    reused: bool,
-) -> Option<TaskPlace> {
-    Some(TaskPlace {
-        workspace_id: value
-            .pointer("/result/workspace/workspace_id")
-            .and_then(Value::as_str)?
-            .to_owned(),
-        pane_id: value
-            .pointer("/result/root_pane/pane_id")
-            .and_then(Value::as_str)?
-            .to_owned(),
-        worktree_path: value
-            .pointer("/result/worktree/path")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .or(worktree_path),
-        reused,
-    })
-}
-
-/// The path of an existing checkout of `branch` in a `worktree.list` answer.
-fn worktree_for_branch(value: &Value, branch: &str) -> Option<String> {
-    value
-        .pointer("/result/worktrees")
-        .and_then(Value::as_array)?
-        .iter()
-        .find(|worktree| {
-            worktree
-                .get("branch")
-                .and_then(Value::as_str)
-                .map(|name| name.strip_prefix("refs/heads/").unwrap_or(name))
-                == Some(branch)
-        })
-        .and_then(|worktree| worktree.get("path").and_then(Value::as_str))
-        .map(str::to_owned)
 }
 
 /// Nothing usable was created: an ordinary error, with the steps attached so
@@ -6366,27 +5594,18 @@ async fn task_repo_roots(state: &AppState, session: &SessionConfig) -> Vec<PathB
         }
     };
 
-    if session.backend == BackendKind::Herdr {
-        match herdr_request(session, "workspace.list", json!({})).await {
-            Ok(value) => {
-                if let Some(workspaces) = value
-                    .pointer("/result/workspaces")
-                    .and_then(Value::as_array)
-                {
-                    for workspace in workspaces {
-                        for key in ["repo_root", "checkout_path"] {
-                            if let Some(path) = workspace
-                                .pointer(&format!("/worktree/{key}"))
-                                .and_then(Value::as_str)
-                            {
-                                push(PathBuf::from(path));
-                            }
-                        }
-                    }
+    match terminal_backend(session).list_workspaces().await {
+        Ok(workspaces) => {
+            for workspace in workspaces {
+                if let Some(path) = workspace.repo_root {
+                    push(path);
+                }
+                if let Some(path) = workspace.checkout_path {
+                    push(path);
                 }
             }
-            Err(err) => eprintln!("task roots: workspace.list failed: {err:#}"),
         }
+        Err(err) => eprintln!("task roots: workspace list failed: {err}"),
     }
 
     for root in session_asset_roots(state, session).await {
@@ -6455,24 +5674,18 @@ impl HerdrCallError {
     }
 }
 
-async fn herdr_call(
-    session: &SessionConfig,
-    method: &str,
-    params: Value,
-) -> Result<Value, HerdrCallError> {
-    let value = herdr_request(session, method, params)
-        .await
-        .map_err(|err| {
-            eprintln!("Herdr request {method} failed: {err:#}");
-            HerdrCallError::Unavailable("Herdr is unavailable".into())
-        })?;
-    if let Some(error) = value.get("error") {
-        return Err(HerdrCallError::Herdr {
+fn backend_call_error(method: &str, error: BackendError) -> HerdrCallError {
+    match error {
+        BackendError::Refused { code, message } => HerdrCallError::Herdr {
             method: method.to_owned(),
-            error: error.clone(),
-        });
+            error: json!({ "code": code, "message": message }),
+        },
+        BackendError::InvalidResponse(_) => HerdrCallError::malformed(method),
+        other @ (BackendError::Unavailable | BackendError::Unsupported(_)) => {
+            HerdrCallError::Unavailable(other.to_string())
+        }
+        other @ BackendError::InvalidTarget(_) => HerdrCallError::Unavailable(other.to_string()),
     }
-    Ok(value)
 }
 
 async fn pane_output(
@@ -6508,67 +5721,42 @@ async fn pane_output(
         source.as_str()
     };
     let session = find_session(&state.config, &session_id)?;
-    if session.backend == BackendKind::Tmux {
-        let request = BackendReadPane {
-            pane_id: BackendPaneId::new(pane_id.clone()),
-            source: match source.as_str() {
-                "visible" => BackendOutputSource::Visible,
-                "recent" => BackendOutputSource::Recent,
-                "recent-unwrapped" => BackendOutputSource::RecentUnwrapped,
-                "detection" => BackendOutputSource::Detection,
-                _ => unreachable!("source was validated above"),
-            },
-            format: match format.as_str() {
-                "text" => BackendOutputFormat::Text,
-                "ansi" => BackendOutputFormat::Ansi,
-                _ => unreachable!("format was validated above"),
-            },
-            lines,
-        };
-        let output = terminal_backend(session)
-            .read_pane(&request)
-            .await
-            .map_err(backend_api_error)?;
-        return Ok(Json(backend::compat::pane_read(output)));
-    }
-    let params = json!({
-        "pane_id": pane_id,
-        "source": herdr_source,
-        "lines": lines,
-        "format": format
-    });
-    let mut answer = call_session_method(&state.config, &session_id, "pane.read", params)
-        .await?
-        .0;
+    let request = BackendReadPane {
+        pane_id: BackendPaneId::new(pane_id.clone()),
+        source: match source.as_str() {
+            "visible" => BackendOutputSource::Visible,
+            "recent" => BackendOutputSource::Recent,
+            "recent-unwrapped" => BackendOutputSource::RecentUnwrapped,
+            "detection" => BackendOutputSource::Detection,
+            _ => unreachable!("source was validated above"),
+        },
+        format: match format.as_str() {
+            "text" => BackendOutputFormat::Text,
+            "ansi" => BackendOutputFormat::Ansi,
+            _ => unreachable!("format was validated above"),
+        },
+        lines,
+    };
+    let output = terminal_backend(session)
+        .read_pane(&request)
+        .await
+        .map_err(backend_api_error)?;
+    let mut answer = backend::compat::pane_read(output);
 
     // Herdr answered with everything it has. For a pane it keeps nothing above
     // the viewport for, everything it has is one screen -- and this is the read
     // that both feeds what the gateway kept and hands it back.
-    if let Some(text) = pane_read_text(&answer) {
-        let key = scrollback::read_key(&session_id, &pane_id, herdr_source, &format);
-        let served = {
-            let Some(mut store) = lock_scrollback(&state) else {
-                return Ok(Json(answer));
-            };
-            if !store.keeps(&session_id, &pane_id) {
-                return Ok(Json(answer));
-            }
-            store.record(&key, &text);
-            store.window(&key, lines as usize)
-        };
-        if let Some(served) = served {
-            // Rows, not bytes. This was `served.len() > text.len()` -- a byte
-            // count -- which is a guess about shape dressed up as a comparison:
-            // a buffer holding strictly more rows than the read can still be
-            // *shorter* in bytes, because the rows it kept are the ones that
-            // scrolled off and those are routinely blank or short. The window
-            // was then silently dropped and the reader got one screen, which
-            // looks exactly like the ring not working. Card #721 deletes every
-            // length-as-shape test on both sides of this contract; this is the
-            // gateway's one.
-            if scrollback::split_lines(&served).len() > scrollback::split_lines(&text).len() {
-                scrollback::replace_read_text(&mut answer, &served);
-            }
+    if let (Some(text), Some(mut store)) = (pane_read_text(&answer), lock_scrollback(&state)) {
+        let served = store.serve_read(
+            &session_id,
+            &pane_id,
+            herdr_source,
+            &format,
+            &text,
+            lines as usize,
+        );
+        if served != text {
+            scrollback::replace_read_text(&mut answer, &served);
         }
     }
     Ok(Json(answer))
@@ -6618,60 +5806,29 @@ async fn pane_parts(
     // `recent_unwrapped` is the only source worth normalizing: the dictionaries
     // key off line starts, and it is the one source where a long line is one
     // line rather than however many the pane happens to be wide.
-    let (backend_text, revision) = match session.backend {
-        BackendKind::Herdr => {
-            let read = herdr_request(
-                &session,
-                "pane.read",
-                json!({
-                    "pane_id": pane_id,
-                    "source": "recent_unwrapped",
-                    "lines": lines,
-                    "format": "text"
-                }),
-            )
-            .await
-            .map_err(|err| {
-                eprintln!("Herdr request pane.read failed: {err:#}");
-                api_error(
-                    StatusCode::BAD_GATEWAY,
-                    "herdr_unavailable",
-                    "Herdr is unavailable",
-                )
-            })?;
-            let revision = ["/result/read/revision", "/result/revision"]
-                .into_iter()
-                .find_map(|pointer| read.pointer(pointer).and_then(Value::as_u64));
-            (pane_read_text(&read).unwrap_or_default(), revision)
-        }
-        BackendKind::Tmux => {
-            let output = terminal_backend(&session)
-                .read_pane(&BackendReadPane {
-                    pane_id: BackendPaneId::new(&pane_id),
-                    source: BackendOutputSource::RecentUnwrapped,
-                    format: BackendOutputFormat::Text,
-                    lines,
-                })
-                .await
-                .map_err(backend_api_error)?;
-            (output.text, output.revision)
-        }
-    };
+    let output = terminal_backend(&session)
+        .read_pane(&BackendReadPane {
+            pane_id: BackendPaneId::new(&pane_id),
+            source: BackendOutputSource::RecentUnwrapped,
+            format: BackendOutputFormat::Text,
+            lines,
+        })
+        .await
+        .map_err(backend_api_error)?;
+    let (backend_text, revision) = (output.text, output.revision);
     // The transcript reads the same pane through a different endpoint, so it
     // has to be given the same rows: two views that disagree about where
     // history ends is the bug this whole thing is trying not to introduce.
-    let text = {
-        let key = scrollback::read_key(&session_id, &pane_id, "recent_unwrapped", "text");
-        match lock_scrollback(&state) {
-            Some(mut store) if store.keeps(&session_id, &pane_id) => {
-                store.record(&key, &backend_text);
-                store
-                    .window(&key, lines as usize)
-                    .filter(|served| served.len() > backend_text.len())
-                    .unwrap_or(backend_text)
-            }
-            _ => backend_text,
-        }
+    let text = match lock_scrollback(&state) {
+        Some(mut store) => store.serve_read(
+            &session_id,
+            &pane_id,
+            "recent_unwrapped",
+            "text",
+            &backend_text,
+            lines as usize,
+        ),
+        None => backend_text,
     };
 
     let dictionary = parts::dictionary_for(agent.as_deref());
@@ -6743,39 +5900,17 @@ async fn pane_agent_and_root(
     session: &SessionConfig,
     pane_id: &str,
 ) -> (Option<String>, Option<PathBuf>) {
-    if session.backend == BackendKind::Tmux {
-        let Ok(pane) = terminal_backend(session)
-            .get_pane(&BackendPaneId::new(pane_id))
-            .await
-        else {
-            return (None, None);
-        };
-        let root = pane
-            .cwd
-            .filter(|path| is_scannable_root(path))
-            .and_then(|path| std::fs::canonicalize(path).ok());
-        return (pane.agent, root);
-    }
-    let pane = herdr_request(session, "pane.get", json!({ "pane_id": pane_id }))
+    let Ok(pane) = terminal_backend(session)
+        .get_pane(&BackendPaneId::new(pane_id))
         .await
-        .ok();
-    let pane = pane
-        .as_ref()
-        .map(|response| response.pointer("/result/pane").unwrap_or(response));
-    let agent = pane
-        .and_then(|pane| pane.get("agent").and_then(Value::as_str))
-        .filter(|agent| !agent.is_empty())
-        .map(str::to_owned);
+    else {
+        return (None, None);
+    };
     let root = pane
-        .and_then(|pane| {
-            pane.get("cwd")
-                .and_then(Value::as_str)
-                .or_else(|| pane.get("foreground_cwd").and_then(Value::as_str))
-        })
-        .map(PathBuf::from)
+        .cwd
         .filter(|path| is_scannable_root(path))
         .and_then(|path| std::fs::canonicalize(path).ok());
-    (agent, root)
+    (pane.agent, root)
 }
 
 /// The per-pane capability descriptor, because agent detection varies pane to
@@ -6942,30 +6077,14 @@ async fn session_agent_events(
 /// envelope. A pane the socket cannot answer for is a 502 rather than a guess:
 /// every caller here is about to act on what this pane is running.
 async fn pane_get(session: &SessionConfig, pane_id: &str) -> ApiResult<Value> {
-    if session.backend == BackendKind::Tmux {
-        let pane = terminal_backend(session)
-            .get_pane(&BackendPaneId::new(pane_id))
-            .await
-            .map_err(backend_api_error)?;
-        return Ok(backend::compat::pane_get(pane)
-            .pointer("/result/pane")
-            .cloned()
-            .unwrap_or_default());
-    }
-    let response = herdr_request(session, "pane.get", json!({ "pane_id": pane_id }))
+    let pane = terminal_backend(session)
+        .get_pane(&BackendPaneId::new(pane_id))
         .await
-        .map_err(|err| {
-            eprintln!("Herdr request pane.get failed: {err:#}");
-            api_error(
-                StatusCode::BAD_GATEWAY,
-                "herdr_unavailable",
-                "Herdr is unavailable",
-            )
-        })?;
-    Ok(response
+        .map_err(backend_api_error)?;
+    Ok(backend::compat::pane_get(pane)
         .pointer("/result/pane")
         .cloned()
-        .unwrap_or(response))
+        .unwrap_or_default())
 }
 
 /// The key row and slash commands for whatever this pane is running.
@@ -7338,27 +6457,11 @@ async fn send_pane_keys(
     pane_id: &str,
     keys: &[String],
 ) -> ApiResult<Value> {
-    if session.backend == BackendKind::Tmux {
-        terminal_backend(session)
-            .send_keys(&BackendPaneId::new(pane_id), keys)
-            .await
-            .map_err(backend_api_error)?;
-        return Ok(backend::compat::command_ok("pane_keys_sent"));
-    }
-    herdr_request(
-        session,
-        "pane.send_keys",
-        json!({ "pane_id": pane_id, "keys": keys }),
-    )
-    .await
-    .map_err(|err| {
-        eprintln!("Herdr request pane.send_keys failed: {err:#}");
-        api_error(
-            StatusCode::BAD_GATEWAY,
-            "herdr_unavailable",
-            "Herdr is unavailable",
-        )
-    })
+    terminal_backend(session)
+        .send_keys(&BackendPaneId::new(pane_id), keys)
+        .await
+        .map_err(backend_api_error)?;
+    Ok(backend::compat::command_ok("pane_keys_sent"))
 }
 
 /// What a pane is drawing right now, as plain text.
@@ -7367,38 +6470,16 @@ async fn send_pane_keys(
 /// callers care about the current screen, and the scrollback of an answered menu
 /// or an already-submitted prompt would only mislead them.
 async fn read_pane_visible_text(session: &SessionConfig, pane_id: &str) -> ApiResult<String> {
-    if session.backend == BackendKind::Tmux {
-        return terminal_backend(session)
-            .read_pane(&BackendReadPane {
-                pane_id: BackendPaneId::new(pane_id),
-                source: BackendOutputSource::Visible,
-                format: BackendOutputFormat::Text,
-                lines: APPROVAL_READ_LINES,
-            })
-            .await
-            .map(|output| output.text)
-            .map_err(backend_api_error);
-    }
-    let read = herdr_request(
-        session,
-        "pane.read",
-        json!({
-            "pane_id": pane_id,
-            "source": "visible",
-            "lines": APPROVAL_READ_LINES,
-            "format": "text"
-        }),
-    )
-    .await
-    .map_err(|err| {
-        eprintln!("Herdr request pane.read failed: {err:#}");
-        api_error(
-            StatusCode::BAD_GATEWAY,
-            "herdr_unavailable",
-            "Herdr is unavailable",
-        )
-    })?;
-    Ok(pane_read_text(&read).unwrap_or_default())
+    terminal_backend(session)
+        .read_pane(&BackendReadPane {
+            pane_id: BackendPaneId::new(pane_id),
+            source: BackendOutputSource::Visible,
+            format: BackendOutputFormat::Text,
+            lines: APPROVAL_READ_LINES,
+        })
+        .await
+        .map(|output| output.text)
+        .map_err(backend_api_error)
 }
 
 /// Read a pane's agent and whatever menu it is drawing.
@@ -7450,20 +6531,11 @@ async fn send_text(
     require_device(&state, &headers)?;
     validate_text(&body.text)?;
     let session = find_session(&state.config, &session_id)?;
-    if session.backend == BackendKind::Tmux {
-        terminal_backend(session)
-            .send_text(&BackendPaneId::new(pane_id), &body.text)
-            .await
-            .map_err(backend_api_error)?;
-        return Ok(Json(backend::compat::command_ok("pane_text_sent")));
-    }
-    call_session_method(
-        &state.config,
-        &session_id,
-        "pane.send_text",
-        json!({ "pane_id": pane_id, "text": body.text }),
-    )
-    .await
+    terminal_backend(session)
+        .send_text(&BackendPaneId::new(pane_id), &body.text)
+        .await
+        .map_err(backend_api_error)?;
+    Ok(Json(backend::compat::command_ok("pane_text_sent")))
 }
 
 async fn send_keys(
@@ -7481,20 +6553,11 @@ async fn send_keys(
         ));
     }
     let session = find_session(&state.config, &session_id)?;
-    if session.backend == BackendKind::Tmux {
-        terminal_backend(session)
-            .send_keys(&BackendPaneId::new(pane_id), &body.keys)
-            .await
-            .map_err(backend_api_error)?;
-        return Ok(Json(backend::compat::command_ok("pane_keys_sent")));
-    }
-    call_session_method(
-        &state.config,
-        &session_id,
-        "pane.send_keys",
-        json!({ "pane_id": pane_id, "keys": body.keys }),
-    )
-    .await
+    terminal_backend(session)
+        .send_keys(&BackendPaneId::new(pane_id), &body.keys)
+        .await
+        .map_err(backend_api_error)?;
+    Ok(Json(backend::compat::command_ok("pane_keys_sent")))
 }
 
 /// A file type the gateway is willing to store, with the extension and MIME
@@ -8306,16 +7369,11 @@ async fn ingest_roots(index: Arc<Mutex<AssetIndex>>, roots: Vec<AssetRoot>) -> V
 /// Herdr is the source of truth for where a session works, but a listing still
 /// has to answer when the socket is down, so the last known roots are kept.
 async fn session_asset_roots(state: &AppState, session: &SessionConfig) -> Vec<AssetRoot> {
-    let response = match session.backend {
-        BackendKind::Herdr => herdr_request(session, "pane.list", json!({}))
-            .await
-            .map_err(|err| format!("{err:#}")),
-        BackendKind::Tmux => terminal_backend(session)
-            .list_panes()
-            .await
-            .map(backend::compat::pane_list)
-            .map_err(|err| err.to_string()),
-    };
+    let response = terminal_backend(session)
+        .list_panes()
+        .await
+        .map(backend::compat::pane_list)
+        .map_err(|err| err.to_string());
     let fresh = match response {
         Ok(value) => pane_list_roots(&session.id, &value),
         Err(err) => {
@@ -8784,12 +7842,7 @@ fn asset_created_payload(entry: &AssetEntry, asset_type: AssetType) -> String {
 }
 
 fn terminal_backend(session: &SessionConfig) -> Box<dyn TerminalBackend> {
-    match session.backend {
-        BackendKind::Herdr => Box::new(HerdrBackend::new(&session.socket_path)),
-        BackendKind::Tmux => Box::new(TmuxBackend::new(
-            (!session.socket_path.is_empty()).then(|| PathBuf::from(&session.socket_path)),
-        )),
-    }
+    backend_registry().connect(session.backend, &session.socket_path)
 }
 
 fn backend_api_error(error: BackendError) -> (StatusCode, Json<Value>) {
@@ -8804,7 +7857,9 @@ fn backend_api_error(error: BackendError) -> (StatusCode, Json<Value>) {
             "backend_unavailable",
             "terminal backend is unavailable",
         ),
-        BackendError::InvalidResponse(_) | BackendError::Refused { .. } => (
+        BackendError::InvalidResponse(_)
+        | BackendError::Refused { .. }
+        | BackendError::Unsupported(_) => (
             StatusCode::BAD_GATEWAY,
             "backend_error",
             "terminal backend request failed",
@@ -8814,167 +7869,6 @@ fn backend_api_error(error: BackendError) -> (StatusCode, Json<Value>) {
     // the host log and return only a stable, non-sensitive API error.
     eprintln!("terminal backend request failed: {error}");
     api_error(status, code, message)
-}
-
-async fn call_session_method(
-    config: &Config,
-    session_id: &str,
-    method: &str,
-    params: Value,
-) -> ApiResult<Json<Value>> {
-    let session = find_session(config, session_id)?;
-    let value = herdr_request(session, method, params)
-        .await
-        .map_err(|err| {
-            eprintln!("Herdr request {method} failed: {err:#}");
-            api_error(
-                StatusCode::BAD_GATEWAY,
-                "herdr_unavailable",
-                "Herdr is unavailable",
-            )
-        })?;
-    Ok(Json(value))
-}
-
-async fn herdr_request(
-    session: &SessionConfig,
-    method: &str,
-    params: Value,
-) -> anyhow::Result<Value> {
-    let request = build_herdr_request(method, params);
-
-    #[cfg(unix)]
-    {
-        let mut stream = UnixStream::connect(&session.socket_path)
-            .await
-            .with_context(|| format!("failed to connect Herdr socket {}", session.socket_path))?;
-        stream.write_all(request.as_bytes()).await?;
-        stream.write_all(b"\n").await?;
-        stream.flush().await?;
-
-        let mut reader = BufReader::new(stream);
-        let mut response = String::new();
-        reader.read_line(&mut response).await?;
-        let value = serde_json::from_str(&response)?;
-        Ok(value)
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = (session, method, params, request);
-        anyhow::bail!("direct Herdr socket access is not implemented on this platform yet");
-    }
-}
-
-#[cfg(unix)]
-async fn herdr_event_stream(session: &SessionConfig) -> anyhow::Result<BufReader<UnixStream>> {
-    let pane_ids = session_pane_ids(session).await?;
-    open_herdr_event_stream(session, event_subscriptions(&pane_ids)).await
-}
-
-#[cfg(unix)]
-async fn herdr_agent_event_stream(
-    session: &SessionConfig,
-) -> anyhow::Result<BufReader<UnixStream>> {
-    let pane_ids = session_pane_ids(session).await?;
-    open_herdr_event_stream(session, agent_event_subscriptions(&pane_ids)).await
-}
-
-#[cfg(unix)]
-async fn session_pane_ids(session: &SessionConfig) -> anyhow::Result<Vec<String>> {
-    let pane_response = herdr_request(session, "pane.list", json!({})).await?;
-    Ok(pane_response
-        .pointer("/result/panes")
-        .and_then(Value::as_array)
-        .context("pane.list response is missing result.panes")?
-        .iter()
-        .filter_map(|pane| pane.get("pane_id").and_then(Value::as_str))
-        .map(str::to_owned)
-        .collect())
-}
-
-#[cfg(unix)]
-async fn open_herdr_event_stream(
-    session: &SessionConfig,
-    subscriptions: Vec<Value>,
-) -> anyhow::Result<BufReader<UnixStream>> {
-    let mut stream = UnixStream::connect(&session.socket_path)
-        .await
-        .with_context(|| format!("failed to connect Herdr socket {}", session.socket_path))?;
-    let request = build_herdr_request(
-        "events.subscribe",
-        json!({
-            "subscriptions": subscriptions
-        }),
-    );
-    stream.write_all(request.as_bytes()).await?;
-    stream.write_all(b"\n").await?;
-    stream.flush().await?;
-    Ok(BufReader::new(stream))
-}
-
-fn event_subscriptions(pane_ids: &[String]) -> Vec<Value> {
-    let mut subscriptions = vec![
-        json!({ "type": "workspace.created" }),
-        json!({ "type": "workspace.updated" }),
-        json!({ "type": "workspace.metadata_updated" }),
-        json!({ "type": "workspace.renamed" }),
-        json!({ "type": "workspace.moved" }),
-        json!({ "type": "workspace.closed" }),
-        json!({ "type": "workspace.focused" }),
-        json!({ "type": "tab.created" }),
-        json!({ "type": "tab.closed" }),
-        json!({ "type": "tab.focused" }),
-        json!({ "type": "tab.renamed" }),
-        json!({ "type": "tab.moved" }),
-        json!({ "type": "pane.created" }),
-        json!({ "type": "pane.updated" }),
-        json!({ "type": "pane.closed" }),
-        json!({ "type": "pane.focused" }),
-        json!({ "type": "pane.moved" }),
-        json!({ "type": "pane.exited" }),
-        json!({ "type": "pane.agent_detected" }),
-        json!({ "type": "layout.updated" }),
-        json!({ "type": "worktree.created" }),
-        json!({ "type": "worktree.opened" }),
-        json!({ "type": "worktree.removed" }),
-    ];
-    subscriptions.extend(
-        pane_ids
-            .iter()
-            .map(|pane_id| json!({ "type": "pane.agent_status_changed", "pane_id": pane_id })),
-    );
-    subscriptions
-}
-
-fn agent_event_subscriptions(pane_ids: &[String]) -> Vec<Value> {
-    pane_ids
-        .iter()
-        .map(|pane_id| json!({ "type": "pane.agent_status_changed", "pane_id": pane_id }))
-        .collect()
-}
-
-#[cfg(not(unix))]
-async fn herdr_event_stream(
-    _session: &SessionConfig,
-) -> anyhow::Result<BufReader<tokio::io::Empty>> {
-    anyhow::bail!("direct Herdr event streaming is not implemented on this platform yet");
-}
-
-#[cfg(not(unix))]
-async fn herdr_agent_event_stream(
-    _session: &SessionConfig,
-) -> anyhow::Result<BufReader<tokio::io::Empty>> {
-    anyhow::bail!("direct Herdr event streaming is not implemented on this platform yet");
-}
-
-fn build_herdr_request(method: &str, params: Value) -> String {
-    json!({
-        "id": format!("gateway:{}", uuid::Uuid::new_v4()),
-        "method": method,
-        "params": params
-    })
-    .to_string()
 }
 
 type ApiResult<T> = Result<T, (StatusCode, Json<Value>)>;
@@ -9004,23 +7898,6 @@ fn bearer_token(headers: &HeaderMap) -> ApiResult<&str> {
     Ok(token)
 }
 
-/// Match a presented token against every device token. Every candidate is
-/// compared in constant time and the loop is not short-circuited, so a caller
-/// cannot learn which device matched from timing.
-fn identify_device(devices: &[DeviceRecord], token: &str) -> Option<String> {
-    if token.len() > 256 {
-        return None;
-    }
-    let presented = hash_token(token);
-    let mut matched = None;
-    for device in devices {
-        if constant_time_eq(presented.as_bytes(), device.token_hash.as_bytes()) {
-            matched = Some(device.id.clone());
-        }
-    }
-    matched
-}
-
 /// Control routes are for paired devices only. The admin token deliberately
 /// does not authorise these: it sits in plaintext on disk for the manage UI,
 /// and these routes can run commands on the host.
@@ -9034,15 +7911,15 @@ fn require_device(state: &AppState, headers: &HeaderMap) -> ApiResult<String> {
             "invalid token",
         ));
     };
-    let now = now_unix_ms();
-    if let Some(device) = devices.iter_mut().find(|device| device.id == device_id) {
-        let stale = now.saturating_sub(device.last_seen_unix_ms) >= DEVICE_LAST_SEEN_FLUSH_MS;
-        device.last_seen_unix_ms = now;
-        if stale {
-            if let Err(err) = write_devices(&devices) {
-                // Losing a last-seen timestamp must not fail the request.
-                eprintln!("failed to persist device last-seen: {err:#}");
-            }
+    if authority::touch_device(
+        &mut devices,
+        &device_id,
+        now_unix_ms(),
+        DEVICE_LAST_SEEN_FLUSH_MS,
+    ) {
+        if let Err(err) = write_devices(&devices) {
+            // Losing a last-seen timestamp must not fail the request.
+            eprintln!("failed to persist device last-seen: {err:#}");
         }
     }
     Ok(device_id)
@@ -9052,9 +7929,7 @@ fn require_device(state: &AppState, headers: &HeaderMap) -> ApiResult<String> {
 /// pending pairing code.
 fn require_admin(config: &Config, headers: &HeaderMap) -> ApiResult<()> {
     let token = bearer_token(headers)?;
-    if token.len() > 256
-        || !constant_time_eq(hash_token(token).as_bytes(), config.token_hash.as_bytes())
-    {
+    if !authority::authenticates_admin(&config.token_hash, token) {
         return Err(api_error(
             StatusCode::FORBIDDEN,
             "invalid_token",
@@ -9133,17 +8008,6 @@ async fn revoke_paired_device(
     Ok(Json(
         json!({ "ok": true, "revoked": device_id, "device_count": devices.len() }),
     ))
-}
-
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut diff = 0_u8;
-    for (left, right) in left.iter().zip(right) {
-        diff |= left ^ right;
-    }
-    diff == 0
 }
 
 fn validate_text(text: &str) -> ApiResult<()> {
@@ -9241,12 +8105,6 @@ async fn send_expo_push_notifications(
         .await?
         .error_for_status()?;
     Ok(response.json().await?)
-}
-
-fn insert_opt<T: Serialize>(map: &mut serde_json::Map<String, Value>, key: &str, value: Option<T>) {
-    if let Some(value) = value {
-        map.insert(key.into(), json!(value));
-    }
 }
 
 fn find_session<'a>(config: &'a Config, session_id: &str) -> ApiResult<&'a SessionConfig> {
@@ -9785,15 +8643,6 @@ impl RandomBytes {
     }
 }
 
-fn valid_pairing_code(code: &str) -> bool {
-    code.len() == PAIRING_CODE_LENGTH
-        && code.as_bytes()[4] == b'-'
-        && code
-            .bytes()
-            .enumerate()
-            .all(|(index, byte)| index == 4 || PAIRING_CODE_ALPHABET.contains(&byte))
-}
-
 /// Device names are echoed into the manage UI's terminal box, so control
 /// characters (ANSI escapes in particular) are rejected outright.
 /// A client install identifier: an opaque token the app generates once and
@@ -9825,12 +8674,6 @@ fn now_unix_ms() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or_default()
-}
-
-fn hash_token(token: &str) -> String {
-    use sha2::{Digest as _, Sha256};
-    let digest = Sha256::digest(token.as_bytes());
-    base64::engine::general_purpose::STANDARD.encode(digest)
 }
 
 fn openapi_spec() -> Value {
@@ -10684,13 +9527,7 @@ const DOCS_HTML: &str = r#"<!doctype html>
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
-
-    #[test]
-    fn tmux_agent_arguments_are_shell_quoted_as_single_words() {
-        assert_eq!(shell_word("plain"), "'plain'");
-        assert_eq!(shell_word("two words"), "'two words'");
-        assert_eq!(shell_word("a'b;$(touch nope)"), "'a'\\''b;$(touch nope)'");
-    }
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     fn test_config(token: &str) -> Config {
         Config {
@@ -10962,16 +9799,9 @@ mod tests {
     }
 
     #[test]
-    fn event_filter_matches_dot_and_underscore_and_reads_the_event_field() {
+    fn event_filter_matches_dot_and_underscore() {
         assert_eq!(normalize_event_name("pane.updated"), "pane_updated");
         assert_eq!(normalize_event_name(" pane_updated "), "pane_updated");
-        assert_eq!(
-            herdr_event_name(r#"{"event":"pane_updated","data":{}}"#).as_deref(),
-            Some("pane_updated")
-        );
-        // A line the gateway cannot parse is forwarded rather than dropped, so a
-        // filter never silently swallows an event shape we did not anticipate.
-        assert_eq!(herdr_event_name("not json"), None);
     }
 
     /// The rebinding case, written as the header it arrives in. A page served
@@ -11227,11 +10057,11 @@ mod tests {
     #[test]
     fn pairing_code_uses_unambiguous_characters() {
         let code = generate_pairing_code();
-        assert_eq!(code.len(), PAIRING_CODE_LENGTH);
+        assert_eq!(code.len(), authority::PAIRING_CODE_LENGTH);
         assert_eq!(code.as_bytes()[4], b'-');
-        assert!(valid_pairing_code(&code));
-        assert!(!valid_pairing_code("ABCD2345"));
-        assert!(!valid_pairing_code("abcD-2345"));
+        assert!(authority::valid_pairing_code(&code));
+        assert!(!authority::valid_pairing_code("ABCD2345"));
+        assert!(!authority::valid_pairing_code("abcD-2345"));
         assert!(!code.contains('0'));
         assert!(!code.contains('O'));
         assert!(!code.contains('1'));
@@ -11256,7 +10086,10 @@ mod tests {
             vec![vec![0_usize; PAIRING_CODE_ALPHABET.len()]; PAIRING_CODE_CHARACTER_COUNT];
         for _ in 0..DRAWS {
             let code = generate_pairing_code();
-            assert!(valid_pairing_code(&code), "{code} is not a pairing code");
+            assert!(
+                authority::valid_pairing_code(&code),
+                "{code} is not a pairing code"
+            );
             let glyphs: Vec<u8> = code.bytes().filter(|byte| *byte != b'-').collect();
             for (position, glyph) in glyphs.iter().enumerate() {
                 let index = PAIRING_CODE_ALPHABET
@@ -11352,16 +10185,32 @@ mod tests {
         })
     }
 
+    fn consume_test_pairing_code(
+        pending: &mut Option<PendingPairing>,
+        request_id: &str,
+        code: &str,
+        now_unix_ms: u128,
+    ) -> Result<(), PairingCodeError> {
+        authority::consume_pairing_code(
+            pending,
+            request_id,
+            code,
+            now_unix_ms,
+            PAIRING_CODE_TTL_MS,
+            MAX_PAIRING_CODE_ATTEMPTS,
+        )
+    }
+
     #[test]
     fn pairing_code_is_consumed_after_one_successful_claim() {
         let mut pending = test_pending_pairing(1_000);
         assert_eq!(
-            consume_pairing_code(&mut pending, "request-1", "2345-6789", 1_001),
+            consume_test_pairing_code(&mut pending, "request-1", "2345-6789", 1_001),
             Ok(())
         );
         assert!(pending.is_none());
         assert_eq!(
-            consume_pairing_code(&mut pending, "request-1", "2345-6789", 1_002),
+            consume_test_pairing_code(&mut pending, "request-1", "2345-6789", 1_002),
             Err(PairingCodeError::Missing)
         );
     }
@@ -11370,7 +10219,7 @@ mod tests {
     fn expired_pairing_code_is_rejected_and_cleared() {
         let mut pending = test_pending_pairing(1_000);
         assert_eq!(
-            consume_pairing_code(
+            consume_test_pairing_code(
                 &mut pending,
                 "request-1",
                 "2345-6789",
@@ -11386,7 +10235,7 @@ mod tests {
         let mut pending = test_pending_pairing(1_000);
         for _ in 0..MAX_PAIRING_CODE_ATTEMPTS {
             assert_eq!(
-                consume_pairing_code(&mut pending, "request-1", "AAAA-AAAA", 1_001),
+                consume_test_pairing_code(&mut pending, "request-1", "AAAA-AAAA", 1_001),
                 Err(PairingCodeError::Invalid)
             );
         }
@@ -11394,26 +10243,11 @@ mod tests {
     }
 
     #[test]
-    fn herdr_request_shape_matches_socket_api() {
-        let encoded = build_herdr_request("pane.read", json!({ "pane_id": "w1:p1" }));
-        let value: Value = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(value["method"], "pane.read");
-        assert_eq!(value["params"]["pane_id"], "w1:p1");
-        assert!(value["id"].as_str().unwrap().starts_with("gateway:"));
-    }
-
-    #[test]
     fn stream_pane_read_becomes_inline_update() {
-        let read = json!({
-            "result": {
-                "read": {
-                    "pane_id": "w1:p2",
-                    "revision": 42,
-                    "text": "hello\n"
-                }
-            }
-        });
-        let frame = stream_pane_frame(&read).unwrap();
+        let frame = StreamPaneFrame {
+            revision: 42,
+            output: "hello\n".into(),
+        };
         let encoded = stream_pane_update_payload(&frame, "w1:p2").unwrap();
         let payload: Value = serde_json::from_str(&encoded).unwrap();
 
@@ -11426,51 +10260,9 @@ mod tests {
     }
 
     #[test]
-    fn stream_pane_update_requires_a_revision() {
-        let read = json!({ "result": { "read": { "text": "hello" } } });
-        assert!(stream_pane_frame(&read).is_none());
-    }
-
-    #[test]
-    fn agent_status_subscriptions_are_scoped_to_each_pane() {
-        let subscriptions = event_subscriptions(&["w1:p1".into(), "w2:p3".into()]);
-        let agent_subscriptions = subscriptions
-            .iter()
-            .filter(|subscription| subscription["type"] == "pane.agent_status_changed")
-            .collect::<Vec<_>>();
-
-        assert_eq!(agent_subscriptions.len(), 2);
-        assert_eq!(agent_subscriptions[0]["pane_id"], "w1:p1");
-        assert_eq!(agent_subscriptions[1]["pane_id"], "w2:p3");
-        assert!(agent_subscriptions
-            .iter()
-            .all(|subscription| subscription["pane_id"].is_string()));
-
-        let watcher_subscriptions = agent_event_subscriptions(&["w1:p1".into(), "w2:p3".into()]);
-        assert_eq!(
-            watcher_subscriptions,
-            vec![
-                json!({ "type": "pane.agent_status_changed", "pane_id": "w1:p1" }),
-                json!({ "type": "pane.agent_status_changed", "pane_id": "w2:p3" })
-            ]
-        );
-    }
-
-    #[test]
     fn herdr_compatibility_requires_protocol_17() {
         assert_eq!(HERDR_PROTOCOL_MIN, 17);
         assert_eq!(HERDR_PROTOCOL_MAX, 17);
-    }
-
-    #[test]
-    fn split_result_uses_protocol_17_pane_shape() {
-        let response = json!({
-            "result": {
-                "type": "pane_created",
-                "pane": { "pane_id": "w1:p2" }
-            }
-        });
-        assert_eq!(created_pane_id(&response), Some("w1:p2"));
     }
 
     #[test]
@@ -13303,100 +12095,6 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
-    /// Protocol 17 answers `workspace.create`, `worktree.create` and
-    /// `worktree.open` with the same workspace/tab/root_pane trio.
-    fn worktree_created_response() -> Value {
-        json!({
-            "id": "1",
-            "result": {
-                "type": "worktree_created",
-                "workspace": { "workspace_id": "ws-9", "number": 2, "label": "task/594",
-                               "focused": false, "pane_count": 1, "tab_count": 1,
-                               "active_tab_id": "tab-9", "agent_status": "unknown" },
-                "tab": { "tab_id": "tab-9" },
-                "root_pane": { "pane_id": "pane-9", "terminal_id": "t-9", "workspace_id": "ws-9",
-                               "tab_id": "tab-9", "focused": false, "agent_status": "unknown",
-                               "revision": 1 },
-                "worktree": { "path": "/Users/dev/code/muqun-task-594", "branch": "task/594",
-                              "is_bare": false, "is_detached": false, "is_prunable": false,
-                              "is_linked_worktree": true, "label": "task/594" }
-            }
-        })
-    }
-
-    #[test]
-    fn a_created_place_is_read_out_of_the_protocol_17_response() {
-        let place = workspace_place(&worktree_created_response(), None, false).unwrap();
-        assert_eq!(place.workspace_id, "ws-9");
-        assert_eq!(place.pane_id, "pane-9");
-        assert_eq!(
-            place.worktree_path.as_deref(),
-            Some("/Users/dev/code/muqun-task-594")
-        );
-        assert!(!place.reused);
-
-        // workspace.create carries no worktree, so the caller's own path, if it
-        // has one, is what fills the field.
-        let created = json!({
-            "id": "1",
-            "result": {
-                "type": "workspace_created",
-                "workspace": { "workspace_id": "ws-1" },
-                "tab": { "tab_id": "tab-1" },
-                "root_pane": { "pane_id": "pane-1" }
-            }
-        });
-        let place = workspace_place(&created, None, false).unwrap();
-        assert_eq!(place.pane_id, "pane-1");
-        assert_eq!(place.worktree_path, None);
-        let place = workspace_place(&created, Some("/tmp/wt".into()), true).unwrap();
-        assert_eq!(place.worktree_path.as_deref(), Some("/tmp/wt"));
-        assert!(place.reused);
-
-        // A response missing the pane is not silently treated as a success:
-        // there would be nowhere to start the agent.
-        let no_pane = json!({ "id": "1", "result": { "workspace": { "workspace_id": "ws-1" } } });
-        assert!(workspace_place(&no_pane, None, false).is_none());
-        let herdr_error = json!({ "id": "1", "error": { "code": "not_found", "message": "no" } });
-        assert!(workspace_place(&herdr_error, None, false).is_none());
-    }
-
-    #[test]
-    fn an_existing_checkout_of_the_branch_is_found_before_another_one_is_made() {
-        let listing = json!({
-            "id": "1",
-            "result": {
-                "type": "worktree_list",
-                "source": { "repo_key": "k", "repo_name": "muqun", "repo_root": "/repo",
-                            "source_checkout_path": "/repo" },
-                "worktrees": [
-                    { "path": "/repo", "branch": "refs/heads/main", "is_bare": false,
-                      "is_detached": false, "is_prunable": false, "is_linked_worktree": false,
-                      "label": "main" },
-                    { "path": "/repo-task-594", "branch": "task/594", "is_bare": false,
-                      "is_detached": false, "is_prunable": false, "is_linked_worktree": true,
-                      "label": "task/594" },
-                    { "path": "/repo-detached", "branch": null, "is_bare": false,
-                      "is_detached": true, "is_prunable": false, "is_linked_worktree": true,
-                      "label": "detached" }
-                ]
-            }
-        });
-        // Herdr reports refs either way round, and both have to match.
-        assert_eq!(
-            worktree_for_branch(&listing, "task/594").as_deref(),
-            Some("/repo-task-594")
-        );
-        assert_eq!(
-            worktree_for_branch(&listing, "main").as_deref(),
-            Some("/repo")
-        );
-        assert_eq!(worktree_for_branch(&listing, "nope"), None);
-        // A detached checkout has no branch and must never be matched by one.
-        assert_eq!(worktree_for_branch(&listing, ""), None);
-        assert_eq!(worktree_for_branch(&json!({}), "main"), None);
-    }
-
     #[test]
     fn a_run_that_got_part_of_the_way_answers_207_with_the_same_body() {
         let payload = json!({ "workspace_id": "ws-1", "pane_id": "pane-1" });
@@ -13563,31 +12261,6 @@ mod tests {
             .0,
             StatusCode::FORBIDDEN
         );
-    }
-
-    #[test]
-    fn a_split_hangs_off_the_focused_pane_of_the_tab_that_was_named() {
-        let panes = json!({
-            "result": { "panes": [
-                { "pane_id": "w1:p1", "tab_id": "t1", "focused": false },
-                { "pane_id": "w1:p2", "tab_id": "t1", "focused": true },
-                { "pane_id": "w2:p1", "tab_id": "t2", "focused": true }
-            ] }
-        });
-
-        // The focused pane, because that is the one the user was looking at.
-        assert_eq!(pane_to_split(&panes, "t1").as_deref(), Some("w1:p2"));
-        assert_eq!(pane_to_split(&panes, "t2").as_deref(), Some("w2:p1"));
-        // A tab this session does not have is nothing to split, which is what
-        // makes an unknown tab_id a refusal rather than a spawn elsewhere.
-        assert_eq!(pane_to_split(&panes, "t9"), None);
-        assert_eq!(pane_to_split(&json!({}), "t1"), None);
-
-        // No pane in the tab is focused: any of them will do, in Herdr's order.
-        let unfocused = json!({
-            "result": { "panes": [{ "pane_id": "w3:p1", "tab_id": "t3" }] }
-        });
-        assert_eq!(pane_to_split(&unfocused, "t3").as_deref(), Some("w3:p1"));
     }
 
     #[tokio::test]

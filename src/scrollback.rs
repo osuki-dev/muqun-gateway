@@ -199,8 +199,7 @@ use std::hash::{Hash, Hasher};
 use serde_json::Value;
 
 /// Rows kept per pane and source, matching the ceiling on a single read.
-/// Whether the gateway keeps rows for panes Herdr reports no scrollback for.
-/// See `keeps` for why this is false in 1.2.0.
+/// Whether the gateway keeps rows for panes the backend reports no scrollback for.
 pub const SCROLLBACK_ENABLED: bool = true;
 
 pub const MAX_PANE_LINES: usize = 5_000;
@@ -536,14 +535,14 @@ pub struct ScrollbackStore {
 }
 
 /// `session/pane`, the key the zero-backlog verdict is held under.
-pub fn pane_key(session_id: &str, pane_id: &str) -> String {
+fn pane_key(session_id: &str, pane_id: &str) -> String {
     format!("{session_id}/{pane_id}")
 }
 
 /// `session/pane/source/format`. Rows read as ANSI and rows read as plain text
 /// are different rows and cannot be spliced against each other, so each read
 /// shape keeps its own buffer.
-pub fn read_key(session_id: &str, pane_id: &str, source: &str, format: &str) -> String {
+fn read_key(session_id: &str, pane_id: &str, source: &str, format: &str) -> String {
     format!("{session_id}/{pane_id}/{source}/{format}")
 }
 
@@ -567,17 +566,7 @@ impl ScrollbackStore {
     ///
     /// A pane nobody has reported on yet answers `false`: not knowing is a
     /// reason to stay out of the way, not a reason to guess.
-    pub fn keeps(&self, session_id: &str, pane_id: &str) -> bool {
-        // On at Ellen's word (2026-07-29), after the terminal contract landed
-        // and with a live probe watching for the duplication that closed it. Keeping rows for a pane Herdr
-        // keeps none for is a nice thing to have; showing a reader their own
-        // conversation with pieces of it repeated is not, and the two arrived
-        // together. With this false the gateway hands back exactly what Herdr
-        // hands it: a pane that cannot scroll back simply does not, which is
-        // where every pane stood a week ago. The machinery and its tests stay
-        // here, and turning this on is how the next version resumes the
-        // argument -- with the anchor, the furniture rule, and a soak test
-        // against a pane under real load before it ships.
+    fn keeps(&self, session_id: &str, pane_id: &str) -> bool {
         if !SCROLLBACK_ENABLED {
             return false;
         }
@@ -600,7 +589,7 @@ impl ScrollbackStore {
     }
 
     /// Fold a read into what is already held.
-    pub fn record(&mut self, key: &str, text: &str) {
+    fn record(&mut self, key: &str, text: &str) {
         let incoming = split_lines(text);
         if incoming.is_empty() {
             return;
@@ -669,7 +658,7 @@ impl ScrollbackStore {
 
     /// The last `rows` rows held for this read, or `None` where the buffer has
     /// nothing more than the caller already has.
-    pub fn window(&self, key: &str, rows: usize) -> Option<String> {
+    fn window(&self, key: &str, rows: usize) -> Option<String> {
         let buffer = self.buffers.get(key)?;
         if buffer.lines.is_empty() {
             return None;
@@ -684,6 +673,49 @@ impl ScrollbackStore {
                 .collect::<Vec<String>>()
                 .join("\n"),
         )
+    }
+
+    /// Observe one backend read and return the deepest row window this store can
+    /// truthfully serve. Callers never compare bytes or assemble storage keys:
+    /// history depth is a row property and the source/format pair is part of the
+    /// store's identity for that read.
+    pub fn serve_read(
+        &mut self,
+        session_id: &str,
+        pane_id: &str,
+        source: &str,
+        format: &str,
+        backend_text: &str,
+        rows: usize,
+    ) -> String {
+        if !self.keeps(session_id, pane_id) {
+            return backend_text.to_owned();
+        }
+
+        let key = read_key(session_id, pane_id, source, format);
+        self.record(&key, backend_text);
+        let backend_rows = split_lines(backend_text).len();
+        self.window(&key, rows)
+            .filter(|served| split_lines(served).len() > backend_rows)
+            .unwrap_or_else(|| backend_text.to_owned())
+    }
+
+    /// Record a sampled stream frame under the same policy as a direct read.
+    /// This deliberately returns nothing: serving is decided only when a client
+    /// asks for a bounded read window.
+    pub fn record_frame(
+        &mut self,
+        session_id: &str,
+        pane_id: &str,
+        source: &str,
+        format: &str,
+        output: &str,
+    ) {
+        if output.is_empty() || !self.keeps(session_id, pane_id) {
+            return;
+        }
+        let key = read_key(session_id, pane_id, source, format);
+        self.record(&key, output);
     }
 
     /// How many rows are held for this pane, across every read shape.
@@ -822,7 +854,12 @@ fn visit_panes_mut(
 /// gateway, so the rows are rewritten in place rather than re-enveloped: the
 /// revision, and everything else Herdr said, stays Herdr's.
 pub fn replace_read_text(value: &mut Value, text: &str) {
-    for pointer in ["/result/read/text", "/result/text"] {
+    for pointer in [
+        "/result/read/output",
+        "/result/read/text",
+        "/result/output",
+        "/result/text",
+    ] {
         if let Some(slot) = value.pointer_mut(pointer) {
             if slot.is_string() {
                 *slot = Value::from(text);
@@ -1288,6 +1325,34 @@ mod tests {
                 .unwrap(),
             "\u{1b}[31mred"
         );
+    }
+
+    #[test]
+    fn serving_prefers_more_rows_even_when_the_backend_screen_has_more_bytes() {
+        let mut store = ScrollbackStore::default();
+        store.observe(
+            "s",
+            &json!({
+                "pane_id": "p",
+                "scroll": { "max_offset_from_bottom": 0, "viewport_rows": 2 }
+            }),
+        );
+
+        assert_eq!(
+            store.serve_read("s", "p", "recent_unwrapped", "text", "a\nb", 10),
+            "a\nb"
+        );
+        let served = store.serve_read(
+            "s",
+            "p",
+            "recent_unwrapped",
+            "text",
+            "界界界界界界界界界界\nz",
+            10,
+        );
+
+        assert_eq!(served, "a\nb\n界界界界界界界界界界\nz");
+        assert_eq!(split_lines(&served).len(), 4);
     }
 
     #[test]

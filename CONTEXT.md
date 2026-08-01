@@ -12,11 +12,18 @@ compatibility; the intended repository name is `muqun-gateway`.
 - `src/main.rs`: CLI, configuration and identity lifecycle, HTTP routes,
   pairing/devices, SSE orchestration, Manager UI, and process lifecycle.
 - `src/backend/model.rs`: backend-neutral entities, commands, errors, and the
-  `TerminalBackend` port.
+  `TerminalBackend` port. The port is the test surface for synchronous terminal
+  use cases, including topology, terminal I/O, agents, and optional worktrees.
 - `src/backend/herdr.rs`: Herdr protocol-17 socket adapter and subscription.
 - `src/backend/tmux.rs`: argv-only tmux adapter and polling event source.
+- `src/backend/registry.rs`: static adapter registry for construction,
+  availability checks, endpoint rendering, and setup defaults.
 - `src/backend/compat.rs`: maps neutral models into the legacy Herdr-shaped API.
-- `src/scrollback.rs`: bounded scrollback retention and output cursors.
+- `src/authority.rs`: pure pairing-code and credential authority; owns hashed
+  device records, token verification, install replacement, and last-seen policy.
+- `src/scrollback.rs`: bounded scrollback retention and the application policy
+  for observing frames and serving row-bounded reads. Callers do not assemble
+  cache keys or compare output byte lengths.
 - `docs/architecture.md`: Clean/Hexagonal boundaries and compatibility rules.
 - `herdr-plugin.toml`, `install.sh`, `scripts/`: plugin packaging and releases.
 
@@ -28,13 +35,20 @@ The stable domain concepts are sessions, workspaces, tabs, panes, agents,
 terminal output, and backend commands. A configured session selects one
 `TerminalBackend`; multiple Herdr and tmux sessions can coexist. HTTP handlers
 authenticate a device, resolve `sessionId`, invoke the backend port, then pass
-neutral results through the compatibility mapper. Herdr pushes native events;
-tmux polling produces the same internal event vocabulary for SSE and push.
+neutral results through the compatibility mapper. Synchronous use cases do not
+branch on backend kind. `TerminalBackend::activity_stream` normalizes Herdr
+native events and tmux topology polling into the same internal vocabulary for
+SSE and push.
 
 The gateway owns pairing identity, device tokens, network listener, backend
 registry, Manager, SSE fan-out, and lifecycle. A backend owns only interaction
 with its terminal system. The first session is compatibility-sensitive because
 older Muqun UI currently opens the first `/api/sessions` item.
+
+HTTP extracts credentials and maps errors; `authority.rs` decides whether a
+credential is a paired device or the narrow local-manager identity. Device
+records persist only token hashes. File I/O remains an outbound concern in the
+composition root, so credential policy is testable without HTTP or disk.
 
 ## Engineering conventions
 
@@ -49,6 +63,10 @@ older Muqun UI currently opens the first `/api/sessions` item.
 - Errors returned to clients are bounded and generic; detailed backend errors
   belong in local logs. Avoid logging bearer or admin tokens.
 - Prefer small neutral model additions over copying a use case per backend.
+- Add a shipped backend once in `backend/registry.rs`; route and Manager code
+  must not grow backend-kind presentation or construction branches.
+- Optional backend capabilities return `BackendError::Unsupported`; application
+  workflows choose a fallback without inspecting backend kind.
 
 ## Configuration and deployment
 
@@ -65,10 +83,10 @@ grant terminal control and must be handled like SSH credentials.
 ## Verification
 
 Run `cargo fmt --check`, `cargo test --offline`, `cargo clippy --offline --all-targets
--- -D warnings`, and `cargo build --release --offline`. The ignored real-tmux
-contract uses an isolated socket and should be run when tmux behavior changes.
-Herdr integration checks should remain read-only against a user's live socket;
-write API checks belong on an isolated tmux socket.
+-- -D warnings`, and `cargo build --release --offline`. The ignored Herdr and
+tmux contracts use isolated sockets and should be run when adapter behavior
+changes. Live Herdr integration checks should remain read-only; write checks
+belong on isolated adapter fixtures.
 
 Important quirks:
 
