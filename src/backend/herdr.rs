@@ -10,8 +10,9 @@ use tokio::net::UnixStream;
 use super::{
     Agent, AgentStatus, BackendActivity, BackendActivityStream, BackendError, BackendFuture,
     BackendKind, BackendMetadata, CreateTab, CreateWorkspace, OutputFormat, OutputSource, Pane,
-    PaneId, PaneOutput, ReadPane, SplitDirection, SplitPane, StartAgent, StartedAgent, Tab, TabId,
-    TerminalBackend, Workspace, WorkspaceId, Worktree, WorktreePlacement, WorktreeRequest,
+    PaneId, PaneOutput, PaneRange, ReadPane, SplitDirection, SplitPane, StartAgent, StartedAgent,
+    Tab, TabId, TerminalBackend, Workspace, WorkspaceId, Worktree, WorktreePlacement,
+    WorktreeRequest,
 };
 
 pub struct HerdrBackend {
@@ -256,10 +257,16 @@ impl TerminalBackend for HerdrBackend {
             let revision = ["/result/read/revision", "/result/revision"]
                 .into_iter()
                 .find_map(|pointer| response.pointer(pointer).and_then(Value::as_u64));
+            let scrollback_rows = [
+                "/result/read/scroll/max_offset_from_bottom",
+                "/result/scroll/max_offset_from_bottom",
+            ]
+            .into_iter()
+            .find_map(|pointer| response.pointer(pointer).and_then(Value::as_u64))
+            .and_then(|rows| u32::try_from(rows).ok());
             Ok(PaneOutput {
-                text: text.to_owned(),
                 revision,
-                range: None,
+                ..herdr_pane_output(text, scrollback_rows)
             })
         })
     }
@@ -726,6 +733,27 @@ fn activity_subscriptions(panes: &[Pane]) -> Vec<Value> {
     subscriptions
 }
 
+/// The tail a herdr read returned, expressed as an absolute range.
+///
+/// `scrollback_rows` is herdr's own count where it reports one. Muqun has
+/// measured that count disagreeing with what `pane.read` hands over (a pane
+/// claiming 2765 rows yielding 992 lines), so this does not treat it as
+/// authoritative — it only places it next to the line count it failed to
+/// predict, in one response, where a client can compare them.
+fn herdr_pane_output(text: &str, scrollback_rows: Option<u32>) -> PaneOutput {
+    let served = text.lines().count() as u32;
+    let total = scrollback_rows.unwrap_or(served).max(served);
+    PaneOutput {
+        text: text.to_owned(),
+        revision: None,
+        range: Some(PaneRange {
+            start: total.saturating_sub(served),
+            end: total,
+            total,
+        }),
+    }
+}
+
 fn required_string<'a>(
     value: &'a Value,
     field: &str,
@@ -838,6 +866,31 @@ mod tests {
             }),
             _ => json!({ "ok": true }),
         }
+    }
+
+    #[test]
+    fn herdr_range_describes_the_tail_it_returned_not_the_one_requested() {
+        // The daemon has no range parameter, so a range request is answered with a
+        // tail. Reporting that honestly is what lets the client stop asking.
+        let output = herdr_pane_output("line1\nline2\nline3", Some(900));
+        let range = output.range.unwrap();
+        assert_eq!(range.total, 900);
+        assert_eq!(range.end, 900);
+        assert_eq!(range.start, 897);
+    }
+
+    #[test]
+    fn herdr_range_falls_back_to_the_line_count_when_the_daemon_reports_no_total() {
+        let output = herdr_pane_output("line1\nline2", None);
+        let range = output.range.unwrap();
+        assert_eq!(
+            range,
+            PaneRange {
+                start: 0,
+                end: 2,
+                total: 2
+            }
+        );
     }
 
     #[test]
