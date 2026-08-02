@@ -14,3 +14,6 @@ config.json
 *.swp
 .idea/
 .vscode/
+
+# Subagent-driven-development scratch workspace
+.superpowers/
