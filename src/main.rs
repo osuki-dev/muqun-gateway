@@ -1066,6 +1066,15 @@ fn upsert_backend_session(
         socket_path: socket_path.unwrap_or_else(|| default_backend_socket(backend)),
         backend,
     });
+    // Muqun selects sessions[0] and exposes no picker, so ordering is what
+    // makes tmux the backend a client actually reaches. Stable, so two
+    // sessions of the same backend keep the order they were added in.
+    config
+        .sessions
+        .sort_by_key(|session| match session.backend {
+            BackendKind::Tmux => 0,
+            BackendKind::Herdr => 1,
+        });
     Ok(id)
 }
 
@@ -12590,6 +12599,18 @@ mod tests {
     }
 
     #[test]
+    fn tmux_sessions_sort_ahead_of_herdr_whatever_order_they_were_added() {
+        let mut config = test_config("token");
+        config.sessions.clear();
+        upsert_backend_session(&mut config, BackendKind::Herdr, None, None, None).unwrap();
+        upsert_backend_session(&mut config, BackendKind::Tmux, None, None, None).unwrap();
+        // The app reads sessions[0] and shows no picker, so this ordering is the
+        // whole of "tmux is the default backend" as far as a client can tell.
+        assert_eq!(config.sessions[0].backend, BackendKind::Tmux);
+        assert_eq!(config.sessions[1].backend, BackendKind::Herdr);
+    }
+
+    #[test]
     fn adding_a_backend_preserves_the_primary_session_and_is_idempotent() {
         let mut config = test_config("token");
         config.sessions[0] = SessionConfig {
@@ -12827,8 +12848,8 @@ mod tests {
                 .unwrap();
         assert_eq!(merged.server_id, "paired-herdr");
         assert_eq!(merged.sessions.len(), 2);
-        assert_eq!(merged.sessions[0].backend, BackendKind::Herdr);
-        assert_eq!(merged.sessions[1].backend, BackendKind::Tmux);
+        assert_eq!(merged.sessions[0].backend, BackendKind::Tmux);
+        assert_eq!(merged.sessions[1].backend, BackendKind::Herdr);
         assert!(target_config_dir.join(HERDR_PLUGIN_IMPORT_MARKER).exists());
         std::fs::remove_dir_all(root).ok();
     }
