@@ -245,29 +245,7 @@ impl TerminalBackend for HerdrBackend {
                     }),
                 )
                 .await?;
-            let text = [
-                "/result/read/output",
-                "/result/read/text",
-                "/result/output",
-                "/result/text",
-            ]
-            .into_iter()
-            .find_map(|pointer| response.pointer(pointer).and_then(Value::as_str))
-            .ok_or(BackendError::InvalidResponse("pane output"))?;
-            let revision = ["/result/read/revision", "/result/revision"]
-                .into_iter()
-                .find_map(|pointer| response.pointer(pointer).and_then(Value::as_u64));
-            let scrollback_rows = [
-                "/result/read/scroll/max_offset_from_bottom",
-                "/result/scroll/max_offset_from_bottom",
-            ]
-            .into_iter()
-            .find_map(|pointer| response.pointer(pointer).and_then(Value::as_u64))
-            .and_then(|rows| u32::try_from(rows).ok());
-            Ok(PaneOutput {
-                revision,
-                ..herdr_pane_output(text, scrollback_rows)
-            })
+            pane_output_from_response(&response)
         })
     }
 
@@ -740,18 +718,63 @@ fn activity_subscriptions(panes: &[Pane]) -> Vec<Value> {
 /// claiming 2765 rows yielding 992 lines), so this does not treat it as
 /// authoritative — it only places it next to the line count it failed to
 /// predict, in one response, where a client can compare them.
+///
+/// When herdr reports no count at all, `total` is unknown, not "equal to what
+/// was served" — synthesizing one would print `start: 0` on every read
+/// (`total.saturating_sub(served)` with `total == served` is always zero),
+/// which is the contract's signal for "the oldest line has been reached".
+/// That is false on a pane holding thousands of lines and would silently stop
+/// backward paging on herdr the moment a client starts trusting `start == 0`.
+/// So this reports `range: None` instead: `Option<PaneRange>` exists exactly
+/// for "this backend cannot say", and callers already fall back to the
+/// measured behaviour they use today when they see `None`.
 fn herdr_pane_output(text: &str, scrollback_rows: Option<u32>) -> PaneOutput {
     let served = text.lines().count() as u32;
-    let total = scrollback_rows.unwrap_or(served).max(served);
-    PaneOutput {
-        text: text.to_owned(),
-        revision: None,
-        range: Some(PaneRange {
+    let range = scrollback_rows.map(|total| {
+        let total = total.max(served);
+        PaneRange {
             start: total.saturating_sub(served),
             end: total,
             total,
-        }),
+        }
+    });
+    PaneOutput {
+        text: text.to_owned(),
+        revision: None,
+        range,
     }
+}
+
+/// Parse a herdr `pane.read` response into a [`PaneOutput`].
+///
+/// Pulled out of [`HerdrBackend::read_pane`] so the pointer probing --
+/// including the `scroll.max_offset_from_bottom` lookup that is the only path
+/// able to produce `Some(range)` from herdr -- can be exercised with fixture
+/// `Value`s instead of a live socket.
+fn pane_output_from_response(response: &Value) -> Result<PaneOutput, BackendError> {
+    let text = [
+        "/result/read/output",
+        "/result/read/text",
+        "/result/output",
+        "/result/text",
+    ]
+    .into_iter()
+    .find_map(|pointer| response.pointer(pointer).and_then(Value::as_str))
+    .ok_or(BackendError::InvalidResponse("pane output"))?;
+    let revision = ["/result/read/revision", "/result/revision"]
+        .into_iter()
+        .find_map(|pointer| response.pointer(pointer).and_then(Value::as_u64));
+    let scrollback_rows = [
+        "/result/read/scroll/max_offset_from_bottom",
+        "/result/scroll/max_offset_from_bottom",
+    ]
+    .into_iter()
+    .find_map(|pointer| response.pointer(pointer).and_then(Value::as_u64))
+    .and_then(|rows| u32::try_from(rows).ok());
+    Ok(PaneOutput {
+        revision,
+        ..herdr_pane_output(text, scrollback_rows)
+    })
 }
 
 fn required_string<'a>(
@@ -880,16 +903,63 @@ mod tests {
     }
 
     #[test]
-    fn herdr_range_falls_back_to_the_line_count_when_the_daemon_reports_no_total() {
+    fn herdr_range_is_none_when_the_daemon_reports_no_total() {
+        // total == served would print start: 0 unconditionally, which is the
+        // contract's "oldest line reached" signal. That is false on a pane
+        // holding thousands of lines herdr just declined to count, so an
+        // unknown total must stay None rather than turn into a fabricated
+        // range -- None is what lets a client fall back to the measured
+        // paging behaviour it already has for herdr today.
         let output = herdr_pane_output("line1\nline2", None);
-        let range = output.range.unwrap();
-        assert_eq!(
-            range,
-            PaneRange {
-                start: 0,
-                end: 2,
-                total: 2
+        assert_eq!(output.range, None);
+    }
+
+    #[test]
+    fn pane_output_from_response_reports_no_range_when_herdr_carries_no_scroll_data() {
+        let response = json!({ "result": { "read": { "text": "line1\nline2", "revision": 9 } } });
+        let output = pane_output_from_response(&response).unwrap();
+        assert_eq!(output.revision, Some(9));
+        assert_eq!(output.range, None);
+    }
+
+    #[test]
+    fn pane_output_from_response_turns_a_nested_scroll_count_into_a_range() {
+        let response = json!({
+            "result": {
+                "read": {
+                    "text": "line1\nline2\nline3",
+                    "revision": 4,
+                    "scroll": { "max_offset_from_bottom": 900 }
+                }
             }
+        });
+        let output = pane_output_from_response(&response).unwrap();
+        assert_eq!(
+            output.range,
+            Some(PaneRange {
+                start: 897,
+                end: 900,
+                total: 900
+            })
+        );
+    }
+
+    #[test]
+    fn pane_output_from_response_turns_a_flat_scroll_count_into_a_range() {
+        let response = json!({
+            "result": {
+                "text": "line1\nline2\nline3",
+                "scroll": { "max_offset_from_bottom": 900 }
+            }
+        });
+        let output = pane_output_from_response(&response).unwrap();
+        assert_eq!(
+            output.range,
+            Some(PaneRange {
+                start: 897,
+                end: 900,
+                total: 900
+            })
         );
     }
 
