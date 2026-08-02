@@ -318,8 +318,6 @@ impl TerminalBackend for TmuxBackend {
     fn read_pane<'a>(&'a self, request: &'a ReadPane) -> BackendFuture<'a, PaneOutput> {
         Box::pin(async move {
             validate_tmux_id(request.pane_id.as_str(), '%', "pane")?;
-            let (history_size, pane_height) = self.pane_metrics(&request.pane_id).await?;
-            let total = history_size.saturating_add(pane_height);
 
             let mut args = vec!["capture-pane".to_owned(), "-p".to_owned()];
             if request.format == OutputFormat::Ansi {
@@ -329,26 +327,30 @@ impl TerminalBackend for TmuxBackend {
                 args.push("-J".to_owned());
             }
 
-            let range = match (request.start, request.end) {
-                // `visible` is the live screen, which no range addresses.
-                (Some(start), Some(end)) if request.source != OutputSource::Visible => {
-                    let start = start.min(total.saturating_sub(1));
-                    let end = end.min(total).max(start + 1);
-                    let end = end.min(start + MAX_CAPTURE_LINES);
-                    let (s, e) = capture_bounds(start, end, history_size);
+            // `pane_metrics` costs a second tmux subprocess, so only pay for it
+            // when a range actually needs resolving. The tail (no-range) path,
+            // including the `Visible` hot polling path, must reach
+            // `capture-pane` exactly as it did before ranges existed.
+            let range = if wants_absolute_range(request.source, request.start, request.end) {
+                let (history_size, pane_height) = self.pane_metrics(&request.pane_id).await?;
+                let total = history_size.saturating_add(pane_height);
+                let range = clamp_range(
+                    request.start.expect("checked by wants_absolute_range"),
+                    request.end.expect("checked by wants_absolute_range"),
+                    total,
+                );
+                let (s, e) = capture_bounds(range.start, range.end, history_size);
+                args.push("-S".to_owned());
+                args.push(s.to_string());
+                args.push("-E".to_owned());
+                args.push(e.to_string());
+                Some(range)
+            } else {
+                if request.source != OutputSource::Visible {
                     args.push("-S".to_owned());
-                    args.push(s.to_string());
-                    args.push("-E".to_owned());
-                    args.push(e.to_string());
-                    Some(PaneRange { start, end, total })
+                    args.push(format!("-{}", request.lines));
                 }
-                _ => {
-                    if request.source != OutputSource::Visible {
-                        args.push("-S".to_owned());
-                        args.push(format!("-{}", request.lines));
-                    }
-                    None
-                }
+                None
             };
 
             args.push("-t".to_owned());
@@ -357,16 +359,11 @@ impl TerminalBackend for TmuxBackend {
 
             let (text, range) = match range {
                 Some(range) => (captured, Some(range)),
-                None => {
-                    let text = tail_lines(&captured, request.lines as usize);
-                    let served = text.lines().count() as u32;
-                    let range = PaneRange {
-                        start: total.saturating_sub(served),
-                        end: total,
-                        total,
-                    };
-                    (text, Some(range))
-                }
+                // Metrics were never fetched here, so there is nothing honest to
+                // report: `PaneOutput.range` exists precisely for "this backend
+                // cannot say", and inventing a range would cost a subprocess this
+                // path is not allowed to spend.
+                None => (tail_lines(&captured, request.lines as usize), None),
             };
 
             Ok(PaneOutput {
@@ -800,6 +797,24 @@ fn validate_tmux_id(value: &str, prefix: char, kind: &'static str) -> Result<(),
     Ok(())
 }
 
+/// Whether a read actually addresses an absolute range.
+///
+/// Both bounds must be given, and `Visible` is the live screen: no range
+/// addresses it, so a `Visible` read with a range attached still reads the
+/// current screen rather than history.
+fn wants_absolute_range(source: OutputSource, start: Option<u32>, end: Option<u32>) -> bool {
+    source != OutputSource::Visible && start.is_some() && end.is_some()
+}
+
+/// Clamp a requested absolute `[start, end)` range to what tmux can serve:
+/// never past `total`, never empty, never wider than `MAX_CAPTURE_LINES`.
+fn clamp_range(start: u32, end: u32, total: u32) -> PaneRange {
+    let start = start.min(total.saturating_sub(1));
+    let end = end.min(total).max(start + 1);
+    let end = end.min(start + MAX_CAPTURE_LINES);
+    PaneRange { start, end, total }
+}
+
 /// Absolute `[start, end)` to the inclusive `-S`/`-E` pair tmux wants.
 ///
 /// tmux numbers rows from the top of the *visible* pane: 0 is the first visible
@@ -943,6 +958,106 @@ mod tests {
         assert_eq!(capture_bounds(0, 41, 0), (0, 40));
     }
 
+    #[test]
+    fn wants_absolute_range_requires_both_bounds_and_a_non_visible_source() {
+        assert!(wants_absolute_range(
+            OutputSource::RecentUnwrapped,
+            Some(0),
+            Some(10)
+        ));
+        assert!(wants_absolute_range(
+            OutputSource::Recent,
+            Some(0),
+            Some(10)
+        ));
+        assert!(wants_absolute_range(
+            OutputSource::Detection,
+            Some(0),
+            Some(10)
+        ));
+        // `Visible` is the live screen: a range attached to it is ignored.
+        assert!(!wants_absolute_range(
+            OutputSource::Visible,
+            Some(0),
+            Some(10)
+        ));
+        // Either bound missing means "no range requested".
+        assert!(!wants_absolute_range(
+            OutputSource::RecentUnwrapped,
+            Some(0),
+            None
+        ));
+        assert!(!wants_absolute_range(
+            OutputSource::RecentUnwrapped,
+            None,
+            Some(10)
+        ));
+        assert!(!wants_absolute_range(
+            OutputSource::RecentUnwrapped,
+            None,
+            None
+        ));
+    }
+
+    #[test]
+    fn clamp_range_keeps_a_range_that_already_fits() {
+        assert_eq!(
+            clamp_range(10, 20, 100),
+            PaneRange {
+                start: 10,
+                end: 20,
+                total: 100
+            }
+        );
+    }
+
+    #[test]
+    fn clamp_range_pulls_an_overshooting_end_back_to_total_instead_of_erroring() {
+        assert_eq!(
+            clamp_range(90, 500, 100),
+            PaneRange {
+                start: 90,
+                end: 100,
+                total: 100
+            }
+        );
+    }
+
+    #[test]
+    fn clamp_range_pulls_an_overshooting_start_back_to_the_newest_line() {
+        assert_eq!(
+            clamp_range(150, 200, 100),
+            PaneRange {
+                start: 99,
+                end: 100,
+                total: 100
+            }
+        );
+    }
+
+    #[test]
+    fn clamp_range_caps_width_at_max_capture_lines() {
+        let total = MAX_CAPTURE_LINES * 3;
+        assert_eq!(
+            clamp_range(0, total, total),
+            PaneRange {
+                start: 0,
+                end: MAX_CAPTURE_LINES,
+                total
+            }
+        );
+        // The cap follows `start`, not the origin: a request for a wide slice
+        // starting mid-history still serves at most `MAX_CAPTURE_LINES`.
+        assert_eq!(
+            clamp_range(10, total, total),
+            PaneRange {
+                start: 10,
+                end: 10 + MAX_CAPTURE_LINES,
+                total
+            }
+        );
+    }
+
     /// Fresh backend on a private tmux socket, isolated from any real server.
     fn fresh_backend() -> TmuxBackend {
         let socket =
@@ -977,6 +1092,113 @@ mod tests {
         let (history, height) = backend.pane_metrics(&pane.id).await.unwrap();
         assert_eq!(Some(height), pane.viewport_rows);
         assert_eq!(Some(history), pane.max_offset_from_bottom);
+        backend.close_workspace(&workspace.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a tmux server"]
+    async fn read_pane_serves_an_absolute_range_end_to_end() {
+        let (backend, workspace) = contract_workspace().await;
+        let panes = backend.list_panes().await.unwrap();
+        let pane = panes
+            .iter()
+            .find(|p| p.workspace_id == workspace.id)
+            .unwrap()
+            .clone();
+        backend.send_text(&pane.id, "seq 1 500").await.unwrap();
+        backend
+            .send_keys(&pane.id, &["Enter".to_owned()])
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let (history, height) = backend.pane_metrics(&pane.id).await.unwrap();
+        let total = history + height;
+
+        // Full-range read should equal a huge tail read, line for line.
+        let full = backend
+            .read_pane(&ReadPane {
+                pane_id: pane.id.clone(),
+                source: OutputSource::RecentUnwrapped,
+                format: OutputFormat::Text,
+                lines: total,
+                start: Some(0),
+                end: Some(total),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            full.range,
+            Some(PaneRange {
+                start: 0,
+                end: total,
+                total
+            })
+        );
+        assert_eq!(full.text.lines().count() as u32, total);
+
+        // A middle slice returns exactly `end - start` lines, and they line up
+        // with the same slice of the full read.
+        let mid = backend
+            .read_pane(&ReadPane {
+                pane_id: pane.id.clone(),
+                source: OutputSource::RecentUnwrapped,
+                format: OutputFormat::Text,
+                lines: total,
+                start: Some(10),
+                end: Some(20),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            mid.range,
+            Some(PaneRange {
+                start: 10,
+                end: 20,
+                total
+            })
+        );
+        assert_eq!(mid.text.lines().count(), 10);
+        let full_lines: Vec<&str> = full.text.lines().collect();
+        let mid_lines: Vec<&str> = mid.text.lines().collect();
+        assert_eq!(&full_lines[10..20], mid_lines.as_slice());
+
+        // An `end` past `total` clamps rather than erroring or overshooting.
+        let clamped = backend
+            .read_pane(&ReadPane {
+                pane_id: pane.id.clone(),
+                source: OutputSource::RecentUnwrapped,
+                format: OutputFormat::Text,
+                lines: total,
+                start: Some(total - 3),
+                end: Some(total + 500),
+            })
+            .await
+            .unwrap();
+        assert_eq!(clamped.text.lines().count(), 3);
+        assert_eq!(
+            clamped.range,
+            Some(PaneRange {
+                start: total - 3,
+                end: total,
+                total
+            })
+        );
+
+        // `Visible` ignores an attached range and reads the live screen.
+        let visible = backend
+            .read_pane(&ReadPane {
+                pane_id: pane.id.clone(),
+                source: OutputSource::Visible,
+                format: OutputFormat::Text,
+                lines: 80,
+                start: Some(0),
+                end: Some(5),
+            })
+            .await
+            .unwrap();
+        assert_eq!(visible.range, None);
+        assert_eq!(visible.text.lines().count(), height as usize);
+
         backend.close_workspace(&workspace.id).await.unwrap();
     }
 
