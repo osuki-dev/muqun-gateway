@@ -12,11 +12,13 @@ mod tmux;
 pub mod compat;
 
 pub use herdr::HerdrBackend;
+#[allow(unused_imports)]
 pub use model::{
     Agent, AgentStatus, BackendActivity, BackendActivityStream, BackendError, BackendFuture,
     BackendKind, BackendMetadata, CreateTab, CreateWorkspace, OutputFormat, OutputSource, Pane,
-    PaneId, PaneOutput, ReadPane, SplitDirection, SplitPane, StartAgent, StartedAgent, Tab, TabId,
-    TerminalBackend, Workspace, WorkspaceId, Worktree, WorktreePlacement, WorktreeRequest,
+    PaneId, PaneOutput, PaneRange, ReadPane, SplitDirection, SplitPane, StartAgent, StartedAgent,
+    Tab, TabId, TerminalBackend, Workspace, WorkspaceId, Worktree, WorktreePlacement,
+    WorktreeRequest,
 };
 pub use registry::BackendRegistry;
 pub use tmux::TmuxBackend;

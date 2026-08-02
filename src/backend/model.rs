@@ -223,6 +223,21 @@ pub struct PaneOutput {
     pub revision: Option<u64>,
 }
 
+/// Which absolute lines of a pane a read actually returned.
+///
+/// Line 0 is the oldest line the pane still holds and `total` is one past the
+/// newest, so `start == 0` means the reader has reached the top. This always
+/// describes what was served, never what was asked for: a backend that cannot
+/// honour a requested range still reports the tail it did return, which is what
+/// lets one response shape cover both backends without a capability flag.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneRange {
+    pub start: u32,
+    pub end: u32,
+    pub total: u32,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateWorkspace {
     pub cwd: Option<PathBuf>,

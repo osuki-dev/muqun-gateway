@@ -736,6 +736,20 @@ fn validate_tmux_id(value: &str, prefix: char, kind: &'static str) -> Result<(),
     Ok(())
 }
 
+/// Absolute `[start, end)` to the inclusive `-S`/`-E` pair tmux wants.
+///
+/// tmux numbers rows from the top of the *visible* pane: 0 is the first visible
+/// row and negatives reach back into scrollback, so absolute line `i` sits at
+/// `i - history_size`. `-E` is inclusive, hence the extra `- 1`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn capture_bounds(start: u32, end: u32, history_size: u32) -> (i64, i64) {
+    let origin = i64::from(history_size);
+    (
+        i64::from(start) - origin,
+        i64::from(end.max(start + 1)) - 1 - origin,
+    )
+}
+
 fn tail_lines(text: &str, limit: usize) -> String {
     if limit == 0 {
         return String::new();
@@ -851,6 +865,19 @@ mod tests {
         let backend = TmuxBackend::with_binary("tmux", Some(PathBuf::from("/tmp/tmux.sock")));
         assert_eq!(backend.binary, PathBuf::from("tmux"));
         assert_eq!(backend.socket_path, Some(PathBuf::from("/tmp/tmux.sock")));
+    }
+
+    #[test]
+    fn capture_bounds_map_absolute_lines_onto_tmux_coordinates() {
+        // Measured live: history_size 463, pane_height 41, total 504.
+        // tmux counts from the top of the visible pane, and -E is inclusive.
+        assert_eq!(capture_bounds(0, 504, 463), (-463, 40));
+        // The oldest line alone.
+        assert_eq!(capture_bounds(0, 1, 463), (-463, -463));
+        // The first visible row alone.
+        assert_eq!(capture_bounds(463, 464, 463), (0, 0));
+        // A pane with no scrollback at all.
+        assert_eq!(capture_bounds(0, 41, 0), (0, 40));
     }
 
     #[tokio::test]
