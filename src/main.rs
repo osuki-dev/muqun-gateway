@@ -6330,17 +6330,28 @@ async fn pane_output(
     // Herdr answered with everything it has. For a pane it keeps nothing above
     // the viewport for, everything it has is one screen -- and this is the read
     // that both feeds what the gateway kept and hands it back.
-    if let (Some(text), Some(mut store)) = (pane_read_text(&answer), lock_scrollback(&state)) {
-        let served = store.serve_read(
-            &session_id,
-            &pane_id,
-            herdr_source,
-            &format,
-            &text,
-            lines as usize,
-        );
-        if served != text {
-            scrollback::replace_read_text(&mut answer, &served);
+    //
+    // Scoped to the tail path only (`range.is_none()`): stitching windows the
+    // local buffer by `lines`, which has no relationship to a requested
+    // `[start, end)`, and it only ever rewrites the text pointer, never
+    // `range`. A range-addressed read already got the backend's own answer
+    // for that exact slice; substituting a differently-windowed text under an
+    // unchanged `range` would make the response lie about which lines it
+    // holds, which is worse than the fabricated `start: 0` Task 3 already
+    // ruled out.
+    if range.is_none() {
+        if let (Some(text), Some(mut store)) = (pane_read_text(&answer), lock_scrollback(&state)) {
+            let served = store.serve_read(
+                &session_id,
+                &pane_id,
+                herdr_source,
+                &format,
+                &text,
+                lines as usize,
+            );
+            if served != text {
+                scrollback::replace_read_text(&mut answer, &served);
+            }
         }
     }
     Ok(Json(answer))
@@ -13454,6 +13465,61 @@ mod tests {
         // Herdr's own answer is the last screen alone.
         assert_eq!(screens.last().unwrap(), "row 3\nrow 4\nrow 5\nrow 6");
         assert_eq!(served, "row 0\nrow 1\nrow 2\nrow 3\nrow 4\nrow 5\nrow 6");
+    }
+
+    async fn read_output_range(state: &AppState, start: u32, end: u32) -> String {
+        let response = pane_output(
+            State(state.clone()),
+            Path(("default".into(), "wM:p1".into())),
+            Query(OutputQuery {
+                source: Some("recent-unwrapped".into()),
+                lines: None,
+                format: Some("text".into()),
+                start: Some(start),
+                end: Some(end),
+            }),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap();
+        pane_read_text(&response.0).unwrap_or_default()
+    }
+
+    /// The bug this pins: a pane the scrollback store is keeping rows for is
+    /// exactly the condition the tail-path stitching above exists for, and
+    /// `keeps()` is decided from session/pane identity and Herdr's own scroll
+    /// telemetry alone -- nothing about it depends on whether the *current*
+    /// request happens to be range-addressed. Without gating on that, this
+    /// same "kept" pane, read with an explicit `[start, end)`, would come back
+    /// windowed by the plain `lines` default (200) rather than sliced to the
+    /// requested range, while nothing about the response said so.
+    ///
+    /// Reuses the exact setup `a_zero_backlog_pane_hands_back_more_than_herdr_kept`
+    /// uses to prove stitching *does* widen a tail read for this pane, then
+    /// shows a range-addressed read of the same pane is answered with exactly
+    /// what Herdr served -- the last screen alone, not the seven-row window.
+    #[tokio::test]
+    async fn a_range_addressed_read_is_never_widened_by_local_scrollback() {
+        let screens = repainting_screens();
+        let herdr = FakeHerdr::start(screens.iter().map(String::as_str).collect(), None);
+        let state = output_state(&herdr);
+        state.scrollback.lock().unwrap().observe(
+            "default",
+            &json!({ "pane_id": "wM:p1", "scroll": { "max_offset_from_bottom": 0, "viewport_rows": 4 } }),
+        );
+
+        // Feed the store the same four repaints that, in the tail-path test,
+        // make a fifth plain read come back as all seven kept rows.
+        for _ in 0..4 {
+            read_output(&state, 240).await;
+        }
+
+        let served = read_output_range(&state, 0, 240).await;
+
+        // Herdr's own answer for this read is the last screen alone -- the
+        // range-addressed request must get exactly that, not the stitched span.
+        assert_eq!(screens.last().unwrap(), "row 3\nrow 4\nrow 5\nrow 6");
+        assert_eq!(served, "row 3\nrow 4\nrow 5\nrow 6");
     }
 
     /// And having kept them, it says so where the reader's affordance looks --
