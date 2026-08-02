@@ -979,3 +979,219 @@ cd ~/.osuki/herdr-gateway
 git add src/backend/tmux.rs CONTEXT.md
 git commit -m "test: assert disjoint ranges tile a tmux pane exactly"
 ```
+
+---
+
+### Task 10: Stop sending the grid's padding
+
+Depends on Task 2, which rewrites the function this changes.
+
+A terminal pads every row to its own width. That padding is an artifact of the
+grid, not content, and `capture-pane` drops it unless `-J` is passed. The
+gateway passes `-J` for `recent-unwrapped` because it wants wrapped logical
+lines joined — and gets the padding as an unwanted second effect.
+
+Measured on a 357-column pane: 21 of 83 lines came back as several hundred
+spaces and nothing else, and the payload was 19960 bytes against 7930 with the
+padding removed. That is 2.5x the bytes, over a phone link, carrying nothing.
+
+**Files:**
+- Modify: `src/backend/tmux.rs` (`read_pane`)
+
+**Interfaces:**
+- Produces: `fn strip_grid_padding(text: &str) -> String` in `backend::tmux`.
+
+- [ ] **Step 10.1: Write the failing test**
+
+```rust
+#[test]
+fn grid_padding_is_not_content() {
+    // -J pads every row out to the pane width. A row of nothing but padding is
+    // a blank row, and a row with padding is the row without it.
+    assert_eq!(strip_grid_padding("text   \n      \nmore  "), "text\n\nmore");
+    // Interior spacing is content and must survive: it is what aligns a table.
+    assert_eq!(strip_grid_padding("a   b   "), "a   b");
+    // Leading indentation is content too.
+    assert_eq!(strip_grid_padding("    indented   "), "    indented");
+    assert_eq!(strip_grid_padding(""), "");
+}
+```
+
+- [ ] **Step 10.2: Run it and watch it fail**
+
+Run: `cargo test --offline grid_padding`
+Expected: FAIL, `cannot find function 'strip_grid_padding'`.
+
+- [ ] **Step 10.3: Implement**
+
+```rust
+/// Drop each row's trailing padding.
+///
+/// tmux pads rows to the pane width and `-J` preserves that padding, so a
+/// 357-column pane sends a few hundred spaces after every short line. Only
+/// trailing runs go: interior spacing aligns tables and leading spacing is
+/// indentation, and both are content.
+fn strip_grid_padding(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for (index, line) in text.split('\n').enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        out.push_str(line.trim_end_matches([' ', '\t']));
+    }
+    out
+}
+```
+
+- [ ] **Step 10.4: Run it and watch it pass**
+
+Run: `cargo test --offline grid_padding`
+Expected: PASS.
+
+- [ ] **Step 10.5: Apply it in `read_pane`**
+
+In `src/backend/tmux.rs`, wrap the captured text before it becomes `PaneOutput`:
+
+```rust
+let captured = strip_grid_padding(&self.output(&args).await?);
+```
+
+Both the range path and the tail path read from `captured`, so one call covers
+both. `text_revision` then hashes the stripped text, which is what the client
+sees — a revision that changed only in padding was never a change.
+
+- [ ] **Step 10.6: Verify nothing else depended on the padding**
+
+Run: `cargo test --offline`
+Expected: all pass. `scrollback.rs` counts rows rather than columns, so row
+counts are unchanged; a failure here means something was measuring width off
+the padding and should be read carefully before it is "fixed".
+
+- [ ] **Step 10.7: Commit**
+
+```bash
+git add src/backend/tmux.rs
+git commit -m "fix: stop sending a tmux pane's grid padding as content"
+```
+
+---
+
+### Task 11: The renderer takes the pane's width
+
+This is the durable half. Today `parseTerminalSnapshot` infers grid width from
+the widest line it happens to have received, clamped to
+`MAX_SNAPSHOT_COLUMNS = 320` (`src/terminal/terminal-core.ts:830-840`). Two
+consequences, both observed:
+
+- A 357-column pane exceeds the clamp, so every row overflows the grid and its
+  tail lands on the next row. With Task 10's padding gone that tail is empty,
+  which is the blank row between every line in the reported screenshot.
+- The inferred width moves with the content. A read that happens to hold only
+  short lines narrows the grid and reflows the screen, and the next read widens
+  it again.
+
+The gateway has always reported the authoritative number — `compat.rs` sends
+`width` on every pane — it simply never reached the renderer. Passing it makes
+the width a fact with one source instead of a guess with none.
+
+**Files:**
+- Modify: `Muqun/src/terminal/terminal-core.ts` (`parseTerminalSnapshot`)
+- Modify: `Muqun/src/components/skia-terminal.tsx:364`
+- Test: `Muqun/src/terminal/__tests__/flat-fast-path.test.ts`
+
+**Interfaces:**
+- Produces: `parseTerminalSnapshot(input: string, theme?: TerminalTheme, columns?: number): TerminalFrame`
+
+The third parameter is optional, so all eighteen existing call sites keep
+compiling unchanged.
+
+- [ ] **Step 11.1: Write the failing tests**
+
+```ts
+test('a supplied width decides the grid, not the widest line', () => {
+  // A short read must not narrow the grid: that is what reflows a pane when
+  // nothing about it changed.
+  const frame = parseTerminalSnapshot('hi\n', DEFAULT_TERMINAL_THEME, 357);
+  expect(frame.columns).toBe(357);
+});
+
+test('a supplied width beats the inference cap', () => {
+  // 320 is a fallback clamp for when nobody knows. A pane that reports 357 is
+  // not a guess to be clamped.
+  const wide = 'x'.repeat(357);
+  const frame = parseTerminalSnapshot(`${wide}\n`, DEFAULT_TERMINAL_THEME, 357);
+  expect(frame.columns).toBe(357);
+  expect(frame.lines[0].cells.length).toBeLessThanOrEqual(357);
+});
+
+test('without a supplied width it still measures', () => {
+  // Demo mode and gateways that do not report a width.
+  const frame = parseTerminalSnapshot('hi\n');
+  expect(frame.columns).toBe(40); // MIN_SNAPSHOT_COLUMNS
+});
+```
+
+- [ ] **Step 11.2: Run them and watch them fail**
+
+Run: `cd ~/.osuki/Muqun && bun test flat-fast-path`
+Expected: FAIL — the third argument is ignored and the first test reports 40.
+
+- [ ] **Step 11.3: Implement**
+
+```ts
+export function parseTerminalSnapshot(
+  input: string,
+  theme: TerminalTheme = DEFAULT_TERMINAL_THEME,
+  columns?: number
+): TerminalFrame {
+  if (!forceFullEmulation) {
+    const flat = parseFlatSnapshot(input, theme, columns);
+    if (flat) return flat;
+  }
+  const measured = measureSnapshot(input);
+  // A reported width is the pane's own; the measurement is what to do when
+  // nobody said. Clamping a reported width against MAX_SNAPSHOT_COLUMNS would
+  // reintroduce exactly the overflow this parameter exists to remove.
+  const dimensions = {
+    columns: columns && columns > 0 ? columns : measured.columns,
+    rows: measured.rows,
+  };
+  // ...unchanged from here
+```
+
+`parseFlatSnapshot` takes the same optional third argument and uses it in place
+of its own width measurement. Where it does not measure width at all, pass the
+argument through and leave its body alone.
+
+- [ ] **Step 11.4: Run them and watch them pass**
+
+Run: `bun test flat-fast-path && npx tsc --noEmit`
+Expected: PASS, no type errors.
+
+- [ ] **Step 11.5: Feed the real width in**
+
+`src/components/skia-terminal.tsx:364` is the render path. The component needs
+the pane's `width` as a prop from `[serverId].tsx`, which already holds the pane
+record the gateway sent:
+
+```tsx
+    () => parseTerminalSnapshot(coalescedOutput, terminalTheme, paneColumns),
+```
+
+Add `paneColumns?: number` to the component's props and pass
+`pane.raw.width` at the call site. Leave `skia-terminal.web.tsx` alone — it is a
+text fallback with no grid to size.
+
+- [ ] **Step 11.6: Verify the whole suite**
+
+Run: `bun test && npx tsc --noEmit`
+Expected: PASS. Several existing tests assert on `frame.columns` from the
+inference path; none pass a width, so all keep their current answers.
+
+- [ ] **Step 11.7: Commit**
+
+```bash
+cd ~/.osuki/Muqun
+git add src/terminal/terminal-core.ts src/components/skia-terminal.tsx src/app/servers/\[serverId\].tsx src/terminal/__tests__/flat-fast-path.test.ts
+git commit -m "fix: size the terminal grid from the pane's reported width"
+```
