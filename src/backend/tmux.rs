@@ -355,7 +355,7 @@ impl TerminalBackend for TmuxBackend {
 
             args.push("-t".to_owned());
             args.push(request.pane_id.as_str().to_owned());
-            let captured = self.output(&args).await?;
+            let captured = strip_grid_padding(&self.output(&args).await?);
 
             let (text, range) = match range {
                 Some(range) => (captured, Some(range)),
@@ -828,6 +828,23 @@ fn capture_bounds(start: u32, end: u32, history_size: u32) -> (i64, i64) {
     )
 }
 
+/// Drop each row's trailing padding.
+///
+/// tmux pads rows to the pane width and `-J` preserves that padding, so a
+/// 357-column pane sends a few hundred spaces after every short line. Only
+/// trailing runs go: interior spacing aligns tables and leading spacing is
+/// indentation, and both are content.
+fn strip_grid_padding(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for (index, line) in text.split('\n').enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        out.push_str(line.trim_end_matches([' ', '\t']));
+    }
+    out
+}
+
 fn tail_lines(text: &str, limit: usize) -> String {
     if limit == 0 {
         return String::new();
@@ -910,6 +927,21 @@ mod tests {
         assert_eq!(tail_lines("one\ntwo\nthree\nfour\n", 2), "three\nfour");
         assert_eq!(tail_lines("one\ntwo", 10), "one\ntwo");
         assert_eq!(tail_lines("one", 0), "");
+    }
+
+    #[test]
+    fn grid_padding_is_not_content() {
+        // -J pads every row out to the pane width. A row of nothing but padding is
+        // a blank row, and a row with padding is the row without it.
+        assert_eq!(
+            strip_grid_padding("text   \n      \nmore  "),
+            "text\n\nmore"
+        );
+        // Interior spacing is content and must survive: it is what aligns a table.
+        assert_eq!(strip_grid_padding("a   b   "), "a   b");
+        // Leading indentation is content too.
+        assert_eq!(strip_grid_padding("    indented   "), "    indented");
+        assert_eq!(strip_grid_padding(""), "");
     }
 
     #[test]
