@@ -12,7 +12,6 @@ mod tmux;
 pub mod compat;
 
 pub use herdr::HerdrBackend;
-#[allow(unused_imports)]
 pub use model::{
     Agent, AgentStatus, BackendActivity, BackendActivityStream, BackendError, BackendFuture,
     BackendKind, BackendMetadata, CreateTab, CreateWorkspace, OutputFormat, OutputSource, Pane,

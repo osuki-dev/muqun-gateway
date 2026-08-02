@@ -259,6 +259,7 @@ impl TerminalBackend for HerdrBackend {
             Ok(PaneOutput {
                 text: text.to_owned(),
                 revision,
+                range: None,
             })
         })
     }
@@ -986,6 +987,8 @@ mod tests {
                     source: OutputSource::RecentUnwrapped,
                     format: OutputFormat::Text,
                     lines: 200,
+                    start: None,
+                    end: None,
                 })
                 .await
                 .unwrap()

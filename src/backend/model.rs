@@ -215,12 +215,18 @@ pub struct ReadPane {
     pub source: OutputSource,
     pub format: OutputFormat,
     pub lines: u32,
+    /// Absolute half-open range to read. `None` keeps the tail-of-`lines`
+    /// behaviour every existing caller relies on.
+    pub start: Option<u32>,
+    pub end: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaneOutput {
     pub text: String,
     pub revision: Option<u64>,
+    /// Which absolute lines this text is, where the backend can say.
+    pub range: Option<PaneRange>,
 }
 
 /// Which absolute lines of a pane a read actually returned.
@@ -230,7 +236,6 @@ pub struct PaneOutput {
 /// describes what was served, never what was asked for: a backend that cannot
 /// honour a requested range still reports the tail it did return, which is what
 /// lets one response shape cover both backends without a capability flag.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaneRange {
     pub start: u32,

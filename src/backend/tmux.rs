@@ -9,11 +9,15 @@ use tokio::process::Command;
 use super::{
     Agent, AgentStatus, BackendActivity, BackendActivityStream, BackendError, BackendFuture,
     BackendKind, BackendMetadata, CreateTab, CreateWorkspace, OutputFormat, OutputSource, Pane,
-    PaneId, PaneOutput, ReadPane, SplitDirection, SplitPane, StartAgent, StartedAgent, Tab, TabId,
-    TerminalBackend, Workspace, WorkspaceId,
+    PaneId, PaneOutput, PaneRange, ReadPane, SplitDirection, SplitPane, StartAgent, StartedAgent,
+    Tab, TabId, TerminalBackend, Workspace, WorkspaceId,
 };
 
 const FIELD_SEPARATOR: char = '\u{1f}';
+
+/// Mirrors `MAX_OUTPUT_LINES` in main. The backend clamps too so a direct
+/// caller cannot ask tmux for a hundred thousand rows.
+const MAX_CAPTURE_LINES: u32 = 5000;
 
 #[derive(Clone)]
 pub struct TmuxBackend {
@@ -116,6 +120,29 @@ impl TmuxBackend {
 
     fn format(fields: &[&str]) -> String {
         fields.join(&FIELD_SEPARATOR.to_string())
+    }
+
+    /// `(history_size, pane_height)` for one pane.
+    ///
+    /// `list_panes` carries both, but a single read has no reason to query every
+    /// pane on the server to learn about one of them.
+    async fn pane_metrics(&self, pane: &PaneId) -> Result<(u32, u32), BackendError> {
+        validate_tmux_id(pane.as_str(), '%', "pane")?;
+        let output = self
+            .output(&[
+                "display-message".to_owned(),
+                "-p".to_owned(),
+                "-t".to_owned(),
+                pane.as_str().to_owned(),
+                "-F".to_owned(),
+                "#{history_size}\t#{pane_height}".to_owned(),
+            ])
+            .await?;
+        let line = output.lines().next().unwrap_or_default();
+        let mut parts = line.split('\t');
+        let history = parse_u32(parts.next().unwrap_or_default(), "pane")?;
+        let height = parse_u32(parts.next().unwrap_or_default(), "pane")?;
+        Ok((history, height))
     }
 }
 
@@ -291,6 +318,9 @@ impl TerminalBackend for TmuxBackend {
     fn read_pane<'a>(&'a self, request: &'a ReadPane) -> BackendFuture<'a, PaneOutput> {
         Box::pin(async move {
             validate_tmux_id(request.pane_id.as_str(), '%', "pane")?;
+            let (history_size, pane_height) = self.pane_metrics(&request.pane_id).await?;
+            let total = history_size.saturating_add(pane_height);
+
             let mut args = vec!["capture-pane".to_owned(), "-p".to_owned()];
             if request.format == OutputFormat::Ansi {
                 args.push("-e".to_owned());
@@ -298,17 +328,51 @@ impl TerminalBackend for TmuxBackend {
             if request.source == OutputSource::RecentUnwrapped {
                 args.push("-J".to_owned());
             }
-            if request.source != OutputSource::Visible {
-                args.push("-S".to_owned());
-                args.push(format!("-{}", request.lines));
-            }
+
+            let range = match (request.start, request.end) {
+                // `visible` is the live screen, which no range addresses.
+                (Some(start), Some(end)) if request.source != OutputSource::Visible => {
+                    let start = start.min(total.saturating_sub(1));
+                    let end = end.min(total).max(start + 1);
+                    let end = end.min(start + MAX_CAPTURE_LINES);
+                    let (s, e) = capture_bounds(start, end, history_size);
+                    args.push("-S".to_owned());
+                    args.push(s.to_string());
+                    args.push("-E".to_owned());
+                    args.push(e.to_string());
+                    Some(PaneRange { start, end, total })
+                }
+                _ => {
+                    if request.source != OutputSource::Visible {
+                        args.push("-S".to_owned());
+                        args.push(format!("-{}", request.lines));
+                    }
+                    None
+                }
+            };
+
             args.push("-t".to_owned());
             args.push(request.pane_id.as_str().to_owned());
             let captured = self.output(&args).await?;
-            let text = tail_lines(&captured, request.lines as usize);
+
+            let (text, range) = match range {
+                Some(range) => (captured, Some(range)),
+                None => {
+                    let text = tail_lines(&captured, request.lines as usize);
+                    let served = text.lines().count() as u32;
+                    let range = PaneRange {
+                        start: total.saturating_sub(served),
+                        end: total,
+                        total,
+                    };
+                    (text, Some(range))
+                }
+            };
+
             Ok(PaneOutput {
                 revision: Some(text_revision(&text)),
                 text,
+                range,
             })
         })
     }
@@ -741,7 +805,6 @@ fn validate_tmux_id(value: &str, prefix: char, kind: &'static str) -> Result<(),
 /// tmux numbers rows from the top of the *visible* pane: 0 is the first visible
 /// row and negatives reach back into scrollback, so absolute line `i` sits at
 /// `i - history_size`. `-E` is inclusive, hence the extra `- 1`.
-#[cfg_attr(not(test), allow(dead_code))]
 fn capture_bounds(start: u32, end: u32, history_size: u32) -> (i64, i64) {
     let origin = i64::from(history_size);
     (
@@ -880,15 +943,50 @@ mod tests {
         assert_eq!(capture_bounds(0, 41, 0), (0, 40));
     }
 
+    /// Fresh backend on a private tmux socket, isolated from any real server.
+    fn fresh_backend() -> TmuxBackend {
+        let socket =
+            std::env::temp_dir().join(format!("gateway-test-{}.sock", uuid::Uuid::new_v4()));
+        TmuxBackend::new(Some(socket))
+    }
+
+    /// A fresh backend with one workspace already created on it, for contract
+    /// tests that just need somewhere live to read from.
+    async fn contract_workspace() -> (TmuxBackend, Workspace) {
+        let backend = fresh_backend();
+        let workspace = backend
+            .create_workspace(&CreateWorkspace {
+                cwd: Some(std::env::temp_dir()),
+                label: Some("gateway-contract".into()),
+                focus: true,
+            })
+            .await
+            .unwrap();
+        (backend, workspace)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a tmux server"]
+    async fn pane_metrics_report_history_and_height() {
+        let (backend, workspace) = contract_workspace().await;
+        let panes = backend.list_panes().await.unwrap();
+        let pane = panes
+            .iter()
+            .find(|p| p.workspace_id == workspace.id)
+            .unwrap();
+        let (history, height) = backend.pane_metrics(&pane.id).await.unwrap();
+        assert_eq!(Some(height), pane.viewport_rows);
+        assert_eq!(Some(history), pane.max_offset_from_bottom);
+        backend.close_workspace(&workspace.id).await.unwrap();
+    }
+
     #[tokio::test]
     #[ignore = "requires permission to create a local tmux Unix socket"]
     async fn isolated_tmux_server_satisfies_the_read_write_contract() {
         if Command::new("tmux").arg("-V").output().await.is_err() {
             return;
         }
-        let socket =
-            std::env::temp_dir().join(format!("gateway-test-{}.sock", uuid::Uuid::new_v4()));
-        let backend = TmuxBackend::new(Some(socket));
+        let backend = fresh_backend();
         assert!(backend.list_workspaces().await.unwrap().is_empty());
         let mut activity = backend.activity_stream().await.unwrap();
         let activity_change = tokio::spawn(async move {
@@ -949,6 +1047,8 @@ mod tests {
                 source: OutputSource::Visible,
                 format: OutputFormat::Text,
                 lines: 80,
+                start: None,
+                end: None,
             })
             .await
             .unwrap();
@@ -966,6 +1066,8 @@ mod tests {
                 source: OutputSource::RecentUnwrapped,
                 format: OutputFormat::Text,
                 lines: 240,
+                start: None,
+                end: None,
             })
             .await
             .unwrap();
@@ -975,6 +1077,8 @@ mod tests {
                 source: OutputSource::RecentUnwrapped,
                 format: OutputFormat::Text,
                 lines: 720,
+                start: None,
+                end: None,
             })
             .await
             .unwrap();

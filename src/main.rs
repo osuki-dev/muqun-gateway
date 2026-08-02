@@ -3993,6 +3993,8 @@ fn stream_read_request(pane_id: &str, opts: &StreamOutputOpts) -> BackendReadPan
             BackendOutputFormat::Ansi
         },
         lines: opts.lines,
+        start: None,
+        end: None,
     }
 }
 
@@ -4495,6 +4497,8 @@ async fn backend_agent_list(session: &SessionConfig) -> Result<Value, BackendErr
                 source: BackendOutputSource::Visible,
                 format: BackendOutputFormat::Text,
                 lines: APPROVAL_READ_LINES,
+                start: None,
+                end: None,
             })
             .await;
         if let Ok(output) = output {
@@ -6285,6 +6289,8 @@ async fn pane_output(
             _ => unreachable!("format was validated above"),
         },
         lines,
+        start: None,
+        end: None,
     };
     let output = terminal_backend(session)
         .read_pane(&request)
@@ -6361,6 +6367,8 @@ async fn pane_parts(
             source: BackendOutputSource::RecentUnwrapped,
             format: BackendOutputFormat::Text,
             lines,
+            start: None,
+            end: None,
         })
         .await
         .map_err(backend_api_error)?;
@@ -7025,6 +7033,8 @@ async fn read_pane_visible_text(session: &SessionConfig, pane_id: &str) -> ApiRe
             source: BackendOutputSource::Visible,
             format: BackendOutputFormat::Text,
             lines: APPROVAL_READ_LINES,
+            start: None,
+            end: None,
         })
         .await
         .map(|output| output.text)
