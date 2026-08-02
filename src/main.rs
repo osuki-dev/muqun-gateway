@@ -702,6 +702,9 @@ struct OutputQuery {
     source: Option<String>,
     lines: Option<u32>,
     format: Option<String>,
+    /// Absolute half-open range. Both or neither; the range wins over `lines`.
+    start: Option<u32>,
+    end: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -6241,6 +6244,31 @@ fn backend_call_error(method: &str, error: BackendError) -> HerdrCallError {
     }
 }
 
+/// A requested range, clamped to what one response may carry.
+///
+/// Out-of-bounds clamps instead of failing: a reader paging toward the top will
+/// always eventually ask for more than the pane holds, and that is how reaching
+/// the top looks from outside, not a mistake worth an error for.
+fn validate_output_range(start: Option<u32>, end: Option<u32>) -> ApiResult<Option<(u32, u32)>> {
+    match (start, end) {
+        (None, None) => Ok(None),
+        (Some(start), Some(end)) if start < end => Ok(Some((
+            start,
+            end.min(start.saturating_add(MAX_OUTPUT_LINES)),
+        ))),
+        (Some(_), Some(_)) => Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_range",
+            "start must be less than end",
+        )),
+        _ => Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_range",
+            "start and end must be given together",
+        )),
+    }
+}
+
 async fn pane_output(
     State(state): State<AppState>,
     Path((session_id, pane_id)): Path<(String, String)>,
@@ -6248,6 +6276,7 @@ async fn pane_output(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
+    let range = validate_output_range(query.start, query.end)?;
     let source = query.source.unwrap_or_else(|| "recent-unwrapped".into());
     if !matches!(
         source.as_str(),
@@ -6289,8 +6318,8 @@ async fn pane_output(
             _ => unreachable!("format was validated above"),
         },
         lines,
-        start: None,
-        end: None,
+        start: range.map(|(start, _)| start),
+        end: range.map(|(_, end)| end),
     };
     let output = terminal_backend(session)
         .read_pane(&request)
@@ -9554,6 +9583,8 @@ fn openapi_spec() -> Value {
                         path_param("paneId"),
                         query_param("source", "Pane read source, for example recent-unwrapped, recent, visible, or detection"),
                         query_param("lines", "Maximum line count"),
+                        query_param("start", "First absolute line to read, 0 being the oldest the pane holds. Requires end."),
+                        query_param("end", "One past the last absolute line to read. Requires start. A range wins over lines, and is clamped to 5000 lines and to what the pane holds rather than refused."),
                         query_param("format", "Output format: text or ansi")
                     ],
                     "responses": ok_response()
@@ -10244,6 +10275,34 @@ mod tests {
 
     fn error_body(refusal: &(StatusCode, Json<Value>)) -> Value {
         refusal.1 .0.clone()
+    }
+
+    #[test]
+    fn an_output_range_needs_both_ends_or_neither() {
+        assert!(validate_output_range(None, None).unwrap().is_none());
+        assert_eq!(
+            validate_output_range(Some(10), Some(20)).unwrap(),
+            Some((10, 20))
+        );
+        assert!(validate_output_range(Some(10), None).is_err());
+        assert!(validate_output_range(None, Some(20)).is_err());
+    }
+
+    #[test]
+    fn an_output_range_must_run_forwards() {
+        assert!(validate_output_range(Some(20), Some(20)).is_err());
+        assert!(validate_output_range(Some(21), Some(20)).is_err());
+    }
+
+    #[test]
+    fn an_oversized_output_range_is_trimmed_from_its_start_rather_than_refused() {
+        // A reader scrolling toward the top always eventually overreaches. That is
+        // an arrival at the top, not a client mistake, so it clamps.
+        let (start, end) = validate_output_range(Some(0), Some(50_000))
+            .unwrap()
+            .unwrap();
+        assert_eq!(start, 0);
+        assert_eq!(end, MAX_OUTPUT_LINES);
     }
 
     /// The refusal a request reads is in the language it asked for, and the
@@ -12336,7 +12395,10 @@ mod tests {
             spec["components"]["securitySchemes"]["bearerAuth"]["scheme"],
             "bearer"
         );
-        assert!(spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/output"].is_object());
+        let output = &spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/output"]["get"];
+        assert!(output.is_object());
+        assert_eq!(output["parameters"][4]["name"], "start");
+        assert_eq!(output["parameters"][5]["name"], "end");
         assert!(spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/zoom"].is_object());
         assert!(spec["paths"]["/api/sessions/{sessionId}/events"].is_object());
         assert!(spec["paths"]["/api/pair/request"].is_object());
@@ -12418,7 +12480,7 @@ mod tests {
         assert!(spec["paths"]["/api/uploads"]["post"]["responses"]["415"].is_object());
         assert_eq!(
             spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/output"]["get"]["parameters"]
-                [4]["name"],
+                [6]["name"],
             "format"
         );
 
@@ -13362,6 +13424,8 @@ mod tests {
                 source: Some("recent-unwrapped".into()),
                 lines: Some(lines),
                 format: Some("text".into()),
+                start: None,
+                end: None,
             }),
             bearer_headers("token"),
         )

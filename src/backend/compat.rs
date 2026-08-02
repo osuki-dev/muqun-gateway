@@ -40,15 +40,18 @@ pub fn pane_get(value: Pane) -> Value {
 }
 
 pub fn pane_read(output: PaneOutput) -> Value {
-    json!({
-        "result": {
-            "type": "pane_read",
-            "read": {
-                "output": output.text,
-                "revision": output.revision,
-            }
-        }
-    })
+    let mut read = json!({
+        "output": output.text,
+        "revision": output.revision,
+    });
+    if let Some(range) = output.range {
+        read["range"] = json!({
+            "start": range.start,
+            "end": range.end,
+            "total": range.total,
+        });
+    }
+    json!({ "result": { "type": "pane_read", "read": read } })
 }
 
 pub fn workspace_created(value: Workspace, created_tab: Tab, root_pane: Pane) -> Value {
