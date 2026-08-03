@@ -1067,13 +1067,13 @@ fn upsert_backend_session(
         socket_path: socket_path.unwrap_or_else(|| default_backend_socket(backend)),
         backend,
     });
-    // `GET /api/sessions` no longer serves in this stored order -- it
-    // reorders every request by which backend actually has something live in
-    // it (see `session_order_key` / `sessions()`). What this stored order
-    // still governs: `gateway_metadata`'s "primary" session for `/health` and
-    // `/api/meta` (it reads `config.sessions.first()`), and the order
-    // `configure_backend list` and `config.json` present to a human. Stable,
-    // so two sessions of the same backend keep the order they were added in.
+    // Neither `GET /api/sessions` nor `gateway_metadata`'s "primary" session
+    // for `/health` and `/api/meta` serve in this stored order any more --
+    // both reorder every request by which backend actually has something
+    // live in it (see `session_order_key` / `ordered_sessions`). What this
+    // stored order still governs: the order `configure_backend list` and
+    // `config.json` present to a human. Stable, so two sessions of the same
+    // backend keep the order they were added in.
     config
         .sessions
         .sort_by_key(|session| match session.backend {
@@ -3677,7 +3677,14 @@ async fn api_set_label(
 }
 
 async fn gateway_metadata(state: &AppState) -> ApiResult<Value> {
-    let primary = state.config.sessions.first().ok_or_else(|| {
+    // The primary session described below must be the one `GET /api/sessions`
+    // leads with, not merely the first configured one: with tmux dead or
+    // empty and herdr live, the app connects to whichever session
+    // `sessions[0]` names, and `assertSupportedHerdr` has to validate *that*
+    // session's metadata, not a stored-order tmux entry that always reports
+    // `compatible: true`. See `ordered_sessions`.
+    let ordered = ordered_sessions(state).await;
+    let primary = ordered.first().copied().ok_or_else(|| {
         api_error(
             StatusCode::BAD_GATEWAY,
             "backend_unavailable",
@@ -3840,11 +3847,20 @@ fn session_order_key(session: &SessionConfig, liveness: SessionLiveness) -> (Ses
     (liveness, backend_rank)
 }
 
-async fn sessions(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
-    require_device(&state, &headers)?;
-    // Order, don't filter: every configured session stays in the response,
-    // even when nothing is reachable, so a client that reads only
-    // `sessions[0]` never sees `undefined` where it used to see a session.
+/// Every configured session, ordered exactly as `GET /api/sessions` presents
+/// them: liveness first, tmux ahead of herdr as the tiebreaker.
+///
+/// Shared with `gateway_metadata` so the "primary" session it describes for
+/// `/health` and `/api/meta` is always the same one a client that reads
+/// `sessions[0]` from `/api/sessions` actually connects to. Two copies of
+/// this ordering agreeing by construction is the only way to keep them
+/// agreeing at all -- a second, independently-written rank is a second place
+/// for the two endpoints to drift apart.
+///
+/// Orders, never filters: every configured session stays in the result, even
+/// when nothing is reachable, so a client that reads only the first entry
+/// never sees `undefined` where it used to see a session.
+async fn ordered_sessions(state: &AppState) -> Vec<&SessionConfig> {
     let liveness =
         futures::future::join_all(state.config.sessions.iter().map(|session| async move {
             let backend = terminal_backend(session);
@@ -3866,10 +3882,15 @@ async fn sessions(State(state): State<AppState>, headers: HeaderMap) -> ApiResul
         .await;
     let mut order: Vec<usize> = (0..state.config.sessions.len()).collect();
     order.sort_by_key(|&index| session_order_key(&state.config.sessions[index], liveness[index]));
-    let sessions: Vec<&SessionConfig> = order
+    order
         .into_iter()
         .map(|index| &state.config.sessions[index])
-        .collect();
+        .collect()
+}
+
+async fn sessions(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let sessions = ordered_sessions(&state).await;
     Ok(Json(json!({ "sessions": sessions })))
 }
 
@@ -12703,13 +12724,14 @@ mod tests {
         config.sessions.clear();
         upsert_backend_session(&mut config, BackendKind::Herdr, None, None, None).unwrap();
         upsert_backend_session(&mut config, BackendKind::Tmux, None, None, None).unwrap();
-        // `GET /api/sessions` no longer serves in this order -- it reorders by
-        // liveness on every request (see `session_order_key`). This stable
-        // storage order is what's left to matter: the "primary" session
-        // `gateway_metadata` reports for `/health` and `/api/meta`, and the
-        // order `configure_backend list` prints. Keeping tmux first there too
-        // is the harmless, previously-established default, not a competing
-        // ordering rule for the app.
+        // Neither `GET /api/sessions` nor `gateway_metadata`'s "primary"
+        // session for `/health` and `/api/meta` serve in this order any more
+        // -- both reorder by liveness on every request (see
+        // `session_order_key` / `ordered_sessions`). This stable storage
+        // order is what's left to matter: the order `configure_backend list`
+        // prints. Keeping tmux first there too is the harmless,
+        // previously-established default, not a competing ordering rule for
+        // the app.
         assert_eq!(config.sessions[0].backend, BackendKind::Tmux);
         assert_eq!(config.sessions[1].backend, BackendKind::Herdr);
     }
@@ -13317,6 +13339,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(session_ids(&response.0), vec!["herdr-live", "tmux-dead"]);
+    }
+
+    /// The dual-backend defect the final review caught: with tmux dead (or
+    /// merely empty) and herdr live, the app connects to whichever session
+    /// `GET /api/sessions` leads with -- but it validates that connection
+    /// against the metadata `/health`/`/api/meta` describe as "primary".
+    /// Before this fix `gateway_metadata` always read
+    /// `config.sessions.first()`, which is stored order (tmux-first) and
+    /// ignores liveness entirely, so it kept describing the dead tmux
+    /// session -- whose `session_metadata` hardcodes `compatible: true` --
+    /// while the app was actually talking to herdr. The version fence
+    /// `assertSupportedHerdr` exists to enforce was defeated for exactly this
+    /// configuration. `gateway_metadata`'s primary must agree with
+    /// `sessions()`'s first entry.
+    #[tokio::test]
+    async fn gateway_metadata_primary_agrees_with_the_sessions_endpoint() {
+        let herdr = FakePaneListHerdr::start(json!([
+            { "pane_id": "p1", "workspace_id": "w1", "tab_id": "t1" }
+        ]));
+        let mut state = test_state("admin", vec![test_device("d1", "token")]);
+        state.config.sessions = vec![
+            SessionConfig {
+                id: "tmux-dead".into(),
+                label: "tmux".into(),
+                socket_path: std::env::temp_dir()
+                    .join(format!("tmux-absent-{}.sock", uuid::Uuid::new_v4()))
+                    .to_string_lossy()
+                    .into_owned(),
+                backend: BackendKind::Tmux,
+            },
+            herdr.session("herdr-live"),
+        ];
+
+        let metadata = gateway_metadata(&state).await.unwrap();
+        assert_eq!(metadata["backend"]["sessionId"], "herdr-live");
+        assert_eq!(metadata["backend"]["kind"], json!(BackendKind::Herdr));
     }
 
     /// Ordering must never turn into filtering: every configured session is
