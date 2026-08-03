@@ -232,10 +232,18 @@ pub struct PaneOutput {
 /// Which absolute lines of a pane a read actually returned.
 ///
 /// Line 0 is the oldest line the pane still holds and `total` is one past the
-/// newest, so `start == 0` means the reader has reached the top. This always
-/// describes what was served, never what was asked for: a backend that cannot
-/// honour a requested range still reports the tail it did return, which is what
-/// lets one response shape cover both backends without a capability flag.
+/// newest, so `start == 0` means the reader has reached the top. This is
+/// `Some` only where a backend actually served the range it was asked for --
+/// tmux, whose `capture-pane -S/-E` can address an absolute span. A backend
+/// that cannot honour a requested range (herdr, whose `pane.read` has no
+/// range parameter) reports `None` rather than describing a tail it merely
+/// happened to serve: a range built from an unrequested tail is
+/// indistinguishable, on the wire, from one that genuinely satisfied the
+/// request, and `start == 0` on the former would be read as "top reached"
+/// when it is nothing of the kind. `Option<PaneRange>` exists exactly to keep
+/// that distinction, so a client on `None` falls back to the measured paging
+/// behaviour it already has rather than trusting a range that was never
+/// honoured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaneRange {
     pub start: u32,

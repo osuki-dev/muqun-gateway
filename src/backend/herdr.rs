@@ -10,9 +10,8 @@ use tokio::net::UnixStream;
 use super::{
     Agent, AgentStatus, BackendActivity, BackendActivityStream, BackendError, BackendFuture,
     BackendKind, BackendMetadata, CreateTab, CreateWorkspace, OutputFormat, OutputSource, Pane,
-    PaneId, PaneOutput, PaneRange, ReadPane, SplitDirection, SplitPane, StartAgent, StartedAgent,
-    Tab, TabId, TerminalBackend, Workspace, WorkspaceId, Worktree, WorktreePlacement,
-    WorktreeRequest,
+    PaneId, PaneOutput, ReadPane, SplitDirection, SplitPane, StartAgent, StartedAgent, Tab, TabId,
+    TerminalBackend, Workspace, WorkspaceId, Worktree, WorktreePlacement, WorktreeRequest,
 };
 
 pub struct HerdrBackend {
@@ -711,46 +710,34 @@ fn activity_subscriptions(panes: &[Pane]) -> Vec<Value> {
     subscriptions
 }
 
-/// The tail a herdr read returned, expressed as an absolute range.
+/// Turn a herdr `pane.read` text answer into a [`PaneOutput`].
 ///
-/// `scrollback_rows` is herdr's own count where it reports one. Muqun has
-/// measured that count disagreeing with what `pane.read` hands over (a pane
-/// claiming 2765 rows yielding 992 lines), so this does not treat it as
-/// authoritative — it only places it next to the line count it failed to
-/// predict, in one response, where a client can compare them.
+/// `range` is always `None`. herdr's `pane.read` has no range parameter, so
+/// it can never honour a requested `[start, end)` — any range it constructed
+/// could only ever describe the tail it happened to serve, not the span the
+/// caller asked for. A response cannot tell those two apart once `range` is
+/// attached: `start == 0` reads identically whether it means "you asked for
+/// the top" or "this is merely where our unrequested tail began", and the
+/// latter is the false "top of scrollback reached" signal on exactly the
+/// panes the gateway's own ring buffers for (`ScrollbackStore::keeps` keys
+/// off the same `max_offset_from_bottom == 0` herdr reports here) — the ring
+/// simultaneously advertises real depth for that pane in its entity
+/// (`ScrollbackStore::amend`), so a fabricated `range` would have the read
+/// and the entity disagree about whether there is more to pull.
 ///
-/// When herdr reports no count at all, `total` is unknown, not "equal to what
-/// was served" — synthesizing one would print `start: 0` on every read
-/// (`total.saturating_sub(served)` with `total == served` is always zero),
-/// which is the contract's signal for "the oldest line has been reached".
-/// That is false on a pane holding thousands of lines and would silently stop
-/// backward paging on herdr the moment a client starts trusting `start == 0`.
-/// So this reports `range: None` instead: `Option<PaneRange>` exists exactly
-/// for "this backend cannot say", and callers already fall back to the
-/// measured behaviour they use today when they see `None`.
-fn herdr_pane_output(text: &str, scrollback_rows: Option<u32>) -> PaneOutput {
-    let served = text.lines().count() as u32;
-    let range = scrollback_rows.map(|total| {
-        let total = total.max(served);
-        PaneRange {
-            start: total.saturating_sub(served),
-            end: total,
-            total,
-        }
-    });
+/// Leaving it `None` unconditionally is what makes `range` mean one thing
+/// across both backends: *the backend served the range you requested*.
+/// Callers already have a measured fallback for herdr today (paging by
+/// repeated `lines` reads), and `None` is what keeps them on it.
+fn herdr_pane_output(text: &str) -> PaneOutput {
     PaneOutput {
         text: text.to_owned(),
         revision: None,
-        range,
+        range: None,
     }
 }
 
 /// Parse a herdr `pane.read` response into a [`PaneOutput`].
-///
-/// Pulled out of [`HerdrBackend::read_pane`] so the pointer probing --
-/// including the `scroll.max_offset_from_bottom` lookup that is the only path
-/// able to produce `Some(range)` from herdr -- can be exercised with fixture
-/// `Value`s instead of a live socket.
 fn pane_output_from_response(response: &Value) -> Result<PaneOutput, BackendError> {
     let text = [
         "/result/read/output",
@@ -764,16 +751,9 @@ fn pane_output_from_response(response: &Value) -> Result<PaneOutput, BackendErro
     let revision = ["/result/read/revision", "/result/revision"]
         .into_iter()
         .find_map(|pointer| response.pointer(pointer).and_then(Value::as_u64));
-    let scrollback_rows = [
-        "/result/read/scroll/max_offset_from_bottom",
-        "/result/scroll/max_offset_from_bottom",
-    ]
-    .into_iter()
-    .find_map(|pointer| response.pointer(pointer).and_then(Value::as_u64))
-    .and_then(|rows| u32::try_from(rows).ok());
     Ok(PaneOutput {
         revision,
-        ..herdr_pane_output(text, scrollback_rows)
+        ..herdr_pane_output(text)
     })
 }
 
@@ -892,38 +872,27 @@ mod tests {
     }
 
     #[test]
-    fn herdr_range_describes_the_tail_it_returned_not_the_one_requested() {
-        // The daemon has no range parameter, so a range request is answered with a
-        // tail. Reporting that honestly is what lets the client stop asking.
-        let output = herdr_pane_output("line1\nline2\nline3", Some(900));
-        let range = output.range.unwrap();
-        assert_eq!(range.total, 900);
-        assert_eq!(range.end, 900);
-        assert_eq!(range.start, 897);
+    fn herdr_never_constructs_a_range() {
+        // herdr's `pane.read` has no range parameter, so it can never honour
+        // one it was asked for -- and any range it invented from a tail it
+        // merely happened to serve would be indistinguishable, on the wire,
+        // from a genuinely honoured request. `None` unconditionally is the
+        // only answer that does not lie about that, on every pane shape:
+        // a short read, a long one, and the empty read a fresh pane starts
+        // from.
+        assert_eq!(herdr_pane_output("line1\nline2\nline3").range, None);
+        assert_eq!(herdr_pane_output("line1\nline2").range, None);
+        assert_eq!(herdr_pane_output("").range, None);
     }
 
     #[test]
-    fn herdr_range_is_none_when_the_daemon_reports_no_total() {
-        // total == served would print start: 0 unconditionally, which is the
-        // contract's "oldest line reached" signal. That is false on a pane
-        // holding thousands of lines herdr just declined to count, so an
-        // unknown total must stay None rather than turn into a fabricated
-        // range -- None is what lets a client fall back to the measured
-        // paging behaviour it already has for herdr today.
-        let output = herdr_pane_output("line1\nline2", None);
-        assert_eq!(output.range, None);
-    }
-
-    #[test]
-    fn pane_output_from_response_reports_no_range_when_herdr_carries_no_scroll_data() {
-        let response = json!({ "result": { "read": { "text": "line1\nline2", "revision": 9 } } });
-        let output = pane_output_from_response(&response).unwrap();
-        assert_eq!(output.revision, Some(9));
-        assert_eq!(output.range, None);
-    }
-
-    #[test]
-    fn pane_output_from_response_turns_a_nested_scroll_count_into_a_range() {
+    fn pane_output_from_response_never_reports_a_range() {
+        // Even where herdr's response nests a `scroll.max_offset_from_bottom`
+        // count next to the read -- the field this used to read as a
+        // fabricated tail-of-total -- it must not turn into a `range`. That
+        // count is Herdr's own, unrelated to what a range would mean here,
+        // and this backend has no way to honour a requested range regardless
+        // of what herdr reports.
         let response = json!({
             "result": {
                 "read": {
@@ -934,33 +903,8 @@ mod tests {
             }
         });
         let output = pane_output_from_response(&response).unwrap();
-        assert_eq!(
-            output.range,
-            Some(PaneRange {
-                start: 897,
-                end: 900,
-                total: 900
-            })
-        );
-    }
-
-    #[test]
-    fn pane_output_from_response_turns_a_flat_scroll_count_into_a_range() {
-        let response = json!({
-            "result": {
-                "text": "line1\nline2\nline3",
-                "scroll": { "max_offset_from_bottom": 900 }
-            }
-        });
-        let output = pane_output_from_response(&response).unwrap();
-        assert_eq!(
-            output.range,
-            Some(PaneRange {
-                start: 897,
-                end: 900,
-                total: 900
-            })
-        );
+        assert_eq!(output.revision, Some(4));
+        assert_eq!(output.range, None);
     }
 
     #[test]
