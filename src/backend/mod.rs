@@ -8,6 +8,7 @@ mod herdr;
 mod model;
 mod registry;
 mod tmux;
+mod tmux_wire;
 
 pub mod compat;
 
@@ -21,3 +22,4 @@ pub use model::{
 };
 pub use registry::BackendRegistry;
 pub use tmux::TmuxBackend;
+pub use tmux_wire::TmuxWireIds;

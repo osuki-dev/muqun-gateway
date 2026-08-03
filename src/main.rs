@@ -61,7 +61,8 @@ use backend::{
     OutputFormat as BackendOutputFormat, OutputSource as BackendOutputSource,
     PaneId as BackendPaneId, ReadPane as BackendReadPane, SplitDirection as BackendSplitDirection,
     SplitPane as BackendSplitPane, StartAgent as BackendStartAgent, TabId as BackendTabId,
-    TerminalBackend, WorkspaceId as BackendWorkspaceId, WorktreeRequest as BackendWorktreeRequest,
+    TerminalBackend, TmuxWireIds, WorkspaceId as BackendWorkspaceId,
+    WorktreeRequest as BackendWorktreeRequest,
 };
 
 const CONFIG_FILE: &str = "config.json";
@@ -8449,8 +8450,19 @@ fn asset_created_payload(entry: &AssetEntry, asset_type: AssetType) -> String {
     content_envelope(json!({ "asset": asset_json(entry, asset_type) })).to_string()
 }
 
+/// The only call site that turns a session into a live backend. tmux ids
+/// collide with URL percent-encoding past pane 9 (see `backend::tmux_wire`),
+/// so a tmux session is wrapped here to translate ids to and from wire form
+/// before any handler sees them -- a future handler that reaches its backend
+/// through this function gets the translation automatically, with nothing to
+/// remember. herdr sessions are returned unwrapped: herdr's own ids already
+/// work today and must not change.
 fn terminal_backend(session: &SessionConfig) -> Box<dyn TerminalBackend> {
-    backend_registry().connect(session.backend, &session.socket_path)
+    let backend = backend_registry().connect(session.backend, &session.socket_path);
+    match session.backend {
+        BackendKind::Tmux => Box::new(TmuxWireIds::new(backend)),
+        BackendKind::Herdr => backend,
+    }
 }
 
 fn backend_api_error(error: BackendError) -> (StatusCode, Json<Value>) {
