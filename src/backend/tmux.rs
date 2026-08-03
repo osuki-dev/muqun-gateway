@@ -1340,6 +1340,53 @@ mod tests {
         assert_eq!(third_page.text.lines().count(), 720);
         assert!(third_page.text.ends_with(&first_page.text));
 
+        let metrics = backend.pane_metrics(&split.id).await.unwrap();
+        let total = metrics.0 + metrics.1;
+        let lower = backend
+            .read_pane(&ReadPane {
+                pane_id: split.id.clone(),
+                source: OutputSource::RecentUnwrapped,
+                format: OutputFormat::Text,
+                lines: 0,
+                start: Some(total - 200),
+                end: Some(total - 100),
+            })
+            .await
+            .unwrap();
+        let upper = backend
+            .read_pane(&ReadPane {
+                pane_id: split.id.clone(),
+                source: OutputSource::RecentUnwrapped,
+                format: OutputFormat::Text,
+                lines: 0,
+                start: Some(total - 100),
+                end: Some(total),
+            })
+            .await
+            .unwrap();
+        let spanning = backend
+            .read_pane(&ReadPane {
+                pane_id: split.id.clone(),
+                source: OutputSource::RecentUnwrapped,
+                format: OutputFormat::Text,
+                lines: 0,
+                start: Some(total - 200),
+                end: Some(total),
+            })
+            .await
+            .unwrap();
+        // Disjoint pages tile the span exactly: this is the property the whole
+        // change exists for, and the one a growing tail could never have.
+        //
+        // Note: unlike the tail (no-range) path, which joins lines with
+        // `.lines().join("\n")` and drops any trailing newline, the
+        // range-addressed path in `read_pane` returns tmux's raw
+        // `capture-pane` output verbatim, and tmux terminates every captured
+        // line -- including the last -- with `\n`. So `lower.text` already
+        // ends in `\n`; concatenating with no separator is what tiles.
+        assert_eq!(format!("{}{}", lower.text, upper.text), spanning.text);
+        assert_eq!(lower.range.unwrap().end, upper.range.unwrap().start);
+
         backend.close_workspace(&workspace.id).await.unwrap();
     }
 }

@@ -88,7 +88,9 @@ Run `cargo fmt --check`, `cargo test --offline`, `cargo clippy --offline --all-t
 -- -D warnings`, and `cargo build --release --offline`. The ignored Herdr and
 tmux contracts use isolated sockets and should be run when adapter behavior
 changes. Live Herdr integration checks should remain read-only; write checks
-belong on isolated adapter fixtures.
+belong on isolated adapter fixtures. The tmux contract test now also asserts
+that disjoint absolute ranges tile a pane exactly; it needs a real tmux
+server, so it stays behind `--ignored`.
 
 Important quirks:
 
