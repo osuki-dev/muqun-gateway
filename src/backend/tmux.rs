@@ -19,6 +19,13 @@ const FIELD_SEPARATOR: char = '\u{1f}';
 /// caller cannot ask tmux for a hundred thousand rows.
 const MAX_CAPTURE_LINES: u32 = 5000;
 
+/// Initial window size, in rows, probed on each side of a boundary to find
+/// the logical-line cut it should snap to. Doubles (capped at
+/// `MAX_CAPTURE_LINES`) when a probe is inconclusive. Most wrapped lines are
+/// a handful of physical rows, so the common case resolves from this first,
+/// smallest window at the cost of one extra `capture-pane` call.
+const WRAP_SNAP_WINDOW: u32 = 64;
+
 #[derive(Clone)]
 pub struct TmuxBackend {
     binary: PathBuf,
@@ -120,6 +127,137 @@ impl TmuxBackend {
 
     fn format(fields: &[&str]) -> String {
         fields.join(&FIELD_SEPARATOR.to_string())
+    }
+
+    /// Wrap flags for absolute physical rows `[lo, hi)`, oldest first.
+    ///
+    /// Un-joined and without `-e`: this exists purely to read tmux's own
+    /// per-row `W` flag (see `row_flag_is_wrapped`), never to read content.
+    /// Combining `-F` with `-J` corrupts the text -- measured live, the flag
+    /// column leaks into the joined line instead of being dropped -- so this
+    /// must stay a separate capture from the one that serves `PaneOutput.text`.
+    async fn wrap_flags(
+        &self,
+        pane: &PaneId,
+        history_size: u32,
+        lo: u32,
+        hi: u32,
+    ) -> Result<Vec<bool>, BackendError> {
+        if lo >= hi {
+            return Ok(Vec::new());
+        }
+        let (s, e) = capture_bounds(lo, hi, history_size);
+        let output = self
+            .output(&[
+                "capture-pane".to_owned(),
+                "-p".to_owned(),
+                "-F".to_owned(),
+                "-S".to_owned(),
+                s.to_string(),
+                "-E".to_owned(),
+                e.to_string(),
+                "-t".to_owned(),
+                pane.as_str().to_owned(),
+            ])
+            .await?;
+        Ok(output.lines().map(row_flag_is_wrapped).collect())
+    }
+
+    /// The largest valid cut position `<= p` (see `floor_within`), widening
+    /// the probed window and retrying for as long as it stays inconclusive.
+    ///
+    /// The common case -- `p` already a valid cut, which is every position in
+    /// content that never wraps -- resolves from the first, smallest window.
+    /// The window is capped at `MAX_CAPTURE_LINES`: a single logical line
+    /// wrapping across more rows than that is already a pathological input
+    /// this backend clamps elsewhere, so this best-effort's at the cap rather
+    /// than growing without bound.
+    async fn floor_cut(
+        &self,
+        pane: &PaneId,
+        history_size: u32,
+        total: u32,
+        p: u32,
+    ) -> Result<u32, BackendError> {
+        if p == 0 || p >= total {
+            return Ok(p.min(total));
+        }
+        let mut window = WRAP_SNAP_WINDOW;
+        loop {
+            let lo = p.saturating_sub(window);
+            let flags = self.wrap_flags(pane, history_size, lo, p).await?;
+            if let Some(q) = floor_within(&flags, lo, p) {
+                return Ok(q);
+            }
+            if window >= MAX_CAPTURE_LINES {
+                return Ok(lo);
+            }
+            window = window.saturating_mul(2).min(MAX_CAPTURE_LINES);
+        }
+    }
+
+    /// The smallest valid cut position `>= p` (see `ceil_within`), widening
+    /// the probed window and retrying for as long as it stays inconclusive.
+    async fn ceil_cut(
+        &self,
+        pane: &PaneId,
+        history_size: u32,
+        total: u32,
+        p: u32,
+    ) -> Result<u32, BackendError> {
+        if p == 0 || p >= total {
+            return Ok(p.min(total));
+        }
+        let mut window = WRAP_SNAP_WINDOW;
+        loop {
+            let hi = p.saturating_add(window).min(total);
+            let flags = self.wrap_flags(pane, history_size, p - 1, hi).await?;
+            let reached_total = (hi == total).then_some(total);
+            if let Some(q) = ceil_within(&flags, p, reached_total) {
+                return Ok(q);
+            }
+            if window >= MAX_CAPTURE_LINES {
+                return Ok(hi);
+            }
+            window = window.saturating_mul(2).min(MAX_CAPTURE_LINES);
+        }
+    }
+
+    /// Snap a requested `[start, end)` outward so it never splits a logical
+    /// line that `-J` would otherwise have joined -- physical-row addressing
+    /// and logical-line joining agree at every reported boundary.
+    ///
+    /// Both bounds resolve through the same position-only `floor_cut`, so two
+    /// adjacent reads sharing a boundary value always resolve it to the same
+    /// row: whichever page is asked for first still ends exactly where the
+    /// second begins, and paging stays disjoint rather than trading a split
+    /// fragment for a duplicated line. The one case that rule can't serve --
+    /// `start` and `end` both landing inside the very same wrapped run, which
+    /// would otherwise collapse the range to nothing -- falls back to
+    /// `ceil_cut` so the read still returns that run whole rather than
+    /// silently returning no content at all.
+    async fn snap_to_logical_lines(
+        &self,
+        pane: &PaneId,
+        history_size: u32,
+        range: PaneRange,
+    ) -> Result<PaneRange, BackendError> {
+        let start = self
+            .floor_cut(pane, history_size, range.total, range.start)
+            .await?;
+        let mut end = self
+            .floor_cut(pane, history_size, range.total, range.end)
+            .await?;
+        if end <= start {
+            end = self
+                .ceil_cut(pane, history_size, range.total, range.end)
+                .await?;
+        }
+        Ok(PaneRange {
+            start,
+            end,
+            total: range.total,
+        })
     }
 
     /// `(history_size, pane_height)` for one pane.
@@ -339,6 +477,19 @@ impl TerminalBackend for TmuxBackend {
                     request.end.expect("checked by wants_absolute_range"),
                     total,
                 );
+                // Only `RecentUnwrapped` joins physical rows with `-J`, so
+                // only it can have a boundary land inside a wrapped line
+                // instead of between two logical ones. `Recent` and
+                // `Detection` address the same physical rows without
+                // joining, where no snap is needed: cutting a wrapped line's
+                // physical rows apart there is simply reading two physical
+                // rows, not splitting a logical one.
+                let range = if request.source == OutputSource::RecentUnwrapped {
+                    self.snap_to_logical_lines(&request.pane_id, history_size, range)
+                        .await?
+                } else {
+                    range
+                };
                 let (s, e) = capture_bounds(range.start, range.end, history_size);
                 args.push("-S".to_owned());
                 args.push(s.to_string());
@@ -890,6 +1041,62 @@ fn strip_trailing_newline(mut text: String) -> String {
     text
 }
 
+/// Whether a `capture-pane -F` row continues onto the next physical row.
+///
+/// `-F` prefixes each row with its flag column -- one or more characters,
+/// e.g. `-`, `X`, or `WX` -- then a single space, then the row's own
+/// content. `W` is tmux's own record of a wrap: measured live, it is set
+/// exactly on a row whose content continues onto the next physical row
+/// without a line break, and NOT set on a row that merely happens to fill
+/// the pane's full width before an explicit newline. That distinction is why
+/// this flag is used instead of a width heuristic, which cannot tell those
+/// two cases apart.
+fn row_flag_is_wrapped(line: &str) -> bool {
+    line.split(' ').next().unwrap_or_default().contains('W')
+}
+
+/// The largest valid cut position `<= p`, using wrap flags already fetched
+/// for absolute rows `[lo, p)` (`flags[i]` is whether row `lo + i` wraps
+/// into row `lo + i + 1`).
+///
+/// A position `q` is a valid cut when nothing wraps into it -- cutting there
+/// never splits a logical line. Content that never wraps has no positions
+/// where anything wraps into it, so every `p` is already valid and this is a
+/// no-op: the aligned case and all unwrapped content are unaffected.
+///
+/// Returns `None` when the window itself isn't wide enough to tell -- every
+/// row down to `lo` is still mid-run and `lo > 0` -- so the caller must widen
+/// the window and retry.
+fn floor_within(flags: &[bool], lo: u32, p: u32) -> Option<u32> {
+    let mut q = p;
+    while q > lo {
+        if !flags[(q - 1 - lo) as usize] {
+            return Some(q);
+        }
+        q -= 1;
+    }
+    (lo == 0).then_some(0)
+}
+
+/// The smallest valid cut position `>= p`, using wrap flags already fetched
+/// for absolute rows `[p - 1, p - 1 + flags.len())` (`flags[i]` is whether
+/// row `p - 1 + i` wraps into row `p + i`).
+///
+/// `end_if_window_reached_total` is `Some(total)` when the fetched window
+/// already reaches the pane's end, so running off the window's edge without
+/// resolving still has an answer (`total` is always a valid cut). Otherwise
+/// it is `None`, and the caller must widen the window and retry.
+fn ceil_within(flags: &[bool], p: u32, end_if_window_reached_total: Option<u32>) -> Option<u32> {
+    let mut k = 0;
+    while k < flags.len() && flags[k] {
+        k += 1;
+    }
+    if k < flags.len() {
+        return Some(p + k as u32);
+    }
+    end_if_window_reached_total
+}
+
 fn text_revision(text: &str) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut hasher);
@@ -1092,6 +1299,75 @@ mod tests {
         assert_eq!(capture_bounds(463, 464, 463), (0, 0));
         // A pane with no scrollback at all.
         assert_eq!(capture_bounds(0, 41, 0), (0, 40));
+    }
+
+    #[test]
+    fn wrap_flag_column_is_parsed_from_capture_pane_dash_f_output() {
+        // Measured live against tmux 3.7b: `capture-pane -F` prefixes each row
+        // with its flag column (possibly several characters, e.g. `WX`), a
+        // single space, then the row's own content. `W` means the row
+        // continues onto the next physical row.
+        assert!(row_flag_is_wrapped("W line 001 xxxxx"));
+        assert!(row_flag_is_wrapped("WX emoji-wrap 🎉AAA"));
+        assert!(!row_flag_is_wrapped("- xxxxx"));
+        assert!(!row_flag_is_wrapped("X .dotfiles main "));
+        // A blank captured row is still `flag SPACE` with empty content.
+        assert!(!row_flag_is_wrapped("- "));
+    }
+
+    #[test]
+    fn floor_within_is_a_no_op_when_nothing_wraps() {
+        // Content that never wraps must resolve to itself: the aligned case
+        // and all unwrapped content must be unaffected by snapping.
+        let flags = [false, false, false, false];
+        assert_eq!(floor_within(&flags, 0, 4), Some(4));
+        assert_eq!(floor_within(&flags, 0, 2), Some(2));
+        assert_eq!(floor_within(&flags, 0, 0), Some(0));
+    }
+
+    #[test]
+    fn floor_within_rounds_a_boundary_back_to_the_wrapped_lines_start() {
+        // Rows 2 and 3 are one wrapped line: row 2 continues into row 3.
+        // flags[i] means absolute row (lo + i) wraps into row (lo + i + 1).
+        let flags = [false, false, true, false, false];
+        // lo = 0, so flags[i] describes row i.
+        // A boundary landing inside the wrap (row 3) must snap back to its start (row 2).
+        assert_eq!(floor_within(&flags, 0, 3), Some(2));
+        // A boundary already at a valid cut is left alone.
+        assert_eq!(floor_within(&flags, 0, 2), Some(2));
+        assert_eq!(floor_within(&flags, 0, 4), Some(4));
+    }
+
+    #[test]
+    fn floor_within_returns_none_when_the_window_does_not_reach_a_resolved_boundary() {
+        // The whole window, right up to its own lower edge, is one unbroken
+        // wrapped run: the caller cannot tell where the run began and must
+        // widen the window and retry.
+        let flags = [true, true, true];
+        assert_eq!(floor_within(&flags, 10, 13), None);
+    }
+
+    #[test]
+    fn ceil_within_is_a_no_op_when_nothing_wraps() {
+        // flags describe rows starting at (p - 1); here p = 5, so flags[0] is
+        // row 4's wrap state.
+        let flags = [false, false, false];
+        assert_eq!(ceil_within(&flags, 5, Some(8)), Some(5));
+    }
+
+    #[test]
+    fn ceil_within_rounds_a_boundary_forward_past_the_wrapped_run() {
+        // p = 5 lands inside a run: row 4 (flags[0]) wraps into row 5, and
+        // row 5 (flags[1]) wraps into row 6, but row 6 (flags[2]) does not
+        // wrap further -- the run ends at row 6, so the next valid cut is 7.
+        let flags = [true, true, false];
+        assert_eq!(ceil_within(&flags, 5, Some(8)), Some(7));
+    }
+
+    #[test]
+    fn ceil_within_returns_none_when_the_window_does_not_resolve_and_has_not_reached_total() {
+        let flags = [true, true, true];
+        assert_eq!(ceil_within(&flags, 5, None), None);
     }
 
     #[test]
@@ -1611,27 +1887,130 @@ mod tests {
         // Misaligned: the boundary sits inside one wrapped line's two
         // physical rows. Each side of the split only ever sees its own half
         // of that capture-pane invocation, so `-J` cannot join across the
-        // split -- the wrapped line comes back as two separate fragments
-        // instead of the one logical line `spanning` shows. This is the
-        // known gap the final review surfaced: physical-row addressing and
-        // logical-line joining disagree exactly at a wrap, and nothing in
-        // `read_pane` detects or corrects for it today.
+        // split on its own -- but `read_pane` now snaps a boundary landing
+        // inside a wrapped line outward to the logical-line boundary it
+        // belongs to, so the split never happens and tiling holds exactly,
+        // the same as the aligned case above.
         let misaligned = base + 41;
         let lower = read_range(0, misaligned).await;
         let upper = read_range(misaligned, total).await;
         let concatenated = format!("{}\n{}", lower.text, upper.text);
-        assert_ne!(
+        assert_eq!(
             concatenated, spanning.text,
-            "a boundary landing inside a wrapped line was expected to break tiling; \
-             if this now passes, the wrap-boundary gap this test documents has been fixed \
-             and this assertion should flip to assert_eq!"
+            "a boundary landing inside a wrapped line must still tile exactly: read_pane \
+             is expected to snap it outward to the enclosing logical line's boundary"
+        );
+
+        // `range` must keep meaning "what was served": since the snap moved
+        // the actual cut from `misaligned` to the wrapped line's real
+        // boundary, both sides must report that snapped position, not the
+        // requested one -- and they must agree with each other, so a client
+        // comparing consecutive pages' ranges sees them as genuinely
+        // disjoint and adjacent, not just happens-to-tile text.
+        let lower_range = lower.range.unwrap();
+        let upper_range = upper.range.unwrap();
+        assert_eq!(
+            lower_range.end, upper_range.start,
+            "snapping must report honestly: adjacent pages' reported ranges must still \
+             meet exactly at the boundary that was actually served"
+        );
+        assert_ne!(
+            lower_range.end, misaligned,
+            "a snapped read must report the boundary it actually served, not the one \
+             that was requested"
+        );
+
+        backend.close_workspace(&workspace.id).await.unwrap();
+    }
+
+    /// `range_tiling_across_a_wrapped_line_boundary` only ever asks for wide
+    /// pages, so a boundary's `floor_cut` never lands past the start of the
+    /// same wrapped run the *other* boundary already floored to -- the
+    /// ordinary two-row wrap there is enough to prove tiling, but never
+    /// exercises `snap_to_logical_lines`'s fallback. This drives a
+    /// three-physical-row logical line and asks for a slice that starts and
+    /// ends strictly inside it, touching neither the run's first row nor its
+    /// last: both bounds floor to the same position (the run's start), which
+    /// would otherwise collapse the read to nothing. It must instead fall
+    /// back to serving the whole run.
+    #[tokio::test]
+    #[ignore = "requires a tmux server"]
+    async fn range_wholly_inside_a_wrapped_run_falls_back_to_the_whole_run() {
+        let (backend, workspace) = contract_workspace().await;
+        let panes = backend.list_panes().await.unwrap();
+        let pane = panes
+            .iter()
+            .find(|p| p.workspace_id == workspace.id)
+            .unwrap()
+            .clone();
+
+        // "wraprun " (8 columns) plus 221 `x`s is 229 columns: in an
+        // 80-column pane that is ceil(229 / 80) = 3 physical rows, none of
+        // them full only by coincidence -- the label makes the row locatable
+        // and the run long enough that an interior slice can miss both ends.
+        backend
+            .send_text(
+                &pane.id,
+                "clear; printf 'wraprun %s\\n' \"$(printf 'x%.0s' {1..221})\"",
+            )
+            .await
+            .unwrap();
+        backend
+            .send_keys(&pane.id, &["Enter".to_owned()])
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let (history, height) = backend.pane_metrics(&pane.id).await.unwrap();
+        let total = history + height;
+
+        let physical = backend
+            .read_pane(&ReadPane {
+                pane_id: pane.id.clone(),
+                source: OutputSource::Recent,
+                format: OutputFormat::Text,
+                lines: total,
+                start: Some(0),
+                end: Some(total),
+            })
+            .await
+            .unwrap();
+        let physical_rows: Vec<&str> = physical.text.lines().collect();
+        let base = physical_rows
+            .iter()
+            .position(|row| row.starts_with("wraprun "))
+            .expect("the wrapped run's first physical row") as u32;
+
+        // The run's middle row alone: strictly inside on both sides.
+        let interior = backend
+            .read_pane(&ReadPane {
+                pane_id: pane.id.clone(),
+                source: OutputSource::RecentUnwrapped,
+                format: OutputFormat::Text,
+                lines: total,
+                start: Some(base + 1),
+                end: Some(base + 2),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            interior.range,
+            Some(PaneRange {
+                start: base,
+                end: base + 3,
+                total
+            }),
+            "a request wholly inside a wrapped run must be reported as the whole run, \
+             not the interior slice that was asked for"
         );
         assert_eq!(
-            concatenated.lines().count(),
-            spanning.text.lines().count() + 1,
-            "the split wrapped line should show up as one extra fragment, not lost or \
-             duplicated content"
+            interior.text.lines().count(),
+            1,
+            "the whole run must come back joined into its one logical line"
         );
+        assert!(interior.text.starts_with("wraprun "));
+        assert_eq!(interior.text.matches('x').count(), 221);
 
         backend.close_workspace(&workspace.id).await.unwrap();
     }
