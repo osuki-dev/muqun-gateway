@@ -980,6 +980,59 @@ mod tests {
         assert_eq!(strip_grid_padding(""), "");
     }
 
+    /// The app always requests `format: 'ansi'`, so every existing test above
+    /// -- which feeds plain text -- proves nothing about whether padding
+    /// removal runs at all in production. This fixture is shaped like what a
+    /// live, isolated `tmux capture-pane -p -e -J` actually emits for a
+    /// full-width colored row: verified against a real tmux 3.7b on a private
+    /// socket (never the developer's default server) at a 357-column pane --
+    /// the width the module doc cites -- with a reverse-video composer row
+    /// and a dimmed status row, each padded to the pane width with real
+    /// (written) trailing spaces.
+    ///
+    /// The measured placement, across many such captures: tmux always opens
+    /// an SGR run right before the characters it colors and never appends a
+    /// closing escape after trailing padding with nothing following it in
+    /// the same row -- the reset for a colored row shows up at the *head* of
+    /// whatever content needs different attributes next (another row, or
+    /// nothing at all), never orphaned at this row's tail. So the escape
+    /// sits before the real content, the padding trails after it same as
+    /// plain text, and `trim_end_matches` reaches it exactly as it does on
+    /// the plain-text fixtures above. This is not a no-op on the format the
+    /// app actually uses.
+    #[test]
+    fn grid_padding_is_stripped_from_a_realistic_ansi_capture() {
+        const PANE_WIDTH: usize = 357;
+        let composer_prefix = "\x1b[7m > composer text";
+        let status_prefix = "\x1b[2m auto mode on";
+        let composer_row = format!(
+            "{composer_prefix}{}",
+            " ".repeat(PANE_WIDTH - composer_prefix.len())
+        );
+        let status_row = format!(
+            "{status_prefix}{}",
+            " ".repeat(PANE_WIDTH - status_prefix.len())
+        );
+        let captured = format!("{composer_row}\n{status_row}");
+
+        let stripped = strip_grid_padding(&captured);
+
+        assert_eq!(stripped, format!("{composer_prefix}\n{status_prefix}"));
+        // The escape sequences that open each colored run survive untouched.
+        assert!(stripped.contains("\x1b[7m"));
+        assert!(stripped.contains("\x1b[2m"));
+        // What `PaneRange` depends on: stripping padding must not change how
+        // many lines the text holds.
+        assert_eq!(stripped.lines().count(), captured.lines().count());
+
+        let before = captured.len();
+        let after = stripped.len();
+        println!(
+            "realistic ANSI capture: {before} bytes -> {after} bytes ({:.0}% removed)",
+            (1.0 - after as f64 / before as f64) * 100.0
+        );
+    }
+
     #[test]
     fn agent_detection_is_conservative() {
         assert_eq!(detected_agent(Some("claude")), Some("claude".into()));
@@ -1444,6 +1497,141 @@ mod tests {
         // for the concatenation to tile the spanning read.
         assert_eq!(format!("{}\n{}", lower.text, upper.text), spanning.text);
         assert_eq!(lower.range.unwrap().end, upper.range.unwrap().start);
+
+        backend.close_workspace(&workspace.id).await.unwrap();
+    }
+
+    /// The tiling assertion above is only proven against `seq 1 800`, which
+    /// never wraps in an 80-column pane. `-J` joins wrapped *physical* rows
+    /// into one logical line, but `[start, end)` still addresses physical
+    /// rows (`history_size + pane_height`), so nothing stops a client-chosen
+    /// boundary from landing between the two physical rows of one wrapped
+    /// logical line rather than between two logical lines. This proves what
+    /// happens on both sides of that boundary: aligned with the wrap, and
+    /// landing inside it.
+    #[tokio::test]
+    #[ignore = "requires a tmux server"]
+    async fn range_tiling_across_a_wrapped_line_boundary() {
+        let (backend, workspace) = contract_workspace().await;
+        let panes = backend.list_panes().await.unwrap();
+        let pane = panes
+            .iter()
+            .find(|p| p.workspace_id == workspace.id)
+            .unwrap()
+            .clone();
+
+        // Every logical line here is 129 columns (a 9-column label plus 120
+        // `x`s) in the default 80-column pane, so every one of them wraps
+        // into exactly two physical rows -- a fixed, known ratio the rest of
+        // this test leans on.
+        const LOGICAL_LINES: usize = 60;
+        backend
+            .send_text(
+                &pane.id,
+                &format!(
+                    "clear; for i in $(seq 1 {LOGICAL_LINES}); do printf 'line %03d %s\\n' \"$i\" \"$(printf 'x%.0s' {{1..120}})\"; done"
+                ),
+            )
+            .await
+            .unwrap();
+        backend
+            .send_keys(&pane.id, &["Enter".to_owned()])
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+        let (history, height) = backend.pane_metrics(&pane.id).await.unwrap();
+        let total = history + height;
+
+        // A physical (un-joined) read of the whole pane, so each wrapped
+        // line's two physical rows come back as two separate entries and
+        // `line 001`'s row can be located exactly -- `Recent` never adds
+        // `-J`, unlike the `RecentUnwrapped` source everything else here
+        // uses.
+        let physical = backend
+            .read_pane(&ReadPane {
+                pane_id: pane.id.clone(),
+                source: OutputSource::Recent,
+                format: OutputFormat::Text,
+                lines: total,
+                start: Some(0),
+                end: Some(total),
+            })
+            .await
+            .unwrap();
+        let physical_rows: Vec<&str> = physical.text.lines().collect();
+        assert_eq!(physical_rows.len() as u32, total);
+        let base = physical_rows
+            .iter()
+            .position(|row| row.starts_with("line 001 "))
+            .expect("the wrapped block's first physical row") as u32;
+
+        let spanning = backend
+            .read_pane(&ReadPane {
+                pane_id: pane.id.clone(),
+                source: OutputSource::RecentUnwrapped,
+                format: OutputFormat::Text,
+                lines: total,
+                start: Some(0),
+                end: Some(total),
+            })
+            .await
+            .unwrap();
+
+        let read_range = |start: u32, end: u32| {
+            let backend = &backend;
+            let pane_id = pane.id.clone();
+            async move {
+                backend
+                    .read_pane(&ReadPane {
+                        pane_id,
+                        source: OutputSource::RecentUnwrapped,
+                        format: OutputFormat::Text,
+                        lines: total,
+                        start: Some(start),
+                        end: Some(end),
+                    })
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // Aligned: the boundary sits between two logical lines (an even
+        // number of physical rows into the wrapped block). Tiling holds,
+        // same as the unwrapped case above.
+        let aligned = base + 40;
+        let lower = read_range(0, aligned).await;
+        let upper = read_range(aligned, total).await;
+        assert_eq!(
+            format!("{}\n{}", lower.text, upper.text),
+            spanning.text,
+            "a boundary between two logical lines must still tile exactly"
+        );
+
+        // Misaligned: the boundary sits inside one wrapped line's two
+        // physical rows. Each side of the split only ever sees its own half
+        // of that capture-pane invocation, so `-J` cannot join across the
+        // split -- the wrapped line comes back as two separate fragments
+        // instead of the one logical line `spanning` shows. This is the
+        // known gap the final review surfaced: physical-row addressing and
+        // logical-line joining disagree exactly at a wrap, and nothing in
+        // `read_pane` detects or corrects for it today.
+        let misaligned = base + 41;
+        let lower = read_range(0, misaligned).await;
+        let upper = read_range(misaligned, total).await;
+        let concatenated = format!("{}\n{}", lower.text, upper.text);
+        assert_ne!(
+            concatenated, spanning.text,
+            "a boundary landing inside a wrapped line was expected to break tiling; \
+             if this now passes, the wrap-boundary gap this test documents has been fixed \
+             and this assertion should flip to assert_eq!"
+        );
+        assert_eq!(
+            concatenated.lines().count(),
+            spanning.text.lines().count() + 1,
+            "the split wrapped line should show up as one extra fragment, not lost or \
+             duplicated content"
+        );
 
         backend.close_workspace(&workspace.id).await.unwrap();
     }
