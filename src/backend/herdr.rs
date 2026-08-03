@@ -599,6 +599,8 @@ fn pane_from_json(value: &Value) -> Result<Pane, BackendError> {
                     .and_then(Value::as_u64)
                     .and_then(|rows| u32::try_from(rows).ok())
             }),
+        // Herdr's own envelope has never carried this; nothing to read.
+        alternate_on: None,
     })
 }
 

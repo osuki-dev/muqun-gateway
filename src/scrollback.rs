@@ -530,6 +530,13 @@ pub struct ScrollbackStore {
     /// Panes Herdr reports no scrollback for, by `session/pane`. Only these are
     /// ever recorded or answered from.
     kept: HashMap<String, bool>,
+    /// Panes whose foreground program owns an alternate screen (tmux's
+    /// `#{alternate_on}`, riding `Pane::alternate_on` -- see that field's own
+    /// doc), by `session/pane`. Absent means unknown, which `owns_screen`
+    /// below reads as `false`: a pane this store cannot positively identify as
+    /// screen-owning keeps the accumulate-and-place behaviour every pane had
+    /// before this field existed.
+    owns_screen: HashMap<String, bool>,
     total_bytes: usize,
     clock: u64,
 }
@@ -559,6 +566,10 @@ impl ScrollbackStore {
                 self.kept
                     .insert(pane_key(session_id, pane_id), maximum <= 0.0);
             }
+            if let Some(alternate) = scroll.get("alternate_on").and_then(Value::as_bool) {
+                self.owns_screen
+                    .insert(pane_key(session_id, pane_id), alternate);
+            }
         });
     }
 
@@ -577,6 +588,18 @@ impl ScrollbackStore {
             .unwrap_or(false)
     }
 
+    /// Whether this pane's foreground program owns an alternate screen --
+    /// repaints in place rather than prints and scrolls -- so a read that
+    /// overlaps nothing held should replace rather than accumulate. See
+    /// `record`'s own doc on why the two cases need different answers, and
+    /// `owns_screen`'s field doc on why unknown reads as `false` here.
+    fn owns_screen(&self, session_id: &str, pane_id: &str) -> bool {
+        self.owns_screen
+            .get(&pane_key(session_id, pane_id))
+            .copied()
+            .unwrap_or(false)
+    }
+
     /// What the observation rule alone says about this pane, with the feature
     /// switch left out of it. The switch is a shipping decision; the rule is
     /// the thing the tests are about.
@@ -589,7 +612,20 @@ impl ScrollbackStore {
     }
 
     /// Fold a read into what is already held.
-    fn record(&mut self, key: &str, text: &str) {
+    ///
+    /// `owns_screen` is `Pane::alternate_on`, forwarded by the caller: a pane
+    /// whose foreground program repaints an alternate screen -- nvim, an agent
+    /// wrapped in one -- has no real history above its current screen for this
+    /// buffer to reconstruct, unlike the printing-and-scrolling pane the rest
+    /// of this function's placement logic was written for. Every read of one
+    /// *is* the whole of the pane's current truth, so it replaces outright
+    /// rather than being placed against what came before: the two-stacked-
+    /// frames bug this exists to prevent is exactly what "neither placement
+    /// believed anything, so keep the read on top of what we had" produces
+    /// for a screen that repainted rather than scrolled -- the client fixes
+    /// the identical mistake in `foldPaneRead`'s own `ownsScreen` (see
+    /// `src/terminal/history.ts` in the Muqun repo, card #795, defect 2).
+    fn record(&mut self, key: &str, text: &str, owns_screen: bool) {
         let incoming = split_lines(text);
         if incoming.is_empty() {
             return;
@@ -599,6 +635,18 @@ impl ScrollbackStore {
         let buffer = self.buffers.entry(key.to_owned()).or_default();
         let before = buffer.bytes;
         buffer.touched = clock;
+
+        if owns_screen {
+            buffer.drop_back(buffer.lines.len());
+            for line in incoming {
+                buffer.push(line);
+            }
+            buffer.trim();
+            buffer.last_frame = buffer.hashes.iter().copied().collect();
+            self.total_bytes = self.total_bytes + buffer.bytes - before;
+            self.evict();
+            return;
+        }
 
         // What this frame and the one before it end with identically is the
         // pane's furniture, not its history: an agent's composer -- the rule,
@@ -693,7 +741,8 @@ impl ScrollbackStore {
         }
 
         let key = read_key(session_id, pane_id, source, format);
-        self.record(&key, backend_text);
+        let owns_screen = self.owns_screen(session_id, pane_id);
+        self.record(&key, backend_text, owns_screen);
         let backend_rows = split_lines(backend_text).len();
         self.window(&key, rows)
             .filter(|served| split_lines(served).len() > backend_rows)
@@ -715,7 +764,8 @@ impl ScrollbackStore {
             return;
         }
         let key = read_key(session_id, pane_id, source, format);
-        self.record(&key, output);
+        let owns_screen = self.owns_screen(session_id, pane_id);
+        self.record(&key, output, owns_screen);
     }
 
     /// How many rows are held for this pane, across every read shape.
@@ -907,7 +957,7 @@ mod tests {
 
         let mut store = ScrollbackStore::default();
         for frame in &frames {
-            store.record("replay", frame);
+            store.record("replay", frame, false);
         }
         let held = store.window("replay", MAX_PANE_LINES).unwrap_or_default();
         let rows: Vec<&str> = held.lines().collect();
@@ -994,7 +1044,7 @@ mod tests {
                 // The clock, on the bottom row, changing every single frame.
                 format!("  {}m {}s · ↓ {}k tokens", round, round * 7, round * 13),
             ]);
-            store.record("pane", &frame.join("\n"));
+            store.record("pane", &frame.join("\n"), false);
         }
         let held = store.window("pane", 5_000).unwrap();
         let lines: Vec<&str> = held.lines().collect();
@@ -1027,7 +1077,7 @@ mod tests {
                 .map(|row| format!("head {} of round {round}", row + round * 10))
                 .collect();
             frame.extend(tail.iter().cloned());
-            store.record("pane", &frame.join("\n"));
+            store.record("pane", &frame.join("\n"), false);
         }
         let held = store.window("pane", 5_000).unwrap();
         let lines: Vec<&str> = held.lines().collect();
@@ -1054,7 +1104,7 @@ mod tests {
                 .into_iter()
                 .chain(chrome.iter().map(|line| (*line).to_owned()))
                 .collect();
-            store.record("pane", &frame.join("\n"));
+            store.record("pane", &frame.join("\n"), false);
         }
         let held = store.window("pane", 5_000).unwrap();
         let lines: Vec<&str> = held.lines().collect();
@@ -1084,7 +1134,7 @@ mod tests {
     fn scroll_a_screen(store: &mut ScrollbackStore, key: &str, rows: usize) {
         for top in 0..rows.saturating_sub(64) {
             let screen: Vec<String> = (top..top + 65).map(|row| format!("row {row}")).collect();
-            store.record(key, &screen.join("\n"));
+            store.record(key, &screen.join("\n"), false);
         }
     }
 
@@ -1101,33 +1151,33 @@ mod tests {
     #[test]
     fn a_first_read_is_kept_whole() {
         let mut store = ScrollbackStore::default();
-        store.record("k", &screen(&["1", "2", "3"]));
+        store.record("k", &screen(&["1", "2", "3"]), false);
         assert_eq!(store.window("k", 10).unwrap(), "1\n2\n3");
     }
 
     #[test]
     fn an_unchanged_screen_adds_nothing() {
         let mut store = ScrollbackStore::default();
-        store.record("k", &screen(&["1", "2", "3"]));
-        store.record("k", &screen(&["1", "2", "3"]));
-        store.record("k", &screen(&["1", "2", "3"]));
+        store.record("k", &screen(&["1", "2", "3"]), false);
+        store.record("k", &screen(&["1", "2", "3"]), false);
+        store.record("k", &screen(&["1", "2", "3"]), false);
         assert_eq!(store.window("k", 10).unwrap(), "1\n2\n3");
     }
 
     #[test]
     fn a_scrolled_screen_keeps_what_rolled_off_the_top() {
         let mut store = ScrollbackStore::default();
-        store.record("k", &screen(&["1", "2", "3", "4"]));
-        store.record("k", &screen(&["3", "4", "5", "6"]));
+        store.record("k", &screen(&["1", "2", "3", "4"]), false);
+        store.record("k", &screen(&["3", "4", "5", "6"]), false);
         assert_eq!(store.window("k", 10).unwrap(), "1\n2\n3\n4\n5\n6");
     }
 
     #[test]
     fn the_seam_is_neither_duplicated_nor_dropped() {
         let mut store = ScrollbackStore::default();
-        store.record("k", &screen(&["a", "b", "c", "d", "e"]));
-        store.record("k", &screen(&["b", "c", "d", "e", "f"]));
-        store.record("k", &screen(&["c", "d", "e", "f", "g"]));
+        store.record("k", &screen(&["a", "b", "c", "d", "e"]), false);
+        store.record("k", &screen(&["b", "c", "d", "e", "f"]), false);
+        store.record("k", &screen(&["c", "d", "e", "f", "g"]), false);
         assert_eq!(store.window("k", 20).unwrap(), "a\nb\nc\nd\ne\nf\ng");
     }
 
@@ -1137,10 +1187,10 @@ mod tests {
         // screen whose clock ticks must not append itself every time.
         let mut store = ScrollbackStore::default();
         let mut rows: Vec<String> = (0..20).map(|row| format!("row {row}")).collect();
-        store.record("k", &rows.join("\n"));
+        store.record("k", &rows.join("\n"), false);
         for tick in 0..50 {
             rows[7] = format!("working {tick}");
-            store.record("k", &rows.join("\n"));
+            store.record("k", &rows.join("\n"), false);
         }
         let held = store.window("k", 500).unwrap();
         assert_eq!(split_lines(&held).len(), 20);
@@ -1153,22 +1203,90 @@ mod tests {
         // content, not two renderings of the same content, and dropping the
         // first would throw away exactly what this exists to keep.
         let mut store = ScrollbackStore::default();
-        store.record("k", &screen(&["old 1", "old 2", "old 3", "old 4"]));
-        store.record("k", &screen(&["new 1", "new 2", "new 3", "new 4"]));
+        store.record("k", &screen(&["old 1", "old 2", "old 3", "old 4"]), false);
+        store.record("k", &screen(&["new 1", "new 2", "new 3", "new 4"]), false);
         assert_eq!(
             store.window("k", 20).unwrap(),
             "old 1\nold 2\nold 3\nold 4\nnew 1\nnew 2\nnew 3\nnew 4"
         );
     }
 
+    // Card #795, defect 2: a detected nvim pane rendered two stacked copies
+    // of its own screen. Root-caused to this exact mechanism -- confirmed
+    // live against the real gateway, not just here -- `record`'s "neither
+    // placement believed anything, so keep the read on top" fallback,
+    // written for a genuinely scrolling pane whose output outran the poll,
+    // firing for an alternate-screen pane's ordinary repaint instead. A
+    // screen that owns its screen has no real history for this buffer to
+    // protect, so it must replace, not accumulate, however different two
+    // consecutive reads of it are.
+    #[test]
+    fn a_screen_owning_pane_replaces_rather_than_accumulates() {
+        let mut store = ScrollbackStore::default();
+        store.record("k", &screen(&["old 1", "old 2", "old 3", "old 4"]), true);
+        store.record("k", &screen(&["new 1", "new 2", "new 3", "new 4"]), true);
+        // The mirror of `a_screen_that_shares_nothing_is_kept_on_top_of_the_one_it_followed`:
+        // same two screens sharing nothing, `owns_screen` true instead of
+        // false, and the old screen must be gone rather than kept above the
+        // new one.
+        assert_eq!(store.window("k", 20).unwrap(), "new 1\nnew 2\nnew 3\nnew 4");
+    }
+
+    #[test]
+    fn a_screen_owning_pane_with_a_real_overlap_still_just_replaces() {
+        // Not only the zero-overlap fallback: even a repaint the placement
+        // heuristics *could* have matched (an unchanged screen, a small
+        // scroll) is exactly the current screen and nothing this buffer
+        // needs to reconstruct history from -- there is no "and then" for a
+        // repaint to have.
+        let mut store = ScrollbackStore::default();
+        store.record("k", &screen(&["row 0", "row 1", "row 2"]), true);
+        store.record("k", &screen(&["row 0", "row 1", "row 2 CHANGED"]), true);
+        assert_eq!(
+            store.window("k", 20).unwrap(),
+            "row 0\nrow 1\nrow 2 CHANGED"
+        );
+    }
+
+    #[test]
+    fn a_screen_owning_pane_first_read_is_kept_whole() {
+        let mut store = ScrollbackStore::default();
+        store.record("k", &screen(&["1", "2", "3"]), true);
+        assert_eq!(store.window("k", 20).unwrap(), "1\n2\n3");
+    }
+
+    #[test]
+    fn an_unknown_pane_keeps_accumulating_until_alternate_on_is_observed() {
+        // `owns_screen` defaults to `false` for a pane this store has not
+        // been told about (the same conservatism `keeps` already applies to
+        // `max_offset_from_bottom`), so a caller too old to report
+        // `alternate_on`, or a pane not yet listed once, must not change
+        // behaviour for a pane that already worked.
+        let store = ScrollbackStore::default();
+        assert!(!store.owns_screen("s", "p"));
+    }
+
+    #[test]
+    fn observing_alternate_on_is_what_flips_owns_screen() {
+        let mut store = ScrollbackStore::default();
+        store.observe(
+            "s",
+            &json!({
+                "pane_id": "p",
+                "scroll": { "max_offset_from_bottom": 0, "alternate_on": true },
+            }),
+        );
+        assert!(store.owns_screen("s", "p"));
+    }
+
     #[test]
     fn history_survives_a_burst_that_outran_the_poll() {
         let mut store = ScrollbackStore::default();
-        store.record("k", &screen(&["1", "2", "3", "4"]));
+        store.record("k", &screen(&["1", "2", "3", "4"]), false);
         // Scrolls by two, so 1 and 2 become history.
-        store.record("k", &screen(&["3", "4", "5", "6"]));
+        store.record("k", &screen(&["3", "4", "5", "6"]), false);
         // Then the screen jumps past what can be followed.
-        store.record("k", &screen(&["x", "y", "z", "w"]));
+        store.record("k", &screen(&["x", "y", "z", "w"]), false);
         assert_eq!(
             store.window("k", 20).unwrap(),
             "1\n2\n3\n4\n5\n6\nx\ny\nz\nw"
@@ -1178,7 +1296,7 @@ mod tests {
     #[test]
     fn a_window_asks_for_no_more_than_it_holds() {
         let mut store = ScrollbackStore::default();
-        store.record("k", &screen(&["1", "2", "3"]));
+        store.record("k", &screen(&["1", "2", "3"]), false);
         assert_eq!(store.window("k", 2).unwrap(), "2\n3");
         assert_eq!(store.window("k", 999).unwrap(), "1\n2\n3");
         assert!(store.window("missing", 10).is_none());
@@ -1192,7 +1310,7 @@ mod tests {
         let total = MAX_PANE_LINES + 200;
         for top in 0..total {
             let rows: Vec<String> = (top..top + 20).map(|row| format!("row {row}")).collect();
-            store.record("k", &rows.join("\n"));
+            store.record("k", &rows.join("\n"), false);
         }
         let held = store.window("k", MAX_PANE_LINES * 2).unwrap();
         let rows = split_lines(&held);
@@ -1208,7 +1326,7 @@ mod tests {
     fn the_buffer_ceiling_forgets_the_pane_nobody_looked_at() {
         let mut store = ScrollbackStore::default();
         for index in 0..(MAX_BUFFERS + 5) {
-            store.record(&format!("pane-{index}"), "hello");
+            store.record(&format!("pane-{index}"), "hello", false);
         }
         assert!(store.buffers.len() <= MAX_BUFFERS);
         assert!(store.window("pane-0", 10).is_none());
@@ -1298,7 +1416,11 @@ mod tests {
     #[test]
     fn a_buffer_shallower_than_the_viewport_promises_nothing() {
         let mut store = ScrollbackStore::default();
-        store.record(&read_key("s", "p", "recent_unwrapped", "text"), "one\ntwo");
+        store.record(
+            &read_key("s", "p", "recent_unwrapped", "text"),
+            "one\ntwo",
+            false,
+        );
         let original = json!({ "pane_id": "p", "scroll": { "max_offset_from_bottom": 0, "viewport_rows": 65 } });
         let mut value = original.clone();
         store.amend("s", &mut value);
@@ -1308,10 +1430,15 @@ mod tests {
     #[test]
     fn ansi_and_text_reads_of_one_pane_do_not_splice_into_each_other() {
         let mut store = ScrollbackStore::default();
-        store.record(&read_key("s", "p", "recent_unwrapped", "text"), "plain");
+        store.record(
+            &read_key("s", "p", "recent_unwrapped", "text"),
+            "plain",
+            false,
+        );
         store.record(
             &read_key("s", "p", "recent_unwrapped", "ansi"),
             "\u{1b}[31mred",
+            false,
         );
         assert_eq!(
             store
@@ -1454,7 +1581,7 @@ mod tests {
             for poll in 0..12 {
                 let screen = agent_screen(poll * scroll, poll);
                 reads.push(split_lines(&screen));
-                store.record("k", &screen);
+                store.record("k", &screen, false);
             }
             let held = store.window("k", MAX_PANE_LINES).unwrap();
             let rows = split_lines(&held);
@@ -1489,8 +1616,8 @@ mod tests {
         // of the read -- and believing that would throw away every transcript
         // row that scrolled. The agreeing run has to start where the read does.
         let mut store = ScrollbackStore::default();
-        store.record("k", &agent_screen(0, 0));
-        store.record("k", &agent_screen(50, 1));
+        store.record("k", &agent_screen(0, 0), false);
+        store.record("k", &agent_screen(50, 1), false);
         let rows = split_lines(&store.window("k", MAX_PANE_LINES).unwrap());
         // 56 transcript rows, then 50 more scrolled in, then the composer.
         assert_eq!(rows.len(), AGENT_TRANSCRIPT_ROWS + 50 + AGENT_BOX_ROWS);
@@ -1509,7 +1636,7 @@ mod tests {
             printed.push(format!("── case {round} ──────────────"));
             printed.extend(block.iter().map(|row| (*row).to_owned()));
             let top = printed.len().saturating_sub(20);
-            store.record("k", &printed[top..].join("\n"));
+            store.record("k", &printed[top..].join("\n"), false);
         }
         let held = store.window("k", MAX_PANE_LINES).unwrap();
         let rows = split_lines(&held);
@@ -1523,12 +1650,12 @@ mod tests {
         // `clear` then fresh output: nothing is a re-send, and the read has to
         // land whole on top of what it followed rather than be folded into it.
         let mut store = ScrollbackStore::default();
-        store.record("k", &agent_screen(0, 0));
+        store.record("k", &agent_screen(0, 0), false);
         let before = split_lines(&store.window("k", MAX_PANE_LINES).unwrap()).len();
         let fresh: Vec<String> = (0..40)
             .map(|row| format!("$ a completely different program, line {row}"))
             .collect();
-        store.record("k", &fresh.join("\n"));
+        store.record("k", &fresh.join("\n"), false);
         let rows = split_lines(&store.window("k", MAX_PANE_LINES).unwrap());
         assert_eq!(rows.len(), before + 40);
         assert!(rows[0].contains("transcript row 0 "));
@@ -1545,12 +1672,12 @@ mod tests {
         // again. Writing them a second time is the whole of the duplication left
         // once the pinned composer is handled.
         let mut store = ScrollbackStore::default();
-        store.record("k", &agent_screen(0, 0));
-        store.record("k", &agent_screen(12, 1));
+        store.record("k", &agent_screen(0, 0), false);
+        store.record("k", &agent_screen(12, 1), false);
         let scrolled = split_lines(&store.window("k", MAX_PANE_LINES).unwrap()).len();
         assert_eq!(scrolled, AGENT_TRANSCRIPT_ROWS + 12 + AGENT_BOX_ROWS);
         // Back to where it was.
-        store.record("k", &agent_screen(0, 2));
+        store.record("k", &agent_screen(0, 2), false);
         let held = store.window("k", MAX_PANE_LINES).unwrap();
         assert!(substantial_duplicates(&held).is_empty());
         assert_eq!(
@@ -1567,12 +1694,13 @@ mod tests {
         // again: appending rows the buffer already ends with cannot be right
         // whatever the placement thought.
         let mut store = ScrollbackStore::default();
-        store.record("k", "keep me\ntail 1\ntail 2\ntail 3");
+        store.record("k", "keep me\ntail 1\ntail 2\ntail 3", false);
         // Shares its head with the buffer's tail, but is otherwise a different
         // screen -- too different for either placement to believe.
         store.record(
             "k",
             "tail 1\ntail 2\ntail 3\nq\nw\ne\nr\nt\ny\nu\ni\no\np\na\ns\nd",
+            false,
         );
         let held = store.window("k", MAX_PANE_LINES).unwrap();
         let rows = split_lines(&held);
@@ -1601,7 +1729,7 @@ mod tests {
             top += scroll;
             let screen = agent_screen(top, poll);
             reads.push(split_lines(&screen));
-            store.record("k", &screen);
+            store.record("k", &screen, false);
         }
         let held = store.window("k", MAX_PANE_LINES).unwrap();
         let duplicates = substantial_duplicates(&held);
@@ -1621,10 +1749,10 @@ mod tests {
         // The reader's paging re-requests the whole window at a wider limit, so
         // the same rows arrive again inside a longer read.
         let mut store = ScrollbackStore::default();
-        store.record("k", &screen(&["1", "2", "3", "4"]));
-        store.record("k", &screen(&["3", "4", "5", "6"]));
+        store.record("k", &screen(&["1", "2", "3", "4"]), false);
+        store.record("k", &screen(&["3", "4", "5", "6"]), false);
         let held_before = store.window("k", 100).unwrap();
-        store.record("k", &screen(&["1", "2", "3", "4", "5", "6"]));
+        store.record("k", &screen(&["1", "2", "3", "4", "5", "6"]), false);
         assert_eq!(store.window("k", 100).unwrap(), held_before);
     }
 }

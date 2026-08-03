@@ -145,6 +145,20 @@ pub struct Pane {
     /// Display rows available above the current viewport.
     pub max_offset_from_bottom: Option<u32>,
     pub viewport_rows: Option<u32>,
+    /// Whether the pane's foreground program owns an alternate screen (tmux's
+    /// `#{alternate_on}`) -- a modal editor, an agent wrapped in one, anything
+    /// that repaints in place rather than prints and scrolls. `None` where the
+    /// backend cannot say (Herdr; a tmux pane before its first list).
+    ///
+    /// Gateway-internal for now: `ScrollbackStore` is the one reader
+    /// (`src/scrollback.rs`), which needs it to tell "this pane's screen
+    /// changed completely, keep what we already had above it" (a genuinely
+    /// scrolling pane the placement lost track of) apart from "this pane's
+    /// screen changed completely because it repainted" (an alternate-screen
+    /// pane, which has nothing above its current screen to keep). Riding the
+    /// same envelope `ScrollbackStore::observe` already walks
+    /// (`compat::pane_list`) rather than a second channel.
+    pub alternate_on: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

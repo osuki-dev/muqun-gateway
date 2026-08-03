@@ -13131,6 +13131,7 @@ mod tests {
             agent_status: BackendAgentStatus::Unknown,
             max_offset_from_bottom: None,
             viewport_rows: None,
+            alternate_on: None,
         }];
         let outcome = session_liveness(
             Box::pin(async move { Ok(panes) }),

@@ -413,11 +413,12 @@ impl TerminalBackend for TmuxBackend {
                 "#{pane_height}",
                 "#{pane_current_command}",
                 "#{history_size}",
+                "#{alternate_on}",
             ]);
             let output = self
                 .list_output(["list-panes", "-a", "-F", &format])
                 .await?;
-            parse_rows(&output, 12, "pane")?
+            parse_rows(&output, 13, "pane")?
                 .into_iter()
                 .map(pane_from_fields)
                 .collect()
@@ -855,6 +856,17 @@ fn pane_from_fields(fields: Vec<String>) -> Result<Pane, BackendError> {
         agent_status: AgentStatus::Unknown,
         max_offset_from_bottom: Some(parse_u32(&fields[11], "pane")?),
         viewport_rows: Some(parse_u32(&fields[9], "pane")?),
+        // Lenient, unlike `focused`'s `parse_flag`: this is a new field with
+        // one internal reader (`ScrollbackStore`), and that reader already
+        // treats "unknown" as "leave this pane alone" (see
+        // `ScrollbackStore::observe`). An unexpected value from a tmux this
+        // was never tested against should fall back to that same "unknown"
+        // rather than fail the whole pane list over one optional field.
+        alternate_on: match fields[12].as_str() {
+            "1" => Some(true),
+            "0" => Some(false),
+            _ => None,
+        },
     })
 }
 
@@ -1134,9 +1146,10 @@ mod tests {
             "41",
             "claude",
             "12",
+            "1",
         ]
         .join(&FIELD_SEPARATOR.to_string());
-        let fields = parse_rows(&row, 12, "pane").unwrap().remove(0);
+        let fields = parse_rows(&row, 13, "pane").unwrap().remove(0);
         let pane = pane_from_fields(fields).unwrap();
 
         assert_eq!(pane.workspace_id.as_str(), "$0");
@@ -1146,6 +1159,35 @@ mod tests {
         assert_eq!(pane.cwd, Some(PathBuf::from("/work/project")));
         assert_eq!(pane.max_offset_from_bottom, Some(12));
         assert_eq!(pane.viewport_rows, Some(41));
+        assert_eq!(pane.alternate_on, Some(true));
+    }
+
+    #[test]
+    fn an_unrecognised_alternate_on_value_is_unknown_rather_than_a_parse_failure() {
+        // `alternate_on` is read leniently (see its own comment in
+        // `pane_from_fields`): an unexpected value from a tmux this was never
+        // tested against must not fail the whole pane list over one optional
+        // field the way `focused`'s `parse_flag` is allowed to for a field
+        // every caller depends on.
+        let row = [
+            "$0",
+            "@2",
+            "%9",
+            "agent",
+            "/work/project",
+            "1",
+            "1",
+            "1",
+            "122",
+            "41",
+            "claude",
+            "12",
+            "",
+        ]
+        .join(&FIELD_SEPARATOR.to_string());
+        let fields = parse_rows(&row, 13, "pane").unwrap().remove(0);
+        let pane = pane_from_fields(fields).unwrap();
+        assert_eq!(pane.alternate_on, None);
     }
 
     #[test]
