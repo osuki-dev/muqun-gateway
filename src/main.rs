@@ -1687,7 +1687,7 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
             post(send_keys),
         )
         .route(
-            "/api/sessions/{session_id}/workspaces/{workspace_id}/assets",
+            "/api/sessions/{session_id}/tabs/{tab_id}/assets",
             get(session_assets),
         )
         .route("/api/assets/{asset_id}/content", get(asset_content))
@@ -7668,6 +7668,7 @@ struct AssetRoot {
     path: PathBuf,
     session_id: String,
     workspace_id: Option<String>,
+    tab_id: Option<String>,
     pane_id: Option<String>,
 }
 
@@ -7681,7 +7682,48 @@ struct AssetEntry {
     root: PathBuf,
     session_id: String,
     workspace_id: Option<String>,
+    tab_id: Option<String>,
     pane_id: Option<String>,
+}
+
+/// Which unit an assets request is scoped to.
+///
+/// tmux's tab is the tmux window, and is the granularity this exists to scope
+/// to: a tmux *session* -- what this gateway calls a workspace -- spans every
+/// project the developer happens to have a window open on, so scoping by
+/// workspace narrows nothing on a machine with one tmux session (see
+/// `tmux.rs:840-841`: `fields[0]` / the session is the workspace, `fields[1]`
+/// / the window is the tab).
+///
+/// Herdr's tabs sit *inside* one of its own workspaces -- a herdr workspace's
+/// `tab_count` need not be one -- and herdr's own workspace is already the
+/// granularity card #802 scoped to. Narrowing a herdr session down to one tab
+/// could hide a sibling tab's files that belong to the very same piece of
+/// work, which would be a behavior change on a path herdr already had right
+/// ("herdr must not change"). So a herdr session's tab id is resolved to the
+/// workspace that owns it (`resolve_asset_scope`), and everything downstream
+/// -- roots, the index, the cache -- scopes on that workspace instead of the
+/// tab.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum AssetScope {
+    Tab(String),
+    Workspace(String),
+}
+
+impl AssetScope {
+    fn matches_root(&self, root: &AssetRoot) -> bool {
+        match self {
+            AssetScope::Tab(id) => root.tab_id.as_deref() == Some(id.as_str()),
+            AssetScope::Workspace(id) => root.workspace_id.as_deref() == Some(id.as_str()),
+        }
+    }
+
+    fn matches_entry(&self, entry: &AssetEntry) -> bool {
+        match self {
+            AssetScope::Tab(id) => entry.tab_id.as_deref() == Some(id.as_str()),
+            AssetScope::Workspace(id) => entry.workspace_id.as_deref() == Some(id.as_str()),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -7698,10 +7740,10 @@ struct ScannedFile {
 #[derive(Debug, Default)]
 struct AssetIndex {
     entries: HashMap<String, AssetEntry>,
-    /// Keyed on `(session_id, workspace_id)`. `workspace_id` is `None` for the
-    /// whole-session callers and `Some` for a workspace-scoped one, so the two
-    /// never share a slot -- see `session_asset_roots`.
-    roots: HashMap<(String, Option<String>), Vec<AssetRoot>>,
+    /// Keyed on `(session_id, scope)`. `scope` is `None` for the whole-session
+    /// callers and `Some` for a scoped one, so the two never share a slot --
+    /// see `session_asset_roots`.
+    roots: HashMap<(String, Option<AssetScope>), Vec<AssetRoot>>,
 }
 
 impl AssetIndex {
@@ -7720,6 +7762,7 @@ impl AssetIndex {
                     existing.root = entry.root;
                     existing.session_id = entry.session_id;
                     existing.workspace_id = entry.workspace_id;
+                    existing.tab_id = entry.tab_id;
                     existing.pane_id = entry.pane_id;
                 }
                 false
@@ -7738,18 +7781,16 @@ impl AssetIndex {
     fn remember_roots(
         &mut self,
         session_id: &str,
-        workspace_id: Option<&str>,
+        scope: Option<&AssetScope>,
         roots: Vec<AssetRoot>,
     ) {
-        self.roots.insert(
-            (session_id.to_owned(), workspace_id.map(str::to_owned)),
-            roots,
-        );
+        self.roots
+            .insert((session_id.to_owned(), scope.cloned()), roots);
     }
 
-    fn known_roots(&self, session_id: &str, workspace_id: Option<&str>) -> Vec<AssetRoot> {
+    fn known_roots(&self, session_id: &str, scope: Option<&AssetScope>) -> Vec<AssetRoot> {
         self.roots
-            .get(&(session_id.to_owned(), workspace_id.map(str::to_owned)))
+            .get(&(session_id.to_owned(), scope.cloned()))
             .cloned()
             .unwrap_or_default()
     }
@@ -7758,11 +7799,11 @@ impl AssetIndex {
     fn session_assets(
         &self,
         session_id: &str,
-        workspace_id: &str,
+        scope: &AssetScope,
         since_unix_ms: Option<u128>,
         limit: usize,
     ) -> Vec<AssetEntry> {
-        let mut entries = self.session_assets_ordered(session_id, workspace_id, since_unix_ms);
+        let mut entries = self.session_assets_ordered(session_id, scope, since_unix_ms);
         entries.truncate(limit);
         entries
     }
@@ -7775,25 +7816,26 @@ impl AssetIndex {
     /// look past the page to fill it: a `kind` filter cannot be answered from
     /// the index, because what a file is comes from its bytes.
     ///
-    /// Filtered by `workspace_id` as well as `session_id`: an entry ingested
-    /// under this session from a different workspace -- whether from before
+    /// Filtered by `scope` as well as `session_id`: an entry ingested under
+    /// this session from an unrelated tab or workspace -- whether from before
     /// this scoping existed, or from the cold-start reindex in `asset_content`,
     /// which still rebuilds a whole session's worth of roots -- must not leak
-    /// into a listing scoped to one workspace. An entry with no workspace_id at
-    /// all (the exact-path lookup can index one without ever calling
-    /// `pane_list_roots`) never matches a specific workspace either, for the
-    /// same reason: an unattributed file is not known to belong here.
+    /// into a listing scoped to one tab (or, for herdr, one workspace). An
+    /// entry with neither a workspace_id nor a tab_id (the exact-path lookup
+    /// can index one without ever calling `pane_list_roots`) never matches a
+    /// specific scope either, for the same reason: an unattributed file is not
+    /// known to belong here.
     fn session_assets_ordered(
         &self,
         session_id: &str,
-        workspace_id: &str,
+        scope: &AssetScope,
         since_unix_ms: Option<u128>,
     ) -> Vec<AssetEntry> {
         let mut entries: Vec<AssetEntry> = self
             .entries
             .values()
             .filter(|entry| entry.session_id == session_id)
-            .filter(|entry| entry.workspace_id.as_deref() == Some(workspace_id))
+            .filter(|entry| scope.matches_entry(entry))
             .filter(|entry| match since_unix_ms {
                 Some(since) => entry.modified_unix_ms > since,
                 None => true,
@@ -7965,6 +8007,10 @@ fn pane_list_roots(session_id: &str, response: &Value) -> Vec<AssetRoot> {
                 .get("workspace_id")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
+            tab_id: pane
+                .get("tab_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
             pane_id: pane
                 .get("pane_id")
                 .and_then(Value::as_str)
@@ -7999,6 +8045,13 @@ fn worktree_event_root(session_id: &str, line: &str) -> Option<AssetRoot> {
             .and_then(Value::as_str)
             .or_else(|| value.pointer("/data/workspace_id").and_then(Value::as_str))
             .map(str::to_owned),
+        // The event carries the checkout's workspace, never a tab -- herdr's
+        // own worktree.* payloads have no tab in them. Scoping never needs it:
+        // a herdr session always resolves a request's tab to its workspace
+        // (see `AssetScope`), and a tmux session never produces this event in
+        // the first place (tmux worktrees are made through the git fallback,
+        // with no protocol event of their own).
+        tab_id: None,
         pane_id: None,
     })
 }
@@ -8090,6 +8143,7 @@ fn ingest_root(index: &Mutex<AssetIndex>, root: &AssetRoot) -> Vec<AssetEntry> {
             root: canonical.clone(),
             session_id: root.session_id.clone(),
             workspace_id: root.workspace_id.clone(),
+            tab_id: root.tab_id.clone(),
             pane_id: root.pane_id.clone(),
         };
         if index.upsert(entry.clone()) {
@@ -8117,23 +8171,24 @@ async fn ingest_roots(index: Arc<Mutex<AssetIndex>>, roots: Vec<AssetRoot>) -> V
 /// Herdr is the source of truth for where a session works, but a listing still
 /// has to answer when the socket is down, so the last known roots are kept.
 ///
-/// `workspace_id` narrows the pane list tmux hands back -- every pane on the
-/// whole server -- down to the one workspace a caller asked about. `None`
-/// keeps the old, whole-session answer for the callers that still want it
-/// (the recent-directories picker, a task's candidate repo roots, and the
+/// `scope` narrows the pane list tmux hands back -- every pane on the whole
+/// server -- down to the one tab a caller asked about (or, for a herdr
+/// session, the workspace that tab lives in; see `AssetScope`). `None` keeps
+/// the old, whole-session answer for the callers that still want it (the
+/// recent-directories picker, a task's candidate repo roots, and the
 /// cold-start reindex), so nothing about them changes.
 ///
-/// The cache is keyed on `(session_id, workspace_id)`, not on `session_id`
-/// alone: a workspace-scoped call and a whole-session call against the same
-/// session must not read back each other's roots when `list_panes` fails and
-/// the last known set is served instead. Collapsing the key back to
-/// `session_id` alone would quietly widen every workspace-scoped listing back
-/// out to the whole machine the moment the socket hiccuped -- the exact bug
-/// this function exists to close, just deferred to the fallback path.
+/// The cache is keyed on `(session_id, scope)`, not on `session_id` alone: a
+/// scoped call and a whole-session call against the same session must not
+/// read back each other's roots when `list_panes` fails and the last known
+/// set is served instead. Collapsing the key back to `session_id` alone would
+/// quietly widen every scoped listing back out to the whole machine the
+/// moment the socket hiccuped -- the exact bug this function exists to close,
+/// just deferred to the fallback path.
 async fn session_asset_roots(
     state: &AppState,
     session: &SessionConfig,
-    workspace_id: Option<&str>,
+    scope: Option<&AssetScope>,
 ) -> Vec<AssetRoot> {
     let response = terminal_backend(session)
         .list_panes()
@@ -8147,19 +8202,51 @@ async fn session_asset_roots(
             Vec::new()
         }
     };
-    if let Some(workspace_id) = workspace_id {
-        fresh.retain(|root| root.workspace_id.as_deref() == Some(workspace_id));
+    if let Some(scope) = scope {
+        fresh.retain(|root| scope.matches_root(root));
     }
     if fresh.is_empty() {
         return match state.assets.lock() {
-            Ok(index) => index.known_roots(&session.id, workspace_id),
+            Ok(index) => index.known_roots(&session.id, scope),
             Err(_) => Vec::new(),
         };
     }
     if let Ok(mut index) = state.assets.lock() {
-        index.remember_roots(&session.id, workspace_id, fresh.clone());
+        index.remember_roots(&session.id, scope, fresh.clone());
     }
     fresh
+}
+
+/// What a request's tab id actually scopes to, for this session's backend.
+///
+/// tmux: the tab id names a tmux window directly, which is exactly the unit
+/// this card narrows to -- no lookup needed.
+///
+/// Herdr: herdr's own tabs sit inside one of its workspaces, and a herdr
+/// workspace is the granularity that must not narrow (see `AssetScope`). The
+/// tab id is translated to the workspace that owns it by asking the live pane
+/// list which workspace that tab's panes belong to. A tab the pane list no
+/// longer has -- a closed tab, or a socket hiccup -- still needs *some* scope
+/// to key the cache and filter on, so the tab id itself is kept as the
+/// fallback: this keeps the answer scoped (and therefore empty rather than
+/// silently widened back to every workspace) even when the live lookup can't
+/// resolve it.
+async fn resolve_asset_scope(session: &SessionConfig, tab_id: &str) -> AssetScope {
+    if !session.backend.is_herdr() {
+        return AssetScope::Tab(tab_id.to_owned());
+    }
+    let workspace_id = terminal_backend(session)
+        .list_panes()
+        .await
+        .ok()
+        .and_then(|panes| {
+            panes
+                .into_iter()
+                .find(|pane| pane.tab_id.as_str() == tab_id)
+        })
+        .map(|pane| pane.workspace_id.as_str().to_owned())
+        .unwrap_or_else(|| tab_id.to_owned());
+    AssetScope::Workspace(workspace_id)
 }
 
 fn canonical_roots(roots: &[AssetRoot]) -> Vec<PathBuf> {
@@ -8244,6 +8331,7 @@ fn asset_entry_for_path(raw: &str, roots: &[AssetRoot]) -> Option<AssetEntry> {
         root,
         session_id: owner.session_id.clone(),
         workspace_id: owner.workspace_id.clone(),
+        tab_id: owner.tab_id.clone(),
         pane_id: owner.pane_id.clone(),
     })
 }
@@ -8367,27 +8455,35 @@ fn asset_page(entries: Vec<AssetEntry>, kinds: &[String], limit: usize) -> Vec<V
     page
 }
 
-/// List what one workspace produced recently, newest first.
+/// List what one tab produced recently, newest first.
 ///
-/// Scoped to a workspace rather than to a session: with the tmux backend a
-/// session is the whole tmux server, and every pane on the machine -- across
-/// every project anyone happens to have open -- shares one `session_id`. An
-/// agent's Files sheet asks "what did this piece of work touch", which is the
-/// workspace it is showing, not every workspace the backend happens to know
-/// about. `workspace_id` is a wire id exactly like a pane id on the other
+/// Scoped to a tab rather than to a session or a workspace: with the tmux
+/// backend a session is the whole tmux server and a workspace is a tmux
+/// session -- one `tmux new-session`, which is commonly one long-running
+/// `Work` session with a window per project -- so either one still pools
+/// every project anyone happens to have open in that session. An agent's
+/// Files sheet asks "what did this piece of work touch", which is the tab
+/// (the tmux window) it is showing, not every tab the workspace happens to
+/// contain. `tab_id` is a wire id exactly like a pane id on the other
 /// handlers: the client already holds it from whatever pane or agent view
-/// opened this sheet, and it is compared as-is against the wire-form
-/// `workspace_id` `list_panes()` already hands back, with no separate decode
-/// step needed because both sides went through the same `TmuxWireIds` seam.
+/// opened this sheet, and it is compared as-is against the wire-form `tab_id`
+/// `list_panes()` already hands back, with no separate decode step needed
+/// because both sides went through the same `TmuxWireIds` seam.
+///
+/// A herdr session's tab id is translated to its owning workspace before any
+/// of this scoping happens (`resolve_asset_scope`), because herdr's own tabs
+/// sit inside a workspace and that workspace is the granularity herdr must
+/// keep -- see `AssetScope`.
 async fn session_assets(
     State(state): State<AppState>,
-    Path((session_id, workspace_id)): Path<(String, String)>,
+    Path((session_id, tab_id)): Path<(String, String)>,
     Query(query): Query<AssetsQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
     let session = find_session(&state.config, &session_id)?.clone();
-    let roots = session_asset_roots(&state, &session, Some(workspace_id.as_str())).await;
+    let scope = resolve_asset_scope(&session, &tab_id).await;
+    let roots = session_asset_roots(&state, &session, Some(&scope)).await;
 
     // An exact path lookup asks about one file, so it neither waits for a scan
     // nor pages: it answers with that file or with nothing.
@@ -8411,7 +8507,7 @@ async fn session_assets(
         };
         return Ok(Json(content_envelope(json!({
             "session_id": session_id,
-            "workspace_id": workspace_id,
+            "tab_id": tab_id,
             "assets": assets,
             "path": query.path,
         }))));
@@ -8435,9 +8531,9 @@ async fn session_assets(
     let entries = {
         let index = lock_assets(&state)?;
         if kinds.is_empty() {
-            index.session_assets(&session_id, &workspace_id, since, limit)
+            index.session_assets(&session_id, &scope, since, limit)
         } else {
-            index.session_assets_ordered(&session_id, &workspace_id, since)
+            index.session_assets_ordered(&session_id, &scope, since)
         }
     };
     let filter = kinds.clone();
@@ -8447,7 +8543,7 @@ async fn session_assets(
 
     Ok(Json(content_envelope(json!({
         "session_id": session_id,
-        "workspace_id": workspace_id,
+        "tab_id": tab_id,
         "assets": assets,
         "limit": limit,
         "since": since.map(|since| since as u64),
@@ -9574,17 +9670,17 @@ fn openapi_spec() -> Value {
                     "responses": upload_responses()
                 }
             },
-            "/api/sessions/{sessionId}/workspaces/{workspaceId}/assets": {
+            "/api/sessions/{sessionId}/tabs/{tabId}/assets": {
                 "get": {
-                    "summary": "List files this workspace produced recently, newest first",
-                    "description": "Unified content model, schema version 1.0.0. The response is the versioned envelope: schema_version, capabilities, and data, with the assets under data.assets. Assets are fed by the Herdr worktree events the gateway subscribes to, and by an mtime scan of the workspace's roots, which is what a cold start uses. The scan is shallow, budgeted, and skips dot directories, dependency directories, and build output. Scoped to workspaceId, not to the whole session: a tmux-backed session spans every workspace on the machine, and this answers only for the one the caller is looking at.",
+                    "summary": "List files this tab produced recently, newest first",
+                    "description": "Unified content model, schema version 1.0.0. The response is the versioned envelope: schema_version, capabilities, and data, with the assets under data.assets. Assets are fed by the Herdr worktree events the gateway subscribes to, and by an mtime scan of the tab's roots, which is what a cold start uses. The scan is shallow, budgeted, and skips dot directories, dependency directories, and build output. Scoped to tabId, not to the whole session or workspace: a tmux-backed session spans every project the developer has a window open on, and a tmux-backed workspace (a whole tmux session, commonly one long-running session with a window per project) spans every one of those projects too, so this answers only for the one tab the caller is looking at. A herdr-backed session's tabId is resolved to the workspace it belongs to instead, because herdr's own tabs sit inside one of its workspaces and that workspace must not narrow further.",
                     "parameters": [
                         path_param("sessionId"),
-                        path_param("workspaceId"),
+                        path_param("tabId"),
                         query_param("since", "Unix milliseconds, the same unit as modified_unix_ms; only files modified strictly after this are returned"),
                         query_param("limit", "How many assets to return, 1 to 200, default 50"),
                         query_param("kind", "Comma-separated allow-list of kinds -- image, markdown, text, pdf, binary -- filtered during the scan, so kind=image&limit=50 answers with the 50 newest images rather than the images among the 50 newest files. Absent or empty means every kind; a value outside the taxonomy matches nothing rather than erroring. The applied list is echoed back as data.kind"),
-                        query_param("path", "Resolve one absolute path exactly, for a file path tapped in terminal output. Takes precedence over since and limit. Answers with one asset, or with none when the path does not canonicalize to a file inside this workspace's roots -- a fenced-out path is a miss, not an error")
+                        query_param("path", "Resolve one absolute path exactly, for a file path tapped in terminal output. Takes precedence over since and limit. Answers with one asset, or with none when the path does not canonicalize to a file inside this tab's roots -- a fenced-out path is a miss, not an error")
                     ],
                     "responses": assets_responses()
                 }
@@ -11745,6 +11841,7 @@ mod tests {
             root: root.to_path_buf(),
             session_id: "default".into(),
             workspace_id: Some("wA".into()),
+            tab_id: Some("wA:t1".into()),
             pane_id: Some("wA:p1".into()),
         }
     }
@@ -12003,7 +12100,9 @@ mod tests {
         assert_eq!(index.entries.len(), 2);
 
         // `test_asset_entry` puts everything in workspace "wA".
-        let listed = index.session_assets("default", "wA", None, 10);
+        let scope_a = AssetScope::Workspace("wA".into());
+        let scope_b = AssetScope::Workspace("wB".into());
+        let listed = index.session_assets("default", &scope_a, None, 10);
         assert_eq!(
             listed
                 .iter()
@@ -12016,20 +12115,24 @@ mod tests {
 
         // `since` is exclusive, and `limit` cuts the newest page.
         assert_eq!(
-            index.session_assets("default", "wA", Some(2_000), 10).len(),
+            index
+                .session_assets("default", &scope_a, Some(2_000), 10)
+                .len(),
             1
         );
         assert_eq!(
-            index.session_assets("default", "wA", Some(3_000), 10).len(),
+            index
+                .session_assets("default", &scope_a, Some(3_000), 10)
+                .len(),
             0
         );
-        assert_eq!(index.session_assets("default", "wA", None, 1).len(), 1);
-        assert_eq!(index.session_assets("other", "wA", None, 10).len(), 0);
+        assert_eq!(index.session_assets("default", &scope_a, None, 1).len(), 1);
+        assert_eq!(index.session_assets("other", &scope_a, None, 10).len(), 0);
         // Same session, a different workspace: none of "wA"'s files leak into
         // it. This is the defect the workspace scope closes -- everything
         // above proves the index still works exactly as it did, this proves
         // it no longer answers wider than the workspace asked for.
-        assert_eq!(index.session_assets("default", "wB", None, 10).len(), 0);
+        assert_eq!(index.session_assets("default", &scope_b, None, 10).len(), 0);
 
         // Nested roots see the same file; the deeper one owns it.
         let shared = nested.join("shared.txt");
@@ -12279,6 +12382,7 @@ mod tests {
             path: workspace.clone(),
             session_id: "default".into(),
             workspace_id: Some("wA".into()),
+            tab_id: Some("wA:t1".into()),
             pane_id: Some("wA:p1".into()),
         }];
 
@@ -12311,6 +12415,7 @@ mod tests {
             path: workspace.join("a"),
             session_id: "default".into(),
             workspace_id: Some("wB".into()),
+            tab_id: Some("wB:t1".into()),
             pane_id: Some("wB:p1".into()),
         };
         let mut both = roots.clone();
@@ -12336,10 +12441,10 @@ mod tests {
         let home = dirs::home_dir().unwrap();
         let response = json!({
             "result": { "panes": [
-                { "pane_id": "wA:p1", "workspace_id": "wA", "cwd": "/Users/okk/.repos/muqun" },
+                { "pane_id": "wA:p1", "workspace_id": "wA", "tab_id": "wA:t1", "cwd": "/Users/okk/.repos/muqun" },
                 // A second pane in the same directory is the same root.
-                { "pane_id": "wA:p2", "workspace_id": "wA", "cwd": "/Users/okk/.repos/muqun" },
-                { "pane_id": "wB:p1", "workspace_id": "wB", "foreground_cwd": "/Users/okk/.ws/api" },
+                { "pane_id": "wA:p2", "workspace_id": "wA", "tab_id": "wA:t1", "cwd": "/Users/okk/.repos/muqun" },
+                { "pane_id": "wB:p1", "workspace_id": "wB", "tab_id": "wB:t1", "foreground_cwd": "/Users/okk/.ws/api" },
                 { "pane_id": "wC:p1", "workspace_id": "wC", "cwd": "/" },
                 { "pane_id": "wD:p1", "workspace_id": "wD", "cwd": home.to_string_lossy() },
                 { "pane_id": "wE:p1", "workspace_id": "wE" }
@@ -12357,8 +12462,80 @@ mod tests {
             ]
         );
         assert_eq!(roots[0].pane_id.as_deref(), Some("wA:p1"));
+        assert_eq!(roots[0].tab_id.as_deref(), Some("wA:t1"));
         assert_eq!(roots[1].workspace_id.as_deref(), Some("wB"));
+        assert_eq!(roots[1].tab_id.as_deref(), Some("wB:t1"));
         assert!(pane_list_roots("default", &json!({ "result": {} })).is_empty());
+    }
+
+    #[test]
+    fn asset_scope_narrows_to_a_tab_or_to_a_workspace_and_never_to_the_other() {
+        // The invariant card #802's tab-scoping stands on: a `Tab` scope only
+        // ever matches its own tmux window, and a `Workspace` scope (what a
+        // herdr session resolves its tab to) matches every tab inside that
+        // workspace -- so a herdr workspace with more than one tab keeps
+        // seeing all of them, exactly as it did before tabs existed here.
+        let root_in_tab_a = AssetRoot {
+            path: PathBuf::from("/work/a"),
+            session_id: "default".into(),
+            workspace_id: Some("wM".into()),
+            tab_id: Some("wM:t1".into()),
+            pane_id: Some("wM:t1:p1".into()),
+        };
+        let root_in_tab_b = AssetRoot {
+            path: PathBuf::from("/work/b"),
+            session_id: "default".into(),
+            workspace_id: Some("wM".into()),
+            tab_id: Some("wM:t2".into()),
+            pane_id: Some("wM:t2:p1".into()),
+        };
+        let root_elsewhere = AssetRoot {
+            path: PathBuf::from("/work/c"),
+            session_id: "default".into(),
+            workspace_id: Some("wN".into()),
+            tab_id: Some("wN:t1".into()),
+            pane_id: Some("wN:t1:p1".into()),
+        };
+
+        let tab_scope = AssetScope::Tab("wM:t1".into());
+        assert!(tab_scope.matches_root(&root_in_tab_a));
+        assert!(!tab_scope.matches_root(&root_in_tab_b));
+        assert!(!tab_scope.matches_root(&root_elsewhere));
+
+        // A herdr session's tab id resolves to its workspace before scoping,
+        // so both of that workspace's tabs match -- this is the "herdr must
+        // not narrow" guarantee, proven at the layer that actually filters.
+        let workspace_scope = AssetScope::Workspace("wM".into());
+        assert!(workspace_scope.matches_root(&root_in_tab_a));
+        assert!(workspace_scope.matches_root(&root_in_tab_b));
+        assert!(!workspace_scope.matches_root(&root_elsewhere));
+    }
+
+    #[tokio::test]
+    async fn a_tmux_session_scopes_by_tab_directly_and_a_herdr_session_resolves_it_to_a_workspace()
+    {
+        // tmux: the tab id is used verbatim, no lookup involved.
+        let mut session = test_config("token").sessions[0].clone();
+        session.backend = BackendKind::Tmux;
+        assert_eq!(
+            resolve_asset_scope(&session, "@3").await,
+            AssetScope::Tab("@3".into())
+        );
+
+        // herdr: with no live socket to ask (as in every other test in this
+        // file), the tab id can't be translated to its owning workspace, so
+        // it is kept as-is rather than silently widened to "no scope at all".
+        // This is also exactly what makes every pre-existing
+        // `session_assets(Path(("default", "wA")))` test call in this file
+        // keep behaving as a workspace-scoped call after this change: they
+        // never had a live socket either.
+        let mut herdr_session = test_config("token").sessions[0].clone();
+        herdr_session.backend = BackendKind::Herdr;
+        herdr_session.socket_path = "/tmp/herdr-does-not-exist.sock".into();
+        assert_eq!(
+            resolve_asset_scope(&herdr_session, "wA").await,
+            AssetScope::Workspace("wA".into())
+        );
     }
 
     #[test]
@@ -12647,10 +12824,7 @@ mod tests {
             spec["paths"]["/api/uploads"]["post"]["requestBody"]["content"]["multipart/form-data"]
                 .is_object()
         );
-        assert!(
-            spec["paths"]["/api/sessions/{sessionId}/workspaces/{workspaceId}/assets"]["get"]
-                .is_object()
-        );
+        assert!(spec["paths"]["/api/sessions/{sessionId}/tabs/{tabId}/assets"]["get"].is_object());
         let parts = &spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/parts"]["get"];
         assert!(parts.is_object());
         assert_eq!(parts["parameters"][2]["name"], "lines");
@@ -12705,9 +12879,9 @@ mod tests {
             CONTENT_SCHEMA_VERSION
         );
         assert_eq!(
-            spec["paths"]["/api/sessions/{sessionId}/workspaces/{workspaceId}/assets"]["get"]
-                ["responses"]["200"]["content"]["application/json"]["schema"]["properties"]
-                ["schema_version"]["const"],
+            spec["paths"]["/api/sessions/{sessionId}/tabs/{tabId}/assets"]["get"]["responses"]
+                ["200"]["content"]["application/json"]["schema"]["properties"]["schema_version"]
+                ["const"],
             CONTENT_SCHEMA_VERSION
         );
         assert!(
@@ -13712,12 +13886,14 @@ mod tests {
                     path: repo.clone(),
                     session_id: "default".into(),
                     workspace_id: Some("wA".into()),
+                    tab_id: Some("wA:t1".into()),
                     pane_id: Some("wA:p1".into()),
                 },
                 AssetRoot {
                     path: plain.clone(),
                     session_id: "default".into(),
                     workspace_id: Some("wB".into()),
+                    tab_id: Some("wB:t1".into()),
                     pane_id: Some("wB:p1".into()),
                 },
             ],
