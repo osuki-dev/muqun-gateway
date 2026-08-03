@@ -358,7 +358,14 @@ impl TerminalBackend for TmuxBackend {
             let captured = strip_grid_padding(&self.output(&args).await?);
 
             let (text, range) = match range {
-                Some(range) => (captured, Some(range)),
+                // `capture-pane` terminates every row -- including the last --
+                // with `\n`, so `captured` carries a trailing newline the tail
+                // path never has (`tail_lines` builds its result with
+                // `.lines()` + `.join("\n")`, which drops it). Strip that one
+                // trailing `\n` so both paths return the same shape for the
+                // same content; this removes a terminator, not a line, so the
+                // line count `range` describes is unaffected.
+                Some(range) => (strip_trailing_newline(captured), Some(range)),
                 // Metrics were never fetched here, so there is nothing honest to
                 // report: `PaneOutput.range` exists precisely for "this backend
                 // cannot say", and inventing a range would cost a subprocess this
@@ -852,6 +859,19 @@ fn tail_lines(text: &str, limit: usize) -> String {
     let lines = text.lines().collect::<Vec<_>>();
     let start = lines.len().saturating_sub(limit);
     lines[start..].join("\n")
+}
+
+/// Drop a single trailing `\n`, if present.
+///
+/// `capture-pane` terminates every captured row with `\n`, including the
+/// last. Removing just that one terminator (never more, never a whole line)
+/// makes the range-addressed `read_pane` path match the shape `tail_lines`
+/// already produces, without changing how many lines the text holds.
+fn strip_trailing_newline(mut text: String) -> String {
+    if text.ends_with('\n') {
+        text.pop();
+    }
+    text
 }
 
 fn text_revision(text: &str) -> u64 {
@@ -1378,13 +1398,12 @@ mod tests {
         // Disjoint pages tile the span exactly: this is the property the whole
         // change exists for, and the one a growing tail could never have.
         //
-        // Note: unlike the tail (no-range) path, which joins lines with
-        // `.lines().join("\n")` and drops any trailing newline, the
-        // range-addressed path in `read_pane` returns tmux's raw
-        // `capture-pane` output verbatim, and tmux terminates every captured
-        // line -- including the last -- with `\n`. So `lower.text` already
-        // ends in `\n`; concatenating with no separator is what tiles.
-        assert_eq!(format!("{}{}", lower.text, upper.text), spanning.text);
+        // Both the tail (no-range) and range-addressed paths in `read_pane`
+        // return the same shape: no trailing newline. So `lower.text` no
+        // longer carries the `\n` that separated it from `upper.text` in raw
+        // `capture-pane` output; that separator has to be put back explicitly
+        // for the concatenation to tile the spanning read.
+        assert_eq!(format!("{}\n{}", lower.text, upper.text), spanning.text);
         assert_eq!(lower.range.unwrap().end, upper.range.unwrap().start);
 
         backend.close_workspace(&workspace.id).await.unwrap();
