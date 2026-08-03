@@ -56,9 +56,9 @@ use authority::{hash_token, identify_device, DeviceRecord, PairingCodeError, Pen
 
 use crate::i18n::Locale;
 use backend::{
-    AgentStatus as BackendAgentStatus, BackendError, BackendKind, BackendRegistry,
+    AgentStatus as BackendAgentStatus, BackendError, BackendFuture, BackendKind, BackendRegistry,
     CreateTab as BackendCreateTab, CreateWorkspace as BackendCreateWorkspace,
-    OutputFormat as BackendOutputFormat, OutputSource as BackendOutputSource,
+    OutputFormat as BackendOutputFormat, OutputSource as BackendOutputSource, Pane,
     PaneId as BackendPaneId, ReadPane as BackendReadPane, SplitDirection as BackendSplitDirection,
     SplitPane as BackendSplitPane, StartAgent as BackendStartAgent, TabId as BackendTabId,
     TerminalBackend, TmuxWireIds, WorkspaceId as BackendWorkspaceId,
@@ -3781,9 +3781,79 @@ async fn session_metadata(session: &SessionConfig) -> (Value, Value) {
     }
 }
 
+/// How much of "there's something to actually look at" a configured session
+/// offers, most useful first. `GET /api/sessions` orders by this instead of a
+/// fixed backend rank, because the app reads `sessions[0]` and shows no
+/// picker -- whichever backend actually has something in it is the one that
+/// needs to be first, and only the gateway is in a position to know which
+/// that is on any given request.
+///
+/// Declared top-to-bottom in the order it should sort, so deriving `Ord`
+/// gives exactly the "most significant first" comparison the endpoint wants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum SessionLiveness {
+    HasPanes,
+    Empty,
+    Unreachable,
+}
+
+/// How long `GET /api/sessions` waits on a single backend before counting it
+/// as unreachable. A dead socket that refuses the connection resolves this
+/// fast on its own; this bound exists for the backend that accepts a
+/// connection and then never answers, which would otherwise hang the whole
+/// endpoint on one dead session.
+const SESSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Turn a `list_panes` call into a liveness bucket, bounded by `timeout`.
+///
+/// Takes the future rather than a backend or a `SessionConfig` so it can be
+/// exercised with a canned outcome -- immediate success with or without
+/// panes, immediate failure, or a future that never resolves -- without
+/// standing up a real Herdr or tmux backend.
+async fn session_liveness(
+    list_panes: BackendFuture<'_, Vec<Pane>>,
+    timeout: Duration,
+) -> SessionLiveness {
+    match tokio::time::timeout(timeout, list_panes).await {
+        Ok(Ok(panes)) if !panes.is_empty() => SessionLiveness::HasPanes,
+        Ok(Ok(_)) => SessionLiveness::Empty,
+        Ok(Err(_)) | Err(_) => SessionLiveness::Unreachable,
+    }
+}
+
+/// `GET /api/sessions` ordering key: liveness first (has panes, then
+/// empty-but-reachable, then unreachable), tmux before herdr as the
+/// tiebreaker between otherwise-equal entries.
+///
+/// Pure and independent of any backend, so every bucket -- including "every
+/// configured session is unreachable" -- gets a fast, deterministic unit
+/// test instead of depending on a live tmux or Herdr server.
+fn session_order_key(session: &SessionConfig, liveness: SessionLiveness) -> (SessionLiveness, u8) {
+    let backend_rank = match session.backend {
+        BackendKind::Tmux => 0,
+        BackendKind::Herdr => 1,
+    };
+    (liveness, backend_rank)
+}
+
 async fn sessions(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
-    Ok(Json(json!({ "sessions": state.config.sessions })))
+    // Order, don't filter: every configured session stays in the response,
+    // even when nothing is reachable, so a client that reads only
+    // `sessions[0]` never sees `undefined` where it used to see a session.
+    let liveness =
+        futures::future::join_all(state.config.sessions.iter().map(|session| async move {
+            let backend = terminal_backend(session);
+            session_liveness(backend.list_panes(), SESSION_PROBE_TIMEOUT).await
+        }))
+        .await;
+    let mut order: Vec<usize> = (0..state.config.sessions.len()).collect();
+    order.sort_by_key(|&index| session_order_key(&state.config.sessions[index], liveness[index]));
+    let sessions: Vec<&SessionConfig> = order
+        .into_iter()
+        .map(|index| &state.config.sessions[index])
+        .collect();
+    Ok(Json(json!({ "sessions": sessions })))
 }
 
 async fn snapshot(
@@ -12616,10 +12686,181 @@ mod tests {
         config.sessions.clear();
         upsert_backend_session(&mut config, BackendKind::Herdr, None, None, None).unwrap();
         upsert_backend_session(&mut config, BackendKind::Tmux, None, None, None).unwrap();
-        // The app reads sessions[0] and shows no picker, so this ordering is the
-        // whole of "tmux is the default backend" as far as a client can tell.
+        // `GET /api/sessions` no longer serves in this order -- it reorders by
+        // liveness on every request (see `session_order_key`). This stable
+        // storage order is what's left to matter: the "primary" session
+        // `gateway_metadata` reports for `/health` and `/api/meta`, and the
+        // order `configure_backend list` prints. Keeping tmux first there too
+        // is the harmless, previously-established default, not a competing
+        // ordering rule for the app.
         assert_eq!(config.sessions[0].backend, BackendKind::Tmux);
         assert_eq!(config.sessions[1].backend, BackendKind::Herdr);
+    }
+
+    fn liveness_session(id: &str, backend: BackendKind) -> SessionConfig {
+        SessionConfig {
+            id: id.into(),
+            label: id.into(),
+            socket_path: String::new(),
+            backend,
+        }
+    }
+
+    #[test]
+    fn liveness_outranks_backend_kind_in_the_sessions_ordering_key() {
+        use SessionLiveness::{Empty, HasPanes, Unreachable};
+        // A reachable-and-populated herdr session outranks an empty or dead
+        // tmux one -- liveness is the significant digit, backend kind is only
+        // the tiebreaker.
+        let empty_tmux = liveness_session("t", BackendKind::Tmux);
+        let herdr_with_panes = liveness_session("h", BackendKind::Herdr);
+        assert!(
+            session_order_key(&herdr_with_panes, HasPanes) < session_order_key(&empty_tmux, Empty)
+        );
+
+        let dead_tmux = liveness_session("t", BackendKind::Tmux);
+        assert!(
+            session_order_key(&herdr_with_panes, HasPanes)
+                < session_order_key(&dead_tmux, Unreachable)
+        );
+        assert!(session_order_key(&empty_tmux, Empty) < session_order_key(&dead_tmux, Unreachable));
+    }
+
+    #[test]
+    fn tmux_breaks_ties_ahead_of_herdr_at_every_liveness_level() {
+        for liveness in [
+            SessionLiveness::HasPanes,
+            SessionLiveness::Empty,
+            SessionLiveness::Unreachable,
+        ] {
+            let tmux = liveness_session("t", BackendKind::Tmux);
+            let herdr = liveness_session("h", BackendKind::Herdr);
+            assert!(
+                session_order_key(&tmux, liveness) < session_order_key(&herdr, liveness),
+                "tmux should sort ahead of herdr when both are {liveness:?}"
+            );
+        }
+    }
+
+    /// Sorting a full session list by the key, including every configured
+    /// session staying present when none of them are reachable -- ordering
+    /// must never turn into filtering.
+    #[test]
+    fn sorting_by_the_key_orders_without_dropping_anyone() {
+        let sessions = [
+            liveness_session("herdr-empty", BackendKind::Herdr),
+            liveness_session("tmux-dead", BackendKind::Tmux),
+            liveness_session("herdr-live", BackendKind::Herdr),
+            liveness_session("tmux-empty", BackendKind::Tmux),
+        ];
+        let liveness = [
+            SessionLiveness::Empty,
+            SessionLiveness::Unreachable,
+            SessionLiveness::HasPanes,
+            SessionLiveness::Empty,
+        ];
+        let mut order: Vec<usize> = (0..sessions.len()).collect();
+        order.sort_by_key(|&index| session_order_key(&sessions[index], liveness[index]));
+        let ids: Vec<&str> = order
+            .iter()
+            .map(|&index| sessions[index].id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["herdr-live", "tmux-empty", "herdr-empty", "tmux-dead"]
+        );
+        assert_eq!(
+            order.len(),
+            sessions.len(),
+            "every session stays in the list"
+        );
+    }
+
+    /// All-unreachable is the case that matters most: a client reading only
+    /// `sessions[0]` must still get a session back, not `undefined`.
+    #[test]
+    fn every_session_survives_when_all_are_unreachable() {
+        let sessions = [
+            liveness_session("a", BackendKind::Herdr),
+            liveness_session("b", BackendKind::Tmux),
+            liveness_session("c", BackendKind::Herdr),
+        ];
+        let mut order: Vec<usize> = (0..sessions.len()).collect();
+        order.sort_by_key(|&index| {
+            session_order_key(&sessions[index], SessionLiveness::Unreachable)
+        });
+        assert_eq!(order.len(), 3);
+        // Tmux still wins the tiebreak; the two herdr entries keep the
+        // relative order they were configured in (stable sort).
+        let ids: Vec<&str> = order
+            .iter()
+            .map(|&index| sessions[index].id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["b", "a", "c"]);
+    }
+
+    #[tokio::test]
+    async fn session_liveness_reports_panes_present() {
+        let panes = vec![Pane {
+            id: BackendPaneId::new("p1"),
+            terminal_id: None,
+            workspace_id: BackendWorkspaceId::new("w1"),
+            tab_id: BackendTabId::new("t1"),
+            label: None,
+            terminal_title: None,
+            cwd: None,
+            focused: false,
+            width: None,
+            height: None,
+            revision: None,
+            foreground_command: None,
+            agent: None,
+            agent_status: BackendAgentStatus::Unknown,
+            max_offset_from_bottom: None,
+            viewport_rows: None,
+        }];
+        let outcome = session_liveness(
+            Box::pin(async move { Ok(panes) }),
+            Duration::from_millis(50),
+        )
+        .await;
+        assert_eq!(outcome, SessionLiveness::HasPanes);
+    }
+
+    #[tokio::test]
+    async fn session_liveness_reports_reachable_but_empty() {
+        let outcome = session_liveness(
+            Box::pin(async { Ok(Vec::new()) }),
+            Duration::from_millis(50),
+        )
+        .await;
+        assert_eq!(outcome, SessionLiveness::Empty);
+    }
+
+    #[tokio::test]
+    async fn session_liveness_reports_unreachable_on_a_backend_error() {
+        let outcome = session_liveness(
+            Box::pin(async { Err(BackendError::Unavailable) }),
+            Duration::from_millis(50),
+        )
+        .await;
+        assert_eq!(outcome, SessionLiveness::Unreachable);
+    }
+
+    /// The case a failed connect does not cover: a backend that accepts and
+    /// then never answers must not hang `GET /api/sessions` -- it has to be
+    /// discovered by timeout.
+    #[tokio::test]
+    async fn session_liveness_reports_unreachable_on_timeout_without_waiting_for_the_probe() {
+        let outcome = session_liveness(
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                Ok(Vec::new())
+            }),
+            Duration::from_millis(20),
+        )
+        .await;
+        assert_eq!(outcome, SessionLiveness::Unreachable);
     }
 
     #[test]
@@ -12973,6 +13214,206 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         state
+    }
+
+    /// A Herdr socket that answers `pane.list` with a fixed set of panes (or
+    /// none), for driving the real `HerdrBackend` -> `list_panes` path that
+    /// `sessions()` probes end to end, without needing Herdr installed or a
+    /// live tmux server.
+    struct FakePaneListHerdr {
+        socket_path: PathBuf,
+    }
+
+    impl FakePaneListHerdr {
+        fn start(panes: Value) -> Self {
+            let socket_path = std::env::temp_dir().join(format!(
+                "herdr-panelist-{}.sock",
+                uuid::Uuid::new_v4().simple()
+            ));
+            let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        continue;
+                    }
+                    let request: Value = serde_json::from_str(&line).unwrap_or_default();
+                    let response = json!({
+                        "id": request["id"],
+                        "result": { "panes": panes.clone() }
+                    })
+                    .to_string();
+                    let mut stream = reader.into_inner();
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.write_all(b"\n").await;
+                    let _ = stream.flush().await;
+                }
+            });
+            Self { socket_path }
+        }
+
+        fn session(&self, id: &str) -> SessionConfig {
+            SessionConfig {
+                id: id.into(),
+                label: id.into(),
+                socket_path: self.socket_path.to_string_lossy().into_owned(),
+                backend: BackendKind::Herdr,
+            }
+        }
+    }
+
+    fn session_ids(response: &Value) -> Vec<String> {
+        response["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|session| session["id"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// End to end through the real handler: a herdr session that actually has
+    /// a pane outranks a tmux session configured but not running -- the
+    /// motivating regression for this card, where the app reads
+    /// `sessions[0]` and the old static tmux-first order pointed it at the
+    /// dead backend.
+    #[tokio::test]
+    async fn sessions_endpoint_puts_a_live_backend_ahead_of_a_configured_but_dead_one() {
+        let herdr = FakePaneListHerdr::start(json!([
+            { "pane_id": "p1", "workspace_id": "w1", "tab_id": "t1" }
+        ]));
+        let mut state = test_state("admin", vec![test_device("d1", "token")]);
+        state.config.sessions = vec![
+            SessionConfig {
+                id: "tmux-dead".into(),
+                label: "tmux".into(),
+                socket_path: std::env::temp_dir()
+                    .join(format!("tmux-absent-{}.sock", uuid::Uuid::new_v4()))
+                    .to_string_lossy()
+                    .into_owned(),
+                backend: BackendKind::Tmux,
+            },
+            herdr.session("herdr-live"),
+        ];
+
+        let response = sessions(State(state), bearer_headers("token"))
+            .await
+            .unwrap();
+        assert_eq!(session_ids(&response.0), vec!["herdr-live", "tmux-dead"]);
+    }
+
+    /// Ordering must never turn into filtering: every configured session is
+    /// still in the response when none of them are reachable, so a client
+    /// reading `sessions[0]` finds a session object instead of `undefined`.
+    #[tokio::test]
+    async fn sessions_endpoint_keeps_every_session_when_nothing_is_reachable() {
+        let mut state = unreachable_state();
+        state.config.sessions.push(SessionConfig {
+            id: "tmux-also-dead".into(),
+            label: "tmux".into(),
+            socket_path: std::env::temp_dir()
+                .join(format!("tmux-absent-{}.sock", uuid::Uuid::new_v4()))
+                .to_string_lossy()
+                .into_owned(),
+            backend: BackendKind::Tmux,
+        });
+        let configured = state.config.sessions.len();
+
+        let response = sessions(State(state), bearer_headers("token"))
+            .await
+            .unwrap();
+        let ids = session_ids(&response.0);
+        assert_eq!(ids.len(), configured, "no session drops out of the list");
+        // Both are unreachable, so tmux still wins the tiebreak.
+        assert_eq!(ids[0], "tmux-also-dead");
+    }
+
+    /// A reachable session with no panes open still outranks an unreachable
+    /// one, and still trails a session that actually has something in it.
+    #[tokio::test]
+    async fn sessions_endpoint_ranks_reachable_empty_between_live_and_dead() {
+        let empty_herdr = FakePaneListHerdr::start(json!([]));
+        let busy_herdr = FakePaneListHerdr::start(json!([
+            { "pane_id": "p1", "workspace_id": "w1", "tab_id": "t1" }
+        ]));
+        let mut state = test_state("admin", vec![test_device("d1", "token")]);
+        state.config.sessions = vec![
+            empty_herdr.session("empty"),
+            SessionConfig {
+                id: "dead".into(),
+                label: "dead".into(),
+                socket_path: std::env::temp_dir()
+                    .join(format!("herdr-absent-{}.sock", uuid::Uuid::new_v4()))
+                    .to_string_lossy()
+                    .into_owned(),
+                backend: BackendKind::Herdr,
+            },
+            busy_herdr.session("busy"),
+        ];
+
+        let response = sessions(State(state), bearer_headers("token"))
+            .await
+            .unwrap();
+        assert_eq!(session_ids(&response.0), vec!["busy", "empty", "dead"]);
+    }
+
+    /// Same regression as `sessions_endpoint_puts_a_live_backend_ahead_of_a_configured_but_dead_one`,
+    /// but against a genuinely live tmux server instead of a fake -- on a
+    /// private socket this test creates and owns, never the developer's
+    /// default tmux server. Requires `tmux` on `PATH` and permission to
+    /// create a Unix socket, so it is `--ignored` like the other isolated
+    /// tmux contract tests.
+    #[tokio::test]
+    #[ignore = "requires permission to create a local tmux Unix socket"]
+    async fn sessions_endpoint_puts_a_live_isolated_tmux_session_ahead_of_a_dead_herdr_one() {
+        if tokio::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .await
+            .is_err()
+        {
+            eprintln!("skipping: no tmux on PATH");
+            return;
+        }
+        let socket_path = std::env::temp_dir().join(format!(
+            "gateway-sessions-live-{}.sock",
+            uuid::Uuid::new_v4()
+        ));
+        let tmux = backend::TmuxBackend::new(Some(socket_path.clone()));
+        let workspace = tmux
+            .create_workspace(&BackendCreateWorkspace {
+                cwd: Some(std::env::temp_dir()),
+                label: Some("gateway-sessions-live".into()),
+                focus: true,
+            })
+            .await
+            .unwrap();
+
+        let mut state = test_state("admin", vec![test_device("d1", "token")]);
+        state.config.sessions = vec![
+            SessionConfig {
+                id: "herdr-dead".into(),
+                label: "herdr".into(),
+                socket_path: std::env::temp_dir()
+                    .join(format!("herdr-absent-{}.sock", uuid::Uuid::new_v4()))
+                    .to_string_lossy()
+                    .into_owned(),
+                backend: BackendKind::Herdr,
+            },
+            SessionConfig {
+                id: "tmux-live".into(),
+                label: "tmux".into(),
+                socket_path: socket_path.to_string_lossy().into_owned(),
+                backend: BackendKind::Tmux,
+            },
+        ];
+
+        let response = sessions(State(state), bearer_headers("token"))
+            .await
+            .unwrap();
+        assert_eq!(session_ids(&response.0), vec!["tmux-live", "herdr-dead"]);
+
+        tmux.close_workspace(&workspace.id).await.unwrap();
     }
 
     fn spawn_body(agent: &str, cwd: Option<&str>) -> SpawnBody {
