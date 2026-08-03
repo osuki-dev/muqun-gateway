@@ -665,6 +665,22 @@ impl TerminalBackend for TmuxBackend {
             }
         })
     }
+
+    /// Runs a raw tmux query outside of `list_output`, so "no server running"
+    /// surfaces as the error it is instead of being folded into an empty
+    /// topology. `list-sessions` is enough to answer the question and cheaper
+    /// than listing panes; any failure *other* than the no-server message
+    /// (tmux missing, some other refusal) is left alone here -- `list_panes`
+    /// itself will surface that failure on its own right after this returns
+    /// "reachable", so there's nothing this probe needs to diagnose twice.
+    fn probe_reachable(&self) -> BackendFuture<'_, bool> {
+        Box::pin(async move {
+            match self.output(["list-sessions"]).await {
+                Err(BackendError::Refused { message, .. }) => Ok(!means_no_tmux_server(&message)),
+                _ => Ok(true),
+            }
+        })
+    }
 }
 
 fn pane_from_fields(fields: Vec<String>) -> Result<Pane, BackendError> {
@@ -990,6 +1006,21 @@ mod tests {
         assert!(!means_no_tmux_server("can't find pane: %99"));
     }
 
+    /// The exact masking the test above documents, from the other side:
+    /// `list_panes` (via `list_output`) reports the same nonexistent socket
+    /// as an empty topology, not an error -- correct for every other caller,
+    /// but it would make a dead tmux server indistinguishable from a live one
+    /// with nothing in it. `probe_reachable` exists so a caller that needs to
+    /// tell those two apart can.
+    #[tokio::test]
+    async fn probe_reachable_tells_no_server_apart_from_list_panes_reporting_empty() {
+        let socket =
+            std::env::temp_dir().join(format!("gateway-probe-{}.sock", uuid::Uuid::new_v4()));
+        let backend = TmuxBackend::new(Some(socket));
+        assert!(!backend.probe_reachable().await.unwrap());
+        assert_eq!(backend.list_panes().await.unwrap(), Vec::new());
+    }
+
     #[test]
     fn command_runner_never_needs_a_shell() {
         let backend = TmuxBackend::with_binary("tmux", Some(PathBuf::from("/tmp/tmux.sock")));
@@ -1144,6 +1175,14 @@ mod tests {
         let (history, height) = backend.pane_metrics(&pane.id).await.unwrap();
         assert_eq!(Some(height), pane.viewport_rows);
         assert_eq!(Some(history), pane.max_offset_from_bottom);
+        backend.close_workspace(&workspace.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a tmux server"]
+    async fn probe_reachable_is_true_against_a_genuinely_live_server() {
+        let (backend, workspace) = contract_workspace().await;
+        assert!(backend.probe_reachable().await.unwrap());
         backend.close_workspace(&workspace.id).await.unwrap();
     }
 

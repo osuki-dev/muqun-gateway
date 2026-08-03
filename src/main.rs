@@ -1067,9 +1067,13 @@ fn upsert_backend_session(
         socket_path: socket_path.unwrap_or_else(|| default_backend_socket(backend)),
         backend,
     });
-    // Muqun selects sessions[0] and exposes no picker, so ordering is what
-    // makes tmux the backend a client actually reaches. Stable, so two
-    // sessions of the same backend keep the order they were added in.
+    // `GET /api/sessions` no longer serves in this stored order -- it
+    // reorders every request by which backend actually has something live in
+    // it (see `session_order_key` / `sessions()`). What this stored order
+    // still governs: `gateway_metadata`'s "primary" session for `/health` and
+    // `/api/meta` (it reads `config.sessions.first()`), and the order
+    // `configure_backend list` and `config.json` present to a human. Stable,
+    // so two sessions of the same backend keep the order they were added in.
     config
         .sessions
         .sort_by_key(|session| match session.backend {
@@ -3844,7 +3848,20 @@ async fn sessions(State(state): State<AppState>, headers: HeaderMap) -> ApiResul
     let liveness =
         futures::future::join_all(state.config.sessions.iter().map(|session| async move {
             let backend = terminal_backend(session);
-            session_liveness(backend.list_panes(), SESSION_PROBE_TIMEOUT).await
+            // `probe_reachable` catches the one case `list_panes` cannot tell
+            // apart on its own: tmux's `list_output` deliberately maps "no
+            // server running" onto an empty pane list for every other
+            // caller, which would otherwise make a dead tmux backend
+            // indistinguishable from a live one that holds nothing. Both
+            // calls run inside the one probe `session_liveness` bounds, so a
+            // dead backend is still discovered by a single timeout, not two.
+            let probe = async {
+                match backend.probe_reachable().await {
+                    Ok(false) => Err(BackendError::Unavailable),
+                    _ => backend.list_panes().await,
+                }
+            };
+            session_liveness(Box::pin(probe), SESSION_PROBE_TIMEOUT).await
         }))
         .await;
     let mut order: Vec<usize> = (0..state.config.sessions.len()).collect();
@@ -13324,8 +13341,50 @@ mod tests {
             .unwrap();
         let ids = session_ids(&response.0);
         assert_eq!(ids.len(), configured, "no session drops out of the list");
-        // Both are unreachable, so tmux still wins the tiebreak.
+        // Both are genuinely SessionLiveness::Unreachable here -- the herdr
+        // entry via a refused connection, the tmux entry via
+        // `probe_reachable` catching the same "no such file or directory"
+        // that `list_output` would otherwise fold into an empty topology
+        // (see `probe_reachable_tells_no_server_apart_from_list_panes_reporting_empty`
+        // in `backend/tmux.rs`). So this genuinely exercises the tmux/herdr
+        // tiebreak between two unreachable entries, not an accident of tmux
+        // misreporting as merely empty.
         assert_eq!(ids[0], "tmux-also-dead");
+    }
+
+    /// The regression `sessions_endpoint_keeps_every_session_when_nothing_is_reachable`
+    /// could not have caught on its own: before `probe_reachable`, a tmux
+    /// session pointed at a socket nothing is listening on classified as
+    /// `SessionLiveness::Empty` (via `list_output`'s "no server is an empty
+    /// topology" masking), not `Unreachable`. That happened to still sort
+    /// tmux first against an `Unreachable` herdr entry -- Empty outranks
+    /// Unreachable regardless of the tiebreak -- so the bug was invisible
+    /// there. Pairing the dead tmux session with a *reachable-but-empty*
+    /// herdr session instead exposes it directly: a herdr session that is
+    /// genuinely `Empty` must outrank a tmux session that is genuinely
+    /// `Unreachable`, which only holds if tmux's "no server" case is actually
+    /// classified as `Unreachable` and not conflated with `Empty`.
+    #[tokio::test]
+    async fn sessions_endpoint_ranks_a_reachable_empty_backend_ahead_of_a_dead_tmux_one() {
+        let empty_herdr = FakePaneListHerdr::start(json!([]));
+        let mut state = test_state("admin", vec![test_device("d1", "token")]);
+        state.config.sessions = vec![
+            SessionConfig {
+                id: "tmux-dead".into(),
+                label: "tmux".into(),
+                socket_path: std::env::temp_dir()
+                    .join(format!("tmux-absent-{}.sock", uuid::Uuid::new_v4()))
+                    .to_string_lossy()
+                    .into_owned(),
+                backend: BackendKind::Tmux,
+            },
+            empty_herdr.session("herdr-empty"),
+        ];
+
+        let response = sessions(State(state), bearer_headers("token"))
+            .await
+            .unwrap();
+        assert_eq!(session_ids(&response.0), vec!["herdr-empty", "tmux-dead"]);
     }
 
     /// A reachable session with no panes open still outranks an unreachable

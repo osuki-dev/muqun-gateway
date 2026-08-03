@@ -379,6 +379,12 @@ impl TerminalBackend for TmuxWireIds {
             ))
         })
     }
+
+    fn probe_reachable(&self) -> BackendFuture<'_, bool> {
+        // No id on either side of this call -- nothing to translate, just
+        // forward to the wrapped tmux backend's own answer.
+        self.inner.probe_reachable()
+    }
 }
 
 #[cfg(test)]

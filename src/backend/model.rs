@@ -361,6 +361,26 @@ pub trait TerminalBackend: Send + Sync {
     ) -> BackendFuture<'a, WorktreePlacement> {
         Box::pin(async { Err(BackendError::Unsupported("worktrees")) })
     }
+
+    /// Whether the backend's own server is there at all, apart from whether
+    /// it currently holds anything.
+    ///
+    /// For most backends `list_panes`'s own success/failure already answers
+    /// this on its own -- a connection that cannot be made surfaces as an
+    /// error, full stop. This exists only because tmux's `list_output`
+    /// deliberately folds "no server running" into an *empty* topology for
+    /// every other caller (closing the last workspace must not start looking
+    /// like an error), which would otherwise make a dead tmux server
+    /// indistinguishable from a live one that happens to hold nothing. A
+    /// caller that needs to tell those two apart -- `GET /api/sessions`'s
+    /// liveness probe -- asks here first.
+    ///
+    /// Defaults to "reachable", so a backend that never overrides this keeps
+    /// relying purely on `list_panes`'s own error path, exactly as before
+    /// this method existed.
+    fn probe_reachable(&self) -> BackendFuture<'_, bool> {
+        Box::pin(async { Ok(true) })
+    }
 }
 
 #[cfg(test)]
