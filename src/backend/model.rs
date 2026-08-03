@@ -150,14 +150,17 @@ pub struct Pane {
     /// that repaints in place rather than prints and scrolls. `None` where the
     /// backend cannot say (Herdr; a tmux pane before its first list).
     ///
-    /// Gateway-internal for now: `ScrollbackStore` is the one reader
-    /// (`src/scrollback.rs`), which needs it to tell "this pane's screen
-    /// changed completely, keep what we already had above it" (a genuinely
-    /// scrolling pane the placement lost track of) apart from "this pane's
-    /// screen changed completely because it repainted" (an alternate-screen
-    /// pane, which has nothing above its current screen to keep). Riding the
-    /// same envelope `ScrollbackStore::observe` already walks
-    /// (`compat::pane_list`) rather than a second channel.
+    /// Gateway-internal, and currently unread. Card #795 first added this for
+    /// `ScrollbackStore` (`src/scrollback.rs`) to gate its replace-vs-
+    /// accumulate fold on, but measured wrong live: `alternate_on` is 1 for an
+    /// agent pane exactly as it is for an editor's -- Claude Code, opencode
+    /// and codex all own an alternate screen too (see that module's own
+    /// doc) -- so it cannot tell an editor's pane from an agent's, and a card
+    /// #795 follow-up dropped it as that switch in favour of
+    /// `foreground_command` (`is_editor_command` in `src/scrollback.rs`).
+    /// Left here, still riding the same envelope `ScrollbackStore::observe`
+    /// already walks (`compat::pane_list`), as a raw signal a future reader
+    /// may still want.
     pub alternate_on: Option<bool>,
 }
 

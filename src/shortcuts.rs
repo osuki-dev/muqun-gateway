@@ -370,10 +370,19 @@ fn profile_commands(profile: Option<&Profile>) -> &'static [SlashCommand] {
         .unwrap_or(&[])
 }
 
-/// Programs that take over the whole screen, recognised from the pane title.
-/// An editor is not an agent, so the agent field never names it.
-const EDITOR_TITLES: &[&str] = &["vim", "nvim", "nvi", "helix", "hx", "emacs", "nano"];
+/// Programs that take over the whole screen. An editor is not an agent, so the
+/// agent field never names it.
+///
+/// Shared with `scrollback.rs`'s `is_editor_command`, which asks the same "is
+/// this pane an editor" question against a different signal
+/// (`foreground_command`, tmux's own report of the running process, rather
+/// than the pane title matched here): `ScrollbackStore` needs to tell an
+/// editor's pane from an agent's to decide whether a read replaces or
+/// accumulates, and an agent pane must never answer yes (card #795 -- see
+/// that module's own doc on `record`).
+pub(crate) const EDITOR_PROGRAMS: &[&str] = &["vim", "nvim", "nvi", "helix", "hx", "emacs", "nano"];
 
+/// Recognised from the pane title.
 fn is_editor_title(title: &str) -> bool {
     let head = title
         .trim()
@@ -384,7 +393,7 @@ fn is_editor_title(title: &str) -> bool {
         .next()
         .unwrap_or("")
         .to_ascii_lowercase();
-    EDITOR_TITLES.contains(&head.as_str())
+    EDITOR_PROGRAMS.contains(&head.as_str())
 }
 
 /// Resolves what a pane is running into the keys and commands it responds to.

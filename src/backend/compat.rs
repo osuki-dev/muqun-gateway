@@ -161,11 +161,12 @@ fn pane(value: Pane) -> Value {
         "scroll": {
             "max_offset_from_bottom": value.max_offset_from_bottom.unwrap_or(0),
             "viewport_rows": value.viewport_rows.or(value.height),
-            // Gateway-internal today (see `Pane::alternate_on`'s own doc): the
-            // one reader is `ScrollbackStore::observe`, which already walks
-            // this `scroll` object for every pane on every list/snapshot, so
-            // riding along here costs nothing new to plumb. Not consumed by
-            // the app yet.
+            // Gateway-internal, and currently unread (see `Pane::alternate_on`'s
+            // own doc: card #795 found it could not tell an editor's pane from
+            // an agent's). Left on this envelope regardless, since
+            // `ScrollbackStore::observe` already walks it for every pane on
+            // every list/snapshot and removing it buys nothing. Not consumed
+            // by the app yet.
             "alternate_on": value.alternate_on,
         }
     })
