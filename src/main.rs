@@ -1686,7 +1686,10 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
             "/api/sessions/{session_id}/panes/{pane_id}/send-keys",
             post(send_keys),
         )
-        .route("/api/sessions/{session_id}/assets", get(session_assets))
+        .route(
+            "/api/sessions/{session_id}/workspaces/{workspace_id}/assets",
+            get(session_assets),
+        )
         .route("/api/assets/{asset_id}/content", get(asset_content))
         // A route-level limit is applied inside the router-wide one, so uploads
         // get their own ceiling while every JSON route keeps the small one.
@@ -5953,7 +5956,7 @@ async fn recent_cwds(
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
     let session = find_session(&state.config, &session_id)?.clone();
-    let roots = session_asset_roots(&state, &session).await;
+    let roots = session_asset_roots(&state, &session, None).await;
 
     let cwds = tokio::task::spawn_blocking(move || {
         roots
@@ -6282,7 +6285,7 @@ async fn task_repo_roots(state: &AppState, session: &SessionConfig) -> Vec<PathB
         Err(err) => eprintln!("task roots: workspace list failed: {err}"),
     }
 
-    for root in session_asset_roots(state, session).await {
+    for root in session_asset_roots(state, session, None).await {
         push(root.path);
     }
     roots
@@ -6702,8 +6705,10 @@ async fn pane_files(
 
     // The roots come from the same place the asset listing's do -- the pane
     // cwds Herdr reports -- so this endpoint cannot reach a directory the
-    // assets API would refuse.
-    let roots = session_asset_roots(&state, &session).await;
+    // assets API would refuse. Whole-session here (not workspace-scoped): the
+    // narrowing below is to one exact pane, which is already narrower than one
+    // workspace, so there is nothing for a workspace filter to add.
+    let roots = session_asset_roots(&state, &session, None).await;
     let root = roots
         .iter()
         .find(|root| root.pane_id.as_deref() == Some(pane_id.as_str()))
@@ -7693,7 +7698,10 @@ struct ScannedFile {
 #[derive(Debug, Default)]
 struct AssetIndex {
     entries: HashMap<String, AssetEntry>,
-    roots: HashMap<String, Vec<AssetRoot>>,
+    /// Keyed on `(session_id, workspace_id)`. `workspace_id` is `None` for the
+    /// whole-session callers and `Some` for a workspace-scoped one, so the two
+    /// never share a slot -- see `session_asset_roots`.
+    roots: HashMap<(String, Option<String>), Vec<AssetRoot>>,
 }
 
 impl AssetIndex {
@@ -7727,22 +7735,34 @@ impl AssetIndex {
         self.entries.get(id).cloned()
     }
 
-    fn remember_roots(&mut self, session_id: &str, roots: Vec<AssetRoot>) {
-        self.roots.insert(session_id.to_owned(), roots);
+    fn remember_roots(
+        &mut self,
+        session_id: &str,
+        workspace_id: Option<&str>,
+        roots: Vec<AssetRoot>,
+    ) {
+        self.roots.insert(
+            (session_id.to_owned(), workspace_id.map(str::to_owned)),
+            roots,
+        );
     }
 
-    fn known_roots(&self, session_id: &str) -> Vec<AssetRoot> {
-        self.roots.get(session_id).cloned().unwrap_or_default()
+    fn known_roots(&self, session_id: &str, workspace_id: Option<&str>) -> Vec<AssetRoot> {
+        self.roots
+            .get(&(session_id.to_owned(), workspace_id.map(str::to_owned)))
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Newest first, cut to one page.
     fn session_assets(
         &self,
         session_id: &str,
+        workspace_id: &str,
         since_unix_ms: Option<u128>,
         limit: usize,
     ) -> Vec<AssetEntry> {
-        let mut entries = self.session_assets_ordered(session_id, since_unix_ms);
+        let mut entries = self.session_assets_ordered(session_id, workspace_id, since_unix_ms);
         entries.truncate(limit);
         entries
     }
@@ -7754,15 +7774,26 @@ impl AssetIndex {
     /// The caller that wants this rather than a page is the one that has to
     /// look past the page to fill it: a `kind` filter cannot be answered from
     /// the index, because what a file is comes from its bytes.
+    ///
+    /// Filtered by `workspace_id` as well as `session_id`: an entry ingested
+    /// under this session from a different workspace -- whether from before
+    /// this scoping existed, or from the cold-start reindex in `asset_content`,
+    /// which still rebuilds a whole session's worth of roots -- must not leak
+    /// into a listing scoped to one workspace. An entry with no workspace_id at
+    /// all (the exact-path lookup can index one without ever calling
+    /// `pane_list_roots`) never matches a specific workspace either, for the
+    /// same reason: an unattributed file is not known to belong here.
     fn session_assets_ordered(
         &self,
         session_id: &str,
+        workspace_id: &str,
         since_unix_ms: Option<u128>,
     ) -> Vec<AssetEntry> {
         let mut entries: Vec<AssetEntry> = self
             .entries
             .values()
             .filter(|entry| entry.session_id == session_id)
+            .filter(|entry| entry.workspace_id.as_deref() == Some(workspace_id))
             .filter(|entry| match since_unix_ms {
                 Some(since) => entry.modified_unix_ms > since,
                 None => true,
@@ -8085,27 +8116,48 @@ async fn ingest_roots(index: Arc<Mutex<AssetIndex>>, roots: Vec<AssetRoot>) -> V
 
 /// Herdr is the source of truth for where a session works, but a listing still
 /// has to answer when the socket is down, so the last known roots are kept.
-async fn session_asset_roots(state: &AppState, session: &SessionConfig) -> Vec<AssetRoot> {
+///
+/// `workspace_id` narrows the pane list tmux hands back -- every pane on the
+/// whole server -- down to the one workspace a caller asked about. `None`
+/// keeps the old, whole-session answer for the callers that still want it
+/// (the recent-directories picker, a task's candidate repo roots, and the
+/// cold-start reindex), so nothing about them changes.
+///
+/// The cache is keyed on `(session_id, workspace_id)`, not on `session_id`
+/// alone: a workspace-scoped call and a whole-session call against the same
+/// session must not read back each other's roots when `list_panes` fails and
+/// the last known set is served instead. Collapsing the key back to
+/// `session_id` alone would quietly widen every workspace-scoped listing back
+/// out to the whole machine the moment the socket hiccuped -- the exact bug
+/// this function exists to close, just deferred to the fallback path.
+async fn session_asset_roots(
+    state: &AppState,
+    session: &SessionConfig,
+    workspace_id: Option<&str>,
+) -> Vec<AssetRoot> {
     let response = terminal_backend(session)
         .list_panes()
         .await
         .map(backend::compat::pane_list)
         .map_err(|err| err.to_string());
-    let fresh = match response {
+    let mut fresh = match response {
         Ok(value) => pane_list_roots(&session.id, &value),
         Err(err) => {
             eprintln!("asset roots: pane.list failed: {err}");
             Vec::new()
         }
     };
+    if let Some(workspace_id) = workspace_id {
+        fresh.retain(|root| root.workspace_id.as_deref() == Some(workspace_id));
+    }
     if fresh.is_empty() {
         return match state.assets.lock() {
-            Ok(index) => index.known_roots(&session.id),
+            Ok(index) => index.known_roots(&session.id, workspace_id),
             Err(_) => Vec::new(),
         };
     }
     if let Ok(mut index) = state.assets.lock() {
-        index.remember_roots(&session.id, fresh.clone());
+        index.remember_roots(&session.id, workspace_id, fresh.clone());
     }
     fresh
 }
@@ -8315,16 +8367,27 @@ fn asset_page(entries: Vec<AssetEntry>, kinds: &[String], limit: usize) -> Vec<V
     page
 }
 
-/// List what a session's workspaces produced recently, newest first.
+/// List what one workspace produced recently, newest first.
+///
+/// Scoped to a workspace rather than to a session: with the tmux backend a
+/// session is the whole tmux server, and every pane on the machine -- across
+/// every project anyone happens to have open -- shares one `session_id`. An
+/// agent's Files sheet asks "what did this piece of work touch", which is the
+/// workspace it is showing, not every workspace the backend happens to know
+/// about. `workspace_id` is a wire id exactly like a pane id on the other
+/// handlers: the client already holds it from whatever pane or agent view
+/// opened this sheet, and it is compared as-is against the wire-form
+/// `workspace_id` `list_panes()` already hands back, with no separate decode
+/// step needed because both sides went through the same `TmuxWireIds` seam.
 async fn session_assets(
     State(state): State<AppState>,
-    Path(session_id): Path<String>,
+    Path((session_id, workspace_id)): Path<(String, String)>,
     Query(query): Query<AssetsQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
     let session = find_session(&state.config, &session_id)?.clone();
-    let roots = session_asset_roots(&state, &session).await;
+    let roots = session_asset_roots(&state, &session, Some(workspace_id.as_str())).await;
 
     // An exact path lookup asks about one file, so it neither waits for a scan
     // nor pages: it answers with that file or with nothing.
@@ -8348,6 +8411,7 @@ async fn session_assets(
         };
         return Ok(Json(content_envelope(json!({
             "session_id": session_id,
+            "workspace_id": workspace_id,
             "assets": assets,
             "path": query.path,
         }))));
@@ -8364,16 +8428,16 @@ async fn session_assets(
     // Unfiltered, the index cuts the page and only that page is sniffed:
     // metadata came from the scan, and reading a handful of file heads is cheap
     // where reading every file in the workspace would not be. A `kind` filter
-    // has to be given the whole session in order instead, because the index
+    // has to be given the whole workspace in order instead, because the index
     // does not know what a file is -- its bytes do -- and the page has to be
     // filled from the newest matches rather than from whatever the newest
     // handful of files happened to be.
     let entries = {
         let index = lock_assets(&state)?;
         if kinds.is_empty() {
-            index.session_assets(&session_id, since, limit)
+            index.session_assets(&session_id, &workspace_id, since, limit)
         } else {
-            index.session_assets_ordered(&session_id, since)
+            index.session_assets_ordered(&session_id, &workspace_id, since)
         }
     };
     let filter = kinds.clone();
@@ -8383,6 +8447,7 @@ async fn session_assets(
 
     Ok(Json(content_envelope(json!({
         "session_id": session_id,
+        "workspace_id": workspace_id,
         "assets": assets,
         "limit": limit,
         "since": since.map(|since| since as u64),
@@ -8410,7 +8475,7 @@ async fn asset_content(
         // Cold start: the app may hold an id from before a restart, so rebuild
         // the index from the live sessions once before answering.
         for session in state.config.sessions.clone() {
-            let roots = session_asset_roots(&state, &session).await;
+            let roots = session_asset_roots(&state, &session, None).await;
             ingest_roots(state.assets.clone(), roots).await;
         }
         entry = lock_assets(&state)?.get(&asset_id);
@@ -8426,7 +8491,7 @@ async fn asset_content(
     let session = find_session(&state.config, &entry.session_id)
         .map_err(|_| asset_not_found())?
         .clone();
-    let roots = canonical_roots(&session_asset_roots(&state, &session).await);
+    let roots = canonical_roots(&session_asset_roots(&state, &session, None).await);
     let entry_path = entry.path.clone();
     let Some(path) =
         tokio::task::spawn_blocking(move || resolve_indexed_asset_path(&entry_path, &roots))
@@ -9509,16 +9574,17 @@ fn openapi_spec() -> Value {
                     "responses": upload_responses()
                 }
             },
-            "/api/sessions/{sessionId}/assets": {
+            "/api/sessions/{sessionId}/workspaces/{workspaceId}/assets": {
                 "get": {
-                    "summary": "List files this session's workspaces produced recently, newest first",
-                    "description": "Unified content model, schema version 1.0.0. The response is the versioned envelope: schema_version, capabilities, and data, with the assets under data.assets. Assets are fed by the Herdr worktree events the gateway subscribes to, and by an mtime scan of the session's workspace roots, which is what a cold start uses. The scan is shallow, budgeted, and skips dot directories, dependency directories, and build output.",
+                    "summary": "List files this workspace produced recently, newest first",
+                    "description": "Unified content model, schema version 1.0.0. The response is the versioned envelope: schema_version, capabilities, and data, with the assets under data.assets. Assets are fed by the Herdr worktree events the gateway subscribes to, and by an mtime scan of the workspace's roots, which is what a cold start uses. The scan is shallow, budgeted, and skips dot directories, dependency directories, and build output. Scoped to workspaceId, not to the whole session: a tmux-backed session spans every workspace on the machine, and this answers only for the one the caller is looking at.",
                     "parameters": [
                         path_param("sessionId"),
+                        path_param("workspaceId"),
                         query_param("since", "Unix milliseconds, the same unit as modified_unix_ms; only files modified strictly after this are returned"),
                         query_param("limit", "How many assets to return, 1 to 200, default 50"),
                         query_param("kind", "Comma-separated allow-list of kinds -- image, markdown, text, pdf, binary -- filtered during the scan, so kind=image&limit=50 answers with the 50 newest images rather than the images among the 50 newest files. Absent or empty means every kind; a value outside the taxonomy matches nothing rather than erroring. The applied list is echoed back as data.kind"),
-                        query_param("path", "Resolve one absolute path exactly, for a file path tapped in terminal output. Takes precedence over since and limit. Answers with one asset, or with none when the path does not canonicalize to a file inside a workspace root -- a fenced-out path is a miss, not an error")
+                        query_param("path", "Resolve one absolute path exactly, for a file path tapped in terminal output. Takes precedence over since and limit. Answers with one asset, or with none when the path does not canonicalize to a file inside this workspace's roots -- a fenced-out path is a miss, not an error")
                     ],
                     "responses": assets_responses()
                 }
@@ -11936,7 +12002,8 @@ mod tests {
         assert!(!index.upsert(rescanned));
         assert_eq!(index.entries.len(), 2);
 
-        let listed = index.session_assets("default", None, 10);
+        // `test_asset_entry` puts everything in workspace "wA".
+        let listed = index.session_assets("default", "wA", None, 10);
         assert_eq!(
             listed
                 .iter()
@@ -11948,10 +12015,21 @@ mod tests {
         assert_eq!(listed[0].modified_unix_ms, 3_000);
 
         // `since` is exclusive, and `limit` cuts the newest page.
-        assert_eq!(index.session_assets("default", Some(2_000), 10).len(), 1);
-        assert_eq!(index.session_assets("default", Some(3_000), 10).len(), 0);
-        assert_eq!(index.session_assets("default", None, 1).len(), 1);
-        assert_eq!(index.session_assets("other", None, 10).len(), 0);
+        assert_eq!(
+            index.session_assets("default", "wA", Some(2_000), 10).len(),
+            1
+        );
+        assert_eq!(
+            index.session_assets("default", "wA", Some(3_000), 10).len(),
+            0
+        );
+        assert_eq!(index.session_assets("default", "wA", None, 1).len(), 1);
+        assert_eq!(index.session_assets("other", "wA", None, 10).len(), 0);
+        // Same session, a different workspace: none of "wA"'s files leak into
+        // it. This is the defect the workspace scope closes -- everything
+        // above proves the index still works exactly as it did, this proves
+        // it no longer answers wider than the workspace asked for.
+        assert_eq!(index.session_assets("default", "wB", None, 10).len(), 0);
 
         // Nested roots see the same file; the deeper one owns it.
         let shared = nested.join("shared.txt");
@@ -12026,9 +12104,10 @@ mod tests {
     }
 
     async fn listed_asset_names(state: &AppState, kind: Option<&str>, limit: usize) -> Vec<String> {
+        // `test_asset_entry` puts every fixture in workspace "wA".
         let response = session_assets(
             State(state.clone()),
-            Path("default".into()),
+            Path(("default".into(), "wA".into())),
             Query(asset_listing_query(kind, limit)),
             bearer_headers("token"),
         )
@@ -12104,7 +12183,7 @@ mod tests {
         // from one old enough to have ignored the parameter.
         let response = session_assets(
             State(state.clone()),
-            Path("default".into()),
+            Path(("default".into(), "wA".into())),
             Query(asset_listing_query(Some("Image"), 3)),
             bearer_headers("token"),
         )
@@ -12114,13 +12193,30 @@ mod tests {
         assert_eq!(response.0["data"]["assets"][0]["kind"], "image");
         let unfiltered = session_assets(
             State(state.clone()),
-            Path("default".into()),
+            Path(("default".into(), "wA".into())),
             Query(asset_listing_query(None, 3)),
             bearer_headers("token"),
         )
         .await
         .unwrap();
         assert_eq!(unfiltered.0["data"]["kind"], json!([]));
+
+        // A different workspace in the same session sees none of it: the
+        // scope this fix adds is the workspace, not the session, and this is
+        // the reported defect in miniature -- another workspace's files never
+        // showing up in this one's listing.
+        let other_workspace = session_assets(
+            State(state.clone()),
+            Path(("default".into(), "wB".into())),
+            Query(asset_listing_query(None, 3)),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap();
+        assert!(other_workspace.0["data"]["assets"]
+            .as_array()
+            .unwrap()
+            .is_empty());
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -12551,7 +12647,10 @@ mod tests {
             spec["paths"]["/api/uploads"]["post"]["requestBody"]["content"]["multipart/form-data"]
                 .is_object()
         );
-        assert!(spec["paths"]["/api/sessions/{sessionId}/assets"]["get"].is_object());
+        assert!(
+            spec["paths"]["/api/sessions/{sessionId}/workspaces/{workspaceId}/assets"]["get"]
+                .is_object()
+        );
         let parts = &spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/parts"]["get"];
         assert!(parts.is_object());
         assert_eq!(parts["parameters"][2]["name"], "lines");
@@ -12606,8 +12705,9 @@ mod tests {
             CONTENT_SCHEMA_VERSION
         );
         assert_eq!(
-            spec["paths"]["/api/sessions/{sessionId}/assets"]["get"]["responses"]["200"]["content"]
-                ["application/json"]["schema"]["properties"]["schema_version"]["const"],
+            spec["paths"]["/api/sessions/{sessionId}/workspaces/{workspaceId}/assets"]["get"]
+                ["responses"]["200"]["content"]["application/json"]["schema"]["properties"]
+                ["schema_version"]["const"],
             CONTENT_SCHEMA_VERSION
         );
         assert!(
@@ -13606,6 +13706,7 @@ mod tests {
         let state = unreachable_state();
         state.assets.lock().unwrap().remember_roots(
             "default",
+            None,
             vec![
                 AssetRoot {
                     path: repo.clone(),
