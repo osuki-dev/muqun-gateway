@@ -2623,12 +2623,12 @@ async fn send_test_notification(
         .clone();
     // The person waiting to see whether push works is the one holding the phone
     // that made this call, so the defaults are written in that request's
-    // language. "Herdr Gateway" is the product's name and stays in Latin script
+    // language. "Muqun Gateway" is the product's name and stays in Latin script
     // in every locale, the same way the app leaves "Gateway" alone.
     let locale = Locale::from_headers(&headers);
     let result = send_expo_push_notifications(
         &tokens,
-        body.title.unwrap_or_else(|| "Herdr Gateway".into()),
+        body.title.unwrap_or_else(|| "Muqun Gateway".into()),
         body.body.unwrap_or_else(|| {
             i18n::t(locale, "Muqun push notifications are connected.").to_owned()
         }),
@@ -3175,7 +3175,7 @@ fn print_manage_screen(
         String::from("Muqun Terminal Gateway"),
         String::from(""),
         String::from("keys   : [s] start  [t] stop  [p] pair  [x] revoke"),
-        String::from("         [h] Herdr  [m] tmux  [f] default backend"),
+        String::from("         [m] tmux  [h] Herdr  [f] default backend"),
         String::from("         [d] remove [u] url   [a] auto  [e] encryption"),
         String::from("         [r] refresh [q] close"),
         format!("server : {server}"),
@@ -3256,7 +3256,7 @@ fn print_manage_screen(
             String::from(""),
             String::from("[s] start  [t] stop  [p] pair"),
             String::from("[x] revoke [r] refresh [q] close"),
-            String::from("[h] Herdr  [m] tmux  [f] default"),
+            String::from("[m] tmux  [h] Herdr  [f] default"),
             String::from("[d] remove [u] URL   [a] auto"),
             format!("[e] encryption: {}", config.transport_encryption.as_str()),
             String::from(""),
@@ -9444,7 +9444,7 @@ fn default_socket_path() -> String {
 
 fn hostname_label() -> String {
     // HOSTNAME is often unset on macOS, which left every server named the
-    // generic "Herdr Server". Fall back to the real machine name so a fresh
+    // generic "Server". Fall back to the real machine name so a fresh
     // install is at least recognisable before the user renames it.
     if let Ok(value) = std::env::var("HOSTNAME") {
         let trimmed = value.trim();
@@ -9460,7 +9460,7 @@ fn hostname_label() -> String {
             }
         }
     }
-    "Herdr Server".into()
+    "Server".into()
 }
 
 /// Persist a new display label into the config (and the pairing payload), so a
@@ -9605,7 +9605,7 @@ fn openapi_spec() -> Value {
         "info": {
             "title": "Terminal Gateway API",
             "version": env!("CARGO_PKG_VERSION"),
-            "description": "Token-protected mobile API for controlling local terminal workspaces through a configured Herdr or tmux backend. Human-readable text is localized: send X-Muqun-Locale (or Accept-Language) with `en` or `zh-TW`. Error `code` values, decision names and other wire vocabulary are the same bytes in every locale."
+            "description": "Token-protected mobile API for controlling local terminal workspaces through a configured tmux or Herdr backend. Human-readable text is localized: send X-Muqun-Locale (or Accept-Language) with `en` or `zh-TW`. Error `code` values, decision names and other wire vocabulary are the same bytes in every locale."
         },
         "components": {
             "securitySchemes": {
@@ -9717,9 +9717,9 @@ fn openapi_spec() -> Value {
                     "responses": ok_response()
                 }
             },
-            "/api/sessions/{sessionId}/snapshot": { "get": session_endpoint("Return Herdr session.snapshot") },
+            "/api/sessions/{sessionId}/snapshot": { "get": session_endpoint("Return the session snapshot") },
             "/api/sessions/{sessionId}/workspaces": {
-                "get": session_endpoint("List Herdr workspaces"),
+                "get": session_endpoint("List workspaces"),
                 "post": {
                     "summary": "Create a workspace",
                     "parameters": [path_param("sessionId")],
@@ -9738,7 +9738,7 @@ fn openapi_spec() -> Value {
                 "delete": resource_endpoint("Close a workspace", "workspaceId")
             },
             "/api/sessions/{sessionId}/tabs": {
-                "get": session_endpoint("List Herdr tabs"),
+                "get": session_endpoint("List tabs"),
                 "post": {
                     "summary": "Create a tab",
                     "parameters": [path_param("sessionId")],
@@ -9756,7 +9756,7 @@ fn openapi_spec() -> Value {
                 },
                 "delete": resource_endpoint("Close a tab", "tabId")
             },
-            "/api/sessions/{sessionId}/panes": { "get": session_endpoint("List Herdr panes") },
+            "/api/sessions/{sessionId}/panes": { "get": session_endpoint("List panes") },
             "/api/sessions/{sessionId}/panes/{paneId}": {
                 "get": resource_endpoint("Get a pane", "paneId"),
                 "patch": {
@@ -9811,7 +9811,7 @@ fn openapi_spec() -> Value {
             "/api/sessions/{sessionId}/tasks": {
                 "post": {
                     "summary": "Start a new task: a checkout, a workspace, an agent, and the first prompt",
-                    "description": "With `branch_name`, the task gets its own git worktree; without it, the task runs in the repo as it stands. `repo_path` must be, or be inside, a workspace this session already has open -- anything else is 403, and a symlink out of one resolves to the outside path and fails there too. `branch_name` is held to letters, digits, dot, underscore, dash and slash, with `..`, a leading dash, and dot-leading segments refused, so it can only ever be a ref and never an argument. The agent is started with Herdr's `agent.start`, which waits for it to become interactive before the prompt is sent. Asking twice for the same branch reuses the existing checkout rather than making a second one.",
+                    "description": "With `branch_name`, the task gets its own git worktree; without it, the task runs in the repo as it stands. `repo_path` must be, or be inside, a workspace this session already has open -- anything else is 403, and a symlink out of one resolves to the outside path and fails there too. `branch_name` is held to letters, digits, dot, underscore, dash and slash, with `..`, a leading dash, and dot-leading segments refused, so it can only ever be a ref and never an argument. The agent is started, then the gateway waits for it to become interactive before the prompt is sent. Asking twice for the same branch reuses the existing checkout rather than making a second one.",
                     "parameters": [path_param("sessionId")],
                     "requestBody": json_body(json!({
                         "type": "object",
@@ -9839,7 +9839,7 @@ fn openapi_spec() -> Value {
                         "required": ["agent"],
                         "properties": {
                             "agent": { "type": "string", "description": "Agent kind from GET /api/agents/catalog, or a profile named in agents.json" },
-                            "cwd": { "type": "string", "description": "Absolute path, inside a workspace this session has open; omit to take Herdr's default" },
+                            "cwd": { "type": "string", "description": "Absolute path, inside a workspace this session has open; omit to take the backend's default" },
                             "tab_id": { "type": "string", "description": "Split this tab's focused pane instead of opening a new tab" },
                             "prompt": { "type": "string", "description": "Sent once the agent is interactive" }
                         }
@@ -9850,7 +9850,7 @@ fn openapi_spec() -> Value {
             "/api/sessions/{sessionId}/recent-cwds": {
                 "get": {
                     "summary": "The distinct working directories of this session's panes",
-                    "description": "A picker for spawn, and deliberately not a directory browser: it answers with the cwds Herdr reports for the panes that exist right now, deduplicated and held to the same rule the asset scan uses, so the filesystem root and a bare home directory are not on it. Each entry carries path, name, the pane and workspace it came from, and git, which says whether the directory is a checkout. Nothing here can be used to walk the host.",
+                    "description": "A picker for spawn, and deliberately not a directory browser: it answers with the cwds the session reports for the panes that exist right now, deduplicated and held to the same rule the asset scan uses, so the filesystem root and a bare home directory are not on it. Each entry carries path, name, the pane and workspace it came from, and git, which says whether the directory is a checkout. Nothing here can be used to walk the host.",
                     "parameters": [path_param("sessionId")],
                     "responses": ok_response()
                 }
@@ -9866,7 +9866,7 @@ fn openapi_spec() -> Value {
             "/api/sessions/{sessionId}/panes/{paneId}/shortcuts": {
                 "get": resource_endpoint("Key row and slash commands for a pane", "paneId")
             },
-            "/api/sessions/{sessionId}/agents": { "get": session_endpoint("List Herdr agents") },
+            "/api/sessions/{sessionId}/agents": { "get": session_endpoint("List agents") },
             "/api/sessions/{sessionId}/agents/{target}": { "get": resource_endpoint("Get an agent", "target") },
             "/api/sessions/{sessionId}/agents/{target}/focus": { "post": resource_endpoint("Focus an agent", "target") },
             "/api/sessions/{sessionId}/agents/{target}/send": {
@@ -9895,7 +9895,7 @@ fn openapi_spec() -> Value {
             "/api/sessions/{sessionId}/panes/{paneId}/parts": {
                 "get": {
                     "summary": "Read the pane's transcript normalized into content-model parts",
-                    "description": "Unified content model, schema version 1.4.0. Same envelope as the asset endpoints: schema_version, capabilities, and data, with the ordered parts under data.parts. Two sources can answer, and data.pane.parts says which did. native: the agent runs a protocol the gateway was pointed at (opencode's server API today), so a tool's exit code, the patch an edit produced, the checklist a todo write submitted and any pending permission arrive as data; range then spans the adapter's own rendering, which is the parts' fallback_text joined by newlines. dictionary: the pane's recent-unwrapped text read through the marker table of whichever agent Herdr reports -- Claude Code, Qoder, Codex and opencode. text: no table covers this pane, so everything degraded to prose, which is an answer and not an error. Whichever source answered, every part carries fallback_text verbatim, so an unknown type still renders and a source that drifts loses structure and never loses content. data.pane.composer carries the slash commands this agent understands and whether @ file mentions make sense, and is absent entirely for an agent the gateway has no table for. The raw output endpoint is unchanged and remains the fallback path.",
+                    "description": "Unified content model, schema version 1.4.0. Same envelope as the asset endpoints: schema_version, capabilities, and data, with the ordered parts under data.parts. Two sources can answer, and data.pane.parts says which did. native: the agent runs a protocol the gateway was pointed at (opencode's server API today), so a tool's exit code, the patch an edit produced, the checklist a todo write submitted and any pending permission arrive as data; range then spans the adapter's own rendering, which is the parts' fallback_text joined by newlines. dictionary: the pane's recent-unwrapped text read through the marker table of whichever agent the session reports -- Claude Code, Qoder, Codex and opencode. text: no table covers this pane, so everything degraded to prose, which is an answer and not an error. Whichever source answered, every part carries fallback_text verbatim, so an unknown type still renders and a source that drifts loses structure and never loses content. data.pane.composer carries the slash commands this agent understands and whether @ file mentions make sense, and is absent entirely for an agent the gateway has no table for. The raw output endpoint is unchanged and remains the fallback path.",
                     "parameters": [
                         path_param("sessionId"),
                         path_param("paneId"),
@@ -9907,7 +9907,7 @@ fn openapi_spec() -> Value {
             "/api/sessions/{sessionId}/panes/{paneId}/files": {
                 "get": {
                     "summary": "Fuzzy path search inside the pane's workspace, for @ file mentions",
-                    "description": "Answers paths only -- no contents, no sizes, no absolute paths. The only directory searched is the pane's own working directory as Herdr reports it, canonicalized, which is the same fence the asset API is gated on; a pane sitting at the filesystem root or straight in the home directory has no workspace and answers with an empty list rather than an error, so this cannot be used to probe the host. Symlinks are never followed, and dot, dependency and build directories are skipped, so nothing outside the root can be named. The query is a fuzzy subsequence match over the relative path, ranked so that the file name beats the directories above it; an empty query answers with the shallowest files, which is what a picker shows before anything is typed. kind is decided from the name alone because nothing is read -- the asset content endpoint sniffs the bytes again when a file is actually opened.",
+                    "description": "Answers paths only -- no contents, no sizes, no absolute paths. The only directory searched is the pane's own working directory as the session reports it, canonicalized, which is the same fence the asset API is gated on; a pane sitting at the filesystem root or straight in the home directory has no workspace and answers with an empty list rather than an error, so this cannot be used to probe the host. Symlinks are never followed, and dot, dependency and build directories are skipped, so nothing outside the root can be named. The query is a fuzzy subsequence match over the relative path, ranked so that the file name beats the directories above it; an empty query answers with the shallowest files, which is what a picker shows before anything is typed. kind is decided from the name alone because nothing is read -- the asset content endpoint sniffs the bytes again when a file is actually opened.",
                     "parameters": [
                         path_param("sessionId"),
                         path_param("paneId"),
@@ -9954,7 +9954,7 @@ fn openapi_spec() -> Value {
             },
             "/api/sessions/{sessionId}/panes/{paneId}/send-keys": {
                 "post": {
-                    "summary": "Send Herdr key names to a pane",
+                    "summary": "Send key names to a pane",
                     "parameters": [path_param("sessionId"), path_param("paneId")],
                     "requestBody": json_body(json!({
                         "type": "object",

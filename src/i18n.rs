@@ -285,8 +285,10 @@ pub fn t_slots(locale: Locale, source: &str, slots: &[(&str, &str)]) -> String {
 //    `allow_always`, `deny`, `visible`, `recent`, `recent-unwrapped`,
 //    `detection`, every field name, and the route `GET /api/agents/catalog` are
 //    values a client sends back to us. Only the sentence around them moves.
-//  * **Product names stay in Latin script.** Muqun, Herdr, Gateway and Expo are
-//    names, not words.
+//  * **Product names stay in Latin script.** Herdr, Gateway and Expo are names,
+//    not words. Muqun is the exception in ZH_TW and JA: the app is called 牧群
+//    there, matching the localisation already published on osuki.dev, so those
+//    two tables spell it that way instead of leaving it Latin.
 //  * **Each table agrees with the app catalog of the same language.** The two
 //    halves are read by the same person on the same screen: the gateway writes
 //    the approval prompt, the app writes the button under it.
@@ -297,7 +299,8 @@ pub fn t_slots(locale: Locale, source: &str, slots: &[(&str, &str)]) -> String {
 /// 終端機, 檔案, 伺服器, 網路, 儲存, 預設, 程式碼, 連線. The app's own catalog
 /// is the other half of this vocabulary and these agree with it: 核准, 拒絕,
 /// 代理程式, 面板, 工作區, 工作階段, 配對 -- and Gateway, which stays in Latin
-/// script because it is the product's name.
+/// script because it is the product's name. Muqun itself is 牧群 here, the same
+/// word the app and osuki.dev use in this language.
 const ZH_TW: &[(&str, &str)] = &[
     // -- approval labels the gateway writes for itself -----------------------
     ("Approve", "核准"),
@@ -315,7 +318,7 @@ const ZH_TW: &[(&str, &str)] = &[
     ("{name} finished running.", "{name} 已執行完畢。"),
     (
         "Muqun push notifications are connected.",
-        "Muqun 推播通知已連線。",
+        "牧群推播通知已連線。",
     ),
     // -- API error messages --------------------------------------------------
     ("Expo push service request failed", "Expo 推播服務請求失敗"),
@@ -489,6 +492,9 @@ const ZH_TW: &[(&str, &str)] = &[
 /// `pane` and `panel` are one word here, パネル, because they are one thing in
 /// the product. The app catalog makes the same call, so the two halves of a
 /// sentence a reader sees split across the two surfaces agree.
+///
+/// Muqun itself is 牧群（ぼくぐん） here, the reading given once and dropped
+/// after, matching the app catalog and osuki.dev.
 const JA: &[(&str, &str)] = &[
     // -- approval labels the gateway writes for itself -----------------------
     ("Approve", "承認"),
@@ -504,7 +510,7 @@ const JA: &[(&str, &str)] = &[
     ("{name} is waiting for your approval.", "{name} が承認を待っています。"),
     ("{name} needs your input.", "{name} が入力を待っています。"),
     ("{name} finished running.", "{name} の実行が完了しました。"),
-    ("Muqun push notifications are connected.", "Muqun のプッシュ通知が接続されました。"),
+    ("Muqun push notifications are connected.", "牧群（ぼくぐん）のプッシュ通知が接続されました。"),
     // -- API error messages --------------------------------------------------
     ("Expo push service request failed", "Expo プッシュサービスへのリクエストが失敗しました"),
     ("Herdr did not return the created pane id", "Herdr が作成したパネルの id を返しませんでした"),
