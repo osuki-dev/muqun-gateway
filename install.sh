@@ -4,13 +4,23 @@
 #   curl -fsSL https://raw.githubusercontent.com/osuki-dev/muqun-gateway/main/install.sh | sh
 #
 # tmux is the primary backend and needs nothing beyond tmux itself. Herdr is
-# also supported: when Herdr is on PATH, this installs Muqun Gateway as a
-# Herdr plugin instead, and setup/start/the pairing QR are driven through
-# plugin actions inside a herdr session, same as before.
+# also supported. The two are not an either/or choice -- the gateway happily
+# drives both backends from one config at once (see `manage`'s "Terminal
+# backends" list) -- so this installer configures whichever of them is
+# actually present, independently:
+#
+#   - Herdr present, tmux absent: installed as a Herdr plugin, same as
+#     always. Setup/start/the pairing QR are driven through plugin actions
+#     inside a herdr session.
+#   - tmux present (with or without Herdr): the standalone binary is
+#     installed and configures every backend that is present. tmux is always
+#     the default when it is one of them; a pre-existing Herdr-plugin
+#     pairing, if there is one, is adopted rather than orphaned.
 #
 # On a first install it also configures, starts, and opens the pairing QR for
 # you. Re-running updates the binary, runs idempotent setup, and reloads it
-# while preserving the server identity, devices, and backend list.
+# while preserving the server identity, devices, and backend list -- and
+# never flips a default an earlier install already chose.
 # macOS and Linux only.
 set -eu
 
@@ -55,12 +65,27 @@ case "$(uname -s)" in
   *)      die "Unsupported OS '$(uname -s)'. macOS and Linux only for now." ;;
 esac
 
-# 2. Herdr is one of two backends, not a requirement. When it is on PATH,
-#    install as a Herdr plugin (the path this script has always taken).
-#    Otherwise install the standalone binary and configure the tmux backend
-#    directly -- tmux is primary and needs no other terminal manager running.
-if command -v herdr >/dev/null 2>&1; then
-  # 2a. Older Herdr versions parse the plugin manifest before checking its
+# 2. Detect each backend independently -- this used to be a single if/else
+#    gate on Herdr alone, which meant Herdr won whenever it was installed,
+#    regardless of whether tmux was there too or which one the reader
+#    actually wanted. The two are not mutually exclusive, so neither is this
+#    check.
+have_herdr=0
+command -v herdr >/dev/null 2>&1 && have_herdr=1
+have_tmux=0
+command -v tmux >/dev/null 2>&1 && have_tmux=1
+
+if [ "$have_herdr" = 0 ] && [ "$have_tmux" = 0 ]; then
+  die "Neither Herdr (https://herdr.dev) nor tmux was found. Install one of them, then retry."
+fi
+
+# 3. Herdr alone: install as a Herdr plugin, exactly as this script has
+#    always done. Unchanged so a Herdr-only machine keeps behaving exactly
+#    as it does today. When tmux is *also* present this is not the path
+#    taken -- see step 4, which configures both backends on one standalone
+#    install instead of two separate ones.
+if [ "$have_herdr" = 1 ] && [ "$have_tmux" = 0 ]; then
+  # 3a. Older Herdr versions parse the plugin manifest before checking its
   #     declared minimum version. Check here first so users get an actionable
   #     upgrade message instead of a TOML error for newer manifest fields.
   herdr_version="$(herdr --version 2>/dev/null | awk 'NR == 1 && $1 == "herdr" { print $2 }')"
@@ -78,7 +103,7 @@ if command -v herdr >/dev/null 2>&1; then
   fi
   info "Detected Herdr $herdr_version"
 
-  # 2b. Install downloads a prebuilt, statically linked binary, so Rust is
+  # 3b. Install downloads a prebuilt, statically linked binary, so Rust is
   #     optional -- only needed as a fallback when no release binary matches
   #     this OS/arch.
   if ! command -v cargo >/dev/null 2>&1; then
@@ -86,7 +111,7 @@ if command -v herdr >/dev/null 2>&1; then
     echo "   (If none matches your platform, install Rust from https://rustup.rs and retry.)"
   fi
 
-  # 2c. Install or update. Reinstalling a GitHub-managed plugin replaces its
+  # 3c. Install or update. Reinstalling a GitHub-managed plugin replaces its
   #     checkout in place -- no uninstall needed. A local dev link is the one
   #     case Herdr refuses to install over, so detect it and explain instead
   #     of failing. `existing` (captured before install) also tells
@@ -106,7 +131,7 @@ if command -v herdr >/dev/null 2>&1; then
   fi
   herdr plugin install "$REPO" --yes
 
-  # 2d. Configure, (re)load, and show the pairing QR. setup is idempotent --
+  # 3d. Configure, (re)load, and show the pairing QR. setup is idempotent --
   #     it keeps an existing server id, token, and URL, so running it every
   #     time is safe (paired devices survive) and also repairs an install
   #     whose earlier setup never completed. stop+start then reloads the
@@ -148,12 +173,17 @@ if command -v herdr >/dev/null 2>&1; then
   exit 0
 fi
 
-# 3. Standalone path: no Herdr, so no plugin manager to install into or run
-#    actions through. tmux is what `setup` configures here, so it has to
-#    actually be there -- unlike Herdr this script cannot install it for you.
-info "Herdr not found; installing standalone with the tmux backend."
-command -v tmux >/dev/null 2>&1 \
-  || die "Neither Herdr (https://herdr.dev) nor tmux was found. Install one of them, then retry."
+# 4. tmux is present (Herdr may or may not also be). One standalone install,
+#    configured with every backend that is present -- tmux always, and Herdr
+#    too when it is on PATH. This is also where a machine that used to be
+#    Herdr-only (and went through step 3 on some earlier run) gets its
+#    existing pairing adopted rather than left behind: see the
+#    import-herdr-plugin call below.
+if [ "$have_herdr" = 1 ]; then
+  info "Herdr and tmux both found; installing standalone and configuring both backends."
+else
+  info "Herdr not found; installing standalone with the tmux backend."
+fi
 
 os="$(uname -s)"
 arch="$(uname -m)"
@@ -190,20 +220,73 @@ case ":$PATH:" in
   *) warn "$INSTALL_DIR is not on your PATH. Add it, or call $binary directly." ;;
 esac
 
+# MUQUN_GATEWAY_PORT and MUQUN_GATEWAY_TMUX_SOCKET are not needed for a
+# normal install -- setup's own defaults (the default port, and the tmux
+# backend pointed at the ambient default tmux server) are the whole point --
+# but let this script be exercised end to end (alongside
+# XDG_CONFIG_HOME/XDG_DATA_HOME/INSTALL_DIR) without touching a gateway
+# already bound to the default port, or a tmux backend that would otherwise
+# poll whatever the ambient default tmux server happens to be.
+port_args=""
+[ -n "${MUQUN_GATEWAY_PORT:-}" ] && port_args="--port ${MUQUN_GATEWAY_PORT}"
+tmux_socket_args=""
+[ -n "${MUQUN_GATEWAY_TMUX_SOCKET:-}" ] && tmux_socket_args="--socket-path ${MUQUN_GATEWAY_TMUX_SOCKET}"
+
+if [ "$have_herdr" = 1 ]; then
+  # A machine that went through step 3 on an earlier run (Herdr-only, back
+  # then) may have real paired devices sitting in that Herdr-plugin config.
+  # Adopt it into the standalone install below instead of leaving it behind.
+  # A no-op, not an error, when there is nothing to adopt -- a fresh machine,
+  # or one already adopted on an earlier run of this script.
+  "$binary" import-herdr-plugin >/dev/null 2>&1 || true
+fi
+
+# Snapshot what this install already has -- before adding anything -- so an
+# already-chosen default is restored below rather than silently flipped by
+# adding a new backend, and so "fresh install" vs. "update" is judged on the
+# state that actually existed when this run started.
+config_existed=0
+previous_default=""
+if previous_backends="$("$binary" backend list 2>/dev/null)" && [ -n "$previous_backends" ]; then
+  config_existed=1
+  previous_default="$(printf '%s\n' "$previous_backends" | head -n 1 | cut -f2)"
+fi
+
 # setup is idempotent -- it keeps an existing server id, token, and URL, so
 # running it on every install/update is safe and also repairs an install
 # whose earlier setup never completed.
 info "Configuring the tmux backend..."
-"$binary" setup --backend tmux
+# shellcheck disable=SC2086 # each *_args is either empty or one flag + one plain value
+"$binary" setup --backend tmux $port_args $tmux_socket_args
+
+if [ "$have_herdr" = 1 ]; then
+  info "Configuring the Herdr backend..."
+  "$binary" backend add herdr >/dev/null
+fi
+
+# tmux is the default whenever it is configured -- the one remaining role of
+# "which backend is primary" -- except an update must never flip a default an
+# earlier install already chose. A fresh install (nothing configured before
+# this run) always gets tmux as the default; an update keeps whatever was
+# already the default.
+if [ "$config_existed" = 1 ]; then
+  if [ -n "$previous_default" ] && [ "$previous_default" != "tmux" ]; then
+    restore_id="$("$binary" backend list | awk -F'\t' -v want="$previous_default" '$2 == want { print $1; exit }')"
+    [ -n "$restore_id" ] && "$binary" backend default "$restore_id" >/dev/null
+  fi
+else
+  tmux_id="$("$binary" backend list | awk -F'\t' '$2 == "tmux" { print $1; exit }')"
+  [ -n "$tmux_id" ] && "$binary" backend default "$tmux_id" >/dev/null
+fi
+
 "$binary" stop  >/dev/null 2>&1 || true
 "$binary" start
 
 echo
-green "Muqun Gateway is configured and running with the tmux backend."
+green "Muqun Gateway is configured and running."
+echo "Backends configured:"
+"$binary" backend list | awk -F'\t' '{ printf "  %s %s (%s)\n", (NR == 1 ? "*" : " "), $1, $2 }'
+echo "(* default)"
+echo
 echo "Open the pairing QR any time with:"
 echo "  $binary manage"
-echo
-echo "This path -- installer-driven standalone tmux setup -- is new with this"
-echo "release and has not yet been exercised on a machine that never had Herdr"
-echo "installed; if something looks wrong, run the three commands above by hand"
-echo "and compare their output."

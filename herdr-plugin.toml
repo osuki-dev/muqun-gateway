@@ -10,11 +10,17 @@ platforms = ["linux", "macos"]
 [[build]]
 command = ["sh", "scripts/fetch-binary.sh"]
 
+# Explicit --backend so this keeps configuring Herdr regardless of what the
+# CLI's own default is or ever becomes -- a bare `setup` now preserves
+# whatever an existing install already runs, and a fresh install with
+# nothing configured yet now defaults to tmux (see main.rs). Neither of
+# those is what a Herdr-plugin install -- which may have no tmux on the
+# machine at all -- wants from this action.
 [[actions]]
 id = "setup"
 title = "Setup Gateway"
 contexts = ["workspace"]
-command = ["./target/release/muqun-gateway", "setup"]
+command = ["./target/release/muqun-gateway", "setup", "--backend", "herdr"]
 
 [[actions]]
 id = "start"

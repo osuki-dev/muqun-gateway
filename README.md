@@ -21,13 +21,21 @@ pairing QR (macOS and Linux; Windows is not supported yet):
 curl -fsSL https://raw.githubusercontent.com/osuki-dev/muqun-gateway/main/install.sh | sh
 ```
 
-tmux is the primary backend and this is all it needs -- no Herdr required.
-When [Herdr](https://herdr.dev) is on `PATH`, the script installs Muqun
-Gateway as a Herdr plugin instead, the same way it always has (rest of this
-section describes that path). Otherwise it downloads the standalone binary,
-runs `setup --backend tmux`, and starts it directly; that path is new and has
-not yet been run end to end on a machine without Herdr, so if something looks
-off, run the printed commands by hand and compare.
+tmux is the primary backend and this is all it needs -- no Herdr required. The
+two are not an either/or choice, so the installer configures whichever is
+actually present:
+
+- **Herdr only:** installed as a Herdr plugin, the same way it always has
+  (rest of this section describes that path).
+- **tmux, with or without Herdr:** the standalone binary is downloaded and
+  every backend that is present gets configured on it -- tmux always, and
+  Herdr too when it is on `PATH`. tmux is the default whenever it is
+  configured. A pre-existing Herdr-plugin pairing, if there is one, is
+  adopted (see "Use Herdr and tmux together" below) rather than left behind.
+
+Re-running the installer is idempotent either way: it never duplicates a
+backend, never loses a paired device, and never flips a default an earlier
+install already chose.
 
 Muqun Gateway requires Herdr 0.7.5 or newer when installed as a Herdr plugin.
 The installer checks this before Herdr reads the plugin

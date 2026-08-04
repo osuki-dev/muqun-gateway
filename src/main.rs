@@ -281,9 +281,12 @@ enum Command {
         port: u16,
         #[arg(long)]
         socket_path: Option<String>,
-        /// Terminal workspace backend. Existing installs default to Herdr.
-        #[arg(long, value_enum, default_value_t = SetupBackend::Herdr)]
-        backend: SetupBackend,
+        /// Terminal workspace backend to configure. Omit it to leave an
+        /// existing install's backend alone (a bare `setup` never switches
+        /// what an install already runs); a genuinely fresh install with
+        /// nothing configured yet defaults to tmux.
+        #[arg(long, value_enum)]
+        backend: Option<SetupBackend>,
         /// Application transport encryption for newly paired devices.
         #[arg(long, value_enum)]
         transport_encryption: Option<TransportEncryptionMode>,
@@ -802,7 +805,7 @@ async fn main() -> anyhow::Result<()> {
             public_url,
             port,
             socket_path,
-            backend.into(),
+            backend.map(Into::into),
             transport_encryption,
         )?,
         Command::Run { config } => run(config).await?,
@@ -823,14 +826,35 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What `setup --backend` configures when the flag is left off.
+///
+/// An omitted `--backend` must never flip what an existing install already
+/// runs -- that is the whole complaint this default used to earn ("Herdr
+/// wins whenever it is installed, regardless of ... what the reader wants").
+/// So "no backend named" means "keep doing what this install already does"
+/// whenever there is an existing install to keep doing it: the same rule a
+/// bare `herdr plugin action invoke *.setup` (no CLI flags available to it)
+/// relies on to stay a no-op on every Herdr-plugin update. Only a genuinely
+/// fresh install -- nothing configured yet -- falls back to a hard default,
+/// and tmux is the honest one: it is the primary backend everywhere else
+/// (the app, the website, the store listing), and it needs nothing beyond
+/// tmux itself.
+fn resolve_setup_backend(explicit: Option<BackendKind>, existing: Option<&Config>) -> BackendKind {
+    explicit.unwrap_or_else(|| {
+        existing
+            .and_then(|config| config.sessions.first())
+            .map(|session| session.backend)
+            .unwrap_or(BackendKind::Tmux)
+    })
+}
+
 fn setup(
     public_url: Option<String>,
     port: u16,
     socket_path: Option<String>,
-    backend: BackendKind,
+    backend: Option<BackendKind>,
     transport_encryption: Option<TransportEncryptionMode>,
 ) -> anyhow::Result<()> {
-    ensure_backend_available(backend)?;
     let config_dir = config_dir()?;
     std::fs::create_dir_all(&config_dir)
         .with_context(|| format!("failed to create config dir {}", config_dir.display()))?;
@@ -843,6 +867,9 @@ fn setup(
         &config_dir.join(CONFIG_FILE),
         &config_dir.join(PAIRING_FILE),
     );
+
+    let backend = resolve_setup_backend(backend, existing.as_ref().map(|install| &install.config));
+    ensure_backend_available(backend)?;
 
     let (server_id, token, token_hash) = match &existing {
         Some(install) => (
@@ -13352,6 +13379,52 @@ mod tests {
         assert_eq!(config.sessions[0].id, "tmux");
         assert_eq!(config.sessions[1].id, "default");
         assert!(make_backend_default(&mut config, "missing").is_err());
+    }
+
+    #[test]
+    fn a_fresh_install_with_no_backend_named_defaults_to_tmux() {
+        assert_eq!(
+            resolve_setup_backend(None, None),
+            BackendKind::Tmux,
+            "nothing configured yet, and nothing asked for -- tmux is primary"
+        );
+    }
+
+    #[test]
+    fn an_explicit_backend_always_wins_over_whatever_already_exists() {
+        let herdr_only = test_config("token"); // sessions[0] is Herdr, see test_config
+        assert_eq!(
+            resolve_setup_backend(Some(BackendKind::Tmux), Some(&herdr_only)),
+            BackendKind::Tmux
+        );
+    }
+
+    #[test]
+    fn an_existing_herdr_install_stays_herdr_when_backend_is_left_off() {
+        // The exact case the old `default_value_t = SetupBackend::Herdr` was
+        // protecting: a bare `setup` (e.g. the Herdr-plugin action, which has
+        // no way to pass --backend) on a machine already running Herdr must
+        // not start asking for tmux, which might not even be installed.
+        let herdr_only = test_config("token");
+        assert_eq!(
+            resolve_setup_backend(None, Some(&herdr_only)),
+            BackendKind::Herdr
+        );
+    }
+
+    #[test]
+    fn an_existing_tmux_install_stays_tmux_when_backend_is_left_off() {
+        let mut tmux_only = test_config("token");
+        tmux_only.sessions[0] = SessionConfig {
+            id: "default".into(),
+            label: "tmux".into(),
+            socket_path: String::new(),
+            backend: BackendKind::Tmux,
+        };
+        assert_eq!(
+            resolve_setup_backend(None, Some(&tmux_only)),
+            BackendKind::Tmux
+        );
     }
 
     #[test]
