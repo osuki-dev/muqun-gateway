@@ -3192,10 +3192,33 @@ fn print_manage_screen(
         .as_ref()
         .map(|config| config.public_url.clone())
         .unwrap_or_else(|| "run setup first".into());
-    let status = match read_pid()? {
-        Some(pid) if process_running(pid) => format!("running ({pid})"),
-        Some(_) => String::from("stale pid"),
-        None => String::from("stopped"),
+    let pid_on_disk = read_pid()?;
+    let running_pid = pid_on_disk.filter(|&pid| process_running(pid));
+    let status = match (running_pid, pid_on_disk) {
+        (Some(pid), _) => format!("running ({pid})"),
+        (None, Some(_)) => String::from("stale pid"),
+        (None, None) => String::from("stopped"),
+    };
+    // `run` loads config.json once at startup into a plain value and never
+    // re-reads it (see `AppState`); every setting below this line -- and the
+    // encryption line, backend list, default marker, and URL further down --
+    // comes straight from disk, not from what the running process actually
+    // enforces. If the file was rewritten after the process started, those
+    // fields are pending, not live, and the panel needs to say so instead of
+    // presenting them as current.
+    let restart_pending = running_pid.is_some() && config_changed_since_start();
+    let pending_note = if restart_pending {
+        " (pending restart -- [t] stop, [s] start to apply)"
+    } else {
+        ""
+    };
+    // Same signal, shorter: the QR panel is a narrow two-column layout where
+    // the long-form hint would blow the column width, and [s]/[t] are already
+    // listed as controls right there.
+    let pending_note_short = if restart_pending {
+        " (pending restart)"
+    } else {
+        ""
     };
 
     let mut lines = vec![
@@ -3208,21 +3231,25 @@ fn print_manage_screen(
         format!("server : {server}"),
         format!("status : {status}"),
     ];
-    push_wrapped_field(&mut lines, "url    ", &url, 64);
+    push_wrapped_field(&mut lines, "url    ", &format!("{url}{pending_note}"), 64);
     push_wrapped_field(&mut lines, "message", message, 64);
     lines.push(String::new());
     if let Some(config) = &config {
         lines.push(format!(
-            "encryption: {}{}",
+            "encryption: {}{}{}",
             config.transport_encryption.as_str(),
             if config.transport_encryption == TransportEncryptionMode::Disabled {
                 " (token-only; unsafe on public HTTP)"
             } else {
                 ""
-            }
+            },
+            pending_note
         ));
         lines.push(String::new());
-        lines.push(format!("Terminal backends ({})", config.sessions.len()));
+        lines.push(format!(
+            "Terminal backends ({}){pending_note}",
+            config.sessions.len()
+        ));
         for (index, session) in config.sessions.iter().enumerate() {
             let endpoint = backend_endpoint(session);
             lines.push(format!(
@@ -3285,13 +3312,22 @@ fn print_manage_screen(
             String::from("[x] revoke [r] refresh [q] close"),
             String::from("[m] tmux  [h] Herdr  [f] default"),
             String::from("[d] remove [u] URL   [a] auto"),
-            format!("[e] encryption: {}", config.transport_encryption.as_str()),
+            format!(
+                "[e] encryption: {}{}",
+                config.transport_encryption.as_str(),
+                pending_note_short
+            ),
             String::from(""),
             format!("server: {}", truncate(&server, 26)),
             format!("status: {}", truncate(&status, 25)),
         ];
-        push_wrapped_field(&mut qr_controls, "url", &url, 34);
-        qr_controls.push(String::from("backends (* default):"));
+        push_wrapped_field(
+            &mut qr_controls,
+            "url",
+            &format!("{url}{pending_note_short}"),
+            34,
+        );
+        qr_controls.push(format!("backends (* default):{pending_note_short}"));
         for (index, session) in config.sessions.iter().enumerate() {
             qr_controls.push(format!(
                 " {} {} ({})",
@@ -9330,6 +9366,40 @@ fn read_pid() -> anyhow::Result<Option<u32>> {
         return Ok(None);
     };
     Ok(text.trim().parse::<u32>().ok())
+}
+
+/// Whether `config.json` has been rewritten more recently than the running
+/// gateway process started.
+///
+/// `run` reads `config.json` exactly once, at startup, into a plain `Config`
+/// value that lives for the process's lifetime (see `AppState`); nothing
+/// re-reads the file afterward. So once the process is up, the file on disk
+/// and the settings it is actually enforcing (transport encryption, the
+/// backend list, the default backend, the public URL) can only drift apart,
+/// never resync, until the next restart.
+///
+/// There is no live channel to ask the running process what it loaded, so
+/// this compares two mtimes as a proxy: the pid file, written immediately
+/// after the process is spawned (see `start_background_inner`), stands in
+/// for "when the running process started". If `config.json` was modified
+/// after that, the running process cannot have seen the change.
+fn config_changed_since_start() -> bool {
+    let Ok(config_path) = config_dir().map(|dir| dir.join(CONFIG_FILE)) else {
+        return false;
+    };
+    let Ok(pid_file) = pid_path() else {
+        return false;
+    };
+    let (Ok(config_meta), Ok(pid_meta)) = (
+        std::fs::metadata(&config_path),
+        std::fs::metadata(&pid_file),
+    ) else {
+        return false;
+    };
+    let (Ok(config_mtime), Ok(pid_mtime)) = (config_meta.modified(), pid_meta.modified()) else {
+        return false;
+    };
+    config_mtime > pid_mtime
 }
 
 fn read_pairing_file() -> anyhow::Result<PairingFile> {
