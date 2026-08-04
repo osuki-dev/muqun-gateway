@@ -454,6 +454,10 @@ const ZH_TW: &[(&str, &str)] = &[
         "配對請求次數過多，請稍後再試",
     ),
     (
+        "transport encryption is disabled on this gateway; scan its current QR code",
+        "這個 Gateway 已停用傳輸加密，請掃描它目前的 QR Code",
+    ),
+    (
         "workspace_label must be at most 120 printable characters",
         "workspace_label 最多 120 個可列印字元",
     ),
@@ -600,6 +604,10 @@ const JA: &[(&str, &str)] = &[
     ("token must be an Expo push token", "token は Expo のプッシュトークンにしてください"),
     ("too many pairing requests; try again later", "ペアリング要求が多すぎます。しばらくしてからお試しください"),
     (
+        "transport encryption is disabled on this gateway; scan its current QR code",
+        "この Gateway では転送の暗号化が無効になっています。現在の QR コードをスキャンしてください",
+    ),
+    (
         "workspace_label must be at most 120 printable characters",
         "workspace_label は表示可能な文字で 120 文字以内にしてください",
     ),
@@ -733,6 +741,10 @@ const KO: &[(&str, &str)] = &[
     ("this approval offers no option with that meaning", "이 승인에는 그 뜻에 해당하는 옵션이 없습니다"),
     ("token must be an Expo push token", "token은 Expo 푸시 토큰이어야 합니다"),
     ("too many pairing requests; try again later", "페어링 요청이 너무 많습니다. 잠시 후 다시 시도하세요"),
+    (
+        "transport encryption is disabled on this gateway; scan its current QR code",
+        "이 Gateway는 전송 암호화가 비활성화되어 있습니다. 현재 QR 코드를 스캔하세요",
+    ),
     (
         "workspace_label must be at most 120 printable characters",
         "workspace_label은 출력 가능한 문자로 최대 120자여야 합니다",
@@ -906,6 +918,10 @@ const DE: &[(&str, &str)] = &[
     (
         "too many pairing requests; try again later",
         "zu viele Kopplungsanfragen; versuche es später erneut",
+    ),
+    (
+        "transport encryption is disabled on this gateway; scan its current QR code",
+        "die Übertragungsverschlüsselung ist auf diesem Gateway deaktiviert; scanne seinen aktuellen QR-Code",
     ),
     (
         "workspace_label must be at most 120 printable characters",
@@ -1088,6 +1104,10 @@ const FR: &[(&str, &str)] = &[
         "trop de demandes d’appairage ; réessayez plus tard",
     ),
     (
+        "transport encryption is disabled on this gateway; scan its current QR code",
+        "le chiffrement du transport est désactivé sur ce Gateway ; scannez son QR code actuel",
+    ),
+    (
         "workspace_label must be at most 120 printable characters",
         "workspace_label doit faire au plus 120 caractères imprimables",
     ),
@@ -1258,6 +1278,10 @@ const ES: &[(&str, &str)] = &[
         "demasiadas solicitudes de vinculación; inténtalo más tarde",
     ),
     (
+        "transport encryption is disabled on this gateway; scan its current QR code",
+        "el cifrado de transporte está desactivado en este gateway; escanea su código QR actual",
+    ),
+    (
         "workspace_label must be at most 120 printable characters",
         "workspace_label debe tener 120 caracteres imprimibles como máximo",
     ),
@@ -1426,6 +1450,10 @@ const PT: &[(&str, &str)] = &[
     (
         "too many pairing requests; try again later",
         "demasiados pedidos de emparelhamento; tente novamente mais tarde",
+    ),
+    (
+        "transport encryption is disabled on this gateway; scan its current QR code",
+        "a encriptação de transporte está desativada neste gateway; leia o respetivo código QR atual",
     ),
     (
         "workspace_label must be at most 120 printable characters",

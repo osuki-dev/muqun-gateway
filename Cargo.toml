@@ -35,3 +35,4 @@ sha2 = "0.10.9"
 tokio = { version = "1.53.0", features = ["fs", "macros", "net", "process", "rt-multi-thread", "io-util", "sync", "time"] }
 tokio-stream = "0.1.18"
 uuid = { version = "1.24.0", features = ["v4"] }
+argon2 = { version = "0.5.3", default-features = false, features = ["alloc"] }

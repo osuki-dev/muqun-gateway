@@ -2288,7 +2288,7 @@ async fn pair_claim(State(state): State<AppState>, Json(wire): Json<Value>) -> A
         transport::Direction::PairingRequest,
     )?;
     require_pairing_transport(state.config.transport_encryption, request_nonce.is_some())?;
-    let (device_name, install_id) = {
+    let (device_name, install_id, code) = {
         let mut pending = state.pending_pairing.lock().map_err(|_| {
             api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -2327,7 +2327,7 @@ async fn pair_claim(State(state): State<AppState>, Json(wire): Json<Value>) -> A
                 "invalid pairing code",
             ),
         })?;
-        (device_name, install_id)
+        (device_name, install_id, code)
     };
 
     // Each device gets its own token so it can be revoked without disturbing
@@ -2371,11 +2371,31 @@ async fn pair_claim(State(state): State<AppState>, Json(wire): Json<Value>) -> A
         response_payload["transport_key"] = Value::String(device_transport_key);
         response_payload["transport"] = Value::String("muqun-aes-256-gcm-v1".into());
     }
-    let response = pairing_response(
-        response_payload,
-        b"POST /api/pair/claim",
-        request_nonce.as_deref(),
-    )?;
+    let response = if request_nonce.is_some() {
+        // Scanned the QR: request and response are both sealed with the
+        // pre-shared key it carried. Unchanged from before this card.
+        pairing_response(
+            response_payload,
+            b"POST /api/pair/claim",
+            request_nonce.as_deref(),
+        )?
+    } else if state.config.transport_encryption == TransportEncryptionMode::Required {
+        // Typed the address and code: there is no pre-shared key, so the code
+        // just spent to authenticate this claim is also what protects the
+        // response in transit. See `code_pairing_response` for why that is
+        // sound with an eight-character code and what it still costs.
+        code_pairing_response(
+            response_payload,
+            b"POST /api/pair/claim",
+            &code,
+            &body.request_id,
+        )
+        .await?
+    } else {
+        // Encryption is disabled -- the response was never going to be sealed
+        // either way.
+        pairing_response(response_payload, b"POST /api/pair/claim", None)?
+    };
     if request_nonce.is_some() {
         if let Err(err) = rotate_pairing_transport_key() {
             // The device is already enrolled and the response is already sealed
@@ -2405,20 +2425,27 @@ fn pairing_transport_material() -> ApiResult<Vec<u8>> {
     })
 }
 
+/// Rejects only a request sealed with a key that can no longer be right: an
+/// encrypted body arriving while this gateway's encryption is `Disabled`
+/// means the caller is holding a QR (or a cached pairing key) from before the
+/// owner turned it off.
+///
+/// This used to also reject the opposite pairing (`Required`, unencrypted)
+/// with "scan the Gateway QR ...". That case is not an error anymore: card
+/// #821 gave `pair_claim` a second way to authenticate an unencrypted
+/// request -- the one-time code itself, checked in `pair_claim` and then
+/// spent again as the key that seals the response (see
+/// `code_pairing_response`). `pair_request` never carried anything secret, so
+/// it never needed the QR's key to begin with.
 fn require_pairing_transport(mode: TransportEncryptionMode, encrypted: bool) -> ApiResult<()> {
-    match (mode, encrypted) {
-        (TransportEncryptionMode::Required, false) => Err(api_error(
-            StatusCode::UPGRADE_REQUIRED,
-            "encrypted_pairing_required",
-            "scan the Gateway QR with a Muqun version that supports encrypted pairing",
-        )),
-        (TransportEncryptionMode::Disabled, true) => Err(api_error(
+    if mode == TransportEncryptionMode::Disabled && encrypted {
+        return Err(api_error(
             StatusCode::CONFLICT,
             "encrypted_pairing_disabled",
             "transport encryption is disabled on this gateway; scan its current QR code",
-        )),
-        _ => Ok(()),
+        ));
     }
+    Ok(())
 }
 
 fn decode_pairing_body<T: serde::de::DeserializeOwned>(
@@ -2484,6 +2511,123 @@ fn pairing_response(value: Value, aad: &[u8], request_nonce: Option<&str>) -> Ap
     let response_aad = [aad, b"\n", request_nonce.as_bytes()].concat();
     let envelope = transport::seal(
         &pairing_transport_material()?,
+        transport::Direction::PairingResponse,
+        &response_aad,
+        &plaintext,
+        now_unix_ms(),
+    )
+    .map_err(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "response_encryption_failed",
+            "failed to encrypt response",
+        )
+    })?;
+    Ok(Json(envelope).into_response())
+}
+
+/// Argon2id parameters for turning a claimed pairing code into transport key
+/// material. OWASP's second recommended interactive Argon2id setting (m =
+/// 19 MiB, t = 2, p = 1): materially more expensive per guess than a bare
+/// hash without being slow enough to make the app visibly stall.
+const CODE_KDF_MEMORY_KIB: u32 = 19_456;
+const CODE_KDF_TIME_COST: u32 = 2;
+const CODE_KDF_PARALLELISM: u32 = 1;
+const CODE_KDF_OUTPUT_LEN: usize = 32;
+
+/// The key material a claimed one-time code stands in for the QR's pre-shared
+/// key, for exactly one response.
+///
+/// A scanned QR carries 256 bits of random key; a code a person can read off
+/// a screen and type on a phone carries about 40 (eight glyphs from a
+/// 32-symbol alphabet -- see `generate_pairing_code`). That gap is real: it
+/// is the reason a PAKE is the "actually correctly shaped" answer to this
+/// problem (card #821's own words). What closes enough of the gap to ship
+/// tonight is that the code is not used as an AES key directly -- it is run
+/// through Argon2id first, so an attacker who captures the sealed claim
+/// response off the network cannot test candidate codes at hash speed. At
+/// roughly 20-50 ms per guess on ordinary hardware, the full 32^8 space is
+/// centuries of compute, not the minutes a bare HKDF would cost. Online
+/// guessing is separately bounded the way it always was: eight wrong answers
+/// burn the code (`MAX_PAIRING_CODE_ATTEMPTS`) and it is five minutes old at
+/// most (`PAIRING_CODE_TTL_MS`).
+///
+/// The salt is derived from `request_id` rather than being random: both sides
+/// need to land on the same key without a round trip to agree on a salt, and
+/// `request_id` is already a CSPRNG value unique to this one pairing attempt
+/// (see `createRequestId` in the app), so it is exactly as good a salt as one
+/// generated fresh, minus the round trip. It is hashed to a fixed 32 bytes
+/// first because Argon2's own salt floor is 8 bytes and `request_id` is only
+/// guaranteed to be 1-80.
+fn code_pairing_material(code: &str, request_id: &str) -> anyhow::Result<[u8; 32]> {
+    use argon2::{Algorithm, Argon2, Params, Version};
+    use sha2::{Digest as _, Sha256};
+
+    let mut salt = [0_u8; 32];
+    salt.copy_from_slice(&Sha256::digest(
+        [
+            b"muqun-pairing-code-salt-v1".as_slice(),
+            request_id.as_bytes(),
+        ]
+        .concat(),
+    ));
+    let params = Params::new(
+        CODE_KDF_MEMORY_KIB,
+        CODE_KDF_TIME_COST,
+        CODE_KDF_PARALLELISM,
+        Some(CODE_KDF_OUTPUT_LEN),
+    )
+    .map_err(|err| anyhow::anyhow!("invalid argon2 parameters: {err}"))?;
+    let hasher = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut material = [0_u8; 32];
+    hasher
+        .hash_password_into(code.as_bytes(), &salt, &mut material)
+        .map_err(|err| anyhow::anyhow!("code-derived key material failed: {err}"))?;
+    Ok(material)
+}
+
+/// Seals a claim response with material derived from the one-time code that
+/// just authenticated it, for a device pairing by address and code rather
+/// than by QR. See `code_pairing_material` for why an eight-character code
+/// run through Argon2id is enough for this one message.
+///
+/// Argon2id is deliberately memory-hard and therefore not free to run: it is
+/// spawned onto a blocking thread so a burst of pairing attempts cannot stall
+/// the async runtime's worker threads.
+async fn code_pairing_response(
+    value: Value,
+    aad: &[u8],
+    code: &str,
+    request_id: &str,
+) -> ApiResult<Response> {
+    let plaintext = serde_json::to_vec(&value).map_err(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "response_encoding_failed",
+            "failed to encode response",
+        )
+    })?;
+    let code = code.to_owned();
+    let request_id = request_id.to_owned();
+    let material = tokio::task::spawn_blocking(move || code_pairing_material(&code, &request_id))
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "response_encryption_failed",
+                "failed to encrypt response",
+            )
+        })?
+        .map_err(|_| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "response_encryption_failed",
+                "failed to encrypt response",
+            )
+        })?;
+    let response_aad = [aad, b"\ncode-pairing\n"].concat();
+    let envelope = transport::seal(
+        &material,
         transport::Direction::PairingResponse,
         &response_aad,
         &plaintext,
@@ -3264,13 +3408,15 @@ fn print_manage_screen(
     }
 
     // A device mid-pairing takes priority: show its name + the code to enter.
+    // `url` is already on screen above this block, so the message can point
+    // at it rather than repeat it -- there is no QR involved in this path.
     if let Some(pending) = pending_pairing {
         lines.extend([
             String::from("Pairing request"),
             format!("device : {}", truncate(&pending.device_name, 48)),
             format!("code   : {}", pending.code),
             String::from(""),
-            String::from("Enter this code in Muqun to finish pairing."),
+            String::from("In Muqun, enter the address above and this code."),
         ]);
         write_centered_panel(&lines)?;
         return Ok(());
@@ -11481,11 +11627,231 @@ mod tests {
     }
 
     #[test]
-    fn pairing_transport_policy_has_no_implicit_downgrade() {
+    fn pairing_transport_policy_rejects_only_a_stale_encrypted_request() {
+        // `Required` no longer forces an encrypted request through this gate:
+        // `pair_claim` authenticates an unencrypted one with the one-time
+        // code instead (see `code_pairing_response`), and `pair_request`
+        // never carried anything worth protecting.
         assert!(require_pairing_transport(TransportEncryptionMode::Required, true).is_ok());
-        assert!(require_pairing_transport(TransportEncryptionMode::Required, false).is_err());
+        assert!(require_pairing_transport(TransportEncryptionMode::Required, false).is_ok());
         assert!(require_pairing_transport(TransportEncryptionMode::Disabled, false).is_ok());
+        // The one case still worth rejecting: a request sealed with a key
+        // from before encryption was turned off.
         assert!(require_pairing_transport(TransportEncryptionMode::Disabled, true).is_err());
+    }
+
+    /// Reads the code `manage` would show a reader on the machine's screen,
+    /// after a device with no QR key has called `pair_request`.
+    fn pending_code(state: &AppState) -> String {
+        state
+            .pending_pairing
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("pair_request left a pending code")
+            .code
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn manual_pairing_ends_up_with_the_same_transport_key_a_qr_pairing_would() {
+        let state = test_state("admin-token", vec![]);
+        assert_eq!(
+            state.config.transport_encryption,
+            TransportEncryptionMode::Required
+        );
+        // No `k`: exactly what a device that typed the address, rather than
+        // scanning a QR, sends.
+        let request_response = pair_request(
+            State(state.clone()),
+            Json(json!({ "request_id": "manual-1", "device_name": "Readers phone" })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(request_response.status(), StatusCode::OK);
+
+        let code = pending_code(&state);
+        let claim_response = pair_claim(
+            State(state.clone()),
+            Json(json!({ "request_id": "manual-1", "code": code })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(claim_response.status(), StatusCode::OK);
+
+        // The body is a sealed envelope, not a plain pairing payload: it was
+        // never sent in the clear even though the request that earned it
+        // carried no pre-shared key.
+        let body = axum::body::to_bytes(claim_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let envelope: transport::Envelope = serde_json::from_slice(&body).unwrap();
+        let material = code_pairing_material(&code, "manual-1").unwrap();
+        let plaintext = transport::open(
+            &material,
+            transport::Direction::PairingResponse,
+            b"POST /api/pair/claim\ncode-pairing\n",
+            &envelope,
+            now_unix_ms(),
+        )
+        .expect("a reader who typed the correct code can open the response");
+        let payload: Value = serde_json::from_slice(&plaintext).unwrap();
+        assert_eq!(payload["kind"], "muqun-gateway");
+        // Same shape a QR pairing gets from this gateway: a device transport
+        // key, not just a bearer token. No silent downgrade.
+        assert_eq!(payload["transport"], "muqun-aes-256-gcm-v1");
+        assert!(payload["device_id"].as_str().is_some());
+        let transport_key = payload["transport_key"].as_str().unwrap();
+        assert!(transport::decode_key(transport_key).is_ok_and(|key| key.len() == 32));
+    }
+
+    #[tokio::test]
+    async fn manual_pairing_response_cannot_be_opened_without_the_code() {
+        let state = test_state("admin-token", vec![]);
+        pair_request(
+            State(state.clone()),
+            Json(json!({ "request_id": "manual-eaves", "device_name": "Phone" })),
+        )
+        .await
+        .unwrap();
+        let code = pending_code(&state);
+        let claim_response = pair_claim(
+            State(state.clone()),
+            Json(json!({ "request_id": "manual-eaves", "code": code })),
+        )
+        .await
+        .unwrap();
+        let body = axum::body::to_bytes(claim_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let envelope: transport::Envelope = serde_json::from_slice(&body).unwrap();
+
+        // A passive observer who saw the wire traffic but not the code typed
+        // into the phone has to brute force the code before this opens --
+        // guessing wrong does not open it.
+        let wrong_material = code_pairing_material("AAAA-AAAA", "manual-eaves").unwrap();
+        assert!(transport::open(
+            &wrong_material,
+            transport::Direction::PairingResponse,
+            b"POST /api/pair/claim\ncode-pairing\n",
+            &envelope,
+            now_unix_ms(),
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn manual_pairing_omits_the_transport_key_when_encryption_is_disabled() {
+        let mut state = test_state("admin-token", vec![]);
+        state.config.transport_encryption = TransportEncryptionMode::Disabled;
+        pair_request(
+            State(state.clone()),
+            Json(json!({ "request_id": "manual-2", "device_name": "Phone" })),
+        )
+        .await
+        .unwrap();
+        let code = pending_code(&state);
+        let claim_response = pair_claim(
+            State(state.clone()),
+            Json(json!({ "request_id": "manual-2", "code": code })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(claim_response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(claim_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        // Plain JSON, not a sealed envelope: `Disabled` never sealed a
+        // response before this card and still does not.
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["kind"], "muqun-gateway");
+        assert!(payload.get("transport_key").is_none());
+        assert!(payload.get("transport").is_none());
+    }
+
+    #[tokio::test]
+    async fn manual_pairing_code_is_single_use() {
+        let state = test_state("admin-token", vec![]);
+        pair_request(
+            State(state.clone()),
+            Json(json!({ "request_id": "manual-3", "device_name": "Phone" })),
+        )
+        .await
+        .unwrap();
+        let code = pending_code(&state);
+        pair_claim(
+            State(state.clone()),
+            Json(json!({ "request_id": "manual-3", "code": code.clone() })),
+        )
+        .await
+        .unwrap();
+
+        let (status, Json(body)) = pair_claim(
+            State(state.clone()),
+            Json(json!({ "request_id": "manual-3", "code": code })),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"]["code"], "pairing_not_requested");
+    }
+
+    #[tokio::test]
+    async fn manual_pairing_code_expires_server_side() {
+        let state = test_state("admin-token", vec![]);
+        let code = "2345-6789".to_owned();
+        *state.pending_pairing.lock().unwrap() = Some(PendingPairing {
+            request_id: "manual-4".into(),
+            device_name: "Phone".into(),
+            install_id: None,
+            code_hash: hash_token(&code),
+            code,
+            created_unix_ms: 0,
+            failed_attempts: 0,
+        });
+
+        let (status, Json(body)) = pair_claim(
+            State(state.clone()),
+            Json(json!({ "request_id": "manual-4", "code": "2345-6789" })),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::GONE);
+        assert_eq!(body["error"]["code"], "pairing_code_expired");
+    }
+
+    #[tokio::test]
+    async fn manual_pairing_wrong_codes_are_rate_limited_and_burn_the_pairing() {
+        let state = test_state("admin-token", vec![]);
+        pair_request(
+            State(state.clone()),
+            Json(json!({ "request_id": "manual-5", "device_name": "Phone" })),
+        )
+        .await
+        .unwrap();
+
+        for _ in 0..MAX_PAIRING_CODE_ATTEMPTS {
+            let (status, Json(body)) = pair_claim(
+                State(state.clone()),
+                Json(json!({ "request_id": "manual-5", "code": "AAAA-AAAA" })),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(body["error"]["code"], "invalid_pairing_code");
+        }
+
+        // The correct code no longer works either: the pairing burned after
+        // `MAX_PAIRING_CODE_ATTEMPTS` wrong guesses, same as it always did.
+        let real_code = "2345-6789";
+        let (status, Json(body)) = pair_claim(
+            State(state.clone()),
+            Json(json!({ "request_id": "manual-5", "code": real_code })),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"]["code"], "pairing_not_requested");
     }
 
     #[test]
