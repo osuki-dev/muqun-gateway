@@ -527,8 +527,15 @@ impl PaneBuffer {
 #[derive(Debug, Default)]
 pub struct ScrollbackStore {
     buffers: HashMap<String, PaneBuffer>,
-    /// Panes Herdr reports no scrollback for, by `session/pane`. Only these are
-    /// ever recorded or answered from.
+    /// Panes worth recording synthetic history for, by `session/pane`. Only
+    /// these are ever recorded or answered from.
+    ///
+    /// True for a pane whose own scrollback is frozen rather than merely
+    /// small: one on an alternate screen (`alternate_on: true`), which tmux
+    /// will never grow no matter how long the reader waits, or -- when the
+    /// backend cannot say (Herdr; a tmux pane before its first list, where
+    /// `alternate_on` is `None`) -- one Herdr reports zero rows above for.
+    /// See `keeps`.
     kept: HashMap<String, bool>,
     /// Panes whose foreground program is a full-screen editor -- see
     /// `is_editor_command` -- by `session/pane`. Absent means unknown, which
@@ -576,19 +583,37 @@ fn is_editor_command(command: Option<&str>) -> bool {
 }
 
 impl ScrollbackStore {
-    /// Learn from a Herdr answer which panes hold no scrollback of their own.
+    /// Learn from a Herdr answer which panes have scrollback of their own that
+    /// this store must stay out of, versus which are frozen and need it.
     ///
     /// Takes any `pane.list`, `pane.get` or `session.snapshot` body and walks it
     /// for pane objects, so it does not have to know the shape of each. The
     /// approval watcher already calls `pane.list` every 1500ms, which keeps this
     /// current without asking Herdr for anything new.
+    ///
+    /// A pane is kept when its foreground program owns an alternate screen:
+    /// `alternate_on: true` means tmux will never write another row above it,
+    /// however many it already has (a residue from before the program took
+    /// the screen -- 29 lines for a Claude pane measured live -- is not
+    /// meaningfully more useful than none, and unlike none it will never
+    /// grow). `max_offset_from_bottom <= 0` remains the fallback for where
+    /// `alternate_on` is unknown: a Herdr backend, or a tmux pane before its
+    /// first list. Checking the offset alone, as this used to, answers "is
+    /// there a little scrollback right now" -- a number that drifts with how
+    /// much ran before the program switched screens -- rather than "will this
+    /// pane's own scrollback ever include what is about to scroll off", which
+    /// is the question this store actually needs answered and the one
+    /// `alternate_on` answers directly.
     pub fn observe(&mut self, session_id: &str, value: &Value) {
         visit_panes(value, &mut |pane_id, pane| {
             if let Some(scroll) = pane.get("scroll").and_then(Value::as_object) {
                 if let Some(maximum) = scroll.get("max_offset_from_bottom").and_then(Value::as_f64)
                 {
-                    self.kept
-                        .insert(pane_key(session_id, pane_id), maximum <= 0.0);
+                    let alternate = scroll.get("alternate_on").and_then(Value::as_bool);
+                    self.kept.insert(
+                        pane_key(session_id, pane_id),
+                        alternate == Some(true) || maximum <= 0.0,
+                    );
                 }
             }
             if let Some(command) = pane.get("foreground_command").and_then(Value::as_str) {
@@ -828,21 +853,31 @@ impl ScrollbackStore {
     /// `max_offset_from_bottom + viewport_rows` off the pane, not off the
     /// output. Without this the rows would be kept and never asked for.
     ///
-    /// It only ever raises the number, and only for panes Herdr reported zero
-    /// for, so a pane with real scrollback is left exactly as it arrived.
+    /// It only ever raises the number, and only for panes this store `keeps`
+    /// -- not, as this used to read, only for panes reporting exactly zero.
+    /// `%17` measured live: `alternate_on: true`, a 29-line residue from
+    /// before Claude took the screen, and therefore `keeps` (once that
+    /// answers off `alternate_on` rather than off this same zero check --
+    /// see its own doc) records it. Gating the amendment on the zero check
+    /// too would still have been a bug even so: the store would grow the
+    /// pane's synthetic history underneath it forever while `amend` kept
+    /// republishing Herdr's frozen 29 on every call, and the reader would
+    /// never be offered a pull for any of it. `keeps` is the one true
+    /// answer to "does this store speak for this pane" and both halves --
+    /// whether to record, and whether to say so -- must agree with it.
+    /// Reading it here rather than re-deriving the same verdict from this
+    /// call's own payload also means the two can never drift: `observe` is
+    /// always called immediately before `amend` on the same body (see
+    /// `main.rs`), so the map this reads is the map that body just wrote.
     pub fn amend(&self, session_id: &str, value: &mut Value) {
         let mut updates: Vec<(String, u64)> = Vec::new();
         visit_panes(value, &mut |pane_id, pane| {
+            if !self.keeps(session_id, pane_id) {
+                return;
+            }
             let Some(scroll) = pane.get("scroll").and_then(Value::as_object) else {
                 return;
             };
-            let maximum = scroll
-                .get("max_offset_from_bottom")
-                .and_then(Value::as_f64)
-                .unwrap_or(-1.0);
-            if maximum != 0.0 {
-                return;
-            }
             let viewport = scroll
                 .get("viewport_rows")
                 .and_then(Value::as_u64)
@@ -1419,6 +1454,93 @@ mod tests {
         assert!(!store.observed_as_kept("other", "wM:p1"));
     }
 
+    // The gap between the two mechanisms, measured live: a Claude pane
+    // (`%17`) that ran `nvim .` before Claude took the alternate screen has a
+    // 29-line residue from before the switch -- tmux's `history_size`, which
+    // `max_offset_from_bottom` mirrors verbatim for the tmux backend -- and
+    // that residue will never grow no matter how long the conversation runs,
+    // because everything printed since went to the alternate screen instead.
+    // The old predicate (`max_offset_from_bottom <= 0.0` alone) answered
+    // "false" for it: not kept by tmux in any way that matters (the 29 lines
+    // are frozen, not scrollback the reader can page into), and not recorded
+    // by this store either. `alternate_on` is the fix because it is the
+    // question this store actually needs answered -- will tmux ever add to
+    // this pane's own history -- rather than a proxy for it that only agrees
+    // with the answer when the residue happens to be zero.
+    #[test]
+    fn an_alternate_screen_pane_with_a_shallow_residue_is_kept() {
+        let mut store = ScrollbackStore::default();
+        store.observe(
+            "default",
+            &json!({
+                "result": {
+                    "panes": [
+                        // %17: history_size 29, alternate_on 1 -- a Claude pane
+                        // with residue from before the switch, measured live.
+                        { "pane_id": "%17", "scroll": { "max_offset_from_bottom": 29, "viewport_rows": 63, "alternate_on": true } },
+                        // %1: history_size 0, alternate_on 1 -- a Claude pane
+                        // that switched with nothing printed first. Already
+                        // kept under the old predicate; must stay kept.
+                        { "pane_id": "%1", "scroll": { "max_offset_from_bottom": 0, "viewport_rows": 63, "alternate_on": true } }
+                    ]
+                }
+            }),
+        );
+        assert!(
+            store.observed_as_kept("default", "%17"),
+            "29 frozen lines is not meaningfully more useful than none, and unlike \
+             none it looked like real scrollback under the old rule"
+        );
+        assert!(store.observed_as_kept("default", "%1"));
+    }
+
+    // The other half of the same fix: a pane that genuinely scrolls -- codex,
+    // bun, anything tmux keeps real history for -- must not become "kept" just
+    // because its `max_offset_from_bottom` happens to be small early on. Only
+    // `alternate_on: false` (or a pane observed with no `alternate_on` at all,
+    // the pre-card-795 shape) proves that, and it must keep winning over a
+    // small offset the same way it always has.
+    #[test]
+    fn a_genuinely_scrolling_pane_is_never_kept_regardless_of_offset() {
+        let mut store = ScrollbackStore::default();
+        store.observe(
+            "default",
+            &json!({
+                "result": {
+                    "panes": [
+                        // %47 (codex): prints and scrolls, alternate_on false,
+                        // caught early with only a little scrollback so far.
+                        { "pane_id": "%47", "scroll": { "max_offset_from_bottom": 6, "viewport_rows": 63, "alternate_on": false } },
+                        // %34 (bun): the same pane, deep into a long build.
+                        { "pane_id": "%34", "scroll": { "max_offset_from_bottom": 13_643, "viewport_rows": 63, "alternate_on": false } }
+                    ]
+                }
+            }),
+        );
+        assert!(!store.observed_as_kept("default", "%47"));
+        assert!(!store.observed_as_kept("default", "%34"));
+    }
+
+    // Where the backend cannot say (Herdr; the shape every existing test above
+    // this one uses), the fallback is exactly the old rule -- unchanged.
+    #[test]
+    fn unknown_alternate_on_falls_back_to_the_offset_alone() {
+        let mut store = ScrollbackStore::default();
+        store.observe(
+            "default",
+            &json!({
+                "result": {
+                    "panes": [
+                        { "pane_id": "h1", "scroll": { "max_offset_from_bottom": 0, "viewport_rows": 63 } },
+                        { "pane_id": "h2", "scroll": { "max_offset_from_bottom": 29, "viewport_rows": 63 } }
+                    ]
+                }
+            }),
+        );
+        assert!(store.observed_as_kept("default", "h1"));
+        assert!(!store.observed_as_kept("default", "h2"));
+    }
+
     #[test]
     fn a_pane_that_grows_scrollback_stops_being_kept() {
         let mut store = ScrollbackStore::default();
@@ -1445,6 +1567,10 @@ mod tests {
                 ]
             }
         });
+        // `amend` now answers off `keeps`, not off this call's own zero check
+        // -- `observe`, always run immediately before it in production, is
+        // what populates that.
+        store.observe("s", &value);
         store.amend("s", &mut value);
         // 236 rows held, 65 of them on screen: 171 the reader can reach for.
         assert_eq!(
@@ -1453,6 +1579,45 @@ mod tests {
                 .unwrap(),
             &json!(236 - 65)
         );
+    }
+
+    // The end-to-end shape of the `%17` fix: a pane with a shallow, frozen
+    // residue (`alternate_on: true`, `max_offset_from_bottom: 29`, unlike
+    // `%1`'s 0) is amended upward as the store accumulates past what tmux
+    // ever reported, instead of being stuck republishing 29 forever. Without
+    // `amend` also switching to `keeps`, this would still fail even with
+    // `keeps` itself fixed: recording is only half of offering the pull.
+    #[test]
+    fn an_alternate_screen_pane_with_a_residue_is_amended_past_it() {
+        let mut store = ScrollbackStore::default();
+        let observed = json!({
+            "result": {
+                "panes": [
+                    { "pane_id": "%17", "scroll": { "max_offset_from_bottom": 29, "viewport_rows": 63, "alternate_on": true } }
+                ]
+            }
+        });
+        store.observe("default", &observed);
+        // The conversation goes on long past the 29-line residue tmux will
+        // ever report for this pane.
+        scroll_a_screen(
+            &mut store,
+            &read_key("default", "%17", "recent_unwrapped", "text"),
+            300,
+        );
+        let mut value = observed.clone();
+        store.amend("default", &mut value);
+        let amended = value
+            .pointer("/result/panes/0/scroll/max_offset_from_bottom")
+            .unwrap()
+            .as_u64()
+            .unwrap();
+        assert!(
+            amended > 29,
+            "the store held more than tmux's frozen residue, and the reader \
+             must be offered a pull for it: got {amended}"
+        );
+        assert_eq!(amended, 300 - 63);
     }
 
     #[test]
@@ -1466,10 +1631,13 @@ mod tests {
         let original = json!({
             "result": {
                 "panes": [
-                    { "pane_id": "p", "scroll": { "max_offset_from_bottom": 908, "viewport_rows": 65 } }
+                    // `alternate_on: false`: a genuinely scrolling pane, kept
+                    // by neither predicate however deep its own history goes.
+                    { "pane_id": "p", "scroll": { "max_offset_from_bottom": 908, "viewport_rows": 65, "alternate_on": false } }
                 ]
             }
         });
+        store.observe("s", &original);
         let mut value = original.clone();
         store.amend("s", &mut value);
         assert_eq!(value, original);
@@ -1483,7 +1651,14 @@ mod tests {
             "one\ntwo",
             false,
         );
-        let original = json!({ "pane_id": "p", "scroll": { "max_offset_from_bottom": 0, "viewport_rows": 65 } });
+        let original = json!({
+            "result": {
+                "panes": [
+                    { "pane_id": "p", "scroll": { "max_offset_from_bottom": 0, "viewport_rows": 65 } }
+                ]
+            }
+        });
+        store.observe("s", &original);
         let mut value = original.clone();
         store.amend("s", &mut value);
         assert_eq!(value, original);
