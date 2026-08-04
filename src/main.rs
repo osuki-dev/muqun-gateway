@@ -910,7 +910,7 @@ fn setup(
     write_config(&path, &config)?;
 
     let payload = PairingPayload {
-        kind: "herdr-gateway".into(),
+        kind: "muqun-gateway".into(),
         server_id: config.server_id.clone(),
         label: config.label.clone(),
         url: public_url,
@@ -947,7 +947,7 @@ fn setup(
         }
     }
     println!("pairing identity is ready");
-    println!("run `herdr-gateway manage` in any terminal to scan the QR code");
+    println!("run `muqun-gateway manage` in any terminal to scan the QR code");
     Ok(())
 }
 
@@ -1265,7 +1265,7 @@ fn import_herdr_plugin(
     for session in &merged.sessions {
         println!("  {} ({})", session.id, session.backend.as_str());
     }
-    println!("source files were retained; run `herdr-gateway start` when ready");
+    println!("source files were retained; run `muqun-gateway start` when ready");
     Ok(())
 }
 
@@ -2333,7 +2333,7 @@ async fn pair_claim(State(state): State<AppState>, Json(wire): Json<Value>) -> A
     }
 
     let mut response_payload = json!({
-        "kind": "herdr-gateway",
+        "kind": "muqun-gateway",
         "server_id": state.config.server_id,
         "label": state.config.label,
         "url": state.config.public_url,
@@ -8569,9 +8569,27 @@ async fn asset_content(
     let mut entry = lock_assets(&state)?.get(&asset_id);
     if entry.is_none() {
         // Cold start: the app may hold an id from before a restart, so rebuild
-        // the index from the live sessions once before answering.
+        // the index from the live sessions once before answering. Uploads
+        // are not under any pane's cwd -- they are the gateway's own
+        // directory, not a workspace one -- so a rebuild from pane roots
+        // alone would never see an upload made before the restart that just
+        // emptied the index, even though the file is still on disk and
+        // `resolve_indexed_asset_path` would happily serve it once the entry
+        // exists. It is folded in here as one more root per session, which
+        // widens nothing the gateway was not already willing to serve: the
+        // uploads directory is its own, not a workspace's.
+        let uploads = uploads_dir().ok();
         for session in state.config.sessions.clone() {
-            let roots = session_asset_roots(&state, &session, None).await;
+            let mut roots = session_asset_roots(&state, &session, None).await;
+            if let Some(uploads) = &uploads {
+                roots.push(AssetRoot {
+                    path: uploads.clone(),
+                    session_id: session.id.clone(),
+                    workspace_id: None,
+                    tab_id: None,
+                    pane_id: None,
+                });
+            }
             ingest_roots(state.assets.clone(), roots).await;
         }
         entry = lock_assets(&state)?.get(&asset_id);
@@ -9087,17 +9105,69 @@ fn state_dir() -> anyhow::Result<std::path::PathBuf> {
     standalone_state_dir()
 }
 
+/// The gateway's standalone directory name before the muqun-gateway rename.
+/// Kept only so an existing install's config and state can be found once and
+/// carried forward; nothing else should reference it.
+const PRE_RENAME_STANDALONE_DIR_NAME: &str = "herdr-gateway";
+
+/// Move an install's directory from the pre-rename name to the current one,
+/// the first time it is asked for after upgrading.
+///
+/// A same-filesystem `rename` is atomic at the directory-entry level -- there
+/// is no window in which both names exist with half the files in each -- so
+/// this step itself cannot leave an install half-migrated. What can still
+/// split state across both names is a gateway built under the pre-rename
+/// name that is *still running* against this directory: it does not know the
+/// directory was just renamed out from under it, and the next thing it
+/// writes -- a push token, an upload, its own pid file -- recreates the old
+/// directory fresh, right next to the one this just moved. So this refuses
+/// to migrate at all while such a process is found listening on the old
+/// config's port, rather than migrate and let the two diverge; the caller
+/// gets a plain error naming the pid to stop instead of a silently split
+/// install. Once the new name exists, the old one is never inspected again:
+/// a directory an owner later recreates under the old name is left alone
+/// rather than merged in.
+fn migrate_renamed_standalone_dir(parent: &std::path::Path) -> anyhow::Result<PathBuf> {
+    let new_dir = parent.join("muqun-gateway");
+    let old_dir = parent.join(PRE_RENAME_STANDALONE_DIR_NAME);
+    if new_dir.exists() || !old_dir.exists() {
+        return Ok(new_dir);
+    }
+    let old_config_path = old_dir.join(CONFIG_FILE).to_string_lossy().into_owned();
+    if let Ok(old_config) = load_config(Some(old_config_path)) {
+        if let Ok(old_pids) = listener_pids_named(old_config.port(), PRE_RENAME_STANDALONE_DIR_NAME)
+        {
+            if let Some(&pid) = old_pids.first() {
+                anyhow::bail!(
+                    "a gateway is still running under the pre-rename name {} (pid {pid}); stop \
+                     it before this directory can be migrated to muqun-gateway -- migrating \
+                     underneath a still-running process would split its data across both names",
+                    PRE_RENAME_STANDALONE_DIR_NAME
+                );
+            }
+        }
+    }
+    std::fs::rename(&old_dir, &new_dir).with_context(|| {
+        format!(
+            "failed to migrate {} to {}",
+            old_dir.display(),
+            new_dir.display()
+        )
+    })?;
+    eprintln!("migrated {} to {}", old_dir.display(), new_dir.display());
+    Ok(new_dir)
+}
+
 fn standalone_config_dir() -> anyhow::Result<PathBuf> {
-    Ok(dirs::config_dir()
-        .context("failed to locate config directory")?
-        .join("herdr-gateway"))
+    let parent = dirs::config_dir().context("failed to locate config directory")?;
+    migrate_renamed_standalone_dir(&parent)
 }
 
 fn standalone_state_dir() -> anyhow::Result<PathBuf> {
-    Ok(dirs::data_dir()
+    let parent = dirs::data_dir()
         .or_else(dirs::config_dir)
-        .context("failed to locate state directory")?
-        .join("herdr-gateway"))
+        .context("failed to locate state directory")?;
+    migrate_renamed_standalone_dir(&parent)
 }
 
 fn default_herdr_plugin_config_dir() -> anyhow::Result<PathBuf> {
@@ -9286,12 +9356,20 @@ fn stop_pid(pid: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
-const GATEWAY_PROCESS_NAME: &str = "herdr-gateway";
+const GATEWAY_PROCESS_NAME: &str = "muqun-gateway";
 
 /// Find gateway processes listening on `port`. Anything that is not the gateway
 /// is filtered out by process name: `stop` must never kill an unrelated service
 /// that happens to hold the port.
 fn gateway_listener_pids(port: u16) -> anyhow::Result<Vec<u32>> {
+    listener_pids_named(port, GATEWAY_PROCESS_NAME)
+}
+
+/// Same search, but for an arbitrary process name rather than this build's own
+/// [`GATEWAY_PROCESS_NAME`]. Used to detect a gateway still running under the
+/// pre-rename binary name, which this build's own name-filtered search would
+/// never find.
+fn listener_pids_named(port: u16, process_name: &str) -> anyhow::Result<Vec<u32>> {
     #[cfg(target_os = "macos")]
     let mut pids = {
         let output = ProcessCommand::new("lsof")
@@ -9304,7 +9382,7 @@ fn gateway_listener_pids(port: u16) -> anyhow::Result<Vec<u32>> {
         String::from_utf8_lossy(&output.stdout)
             .lines()
             .filter_map(|value| value.trim().parse::<u32>().ok())
-            .filter(|pid| process_is_gateway(*pid))
+            .filter(|pid| process_matches_name(*pid, process_name))
             .collect::<Vec<_>>()
     };
 
@@ -9318,7 +9396,7 @@ fn gateway_listener_pids(port: u16) -> anyhow::Result<Vec<u32>> {
         let port_suffix = format!(":{port}");
         let mut pids = Vec::new();
         for line in text.lines() {
-            if !line.contains(&port_suffix) || !line.contains(GATEWAY_PROCESS_NAME) {
+            if !line.contains(&port_suffix) || !line.contains(process_name) {
                 continue;
             }
             let Some(pid_start) = line.find("pid=") else {
@@ -9340,9 +9418,11 @@ fn gateway_listener_pids(port: u16) -> anyhow::Result<Vec<u32>> {
     Ok(pids)
 }
 
-/// Confirm a pid really belongs to the gateway before signalling it.
+/// Confirm a pid really belongs to a process named `process_name` before
+/// trusting it (e.g. before signalling it, or before refusing a directory
+/// migration on its account).
 #[cfg(target_os = "macos")]
-fn process_is_gateway(pid: u32) -> bool {
+fn process_matches_name(pid: u32, process_name: &str) -> bool {
     ProcessCommand::new("ps")
         .args(["-p", &pid.to_string(), "-o", "comm="])
         .output()
@@ -9352,7 +9432,7 @@ fn process_is_gateway(pid: u32) -> bool {
                     .trim()
                     .rsplit('/')
                     .next()
-                    .is_some_and(|name| name.starts_with(GATEWAY_PROCESS_NAME))
+                    .is_some_and(|name| name.starts_with(process_name))
         })
 }
 
@@ -11278,7 +11358,7 @@ mod tests {
     #[test]
     fn pairing_payload_contains_mobile_connection_fields() {
         let payload = PairingPayload {
-            kind: "herdr-gateway".into(),
+            kind: "muqun-gateway".into(),
             server_id: "server-1".into(),
             label: "machine".into(),
             url: "http://100.1.2.3:23100".into(),
@@ -11286,7 +11366,7 @@ mod tests {
             transport_key: "transport-secret".into(),
         };
         let value: Value = serde_json::from_str(&serde_json::to_string(&payload).unwrap()).unwrap();
-        assert_eq!(value["kind"], "herdr-gateway");
+        assert_eq!(value["kind"], "muqun-gateway");
         assert_eq!(value["url"], "http://100.1.2.3:23100");
         assert_eq!(value["token"], "secret");
     }
@@ -11965,6 +12045,52 @@ mod tests {
         assert!(index.get(&asset_id(&never)).is_none());
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_uploads_directory_ingests_like_any_other_root_and_survives_a_cold_start() {
+        // The bug this guards against: an upload lives in the gateway's own
+        // uploads directory, which is not under any pane's cwd, so a rebuild
+        // that only walks pane roots never finds it again once the in-memory
+        // index is gone (e.g. after a restart). The cold-start path in
+        // `asset_content` now adds the uploads directory as one more root per
+        // session -- this proves that root ingests the same way a pane root
+        // does, and that the resulting entry answers a lookup with none of the
+        // session's live roots present, exactly the state a fresh process is
+        // in right after startup.
+        let uploads = asset_test_dir("uploads-cold-start");
+        let upload = uploads.join("5969c1e3.webp");
+        std::fs::write(&upload, b"fake webp bytes").unwrap();
+
+        let root = AssetRoot {
+            path: uploads.clone(),
+            session_id: "default".into(),
+            workspace_id: None,
+            tab_id: None,
+            pane_id: None,
+        };
+        let index: Mutex<AssetIndex> = Mutex::new(AssetIndex::default());
+        let created = ingest_root(&index, &root);
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].path, upload);
+        assert_eq!(created[0].session_id, "default");
+
+        // Simulate the state right after a restart answering `asset_content`:
+        // the entry is in the index (just rebuilt), but the session's live
+        // roots -- the pane cwds -- do not include the uploads directory and
+        // never will. `resolve_indexed_asset_path`'s own-path fallback is what
+        // actually serves it; this proves the entry it is given exists to
+        // fall back on at all.
+        let id = asset_id(&upload);
+        let entry = index.lock().unwrap().get(&id).unwrap();
+        assert_eq!(entry.path, upload);
+        let no_live_pane_roots: Vec<PathBuf> = Vec::new();
+        assert_eq!(
+            resolve_indexed_asset_path(&entry.path, &no_live_pane_roots),
+            Some(upload.clone())
+        );
+
+        std::fs::remove_dir_all(&uploads).ok();
     }
 
     #[cfg(unix)]
@@ -13249,6 +13375,77 @@ mod tests {
     }
 
     #[test]
+    fn a_renamed_standalone_dir_migrates_once_and_never_again() {
+        let parent = std::env::temp_dir().join(format!("gateway-rename-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&parent).unwrap();
+        let old_dir = parent.join(PRE_RENAME_STANDALONE_DIR_NAME);
+        std::fs::create_dir_all(&old_dir).unwrap();
+        // A real, parseable config so the pre-migration liveness check has a
+        // port to look at -- this is the ordinary case: an install whose old
+        // gateway has already been stopped, so nothing is listening on that
+        // port under the old name and the migration proceeds. (The refusal
+        // path -- a process actually found listening -- is not exercised
+        // here: this file does not spawn real OS processes to unit-test
+        // process introspection anywhere else either, and that path was
+        // verified operationally when this fix was written, against a
+        // gateway genuinely still running under the pre-rename name.)
+        std::fs::write(
+            old_dir.join(CONFIG_FILE),
+            serde_json::to_vec(&test_config("migration-token")).unwrap(),
+        )
+        .unwrap();
+
+        let migrated = migrate_renamed_standalone_dir(&parent).unwrap();
+        assert_eq!(migrated, parent.join("muqun-gateway"));
+        assert!(!old_dir.exists());
+        assert!(migrated.join(CONFIG_FILE).exists());
+
+        // A directory recreated under the old name afterward is left alone:
+        // once the new name exists, migration never looks at the old one again.
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::write(old_dir.join("marker"), b"should not move").unwrap();
+        let migrated_again = migrate_renamed_standalone_dir(&parent).unwrap();
+        assert_eq!(migrated_again, migrated);
+        assert!(old_dir.join("marker").exists());
+        assert!(!migrated.join("marker").exists());
+
+        std::fs::remove_dir_all(&parent).ok();
+    }
+
+    #[test]
+    fn no_old_dir_and_no_new_dir_migrates_nothing() {
+        let parent =
+            std::env::temp_dir().join(format!("gateway-rename-none-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&parent).unwrap();
+        let migrated = migrate_renamed_standalone_dir(&parent).unwrap();
+        assert_eq!(migrated, parent.join("muqun-gateway"));
+        assert!(!migrated.exists());
+        std::fs::remove_dir_all(&parent).ok();
+    }
+
+    #[test]
+    fn an_unparseable_old_config_does_not_block_migration() {
+        // No port can be read from this, so the liveness check has nothing to
+        // ask about and degrades to "proceed" rather than "refuse forever" --
+        // an install should not be permanently stuck migrating because one
+        // file did not parse.
+        let parent = std::env::temp_dir().join(format!(
+            "gateway-rename-unparseable-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&parent).unwrap();
+        let old_dir = parent.join(PRE_RENAME_STANDALONE_DIR_NAME);
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::write(old_dir.join(CONFIG_FILE), b"{}").unwrap();
+
+        let migrated = migrate_renamed_standalone_dir(&parent).unwrap();
+        assert_eq!(migrated, parent.join("muqun-gateway"));
+        assert!(!old_dir.exists());
+
+        std::fs::remove_dir_all(&parent).ok();
+    }
+
+    #[test]
     fn backend_ids_and_labels_reject_terminal_control_input() {
         assert!(validate_session_id("tmux-2").is_ok());
         assert!(validate_session_id("../tmux").is_err());
@@ -13300,7 +13497,7 @@ mod tests {
         let config = test_config("admin-token");
         let pairing = PairingFile {
             payload: PairingPayload {
-                kind: "herdr-gateway".into(),
+                kind: "muqun-gateway".into(),
                 server_id: config.server_id.clone(),
                 label: config.label.clone(),
                 url: config.public_url.clone(),
@@ -13362,7 +13559,7 @@ mod tests {
         plugin.public_url = "http://127.0.0.1:31987".into();
         let plugin_pairing = PairingFile {
             payload: PairingPayload {
-                kind: "herdr-gateway".into(),
+                kind: "muqun-gateway".into(),
                 server_id: plugin.server_id.clone(),
                 label: plugin.label.clone(),
                 url: plugin.public_url.clone(),
@@ -13387,7 +13584,7 @@ mod tests {
         };
         let standalone_pairing = PairingFile {
             payload: PairingPayload {
-                kind: "herdr-gateway".into(),
+                kind: "muqun-gateway".into(),
                 server_id: standalone.server_id.clone(),
                 label: standalone.label.clone(),
                 url: standalone.public_url.clone(),

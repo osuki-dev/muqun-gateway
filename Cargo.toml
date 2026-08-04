@@ -1,10 +1,10 @@
 [package]
-name = "herdr-gateway"
+name = "muqun-gateway"
 version = "0.5.0"
 edition = "2021"
 license = "MIT"
 description = "Token-protected mobile gateway for Herdr and tmux terminal workspaces."
-repository = "https://github.com/osuki-dev/herdr-gateway"
+repository = "https://github.com/osuki-dev/muqun-gateway"
 readme = "README.md"
 keywords = ["terminal", "gateway", "tmux", "herdr", "tailscale"]
 categories = ["command-line-utilities"]

@@ -688,7 +688,7 @@ mod tests {
         assert!(find_on_path("").is_none());
         // Something every POSIX box has, to prove the probe does find things.
         assert!(find_on_path("sh").is_some());
-        assert!(find_on_path("herdr-gateway-definitely-not-installed").is_none());
+        assert!(find_on_path("muqun-gateway-definitely-not-installed").is_none());
     }
 
     #[test]

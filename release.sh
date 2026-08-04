@@ -46,4 +46,4 @@ git tag -a "$tag" -m "$tag"
 info "Pushing main and $tag (this kicks off the release build)"
 git push origin main "$tag"
 
-printf '\033[1;32mReleased %s.\033[0m CI is now building the binaries: https://github.com/osuki-dev/herdr-gateway/actions\n' "$tag"
+printf '\033[1;32mReleased %s.\033[0m CI is now building the binaries: https://github.com/osuki-dev/muqun-gateway/actions\n' "$tag"

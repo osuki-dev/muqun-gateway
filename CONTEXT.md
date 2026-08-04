@@ -3,9 +3,10 @@
 ## Purpose
 
 This repository implements Muqun's local terminal gateway. It exposes one
-authenticated HTTP/SSE contract over one or more terminal backends. The current
-binary and Herdr plugin identifiers remain `herdr-gateway` / `herdr.gateway` for
-compatibility; the intended repository name is `muqun-gateway`.
+authenticated HTTP/SSE contract over one or more terminal backends. The
+repository, package, and binary are `muqun-gateway`; the Herdr plugin
+identifier stays `herdr.gateway` because it names the Herdr integration, not
+the gateway itself (see the last line of this file).
 
 ## Shape of the codebase
 
@@ -70,10 +71,15 @@ composition root, so credential policy is testable without HTTP or disk.
 
 ## Configuration and deployment
 
-Standalone config defaults to `~/.config/herdr-gateway`; mutable state defaults
-to `~/.local/state/herdr-gateway`. The Herdr plugin supplies its own directories
-through environment variables until `import-herdr-plugin` writes the migration
-marker. After that, direct CLI and plugin actions share standalone ownership.
+Standalone config defaults to `~/.config/muqun-gateway`; mutable state defaults
+to `~/.local/share/muqun-gateway`. An install that predates the muqun-gateway
+rename is migrated once, automatically, the first time either directory is
+resolved: if the new name is absent and the old `herdr-gateway` one is
+present, it is renamed in place (an atomic same-filesystem `rename`, so there
+is no partially-migrated state) and never looked at again. The Herdr plugin
+supplies its own directories through environment variables until
+`import-herdr-plugin` writes the migration marker. After that, direct CLI and
+plugin actions share standalone ownership.
 
 The public listener is normally localhost behind Tailscale Serve HTTPS or a
 Tailscale IPv4 address. HTTPS is preferred. Application transport encryption is
@@ -98,4 +104,6 @@ Important quirks:
 - Removing a backend never terminates the corresponding terminal sessions.
 - The current Muqun data layer is multi-session capable, but its ordinary UI
   automatically selects the first session and does not yet expose a picker.
-- The plugin ID and legacy metadata names must survive the repository rename.
+- The Herdr plugin ID (`herdr.gateway`) and the legacy `herdr` response
+  metadata are the Herdr-integration surface, not the gateway's own name --
+  they do not follow the gateway when it is renamed.

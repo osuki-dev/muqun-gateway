@@ -14,25 +14,25 @@ command = ["sh", "scripts/fetch-binary.sh"]
 id = "setup"
 title = "Setup Gateway"
 contexts = ["workspace"]
-command = ["./target/release/herdr-gateway", "setup"]
+command = ["./target/release/muqun-gateway", "setup"]
 
 [[actions]]
 id = "start"
 title = "Start Gateway"
 contexts = ["workspace"]
-command = ["./target/release/herdr-gateway", "start"]
+command = ["./target/release/muqun-gateway", "start"]
 
 [[actions]]
 id = "stop"
 title = "Stop Gateway"
 contexts = ["workspace"]
-command = ["./target/release/herdr-gateway", "stop"]
+command = ["./target/release/muqun-gateway", "stop"]
 
 [[actions]]
 id = "status"
 title = "Gateway Status"
 contexts = ["workspace"]
-command = ["./target/release/herdr-gateway", "status"]
+command = ["./target/release/muqun-gateway", "status"]
 
 [[panes]]
 id = "manage"
@@ -40,10 +40,10 @@ title = "Gateway Manager"
 placement = "popup"
 width = 92
 height = 40
-command = ["./target/release/herdr-gateway", "manage"]
+command = ["./target/release/muqun-gateway", "manage"]
 
 [[panes]]
 id = "foreground"
 title = "Gateway Foreground"
 placement = "tab"
-command = ["./target/release/herdr-gateway", "run"]
+command = ["./target/release/muqun-gateway", "run"]

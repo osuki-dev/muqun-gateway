@@ -1,4 +1,4 @@
-# Terminal Gateway (currently `herdr-gateway`)
+# Muqun Gateway
 
 Rust terminal-backend gateway and Herdr plugin for Muqun.
 
@@ -6,36 +6,46 @@ The gateway exposes one device-authenticated HTTP API for reading and controllin
 workspaces, tabs, panes, agents, and pane output. One process can talk to both
 Herdr's socket API and a local tmux server at the same time. The HTTP contract
 stays the same, so the
-Muqun app does not need a backend-specific implementation. The repository,
-binary, plugin id, and legacy response envelope retain their Herdr names until
-a separate compatibility-safe rename.
+Muqun app does not need a backend-specific implementation. The repository and
+binary are `muqun-gateway`; the Herdr plugin id (`herdr.gateway`) and the
+legacy `herdr` response envelope name the Herdr integration itself, which is
+still supported, and keep their own names.
 
 ## Install
 
-One command that checks your system, installs the plugin, and on a **first
-install** also configures it, starts it, and opens the pairing QR (macOS and
-Linux; Windows is not supported yet):
+One command that checks your system and installs Muqun Gateway, and on a
+**first install** also configures it, starts it, and shows how to view the
+pairing QR (macOS and Linux; Windows is not supported yet):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/osuki-dev/herdr-gateway/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/osuki-dev/muqun-gateway/main/install.sh | sh
 ```
 
-Herdr Gateway requires Herdr 0.7.5 or newer. The installer checks this before
-Herdr reads the plugin manifest; on an older version it stops with the exact
-`herdr update --handoff` command instead of exposing an unrelated TOML parse
-error. Herdr 0.7.5 installs plugins globally for the current user, so the plugin
-can be installed from any shell. Its setup, start, and pairing-QR actions still
-need a live herdr session; if none is reachable, the script installs the plugin
-and prints the manual commands to finish.
+tmux is the primary backend and this is all it needs -- no Herdr required.
+When [Herdr](https://herdr.dev) is on `PATH`, the script installs Muqun
+Gateway as a Herdr plugin instead, the same way it always has (rest of this
+section describes that path). Otherwise it downloads the standalone binary,
+runs `setup --backend tmux`, and starts it directly; that path is new and has
+not yet been run end to end on a machine without Herdr, so if something looks
+off, run the printed commands by hand and compare.
 
-It needs [Herdr](https://herdr.dev). Install downloads a prebuilt, statically
-linked binary for your platform, so no Rust toolchain is required -- it is only
-a fallback if no release binary matches your OS/arch.
+Muqun Gateway requires Herdr 0.7.5 or newer when installed as a Herdr plugin.
+The installer checks this before Herdr reads the plugin
+manifest; on an older version it stops with the exact `herdr update --handoff`
+command instead of exposing an unrelated TOML parse error. Herdr 0.7.5 installs
+plugins globally for the current user, so the plugin can be installed from any
+shell. Its setup, start, and pairing-QR actions still need a live herdr
+session; if none is reachable, the script installs the plugin and prints the
+manual commands to finish.
+
+Install downloads a prebuilt, statically linked binary for your platform, so no
+Rust toolchain is required -- it is only a fallback if no release binary
+matches your OS/arch.
 
 If you prefer to do it by hand, install directly with Herdr's plugin installer:
 
 ```sh
-herdr plugin install osuki-dev/herdr-gateway
+herdr plugin install osuki-dev/muqun-gateway
 ```
 
 then configure once, start, and open the manager panel to view the QR code,
@@ -47,7 +57,7 @@ herdr plugin action invoke herdr.gateway.start
 herdr plugin pane open --plugin herdr.gateway --entrypoint manage
 ```
 
-The manager is also available outside Herdr with `herdr-gateway manage`; it is
+The manager is also available outside Herdr with `muqun-gateway manage`; it is
 owned by the gateway, not by either terminal backend. Press `h` or `m` to add a
 Herdr or tmux backend, `f` to choose the default session, and `d` to remove one.
 Backend changes take effect after
@@ -71,7 +81,7 @@ reinstalling a GitHub-managed plugin replaces its checkout in place. Re-run the
 same one command:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/osuki-dev/herdr-gateway/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/osuki-dev/muqun-gateway/main/install.sh | sh
 ```
 
 On a re-run the script updates the plugin and **reloads the binary for you**
@@ -83,13 +93,13 @@ actions can attach.
 Or reinstall directly (then restart it yourself, see below):
 
 ```sh
-herdr plugin install osuki-dev/herdr-gateway
+herdr plugin install osuki-dev/muqun-gateway
 ```
 
 Pin a specific version with `--ref`:
 
 ```sh
-herdr plugin install osuki-dev/herdr-gateway --ref v0.3.0
+herdr plugin install osuki-dev/muqun-gateway --ref v0.3.0
 ```
 
 After updating, restart the gateway so the new build takes over:
@@ -125,18 +135,18 @@ upserts that backend without removing the existing one:
 
 ```sh
 cargo build --release
-./target/release/herdr-gateway setup --backend tmux
-./target/release/herdr-gateway backend add herdr
-./target/release/herdr-gateway backend list
-./target/release/herdr-gateway start
-./target/release/herdr-gateway manage
+./target/release/muqun-gateway setup --backend tmux
+./target/release/muqun-gateway backend add herdr
+./target/release/muqun-gateway backend list
+./target/release/muqun-gateway start
+./target/release/muqun-gateway manage
 ```
 
 By default the adapter uses the current user's normal tmux server. To target a
 specific tmux socket, pass its absolute path using the existing option:
 
 ```sh
-./target/release/herdr-gateway setup --backend tmux --socket-path /absolute/path/to/tmux.sock
+./target/release/muqun-gateway setup --backend tmux --socket-path /absolute/path/to/tmux.sock
 ```
 
 `backend add tmux` and `backend remove <id>` are also available. Existing config
@@ -147,18 +157,18 @@ configured sessions and newer clients can offer a session selector.
 Choose which session older clients open first with:
 
 ```sh
-./target/release/herdr-gateway backend default tmux
+./target/release/muqun-gateway backend default tmux
 ```
 
-If Herdr Gateway is already installed as a plugin and paired with Muqun, migrate
+If Muqun Gateway is already installed as a plugin and paired with Muqun, migrate
 that identity before switching to the standalone process. Stop the plugin copy
 first so only one process owns the port:
 
 ```sh
 herdr plugin action invoke herdr.gateway.stop
-./target/release/herdr-gateway import-herdr-plugin
-./target/release/herdr-gateway start
-./target/release/herdr-gateway manage
+./target/release/muqun-gateway import-herdr-plugin
+./target/release/muqun-gateway start
+./target/release/muqun-gateway manage
 ```
 
 The import keeps Herdr as the first session, merges any standalone tmux session
@@ -191,14 +201,14 @@ Transport encryption is `required` by default. It can be selected during setup
 or toggled with `e` in the manager (restart the gateway after toggling):
 
 ```sh
-herdr-gateway setup --backend tmux --transport-encryption required
-herdr-gateway setup --backend tmux --transport-encryption disabled
+muqun-gateway setup --backend tmux --transport-encryption required
+muqun-gateway setup --backend tmux --transport-encryption disabled
 ```
 
 `disabled` is token-only compatibility mode. Its QR omits `k`; anyone who gets
 the device bearer token can call the API, so do not use it on public HTTP.
 
-The gateway URL is configurable. During `setup`, Herdr Gateway chooses a default
+The gateway URL is configurable. During `setup`, Muqun Gateway chooses a default
 URL in this order:
 
 1. `https://<tailscale-magic-name>` when Tailscale is running and Tailscale Serve appears to be forwarding the gateway port.
@@ -262,9 +272,9 @@ There are two kinds of credential, and they are not interchangeable:
   cannot reach the routes that run commands on the host.
 
 ```sh
-herdr-gateway devices             # list paired devices and when each was last seen
-herdr-gateway revoke <device_id>  # revoke one device
-herdr-gateway revoke --all        # revoke every device
+muqun-gateway devices             # list paired devices and when each was last seen
+muqun-gateway revoke <device_id>  # revoke one device
+muqun-gateway revoke --all        # revoke every device
 ```
 
 The same thing is available over the API, so Muqun can show and revoke devices
@@ -698,7 +708,7 @@ wording, which is the same rule the pushes are held to.
 
 ## Compatibility and API versions
 
-Herdr Gateway 0.5.0 requires Herdr 0.7.5 or newer and socket protocol 17.
+Muqun Gateway 0.5.0 requires Herdr 0.7.5 or newer and socket protocol 17.
 Earlier Herdr releases are intentionally unsupported; update Herdr and restart
 the running session before starting this Gateway release.
 

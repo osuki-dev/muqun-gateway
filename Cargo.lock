@@ -596,31 +596,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
-name = "herdr-gateway"
-version = "0.5.0"
-dependencies = [
- "aes-gcm",
- "anyhow",
- "async-stream",
- "axum",
- "base64",
- "clap",
- "crossterm",
- "dirs",
- "futures",
- "hkdf",
- "libc",
- "qrcode",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "tokio-stream",
- "uuid",
-]
-
-[[package]]
 name = "hkdf"
 version = "0.12.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -983,6 +958,31 @@ dependencies = [
  "mime",
  "spin",
  "version_check",
+]
+
+[[package]]
+name = "muqun-gateway"
+version = "0.5.0"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "async-stream",
+ "axum",
+ "base64",
+ "clap",
+ "crossterm",
+ "dirs",
+ "futures",
+ "hkdf",
+ "libc",
+ "qrcode",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-stream",
+ "uuid",
 ]
 
 [[package]]
