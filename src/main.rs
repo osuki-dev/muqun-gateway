@@ -7491,22 +7491,24 @@ async fn send_keys(
     Ok(Json(backend::compat::command_ok("pane_keys_sent")))
 }
 
-/// A file type the gateway is willing to store, with the extension and MIME
-/// type derived from the bytes themselves.
+/// A file type the gateway is willing to store. Binary formats get both fields
+/// from their magic bytes; UTF-8 text earns only a small extension allow-list
+/// after its content has passed the text probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct UploadKind {
     extension: &'static str,
     mime: &'static str,
 }
 
-/// Accept an image from the phone, park it in the gateway's own upload
+/// Accept a file from the phone, park it in the gateway's own upload
 /// directory and hand back a local path. The app then sends that path to an
 /// agent as ordinary text, so the agent reads the file straight off this
 /// machine.
 ///
-/// This first version takes images only. The stored name is generated here and
-/// the extension comes from the sniffed content, so nothing the client sends
-/// reaches the filesystem.
+/// Images and PDFs are identified by magic bytes. Source and document text has
+/// to be valid, low-control UTF-8 before its display-name extension is allowed
+/// to influence the generated stored name. Nothing from the client is ever
+/// used as a path.
 async fn upload_file(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -7556,9 +7558,9 @@ async fn upload_file(
         ));
     }
 
-    // Executables are checked separately from the image allow-list so the
-    // refusal says what it means, and so the rule still holds if the allow-list
-    // ever grows a format that a script could hide inside.
+    // Executables are checked separately from the content allow-list so the
+    // refusal says what it means, and so adding a document format cannot
+    // accidentally make an executable acceptable.
     if looks_executable(&bytes) {
         return Err(api_error(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -7566,11 +7568,14 @@ async fn upload_file(
             "executables and scripts are not accepted",
         ));
     }
-    let Some(kind) = sniff_upload_kind(&bytes) else {
+    let Some(kind) = sniff_upload_kind(&bytes)
+        .or_else(|| sniff_office_upload_kind(&bytes))
+        .or_else(|| sniff_document_upload_kind(&bytes, &client_name))
+    else {
         return Err(api_error(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "unsupported_file_type",
-            "only png, jpeg, gif, webp, and heic images are accepted",
+            "only supported images, office documents, PDF, and UTF-8 text are accepted",
         ));
     };
 
@@ -7675,6 +7680,249 @@ fn sniff_upload_kind(bytes: &[u8]) -> Option<UploadKind> {
         });
     }
     None
+}
+
+/// Recognise modern Office/OpenDocument containers without extracting them.
+/// The central directory carries entry names in plain bytes even when the
+/// entries themselves are compressed, which is enough to distinguish a Word,
+/// Excel or PowerPoint package from an arbitrary zip. ODF additionally puts an
+/// uncompressed `mimetype` entry first by specification.
+fn sniff_office_upload_kind(bytes: &[u8]) -> Option<UploadKind> {
+    let names = zip_entry_names(bytes)?;
+    let has = |needle: &str| names.iter().any(|name| *name == needle);
+    let ooxml_root = has("[Content_Types].xml") && has("_rels/.rels");
+    let mut ooxml = Vec::new();
+    if ooxml_root && has("word/document.xml") {
+        ooxml.push(UploadKind {
+            extension: "docx",
+            mime: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        });
+    }
+    if ooxml_root && has("xl/workbook.xml") {
+        ooxml.push(UploadKind {
+            extension: "xlsx",
+            mime: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        });
+    }
+    if ooxml_root && has("ppt/presentation.xml") {
+        ooxml.push(UploadKind {
+            extension: "pptx",
+            mime: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        });
+    }
+    if ooxml.len() == 1 {
+        return ooxml.pop();
+    }
+    if !ooxml.is_empty() {
+        // A package claiming to be multiple Office document kinds is not one
+        // the app or an agent should be asked to interpret.
+        return None;
+    }
+
+    if !has("content.xml") || !has("META-INF/manifest.xml") {
+        return None;
+    }
+    let (name, mime) = stored_first_zip_entry(bytes)?;
+    if name != "mimetype" {
+        return None;
+    }
+    match mime {
+        b"application/vnd.oasis.opendocument.text" => Some(UploadKind {
+            extension: "odt",
+            mime: "application/vnd.oasis.opendocument.text",
+        }),
+        b"application/vnd.oasis.opendocument.spreadsheet" => Some(UploadKind {
+            extension: "ods",
+            mime: "application/vnd.oasis.opendocument.spreadsheet",
+        }),
+        b"application/vnd.oasis.opendocument.presentation" => Some(UploadKind {
+            extension: "odp",
+            mime: "application/vnd.oasis.opendocument.presentation",
+        }),
+        _ => None,
+    }
+}
+
+const ZIP_LOCAL_HEADER: &[u8; 4] = b"PK\x03\x04";
+const ZIP_CENTRAL_HEADER: &[u8; 4] = b"PK\x01\x02";
+const ZIP_END_HEADER: &[u8; 4] = b"PK\x05\x06";
+const MAX_OFFICE_ZIP_ENTRIES: usize = 4_096;
+
+fn zip_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(
+        bytes.get(offset..offset + 2)?.try_into().ok()?,
+    ))
+}
+
+fn zip_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        bytes.get(offset..offset + 4)?.try_into().ok()?,
+    ))
+}
+
+/// Read only bounded metadata from an ordinary (non-Zip64) central directory.
+/// Encrypted entries, split archives and malformed offsets all fail closed.
+fn zip_entry_names(bytes: &[u8]) -> Option<Vec<&str>> {
+    if bytes.len() < 22 || !bytes.starts_with(ZIP_LOCAL_HEADER) {
+        return None;
+    }
+    let search_start = bytes.len().saturating_sub(22 + u16::MAX as usize);
+    let eocd = (search_start..=bytes.len() - 22)
+        .rev()
+        .find(|offset| bytes.get(*offset..*offset + 4) == Some(ZIP_END_HEADER.as_slice()))?;
+    if zip_u16(bytes, eocd + 4)? != 0 || zip_u16(bytes, eocd + 6)? != 0 {
+        return None;
+    }
+    let disk_entries = zip_u16(bytes, eocd + 8)? as usize;
+    let entry_count = zip_u16(bytes, eocd + 10)? as usize;
+    if entry_count != disk_entries || entry_count == 0 || entry_count > MAX_OFFICE_ZIP_ENTRIES {
+        return None;
+    }
+    let central_size = zip_u32(bytes, eocd + 12)? as usize;
+    let central_offset = zip_u32(bytes, eocd + 16)? as usize;
+    let central_end = central_offset.checked_add(central_size)?;
+    if central_end > eocd || central_end > bytes.len() {
+        return None;
+    }
+
+    let mut cursor = central_offset;
+    let mut names = Vec::with_capacity(entry_count);
+    for _ in 0..entry_count {
+        if bytes.get(cursor..cursor + 4)? != ZIP_CENTRAL_HEADER {
+            return None;
+        }
+        // Bit zero is traditional ZIP encryption. An agent could not inspect
+        // it anyway, and accepting opaque encrypted containers would defeat
+        // the entry-name validation this function exists to provide.
+        if zip_u16(bytes, cursor + 8)? & 1 != 0 {
+            return None;
+        }
+        let name_len = zip_u16(bytes, cursor + 28)? as usize;
+        let extra_len = zip_u16(bytes, cursor + 30)? as usize;
+        let comment_len = zip_u16(bytes, cursor + 32)? as usize;
+        let name_start = cursor.checked_add(46)?;
+        let name_end = name_start.checked_add(name_len)?;
+        let next = name_end.checked_add(extra_len)?.checked_add(comment_len)?;
+        if next > central_end {
+            return None;
+        }
+        let name = std::str::from_utf8(bytes.get(name_start..name_end)?).ok()?;
+        if name.contains('\0') || name.starts_with('/') || name.split('/').any(|part| part == "..")
+        {
+            return None;
+        }
+        names.push(name);
+        cursor = next;
+    }
+    (cursor == central_end).then_some(names)
+}
+
+/// ODF's first entry is mandated to be uncompressed `mimetype`. Reading that
+/// tiny stored value does not inflate attacker-controlled data.
+fn stored_first_zip_entry(bytes: &[u8]) -> Option<(&str, &[u8])> {
+    if bytes.get(0..4)? != ZIP_LOCAL_HEADER {
+        return None;
+    }
+    let flags = zip_u16(bytes, 6)?;
+    let method = zip_u16(bytes, 8)?;
+    if flags & 1 != 0 || method != 0 {
+        return None;
+    }
+    let compressed = zip_u32(bytes, 18)? as usize;
+    let uncompressed = zip_u32(bytes, 22)? as usize;
+    if compressed != uncompressed || compressed > 256 {
+        return None;
+    }
+    let name_len = zip_u16(bytes, 26)? as usize;
+    let extra_len = zip_u16(bytes, 28)? as usize;
+    let name_start = 30usize;
+    let name_end = name_start.checked_add(name_len)?;
+    let data_start = name_end.checked_add(extra_len)?;
+    let data_end = data_start.checked_add(compressed)?;
+    Some((
+        std::str::from_utf8(bytes.get(name_start..name_end)?).ok()?,
+        bytes.get(data_start..data_end)?,
+    ))
+}
+
+/// Documents stay deliberately narrow: PDF has an unambiguous signature and
+/// everything else must first pass the same UTF-8 text probe used by the asset
+/// browser. The filename may then preserve a useful source/document extension,
+/// but can never turn binary bytes into an accepted upload.
+fn sniff_document_upload_kind(bytes: &[u8], client_name: &str) -> Option<UploadKind> {
+    if bytes.starts_with(b"%PDF-") {
+        return Some(UploadKind {
+            extension: "pdf",
+            mime: "application/pdf",
+        });
+    }
+    if !looks_textual(bytes) {
+        return None;
+    }
+
+    let extension = client_name
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase());
+    Some(match extension.as_deref() {
+        Some("md" | "markdown" | "mdx") => UploadKind {
+            extension: "md",
+            mime: "text/markdown; charset=utf-8",
+        },
+        Some("json") => UploadKind {
+            extension: "json",
+            mime: "application/json",
+        },
+        Some("jsonl" | "ndjson") => UploadKind {
+            extension: "jsonl",
+            mime: "application/x-ndjson",
+        },
+        Some("csv") => UploadKind {
+            extension: "csv",
+            mime: "text/csv; charset=utf-8",
+        },
+        Some("yaml" | "yml") => UploadKind {
+            extension: "yaml",
+            mime: "application/yaml",
+        },
+        Some("toml") => UploadKind {
+            extension: "toml",
+            mime: "application/toml",
+        },
+        Some("xml") => UploadKind {
+            extension: "xml",
+            mime: "application/xml",
+        },
+        Some("rtf") => UploadKind {
+            extension: "rtf",
+            mime: "application/rtf",
+        },
+        Some("ts") => text_upload_kind("ts"),
+        Some("tsx") => text_upload_kind("tsx"),
+        Some("js") => text_upload_kind("js"),
+        Some("jsx") => text_upload_kind("jsx"),
+        Some("css") => text_upload_kind("css"),
+        Some("html") => text_upload_kind("html"),
+        Some("py") => text_upload_kind("py"),
+        Some("rs") => text_upload_kind("rs"),
+        Some("go") => text_upload_kind("go"),
+        Some("java") => text_upload_kind("java"),
+        Some("kt") => text_upload_kind("kt"),
+        Some("swift") => text_upload_kind("swift"),
+        Some("c") => text_upload_kind("c"),
+        Some("h") => text_upload_kind("h"),
+        Some("cpp") => text_upload_kind("cpp"),
+        Some("hpp") => text_upload_kind("hpp"),
+        Some("sql") => text_upload_kind("sql"),
+        Some("log") => text_upload_kind("log"),
+        _ => text_upload_kind("txt"),
+    })
+}
+
+fn text_upload_kind(extension: &'static str) -> UploadKind {
+    UploadKind {
+        extension,
+        mime: "text/plain; charset=utf-8",
+    }
 }
 
 /// HEIC is an ISO base media file: a `ftyp` box whose brand names the flavour.
@@ -12197,6 +12445,58 @@ mod tests {
         bytes
     }
 
+    fn test_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut central = Vec::new();
+        for (name, body) in entries {
+            let local_offset = bytes.len() as u32;
+            bytes.extend_from_slice(ZIP_LOCAL_HEADER);
+            bytes.extend_from_slice(&20u16.to_le_bytes()); // version needed
+            bytes.extend_from_slice(&0u16.to_le_bytes()); // flags
+            bytes.extend_from_slice(&0u16.to_le_bytes()); // stored
+            bytes.extend_from_slice(&0u16.to_le_bytes()); // time
+            bytes.extend_from_slice(&0u16.to_le_bytes()); // date
+            bytes.extend_from_slice(&0u32.to_le_bytes()); // crc (not read by the probe)
+            bytes.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            bytes.extend_from_slice(&0u16.to_le_bytes()); // extra
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.extend_from_slice(body);
+
+            central.extend_from_slice(ZIP_CENTRAL_HEADER);
+            central.extend_from_slice(&20u16.to_le_bytes()); // made by
+            central.extend_from_slice(&20u16.to_le_bytes()); // needed
+            central.extend_from_slice(&0u16.to_le_bytes()); // flags
+            central.extend_from_slice(&0u16.to_le_bytes()); // stored
+            central.extend_from_slice(&0u16.to_le_bytes()); // time
+            central.extend_from_slice(&0u16.to_le_bytes()); // date
+            central.extend_from_slice(&0u32.to_le_bytes()); // crc
+            central.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes()); // extra
+            central.extend_from_slice(&0u16.to_le_bytes()); // comment
+            central.extend_from_slice(&0u16.to_le_bytes()); // disk
+            central.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
+            central.extend_from_slice(&0u32.to_le_bytes()); // external attrs
+            central.extend_from_slice(&local_offset.to_le_bytes());
+            central.extend_from_slice(name.as_bytes());
+        }
+        let central_offset = bytes.len() as u32;
+        let central_size = central.len() as u32;
+        bytes.extend_from_slice(&central);
+        bytes.extend_from_slice(ZIP_END_HEADER);
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // disk
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // central disk
+        bytes.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(&central_size.to_le_bytes());
+        bytes.extend_from_slice(&central_offset.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // comment
+        bytes
+    }
+
     #[test]
     fn uploads_are_typed_by_content_not_by_name() {
         assert_eq!(sniff_upload_kind(&png_bytes()).unwrap().mime, "image/png");
@@ -12229,16 +12529,87 @@ mod tests {
     }
 
     #[test]
-    fn everything_that_is_not_an_image_is_refused() {
-        // This first version carries images only. A document or a text file is
-        // a 415 like any other unrecognised content, so nothing without an
-        // image magic number can be parked on the host.
-        assert!(sniff_upload_kind(b"%PDF-1.7\n1 0 obj").is_none());
-        assert!(sniff_upload_kind(b"# notes\n\nplain, with no magic number\n").is_none());
-        assert!(sniff_upload_kind(b"{\"a\":1}").is_none());
-        assert!(sniff_upload_kind(b"a,b,c\n1,2,3\n").is_none());
-        assert!(sniff_upload_kind(b"2026-07-25 12:00:00 INFO started\n").is_none());
-        assert!(sniff_upload_kind(b"PK\x03\x04").is_none());
+    fn safe_documents_are_typed_by_content_before_name() {
+        let pdf = sniff_document_upload_kind(b"%PDF-1.7\n1 0 obj", "notes.txt").unwrap();
+        assert_eq!(pdf.extension, "pdf");
+        assert_eq!(pdf.mime, "application/pdf");
+
+        let markdown = sniff_document_upload_kind(b"# notes\n\nplain\n", "notes.md").unwrap();
+        assert_eq!(markdown.extension, "md");
+        assert_eq!(markdown.mime, "text/markdown; charset=utf-8");
+
+        let source = sniff_document_upload_kind(b"const answer = 42;\n", "answer.ts").unwrap();
+        assert_eq!(source.extension, "ts");
+        assert_eq!(source.mime, "text/plain; charset=utf-8");
+
+        let unknown = sniff_document_upload_kind(b"plain UTF-8\n", "README.weird").unwrap();
+        assert_eq!(unknown.extension, "txt");
+    }
+
+    #[test]
+    fn modern_office_packages_are_recognised_from_their_zip_structure() {
+        let docx = test_zip(&[
+            ("[Content_Types].xml", b"types"),
+            ("_rels/.rels", b"rels"),
+            ("word/document.xml", b"document"),
+        ]);
+        assert_eq!(sniff_office_upload_kind(&docx).unwrap().extension, "docx");
+
+        let xlsx = test_zip(&[
+            ("[Content_Types].xml", b"types"),
+            ("_rels/.rels", b"rels"),
+            ("xl/workbook.xml", b"workbook"),
+        ]);
+        assert_eq!(sniff_office_upload_kind(&xlsx).unwrap().extension, "xlsx");
+
+        let pptx = test_zip(&[
+            ("[Content_Types].xml", b"types"),
+            ("_rels/.rels", b"rels"),
+            ("ppt/presentation.xml", b"presentation"),
+        ]);
+        assert_eq!(sniff_office_upload_kind(&pptx).unwrap().extension, "pptx");
+    }
+
+    #[test]
+    fn open_document_packages_require_the_stored_mimetype_first() {
+        let odt = test_zip(&[
+            ("mimetype", b"application/vnd.oasis.opendocument.text"),
+            ("content.xml", b"content"),
+            ("META-INF/manifest.xml", b"manifest"),
+        ]);
+        assert_eq!(sniff_office_upload_kind(&odt).unwrap().extension, "odt");
+
+        let mimetype_late = test_zip(&[
+            ("content.xml", b"content"),
+            ("mimetype", b"application/vnd.oasis.opendocument.text"),
+            ("META-INF/manifest.xml", b"manifest"),
+        ]);
+        assert!(sniff_office_upload_kind(&mimetype_late).is_none());
+    }
+
+    #[test]
+    fn binary_documents_and_archives_are_refused() {
+        let ordinary_zip = test_zip(&[("hello.txt", b"hello")]);
+        assert!(sniff_office_upload_kind(&ordinary_zip).is_none());
+        assert!(sniff_document_upload_kind(&ordinary_zip, "archive.zip").is_none());
+        let ambiguous = test_zip(&[
+            ("[Content_Types].xml", b"types"),
+            ("_rels/.rels", b"rels"),
+            ("word/document.xml", b"document"),
+            ("xl/workbook.xml", b"workbook"),
+        ]);
+        assert!(sniff_office_upload_kind(&ambiguous).is_none());
+        let traversal = test_zip(&[
+            ("[Content_Types].xml", b"types"),
+            ("_rels/.rels", b"rels"),
+            ("../word/document.xml", b"document"),
+        ]);
+        assert!(sniff_office_upload_kind(&traversal).is_none());
+        assert!(sniff_document_upload_kind(b"hello\0world", "notes.txt").is_none());
+        assert!(sniff_document_upload_kind(b"\xff\xfe\x00x", "notes.txt").is_none());
+        // A filename can preserve a useful extension only after the bytes have
+        // passed the text probe; it cannot disguise an archive as source.
+        assert!(sniff_document_upload_kind(b"PK\x03\x04", "archive.ts").is_none());
     }
 
     #[test]

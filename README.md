@@ -392,11 +392,16 @@ answers with the absolute path, the sanitised original name, the size, and the
 detected MIME type, so the app can send that path to an agent as ordinary text
 and the agent reads the file straight off the host.
 
-This first version accepts images only: png, jpeg, gif, webp, and heic. The
-type is decided by sniffing the content, so everything else is refused with
-`415`, executables and scripts included, and the client's filename is only
-echoed back and never reaches the filesystem. The body is capped at 25 MiB, and
-stored uploads are deleted 48 hours after they were written.
+The endpoint accepts png, jpeg, gif, webp and heic images; PDF; modern Office
+DOCX/XLSX/PPTX; OpenDocument ODT/ODS/ODP; and UTF-8 text/source files. Images
+and PDFs are identified from magic bytes. Office containers must expose the
+expected package structure in a bounded ZIP central-directory check, without
+extracting their contents. Text must pass a UTF-8/control-character probe
+before a small extension allow-list can preserve a useful suffix. Other binary
+formats return `415`, as do executables and scripts with executable signatures.
+The client's filename is only echoed after sanitising and never becomes a
+filesystem path. The body is capped at 25 MiB, stored files use mode `0600`,
+and uploads are deleted 48 hours after they were written.
 
 ### Starting a task
 
