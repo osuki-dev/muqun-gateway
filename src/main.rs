@@ -21,7 +21,7 @@ use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse as _, Response};
 use axum::routing::{get, patch, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use base64::Engine as _;
 use clap::{Parser, Subcommand, ValueEnum};
 use crossterm::cursor::MoveTo;
@@ -1775,6 +1775,19 @@ struct EncryptedResponsePayload {
     body: String,
 }
 
+/// What an encrypted-transport request leaves behind for a handler that
+/// answers with a stream instead of a finite body. A whole-response envelope
+/// cannot authenticate a response that never ends, so the events handler
+/// seals each event on its own -- and this is the key material and request
+/// binding it seals under. Injected by `decrypt_transport_request`, so its
+/// presence also proves the request itself authenticated.
+#[derive(Clone)]
+struct EncryptedStreamContext {
+    material: Vec<u8>,
+    request_aad: String,
+    request_nonce: String,
+}
+
 /// Decrypt an authenticated request before Axum extractors see it, then seal
 /// the complete response. Route names and byte counts remain HTTP metadata;
 /// credentials and application payloads do not.
@@ -1795,6 +1808,24 @@ async fn encrypted_transport(
     match decrypt_transport_request(&state, request).await {
         Ok((request, material, aad, request_nonce)) => {
             let response = next.run(request).await;
+            // An event stream never ends, so it cannot ride the one-envelope
+            // response path -- buffering it here would simply hang the
+            // connection. The events handler has already sealed every event
+            // individually under the stream context injected above, so the
+            // response passes through as standard SSE.
+            if response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("text/event-stream"))
+            {
+                let mut response = response;
+                response.headers_mut().insert(
+                    axum::http::HeaderName::from_static(TRANSPORT_HEADER),
+                    HeaderValue::from_static("1"),
+                );
+                return response;
+            }
             encrypt_transport_response(response, &material, &aad, &request_nonce).await
         }
         Err(error) => error.into_response(),
@@ -1945,6 +1976,11 @@ async fn decrypt_transport_request(
         parts.headers.remove(axum::http::header::CONTENT_TYPE);
     }
     parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    parts.extensions.insert(EncryptedStreamContext {
+        material: material.clone(),
+        request_aad: aad.clone(),
+        request_nonce: envelope.nonce.clone(),
+    });
     Ok((
         Request::from_parts(parts, Body::from(body)),
         material,
@@ -4363,6 +4399,81 @@ fn normalize_event_name(value: &str) -> String {
     value.trim().replace('.', "_")
 }
 
+/// The SSE event name every encrypted stream record travels under. The real
+/// event name is inside the sealed payload, where it is authenticated; the
+/// outer name is the one piece of stream metadata deliberately left readable.
+const ENCRYPTED_SSE_EVENT: &str = "muqun.encrypted";
+
+/// Seals one connection's events, each under its own AES-256-GCM record.
+///
+/// The per-stream key binds the device key, a fresh stream id and the request
+/// envelope's nonce (see `transport::derive_stream_key`); the nonce is the
+/// event's sequence number, and the AAD carries request AAD, stream id and
+/// seq. Together: a record that is modified, reordered, replayed -- within
+/// this stream or from any other -- or dropped (the client checks seq
+/// continuity) fails authentication on the phone.
+struct EventStreamSealer {
+    key: [u8; 32],
+    stream_id: String,
+    request_aad: String,
+    seq: u64,
+}
+
+impl EventStreamSealer {
+    fn new(context: &EncryptedStreamContext) -> anyhow::Result<Self> {
+        let stream_id = generate_token();
+        let key =
+            transport::derive_stream_key(&context.material, &stream_id, &context.request_nonce)?;
+        Ok(Self {
+            key,
+            stream_id,
+            request_aad: context.request_aad.clone(),
+            seq: 0,
+        })
+    }
+
+    fn seal(&mut self, name: &str, data: &str) -> anyhow::Result<Event> {
+        let record = self.seal_record(name, data)?;
+        Ok(Event::default().event(ENCRYPTED_SSE_EVENT).data(record))
+    }
+
+    /// The `data:` line of one sealed record, split out so a test can open
+    /// what left the sealer without reaching inside axum's `Event`.
+    fn seal_record(&mut self, name: &str, data: &str) -> anyhow::Result<String> {
+        let seq = self.seq;
+        let plaintext = serde_json::to_vec(&json!({ "event": name, "data": data }))?;
+        let aad = format!("{}\n{}\n{}", self.request_aad, self.stream_id, seq);
+        let ciphertext =
+            transport::seal_stream_event(&self.key, seq, aad.as_bytes(), &plaintext)?;
+        // Only counted once sealing succeeded, so a failed record does not
+        // burn a seq the client would then read as a gap.
+        self.seq += 1;
+        Ok(json!({
+            "v": 1,
+            "sid": self.stream_id,
+            "seq": seq,
+            "ciphertext": ciphertext,
+        })
+        .to_string())
+    }
+}
+
+/// One event, sealed when this connection is encrypted and plain when it is
+/// not. `None` means the record could not be sealed; the event is dropped
+/// rather than ever leaving in the clear.
+fn stream_event(sealer: &mut Option<EventStreamSealer>, name: &str, data: &str) -> Option<Event> {
+    match sealer {
+        Some(sealer) => match sealer.seal(name, data) {
+            Ok(event) => Some(event),
+            Err(error) => {
+                eprintln!("failed to seal stream event: {error}");
+                None
+            }
+        },
+        None => Some(Event::default().event(name.to_owned()).data(data.to_owned())),
+    }
+}
+
 type GatewayEventStream =
     Pin<Box<dyn Stream<Item = Result<Event, std::convert::Infallible>> + Send>>;
 
@@ -4370,9 +4481,23 @@ async fn events(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
     Query(query): Query<EventsQuery>,
+    stream_crypto: Option<Extension<EncryptedStreamContext>>,
     headers: HeaderMap,
 ) -> Result<Response, (StatusCode, Json<Value>)> {
     require_device(&state, &headers)?;
+    // Present exactly when the request arrived through the encrypted
+    // transport. From here on every event this connection emits is sealed;
+    // a device paired without a transport key keeps the plaintext stream.
+    let mut sealer = match stream_crypto {
+        Some(Extension(context)) => Some(EventStreamSealer::new(&context).map_err(|_| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "transport_key_unavailable",
+                "encrypted transport is unavailable",
+            )
+        })?),
+        None => None,
+    };
     let session = find_session(&state.config, &session_id)?.clone();
     let wanted: Option<std::collections::HashSet<String>> = query.types.as_ref().map(|value| {
         value
@@ -4439,7 +4564,9 @@ async fn events(
                                     keep_stream_frame(&scrollback_store, &session_id, pane_id, &stream_opts, &output);
                                 }
                             }
-                            yield Ok(Event::default().event("herdr").data(payload));
+                            if let Some(event) = stream_event(&mut sealer, "herdr", &payload) {
+                                yield Ok(event);
+                            }
                         }
                         if let Some(root) = worktree_event_root(&session_id, &data) {
                             let created = ingest_roots(assets.clone(), vec![root]).await;
@@ -4451,9 +4578,10 @@ async fn events(
                                     .take(MAX_ASSET_EVENTS_PER_WORKTREE)
                                 {
                                     let asset_type = sniff_asset_type(&read_asset_head(&entry.path), &entry.name);
-                                    yield Ok(Event::default()
-                                        .event("asset.created")
-                                        .data(asset_created_payload(&entry, asset_type)));
+                                    let payload = asset_created_payload(&entry, asset_type);
+                                    if let Some(event) = stream_event(&mut sealer, "asset.created", &payload) {
+                                        yield Ok(event);
+                                    }
                                 }
                             }
                         } else if let Some(removed) = worktree_event_removed_root(&data) {
@@ -4464,7 +4592,9 @@ async fn events(
                     }
                     Some(Err(err)) => {
                         eprintln!("terminal activity stream failed: {err}");
-                        yield Ok(Event::default().event("gateway.error").data("Terminal activity stream unavailable"));
+                        if let Some(event) = stream_event(&mut sealer, "gateway.error", "Terminal activity stream unavailable") {
+                            yield Ok(event);
+                        }
                         break;
                     }
                     None => break,
@@ -4476,7 +4606,9 @@ async fn events(
                             if let Some(pane_id) = stream_opts.pane.as_deref() {
                                 keep_stream_frame(&scrollback_store, &session_id, pane_id, &stream_opts, &frame.output);
                                 if let Some(payload) = stream_pane_update_payload(&frame, pane_id) {
-                                    yield Ok(Event::default().event("herdr").data(payload));
+                                    if let Some(event) = stream_event(&mut sealer, "herdr", &payload) {
+                                        yield Ok(event);
+                                    }
                                 }
                             }
                         }
@@ -4487,7 +4619,9 @@ async fn events(
                         Ok(approval) => {
                             let wanted_name = normalize_event_name(approval.name);
                             if wanted.as_ref().is_none_or(|set| set.contains(&wanted_name)) {
-                                yield Ok(Event::default().event(approval.name).data(approval.payload));
+                                if let Some(event) = stream_event(&mut sealer, approval.name, &approval.payload) {
+                                    yield Ok(event);
+                                }
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
@@ -11133,6 +11267,69 @@ mod tests {
             require_device(&state, request.headers()).unwrap(),
             "phone-1"
         );
+    }
+
+    /// The decrypted request carries the stream context a sealing handler
+    /// needs, and records sealed under it open exactly the way the app's
+    /// decryptor is specified to: derive from (device key, sid, request
+    /// nonce), AAD of request AAD + sid + seq, nonce = seq.
+    #[tokio::test]
+    async fn an_encrypted_request_leaves_a_stream_context_the_sealer_honours() {
+        let token = "device-token";
+        let transport_key = generate_token();
+        let material = transport::decode_key(&transport_key).unwrap();
+        let mut device = test_device("phone-1", token);
+        device.transport_key = Some(transport_key);
+        let state = test_state("admin-token", vec![device]);
+
+        let (request, _, aad, nonce) =
+            decrypt_transport_request(&state, encrypted_test_request("phone-1", &material, token))
+                .await
+                .unwrap();
+        let context = request
+            .extensions()
+            .get::<EncryptedStreamContext>()
+            .expect("stream context is injected for every encrypted request")
+            .clone();
+        assert_eq!(context.request_aad, aad);
+        assert_eq!(context.request_nonce, nonce);
+        assert_eq!(context.material, material);
+
+        let mut sealer = EventStreamSealer::new(&context).unwrap();
+        let first: Value =
+            serde_json::from_str(&sealer.seal_record("herdr", "{\"n\":1}").unwrap()).unwrap();
+        let second: Value =
+            serde_json::from_str(&sealer.seal_record("approval.pending", "{}").unwrap()).unwrap();
+        assert_eq!(first["v"], 1);
+        assert_eq!(first["seq"], 0);
+        assert_eq!(second["seq"], 1);
+        let sid = first["sid"].as_str().unwrap();
+        assert_eq!(second["sid"].as_str().unwrap(), sid);
+
+        let key = transport::derive_stream_key(&material, sid, &nonce).unwrap();
+        let open = |record: &Value| {
+            let seq = record["seq"].as_u64().unwrap();
+            let aad = format!("{}\n{}\n{}", aad, sid, seq);
+            transport::open_stream_event(
+                &key,
+                seq,
+                aad.as_bytes(),
+                record["ciphertext"].as_str().unwrap(),
+            )
+        };
+        let inner: Value = serde_json::from_slice(&open(&first).unwrap()).unwrap();
+        assert_eq!(inner["event"], "herdr");
+        assert_eq!(inner["data"], "{\"n\":1}");
+        let inner: Value = serde_json::from_slice(&open(&second).unwrap()).unwrap();
+        assert_eq!(inner["event"], "approval.pending");
+
+        // A record moved to another slot in the stream never opens: the seq is
+        // in both the nonce and the AAD, so reorder and replay both fail.
+        let replayed = json!({
+            "v": 1, "sid": sid, "seq": 1,
+            "ciphertext": first["ciphertext"].as_str().unwrap(),
+        });
+        assert!(open(&replayed).is_err());
     }
 
     /// A paired device's headers with the app's locale header on them, which is
