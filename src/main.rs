@@ -8893,6 +8893,27 @@ fn resolve_indexed_asset_path(stored: &FsPath, roots: &[PathBuf]) -> Option<Path
 ///
 /// A scan is not involved, so a file deeper or more obscure than the scan
 /// bothers with still resolves: the user pointed at it.
+/// A session's roots with the gateway's uploads directory appended, so a
+/// lookup can answer for a file the gateway itself stored on the phone's
+/// behalf. `None` -- a state dir that cannot be resolved -- leaves the roots
+/// exactly as they were.
+fn with_uploads_root(
+    mut roots: Vec<AssetRoot>,
+    session_id: &str,
+    uploads: Option<PathBuf>,
+) -> Vec<AssetRoot> {
+    if let Some(path) = uploads {
+        roots.push(AssetRoot {
+            path,
+            session_id: session_id.to_owned(),
+            workspace_id: None,
+            tab_id: None,
+            pane_id: None,
+        });
+    }
+    roots
+}
+
 fn asset_entry_for_path(raw: &str, roots: &[AssetRoot]) -> Option<AssetEntry> {
     let path = std::fs::canonicalize(raw).ok()?;
     if !path.is_file() {
@@ -9079,7 +9100,14 @@ async fn session_assets(
     // An exact path lookup asks about one file, so it neither waits for a scan
     // nor pages: it answers with that file or with nothing.
     if let Some(wanted) = query.path.clone() {
-        let lookup_roots = roots.clone();
+        // The uploads directory rides along as one more root, the same fold-in
+        // `asset_content`'s cold start does. An upload's path is printed into
+        // the pane and handed back by the upload response, but the file lives
+        // in the gateway's own directory, never under a pane's cwd -- so
+        // without this, the one path the client is guaranteed to hold is the
+        // one path the lookup could never answer. Serving it widens nothing:
+        // the directory is the gateway's own.
+        let lookup_roots = with_uploads_root(roots.clone(), &session_id, uploads_dir().ok());
         let entry = tokio::task::spawn_blocking(move || {
             let entry = asset_entry_for_path(&wanted, &lookup_roots)?;
             let asset_type = sniff_asset_type(&read_asset_head(&entry.path), &entry.name);
@@ -13515,6 +13543,38 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn an_exact_path_lookup_reaches_an_upload_only_through_the_uploads_root() {
+        // The path a client is guaranteed to hold for an upload is the one the
+        // upload response returned -- the gateway's own directory, never under
+        // a pane's cwd. Without the fold-in, that exact path was the one
+        // lookup that could never answer.
+        let base = asset_test_dir("uploads-by-path");
+        let uploads = base.join("uploads");
+        std::fs::create_dir_all(&uploads).unwrap();
+        let stored = uploads.join("9126cf50.webp");
+        std::fs::write(&stored, b"fake webp bytes").unwrap();
+        let pane_roots = vec![AssetRoot {
+            path: base.join("workspace"),
+            session_id: "default".into(),
+            workspace_id: None,
+            tab_id: None,
+            pane_id: None,
+        }];
+
+        // Pane roots alone miss it; the composed lookup roots answer it.
+        assert!(asset_entry_for_path(&stored.to_string_lossy(), &pane_roots).is_none());
+        let composed = with_uploads_root(pane_roots.clone(), "default", Some(uploads.clone()));
+        let found = asset_entry_for_path(&stored.to_string_lossy(), &composed).unwrap();
+        assert_eq!(found.path, stored);
+        assert_eq!(found.session_id, "default");
+
+        // No uploads directory resolved leaves the roots untouched.
+        assert_eq!(with_uploads_root(pane_roots.clone(), "default", None).len(), 1);
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
