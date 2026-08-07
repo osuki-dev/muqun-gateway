@@ -1405,8 +1405,15 @@ fn auto_public_url(port: u16) -> PublicUrlSelection {
     {
         // Prefer the MagicDNS name in the URL over the raw IP: it's stable across
         // IP changes and is the name the user gets HTTPS on the moment they point
-        // Tailscale Serve at the gateway. The listener still binds to the IP, and
-        // MagicDNS resolves the name to it, so the phone reaches it either way.
+        // Tailscale Serve at the gateway.
+        //
+        // The listener binds 0.0.0.0 and not that IP. Binding the tailnet
+        // address makes the gateway's own start depend on Tailscale having come
+        // up first -- before it has, the address does not exist on any
+        // interface and bind fails outright -- and it is the same address the
+        // machine loses whenever the tailnet reassigns it. Nothing is more
+        // exposed by the wildcard than by the name already published in the QR:
+        // every route in is token-checked either way.
         let magic_dns = status
             .pointer("/Self/DNSName")
             .and_then(Value::as_str)
@@ -1416,12 +1423,12 @@ fn auto_public_url(port: u16) -> PublicUrlSelection {
             Some(name) => PublicUrlSelection {
                 url: format!("http://{name}:{port}"),
                 source: String::from("tailscale magicdns (http; set up Serve for https)"),
-                listen_host: ip.to_string(),
+                listen_host: String::from("0.0.0.0"),
             },
             None => PublicUrlSelection {
                 url: format!("http://{ip}:{port}"),
                 source: String::from("tailscale ip"),
-                listen_host: ip.to_string(),
+                listen_host: String::from("0.0.0.0"),
             },
         };
     }
@@ -1616,6 +1623,9 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         .listen
         .parse()
         .with_context(|| format!("invalid listen address {}", config.listen))?;
+    // Read before `config` moves into the state, and printed after the routes
+    // are built so it is the last thing on screen rather than the first.
+    let listen_warning = unreachable_listen_warning(&config.listen, &config.public_url);
 
     let state = AppState {
         config,
@@ -1781,6 +1791,9 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         .layer(middleware::from_fn(request_locale))
         .with_state(state);
 
+    if let Some(warning) = listen_warning {
+        eprintln!("{warning}");
+    }
     println!("terminal gateway listening on http://{addr}");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
@@ -3038,7 +3051,8 @@ fn manage() -> anyhow::Result<()> {
             }
             "u" | "url" => match prompt_public_url()? {
                 Some(url) => {
-                    update_public_url(&url)?;
+                    let listen = listen_for_explicit_public_url(&url, configured_port());
+                    update_public_url(&url, &listen)?;
                     message = format!("url updated: {}", truncate(&url, 36));
                 }
                 None => {
@@ -3046,8 +3060,9 @@ fn manage() -> anyhow::Result<()> {
                 }
             },
             "a" | "auto" => {
-                let selection = auto_public_url(configured_port());
-                update_public_url(&selection.url)?;
+                let port = configured_port();
+                let selection = auto_public_url(port);
+                update_public_url(&selection.url, &format!("{}:{port}", selection.listen_host))?;
                 message = format!("auto url: {}", truncate(&selection.url, 36));
             }
             "e" | "encryption" => {
@@ -3369,11 +3384,21 @@ fn confirm_revoke_device(device: &DeviceRecord) -> anyhow::Result<bool> {
     }
 }
 
-fn update_public_url(public_url: &str) -> anyhow::Result<()> {
+/// Point the gateway at a new address -- and move its listener with it.
+///
+/// The listener is not optional here. This used to write `public_url` alone,
+/// which is how an install that was set up before Tailscale was running ended
+/// up advertising a tailnet name while still bound to 127.0.0.1: the startup
+/// auto-upgrade rewrote the URL, left the socket on loopback, and the gateway
+/// came up clean announcing an address that nothing anywhere was listening on.
+/// A URL and the socket that answers it are one decision, so they are one
+/// write.
+fn update_public_url(public_url: &str, listen: &str) -> anyhow::Result<()> {
     let public_url = validate_public_url(public_url)?;
     let config_path = config_dir()?.join(CONFIG_FILE);
     let mut config = load_config(None)?;
     config.public_url = public_url.clone();
+    config.listen = listen.to_owned();
     write_secret_file(&config_path, &serde_json::to_vec_pretty(&config)?)
         .with_context(|| format!("failed to write config {}", config_path.display()))?;
 
@@ -3399,8 +3424,41 @@ fn auto_upgrade_local_public_url() -> anyhow::Result<Option<String>> {
     if is_local_public_url(&selection.url) || selection.url == config.public_url {
         return Ok(None);
     }
-    update_public_url(&selection.url)?;
+    update_public_url(
+        &selection.url,
+        &format!("{}:{}", selection.listen_host, listen.port()),
+    )?;
     Ok(Some(format!("auto url: {}", truncate(&selection.url, 36))))
+}
+
+/// A listener bound to loopback under an address no one outside can use.
+///
+/// This combination starts cleanly and serves nobody: the QR carries a name
+/// that resolves to a real interface, and the socket is only on 127.0.0.1, so
+/// every phone gets a connection refused and the app -- which cannot tell that
+/// apart from a bad code -- reports the code as refused. It is silent, it is
+/// automatic (see `update_public_url`), and it cost a day of looking in the
+/// wrong place, so it says so now.
+///
+/// Loopback with an `https://` address is left alone: that is what Tailscale
+/// Serve looks like, and Serve is *supposed* to terminate TLS outside and
+/// proxy in over loopback.
+fn unreachable_listen_warning(listen: &str, public_url: &str) -> Option<String> {
+    let host = listen.rsplit_once(':').map(|(host, _)| host)?;
+    let bound_to_loopback = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback());
+    if !bound_to_loopback || public_url.starts_with("https://") || is_local_public_url(public_url) {
+        return None;
+    }
+    Some(format!(
+        "warning: this gateway answers only on {listen}, but tells devices to reach it at \
+         {public_url}. Nothing outside this machine can connect, and a phone will report the \
+         pairing code as refused. Fix it with: muqun-gateway manage, then press [a] to detect \
+         the address again."
+    ))
 }
 
 fn is_local_public_url(url: &str) -> bool {
@@ -15123,6 +15181,37 @@ mod tests {
             listen_for_explicit_public_url("https://host.tailnet.ts.net", 23847),
             "0.0.0.0:23847"
         );
+    }
+
+    /// The shape that shipped: a tailnet name in the QR, a socket on loopback.
+    ///
+    /// It is reached without anyone choosing it -- install before Tailscale is
+    /// up, and the next start rewrites the URL and leaves the socket behind --
+    /// so the gateway has to say so rather than come up looking healthy.
+    #[test]
+    fn a_loopback_socket_under_a_tailnet_name_is_warned_about() {
+        let warning = unreachable_listen_warning("127.0.0.1:23847", "http://y.ts.net:23847")
+            .expect("a loopback socket cannot serve a tailnet name");
+        assert!(warning.contains("127.0.0.1:23847"));
+        assert!(warning.contains("http://y.ts.net:23847"));
+    }
+
+    #[test]
+    fn a_reachable_listener_is_not_warned_about() {
+        assert!(unreachable_listen_warning("0.0.0.0:23847", "http://y.ts.net:23847").is_none());
+        assert!(
+            unreachable_listen_warning("100.99.165.54:23847", "http://y.ts.net:23847").is_none()
+        );
+    }
+
+    /// Loopback is correct under a local URL, and correct under Tailscale
+    /// Serve -- which terminates TLS outside and proxies in over 127.0.0.1.
+    /// Warning about either would train people to ignore the warning.
+    #[test]
+    fn loopback_is_left_alone_where_loopback_is_the_answer() {
+        assert!(unreachable_listen_warning("127.0.0.1:23847", "http://127.0.0.1:23847").is_none());
+        assert!(unreachable_listen_warning("127.0.0.1:23847", "http://localhost:23847").is_none());
+        assert!(unreachable_listen_warning("127.0.0.1:23847", "https://y.ts.net").is_none());
     }
 
     #[test]
