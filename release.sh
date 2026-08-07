@@ -36,8 +36,14 @@ sed -i.bak "s/^version = \"$current\"/version = \"$next\"/" Cargo.toml herdr-plu
 rm -f Cargo.toml.bak herdr-plugin.toml.bak
 
 info "Rebuilding so Cargo.lock and tests reflect the new version"
-cargo build --release --locked >/dev/null
-cargo test >/dev/null
+# Not `--locked`. Cargo.lock records this package's own version, so the bump two
+# lines above always invalidates it, and `--locked` exists to refuse exactly
+# that -- it made this step fail on every release where the version actually
+# changed. `--offline` keeps the guarantee that was wanted here: no registry
+# access, so no dependency can quietly move; only the local version entry is
+# rewritten, which is the point of running this at all.
+cargo build --release --offline >/dev/null
+cargo test --offline >/dev/null
 
 git add Cargo.toml herdr-plugin.toml Cargo.lock
 git commit -m "release: $tag"
