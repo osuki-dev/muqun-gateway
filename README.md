@@ -534,7 +534,7 @@ can tell this gateway from one old enough to have ignored the parameter.
 
 Two feeds keep the list current. Herdr's `worktree.*` events, which the gateway
 already subscribes to, carry the checkout's root path and its workspace but no
-file information -- protocol 17 has no per-file event -- so each one is taken as
+file information -- Herdr has no per-file event -- so each one is taken as
 a "this root just changed" trigger and the files come from scanning exactly that
 root at that moment. Newly seen files are announced on the events stream as
 `asset.created`, carrying one asset in the same envelope, and obeying the same
@@ -721,9 +721,20 @@ wording, which is the same rule the pushes are held to.
 
 ## Compatibility and API versions
 
-Muqun Gateway 0.5.0 requires Herdr 0.7.5 or newer and socket protocol 17.
-Earlier Herdr releases are intentionally unsupported; update Herdr and restart
-the running session before starting this Gateway release.
+Muqun Gateway 0.5.0 requires Herdr 0.7.5 or newer, which is socket protocol 17
+or newer. Earlier Herdr releases are intentionally unsupported; update Herdr and
+restart the running session before starting this Gateway release.
+
+There is deliberately no upper bound. Herdr's protocol number versions its
+bincode TUI client/server link, and the JSON socket API this gateway speaks only
+echoes the same number back from `ping`, so it moves for changes the gateway
+never consumes -- 17 to 19, across Herdr 0.7.5 to 0.8.0, was terminal input
+work, while the JSON schema itself only grew. A ceiling turned every Herdr
+release into an outage for a change that did not affect the gateway, so a newer
+Herdr is served and a real incompatibility surfaces on the request that fails
+rather than by refusing to connect at all. `/health` reports this as
+`herdr.supportedProtocolMax: null`; a numeric value there is an older gateway
+that still pins one.
 
 The Gateway API has its own Semantic Version (`apiVersion`), independent from
 the Gateway binary version and the installed Herdr version. `/health` and the
