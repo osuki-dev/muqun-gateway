@@ -9787,9 +9787,13 @@ fn api_error_in(
 }
 
 fn load_config(config_path: Option<String>) -> anyhow::Result<Config> {
-    let path = config_path
-        .map(Into::into)
-        .unwrap_or(config_dir()?.join(CONFIG_FILE));
+    // Resolved lazily on purpose: `config_dir` consults the rename migration,
+    // which loads the pre-rename config by explicit path. An eagerly evaluated
+    // default would recurse between the two until the stack ran out.
+    let path = match config_path {
+        Some(path) => PathBuf::from(path),
+        None => config_dir()?.join(CONFIG_FILE),
+    };
     let bytes = std::fs::read(&path)
         .with_context(|| format!("failed to read config {}", path.display()))?;
     Ok(serde_json::from_slice(&bytes)?)
