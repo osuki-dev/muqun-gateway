@@ -285,8 +285,10 @@ pub fn t_slots(locale: Locale, source: &str, slots: &[(&str, &str)]) -> String {
 //    `allow_always`, `deny`, `visible`, `recent`, `recent-unwrapped`,
 //    `detection`, every field name, and the route `GET /api/agents/catalog` are
 //    values a client sends back to us. Only the sentence around them moves.
-//  * **Product names stay in Latin script.** Muqun, Herdr, Gateway and Expo are
-//    names, not words.
+//  * **Product names stay in Latin script.** Herdr, Gateway and Expo are names,
+//    not words. Muqun is the exception in ZH_TW and JA: the app is called 牧群
+//    there, matching the localisation already published on osuki.dev, so those
+//    two tables spell it that way instead of leaving it Latin.
 //  * **Each table agrees with the app catalog of the same language.** The two
 //    halves are read by the same person on the same screen: the gateway writes
 //    the approval prompt, the app writes the button under it.
@@ -297,7 +299,8 @@ pub fn t_slots(locale: Locale, source: &str, slots: &[(&str, &str)]) -> String {
 /// 終端機, 檔案, 伺服器, 網路, 儲存, 預設, 程式碼, 連線. The app's own catalog
 /// is the other half of this vocabulary and these agree with it: 核准, 拒絕,
 /// 代理程式, 面板, 工作區, 工作階段, 配對 -- and Gateway, which stays in Latin
-/// script because it is the product's name.
+/// script because it is the product's name. Muqun itself is 牧群 here, the same
+/// word the app and osuki.dev use in this language.
 const ZH_TW: &[(&str, &str)] = &[
     // -- approval labels the gateway writes for itself -----------------------
     ("Approve", "核准"),
@@ -315,7 +318,7 @@ const ZH_TW: &[(&str, &str)] = &[
     ("{name} finished running.", "{name} 已執行完畢。"),
     (
         "Muqun push notifications are connected.",
-        "Muqun 推播通知已連線。",
+        "牧群推播通知已連線。",
     ),
     // -- API error messages --------------------------------------------------
     ("Expo push service request failed", "Expo 推播服務請求失敗"),
@@ -451,6 +454,10 @@ const ZH_TW: &[(&str, &str)] = &[
         "配對請求次數過多，請稍後再試",
     ),
     (
+        "transport encryption is disabled on this gateway; scan its current QR code",
+        "這個 Gateway 已停用傳輸加密，請掃描它目前的 QR Code",
+    ),
+    (
         "workspace_label must be at most 120 printable characters",
         "workspace_label 最多 120 個可列印字元",
     ),
@@ -489,6 +496,9 @@ const ZH_TW: &[(&str, &str)] = &[
 /// `pane` and `panel` are one word here, パネル, because they are one thing in
 /// the product. The app catalog makes the same call, so the two halves of a
 /// sentence a reader sees split across the two surfaces agree.
+///
+/// Muqun itself is 牧群（ぼくぐん） here, the reading given once and dropped
+/// after, matching the app catalog and osuki.dev.
 const JA: &[(&str, &str)] = &[
     // -- approval labels the gateway writes for itself -----------------------
     ("Approve", "承認"),
@@ -504,7 +514,7 @@ const JA: &[(&str, &str)] = &[
     ("{name} is waiting for your approval.", "{name} が承認を待っています。"),
     ("{name} needs your input.", "{name} が入力を待っています。"),
     ("{name} finished running.", "{name} の実行が完了しました。"),
-    ("Muqun push notifications are connected.", "Muqun のプッシュ通知が接続されました。"),
+    ("Muqun push notifications are connected.", "牧群（ぼくぐん）のプッシュ通知が接続されました。"),
     // -- API error messages --------------------------------------------------
     ("Expo push service request failed", "Expo プッシュサービスへのリクエストが失敗しました"),
     ("Herdr did not return the created pane id", "Herdr が作成したパネルの id を返しませんでした"),
@@ -593,6 +603,10 @@ const JA: &[(&str, &str)] = &[
     ("this approval offers no option with that meaning", "この承認にその意味の選択肢はありません"),
     ("token must be an Expo push token", "token は Expo のプッシュトークンにしてください"),
     ("too many pairing requests; try again later", "ペアリング要求が多すぎます。しばらくしてからお試しください"),
+    (
+        "transport encryption is disabled on this gateway; scan its current QR code",
+        "この Gateway では転送の暗号化が無効になっています。現在の QR コードをスキャンしてください",
+    ),
     (
         "workspace_label must be at most 120 printable characters",
         "workspace_label は表示可能な文字で 120 文字以内にしてください",
@@ -727,6 +741,10 @@ const KO: &[(&str, &str)] = &[
     ("this approval offers no option with that meaning", "이 승인에는 그 뜻에 해당하는 옵션이 없습니다"),
     ("token must be an Expo push token", "token은 Expo 푸시 토큰이어야 합니다"),
     ("too many pairing requests; try again later", "페어링 요청이 너무 많습니다. 잠시 후 다시 시도하세요"),
+    (
+        "transport encryption is disabled on this gateway; scan its current QR code",
+        "이 Gateway는 전송 암호화가 비활성화되어 있습니다. 현재 QR 코드를 스캔하세요",
+    ),
     (
         "workspace_label must be at most 120 printable characters",
         "workspace_label은 출력 가능한 문자로 최대 120자여야 합니다",
@@ -900,6 +918,10 @@ const DE: &[(&str, &str)] = &[
     (
         "too many pairing requests; try again later",
         "zu viele Kopplungsanfragen; versuche es später erneut",
+    ),
+    (
+        "transport encryption is disabled on this gateway; scan its current QR code",
+        "die Übertragungsverschlüsselung ist auf diesem Gateway deaktiviert; scanne seinen aktuellen QR-Code",
     ),
     (
         "workspace_label must be at most 120 printable characters",
@@ -1082,6 +1104,10 @@ const FR: &[(&str, &str)] = &[
         "trop de demandes d’appairage ; réessayez plus tard",
     ),
     (
+        "transport encryption is disabled on this gateway; scan its current QR code",
+        "le chiffrement du transport est désactivé sur ce Gateway ; scannez son QR code actuel",
+    ),
+    (
         "workspace_label must be at most 120 printable characters",
         "workspace_label doit faire au plus 120 caractères imprimables",
     ),
@@ -1252,6 +1278,10 @@ const ES: &[(&str, &str)] = &[
         "demasiadas solicitudes de vinculación; inténtalo más tarde",
     ),
     (
+        "transport encryption is disabled on this gateway; scan its current QR code",
+        "el cifrado de transporte está desactivado en este gateway; escanea su código QR actual",
+    ),
+    (
         "workspace_label must be at most 120 printable characters",
         "workspace_label debe tener 120 caracteres imprimibles como máximo",
     ),
@@ -1420,6 +1450,10 @@ const PT: &[(&str, &str)] = &[
     (
         "too many pairing requests; try again later",
         "demasiados pedidos de emparelhamento; tente novamente mais tarde",
+    ),
+    (
+        "transport encryption is disabled on this gateway; scan its current QR code",
+        "a encriptação de transporte está desativada neste gateway; leia o respetivo código QR atual",
     ),
     (
         "workspace_label must be at most 120 printable characters",

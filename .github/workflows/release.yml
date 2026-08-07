@@ -55,9 +55,9 @@ jobs:
         run: cross build --release --locked --target ${{ matrix.target }}
 
       - name: Stage binary
-        run: cp "target/${{ matrix.target }}/release/herdr-gateway" "herdr-gateway-${{ matrix.target }}"
+        run: cp "target/${{ matrix.target }}/release/muqun-gateway" "muqun-gateway-${{ matrix.target }}"
 
       - name: Attach to release
         uses: softprops/action-gh-release@v2
         with:
-          files: herdr-gateway-${{ matrix.target }}
+          files: muqun-gateway-${{ matrix.target }}

@@ -1,8 +1,8 @@
 id = "herdr.gateway"
-name = "Herdr Gateway"
+name = "Muqun Gateway (Herdr integration)"
 version = "0.5.0"
 min_herdr_version = "0.7.5"
-description = "Expose a token-protected mobile gateway API for Herdr."
+description = "Run Muqun's token-protected terminal gateway with Herdr and tmux backends."
 platforms = ["linux", "macos"]
 
 # Downloads a prebuilt binary for this OS/arch (no Rust needed), and only
@@ -10,40 +10,46 @@ platforms = ["linux", "macos"]
 [[build]]
 command = ["sh", "scripts/fetch-binary.sh"]
 
+# Explicit --backend so this keeps configuring Herdr regardless of what the
+# CLI's own default is or ever becomes -- a bare `setup` now preserves
+# whatever an existing install already runs, and a fresh install with
+# nothing configured yet now defaults to tmux (see main.rs). Neither of
+# those is what a Herdr-plugin install -- which may have no tmux on the
+# machine at all -- wants from this action.
 [[actions]]
 id = "setup"
 title = "Setup Gateway"
 contexts = ["workspace"]
-command = ["./target/release/herdr-gateway", "setup"]
+command = ["./target/release/muqun-gateway", "setup", "--backend", "herdr"]
 
 [[actions]]
 id = "start"
 title = "Start Gateway"
 contexts = ["workspace"]
-command = ["./target/release/herdr-gateway", "start"]
+command = ["./target/release/muqun-gateway", "start"]
 
 [[actions]]
 id = "stop"
 title = "Stop Gateway"
 contexts = ["workspace"]
-command = ["./target/release/herdr-gateway", "stop"]
+command = ["./target/release/muqun-gateway", "stop"]
 
 [[actions]]
 id = "status"
 title = "Gateway Status"
 contexts = ["workspace"]
-command = ["./target/release/herdr-gateway", "status"]
+command = ["./target/release/muqun-gateway", "status"]
 
 [[panes]]
 id = "manage"
 title = "Gateway Manager"
 placement = "popup"
 width = 92
-height = 34
-command = ["./target/release/herdr-gateway", "manage"]
+height = 40
+command = ["./target/release/muqun-gateway", "manage"]
 
 [[panes]]
 id = "foreground"
 title = "Gateway Foreground"
 placement = "tab"
-command = ["./target/release/herdr-gateway", "run"]
+command = ["./target/release/muqun-gateway", "run"]

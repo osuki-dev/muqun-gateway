@@ -1,50 +1,76 @@
-# Herdr Gateway
+# Muqun Gateway
 
-Rust Herdr plugin and token-protected mobile gateway for Muqun.
+Rust terminal-backend gateway and Herdr plugin for Muqun.
 
-Herdr Gateway exposes a small HTTP API for reading Herdr workspaces, tabs, panes,
-agents, pane output, and sending pane input. It talks to the local Herdr socket
-API and is intended to be reached from trusted devices over a private network
-such as Tailscale.
+The gateway exposes one device-authenticated HTTP API for reading and controlling
+workspaces, tabs, panes, agents, and pane output. One process can talk to both
+Herdr's socket API and a local tmux server at the same time. The HTTP contract
+stays the same, so the
+Muqun app does not need a backend-specific implementation. The repository and
+binary are `muqun-gateway`; the Herdr plugin id (`herdr.gateway`) and the
+legacy `herdr` response envelope name the Herdr integration itself, which is
+still supported, and keep their own names.
 
 ## Install
 
-One command that checks your system, installs the plugin, and on a **first
-install** also configures it, starts it, and opens the pairing QR (macOS and
-Linux; Windows is not supported yet):
+One command that checks your system and installs Muqun Gateway, and on a
+**first install** also configures it, starts it, and shows how to view the
+pairing QR (macOS and Linux; Windows is not supported yet):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/osuki-dev/herdr-gateway/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/osuki-dev/muqun-gateway/main/install.sh | sh
 ```
 
-Herdr Gateway requires Herdr 0.7.5 or newer. The installer checks this before
-Herdr reads the plugin manifest; on an older version it stops with the exact
-`herdr update --handoff` command instead of exposing an unrelated TOML parse
-error. Herdr 0.7.5 installs plugins globally for the current user, so the plugin
-can be installed from any shell. Its setup, start, and pairing-QR actions still
-need a live herdr session; if none is reachable, the script installs the plugin
-and prints the manual commands to finish.
+tmux is the primary backend and this is all it needs -- no Herdr required. The
+two are not an either/or choice, so the installer configures whichever is
+actually present:
 
-It needs [Herdr](https://herdr.dev). Install downloads a prebuilt, statically
-linked binary for your platform, so no Rust toolchain is required -- it is only
-a fallback if no release binary matches your OS/arch.
+- **Herdr only:** installed as a Herdr plugin, the same way it always has
+  (rest of this section describes that path).
+- **tmux, with or without Herdr:** the standalone binary is downloaded and
+  every backend that is present gets configured on it -- tmux always, and
+  Herdr too when it is on `PATH`. tmux is the default whenever it is
+  configured. A pre-existing Herdr-plugin pairing, if there is one, is
+  adopted (see "Use Herdr and tmux together" below) rather than left behind.
+
+Re-running the installer is idempotent either way: it never duplicates a
+backend, never loses a paired device, and never flips a default an earlier
+install already chose.
+
+Muqun Gateway requires Herdr 0.7.5 or newer when installed as a Herdr plugin.
+The installer checks this before Herdr reads the plugin
+manifest; on an older version it stops with the exact `herdr update --handoff`
+command instead of exposing an unrelated TOML parse error. Herdr 0.7.5 installs
+plugins globally for the current user, so the plugin can be installed from any
+shell. Its setup, start, and pairing-QR actions still need a live herdr
+session; if none is reachable, the script installs the plugin and prints the
+manual commands to finish.
+
+Install downloads a prebuilt, statically linked binary for your platform, so no
+Rust toolchain is required -- it is only a fallback if no release binary
+matches your OS/arch.
 
 If you prefer to do it by hand, install directly with Herdr's plugin installer:
 
 ```sh
-herdr plugin install osuki-dev/herdr-gateway
+herdr plugin install osuki-dev/muqun-gateway
 ```
 
 then configure once, start, and open the manager panel to view the QR code,
 approve pairing requests, and start or stop the gateway:
 
 ```sh
-herdr plugin action invoke herdr.gateway.setup   # first time only -- mints server id + token
+herdr plugin action invoke herdr.gateway.setup   # idempotent; keeps identity and pairings
 herdr plugin action invoke herdr.gateway.start
 herdr plugin pane open --plugin herdr.gateway --entrypoint manage
 ```
 
-In the manager panel, press `u` to edit the public gateway URL. Press `a` to
+The manager is also available outside Herdr with `muqun-gateway manage`; it is
+owned by the gateway, not by either terminal backend. Press `h` or `m` to add a
+Herdr or tmux backend, `f` to choose the default session, and `d` to remove one.
+Backend changes take effect after
+the gateway restarts and never close the underlying Herdr or tmux sessions.
+Press `u` to edit the public gateway URL. Press `a` to
 auto-detect it again. Saving the URL updates both the gateway config and the
 pairing QR code. Once a device is paired, the panel shows the paired-device list
 instead of the QR; press `p` to bring the QR back and pair another device. Press
@@ -63,25 +89,25 @@ reinstalling a GitHub-managed plugin replaces its checkout in place. Re-run the
 same one command:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/osuki-dev/herdr-gateway/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/osuki-dev/muqun-gateway/main/install.sh | sh
 ```
 
 On a re-run the script updates the plugin and **reloads the binary for you**
-(stop + start). It does **not** re-run setup, because setup mints a fresh server
-id and token -- skipping it keeps every device you have already paired.
+(stop + start). Setup is idempotent and keeps the server identity, tokens,
+devices, and backend list.
 Installation may run from any shell; keep a herdr session running so the reload
 actions can attach.
 
 Or reinstall directly (then restart it yourself, see below):
 
 ```sh
-herdr plugin install osuki-dev/herdr-gateway
+herdr plugin install osuki-dev/muqun-gateway
 ```
 
 Pin a specific version with `--ref`:
 
 ```sh
-herdr plugin install osuki-dev/herdr-gateway --ref v0.3.0
+herdr plugin install osuki-dev/muqun-gateway --ref v0.3.0
 ```
 
 After updating, restart the gateway so the new build takes over:
@@ -109,6 +135,56 @@ herdr plugin action invoke herdr.gateway.start
 herdr plugin pane open --plugin herdr.gateway --entrypoint manage
 ```
 
+### Use Herdr and tmux together
+
+tmux 3.x must be installed and visible on the gateway process's `PATH`. Build
+the binary, configure one backend, then add the other. Re-running `setup`
+upserts that backend without removing the existing one:
+
+```sh
+cargo build --release
+./target/release/muqun-gateway setup --backend tmux
+./target/release/muqun-gateway backend add herdr
+./target/release/muqun-gateway backend list
+./target/release/muqun-gateway start
+./target/release/muqun-gateway manage
+```
+
+By default the adapter uses the current user's normal tmux server. To target a
+specific tmux socket, pass its absolute path using the existing option:
+
+```sh
+./target/release/muqun-gateway setup --backend tmux --socket-path /absolute/path/to/tmux.sock
+```
+
+`backend add tmux` and `backend remove <id>` are also available. Existing config
+files without a `backend` field continue to mean Herdr. The first configured
+session remains the primary session for older Muqun builds; the API exposes all
+configured sessions and newer clients can offer a session selector.
+
+Choose which session older clients open first with:
+
+```sh
+./target/release/muqun-gateway backend default tmux
+```
+
+If Muqun Gateway is already installed as a plugin and paired with Muqun, migrate
+that identity before switching to the standalone process. Stop the plugin copy
+first so only one process owns the port:
+
+```sh
+herdr plugin action invoke herdr.gateway.stop
+./target/release/muqun-gateway import-herdr-plugin
+./target/release/muqun-gateway start
+./target/release/muqun-gateway manage
+```
+
+The import keeps Herdr as the first session, merges any standalone tmux session
+and paired devices, writes `*.before-herdr-import` backups, and leaves the
+plugin's source files untouched. After import, plugin actions and direct CLI
+commands resolve the same standalone config, so they cannot start competing
+gateway identities accidentally.
+
 If you previously installed the GitHub-managed plugin, uninstall it before
 linking a local checkout:
 
@@ -118,16 +194,29 @@ herdr plugin uninstall herdr.gateway
 
 ## Pairing
 
-The manager panel displays a QR code for Muqun. The QR code contains only the
-gateway URL and server ID:
+The manager panel displays a QR code for Muqun. With the default encrypted
+transport it contains the gateway URL, server ID, and a pairing-only bootstrap
+secret:
 
 ```text
-muqun://pair?u=<gateway_url>&s=<server_id>
+muqun://pair?u=<gateway_url>&s=<server_id>&k=<pairing_bootstrap_key>
 ```
 
-It does not contain the bearer token.
+It never contains a bearer token or a device transport key. The bootstrap key
+is rotated after a successful encrypted pairing.
 
-The gateway URL is configurable. During `setup`, Herdr Gateway chooses a default
+Transport encryption is `required` by default. It can be selected during setup
+or toggled with `e` in the manager (restart the gateway after toggling):
+
+```sh
+muqun-gateway setup --backend tmux --transport-encryption required
+muqun-gateway setup --backend tmux --transport-encryption disabled
+```
+
+`disabled` is token-only compatibility mode. Its QR omits `k`; anyone who gets
+the device bearer token can call the API, so do not use it on public HTTP.
+
+The gateway URL is configurable. During `setup`, Muqun Gateway chooses a default
 URL in this order:
 
 1. `https://<tailscale-magic-name>` when Tailscale is running and Tailscale Serve appears to be forwarding the gateway port.
@@ -166,7 +255,9 @@ Pairing flow:
 2. Muqun sends a pairing request with a request ID and device name.
 3. The manager panel hides the QR code and shows the device name plus a short confirmation code.
 4. Enter the confirmation code in Muqun.
-5. Muqun claims the pairing request and receives a token minted for that device.
+5. Muqun claims the pairing request. In `required` mode it receives both a
+   device token and a separate device transport key; neither is issued before
+   the confirmation code is successfully consumed.
 
 Pending pairing state is held in gateway process memory and is not written to
 disk.
@@ -174,22 +265,24 @@ disk.
 ## Devices and revocation
 
 Every successful pairing mints a token belonging to that one device, stored
-hashed in `devices.json`. Revoking a device cuts off only that device; the
-others keep working.
+hashed in `devices.json`. In `required` mode it also stores a per-device
+transport key. Revoking a device cuts off only that device; the others keep
+working.
 
 There are two kinds of credential, and they are not interchangeable:
 
-- **Device tokens** are the only thing that authorises a control route. They
-  exist on the paired device and are stored hashed on the server.
+- **Device tokens** identify an enrolled credential and are stored hashed on
+  the server. For encrypted devices they are insufficient without the matching
+  device id and transport key; in `disabled` mode they remain bearer tokens.
 - **The admin token** in `pairing.json` belongs to the local manager panel and
   authorises only pending-pairing reads and device revocation. It is never
   handed out to a device. Because it sits in plaintext on disk, it deliberately
   cannot reach the routes that run commands on the host.
 
 ```sh
-herdr-gateway devices             # list paired devices and when each was last seen
-herdr-gateway revoke <device_id>  # revoke one device
-herdr-gateway revoke --all        # revoke every device
+muqun-gateway devices             # list paired devices and when each was last seen
+muqun-gateway revoke <device_id>  # revoke one device
+muqun-gateway revoke --all        # revoke every device
 ```
 
 The same thing is available over the API, so Muqun can show and revoke devices
@@ -209,11 +302,15 @@ GET /docs
 GET /openapi.json
 ```
 
-Control routes require a paired device's bearer token:
+In `disabled` compatibility mode, control routes use a bearer token:
 
 ```http
 Authorization: Bearer <device_token>
 ```
+
+In the default `required` mode, Muqun instead sends an AES-GCM envelope bound
+to the device id; the token is inside the authenticated ciphertext and is never
+sent as an HTTP bearer credential.
 
 `POST /api/pair/request` and `POST /api/pair/claim` are unauthenticated, since
 that is how a device gets its token. `GET /api/pair/pending` takes the admin
@@ -295,11 +392,16 @@ answers with the absolute path, the sanitised original name, the size, and the
 detected MIME type, so the app can send that path to an agent as ordinary text
 and the agent reads the file straight off the host.
 
-This first version accepts images only: png, jpeg, gif, webp, and heic. The
-type is decided by sniffing the content, so everything else is refused with
-`415`, executables and scripts included, and the client's filename is only
-echoed back and never reaches the filesystem. The body is capped at 25 MiB, and
-stored uploads are deleted 48 hours after they were written.
+The endpoint accepts png, jpeg, gif, webp and heic images; PDF; modern Office
+DOCX/XLSX/PPTX; OpenDocument ODT/ODS/ODP; and UTF-8 text/source files. Images
+and PDFs are identified from magic bytes. Office containers must expose the
+expected package structure in a bounded ZIP central-directory check, without
+extracting their contents. Text must pass a UTF-8/control-character probe
+before a small extension allow-list can preserve a useful suffix. Other binary
+formats return `415`, as do executables and scripts with executable signatures.
+The client's filename is only echoed after sanitising and never becomes a
+filesystem path. The body is capped at 25 MiB, stored files use mode `0600`,
+and uploads are deleted 48 hours after they were written.
 
 ### Starting a task
 
@@ -432,7 +534,7 @@ can tell this gateway from one old enough to have ignored the parameter.
 
 Two feeds keep the list current. Herdr's `worktree.*` events, which the gateway
 already subscribes to, carry the checkout's root path and its workspace but no
-file information -- protocol 17 has no per-file event -- so each one is taken as
+file information -- Herdr has no per-file event -- so each one is taken as
 a "this root just changed" trigger and the files come from scanning exactly that
 root at that moment. Newly seen files are announced on the events stream as
 `asset.created`, carrying one asset in the same envelope, and obeying the same
@@ -619,9 +721,20 @@ wording, which is the same rule the pushes are held to.
 
 ## Compatibility and API versions
 
-Herdr Gateway 0.5.0 requires Herdr 0.7.5 or newer and socket protocol 17.
-Earlier Herdr releases are intentionally unsupported; update Herdr and restart
-the running session before starting this Gateway release.
+Muqun Gateway 0.5.0 requires Herdr 0.7.5 or newer, which is socket protocol 17
+or newer. Earlier Herdr releases are intentionally unsupported; update Herdr and
+restart the running session before starting this Gateway release.
+
+There is deliberately no upper bound. Herdr's protocol number versions its
+bincode TUI client/server link, and the JSON socket API this gateway speaks only
+echoes the same number back from `ping`, so it moves for changes the gateway
+never consumes -- 17 to 19, across Herdr 0.7.5 to 0.8.0, was terminal input
+work, while the JSON schema itself only grew. A ceiling turned every Herdr
+release into an outage for a change that did not affect the gateway, so a newer
+Herdr is served and a real incompatibility surfaces on the request that fails
+rather than by refusing to connect at all. `/health` reports this as
+`herdr.supportedProtocolMax: null`; a numeric value there is an older gateway
+that still pins one.
 
 The Gateway API has its own Semantic Version (`apiVersion`), independent from
 the Gateway binary version and the installed Herdr version. `/health` and the
@@ -636,6 +749,12 @@ version. Calendar dates may be appended as release build metadata, but are not
 used to decide compatibility. Existing unversioned routes remain available for
 older Muqun releases.
 
+Opening a terminal in released Muqun builds sends a legacy `pane/zoom` request.
+The gateway acknowledges that route without forwarding it: connecting from the
+app must not change tmux or Herdr focus, splits, or zoom state. Other control
+routes still validate their target and return `backend_target_not_found` for a
+pane, tab, or workspace that was actually closed.
+
 Pairing confirmation codes expire after five minutes and are consumed atomically
 after the first successful claim. A consumed or expired code cannot be reused,
 and eight failed attempts invalidate the pending code.
@@ -643,9 +762,10 @@ and eight failed attempts invalidate the pending code.
 Security defaults:
 
 - No raw Herdr API proxy is exposed.
-- Control routes require a paired device's bearer token.
+- Encrypted control routes require the paired device id, transport key, and
+  token; possession of the token alone is rejected.
 - The admin token cannot reach a control route, only the pending-pairing read.
-- QR pairing does not expose any token.
+- QR pairing exposes no bearer or device key; its bootstrap key is pairing-only.
 - Each device gets its own token and can be revoked on its own.
 - Token verification uses a constant-time hash comparison against every candidate.
 - Device names are rejected if they contain control characters, so a pairing request cannot forge the manager panel with terminal escapes.
@@ -681,10 +801,18 @@ Security defaults:
   oversized request is refused while it streams rather than after it is read.
 - Uploads are swept at startup and every hour, and deleted after 48 hours.
 
-Prefer Tailscale Serve HTTPS whenever it is available. Direct HTTP over a
-Tailscale IP remains supported for user-managed private networks, but HTTP does
-not provide transport encryption by itself; the security of that connection
-depends on the tailnet and its access controls.
+Prefer Tailscale Serve HTTPS whenever it is available. The default application
+transport additionally encrypts pairing and API payloads with AES-256-GCM,
+derives separate request and response keys, and rejects reused authenticated
+request nonces. Muqun keeps the per-device material in its encrypted secure
+storage record. HTTP metadata such as routes, query strings, sizes, timing, and
+device id remains visible, and endpoint compromise is out of scope; application
+encryption is defense in depth, not a replacement for HTTPS, WireGuard, or
+Tailscale ACLs.
+
+When `transport_encryption` is `disabled`, plain HTTP exposes both payloads and
+bearer credentials to observers. Treat that mode as an explicit compatibility
+choice only.
 
 ## Publishing
 

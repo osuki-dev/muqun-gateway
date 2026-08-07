@@ -1,11 +1,11 @@
 #!/usr/bin/env sh
 # Herdr runs this as the plugin's build step (see herdr-plugin.toml). It puts a
-# herdr-gateway binary at target/release/, preferring a prebuilt release asset
+# muqun-gateway binary at target/release/, preferring a prebuilt release asset
 # so the install needs no Rust toolchain, and falling back to `cargo build` when
 # no matching binary is published (e.g. an untagged main checkout).
 set -eu
 
-REPO="osuki-dev/herdr-gateway"
+REPO="osuki-dev/muqun-gateway"
 VERSION="$(grep -m1 '^version' Cargo.toml | sed 's/[^"]*"\([^"]*\)".*/\1/')"
 
 os="$(uname -s)"
@@ -21,11 +21,11 @@ esac
 download() {
   [ -n "$target" ] || return 1
   command -v curl >/dev/null 2>&1 || return 1
-  url="https://github.com/$REPO/releases/download/v$VERSION/herdr-gateway-$target"
+  url="https://github.com/$REPO/releases/download/v$VERSION/muqun-gateway-$target"
   echo "Fetching prebuilt binary: $url"
   mkdir -p target/release
-  curl -fSL "$url" -o target/release/herdr-gateway || return 1
-  chmod +x target/release/herdr-gateway
+  curl -fSL "$url" -o target/release/muqun-gateway || return 1
+  chmod +x target/release/muqun-gateway
 }
 
 if download; then

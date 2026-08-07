@@ -1,22 +1,28 @@
 [package]
-name = "herdr-gateway"
+name = "muqun-gateway"
 version = "0.5.0"
 edition = "2021"
 license = "MIT"
-description = "Token-protected mobile gateway for Herdr, the terminal workspace manager for AI coding agents."
-repository = "https://github.com/osuki-dev/herdr-gateway"
+description = "Token-protected mobile gateway for Herdr and tmux terminal workspaces."
+repository = "https://github.com/osuki-dev/muqun-gateway"
 readme = "README.md"
-keywords = ["herdr", "terminal", "gateway", "tailscale", "cli"]
+keywords = ["terminal", "gateway", "tmux", "herdr", "tailscale"]
 categories = ["command-line-utilities"]
 
 [dependencies]
 anyhow = "1.0.103"
+aes-gcm = "0.10.3"
 async-stream = "0.3.6"
 axum = { version = "0.8.9", features = ["multipart"] }
 base64 = "0.22.1"
 clap = { version = "4.6.2", features = ["derive"] }
 crossterm = "0.29.0"
 dirs = "6.0.0"
+# Just `join_all`, to probe configured backends concurrently in
+# `GET /api/sessions` -- tokio has no bundled fan-out-and-collect primitive
+# for a dynamic list of futures that doesn't require spawning tasks.
+futures = { version = "0.3.32", default-features = false, features = ["std"] }
+hkdf = "0.12.4"
 libc = "0.2.178"
 # Default features pull in the `image` crate -- a full image decoder, and the
 # largest attack surface in this dependency tree -- for a renderer this gateway
@@ -26,6 +32,7 @@ reqwest = { version = "0.12.24", default-features = false, features = ["json", "
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sha2 = "0.10.9"
-tokio = { version = "1.53.0", features = ["fs", "macros", "net", "rt-multi-thread", "io-util", "sync", "time"] }
+tokio = { version = "1.53.0", features = ["fs", "macros", "net", "process", "rt-multi-thread", "io-util", "sync", "time"] }
 tokio-stream = "0.1.18"
 uuid = { version = "1.24.0", features = ["v4"] }
+argon2 = { version = "0.5.3", default-features = false, features = ["alloc"] }

@@ -199,8 +199,7 @@ use std::hash::{Hash, Hasher};
 use serde_json::Value;
 
 /// Rows kept per pane and source, matching the ceiling on a single read.
-/// Whether the gateway keeps rows for panes Herdr reports no scrollback for.
-/// See `keeps` for why this is false in 1.2.0.
+/// Whether the gateway keeps rows for panes the backend reports no scrollback for.
 pub const SCROLLBACK_ENABLED: bool = true;
 
 pub const MAX_PANE_LINES: usize = 5_000;
@@ -528,37 +527,100 @@ impl PaneBuffer {
 #[derive(Debug, Default)]
 pub struct ScrollbackStore {
     buffers: HashMap<String, PaneBuffer>,
-    /// Panes Herdr reports no scrollback for, by `session/pane`. Only these are
-    /// ever recorded or answered from.
+    /// Panes worth recording synthetic history for, by `session/pane`. Only
+    /// these are ever recorded or answered from.
+    ///
+    /// True for a pane whose own scrollback is frozen rather than merely
+    /// small: one on an alternate screen (`alternate_on: true`), which tmux
+    /// will never grow no matter how long the reader waits, or -- when the
+    /// backend cannot say (Herdr; a tmux pane before its first list, where
+    /// `alternate_on` is `None`) -- one Herdr reports zero rows above for.
+    /// See `keeps`.
     kept: HashMap<String, bool>,
+    /// Panes whose foreground program is a full-screen editor -- see
+    /// `is_editor_command` -- by `session/pane`. Absent means unknown, which
+    /// `owns_screen` below reads as `false`: a pane this store cannot
+    /// positively identify as an editor keeps the accumulate-and-place
+    /// behaviour every pane had before this field existed, which includes
+    /// every agent pane (`is_editor_command`'s doc says why that has to be
+    /// true).
+    owns_screen: HashMap<String, bool>,
     total_bytes: usize,
     clock: u64,
 }
 
 /// `session/pane`, the key the zero-backlog verdict is held under.
-pub fn pane_key(session_id: &str, pane_id: &str) -> String {
+fn pane_key(session_id: &str, pane_id: &str) -> String {
     format!("{session_id}/{pane_id}")
 }
 
 /// `session/pane/source/format`. Rows read as ANSI and rows read as plain text
 /// are different rows and cannot be spliced against each other, so each read
 /// shape keeps its own buffer.
-pub fn read_key(session_id: &str, pane_id: &str, source: &str, format: &str) -> String {
+fn read_key(session_id: &str, pane_id: &str, source: &str, format: &str) -> String {
     format!("{session_id}/{pane_id}/{source}/{format}")
 }
 
+/// Whether `command` -- a pane's `foreground_command`, tmux's own
+/// `#{pane_current_command}` -- names a full-screen editor.
+///
+/// This, not `Pane::alternate_on`, is `record`'s discriminator (card #795).
+/// `alternate_on` was tried first and measured wrong on a live machine: a
+/// Claude Code pane reports `alternate_on=1` exactly like nvim's ("%1|claude|
+/// alternate_on=1|history_size=0" next to "%27|nvim|alternate_on=1|
+/// history_size=0"), because an agent wrapped in one also owns an alternate
+/// screen -- it is precisely one of the panes this module's own doc says it
+/// exists to serve. `foreground_command` is what `shortcuts::is_editor_title`
+/// answers the same question from for keybindings, except against a pane's
+/// title, a signal the program sets for itself and can leave stale or unset;
+/// `foreground_command` is tmux's own report of the process actually running
+/// and cannot be renamed away. Shares `shortcuts::EDITOR_PROGRAMS` rather than
+/// a second list that could quietly drift from it.
+fn is_editor_command(command: Option<&str>) -> bool {
+    command.is_some_and(|command| {
+        crate::shortcuts::EDITOR_PROGRAMS.contains(&command.trim().to_ascii_lowercase().as_str())
+    })
+}
+
 impl ScrollbackStore {
-    /// Learn from a Herdr answer which panes hold no scrollback of their own.
+    /// Learn from a Herdr answer which panes have scrollback of their own that
+    /// this store must stay out of, versus which are frozen and need it.
     ///
     /// Takes any `pane.list`, `pane.get` or `session.snapshot` body and walks it
     /// for pane objects, so it does not have to know the shape of each. The
     /// approval watcher already calls `pane.list` every 1500ms, which keeps this
     /// current without asking Herdr for anything new.
+    ///
+    /// A pane is kept when its foreground program owns an alternate screen:
+    /// `alternate_on: true` means tmux will never write another row above it,
+    /// however many it already has (a residue from before the program took
+    /// the screen -- 29 lines for a Claude pane measured live -- is not
+    /// meaningfully more useful than none, and unlike none it will never
+    /// grow). `max_offset_from_bottom <= 0` remains the fallback for where
+    /// `alternate_on` is unknown: a Herdr backend, or a tmux pane before its
+    /// first list. Checking the offset alone, as this used to, answers "is
+    /// there a little scrollback right now" -- a number that drifts with how
+    /// much ran before the program switched screens -- rather than "will this
+    /// pane's own scrollback ever include what is about to scroll off", which
+    /// is the question this store actually needs answered and the one
+    /// `alternate_on` answers directly.
     pub fn observe(&mut self, session_id: &str, value: &Value) {
-        visit_panes(value, &mut |pane_id, scroll| {
-            if let Some(maximum) = scroll.get("max_offset_from_bottom").and_then(Value::as_f64) {
-                self.kept
-                    .insert(pane_key(session_id, pane_id), maximum <= 0.0);
+        visit_panes(value, &mut |pane_id, pane| {
+            if let Some(scroll) = pane.get("scroll").and_then(Value::as_object) {
+                if let Some(maximum) = scroll.get("max_offset_from_bottom").and_then(Value::as_f64)
+                {
+                    let alternate = scroll.get("alternate_on").and_then(Value::as_bool);
+                    self.kept.insert(
+                        pane_key(session_id, pane_id),
+                        alternate == Some(true) || maximum <= 0.0,
+                    );
+                }
+            }
+            if let Some(command) = pane.get("foreground_command").and_then(Value::as_str) {
+                self.owns_screen.insert(
+                    pane_key(session_id, pane_id),
+                    is_editor_command(Some(command)),
+                );
             }
         });
     }
@@ -567,17 +629,7 @@ impl ScrollbackStore {
     ///
     /// A pane nobody has reported on yet answers `false`: not knowing is a
     /// reason to stay out of the way, not a reason to guess.
-    pub fn keeps(&self, session_id: &str, pane_id: &str) -> bool {
-        // On at Ellen's word (2026-07-29), after the terminal contract landed
-        // and with a live probe watching for the duplication that closed it. Keeping rows for a pane Herdr
-        // keeps none for is a nice thing to have; showing a reader their own
-        // conversation with pieces of it repeated is not, and the two arrived
-        // together. With this false the gateway hands back exactly what Herdr
-        // hands it: a pane that cannot scroll back simply does not, which is
-        // where every pane stood a week ago. The machinery and its tests stay
-        // here, and turning this on is how the next version resumes the
-        // argument -- with the anchor, the furniture rule, and a soak test
-        // against a pane under real load before it ships.
+    fn keeps(&self, session_id: &str, pane_id: &str) -> bool {
         if !SCROLLBACK_ENABLED {
             return false;
         }
@@ -588,9 +640,22 @@ impl ScrollbackStore {
             .unwrap_or(false)
     }
 
+    /// Whether this pane's foreground program is a full-screen editor -- so a
+    /// read that overlaps nothing held should replace rather than accumulate.
+    /// See `record`'s own doc on why the two cases need different answers,
+    /// `is_editor_command`'s doc on what this is keyed on and why, and
+    /// `owns_screen`'s field doc on why unknown reads as `false` here.
+    fn owns_screen(&self, session_id: &str, pane_id: &str) -> bool {
+        self.owns_screen
+            .get(&pane_key(session_id, pane_id))
+            .copied()
+            .unwrap_or(false)
+    }
+
     /// What the observation rule alone says about this pane, with the feature
     /// switch left out of it. The switch is a shipping decision; the rule is
     /// the thing the tests are about.
+    #[cfg(test)]
     pub fn observed_as_kept(&self, session_id: &str, pane_id: &str) -> bool {
         self.kept
             .get(&pane_key(session_id, pane_id))
@@ -599,7 +664,26 @@ impl ScrollbackStore {
     }
 
     /// Fold a read into what is already held.
-    pub fn record(&mut self, key: &str, text: &str) {
+    ///
+    /// `owns_screen` is `is_editor_command` on the pane's `foreground_command`,
+    /// forwarded by the caller -- not `Pane::alternate_on`. An editor -- nvim
+    /// among them -- repaints a static rectangle: nothing scrolls off the top,
+    /// `history_size` stays 0, and every read of one *is* the whole of the
+    /// pane's current truth, so it replaces outright rather than being placed
+    /// against what came before. The two-stacked-frames bug this exists to
+    /// prevent is exactly what "neither placement believed anything, so keep
+    /// the read on top of what we had" produces for a screen that repainted
+    /// rather than scrolled. An agent pane (Claude Code, opencode, codex, each
+    /// wrapped in one) also owns an alternate screen -- `alternate_on` is 1
+    /// for it exactly as it is for an editor's -- but its conversation
+    /// genuinely scrolls away above the viewport, and accumulating what the
+    /// gateway saw of it is this whole module's purpose (see its own doc), so
+    /// it must not take this branch: `is_editor_command` reads `false` for it,
+    /// same as for anything this store cannot positively identify as an
+    /// editor. The client fixes the identical mistake in `foldPaneRead`'s own
+    /// `ownsScreen` (see `src/terminal/history.ts` in the Muqun repo, card
+    /// #795, defect 2).
+    fn record(&mut self, key: &str, text: &str, owns_screen: bool) {
         let incoming = split_lines(text);
         if incoming.is_empty() {
             return;
@@ -609,6 +693,18 @@ impl ScrollbackStore {
         let buffer = self.buffers.entry(key.to_owned()).or_default();
         let before = buffer.bytes;
         buffer.touched = clock;
+
+        if owns_screen {
+            buffer.drop_back(buffer.lines.len());
+            for line in incoming {
+                buffer.push(line);
+            }
+            buffer.trim();
+            buffer.last_frame = buffer.hashes.iter().copied().collect();
+            self.total_bytes = self.total_bytes + buffer.bytes - before;
+            self.evict();
+            return;
+        }
 
         // What this frame and the one before it end with identically is the
         // pane's furniture, not its history: an agent's composer -- the rule,
@@ -668,7 +764,7 @@ impl ScrollbackStore {
 
     /// The last `rows` rows held for this read, or `None` where the buffer has
     /// nothing more than the caller already has.
-    pub fn window(&self, key: &str, rows: usize) -> Option<String> {
+    fn window(&self, key: &str, rows: usize) -> Option<String> {
         let buffer = self.buffers.get(key)?;
         if buffer.lines.is_empty() {
             return None;
@@ -683,6 +779,51 @@ impl ScrollbackStore {
                 .collect::<Vec<String>>()
                 .join("\n"),
         )
+    }
+
+    /// Observe one backend read and return the deepest row window this store can
+    /// truthfully serve. Callers never compare bytes or assemble storage keys:
+    /// history depth is a row property and the source/format pair is part of the
+    /// store's identity for that read.
+    pub fn serve_read(
+        &mut self,
+        session_id: &str,
+        pane_id: &str,
+        source: &str,
+        format: &str,
+        backend_text: &str,
+        rows: usize,
+    ) -> String {
+        if !self.keeps(session_id, pane_id) {
+            return backend_text.to_owned();
+        }
+
+        let key = read_key(session_id, pane_id, source, format);
+        let owns_screen = self.owns_screen(session_id, pane_id);
+        self.record(&key, backend_text, owns_screen);
+        let backend_rows = split_lines(backend_text).len();
+        self.window(&key, rows)
+            .filter(|served| split_lines(served).len() > backend_rows)
+            .unwrap_or_else(|| backend_text.to_owned())
+    }
+
+    /// Record a sampled stream frame under the same policy as a direct read.
+    /// This deliberately returns nothing: serving is decided only when a client
+    /// asks for a bounded read window.
+    pub fn record_frame(
+        &mut self,
+        session_id: &str,
+        pane_id: &str,
+        source: &str,
+        format: &str,
+        output: &str,
+    ) {
+        if output.is_empty() || !self.keeps(session_id, pane_id) {
+            return;
+        }
+        let key = read_key(session_id, pane_id, source, format);
+        let owns_screen = self.owns_screen(session_id, pane_id);
+        self.record(&key, output, owns_screen);
     }
 
     /// How many rows are held for this pane, across every read shape.
@@ -712,18 +853,31 @@ impl ScrollbackStore {
     /// `max_offset_from_bottom + viewport_rows` off the pane, not off the
     /// output. Without this the rows would be kept and never asked for.
     ///
-    /// It only ever raises the number, and only for panes Herdr reported zero
-    /// for, so a pane with real scrollback is left exactly as it arrived.
+    /// It only ever raises the number, and only for panes this store `keeps`
+    /// -- not, as this used to read, only for panes reporting exactly zero.
+    /// `%17` measured live: `alternate_on: true`, a 29-line residue from
+    /// before Claude took the screen, and therefore `keeps` (once that
+    /// answers off `alternate_on` rather than off this same zero check --
+    /// see its own doc) records it. Gating the amendment on the zero check
+    /// too would still have been a bug even so: the store would grow the
+    /// pane's synthetic history underneath it forever while `amend` kept
+    /// republishing Herdr's frozen 29 on every call, and the reader would
+    /// never be offered a pull for any of it. `keeps` is the one true
+    /// answer to "does this store speak for this pane" and both halves --
+    /// whether to record, and whether to say so -- must agree with it.
+    /// Reading it here rather than re-deriving the same verdict from this
+    /// call's own payload also means the two can never drift: `observe` is
+    /// always called immediately before `amend` on the same body (see
+    /// `main.rs`), so the map this reads is the map that body just wrote.
     pub fn amend(&self, session_id: &str, value: &mut Value) {
         let mut updates: Vec<(String, u64)> = Vec::new();
-        visit_panes(value, &mut |pane_id, scroll| {
-            let maximum = scroll
-                .get("max_offset_from_bottom")
-                .and_then(Value::as_f64)
-                .unwrap_or(-1.0);
-            if maximum != 0.0 {
+        visit_panes(value, &mut |pane_id, pane| {
+            if !self.keeps(session_id, pane_id) {
                 return;
             }
+            let Some(scroll) = pane.get("scroll").and_then(Value::as_object) else {
+                return;
+            };
             let viewport = scroll
                 .get("viewport_rows")
                 .and_then(Value::as_u64)
@@ -766,13 +920,18 @@ impl ScrollbackStore {
 /// `pane.list`, `pane.get` and `session.snapshot` nest panes differently and the
 /// gateway models none of them; walking for the pair of fields is what lets one
 /// function serve all three and survive a shape it has not seen.
+///
+/// Hands the visitor the whole pane object, not just `scroll`: `observe` needs
+/// `foreground_command`, a sibling of `scroll` rather than a member of it (see
+/// `is_editor_command`), and a second walk of the same body for one more field
+/// would be the kind of thing this function exists to avoid.
 fn visit_panes(value: &Value, visit: &mut impl FnMut(&str, &serde_json::Map<String, Value>)) {
     match value {
         Value::Object(map) => {
-            if let (Some(Value::String(pane_id)), Some(Value::Object(scroll))) =
+            if let (Some(Value::String(pane_id)), Some(Value::Object(_))) =
                 (map.get("pane_id"), map.get("scroll"))
             {
-                visit(pane_id, scroll);
+                visit(pane_id, map);
             }
             for nested in map.values() {
                 visit_panes(nested, visit);
@@ -821,7 +980,12 @@ fn visit_panes_mut(
 /// gateway, so the rows are rewritten in place rather than re-enveloped: the
 /// revision, and everything else Herdr said, stays Herdr's.
 pub fn replace_read_text(value: &mut Value, text: &str) {
-    for pointer in ["/result/read/text", "/result/text"] {
+    for pointer in [
+        "/result/read/output",
+        "/result/read/text",
+        "/result/output",
+        "/result/text",
+    ] {
         if let Some(slot) = value.pointer_mut(pointer) {
             if slot.is_string() {
                 *slot = Value::from(text);
@@ -869,7 +1033,7 @@ mod tests {
 
         let mut store = ScrollbackStore::default();
         for frame in &frames {
-            store.record("replay", frame);
+            store.record("replay", frame, false);
         }
         let held = store.window("replay", MAX_PANE_LINES).unwrap_or_default();
         let rows: Vec<&str> = held.lines().collect();
@@ -956,7 +1120,7 @@ mod tests {
                 // The clock, on the bottom row, changing every single frame.
                 format!("  {}m {}s · ↓ {}k tokens", round, round * 7, round * 13),
             ]);
-            store.record("pane", &frame.join("\n"));
+            store.record("pane", &frame.join("\n"), false);
         }
         let held = store.window("pane", 5_000).unwrap();
         let lines: Vec<&str> = held.lines().collect();
@@ -989,7 +1153,7 @@ mod tests {
                 .map(|row| format!("head {} of round {round}", row + round * 10))
                 .collect();
             frame.extend(tail.iter().cloned());
-            store.record("pane", &frame.join("\n"));
+            store.record("pane", &frame.join("\n"), false);
         }
         let held = store.window("pane", 5_000).unwrap();
         let lines: Vec<&str> = held.lines().collect();
@@ -1016,7 +1180,7 @@ mod tests {
                 .into_iter()
                 .chain(chrome.iter().map(|line| (*line).to_owned()))
                 .collect();
-            store.record("pane", &frame.join("\n"));
+            store.record("pane", &frame.join("\n"), false);
         }
         let held = store.window("pane", 5_000).unwrap();
         let lines: Vec<&str> = held.lines().collect();
@@ -1035,7 +1199,6 @@ mod tests {
             .any(|line| line.starts_with("line 319 of round 7")));
     }
 
-    use super::*;
     use serde_json::json;
 
     fn screen(rows: &[&str]) -> String {
@@ -1047,7 +1210,7 @@ mod tests {
     fn scroll_a_screen(store: &mut ScrollbackStore, key: &str, rows: usize) {
         for top in 0..rows.saturating_sub(64) {
             let screen: Vec<String> = (top..top + 65).map(|row| format!("row {row}")).collect();
-            store.record(key, &screen.join("\n"));
+            store.record(key, &screen.join("\n"), false);
         }
     }
 
@@ -1064,33 +1227,33 @@ mod tests {
     #[test]
     fn a_first_read_is_kept_whole() {
         let mut store = ScrollbackStore::default();
-        store.record("k", &screen(&["1", "2", "3"]));
+        store.record("k", &screen(&["1", "2", "3"]), false);
         assert_eq!(store.window("k", 10).unwrap(), "1\n2\n3");
     }
 
     #[test]
     fn an_unchanged_screen_adds_nothing() {
         let mut store = ScrollbackStore::default();
-        store.record("k", &screen(&["1", "2", "3"]));
-        store.record("k", &screen(&["1", "2", "3"]));
-        store.record("k", &screen(&["1", "2", "3"]));
+        store.record("k", &screen(&["1", "2", "3"]), false);
+        store.record("k", &screen(&["1", "2", "3"]), false);
+        store.record("k", &screen(&["1", "2", "3"]), false);
         assert_eq!(store.window("k", 10).unwrap(), "1\n2\n3");
     }
 
     #[test]
     fn a_scrolled_screen_keeps_what_rolled_off_the_top() {
         let mut store = ScrollbackStore::default();
-        store.record("k", &screen(&["1", "2", "3", "4"]));
-        store.record("k", &screen(&["3", "4", "5", "6"]));
+        store.record("k", &screen(&["1", "2", "3", "4"]), false);
+        store.record("k", &screen(&["3", "4", "5", "6"]), false);
         assert_eq!(store.window("k", 10).unwrap(), "1\n2\n3\n4\n5\n6");
     }
 
     #[test]
     fn the_seam_is_neither_duplicated_nor_dropped() {
         let mut store = ScrollbackStore::default();
-        store.record("k", &screen(&["a", "b", "c", "d", "e"]));
-        store.record("k", &screen(&["b", "c", "d", "e", "f"]));
-        store.record("k", &screen(&["c", "d", "e", "f", "g"]));
+        store.record("k", &screen(&["a", "b", "c", "d", "e"]), false);
+        store.record("k", &screen(&["b", "c", "d", "e", "f"]), false);
+        store.record("k", &screen(&["c", "d", "e", "f", "g"]), false);
         assert_eq!(store.window("k", 20).unwrap(), "a\nb\nc\nd\ne\nf\ng");
     }
 
@@ -1100,10 +1263,10 @@ mod tests {
         // screen whose clock ticks must not append itself every time.
         let mut store = ScrollbackStore::default();
         let mut rows: Vec<String> = (0..20).map(|row| format!("row {row}")).collect();
-        store.record("k", &rows.join("\n"));
+        store.record("k", &rows.join("\n"), false);
         for tick in 0..50 {
             rows[7] = format!("working {tick}");
-            store.record("k", &rows.join("\n"));
+            store.record("k", &rows.join("\n"), false);
         }
         let held = store.window("k", 500).unwrap();
         assert_eq!(split_lines(&held).len(), 20);
@@ -1116,22 +1279,111 @@ mod tests {
         // content, not two renderings of the same content, and dropping the
         // first would throw away exactly what this exists to keep.
         let mut store = ScrollbackStore::default();
-        store.record("k", &screen(&["old 1", "old 2", "old 3", "old 4"]));
-        store.record("k", &screen(&["new 1", "new 2", "new 3", "new 4"]));
+        store.record("k", &screen(&["old 1", "old 2", "old 3", "old 4"]), false);
+        store.record("k", &screen(&["new 1", "new 2", "new 3", "new 4"]), false);
         assert_eq!(
             store.window("k", 20).unwrap(),
             "old 1\nold 2\nold 3\nold 4\nnew 1\nnew 2\nnew 3\nnew 4"
         );
     }
 
+    // Card #795, defect 2: a detected nvim pane rendered two stacked copies
+    // of its own screen. Root-caused to this exact mechanism -- confirmed
+    // live against the real gateway, not just here -- `record`'s "neither
+    // placement believed anything, so keep the read on top" fallback,
+    // written for a genuinely scrolling pane whose output outran the poll,
+    // firing for an alternate-screen pane's ordinary repaint instead. A
+    // screen that owns its screen has no real history for this buffer to
+    // protect, so it must replace, not accumulate, however different two
+    // consecutive reads of it are.
+    #[test]
+    fn a_screen_owning_pane_replaces_rather_than_accumulates() {
+        let mut store = ScrollbackStore::default();
+        store.record("k", &screen(&["old 1", "old 2", "old 3", "old 4"]), true);
+        store.record("k", &screen(&["new 1", "new 2", "new 3", "new 4"]), true);
+        // The mirror of `a_screen_that_shares_nothing_is_kept_on_top_of_the_one_it_followed`:
+        // same two screens sharing nothing, `owns_screen` true instead of
+        // false, and the old screen must be gone rather than kept above the
+        // new one.
+        assert_eq!(store.window("k", 20).unwrap(), "new 1\nnew 2\nnew 3\nnew 4");
+    }
+
+    #[test]
+    fn a_screen_owning_pane_with_a_real_overlap_still_just_replaces() {
+        // Not only the zero-overlap fallback: even a repaint the placement
+        // heuristics *could* have matched (an unchanged screen, a small
+        // scroll) is exactly the current screen and nothing this buffer
+        // needs to reconstruct history from -- there is no "and then" for a
+        // repaint to have.
+        let mut store = ScrollbackStore::default();
+        store.record("k", &screen(&["row 0", "row 1", "row 2"]), true);
+        store.record("k", &screen(&["row 0", "row 1", "row 2 CHANGED"]), true);
+        assert_eq!(
+            store.window("k", 20).unwrap(),
+            "row 0\nrow 1\nrow 2 CHANGED"
+        );
+    }
+
+    #[test]
+    fn a_screen_owning_pane_first_read_is_kept_whole() {
+        let mut store = ScrollbackStore::default();
+        store.record("k", &screen(&["1", "2", "3"]), true);
+        assert_eq!(store.window("k", 20).unwrap(), "1\n2\n3");
+    }
+
+    #[test]
+    fn an_unknown_pane_keeps_accumulating_until_its_foreground_command_is_observed() {
+        // `owns_screen` defaults to `false` for a pane this store has not
+        // been told about (the same conservatism `keeps` already applies to
+        // `max_offset_from_bottom`), so a caller too old to report
+        // `foreground_command`, or a pane not yet listed once, must not
+        // change behaviour for a pane that already worked.
+        let store = ScrollbackStore::default();
+        assert!(!store.owns_screen("s", "p"));
+    }
+
+    #[test]
+    fn observing_an_editor_foreground_command_is_what_flips_owns_screen() {
+        let mut store = ScrollbackStore::default();
+        store.observe(
+            "s",
+            &json!({
+                "pane_id": "p",
+                "foreground_command": "nvim",
+                "scroll": { "max_offset_from_bottom": 0 },
+            }),
+        );
+        assert!(store.owns_screen("s", "p"));
+    }
+
+    // Card #795 follow-up: the regression this whole file exists to guard
+    // against now. `alternate_on` was tried as the switch first and measured
+    // wrong live -- a Claude Code pane reports `alternate_on=1` exactly like
+    // nvim's -- because an agent pane also owns an alternate screen; it is
+    // precisely one of the panes this module's own doc says it exists to
+    // serve. `alternate_on` alone must never flip `owns_screen`.
+    #[test]
+    fn observing_alternate_on_alone_does_not_flip_owns_screen() {
+        let mut store = ScrollbackStore::default();
+        store.observe(
+            "s",
+            &json!({
+                "pane_id": "p",
+                "foreground_command": "claude",
+                "scroll": { "max_offset_from_bottom": 0, "alternate_on": true },
+            }),
+        );
+        assert!(!store.owns_screen("s", "p"));
+    }
+
     #[test]
     fn history_survives_a_burst_that_outran_the_poll() {
         let mut store = ScrollbackStore::default();
-        store.record("k", &screen(&["1", "2", "3", "4"]));
+        store.record("k", &screen(&["1", "2", "3", "4"]), false);
         // Scrolls by two, so 1 and 2 become history.
-        store.record("k", &screen(&["3", "4", "5", "6"]));
+        store.record("k", &screen(&["3", "4", "5", "6"]), false);
         // Then the screen jumps past what can be followed.
-        store.record("k", &screen(&["x", "y", "z", "w"]));
+        store.record("k", &screen(&["x", "y", "z", "w"]), false);
         assert_eq!(
             store.window("k", 20).unwrap(),
             "1\n2\n3\n4\n5\n6\nx\ny\nz\nw"
@@ -1141,7 +1393,7 @@ mod tests {
     #[test]
     fn a_window_asks_for_no_more_than_it_holds() {
         let mut store = ScrollbackStore::default();
-        store.record("k", &screen(&["1", "2", "3"]));
+        store.record("k", &screen(&["1", "2", "3"]), false);
         assert_eq!(store.window("k", 2).unwrap(), "2\n3");
         assert_eq!(store.window("k", 999).unwrap(), "1\n2\n3");
         assert!(store.window("missing", 10).is_none());
@@ -1155,7 +1407,7 @@ mod tests {
         let total = MAX_PANE_LINES + 200;
         for top in 0..total {
             let rows: Vec<String> = (top..top + 20).map(|row| format!("row {row}")).collect();
-            store.record("k", &rows.join("\n"));
+            store.record("k", &rows.join("\n"), false);
         }
         let held = store.window("k", MAX_PANE_LINES * 2).unwrap();
         let rows = split_lines(&held);
@@ -1171,7 +1423,7 @@ mod tests {
     fn the_buffer_ceiling_forgets_the_pane_nobody_looked_at() {
         let mut store = ScrollbackStore::default();
         for index in 0..(MAX_BUFFERS + 5) {
-            store.record(&format!("pane-{index}"), "hello");
+            store.record(&format!("pane-{index}"), "hello", false);
         }
         assert!(store.buffers.len() <= MAX_BUFFERS);
         assert!(store.window("pane-0", 10).is_none());
@@ -1202,6 +1454,93 @@ mod tests {
         assert!(!store.observed_as_kept("other", "wM:p1"));
     }
 
+    // The gap between the two mechanisms, measured live: a Claude pane
+    // (`%17`) that ran `nvim .` before Claude took the alternate screen has a
+    // 29-line residue from before the switch -- tmux's `history_size`, which
+    // `max_offset_from_bottom` mirrors verbatim for the tmux backend -- and
+    // that residue will never grow no matter how long the conversation runs,
+    // because everything printed since went to the alternate screen instead.
+    // The old predicate (`max_offset_from_bottom <= 0.0` alone) answered
+    // "false" for it: not kept by tmux in any way that matters (the 29 lines
+    // are frozen, not scrollback the reader can page into), and not recorded
+    // by this store either. `alternate_on` is the fix because it is the
+    // question this store actually needs answered -- will tmux ever add to
+    // this pane's own history -- rather than a proxy for it that only agrees
+    // with the answer when the residue happens to be zero.
+    #[test]
+    fn an_alternate_screen_pane_with_a_shallow_residue_is_kept() {
+        let mut store = ScrollbackStore::default();
+        store.observe(
+            "default",
+            &json!({
+                "result": {
+                    "panes": [
+                        // %17: history_size 29, alternate_on 1 -- a Claude pane
+                        // with residue from before the switch, measured live.
+                        { "pane_id": "%17", "scroll": { "max_offset_from_bottom": 29, "viewport_rows": 63, "alternate_on": true } },
+                        // %1: history_size 0, alternate_on 1 -- a Claude pane
+                        // that switched with nothing printed first. Already
+                        // kept under the old predicate; must stay kept.
+                        { "pane_id": "%1", "scroll": { "max_offset_from_bottom": 0, "viewport_rows": 63, "alternate_on": true } }
+                    ]
+                }
+            }),
+        );
+        assert!(
+            store.observed_as_kept("default", "%17"),
+            "29 frozen lines is not meaningfully more useful than none, and unlike \
+             none it looked like real scrollback under the old rule"
+        );
+        assert!(store.observed_as_kept("default", "%1"));
+    }
+
+    // The other half of the same fix: a pane that genuinely scrolls -- codex,
+    // bun, anything tmux keeps real history for -- must not become "kept" just
+    // because its `max_offset_from_bottom` happens to be small early on. Only
+    // `alternate_on: false` (or a pane observed with no `alternate_on` at all,
+    // the pre-card-795 shape) proves that, and it must keep winning over a
+    // small offset the same way it always has.
+    #[test]
+    fn a_genuinely_scrolling_pane_is_never_kept_regardless_of_offset() {
+        let mut store = ScrollbackStore::default();
+        store.observe(
+            "default",
+            &json!({
+                "result": {
+                    "panes": [
+                        // %47 (codex): prints and scrolls, alternate_on false,
+                        // caught early with only a little scrollback so far.
+                        { "pane_id": "%47", "scroll": { "max_offset_from_bottom": 6, "viewport_rows": 63, "alternate_on": false } },
+                        // %34 (bun): the same pane, deep into a long build.
+                        { "pane_id": "%34", "scroll": { "max_offset_from_bottom": 13_643, "viewport_rows": 63, "alternate_on": false } }
+                    ]
+                }
+            }),
+        );
+        assert!(!store.observed_as_kept("default", "%47"));
+        assert!(!store.observed_as_kept("default", "%34"));
+    }
+
+    // Where the backend cannot say (Herdr; the shape every existing test above
+    // this one uses), the fallback is exactly the old rule -- unchanged.
+    #[test]
+    fn unknown_alternate_on_falls_back_to_the_offset_alone() {
+        let mut store = ScrollbackStore::default();
+        store.observe(
+            "default",
+            &json!({
+                "result": {
+                    "panes": [
+                        { "pane_id": "h1", "scroll": { "max_offset_from_bottom": 0, "viewport_rows": 63 } },
+                        { "pane_id": "h2", "scroll": { "max_offset_from_bottom": 29, "viewport_rows": 63 } }
+                    ]
+                }
+            }),
+        );
+        assert!(store.observed_as_kept("default", "h1"));
+        assert!(!store.observed_as_kept("default", "h2"));
+    }
+
     #[test]
     fn a_pane_that_grows_scrollback_stops_being_kept() {
         let mut store = ScrollbackStore::default();
@@ -1228,6 +1567,10 @@ mod tests {
                 ]
             }
         });
+        // `amend` now answers off `keeps`, not off this call's own zero check
+        // -- `observe`, always run immediately before it in production, is
+        // what populates that.
+        store.observe("s", &value);
         store.amend("s", &mut value);
         // 236 rows held, 65 of them on screen: 171 the reader can reach for.
         assert_eq!(
@@ -1236,6 +1579,45 @@ mod tests {
                 .unwrap(),
             &json!(236 - 65)
         );
+    }
+
+    // The end-to-end shape of the `%17` fix: a pane with a shallow, frozen
+    // residue (`alternate_on: true`, `max_offset_from_bottom: 29`, unlike
+    // `%1`'s 0) is amended upward as the store accumulates past what tmux
+    // ever reported, instead of being stuck republishing 29 forever. Without
+    // `amend` also switching to `keeps`, this would still fail even with
+    // `keeps` itself fixed: recording is only half of offering the pull.
+    #[test]
+    fn an_alternate_screen_pane_with_a_residue_is_amended_past_it() {
+        let mut store = ScrollbackStore::default();
+        let observed = json!({
+            "result": {
+                "panes": [
+                    { "pane_id": "%17", "scroll": { "max_offset_from_bottom": 29, "viewport_rows": 63, "alternate_on": true } }
+                ]
+            }
+        });
+        store.observe("default", &observed);
+        // The conversation goes on long past the 29-line residue tmux will
+        // ever report for this pane.
+        scroll_a_screen(
+            &mut store,
+            &read_key("default", "%17", "recent_unwrapped", "text"),
+            300,
+        );
+        let mut value = observed.clone();
+        store.amend("default", &mut value);
+        let amended = value
+            .pointer("/result/panes/0/scroll/max_offset_from_bottom")
+            .unwrap()
+            .as_u64()
+            .unwrap();
+        assert!(
+            amended > 29,
+            "the store held more than tmux's frozen residue, and the reader \
+             must be offered a pull for it: got {amended}"
+        );
+        assert_eq!(amended, 300 - 63);
     }
 
     #[test]
@@ -1249,10 +1631,13 @@ mod tests {
         let original = json!({
             "result": {
                 "panes": [
-                    { "pane_id": "p", "scroll": { "max_offset_from_bottom": 908, "viewport_rows": 65 } }
+                    // `alternate_on: false`: a genuinely scrolling pane, kept
+                    // by neither predicate however deep its own history goes.
+                    { "pane_id": "p", "scroll": { "max_offset_from_bottom": 908, "viewport_rows": 65, "alternate_on": false } }
                 ]
             }
         });
+        store.observe("s", &original);
         let mut value = original.clone();
         store.amend("s", &mut value);
         assert_eq!(value, original);
@@ -1261,8 +1646,19 @@ mod tests {
     #[test]
     fn a_buffer_shallower_than_the_viewport_promises_nothing() {
         let mut store = ScrollbackStore::default();
-        store.record(&read_key("s", "p", "recent_unwrapped", "text"), "one\ntwo");
-        let original = json!({ "pane_id": "p", "scroll": { "max_offset_from_bottom": 0, "viewport_rows": 65 } });
+        store.record(
+            &read_key("s", "p", "recent_unwrapped", "text"),
+            "one\ntwo",
+            false,
+        );
+        let original = json!({
+            "result": {
+                "panes": [
+                    { "pane_id": "p", "scroll": { "max_offset_from_bottom": 0, "viewport_rows": 65 } }
+                ]
+            }
+        });
+        store.observe("s", &original);
         let mut value = original.clone();
         store.amend("s", &mut value);
         assert_eq!(value, original);
@@ -1271,10 +1667,15 @@ mod tests {
     #[test]
     fn ansi_and_text_reads_of_one_pane_do_not_splice_into_each_other() {
         let mut store = ScrollbackStore::default();
-        store.record(&read_key("s", "p", "recent_unwrapped", "text"), "plain");
+        store.record(
+            &read_key("s", "p", "recent_unwrapped", "text"),
+            "plain",
+            false,
+        );
         store.record(
             &read_key("s", "p", "recent_unwrapped", "ansi"),
             "\u{1b}[31mred",
+            false,
         );
         assert_eq!(
             store
@@ -1288,6 +1689,34 @@ mod tests {
                 .unwrap(),
             "\u{1b}[31mred"
         );
+    }
+
+    #[test]
+    fn serving_prefers_more_rows_even_when_the_backend_screen_has_more_bytes() {
+        let mut store = ScrollbackStore::default();
+        store.observe(
+            "s",
+            &json!({
+                "pane_id": "p",
+                "scroll": { "max_offset_from_bottom": 0, "viewport_rows": 2 }
+            }),
+        );
+
+        assert_eq!(
+            store.serve_read("s", "p", "recent_unwrapped", "text", "a\nb", 10),
+            "a\nb"
+        );
+        let served = store.serve_read(
+            "s",
+            "p",
+            "recent_unwrapped",
+            "text",
+            "界界界界界界界界界界\nz",
+            10,
+        );
+
+        assert_eq!(served, "a\nb\n界界界界界界界界界界\nz");
+        assert_eq!(split_lines(&served).len(), 4);
     }
 
     #[test]
@@ -1338,6 +1767,42 @@ mod tests {
         rows.join("\n")
     }
 
+    /// `session/pane` for the agent-shaped tests below, matched with `read_key`
+    /// against `"recent_unwrapped"`/`"text"`.
+    const AGENT_SESSION: &str = "s";
+    const AGENT_PANE: &str = "p";
+
+    /// Reports the same envelope `compat::pane` emits for a live Claude Code
+    /// pane (card #795: `foreground_command: "claude"`, `alternate_on: true`,
+    /// `max_offset_from_bottom: 0`), so a test that calls this and then reads
+    /// or records through `serve_read`/`record_frame` exercises the value
+    /// `owns_screen` production actually computes for an agent pane, not a
+    /// hand-passed parameter.
+    fn observe_agent_pane(store: &mut ScrollbackStore) {
+        store.observe(
+            AGENT_SESSION,
+            &json!({
+                "pane_id": AGENT_PANE,
+                "foreground_command": "claude",
+                "scroll": {
+                    "max_offset_from_bottom": 0,
+                    "viewport_rows": AGENT_SCREEN_ROWS,
+                    "alternate_on": true,
+                },
+            }),
+        );
+    }
+
+    /// The window `observe_agent_pane`'s pane has recorded, through the same
+    /// `recent_unwrapped`/`text` shape `serve_read`/`record_frame` key it
+    /// under.
+    fn agent_window(store: &ScrollbackStore, rows: usize) -> Option<String> {
+        store.window(
+            &read_key(AGENT_SESSION, AGENT_PANE, "recent_unwrapped", "text"),
+            rows,
+        )
+    }
+
     /// Every row of every read, in the order the reads arrived, appears in the
     /// buffer in that order -- the buffer is a supersequence of its own input.
     /// A history that lost rows is a nuisance; a history that reordered them is
@@ -1383,15 +1848,28 @@ mod tests {
         // upward, however quiet the pane is, because the box is matched against
         // transcript rows it never was. Before the anchored placement every one
         // of these scrolls appended a whole sixty-four row screen.
+        //
+        // Driven through `observe_agent_pane` -> `record_frame`, the real path
+        // production data takes, rather than a hand-passed `owns_screen`: this
+        // is the exact pane shape card #795's fix broke (see
+        // `an_agent_pane_shaped_like_production_keeps_its_transcript`), so its
+        // own coverage has to exercise the same value production computes.
         for scroll in [1_usize, 5, 19, 20, 30, 40, 50] {
             let mut store = ScrollbackStore::default();
+            observe_agent_pane(&mut store);
             let mut reads: Vec<Vec<String>> = Vec::new();
             for poll in 0..12 {
                 let screen = agent_screen(poll * scroll, poll);
                 reads.push(split_lines(&screen));
-                store.record("k", &screen);
+                store.record_frame(
+                    AGENT_SESSION,
+                    AGENT_PANE,
+                    "recent_unwrapped",
+                    "text",
+                    &screen,
+                );
             }
-            let held = store.window("k", MAX_PANE_LINES).unwrap();
+            let held = agent_window(&store, MAX_PANE_LINES).unwrap();
             let rows = split_lines(&held);
 
             let duplicates = substantial_duplicates(&held);
@@ -1423,10 +1901,26 @@ mod tests {
         // lines up with itself -- eight agreeing rows, sixty rows from the head
         // of the read -- and believing that would throw away every transcript
         // row that scrolled. The agreeing run has to start where the read does.
+        //
+        // Driven through `observe_agent_pane` -> `record_frame` (see that
+        // test's own note on why).
         let mut store = ScrollbackStore::default();
-        store.record("k", &agent_screen(0, 0));
-        store.record("k", &agent_screen(50, 1));
-        let rows = split_lines(&store.window("k", MAX_PANE_LINES).unwrap());
+        observe_agent_pane(&mut store);
+        store.record_frame(
+            AGENT_SESSION,
+            AGENT_PANE,
+            "recent_unwrapped",
+            "text",
+            &agent_screen(0, 0),
+        );
+        store.record_frame(
+            AGENT_SESSION,
+            AGENT_PANE,
+            "recent_unwrapped",
+            "text",
+            &agent_screen(50, 1),
+        );
+        let rows = split_lines(&agent_window(&store, MAX_PANE_LINES).unwrap());
         // 56 transcript rows, then 50 more scrolled in, then the composer.
         assert_eq!(rows.len(), AGENT_TRANSCRIPT_ROWS + 50 + AGENT_BOX_ROWS);
         assert!(rows[0].contains("transcript row 0 "));
@@ -1444,7 +1938,7 @@ mod tests {
             printed.push(format!("── case {round} ──────────────"));
             printed.extend(block.iter().map(|row| (*row).to_owned()));
             let top = printed.len().saturating_sub(20);
-            store.record("k", &printed[top..].join("\n"));
+            store.record("k", &printed[top..].join("\n"), false);
         }
         let held = store.window("k", MAX_PANE_LINES).unwrap();
         let rows = split_lines(&held);
@@ -1458,12 +1952,12 @@ mod tests {
         // `clear` then fresh output: nothing is a re-send, and the read has to
         // land whole on top of what it followed rather than be folded into it.
         let mut store = ScrollbackStore::default();
-        store.record("k", &agent_screen(0, 0));
+        store.record("k", &agent_screen(0, 0), false);
         let before = split_lines(&store.window("k", MAX_PANE_LINES).unwrap()).len();
         let fresh: Vec<String> = (0..40)
             .map(|row| format!("$ a completely different program, line {row}"))
             .collect();
-        store.record("k", &fresh.join("\n"));
+        store.record("k", &fresh.join("\n"), false);
         let rows = split_lines(&store.window("k", MAX_PANE_LINES).unwrap());
         assert_eq!(rows.len(), before + 40);
         assert!(rows[0].contains("transcript row 0 "));
@@ -1480,12 +1974,12 @@ mod tests {
         // again. Writing them a second time is the whole of the duplication left
         // once the pinned composer is handled.
         let mut store = ScrollbackStore::default();
-        store.record("k", &agent_screen(0, 0));
-        store.record("k", &agent_screen(12, 1));
+        store.record("k", &agent_screen(0, 0), false);
+        store.record("k", &agent_screen(12, 1), false);
         let scrolled = split_lines(&store.window("k", MAX_PANE_LINES).unwrap()).len();
         assert_eq!(scrolled, AGENT_TRANSCRIPT_ROWS + 12 + AGENT_BOX_ROWS);
         // Back to where it was.
-        store.record("k", &agent_screen(0, 2));
+        store.record("k", &agent_screen(0, 2), false);
         let held = store.window("k", MAX_PANE_LINES).unwrap();
         assert!(substantial_duplicates(&held).is_empty());
         assert_eq!(
@@ -1502,12 +1996,13 @@ mod tests {
         // again: appending rows the buffer already ends with cannot be right
         // whatever the placement thought.
         let mut store = ScrollbackStore::default();
-        store.record("k", "keep me\ntail 1\ntail 2\ntail 3");
+        store.record("k", "keep me\ntail 1\ntail 2\ntail 3", false);
         // Shares its head with the buffer's tail, but is otherwise a different
         // screen -- too different for either placement to believe.
         store.record(
             "k",
             "tail 1\ntail 2\ntail 3\nq\nw\ne\nr\nt\ny\nu\ni\no\np\na\ns\nd",
+            false,
         );
         let held = store.window("k", MAX_PANE_LINES).unwrap();
         let rows = split_lines(&held);
@@ -1522,7 +2017,11 @@ mod tests {
         // The whole failure as the pane actually lives it: bursts of output
         // between polls, quiet spells where only the timer turns, and a couple
         // of jumps that outran the poll entirely.
+        //
+        // Driven through `observe_agent_pane` -> `record_frame` (see that
+        // test's own note on why).
         let mut store = ScrollbackStore::default();
+        observe_agent_pane(&mut store);
         let mut reads: Vec<Vec<String>> = Vec::new();
         let mut top = 0;
         for poll in 0..200 {
@@ -1536,9 +2035,15 @@ mod tests {
             top += scroll;
             let screen = agent_screen(top, poll);
             reads.push(split_lines(&screen));
-            store.record("k", &screen);
+            store.record_frame(
+                AGENT_SESSION,
+                AGENT_PANE,
+                "recent_unwrapped",
+                "text",
+                &screen,
+            );
         }
-        let held = store.window("k", MAX_PANE_LINES).unwrap();
+        let held = agent_window(&store, MAX_PANE_LINES).unwrap();
         let duplicates = substantial_duplicates(&held);
         assert!(
             duplicates.is_empty(),
@@ -1556,10 +2061,107 @@ mod tests {
         // The reader's paging re-requests the whole window at a wider limit, so
         // the same rows arrive again inside a longer read.
         let mut store = ScrollbackStore::default();
-        store.record("k", &screen(&["1", "2", "3", "4"]));
-        store.record("k", &screen(&["3", "4", "5", "6"]));
+        store.record("k", &screen(&["1", "2", "3", "4"]), false);
+        store.record("k", &screen(&["3", "4", "5", "6"]), false);
         let held_before = store.window("k", 100).unwrap();
-        store.record("k", &screen(&["1", "2", "3", "4", "5", "6"]));
+        store.record("k", &screen(&["1", "2", "3", "4", "5", "6"]), false);
         assert_eq!(store.window("k", 100).unwrap(), held_before);
+    }
+
+    #[test]
+    fn an_agent_pane_shaped_like_production_keeps_its_transcript() {
+        // Card #795 confirmation. Measured live: a Claude Code pane reports
+        // `alternate_on=1`, exactly like nvim's ("%1|claude|alternate_on=1|
+        // history_size=0" vs. "%27|nvim|alternate_on=1|history_size=0"), so
+        // gating `record`'s replace fallback on `alternate_on` alone cannot
+        // tell an editor's pane from an agent's. This drives an agent-shaped
+        // pane through the real `observe()` -> `keeps()` -> `serve_read()`
+        // path with the exact envelope shape `compat::pane` emits for one
+        // (`alternate_on: true`, `foreground_command: "claude"`) -- not a
+        // hand-passed parameter -- and asserts on the transcript this store
+        // ends up serving.
+        let mut store = ScrollbackStore::default();
+        observe_agent_pane(&mut store);
+        let mut top = 0;
+        for poll in 0..40 {
+            let scroll = match poll % 5 {
+                0 | 1 => 0,
+                2 | 3 => 2,
+                _ => 24,
+            };
+            top += scroll;
+            let screen = agent_screen(top, poll);
+            store.serve_read(
+                AGENT_SESSION,
+                AGENT_PANE,
+                "recent_unwrapped",
+                "text",
+                &screen,
+                MAX_PANE_LINES,
+            );
+        }
+        let held = agent_window(&store, MAX_PANE_LINES).unwrap();
+        let rows = split_lines(&held);
+        // The pane's viewport is AGENT_SCREEN_ROWS rows; the transcript has
+        // scrolled `top` rows past that. If the store served only the current
+        // screen -- the regression -- this holds at most AGENT_SCREEN_ROWS
+        // rows and the earliest transcript row is gone.
+        assert!(
+            rows.len() > AGENT_SCREEN_ROWS,
+            "held only {} rows (viewport is {}); the agent pane's transcript \
+             collapsed to its current screen",
+            rows.len(),
+            AGENT_SCREEN_ROWS
+        );
+        assert!(
+            rows[0].contains("transcript row 0 "),
+            "the earliest transcript row is gone: {:?}",
+            rows.first()
+        );
+    }
+
+    #[test]
+    fn an_nvim_pane_shaped_like_production_replaces_rather_than_accumulates() {
+        // The other half of card #795's confirmation, driven the same way as
+        // `an_agent_pane_shaped_like_production_keeps_its_transcript`: the
+        // exact envelope shape `compat::pane` emits for a live nvim pane
+        // (`foreground_command: "nvim"`, `history_size: 0`, so
+        // `max_offset_from_bottom: 0`), through the real `observe()` ->
+        // `keeps()` -> `serve_read()` path. nvim is a static rectangle --
+        // nothing scrolls off the top -- so accumulating two unrelated-looking
+        // repaints of it is exactly the doubled-frame bug `69c6df8` fixed, and
+        // must not come back.
+        let mut store = ScrollbackStore::default();
+        store.observe(
+            "s",
+            &json!({
+                "pane_id": "p",
+                "foreground_command": "nvim",
+                "scroll": { "max_offset_from_bottom": 0, "viewport_rows": 3 },
+            }),
+        );
+        store.serve_read(
+            "s",
+            "p",
+            "recent_unwrapped",
+            "text",
+            "old 1\nold 2\nold 3",
+            20,
+        );
+        let served = store.serve_read(
+            "s",
+            "p",
+            "recent_unwrapped",
+            "text",
+            "new 1\nnew 2\nnew 3",
+            20,
+        );
+        assert_eq!(served, "new 1\nnew 2\nnew 3");
+        assert_eq!(
+            store
+                .window(&read_key("s", "p", "recent_unwrapped", "text"), 20)
+                .unwrap(),
+            "new 1\nnew 2\nnew 3"
+        );
     }
 }

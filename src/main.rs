@@ -8,11 +8,12 @@ use std::process::{Command as ProcessCommand, Stdio};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path as FsPath, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context as _;
-use axum::body::Body;
+use axum::body::{to_bytes, Body};
 use axum::extract::multipart::{MultipartError, MultipartRejection};
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
@@ -20,9 +21,9 @@ use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse as _, Response};
 use axum::routing::{get, patch, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use base64::Engine as _;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use crossterm::cursor::MoveTo;
 use crossterm::event::{
     poll as poll_event, read as read_event, Event as TerminalEvent, KeyCode, KeyEventKind,
@@ -36,30 +37,45 @@ use qrcode::render::unicode;
 use qrcode::{EcLevel, QrCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio_stream::Stream;
+use tokio_stream::{Stream, StreamExt as _};
 
 mod agent_events;
 mod approvals;
+mod authority;
+mod backend;
 mod composer;
 mod i18n;
 mod native;
 mod parts;
 mod scrollback;
 mod shortcuts;
+mod state_lock;
 mod tasks;
+mod transport;
+
+use authority::{hash_token, identify_device, DeviceRecord, PairingCodeError, PendingPairing};
 
 use crate::i18n::Locale;
-
-#[cfg(unix)]
-use tokio::net::UnixStream;
+use backend::{
+    AgentStatus as BackendAgentStatus, BackendError, BackendFuture, BackendKind, BackendRegistry,
+    CreateTab as BackendCreateTab, CreateWorkspace as BackendCreateWorkspace,
+    OutputFormat as BackendOutputFormat, OutputSource as BackendOutputSource, Pane,
+    PaneId as BackendPaneId, ReadPane as BackendReadPane, SplitDirection as BackendSplitDirection,
+    SplitPane as BackendSplitPane, StartAgent as BackendStartAgent, TabId as BackendTabId,
+    TerminalBackend, TmuxWireIds, WorkspaceId as BackendWorkspaceId,
+    WorktreeRequest as BackendWorktreeRequest,
+};
 
 const CONFIG_FILE: &str = "config.json";
 const PAIRING_FILE: &str = "pairing.json";
 const PUSH_TOKENS_FILE: &str = "push-tokens.json";
 const DEVICES_FILE: &str = "devices.json";
+/// The generation of `devices.json` that the last write replaced, kept so a
+/// device file that goes bad is recoverable rather than terminal.
+const DEVICES_BACKUP_FILE: &str = "devices.json.bak";
 const PID_FILE: &str = "gateway.pid";
 const LOG_FILE: &str = "gateway.log";
+const HERDR_PLUGIN_IMPORT_MARKER: &str = ".herdr-plugin-imported";
 // Deliberately outside the common-service range and outside the OS ephemeral
 // ranges (Linux 32768-60999, macOS 49152-65535) so setup rarely collides.
 const DEFAULT_PORT: u16 = 23847;
@@ -73,7 +89,6 @@ const MAX_OUTPUT_LINES: u32 = 5000;
 const PARTS_DEFAULT_LINES: u32 = 400;
 const MAX_SEND_TEXT_BYTES: usize = 64 * 1024;
 const PAIRING_CODE_CHARACTER_COUNT: usize = 8;
-const PAIRING_CODE_LENGTH: usize = PAIRING_CODE_CHARACTER_COUNT + 1;
 const PAIRING_CODE_TTL_MS: u128 = 5 * 60 * 1000;
 const MAX_PAIRING_CODE_ATTEMPTS: u8 = 8;
 const PAIRING_RATE_LIMIT_WINDOW_MS: u128 = 10 * 60 * 1000;
@@ -155,10 +170,27 @@ const MANAGE_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 /// every pane or sending unchanged terminal frames over the network.
 const STREAM_OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(150);
 const STREAM_OUTPUT_READ_TIMEOUT: Duration = Duration::from_millis(100);
-const GATEWAY_API_VERSION: &str = "1.5.0";
+const GATEWAY_API_VERSION: &str = "1.7.0";
 const GATEWAY_API_MAJOR: u64 = 1;
+/// The oldest Herdr socket protocol this gateway knows how to speak.
+///
+/// There is deliberately no ceiling. `PROTOCOL_VERSION` in Herdr versions its
+/// *bincode TUI* client/server link; the JSON socket API this gateway actually
+/// speaks merely echoes the same number back from `ping`. Its bumps therefore
+/// track terminal input work the gateway never touches -- 17 to 19, across
+/// Herdr 0.7.5 to 0.8.0, was repeat counts, a text-commit message and a Kitty
+/// keyboard report -- while the JSON schema itself has only ever grown
+/// additively: new event types, new optional params, no field removed or
+/// retyped. Pinning a maximum turned every future Herdr release into a total
+/// outage for changes this gateway does not consume, and `herdr update` puts
+/// that one command away. So a newer Herdr is assumed compatible, and a real
+/// break is caught where it would actually surface -- the request that fails --
+/// rather than by refusing to serve anything at all.
+///
+/// The floor stays, because old and new are not symmetric. A genuinely ancient
+/// Herdr predates JSON fields this gateway requires, so failing fast beats a
+/// stream of unrelated errors from every workspace, pane, and event request.
 const HERDR_PROTOCOL_MIN: u64 = 17;
-const HERDR_PROTOCOL_MAX: u64 = 17;
 const MAX_REQUEST_BODY_BYTES: usize = 128 * 1024;
 const UPLOADS_DIR: &str = "uploads";
 /// Ceiling on one upload body, enforced by the framework's body limit so an
@@ -249,11 +281,13 @@ const API_CAPABILITIES: &[&str] = &[
     "push_token_revocation",
     "recent_cwds",
     "tasks",
+    "terminal_backends",
+    "multiple_terminal_backends",
     "terminal_input",
 ];
 
 #[derive(Parser)]
-#[command(name = "gateway", about = "Mobile gateway for Herdr")]
+#[command(name = "gateway", about = "Mobile gateway for terminal workspaces")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -268,6 +302,15 @@ enum Command {
         port: u16,
         #[arg(long)]
         socket_path: Option<String>,
+        /// Terminal workspace backend to configure. Omit it to leave an
+        /// existing install's backend alone (a bare `setup` never switches
+        /// what an install already runs); a genuinely fresh install with
+        /// nothing configured yet defaults to tmux.
+        #[arg(long, value_enum)]
+        backend: Option<SetupBackend>,
+        /// Application transport encryption for newly paired devices.
+        #[arg(long, value_enum)]
+        transport_encryption: Option<TransportEncryptionMode>,
     },
     Run {
         #[arg(long)]
@@ -277,6 +320,22 @@ enum Command {
     Stop,
     Status,
     Manage,
+    /// Add, remove, or inspect terminal backends in this gateway.
+    Backend {
+        #[command(subcommand)]
+        command: BackendCommand,
+    },
+    /// Adopt an existing Herdr plugin pairing into the standalone gateway.
+    ImportHerdrPlugin {
+        #[arg(long)]
+        config_dir: Option<PathBuf>,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[arg(long, hide = true)]
+        target_config_dir: Option<PathBuf>,
+        #[arg(long, hide = true)]
+        target_state_dir: Option<PathBuf>,
+    },
     /// List devices that hold a gateway token.
     Devices,
     /// Revoke one device's token, or every device token with --all.
@@ -288,6 +347,60 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum BackendCommand {
+    List,
+    Add {
+        #[arg(value_enum)]
+        backend: SetupBackend,
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long)]
+        socket_path: Option<String>,
+    },
+    Remove {
+        id: String,
+    },
+    /// Make one configured backend the first session returned to clients.
+    Default {
+        id: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SetupBackend {
+    Herdr,
+    Tmux,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+enum TransportEncryptionMode {
+    #[default]
+    Required,
+    Disabled,
+}
+
+impl TransportEncryptionMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Required => "required",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
+impl From<SetupBackend> for BackendKind {
+    fn from(value: SetupBackend) -> Self {
+        match value {
+            SetupBackend::Herdr => Self::Herdr,
+            SetupBackend::Tmux => Self::Tmux,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Config {
     server_id: String,
@@ -297,8 +410,12 @@ struct Config {
     /// Hash of the admin token. The admin token lives in `pairing.json` and is
     /// used by the local `manage` UI; paired devices get their own tokens.
     token_hash: String,
+    /// Controls how newly paired devices authenticate their HTTP transport.
+    /// Existing encrypted device records keep working after this changes.
+    #[serde(default, skip_serializing_if = "is_required_transport")]
+    transport_encryption: TransportEncryptionMode,
     sessions: Vec<SessionConfig>,
-    /// Herdr agent kind -> the executable `GET /api/agents/catalog` looks for on
+    /// Agent kind -> the executable `GET /api/agents/catalog` looks for on
     /// `PATH`. Only needed when a kind's binary is named something else on this
     /// machine; absent, every kind probes for its own name. Optional and
     /// omitted when empty, so an existing `config.json` keeps working untouched.
@@ -321,6 +438,10 @@ struct Config {
     rich_agent_pushes: bool,
 }
 
+fn is_required_transport(mode: &TransportEncryptionMode) -> bool {
+    *mode == TransportEncryptionMode::Required
+}
+
 /// `skip_serializing_if` for a flag whose absence is its default.
 fn is_false(value: &bool) -> bool {
     !*value
@@ -340,6 +461,9 @@ struct SessionConfig {
     id: String,
     label: String,
     socket_path: String,
+    /// Omitted for every existing config, where Herdr remains the default.
+    #[serde(default, skip_serializing_if = "BackendKind::is_herdr")]
+    backend: BackendKind,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -349,6 +473,10 @@ struct PairingPayload {
     label: String,
     url: String,
     token: String,
+    /// QR-only bootstrap secret used to protect pairing before a device token
+    /// exists. Older pairing files are upgraded the next time setup runs.
+    #[serde(default)]
+    transport_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -360,26 +488,6 @@ struct PublicUrlSelection {
     url: String,
     source: String,
     listen_host: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct PendingPairing {
-    request_id: String,
-    device_name: String,
-    #[serde(default)]
-    install_id: Option<String>,
-    code: String,
-    code_hash: String,
-    created_unix_ms: u128,
-    #[serde(default)]
-    failed_attempts: u8,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum PairingCodeError {
-    Missing,
-    Expired,
-    Invalid,
 }
 
 #[derive(Deserialize)]
@@ -427,22 +535,6 @@ impl PushTokenRecord {
             .and_then(Locale::from_code)
             .unwrap_or_default()
     }
-}
-
-/// One paired device. Each successful pairing mints a token that only this
-/// record can authenticate, so a single device can be revoked on its own.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct DeviceRecord {
-    id: String,
-    name: String,
-    token_hash: String,
-    paired_unix_ms: u128,
-    #[serde(default)]
-    last_seen_unix_ms: u128,
-    /// The client's stable install identifier, used to replace an earlier
-    /// record for the same device instead of piling up duplicates.
-    #[serde(default)]
-    install_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -635,6 +727,9 @@ struct OutputQuery {
     source: Option<String>,
     lines: Option<u32>,
     format: Option<String>,
+    /// Absolute half-open range. Both or neither; the range wins over `lines`.
+    start: Option<u32>,
+    end: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -725,19 +820,62 @@ async fn main() -> anyhow::Result<()> {
             public_url,
             port,
             socket_path,
-        } => setup(public_url, port, socket_path)?,
+            backend,
+            transport_encryption,
+        } => setup(
+            public_url,
+            port,
+            socket_path,
+            backend.map(Into::into),
+            transport_encryption,
+        )?,
         Command::Run { config } => run(config).await?,
         Command::Start => start_background()?,
         Command::Stop => stop_background()?,
         Command::Status => status()?,
         Command::Manage => manage()?,
+        Command::Backend { command } => configure_backend(command)?,
+        Command::ImportHerdrPlugin {
+            config_dir,
+            state_dir,
+            target_config_dir,
+            target_state_dir,
+        } => import_herdr_plugin(config_dir, state_dir, target_config_dir, target_state_dir)?,
         Command::Devices => list_devices()?,
         Command::Revoke { device_id, all } => revoke_device(device_id, all)?,
     }
     Ok(())
 }
 
-fn setup(public_url: Option<String>, port: u16, socket_path: Option<String>) -> anyhow::Result<()> {
+/// What `setup --backend` configures when the flag is left off.
+///
+/// An omitted `--backend` must never flip what an existing install already
+/// runs -- that is the whole complaint this default used to earn ("Herdr
+/// wins whenever it is installed, regardless of ... what the reader wants").
+/// So "no backend named" means "keep doing what this install already does"
+/// whenever there is an existing install to keep doing it: the same rule a
+/// bare `herdr plugin action invoke *.setup` (no CLI flags available to it)
+/// relies on to stay a no-op on every Herdr-plugin update. Only a genuinely
+/// fresh install -- nothing configured yet -- falls back to a hard default,
+/// and tmux is the honest one: it is the primary backend everywhere else
+/// (the app, the website, the store listing), and it needs nothing beyond
+/// tmux itself.
+fn resolve_setup_backend(explicit: Option<BackendKind>, existing: Option<&Config>) -> BackendKind {
+    explicit.unwrap_or_else(|| {
+        existing
+            .and_then(|config| config.sessions.first())
+            .map(|session| session.backend)
+            .unwrap_or(BackendKind::Tmux)
+    })
+}
+
+fn setup(
+    public_url: Option<String>,
+    port: u16,
+    socket_path: Option<String>,
+    backend: Option<BackendKind>,
+    transport_encryption: Option<TransportEncryptionMode>,
+) -> anyhow::Result<()> {
     let config_dir = config_dir()?;
     std::fs::create_dir_all(&config_dir)
         .with_context(|| format!("failed to create config dir {}", config_dir.display()))?;
@@ -746,16 +884,19 @@ fn setup(public_url: Option<String>, port: u16, socket_path: Option<String>) -> 
     // or a retry) refreshes settings without minting a new server id or token --
     // that would orphan every already-paired device. Only a consistent config +
     // pairing pair is trusted; a half-written state falls back to a fresh mint.
-    let existing = load_existing_identity(
+    let existing = load_existing_install(
         &config_dir.join(CONFIG_FILE),
         &config_dir.join(PAIRING_FILE),
     );
 
+    let backend = resolve_setup_backend(backend, existing.as_ref().map(|install| &install.config));
+    ensure_backend_available(backend)?;
+
     let (server_id, token, token_hash) = match &existing {
-        Some(id) => (
-            id.server_id.clone(),
-            id.token.clone(),
-            id.token_hash.clone(),
+        Some(install) => (
+            install.config.server_id.clone(),
+            install.pairing.payload.token.clone(),
+            install.config.token_hash.clone(),
         ),
         None => {
             let token = generate_token();
@@ -768,14 +909,14 @@ fn setup(public_url: Option<String>, port: u16, socket_path: Option<String>) -> 
     // the URL and listen address it already has (including one set from the
     // manage panel); only a fresh install auto-detects.
     let (public_url, listen, url_source) = match (public_url, &existing) {
-        (Some(url), _) => (
-            validate_public_url(&url)?,
-            format!("0.0.0.0:{port}"),
-            String::from("manual --public-url"),
-        ),
-        (None, Some(id)) => (
-            id.public_url.clone(),
-            id.listen.clone(),
+        (Some(url), _) => {
+            let url = validate_public_url(&url)?;
+            let listen = listen_for_explicit_public_url(&url, port);
+            (url, listen, String::from("manual --public-url"))
+        }
+        (None, Some(install)) => (
+            install.config.public_url.clone(),
+            install.config.listen.clone(),
             String::from("existing config"),
         ),
         (None, None) => {
@@ -787,35 +928,42 @@ fn setup(public_url: Option<String>, port: u16, socket_path: Option<String>) -> 
             )
         }
     };
-    let socket_path = socket_path
-        .or_else(|| std::env::var("HERDR_SOCKET_PATH").ok())
-        .unwrap_or_else(default_socket_path);
-
-    let config = Config {
-        server_id,
-        label: hostname_label(),
-        listen,
-        public_url: public_url.clone(),
-        token_hash,
-        sessions: vec![SessionConfig {
-            id: "default".into(),
-            label: "Default".into(),
-            socket_path,
-        }],
-        agent_commands: BTreeMap::new(),
-        rich_agent_pushes: false,
+    let transport_key = existing
+        .as_ref()
+        .map(|install| install.pairing.payload.transport_key.clone())
+        .filter(|value| transport::decode_key(value).is_ok_and(|key| key.len() == 32))
+        .unwrap_or_else(generate_token);
+    let mut config = match existing {
+        Some(install) => install.config,
+        None => Config {
+            server_id,
+            label: hostname_label(),
+            listen: listen.clone(),
+            public_url: public_url.clone(),
+            token_hash,
+            transport_encryption: TransportEncryptionMode::Required,
+            sessions: Vec::new(),
+            agent_commands: BTreeMap::new(),
+            rich_agent_pushes: false,
+        },
     };
+    config.listen = listen;
+    config.public_url = public_url.clone();
+    if let Some(mode) = transport_encryption {
+        config.transport_encryption = mode;
+    }
+    upsert_backend_session(&mut config, backend, None, None, socket_path)?;
 
     let path = config_dir.join(CONFIG_FILE);
-    write_secret_file(&path, &serde_json::to_vec_pretty(&config)?)
-        .with_context(|| format!("failed to write config {}", path.display()))?;
+    write_config(&path, &config)?;
 
     let payload = PairingPayload {
-        kind: "herdr-gateway".into(),
+        kind: "muqun-gateway".into(),
         server_id: config.server_id.clone(),
         label: config.label.clone(),
         url: public_url,
         token,
+        transport_key,
     };
     let pairing_path = config_dir.join(PAIRING_FILE);
     write_secret_file(
@@ -827,29 +975,39 @@ fn setup(public_url: Option<String>, port: u16, socket_path: Option<String>) -> 
     println!("wrote config: {}", path.display());
     println!("wrote pairing file: {}", pairing_path.display());
     println!("public URL: {} ({url_source})", payload.url);
+    println!(
+        "transport encryption: {}",
+        config.transport_encryption.as_str()
+    );
+    if config.transport_encryption == TransportEncryptionMode::Disabled {
+        println!(
+            "warning: transport encryption is disabled; a leaked bearer token can call the API"
+        );
+    }
     if payload.url.contains("127.0.0.1") || payload.url.contains("localhost") {
         println!("warning: pairing URL is local-only; rerun setup after starting Tailscale or pass --public-url");
+    } else if payload.url.starts_with("http://") {
+        let protection = transport_protection(&config);
+        if protection == "tailscale-wireguard" {
+            println!("security: HTTP is carried inside Tailscale WireGuard; Tailscale Serve HTTPS is still preferred");
+        } else {
+            println!("warning: HTTP exposes bearer tokens on the network; configure HTTPS or bind only to Tailscale");
+        }
     }
     println!("pairing identity is ready");
-    println!("open the Gateway Manager pane to scan the QR code");
+    println!("run `muqun-gateway manage` in any terminal to scan the QR code");
     Ok(())
 }
 
-/// The parts of a prior install that setup preserves so a rerun keeps devices
-/// paired. Pulled from both files: the server id and admin token hash live in
-/// the config, the raw admin token lives in the pairing file.
-struct ExistingIdentity {
-    server_id: String,
-    token: String,
-    token_hash: String,
-    public_url: String,
-    listen: String,
+struct ExistingInstall {
+    config: Config,
+    pairing: PairingFile,
 }
 
-fn load_existing_identity(
+fn load_existing_install(
     config_path: &std::path::Path,
     pairing_path: &std::path::Path,
-) -> Option<ExistingIdentity> {
+) -> Option<ExistingInstall> {
     let config: Config = serde_json::from_slice(&std::fs::read(config_path).ok()?).ok()?;
     let pairing: PairingFile = serde_json::from_slice(&std::fs::read(pairing_path).ok()?).ok()?;
     // A config whose pairing file points at a different server is inconsistent;
@@ -858,13 +1016,357 @@ fn load_existing_identity(
     if pairing.payload.server_id != config.server_id {
         return None;
     }
-    Some(ExistingIdentity {
-        server_id: config.server_id,
-        token: pairing.payload.token,
-        token_hash: config.token_hash,
-        public_url: config.public_url,
-        listen: config.listen,
-    })
+    if hash_token(&pairing.payload.token) != config.token_hash {
+        return None;
+    }
+    Some(ExistingInstall { config, pairing })
+}
+
+fn ensure_backend_available(backend: BackendKind) -> anyhow::Result<()> {
+    backend_registry().ensure_available(backend)
+}
+
+fn default_backend_socket(backend: BackendKind) -> String {
+    backend_registry().default_socket(backend)
+}
+
+fn default_backend_label(backend: BackendKind) -> &'static str {
+    backend_registry().default_label(backend)
+}
+
+fn backend_registry() -> BackendRegistry {
+    BackendRegistry::new(
+        std::env::var("HERDR_SOCKET_PATH")
+            .ok()
+            .unwrap_or_else(default_socket_path),
+    )
+}
+
+fn backend_endpoint(session: &SessionConfig) -> String {
+    backend_registry()
+        .endpoint(session.backend, &session.socket_path)
+        .into_owned()
+}
+
+fn validate_session_id(id: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !id.is_empty() && id.len() <= 64,
+        "backend id must be 1 to 64 bytes"
+    );
+    anyhow::ensure!(
+        id.bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')),
+        "backend id may contain only letters, numbers, '.', '-', and '_'"
+    );
+    Ok(())
+}
+
+fn next_backend_id(config: &Config, backend: BackendKind) -> String {
+    if config.sessions.is_empty() {
+        return String::from("default");
+    }
+    let base = backend.as_str();
+    if config.sessions.iter().all(|session| session.id != base) {
+        return base.to_owned();
+    }
+    (2..)
+        .map(|suffix| format!("{base}-{suffix}"))
+        .find(|candidate| {
+            config
+                .sessions
+                .iter()
+                .all(|session| session.id != *candidate)
+        })
+        .expect("an unused backend id exists")
+}
+
+fn upsert_backend_session(
+    config: &mut Config,
+    backend: BackendKind,
+    requested_id: Option<String>,
+    label: Option<String>,
+    socket_path: Option<String>,
+) -> anyhow::Result<String> {
+    ensure_backend_available(backend)?;
+    if let Some(session) = config.sessions.iter_mut().find(|session| {
+        session.backend == backend && requested_id.as_deref().is_none_or(|id| session.id == id)
+    }) {
+        if let Some(label) = label {
+            validate_label(&label)?;
+            session.label = label;
+        }
+        if let Some(socket_path) = socket_path {
+            session.socket_path = socket_path;
+        }
+        return Ok(session.id.clone());
+    }
+
+    let id = requested_id.unwrap_or_else(|| next_backend_id(config, backend));
+    validate_session_id(&id)?;
+    anyhow::ensure!(
+        config.sessions.iter().all(|session| session.id != id),
+        "backend id {id} already exists"
+    );
+    let label = label.unwrap_or_else(|| default_backend_label(backend).to_owned());
+    validate_label(&label)?;
+    config.sessions.push(SessionConfig {
+        id: id.clone(),
+        label,
+        socket_path: socket_path.unwrap_or_else(|| default_backend_socket(backend)),
+        backend,
+    });
+    // Neither `GET /api/sessions` nor `gateway_metadata`'s "primary" session
+    // for `/health` and `/api/meta` serve in this stored order any more --
+    // both reorder every request by which backend actually has something
+    // live in it (see `session_order_key` / `ordered_sessions`). What this
+    // stored order still governs: the order `configure_backend list` and
+    // `config.json` present to a human. Stable, so two sessions of the same
+    // backend keep the order they were added in.
+    config
+        .sessions
+        .sort_by_key(|session| match session.backend {
+            BackendKind::Tmux => 0,
+            BackendKind::Herdr => 1,
+        });
+    Ok(id)
+}
+
+fn validate_label(label: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(!label.trim().is_empty(), "backend label cannot be empty");
+    anyhow::ensure!(
+        label.chars().count() <= MAX_WORKSPACE_LABEL_CHARS,
+        "backend label is too long"
+    );
+    anyhow::ensure!(
+        !label.chars().any(char::is_control),
+        "backend label cannot contain control characters"
+    );
+    Ok(())
+}
+
+fn write_config(path: &std::path::Path, config: &Config) -> anyhow::Result<()> {
+    write_secret_file(path, &serde_json::to_vec_pretty(config)?)
+        .with_context(|| format!("failed to write config {}", path.display()))
+}
+
+fn configure_backend(command: BackendCommand) -> anyhow::Result<()> {
+    let path = config_dir()?.join(CONFIG_FILE);
+    let mut config = load_config(None)?;
+    match command {
+        BackendCommand::List => {
+            for session in &config.sessions {
+                let endpoint = backend_endpoint(session);
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    session.id,
+                    session.backend.as_str(),
+                    session.label,
+                    endpoint
+                );
+            }
+            return Ok(());
+        }
+        BackendCommand::Add {
+            backend,
+            id,
+            label,
+            socket_path,
+        } => {
+            let id = upsert_backend_session(&mut config, backend.into(), id, label, socket_path)?;
+            write_config(&path, &config)?;
+            println!("backend {id} configured; restart the gateway to apply changes");
+        }
+        BackendCommand::Remove { id } => {
+            validate_session_id(&id)?;
+            anyhow::ensure!(config.sessions.len() > 1, "cannot remove the only backend");
+            let previous_len = config.sessions.len();
+            config.sessions.retain(|session| session.id != id);
+            anyhow::ensure!(
+                config.sessions.len() != previous_len,
+                "backend {id} not found"
+            );
+            write_config(&path, &config)?;
+            println!("backend {id} removed; restart the gateway to apply changes");
+        }
+        BackendCommand::Default { id } => {
+            make_backend_default(&mut config, &id)?;
+            write_config(&path, &config)?;
+            println!("backend {id} is now the default; restart the gateway to apply changes");
+        }
+    }
+    Ok(())
+}
+
+fn make_backend_default(config: &mut Config, id: &str) -> anyhow::Result<()> {
+    validate_session_id(id)?;
+    let position = config
+        .sessions
+        .iter()
+        .position(|session| session.id == id)
+        .with_context(|| format!("backend {id} not found"))?;
+    if position > 0 {
+        let session = config.sessions.remove(position);
+        config.sessions.insert(0, session);
+    }
+    Ok(())
+}
+
+fn import_herdr_plugin(
+    source_config_dir: Option<PathBuf>,
+    source_state_dir: Option<PathBuf>,
+    target_config_dir: Option<PathBuf>,
+    target_state_dir: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let source_config_dir = source_config_dir.unwrap_or(default_herdr_plugin_config_dir()?);
+    let source_state_dir = source_state_dir.unwrap_or(default_herdr_plugin_state_dir()?);
+    let source = load_existing_install(
+        &source_config_dir.join(CONFIG_FILE),
+        &source_config_dir.join(PAIRING_FILE),
+    )
+    .context("Herdr plugin config and pairing files are missing or inconsistent")?;
+    anyhow::ensure!(
+        source
+            .config
+            .sessions
+            .iter()
+            .any(|session| session.backend == BackendKind::Herdr),
+        "the source installation does not configure a Herdr backend"
+    );
+    let running = gateway_listener_pids(source.config.port()).unwrap_or_default();
+    anyhow::ensure!(
+        running.is_empty(),
+        "stop the running gateway before importing its pairing identity"
+    );
+
+    let target_config_dir = target_config_dir.unwrap_or(standalone_config_dir()?);
+    let target_state_dir = target_state_dir.unwrap_or(standalone_state_dir()?);
+    std::fs::create_dir_all(&target_config_dir)?;
+    std::fs::create_dir_all(&target_state_dir)?;
+    // This merges records into the target's device file. A gateway running
+    // against that directory holds the pre-merge list in memory and would
+    // write it back over the merge at its next pairing, so the import has to
+    // own the directory outright while it runs.
+    let _target_lock = state_lock::StateLock::acquire(&target_state_dir)
+        .context("cannot import into a state directory a gateway is using")?;
+    let target_config_path = target_config_dir.join(CONFIG_FILE);
+    let target_pairing_path = target_config_dir.join(PAIRING_FILE);
+    let target = if target_config_path.exists() || target_pairing_path.exists() {
+        Some(
+            load_existing_install(&target_config_path, &target_pairing_path).context(
+                "standalone config and pairing files are inconsistent; refusing to overwrite them",
+            )?,
+        )
+    } else {
+        None
+    };
+
+    let mut merged = source.config;
+    if let Some(target) = &target {
+        for session in &target.config.sessions {
+            if merged
+                .sessions
+                .iter()
+                .any(|existing| existing.backend == session.backend)
+            {
+                continue;
+            }
+            upsert_backend_session(
+                &mut merged,
+                session.backend,
+                None,
+                Some(session.label.clone()),
+                Some(session.socket_path.clone()),
+            )?;
+        }
+        for (kind, command) in &target.config.agent_commands {
+            merged
+                .agent_commands
+                .entry(kind.clone())
+                .or_insert_with(|| command.clone());
+        }
+        merged.rich_agent_pushes |= target.config.rich_agent_pushes;
+    }
+
+    backup_secret_file(&target_config_path)?;
+    backup_secret_file(&target_pairing_path)?;
+    write_config(&target_config_path, &merged)?;
+    write_secret_file(
+        &target_pairing_path,
+        &serde_json::to_vec_pretty(&source.pairing)?,
+    )?;
+
+    merge_plugin_state::<DeviceRecord, _>(
+        &source_state_dir.join(DEVICES_FILE),
+        &target_state_dir.join(DEVICES_FILE),
+        |left, right| left.id == right.id || left.token_hash == right.token_hash,
+    )?;
+    merge_plugin_state::<PushTokenRecord, _>(
+        &source_state_dir.join(PUSH_TOKENS_FILE),
+        &target_state_dir.join(PUSH_TOKENS_FILE),
+        |left, right| left.token == right.token,
+    )?;
+    write_secret_file(
+        &target_config_dir.join(HERDR_PLUGIN_IMPORT_MARKER),
+        source_config_dir.to_string_lossy().as_bytes(),
+    )?;
+
+    println!(
+        "imported Herdr plugin pairing into {}",
+        target_config_dir.display()
+    );
+    println!("preserved server id: {}", merged.server_id);
+    println!("configured backends:");
+    for session in &merged.sessions {
+        println!("  {} ({})", session.id, session.backend.as_str());
+    }
+    println!("source files were retained; run `muqun-gateway start` when ready");
+    Ok(())
+}
+
+fn backup_secret_file(path: &std::path::Path) -> anyhow::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("gateway-secret");
+    let backup = path.with_file_name(format!("{file_name}.before-herdr-import"));
+    if !backup.exists() {
+        write_secret_file(&backup, &std::fs::read(path)?)?;
+    }
+    Ok(())
+}
+
+fn merge_plugin_state<T, F>(
+    source_path: &std::path::Path,
+    target_path: &std::path::Path,
+    same: F,
+) -> anyhow::Result<()>
+where
+    T: Serialize + serde::de::DeserializeOwned,
+    F: Fn(&T, &T) -> bool,
+{
+    let mut source: Vec<T> = if source_path.exists() {
+        serde_json::from_slice(&std::fs::read(source_path)?)?
+    } else {
+        Vec::new()
+    };
+    let target: Vec<T> = if target_path.exists() {
+        serde_json::from_slice(&std::fs::read(target_path)?)?
+    } else {
+        Vec::new()
+    };
+    for value in target {
+        if !source.iter().any(|existing| same(existing, &value)) {
+            source.push(value);
+        }
+    }
+    backup_secret_file(target_path)?;
+    if !source.is_empty() || target_path.exists() || source_path.exists() {
+        write_secret_file(target_path, &serde_json::to_vec_pretty(&source)?)?;
+    }
+    Ok(())
 }
 
 fn auto_public_url(port: u16) -> PublicUrlSelection {
@@ -1003,6 +1505,13 @@ fn start_background_inner(verbose: bool) -> anyhow::Result<()> {
             return Ok(());
         }
     }
+    // The pid file only knows about gateways this subcommand started. One
+    // launched by systemd, or by hand, leaves no pid file at all -- and that
+    // is precisely the pairing-losing case. Ask the state directory instead,
+    // then hand the lock straight to the child. Without this the spawn below
+    // would "succeed" and the child would die a moment later in the log,
+    // where nobody is looking.
+    drop(state_lock::StateLock::acquire(&state_dir)?);
 
     let exe = std::env::current_exe().context("failed to find current executable")?;
     let config = config_dir()?.join(CONFIG_FILE);
@@ -1091,6 +1600,17 @@ fn stop_background_inner(verbose: bool) -> anyhow::Result<()> {
 }
 
 async fn run(config_path: Option<String>) -> anyhow::Result<()> {
+    // Taken before the device list is read and held for the life of the
+    // process. This gateway caches the whole list in memory and rewrites the
+    // whole file on every change, so a second gateway against the same
+    // directory would not interleave with it -- it would overwrite it, and
+    // whichever devices the loser had paired would be silently unpaired.
+    //
+    // The binding has to be named: `let _ = ...` would drop the lock on the
+    // spot and leave this gateway believing it owned a directory it had
+    // already released.
+    let _state_lock = state_lock::StateLock::acquire(&state_dir()?)?;
+    ensure_pairing_transport_key()?;
     let config = load_config(config_path)?;
     let addr: SocketAddr = config
         .listen
@@ -1101,8 +1621,8 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         config,
         pending_pairing: Arc::new(Mutex::new(None)),
         pairing_requests: Arc::new(Mutex::new(VecDeque::new())),
-        push_tokens: Arc::new(Mutex::new(read_push_tokens().unwrap_or_default())),
-        devices: Arc::new(Mutex::new(read_devices().unwrap_or_default())),
+        push_tokens: Arc::new(Mutex::new(load_push_tokens_for_service())),
+        devices: Arc::new(Mutex::new(load_devices_for_service()?)),
         assets: Arc::new(Mutex::new(AssetIndex::default())),
         scrollback: Arc::new(Mutex::new(scrollback::ScrollbackStore::default())),
         agent_events: Arc::new(Mutex::new(agent_events::AgentEventLog::default())),
@@ -1237,7 +1757,10 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
             "/api/sessions/{session_id}/panes/{pane_id}/send-keys",
             post(send_keys),
         )
-        .route("/api/sessions/{session_id}/assets", get(session_assets))
+        .route(
+            "/api/sessions/{session_id}/tabs/{tab_id}/assets",
+            get(session_assets),
+        )
         .route("/api/assets/{asset_id}/content", get(asset_content))
         // A route-level limit is applied inside the router-wide one, so uploads
         // get their own ceiling while every JSON route keeps the small one.
@@ -1247,6 +1770,10 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         )
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .layer(middleware::from_fn_with_state(
+            state.clone(),
+            encrypted_transport,
+        ))
+        .layer(middleware::from_fn_with_state(
             known_hosts(&state.config),
             known_host,
         ))
@@ -1254,7 +1781,7 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         .layer(middleware::from_fn(request_locale))
         .with_state(state);
 
-    println!("herdr gateway listening on http://{addr}");
+    println!("terminal gateway listening on http://{addr}");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
@@ -1270,6 +1797,322 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
 async fn request_locale(request: Request<Body>, next: Next) -> Response {
     let locale = Locale::from_headers(request.headers());
     i18n::scope(locale, next.run(request)).await
+}
+
+const TRANSPORT_HEADER: &str = "x-muqun-transport";
+const TRANSPORT_DEVICE_HEADER: &str = "x-muqun-device";
+const TRANSPORT_ENVELOPE_HEADER: &str = "x-muqun-envelope";
+const TRANSPORT_PROOF_HEADER: &str = "x-muqun-internal-device-proof";
+
+#[derive(Serialize, Deserialize)]
+struct EncryptedRequestPayload {
+    token: String,
+    #[serde(default)]
+    content_type: Option<String>,
+    body: String,
+}
+
+#[derive(Serialize)]
+struct EncryptedResponsePayload {
+    status: u16,
+    headers: BTreeMap<String, String>,
+    body: String,
+}
+
+/// What an encrypted-transport request leaves behind for a handler that
+/// answers with a stream instead of a finite body. A whole-response envelope
+/// cannot authenticate a response that never ends, so the events handler
+/// seals each event on its own -- and this is the key material and request
+/// binding it seals under. Injected by `decrypt_transport_request`, so its
+/// presence also proves the request itself authenticated.
+#[derive(Clone)]
+struct EncryptedStreamContext {
+    material: Vec<u8>,
+    request_aad: String,
+    request_nonce: String,
+}
+
+/// Decrypt an authenticated request before Axum extractors see it, then seal
+/// the complete response. Route names and byte counts remain HTTP metadata;
+/// credentials and application payloads do not.
+async fn encrypted_transport(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    if request
+        .headers()
+        .get(TRANSPORT_HEADER)
+        .and_then(|value| value.to_str().ok())
+        != Some("1")
+    {
+        return next.run(request).await;
+    }
+
+    match decrypt_transport_request(&state, request).await {
+        Ok((request, material, aad, request_nonce)) => {
+            let response = next.run(request).await;
+            // An event stream never ends, so it cannot ride the one-envelope
+            // response path -- buffering it here would simply hang the
+            // connection. The events handler has already sealed every event
+            // individually under the stream context injected above, so the
+            // response passes through as standard SSE.
+            if response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("text/event-stream"))
+            {
+                let mut response = response;
+                response.headers_mut().insert(
+                    axum::http::HeaderName::from_static(TRANSPORT_HEADER),
+                    HeaderValue::from_static("1"),
+                );
+                return response;
+            }
+            encrypt_transport_response(response, &material, &aad, &request_nonce).await
+        }
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn decrypt_transport_request(
+    state: &AppState,
+    request: Request<Body>,
+) -> ApiResult<(Request<Body>, Vec<u8>, String, String)> {
+    let (mut parts, body) = request.into_parts();
+    let device_id = parts
+        .headers
+        .get(TRANSPORT_DEVICE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| value.len() <= 80)
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::UNAUTHORIZED,
+                "missing_transport_device",
+                "missing encrypted transport device",
+            )
+        })?;
+    let (token_hash, transport_key) = {
+        let devices = lock_devices(state)?;
+        let device = devices
+            .iter()
+            .find(|device| device.id == device_id)
+            .ok_or_else(|| api_error(StatusCode::FORBIDDEN, "invalid_token", "invalid token"))?;
+        let transport_key = device.transport_key.clone().ok_or_else(|| {
+            api_error(
+                StatusCode::UPGRADE_REQUIRED,
+                "device_repair_required",
+                "pair this device again to enable encrypted transport",
+            )
+        })?;
+        (device.token_hash.clone(), transport_key)
+    };
+    let material = transport::decode_key(&transport_key).map_err(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "transport_key_unavailable",
+            "encrypted transport is unavailable",
+        )
+    })?;
+    let aad = format!(
+        "{} {}",
+        parts.method,
+        parts
+            .uri
+            .path_and_query()
+            .map_or(parts.uri.path(), |value| value.as_str())
+    );
+    let body_bytes = to_bytes(body, MAX_UPLOAD_BYTES + MAX_REQUEST_BODY_BYTES)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_envelope",
+                "invalid encrypted request",
+            )
+        })?;
+    let envelope_bytes = match parts.headers.get(TRANSPORT_ENVELOPE_HEADER) {
+        Some(value) => transport::decode_key(value.to_str().unwrap_or_default()).map_err(|_| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_envelope",
+                "invalid encrypted request",
+            )
+        })?,
+        None => body_bytes.to_vec(),
+    };
+    let envelope: transport::Envelope = serde_json::from_slice(&envelope_bytes).map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_envelope",
+            "invalid encrypted request",
+        )
+    })?;
+    let plaintext = transport::open(
+        &material,
+        transport::Direction::Request,
+        aad.as_bytes(),
+        &envelope,
+        now_unix_ms(),
+    )
+    .map_err(|_| {
+        api_error(
+            StatusCode::FORBIDDEN,
+            "invalid_envelope",
+            "invalid encrypted request",
+        )
+    })?;
+    let payload: EncryptedRequestPayload = serde_json::from_slice(&plaintext).map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "invalid request",
+        )
+    })?;
+    if hash_token(&payload.token) != token_hash {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "invalid_token",
+            "invalid token",
+        ));
+    }
+    // Only authenticated envelopes enter the replay cache. Otherwise anyone
+    // who knows a device id could fill it with arbitrary nonces.
+    remember_transport_nonce(device_id, &envelope)?;
+    let body = transport::decode_key(&payload.body).map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "invalid request",
+        )
+    })?;
+    parts.headers.remove(TRANSPORT_HEADER);
+    parts.headers.remove(TRANSPORT_DEVICE_HEADER);
+    parts.headers.remove(TRANSPORT_ENVELOPE_HEADER);
+    parts.headers.insert(
+        axum::http::HeaderName::from_static(TRANSPORT_PROOF_HEADER),
+        HeaderValue::from_str(&transport_key).map_err(|_| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "transport_key_unavailable",
+                "encrypted transport is unavailable",
+            )
+        })?,
+    );
+    parts.headers.insert(
+        axum::http::header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {}", payload.token))
+            .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid_token", "invalid token"))?,
+    );
+    if let Some(content_type) = payload.content_type {
+        parts.headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_str(&content_type).map_err(|_| {
+                api_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_content_type",
+                    "invalid content type",
+                )
+            })?,
+        );
+    } else {
+        parts.headers.remove(axum::http::header::CONTENT_TYPE);
+    }
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    parts.extensions.insert(EncryptedStreamContext {
+        material: material.clone(),
+        request_aad: aad.clone(),
+        request_nonce: envelope.nonce.clone(),
+    });
+    Ok((
+        Request::from_parts(parts, Body::from(body)),
+        material,
+        aad,
+        envelope.nonce,
+    ))
+}
+
+fn remember_transport_nonce(device_id: &str, envelope: &transport::Envelope) -> ApiResult<()> {
+    use std::sync::OnceLock;
+    static SEEN: OnceLock<Mutex<HashMap<String, u128>>> = OnceLock::new();
+    let mut seen = SEEN
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|_| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "replay_cache_failed",
+                "request failed",
+            )
+        })?;
+    let now = now_unix_ms();
+    seen.retain(|_, timestamp| now.abs_diff(*timestamp) <= transport::MAX_CLOCK_SKEW_MS);
+    let key = format!("{device_id}:{}", envelope.nonce);
+    if seen.insert(key, envelope.timestamp_ms).is_some() {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "replayed_request",
+            "request was already used",
+        ));
+    }
+    Ok(())
+}
+
+async fn encrypt_transport_response(
+    response: Response,
+    material: &[u8],
+    aad: &str,
+    request_nonce: &str,
+) -> Response {
+    let (parts, body) = response.into_parts();
+    let body = match to_bytes(body, MAX_UPLOAD_BYTES + MAX_REQUEST_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(_) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "response_too_large",
+                "failed to encrypt response",
+            )
+            .into_response()
+        }
+    };
+    let headers = parts
+        .headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_owned(), value.to_owned()))
+        })
+        .collect();
+    let payload = EncryptedResponsePayload {
+        status: parts.status.as_u16(),
+        headers,
+        body: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(body),
+    };
+    let plaintext = match serde_json::to_vec(&payload) {
+        Ok(value) => value,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let response_aad = format!("{aad}\n{request_nonce}");
+    let envelope = match transport::seal(
+        material,
+        transport::Direction::Response,
+        response_aad.as_bytes(),
+        &plaintext,
+        now_unix_ms(),
+    ) {
+        Ok(value) => value,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let mut response = Json(envelope).into_response();
+    response.headers_mut().insert(
+        axum::http::HeaderName::from_static(TRANSPORT_HEADER),
+        HeaderValue::from_static("1"),
+    );
+    response
 }
 
 /// Refuse a request that arrived under a name this gateway does not answer to.
@@ -1413,8 +2256,14 @@ async fn openapi_json() -> Json<Value> {
 
 async fn pair_request(
     State(state): State<AppState>,
-    Json(body): Json<PairRequestBody>,
-) -> ApiResult<Json<Value>> {
+    Json(wire): Json<Value>,
+) -> ApiResult<Response> {
+    let (body, request_nonce) = decode_pairing_body::<PairRequestBody>(
+        wire,
+        b"POST /api/pair/request",
+        transport::Direction::PairingRequest,
+    )?;
+    require_pairing_transport(state.config.transport_encryption, request_nonce.is_some())?;
     if !valid_request_id(&body.request_id) {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
@@ -1446,9 +2295,13 @@ async fn pair_request(
         )
     })?;
     if let Some(pending) = pending_pairing.as_ref() {
-        if !pairing_code_expired(pending, now) {
+        if !authority::pairing_code_expired(pending, now, PAIRING_CODE_TTL_MS) {
             if pending.request_id == body.request_id {
-                return Ok(Json(pair_request_response(&state.config, &body.request_id)));
+                return pairing_response(
+                    pair_request_response(&state.config, &body.request_id),
+                    b"POST /api/pair/request",
+                    request_nonce.as_deref(),
+                );
             }
             return Err(api_error(
                 StatusCode::CONFLICT,
@@ -1476,7 +2329,11 @@ async fn pair_request(
         failed_attempts: 0,
     };
     *pending_pairing = Some(pending);
-    Ok(Json(pair_request_response(&state.config, &body.request_id)))
+    pairing_response(
+        pair_request_response(&state.config, &body.request_id),
+        b"POST /api/pair/request",
+        request_nonce.as_deref(),
+    )
 }
 
 fn record_pairing_request(state: &AppState, now_unix_ms: u128) -> ApiResult<()> {
@@ -1504,11 +2361,14 @@ fn record_pairing_request(state: &AppState, now_unix_ms: u128) -> ApiResult<()> 
     Ok(())
 }
 
-async fn pair_claim(
-    State(state): State<AppState>,
-    Json(body): Json<PairClaimBody>,
-) -> ApiResult<Json<Value>> {
-    let (device_name, install_id) = {
+async fn pair_claim(State(state): State<AppState>, Json(wire): Json<Value>) -> ApiResult<Response> {
+    let (body, request_nonce) = decode_pairing_body::<PairClaimBody>(
+        wire,
+        b"POST /api/pair/claim",
+        transport::Direction::PairingRequest,
+    )?;
+    require_pairing_transport(state.config.transport_encryption, request_nonce.is_some())?;
+    let (device_name, install_id, code) = {
         let mut pending = state.pending_pairing.lock().map_err(|_| {
             api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1522,52 +2382,53 @@ async fn pair_claim(
             .unwrap_or_else(|| "Muqun app".into());
         let install_id = pending.as_ref().and_then(|value| value.install_id.clone());
         let code = body.code.trim().to_ascii_uppercase();
-        consume_pairing_code(&mut pending, &body.request_id, &code, now_unix_ms()).map_err(
-            |error| match error {
-                PairingCodeError::Missing => api_error(
-                    StatusCode::FORBIDDEN,
-                    "pairing_not_requested",
-                    "no pending pairing request",
-                ),
-                PairingCodeError::Expired => api_error(
-                    StatusCode::GONE,
-                    "pairing_code_expired",
-                    "pairing code expired; request a new code",
-                ),
-                PairingCodeError::Invalid => api_error(
-                    StatusCode::FORBIDDEN,
-                    "invalid_pairing_code",
-                    "invalid pairing code",
-                ),
-            },
-        )?;
-        (device_name, install_id)
+        authority::consume_pairing_code(
+            &mut pending,
+            &body.request_id,
+            &code,
+            now_unix_ms(),
+            PAIRING_CODE_TTL_MS,
+            MAX_PAIRING_CODE_ATTEMPTS,
+        )
+        .map_err(|error| match error {
+            PairingCodeError::Missing => api_error(
+                StatusCode::FORBIDDEN,
+                "pairing_not_requested",
+                "no pending pairing request",
+            ),
+            PairingCodeError::Expired => api_error(
+                StatusCode::GONE,
+                "pairing_code_expired",
+                "pairing code expired; request a new code",
+            ),
+            PairingCodeError::Invalid => api_error(
+                StatusCode::FORBIDDEN,
+                "invalid_pairing_code",
+                "invalid pairing code",
+            ),
+        })?;
+        (device_name, install_id, code)
     };
 
     // Each device gets its own token so it can be revoked without disturbing
     // the others. The admin token in pairing.json is never handed out.
     let token = generate_token();
+    let device_transport_key = (state.config.transport_encryption
+        == TransportEncryptionMode::Required)
+        .then(generate_token);
     let record = DeviceRecord {
         id: uuid::Uuid::new_v4().to_string(),
         name: device_name,
         token_hash: hash_token(&token),
+        transport_key: device_transport_key.clone(),
         paired_unix_ms: now_unix_ms(),
         last_seen_unix_ms: now_unix_ms(),
         install_id: install_id.clone(),
     };
+    let device_id = record.id.clone();
     {
         let mut devices = lock_devices(&state)?;
-        // One record per install: replace an earlier pairing from the same
-        // device rather than accumulating duplicates.
-        if let Some(install_id) = install_id.as_deref() {
-            devices.retain(|device| device.install_id.as_deref() != Some(install_id));
-        }
-        devices.push(record);
-        devices.sort_by_key(|item| item.paired_unix_ms);
-        if devices.len() > MAX_DEVICES {
-            let excess = devices.len() - MAX_DEVICES;
-            devices.drain(..excess);
-        }
+        authority::enroll_device(&mut devices, record, MAX_DEVICES);
         write_devices(&devices).map_err(|err| {
             eprintln!("failed to write device tokens: {err:#}");
             api_error(
@@ -1578,13 +2439,288 @@ async fn pair_claim(
         })?;
     }
 
-    Ok(Json(json!({
-        "kind": "herdr-gateway",
+    let mut response_payload = json!({
+        "kind": "muqun-gateway",
         "server_id": state.config.server_id,
         "label": state.config.label,
         "url": state.config.public_url,
-        "token": token
-    })))
+        "token": token,
+        "device_id": device_id
+    });
+    if let Some(device_transport_key) = device_transport_key {
+        response_payload["transport_key"] = Value::String(device_transport_key);
+        response_payload["transport"] = Value::String("muqun-aes-256-gcm-v1".into());
+    }
+    let response = if request_nonce.is_some() {
+        // Scanned the QR: request and response are both sealed with the
+        // pre-shared key it carried. Unchanged from before this card.
+        pairing_response(
+            response_payload,
+            b"POST /api/pair/claim",
+            request_nonce.as_deref(),
+        )?
+    } else if state.config.transport_encryption == TransportEncryptionMode::Required {
+        // Typed the address and code: there is no pre-shared key, so the code
+        // just spent to authenticate this claim is also what protects the
+        // response in transit. See `code_pairing_response` for why that is
+        // sound with an eight-character code and what it still costs.
+        code_pairing_response(
+            response_payload,
+            b"POST /api/pair/claim",
+            &code,
+            &body.request_id,
+        )
+        .await?
+    } else {
+        // Encryption is disabled -- the response was never going to be sealed
+        // either way.
+        pairing_response(response_payload, b"POST /api/pair/claim", None)?
+    };
+    if request_nonce.is_some() {
+        if let Err(err) = rotate_pairing_transport_key() {
+            // The device is already enrolled and the response is already sealed
+            // with the scanned key. Do not strand it by discarding that response.
+            // The manager will generate a fresh key on the next successful write.
+            eprintln!("warning: failed to rotate pairing transport key: {err:#}");
+        }
+    }
+    Ok(response)
+}
+
+fn pairing_transport_material() -> ApiResult<Vec<u8>> {
+    let pairing = read_pairing_file().map_err(|err| {
+        eprintln!("failed to read pairing transport key: {err:#}");
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "pairing_transport_unavailable",
+            "encrypted pairing is unavailable",
+        )
+    })?;
+    transport::decode_key(&pairing.payload.transport_key).map_err(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "pairing_transport_unavailable",
+            "encrypted pairing is unavailable",
+        )
+    })
+}
+
+/// Rejects only a request sealed with a key that can no longer be right: an
+/// encrypted body arriving while this gateway's encryption is `Disabled`
+/// means the caller is holding a QR (or a cached pairing key) from before the
+/// owner turned it off.
+///
+/// This used to also reject the opposite pairing (`Required`, unencrypted)
+/// with "scan the Gateway QR ...". That case is not an error anymore: card
+/// #821 gave `pair_claim` a second way to authenticate an unencrypted
+/// request -- the one-time code itself, checked in `pair_claim` and then
+/// spent again as the key that seals the response (see
+/// `code_pairing_response`). `pair_request` never carried anything secret, so
+/// it never needed the QR's key to begin with.
+fn require_pairing_transport(mode: TransportEncryptionMode, encrypted: bool) -> ApiResult<()> {
+    if mode == TransportEncryptionMode::Disabled && encrypted {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "encrypted_pairing_disabled",
+            "transport encryption is disabled on this gateway; scan its current QR code",
+        ));
+    }
+    Ok(())
+}
+
+fn decode_pairing_body<T: serde::de::DeserializeOwned>(
+    wire: Value,
+    aad: &[u8],
+    direction: transport::Direction,
+) -> ApiResult<(T, Option<String>)> {
+    if wire.get("version").is_none() {
+        return serde_json::from_value(wire)
+            .map(|body| (body, None))
+            .map_err(|_| {
+                api_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "invalid request",
+                )
+            });
+    }
+    let envelope: transport::Envelope = serde_json::from_value(wire).map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_envelope",
+            "invalid encrypted request",
+        )
+    })?;
+    let plaintext = transport::open(
+        &pairing_transport_material()?,
+        direction,
+        aad,
+        &envelope,
+        now_unix_ms(),
+    )
+    .map_err(|_| {
+        api_error(
+            StatusCode::FORBIDDEN,
+            "invalid_envelope",
+            "invalid encrypted request",
+        )
+    })?;
+    let nonce = envelope.nonce;
+    serde_json::from_slice(&plaintext)
+        .map(|body| (body, Some(nonce)))
+        .map_err(|_| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "invalid request",
+            )
+        })
+}
+
+fn pairing_response(value: Value, aad: &[u8], request_nonce: Option<&str>) -> ApiResult<Response> {
+    let Some(request_nonce) = request_nonce else {
+        return Ok(Json(value).into_response());
+    };
+    let plaintext = serde_json::to_vec(&value).map_err(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "response_encoding_failed",
+            "failed to encode response",
+        )
+    })?;
+    let response_aad = [aad, b"\n", request_nonce.as_bytes()].concat();
+    let envelope = transport::seal(
+        &pairing_transport_material()?,
+        transport::Direction::PairingResponse,
+        &response_aad,
+        &plaintext,
+        now_unix_ms(),
+    )
+    .map_err(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "response_encryption_failed",
+            "failed to encrypt response",
+        )
+    })?;
+    Ok(Json(envelope).into_response())
+}
+
+/// Argon2id parameters for turning a claimed pairing code into transport key
+/// material. OWASP's second recommended interactive Argon2id setting (m =
+/// 19 MiB, t = 2, p = 1): materially more expensive per guess than a bare
+/// hash without being slow enough to make the app visibly stall.
+const CODE_KDF_MEMORY_KIB: u32 = 19_456;
+const CODE_KDF_TIME_COST: u32 = 2;
+const CODE_KDF_PARALLELISM: u32 = 1;
+const CODE_KDF_OUTPUT_LEN: usize = 32;
+
+/// The key material a claimed one-time code stands in for the QR's pre-shared
+/// key, for exactly one response.
+///
+/// A scanned QR carries 256 bits of random key; a code a person can read off
+/// a screen and type on a phone carries about 40 (eight glyphs from a
+/// 32-symbol alphabet -- see `generate_pairing_code`). That gap is real: it
+/// is the reason a PAKE is the "actually correctly shaped" answer to this
+/// problem (card #821's own words). What closes enough of the gap to ship
+/// tonight is that the code is not used as an AES key directly -- it is run
+/// through Argon2id first, so an attacker who captures the sealed claim
+/// response off the network cannot test candidate codes at hash speed. At
+/// roughly 20-50 ms per guess on ordinary hardware, the full 32^8 space is
+/// centuries of compute, not the minutes a bare HKDF would cost. Online
+/// guessing is separately bounded the way it always was: eight wrong answers
+/// burn the code (`MAX_PAIRING_CODE_ATTEMPTS`) and it is five minutes old at
+/// most (`PAIRING_CODE_TTL_MS`).
+///
+/// The salt is derived from `request_id` rather than being random: both sides
+/// need to land on the same key without a round trip to agree on a salt, and
+/// `request_id` is already a CSPRNG value unique to this one pairing attempt
+/// (see `createRequestId` in the app), so it is exactly as good a salt as one
+/// generated fresh, minus the round trip. It is hashed to a fixed 32 bytes
+/// first because Argon2's own salt floor is 8 bytes and `request_id` is only
+/// guaranteed to be 1-80.
+fn code_pairing_material(code: &str, request_id: &str) -> anyhow::Result<[u8; 32]> {
+    use argon2::{Algorithm, Argon2, Params, Version};
+    use sha2::{Digest as _, Sha256};
+
+    let mut salt = [0_u8; 32];
+    salt.copy_from_slice(&Sha256::digest(
+        [
+            b"muqun-pairing-code-salt-v1".as_slice(),
+            request_id.as_bytes(),
+        ]
+        .concat(),
+    ));
+    let params = Params::new(
+        CODE_KDF_MEMORY_KIB,
+        CODE_KDF_TIME_COST,
+        CODE_KDF_PARALLELISM,
+        Some(CODE_KDF_OUTPUT_LEN),
+    )
+    .map_err(|err| anyhow::anyhow!("invalid argon2 parameters: {err}"))?;
+    let hasher = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut material = [0_u8; 32];
+    hasher
+        .hash_password_into(code.as_bytes(), &salt, &mut material)
+        .map_err(|err| anyhow::anyhow!("code-derived key material failed: {err}"))?;
+    Ok(material)
+}
+
+/// Seals a claim response with material derived from the one-time code that
+/// just authenticated it, for a device pairing by address and code rather
+/// than by QR. See `code_pairing_material` for why an eight-character code
+/// run through Argon2id is enough for this one message.
+///
+/// Argon2id is deliberately memory-hard and therefore not free to run: it is
+/// spawned onto a blocking thread so a burst of pairing attempts cannot stall
+/// the async runtime's worker threads.
+async fn code_pairing_response(
+    value: Value,
+    aad: &[u8],
+    code: &str,
+    request_id: &str,
+) -> ApiResult<Response> {
+    let plaintext = serde_json::to_vec(&value).map_err(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "response_encoding_failed",
+            "failed to encode response",
+        )
+    })?;
+    let code = code.to_owned();
+    let request_id = request_id.to_owned();
+    let material = tokio::task::spawn_blocking(move || code_pairing_material(&code, &request_id))
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "response_encryption_failed",
+                "failed to encrypt response",
+            )
+        })?
+        .map_err(|_| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "response_encryption_failed",
+                "failed to encrypt response",
+            )
+        })?;
+    let response_aad = [aad, b"\ncode-pairing\n"].concat();
+    let envelope = transport::seal(
+        &material,
+        transport::Direction::PairingResponse,
+        &response_aad,
+        &plaintext,
+        now_unix_ms(),
+    )
+    .map_err(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "response_encryption_failed",
+            "failed to encrypt response",
+        )
+    })?;
+    Ok(Json(envelope).into_response())
 }
 
 fn pair_request_response(config: &Config, request_id: &str) -> Value {
@@ -1595,38 +2731,6 @@ fn pair_request_response(config: &Config, request_id: &str) -> Value {
         "status": "pending",
         "expires_in_ms": PAIRING_CODE_TTL_MS
     })
-}
-
-fn consume_pairing_code(
-    pending: &mut Option<PendingPairing>,
-    request_id: &str,
-    code: &str,
-    now_unix_ms: u128,
-) -> Result<(), PairingCodeError> {
-    let Some(current) = pending.as_mut() else {
-        return Err(PairingCodeError::Missing);
-    };
-    if pairing_code_expired(current, now_unix_ms) {
-        *pending = None;
-        return Err(PairingCodeError::Expired);
-    }
-    let request_matches = constant_time_eq(request_id.as_bytes(), current.request_id.as_bytes());
-    let valid = valid_pairing_code(code)
-        && request_matches
-        && constant_time_eq(hash_token(code).as_bytes(), current.code_hash.as_bytes());
-    if !valid {
-        current.failed_attempts = current.failed_attempts.saturating_add(1);
-        if current.failed_attempts >= MAX_PAIRING_CODE_ATTEMPTS {
-            *pending = None;
-        }
-        return Err(PairingCodeError::Invalid);
-    }
-    *pending = None;
-    Ok(())
-}
-
-fn pairing_code_expired(pending: &PendingPairing, now_unix_ms: u128) -> bool {
-    now_unix_ms.saturating_sub(pending.created_unix_ms) >= PAIRING_CODE_TTL_MS
 }
 
 async fn pair_pending(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
@@ -1640,10 +2744,9 @@ async fn pair_pending(State(state): State<AppState>, headers: HeaderMap) -> ApiR
             "failed to lock pending pairing state",
         )
     })?;
-    if pending
-        .as_ref()
-        .is_some_and(|value| pairing_code_expired(value, now_unix_ms()))
-    {
+    if pending.as_ref().is_some_and(|value| {
+        authority::pairing_code_expired(value, now_unix_ms(), PAIRING_CODE_TTL_MS)
+    }) {
         *pending = None;
     }
     if let Some(pending) = pending.as_ref() {
@@ -1771,12 +2874,12 @@ async fn send_test_notification(
         .clone();
     // The person waiting to see whether push works is the one holding the phone
     // that made this call, so the defaults are written in that request's
-    // language. "Herdr Gateway" is the product's name and stays in Latin script
+    // language. "Muqun Gateway" is the product's name and stays in Latin script
     // in every locale, the same way the app leaves "Gateway" alone.
     let locale = Locale::from_headers(&headers);
     let result = send_expo_push_notifications(
         &tokens,
-        body.title.unwrap_or_else(|| "Herdr Gateway".into()),
+        body.title.unwrap_or_else(|| "Muqun Gateway".into()),
         body.body.unwrap_or_else(|| {
             i18n::t(locale, "Muqun push notifications are connected.").to_owned()
         }),
@@ -1807,8 +2910,17 @@ fn status() -> anyhow::Result<()> {
     println!("label: {}", config.label);
     println!("listen: {}", config.listen);
     println!("public_url: {}", config.public_url);
+    println!(
+        "transport_encryption: {}",
+        config.transport_encryption.as_str()
+    );
     for session in config.sessions {
-        println!("session {}: {}", session.id, session.socket_path);
+        let endpoint = backend_endpoint(&session);
+        println!(
+            "session {}: backend={} endpoint={endpoint}",
+            session.id,
+            session.backend.as_str()
+        );
     }
     match read_pid()? {
         Some(pid) if process_running(pid) => println!("gateway: running pid {pid}"),
@@ -1819,10 +2931,20 @@ fn status() -> anyhow::Result<()> {
 }
 
 fn manage() -> anyhow::Result<()> {
+    ensure_pairing_transport_key()?;
     let _terminal = TerminalModeGuard::enter()?;
     let mut message = auto_upgrade_local_public_url()?.unwrap_or_else(|| String::from("ready"));
     let mut pending_pairing = fetch_pending_pairing().ok().flatten();
-    let mut devices = read_devices().unwrap_or_default();
+    let mut devices = match read_devices() {
+        Ok(devices) => devices,
+        Err(error) => {
+            // An unreadable device file is not an empty one. Reporting it as
+            // "no paired devices" is how an owner is talked into re-pairing,
+            // and re-pairing is the write that makes the loss permanent.
+            message = format!("could not read paired devices: {error}");
+            Vec::new()
+        }
+    };
     // False by default so a finished pairing lands on the device list; `p` flips
     // it on to add another device.
     let mut show_qr = false;
@@ -1831,7 +2953,11 @@ fn manage() -> anyhow::Result<()> {
     loop {
         if !poll_event(MANAGE_REFRESH_INTERVAL)? {
             let next_pending_pairing = fetch_pending_pairing().ok().flatten();
-            let next_devices = read_devices().unwrap_or_default();
+            // A refresh that cannot read the file keeps showing the last list
+            // it could read, rather than blanking the screen mid-write.
+            let Ok(next_devices) = read_devices() else {
+                continue;
+            };
             if next_pending_pairing != pending_pairing || next_devices != devices {
                 // A newly paired device flips off the QR so the screen settles on
                 // the device list instead of showing a fresh code.
@@ -1864,8 +2990,13 @@ fn manage() -> anyhow::Result<()> {
         };
         match input.as_str() {
             "s" | "start" => {
-                start_background_inner(false)?;
-                message = String::from("start requested");
+                // A refusal -- another gateway already owns this state
+                // directory -- belongs on the status line. Propagating it
+                // would drop the operator out of the UI on a keypress.
+                message = match start_background_inner(false) {
+                    Ok(()) => String::from("start requested"),
+                    Err(error) => first_line(&error.to_string()),
+                };
             }
             "t" | "stop" => {
                 stop_background_inner(false)?;
@@ -1879,15 +3010,23 @@ fn manage() -> anyhow::Result<()> {
                 if devices.is_empty() {
                     message = String::from("no paired devices to revoke");
                 } else if let Some(device) = prompt_revoke_device(&devices)? {
-                    if revoke_managed_device(&device.id)? {
-                        message =
-                            format!("revoked {}; scan to pair again", truncate(&device.name, 32));
-                        // Revocation usually means the user is replacing this
-                        // app's credential. Return straight to the pairing QR
-                        // instead of leaving them on the remaining device list.
-                        show_qr = true;
-                    } else {
-                        message = String::from("device was already revoked");
+                    // A revocation that could not be carried out is a status
+                    // line, not an exit: dropping the operator out of the UI
+                    // mid-revoke tells them nothing about what happened.
+                    match revoke_managed_device(&device.id) {
+                        Ok(true) => {
+                            message = format!(
+                                "revoked {}; scan to pair again",
+                                truncate(&device.name, 32)
+                            );
+                            // Revocation usually means the user is replacing
+                            // this app's credential. Return straight to the
+                            // pairing QR instead of leaving them on the
+                            // remaining device list.
+                            show_qr = true;
+                        }
+                        Ok(false) => message = String::from("device was already revoked"),
+                        Err(error) => message = first_line(&format!("{error:#}")),
                     }
                 } else {
                     message = String::from("revoke cancelled");
@@ -1911,15 +3050,199 @@ fn manage() -> anyhow::Result<()> {
                 update_public_url(&selection.url)?;
                 message = format!("auto url: {}", truncate(&selection.url, 36));
             }
+            "e" | "encryption" => {
+                message = toggle_transport_encryption()?;
+                show_qr = true;
+            }
+            "h" | "herdr" => {
+                message = enable_managed_backend(BackendKind::Herdr)?;
+            }
+            "m" | "tmux" => {
+                message = enable_managed_backend(BackendKind::Tmux)?;
+            }
+            "d" | "backend" => {
+                message = match prompt_remove_backend()? {
+                    Some(id) => remove_managed_backend(&id)?,
+                    None => String::from("backend unchanged"),
+                };
+            }
+            "f" | "default" => {
+                message = match prompt_default_backend()? {
+                    Some(id) => set_managed_default_backend(&id)?,
+                    None => String::from("default backend unchanged"),
+                };
+            }
             "q" | "quit" => break,
             other => message = format!("unknown command: {other}"),
         }
 
         pending_pairing = fetch_pending_pairing().ok().flatten();
-        devices = read_devices().unwrap_or_default();
+        match read_devices() {
+            Ok(next_devices) => devices = next_devices,
+            Err(error) => message = format!("could not read paired devices: {error}"),
+        }
         print_manage_screen(&message, pending_pairing.as_ref(), &devices, show_qr)?;
     }
     Ok(())
+}
+
+fn enable_managed_backend(backend: BackendKind) -> anyhow::Result<String> {
+    let path = config_dir()?.join(CONFIG_FILE);
+    let mut config = load_config(None)?;
+    if let Some(session) = config
+        .sessions
+        .iter()
+        .find(|session| session.backend == backend)
+    {
+        return Ok(format!(
+            "{} backend already configured as {}",
+            backend.as_str(),
+            session.id
+        ));
+    }
+    let id = upsert_backend_session(&mut config, backend, None, None, None)?;
+    write_config(&path, &config)?;
+    Ok(format!("added {id}; restart gateway to apply"))
+}
+
+fn toggle_transport_encryption() -> anyhow::Result<String> {
+    let path = config_dir()?.join(CONFIG_FILE);
+    let mut config = load_config(None)?;
+    config.transport_encryption = match config.transport_encryption {
+        TransportEncryptionMode::Required => TransportEncryptionMode::Disabled,
+        TransportEncryptionMode::Disabled => TransportEncryptionMode::Required,
+    };
+    let mode = config.transport_encryption;
+    write_config(&path, &config)?;
+    let warning = if mode == TransportEncryptionMode::Disabled {
+        "; warning: leaked bearer tokens can call the API"
+    } else {
+        ""
+    };
+    Ok(format!(
+        "encryption {}{warning}; restart gateway to apply",
+        mode.as_str()
+    ))
+}
+
+fn remove_managed_backend(id: &str) -> anyhow::Result<String> {
+    validate_session_id(id)?;
+    let path = config_dir()?.join(CONFIG_FILE);
+    let mut config = load_config(None)?;
+    anyhow::ensure!(config.sessions.len() > 1, "cannot remove the only backend");
+    let previous_len = config.sessions.len();
+    config.sessions.retain(|session| session.id != id);
+    anyhow::ensure!(
+        config.sessions.len() != previous_len,
+        "backend {id} not found"
+    );
+    write_config(&path, &config)?;
+    Ok(format!("removed {id}; restart gateway to apply"))
+}
+
+fn set_managed_default_backend(id: &str) -> anyhow::Result<String> {
+    let path = config_dir()?.join(CONFIG_FILE);
+    let mut config = load_config(None)?;
+    make_backend_default(&mut config, id)?;
+    write_config(&path, &config)?;
+    Ok(format!("default is now {id}; restart gateway to apply"))
+}
+
+fn prompt_default_backend() -> anyhow::Result<Option<String>> {
+    let config = load_config(None)?;
+    prompt_backend_picker(&config.sessions, "Choose the default terminal backend")
+}
+
+fn prompt_remove_backend() -> anyhow::Result<Option<String>> {
+    let config = load_config(None)?;
+    if config.sessions.len() <= 1 {
+        return Ok(None);
+    }
+    let Some(id) = prompt_backend_picker(&config.sessions, "Remove a terminal backend")? else {
+        return Ok(None);
+    };
+    let session = config
+        .sessions
+        .iter()
+        .find(|session| session.id == id)
+        .context("selected backend disappeared")?;
+    Ok(confirm_remove_backend(session)?.then_some(id))
+}
+
+fn prompt_backend_picker(
+    sessions: &[SessionConfig],
+    title: &str,
+) -> anyhow::Result<Option<String>> {
+    if sessions.is_empty() {
+        return Ok(None);
+    }
+    let mut selected = 0_usize;
+    loop {
+        render_backend_picker(title, sessions, selected)?;
+        let TerminalEvent::Key(event) = read_event()? else {
+            continue;
+        };
+        if event.kind != KeyEventKind::Press {
+            continue;
+        }
+        match event.code {
+            KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(sessions.len() - 1),
+            KeyCode::Enter => return Ok(Some(sessions[selected].id.clone())),
+            KeyCode::Esc | KeyCode::Char('q') => return Ok(None),
+            _ => {}
+        }
+    }
+}
+
+fn render_backend_picker(
+    title: &str,
+    sessions: &[SessionConfig],
+    selected: usize,
+) -> anyhow::Result<()> {
+    execute!(stdout(), Clear(ClearType::All), MoveTo(0, 0))?;
+    let mut lines = vec![
+        title.to_owned(),
+        String::new(),
+        String::from("Up/Down or j/k selects | Enter continues | Esc cancels"),
+        String::new(),
+    ];
+    for (index, session) in sessions.iter().enumerate() {
+        lines.push(format!(
+            "{} {}   {}   {}",
+            if index == selected { ">" } else { " " },
+            session.id,
+            session.backend.as_str(),
+            truncate(&session.label, 30)
+        ));
+    }
+    write_centered_panel(&lines)
+}
+
+fn confirm_remove_backend(session: &SessionConfig) -> anyhow::Result<bool> {
+    loop {
+        execute!(stdout(), Clear(ClearType::All), MoveTo(0, 0))?;
+        write_centered_panel(&[
+            String::from("Remove terminal backend?"),
+            String::new(),
+            format!("{} ({})", session.label, session.backend.as_str()),
+            String::from("Existing terminal sessions are not deleted."),
+            String::from("The gateway must be restarted after this change."),
+            String::new(),
+            String::from("y remove | n or Esc cancel"),
+        ])?;
+        let TerminalEvent::Key(event) = read_event()? else {
+            continue;
+        };
+        if event.kind != KeyEventKind::Press {
+            continue;
+        }
+        match event.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => return Ok(true),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => return Ok(false),
+            _ => {}
+        }
+    }
 }
 
 fn prompt_public_url() -> anyhow::Result<Option<String>> {
@@ -2120,34 +3443,89 @@ fn print_manage_screen(
         .unwrap_or_else(|| "not configured".into());
     let url = config
         .as_ref()
-        .map(|config| truncate(&config.public_url, 44))
+        .map(|config| config.public_url.clone())
         .unwrap_or_else(|| "run setup first".into());
-    let status = match read_pid()? {
-        Some(pid) if process_running(pid) => format!("running ({pid})"),
-        Some(_) => String::from("stale pid"),
-        None => String::from("stopped"),
+    let pid_on_disk = read_pid()?;
+    let running_pid = pid_on_disk.filter(|&pid| process_running(pid));
+    let status = match (running_pid, pid_on_disk) {
+        (Some(pid), _) => format!("running ({pid})"),
+        (None, Some(_)) => String::from("stale pid"),
+        (None, None) => String::from("stopped"),
+    };
+    // `run` loads config.json once at startup into a plain value and never
+    // re-reads it (see `AppState`); every setting below this line -- and the
+    // encryption line, backend list, default marker, and URL further down --
+    // comes straight from disk, not from what the running process actually
+    // enforces. If the file was rewritten after the process started, those
+    // fields are pending, not live, and the panel needs to say so instead of
+    // presenting them as current.
+    let restart_pending = running_pid.is_some() && config_changed_since_start();
+    let pending_note = if restart_pending {
+        " (pending restart -- [t] stop, [s] start to apply)"
+    } else {
+        ""
+    };
+    // Same signal, shorter: the QR panel is a narrow two-column layout where
+    // the long-form hint would blow the column width, and [s]/[t] are already
+    // listed as controls right there.
+    let pending_note_short = if restart_pending {
+        " (pending restart)"
+    } else {
+        ""
     };
 
     let mut lines = vec![
-        String::from("Herdr Gateway for Muqun"),
+        String::from("Muqun Terminal Gateway"),
         String::from(""),
         String::from("keys   : [s] start  [t] stop  [p] pair  [x] revoke"),
-        String::from("         [u] url    [a] auto  [r] refresh  [q] close"),
+        String::from("         [m] tmux  [h] Herdr  [f] default backend"),
+        String::from("         [d] remove [u] url   [a] auto  [e] encryption"),
+        String::from("         [r] refresh [q] close"),
         format!("server : {server}"),
-        format!("url    : {url}"),
         format!("status : {status}"),
-        format!("message: {}", truncate(message, 58)),
-        String::from(""),
     ];
+    push_wrapped_field(&mut lines, "url    ", &format!("{url}{pending_note}"), 64);
+    push_wrapped_field(&mut lines, "message", message, 64);
+    lines.push(String::new());
+    if let Some(config) = &config {
+        lines.push(format!(
+            "encryption: {}{}{}",
+            config.transport_encryption.as_str(),
+            if config.transport_encryption == TransportEncryptionMode::Disabled {
+                " (token-only; unsafe on public HTTP)"
+            } else {
+                ""
+            },
+            pending_note
+        ));
+        lines.push(String::new());
+        lines.push(format!(
+            "Terminal backends ({}){pending_note}",
+            config.sessions.len()
+        ));
+        for (index, session) in config.sessions.iter().enumerate() {
+            let endpoint = backend_endpoint(session);
+            lines.push(format!(
+                "{} {}  {}  {}",
+                if index == 0 { "*" } else { " " },
+                session.id,
+                session.backend.as_str(),
+                truncate(&endpoint, 38)
+            ));
+        }
+        lines.push(String::new());
+    }
 
     // A device mid-pairing takes priority: show its name + the code to enter.
+    // `url` is already on screen above this block, so the message can point
+    // at it rather than repeat it -- there is no QR involved in this path.
     if let Some(pending) = pending_pairing {
         lines.extend([
             String::from("Pairing request"),
             format!("device : {}", truncate(&pending.device_name, 48)),
             format!("code   : {}", pending.code),
             String::from(""),
-            String::from("Enter this code in Muqun to finish pairing."),
+            String::from("In Muqun, enter the address above and this code."),
         ]);
         write_centered_panel(&lines)?;
         return Ok(());
@@ -2182,20 +3560,38 @@ fn print_manage_screen(
             write_centered_panel(&lines)?;
             return Ok(());
         }
-        let qr_controls = vec![
+        let mut qr_controls = vec![
             String::from("Muqun Gateway"),
             String::from(""),
-            String::from("[s] start   [t] stop"),
-            String::from("[p] pair    [x] revoke"),
-            String::from("[u] URL     [a] auto URL"),
-            String::from("[r] devices / refresh"),
-            String::from("[q/Esc] close"),
+            String::from("[s] start  [t] stop  [p] pair"),
+            String::from("[x] revoke [r] refresh [q] close"),
+            String::from("[m] tmux  [h] Herdr  [f] default"),
+            String::from("[d] remove [u] URL   [a] auto"),
+            format!(
+                "[e] encryption: {}{}",
+                config.transport_encryption.as_str(),
+                pending_note_short
+            ),
             String::from(""),
-            format!("server: {}", truncate(&server, 18)),
-            format!("url: {}", truncate(&url, 21)),
-            format!("status: {}", truncate(&status, 18)),
-            format!("message: {}", truncate(message, 17)),
+            format!("server: {}", truncate(&server, 26)),
+            format!("status: {}", truncate(&status, 25)),
         ];
+        push_wrapped_field(
+            &mut qr_controls,
+            "url",
+            &format!("{url}{pending_note_short}"),
+            34,
+        );
+        qr_controls.push(format!("backends (* default):{pending_note_short}"));
+        for (index, session) in config.sessions.iter().enumerate() {
+            qr_controls.push(format!(
+                " {} {} ({})",
+                if index == 0 { "*" } else { " " },
+                truncate(&session.label, 17),
+                session.backend.as_str()
+            ));
+        }
+        push_wrapped_field(&mut qr_controls, "message", message, 34);
         let mut qr_lines = vec![
             String::from("Scan with Muqun"),
             String::from("Code appears after scan"),
@@ -2204,7 +3600,12 @@ fn print_manage_screen(
         // Config is authoritative for the advertised URL and server id. Older
         // pairing files can retain a stale URL even though their admin token is
         // still valid; rendering from that file made `p` show the wrong server.
-        let encoded = pairing_qr_offer(&config.public_url, &config.server_id);
+        let encoded = pairing_qr_offer(
+            &config.public_url,
+            &config.server_id,
+            (config.transport_encryption == TransportEncryptionMode::Required)
+                .then_some(pairing.payload.transport_key.as_str()),
+        );
         let code = QrCode::with_error_correction_level(encoded.as_bytes(), EcLevel::L)?;
         let image = render_qr(&code);
         for line in image.lines() {
@@ -2362,6 +3763,33 @@ fn truncate(value: &str, max_chars: usize) -> String {
     output
 }
 
+/// The first line of a multi-line error, for the manage screen's one-line
+/// status field. Errors written for a terminal put the essential sentence
+/// first and the remedy underneath; only the first fits here.
+fn first_line(value: &str) -> String {
+    value.lines().next().unwrap_or(value).to_string()
+}
+
+fn push_wrapped_field(lines: &mut Vec<String>, label: &str, value: &str, width: usize) {
+    let prefix = format!("{label}: ");
+    let continuation = " ".repeat(prefix.chars().count());
+    let first_width = width.saturating_sub(prefix.chars().count()).max(1);
+    let mut remaining = value.chars().peekable();
+    let mut first = true;
+    while remaining.peek().is_some() {
+        let chunk = remaining.by_ref().take(first_width).collect::<String>();
+        lines.push(format!(
+            "{}{}",
+            if first { &prefix } else { &continuation },
+            chunk
+        ));
+        first = false;
+    }
+    if first {
+        lines.push(prefix);
+    }
+}
+
 fn fetch_pending_pairing() -> anyhow::Result<Option<PendingPairing>> {
     let pairing = read_pairing_file()?;
     let config = load_config(None)?;
@@ -2490,12 +3918,36 @@ fn validate_public_url(value: &str) -> anyhow::Result<String> {
     Ok(value.trim_end_matches('/').to_string())
 }
 
-fn pairing_qr_offer(url: &str, server_id: &str) -> String {
-    format!(
+fn listen_for_explicit_public_url(public_url: &str, port: u16) -> String {
+    let host = reqwest::Url::parse(public_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned));
+    match host.as_deref() {
+        Some("localhost") => format!("127.0.0.1:{port}"),
+        Some(host) => match host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+        {
+            Ok(std::net::IpAddr::V4(ip)) if ip.is_loopback() => format!("{ip}:{port}"),
+            Ok(std::net::IpAddr::V6(ip)) if ip.is_loopback() => format!("[{ip}]:{port}"),
+            _ => format!("0.0.0.0:{port}"),
+        },
+        None => format!("0.0.0.0:{port}"),
+    }
+}
+
+fn pairing_qr_offer(url: &str, server_id: &str, transport_key: Option<&str>) -> String {
+    let mut offer = format!(
         "muqun://pair?u={}&s={}",
         url_component(url),
         url_component(server_id)
-    )
+    );
+    if let Some(transport_key) = transport_key {
+        offer.push_str("&k=");
+        offer.push_str(&url_component(transport_key));
+    }
+    offer
 }
 
 fn url_component(value: &str) -> String {
@@ -2553,28 +4005,39 @@ async fn api_set_label(
 }
 
 async fn gateway_metadata(state: &AppState) -> ApiResult<Value> {
-    let session = find_session(&state.config, "default")?;
-    let herdr = match herdr_request(session, "ping", json!({})).await {
-        Ok(value) => {
-            let version = value.pointer("/result/version").and_then(Value::as_str);
-            let protocol = value.pointer("/result/protocol").and_then(Value::as_u64);
-            let compatible = protocol
-                .is_some_and(|value| (HERDR_PROTOCOL_MIN..=HERDR_PROTOCOL_MAX).contains(&value));
-            json!({
-                "connected": true,
-                "version": version,
-                "protocol": protocol,
-                "compatible": compatible,
-                "supportedProtocolMin": HERDR_PROTOCOL_MIN,
-                "supportedProtocolMax": HERDR_PROTOCOL_MAX,
-                "response": value
-            })
+    // The primary session described below must be the one `GET /api/sessions`
+    // leads with, not merely the first configured one: with tmux dead or
+    // empty and herdr live, the app connects to whichever session
+    // `sessions[0]` names, and `assertSupportedHerdr` has to validate *that*
+    // session's metadata, not a stored-order tmux entry that always reports
+    // `compatible: true`. See `ordered_sessions`.
+    let ordered = ordered_sessions(state).await;
+    let primary = ordered.first().copied().ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_GATEWAY,
+            "backend_unavailable",
+            "no terminal backend is configured",
+        )
+    })?;
+    let mut backends = Vec::with_capacity(state.config.sessions.len());
+    let mut primary_metadata = None;
+    let mut legacy_herdr = None;
+    for session in &state.config.sessions {
+        let (metadata, compatibility) = session_metadata(session).await;
+        let metadata = json!({
+            "sessionId": session.id,
+            "label": session.label,
+            "kind": session.backend,
+            "connected": metadata.get("connected").cloned().unwrap_or(json!(false)),
+            "version": metadata.get("version").cloned().unwrap_or(Value::Null),
+            "protocol": metadata.get("protocol").cloned().unwrap_or(Value::Null),
+        });
+        if session.id == primary.id {
+            primary_metadata = Some(metadata.clone());
+            legacy_herdr = Some(compatibility);
         }
-        Err(err) => {
-            eprintln!("Herdr metadata request failed: {err:#}");
-            json!({ "connected": false, "error": "Herdr is unavailable" })
-        }
-    };
+        backends.push(metadata);
+    }
     Ok(json!({
         "ok": true,
         "gatewayVersion": env!("CARGO_PKG_VERSION"),
@@ -2585,13 +4048,189 @@ async fn gateway_metadata(state: &AppState) -> ApiResult<Value> {
         "capabilities": API_CAPABILITIES,
         "serverId": state.config.server_id,
         "label": state.config.label,
-        "herdr": herdr
+        "transportSecurity": {
+            "protection": transport_protection(&state.config),
+            "applicationLayerEncryption": false,
+            "httpsRecommended": !state.config.public_url.starts_with("https://")
+        },
+        "backend": primary_metadata.unwrap_or(Value::Null),
+        "backends": backends,
+        "herdr": legacy_herdr.unwrap_or_else(|| json!({ "connected": false }))
     }))
+}
+
+fn transport_protection(config: &Config) -> &'static str {
+    if config.public_url.starts_with("https://") {
+        return "https";
+    }
+    let Ok(listen) = config.listen.parse::<SocketAddr>() else {
+        return "unknown";
+    };
+    if listen.ip().is_loopback() {
+        return "local-only";
+    }
+    match listen.ip() {
+        std::net::IpAddr::V4(ip) if is_tailscale_ipv4(ip) => "tailscale-wireguard",
+        _ => "unencrypted-http",
+    }
+}
+
+fn is_tailscale_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    octets[0] == 100 && (64..=127).contains(&octets[1])
+}
+
+/// Whether a Herdr socket protocol is one this gateway will serve.
+///
+/// Open-ended above [`HERDR_PROTOCOL_MIN`]; see that constant for why.
+fn herdr_protocol_supported(protocol: u64) -> bool {
+    protocol >= HERDR_PROTOCOL_MIN
+}
+
+async fn session_metadata(session: &SessionConfig) -> (Value, Value) {
+    match terminal_backend(session).metadata().await {
+        Ok(metadata) => {
+            // A backend that does not report a protocol at all is taken at the
+            // floor rather than refused: absent is not the same as too old.
+            let compatibility_protocol = metadata.protocol.unwrap_or(HERDR_PROTOCOL_MIN);
+            let compatible = metadata.kind == BackendKind::Tmux
+                || herdr_protocol_supported(compatibility_protocol);
+            let mut compatibility = json!({
+                "connected": true,
+                "version": metadata.version,
+                "protocol": compatibility_protocol,
+                "compatible": compatible,
+                "supportedProtocolMin": HERDR_PROTOCOL_MIN,
+                // `null` is the ceiling: explicitly open-ended, which a client
+                // can tell apart from a gateway too old to send the field.
+                "supportedProtocolMax": Value::Null,
+            });
+            if let (Some(object), Some(response)) = (
+                compatibility.as_object_mut(),
+                metadata.compatibility_response,
+            ) {
+                object.insert("response".into(), response);
+            }
+            (
+                json!({
+                    "kind": metadata.kind,
+                    "connected": true,
+                    "version": metadata.version,
+                    "protocol": metadata.protocol,
+                }),
+                compatibility,
+            )
+        }
+        Err(err) => {
+            eprintln!("terminal metadata request failed: {err}");
+            (
+                json!({ "kind": session.backend, "connected": false }),
+                json!({ "connected": false, "error": "Terminal backend is unavailable" }),
+            )
+        }
+    }
+}
+
+/// How much of "there's something to actually look at" a configured session
+/// offers, most useful first. `GET /api/sessions` orders by this instead of a
+/// fixed backend rank, because the app reads `sessions[0]` and shows no
+/// picker -- whichever backend actually has something in it is the one that
+/// needs to be first, and only the gateway is in a position to know which
+/// that is on any given request.
+///
+/// Declared top-to-bottom in the order it should sort, so deriving `Ord`
+/// gives exactly the "most significant first" comparison the endpoint wants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum SessionLiveness {
+    HasPanes,
+    Empty,
+    Unreachable,
+}
+
+/// How long `GET /api/sessions` waits on a single backend before counting it
+/// as unreachable. A dead socket that refuses the connection resolves this
+/// fast on its own; this bound exists for the backend that accepts a
+/// connection and then never answers, which would otherwise hang the whole
+/// endpoint on one dead session.
+const SESSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Turn a `list_panes` call into a liveness bucket, bounded by `timeout`.
+///
+/// Takes the future rather than a backend or a `SessionConfig` so it can be
+/// exercised with a canned outcome -- immediate success with or without
+/// panes, immediate failure, or a future that never resolves -- without
+/// standing up a real Herdr or tmux backend.
+async fn session_liveness(
+    list_panes: BackendFuture<'_, Vec<Pane>>,
+    timeout: Duration,
+) -> SessionLiveness {
+    match tokio::time::timeout(timeout, list_panes).await {
+        Ok(Ok(panes)) if !panes.is_empty() => SessionLiveness::HasPanes,
+        Ok(Ok(_)) => SessionLiveness::Empty,
+        Ok(Err(_)) | Err(_) => SessionLiveness::Unreachable,
+    }
+}
+
+/// `GET /api/sessions` ordering key: liveness first (has panes, then
+/// empty-but-reachable, then unreachable), tmux before herdr as the
+/// tiebreaker between otherwise-equal entries.
+///
+/// Pure and independent of any backend, so every bucket -- including "every
+/// configured session is unreachable" -- gets a fast, deterministic unit
+/// test instead of depending on a live tmux or Herdr server.
+fn session_order_key(session: &SessionConfig, liveness: SessionLiveness) -> (SessionLiveness, u8) {
+    let backend_rank = match session.backend {
+        BackendKind::Tmux => 0,
+        BackendKind::Herdr => 1,
+    };
+    (liveness, backend_rank)
+}
+
+/// Every configured session, ordered exactly as `GET /api/sessions` presents
+/// them: liveness first, tmux ahead of herdr as the tiebreaker.
+///
+/// Shared with `gateway_metadata` so the "primary" session it describes for
+/// `/health` and `/api/meta` is always the same one a client that reads
+/// `sessions[0]` from `/api/sessions` actually connects to. Two copies of
+/// this ordering agreeing by construction is the only way to keep them
+/// agreeing at all -- a second, independently-written rank is a second place
+/// for the two endpoints to drift apart.
+///
+/// Orders, never filters: every configured session stays in the result, even
+/// when nothing is reachable, so a client that reads only the first entry
+/// never sees `undefined` where it used to see a session.
+async fn ordered_sessions(state: &AppState) -> Vec<&SessionConfig> {
+    let liveness =
+        futures::future::join_all(state.config.sessions.iter().map(|session| async move {
+            let backend = terminal_backend(session);
+            // `probe_reachable` catches the one case `list_panes` cannot tell
+            // apart on its own: tmux's `list_output` deliberately maps "no
+            // server running" onto an empty pane list for every other
+            // caller, which would otherwise make a dead tmux backend
+            // indistinguishable from a live one that holds nothing. Both
+            // calls run inside the one probe `session_liveness` bounds, so a
+            // dead backend is still discovered by a single timeout, not two.
+            let probe = async {
+                match backend.probe_reachable().await {
+                    Ok(false) => Err(BackendError::Unavailable),
+                    _ => backend.list_panes().await,
+                }
+            };
+            session_liveness(Box::pin(probe), SESSION_PROBE_TIMEOUT).await
+        }))
+        .await;
+    let mut order: Vec<usize> = (0..state.config.sessions.len()).collect();
+    order.sort_by_key(|&index| session_order_key(&state.config.sessions[index], liveness[index]));
+    order
+        .into_iter()
+        .map(|index| &state.config.sessions[index])
+        .collect()
 }
 
 async fn sessions(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
-    Ok(Json(json!({ "sessions": state.config.sessions })))
+    let sessions = ordered_sessions(&state).await;
+    Ok(Json(json!({ "sessions": sessions })))
 }
 
 async fn snapshot(
@@ -2600,9 +4239,13 @@ async fn snapshot(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
-    let answer =
-        call_session_method(&state.config, &session_id, "session.snapshot", json!({})).await;
-    Ok(Json(note_and_amend_panes(&state, &session_id, answer?.0)))
+    let session = find_session(&state.config, &session_id)?;
+    let backend = terminal_backend(session);
+    let workspaces = backend.list_workspaces().await.map_err(backend_api_error)?;
+    let tabs = backend.list_tabs().await.map_err(backend_api_error)?;
+    let panes = backend.list_panes().await.map_err(backend_api_error)?;
+    let answer = backend::compat::snapshot(workspaces, tabs, panes);
+    Ok(Json(note_and_amend_panes(&state, &session_id, answer)))
 }
 
 /// Let the scrollback store read a Herdr answer, and answer back for whatever
@@ -2625,7 +4268,12 @@ async fn workspaces(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
-    call_session_method(&state.config, &session_id, "workspace.list", json!({})).await
+    let session = find_session(&state.config, &session_id)?;
+    let workspaces = terminal_backend(session)
+        .list_workspaces()
+        .await
+        .map_err(backend_api_error)?;
+    Ok(Json(backend::compat::workspace_list(workspaces)))
 }
 
 async fn panes(
@@ -2634,8 +4282,13 @@ async fn panes(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
-    let answer = call_session_method(&state.config, &session_id, "pane.list", json!({})).await;
-    Ok(Json(note_and_amend_panes(&state, &session_id, answer?.0)))
+    let session = find_session(&state.config, &session_id)?;
+    let answer = terminal_backend(session)
+        .list_panes()
+        .await
+        .map(backend::compat::pane_list)
+        .map_err(backend_api_error)?;
+    Ok(Json(note_and_amend_panes(&state, &session_id, answer)))
 }
 
 async fn agents(
@@ -2644,7 +4297,12 @@ async fn agents(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
-    call_session_method(&state.config, &session_id, "agent.list", json!({})).await
+    let session = find_session(&state.config, &session_id)?;
+    Ok(Json(
+        backend_agent_list(session)
+            .await
+            .map_err(backend_api_error)?,
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2690,7 +4348,12 @@ fn pane_read_text(value: &Value) -> Option<String> {
     // Herdr nests the text under `result.read.text`; tolerate `result.text` and a
     // bare-string `result` too across versions. Missing all three means no inline
     // output and the client falls back to its own read.
-    for ptr in ["/result/read/text", "/result/text"] {
+    for ptr in [
+        "/result/read/output",
+        "/result/read/text",
+        "/result/output",
+        "/result/text",
+    ] {
         if let Some(text) = value.pointer(ptr).and_then(Value::as_str) {
             return Some(text.to_owned());
         }
@@ -2699,14 +4362,6 @@ fn pane_read_text(value: &Value) -> Option<String> {
         .pointer("/result")
         .and_then(Value::as_str)
         .map(str::to_owned)
-}
-
-fn stream_pane_frame(value: &Value) -> Option<StreamPaneFrame> {
-    let revision = ["/result/read/revision", "/result/revision"]
-        .into_iter()
-        .find_map(|pointer| value.pointer(pointer).and_then(Value::as_u64))?;
-    let output = pane_read_text(value)?;
-    Some(StreamPaneFrame { revision, output })
 }
 
 /// Convert one sampled frame into the enriched `pane_updated` payload consumed
@@ -2727,27 +4382,21 @@ fn stream_pane_update_payload(frame: &StreamPaneFrame, pane_id: &str) -> Option<
 }
 
 async fn poll_stream_pane_update(
-    session: &SessionConfig,
+    backend: &dyn TerminalBackend,
     opts: &StreamOutputOpts,
 ) -> Option<StreamPaneFrame> {
     let pane = opts.pane.as_deref()?;
     let read = tokio::time::timeout(
         STREAM_OUTPUT_READ_TIMEOUT,
-        herdr_request(
-            session,
-            "pane.read",
-            json!({
-                "pane_id": pane,
-                "source": opts.source,
-                "lines": opts.lines,
-                "format": opts.format,
-            }),
-        ),
+        backend.read_pane(&stream_read_request(pane, opts)),
     )
     .await
     .ok()?
     .ok()?;
-    stream_pane_frame(&read)
+    Some(StreamPaneFrame {
+        revision: read.revision.unwrap_or_default(),
+        output: read.text,
+    })
 }
 
 /// If `line` is a `pane.updated` for the streamed pane, read that pane's output
@@ -2756,7 +4405,7 @@ async fn poll_stream_pane_update(
 /// still has its revision and can fall back to a read).
 async fn enrich_pane_update(
     line: &str,
-    session: &SessionConfig,
+    backend: &dyn TerminalBackend,
     opts: &StreamOutputOpts,
 ) -> Option<String> {
     let pane = opts.pane.as_deref()?;
@@ -2777,26 +4426,36 @@ async fn enrich_pane_update(
     // client reads on its own.
     let read = tokio::time::timeout(
         Duration::from_secs(2),
-        herdr_request(
-            session,
-            "pane.read",
-            json!({
-                "pane_id": pane,
-                "source": opts.source,
-                "lines": opts.lines,
-                "format": opts.format,
-            }),
-        ),
+        backend.read_pane(&stream_read_request(pane, opts)),
     )
     .await
     .ok()?
     .ok()?;
-    let text = pane_read_text(&read)?;
     value
         .get_mut("data")
         .and_then(Value::as_object_mut)?
-        .insert("output".into(), Value::String(text));
+        .insert("output".into(), Value::String(read.text));
     serde_json::to_string(&value).ok()
+}
+
+fn stream_read_request(pane_id: &str, opts: &StreamOutputOpts) -> BackendReadPane {
+    BackendReadPane {
+        pane_id: BackendPaneId::new(pane_id),
+        source: match opts.source.as_str() {
+            "visible" => BackendOutputSource::Visible,
+            "recent" => BackendOutputSource::Recent,
+            "detection" => BackendOutputSource::Detection,
+            _ => BackendOutputSource::RecentUnwrapped,
+        },
+        format: if opts.format == "text" {
+            BackendOutputFormat::Text
+        } else {
+            BackendOutputFormat::Ansi
+        },
+        lines: opts.lines,
+        start: None,
+        end: None,
+    }
 }
 
 /// Fold a streamed frame into what the gateway keeps for that pane.
@@ -2811,15 +4470,8 @@ fn keep_stream_frame(
     opts: &StreamOutputOpts,
     output: &str,
 ) {
-    if output.is_empty() {
-        return;
-    }
     let Ok(mut store) = store.lock() else { return };
-    if !store.keeps(session_id, pane_id) {
-        return;
-    }
-    let key = scrollback::read_key(session_id, pane_id, &opts.source, &opts.format);
-    store.record(&key, output);
+    store.record_frame(session_id, pane_id, &opts.source, &opts.format, output);
 }
 
 /// The output an enriched `pane.updated` carries, so the same frame that
@@ -2838,26 +4490,105 @@ fn normalize_event_name(value: &str) -> String {
     value.trim().replace('.', "_")
 }
 
-/// The `event` field of a forwarded Herdr line, used to decide whether a
-/// subscribed client asked for it.
-fn herdr_event_name(line: &str) -> Option<String> {
-    serde_json::from_str::<Value>(line)
-        .ok()?
-        .get("event")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
+/// The SSE event name every encrypted stream record travels under. The real
+/// event name is inside the sealed payload, where it is authenticated; the
+/// outer name is the one piece of stream metadata deliberately left readable.
+const ENCRYPTED_SSE_EVENT: &str = "muqun.encrypted";
+
+/// Seals one connection's events, each under its own AES-256-GCM record.
+///
+/// The per-stream key binds the device key, a fresh stream id and the request
+/// envelope's nonce (see `transport::derive_stream_key`); the nonce is the
+/// event's sequence number, and the AAD carries request AAD, stream id and
+/// seq. Together: a record that is modified, reordered, replayed -- within
+/// this stream or from any other -- or dropped (the client checks seq
+/// continuity) fails authentication on the phone.
+struct EventStreamSealer {
+    key: [u8; 32],
+    stream_id: String,
+    request_aad: String,
+    seq: u64,
 }
+
+impl EventStreamSealer {
+    fn new(context: &EncryptedStreamContext) -> anyhow::Result<Self> {
+        let stream_id = generate_token();
+        let key =
+            transport::derive_stream_key(&context.material, &stream_id, &context.request_nonce)?;
+        Ok(Self {
+            key,
+            stream_id,
+            request_aad: context.request_aad.clone(),
+            seq: 0,
+        })
+    }
+
+    fn seal(&mut self, name: &str, data: &str) -> anyhow::Result<Event> {
+        let record = self.seal_record(name, data)?;
+        Ok(Event::default().event(ENCRYPTED_SSE_EVENT).data(record))
+    }
+
+    /// The `data:` line of one sealed record, split out so a test can open
+    /// what left the sealer without reaching inside axum's `Event`.
+    fn seal_record(&mut self, name: &str, data: &str) -> anyhow::Result<String> {
+        let seq = self.seq;
+        let plaintext = serde_json::to_vec(&json!({ "event": name, "data": data }))?;
+        let aad = format!("{}\n{}\n{}", self.request_aad, self.stream_id, seq);
+        let ciphertext =
+            transport::seal_stream_event(&self.key, seq, aad.as_bytes(), &plaintext)?;
+        // Only counted once sealing succeeded, so a failed record does not
+        // burn a seq the client would then read as a gap.
+        self.seq += 1;
+        Ok(json!({
+            "v": 1,
+            "sid": self.stream_id,
+            "seq": seq,
+            "ciphertext": ciphertext,
+        })
+        .to_string())
+    }
+}
+
+/// One event, sealed when this connection is encrypted and plain when it is
+/// not. `None` means the record could not be sealed; the event is dropped
+/// rather than ever leaving in the clear.
+fn stream_event(sealer: &mut Option<EventStreamSealer>, name: &str, data: &str) -> Option<Event> {
+    match sealer {
+        Some(sealer) => match sealer.seal(name, data) {
+            Ok(event) => Some(event),
+            Err(error) => {
+                eprintln!("failed to seal stream event: {error}");
+                None
+            }
+        },
+        None => Some(Event::default().event(name.to_owned()).data(data.to_owned())),
+    }
+}
+
+type GatewayEventStream =
+    Pin<Box<dyn Stream<Item = Result<Event, std::convert::Infallible>> + Send>>;
 
 async fn events(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
     Query(query): Query<EventsQuery>,
+    stream_crypto: Option<Extension<EncryptedStreamContext>>,
     headers: HeaderMap,
-) -> Result<
-    Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>,
-    (StatusCode, Json<Value>),
-> {
+) -> Result<Response, (StatusCode, Json<Value>)> {
     require_device(&state, &headers)?;
+    // Present exactly when the request arrived through the encrypted
+    // transport. From here on every event this connection emits is sealed;
+    // a device paired without a transport key keeps the plaintext stream.
+    let mut sealer = match stream_crypto {
+        Some(Extension(context)) => Some(EventStreamSealer::new(&context).map_err(|_| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "transport_key_unavailable",
+                "encrypted transport is unavailable",
+            )
+        })?),
+        None => None,
+    };
     let session = find_session(&state.config, &session_id)?.clone();
     let wanted: Option<std::collections::HashSet<String>> = query.types.as_ref().map(|value| {
         value
@@ -2891,132 +4622,109 @@ async fn events(
     let approval_events = wanted
         .as_ref()
         .is_none_or(|set| set.contains("approval_pending") || set.contains("approval_resolved"));
+    let pane_events = wanted
+        .as_ref()
+        .is_none_or(|set| set.contains("pane_updated"));
     let mut approvals_rx = state.approval_events.subscribe();
     let assets = state.assets.clone();
     let scrollback_store = state.scrollback.clone();
+    let backend = terminal_backend(&session);
+    let mut activity = backend.activity_stream().await.map_err(backend_api_error)?;
     let stream = async_stream::stream! {
-        match herdr_event_stream(&session).await {
-            Ok(mut reader) => {
-                let mut line = Vec::new();
-                let mut output_interval = tokio::time::interval(STREAM_OUTPUT_POLL_INTERVAL);
-                output_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                let mut last_stream_output: Option<String> = None;
-                loop {
-                    line.clear();
-                    tokio::select! {
-                        read = reader.read_until(b'\n', &mut line) => match read {
-                            Ok(0) => break,
-                            Ok(_) => {
-                            let data = String::from_utf8_lossy(&line);
-                            let data = data.trim();
-                            if !data.is_empty() {
-                                // Filter at the point of forwarding rather than
-                                // by unsubscribing: a subscribed event a client
-                                // did not ask for costs nothing here, but waking
-                                // the phone for it costs battery.
-                                let keep = match &wanted {
-                                    Some(set) => herdr_event_name(data)
-                                        .map(|name| set.contains(&name))
-                                        .unwrap_or(true),
-                                    None => true,
-                                };
-                                if keep {
-                                    // Fold the viewed pane's output into its
-                                    // update so the client paints on arrival,
-                                    // with no follow-up read hop. Everything
-                                    // else forwards untouched.
-                                    let payload = if stream_opts.pane.is_some() {
-                                        enrich_pane_update(data, &session, &stream_opts)
-                                            .await
-                                            .unwrap_or_else(|| data.to_owned())
-                                    } else {
-                                        data.to_owned()
-                                    };
-                                    // An enriched update is a second source of
-                                    // fresh output for the watched pane. Feeding
-                                    // only the tick would drop frames on a pane
-                                    // busy enough to beat it.
-                                    if let Some(pane_id) = stream_opts.pane.as_deref() {
-                                        if let Some(output) = enriched_pane_output(&payload) {
-                                            keep_stream_frame(&scrollback_store, &session_id, pane_id, &stream_opts, &output);
-                                        }
-                                    }
-                                    yield Ok(Event::default().event("herdr").data(payload));
+        let mut output_interval = tokio::time::interval(STREAM_OUTPUT_POLL_INTERVAL);
+        output_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_stream_output: Option<String> = None;
+        loop {
+            tokio::select! {
+                next = activity.next() => match next {
+                    Some(Ok(activity)) => {
+                        let data = activity.payload.to_string();
+                        let keep = wanted.as_ref().is_none_or(|set| {
+                            activity.name.is_empty() || set.contains(&activity.name)
+                        });
+                        if keep {
+                            let payload = if stream_opts.pane.is_some() {
+                                enrich_pane_update(&data, backend.as_ref(), &stream_opts)
+                                    .await
+                                    .unwrap_or_else(|| data.clone())
+                            } else {
+                                data.clone()
+                            };
+                            if let Some(pane_id) = stream_opts.pane.as_deref() {
+                                if let Some(output) = enriched_pane_output(&payload) {
+                                    keep_stream_frame(&scrollback_store, &session_id, pane_id, &stream_opts, &output);
                                 }
-                                // A worktree event is consumed whether or not
-                                // the client asked to see it: the asset index
-                                // is fed by the same stream that filters.
-                                if let Some(root) = worktree_event_root(&session_id, data) {
-                                    let created = ingest_roots(assets.clone(), vec![root]).await;
-                                    if asset_events {
-                                        let now = now_unix_ms();
-                                        for entry in created
-                                            .into_iter()
-                                            .filter(|entry| now.saturating_sub(entry.modified_unix_ms) <= ASSET_EVENT_MAX_AGE_MS)
-                                            .take(MAX_ASSET_EVENTS_PER_WORKTREE)
-                                        {
-                                            let asset_type = sniff_asset_type(&read_asset_head(&entry.path), &entry.name);
-                                            yield Ok(Event::default()
-                                                .event("asset.created")
-                                                .data(asset_created_payload(&entry, asset_type)));
-                                        }
-                                    }
-                                } else if let Some(removed) = worktree_event_removed_root(data) {
-                                    if let Ok(mut index) = assets.lock() {
-                                        index.forget_under(&removed);
+                            }
+                            if let Some(event) = stream_event(&mut sealer, "herdr", &payload) {
+                                yield Ok(event);
+                            }
+                        }
+                        if let Some(root) = worktree_event_root(&session_id, &data) {
+                            let created = ingest_roots(assets.clone(), vec![root]).await;
+                            if asset_events {
+                                let now = now_unix_ms();
+                                for entry in created
+                                    .into_iter()
+                                    .filter(|entry| now.saturating_sub(entry.modified_unix_ms) <= ASSET_EVENT_MAX_AGE_MS)
+                                    .take(MAX_ASSET_EVENTS_PER_WORKTREE)
+                                {
+                                    let asset_type = sniff_asset_type(&read_asset_head(&entry.path), &entry.name);
+                                    let payload = asset_created_payload(&entry, asset_type);
+                                    if let Some(event) = stream_event(&mut sealer, "asset.created", &payload) {
+                                        yield Ok(event);
                                     }
                                 }
                             }
+                        } else if let Some(removed) = worktree_event_removed_root(&data) {
+                            if let Ok(mut index) = assets.lock() {
+                                index.forget_under(&removed);
                             }
-                            Err(err) => {
-                            eprintln!("Herdr event stream read failed: {err:#}");
-                            yield Ok(Event::default().event("gateway.error").data("Herdr event stream unavailable"));
-                            break;
-                            }
-                        },
-                        _ = output_interval.tick(), if stream_opts.pane.is_some() => {
-                            if let Some(frame) = poll_stream_pane_update(&session, &stream_opts).await {
-                                if last_stream_output.as_deref() != Some(frame.output.as_str()) {
-                                    last_stream_output = Some(frame.output.clone());
-                                    if let Some(pane_id) = stream_opts.pane.as_deref() {
-                                        // The frame the reader is watching is
-                                        // also the only chance to keep it: for a
-                                        // pane Herdr holds no scrollback for,
-                                        // this tick is where its history comes
-                                        // from, and it was being dropped.
-                                        keep_stream_frame(&scrollback_store, &session_id, pane_id, &stream_opts, &frame.output);
-                                        if let Some(payload) = stream_pane_update_payload(&frame, pane_id) {
-                                            yield Ok(Event::default().event("herdr").data(payload));
-                                        }
-                                    }
-                                }
-                            }
-                        },
-                        approval = approvals_rx.recv(), if approval_events => {
-                            match approval {
-                                Ok(approval) => {
-                                    let wanted_name = normalize_event_name(approval.name);
-                                    if wanted.as_ref().is_none_or(|set| set.contains(&wanted_name)) {
-                                        yield Ok(Event::default().event(approval.name).data(approval.payload));
-                                    }
-                                }
-                                // A client that fell behind has missed
-                                // transitions; it re-reads the pane's approval
-                                // rather than being told a stale one.
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                            }
-                        },
+                        }
                     }
-                }
-            }
-            Err(err) => {
-                eprintln!("Herdr event stream connection failed: {err:#}");
-                yield Ok(Event::default().event("gateway.error").data("Herdr event stream unavailable"));
+                    Some(Err(err)) => {
+                        eprintln!("terminal activity stream failed: {err}");
+                        if let Some(event) = stream_event(&mut sealer, "gateway.error", "Terminal activity stream unavailable") {
+                            yield Ok(event);
+                        }
+                        break;
+                    }
+                    None => break,
+                },
+                _ = output_interval.tick(), if stream_opts.pane.is_some() && pane_events => {
+                    if let Some(frame) = poll_stream_pane_update(backend.as_ref(), &stream_opts).await {
+                        if last_stream_output.as_deref() != Some(frame.output.as_str()) {
+                            last_stream_output = Some(frame.output.clone());
+                            if let Some(pane_id) = stream_opts.pane.as_deref() {
+                                keep_stream_frame(&scrollback_store, &session_id, pane_id, &stream_opts, &frame.output);
+                                if let Some(payload) = stream_pane_update_payload(&frame, pane_id) {
+                                    if let Some(event) = stream_event(&mut sealer, "herdr", &payload) {
+                                        yield Ok(event);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                approval = approvals_rx.recv(), if approval_events => {
+                    match approval {
+                        Ok(approval) => {
+                            let wanted_name = normalize_event_name(approval.name);
+                            if wanted.as_ref().is_none_or(|set| set.contains(&wanted_name)) {
+                                if let Some(event) = stream_event(&mut sealer, approval.name, &approval.payload) {
+                                    yield Ok(event);
+                                }
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                },
             }
         }
     };
-    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
+    Ok(Sse::new(Box::pin(stream) as GatewayEventStream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response())
 }
 
 fn spawn_approval_watchers(state: AppState) {
@@ -3042,7 +4750,7 @@ async fn watch_pane_approvals(state: AppState, session: SessionConfig) {
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         ticker.tick().await;
-        let Ok(response) = herdr_request(&session, "pane.list", json!({})).await else {
+        let Ok(panes) = terminal_backend(&session).list_panes().await else {
             continue;
         };
         // This listing is already being fetched, and it is the only place that
@@ -3050,42 +4758,19 @@ async fn watch_pane_approvals(state: AppState, session: SessionConfig) {
         // the buffer knows what to keep before the reader ever opens the pane,
         // and costs Herdr nothing extra.
         if let Some(mut store) = lock_scrollback(&state) {
-            store.observe(&session.id, &response);
+            store.observe(&session.id, &backend::compat::pane_list(panes.clone()));
         }
-
-        let panes = response
-            .pointer("/result/panes")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
 
         let mut seen: Vec<String> = Vec::new();
         for pane in &panes {
-            let Some(pane_id) = pane.get("pane_id").and_then(Value::as_str) else {
-                continue;
-            };
-            let agent = pane
-                .get("agent")
-                .and_then(Value::as_str)
-                .filter(|agent| !agent.is_empty());
+            let pane_id = pane.id.as_str();
+            let agent = pane.agent.as_deref().filter(|agent| !agent.is_empty());
             let Some(agent) = agent else { continue };
             seen.push(pane_id.to_owned());
 
-            let Ok(read) = herdr_request(
-                &session,
-                "pane.read",
-                json!({
-                    "pane_id": pane_id,
-                    "source": "visible",
-                    "lines": APPROVAL_READ_LINES,
-                    "format": "text"
-                }),
-            )
-            .await
-            else {
+            let Ok(text) = read_pane_visible_text(&session, pane_id).await else {
                 continue;
             };
-            let text = pane_read_text(&read).unwrap_or_default();
             match approvals::detect(&text) {
                 Some(approval) => {
                     if pending.get(pane_id) == Some(&approval.fingerprint) {
@@ -3238,50 +4923,40 @@ async fn watch_agent_notifications(state: AppState, session: SessionConfig) {
     let mut statuses = seed_agent_statuses(&session).await;
 
     loop {
-        for mut notification in poll_agent_notifications(&state, &session, &mut statuses).await {
-            enrich_blocked_notification(&state, &session, &mut notification).await;
-            deliver_agent_notification(&state, notification).await;
-        }
-
-        match herdr_agent_event_stream(&session).await {
-            Ok(mut reader) => {
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    match tokio::time::timeout(Duration::from_secs(30), reader.read_line(&mut line))
-                        .await
-                    {
-                        Err(_) | Ok(Ok(0)) => break,
-                        Ok(Ok(_)) => {
-                            let Ok(event) = serde_json::from_str::<Value>(line.trim()) else {
-                                continue;
-                            };
-                            if let Some(mut notification) = absorb_agent_status_event(
-                                &state,
-                                &session.id,
-                                &event,
-                                &mut statuses,
-                            ) {
-                                enrich_blocked_notification(&state, &session, &mut notification)
-                                    .await;
-                                deliver_agent_notification(&state, notification).await;
-                            }
-                        }
-                        Ok(Err(err)) => {
-                            eprintln!(
-                                "Herdr event stream failed for session {}: {err}",
-                                session.id
-                            );
-                            break;
-                        }
+        let backend = terminal_backend(&session);
+        let Ok(mut activity) = backend.activity_stream().await else {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        };
+        let mut poll = tokio::time::interval(Duration::from_secs(2));
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = poll.tick() => {
+                    for mut notification in poll_agent_notifications(&state, &session, &mut statuses).await {
+                        enrich_blocked_notification(&state, &session, &mut notification).await;
+                        deliver_agent_notification(&state, notification).await;
                     }
                 }
-            }
-            Err(err) => {
-                eprintln!(
-                    "Herdr event subscription failed for session {}: {err:#}",
-                    session.id
-                );
+                next = activity.next() => match next {
+                    Some(Ok(event)) if event.name == "pane_agent_status_changed" => {
+                        if let Some(mut notification) = absorb_agent_status_event(
+                            &state,
+                            &session.id,
+                            &event.payload,
+                            &mut statuses,
+                        ) {
+                            enrich_blocked_notification(&state, &session, &mut notification).await;
+                            deliver_agent_notification(&state, notification).await;
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(err)) => {
+                        eprintln!("terminal activity failed for session {}: {err}", session.id);
+                        break;
+                    }
+                    None => break,
+                }
             }
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -3293,7 +4968,7 @@ async fn poll_agent_notifications(
     session: &SessionConfig,
     statuses: &mut HashMap<String, String>,
 ) -> Vec<AgentPushNotice> {
-    let Ok(value) = herdr_request(session, "agent.list", json!({})).await else {
+    let Ok(value) = backend_agent_list(session).await else {
         return Vec::new();
     };
     value
@@ -3350,7 +5025,7 @@ async fn deliver_agent_notification(state: &AppState, notice: AgentPushNotice) {
 }
 
 async fn seed_agent_statuses(session: &SessionConfig) -> HashMap<String, String> {
-    let Ok(value) = herdr_request(session, "agent.list", json!({})).await else {
+    let Ok(value) = backend_agent_list(session).await else {
         return HashMap::new();
     };
     value
@@ -3365,6 +5040,49 @@ async fn seed_agent_statuses(session: &SessionConfig) -> HashMap<String, String>
             ))
         })
         .collect()
+}
+
+async fn backend_agent_list(session: &SessionConfig) -> Result<Value, BackendError> {
+    let terminal = terminal_backend(session);
+    let mut agents = terminal.list_agents().await?;
+    for agent in agents
+        .iter_mut()
+        .filter(|agent| agent.kind.is_some() && agent.status == BackendAgentStatus::Unknown)
+    {
+        let output = terminal
+            .read_pane(&BackendReadPane {
+                pane_id: agent.pane_id.clone(),
+                source: BackendOutputSource::Visible,
+                format: BackendOutputFormat::Text,
+                lines: APPROVAL_READ_LINES,
+                start: None,
+                end: None,
+            })
+            .await;
+        if let Ok(output) = output {
+            agent.status = infer_tmux_agent_status(agent.kind.as_deref(), &output.text);
+        }
+    }
+    Ok(backend::compat::agent_list(&agents))
+}
+
+fn infer_tmux_agent_status(agent: Option<&str>, visible: &str) -> backend::AgentStatus {
+    if approvals::detect(visible).is_some() {
+        return backend::AgentStatus::Blocked;
+    }
+    let Some(dictionary) = parts::dictionary_for(agent) else {
+        return backend::AgentStatus::Unknown;
+    };
+    let normalized = parts::normalize_json(visible, Some(dictionary));
+    match normalized
+        .last()
+        .and_then(|part| part.get("type"))
+        .and_then(Value::as_str)
+    {
+        Some("prompt") => backend::AgentStatus::Idle,
+        Some("status") | Some("tool-block") => backend::AgentStatus::Working,
+        _ => backend::AgentStatus::Unknown,
+    }
 }
 
 /// One agent status change, after the bookkeeping and before anyone decides
@@ -3547,17 +5265,33 @@ async fn create_workspace(
     Json(body): Json<CreateWorkspaceBody>,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
-    let mut params = serde_json::Map::new();
-    insert_opt(&mut params, "cwd", body.cwd);
-    insert_opt(&mut params, "label", body.label);
-    insert_opt(&mut params, "focus", body.focus);
-    call_session_method(
-        &state.config,
-        &session_id,
-        "workspace.create",
-        Value::Object(params),
-    )
-    .await
+    let session = find_session(&state.config, &session_id)?;
+    let backend = terminal_backend(session);
+    let workspace = backend
+        .create_workspace(&BackendCreateWorkspace {
+            cwd: body.cwd.map(PathBuf::from),
+            label: body.label,
+            focus: body.focus.unwrap_or(false),
+        })
+        .await
+        .map_err(backend_api_error)?;
+    let tab = backend
+        .list_tabs()
+        .await
+        .map_err(backend_api_error)?
+        .into_iter()
+        .find(|tab| tab.workspace_id == workspace.id)
+        .ok_or_else(|| backend_api_error(BackendError::InvalidResponse("created tab")))?;
+    let root_pane = backend
+        .list_panes()
+        .await
+        .map_err(backend_api_error)?
+        .into_iter()
+        .find(|pane| pane.tab_id == tab.id)
+        .ok_or_else(|| backend_api_error(BackendError::InvalidResponse("created pane")))?;
+    Ok(Json(backend::compat::workspace_created(
+        workspace, tab, root_pane,
+    )))
 }
 
 async fn focus_workspace(
@@ -3566,13 +5300,12 @@ async fn focus_workspace(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
-    call_session_method(
-        &state.config,
-        &session_id,
-        "workspace.focus",
-        json!({ "workspace_id": workspace_id }),
-    )
-    .await
+    let session = find_session(&state.config, &session_id)?;
+    terminal_backend(session)
+        .focus_workspace(&BackendWorkspaceId::new(workspace_id))
+        .await
+        .map_err(backend_api_error)?;
+    Ok(Json(backend::compat::command_ok("workspace_focused")))
 }
 
 async fn rename_workspace(
@@ -3582,13 +5315,12 @@ async fn rename_workspace(
     Json(body): Json<RenameWorkspaceBody>,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
-    call_session_method(
-        &state.config,
-        &session_id,
-        "workspace.rename",
-        json!({ "workspace_id": workspace_id, "label": body.label }),
-    )
-    .await
+    let session = find_session(&state.config, &session_id)?;
+    terminal_backend(session)
+        .rename_workspace(&BackendWorkspaceId::new(workspace_id), &body.label)
+        .await
+        .map_err(backend_api_error)?;
+    Ok(Json(backend::compat::command_ok("workspace_renamed")))
 }
 
 async fn close_workspace(
@@ -3597,13 +5329,12 @@ async fn close_workspace(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
-    call_session_method(
-        &state.config,
-        &session_id,
-        "workspace.close",
-        json!({ "workspace_id": workspace_id }),
-    )
-    .await
+    let session = find_session(&state.config, &session_id)?;
+    terminal_backend(session)
+        .close_workspace(&BackendWorkspaceId::new(workspace_id))
+        .await
+        .map_err(backend_api_error)?;
+    Ok(Json(backend::compat::command_ok("workspace_closed")))
 }
 
 async fn tabs(
@@ -3612,7 +5343,12 @@ async fn tabs(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
-    call_session_method(&state.config, &session_id, "tab.list", json!({})).await
+    let session = find_session(&state.config, &session_id)?;
+    let tabs = terminal_backend(session)
+        .list_tabs()
+        .await
+        .map_err(backend_api_error)?;
+    Ok(Json(backend::compat::tab_list(tabs)))
 }
 
 async fn create_tab(
@@ -3622,18 +5358,25 @@ async fn create_tab(
     Json(body): Json<CreateTabBody>,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
-    let mut params = serde_json::Map::new();
-    insert_opt(&mut params, "workspace_id", body.workspace_id);
-    insert_opt(&mut params, "label", body.label);
-    insert_opt(&mut params, "cwd", body.cwd);
-    insert_opt(&mut params, "focus", body.focus);
-    call_session_method(
-        &state.config,
-        &session_id,
-        "tab.create",
-        Value::Object(params),
-    )
-    .await
+    let session = find_session(&state.config, &session_id)?;
+    let backend = terminal_backend(session);
+    let tab = backend
+        .create_tab(&BackendCreateTab {
+            workspace_id: body.workspace_id.map(BackendWorkspaceId::new),
+            cwd: body.cwd.map(PathBuf::from),
+            label: body.label,
+            focus: body.focus.unwrap_or(false),
+        })
+        .await
+        .map_err(backend_api_error)?;
+    let root_pane = backend
+        .list_panes()
+        .await
+        .map_err(backend_api_error)?
+        .into_iter()
+        .find(|pane| pane.tab_id == tab.id)
+        .ok_or_else(|| backend_api_error(BackendError::InvalidResponse("created pane")))?;
+    Ok(Json(backend::compat::tab_created(tab, root_pane)))
 }
 
 async fn focus_tab(
@@ -3642,13 +5385,12 @@ async fn focus_tab(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
-    call_session_method(
-        &state.config,
-        &session_id,
-        "tab.focus",
-        json!({ "tab_id": tab_id }),
-    )
-    .await
+    let session = find_session(&state.config, &session_id)?;
+    terminal_backend(session)
+        .focus_tab(&BackendTabId::new(tab_id))
+        .await
+        .map_err(backend_api_error)?;
+    Ok(Json(backend::compat::command_ok("tab_focused")))
 }
 
 async fn rename_tab(
@@ -3658,13 +5400,12 @@ async fn rename_tab(
     Json(body): Json<RenameTabBody>,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
-    call_session_method(
-        &state.config,
-        &session_id,
-        "tab.rename",
-        json!({ "tab_id": tab_id, "label": body.label }),
-    )
-    .await
+    let session = find_session(&state.config, &session_id)?;
+    terminal_backend(session)
+        .rename_tab(&BackendTabId::new(tab_id), &body.label)
+        .await
+        .map_err(backend_api_error)?;
+    Ok(Json(backend::compat::command_ok("tab_renamed")))
 }
 
 async fn close_tab(
@@ -3673,13 +5414,12 @@ async fn close_tab(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
-    call_session_method(
-        &state.config,
-        &session_id,
-        "tab.close",
-        json!({ "tab_id": tab_id }),
-    )
-    .await
+    let session = find_session(&state.config, &session_id)?;
+    terminal_backend(session)
+        .close_tab(&BackendTabId::new(tab_id))
+        .await
+        .map_err(backend_api_error)?;
+    Ok(Json(backend::compat::command_ok("tab_closed")))
 }
 
 async fn pane(
@@ -3688,14 +5428,13 @@ async fn pane(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
-    let answer = call_session_method(
-        &state.config,
-        &session_id,
-        "pane.get",
-        json!({ "pane_id": pane_id }),
-    )
-    .await;
-    Ok(Json(note_and_amend_panes(&state, &session_id, answer?.0)))
+    let session = find_session(&state.config, &session_id)?;
+    let answer = terminal_backend(session)
+        .get_pane(&BackendPaneId::new(pane_id))
+        .await
+        .map(backend::compat::pane_get)
+        .map_err(backend_api_error)?;
+    Ok(Json(note_and_amend_panes(&state, &session_id, answer)))
 }
 
 async fn focus_pane(
@@ -3704,13 +5443,12 @@ async fn focus_pane(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
-    call_session_method(
-        &state.config,
-        &session_id,
-        "pane.focus",
-        json!({ "pane_id": pane_id }),
-    )
-    .await
+    let session = find_session(&state.config, &session_id)?;
+    terminal_backend(session)
+        .focus_pane(&BackendPaneId::new(pane_id))
+        .await
+        .map_err(backend_api_error)?;
+    Ok(Json(backend::compat::command_ok("pane_focused")))
 }
 
 async fn rename_pane(
@@ -3720,13 +5458,12 @@ async fn rename_pane(
     Json(body): Json<RenamePaneBody>,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
-    call_session_method(
-        &state.config,
-        &session_id,
-        "pane.rename",
-        json!({ "pane_id": pane_id, "label": body.label }),
-    )
-    .await
+    let session = find_session(&state.config, &session_id)?;
+    terminal_backend(session)
+        .rename_pane(&BackendPaneId::new(pane_id), &body.label)
+        .await
+        .map_err(backend_api_error)?;
+    Ok(Json(backend::compat::command_ok("pane_renamed")))
 }
 
 async fn close_pane(
@@ -3735,13 +5472,12 @@ async fn close_pane(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
-    call_session_method(
-        &state.config,
-        &session_id,
-        "pane.close",
-        json!({ "pane_id": pane_id }),
-    )
-    .await
+    let session = find_session(&state.config, &session_id)?;
+    terminal_backend(session)
+        .close_pane(&BackendPaneId::new(pane_id))
+        .await
+        .map_err(backend_api_error)?;
+    Ok(Json(backend::compat::command_ok("pane_closed")))
 }
 
 async fn split_pane(
@@ -3758,6 +5494,17 @@ async fn split_pane(
             "direction must be right or down",
         ));
     }
+    if body
+        .ratio
+        .is_some_and(|ratio| !(0.05..=0.95).contains(&ratio))
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_ratio",
+            "ratio must be between 0.05 and 0.95",
+        ));
+    }
+    let session = find_session(&state.config, &session_id)?;
     let command = body
         .command
         .map(|parts| parts.join(" "))
@@ -3765,54 +5512,37 @@ async fn split_pane(
     if let Some(text) = command.as_deref() {
         validate_text(text)?;
     }
-    let mut params = serde_json::Map::new();
-    params.insert("target_pane_id".into(), json!(pane_id));
-    params.insert("direction".into(), json!(body.direction));
-    insert_opt(&mut params, "ratio", body.ratio);
-    insert_opt(&mut params, "cwd", body.cwd);
-    insert_opt(&mut params, "env", body.env);
-    let result = call_session_method(
-        &state.config,
-        &session_id,
-        "pane.split",
-        Value::Object(params),
-    )
-    .await?;
+    let backend = terminal_backend(session);
+    let pane = backend
+        .split_pane(&BackendSplitPane {
+            pane_id: BackendPaneId::new(pane_id),
+            direction: match body.direction.as_str() {
+                "right" => BackendSplitDirection::Right,
+                "down" => BackendSplitDirection::Down,
+                _ => unreachable!("direction was validated above"),
+            },
+            ratio: body.ratio,
+            cwd: body.cwd.map(PathBuf::from),
+            env: body.env,
+        })
+        .await
+        .map_err(backend_api_error)?;
     if let Some(text) = command {
-        let created_pane_id = created_pane_id(&result).ok_or_else(|| {
-            api_error(
-                StatusCode::BAD_GATEWAY,
-                "invalid_split_response",
-                "Herdr did not return the created pane id",
-            )
-        })?;
-        let _ = call_session_method(
-            &state.config,
-            &session_id,
-            "pane.send_text",
-            json!({ "pane_id": created_pane_id, "text": text }),
-        )
-        .await?;
-        let _ = call_session_method(
-            &state.config,
-            &session_id,
-            "pane.send_keys",
-            json!({ "pane_id": created_pane_id, "keys": ["Enter"] }),
-        )
-        .await?;
+        backend
+            .send_text(&pane.id, &text)
+            .await
+            .map_err(backend_api_error)?;
+        backend
+            .send_keys(&pane.id, &["Enter".to_owned()])
+            .await
+            .map_err(backend_api_error)?;
     }
-    Ok(result)
-}
-
-fn created_pane_id(value: &Value) -> Option<&str> {
-    value
-        .pointer("/result/pane/pane_id")
-        .and_then(Value::as_str)
+    Ok(Json(backend::compat::pane_created(pane)))
 }
 
 async fn zoom_pane(
     State(state): State<AppState>,
-    Path((session_id, pane_id)): Path<(String, String)>,
+    Path((session_id, _pane_id)): Path<(String, String)>,
     headers: HeaderMap,
     Json(body): Json<ZoomPaneBody>,
 ) -> ApiResult<Json<Value>> {
@@ -3825,13 +5555,13 @@ async fn zoom_pane(
             "mode must be on, off, or toggle",
         ));
     }
-    call_session_method(
-        &state.config,
-        &session_id,
-        "pane.zoom",
-        json!({ "pane_id": pane_id, "mode": mode }),
-    )
-    .await
+    find_session(&state.config, &session_id)?;
+    // Released Muqun builds POST `zoom:on` whenever a terminal view mounts.
+    // That request is view setup, not an explicit user command. Propagating it
+    // changed the user's tmux/Herdr layout merely by opening the app and raced
+    // stale snapshots into misleading target-not-found errors. Keep the route
+    // and response for wire compatibility, but observation is side-effect free.
+    Ok(Json(backend::compat::command_ok("pane_zoomed")))
 }
 
 async fn agent(
@@ -3840,13 +5570,12 @@ async fn agent(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
-    call_session_method(
-        &state.config,
-        &session_id,
-        "agent.get",
-        json!({ "target": target }),
-    )
-    .await
+    let session = find_session(&state.config, &session_id)?;
+    let agent = terminal_backend(session)
+        .get_agent(&target)
+        .await
+        .map_err(backend_api_error)?;
+    Ok(Json(backend::compat::agent_get(agent)))
 }
 
 async fn focus_agent(
@@ -3855,13 +5584,12 @@ async fn focus_agent(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
-    call_session_method(
-        &state.config,
-        &session_id,
-        "agent.focus",
-        json!({ "target": target }),
-    )
-    .await
+    let session = find_session(&state.config, &session_id)?;
+    terminal_backend(session)
+        .focus_agent(&target)
+        .await
+        .map_err(backend_api_error)?;
+    Ok(Json(backend::compat::command_ok("agent_focused")))
 }
 
 async fn send_agent(
@@ -3890,12 +5618,33 @@ async fn submit_agent_prompt(
     target: &str,
     text: &str,
 ) -> Result<Value, HerdrCallError> {
-    herdr_call(
-        session,
-        "agent.prompt",
-        json!({ "target": target, "text": text }),
-    )
-    .await
+    terminal_backend(session)
+        .prompt_agent(target, text)
+        .await
+        .map(|_| backend::compat::command_ok("agent_prompted"))
+        .map_err(|err| HerdrCallError::Unavailable(err.to_string()))
+}
+
+async fn start_backend_agent(
+    session: &SessionConfig,
+    pane_id: &str,
+    kind: &str,
+    command: &str,
+    args: &[String],
+    timeout_ms: u64,
+) -> Result<Value, HerdrCallError> {
+    let started = terminal_backend(session)
+        .start_agent(&BackendStartAgent {
+            pane_id: BackendPaneId::new(pane_id),
+            kind: kind.to_owned(),
+            command: command.to_owned(),
+            executable: tasks::find_on_path(command),
+            args: args.to_vec(),
+            timeout_ms,
+        })
+        .await
+        .map_err(|err| HerdrCallError::Unavailable(err.to_string()))?;
+    Ok(json!({ "result": { "argv": started.argv } }))
 }
 
 /// Belt and braces for a paste-vs-keypress race in agent TUIs: when the prompt
@@ -3940,7 +5689,7 @@ async fn submit_keypress(session: &SessionConfig, pane_id: &str) {
     let baseline = agent_state_change_seq(session, pane_id).await;
     if baseline.is_none() {
         eprintln!(
-            "agent submit for pane {pane_id}: Herdr lists no agent state for it, \
+            "agent submit for pane {pane_id}: the terminal backend lists no agent state for it, \
              falling back to watching the screen"
         );
     }
@@ -3956,16 +5705,13 @@ async fn submit_keypress(session: &SessionConfig, pane_id: &str) {
             eprintln!("agent submit for pane {pane_id} gave up: the pane never settled");
             return;
         };
-        if let Err(err) = herdr_call(
-            session,
-            "pane.send_keys",
-            json!({ "pane_id": pane_id, "keys": ["Enter"] }),
-        )
-        .await
-        {
+        let sent = terminal_backend(session)
+            .send_keys(&BackendPaneId::new(pane_id), &["Enter".to_owned()])
+            .await;
+        if let Err(err) = sent {
             eprintln!(
                 "agent submit for pane {pane_id} failed to send Enter: {}",
-                err.message()
+                err
             );
             return;
         }
@@ -4001,15 +5747,15 @@ async fn submit_keypress(session: &SessionConfig, pane_id: &str) {
     );
 }
 
-/// Herdr's own count of how many times this pane's agent has changed state.
+/// The backend's count of how many times this pane's agent has changed state.
 ///
-/// `None` means Herdr lists no agent for the pane, which a send to a plain shell
-/// pane legitimately is, or that it could not be asked.
+/// `None` means the backend lists no agent for the pane, which a send to a plain
+/// shell pane legitimately is, or that it could not be asked.
 async fn agent_state_change_seq(session: &SessionConfig, pane_id: &str) -> Option<u64> {
-    let value = match herdr_request(session, "agent.list", json!({})).await {
+    let value = match backend_agent_list(session).await {
         Ok(value) => value,
         Err(err) => {
-            eprintln!("Herdr request agent.list failed: {err:#}");
+            eprintln!("terminal backend agent list failed: {err}");
             return None;
         }
     };
@@ -4237,18 +5983,17 @@ async fn create_task(
         "prompt_submitted": false
     });
 
-    let mut agent_params = serde_json::Map::new();
-    agent_params.insert(
-        "name".into(),
-        json!(label.as_deref().unwrap_or(body.agent.as_str())),
-    );
-    agent_params.insert("kind".into(), json!(body.agent));
-    agent_params.insert("pane_id".into(), json!(place.pane_id));
-    agent_params.insert("timeout_ms".into(), json!(timeout_ms));
-    if let Some(args) = body.agent_args.as_ref() {
-        agent_params.insert("args".into(), json!(args));
-    }
-    match herdr_call(&session, "agent.start", Value::Object(agent_params)).await {
+    let agent_command = tasks::agent_command(&body.agent, &state.config.agent_commands);
+    match start_backend_agent(
+        &session,
+        &place.pane_id,
+        &body.agent,
+        &agent_command,
+        body.agent_args.as_deref().unwrap_or_default(),
+        timeout_ms,
+    )
+    .await
+    {
         Ok(value) => {
             steps.ok(
                 "agent",
@@ -4318,22 +6063,35 @@ async fn prepare_workspace(
     steps: &mut tasks::StepLog,
 ) -> Result<TaskPlace, HerdrCallError> {
     steps.skipped("worktree", "no branch_name was given");
-    let mut params = serde_json::Map::new();
-    params.insert("cwd".into(), json!(repo_path.to_string_lossy()));
-    params.insert("focus".into(), json!(false));
-    insert_opt(&mut params, "label", label);
-    let value = match herdr_call(session, "workspace.create", Value::Object(params)).await {
-        Ok(value) => value,
+    let backend = terminal_backend(session);
+    let workspace = match backend
+        .create_workspace(&BackendCreateWorkspace {
+            cwd: Some(repo_path.to_owned()),
+            label: label.map(str::to_owned),
+            focus: false,
+        })
+        .await
+    {
+        Ok(workspace) => workspace,
         Err(err) => {
+            let err = HerdrCallError::Unavailable(err.to_string());
             steps.failed("workspace", err.code(), &err.message());
             return Err(err);
         }
     };
-    let place = workspace_place(&value, None, false).ok_or_else(|| {
-        let err = HerdrCallError::malformed("workspace.create");
-        steps.failed("workspace", err.code(), &err.message());
-        err
-    })?;
+    let pane = backend
+        .list_panes()
+        .await
+        .map_err(|err| HerdrCallError::Unavailable(err.to_string()))?
+        .into_iter()
+        .find(|pane| pane.workspace_id == workspace.id)
+        .ok_or_else(|| HerdrCallError::malformed("workspace.create"))?;
+    let place = TaskPlace {
+        workspace_id: workspace.id.as_str().to_owned(),
+        pane_id: pane.id.as_str().to_owned(),
+        worktree_path: None,
+        reused: false,
+    };
     steps.ok(
         "workspace",
         json!({ "workspace_id": place.workspace_id, "pane_id": place.pane_id }),
@@ -4429,15 +6187,17 @@ async fn spawn_agent(
         "prompt_submitted": false,
     });
 
-    let mut params = serde_json::Map::new();
-    params.insert("name".into(), json!(body.agent));
-    params.insert("kind".into(), json!(body.agent));
-    params.insert("pane_id".into(), json!(place.pane_id));
-    params.insert(
-        "timeout_ms".into(),
-        json!(tasks::DEFAULT_AGENT_START_TIMEOUT_MS),
-    );
-    match herdr_call(&session, "agent.start", Value::Object(params)).await {
+    let agent_command = tasks::agent_command(&body.agent, &state.config.agent_commands);
+    match start_backend_agent(
+        &session,
+        &place.pane_id,
+        &body.agent,
+        &agent_command,
+        &[],
+        tasks::DEFAULT_AGENT_START_TIMEOUT_MS,
+    )
+    .await
+    {
         Ok(value) => {
             steps.ok(
                 "agent",
@@ -4525,37 +6285,33 @@ async fn spawn_in_new_tab(
     cwd: Option<&str>,
     steps: &mut tasks::StepLog,
 ) -> ApiResult<SpawnPlace> {
-    {
-        let mut params = serde_json::Map::new();
-        insert_opt(&mut params, "cwd", cwd);
-        params.insert("focus".into(), json!(false));
-        let value = herdr_call(session, "tab.create", Value::Object(params))
-            .await
-            .map_err(|err| {
-                steps.failed("pane", err.code(), &err.message());
-                err.into_api_error("tab.create")
-            })?;
-        let pane_id = created_pane_id(&value)
-            .or_else(|| {
-                value
-                    .pointer("/result/root_pane/pane_id")
-                    .and_then(Value::as_str)
-            })
-            .ok_or_else(|| {
-                api_error(
-                    StatusCode::BAD_GATEWAY,
-                    "herdr_malformed_response",
-                    "Herdr did not return the created pane id",
-                )
-            })?
-            .to_owned();
-        let tab_id = value
-            .pointer("/result/tab/tab_id")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        steps.ok("pane", json!({ "pane_id": pane_id, "tab_id": tab_id }));
-        Ok(SpawnPlace { pane_id, tab_id })
-    }
+    let backend = terminal_backend(session);
+    let tab = backend
+        .create_tab(&BackendCreateTab {
+            workspace_id: None,
+            cwd: cwd.map(PathBuf::from),
+            label: None,
+            focus: false,
+        })
+        .await
+        .map_err(backend_api_error)?;
+    let pane_id = backend
+        .list_panes()
+        .await
+        .map_err(backend_api_error)?
+        .into_iter()
+        .find(|pane| pane.tab_id == tab.id)
+        .map(|pane| pane.id.as_str().to_owned())
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                "backend_malformed_response",
+                "terminal backend did not return the created pane",
+            )
+        })?;
+    let tab_id = Some(tab.id.as_str().to_owned());
+    steps.ok("pane", json!({ "pane_id": pane_id, "tab_id": tab_id }));
+    Ok(SpawnPlace { pane_id, tab_id })
 }
 
 /// A task placed beside what the reader was already looking at.
@@ -4572,37 +6328,32 @@ async fn spawn_beside(
             "that tab has no pane to split",
         )
     })?;
-    let mut params = serde_json::Map::new();
-    params.insert("pane_id".into(), json!(host));
-    params.insert("direction".into(), json!("down"));
-    insert_opt(&mut params, "cwd", cwd);
-    params.insert("focus".into(), json!(false));
     // A split that Ghostty refuses -- a tab already carrying as many panes as
     // its layout will hold, which is the ordinary state of a tab someone works
     // in -- must not lose the task. The tab was a preference, not the request:
     // the request was "start this agent". So a refusal falls back to a tab of
     // its own, recorded as such rather than passed off as the split that was
     // asked for.
-    let split = herdr_call(session, "pane.split", Value::Object(params)).await;
-    let value = match split {
-        Ok(value) => value,
+    let split = terminal_backend(session)
+        .split_pane(&BackendSplitPane {
+            pane_id: BackendPaneId::new(&host),
+            direction: BackendSplitDirection::Down,
+            ratio: None,
+            cwd: cwd.map(PathBuf::from),
+            env: None,
+        })
+        .await;
+    let pane = match split {
+        Ok(pane) => pane,
         Err(err) => {
             steps.skipped(
                 "split",
-                &format!("{} -- starting in a tab of its own instead", err.message()),
+                &format!("{err} -- starting in a tab of its own instead"),
             );
             return spawn_in_new_tab(session, cwd, steps).await;
         }
     };
-    let pane_id = created_pane_id(&value)
-        .ok_or_else(|| {
-            api_error(
-                StatusCode::BAD_GATEWAY,
-                "herdr_malformed_response",
-                "Herdr did not return the created pane id",
-            )
-        })?
-        .to_owned();
+    let pane_id = pane.id.as_str().to_owned();
     steps.ok(
         "pane",
         json!({ "pane_id": pane_id, "tab_id": tab_id, "split_from": host }),
@@ -4615,30 +6366,14 @@ async fn spawn_beside(
 
 /// A pane to split in the named tab, preferring the one that has focus.
 async fn pane_in_tab(session: &SessionConfig, tab_id: &str) -> Option<String> {
-    let value = herdr_request(session, "pane.list", json!({})).await.ok()?;
-    pane_to_split(&value, tab_id)
-}
-
-/// Which pane of a `pane.list` a split should hang off, given the tab.
-///
-/// The focused one, because that is the one the user was looking at and the one
-/// a new pane should appear next to. A tab this session does not have answers
-/// with nothing, which is what makes an unknown `tab_id` a refusal rather than
-/// a spawn somewhere else.
-fn pane_to_split(response: &Value, tab_id: &str) -> Option<String> {
-    let panes = response
-        .pointer("/result/panes")
-        .and_then(Value::as_array)?;
-    let in_tab: Vec<&Value> = panes
-        .iter()
-        .filter(|pane| pane.get("tab_id").and_then(Value::as_str) == Some(tab_id))
-        .collect();
-    in_tab
-        .iter()
-        .find(|pane| pane.get("focused").and_then(Value::as_bool) == Some(true))
-        .or_else(|| in_tab.first())
-        .and_then(|pane| pane.get("pane_id").and_then(Value::as_str))
-        .map(str::to_owned)
+    terminal_backend(session)
+        .list_panes()
+        .await
+        .ok()?
+        .into_iter()
+        .filter(|pane| pane.tab_id.as_str() == tab_id)
+        .max_by_key(|pane| pane.focused)
+        .map(|pane| pane.id.as_str().to_owned())
 }
 
 /// The directories this session is already working in, for a spawn picker.
@@ -4655,7 +6390,7 @@ async fn recent_cwds(
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
     let session = find_session(&state.config, &session_id)?.clone();
-    let roots = session_asset_roots(&state, &session).await;
+    let roots = session_asset_roots(&state, &session, None).await;
 
     let cwds = tokio::task::spawn_blocking(move || {
         roots
@@ -4705,13 +6440,7 @@ async fn interrupt_pane(
         .filter(|value| !value.is_empty());
     let key = shortcuts::interrupt_key(agent, title);
 
-    herdr_call(
-        &session,
-        "pane.send_keys",
-        json!({ "pane_id": pane_id, "keys": [key] }),
-    )
-    .await
-    .map_err(|err| err.into_api_error("pane.send_keys"))?;
+    send_pane_keys(&session, &pane_id, std::slice::from_ref(&key)).await?;
 
     Ok(Json(json!({
         "session_id": session_id,
@@ -4739,56 +6468,65 @@ async fn prepare_worktree(
     label: Option<&str>,
     steps: &mut tasks::StepLog,
 ) -> Result<TaskPlace, HerdrCallError> {
-    let cwd = repo_path.to_string_lossy().into_owned();
-
-    let existing = herdr_call(session, "worktree.list", json!({ "cwd": cwd }))
+    let backend = terminal_backend(session);
+    let request = BackendWorktreeRequest {
+        cwd: repo_path.to_owned(),
+        branch: branch.to_owned(),
+        label: label.map(str::to_owned),
+        focus: false,
+    };
+    let existing = backend
+        .list_worktrees(&request.cwd)
         .await
         .ok()
-        .and_then(|value| worktree_for_branch(&value, branch));
+        .and_then(|worktrees| {
+            worktrees.into_iter().find(|worktree| {
+                worktree
+                    .branch
+                    .as_deref()
+                    .map(|name| name.strip_prefix("refs/heads/").unwrap_or(name))
+                    == Some(branch)
+            })
+        });
 
-    if let Some(path) = existing {
-        let mut params = serde_json::Map::new();
-        params.insert("cwd".into(), json!(cwd));
-        params.insert("branch".into(), json!(branch));
-        params.insert("focus".into(), json!(false));
-        insert_opt(&mut params, "label", label);
-        match herdr_call(session, "worktree.open", Value::Object(params)).await {
-            Ok(value) => {
-                if let Some(place) = workspace_place(&value, Some(path.clone()), true) {
-                    steps.ok(
-                        "worktree",
-                        json!({ "path": path, "branch": branch, "reused": true }),
-                    );
-                    steps.ok(
-                        "workspace",
-                        json!({ "workspace_id": place.workspace_id, "pane_id": place.pane_id }),
-                    );
-                    return Ok(place);
-                }
+    if let Some(worktree) = existing {
+        match backend.open_worktree(&request).await {
+            Ok(placement) => {
+                let path = worktree.path.to_string_lossy().into_owned();
+                let place = TaskPlace {
+                    workspace_id: placement.workspace_id.as_str().to_owned(),
+                    pane_id: placement.pane_id.as_str().to_owned(),
+                    worktree_path: Some(path.clone()),
+                    reused: true,
+                };
+                steps.ok(
+                    "worktree",
+                    json!({ "path": path, "branch": branch, "reused": true }),
+                );
+                steps.ok(
+                    "workspace",
+                    json!({ "workspace_id": place.workspace_id, "pane_id": place.pane_id }),
+                );
+                return Ok(place);
             }
             // Reuse is an optimisation, not a contract. If opening the existing
             // checkout fails, fall through and let the create path report a
             // real error rather than masking it with this one.
-            Err(err) => eprintln!("task: worktree.open for {branch} failed: {}", err.message()),
+            Err(err) => eprintln!("task: worktree open for {branch} failed: {err}"),
         }
     }
 
-    let mut params = serde_json::Map::new();
-    params.insert("cwd".into(), json!(cwd));
-    params.insert("branch".into(), json!(branch));
-    params.insert("focus".into(), json!(false));
-    insert_opt(&mut params, "label", label);
-    match herdr_call(session, "worktree.create", Value::Object(params)).await {
-        Ok(value) => {
-            let path = value
-                .pointer("/result/worktree/path")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            let place = workspace_place(&value, path.clone(), false).ok_or_else(|| {
-                let err = HerdrCallError::malformed("worktree.create");
-                steps.failed("worktree", err.code(), &err.message());
-                err
-            })?;
+    match backend.create_worktree(&request).await {
+        Ok(placement) => {
+            let path = placement
+                .path
+                .map(|path| path.to_string_lossy().into_owned());
+            let place = TaskPlace {
+                workspace_id: placement.workspace_id.as_str().to_owned(),
+                pane_id: placement.pane_id.as_str().to_owned(),
+                worktree_path: path.clone(),
+                reused: false,
+            };
             steps.ok(
                 "worktree",
                 json!({ "path": path, "branch": branch, "reused": false }),
@@ -4799,10 +6537,11 @@ async fn prepare_worktree(
             );
             Ok(place)
         }
-        Err(HerdrCallError::Herdr { error, .. }) if tasks::is_unknown_method_error(&error) => {
+        Err(BackendError::Unsupported(_)) => {
             prepare_worktree_with_git(session, repo_path, branch, label, steps).await
         }
         Err(err) => {
+            let err = backend_call_error("worktree.create", err);
             steps.failed("worktree", err.code(), &err.message());
             Err(err)
         }
@@ -4853,15 +6592,28 @@ async fn prepare_worktree_with_git(
         json!({ "path": path, "branch": branch, "reused": !added.created }),
     );
 
-    let mut params = serde_json::Map::new();
-    params.insert("cwd".into(), json!(path));
-    params.insert("focus".into(), json!(false));
-    insert_opt(&mut params, "label", label);
-    let created = match herdr_call(session, "workspace.create", Value::Object(params)).await {
-        // Herdr's own refusal is the useful message here, so it is kept rather
-        // than flattened into "something went wrong".
-        Err(err) => Err(err),
-        Ok(value) => workspace_place(&value, Some(path.clone()), !added.created)
+    let backend = terminal_backend(session);
+    let created = match backend
+        .create_workspace(&BackendCreateWorkspace {
+            cwd: Some(PathBuf::from(&path)),
+            label: label.map(str::to_owned),
+            focus: false,
+        })
+        .await
+    {
+        Err(err) => Err(HerdrCallError::Unavailable(err.to_string())),
+        Ok(workspace) => backend
+            .list_panes()
+            .await
+            .map_err(|err| HerdrCallError::Unavailable(err.to_string()))?
+            .into_iter()
+            .find(|pane| pane.workspace_id == workspace.id)
+            .map(|pane| TaskPlace {
+                workspace_id: workspace.id.as_str().to_owned(),
+                pane_id: pane.id.as_str().to_owned(),
+                worktree_path: Some(path.clone()),
+                reused: !added.created,
+            })
             .ok_or_else(|| HerdrCallError::malformed("workspace.create")),
     };
 
@@ -4898,48 +6650,6 @@ async fn prepare_worktree_with_git(
             Err(err)
         }
     }
-}
-
-/// Herdr answers `workspace.create`, `worktree.create` and `worktree.open` with
-/// the same workspace/tab/root_pane trio, so one reader covers all three.
-fn workspace_place(
-    value: &Value,
-    worktree_path: Option<String>,
-    reused: bool,
-) -> Option<TaskPlace> {
-    Some(TaskPlace {
-        workspace_id: value
-            .pointer("/result/workspace/workspace_id")
-            .and_then(Value::as_str)?
-            .to_owned(),
-        pane_id: value
-            .pointer("/result/root_pane/pane_id")
-            .and_then(Value::as_str)?
-            .to_owned(),
-        worktree_path: value
-            .pointer("/result/worktree/path")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .or(worktree_path),
-        reused,
-    })
-}
-
-/// The path of an existing checkout of `branch` in a `worktree.list` answer.
-fn worktree_for_branch(value: &Value, branch: &str) -> Option<String> {
-    value
-        .pointer("/result/worktrees")
-        .and_then(Value::as_array)?
-        .iter()
-        .find(|worktree| {
-            worktree
-                .get("branch")
-                .and_then(Value::as_str)
-                .map(|name| name.strip_prefix("refs/heads/").unwrap_or(name))
-                == Some(branch)
-        })
-        .and_then(|worktree| worktree.get("path").and_then(Value::as_str))
-        .map(str::to_owned)
 }
 
 /// Nothing usable was created: an ordinary error, with the steps attached so
@@ -4995,28 +6705,21 @@ async fn task_repo_roots(state: &AppState, session: &SessionConfig) -> Vec<PathB
         }
     };
 
-    match herdr_request(session, "workspace.list", json!({})).await {
-        Ok(value) => {
-            if let Some(workspaces) = value
-                .pointer("/result/workspaces")
-                .and_then(Value::as_array)
-            {
-                for workspace in workspaces {
-                    for key in ["repo_root", "checkout_path"] {
-                        if let Some(path) = workspace
-                            .pointer(&format!("/worktree/{key}"))
-                            .and_then(Value::as_str)
-                        {
-                            push(PathBuf::from(path));
-                        }
-                    }
+    match terminal_backend(session).list_workspaces().await {
+        Ok(workspaces) => {
+            for workspace in workspaces {
+                if let Some(path) = workspace.repo_root {
+                    push(path);
+                }
+                if let Some(path) = workspace.checkout_path {
+                    push(path);
                 }
             }
         }
-        Err(err) => eprintln!("task roots: workspace.list failed: {err:#}"),
+        Err(err) => eprintln!("task roots: workspace list failed: {err}"),
     }
 
-    for root in session_asset_roots(state, session).await {
+    for root in session_asset_roots(state, session, None).await {
         push(root.path);
     }
     roots
@@ -5082,24 +6785,43 @@ impl HerdrCallError {
     }
 }
 
-async fn herdr_call(
-    session: &SessionConfig,
-    method: &str,
-    params: Value,
-) -> Result<Value, HerdrCallError> {
-    let value = herdr_request(session, method, params)
-        .await
-        .map_err(|err| {
-            eprintln!("Herdr request {method} failed: {err:#}");
-            HerdrCallError::Unavailable("Herdr is unavailable".into())
-        })?;
-    if let Some(error) = value.get("error") {
-        return Err(HerdrCallError::Herdr {
+fn backend_call_error(method: &str, error: BackendError) -> HerdrCallError {
+    match error {
+        BackendError::Refused { code, message } => HerdrCallError::Herdr {
             method: method.to_owned(),
-            error: error.clone(),
-        });
+            error: json!({ "code": code, "message": message }),
+        },
+        BackendError::InvalidResponse(_) => HerdrCallError::malformed(method),
+        other @ (BackendError::Unavailable | BackendError::Unsupported(_)) => {
+            HerdrCallError::Unavailable(other.to_string())
+        }
+        other @ BackendError::InvalidTarget(_) => HerdrCallError::Unavailable(other.to_string()),
     }
-    Ok(value)
+}
+
+/// A requested range, clamped to what one response may carry.
+///
+/// Out-of-bounds clamps instead of failing: a reader paging toward the top will
+/// always eventually ask for more than the pane holds, and that is how reaching
+/// the top looks from outside, not a mistake worth an error for.
+fn validate_output_range(start: Option<u32>, end: Option<u32>) -> ApiResult<Option<(u32, u32)>> {
+    match (start, end) {
+        (None, None) => Ok(None),
+        (Some(start), Some(end)) if start < end => Ok(Some((
+            start,
+            end.min(start.saturating_add(MAX_OUTPUT_LINES)),
+        ))),
+        (Some(_), Some(_)) => Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_range",
+            "start must be less than end",
+        )),
+        _ => Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_range",
+            "start and end must be given together",
+        )),
+    }
 }
 
 async fn pane_output(
@@ -5109,6 +6831,7 @@ async fn pane_output(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
+    let range = validate_output_range(query.start, query.end)?;
     let source = query.source.unwrap_or_else(|| "recent-unwrapped".into());
     if !matches!(
         source.as_str(),
@@ -5134,42 +6857,54 @@ async fn pane_output(
     } else {
         source.as_str()
     };
-    let params = json!({
-        "pane_id": pane_id,
-        "source": herdr_source,
-        "lines": lines,
-        "format": format
-    });
-    let mut answer = call_session_method(&state.config, &session_id, "pane.read", params)
-        .await?
-        .0;
+    let session = find_session(&state.config, &session_id)?;
+    let request = BackendReadPane {
+        pane_id: BackendPaneId::new(pane_id.clone()),
+        source: match source.as_str() {
+            "visible" => BackendOutputSource::Visible,
+            "recent" => BackendOutputSource::Recent,
+            "recent-unwrapped" => BackendOutputSource::RecentUnwrapped,
+            "detection" => BackendOutputSource::Detection,
+            _ => unreachable!("source was validated above"),
+        },
+        format: match format.as_str() {
+            "text" => BackendOutputFormat::Text,
+            "ansi" => BackendOutputFormat::Ansi,
+            _ => unreachable!("format was validated above"),
+        },
+        lines,
+        start: range.map(|(start, _)| start),
+        end: range.map(|(_, end)| end),
+    };
+    let output = terminal_backend(session)
+        .read_pane(&request)
+        .await
+        .map_err(backend_api_error)?;
+    let mut answer = backend::compat::pane_read(output);
 
     // Herdr answered with everything it has. For a pane it keeps nothing above
     // the viewport for, everything it has is one screen -- and this is the read
     // that both feeds what the gateway kept and hands it back.
-    if let Some(text) = pane_read_text(&answer) {
-        let key = scrollback::read_key(&session_id, &pane_id, herdr_source, &format);
-        let served = {
-            let Some(mut store) = lock_scrollback(&state) else {
-                return Ok(Json(answer));
-            };
-            if !store.keeps(&session_id, &pane_id) {
-                return Ok(Json(answer));
-            }
-            store.record(&key, &text);
-            store.window(&key, lines as usize)
-        };
-        if let Some(served) = served {
-            // Rows, not bytes. This was `served.len() > text.len()` -- a byte
-            // count -- which is a guess about shape dressed up as a comparison:
-            // a buffer holding strictly more rows than the read can still be
-            // *shorter* in bytes, because the rows it kept are the ones that
-            // scrolled off and those are routinely blank or short. The window
-            // was then silently dropped and the reader got one screen, which
-            // looks exactly like the ring not working. Card #721 deletes every
-            // length-as-shape test on both sides of this contract; this is the
-            // gateway's one.
-            if scrollback::split_lines(&served).len() > scrollback::split_lines(&text).len() {
+    //
+    // Scoped to the tail path only (`range.is_none()`): stitching windows the
+    // local buffer by `lines`, which has no relationship to a requested
+    // `[start, end)`, and it only ever rewrites the text pointer, never
+    // `range`. A range-addressed read already got the backend's own answer
+    // for that exact slice; substituting a differently-windowed text under an
+    // unchanged `range` would make the response lie about which lines it
+    // holds, which is worse than the fabricated `start: 0` Task 3 already
+    // ruled out.
+    if range.is_none() {
+        if let (Some(text), Some(mut store)) = (pane_read_text(&answer), lock_scrollback(&state)) {
+            let served = store.serve_read(
+                &session_id,
+                &pane_id,
+                herdr_source,
+                &format,
+                &text,
+                lines as usize,
+            );
+            if served != text {
                 scrollback::replace_read_text(&mut answer, &served);
             }
         }
@@ -5221,45 +6956,32 @@ async fn pane_parts(
     // `recent_unwrapped` is the only source worth normalizing: the dictionaries
     // key off line starts, and it is the one source where a long line is one
     // line rather than however many the pane happens to be wide.
-    let read = herdr_request(
-        &session,
-        "pane.read",
-        json!({
-            "pane_id": pane_id,
-            "source": "recent_unwrapped",
-            "lines": lines,
-            "format": "text"
-        }),
-    )
-    .await
-    .map_err(|err| {
-        eprintln!("Herdr request pane.read failed: {err:#}");
-        api_error(
-            StatusCode::BAD_GATEWAY,
-            "herdr_unavailable",
-            "Herdr is unavailable",
-        )
-    })?;
-    let herdr_text = pane_read_text(&read).unwrap_or_default();
+    let output = terminal_backend(&session)
+        .read_pane(&BackendReadPane {
+            pane_id: BackendPaneId::new(&pane_id),
+            source: BackendOutputSource::RecentUnwrapped,
+            format: BackendOutputFormat::Text,
+            lines,
+            start: None,
+            end: None,
+        })
+        .await
+        .map_err(backend_api_error)?;
+    let (backend_text, revision) = (output.text, output.revision);
     // The transcript reads the same pane through a different endpoint, so it
     // has to be given the same rows: two views that disagree about where
     // history ends is the bug this whole thing is trying not to introduce.
-    let text = {
-        let key = scrollback::read_key(&session_id, &pane_id, "recent_unwrapped", "text");
-        match lock_scrollback(&state) {
-            Some(mut store) if store.keeps(&session_id, &pane_id) => {
-                store.record(&key, &herdr_text);
-                store
-                    .window(&key, lines as usize)
-                    .filter(|served| served.len() > herdr_text.len())
-                    .unwrap_or(herdr_text)
-            }
-            _ => herdr_text,
-        }
+    let text = match lock_scrollback(&state) {
+        Some(mut store) => store.serve_read(
+            &session_id,
+            &pane_id,
+            "recent_unwrapped",
+            "text",
+            &backend_text,
+            lines as usize,
+        ),
+        None => backend_text,
     };
-    let revision = ["/result/read/revision", "/result/revision"]
-        .into_iter()
-        .find_map(|pointer| read.pointer(pointer).and_then(Value::as_u64));
 
     let dictionary = parts::dictionary_for(agent.as_deref());
 
@@ -5330,26 +7052,17 @@ async fn pane_agent_and_root(
     session: &SessionConfig,
     pane_id: &str,
 ) -> (Option<String>, Option<PathBuf>) {
-    let pane = herdr_request(session, "pane.get", json!({ "pane_id": pane_id }))
+    let Ok(pane) = terminal_backend(session)
+        .get_pane(&BackendPaneId::new(pane_id))
         .await
-        .ok();
-    let pane = pane
-        .as_ref()
-        .map(|response| response.pointer("/result/pane").unwrap_or(response));
-    let agent = pane
-        .and_then(|pane| pane.get("agent").and_then(Value::as_str))
-        .filter(|agent| !agent.is_empty())
-        .map(str::to_owned);
+    else {
+        return (None, None);
+    };
     let root = pane
-        .and_then(|pane| {
-            pane.get("cwd")
-                .and_then(Value::as_str)
-                .or_else(|| pane.get("foreground_cwd").and_then(Value::as_str))
-        })
-        .map(PathBuf::from)
+        .cwd
         .filter(|path| is_scannable_root(path))
         .and_then(|path| std::fs::canonicalize(path).ok());
-    (agent, root)
+    (pane.agent, root)
 }
 
 /// The per-pane capability descriptor, because agent detection varies pane to
@@ -5426,8 +7139,10 @@ async fn pane_files(
 
     // The roots come from the same place the asset listing's do -- the pane
     // cwds Herdr reports -- so this endpoint cannot reach a directory the
-    // assets API would refuse.
-    let roots = session_asset_roots(&state, &session).await;
+    // assets API would refuse. Whole-session here (not workspace-scoped): the
+    // narrowing below is to one exact pane, which is already narrower than one
+    // workspace, so there is nothing for a workspace filter to add.
+    let roots = session_asset_roots(&state, &session, None).await;
     let root = roots
         .iter()
         .find(|root| root.pane_id.as_deref() == Some(pane_id.as_str()))
@@ -5516,20 +7231,14 @@ async fn session_agent_events(
 /// envelope. A pane the socket cannot answer for is a 502 rather than a guess:
 /// every caller here is about to act on what this pane is running.
 async fn pane_get(session: &SessionConfig, pane_id: &str) -> ApiResult<Value> {
-    let response = herdr_request(session, "pane.get", json!({ "pane_id": pane_id }))
+    let pane = terminal_backend(session)
+        .get_pane(&BackendPaneId::new(pane_id))
         .await
-        .map_err(|err| {
-            eprintln!("Herdr request pane.get failed: {err:#}");
-            api_error(
-                StatusCode::BAD_GATEWAY,
-                "herdr_unavailable",
-                "Herdr is unavailable",
-            )
-        })?;
-    Ok(response
+        .map_err(backend_api_error)?;
+    Ok(backend::compat::pane_get(pane)
         .pointer("/result/pane")
         .cloned()
-        .unwrap_or(response))
+        .unwrap_or_default())
 }
 
 /// The key row and slash commands for whatever this pane is running.
@@ -5902,20 +7611,11 @@ async fn send_pane_keys(
     pane_id: &str,
     keys: &[String],
 ) -> ApiResult<Value> {
-    herdr_request(
-        session,
-        "pane.send_keys",
-        json!({ "pane_id": pane_id, "keys": keys }),
-    )
-    .await
-    .map_err(|err| {
-        eprintln!("Herdr request pane.send_keys failed: {err:#}");
-        api_error(
-            StatusCode::BAD_GATEWAY,
-            "herdr_unavailable",
-            "Herdr is unavailable",
-        )
-    })
+    terminal_backend(session)
+        .send_keys(&BackendPaneId::new(pane_id), keys)
+        .await
+        .map_err(backend_api_error)?;
+    Ok(backend::compat::command_ok("pane_keys_sent"))
 }
 
 /// What a pane is drawing right now, as plain text.
@@ -5924,26 +7624,18 @@ async fn send_pane_keys(
 /// callers care about the current screen, and the scrollback of an answered menu
 /// or an already-submitted prompt would only mislead them.
 async fn read_pane_visible_text(session: &SessionConfig, pane_id: &str) -> ApiResult<String> {
-    let read = herdr_request(
-        session,
-        "pane.read",
-        json!({
-            "pane_id": pane_id,
-            "source": "visible",
-            "lines": APPROVAL_READ_LINES,
-            "format": "text"
-        }),
-    )
-    .await
-    .map_err(|err| {
-        eprintln!("Herdr request pane.read failed: {err:#}");
-        api_error(
-            StatusCode::BAD_GATEWAY,
-            "herdr_unavailable",
-            "Herdr is unavailable",
-        )
-    })?;
-    Ok(pane_read_text(&read).unwrap_or_default())
+    terminal_backend(session)
+        .read_pane(&BackendReadPane {
+            pane_id: BackendPaneId::new(pane_id),
+            source: BackendOutputSource::Visible,
+            format: BackendOutputFormat::Text,
+            lines: APPROVAL_READ_LINES,
+            start: None,
+            end: None,
+        })
+        .await
+        .map(|output| output.text)
+        .map_err(backend_api_error)
 }
 
 /// Read a pane's agent and whatever menu it is drawing.
@@ -5951,13 +7643,10 @@ async fn read_pane_approval(
     session: &SessionConfig,
     pane_id: &str,
 ) -> ApiResult<(Option<String>, Option<approvals::Approval>)> {
-    let agent = herdr_request(session, "pane.get", json!({ "pane_id": pane_id }))
+    let agent = pane_get(session, pane_id)
         .await
         .ok()
-        .and_then(|response| {
-            let pane = response.pointer("/result/pane").unwrap_or(&response);
-            pane.get("agent").and_then(Value::as_str).map(str::to_owned)
-        })
+        .and_then(|pane| pane.get("agent").and_then(Value::as_str).map(str::to_owned))
         .filter(|agent| !agent.is_empty());
     let text = read_pane_visible_text(session, pane_id).await?;
     Ok((agent, approvals::detect(&text)))
@@ -5997,13 +7686,12 @@ async fn send_text(
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
     validate_text(&body.text)?;
-    call_session_method(
-        &state.config,
-        &session_id,
-        "pane.send_text",
-        json!({ "pane_id": pane_id, "text": body.text }),
-    )
-    .await
+    let session = find_session(&state.config, &session_id)?;
+    terminal_backend(session)
+        .send_text(&BackendPaneId::new(pane_id), &body.text)
+        .await
+        .map_err(backend_api_error)?;
+    Ok(Json(backend::compat::command_ok("pane_text_sent")))
 }
 
 async fn send_keys(
@@ -6020,31 +7708,32 @@ async fn send_keys(
             "keys must contain 1 to 32 entries",
         ));
     }
-    call_session_method(
-        &state.config,
-        &session_id,
-        "pane.send_keys",
-        json!({ "pane_id": pane_id, "keys": body.keys }),
-    )
-    .await
+    let session = find_session(&state.config, &session_id)?;
+    terminal_backend(session)
+        .send_keys(&BackendPaneId::new(pane_id), &body.keys)
+        .await
+        .map_err(backend_api_error)?;
+    Ok(Json(backend::compat::command_ok("pane_keys_sent")))
 }
 
-/// A file type the gateway is willing to store, with the extension and MIME
-/// type derived from the bytes themselves.
+/// A file type the gateway is willing to store. Binary formats get both fields
+/// from their magic bytes; UTF-8 text earns only a small extension allow-list
+/// after its content has passed the text probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct UploadKind {
     extension: &'static str,
     mime: &'static str,
 }
 
-/// Accept an image from the phone, park it in the gateway's own upload
+/// Accept a file from the phone, park it in the gateway's own upload
 /// directory and hand back a local path. The app then sends that path to an
 /// agent as ordinary text, so the agent reads the file straight off this
 /// machine.
 ///
-/// This first version takes images only. The stored name is generated here and
-/// the extension comes from the sniffed content, so nothing the client sends
-/// reaches the filesystem.
+/// Images and PDFs are identified by magic bytes. Source and document text has
+/// to be valid, low-control UTF-8 before its display-name extension is allowed
+/// to influence the generated stored name. Nothing from the client is ever
+/// used as a path.
 async fn upload_file(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -6094,9 +7783,9 @@ async fn upload_file(
         ));
     }
 
-    // Executables are checked separately from the image allow-list so the
-    // refusal says what it means, and so the rule still holds if the allow-list
-    // ever grows a format that a script could hide inside.
+    // Executables are checked separately from the content allow-list so the
+    // refusal says what it means, and so adding a document format cannot
+    // accidentally make an executable acceptable.
     if looks_executable(&bytes) {
         return Err(api_error(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -6104,11 +7793,14 @@ async fn upload_file(
             "executables and scripts are not accepted",
         ));
     }
-    let Some(kind) = sniff_upload_kind(&bytes) else {
+    let Some(kind) = sniff_upload_kind(&bytes)
+        .or_else(|| sniff_office_upload_kind(&bytes))
+        .or_else(|| sniff_document_upload_kind(&bytes, &client_name))
+    else {
         return Err(api_error(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "unsupported_file_type",
-            "only png, jpeg, gif, webp, and heic images are accepted",
+            "only supported images, office documents, PDF, and UTF-8 text are accepted",
         ));
     };
 
@@ -6213,6 +7905,249 @@ fn sniff_upload_kind(bytes: &[u8]) -> Option<UploadKind> {
         });
     }
     None
+}
+
+/// Recognise modern Office/OpenDocument containers without extracting them.
+/// The central directory carries entry names in plain bytes even when the
+/// entries themselves are compressed, which is enough to distinguish a Word,
+/// Excel or PowerPoint package from an arbitrary zip. ODF additionally puts an
+/// uncompressed `mimetype` entry first by specification.
+fn sniff_office_upload_kind(bytes: &[u8]) -> Option<UploadKind> {
+    let names = zip_entry_names(bytes)?;
+    let has = |needle: &str| names.iter().any(|name| *name == needle);
+    let ooxml_root = has("[Content_Types].xml") && has("_rels/.rels");
+    let mut ooxml = Vec::new();
+    if ooxml_root && has("word/document.xml") {
+        ooxml.push(UploadKind {
+            extension: "docx",
+            mime: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        });
+    }
+    if ooxml_root && has("xl/workbook.xml") {
+        ooxml.push(UploadKind {
+            extension: "xlsx",
+            mime: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        });
+    }
+    if ooxml_root && has("ppt/presentation.xml") {
+        ooxml.push(UploadKind {
+            extension: "pptx",
+            mime: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        });
+    }
+    if ooxml.len() == 1 {
+        return ooxml.pop();
+    }
+    if !ooxml.is_empty() {
+        // A package claiming to be multiple Office document kinds is not one
+        // the app or an agent should be asked to interpret.
+        return None;
+    }
+
+    if !has("content.xml") || !has("META-INF/manifest.xml") {
+        return None;
+    }
+    let (name, mime) = stored_first_zip_entry(bytes)?;
+    if name != "mimetype" {
+        return None;
+    }
+    match mime {
+        b"application/vnd.oasis.opendocument.text" => Some(UploadKind {
+            extension: "odt",
+            mime: "application/vnd.oasis.opendocument.text",
+        }),
+        b"application/vnd.oasis.opendocument.spreadsheet" => Some(UploadKind {
+            extension: "ods",
+            mime: "application/vnd.oasis.opendocument.spreadsheet",
+        }),
+        b"application/vnd.oasis.opendocument.presentation" => Some(UploadKind {
+            extension: "odp",
+            mime: "application/vnd.oasis.opendocument.presentation",
+        }),
+        _ => None,
+    }
+}
+
+const ZIP_LOCAL_HEADER: &[u8; 4] = b"PK\x03\x04";
+const ZIP_CENTRAL_HEADER: &[u8; 4] = b"PK\x01\x02";
+const ZIP_END_HEADER: &[u8; 4] = b"PK\x05\x06";
+const MAX_OFFICE_ZIP_ENTRIES: usize = 4_096;
+
+fn zip_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(
+        bytes.get(offset..offset + 2)?.try_into().ok()?,
+    ))
+}
+
+fn zip_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        bytes.get(offset..offset + 4)?.try_into().ok()?,
+    ))
+}
+
+/// Read only bounded metadata from an ordinary (non-Zip64) central directory.
+/// Encrypted entries, split archives and malformed offsets all fail closed.
+fn zip_entry_names(bytes: &[u8]) -> Option<Vec<&str>> {
+    if bytes.len() < 22 || !bytes.starts_with(ZIP_LOCAL_HEADER) {
+        return None;
+    }
+    let search_start = bytes.len().saturating_sub(22 + u16::MAX as usize);
+    let eocd = (search_start..=bytes.len() - 22)
+        .rev()
+        .find(|offset| bytes.get(*offset..*offset + 4) == Some(ZIP_END_HEADER.as_slice()))?;
+    if zip_u16(bytes, eocd + 4)? != 0 || zip_u16(bytes, eocd + 6)? != 0 {
+        return None;
+    }
+    let disk_entries = zip_u16(bytes, eocd + 8)? as usize;
+    let entry_count = zip_u16(bytes, eocd + 10)? as usize;
+    if entry_count != disk_entries || entry_count == 0 || entry_count > MAX_OFFICE_ZIP_ENTRIES {
+        return None;
+    }
+    let central_size = zip_u32(bytes, eocd + 12)? as usize;
+    let central_offset = zip_u32(bytes, eocd + 16)? as usize;
+    let central_end = central_offset.checked_add(central_size)?;
+    if central_end > eocd || central_end > bytes.len() {
+        return None;
+    }
+
+    let mut cursor = central_offset;
+    let mut names = Vec::with_capacity(entry_count);
+    for _ in 0..entry_count {
+        if bytes.get(cursor..cursor + 4)? != ZIP_CENTRAL_HEADER {
+            return None;
+        }
+        // Bit zero is traditional ZIP encryption. An agent could not inspect
+        // it anyway, and accepting opaque encrypted containers would defeat
+        // the entry-name validation this function exists to provide.
+        if zip_u16(bytes, cursor + 8)? & 1 != 0 {
+            return None;
+        }
+        let name_len = zip_u16(bytes, cursor + 28)? as usize;
+        let extra_len = zip_u16(bytes, cursor + 30)? as usize;
+        let comment_len = zip_u16(bytes, cursor + 32)? as usize;
+        let name_start = cursor.checked_add(46)?;
+        let name_end = name_start.checked_add(name_len)?;
+        let next = name_end.checked_add(extra_len)?.checked_add(comment_len)?;
+        if next > central_end {
+            return None;
+        }
+        let name = std::str::from_utf8(bytes.get(name_start..name_end)?).ok()?;
+        if name.contains('\0') || name.starts_with('/') || name.split('/').any(|part| part == "..")
+        {
+            return None;
+        }
+        names.push(name);
+        cursor = next;
+    }
+    (cursor == central_end).then_some(names)
+}
+
+/// ODF's first entry is mandated to be uncompressed `mimetype`. Reading that
+/// tiny stored value does not inflate attacker-controlled data.
+fn stored_first_zip_entry(bytes: &[u8]) -> Option<(&str, &[u8])> {
+    if bytes.get(0..4)? != ZIP_LOCAL_HEADER {
+        return None;
+    }
+    let flags = zip_u16(bytes, 6)?;
+    let method = zip_u16(bytes, 8)?;
+    if flags & 1 != 0 || method != 0 {
+        return None;
+    }
+    let compressed = zip_u32(bytes, 18)? as usize;
+    let uncompressed = zip_u32(bytes, 22)? as usize;
+    if compressed != uncompressed || compressed > 256 {
+        return None;
+    }
+    let name_len = zip_u16(bytes, 26)? as usize;
+    let extra_len = zip_u16(bytes, 28)? as usize;
+    let name_start = 30usize;
+    let name_end = name_start.checked_add(name_len)?;
+    let data_start = name_end.checked_add(extra_len)?;
+    let data_end = data_start.checked_add(compressed)?;
+    Some((
+        std::str::from_utf8(bytes.get(name_start..name_end)?).ok()?,
+        bytes.get(data_start..data_end)?,
+    ))
+}
+
+/// Documents stay deliberately narrow: PDF has an unambiguous signature and
+/// everything else must first pass the same UTF-8 text probe used by the asset
+/// browser. The filename may then preserve a useful source/document extension,
+/// but can never turn binary bytes into an accepted upload.
+fn sniff_document_upload_kind(bytes: &[u8], client_name: &str) -> Option<UploadKind> {
+    if bytes.starts_with(b"%PDF-") {
+        return Some(UploadKind {
+            extension: "pdf",
+            mime: "application/pdf",
+        });
+    }
+    if !looks_textual(bytes) {
+        return None;
+    }
+
+    let extension = client_name
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase());
+    Some(match extension.as_deref() {
+        Some("md" | "markdown" | "mdx") => UploadKind {
+            extension: "md",
+            mime: "text/markdown; charset=utf-8",
+        },
+        Some("json") => UploadKind {
+            extension: "json",
+            mime: "application/json",
+        },
+        Some("jsonl" | "ndjson") => UploadKind {
+            extension: "jsonl",
+            mime: "application/x-ndjson",
+        },
+        Some("csv") => UploadKind {
+            extension: "csv",
+            mime: "text/csv; charset=utf-8",
+        },
+        Some("yaml" | "yml") => UploadKind {
+            extension: "yaml",
+            mime: "application/yaml",
+        },
+        Some("toml") => UploadKind {
+            extension: "toml",
+            mime: "application/toml",
+        },
+        Some("xml") => UploadKind {
+            extension: "xml",
+            mime: "application/xml",
+        },
+        Some("rtf") => UploadKind {
+            extension: "rtf",
+            mime: "application/rtf",
+        },
+        Some("ts") => text_upload_kind("ts"),
+        Some("tsx") => text_upload_kind("tsx"),
+        Some("js") => text_upload_kind("js"),
+        Some("jsx") => text_upload_kind("jsx"),
+        Some("css") => text_upload_kind("css"),
+        Some("html") => text_upload_kind("html"),
+        Some("py") => text_upload_kind("py"),
+        Some("rs") => text_upload_kind("rs"),
+        Some("go") => text_upload_kind("go"),
+        Some("java") => text_upload_kind("java"),
+        Some("kt") => text_upload_kind("kt"),
+        Some("swift") => text_upload_kind("swift"),
+        Some("c") => text_upload_kind("c"),
+        Some("h") => text_upload_kind("h"),
+        Some("cpp") => text_upload_kind("cpp"),
+        Some("hpp") => text_upload_kind("hpp"),
+        Some("sql") => text_upload_kind("sql"),
+        Some("log") => text_upload_kind("log"),
+        _ => text_upload_kind("txt"),
+    })
+}
+
+fn text_upload_kind(extension: &'static str) -> UploadKind {
+    UploadKind {
+        extension,
+        mime: "text/plain; charset=utf-8",
+    }
 }
 
 /// HEIC is an ISO base media file: a `ftyp` box whose brand names the flavour.
@@ -6415,6 +8350,7 @@ struct AssetRoot {
     path: PathBuf,
     session_id: String,
     workspace_id: Option<String>,
+    tab_id: Option<String>,
     pane_id: Option<String>,
 }
 
@@ -6428,7 +8364,48 @@ struct AssetEntry {
     root: PathBuf,
     session_id: String,
     workspace_id: Option<String>,
+    tab_id: Option<String>,
     pane_id: Option<String>,
+}
+
+/// Which unit an assets request is scoped to.
+///
+/// tmux's tab is the tmux window, and is the granularity this exists to scope
+/// to: a tmux *session* -- what this gateway calls a workspace -- spans every
+/// project the developer happens to have a window open on, so scoping by
+/// workspace narrows nothing on a machine with one tmux session (see
+/// `tmux.rs:840-841`: `fields[0]` / the session is the workspace, `fields[1]`
+/// / the window is the tab).
+///
+/// Herdr's tabs sit *inside* one of its own workspaces -- a herdr workspace's
+/// `tab_count` need not be one -- and herdr's own workspace is already the
+/// granularity card #802 scoped to. Narrowing a herdr session down to one tab
+/// could hide a sibling tab's files that belong to the very same piece of
+/// work, which would be a behavior change on a path herdr already had right
+/// ("herdr must not change"). So a herdr session's tab id is resolved to the
+/// workspace that owns it (`resolve_asset_scope`), and everything downstream
+/// -- roots, the index, the cache -- scopes on that workspace instead of the
+/// tab.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum AssetScope {
+    Tab(String),
+    Workspace(String),
+}
+
+impl AssetScope {
+    fn matches_root(&self, root: &AssetRoot) -> bool {
+        match self {
+            AssetScope::Tab(id) => root.tab_id.as_deref() == Some(id.as_str()),
+            AssetScope::Workspace(id) => root.workspace_id.as_deref() == Some(id.as_str()),
+        }
+    }
+
+    fn matches_entry(&self, entry: &AssetEntry) -> bool {
+        match self {
+            AssetScope::Tab(id) => entry.tab_id.as_deref() == Some(id.as_str()),
+            AssetScope::Workspace(id) => entry.workspace_id.as_deref() == Some(id.as_str()),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -6445,7 +8422,10 @@ struct ScannedFile {
 #[derive(Debug, Default)]
 struct AssetIndex {
     entries: HashMap<String, AssetEntry>,
-    roots: HashMap<String, Vec<AssetRoot>>,
+    /// Keyed on `(session_id, scope)`. `scope` is `None` for the whole-session
+    /// callers and `Some` for a scoped one, so the two never share a slot --
+    /// see `session_asset_roots`.
+    roots: HashMap<(String, Option<AssetScope>), Vec<AssetRoot>>,
 }
 
 impl AssetIndex {
@@ -6464,6 +8444,7 @@ impl AssetIndex {
                     existing.root = entry.root;
                     existing.session_id = entry.session_id;
                     existing.workspace_id = entry.workspace_id;
+                    existing.tab_id = entry.tab_id;
                     existing.pane_id = entry.pane_id;
                 }
                 false
@@ -6479,22 +8460,32 @@ impl AssetIndex {
         self.entries.get(id).cloned()
     }
 
-    fn remember_roots(&mut self, session_id: &str, roots: Vec<AssetRoot>) {
-        self.roots.insert(session_id.to_owned(), roots);
+    fn remember_roots(
+        &mut self,
+        session_id: &str,
+        scope: Option<&AssetScope>,
+        roots: Vec<AssetRoot>,
+    ) {
+        self.roots
+            .insert((session_id.to_owned(), scope.cloned()), roots);
     }
 
-    fn known_roots(&self, session_id: &str) -> Vec<AssetRoot> {
-        self.roots.get(session_id).cloned().unwrap_or_default()
+    fn known_roots(&self, session_id: &str, scope: Option<&AssetScope>) -> Vec<AssetRoot> {
+        self.roots
+            .get(&(session_id.to_owned(), scope.cloned()))
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Newest first, cut to one page.
     fn session_assets(
         &self,
         session_id: &str,
+        scope: &AssetScope,
         since_unix_ms: Option<u128>,
         limit: usize,
     ) -> Vec<AssetEntry> {
-        let mut entries = self.session_assets_ordered(session_id, since_unix_ms);
+        let mut entries = self.session_assets_ordered(session_id, scope, since_unix_ms);
         entries.truncate(limit);
         entries
     }
@@ -6506,15 +8497,27 @@ impl AssetIndex {
     /// The caller that wants this rather than a page is the one that has to
     /// look past the page to fill it: a `kind` filter cannot be answered from
     /// the index, because what a file is comes from its bytes.
+    ///
+    /// Filtered by `scope` as well as `session_id`: an entry ingested under
+    /// this session from an unrelated tab or workspace -- whether from before
+    /// this scoping existed, or from the cold-start reindex in `asset_content`,
+    /// which still rebuilds a whole session's worth of roots -- must not leak
+    /// into a listing scoped to one tab (or, for herdr, one workspace). An
+    /// entry with neither a workspace_id nor a tab_id (the exact-path lookup
+    /// can index one without ever calling `pane_list_roots`) never matches a
+    /// specific scope either, for the same reason: an unattributed file is not
+    /// known to belong here.
     fn session_assets_ordered(
         &self,
         session_id: &str,
+        scope: &AssetScope,
         since_unix_ms: Option<u128>,
     ) -> Vec<AssetEntry> {
         let mut entries: Vec<AssetEntry> = self
             .entries
             .values()
             .filter(|entry| entry.session_id == session_id)
+            .filter(|entry| scope.matches_entry(entry))
             .filter(|entry| match since_unix_ms {
                 Some(since) => entry.modified_unix_ms > since,
                 None => true,
@@ -6686,6 +8689,10 @@ fn pane_list_roots(session_id: &str, response: &Value) -> Vec<AssetRoot> {
                 .get("workspace_id")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
+            tab_id: pane
+                .get("tab_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
             pane_id: pane
                 .get("pane_id")
                 .and_then(Value::as_str)
@@ -6720,6 +8727,13 @@ fn worktree_event_root(session_id: &str, line: &str) -> Option<AssetRoot> {
             .and_then(Value::as_str)
             .or_else(|| value.pointer("/data/workspace_id").and_then(Value::as_str))
             .map(str::to_owned),
+        // The event carries the checkout's workspace, never a tab -- herdr's
+        // own worktree.* payloads have no tab in them. Scoping never needs it:
+        // a herdr session always resolves a request's tab to its workspace
+        // (see `AssetScope`), and a tmux session never produces this event in
+        // the first place (tmux worktrees are made through the git fallback,
+        // with no protocol event of their own).
+        tab_id: None,
         pane_id: None,
     })
 }
@@ -6811,6 +8825,7 @@ fn ingest_root(index: &Mutex<AssetIndex>, root: &AssetRoot) -> Vec<AssetEntry> {
             root: canonical.clone(),
             session_id: root.session_id.clone(),
             workspace_id: root.workspace_id.clone(),
+            tab_id: root.tab_id.clone(),
             pane_id: root.pane_id.clone(),
         };
         if index.upsert(entry.clone()) {
@@ -6837,24 +8852,83 @@ async fn ingest_roots(index: Arc<Mutex<AssetIndex>>, roots: Vec<AssetRoot>) -> V
 
 /// Herdr is the source of truth for where a session works, but a listing still
 /// has to answer when the socket is down, so the last known roots are kept.
-async fn session_asset_roots(state: &AppState, session: &SessionConfig) -> Vec<AssetRoot> {
-    let fresh = match herdr_request(session, "pane.list", json!({})).await {
+///
+/// `scope` narrows the pane list tmux hands back -- every pane on the whole
+/// server -- down to the one tab a caller asked about (or, for a herdr
+/// session, the workspace that tab lives in; see `AssetScope`). `None` keeps
+/// the old, whole-session answer for the callers that still want it (the
+/// recent-directories picker, a task's candidate repo roots, and the
+/// cold-start reindex), so nothing about them changes.
+///
+/// The cache is keyed on `(session_id, scope)`, not on `session_id` alone: a
+/// scoped call and a whole-session call against the same session must not
+/// read back each other's roots when `list_panes` fails and the last known
+/// set is served instead. Collapsing the key back to `session_id` alone would
+/// quietly widen every scoped listing back out to the whole machine the
+/// moment the socket hiccuped -- the exact bug this function exists to close,
+/// just deferred to the fallback path.
+async fn session_asset_roots(
+    state: &AppState,
+    session: &SessionConfig,
+    scope: Option<&AssetScope>,
+) -> Vec<AssetRoot> {
+    let response = terminal_backend(session)
+        .list_panes()
+        .await
+        .map(backend::compat::pane_list)
+        .map_err(|err| err.to_string());
+    let mut fresh = match response {
         Ok(value) => pane_list_roots(&session.id, &value),
         Err(err) => {
-            eprintln!("asset roots: pane.list failed: {err:#}");
+            eprintln!("asset roots: pane.list failed: {err}");
             Vec::new()
         }
     };
+    if let Some(scope) = scope {
+        fresh.retain(|root| scope.matches_root(root));
+    }
     if fresh.is_empty() {
         return match state.assets.lock() {
-            Ok(index) => index.known_roots(&session.id),
+            Ok(index) => index.known_roots(&session.id, scope),
             Err(_) => Vec::new(),
         };
     }
     if let Ok(mut index) = state.assets.lock() {
-        index.remember_roots(&session.id, fresh.clone());
+        index.remember_roots(&session.id, scope, fresh.clone());
     }
     fresh
+}
+
+/// What a request's tab id actually scopes to, for this session's backend.
+///
+/// tmux: the tab id names a tmux window directly, which is exactly the unit
+/// this card narrows to -- no lookup needed.
+///
+/// Herdr: herdr's own tabs sit inside one of its workspaces, and a herdr
+/// workspace is the granularity that must not narrow (see `AssetScope`). The
+/// tab id is translated to the workspace that owns it by asking the live pane
+/// list which workspace that tab's panes belong to. A tab the pane list no
+/// longer has -- a closed tab, or a socket hiccup -- still needs *some* scope
+/// to key the cache and filter on, so the tab id itself is kept as the
+/// fallback: this keeps the answer scoped (and therefore empty rather than
+/// silently widened back to every workspace) even when the live lookup can't
+/// resolve it.
+async fn resolve_asset_scope(session: &SessionConfig, tab_id: &str) -> AssetScope {
+    if !session.backend.is_herdr() {
+        return AssetScope::Tab(tab_id.to_owned());
+    }
+    let workspace_id = terminal_backend(session)
+        .list_panes()
+        .await
+        .ok()
+        .and_then(|panes| {
+            panes
+                .into_iter()
+                .find(|pane| pane.tab_id.as_str() == tab_id)
+        })
+        .map(|pane| pane.workspace_id.as_str().to_owned())
+        .unwrap_or_else(|| tab_id.to_owned());
+    AssetScope::Workspace(workspace_id)
 }
 
 fn canonical_roots(roots: &[AssetRoot]) -> Vec<PathBuf> {
@@ -6910,6 +8984,27 @@ fn resolve_indexed_asset_path(stored: &FsPath, roots: &[PathBuf]) -> Option<Path
 ///
 /// A scan is not involved, so a file deeper or more obscure than the scan
 /// bothers with still resolves: the user pointed at it.
+/// A session's roots with the gateway's uploads directory appended, so a
+/// lookup can answer for a file the gateway itself stored on the phone's
+/// behalf. `None` -- a state dir that cannot be resolved -- leaves the roots
+/// exactly as they were.
+fn with_uploads_root(
+    mut roots: Vec<AssetRoot>,
+    session_id: &str,
+    uploads: Option<PathBuf>,
+) -> Vec<AssetRoot> {
+    if let Some(path) = uploads {
+        roots.push(AssetRoot {
+            path,
+            session_id: session_id.to_owned(),
+            workspace_id: None,
+            tab_id: None,
+            pane_id: None,
+        });
+    }
+    roots
+}
+
 fn asset_entry_for_path(raw: &str, roots: &[AssetRoot]) -> Option<AssetEntry> {
     let path = std::fs::canonicalize(raw).ok()?;
     if !path.is_file() {
@@ -6939,6 +9034,7 @@ fn asset_entry_for_path(raw: &str, roots: &[AssetRoot]) -> Option<AssetEntry> {
         root,
         session_id: owner.session_id.clone(),
         workspace_id: owner.workspace_id.clone(),
+        tab_id: owner.tab_id.clone(),
         pane_id: owner.pane_id.clone(),
     })
 }
@@ -7062,21 +9158,47 @@ fn asset_page(entries: Vec<AssetEntry>, kinds: &[String], limit: usize) -> Vec<V
     page
 }
 
-/// List what a session's workspaces produced recently, newest first.
+/// List what one tab produced recently, newest first.
+///
+/// Scoped to a tab rather than to a session or a workspace: with the tmux
+/// backend a session is the whole tmux server and a workspace is a tmux
+/// session -- one `tmux new-session`, which is commonly one long-running
+/// `Work` session with a window per project -- so either one still pools
+/// every project anyone happens to have open in that session. An agent's
+/// Files sheet asks "what did this piece of work touch", which is the tab
+/// (the tmux window) it is showing, not every tab the workspace happens to
+/// contain. `tab_id` is a wire id exactly like a pane id on the other
+/// handlers: the client already holds it from whatever pane or agent view
+/// opened this sheet, and it is compared as-is against the wire-form `tab_id`
+/// `list_panes()` already hands back, with no separate decode step needed
+/// because both sides went through the same `TmuxWireIds` seam.
+///
+/// A herdr session's tab id is translated to its owning workspace before any
+/// of this scoping happens (`resolve_asset_scope`), because herdr's own tabs
+/// sit inside a workspace and that workspace is the granularity herdr must
+/// keep -- see `AssetScope`.
 async fn session_assets(
     State(state): State<AppState>,
-    Path(session_id): Path<String>,
+    Path((session_id, tab_id)): Path<(String, String)>,
     Query(query): Query<AssetsQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
     let session = find_session(&state.config, &session_id)?.clone();
-    let roots = session_asset_roots(&state, &session).await;
+    let scope = resolve_asset_scope(&session, &tab_id).await;
+    let roots = session_asset_roots(&state, &session, Some(&scope)).await;
 
     // An exact path lookup asks about one file, so it neither waits for a scan
     // nor pages: it answers with that file or with nothing.
     if let Some(wanted) = query.path.clone() {
-        let lookup_roots = roots.clone();
+        // The uploads directory rides along as one more root, the same fold-in
+        // `asset_content`'s cold start does. An upload's path is printed into
+        // the pane and handed back by the upload response, but the file lives
+        // in the gateway's own directory, never under a pane's cwd -- so
+        // without this, the one path the client is guaranteed to hold is the
+        // one path the lookup could never answer. Serving it widens nothing:
+        // the directory is the gateway's own.
+        let lookup_roots = with_uploads_root(roots.clone(), &session_id, uploads_dir().ok());
         let entry = tokio::task::spawn_blocking(move || {
             let entry = asset_entry_for_path(&wanted, &lookup_roots)?;
             let asset_type = sniff_asset_type(&read_asset_head(&entry.path), &entry.name);
@@ -7095,6 +9217,7 @@ async fn session_assets(
         };
         return Ok(Json(content_envelope(json!({
             "session_id": session_id,
+            "tab_id": tab_id,
             "assets": assets,
             "path": query.path,
         }))));
@@ -7111,16 +9234,16 @@ async fn session_assets(
     // Unfiltered, the index cuts the page and only that page is sniffed:
     // metadata came from the scan, and reading a handful of file heads is cheap
     // where reading every file in the workspace would not be. A `kind` filter
-    // has to be given the whole session in order instead, because the index
+    // has to be given the whole workspace in order instead, because the index
     // does not know what a file is -- its bytes do -- and the page has to be
     // filled from the newest matches rather than from whatever the newest
     // handful of files happened to be.
     let entries = {
         let index = lock_assets(&state)?;
         if kinds.is_empty() {
-            index.session_assets(&session_id, since, limit)
+            index.session_assets(&session_id, &scope, since, limit)
         } else {
-            index.session_assets_ordered(&session_id, since)
+            index.session_assets_ordered(&session_id, &scope, since)
         }
     };
     let filter = kinds.clone();
@@ -7130,6 +9253,7 @@ async fn session_assets(
 
     Ok(Json(content_envelope(json!({
         "session_id": session_id,
+        "tab_id": tab_id,
         "assets": assets,
         "limit": limit,
         "since": since.map(|since| since as u64),
@@ -7155,9 +9279,27 @@ async fn asset_content(
     let mut entry = lock_assets(&state)?.get(&asset_id);
     if entry.is_none() {
         // Cold start: the app may hold an id from before a restart, so rebuild
-        // the index from the live sessions once before answering.
+        // the index from the live sessions once before answering. Uploads
+        // are not under any pane's cwd -- they are the gateway's own
+        // directory, not a workspace one -- so a rebuild from pane roots
+        // alone would never see an upload made before the restart that just
+        // emptied the index, even though the file is still on disk and
+        // `resolve_indexed_asset_path` would happily serve it once the entry
+        // exists. It is folded in here as one more root per session, which
+        // widens nothing the gateway was not already willing to serve: the
+        // uploads directory is its own, not a workspace's.
+        let uploads = uploads_dir().ok();
         for session in state.config.sessions.clone() {
-            let roots = session_asset_roots(&state, &session).await;
+            let mut roots = session_asset_roots(&state, &session, None).await;
+            if let Some(uploads) = &uploads {
+                roots.push(AssetRoot {
+                    path: uploads.clone(),
+                    session_id: session.id.clone(),
+                    workspace_id: None,
+                    tab_id: None,
+                    pane_id: None,
+                });
+            }
             ingest_roots(state.assets.clone(), roots).await;
         }
         entry = lock_assets(&state)?.get(&asset_id);
@@ -7173,7 +9315,7 @@ async fn asset_content(
     let session = find_session(&state.config, &entry.session_id)
         .map_err(|_| asset_not_found())?
         .clone();
-    let roots = canonical_roots(&session_asset_roots(&state, &session).await);
+    let roots = canonical_roots(&session_asset_roots(&state, &session, None).await);
     let entry_path = entry.path.clone();
     let Some(path) =
         tokio::task::spawn_blocking(move || resolve_indexed_asset_path(&entry_path, &roots))
@@ -7305,165 +9447,45 @@ fn asset_created_payload(entry: &AssetEntry, asset_type: AssetType) -> String {
     content_envelope(json!({ "asset": asset_json(entry, asset_type) })).to_string()
 }
 
-async fn call_session_method(
-    config: &Config,
-    session_id: &str,
-    method: &str,
-    params: Value,
-) -> ApiResult<Json<Value>> {
-    let session = find_session(config, session_id)?;
-    let value = herdr_request(session, method, params)
-        .await
-        .map_err(|err| {
-            eprintln!("Herdr request {method} failed: {err:#}");
-            api_error(
-                StatusCode::BAD_GATEWAY,
-                "herdr_unavailable",
-                "Herdr is unavailable",
-            )
-        })?;
-    Ok(Json(value))
-}
-
-async fn herdr_request(
-    session: &SessionConfig,
-    method: &str,
-    params: Value,
-) -> anyhow::Result<Value> {
-    let request = build_herdr_request(method, params);
-
-    #[cfg(unix)]
-    {
-        let mut stream = UnixStream::connect(&session.socket_path)
-            .await
-            .with_context(|| format!("failed to connect Herdr socket {}", session.socket_path))?;
-        stream.write_all(request.as_bytes()).await?;
-        stream.write_all(b"\n").await?;
-        stream.flush().await?;
-
-        let mut reader = BufReader::new(stream);
-        let mut response = String::new();
-        reader.read_line(&mut response).await?;
-        let value = serde_json::from_str(&response)?;
-        Ok(value)
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = (session, method, params, request);
-        anyhow::bail!("direct Herdr socket access is not implemented on this platform yet");
+/// The only call site that turns a session into a live backend. tmux ids
+/// collide with URL percent-encoding past pane 9 (see `backend::tmux_wire`),
+/// so a tmux session is wrapped here to translate ids to and from wire form
+/// before any handler sees them -- a future handler that reaches its backend
+/// through this function gets the translation automatically, with nothing to
+/// remember. herdr sessions are returned unwrapped: herdr's own ids already
+/// work today and must not change.
+fn terminal_backend(session: &SessionConfig) -> Box<dyn TerminalBackend> {
+    let backend = backend_registry().connect(session.backend, &session.socket_path);
+    match session.backend {
+        BackendKind::Tmux => Box::new(TmuxWireIds::new(backend)),
+        BackendKind::Herdr => backend,
     }
 }
 
-#[cfg(unix)]
-async fn herdr_event_stream(session: &SessionConfig) -> anyhow::Result<BufReader<UnixStream>> {
-    let pane_ids = session_pane_ids(session).await?;
-    open_herdr_event_stream(session, event_subscriptions(&pane_ids)).await
-}
-
-#[cfg(unix)]
-async fn herdr_agent_event_stream(
-    session: &SessionConfig,
-) -> anyhow::Result<BufReader<UnixStream>> {
-    let pane_ids = session_pane_ids(session).await?;
-    open_herdr_event_stream(session, agent_event_subscriptions(&pane_ids)).await
-}
-
-#[cfg(unix)]
-async fn session_pane_ids(session: &SessionConfig) -> anyhow::Result<Vec<String>> {
-    let pane_response = herdr_request(session, "pane.list", json!({})).await?;
-    Ok(pane_response
-        .pointer("/result/panes")
-        .and_then(Value::as_array)
-        .context("pane.list response is missing result.panes")?
-        .iter()
-        .filter_map(|pane| pane.get("pane_id").and_then(Value::as_str))
-        .map(str::to_owned)
-        .collect())
-}
-
-#[cfg(unix)]
-async fn open_herdr_event_stream(
-    session: &SessionConfig,
-    subscriptions: Vec<Value>,
-) -> anyhow::Result<BufReader<UnixStream>> {
-    let mut stream = UnixStream::connect(&session.socket_path)
-        .await
-        .with_context(|| format!("failed to connect Herdr socket {}", session.socket_path))?;
-    let request = build_herdr_request(
-        "events.subscribe",
-        json!({
-            "subscriptions": subscriptions
-        }),
-    );
-    stream.write_all(request.as_bytes()).await?;
-    stream.write_all(b"\n").await?;
-    stream.flush().await?;
-    Ok(BufReader::new(stream))
-}
-
-fn event_subscriptions(pane_ids: &[String]) -> Vec<Value> {
-    let mut subscriptions = vec![
-        json!({ "type": "workspace.created" }),
-        json!({ "type": "workspace.updated" }),
-        json!({ "type": "workspace.metadata_updated" }),
-        json!({ "type": "workspace.renamed" }),
-        json!({ "type": "workspace.moved" }),
-        json!({ "type": "workspace.closed" }),
-        json!({ "type": "workspace.focused" }),
-        json!({ "type": "tab.created" }),
-        json!({ "type": "tab.closed" }),
-        json!({ "type": "tab.focused" }),
-        json!({ "type": "tab.renamed" }),
-        json!({ "type": "tab.moved" }),
-        json!({ "type": "pane.created" }),
-        json!({ "type": "pane.updated" }),
-        json!({ "type": "pane.closed" }),
-        json!({ "type": "pane.focused" }),
-        json!({ "type": "pane.moved" }),
-        json!({ "type": "pane.exited" }),
-        json!({ "type": "pane.agent_detected" }),
-        json!({ "type": "layout.updated" }),
-        json!({ "type": "worktree.created" }),
-        json!({ "type": "worktree.opened" }),
-        json!({ "type": "worktree.removed" }),
-    ];
-    subscriptions.extend(
-        pane_ids
-            .iter()
-            .map(|pane_id| json!({ "type": "pane.agent_status_changed", "pane_id": pane_id })),
-    );
-    subscriptions
-}
-
-fn agent_event_subscriptions(pane_ids: &[String]) -> Vec<Value> {
-    pane_ids
-        .iter()
-        .map(|pane_id| json!({ "type": "pane.agent_status_changed", "pane_id": pane_id }))
-        .collect()
-}
-
-#[cfg(not(unix))]
-async fn herdr_event_stream(
-    _session: &SessionConfig,
-) -> anyhow::Result<BufReader<tokio::io::Empty>> {
-    anyhow::bail!("direct Herdr event streaming is not implemented on this platform yet");
-}
-
-#[cfg(not(unix))]
-async fn herdr_agent_event_stream(
-    _session: &SessionConfig,
-) -> anyhow::Result<BufReader<tokio::io::Empty>> {
-    anyhow::bail!("direct Herdr event streaming is not implemented on this platform yet");
-}
-
-fn build_herdr_request(method: &str, params: Value) -> String {
-    json!({
-        "id": format!("gateway:{}", uuid::Uuid::new_v4()),
-        "method": method,
-        "params": params
-    })
-    .to_string()
+fn backend_api_error(error: BackendError) -> (StatusCode, Json<Value>) {
+    let (status, code, message) = match &error {
+        BackendError::InvalidTarget(_) => (
+            StatusCode::NOT_FOUND,
+            "backend_target_not_found",
+            "terminal target not found",
+        ),
+        BackendError::Unavailable => (
+            StatusCode::BAD_GATEWAY,
+            "backend_unavailable",
+            "terminal backend is unavailable",
+        ),
+        BackendError::InvalidResponse(_)
+        | BackendError::Refused { .. }
+        | BackendError::Unsupported(_) => (
+            StatusCode::BAD_GATEWAY,
+            "backend_error",
+            "terminal backend request failed",
+        ),
+    };
+    // Adapter diagnostics may name a local socket or tmux target. Keep them in
+    // the host log and return only a stable, non-sensitive API error.
+    eprintln!("terminal backend request failed: {error}");
+    api_error(status, code, message)
 }
 
 type ApiResult<T> = Result<T, (StatusCode, Json<Value>)>;
@@ -7493,23 +9515,6 @@ fn bearer_token(headers: &HeaderMap) -> ApiResult<&str> {
     Ok(token)
 }
 
-/// Match a presented token against every device token. Every candidate is
-/// compared in constant time and the loop is not short-circuited, so a caller
-/// cannot learn which device matched from timing.
-fn identify_device(devices: &[DeviceRecord], token: &str) -> Option<String> {
-    if token.len() > 256 {
-        return None;
-    }
-    let presented = hash_token(token);
-    let mut matched = None;
-    for device in devices {
-        if constant_time_eq(presented.as_bytes(), device.token_hash.as_bytes()) {
-            matched = Some(device.id.clone());
-        }
-    }
-    matched
-}
-
 /// Control routes are for paired devices only. The admin token deliberately
 /// does not authorise these: it sits in plaintext on disk for the manage UI,
 /// and these routes can run commands on the host.
@@ -7523,15 +9528,32 @@ fn require_device(state: &AppState, headers: &HeaderMap) -> ApiResult<String> {
             "invalid token",
         ));
     };
-    let now = now_unix_ms();
-    if let Some(device) = devices.iter_mut().find(|device| device.id == device_id) {
-        let stale = now.saturating_sub(device.last_seen_unix_ms) >= DEVICE_LAST_SEEN_FLUSH_MS;
-        device.last_seen_unix_ms = now;
-        if stale {
-            if let Err(err) = write_devices(&devices) {
-                // Losing a last-seen timestamp must not fail the request.
-                eprintln!("failed to persist device last-seen: {err:#}");
-            }
+    if let Some(transport_key) = devices
+        .iter()
+        .find(|device| device.id == device_id)
+        .and_then(|device| device.transport_key.as_deref())
+    {
+        let proof = headers
+            .get(TRANSPORT_PROOF_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        if !authority::authenticates_admin(&hash_token(transport_key), proof) {
+            return Err(api_error(
+                StatusCode::FORBIDDEN,
+                "device_proof_required",
+                "encrypted device proof is required",
+            ));
+        }
+    }
+    if authority::touch_device(
+        &mut devices,
+        &device_id,
+        now_unix_ms(),
+        DEVICE_LAST_SEEN_FLUSH_MS,
+    ) {
+        if let Err(err) = write_devices(&devices) {
+            // Losing a last-seen timestamp must not fail the request.
+            eprintln!("failed to persist device last-seen: {err:#}");
         }
     }
     Ok(device_id)
@@ -7541,9 +9563,7 @@ fn require_device(state: &AppState, headers: &HeaderMap) -> ApiResult<String> {
 /// pending pairing code.
 fn require_admin(config: &Config, headers: &HeaderMap) -> ApiResult<()> {
     let token = bearer_token(headers)?;
-    if token.len() > 256
-        || !constant_time_eq(hash_token(token).as_bytes(), config.token_hash.as_bytes())
-    {
+    if !authority::authenticates_admin(&config.token_hash, token) {
         return Err(api_error(
             StatusCode::FORBIDDEN,
             "invalid_token",
@@ -7622,17 +9642,6 @@ async fn revoke_paired_device(
     Ok(Json(
         json!({ "ok": true, "revoked": device_id, "device_count": devices.len() }),
     ))
-}
-
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut diff = 0_u8;
-    for (left, right) in left.iter().zip(right) {
-        diff |= left ^ right;
-    }
-    diff == 0
 }
 
 fn validate_text(text: &str) -> ApiResult<()> {
@@ -7732,12 +9741,6 @@ async fn send_expo_push_notifications(
     Ok(response.json().await?)
 }
 
-fn insert_opt<T: Serialize>(map: &mut serde_json::Map<String, Value>, key: &str, value: Option<T>) {
-    if let Some(value) = value {
-        map.insert(key.into(), json!(value));
-    }
-}
-
 fn find_session<'a>(config: &'a Config, session_id: &str) -> ApiResult<&'a SessionConfig> {
     config
         .sessions
@@ -7784,31 +9787,151 @@ fn api_error_in(
 }
 
 fn load_config(config_path: Option<String>) -> anyhow::Result<Config> {
-    let path = config_path
-        .map(Into::into)
-        .unwrap_or(config_dir()?.join(CONFIG_FILE));
+    // Resolved lazily on purpose: `config_dir` consults the rename migration,
+    // which loads the pre-rename config by explicit path. An eagerly evaluated
+    // default would recurse between the two until the stack ran out.
+    let path = match config_path {
+        Some(path) => PathBuf::from(path),
+        None => config_dir()?.join(CONFIG_FILE),
+    };
     let bytes = std::fs::read(&path)
         .with_context(|| format!("failed to read config {}", path.display()))?;
     Ok(serde_json::from_slice(&bytes)?)
 }
 
 pub(crate) fn config_dir() -> anyhow::Result<std::path::PathBuf> {
+    let standalone = standalone_config_dir()?;
+    if !standalone.join(HERDR_PLUGIN_IMPORT_MARKER).exists() {
+        if let Ok(path) = std::env::var("HERDR_PLUGIN_CONFIG_DIR") {
+            return Ok(path.into());
+        }
+    }
+    Ok(standalone)
+}
+
+/// Where a test run keeps the state a handler persists.
+///
+/// The handlers under test call the same `write_devices` a running gateway
+/// does, and that resolved to the state directory of whatever gateway is
+/// installed for the current user -- so running the checks on a machine that
+/// also runs this gateway overwrote its real `devices.json` with a test
+/// fixture, unpairing every device its owner had. A test binary gets its own
+/// directory instead, once per process, and never learns the real one.
+#[cfg(test)]
+fn test_state_dir() -> std::path::PathBuf {
+    static TEST_STATE_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    TEST_STATE_DIR
+        .get_or_init(|| {
+            let dir = std::env::temp_dir().join(format!(
+                "muqun-gateway-test-state-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&dir).expect("failed to create the test state directory");
+            dir
+        })
+        .clone()
+}
+
+#[cfg(test)]
+fn state_dir() -> anyhow::Result<std::path::PathBuf> {
+    Ok(test_state_dir())
+}
+
+#[cfg(not(test))]
+fn state_dir() -> anyhow::Result<std::path::PathBuf> {
+    let standalone_config = standalone_config_dir()?;
+    if !standalone_config.join(HERDR_PLUGIN_IMPORT_MARKER).exists() {
+        if let Ok(path) = std::env::var("HERDR_PLUGIN_STATE_DIR") {
+            return Ok(path.into());
+        }
+    }
+    standalone_state_dir()
+}
+
+/// The gateway's standalone directory name before the muqun-gateway rename.
+/// Kept only so an existing install's config and state can be found once and
+/// carried forward; nothing else should reference it.
+const PRE_RENAME_STANDALONE_DIR_NAME: &str = "herdr-gateway";
+
+/// Move an install's directory from the pre-rename name to the current one,
+/// the first time it is asked for after upgrading.
+///
+/// A same-filesystem `rename` is atomic at the directory-entry level -- there
+/// is no window in which both names exist with half the files in each -- so
+/// this step itself cannot leave an install half-migrated. What can still
+/// split state across both names is a gateway built under the pre-rename
+/// name that is *still running* against this directory: it does not know the
+/// directory was just renamed out from under it, and the next thing it
+/// writes -- a push token, an upload, its own pid file -- recreates the old
+/// directory fresh, right next to the one this just moved. So this refuses
+/// to migrate at all while such a process is found listening on the old
+/// config's port, rather than migrate and let the two diverge; the caller
+/// gets a plain error naming the pid to stop instead of a silently split
+/// install. Once the new name exists, the old one is never inspected again:
+/// a directory an owner later recreates under the old name is left alone
+/// rather than merged in.
+fn migrate_renamed_standalone_dir(parent: &std::path::Path) -> anyhow::Result<PathBuf> {
+    let new_dir = parent.join("muqun-gateway");
+    let old_dir = parent.join(PRE_RENAME_STANDALONE_DIR_NAME);
+    if new_dir.exists() || !old_dir.exists() {
+        return Ok(new_dir);
+    }
+    let old_config_path = old_dir.join(CONFIG_FILE).to_string_lossy().into_owned();
+    if let Ok(old_config) = load_config(Some(old_config_path)) {
+        if let Ok(old_pids) = listener_pids_named(old_config.port(), PRE_RENAME_STANDALONE_DIR_NAME)
+        {
+            if let Some(&pid) = old_pids.first() {
+                anyhow::bail!(
+                    "a gateway is still running under the pre-rename name {} (pid {pid}); stop \
+                     it before this directory can be migrated to muqun-gateway -- migrating \
+                     underneath a still-running process would split its data across both names",
+                    PRE_RENAME_STANDALONE_DIR_NAME
+                );
+            }
+        }
+    }
+    std::fs::rename(&old_dir, &new_dir).with_context(|| {
+        format!(
+            "failed to migrate {} to {}",
+            old_dir.display(),
+            new_dir.display()
+        )
+    })?;
+    eprintln!("migrated {} to {}", old_dir.display(), new_dir.display());
+    Ok(new_dir)
+}
+
+fn standalone_config_dir() -> anyhow::Result<PathBuf> {
+    let parent = dirs::config_dir().context("failed to locate config directory")?;
+    migrate_renamed_standalone_dir(&parent)
+}
+
+fn standalone_state_dir() -> anyhow::Result<PathBuf> {
+    let parent = dirs::data_dir()
+        .or_else(dirs::config_dir)
+        .context("failed to locate state directory")?;
+    migrate_renamed_standalone_dir(&parent)
+}
+
+fn default_herdr_plugin_config_dir() -> anyhow::Result<PathBuf> {
     if let Ok(path) = std::env::var("HERDR_PLUGIN_CONFIG_DIR") {
         return Ok(path.into());
     }
     Ok(dirs::config_dir()
         .context("failed to locate config directory")?
-        .join("herdr-gateway"))
+        .join("herdr/plugins/config/herdr.gateway"))
 }
 
-fn state_dir() -> anyhow::Result<std::path::PathBuf> {
+fn default_herdr_plugin_state_dir() -> anyhow::Result<PathBuf> {
     if let Ok(path) = std::env::var("HERDR_PLUGIN_STATE_DIR") {
         return Ok(path.into());
     }
-    Ok(dirs::data_dir()
+    Ok(dirs::state_dir()
+        .or_else(dirs::data_dir)
         .or_else(dirs::config_dir)
         .context("failed to locate state directory")?
-        .join("herdr-gateway"))
+        .join("herdr/plugins/herdr.gateway"))
 }
 
 fn read_push_tokens() -> anyhow::Result<Vec<PushTokenRecord>> {
@@ -7830,23 +9953,87 @@ fn write_push_tokens(tokens: &[PushTokenRecord]) -> anyhow::Result<()> {
 }
 
 fn read_devices() -> anyhow::Result<Vec<DeviceRecord>> {
-    let path = state_dir()?.join(DEVICES_FILE);
+    read_devices_at(&state_dir()?.join(DEVICES_FILE))
+}
+
+/// Load the push-token list for a process that will later persist it.
+///
+/// Same shape as the device file -- held in memory, rewritten whole -- but not
+/// the same stakes. A device re-registers its push token on the next app
+/// launch, so a list lost here refills itself, while a lost pairing has to be
+/// re-established by hand on the device. So this starts anyway rather than
+/// refusing the way `load_devices_for_service` does, and says on stderr what
+/// it dropped instead of starting silently empty.
+fn load_push_tokens_for_service() -> Vec<PushTokenRecord> {
+    match read_push_tokens() {
+        Ok(tokens) => tokens,
+        Err(error) => {
+            eprintln!(
+                "could not read the push token file ({error:#}); starting with none -- devices \
+                 will re-register on their next app launch"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Read the paired-device list, keeping "nothing is paired yet" and "the
+/// pairings are there but I cannot read them" as two different answers.
+///
+/// Collapsing them is what makes this file dangerous. The list is held in
+/// memory for the life of the process and every change writes the whole list
+/// back, so a caller that turns an unreadable file into an empty list has
+/// armed the next pairing to overwrite every record that file still held. An
+/// absent file is genuinely empty; a present one that will not parse is an
+/// error the caller has to handle.
+fn read_devices_at(path: &std::path::Path) -> anyhow::Result<Vec<DeviceRecord>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let bytes = std::fs::read(&path)
+    let bytes = std::fs::read(path)
         .with_context(|| format!("failed to read device file {}", path.display()))?;
-    Ok(serde_json::from_slice(&bytes)?)
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse device file {}", path.display()))
+}
+
+/// Load the device list for a process that will later persist it.
+///
+/// Starting a gateway with an empty list because its device file could not be
+/// read is unrecoverable: the first pairing writes that empty list back over
+/// the file. Refusing to start leaves the file, and the backup beside it,
+/// exactly as they are so an operator can restore them.
+fn load_devices_for_service() -> anyhow::Result<Vec<DeviceRecord>> {
+    let dir = state_dir()?;
+    read_devices_at(&dir.join(DEVICES_FILE)).with_context(|| {
+        format!(
+            "refusing to start with an unreadable device file -- starting would overwrite it \
+             with an empty list and permanently lose every pairing. Restore it from {} and \
+             start again.",
+            dir.join(DEVICES_BACKUP_FILE).display()
+        )
+    })
 }
 
 fn write_devices(devices: &[DeviceRecord]) -> anyhow::Result<()> {
     let dir = state_dir()?;
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create state dir {}", dir.display()))?;
-    write_secret_file(
-        &dir.join(DEVICES_FILE),
-        &serde_json::to_vec_pretty(devices)?,
-    )
+    write_devices_at(&dir, devices)
+}
+
+/// Persist the device list, keeping the generation it replaces beside it.
+///
+/// The backup is what turns a bad list into an inconvenience instead of a
+/// loss. Writing it costs one more small file per change, which is nothing
+/// next to re-pairing every device the owner has.
+fn write_devices_at(dir: &std::path::Path, devices: &[DeviceRecord]) -> anyhow::Result<()> {
+    let path = dir.join(DEVICES_FILE);
+    if let Ok(previous) = std::fs::read(&path) {
+        if !previous.is_empty() {
+            write_secret_file(&dir.join(DEVICES_BACKUP_FILE), &previous)?;
+        }
+    }
+    write_secret_file(&path, &serde_json::to_vec_pretty(devices)?)
 }
 
 fn list_devices() -> anyhow::Result<()> {
@@ -7869,32 +10056,74 @@ fn list_devices() -> anyhow::Result<()> {
 
 fn revoke_device(device_id: Option<String>, all: bool) -> anyhow::Result<()> {
     if all {
-        let mut devices = read_devices()?;
-        let count = devices.len();
-        devices.clear();
-        write_devices(&devices)?;
+        let devices = read_devices()?;
+        let mut count = 0_usize;
+        for device in devices {
+            count += usize::from(revoke_managed_device(&device.id)?);
+        }
         println!("revoked {count} device token(s)");
         return Ok(());
     }
     let Some(device_id) = device_id else {
         anyhow::bail!("pass a device id from `gateway devices`, or --all");
     };
-    if !revoke_device_by_id(&device_id)? {
+    // A running gateway owns the in-memory device list. Revoke through its
+    // narrow manager API so a later pairing write cannot resurrect a token
+    // removed only from disk. The helper falls back to disk when it is stopped.
+    if !revoke_managed_device(&device_id)? {
         anyhow::bail!("device {device_id} not found");
     }
     println!("revoked device {device_id}");
     Ok(())
 }
 
+/// Drop one device straight from the file, with no gateway running.
+///
+/// The whole read-modify-write happens under the state-directory lock, not
+/// just the write. Locking the write alone would still lose records: another
+/// writer's change can land between the read below and the write that follows
+/// it, and the write puts back a list that never contained it. Holding the
+/// lock across both also means that when a gateway *is* running -- it owns the
+/// directory for its lifetime -- this refuses instead of editing the list
+/// behind its back, which is right, because the running gateway would rewrite
+/// its own in-memory list over this one at the next pairing anyway.
 fn revoke_device_by_id(device_id: &str) -> anyhow::Result<bool> {
-    let mut devices = read_devices()?;
-    let previous_len = devices.len();
-    devices.retain(|device| device.id != device_id);
-    if devices.len() == previous_len {
-        return Ok(false);
-    }
-    write_devices(&devices)?;
-    Ok(true)
+    revoke_device_at(&state_dir()?, device_id)
+}
+
+fn revoke_device_at(dir: &std::path::Path, device_id: &str) -> anyhow::Result<bool> {
+    let removed = update_devices_at(dir, |devices| {
+        let previous_len = devices.len();
+        devices.retain(|device| device.id != device_id);
+        (devices.len() != previous_len).then_some(())
+    })?;
+    Ok(removed.is_some())
+}
+
+/// Load the device list, change it, and store it back, owning the state
+/// directory from the first byte read to the last byte written.
+///
+/// The lock has to span the read as well as the write. A change that locked
+/// only its write would read the list, let another writer's pairing land in
+/// the gap, and then store a list that never contained it -- the whole-file
+/// overwrite this module exists to prevent, just with a smaller window. So
+/// `change` runs inside the critical section, and must not block: everything
+/// else that wants to touch this directory is refused while it runs.
+///
+/// `change` returns `None` when it decided not to change anything, which
+/// leaves the file -- and the backup generation beside it -- untouched.
+fn update_devices_at<T>(
+    dir: &std::path::Path,
+    change: impl FnOnce(&mut Vec<DeviceRecord>) -> Option<T>,
+) -> anyhow::Result<Option<T>> {
+    let _lock = state_lock::StateLock::acquire(dir)
+        .context("cannot edit the device list on disk while a gateway owns it")?;
+    let mut devices = read_devices_at(&dir.join(DEVICES_FILE))?;
+    let Some(outcome) = change(&mut devices) else {
+        return Ok(None);
+    };
+    write_devices_at(dir, &devices)?;
+    Ok(Some(outcome))
 }
 
 fn format_unix_ms(value: u128) -> String {
@@ -7922,9 +10151,60 @@ fn read_pid() -> anyhow::Result<Option<u32>> {
     Ok(text.trim().parse::<u32>().ok())
 }
 
+/// Whether `config.json` has been rewritten more recently than the running
+/// gateway process started.
+///
+/// `run` reads `config.json` exactly once, at startup, into a plain `Config`
+/// value that lives for the process's lifetime (see `AppState`); nothing
+/// re-reads the file afterward. So once the process is up, the file on disk
+/// and the settings it is actually enforcing (transport encryption, the
+/// backend list, the default backend, the public URL) can only drift apart,
+/// never resync, until the next restart.
+///
+/// There is no live channel to ask the running process what it loaded, so
+/// this compares two mtimes as a proxy: the pid file, written immediately
+/// after the process is spawned (see `start_background_inner`), stands in
+/// for "when the running process started". If `config.json` was modified
+/// after that, the running process cannot have seen the change.
+fn config_changed_since_start() -> bool {
+    let Ok(config_path) = config_dir().map(|dir| dir.join(CONFIG_FILE)) else {
+        return false;
+    };
+    let Ok(pid_file) = pid_path() else {
+        return false;
+    };
+    let (Ok(config_meta), Ok(pid_meta)) = (
+        std::fs::metadata(&config_path),
+        std::fs::metadata(&pid_file),
+    ) else {
+        return false;
+    };
+    let (Ok(config_mtime), Ok(pid_mtime)) = (config_meta.modified(), pid_meta.modified()) else {
+        return false;
+    };
+    config_mtime > pid_mtime
+}
+
 fn read_pairing_file() -> anyhow::Result<PairingFile> {
     let bytes = std::fs::read(config_dir()?.join(PAIRING_FILE))?;
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn ensure_pairing_transport_key() -> anyhow::Result<()> {
+    let path = config_dir()?.join(PAIRING_FILE);
+    let mut pairing: PairingFile = serde_json::from_slice(&std::fs::read(&path)?)?;
+    if transport::decode_key(&pairing.payload.transport_key).is_ok_and(|key| key.len() == 32) {
+        return Ok(());
+    }
+    pairing.payload.transport_key = generate_token();
+    write_secret_file(&path, &serde_json::to_vec_pretty(&pairing)?)
+}
+
+fn rotate_pairing_transport_key() -> anyhow::Result<()> {
+    let path = config_dir()?.join(PAIRING_FILE);
+    let mut pairing: PairingFile = serde_json::from_slice(&std::fs::read(&path)?)?;
+    pairing.payload.transport_key = generate_token();
+    write_secret_file(&path, &serde_json::to_vec_pretty(&pairing)?)
 }
 
 fn remove_pid_file() -> anyhow::Result<()> {
@@ -7956,12 +10236,20 @@ fn stop_pid(pid: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
-const GATEWAY_PROCESS_NAME: &str = "herdr-gateway";
+const GATEWAY_PROCESS_NAME: &str = "muqun-gateway";
 
 /// Find gateway processes listening on `port`. Anything that is not the gateway
 /// is filtered out by process name: `stop` must never kill an unrelated service
 /// that happens to hold the port.
 fn gateway_listener_pids(port: u16) -> anyhow::Result<Vec<u32>> {
+    listener_pids_named(port, GATEWAY_PROCESS_NAME)
+}
+
+/// Same search, but for an arbitrary process name rather than this build's own
+/// [`GATEWAY_PROCESS_NAME`]. Used to detect a gateway still running under the
+/// pre-rename binary name, which this build's own name-filtered search would
+/// never find.
+fn listener_pids_named(port: u16, process_name: &str) -> anyhow::Result<Vec<u32>> {
     #[cfg(target_os = "macos")]
     let mut pids = {
         let output = ProcessCommand::new("lsof")
@@ -7974,7 +10262,7 @@ fn gateway_listener_pids(port: u16) -> anyhow::Result<Vec<u32>> {
         String::from_utf8_lossy(&output.stdout)
             .lines()
             .filter_map(|value| value.trim().parse::<u32>().ok())
-            .filter(|pid| process_is_gateway(*pid))
+            .filter(|pid| process_matches_name(*pid, process_name))
             .collect::<Vec<_>>()
     };
 
@@ -7988,7 +10276,7 @@ fn gateway_listener_pids(port: u16) -> anyhow::Result<Vec<u32>> {
         let port_suffix = format!(":{port}");
         let mut pids = Vec::new();
         for line in text.lines() {
-            if !line.contains(&port_suffix) || !line.contains(GATEWAY_PROCESS_NAME) {
+            if !line.contains(&port_suffix) || !line.contains(process_name) {
                 continue;
             }
             let Some(pid_start) = line.find("pid=") else {
@@ -8010,8 +10298,11 @@ fn gateway_listener_pids(port: u16) -> anyhow::Result<Vec<u32>> {
     Ok(pids)
 }
 
-/// Confirm a pid really belongs to the gateway before signalling it.
-fn process_is_gateway(pid: u32) -> bool {
+/// Confirm a pid really belongs to a process named `process_name` before
+/// trusting it (e.g. before signalling it, or before refusing a directory
+/// migration on its account).
+#[cfg(target_os = "macos")]
+fn process_matches_name(pid: u32, process_name: &str) -> bool {
     ProcessCommand::new("ps")
         .args(["-p", &pid.to_string(), "-o", "comm="])
         .output()
@@ -8021,7 +10312,7 @@ fn process_is_gateway(pid: u32) -> bool {
                     .trim()
                     .rsplit('/')
                     .next()
-                    .is_some_and(|name| name.starts_with(GATEWAY_PROCESS_NAME))
+                    .is_some_and(|name| name.starts_with(process_name))
         })
 }
 
@@ -8074,31 +10365,73 @@ fn lock_down_secret_dir(dir: &std::path::Path) {
 #[cfg(not(unix))]
 fn lock_down_secret_dir(_dir: &std::path::Path) {}
 
+/// Replace a secret file's contents in one step, never leaving it short.
+///
+/// Truncating the real file and writing into it is what loses pairings. It
+/// puts the file through a window -- open, chmod, write -- in which it is
+/// zero bytes on disk, so a process killed mid-write leaves nothing behind,
+/// and a reader that lands in that window sees an empty file rather than the
+/// records that are still supposed to be there. Writing a complete temporary
+/// file first and renaming it over the target closes that window: `rename` is
+/// atomic within a directory, so every reader sees either the whole previous
+/// generation or the whole new one, and a crash at any point leaves one of
+/// the two rather than a stump.
 fn write_secret_file(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
     if let Some(dir) = path.parent() {
         write_secret_dir_gitignore(dir);
         lock_down_secret_dir(dir);
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .open(path)?;
-        // `mode` only applies when the file is created, so a file written by an
-        // older build keeps its old permissions until they are set explicitly.
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        std::io::Write::write_all(&mut file, bytes)?;
-        Ok(())
-    }
+    let directory = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("secret file path has no file name")?;
+    // The sequence number matters as much as the pid: two threads of one
+    // process writing the same file would otherwise pick the same temporary
+    // and rename each other's half-written copy into place.
+    static TEMPORARY_SEQUENCE: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    let temporary = directory.join(format!(
+        ".{name}.tmp-{}-{}",
+        std::process::id(),
+        TEMPORARY_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
 
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, bytes)?;
+    let write_temporary = || -> anyhow::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .mode(0o600)
+                .open(&temporary)?;
+            // `mode` only applies when the file is created, so a temporary left
+            // by an older build keeps its old permissions until they are set
+            // explicitly.
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            std::io::Write::write_all(&mut file, bytes)?;
+            // The rename is only worth anything if the bytes reached the disk
+            // before the name started pointing at them.
+            file.sync_all()?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&temporary, bytes)?;
+        }
+        std::fs::rename(&temporary, path)?;
         Ok(())
+    };
+
+    match write_temporary() {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // A half-written temporary must not be left to be mistaken for
+            // state, and must not block the next attempt.
+            std::fs::remove_file(&temporary).ok();
+            Err(error.context(format!("failed to write {}", path.display())))
+        }
     }
 }
 
@@ -8113,7 +10446,7 @@ fn default_socket_path() -> String {
 
 fn hostname_label() -> String {
     // HOSTNAME is often unset on macOS, which left every server named the
-    // generic "Herdr Server". Fall back to the real machine name so a fresh
+    // generic "Server". Fall back to the real machine name so a fresh
     // install is at least recognisable before the user renames it.
     if let Ok(value) = std::env::var("HOSTNAME") {
         let trimmed = value.trim();
@@ -8129,7 +10462,7 @@ fn hostname_label() -> String {
             }
         }
     }
-    "Herdr Server".into()
+    "Server".into()
 }
 
 /// Persist a new display label into the config (and the pairing payload), so a
@@ -8235,15 +10568,6 @@ impl RandomBytes {
     }
 }
 
-fn valid_pairing_code(code: &str) -> bool {
-    code.len() == PAIRING_CODE_LENGTH
-        && code.as_bytes()[4] == b'-'
-        && code
-            .bytes()
-            .enumerate()
-            .all(|(index, byte)| index == 4 || PAIRING_CODE_ALPHABET.contains(&byte))
-}
-
 /// Device names are echoed into the manage UI's terminal box, so control
 /// characters (ANSI escapes in particular) are rejected outright.
 /// A client install identifier: an opaque token the app generates once and
@@ -8277,19 +10601,13 @@ fn now_unix_ms() -> u128 {
         .unwrap_or_default()
 }
 
-fn hash_token(token: &str) -> String {
-    use sha2::{Digest as _, Sha256};
-    let digest = Sha256::digest(token.as_bytes());
-    base64::engine::general_purpose::STANDARD.encode(digest)
-}
-
 fn openapi_spec() -> Value {
     json!({
         "openapi": "3.1.0",
         "info": {
-            "title": "Herdr Gateway API",
+            "title": "Terminal Gateway API",
             "version": env!("CARGO_PKG_VERSION"),
-            "description": "Token-protected mobile API for controlling a local Herdr server through the Herdr socket API. Human-readable text is localized: send X-Muqun-Locale (or Accept-Language) with `en` or `zh-TW`. Error `code` values, decision names and other wire vocabulary are the same bytes in every locale."
+            "description": "Token-protected mobile API for controlling local terminal workspaces through a configured tmux or Herdr backend. Human-readable text is localized: send X-Muqun-Locale (or Accept-Language) with `en` or `zh-TW`. Error `code` values, decision names and other wire vocabulary are the same bytes in every locale."
         },
         "components": {
             "securitySchemes": {
@@ -8301,8 +10619,8 @@ fn openapi_spec() -> Value {
         },
         "security": [{ "bearerAuth": [] }],
         "paths": {
-            "/health": { "get": simple_endpoint("Gateway and Herdr health") },
-            "/api/meta": { "get": simple_endpoint("Gateway API and Herdr compatibility metadata") },
+            "/health": { "get": simple_endpoint("Gateway health") },
+            "/api/meta": { "get": simple_endpoint("Gateway API, backend, and legacy compatibility metadata") },
             "/api/pair/request": {
                 "post": {
                     "summary": "Request pairing from Muqun app",
@@ -8354,16 +10672,17 @@ fn openapi_spec() -> Value {
                     "responses": upload_responses()
                 }
             },
-            "/api/sessions/{sessionId}/assets": {
+            "/api/sessions/{sessionId}/tabs/{tabId}/assets": {
                 "get": {
-                    "summary": "List files this session's workspaces produced recently, newest first",
-                    "description": "Unified content model, schema version 1.0.0. The response is the versioned envelope: schema_version, capabilities, and data, with the assets under data.assets. Assets are fed by the Herdr worktree events the gateway subscribes to, and by an mtime scan of the session's workspace roots, which is what a cold start uses. The scan is shallow, budgeted, and skips dot directories, dependency directories, and build output.",
+                    "summary": "List files this tab produced recently, newest first",
+                    "description": "Unified content model, schema version 1.0.0. The response is the versioned envelope: schema_version, capabilities, and data, with the assets under data.assets. Assets are fed by the Herdr worktree events the gateway subscribes to, and by an mtime scan of the tab's roots, which is what a cold start uses. The scan is shallow, budgeted, and skips dot directories, dependency directories, and build output. Scoped to tabId, not to the whole session or workspace: a tmux-backed session spans every project the developer has a window open on, and a tmux-backed workspace (a whole tmux session, commonly one long-running session with a window per project) spans every one of those projects too, so this answers only for the one tab the caller is looking at. A herdr-backed session's tabId is resolved to the workspace it belongs to instead, because herdr's own tabs sit inside one of its workspaces and that workspace must not narrow further.",
                     "parameters": [
                         path_param("sessionId"),
+                        path_param("tabId"),
                         query_param("since", "Unix milliseconds, the same unit as modified_unix_ms; only files modified strictly after this are returned"),
                         query_param("limit", "How many assets to return, 1 to 200, default 50"),
                         query_param("kind", "Comma-separated allow-list of kinds -- image, markdown, text, pdf, binary -- filtered during the scan, so kind=image&limit=50 answers with the 50 newest images rather than the images among the 50 newest files. Absent or empty means every kind; a value outside the taxonomy matches nothing rather than erroring. The applied list is echoed back as data.kind"),
-                        query_param("path", "Resolve one absolute path exactly, for a file path tapped in terminal output. Takes precedence over since and limit. Answers with one asset, or with none when the path does not canonicalize to a file inside a workspace root -- a fenced-out path is a miss, not an error")
+                        query_param("path", "Resolve one absolute path exactly, for a file path tapped in terminal output. Takes precedence over since and limit. Answers with one asset, or with none when the path does not canonicalize to a file inside this tab's roots -- a fenced-out path is a miss, not an error")
                     ],
                     "responses": assets_responses()
                 }
@@ -8376,7 +10695,7 @@ fn openapi_spec() -> Value {
                     "responses": asset_content_responses()
                 }
             },
-            "/api/sessions": { "get": simple_endpoint("List configured Herdr sessions") },
+            "/api/sessions": { "get": simple_endpoint("List configured terminal backend sessions") },
             "/api/sessions/{sessionId}/events": {
                 "get": {
                     "summary": "Stream Herdr lifecycle events as Server-Sent Events",
@@ -8400,9 +10719,9 @@ fn openapi_spec() -> Value {
                     "responses": ok_response()
                 }
             },
-            "/api/sessions/{sessionId}/snapshot": { "get": session_endpoint("Return Herdr session.snapshot") },
+            "/api/sessions/{sessionId}/snapshot": { "get": session_endpoint("Return the session snapshot") },
             "/api/sessions/{sessionId}/workspaces": {
-                "get": session_endpoint("List Herdr workspaces"),
+                "get": session_endpoint("List workspaces"),
                 "post": {
                     "summary": "Create a workspace",
                     "parameters": [path_param("sessionId")],
@@ -8421,7 +10740,7 @@ fn openapi_spec() -> Value {
                 "delete": resource_endpoint("Close a workspace", "workspaceId")
             },
             "/api/sessions/{sessionId}/tabs": {
-                "get": session_endpoint("List Herdr tabs"),
+                "get": session_endpoint("List tabs"),
                 "post": {
                     "summary": "Create a tab",
                     "parameters": [path_param("sessionId")],
@@ -8439,7 +10758,7 @@ fn openapi_spec() -> Value {
                 },
                 "delete": resource_endpoint("Close a tab", "tabId")
             },
-            "/api/sessions/{sessionId}/panes": { "get": session_endpoint("List Herdr panes") },
+            "/api/sessions/{sessionId}/panes": { "get": session_endpoint("List panes") },
             "/api/sessions/{sessionId}/panes/{paneId}": {
                 "get": resource_endpoint("Get a pane", "paneId"),
                 "patch": {
@@ -8471,7 +10790,8 @@ fn openapi_spec() -> Value {
             },
             "/api/sessions/{sessionId}/panes/{paneId}/zoom": {
                 "post": {
-                    "summary": "Zoom a pane for a single-panel viewport",
+                    "summary": "Acknowledge the legacy app viewport request without changing backend zoom",
+                    "description": "Compatibility no-op. Released app builds call this when mounting a terminal; observing a pane must not mutate tmux or Herdr layout.",
                     "parameters": [path_param("sessionId"), path_param("paneId")],
                     "requestBody": json_body(json!({
                         "type": "object",
@@ -8493,7 +10813,7 @@ fn openapi_spec() -> Value {
             "/api/sessions/{sessionId}/tasks": {
                 "post": {
                     "summary": "Start a new task: a checkout, a workspace, an agent, and the first prompt",
-                    "description": "With `branch_name`, the task gets its own git worktree; without it, the task runs in the repo as it stands. `repo_path` must be, or be inside, a workspace this session already has open -- anything else is 403, and a symlink out of one resolves to the outside path and fails there too. `branch_name` is held to letters, digits, dot, underscore, dash and slash, with `..`, a leading dash, and dot-leading segments refused, so it can only ever be a ref and never an argument. The agent is started with Herdr's `agent.start`, which waits for it to become interactive before the prompt is sent. Asking twice for the same branch reuses the existing checkout rather than making a second one.",
+                    "description": "With `branch_name`, the task gets its own git worktree; without it, the task runs in the repo as it stands. `repo_path` must be, or be inside, a workspace this session already has open -- anything else is 403, and a symlink out of one resolves to the outside path and fails there too. `branch_name` is held to letters, digits, dot, underscore, dash and slash, with `..`, a leading dash, and dot-leading segments refused, so it can only ever be a ref and never an argument. The agent is started, then the gateway waits for it to become interactive before the prompt is sent. Asking twice for the same branch reuses the existing checkout rather than making a second one.",
                     "parameters": [path_param("sessionId")],
                     "requestBody": json_body(json!({
                         "type": "object",
@@ -8521,7 +10841,7 @@ fn openapi_spec() -> Value {
                         "required": ["agent"],
                         "properties": {
                             "agent": { "type": "string", "description": "Agent kind from GET /api/agents/catalog, or a profile named in agents.json" },
-                            "cwd": { "type": "string", "description": "Absolute path, inside a workspace this session has open; omit to take Herdr's default" },
+                            "cwd": { "type": "string", "description": "Absolute path, inside a workspace this session has open; omit to take the backend's default" },
                             "tab_id": { "type": "string", "description": "Split this tab's focused pane instead of opening a new tab" },
                             "prompt": { "type": "string", "description": "Sent once the agent is interactive" }
                         }
@@ -8532,7 +10852,7 @@ fn openapi_spec() -> Value {
             "/api/sessions/{sessionId}/recent-cwds": {
                 "get": {
                     "summary": "The distinct working directories of this session's panes",
-                    "description": "A picker for spawn, and deliberately not a directory browser: it answers with the cwds Herdr reports for the panes that exist right now, deduplicated and held to the same rule the asset scan uses, so the filesystem root and a bare home directory are not on it. Each entry carries path, name, the pane and workspace it came from, and git, which says whether the directory is a checkout. Nothing here can be used to walk the host.",
+                    "description": "A picker for spawn, and deliberately not a directory browser: it answers with the cwds the session reports for the panes that exist right now, deduplicated and held to the same rule the asset scan uses, so the filesystem root and a bare home directory are not on it. Each entry carries path, name, the pane and workspace it came from, and git, which says whether the directory is a checkout. Nothing here can be used to walk the host.",
                     "parameters": [path_param("sessionId")],
                     "responses": ok_response()
                 }
@@ -8548,7 +10868,7 @@ fn openapi_spec() -> Value {
             "/api/sessions/{sessionId}/panes/{paneId}/shortcuts": {
                 "get": resource_endpoint("Key row and slash commands for a pane", "paneId")
             },
-            "/api/sessions/{sessionId}/agents": { "get": session_endpoint("List Herdr agents") },
+            "/api/sessions/{sessionId}/agents": { "get": session_endpoint("List agents") },
             "/api/sessions/{sessionId}/agents/{target}": { "get": resource_endpoint("Get an agent", "target") },
             "/api/sessions/{sessionId}/agents/{target}/focus": { "post": resource_endpoint("Focus an agent", "target") },
             "/api/sessions/{sessionId}/agents/{target}/send": {
@@ -8567,6 +10887,8 @@ fn openapi_spec() -> Value {
                         path_param("paneId"),
                         query_param("source", "Pane read source, for example recent-unwrapped, recent, visible, or detection"),
                         query_param("lines", "Maximum line count"),
+                        query_param("start", "First absolute line to read, 0 being the oldest the pane holds. Requires end."),
+                        query_param("end", "One past the last absolute line to read. Requires start. A range wins over lines, and is clamped to 5000 lines and to what the pane holds rather than refused."),
                         query_param("format", "Output format: text or ansi")
                     ],
                     "responses": ok_response()
@@ -8575,7 +10897,7 @@ fn openapi_spec() -> Value {
             "/api/sessions/{sessionId}/panes/{paneId}/parts": {
                 "get": {
                     "summary": "Read the pane's transcript normalized into content-model parts",
-                    "description": "Unified content model, schema version 1.4.0. Same envelope as the asset endpoints: schema_version, capabilities, and data, with the ordered parts under data.parts. Two sources can answer, and data.pane.parts says which did. native: the agent runs a protocol the gateway was pointed at (opencode's server API today), so a tool's exit code, the patch an edit produced, the checklist a todo write submitted and any pending permission arrive as data; range then spans the adapter's own rendering, which is the parts' fallback_text joined by newlines. dictionary: the pane's recent-unwrapped text read through the marker table of whichever agent Herdr reports -- Claude Code, Qoder, Codex and opencode. text: no table covers this pane, so everything degraded to prose, which is an answer and not an error. Whichever source answered, every part carries fallback_text verbatim, so an unknown type still renders and a source that drifts loses structure and never loses content. data.pane.composer carries the slash commands this agent understands and whether @ file mentions make sense, and is absent entirely for an agent the gateway has no table for. The raw output endpoint is unchanged and remains the fallback path.",
+                    "description": "Unified content model, schema version 1.4.0. Same envelope as the asset endpoints: schema_version, capabilities, and data, with the ordered parts under data.parts. Two sources can answer, and data.pane.parts says which did. native: the agent runs a protocol the gateway was pointed at (opencode's server API today), so a tool's exit code, the patch an edit produced, the checklist a todo write submitted and any pending permission arrive as data; range then spans the adapter's own rendering, which is the parts' fallback_text joined by newlines. dictionary: the pane's recent-unwrapped text read through the marker table of whichever agent the session reports -- Claude Code, Qoder, Codex and opencode. text: no table covers this pane, so everything degraded to prose, which is an answer and not an error. Whichever source answered, every part carries fallback_text verbatim, so an unknown type still renders and a source that drifts loses structure and never loses content. data.pane.composer carries the slash commands this agent understands and whether @ file mentions make sense, and is absent entirely for an agent the gateway has no table for. The raw output endpoint is unchanged and remains the fallback path.",
                     "parameters": [
                         path_param("sessionId"),
                         path_param("paneId"),
@@ -8587,7 +10909,7 @@ fn openapi_spec() -> Value {
             "/api/sessions/{sessionId}/panes/{paneId}/files": {
                 "get": {
                     "summary": "Fuzzy path search inside the pane's workspace, for @ file mentions",
-                    "description": "Answers paths only -- no contents, no sizes, no absolute paths. The only directory searched is the pane's own working directory as Herdr reports it, canonicalized, which is the same fence the asset API is gated on; a pane sitting at the filesystem root or straight in the home directory has no workspace and answers with an empty list rather than an error, so this cannot be used to probe the host. Symlinks are never followed, and dot, dependency and build directories are skipped, so nothing outside the root can be named. The query is a fuzzy subsequence match over the relative path, ranked so that the file name beats the directories above it; an empty query answers with the shallowest files, which is what a picker shows before anything is typed. kind is decided from the name alone because nothing is read -- the asset content endpoint sniffs the bytes again when a file is actually opened.",
+                    "description": "Answers paths only -- no contents, no sizes, no absolute paths. The only directory searched is the pane's own working directory as the session reports it, canonicalized, which is the same fence the asset API is gated on; a pane sitting at the filesystem root or straight in the home directory has no workspace and answers with an empty list rather than an error, so this cannot be used to probe the host. Symlinks are never followed, and dot, dependency and build directories are skipped, so nothing outside the root can be named. The query is a fuzzy subsequence match over the relative path, ranked so that the file name beats the directories above it; an empty query answers with the shallowest files, which is what a picker shows before anything is typed. kind is decided from the name alone because nothing is read -- the asset content endpoint sniffs the bytes again when a file is actually opened.",
                     "parameters": [
                         path_param("sessionId"),
                         path_param("paneId"),
@@ -8634,7 +10956,7 @@ fn openapi_spec() -> Value {
             },
             "/api/sessions/{sessionId}/panes/{paneId}/send-keys": {
                 "post": {
-                    "summary": "Send Herdr key names to a pane",
+                    "summary": "Send key names to a pane",
                     "parameters": [path_param("sessionId"), path_param("paneId")],
                     "requestBody": json_body(json!({
                         "type": "object",
@@ -9111,7 +11433,7 @@ fn ok_response() -> Value {
         },
         "401": { "description": "Missing or invalid authorization" },
         "403": { "description": "Invalid token" },
-        "502": { "description": "Herdr socket unavailable or returned an error" }
+        "502": { "description": "Terminal backend unavailable or returned an error" }
     })
 }
 
@@ -9120,7 +11442,7 @@ const DOCS_HTML: &str = r#"<!doctype html>
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Herdr Gateway API Docs</title>
+    <title>Terminal Gateway API Docs</title>
   </head>
   <body>
     <script id="api-reference" data-url="/openapi.json"></script>
@@ -9133,6 +11455,7 @@ const DOCS_HTML: &str = r#"<!doctype html>
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     fn test_config(token: &str) -> Config {
         Config {
@@ -9141,10 +11464,12 @@ mod tests {
             listen: "127.0.0.1:23100".into(),
             public_url: "http://127.0.0.1:23100".into(),
             token_hash: hash_token(token),
+            transport_encryption: TransportEncryptionMode::Required,
             sessions: vec![SessionConfig {
                 id: "default".into(),
                 label: "Default".into(),
                 socket_path: "/tmp/herdr.sock".into(),
+                backend: BackendKind::Herdr,
             }],
             agent_commands: BTreeMap::new(),
             rich_agent_pushes: false,
@@ -9156,6 +11481,7 @@ mod tests {
             id: id.into(),
             name: format!("device {id}"),
             token_hash: hash_token(token),
+            transport_key: None,
             paired_unix_ms: 1_000,
             // Fresh enough that require_device will not flush to disk.
             last_seen_unix_ms: now_unix_ms(),
@@ -9186,6 +11512,123 @@ mod tests {
         headers
     }
 
+    fn encrypted_test_request(device_id: &str, material: &[u8], token: &str) -> Request<Body> {
+        let payload = EncryptedRequestPayload {
+            token: token.into(),
+            content_type: Some("application/json".into()),
+            body: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"ok":true}"#),
+        };
+        let envelope = transport::seal(
+            material,
+            transport::Direction::Request,
+            b"POST /api/test",
+            &serde_json::to_vec(&payload).unwrap(),
+            now_unix_ms(),
+        )
+        .unwrap();
+        Request::builder()
+            .method("POST")
+            .uri("/api/test")
+            .header(TRANSPORT_HEADER, "1")
+            .header(TRANSPORT_DEVICE_HEADER, device_id)
+            .body(Body::from(serde_json::to_vec(&envelope).unwrap()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_stolen_bearer_token_is_not_a_device_transport_credential() {
+        let token = "device-token";
+        let transport_key = generate_token();
+        let material = transport::decode_key(&transport_key).unwrap();
+        let mut device = test_device("phone-1", token);
+        device.transport_key = Some(transport_key);
+        let state = test_state("admin-token", vec![device]);
+        assert!(require_device(&state, &bearer_headers(token)).is_err());
+
+        let stolen_token_material = base64::engine::general_purpose::STANDARD
+            .decode(hash_token(token))
+            .unwrap();
+        let rejected = decrypt_transport_request(
+            &state,
+            encrypted_test_request("phone-1", &stolen_token_material, token),
+        )
+        .await;
+        assert!(rejected.is_err());
+
+        let (request, _, _, _) =
+            decrypt_transport_request(&state, encrypted_test_request("phone-1", &material, token))
+                .await
+                .unwrap();
+        assert_eq!(bearer_token(request.headers()).unwrap(), token);
+        assert_eq!(
+            require_device(&state, request.headers()).unwrap(),
+            "phone-1"
+        );
+    }
+
+    /// The decrypted request carries the stream context a sealing handler
+    /// needs, and records sealed under it open exactly the way the app's
+    /// decryptor is specified to: derive from (device key, sid, request
+    /// nonce), AAD of request AAD + sid + seq, nonce = seq.
+    #[tokio::test]
+    async fn an_encrypted_request_leaves_a_stream_context_the_sealer_honours() {
+        let token = "device-token";
+        let transport_key = generate_token();
+        let material = transport::decode_key(&transport_key).unwrap();
+        let mut device = test_device("phone-1", token);
+        device.transport_key = Some(transport_key);
+        let state = test_state("admin-token", vec![device]);
+
+        let (request, _, aad, nonce) =
+            decrypt_transport_request(&state, encrypted_test_request("phone-1", &material, token))
+                .await
+                .unwrap();
+        let context = request
+            .extensions()
+            .get::<EncryptedStreamContext>()
+            .expect("stream context is injected for every encrypted request")
+            .clone();
+        assert_eq!(context.request_aad, aad);
+        assert_eq!(context.request_nonce, nonce);
+        assert_eq!(context.material, material);
+
+        let mut sealer = EventStreamSealer::new(&context).unwrap();
+        let first: Value =
+            serde_json::from_str(&sealer.seal_record("herdr", "{\"n\":1}").unwrap()).unwrap();
+        let second: Value =
+            serde_json::from_str(&sealer.seal_record("approval.pending", "{}").unwrap()).unwrap();
+        assert_eq!(first["v"], 1);
+        assert_eq!(first["seq"], 0);
+        assert_eq!(second["seq"], 1);
+        let sid = first["sid"].as_str().unwrap();
+        assert_eq!(second["sid"].as_str().unwrap(), sid);
+
+        let key = transport::derive_stream_key(&material, sid, &nonce).unwrap();
+        let open = |record: &Value| {
+            let seq = record["seq"].as_u64().unwrap();
+            let aad = format!("{}\n{}\n{}", aad, sid, seq);
+            transport::open_stream_event(
+                &key,
+                seq,
+                aad.as_bytes(),
+                record["ciphertext"].as_str().unwrap(),
+            )
+        };
+        let inner: Value = serde_json::from_slice(&open(&first).unwrap()).unwrap();
+        assert_eq!(inner["event"], "herdr");
+        assert_eq!(inner["data"], "{\"n\":1}");
+        let inner: Value = serde_json::from_slice(&open(&second).unwrap()).unwrap();
+        assert_eq!(inner["event"], "approval.pending");
+
+        // A record moved to another slot in the stream never opens: the seq is
+        // in both the nonce and the AAD, so reorder and replay both fail.
+        let replayed = json!({
+            "v": 1, "sid": sid, "seq": 1,
+            "ciphertext": first["ciphertext"].as_str().unwrap(),
+        });
+        assert!(open(&replayed).is_err());
+    }
+
     /// A paired device's headers with the app's locale header on them, which is
     /// what every real request from the app carries.
     fn locale_headers(token: &str, locale: &str) -> HeaderMap {
@@ -9199,6 +11642,34 @@ mod tests {
 
     fn error_body(refusal: &(StatusCode, Json<Value>)) -> Value {
         refusal.1 .0.clone()
+    }
+
+    #[test]
+    fn an_output_range_needs_both_ends_or_neither() {
+        assert!(validate_output_range(None, None).unwrap().is_none());
+        assert_eq!(
+            validate_output_range(Some(10), Some(20)).unwrap(),
+            Some((10, 20))
+        );
+        assert!(validate_output_range(Some(10), None).is_err());
+        assert!(validate_output_range(None, Some(20)).is_err());
+    }
+
+    #[test]
+    fn an_output_range_must_run_forwards() {
+        assert!(validate_output_range(Some(20), Some(20)).is_err());
+        assert!(validate_output_range(Some(21), Some(20)).is_err());
+    }
+
+    #[test]
+    fn an_oversized_output_range_is_trimmed_from_its_start_rather_than_refused() {
+        // A reader scrolling toward the top always eventually overreaches. That is
+        // an arrival at the top, not a client mistake, so it clamps.
+        let (start, end) = validate_output_range(Some(0), Some(50_000))
+            .unwrap()
+            .unwrap();
+        assert_eq!(start, 0);
+        assert_eq!(end, MAX_OUTPUT_LINES);
     }
 
     /// The refusal a request reads is in the language it asked for, and the
@@ -9402,17 +11873,226 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    fn device_fixture(id: &str) -> DeviceRecord {
+        DeviceRecord {
+            id: id.into(),
+            name: id.into(),
+            token_hash: authority::hash_token(id),
+            transport_key: None,
+            paired_unix_ms: 1,
+            last_seen_unix_ms: 1,
+            install_id: None,
+        }
+    }
+
+    /// The shape of the loss this file was written for: a device file that a
+    /// process could not read became an empty list, and the next pairing
+    /// wrote that empty list back over the records that were still there.
     #[test]
-    fn event_filter_matches_dot_and_underscore_and_reads_the_event_field() {
+    fn an_unreadable_device_file_is_an_error_not_an_empty_list() {
+        let dir = std::env::temp_dir().join(format!("gateway-devices-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(DEVICES_FILE);
+
+        // A file that was never written is genuinely empty.
+        assert!(read_devices_at(&path).unwrap().is_empty());
+
+        // A write cut short leaves nothing to parse. That is not "no devices".
+        std::fs::write(&path, b"").unwrap();
+        assert!(
+            read_devices_at(&path).is_err(),
+            "a zero-byte device file read as an empty device list"
+        );
+
+        // Nor is a half-written one.
+        std::fs::write(&path, b"[{\"id\":\"phone\",\"na").unwrap();
+        assert!(
+            read_devices_at(&path).is_err(),
+            "a truncated device file read as an empty device list"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Replacing the list must never put the file through a state in which it
+    /// holds less than a whole generation, because every reader of it treats
+    /// what it finds as the complete set of pairings.
+    #[cfg(unix)]
+    #[test]
+    fn replacing_a_secret_file_never_leaves_it_short() {
+        use std::os::unix::fs::MetadataExt as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!("gateway-atomic-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(DEVICES_FILE);
+
+        write_secret_file(&path, b"[\"first\"]").unwrap();
+        let first_inode = std::fs::metadata(&path).unwrap().ino();
+
+        write_secret_file(&path, b"[\"second\"]").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"[\"second\"]");
+        assert_ne!(
+            std::fs::metadata(&path).unwrap().ino(),
+            first_inode,
+            "the file was rewritten in place, so it was empty for part of the write"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the replacement lost the owner-only mode"
+        );
+
+        // The temporary the rename came from must not be left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "left a temporary behind: {leftovers:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Editing the device list on disk while a gateway owns the directory is
+    /// the same loss from the other side: the gateway is holding the whole
+    /// pre-edit list in memory and writes it back at the next pairing, so an
+    /// edit made underneath it is undone without anyone being told. Refusing
+    /// is the only honest answer -- the caller's own fallback is to ask the
+    /// running gateway to do it instead.
+    #[test]
+    fn revoking_on_disk_refuses_while_a_gateway_owns_the_directory() {
+        let dir = std::env::temp_dir().join(format!("gateway-revoke-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_devices_at(&dir, &[device_fixture("phone"), device_fixture("tablet")]).unwrap();
+
+        let owner = state_lock::acquire_within(&dir, state_lock::RELEASE_VISIBLE_WITHIN).unwrap();
+        // Exact, not waited on: while the owner holds it this must be refused
+        // every time.
+        let refused = revoke_device_at(&dir, "phone");
+        assert!(
+            refused.is_err(),
+            "a device was revoked on disk behind a running gateway's back"
+        );
+        assert_eq!(
+            read_devices_at(&dir.join(DEVICES_FILE))
+                .unwrap()
+                .iter()
+                .map(|device| device.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["phone", "tablet"],
+            "the refused revoke still rewrote the device list"
+        );
+
+        // With no gateway running there is no in-memory list to contradict,
+        // and the same call goes through. Waited on rather than asserted on
+        // the next instruction -- see `state_lock::acquire_within`.
+        drop(owner);
+        assert!(
+            state_lock::retry_while_directory_is_busy(|| revoke_device_at(&dir, "phone")).unwrap()
+        );
+        assert_eq!(
+            read_devices_at(&dir.join(DEVICES_FILE))
+                .unwrap()
+                .iter()
+                .map(|device| device.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tablet"]
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The lock has to span the read *and* the write, not just the write.
+    ///
+    /// A change that locked only its write would still lose records, just
+    /// through a smaller window: it reads the whole list, another writer's
+    /// change lands in the gap, and then it stores a list that never
+    /// contained it. This forces exactly that interleaving -- one change is
+    /// held open between its read and its write while a second one tries to
+    /// go -- and the second must be refused rather than allowed to slip in
+    /// and be overwritten a moment later.
+    #[test]
+    fn a_device_list_change_owns_the_directory_from_its_read_to_its_write() {
+        let dir = std::env::temp_dir().join(format!("gateway-devices-rmw-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_devices_at(&dir, &[device_fixture("phone"), device_fixture("tablet")]).unwrap();
+
+        let slow_dir = dir.clone();
+        let slow = std::thread::spawn(move || {
+            state_lock::retry_while_directory_is_busy(|| {
+                update_devices_at(&slow_dir, |devices| {
+                    devices.retain(|device| device.id != "phone");
+                    // Sitting between the read and the write is the entire
+                    // point: this is the window a write-only lock would leave
+                    // open, and it is far longer than the pre-`exec` window
+                    // that makes an unrelated refusal possible.
+                    std::thread::sleep(Duration::from_millis(400));
+                    Some(())
+                })
+            })
+        });
+
+        std::thread::sleep(Duration::from_millis(100));
+        // Exact, not waited on: the slow change is provably mid-flight.
+        let competing = update_devices_at(&dir, |devices| {
+            devices.retain(|device| device.id != "tablet");
+            Some(())
+        });
+        assert!(
+            competing.is_err(),
+            "a second change ran while another was between its read and its write, so the \
+             slower one was about to store a list that never had this change in it"
+        );
+
+        assert!(slow.join().unwrap().unwrap().is_some());
+        assert_eq!(
+            read_devices_at(&dir.join(DEVICES_FILE))
+                .unwrap()
+                .iter()
+                .map(|device| device.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tablet"],
+            "the in-flight change did not land intact"
+        );
+
+        // Once the directory is free again the same change goes through.
+        assert!(
+            state_lock::retry_while_directory_is_busy(|| revoke_device_at(&dir, "tablet")).unwrap()
+        );
+        assert!(read_devices_at(&dir.join(DEVICES_FILE)).unwrap().is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A bad list is survivable as long as the one it replaced is still there.
+    #[test]
+    fn writing_the_device_list_keeps_the_generation_it_replaced() {
+        let dir = std::env::temp_dir().join(format!("gateway-devices-bak-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        write_devices_at(&dir, &[device_fixture("phone"), device_fixture("tablet")]).unwrap();
+        // Nothing was replaced by the first write, so there is nothing to keep.
+        assert!(!dir.join(DEVICES_BACKUP_FILE).exists());
+
+        write_devices_at(&dir, &[]).unwrap();
+        assert!(read_devices_at(&dir.join(DEVICES_FILE)).unwrap().is_empty());
+
+        let kept = read_devices_at(&dir.join(DEVICES_BACKUP_FILE)).unwrap();
+        assert_eq!(
+            kept.iter().map(|device| device.id.as_str()).collect::<Vec<_>>(),
+            vec!["phone", "tablet"],
+            "the replaced pairings were not recoverable"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn event_filter_matches_dot_and_underscore() {
         assert_eq!(normalize_event_name("pane.updated"), "pane_updated");
         assert_eq!(normalize_event_name(" pane_updated "), "pane_updated");
-        assert_eq!(
-            herdr_event_name(r#"{"event":"pane_updated","data":{}}"#).as_deref(),
-            Some("pane_updated")
-        );
-        // A line the gateway cannot parse is forwarded rather than dropped, so a
-        // filter never silently swallows an event shape we did not anticipate.
-        assert_eq!(herdr_event_name("not json"), None);
     }
 
     /// The rebinding case, written as the header it arrives in. A page served
@@ -9522,6 +12202,26 @@ mod tests {
         let state = test_state("secret", vec![test_device("device-1", "device-token")]);
         let err = require_device(&state, &bearer_headers("secret")).unwrap_err();
         assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn app_mount_zoom_is_side_effect_free_for_both_backends() {
+        for backend in [BackendKind::Herdr, BackendKind::Tmux] {
+            let mut state = test_state("secret", vec![test_device("device-1", "device-token")]);
+            state.config.sessions[0].backend = backend;
+            state.config.sessions[0].socket_path = String::from("/definitely/not/a/socket");
+            let response = zoom_pane(
+                State(state),
+                Path((String::from("default"), String::from("missing-pane"))),
+                bearer_headers("device-token"),
+                Json(ZoomPaneBody {
+                    mode: Some(String::from("on")),
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.0["result"]["type"], "pane_zoomed");
+        }
     }
 
     #[test]
@@ -9648,11 +12348,11 @@ mod tests {
     #[test]
     fn pairing_code_uses_unambiguous_characters() {
         let code = generate_pairing_code();
-        assert_eq!(code.len(), PAIRING_CODE_LENGTH);
+        assert_eq!(code.len(), authority::PAIRING_CODE_LENGTH);
         assert_eq!(code.as_bytes()[4], b'-');
-        assert!(valid_pairing_code(&code));
-        assert!(!valid_pairing_code("ABCD2345"));
-        assert!(!valid_pairing_code("abcD-2345"));
+        assert!(authority::valid_pairing_code(&code));
+        assert!(!authority::valid_pairing_code("ABCD2345"));
+        assert!(!authority::valid_pairing_code("abcD-2345"));
         assert!(!code.contains('0'));
         assert!(!code.contains('O'));
         assert!(!code.contains('1'));
@@ -9677,7 +12377,10 @@ mod tests {
             vec![vec![0_usize; PAIRING_CODE_ALPHABET.len()]; PAIRING_CODE_CHARACTER_COUNT];
         for _ in 0..DRAWS {
             let code = generate_pairing_code();
-            assert!(valid_pairing_code(&code), "{code} is not a pairing code");
+            assert!(
+                authority::valid_pairing_code(&code),
+                "{code} is not a pairing code"
+            );
             let glyphs: Vec<u8> = code.bytes().filter(|byte| *byte != b'-').collect();
             for (position, glyph) in glyphs.iter().enumerate() {
                 let index = PAIRING_CODE_ALPHABET
@@ -9773,16 +12476,32 @@ mod tests {
         })
     }
 
+    fn consume_test_pairing_code(
+        pending: &mut Option<PendingPairing>,
+        request_id: &str,
+        code: &str,
+        now_unix_ms: u128,
+    ) -> Result<(), PairingCodeError> {
+        authority::consume_pairing_code(
+            pending,
+            request_id,
+            code,
+            now_unix_ms,
+            PAIRING_CODE_TTL_MS,
+            MAX_PAIRING_CODE_ATTEMPTS,
+        )
+    }
+
     #[test]
     fn pairing_code_is_consumed_after_one_successful_claim() {
         let mut pending = test_pending_pairing(1_000);
         assert_eq!(
-            consume_pairing_code(&mut pending, "request-1", "2345-6789", 1_001),
+            consume_test_pairing_code(&mut pending, "request-1", "2345-6789", 1_001),
             Ok(())
         );
         assert!(pending.is_none());
         assert_eq!(
-            consume_pairing_code(&mut pending, "request-1", "2345-6789", 1_002),
+            consume_test_pairing_code(&mut pending, "request-1", "2345-6789", 1_002),
             Err(PairingCodeError::Missing)
         );
     }
@@ -9791,7 +12510,7 @@ mod tests {
     fn expired_pairing_code_is_rejected_and_cleared() {
         let mut pending = test_pending_pairing(1_000);
         assert_eq!(
-            consume_pairing_code(
+            consume_test_pairing_code(
                 &mut pending,
                 "request-1",
                 "2345-6789",
@@ -9807,7 +12526,7 @@ mod tests {
         let mut pending = test_pending_pairing(1_000);
         for _ in 0..MAX_PAIRING_CODE_ATTEMPTS {
             assert_eq!(
-                consume_pairing_code(&mut pending, "request-1", "AAAA-AAAA", 1_001),
+                consume_test_pairing_code(&mut pending, "request-1", "AAAA-AAAA", 1_001),
                 Err(PairingCodeError::Invalid)
             );
         }
@@ -9815,26 +12534,11 @@ mod tests {
     }
 
     #[test]
-    fn herdr_request_shape_matches_socket_api() {
-        let encoded = build_herdr_request("pane.read", json!({ "pane_id": "w1:p1" }));
-        let value: Value = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(value["method"], "pane.read");
-        assert_eq!(value["params"]["pane_id"], "w1:p1");
-        assert!(value["id"].as_str().unwrap().starts_with("gateway:"));
-    }
-
-    #[test]
     fn stream_pane_read_becomes_inline_update() {
-        let read = json!({
-            "result": {
-                "read": {
-                    "pane_id": "w1:p2",
-                    "revision": 42,
-                    "text": "hello\n"
-                }
-            }
-        });
-        let frame = stream_pane_frame(&read).unwrap();
+        let frame = StreamPaneFrame {
+            revision: 42,
+            output: "hello\n".into(),
+        };
         let encoded = stream_pane_update_payload(&frame, "w1:p2").unwrap();
         let payload: Value = serde_json::from_str(&encoded).unwrap();
 
@@ -9847,64 +12551,37 @@ mod tests {
     }
 
     #[test]
-    fn stream_pane_update_requires_a_revision() {
-        let read = json!({ "result": { "read": { "text": "hello" } } });
-        assert!(stream_pane_frame(&read).is_none());
-    }
-
-    #[test]
-    fn agent_status_subscriptions_are_scoped_to_each_pane() {
-        let subscriptions = event_subscriptions(&["w1:p1".into(), "w2:p3".into()]);
-        let agent_subscriptions = subscriptions
-            .iter()
-            .filter(|subscription| subscription["type"] == "pane.agent_status_changed")
-            .collect::<Vec<_>>();
-
-        assert_eq!(agent_subscriptions.len(), 2);
-        assert_eq!(agent_subscriptions[0]["pane_id"], "w1:p1");
-        assert_eq!(agent_subscriptions[1]["pane_id"], "w2:p3");
-        assert!(agent_subscriptions
-            .iter()
-            .all(|subscription| subscription["pane_id"].is_string()));
-
-        let watcher_subscriptions = agent_event_subscriptions(&["w1:p1".into(), "w2:p3".into()]);
-        assert_eq!(
-            watcher_subscriptions,
-            vec![
-                json!({ "type": "pane.agent_status_changed", "pane_id": "w1:p1" }),
-                json!({ "type": "pane.agent_status_changed", "pane_id": "w2:p3" })
-            ]
-        );
-    }
-
-    #[test]
-    fn herdr_compatibility_requires_protocol_17() {
+    fn herdr_compatibility_has_a_floor_and_no_ceiling() {
+        // The floor is the actual contract: below it the JSON API is a
+        // different shape, so it stays frozen here on purpose.
         assert_eq!(HERDR_PROTOCOL_MIN, 17);
-        assert_eq!(HERDR_PROTOCOL_MAX, 17);
-    }
+        assert!(!herdr_protocol_supported(1));
+        assert!(!herdr_protocol_supported(16));
 
-    #[test]
-    fn split_result_uses_protocol_17_pane_shape() {
-        let response = json!({
-            "result": {
-                "type": "pane_created",
-                "pane": { "pane_id": "w1:p2" }
-            }
-        });
-        assert_eq!(created_pane_id(&response), Some("w1:p2"));
+        // Both Herdr releases in play today.
+        assert!(herdr_protocol_supported(17)); // 0.7.5
+        assert!(herdr_protocol_supported(19)); // 0.8.0
+
+        // And everything above them. A Herdr newer than this build has ever
+        // seen is still served -- the protocol number tracks TUI wire changes
+        // the gateway never speaks, so a bump is not evidence of a break.
+        assert!(herdr_protocol_supported(20));
+        assert!(herdr_protocol_supported(99));
+        assert!(herdr_protocol_supported(u64::MAX));
     }
 
     #[test]
     fn pairing_payload_contains_mobile_connection_fields() {
         let payload = PairingPayload {
-            kind: "herdr-gateway".into(),
+            kind: "muqun-gateway".into(),
             server_id: "server-1".into(),
             label: "machine".into(),
             url: "http://100.1.2.3:23100".into(),
             token: "secret".into(),
+            transport_key: "transport-secret".into(),
         };
         let value: Value = serde_json::from_str(&serde_json::to_string(&payload).unwrap()).unwrap();
-        assert_eq!(value["kind"], "herdr-gateway");
+        assert_eq!(value["kind"], "muqun-gateway");
         assert_eq!(value["url"], "http://100.1.2.3:23100");
         assert_eq!(value["token"], "secret");
     }
@@ -9912,9 +12589,241 @@ mod tests {
     #[test]
     fn manager_qr_uses_the_current_config_fields() {
         assert_eq!(
-            pairing_qr_offer("http://100.1.2.3:23847", "server-1"),
+            pairing_qr_offer("http://100.1.2.3:23847", "server-1", Some("key_1")),
+            "muqun://pair?u=http%3A%2F%2F100.1.2.3%3A23847&s=server-1&k=key_1"
+        );
+        assert_eq!(
+            pairing_qr_offer("http://100.1.2.3:23847", "server-1", None),
             "muqun://pair?u=http%3A%2F%2F100.1.2.3%3A23847&s=server-1"
         );
+    }
+
+    #[test]
+    fn pairing_transport_policy_rejects_only_a_stale_encrypted_request() {
+        // `Required` no longer forces an encrypted request through this gate:
+        // `pair_claim` authenticates an unencrypted one with the one-time
+        // code instead (see `code_pairing_response`), and `pair_request`
+        // never carried anything worth protecting.
+        assert!(require_pairing_transport(TransportEncryptionMode::Required, true).is_ok());
+        assert!(require_pairing_transport(TransportEncryptionMode::Required, false).is_ok());
+        assert!(require_pairing_transport(TransportEncryptionMode::Disabled, false).is_ok());
+        // The one case still worth rejecting: a request sealed with a key
+        // from before encryption was turned off.
+        assert!(require_pairing_transport(TransportEncryptionMode::Disabled, true).is_err());
+    }
+
+    /// Reads the code `manage` would show a reader on the machine's screen,
+    /// after a device with no QR key has called `pair_request`.
+    fn pending_code(state: &AppState) -> String {
+        state
+            .pending_pairing
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("pair_request left a pending code")
+            .code
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn manual_pairing_ends_up_with_the_same_transport_key_a_qr_pairing_would() {
+        let state = test_state("admin-token", vec![]);
+        assert_eq!(
+            state.config.transport_encryption,
+            TransportEncryptionMode::Required
+        );
+        // No `k`: exactly what a device that typed the address, rather than
+        // scanning a QR, sends.
+        let request_response = pair_request(
+            State(state.clone()),
+            Json(json!({ "request_id": "manual-1", "device_name": "Readers phone" })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(request_response.status(), StatusCode::OK);
+
+        let code = pending_code(&state);
+        let claim_response = pair_claim(
+            State(state.clone()),
+            Json(json!({ "request_id": "manual-1", "code": code })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(claim_response.status(), StatusCode::OK);
+
+        // The body is a sealed envelope, not a plain pairing payload: it was
+        // never sent in the clear even though the request that earned it
+        // carried no pre-shared key.
+        let body = axum::body::to_bytes(claim_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let envelope: transport::Envelope = serde_json::from_slice(&body).unwrap();
+        let material = code_pairing_material(&code, "manual-1").unwrap();
+        let plaintext = transport::open(
+            &material,
+            transport::Direction::PairingResponse,
+            b"POST /api/pair/claim\ncode-pairing\n",
+            &envelope,
+            now_unix_ms(),
+        )
+        .expect("a reader who typed the correct code can open the response");
+        let payload: Value = serde_json::from_slice(&plaintext).unwrap();
+        assert_eq!(payload["kind"], "muqun-gateway");
+        // Same shape a QR pairing gets from this gateway: a device transport
+        // key, not just a bearer token. No silent downgrade.
+        assert_eq!(payload["transport"], "muqun-aes-256-gcm-v1");
+        assert!(payload["device_id"].as_str().is_some());
+        let transport_key = payload["transport_key"].as_str().unwrap();
+        assert!(transport::decode_key(transport_key).is_ok_and(|key| key.len() == 32));
+    }
+
+    #[tokio::test]
+    async fn manual_pairing_response_cannot_be_opened_without_the_code() {
+        let state = test_state("admin-token", vec![]);
+        pair_request(
+            State(state.clone()),
+            Json(json!({ "request_id": "manual-eaves", "device_name": "Phone" })),
+        )
+        .await
+        .unwrap();
+        let code = pending_code(&state);
+        let claim_response = pair_claim(
+            State(state.clone()),
+            Json(json!({ "request_id": "manual-eaves", "code": code })),
+        )
+        .await
+        .unwrap();
+        let body = axum::body::to_bytes(claim_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let envelope: transport::Envelope = serde_json::from_slice(&body).unwrap();
+
+        // A passive observer who saw the wire traffic but not the code typed
+        // into the phone has to brute force the code before this opens --
+        // guessing wrong does not open it.
+        let wrong_material = code_pairing_material("AAAA-AAAA", "manual-eaves").unwrap();
+        assert!(transport::open(
+            &wrong_material,
+            transport::Direction::PairingResponse,
+            b"POST /api/pair/claim\ncode-pairing\n",
+            &envelope,
+            now_unix_ms(),
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn manual_pairing_omits_the_transport_key_when_encryption_is_disabled() {
+        let mut state = test_state("admin-token", vec![]);
+        state.config.transport_encryption = TransportEncryptionMode::Disabled;
+        pair_request(
+            State(state.clone()),
+            Json(json!({ "request_id": "manual-2", "device_name": "Phone" })),
+        )
+        .await
+        .unwrap();
+        let code = pending_code(&state);
+        let claim_response = pair_claim(
+            State(state.clone()),
+            Json(json!({ "request_id": "manual-2", "code": code })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(claim_response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(claim_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        // Plain JSON, not a sealed envelope: `Disabled` never sealed a
+        // response before this card and still does not.
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["kind"], "muqun-gateway");
+        assert!(payload.get("transport_key").is_none());
+        assert!(payload.get("transport").is_none());
+    }
+
+    #[tokio::test]
+    async fn manual_pairing_code_is_single_use() {
+        let state = test_state("admin-token", vec![]);
+        pair_request(
+            State(state.clone()),
+            Json(json!({ "request_id": "manual-3", "device_name": "Phone" })),
+        )
+        .await
+        .unwrap();
+        let code = pending_code(&state);
+        pair_claim(
+            State(state.clone()),
+            Json(json!({ "request_id": "manual-3", "code": code.clone() })),
+        )
+        .await
+        .unwrap();
+
+        let (status, Json(body)) = pair_claim(
+            State(state.clone()),
+            Json(json!({ "request_id": "manual-3", "code": code })),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"]["code"], "pairing_not_requested");
+    }
+
+    #[tokio::test]
+    async fn manual_pairing_code_expires_server_side() {
+        let state = test_state("admin-token", vec![]);
+        let code = "2345-6789".to_owned();
+        *state.pending_pairing.lock().unwrap() = Some(PendingPairing {
+            request_id: "manual-4".into(),
+            device_name: "Phone".into(),
+            install_id: None,
+            code_hash: hash_token(&code),
+            code,
+            created_unix_ms: 0,
+            failed_attempts: 0,
+        });
+
+        let (status, Json(body)) = pair_claim(
+            State(state.clone()),
+            Json(json!({ "request_id": "manual-4", "code": "2345-6789" })),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::GONE);
+        assert_eq!(body["error"]["code"], "pairing_code_expired");
+    }
+
+    #[tokio::test]
+    async fn manual_pairing_wrong_codes_are_rate_limited_and_burn_the_pairing() {
+        let state = test_state("admin-token", vec![]);
+        pair_request(
+            State(state.clone()),
+            Json(json!({ "request_id": "manual-5", "device_name": "Phone" })),
+        )
+        .await
+        .unwrap();
+
+        for _ in 0..MAX_PAIRING_CODE_ATTEMPTS {
+            let (status, Json(body)) = pair_claim(
+                State(state.clone()),
+                Json(json!({ "request_id": "manual-5", "code": "AAAA-AAAA" })),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(body["error"]["code"], "invalid_pairing_code");
+        }
+
+        // The correct code no longer works either: the pairing burned after
+        // `MAX_PAIRING_CODE_ATTEMPTS` wrong guesses, same as it always did.
+        let real_code = "2345-6789";
+        let (status, Json(body)) = pair_claim(
+            State(state.clone()),
+            Json(json!({ "request_id": "manual-5", "code": real_code })),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"]["code"], "pairing_not_requested");
     }
 
     #[test]
@@ -10260,6 +13169,58 @@ mod tests {
         bytes
     }
 
+    fn test_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut central = Vec::new();
+        for (name, body) in entries {
+            let local_offset = bytes.len() as u32;
+            bytes.extend_from_slice(ZIP_LOCAL_HEADER);
+            bytes.extend_from_slice(&20u16.to_le_bytes()); // version needed
+            bytes.extend_from_slice(&0u16.to_le_bytes()); // flags
+            bytes.extend_from_slice(&0u16.to_le_bytes()); // stored
+            bytes.extend_from_slice(&0u16.to_le_bytes()); // time
+            bytes.extend_from_slice(&0u16.to_le_bytes()); // date
+            bytes.extend_from_slice(&0u32.to_le_bytes()); // crc (not read by the probe)
+            bytes.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            bytes.extend_from_slice(&0u16.to_le_bytes()); // extra
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.extend_from_slice(body);
+
+            central.extend_from_slice(ZIP_CENTRAL_HEADER);
+            central.extend_from_slice(&20u16.to_le_bytes()); // made by
+            central.extend_from_slice(&20u16.to_le_bytes()); // needed
+            central.extend_from_slice(&0u16.to_le_bytes()); // flags
+            central.extend_from_slice(&0u16.to_le_bytes()); // stored
+            central.extend_from_slice(&0u16.to_le_bytes()); // time
+            central.extend_from_slice(&0u16.to_le_bytes()); // date
+            central.extend_from_slice(&0u32.to_le_bytes()); // crc
+            central.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes()); // extra
+            central.extend_from_slice(&0u16.to_le_bytes()); // comment
+            central.extend_from_slice(&0u16.to_le_bytes()); // disk
+            central.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
+            central.extend_from_slice(&0u32.to_le_bytes()); // external attrs
+            central.extend_from_slice(&local_offset.to_le_bytes());
+            central.extend_from_slice(name.as_bytes());
+        }
+        let central_offset = bytes.len() as u32;
+        let central_size = central.len() as u32;
+        bytes.extend_from_slice(&central);
+        bytes.extend_from_slice(ZIP_END_HEADER);
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // disk
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // central disk
+        bytes.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(&central_size.to_le_bytes());
+        bytes.extend_from_slice(&central_offset.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // comment
+        bytes
+    }
+
     #[test]
     fn uploads_are_typed_by_content_not_by_name() {
         assert_eq!(sniff_upload_kind(&png_bytes()).unwrap().mime, "image/png");
@@ -10292,16 +13253,87 @@ mod tests {
     }
 
     #[test]
-    fn everything_that_is_not_an_image_is_refused() {
-        // This first version carries images only. A document or a text file is
-        // a 415 like any other unrecognised content, so nothing without an
-        // image magic number can be parked on the host.
-        assert!(sniff_upload_kind(b"%PDF-1.7\n1 0 obj").is_none());
-        assert!(sniff_upload_kind(b"# notes\n\nplain, with no magic number\n").is_none());
-        assert!(sniff_upload_kind(b"{\"a\":1}").is_none());
-        assert!(sniff_upload_kind(b"a,b,c\n1,2,3\n").is_none());
-        assert!(sniff_upload_kind(b"2026-07-25 12:00:00 INFO started\n").is_none());
-        assert!(sniff_upload_kind(b"PK\x03\x04").is_none());
+    fn safe_documents_are_typed_by_content_before_name() {
+        let pdf = sniff_document_upload_kind(b"%PDF-1.7\n1 0 obj", "notes.txt").unwrap();
+        assert_eq!(pdf.extension, "pdf");
+        assert_eq!(pdf.mime, "application/pdf");
+
+        let markdown = sniff_document_upload_kind(b"# notes\n\nplain\n", "notes.md").unwrap();
+        assert_eq!(markdown.extension, "md");
+        assert_eq!(markdown.mime, "text/markdown; charset=utf-8");
+
+        let source = sniff_document_upload_kind(b"const answer = 42;\n", "answer.ts").unwrap();
+        assert_eq!(source.extension, "ts");
+        assert_eq!(source.mime, "text/plain; charset=utf-8");
+
+        let unknown = sniff_document_upload_kind(b"plain UTF-8\n", "README.weird").unwrap();
+        assert_eq!(unknown.extension, "txt");
+    }
+
+    #[test]
+    fn modern_office_packages_are_recognised_from_their_zip_structure() {
+        let docx = test_zip(&[
+            ("[Content_Types].xml", b"types"),
+            ("_rels/.rels", b"rels"),
+            ("word/document.xml", b"document"),
+        ]);
+        assert_eq!(sniff_office_upload_kind(&docx).unwrap().extension, "docx");
+
+        let xlsx = test_zip(&[
+            ("[Content_Types].xml", b"types"),
+            ("_rels/.rels", b"rels"),
+            ("xl/workbook.xml", b"workbook"),
+        ]);
+        assert_eq!(sniff_office_upload_kind(&xlsx).unwrap().extension, "xlsx");
+
+        let pptx = test_zip(&[
+            ("[Content_Types].xml", b"types"),
+            ("_rels/.rels", b"rels"),
+            ("ppt/presentation.xml", b"presentation"),
+        ]);
+        assert_eq!(sniff_office_upload_kind(&pptx).unwrap().extension, "pptx");
+    }
+
+    #[test]
+    fn open_document_packages_require_the_stored_mimetype_first() {
+        let odt = test_zip(&[
+            ("mimetype", b"application/vnd.oasis.opendocument.text"),
+            ("content.xml", b"content"),
+            ("META-INF/manifest.xml", b"manifest"),
+        ]);
+        assert_eq!(sniff_office_upload_kind(&odt).unwrap().extension, "odt");
+
+        let mimetype_late = test_zip(&[
+            ("content.xml", b"content"),
+            ("mimetype", b"application/vnd.oasis.opendocument.text"),
+            ("META-INF/manifest.xml", b"manifest"),
+        ]);
+        assert!(sniff_office_upload_kind(&mimetype_late).is_none());
+    }
+
+    #[test]
+    fn binary_documents_and_archives_are_refused() {
+        let ordinary_zip = test_zip(&[("hello.txt", b"hello")]);
+        assert!(sniff_office_upload_kind(&ordinary_zip).is_none());
+        assert!(sniff_document_upload_kind(&ordinary_zip, "archive.zip").is_none());
+        let ambiguous = test_zip(&[
+            ("[Content_Types].xml", b"types"),
+            ("_rels/.rels", b"rels"),
+            ("word/document.xml", b"document"),
+            ("xl/workbook.xml", b"workbook"),
+        ]);
+        assert!(sniff_office_upload_kind(&ambiguous).is_none());
+        let traversal = test_zip(&[
+            ("[Content_Types].xml", b"types"),
+            ("_rels/.rels", b"rels"),
+            ("../word/document.xml", b"document"),
+        ]);
+        assert!(sniff_office_upload_kind(&traversal).is_none());
+        assert!(sniff_document_upload_kind(b"hello\0world", "notes.txt").is_none());
+        assert!(sniff_document_upload_kind(b"\xff\xfe\x00x", "notes.txt").is_none());
+        // A filename can preserve a useful extension only after the bytes have
+        // passed the text probe; it cannot disguise an archive as source.
+        assert!(sniff_document_upload_kind(b"PK\x03\x04", "archive.ts").is_none());
     }
 
     #[test]
@@ -10447,6 +13479,7 @@ mod tests {
             root: root.to_path_buf(),
             session_id: "default".into(),
             workspace_id: Some("wA".into()),
+            tab_id: Some("wA:t1".into()),
             pane_id: Some("wA:p1".into()),
         }
     }
@@ -10570,6 +13603,52 @@ mod tests {
         assert!(index.get(&asset_id(&never)).is_none());
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_uploads_directory_ingests_like_any_other_root_and_survives_a_cold_start() {
+        // The bug this guards against: an upload lives in the gateway's own
+        // uploads directory, which is not under any pane's cwd, so a rebuild
+        // that only walks pane roots never finds it again once the in-memory
+        // index is gone (e.g. after a restart). The cold-start path in
+        // `asset_content` now adds the uploads directory as one more root per
+        // session -- this proves that root ingests the same way a pane root
+        // does, and that the resulting entry answers a lookup with none of the
+        // session's live roots present, exactly the state a fresh process is
+        // in right after startup.
+        let uploads = asset_test_dir("uploads-cold-start");
+        let upload = uploads.join("5969c1e3.webp");
+        std::fs::write(&upload, b"fake webp bytes").unwrap();
+
+        let root = AssetRoot {
+            path: uploads.clone(),
+            session_id: "default".into(),
+            workspace_id: None,
+            tab_id: None,
+            pane_id: None,
+        };
+        let index: Mutex<AssetIndex> = Mutex::new(AssetIndex::default());
+        let created = ingest_root(&index, &root);
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].path, upload);
+        assert_eq!(created[0].session_id, "default");
+
+        // Simulate the state right after a restart answering `asset_content`:
+        // the entry is in the index (just rebuilt), but the session's live
+        // roots -- the pane cwds -- do not include the uploads directory and
+        // never will. `resolve_indexed_asset_path`'s own-path fallback is what
+        // actually serves it; this proves the entry it is given exists to
+        // fall back on at all.
+        let id = asset_id(&upload);
+        let entry = index.lock().unwrap().get(&id).unwrap();
+        assert_eq!(entry.path, upload);
+        let no_live_pane_roots: Vec<PathBuf> = Vec::new();
+        assert_eq!(
+            resolve_indexed_asset_path(&entry.path, &no_live_pane_roots),
+            Some(upload.clone())
+        );
+
+        std::fs::remove_dir_all(&uploads).ok();
     }
 
     #[cfg(unix)]
@@ -10704,7 +13783,10 @@ mod tests {
         assert!(!index.upsert(rescanned));
         assert_eq!(index.entries.len(), 2);
 
-        let listed = index.session_assets("default", None, 10);
+        // `test_asset_entry` puts everything in workspace "wA".
+        let scope_a = AssetScope::Workspace("wA".into());
+        let scope_b = AssetScope::Workspace("wB".into());
+        let listed = index.session_assets("default", &scope_a, None, 10);
         assert_eq!(
             listed
                 .iter()
@@ -10716,10 +13798,25 @@ mod tests {
         assert_eq!(listed[0].modified_unix_ms, 3_000);
 
         // `since` is exclusive, and `limit` cuts the newest page.
-        assert_eq!(index.session_assets("default", Some(2_000), 10).len(), 1);
-        assert_eq!(index.session_assets("default", Some(3_000), 10).len(), 0);
-        assert_eq!(index.session_assets("default", None, 1).len(), 1);
-        assert_eq!(index.session_assets("other", None, 10).len(), 0);
+        assert_eq!(
+            index
+                .session_assets("default", &scope_a, Some(2_000), 10)
+                .len(),
+            1
+        );
+        assert_eq!(
+            index
+                .session_assets("default", &scope_a, Some(3_000), 10)
+                .len(),
+            0
+        );
+        assert_eq!(index.session_assets("default", &scope_a, None, 1).len(), 1);
+        assert_eq!(index.session_assets("other", &scope_a, None, 10).len(), 0);
+        // Same session, a different workspace: none of "wA"'s files leak into
+        // it. This is the defect the workspace scope closes -- everything
+        // above proves the index still works exactly as it did, this proves
+        // it no longer answers wider than the workspace asked for.
+        assert_eq!(index.session_assets("default", &scope_b, None, 10).len(), 0);
 
         // Nested roots see the same file; the deeper one owns it.
         let shared = nested.join("shared.txt");
@@ -10794,9 +13891,10 @@ mod tests {
     }
 
     async fn listed_asset_names(state: &AppState, kind: Option<&str>, limit: usize) -> Vec<String> {
+        // `test_asset_entry` puts every fixture in workspace "wA".
         let response = session_assets(
             State(state.clone()),
-            Path("default".into()),
+            Path(("default".into(), "wA".into())),
             Query(asset_listing_query(kind, limit)),
             bearer_headers("token"),
         )
@@ -10872,7 +13970,7 @@ mod tests {
         // from one old enough to have ignored the parameter.
         let response = session_assets(
             State(state.clone()),
-            Path("default".into()),
+            Path(("default".into(), "wA".into())),
             Query(asset_listing_query(Some("Image"), 3)),
             bearer_headers("token"),
         )
@@ -10882,13 +13980,30 @@ mod tests {
         assert_eq!(response.0["data"]["assets"][0]["kind"], "image");
         let unfiltered = session_assets(
             State(state.clone()),
-            Path("default".into()),
+            Path(("default".into(), "wA".into())),
             Query(asset_listing_query(None, 3)),
             bearer_headers("token"),
         )
         .await
         .unwrap();
         assert_eq!(unfiltered.0["data"]["kind"], json!([]));
+
+        // A different workspace in the same session sees none of it: the
+        // scope this fix adds is the workspace, not the session, and this is
+        // the reported defect in miniature -- another workspace's files never
+        // showing up in this one's listing.
+        let other_workspace = session_assets(
+            State(state.clone()),
+            Path(("default".into(), "wB".into())),
+            Query(asset_listing_query(None, 3)),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap();
+        assert!(other_workspace.0["data"]["assets"]
+            .as_array()
+            .unwrap()
+            .is_empty());
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -10930,6 +14045,38 @@ mod tests {
     }
 
     #[test]
+    fn an_exact_path_lookup_reaches_an_upload_only_through_the_uploads_root() {
+        // The path a client is guaranteed to hold for an upload is the one the
+        // upload response returned -- the gateway's own directory, never under
+        // a pane's cwd. Without the fold-in, that exact path was the one
+        // lookup that could never answer.
+        let base = asset_test_dir("uploads-by-path");
+        let uploads = base.join("uploads");
+        std::fs::create_dir_all(&uploads).unwrap();
+        let stored = uploads.join("9126cf50.webp");
+        std::fs::write(&stored, b"fake webp bytes").unwrap();
+        let pane_roots = vec![AssetRoot {
+            path: base.join("workspace"),
+            session_id: "default".into(),
+            workspace_id: None,
+            tab_id: None,
+            pane_id: None,
+        }];
+
+        // Pane roots alone miss it; the composed lookup roots answer it.
+        assert!(asset_entry_for_path(&stored.to_string_lossy(), &pane_roots).is_none());
+        let composed = with_uploads_root(pane_roots.clone(), "default", Some(uploads.clone()));
+        let found = asset_entry_for_path(&stored.to_string_lossy(), &composed).unwrap();
+        assert_eq!(found.path, stored);
+        assert_eq!(found.session_id, "default");
+
+        // No uploads directory resolved leaves the roots untouched.
+        assert_eq!(with_uploads_root(pane_roots.clone(), "default", None).len(), 1);
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
     fn an_exact_path_lookup_answers_one_asset_or_none_and_never_leaves_the_roots() {
         let base = asset_test_dir("lookup");
         let workspace = base.join("workspace");
@@ -10951,6 +14098,7 @@ mod tests {
             path: workspace.clone(),
             session_id: "default".into(),
             workspace_id: Some("wA".into()),
+            tab_id: Some("wA:t1".into()),
             pane_id: Some("wA:p1".into()),
         }];
 
@@ -10983,6 +14131,7 @@ mod tests {
             path: workspace.join("a"),
             session_id: "default".into(),
             workspace_id: Some("wB".into()),
+            tab_id: Some("wB:t1".into()),
             pane_id: Some("wB:p1".into()),
         };
         let mut both = roots.clone();
@@ -11008,10 +14157,10 @@ mod tests {
         let home = dirs::home_dir().unwrap();
         let response = json!({
             "result": { "panes": [
-                { "pane_id": "wA:p1", "workspace_id": "wA", "cwd": "/Users/okk/.repos/muqun" },
+                { "pane_id": "wA:p1", "workspace_id": "wA", "tab_id": "wA:t1", "cwd": "/Users/okk/.repos/muqun" },
                 // A second pane in the same directory is the same root.
-                { "pane_id": "wA:p2", "workspace_id": "wA", "cwd": "/Users/okk/.repos/muqun" },
-                { "pane_id": "wB:p1", "workspace_id": "wB", "foreground_cwd": "/Users/okk/.ws/api" },
+                { "pane_id": "wA:p2", "workspace_id": "wA", "tab_id": "wA:t1", "cwd": "/Users/okk/.repos/muqun" },
+                { "pane_id": "wB:p1", "workspace_id": "wB", "tab_id": "wB:t1", "foreground_cwd": "/Users/okk/.ws/api" },
                 { "pane_id": "wC:p1", "workspace_id": "wC", "cwd": "/" },
                 { "pane_id": "wD:p1", "workspace_id": "wD", "cwd": home.to_string_lossy() },
                 { "pane_id": "wE:p1", "workspace_id": "wE" }
@@ -11029,8 +14178,80 @@ mod tests {
             ]
         );
         assert_eq!(roots[0].pane_id.as_deref(), Some("wA:p1"));
+        assert_eq!(roots[0].tab_id.as_deref(), Some("wA:t1"));
         assert_eq!(roots[1].workspace_id.as_deref(), Some("wB"));
+        assert_eq!(roots[1].tab_id.as_deref(), Some("wB:t1"));
         assert!(pane_list_roots("default", &json!({ "result": {} })).is_empty());
+    }
+
+    #[test]
+    fn asset_scope_narrows_to_a_tab_or_to_a_workspace_and_never_to_the_other() {
+        // The invariant card #802's tab-scoping stands on: a `Tab` scope only
+        // ever matches its own tmux window, and a `Workspace` scope (what a
+        // herdr session resolves its tab to) matches every tab inside that
+        // workspace -- so a herdr workspace with more than one tab keeps
+        // seeing all of them, exactly as it did before tabs existed here.
+        let root_in_tab_a = AssetRoot {
+            path: PathBuf::from("/work/a"),
+            session_id: "default".into(),
+            workspace_id: Some("wM".into()),
+            tab_id: Some("wM:t1".into()),
+            pane_id: Some("wM:t1:p1".into()),
+        };
+        let root_in_tab_b = AssetRoot {
+            path: PathBuf::from("/work/b"),
+            session_id: "default".into(),
+            workspace_id: Some("wM".into()),
+            tab_id: Some("wM:t2".into()),
+            pane_id: Some("wM:t2:p1".into()),
+        };
+        let root_elsewhere = AssetRoot {
+            path: PathBuf::from("/work/c"),
+            session_id: "default".into(),
+            workspace_id: Some("wN".into()),
+            tab_id: Some("wN:t1".into()),
+            pane_id: Some("wN:t1:p1".into()),
+        };
+
+        let tab_scope = AssetScope::Tab("wM:t1".into());
+        assert!(tab_scope.matches_root(&root_in_tab_a));
+        assert!(!tab_scope.matches_root(&root_in_tab_b));
+        assert!(!tab_scope.matches_root(&root_elsewhere));
+
+        // A herdr session's tab id resolves to its workspace before scoping,
+        // so both of that workspace's tabs match -- this is the "herdr must
+        // not narrow" guarantee, proven at the layer that actually filters.
+        let workspace_scope = AssetScope::Workspace("wM".into());
+        assert!(workspace_scope.matches_root(&root_in_tab_a));
+        assert!(workspace_scope.matches_root(&root_in_tab_b));
+        assert!(!workspace_scope.matches_root(&root_elsewhere));
+    }
+
+    #[tokio::test]
+    async fn a_tmux_session_scopes_by_tab_directly_and_a_herdr_session_resolves_it_to_a_workspace()
+    {
+        // tmux: the tab id is used verbatim, no lookup involved.
+        let mut session = test_config("token").sessions[0].clone();
+        session.backend = BackendKind::Tmux;
+        assert_eq!(
+            resolve_asset_scope(&session, "@3").await,
+            AssetScope::Tab("@3".into())
+        );
+
+        // herdr: with no live socket to ask (as in every other test in this
+        // file), the tab id can't be translated to its owning workspace, so
+        // it is kept as-is rather than silently widened to "no scope at all".
+        // This is also exactly what makes every pre-existing
+        // `session_assets(Path(("default", "wA")))` test call in this file
+        // keep behaving as a workspace-scoped call after this change: they
+        // never had a live socket either.
+        let mut herdr_session = test_config("token").sessions[0].clone();
+        herdr_session.backend = BackendKind::Herdr;
+        herdr_session.socket_path = "/tmp/herdr-does-not-exist.sock".into();
+        assert_eq!(
+            resolve_asset_scope(&herdr_session, "wA").await,
+            AssetScope::Workspace("wA".into())
+        );
     }
 
     #[test]
@@ -11303,7 +14524,10 @@ mod tests {
             spec["components"]["securitySchemes"]["bearerAuth"]["scheme"],
             "bearer"
         );
-        assert!(spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/output"].is_object());
+        let output = &spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/output"]["get"];
+        assert!(output.is_object());
+        assert_eq!(output["parameters"][4]["name"], "start");
+        assert_eq!(output["parameters"][5]["name"], "end");
         assert!(spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/zoom"].is_object());
         assert!(spec["paths"]["/api/sessions/{sessionId}/events"].is_object());
         assert!(spec["paths"]["/api/pair/request"].is_object());
@@ -11316,7 +14540,7 @@ mod tests {
             spec["paths"]["/api/uploads"]["post"]["requestBody"]["content"]["multipart/form-data"]
                 .is_object()
         );
-        assert!(spec["paths"]["/api/sessions/{sessionId}/assets"]["get"].is_object());
+        assert!(spec["paths"]["/api/sessions/{sessionId}/tabs/{tabId}/assets"]["get"].is_object());
         let parts = &spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/parts"]["get"];
         assert!(parts.is_object());
         assert_eq!(parts["parameters"][2]["name"], "lines");
@@ -11371,8 +14595,9 @@ mod tests {
             CONTENT_SCHEMA_VERSION
         );
         assert_eq!(
-            spec["paths"]["/api/sessions/{sessionId}/assets"]["get"]["responses"]["200"]["content"]
-                ["application/json"]["schema"]["properties"]["schema_version"]["const"],
+            spec["paths"]["/api/sessions/{sessionId}/tabs/{tabId}/assets"]["get"]["responses"]
+                ["200"]["content"]["application/json"]["schema"]["properties"]["schema_version"]
+                ["const"],
             CONTENT_SCHEMA_VERSION
         );
         assert!(
@@ -11385,7 +14610,7 @@ mod tests {
         assert!(spec["paths"]["/api/uploads"]["post"]["responses"]["415"].is_object());
         assert_eq!(
             spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/output"]["get"]["parameters"]
-                [4]["name"],
+                [6]["name"],
             "format"
         );
 
@@ -11407,10 +14632,12 @@ mod tests {
         // A minor bump: the routes are additive, so an older client keeps
         // working, and a newer one can gate on the capability rather than on
         // probing for a 404.
-        assert!(GATEWAY_API_VERSION.starts_with("1.5."));
+        assert!(GATEWAY_API_VERSION.starts_with("1.7."));
         assert_eq!(GATEWAY_API_MAJOR, 1);
         assert!(API_CAPABILITIES.contains(&"tasks"));
         assert!(API_CAPABILITIES.contains(&"agent_catalog"));
+        assert!(API_CAPABILITIES.contains(&"terminal_backends"));
+        assert!(API_CAPABILITIES.contains(&"multiple_terminal_backends"));
     }
 
     #[test]
@@ -11463,98 +14690,568 @@ mod tests {
         );
     }
 
-    /// Protocol 17 answers `workspace.create`, `worktree.create` and
-    /// `worktree.open` with the same workspace/tab/root_pane trio.
-    fn worktree_created_response() -> Value {
-        json!({
-            "id": "1",
-            "result": {
-                "type": "worktree_created",
-                "workspace": { "workspace_id": "ws-9", "number": 2, "label": "task/594",
-                               "focused": false, "pane_count": 1, "tab_count": 1,
-                               "active_tab_id": "tab-9", "agent_status": "unknown" },
-                "tab": { "tab_id": "tab-9" },
-                "root_pane": { "pane_id": "pane-9", "terminal_id": "t-9", "workspace_id": "ws-9",
-                               "tab_id": "tab-9", "focused": false, "agent_status": "unknown",
-                               "revision": 1 },
-                "worktree": { "path": "/Users/dev/code/muqun-task-594", "branch": "task/594",
-                              "is_bare": false, "is_detached": false, "is_prunable": false,
-                              "is_linked_worktree": true, "label": "task/594" }
-            }
-        })
+    #[test]
+    fn a_tmux_session_is_explicit_while_old_sessions_stay_herdr() {
+        let old: SessionConfig = serde_json::from_value(json!({
+            "id": "default", "label": "Default", "socket_path": "/tmp/herdr.sock"
+        }))
+        .unwrap();
+        assert_eq!(old.backend, BackendKind::Herdr);
+        assert!(serde_json::to_value(&old).unwrap().get("backend").is_none());
+
+        let tmux = SessionConfig {
+            id: "default".into(),
+            label: "Default".into(),
+            socket_path: String::new(),
+            backend: BackendKind::Tmux,
+        };
+        assert_eq!(serde_json::to_value(tmux).unwrap()["backend"], "tmux");
     }
 
     #[test]
-    fn a_created_place_is_read_out_of_the_protocol_17_response() {
-        let place = workspace_place(&worktree_created_response(), None, false).unwrap();
-        assert_eq!(place.workspace_id, "ws-9");
-        assert_eq!(place.pane_id, "pane-9");
-        assert_eq!(
-            place.worktree_path.as_deref(),
-            Some("/Users/dev/code/muqun-task-594")
-        );
-        assert!(!place.reused);
+    fn tmux_sessions_sort_ahead_of_herdr_whatever_order_they_were_added() {
+        let mut config = test_config("token");
+        config.sessions.clear();
+        upsert_backend_session(&mut config, BackendKind::Herdr, None, None, None).unwrap();
+        upsert_backend_session(&mut config, BackendKind::Tmux, None, None, None).unwrap();
+        // Neither `GET /api/sessions` nor `gateway_metadata`'s "primary"
+        // session for `/health` and `/api/meta` serve in this order any more
+        // -- both reorder by liveness on every request (see
+        // `session_order_key` / `ordered_sessions`). This stable storage
+        // order is what's left to matter: the order `configure_backend list`
+        // prints. Keeping tmux first there too is the harmless,
+        // previously-established default, not a competing ordering rule for
+        // the app.
+        assert_eq!(config.sessions[0].backend, BackendKind::Tmux);
+        assert_eq!(config.sessions[1].backend, BackendKind::Herdr);
+    }
 
-        // workspace.create carries no worktree, so the caller's own path, if it
-        // has one, is what fills the field.
-        let created = json!({
-            "id": "1",
-            "result": {
-                "type": "workspace_created",
-                "workspace": { "workspace_id": "ws-1" },
-                "tab": { "tab_id": "tab-1" },
-                "root_pane": { "pane_id": "pane-1" }
-            }
-        });
-        let place = workspace_place(&created, None, false).unwrap();
-        assert_eq!(place.pane_id, "pane-1");
-        assert_eq!(place.worktree_path, None);
-        let place = workspace_place(&created, Some("/tmp/wt".into()), true).unwrap();
-        assert_eq!(place.worktree_path.as_deref(), Some("/tmp/wt"));
-        assert!(place.reused);
-
-        // A response missing the pane is not silently treated as a success:
-        // there would be nowhere to start the agent.
-        let no_pane = json!({ "id": "1", "result": { "workspace": { "workspace_id": "ws-1" } } });
-        assert!(workspace_place(&no_pane, None, false).is_none());
-        let herdr_error = json!({ "id": "1", "error": { "code": "not_found", "message": "no" } });
-        assert!(workspace_place(&herdr_error, None, false).is_none());
+    fn liveness_session(id: &str, backend: BackendKind) -> SessionConfig {
+        SessionConfig {
+            id: id.into(),
+            label: id.into(),
+            socket_path: String::new(),
+            backend,
+        }
     }
 
     #[test]
-    fn an_existing_checkout_of_the_branch_is_found_before_another_one_is_made() {
-        let listing = json!({
-            "id": "1",
-            "result": {
-                "type": "worktree_list",
-                "source": { "repo_key": "k", "repo_name": "muqun", "repo_root": "/repo",
-                            "source_checkout_path": "/repo" },
-                "worktrees": [
-                    { "path": "/repo", "branch": "refs/heads/main", "is_bare": false,
-                      "is_detached": false, "is_prunable": false, "is_linked_worktree": false,
-                      "label": "main" },
-                    { "path": "/repo-task-594", "branch": "task/594", "is_bare": false,
-                      "is_detached": false, "is_prunable": false, "is_linked_worktree": true,
-                      "label": "task/594" },
-                    { "path": "/repo-detached", "branch": null, "is_bare": false,
-                      "is_detached": true, "is_prunable": false, "is_linked_worktree": true,
-                      "label": "detached" }
-                ]
-            }
+    fn liveness_outranks_backend_kind_in_the_sessions_ordering_key() {
+        use SessionLiveness::{Empty, HasPanes, Unreachable};
+        // A reachable-and-populated herdr session outranks an empty or dead
+        // tmux one -- liveness is the significant digit, backend kind is only
+        // the tiebreaker.
+        let empty_tmux = liveness_session("t", BackendKind::Tmux);
+        let herdr_with_panes = liveness_session("h", BackendKind::Herdr);
+        assert!(
+            session_order_key(&herdr_with_panes, HasPanes) < session_order_key(&empty_tmux, Empty)
+        );
+
+        let dead_tmux = liveness_session("t", BackendKind::Tmux);
+        assert!(
+            session_order_key(&herdr_with_panes, HasPanes)
+                < session_order_key(&dead_tmux, Unreachable)
+        );
+        assert!(session_order_key(&empty_tmux, Empty) < session_order_key(&dead_tmux, Unreachable));
+    }
+
+    #[test]
+    fn tmux_breaks_ties_ahead_of_herdr_at_every_liveness_level() {
+        for liveness in [
+            SessionLiveness::HasPanes,
+            SessionLiveness::Empty,
+            SessionLiveness::Unreachable,
+        ] {
+            let tmux = liveness_session("t", BackendKind::Tmux);
+            let herdr = liveness_session("h", BackendKind::Herdr);
+            assert!(
+                session_order_key(&tmux, liveness) < session_order_key(&herdr, liveness),
+                "tmux should sort ahead of herdr when both are {liveness:?}"
+            );
+        }
+    }
+
+    /// Sorting a full session list by the key, including every configured
+    /// session staying present when none of them are reachable -- ordering
+    /// must never turn into filtering.
+    #[test]
+    fn sorting_by_the_key_orders_without_dropping_anyone() {
+        let sessions = [
+            liveness_session("herdr-empty", BackendKind::Herdr),
+            liveness_session("tmux-dead", BackendKind::Tmux),
+            liveness_session("herdr-live", BackendKind::Herdr),
+            liveness_session("tmux-empty", BackendKind::Tmux),
+        ];
+        let liveness = [
+            SessionLiveness::Empty,
+            SessionLiveness::Unreachable,
+            SessionLiveness::HasPanes,
+            SessionLiveness::Empty,
+        ];
+        let mut order: Vec<usize> = (0..sessions.len()).collect();
+        order.sort_by_key(|&index| session_order_key(&sessions[index], liveness[index]));
+        let ids: Vec<&str> = order
+            .iter()
+            .map(|&index| sessions[index].id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["herdr-live", "tmux-empty", "herdr-empty", "tmux-dead"]
+        );
+        assert_eq!(
+            order.len(),
+            sessions.len(),
+            "every session stays in the list"
+        );
+    }
+
+    /// All-unreachable is the case that matters most: a client reading only
+    /// `sessions[0]` must still get a session back, not `undefined`.
+    #[test]
+    fn every_session_survives_when_all_are_unreachable() {
+        let sessions = [
+            liveness_session("a", BackendKind::Herdr),
+            liveness_session("b", BackendKind::Tmux),
+            liveness_session("c", BackendKind::Herdr),
+        ];
+        let mut order: Vec<usize> = (0..sessions.len()).collect();
+        order.sort_by_key(|&index| {
+            session_order_key(&sessions[index], SessionLiveness::Unreachable)
         });
-        // Herdr reports refs either way round, and both have to match.
+        assert_eq!(order.len(), 3);
+        // Tmux still wins the tiebreak; the two herdr entries keep the
+        // relative order they were configured in (stable sort).
+        let ids: Vec<&str> = order
+            .iter()
+            .map(|&index| sessions[index].id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["b", "a", "c"]);
+    }
+
+    #[tokio::test]
+    async fn session_liveness_reports_panes_present() {
+        let panes = vec![Pane {
+            id: BackendPaneId::new("p1"),
+            terminal_id: None,
+            workspace_id: BackendWorkspaceId::new("w1"),
+            tab_id: BackendTabId::new("t1"),
+            label: None,
+            terminal_title: None,
+            cwd: None,
+            focused: false,
+            width: None,
+            height: None,
+            revision: None,
+            foreground_command: None,
+            agent: None,
+            agent_status: BackendAgentStatus::Unknown,
+            max_offset_from_bottom: None,
+            viewport_rows: None,
+            alternate_on: None,
+        }];
+        let outcome = session_liveness(
+            Box::pin(async move { Ok(panes) }),
+            Duration::from_millis(50),
+        )
+        .await;
+        assert_eq!(outcome, SessionLiveness::HasPanes);
+    }
+
+    #[tokio::test]
+    async fn session_liveness_reports_reachable_but_empty() {
+        let outcome = session_liveness(
+            Box::pin(async { Ok(Vec::new()) }),
+            Duration::from_millis(50),
+        )
+        .await;
+        assert_eq!(outcome, SessionLiveness::Empty);
+    }
+
+    #[tokio::test]
+    async fn session_liveness_reports_unreachable_on_a_backend_error() {
+        let outcome = session_liveness(
+            Box::pin(async { Err(BackendError::Unavailable) }),
+            Duration::from_millis(50),
+        )
+        .await;
+        assert_eq!(outcome, SessionLiveness::Unreachable);
+    }
+
+    /// The case a failed connect does not cover: a backend that accepts and
+    /// then never answers must not hang `GET /api/sessions` -- it has to be
+    /// discovered by timeout.
+    #[tokio::test]
+    async fn session_liveness_reports_unreachable_on_timeout_without_waiting_for_the_probe() {
+        let outcome = session_liveness(
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                Ok(Vec::new())
+            }),
+            Duration::from_millis(20),
+        )
+        .await;
+        assert_eq!(outcome, SessionLiveness::Unreachable);
+    }
+
+    #[test]
+    fn adding_a_backend_preserves_the_primary_session_and_is_idempotent() {
+        let mut config = test_config("token");
+        config.sessions[0] = SessionConfig {
+            id: "default".into(),
+            label: "tmux".into(),
+            socket_path: String::new(),
+            backend: BackendKind::Tmux,
+        };
+
+        let id = upsert_backend_session(
+            &mut config,
+            BackendKind::Herdr,
+            None,
+            None,
+            Some("/tmp/herdr.sock".into()),
+        )
+        .unwrap();
+        assert_eq!(id, "herdr");
+        assert_eq!(config.sessions[0].id, "default");
+        assert_eq!(config.sessions[1].backend, BackendKind::Herdr);
+
+        let id = upsert_backend_session(
+            &mut config,
+            BackendKind::Herdr,
+            None,
+            Some("Herdr local".into()),
+            Some("/tmp/new.sock".into()),
+        )
+        .unwrap();
+        assert_eq!(id, "herdr");
+        assert_eq!(config.sessions.len(), 2);
+        assert_eq!(config.sessions[1].label, "Herdr local");
+        assert_eq!(config.sessions[1].socket_path, "/tmp/new.sock");
+    }
+
+    #[test]
+    fn choosing_a_default_backend_only_reorders_sessions() {
+        let mut config = test_config("token");
+        config.sessions.push(SessionConfig {
+            id: "tmux".into(),
+            label: "Local tmux".into(),
+            socket_path: String::new(),
+            backend: BackendKind::Tmux,
+        });
+        make_backend_default(&mut config, "tmux").unwrap();
+        assert_eq!(config.sessions[0].id, "tmux");
+        assert_eq!(config.sessions[1].id, "default");
+        assert!(make_backend_default(&mut config, "missing").is_err());
+    }
+
+    #[test]
+    fn a_fresh_install_with_no_backend_named_defaults_to_tmux() {
         assert_eq!(
-            worktree_for_branch(&listing, "task/594").as_deref(),
-            Some("/repo-task-594")
+            resolve_setup_backend(None, None),
+            BackendKind::Tmux,
+            "nothing configured yet, and nothing asked for -- tmux is primary"
+        );
+    }
+
+    #[test]
+    fn an_explicit_backend_always_wins_over_whatever_already_exists() {
+        let herdr_only = test_config("token"); // sessions[0] is Herdr, see test_config
+        assert_eq!(
+            resolve_setup_backend(Some(BackendKind::Tmux), Some(&herdr_only)),
+            BackendKind::Tmux
+        );
+    }
+
+    #[test]
+    fn an_existing_herdr_install_stays_herdr_when_backend_is_left_off() {
+        // The exact case the old `default_value_t = SetupBackend::Herdr` was
+        // protecting: a bare `setup` (e.g. the Herdr-plugin action, which has
+        // no way to pass --backend) on a machine already running Herdr must
+        // not start asking for tmux, which might not even be installed.
+        let herdr_only = test_config("token");
+        assert_eq!(
+            resolve_setup_backend(None, Some(&herdr_only)),
+            BackendKind::Herdr
+        );
+    }
+
+    #[test]
+    fn an_existing_tmux_install_stays_tmux_when_backend_is_left_off() {
+        let mut tmux_only = test_config("token");
+        tmux_only.sessions[0] = SessionConfig {
+            id: "default".into(),
+            label: "tmux".into(),
+            socket_path: String::new(),
+            backend: BackendKind::Tmux,
+        };
+        assert_eq!(
+            resolve_setup_backend(None, Some(&tmux_only)),
+            BackendKind::Tmux
+        );
+    }
+
+    #[test]
+    fn manager_fields_wrap_without_losing_url_or_message_text() {
+        let value = "http://osk.taila90692.ts.net:23847/a-long-path";
+        let mut lines = Vec::new();
+        push_wrapped_field(&mut lines, "url", value, 24);
+        let reconstructed = lines
+            .iter()
+            .enumerate()
+            .map(|(index, line)| {
+                if index == 0 {
+                    line.strip_prefix("url: ").unwrap()
+                } else {
+                    line.trim_start()
+                }
+            })
+            .collect::<String>();
+        assert_eq!(reconstructed, value);
+        assert!(lines.iter().all(|line| display_width(line) <= 24));
+    }
+
+    #[test]
+    fn a_renamed_standalone_dir_migrates_once_and_never_again() {
+        let parent = std::env::temp_dir().join(format!("gateway-rename-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&parent).unwrap();
+        let old_dir = parent.join(PRE_RENAME_STANDALONE_DIR_NAME);
+        std::fs::create_dir_all(&old_dir).unwrap();
+        // A real, parseable config so the pre-migration liveness check has a
+        // port to look at -- this is the ordinary case: an install whose old
+        // gateway has already been stopped, so nothing is listening on that
+        // port under the old name and the migration proceeds. (The refusal
+        // path -- a process actually found listening -- is not exercised
+        // here: this file does not spawn real OS processes to unit-test
+        // process introspection anywhere else either, and that path was
+        // verified operationally when this fix was written, against a
+        // gateway genuinely still running under the pre-rename name.)
+        std::fs::write(
+            old_dir.join(CONFIG_FILE),
+            serde_json::to_vec(&test_config("migration-token")).unwrap(),
+        )
+        .unwrap();
+
+        let migrated = migrate_renamed_standalone_dir(&parent).unwrap();
+        assert_eq!(migrated, parent.join("muqun-gateway"));
+        assert!(!old_dir.exists());
+        assert!(migrated.join(CONFIG_FILE).exists());
+
+        // A directory recreated under the old name afterward is left alone:
+        // once the new name exists, migration never looks at the old one again.
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::write(old_dir.join("marker"), b"should not move").unwrap();
+        let migrated_again = migrate_renamed_standalone_dir(&parent).unwrap();
+        assert_eq!(migrated_again, migrated);
+        assert!(old_dir.join("marker").exists());
+        assert!(!migrated.join("marker").exists());
+
+        std::fs::remove_dir_all(&parent).ok();
+    }
+
+    #[test]
+    fn no_old_dir_and_no_new_dir_migrates_nothing() {
+        let parent =
+            std::env::temp_dir().join(format!("gateway-rename-none-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&parent).unwrap();
+        let migrated = migrate_renamed_standalone_dir(&parent).unwrap();
+        assert_eq!(migrated, parent.join("muqun-gateway"));
+        assert!(!migrated.exists());
+        std::fs::remove_dir_all(&parent).ok();
+    }
+
+    #[test]
+    fn an_unparseable_old_config_does_not_block_migration() {
+        // No port can be read from this, so the liveness check has nothing to
+        // ask about and degrades to "proceed" rather than "refuse forever" --
+        // an install should not be permanently stuck migrating because one
+        // file did not parse.
+        let parent = std::env::temp_dir().join(format!(
+            "gateway-rename-unparseable-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&parent).unwrap();
+        let old_dir = parent.join(PRE_RENAME_STANDALONE_DIR_NAME);
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::write(old_dir.join(CONFIG_FILE), b"{}").unwrap();
+
+        let migrated = migrate_renamed_standalone_dir(&parent).unwrap();
+        assert_eq!(migrated, parent.join("muqun-gateway"));
+        assert!(!old_dir.exists());
+
+        std::fs::remove_dir_all(&parent).ok();
+    }
+
+    #[test]
+    fn backend_ids_and_labels_reject_terminal_control_input() {
+        assert!(validate_session_id("tmux-2").is_ok());
+        assert!(validate_session_id("../tmux").is_err());
+        assert!(validate_session_id("tmux\nforged").is_err());
+        assert!(validate_label("Local tmux").is_ok());
+        assert!(validate_label("tmux\x1b[2J").is_err());
+    }
+
+    #[test]
+    fn transport_metadata_distinguishes_tls_tailscale_and_plain_http() {
+        let mut config = test_config("token");
+        config.public_url = "https://host.tailnet.ts.net".into();
+        config.listen = "127.0.0.1:23847".into();
+        assert_eq!(transport_protection(&config), "https");
+
+        config.public_url = "http://host.tailnet.ts.net:23847".into();
+        config.listen = "100.118.124.50:23847".into();
+        assert_eq!(transport_protection(&config), "tailscale-wireguard");
+
+        config.listen = "0.0.0.0:23847".into();
+        assert_eq!(transport_protection(&config), "unencrypted-http");
+    }
+
+    #[test]
+    fn an_explicit_loopback_url_never_opens_the_listener_to_the_lan() {
+        assert_eq!(
+            listen_for_explicit_public_url("http://localhost:23847", 23847),
+            "127.0.0.1:23847"
         );
         assert_eq!(
-            worktree_for_branch(&listing, "main").as_deref(),
-            Some("/repo")
+            listen_for_explicit_public_url("http://127.0.0.1:23847", 23847),
+            "127.0.0.1:23847"
         );
-        assert_eq!(worktree_for_branch(&listing, "nope"), None);
-        // A detached checkout has no branch and must never be matched by one.
-        assert_eq!(worktree_for_branch(&listing, ""), None);
-        assert_eq!(worktree_for_branch(&json!({}), "main"), None);
+        assert_eq!(
+            listen_for_explicit_public_url("http://[::1]:23847", 23847),
+            "[::1]:23847"
+        );
+        assert_eq!(
+            listen_for_explicit_public_url("https://host.tailnet.ts.net", 23847),
+            "0.0.0.0:23847"
+        );
+    }
+
+    #[test]
+    fn an_existing_install_requires_one_consistent_pairing_identity() {
+        let dir =
+            std::env::temp_dir().join(format!("gateway-existing-install-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = test_config("admin-token");
+        let pairing = PairingFile {
+            payload: PairingPayload {
+                kind: "muqun-gateway".into(),
+                server_id: config.server_id.clone(),
+                label: config.label.clone(),
+                url: config.public_url.clone(),
+                token: "admin-token".into(),
+                transport_key: "transport-key".into(),
+            },
+        };
+        std::fs::write(dir.join(CONFIG_FILE), serde_json::to_vec(&config).unwrap()).unwrap();
+        std::fs::write(
+            dir.join(PAIRING_FILE),
+            serde_json::to_vec(&pairing).unwrap(),
+        )
+        .unwrap();
+        assert!(load_existing_install(&dir.join(CONFIG_FILE), &dir.join(PAIRING_FILE)).is_some());
+
+        let mut stale = pairing;
+        stale.payload.token = "different-token".into();
+        std::fs::write(dir.join(PAIRING_FILE), serde_json::to_vec(&stale).unwrap()).unwrap();
+        assert!(load_existing_install(&dir.join(CONFIG_FILE), &dir.join(PAIRING_FILE)).is_none());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn imported_state_is_merged_without_duplicates() {
+        let dir = std::env::temp_dir().join(format!("gateway-state-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.json");
+        let target = dir.join("target.json");
+        std::fs::write(&source, br#"["one","two"]"#).unwrap();
+        std::fs::write(&target, br#"["two","three"]"#).unwrap();
+        merge_plugin_state::<String, _>(&source, &target, |left, right| left == right).unwrap();
+        let merged: Vec<String> = serde_json::from_slice(&std::fs::read(&target).unwrap()).unwrap();
+        assert_eq!(merged, vec!["one", "two", "three"]);
+        assert!(target
+            .with_file_name("target.json.before-herdr-import")
+            .exists());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn plugin_import_keeps_the_paired_identity_and_merges_tmux() {
+        let root = std::env::temp_dir().join(format!("gateway-import-{}", uuid::Uuid::new_v4()));
+        let source_config_dir = root.join("plugin-config");
+        let source_state_dir = root.join("plugin-state");
+        let target_config_dir = root.join("standalone-config");
+        let target_state_dir = root.join("standalone-state");
+        for dir in [
+            &source_config_dir,
+            &source_state_dir,
+            &target_config_dir,
+            &target_state_dir,
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        let mut plugin = test_config("plugin-token");
+        plugin.server_id = "paired-herdr".into();
+        plugin.listen = "127.0.0.1:31987".into();
+        plugin.public_url = "http://127.0.0.1:31987".into();
+        let plugin_pairing = PairingFile {
+            payload: PairingPayload {
+                kind: "muqun-gateway".into(),
+                server_id: plugin.server_id.clone(),
+                label: plugin.label.clone(),
+                url: plugin.public_url.clone(),
+                token: "plugin-token".into(),
+                transport_key: "plugin-transport-key".into(),
+            },
+        };
+        write_config(&source_config_dir.join(CONFIG_FILE), &plugin).unwrap();
+        write_secret_file(
+            &source_config_dir.join(PAIRING_FILE),
+            &serde_json::to_vec(&plugin_pairing).unwrap(),
+        )
+        .unwrap();
+
+        let mut standalone = test_config("tmux-token");
+        standalone.server_id = "discarded-tmux-identity".into();
+        standalone.sessions[0] = SessionConfig {
+            id: "default".into(),
+            label: "tmux".into(),
+            socket_path: String::new(),
+            backend: BackendKind::Tmux,
+        };
+        let standalone_pairing = PairingFile {
+            payload: PairingPayload {
+                kind: "muqun-gateway".into(),
+                server_id: standalone.server_id.clone(),
+                label: standalone.label.clone(),
+                url: standalone.public_url.clone(),
+                token: "tmux-token".into(),
+                transport_key: "tmux-transport-key".into(),
+            },
+        };
+        write_config(&target_config_dir.join(CONFIG_FILE), &standalone).unwrap();
+        write_secret_file(
+            &target_config_dir.join(PAIRING_FILE),
+            &serde_json::to_vec(&standalone_pairing).unwrap(),
+        )
+        .unwrap();
+
+        import_herdr_plugin(
+            Some(source_config_dir),
+            Some(source_state_dir),
+            Some(target_config_dir.clone()),
+            Some(target_state_dir),
+        )
+        .unwrap();
+
+        let merged: Config =
+            serde_json::from_slice(&std::fs::read(target_config_dir.join(CONFIG_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(merged.server_id, "paired-herdr");
+        assert_eq!(merged.sessions.len(), 2);
+        assert_eq!(merged.sessions[0].backend, BackendKind::Tmux);
+        assert_eq!(merged.sessions[1].backend, BackendKind::Herdr);
+        assert!(target_config_dir.join(HERDR_PLUGIN_IMPORT_MARKER).exists());
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -11666,6 +15363,284 @@ mod tests {
         state
     }
 
+    /// A Herdr socket that answers `pane.list` with a fixed set of panes (or
+    /// none), for driving the real `HerdrBackend` -> `list_panes` path that
+    /// `sessions()` probes end to end, without needing Herdr installed or a
+    /// live tmux server.
+    struct FakePaneListHerdr {
+        socket_path: PathBuf,
+    }
+
+    impl FakePaneListHerdr {
+        fn start(panes: Value) -> Self {
+            let socket_path = std::env::temp_dir().join(format!(
+                "herdr-panelist-{}.sock",
+                uuid::Uuid::new_v4().simple()
+            ));
+            let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        continue;
+                    }
+                    let request: Value = serde_json::from_str(&line).unwrap_or_default();
+                    let response = json!({
+                        "id": request["id"],
+                        "result": { "panes": panes.clone() }
+                    })
+                    .to_string();
+                    let mut stream = reader.into_inner();
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.write_all(b"\n").await;
+                    let _ = stream.flush().await;
+                }
+            });
+            Self { socket_path }
+        }
+
+        fn session(&self, id: &str) -> SessionConfig {
+            SessionConfig {
+                id: id.into(),
+                label: id.into(),
+                socket_path: self.socket_path.to_string_lossy().into_owned(),
+                backend: BackendKind::Herdr,
+            }
+        }
+    }
+
+    fn session_ids(response: &Value) -> Vec<String> {
+        response["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|session| session["id"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// End to end through the real handler: a herdr session that actually has
+    /// a pane outranks a tmux session configured but not running -- the
+    /// motivating regression for this card, where the app reads
+    /// `sessions[0]` and the old static tmux-first order pointed it at the
+    /// dead backend.
+    #[tokio::test]
+    async fn sessions_endpoint_puts_a_live_backend_ahead_of_a_configured_but_dead_one() {
+        let herdr = FakePaneListHerdr::start(json!([
+            { "pane_id": "p1", "workspace_id": "w1", "tab_id": "t1" }
+        ]));
+        let mut state = test_state("admin", vec![test_device("d1", "token")]);
+        state.config.sessions = vec![
+            SessionConfig {
+                id: "tmux-dead".into(),
+                label: "tmux".into(),
+                socket_path: std::env::temp_dir()
+                    .join(format!("tmux-absent-{}.sock", uuid::Uuid::new_v4()))
+                    .to_string_lossy()
+                    .into_owned(),
+                backend: BackendKind::Tmux,
+            },
+            herdr.session("herdr-live"),
+        ];
+
+        let response = sessions(State(state), bearer_headers("token"))
+            .await
+            .unwrap();
+        assert_eq!(session_ids(&response.0), vec!["herdr-live", "tmux-dead"]);
+    }
+
+    /// The dual-backend defect the final review caught: with tmux dead (or
+    /// merely empty) and herdr live, the app connects to whichever session
+    /// `GET /api/sessions` leads with -- but it validates that connection
+    /// against the metadata `/health`/`/api/meta` describe as "primary".
+    /// Before this fix `gateway_metadata` always read
+    /// `config.sessions.first()`, which is stored order (tmux-first) and
+    /// ignores liveness entirely, so it kept describing the dead tmux
+    /// session -- whose `session_metadata` hardcodes `compatible: true` --
+    /// while the app was actually talking to herdr. The version fence
+    /// `assertSupportedHerdr` exists to enforce was defeated for exactly this
+    /// configuration. `gateway_metadata`'s primary must agree with
+    /// `sessions()`'s first entry.
+    #[tokio::test]
+    async fn gateway_metadata_primary_agrees_with_the_sessions_endpoint() {
+        let herdr = FakePaneListHerdr::start(json!([
+            { "pane_id": "p1", "workspace_id": "w1", "tab_id": "t1" }
+        ]));
+        let mut state = test_state("admin", vec![test_device("d1", "token")]);
+        state.config.sessions = vec![
+            SessionConfig {
+                id: "tmux-dead".into(),
+                label: "tmux".into(),
+                socket_path: std::env::temp_dir()
+                    .join(format!("tmux-absent-{}.sock", uuid::Uuid::new_v4()))
+                    .to_string_lossy()
+                    .into_owned(),
+                backend: BackendKind::Tmux,
+            },
+            herdr.session("herdr-live"),
+        ];
+
+        let metadata = gateway_metadata(&state).await.unwrap();
+        assert_eq!(metadata["backend"]["sessionId"], "herdr-live");
+        assert_eq!(metadata["backend"]["kind"], json!(BackendKind::Herdr));
+    }
+
+    /// Ordering must never turn into filtering: every configured session is
+    /// still in the response when none of them are reachable, so a client
+    /// reading `sessions[0]` finds a session object instead of `undefined`.
+    #[tokio::test]
+    async fn sessions_endpoint_keeps_every_session_when_nothing_is_reachable() {
+        let mut state = unreachable_state();
+        state.config.sessions.push(SessionConfig {
+            id: "tmux-also-dead".into(),
+            label: "tmux".into(),
+            socket_path: std::env::temp_dir()
+                .join(format!("tmux-absent-{}.sock", uuid::Uuid::new_v4()))
+                .to_string_lossy()
+                .into_owned(),
+            backend: BackendKind::Tmux,
+        });
+        let configured = state.config.sessions.len();
+
+        let response = sessions(State(state), bearer_headers("token"))
+            .await
+            .unwrap();
+        let ids = session_ids(&response.0);
+        assert_eq!(ids.len(), configured, "no session drops out of the list");
+        // Both are genuinely SessionLiveness::Unreachable here -- the herdr
+        // entry via a refused connection, the tmux entry via
+        // `probe_reachable` catching the same "no such file or directory"
+        // that `list_output` would otherwise fold into an empty topology
+        // (see `probe_reachable_tells_no_server_apart_from_list_panes_reporting_empty`
+        // in `backend/tmux.rs`). So this genuinely exercises the tmux/herdr
+        // tiebreak between two unreachable entries, not an accident of tmux
+        // misreporting as merely empty.
+        assert_eq!(ids[0], "tmux-also-dead");
+    }
+
+    /// The regression `sessions_endpoint_keeps_every_session_when_nothing_is_reachable`
+    /// could not have caught on its own: before `probe_reachable`, a tmux
+    /// session pointed at a socket nothing is listening on classified as
+    /// `SessionLiveness::Empty` (via `list_output`'s "no server is an empty
+    /// topology" masking), not `Unreachable`. That happened to still sort
+    /// tmux first against an `Unreachable` herdr entry -- Empty outranks
+    /// Unreachable regardless of the tiebreak -- so the bug was invisible
+    /// there. Pairing the dead tmux session with a *reachable-but-empty*
+    /// herdr session instead exposes it directly: a herdr session that is
+    /// genuinely `Empty` must outrank a tmux session that is genuinely
+    /// `Unreachable`, which only holds if tmux's "no server" case is actually
+    /// classified as `Unreachable` and not conflated with `Empty`.
+    #[tokio::test]
+    async fn sessions_endpoint_ranks_a_reachable_empty_backend_ahead_of_a_dead_tmux_one() {
+        let empty_herdr = FakePaneListHerdr::start(json!([]));
+        let mut state = test_state("admin", vec![test_device("d1", "token")]);
+        state.config.sessions = vec![
+            SessionConfig {
+                id: "tmux-dead".into(),
+                label: "tmux".into(),
+                socket_path: std::env::temp_dir()
+                    .join(format!("tmux-absent-{}.sock", uuid::Uuid::new_v4()))
+                    .to_string_lossy()
+                    .into_owned(),
+                backend: BackendKind::Tmux,
+            },
+            empty_herdr.session("herdr-empty"),
+        ];
+
+        let response = sessions(State(state), bearer_headers("token"))
+            .await
+            .unwrap();
+        assert_eq!(session_ids(&response.0), vec!["herdr-empty", "tmux-dead"]);
+    }
+
+    /// A reachable session with no panes open still outranks an unreachable
+    /// one, and still trails a session that actually has something in it.
+    #[tokio::test]
+    async fn sessions_endpoint_ranks_reachable_empty_between_live_and_dead() {
+        let empty_herdr = FakePaneListHerdr::start(json!([]));
+        let busy_herdr = FakePaneListHerdr::start(json!([
+            { "pane_id": "p1", "workspace_id": "w1", "tab_id": "t1" }
+        ]));
+        let mut state = test_state("admin", vec![test_device("d1", "token")]);
+        state.config.sessions = vec![
+            empty_herdr.session("empty"),
+            SessionConfig {
+                id: "dead".into(),
+                label: "dead".into(),
+                socket_path: std::env::temp_dir()
+                    .join(format!("herdr-absent-{}.sock", uuid::Uuid::new_v4()))
+                    .to_string_lossy()
+                    .into_owned(),
+                backend: BackendKind::Herdr,
+            },
+            busy_herdr.session("busy"),
+        ];
+
+        let response = sessions(State(state), bearer_headers("token"))
+            .await
+            .unwrap();
+        assert_eq!(session_ids(&response.0), vec!["busy", "empty", "dead"]);
+    }
+
+    /// Same regression as `sessions_endpoint_puts_a_live_backend_ahead_of_a_configured_but_dead_one`,
+    /// but against a genuinely live tmux server instead of a fake -- on a
+    /// private socket this test creates and owns, never the developer's
+    /// default tmux server. Requires `tmux` on `PATH` and permission to
+    /// create a Unix socket, so it is `--ignored` like the other isolated
+    /// tmux contract tests.
+    #[tokio::test]
+    #[ignore = "requires permission to create a local tmux Unix socket"]
+    async fn sessions_endpoint_puts_a_live_isolated_tmux_session_ahead_of_a_dead_herdr_one() {
+        if tokio::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .await
+            .is_err()
+        {
+            eprintln!("skipping: no tmux on PATH");
+            return;
+        }
+        let socket_path = std::env::temp_dir().join(format!(
+            "gateway-sessions-live-{}.sock",
+            uuid::Uuid::new_v4()
+        ));
+        let tmux = backend::TmuxBackend::new(Some(socket_path.clone()));
+        let workspace = tmux
+            .create_workspace(&BackendCreateWorkspace {
+                cwd: Some(std::env::temp_dir()),
+                label: Some("gateway-sessions-live".into()),
+                focus: true,
+            })
+            .await
+            .unwrap();
+
+        let mut state = test_state("admin", vec![test_device("d1", "token")]);
+        state.config.sessions = vec![
+            SessionConfig {
+                id: "herdr-dead".into(),
+                label: "herdr".into(),
+                socket_path: std::env::temp_dir()
+                    .join(format!("herdr-absent-{}.sock", uuid::Uuid::new_v4()))
+                    .to_string_lossy()
+                    .into_owned(),
+                backend: BackendKind::Herdr,
+            },
+            SessionConfig {
+                id: "tmux-live".into(),
+                label: "tmux".into(),
+                socket_path: socket_path.to_string_lossy().into_owned(),
+                backend: BackendKind::Tmux,
+            },
+        ];
+
+        let response = sessions(State(state), bearer_headers("token"))
+            .await
+            .unwrap();
+        assert_eq!(session_ids(&response.0), vec!["tmux-live", "herdr-dead"]);
+
+        tmux.close_workspace(&workspace.id).await.unwrap();
+    }
+
     fn spawn_body(agent: &str, cwd: Option<&str>) -> SpawnBody {
         SpawnBody {
             agent: agent.to_owned(),
@@ -11725,31 +15700,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_split_hangs_off_the_focused_pane_of_the_tab_that_was_named() {
-        let panes = json!({
-            "result": { "panes": [
-                { "pane_id": "w1:p1", "tab_id": "t1", "focused": false },
-                { "pane_id": "w1:p2", "tab_id": "t1", "focused": true },
-                { "pane_id": "w2:p1", "tab_id": "t2", "focused": true }
-            ] }
-        });
-
-        // The focused pane, because that is the one the user was looking at.
-        assert_eq!(pane_to_split(&panes, "t1").as_deref(), Some("w1:p2"));
-        assert_eq!(pane_to_split(&panes, "t2").as_deref(), Some("w2:p1"));
-        // A tab this session does not have is nothing to split, which is what
-        // makes an unknown tab_id a refusal rather than a spawn elsewhere.
-        assert_eq!(pane_to_split(&panes, "t9"), None);
-        assert_eq!(pane_to_split(&json!({}), "t1"), None);
-
-        // No pane in the tab is focused: any of them will do, in Herdr's order.
-        let unfocused = json!({
-            "result": { "panes": [{ "pane_id": "w3:p1", "tab_id": "t3" }] }
-        });
-        assert_eq!(pane_to_split(&unfocused, "t3").as_deref(), Some("w3:p1"));
-    }
-
     #[tokio::test]
     async fn recent_cwds_lists_the_panes_directories_and_is_not_a_directory_browser() {
         // The picker for spawn. It answers with what the panes are already in
@@ -11764,17 +15714,20 @@ mod tests {
         let state = unreachable_state();
         state.assets.lock().unwrap().remember_roots(
             "default",
+            None,
             vec![
                 AssetRoot {
                     path: repo.clone(),
                     session_id: "default".into(),
                     workspace_id: Some("wA".into()),
+                    tab_id: Some("wA:t1".into()),
                     pane_id: Some("wA:p1".into()),
                 },
                 AssetRoot {
                     path: plain.clone(),
                     session_id: "default".into(),
                     workspace_id: Some("wB".into()),
+                    tab_id: Some("wB:t1".into()),
                     pane_id: Some("wB:p1".into()),
                 },
             ],
@@ -12040,6 +15993,7 @@ mod tests {
                 id: "default".into(),
                 label: "Default".into(),
                 socket_path: self.socket_path.to_string_lossy().into_owned(),
+                backend: BackendKind::Herdr,
             }
         }
 
@@ -12183,6 +16137,8 @@ mod tests {
                 source: Some("recent-unwrapped".into()),
                 lines: Some(lines),
                 format: Some("text".into()),
+                start: None,
+                end: None,
             }),
             bearer_headers("token"),
         )
@@ -12211,6 +16167,61 @@ mod tests {
         // Herdr's own answer is the last screen alone.
         assert_eq!(screens.last().unwrap(), "row 3\nrow 4\nrow 5\nrow 6");
         assert_eq!(served, "row 0\nrow 1\nrow 2\nrow 3\nrow 4\nrow 5\nrow 6");
+    }
+
+    async fn read_output_range(state: &AppState, start: u32, end: u32) -> String {
+        let response = pane_output(
+            State(state.clone()),
+            Path(("default".into(), "wM:p1".into())),
+            Query(OutputQuery {
+                source: Some("recent-unwrapped".into()),
+                lines: None,
+                format: Some("text".into()),
+                start: Some(start),
+                end: Some(end),
+            }),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap();
+        pane_read_text(&response.0).unwrap_or_default()
+    }
+
+    /// The bug this pins: a pane the scrollback store is keeping rows for is
+    /// exactly the condition the tail-path stitching above exists for, and
+    /// `keeps()` is decided from session/pane identity and Herdr's own scroll
+    /// telemetry alone -- nothing about it depends on whether the *current*
+    /// request happens to be range-addressed. Without gating on that, this
+    /// same "kept" pane, read with an explicit `[start, end)`, would come back
+    /// windowed by the plain `lines` default (200) rather than sliced to the
+    /// requested range, while nothing about the response said so.
+    ///
+    /// Reuses the exact setup `a_zero_backlog_pane_hands_back_more_than_herdr_kept`
+    /// uses to prove stitching *does* widen a tail read for this pane, then
+    /// shows a range-addressed read of the same pane is answered with exactly
+    /// what Herdr served -- the last screen alone, not the seven-row window.
+    #[tokio::test]
+    async fn a_range_addressed_read_is_never_widened_by_local_scrollback() {
+        let screens = repainting_screens();
+        let herdr = FakeHerdr::start(screens.iter().map(String::as_str).collect(), None);
+        let state = output_state(&herdr);
+        state.scrollback.lock().unwrap().observe(
+            "default",
+            &json!({ "pane_id": "wM:p1", "scroll": { "max_offset_from_bottom": 0, "viewport_rows": 4 } }),
+        );
+
+        // Feed the store the same four repaints that, in the tail-path test,
+        // make a fifth plain read come back as all seven kept rows.
+        for _ in 0..4 {
+            read_output(&state, 240).await;
+        }
+
+        let served = read_output_range(&state, 0, 240).await;
+
+        // Herdr's own answer for this read is the last screen alone -- the
+        // range-addressed request must get exactly that, not the stitched span.
+        assert_eq!(screens.last().unwrap(), "row 3\nrow 4\nrow 5\nrow 6");
+        assert_eq!(served, "row 3\nrow 4\nrow 5\nrow 6");
     }
 
     /// And having kept them, it says so where the reader's affordance looks --

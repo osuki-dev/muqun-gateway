@@ -477,15 +477,6 @@ impl StepLog {
     }
 }
 
-/// Herdr answers a method it does not know with a deserialisation error rather
-/// than a "no such method" code, so that is what an old Herdr looks like from
-/// here, and what selects the direct-`git` fallback.
-pub fn is_unknown_method_error(error: &Value) -> bool {
-    let code = error.get("code").and_then(Value::as_str).unwrap_or("");
-    let message = error.get("message").and_then(Value::as_str).unwrap_or("");
-    code == "invalid_request" && message.contains("unknown variant")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -697,7 +688,7 @@ mod tests {
         assert!(find_on_path("").is_none());
         // Something every POSIX box has, to prove the probe does find things.
         assert!(find_on_path("sh").is_some());
-        assert!(find_on_path("herdr-gateway-definitely-not-installed").is_none());
+        assert!(find_on_path("muqun-gateway-definitely-not-installed").is_none());
     }
 
     #[test]
@@ -830,25 +821,6 @@ mod tests {
         assert_eq!(steps[1]["status"], "skipped");
         assert_eq!(steps[2]["error"]["code"], "agent_start_failed");
         assert_eq!(steps[3]["status"], "rolled_back");
-    }
-
-    #[test]
-    fn an_old_herdr_is_recognised_by_the_error_it_gives_for_a_method_it_lacks() {
-        assert!(is_unknown_method_error(&json!({
-            "code": "invalid_request",
-            "message": "invalid request: unknown variant `worktree.create`, expected one of `ping`"
-        })));
-        // A real failure of a method that does exist is not a reason to fall
-        // back to running git ourselves.
-        assert!(!is_unknown_method_error(&json!({
-            "code": "not_found",
-            "message": "workspace not found"
-        })));
-        assert!(!is_unknown_method_error(&json!({
-            "code": "invalid_request",
-            "message": "invalid request: missing field `branch`"
-        })));
-        assert!(!is_unknown_method_error(&json!({})));
     }
 
     #[test]
