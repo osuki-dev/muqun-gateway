@@ -734,9 +734,7 @@ impl TerminalBackend for TmuxBackend {
             let buffer = format!("gateway-{}", uuid::Uuid::new_v4());
             self.output_with_stdin(["load-buffer", "-b", &buffer, "-"], text.as_bytes())
                 .await?;
-            let pasted = self
-                .output(["paste-buffer", "-b", &buffer, "-t", id.as_str(), "-d"])
-                .await;
+            let pasted = self.output(paste_buffer_args(&buffer, id.as_str())).await;
             if pasted.is_err() {
                 let _ = self.output(["delete-buffer", "-b", &buffer]).await;
             }
@@ -889,6 +887,33 @@ fn agent_from_pane(pane: Pane) -> Option<Agent> {
 /// shell structure assembled by the adapter.
 fn shell_word(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// The argv that delivers a loaded buffer into a pane.
+///
+/// `-p` does two separate jobs, and both are load-bearing. Do not drop it for
+/// either one alone.
+///
+/// It keeps a multi-line message one message. `paste-buffer` rewrites every LF
+/// in the buffer to CR, and CR is byte-for-byte what the Enter key sends, so
+/// without `-p` a line-submitting TUI submits at the first embedded newline and
+/// reads the rest as a second, interrupting prompt. `-p` wraps the payload in
+/// the bracketed-paste markers, which say "all of this is content".
+///
+/// It is also the only channel by which an agent can recognise an attachment.
+/// Claude Code converts an image path to an `[Image #N]` reference inside its
+/// paste handler, which typed input never reaches: character-by-character input
+/// and an unbracketed paste both leave the raw path in the prompt. There is no
+/// fallback to lose it to -- the terminal image protocols (Kitty, Sixel, OSC
+/// 1337) are output-only and OSC 52 carries text -- so without `-p` a phone that
+/// attaches a photo sends a long uploads path instead of the picture.
+///
+/// It is safe to pass unconditionally: tmux emits the markers only for a pane
+/// whose program has requested bracketed paste mode (DECSET 2004), so a program
+/// that never asked receives exactly the bytes it received before, and no
+/// program can be handed markers it would print as text.
+fn paste_buffer_args<'a>(buffer: &'a str, pane_id: &'a str) -> [&'a str; 7] {
+    ["paste-buffer", "-b", buffer, "-t", pane_id, "-d", "-p"]
 }
 
 fn refused(stderr: &[u8]) -> BackendError {
@@ -1196,6 +1221,16 @@ mod tests {
         assert!(validate_tmux_id("@9", '%', "pane").is_err());
         assert!(validate_tmux_id("%9;kill-server", '%', "pane").is_err());
         assert!(validate_tmux_id("%", '%', "pane").is_err());
+    }
+
+    #[test]
+    fn pasted_text_is_bracketed_so_a_newline_in_it_is_not_a_submit() {
+        // Without `-p` tmux turns each LF into a CR, which a pane's program
+        // cannot tell from Enter -- a two-line message then arrives as two.
+        assert_eq!(
+            paste_buffer_args("gateway-buf", "%9"),
+            ["paste-buffer", "-b", "gateway-buf", "-t", "%9", "-d", "-p"]
+        );
     }
 
     #[test]
@@ -1547,6 +1582,99 @@ mod tests {
         assert_eq!(Some(height), pane.viewport_rows);
         assert_eq!(Some(history), pane.max_offset_from_bottom);
         backend.close_workspace(&workspace.id).await.unwrap();
+    }
+
+    /// Poll a tmux pane format until it reads as expected, so a contract test
+    /// waits on the pane's actual state instead of a sleep long enough today.
+    async fn wait_for_pane_flag(
+        backend: &TmuxBackend,
+        pane_id: &PaneId,
+        format: &str,
+        expected: &str,
+    ) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let value = backend
+                .output(["display-message", "-p", "-t", pane_id.as_str(), format])
+                .await
+                .unwrap_or_default();
+            if value.trim() == expected {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{format} never became {expected}, last read {value:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Read a recording once the terminator proves the whole payload landed,
+    /// rather than after a sleep that assumes it did.
+    async fn read_when_complete(path: &std::path::Path, terminator: &[u8]) -> Vec<u8> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let received = std::fs::read(path).unwrap_or_default();
+            if received.ends_with(terminator) {
+                return received;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "recording never ended with {:?}, it holds {:?}",
+                String::from_utf8_lossy(terminator),
+                String::from_utf8_lossy(&received)
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a tmux server"]
+    async fn a_newline_reaches_the_pane_as_pasted_content_and_not_as_enter() {
+        let (backend, workspace) = contract_workspace().await;
+        let panes = backend.list_panes().await.unwrap();
+        let pane = panes
+            .iter()
+            .find(|p| p.workspace_id == workspace.id)
+            .unwrap()
+            .clone();
+
+        // Read the pane's own tty rather than its rendered screen: the defect is
+        // in the bytes, and a screen capture cannot tell a CR that submitted
+        // from one that did not. The recorder asks for bracketed paste mode the
+        // way a real TUI does, because that is the condition tmux gates the
+        // markers on.
+        let recording = std::env::temp_dir().join(format!("gateway-paste-{}", uuid::Uuid::new_v4()));
+        let recorder = format!(
+            "printf '\\033[?2004h'; stty raw -echo; timeout 10 cat > {}; stty sane",
+            shell_word(&recording.to_string_lossy())
+        );
+        backend.send_text(&pane.id, &recorder).await.unwrap();
+        backend
+            .send_keys(&pane.id, &["Enter".to_owned()])
+            .await
+            .unwrap();
+
+        // Wait for the mode itself, not for a guess at how long the shell takes
+        // to reach the recorder. The prompt's own readline turns bracketed paste
+        // off while it runs a command and the recorder turns it back on, so a
+        // fixed sleep can land in that gap and read a pane that is recording but
+        // has the mode off -- which is the very thing under test.
+        wait_for_pane_flag(&backend, &pane.id, "#{bracket_paste_flag}", "1").await;
+        backend
+            .send_text(&pane.id, "first line\nsecond line")
+            .await
+            .unwrap();
+
+        let received = read_when_complete(&recording, b"\x1b[201~").await;
+        let _ = std::fs::remove_file(&recording);
+        backend.close_workspace(&workspace.id).await.unwrap();
+        assert_eq!(
+            received,
+            b"\x1b[200~first line\rsecond line\x1b[201~".to_vec(),
+            "the pane received {:?}",
+            String::from_utf8_lossy(&received)
+        );
     }
 
     #[tokio::test]
