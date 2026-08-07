@@ -25,7 +25,9 @@ JSON line protocol      argv-only tmux CLI
 - `src/backend/model.rs` is the reusable domain boundary. It owns opaque IDs,
   workspaces, tabs, panes, agents, worktrees, output requests, commands, and the
   `TerminalBackend` port.
-- `src/backend/herdr.rs` translates protocol 17 JSON requests and responses.
+- `src/backend/herdr.rs` translates Herdr's JSON socket requests and responses
+  (protocol 17 and newer; the README's "Compatibility and API versions" explains
+  why there is no upper bound).
 - `src/backend/tmux.rs` translates tmux format output and commands. It invokes
   tmux directly, never through a shell.
 - `src/backend/registry.rs` is the static composition registry for the adapters

@@ -168,8 +168,25 @@ const STREAM_OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(150);
 const STREAM_OUTPUT_READ_TIMEOUT: Duration = Duration::from_millis(100);
 const GATEWAY_API_VERSION: &str = "1.7.0";
 const GATEWAY_API_MAJOR: u64 = 1;
+/// The oldest Herdr socket protocol this gateway knows how to speak.
+///
+/// There is deliberately no ceiling. `PROTOCOL_VERSION` in Herdr versions its
+/// *bincode TUI* client/server link; the JSON socket API this gateway actually
+/// speaks merely echoes the same number back from `ping`. Its bumps therefore
+/// track terminal input work the gateway never touches -- 17 to 19, across
+/// Herdr 0.7.5 to 0.8.0, was repeat counts, a text-commit message and a Kitty
+/// keyboard report -- while the JSON schema itself has only ever grown
+/// additively: new event types, new optional params, no field removed or
+/// retyped. Pinning a maximum turned every future Herdr release into a total
+/// outage for changes this gateway does not consume, and `herdr update` puts
+/// that one command away. So a newer Herdr is assumed compatible, and a real
+/// break is caught where it would actually surface -- the request that fails --
+/// rather than by refusing to serve anything at all.
+///
+/// The floor stays, because old and new are not symmetric. A genuinely ancient
+/// Herdr predates JSON fields this gateway requires, so failing fast beats a
+/// stream of unrelated errors from every workspace, pane, and event request.
 const HERDR_PROTOCOL_MIN: u64 = 17;
-const HERDR_PROTOCOL_MAX: u64 = 17;
 const MAX_REQUEST_BODY_BYTES: usize = 128 * 1024;
 const UPLOADS_DIR: &str = "uploads";
 /// Ceiling on one upload body, enforced by the framework's body limit so an
@@ -4000,19 +4017,30 @@ fn is_tailscale_ipv4(ip: std::net::Ipv4Addr) -> bool {
     octets[0] == 100 && (64..=127).contains(&octets[1])
 }
 
+/// Whether a Herdr socket protocol is one this gateway will serve.
+///
+/// Open-ended above [`HERDR_PROTOCOL_MIN`]; see that constant for why.
+fn herdr_protocol_supported(protocol: u64) -> bool {
+    protocol >= HERDR_PROTOCOL_MIN
+}
+
 async fn session_metadata(session: &SessionConfig) -> (Value, Value) {
     match terminal_backend(session).metadata().await {
         Ok(metadata) => {
-            let compatibility_protocol = metadata.protocol.unwrap_or(HERDR_PROTOCOL_MAX);
+            // A backend that does not report a protocol at all is taken at the
+            // floor rather than refused: absent is not the same as too old.
+            let compatibility_protocol = metadata.protocol.unwrap_or(HERDR_PROTOCOL_MIN);
             let compatible = metadata.kind == BackendKind::Tmux
-                || (HERDR_PROTOCOL_MIN..=HERDR_PROTOCOL_MAX).contains(&compatibility_protocol);
+                || herdr_protocol_supported(compatibility_protocol);
             let mut compatibility = json!({
                 "connected": true,
                 "version": metadata.version,
                 "protocol": compatibility_protocol,
                 "compatible": compatible,
                 "supportedProtocolMin": HERDR_PROTOCOL_MIN,
-                "supportedProtocolMax": HERDR_PROTOCOL_MAX,
+                // `null` is the ceiling: explicitly open-ended, which a client
+                // can tell apart from a gateway too old to send the field.
+                "supportedProtocolMax": Value::Null,
             });
             if let (Some(object), Some(response)) = (
                 compatibility.as_object_mut(),
@@ -12066,9 +12094,23 @@ mod tests {
     }
 
     #[test]
-    fn herdr_compatibility_requires_protocol_17() {
+    fn herdr_compatibility_has_a_floor_and_no_ceiling() {
+        // The floor is the actual contract: below it the JSON API is a
+        // different shape, so it stays frozen here on purpose.
         assert_eq!(HERDR_PROTOCOL_MIN, 17);
-        assert_eq!(HERDR_PROTOCOL_MAX, 17);
+        assert!(!herdr_protocol_supported(1));
+        assert!(!herdr_protocol_supported(16));
+
+        // Both Herdr releases in play today.
+        assert!(herdr_protocol_supported(17)); // 0.7.5
+        assert!(herdr_protocol_supported(19)); // 0.8.0
+
+        // And everything above them. A Herdr newer than this build has ever
+        // seen is still served -- the protocol number tracks TUI wire changes
+        // the gateway never speaks, so a bump is not evidence of a break.
+        assert!(herdr_protocol_supported(20));
+        assert!(herdr_protocol_supported(99));
+        assert!(herdr_protocol_supported(u64::MAX));
     }
 
     #[test]
