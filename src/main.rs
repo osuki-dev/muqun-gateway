@@ -11963,7 +11963,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         write_devices_at(&dir, &[device_fixture("phone"), device_fixture("tablet")]).unwrap();
 
-        let owner = state_lock::StateLock::acquire(&dir).unwrap();
+        let owner = state_lock::acquire_within(&dir, state_lock::RELEASE_VISIBLE_WITHIN).unwrap();
+        // Exact, not waited on: while the owner holds it this must be refused
+        // every time.
         let refused = revoke_device_at(&dir, "phone");
         assert!(
             refused.is_err(),
@@ -11980,9 +11982,12 @@ mod tests {
         );
 
         // With no gateway running there is no in-memory list to contradict,
-        // and the same call goes through.
+        // and the same call goes through. Waited on rather than asserted on
+        // the next instruction -- see `state_lock::acquire_within`.
         drop(owner);
-        assert!(revoke_device_at(&dir, "phone").unwrap());
+        assert!(
+            state_lock::retry_while_directory_is_busy(|| revoke_device_at(&dir, "phone")).unwrap()
+        );
         assert_eq!(
             read_devices_at(&dir.join(DEVICES_FILE))
                 .unwrap()
@@ -12012,16 +12017,21 @@ mod tests {
 
         let slow_dir = dir.clone();
         let slow = std::thread::spawn(move || {
-            update_devices_at(&slow_dir, |devices| {
-                devices.retain(|device| device.id != "phone");
-                // Sitting between the read and the write is the entire point:
-                // this is the window a write-only lock would leave open.
-                std::thread::sleep(Duration::from_millis(400));
-                Some(())
+            state_lock::retry_while_directory_is_busy(|| {
+                update_devices_at(&slow_dir, |devices| {
+                    devices.retain(|device| device.id != "phone");
+                    // Sitting between the read and the write is the entire
+                    // point: this is the window a write-only lock would leave
+                    // open, and it is far longer than the pre-`exec` window
+                    // that makes an unrelated refusal possible.
+                    std::thread::sleep(Duration::from_millis(400));
+                    Some(())
+                })
             })
         });
 
         std::thread::sleep(Duration::from_millis(100));
+        // Exact, not waited on: the slow change is provably mid-flight.
         let competing = update_devices_at(&dir, |devices| {
             devices.retain(|device| device.id != "tablet");
             Some(())
@@ -12044,7 +12054,9 @@ mod tests {
         );
 
         // Once the directory is free again the same change goes through.
-        assert!(revoke_device_at(&dir, "tablet").unwrap());
+        assert!(
+            state_lock::retry_while_directory_is_busy(|| revoke_device_at(&dir, "tablet")).unwrap()
+        );
         assert!(read_devices_at(&dir.join(DEVICES_FILE)).unwrap().is_empty());
 
         std::fs::remove_dir_all(&dir).ok();

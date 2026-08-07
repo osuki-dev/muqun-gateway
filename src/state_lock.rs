@@ -27,6 +27,22 @@
 //! believing it was alone), and the descriptor is held in a live binding for
 //! as long as the lock is meant to last (dropping it releases the lock early).
 //!
+//! Releasing is not instantaneous *as seen by another acquirer* when the
+//! releasing process is also spawning children, and that is worth knowing
+//! before it is mistaken for a bug. `fork` copies the descriptor table, so a
+//! child that has been forked but has not yet reached `exec` holds a copy of
+//! the lock's descriptor, and the lock lives until the last copy is gone. A
+//! gateway spawns subprocesses constantly (tmux, Herdr, agents), so for a few
+//! microseconds after it exits, a child of its that was mid-spawn can still be
+//! holding the directory. The consequence is bounded and fail-safe: an
+//! acquirer in that window is *refused*, never wrongly let in, and the next
+//! attempt succeeds. It cannot corrupt anything, which is why this is
+//! documented rather than engineered around -- the alternative primitives
+//! trade this window for worse properties (POSIX record locks are not
+//! inherited across `fork`, but they are dropped when the process closes *any*
+//! descriptor to the file, and they do not contend between threads of one
+//! process, which would make this module untestable).
+//!
 //! Assumption: the state directory is on a local filesystem. `flock` over
 //! NFS is emulated by the client and only coordinates between hosts on newer
 //! kernels with NFSv4; on filesystems that cannot lock at all this degrades to
@@ -177,6 +193,54 @@ fn record_holder(file: &std::fs::File) {
     let _ = file.flush();
 }
 
+/// How long a test waits for a released directory to become acquirable.
+///
+/// Sized against the two things it has to tell apart: the `fork`-to-`exec`
+/// window described in the module docs, which is microseconds, and a genuine
+/// leak, which holds the directory for as long as the leaking process lives.
+/// Anything in between does not happen.
+#[cfg(test)]
+pub const RELEASE_VISIBLE_WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Take the directory once it is free, rather than on the very next
+/// instruction after someone released it.
+///
+/// Asserting that a release is visible immediately asserts something this
+/// design does not promise: another thread of this process may be between
+/// `fork` and `exec` while holding an inherited copy of the descriptor (see
+/// the module docs), and a test binary that runs hundreds of tests in
+/// parallel is doing that almost continuously. Waiting for the condition is
+/// not a slack sleep -- it returns the instant the directory is free, and it
+/// still fails if anything holds the lock for longer than the window can
+/// possibly last.
+#[cfg(test)]
+pub fn acquire_within(dir: &Path, limit: std::time::Duration) -> anyhow::Result<StateLock> {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        match StateLock::acquire(dir) {
+            Ok(lock) => return Ok(lock),
+            Err(error) if std::time::Instant::now() >= deadline => return Err(error),
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(2)),
+        }
+    }
+}
+
+/// Retry an operation that takes the state-directory lock until the directory
+/// stops being someone else's. Same reasoning as `acquire_within`.
+#[cfg(test)]
+pub fn retry_while_directory_is_busy<T>(
+    mut attempt: impl FnMut() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let deadline = std::time::Instant::now() + RELEASE_VISIBLE_WITHIN;
+    loop {
+        match attempt() {
+            Ok(value) => return Ok(value),
+            Err(error) if std::time::Instant::now() >= deadline => return Err(error),
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(2)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,18 +260,21 @@ mod tests {
     fn a_second_gateway_cannot_take_a_held_state_directory() {
         let dir = scratch_dir("second");
 
-        let first = StateLock::acquire(&dir).expect("the first gateway could not take the lock");
+        let first = acquire_within(&dir, RELEASE_VISIBLE_WITHIN)
+            .expect("the first gateway could not take the lock");
 
+        // Exact, not waited on: while the first holds it, a second must be
+        // refused every single time.
         let second = StateLock::acquire(&dir);
         assert!(
             second.is_err(),
             "a second gateway took a state directory another one already owned"
         );
 
-        // Releasing hands it straight over; nothing has to be cleaned up.
+        // Releasing hands it over; nothing has to be cleaned up first.
         drop(first);
         assert!(
-            StateLock::acquire(&dir).is_ok(),
+            acquire_within(&dir, RELEASE_VISIBLE_WITHIN).is_ok(),
             "the directory stayed locked after its owner released it"
         );
 
@@ -219,7 +286,7 @@ mod tests {
     #[test]
     fn a_refused_start_names_the_process_holding_the_directory() {
         let dir = scratch_dir("names-holder");
-        let _held = StateLock::acquire(&dir).unwrap();
+        let _held = acquire_within(&dir, RELEASE_VISIBLE_WITHIN).unwrap();
 
         let error = StateLock::acquire(&dir).unwrap_err().to_string();
         assert!(
@@ -269,6 +336,17 @@ mod tests {
                 // another test thread happened to have open at fork time.
                 libc::close(0);
                 libc::close(2);
+                // In one syscall where the kernel has it. Every descriptor
+                // still open here is one this child is briefly holding on
+                // another test thread's behalf, so the loop fallback -- a
+                // thousand syscalls -- is a window worth closing quickly.
+                #[cfg(target_os = "linux")]
+                if libc::close_range(3, libc::c_uint::MAX, 0) != 0 {
+                    for fd in 3..1024 {
+                        libc::close(fd);
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
                 for fd in 3..1024 {
                     libc::close(fd);
                 }
@@ -297,14 +375,17 @@ mod tests {
 
         // Both checks run before anything can panic, so the child is always
         // reaped: a leaked `pause()`-ing orphan is worse than a failed test.
+        // Exact, not waited on: the child is alive and holding it.
         let refused_while_alive = StateLock::acquire(&dir).is_err();
         // SAFETY: `child` is this process's own child and is not yet reaped.
+        // `waitpid` returning is what makes the kill observable -- the lock
+        // is gone once the process is, not once the signal was sent.
         unsafe {
             libc::kill(child, libc::SIGKILL);
             let mut status = 0;
             libc::waitpid(child, &mut status, 0);
         }
-        let reclaimed_after_kill = StateLock::acquire(&dir).is_ok();
+        let reclaimed_after_kill = acquire_within(&dir, RELEASE_VISIBLE_WITHIN).is_ok();
 
         assert!(
             refused_while_alive,
@@ -318,15 +399,21 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The gateway spawns long-lived children (tmux, Herdr). If they inherited
-    /// the lock descriptor across `exec`, one of them outliving the gateway
-    /// would keep the state directory locked with no gateway to blame for it.
+    /// The gateway spawns long-lived children (tmux, Herdr). If one of them
+    /// inherited the lock descriptor *across `exec`*, it would keep the state
+    /// directory locked for its whole life, with no gateway left to blame for
+    /// it -- and unlike the brief pre-`exec` window in the module docs, that
+    /// would be unbounded. `O_CLOEXEC` on the lock file is what prevents it.
+    ///
+    /// The child here lives 30 seconds and the wait below gives up after 5, so
+    /// a descriptor that really did survive `exec` fails this test rather than
+    /// being waited out.
     #[cfg(unix)]
     #[test]
     fn a_spawned_child_process_does_not_keep_the_directory_locked() {
         let dir = scratch_dir("cloexec");
 
-        let lock = StateLock::acquire(&dir).unwrap();
+        let lock = acquire_within(&dir, RELEASE_VISIBLE_WITHIN).unwrap();
         let mut child = std::process::Command::new("sleep")
             .arg("30")
             .stdin(std::process::Stdio::null())
@@ -336,7 +423,7 @@ mod tests {
             .expect("failed to spawn a child process");
         drop(lock);
 
-        let reclaimed = StateLock::acquire(&dir);
+        let reclaimed = acquire_within(&dir, RELEASE_VISIBLE_WITHIN);
         let outlived = child.try_wait().ok().flatten().is_none();
         child.kill().ok();
         child.wait().ok();
@@ -358,7 +445,7 @@ mod tests {
         let dir = scratch_dir("keeps-file");
 
         let path = dir.join(LOCK_FILE);
-        let lock = StateLock::acquire(&dir).unwrap();
+        let lock = acquire_within(&dir, RELEASE_VISIBLE_WITHIN).unwrap();
         assert!(path.exists());
         drop(lock);
 
@@ -377,8 +464,8 @@ mod tests {
         let first_dir = scratch_dir("separate-a");
         let second_dir = scratch_dir("separate-b");
 
-        let _first = StateLock::acquire(&first_dir).unwrap();
-        assert!(StateLock::acquire(&second_dir).is_ok());
+        let _first = acquire_within(&first_dir, RELEASE_VISIBLE_WITHIN).unwrap();
+        assert!(acquire_within(&second_dir, RELEASE_VISIBLE_WITHIN).is_ok());
 
         std::fs::remove_dir_all(&first_dir).ok();
         std::fs::remove_dir_all(&second_dir).ok();
