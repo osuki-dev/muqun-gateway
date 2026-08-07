@@ -931,6 +931,15 @@ fn means_no_tmux_server(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     message.contains("no server running")
         || message.contains("failed to connect to server")
+        // The prefix, not the reason in the parentheses. tmux prints
+        // "error connecting to <socket> (<reason>)", and the reason varies with
+        // why the connect failed: a missing file, a path past the 104-byte
+        // sockaddr_un limit, a socket owned by somebody else. Matching the
+        // reasons one at a time meant every unlisted one came back as "the
+        // server is there" -- which is exactly the answer `probe_reachable`
+        // exists to avoid giving. A caller cannot talk to a server tmux could
+        // not connect to, whichever way the connect failed.
+        || message.contains("error connecting to")
         || message.contains("no such file or directory")
 }
 
@@ -1339,6 +1348,18 @@ mod tests {
         ));
         assert!(means_no_tmux_server(
             "error connecting to /tmp/missing.sock (No such file or directory)"
+        ));
+        // The same failure with a different reason in the parentheses. macOS
+        // puts its temp directory 48 characters deep, so a socket named under
+        // it clears the 104-byte sockaddr_un limit and tmux reports this
+        // instead -- which read as "a server is running" until the check
+        // stopped enumerating reasons. Real installs meet it too: any socket
+        // path a user configures can be too long, or owned by somebody else.
+        assert!(means_no_tmux_server(
+            "error connecting to /var/folders/hw/s_30091j58v_qzbn0462b8rr0000gn/T/x.sock (File name too long)"
+        ));
+        assert!(means_no_tmux_server(
+            "error connecting to /tmp/theirs.sock (Permission denied)"
         ));
         assert!(!means_no_tmux_server("can't find pane: %99"));
     }
