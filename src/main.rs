@@ -49,6 +49,7 @@ mod native;
 mod parts;
 mod scrollback;
 mod shortcuts;
+mod state_lock;
 mod tasks;
 mod transport;
 
@@ -1241,6 +1242,12 @@ fn import_herdr_plugin(
     let target_state_dir = target_state_dir.unwrap_or(standalone_state_dir()?);
     std::fs::create_dir_all(&target_config_dir)?;
     std::fs::create_dir_all(&target_state_dir)?;
+    // This merges records into the target's device file. A gateway running
+    // against that directory holds the pre-merge list in memory and would
+    // write it back over the merge at its next pairing, so the import has to
+    // own the directory outright while it runs.
+    let _target_lock = state_lock::StateLock::acquire(&target_state_dir)
+        .context("cannot import into a state directory a gateway is using")?;
     let target_config_path = target_config_dir.join(CONFIG_FILE);
     let target_pairing_path = target_config_dir.join(PAIRING_FILE);
     let target = if target_config_path.exists() || target_pairing_path.exists() {
@@ -1498,6 +1505,13 @@ fn start_background_inner(verbose: bool) -> anyhow::Result<()> {
             return Ok(());
         }
     }
+    // The pid file only knows about gateways this subcommand started. One
+    // launched by systemd, or by hand, leaves no pid file at all -- and that
+    // is precisely the pairing-losing case. Ask the state directory instead,
+    // then hand the lock straight to the child. Without this the spawn below
+    // would "succeed" and the child would die a moment later in the log,
+    // where nobody is looking.
+    drop(state_lock::StateLock::acquire(&state_dir)?);
 
     let exe = std::env::current_exe().context("failed to find current executable")?;
     let config = config_dir()?.join(CONFIG_FILE);
@@ -1586,6 +1600,16 @@ fn stop_background_inner(verbose: bool) -> anyhow::Result<()> {
 }
 
 async fn run(config_path: Option<String>) -> anyhow::Result<()> {
+    // Taken before the device list is read and held for the life of the
+    // process. This gateway caches the whole list in memory and rewrites the
+    // whole file on every change, so a second gateway against the same
+    // directory would not interleave with it -- it would overwrite it, and
+    // whichever devices the loser had paired would be silently unpaired.
+    //
+    // The binding has to be named: `let _ = ...` would drop the lock on the
+    // spot and leave this gateway believing it owned a directory it had
+    // already released.
+    let _state_lock = state_lock::StateLock::acquire(&state_dir()?)?;
     ensure_pairing_transport_key()?;
     let config = load_config(config_path)?;
     let addr: SocketAddr = config
@@ -1597,7 +1621,7 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         config,
         pending_pairing: Arc::new(Mutex::new(None)),
         pairing_requests: Arc::new(Mutex::new(VecDeque::new())),
-        push_tokens: Arc::new(Mutex::new(read_push_tokens().unwrap_or_default())),
+        push_tokens: Arc::new(Mutex::new(load_push_tokens_for_service())),
         devices: Arc::new(Mutex::new(load_devices_for_service()?)),
         assets: Arc::new(Mutex::new(AssetIndex::default())),
         scrollback: Arc::new(Mutex::new(scrollback::ScrollbackStore::default())),
@@ -2966,8 +2990,13 @@ fn manage() -> anyhow::Result<()> {
         };
         match input.as_str() {
             "s" | "start" => {
-                start_background_inner(false)?;
-                message = String::from("start requested");
+                // A refusal -- another gateway already owns this state
+                // directory -- belongs on the status line. Propagating it
+                // would drop the operator out of the UI on a keypress.
+                message = match start_background_inner(false) {
+                    Ok(()) => String::from("start requested"),
+                    Err(error) => first_line(&error.to_string()),
+                };
             }
             "t" | "stop" => {
                 stop_background_inner(false)?;
@@ -2981,15 +3010,23 @@ fn manage() -> anyhow::Result<()> {
                 if devices.is_empty() {
                     message = String::from("no paired devices to revoke");
                 } else if let Some(device) = prompt_revoke_device(&devices)? {
-                    if revoke_managed_device(&device.id)? {
-                        message =
-                            format!("revoked {}; scan to pair again", truncate(&device.name, 32));
-                        // Revocation usually means the user is replacing this
-                        // app's credential. Return straight to the pairing QR
-                        // instead of leaving them on the remaining device list.
-                        show_qr = true;
-                    } else {
-                        message = String::from("device was already revoked");
+                    // A revocation that could not be carried out is a status
+                    // line, not an exit: dropping the operator out of the UI
+                    // mid-revoke tells them nothing about what happened.
+                    match revoke_managed_device(&device.id) {
+                        Ok(true) => {
+                            message = format!(
+                                "revoked {}; scan to pair again",
+                                truncate(&device.name, 32)
+                            );
+                            // Revocation usually means the user is replacing
+                            // this app's credential. Return straight to the
+                            // pairing QR instead of leaving them on the
+                            // remaining device list.
+                            show_qr = true;
+                        }
+                        Ok(false) => message = String::from("device was already revoked"),
+                        Err(error) => message = first_line(&format!("{error:#}")),
                     }
                 } else {
                     message = String::from("revoke cancelled");
@@ -3724,6 +3761,13 @@ fn truncate(value: &str, max_chars: usize) -> String {
         output.push_str("...");
     }
     output
+}
+
+/// The first line of a multi-line error, for the manage screen's one-line
+/// status field. Errors written for a terminal put the essential sentence
+/// first and the remedy underneath; only the first fits here.
+fn first_line(value: &str) -> String {
+    value.lines().next().unwrap_or(value).to_string()
 }
 
 fn push_wrapped_field(lines: &mut Vec<String>, label: &str, value: &str, width: usize) {
@@ -9908,6 +9952,27 @@ fn read_devices() -> anyhow::Result<Vec<DeviceRecord>> {
     read_devices_at(&state_dir()?.join(DEVICES_FILE))
 }
 
+/// Load the push-token list for a process that will later persist it.
+///
+/// Same shape as the device file -- held in memory, rewritten whole -- but not
+/// the same stakes. A device re-registers its push token on the next app
+/// launch, so a list lost here refills itself, while a lost pairing has to be
+/// re-established by hand on the device. So this starts anyway rather than
+/// refusing the way `load_devices_for_service` does, and says on stderr what
+/// it dropped instead of starting silently empty.
+fn load_push_tokens_for_service() -> Vec<PushTokenRecord> {
+    match read_push_tokens() {
+        Ok(tokens) => tokens,
+        Err(error) => {
+            eprintln!(
+                "could not read the push token file ({error:#}); starting with none -- devices \
+                 will re-register on their next app launch"
+            );
+            Vec::new()
+        }
+    }
+}
+
 /// Read the paired-device list, keeping "nothing is paired yet" and "the
 /// pairings are there but I cannot read them" as two different answers.
 ///
@@ -10008,15 +10073,53 @@ fn revoke_device(device_id: Option<String>, all: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Drop one device straight from the file, with no gateway running.
+///
+/// The whole read-modify-write happens under the state-directory lock, not
+/// just the write. Locking the write alone would still lose records: another
+/// writer's change can land between the read below and the write that follows
+/// it, and the write puts back a list that never contained it. Holding the
+/// lock across both also means that when a gateway *is* running -- it owns the
+/// directory for its lifetime -- this refuses instead of editing the list
+/// behind its back, which is right, because the running gateway would rewrite
+/// its own in-memory list over this one at the next pairing anyway.
 fn revoke_device_by_id(device_id: &str) -> anyhow::Result<bool> {
-    let mut devices = read_devices()?;
-    let previous_len = devices.len();
-    devices.retain(|device| device.id != device_id);
-    if devices.len() == previous_len {
-        return Ok(false);
-    }
-    write_devices(&devices)?;
-    Ok(true)
+    revoke_device_at(&state_dir()?, device_id)
+}
+
+fn revoke_device_at(dir: &std::path::Path, device_id: &str) -> anyhow::Result<bool> {
+    let removed = update_devices_at(dir, |devices| {
+        let previous_len = devices.len();
+        devices.retain(|device| device.id != device_id);
+        (devices.len() != previous_len).then_some(())
+    })?;
+    Ok(removed.is_some())
+}
+
+/// Load the device list, change it, and store it back, owning the state
+/// directory from the first byte read to the last byte written.
+///
+/// The lock has to span the read as well as the write. A change that locked
+/// only its write would read the list, let another writer's pairing land in
+/// the gap, and then store a list that never contained it -- the whole-file
+/// overwrite this module exists to prevent, just with a smaller window. So
+/// `change` runs inside the critical section, and must not block: everything
+/// else that wants to touch this directory is refused while it runs.
+///
+/// `change` returns `None` when it decided not to change anything, which
+/// leaves the file -- and the backup generation beside it -- untouched.
+fn update_devices_at<T>(
+    dir: &std::path::Path,
+    change: impl FnOnce(&mut Vec<DeviceRecord>) -> Option<T>,
+) -> anyhow::Result<Option<T>> {
+    let _lock = state_lock::StateLock::acquire(dir)
+        .context("cannot edit the device list on disk while a gateway owns it")?;
+    let mut devices = read_devices_at(&dir.join(DEVICES_FILE))?;
+    let Some(outcome) = change(&mut devices) else {
+        return Ok(None);
+    };
+    write_devices_at(dir, &devices)?;
+    Ok(Some(outcome))
 }
 
 fn format_unix_ms(value: u128) -> String {
@@ -11844,6 +11947,105 @@ mod tests {
             .filter(|name| name.contains(".tmp-"))
             .collect();
         assert!(leftovers.is_empty(), "left a temporary behind: {leftovers:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Editing the device list on disk while a gateway owns the directory is
+    /// the same loss from the other side: the gateway is holding the whole
+    /// pre-edit list in memory and writes it back at the next pairing, so an
+    /// edit made underneath it is undone without anyone being told. Refusing
+    /// is the only honest answer -- the caller's own fallback is to ask the
+    /// running gateway to do it instead.
+    #[test]
+    fn revoking_on_disk_refuses_while_a_gateway_owns_the_directory() {
+        let dir = std::env::temp_dir().join(format!("gateway-revoke-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_devices_at(&dir, &[device_fixture("phone"), device_fixture("tablet")]).unwrap();
+
+        let owner = state_lock::StateLock::acquire(&dir).unwrap();
+        let refused = revoke_device_at(&dir, "phone");
+        assert!(
+            refused.is_err(),
+            "a device was revoked on disk behind a running gateway's back"
+        );
+        assert_eq!(
+            read_devices_at(&dir.join(DEVICES_FILE))
+                .unwrap()
+                .iter()
+                .map(|device| device.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["phone", "tablet"],
+            "the refused revoke still rewrote the device list"
+        );
+
+        // With no gateway running there is no in-memory list to contradict,
+        // and the same call goes through.
+        drop(owner);
+        assert!(revoke_device_at(&dir, "phone").unwrap());
+        assert_eq!(
+            read_devices_at(&dir.join(DEVICES_FILE))
+                .unwrap()
+                .iter()
+                .map(|device| device.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tablet"]
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The lock has to span the read *and* the write, not just the write.
+    ///
+    /// A change that locked only its write would still lose records, just
+    /// through a smaller window: it reads the whole list, another writer's
+    /// change lands in the gap, and then it stores a list that never
+    /// contained it. This forces exactly that interleaving -- one change is
+    /// held open between its read and its write while a second one tries to
+    /// go -- and the second must be refused rather than allowed to slip in
+    /// and be overwritten a moment later.
+    #[test]
+    fn a_device_list_change_owns_the_directory_from_its_read_to_its_write() {
+        let dir = std::env::temp_dir().join(format!("gateway-devices-rmw-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_devices_at(&dir, &[device_fixture("phone"), device_fixture("tablet")]).unwrap();
+
+        let slow_dir = dir.clone();
+        let slow = std::thread::spawn(move || {
+            update_devices_at(&slow_dir, |devices| {
+                devices.retain(|device| device.id != "phone");
+                // Sitting between the read and the write is the entire point:
+                // this is the window a write-only lock would leave open.
+                std::thread::sleep(Duration::from_millis(400));
+                Some(())
+            })
+        });
+
+        std::thread::sleep(Duration::from_millis(100));
+        let competing = update_devices_at(&dir, |devices| {
+            devices.retain(|device| device.id != "tablet");
+            Some(())
+        });
+        assert!(
+            competing.is_err(),
+            "a second change ran while another was between its read and its write, so the \
+             slower one was about to store a list that never had this change in it"
+        );
+
+        assert!(slow.join().unwrap().unwrap().is_some());
+        assert_eq!(
+            read_devices_at(&dir.join(DEVICES_FILE))
+                .unwrap()
+                .iter()
+                .map(|device| device.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tablet"],
+            "the in-flight change did not land intact"
+        );
+
+        // Once the directory is free again the same change goes through.
+        assert!(revoke_device_at(&dir, "tablet").unwrap());
+        assert!(read_devices_at(&dir.join(DEVICES_FILE)).unwrap().is_empty());
 
         std::fs::remove_dir_all(&dir).ok();
     }
