@@ -69,6 +69,9 @@ const CONFIG_FILE: &str = "config.json";
 const PAIRING_FILE: &str = "pairing.json";
 const PUSH_TOKENS_FILE: &str = "push-tokens.json";
 const DEVICES_FILE: &str = "devices.json";
+/// The generation of `devices.json` that the last write replaced, kept so a
+/// device file that goes bad is recoverable rather than terminal.
+const DEVICES_BACKUP_FILE: &str = "devices.json.bak";
 const PID_FILE: &str = "gateway.pid";
 const LOG_FILE: &str = "gateway.log";
 const HERDR_PLUGIN_IMPORT_MARKER: &str = ".herdr-plugin-imported";
@@ -1595,7 +1598,7 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         pending_pairing: Arc::new(Mutex::new(None)),
         pairing_requests: Arc::new(Mutex::new(VecDeque::new())),
         push_tokens: Arc::new(Mutex::new(read_push_tokens().unwrap_or_default())),
-        devices: Arc::new(Mutex::new(read_devices().unwrap_or_default())),
+        devices: Arc::new(Mutex::new(load_devices_for_service()?)),
         assets: Arc::new(Mutex::new(AssetIndex::default())),
         scrollback: Arc::new(Mutex::new(scrollback::ScrollbackStore::default())),
         agent_events: Arc::new(Mutex::new(agent_events::AgentEventLog::default())),
@@ -2908,7 +2911,16 @@ fn manage() -> anyhow::Result<()> {
     let _terminal = TerminalModeGuard::enter()?;
     let mut message = auto_upgrade_local_public_url()?.unwrap_or_else(|| String::from("ready"));
     let mut pending_pairing = fetch_pending_pairing().ok().flatten();
-    let mut devices = read_devices().unwrap_or_default();
+    let mut devices = match read_devices() {
+        Ok(devices) => devices,
+        Err(error) => {
+            // An unreadable device file is not an empty one. Reporting it as
+            // "no paired devices" is how an owner is talked into re-pairing,
+            // and re-pairing is the write that makes the loss permanent.
+            message = format!("could not read paired devices: {error}");
+            Vec::new()
+        }
+    };
     // False by default so a finished pairing lands on the device list; `p` flips
     // it on to add another device.
     let mut show_qr = false;
@@ -2917,7 +2929,11 @@ fn manage() -> anyhow::Result<()> {
     loop {
         if !poll_event(MANAGE_REFRESH_INTERVAL)? {
             let next_pending_pairing = fetch_pending_pairing().ok().flatten();
-            let next_devices = read_devices().unwrap_or_default();
+            // A refresh that cannot read the file keeps showing the last list
+            // it could read, rather than blanking the screen mid-write.
+            let Ok(next_devices) = read_devices() else {
+                continue;
+            };
             if next_pending_pairing != pending_pairing || next_devices != devices {
                 // A newly paired device flips off the QR so the screen settles on
                 // the device list instead of showing a fresh code.
@@ -3024,7 +3040,10 @@ fn manage() -> anyhow::Result<()> {
         }
 
         pending_pairing = fetch_pending_pairing().ok().flatten();
-        devices = read_devices().unwrap_or_default();
+        match read_devices() {
+            Ok(next_devices) => devices = next_devices,
+            Err(error) => message = format!("could not read paired devices: {error}"),
+        }
         print_manage_screen(&message, pending_pairing.as_ref(), &devices, show_qr)?;
     }
     Ok(())
@@ -9742,6 +9761,36 @@ pub(crate) fn config_dir() -> anyhow::Result<std::path::PathBuf> {
     Ok(standalone)
 }
 
+/// Where a test run keeps the state a handler persists.
+///
+/// The handlers under test call the same `write_devices` a running gateway
+/// does, and that resolved to the state directory of whatever gateway is
+/// installed for the current user -- so running the checks on a machine that
+/// also runs this gateway overwrote its real `devices.json` with a test
+/// fixture, unpairing every device its owner had. A test binary gets its own
+/// directory instead, once per process, and never learns the real one.
+#[cfg(test)]
+fn test_state_dir() -> std::path::PathBuf {
+    static TEST_STATE_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    TEST_STATE_DIR
+        .get_or_init(|| {
+            let dir = std::env::temp_dir().join(format!(
+                "muqun-gateway-test-state-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&dir).expect("failed to create the test state directory");
+            dir
+        })
+        .clone()
+}
+
+#[cfg(test)]
+fn state_dir() -> anyhow::Result<std::path::PathBuf> {
+    Ok(test_state_dir())
+}
+
+#[cfg(not(test))]
 fn state_dir() -> anyhow::Result<std::path::PathBuf> {
     let standalone_config = standalone_config_dir()?;
     if !standalone_config.join(HERDR_PLUGIN_IMPORT_MARKER).exists() {
@@ -9856,23 +9905,66 @@ fn write_push_tokens(tokens: &[PushTokenRecord]) -> anyhow::Result<()> {
 }
 
 fn read_devices() -> anyhow::Result<Vec<DeviceRecord>> {
-    let path = state_dir()?.join(DEVICES_FILE);
+    read_devices_at(&state_dir()?.join(DEVICES_FILE))
+}
+
+/// Read the paired-device list, keeping "nothing is paired yet" and "the
+/// pairings are there but I cannot read them" as two different answers.
+///
+/// Collapsing them is what makes this file dangerous. The list is held in
+/// memory for the life of the process and every change writes the whole list
+/// back, so a caller that turns an unreadable file into an empty list has
+/// armed the next pairing to overwrite every record that file still held. An
+/// absent file is genuinely empty; a present one that will not parse is an
+/// error the caller has to handle.
+fn read_devices_at(path: &std::path::Path) -> anyhow::Result<Vec<DeviceRecord>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let bytes = std::fs::read(&path)
+    let bytes = std::fs::read(path)
         .with_context(|| format!("failed to read device file {}", path.display()))?;
-    Ok(serde_json::from_slice(&bytes)?)
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse device file {}", path.display()))
+}
+
+/// Load the device list for a process that will later persist it.
+///
+/// Starting a gateway with an empty list because its device file could not be
+/// read is unrecoverable: the first pairing writes that empty list back over
+/// the file. Refusing to start leaves the file, and the backup beside it,
+/// exactly as they are so an operator can restore them.
+fn load_devices_for_service() -> anyhow::Result<Vec<DeviceRecord>> {
+    let dir = state_dir()?;
+    read_devices_at(&dir.join(DEVICES_FILE)).with_context(|| {
+        format!(
+            "refusing to start with an unreadable device file -- starting would overwrite it \
+             with an empty list and permanently lose every pairing. Restore it from {} and \
+             start again.",
+            dir.join(DEVICES_BACKUP_FILE).display()
+        )
+    })
 }
 
 fn write_devices(devices: &[DeviceRecord]) -> anyhow::Result<()> {
     let dir = state_dir()?;
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create state dir {}", dir.display()))?;
-    write_secret_file(
-        &dir.join(DEVICES_FILE),
-        &serde_json::to_vec_pretty(devices)?,
-    )
+    write_devices_at(&dir, devices)
+}
+
+/// Persist the device list, keeping the generation it replaces beside it.
+///
+/// The backup is what turns a bad list into an inconvenience instead of a
+/// loss. Writing it costs one more small file per change, which is nothing
+/// next to re-pairing every device the owner has.
+fn write_devices_at(dir: &std::path::Path, devices: &[DeviceRecord]) -> anyhow::Result<()> {
+    let path = dir.join(DEVICES_FILE);
+    if let Ok(previous) = std::fs::read(&path) {
+        if !previous.is_empty() {
+            write_secret_file(&dir.join(DEVICES_BACKUP_FILE), &previous)?;
+        }
+    }
+    write_secret_file(&path, &serde_json::to_vec_pretty(devices)?)
 }
 
 fn list_devices() -> anyhow::Result<()> {
@@ -10166,31 +10258,73 @@ fn lock_down_secret_dir(dir: &std::path::Path) {
 #[cfg(not(unix))]
 fn lock_down_secret_dir(_dir: &std::path::Path) {}
 
+/// Replace a secret file's contents in one step, never leaving it short.
+///
+/// Truncating the real file and writing into it is what loses pairings. It
+/// puts the file through a window -- open, chmod, write -- in which it is
+/// zero bytes on disk, so a process killed mid-write leaves nothing behind,
+/// and a reader that lands in that window sees an empty file rather than the
+/// records that are still supposed to be there. Writing a complete temporary
+/// file first and renaming it over the target closes that window: `rename` is
+/// atomic within a directory, so every reader sees either the whole previous
+/// generation or the whole new one, and a crash at any point leaves one of
+/// the two rather than a stump.
 fn write_secret_file(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
     if let Some(dir) = path.parent() {
         write_secret_dir_gitignore(dir);
         lock_down_secret_dir(dir);
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .open(path)?;
-        // `mode` only applies when the file is created, so a file written by an
-        // older build keeps its old permissions until they are set explicitly.
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        std::io::Write::write_all(&mut file, bytes)?;
-        Ok(())
-    }
+    let directory = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("secret file path has no file name")?;
+    // The sequence number matters as much as the pid: two threads of one
+    // process writing the same file would otherwise pick the same temporary
+    // and rename each other's half-written copy into place.
+    static TEMPORARY_SEQUENCE: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    let temporary = directory.join(format!(
+        ".{name}.tmp-{}-{}",
+        std::process::id(),
+        TEMPORARY_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
 
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, bytes)?;
+    let write_temporary = || -> anyhow::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .mode(0o600)
+                .open(&temporary)?;
+            // `mode` only applies when the file is created, so a temporary left
+            // by an older build keeps its old permissions until they are set
+            // explicitly.
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            std::io::Write::write_all(&mut file, bytes)?;
+            // The rename is only worth anything if the bytes reached the disk
+            // before the name started pointing at them.
+            file.sync_all()?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&temporary, bytes)?;
+        }
+        std::fs::rename(&temporary, path)?;
         Ok(())
+    };
+
+    match write_temporary() {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // A half-written temporary must not be left to be mistaken for
+            // state, and must not block the next attempt.
+            std::fs::remove_file(&temporary).ok();
+            Err(error.context(format!("failed to write {}", path.display())))
+        }
     }
 }
 
@@ -11628,6 +11762,111 @@ mod tests {
         assert_eq!(mode & 0o777, 0o700, "the directory is still readable");
         let file = std::fs::metadata(&secret).unwrap().permissions().mode();
         assert_eq!(file & 0o777, 0o600, "the secret is still readable");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn device_fixture(id: &str) -> DeviceRecord {
+        DeviceRecord {
+            id: id.into(),
+            name: id.into(),
+            token_hash: authority::hash_token(id),
+            transport_key: None,
+            paired_unix_ms: 1,
+            last_seen_unix_ms: 1,
+            install_id: None,
+        }
+    }
+
+    /// The shape of the loss this file was written for: a device file that a
+    /// process could not read became an empty list, and the next pairing
+    /// wrote that empty list back over the records that were still there.
+    #[test]
+    fn an_unreadable_device_file_is_an_error_not_an_empty_list() {
+        let dir = std::env::temp_dir().join(format!("gateway-devices-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(DEVICES_FILE);
+
+        // A file that was never written is genuinely empty.
+        assert!(read_devices_at(&path).unwrap().is_empty());
+
+        // A write cut short leaves nothing to parse. That is not "no devices".
+        std::fs::write(&path, b"").unwrap();
+        assert!(
+            read_devices_at(&path).is_err(),
+            "a zero-byte device file read as an empty device list"
+        );
+
+        // Nor is a half-written one.
+        std::fs::write(&path, b"[{\"id\":\"phone\",\"na").unwrap();
+        assert!(
+            read_devices_at(&path).is_err(),
+            "a truncated device file read as an empty device list"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Replacing the list must never put the file through a state in which it
+    /// holds less than a whole generation, because every reader of it treats
+    /// what it finds as the complete set of pairings.
+    #[cfg(unix)]
+    #[test]
+    fn replacing_a_secret_file_never_leaves_it_short() {
+        use std::os::unix::fs::MetadataExt as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!("gateway-atomic-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(DEVICES_FILE);
+
+        write_secret_file(&path, b"[\"first\"]").unwrap();
+        let first_inode = std::fs::metadata(&path).unwrap().ino();
+
+        write_secret_file(&path, b"[\"second\"]").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"[\"second\"]");
+        assert_ne!(
+            std::fs::metadata(&path).unwrap().ino(),
+            first_inode,
+            "the file was rewritten in place, so it was empty for part of the write"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the replacement lost the owner-only mode"
+        );
+
+        // The temporary the rename came from must not be left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "left a temporary behind: {leftovers:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A bad list is survivable as long as the one it replaced is still there.
+    #[test]
+    fn writing_the_device_list_keeps_the_generation_it_replaced() {
+        let dir = std::env::temp_dir().join(format!("gateway-devices-bak-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        write_devices_at(&dir, &[device_fixture("phone"), device_fixture("tablet")]).unwrap();
+        // Nothing was replaced by the first write, so there is nothing to keep.
+        assert!(!dir.join(DEVICES_BACKUP_FILE).exists());
+
+        write_devices_at(&dir, &[]).unwrap();
+        assert!(read_devices_at(&dir.join(DEVICES_FILE)).unwrap().is_empty());
+
+        let kept = read_devices_at(&dir.join(DEVICES_BACKUP_FILE)).unwrap();
+        assert_eq!(
+            kept.iter().map(|device| device.id.as_str()).collect::<Vec<_>>(),
+            vec!["phone", "tablet"],
+            "the replaced pairings were not recoverable"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
