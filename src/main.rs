@@ -48,6 +48,7 @@ mod i18n;
 mod native;
 mod parts;
 mod scrollback;
+mod service;
 mod shortcuts;
 mod state_lock;
 mod tasks;
@@ -320,6 +321,11 @@ enum Command {
     Stop,
     Status,
     Manage,
+    /// Keep the gateway running across a logout or a reboot.
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
+    },
     /// Add, remove, or inspect terminal backends in this gateway.
     Backend {
         #[command(subcommand)]
@@ -345,6 +351,17 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum ServiceCommand {
+    /// Register the gateway with this user's init system so it starts at login
+    /// and comes back after a crash or a reboot.
+    Install,
+    /// Remove that registration. Pairings, devices and config are untouched.
+    Uninstall,
+    /// Whether an init system is currently managing the gateway.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -834,6 +851,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Stop => stop_background()?,
         Command::Status => status()?,
         Command::Manage => manage()?,
+        Command::Service { command } => run_service_command(command)?,
         Command::Backend { command } => configure_backend(command)?,
         Command::ImportHerdrPlugin {
             config_dir,
@@ -1496,6 +1514,97 @@ fn proxy_targets_port(proxy: &str, port: u16) -> bool {
         == Some(port)
 }
 
+/// `service install|uninstall|status`.
+///
+/// Install deliberately stops the pid-file gateway first. The two ways of
+/// running are not additive: leave the detached child up and the agent starts a
+/// second gateway a moment later, which loses the port race, dies in the log,
+/// and leaves a machine that looks installed and answers nothing.
+fn run_service_command(command: ServiceCommand) -> anyhow::Result<()> {
+    match command {
+        ServiceCommand::Install => {
+            stop_background_inner(false)?;
+            service::install(&service_paths()?)?;
+            println!("The gateway now starts when you log in, and restarts if it stops.");
+            println!("Undo it with: muqun-gateway service uninstall");
+        }
+        ServiceCommand::Uninstall => {
+            service::uninstall()?;
+            // Removing the agent stops the process it was supervising, and the
+            // reader did not ask for their phone to lose the machine -- only
+            // for it to stop coming back by itself. So hand it back to the
+            // detached-child path it would have been on all along.
+            //
+            // The stop is not redundant. `launchctl bootout` returns before the
+            // process it booted out has gone, and that process still owns the
+            // state directory, so starting the replacement immediately loses
+            // the lock race and dies -- observed: uninstall then reported the
+            // lock error and left nothing running, which is the one outcome
+            // this branch exists to prevent. Nothing can revive it now that the
+            // unit is gone, so stopping first is safe as well as necessary.
+            stop_background_inner(false)?;
+            // Best effort by design. The registration is already gone, which is
+            // what was asked for; failing the whole command because the
+            // replacement did not come up would report the part that worked as
+            // a failure, and leave the reader with no idea which half happened.
+            match start_background_inner(false) {
+                Ok(()) => println!(
+                    "The gateway is still running, but it will not come back after a reboot."
+                ),
+                Err(error) => {
+                    println!("Autostart is removed, but the gateway did not restart: {error}");
+                    println!("Start it again with: muqun-gateway start");
+                }
+            }
+        }
+        ServiceCommand::Status => {
+            // Only ever asked once there is a config to ask about. Without one
+            // `configured_port` falls back to the default port, and the
+            // listener check then reports whatever else is on it -- another
+            // account's gateway, or one this install knows nothing about -- as
+            // "running". A fresh install would be told it was already up.
+            let running = match load_config(None) {
+                Ok(config) => Some(
+                    read_pid()?.is_some_and(process_running)
+                        || !gateway_listener_pids(config.port())?.is_empty(),
+                ),
+                Err(_) => None,
+            };
+            match service::state()? {
+                service::ServiceState::Installed => {
+                    println!("service: installed ({})", service::unit_path()?.display());
+                }
+                service::ServiceState::FileOnly => {
+                    println!(
+                        "service: a unit file exists at {} but the init system has not loaded it.",
+                        service::unit_path()?.display()
+                    );
+                    println!("Re-run `muqun-gateway service install` to repair it.");
+                }
+                service::ServiceState::NotInstalled => {
+                    println!("service: not installed -- the gateway will not survive a reboot.");
+                    println!("Install it with: muqun-gateway service install");
+                }
+            }
+            match running {
+                Some(true) => println!("gateway: running"),
+                Some(false) => println!("gateway: not running"),
+                None => println!("gateway: not configured yet -- run `muqun-gateway setup`"),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn service_paths() -> anyhow::Result<service::ServicePaths> {
+    Ok(service::ServicePaths {
+        exe: std::env::current_exe().context("failed to find current executable")?,
+        config: config_dir()?.join(CONFIG_FILE),
+        log: state_dir()?.join(LOG_FILE),
+        home: dirs::home_dir().context("failed to locate the home directory")?,
+    })
+}
+
 fn start_background() -> anyhow::Result<()> {
     start_background_inner(true)
 }
@@ -1602,6 +1711,16 @@ fn stop_background_inner(verbose: bool) -> anyhow::Result<()> {
     remove_pid_file()?;
     if verbose && !stopped {
         println!("gateway is not running");
+    }
+    // Killing the process is not stopping it once an init system is watching:
+    // KeepAlive and Restart=always both put it straight back, so a reader who
+    // ran `stop` and then found it running would have every reason to think the
+    // command was broken. Say which one is holding it up instead.
+    if verbose && stopped && service::is_installed() {
+        println!(
+            "note: the installed service will start it again. Run `muqun-gateway service uninstall`\n\
+             to stop it for good."
+        );
     }
     Ok(())
 }
