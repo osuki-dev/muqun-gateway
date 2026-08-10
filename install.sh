@@ -282,6 +282,78 @@ fi
 "$binary" stop  >/dev/null 2>&1 || true
 "$binary" start
 
+# Autostart, asked rather than assumed.
+#
+# `start` above spawns a detached child. It outlives this terminal, and that is
+# all it was ever asked to do -- it does not outlive a reboot. So without this
+# step the phone stops reaching the machine the next time it restarts, with no
+# signal on either side saying why.
+#
+# Asking is deliberate. This writes a file into the reader's home directory and
+# leaves something running on their computer indefinitely; that is not a default
+# to take in silence, however convenient. The explanation comes before the
+# question, because "install a service?" with no answer to "what for, and what
+# does it touch?" is not a question anybody can answer.
+#
+# stdin is the script itself on the documented `curl ... | sh` path, so the
+# prompt has to read the terminal directly. When there is no terminal at all --
+# CI, a provisioning script -- the answer is no, and the command to do it later
+# is printed instead. An unattended run must not quietly install a service.
+# Anchored at the front, not a substring match: "not installed" contains
+# "installed", so `*installed*` answers yes to both states. It did, and the
+# prompt this whole block exists for never appeared.
+service_state="$("$binary" service status 2>/dev/null | head -n 1 || true)"
+case "$service_state" in
+  "service: installed"*) already_installed=1 ;;
+  *) already_installed=0 ;;
+esac
+
+if [ "$already_installed" = 1 ]; then
+  info "Autostart is already set up; leaving it alone."
+elif (exec 3< /dev/tty) 2>/dev/null; then
+  echo
+  echo "Start the gateway automatically?"
+  echo
+  echo "  The Muqun app on your phone talks to this gateway. As things stand it"
+  echo "  runs until this computer restarts -- after a reboot your phone cannot"
+  echo "  reach this machine until you come back and start it by hand."
+  echo
+  if [ "$(uname -s)" = "Darwin" ]; then
+    echo "  Saying yes writes a LaunchAgent to ~/Library/LaunchAgents. It runs as"
+    echo "  you, starts when you log in, and comes back if it stops."
+  else
+    echo "  Saying yes writes a systemd user unit to ~/.config/systemd/user and"
+    echo "  enables lingering, so it runs as you, starts when the machine boots,"
+    echo "  and comes back if it stops."
+  fi
+  echo "  No administrator password, nothing outside your home directory, and"
+  echo "  nothing that runs as root."
+  echo
+  echo "  Undo it any time with:  $binary service uninstall"
+  echo
+  printf "Set it up now? [Y/n] "
+  # A read that fails means no, never yes. /dev/tty can be openable and still
+  # unreadable -- a detached CI shell hands back exactly that -- and the earlier
+  # version of this line turned that failure into an empty answer, which fell
+  # through to the default and installed a service on a machine that was never
+  # asked. Enter still means yes; only a real answer can.
+  if read -r answer < /dev/tty 2>/dev/null; then
+    :
+  else
+    answer=n
+    echo
+    warn "Could not read an answer from the terminal, so autostart was not set up."
+  fi
+  case "$answer" in
+    [Nn]*) warn "Skipped. The gateway stops when this computer restarts." ;;
+    *) "$binary" service install ;;
+  esac
+else
+  warn "No terminal to ask on, so autostart was not set up."
+  echo "  The gateway stops when this computer restarts. To make it come back:"
+  echo "    $binary service install"
+fi
+
 echo
 green "Muqun Gateway is configured and running."
 echo "Backends configured:"
