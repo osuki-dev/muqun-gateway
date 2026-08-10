@@ -1558,8 +1558,18 @@ fn run_service_command(command: ServiceCommand) -> anyhow::Result<()> {
             }
         }
         ServiceCommand::Status => {
-            let running = read_pid()?.is_some_and(process_running)
-                || !gateway_listener_pids(configured_port())?.is_empty();
+            // Only ever asked once there is a config to ask about. Without one
+            // `configured_port` falls back to the default port, and the
+            // listener check then reports whatever else is on it -- another
+            // account's gateway, or one this install knows nothing about -- as
+            // "running". A fresh install would be told it was already up.
+            let running = match load_config(None) {
+                Ok(config) => Some(
+                    read_pid()?.is_some_and(process_running)
+                        || !gateway_listener_pids(config.port())?.is_empty(),
+                ),
+                Err(_) => None,
+            };
             match service::state()? {
                 service::ServiceState::Installed => {
                     println!("service: installed ({})", service::unit_path()?.display());
@@ -1576,7 +1586,11 @@ fn run_service_command(command: ServiceCommand) -> anyhow::Result<()> {
                     println!("Install it with: muqun-gateway service install");
                 }
             }
-            println!("gateway: {}", if running { "running" } else { "not running" });
+            match running {
+                Some(true) => println!("gateway: running"),
+                Some(false) => println!("gateway: not running"),
+                None => println!("gateway: not configured yet -- run `muqun-gateway setup`"),
+            }
         }
     }
     Ok(())
