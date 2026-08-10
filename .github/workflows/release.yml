@@ -17,7 +17,26 @@ permissions:
   contents: write
 
 jobs:
+  # The release is created once, here, before any binary is built.
+  #
+  # It used to be created by whichever matrix job got there first, which is a
+  # race four ways: on v0.7.0 two macOS jobs both called it a new release, the
+  # loser was handed an id that stopped existing a moment later, and its upload
+  # failed with a 404 -- so the tag shipped with three of its four binaries and
+  # the missing one was `aarch64-apple-darwin`, which is every Apple Silicon
+  # Mac. `install.sh` then finds no prebuilt binary for the commonest target and
+  # falls back to telling people to build from source.
+  #
+  # With the release already there, every matrix job takes the "it exists"
+  # path and only uploads, which was never the racy part.
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create the release
+        uses: softprops/action-gh-release@v2
+
   build:
+    needs: release
     strategy:
       fail-fast: false
       matrix:
