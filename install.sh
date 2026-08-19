@@ -142,9 +142,25 @@ if [ "$have_herdr" = 1 ] && [ "$have_tmux" = 0 ]; then
   info "Configuring and starting the gateway..."
   if herdr plugin action invoke "$PLUGIN_ID.setup" >/dev/null 2>&1; then
     sleep 2   # setup runs in a herdr pane; let it write the config first
-    herdr plugin action invoke "$PLUGIN_ID.stop"  >/dev/null 2>&1 || true
-    sleep 1
-    herdr plugin action invoke "$PLUGIN_ID.start" >/dev/null 2>&1 || true
+    # A gateway an operator wired into systemd must be reloaded through its
+    # supervisor. The plugin's stop kills by pid and port, and against a
+    # Restart=always unit that only starts a lock race the unit then loses
+    # every few seconds (see src/supervision.rs for the incident this comes
+    # from). Linux-only by construction: macOS has no systemctl, so it and
+    # any machine without a matching unit keep the plugin stop/start path.
+    systemd_unit=""
+    if command -v systemctl >/dev/null 2>&1; then
+      systemd_unit="$(systemctl --user list-units --type=service --all --plain --no-legend 2>/dev/null \
+        | awk '$1 ~ /muqun-gateway/ {print $1; exit}')"
+    fi
+    if [ -n "$systemd_unit" ]; then
+      info "Reloading through the systemd unit $systemd_unit..."
+      systemctl --user restart "$systemd_unit" || true
+    else
+      herdr plugin action invoke "$PLUGIN_ID.stop"  >/dev/null 2>&1 || true
+      sleep 1
+      herdr plugin action invoke "$PLUGIN_ID.start" >/dev/null 2>&1 || true
+    fi
     sleep 1
     herdr plugin pane open --plugin "$PLUGIN_ID" --entrypoint manage >/dev/null 2>&1 || true
     auto_done=1
