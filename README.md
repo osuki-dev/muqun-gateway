@@ -1,10 +1,10 @@
 # Muqun Gateway
 
-The program that lets [Muqun](https://osuki.dev/muqun) reach a terminal on your
+The program that lets [Muqun](https://muqun.dev) reach a terminal on your
 own computer. It runs on your machine, talks to tmux or to Herdr, and answers
 your phone directly — there is no account and no server of ours in between.
 
-**Get the app: [osuki.dev/muqun](https://osuki.dev/muqun)**
+**Get the app: [muqun.dev](https://muqun.dev)**
 
 macOS and Linux. Windows is not supported yet.
 
