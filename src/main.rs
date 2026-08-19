@@ -51,6 +51,7 @@ mod scrollback;
 mod service;
 mod shortcuts;
 mod state_lock;
+mod supervision;
 mod tasks;
 mod transport;
 
@@ -1685,13 +1686,34 @@ fn configured_port() -> u16 {
 
 fn stop_background_inner(verbose: bool) -> anyhow::Result<()> {
     let mut stopped = false;
+    // Killing a supervised gateway by pid is never what anyone means: a
+    // `Restart=always` unit immediately brings it back -- or, worse, loses
+    // the state-directory lock race to whatever this stop was making room
+    // for and then fails its restart every few seconds indefinitely. Skip
+    // such pids and tell the operator the command that actually works.
+    let mut supervised: Option<supervision::SystemdUnit> = None;
+    let mut refuse_or_stop = |pid: u32, label: &str| -> anyhow::Result<()> {
+        if let Some(unit) = supervision::managing_gateway_unit(pid) {
+            if verbose {
+                println!(
+                    "gateway pid {pid} is managed by systemd as {}; leaving it to its supervisor",
+                    unit.unit
+                );
+            }
+            supervised.get_or_insert(unit);
+            return Ok(());
+        }
+        stop_pid(pid)?;
+        stopped = true;
+        if verbose {
+            println!("gateway stopped {label} {pid}");
+        }
+        Ok(())
+    };
+
     if let Some(pid) = read_pid()? {
         if process_running(pid) {
-            stop_pid(pid)?;
-            stopped = true;
-            if verbose {
-                println!("gateway stopped pid {pid}");
-            }
+            refuse_or_stop(pid, "pid")?;
         } else if verbose {
             println!("gateway pid file exists, but pid {pid} is not running");
         }
@@ -1700,15 +1722,18 @@ fn stop_background_inner(verbose: bool) -> anyhow::Result<()> {
     let port = configured_port();
     for pid in gateway_listener_pids(port)? {
         if process_running(pid) {
-            stop_pid(pid)?;
-            stopped = true;
-            if verbose {
-                println!("gateway stopped listener pid {pid}");
-            }
+            refuse_or_stop(pid, "listener pid")?;
         }
     }
 
     remove_pid_file()?;
+    if let Some(unit) = supervised {
+        anyhow::bail!(
+            "the running gateway is managed by systemd as {}; stop it with `{}`",
+            unit.unit,
+            unit.systemctl("stop")
+        );
+    }
     if verbose && !stopped {
         println!("gateway is not running");
     }

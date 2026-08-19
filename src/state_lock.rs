@@ -95,6 +95,25 @@ pub fn holder_pid(path: &Path) -> Option<u32> {
 }
 
 fn contended_message(state_dir: &Path, lock_path: &Path) -> String {
+    // A holder that systemd manages deserves a different refusal entirely.
+    // "Stop it with `muqun-gateway stop`" is a trap there: the supervisor
+    // restarts it within seconds, and if this process wins the lock race in
+    // that window the unit then fails its restart every few seconds for as
+    // long as nobody notices -- which, in the incident that motivated this,
+    // was six days and 179k restarts.
+    if let Some(unit) = holder_pid(lock_path).and_then(crate::supervision::managing_gateway_unit) {
+        return format!(
+            "another muqun-gateway already owns the state directory {}, and it is managed \
+             by systemd as {}.\n\
+             Do not start a second gateway by hand next to a supervised one -- manage that \
+             one instead:\n\
+             restart it with `{}`, or stop it for good with `{}`.",
+            state_dir.display(),
+            unit.unit,
+            unit.systemctl("restart"),
+            unit.systemctl("stop")
+        );
+    }
     let holder = match holder_pid(lock_path) {
         Some(pid) => format!("pid {pid}"),
         None => String::from("its pid could not be read from the lock file"),
