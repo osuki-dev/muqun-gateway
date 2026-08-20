@@ -122,13 +122,7 @@ pub fn open_stream_event(
     let cipher = Aes256Gcm::new_from_slice(key).expect("AES-256 key has fixed length");
     let nonce = stream_nonce(seq);
     cipher
-        .decrypt(
-            Nonce::from_slice(&nonce),
-            Payload {
-                msg: &sealed,
-                aad,
-            },
-        )
+        .decrypt(Nonce::from_slice(&nonce), Payload { msg: &sealed, aad })
         .map_err(|_| anyhow!("stream authentication failed"))
 }
 
@@ -238,13 +232,14 @@ mod tests {
         assert_eq!(
             key,
             [
-                0xa5, 0x1b, 0x22, 0x38, 0xd4, 0xdd, 0xd0, 0xf6, 0x66, 0xa9, 0xbe, 0x3b, 0x93,
-                0x31, 0x69, 0x1a, 0xb5, 0x42, 0xfd, 0xee, 0xb2, 0x4a, 0x4c, 0xa2, 0xab, 0x7c,
-                0x1a, 0xda, 0xb6, 0xdc, 0x7c, 0x63,
+                0xa5, 0x1b, 0x22, 0x38, 0xd4, 0xdd, 0xd0, 0xf6, 0x66, 0xa9, 0xbe, 0x3b, 0x93, 0x31,
+                0x69, 0x1a, 0xb5, 0x42, 0xfd, 0xee, 0xb2, 0x4a, 0x4c, 0xa2, 0xab, 0x7c, 0x1a, 0xda,
+                0xb6, 0xdc, 0x7c, 0x63,
             ]
         );
         let aad = b"GET /api/sessions/main/events?types=pane_updated\nstream-fixture\n7";
-        let sealed = seal_stream_event(&key, 7, aad, b"{\"event\":\"herdr\",\"data\":\"hello\"}").unwrap();
+        let sealed =
+            seal_stream_event(&key, 7, aad, b"{\"event\":\"herdr\",\"data\":\"hello\"}").unwrap();
         assert_eq!(
             sealed,
             "0afg46aA-yj6Uts5xXCCNP5EbDcFekXZzFWOTuUoD8vWBTvoYRZrlSBcnLS4VK9g"
@@ -260,7 +255,10 @@ mod tests {
         let material = [3_u8; 32];
         let key = derive_stream_key(&material, "sid-a", "nonce-a").unwrap();
         let sealed = seal_stream_event(&key, 0, b"aad\nsid-a\n0", b"first").unwrap();
-        assert_eq!(open_stream_event(&key, 0, b"aad\nsid-a\n0", &sealed).unwrap(), b"first");
+        assert_eq!(
+            open_stream_event(&key, 0, b"aad\nsid-a\n0", &sealed).unwrap(),
+            b"first"
+        );
         // A different seq is a different nonce and a different AAD: both fail.
         assert!(open_stream_event(&key, 1, b"aad\nsid-a\n0", &sealed).is_err());
         assert!(open_stream_event(&key, 0, b"aad\nsid-a\n1", &sealed).is_err());
