@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 # One-command install, update, and first-run setup for Muqun Gateway.
 #
-#   curl -fsSL https://raw.githubusercontent.com/osuki-dev/muqun-gateway/main/install.sh | sh
+#   curl -fsSL https://muqun.dev/gateway.sh | sh
 #
 # tmux is the primary backend and needs nothing beyond tmux itself. Herdr is
 # also supported. The two are not an either/or choice -- the gateway happily

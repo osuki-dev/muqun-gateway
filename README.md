@@ -14,7 +14,7 @@ One command. It checks the machine, installs the gateway, and on a first
 install also configures it, starts it, and shows you the pairing QR:
 
 ```sh
-curl -fsSL https://osuki.dev/muqun/gateway.sh | sh
+curl -fsSL https://muqun.dev/gateway.sh | sh
 ```
 
 It downloads a prebuilt, statically linked binary for your platform, so no Rust
