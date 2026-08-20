@@ -4736,8 +4736,7 @@ impl EventStreamSealer {
         let seq = self.seq;
         let plaintext = serde_json::to_vec(&json!({ "event": name, "data": data }))?;
         let aad = format!("{}\n{}\n{}", self.request_aad, self.stream_id, seq);
-        let ciphertext =
-            transport::seal_stream_event(&self.key, seq, aad.as_bytes(), &plaintext)?;
+        let ciphertext = transport::seal_stream_event(&self.key, seq, aad.as_bytes(), &plaintext)?;
         // Only counted once sealing succeeded, so a failed record does not
         // burn a seq the client would then read as a gap.
         self.seq += 1;
@@ -4763,7 +4762,7 @@ fn stream_event(sealer: &mut Option<EventStreamSealer>, name: &str, data: &str) 
                 None
             }
         },
-        None => Some(Event::default().event(name.to_owned()).data(data.to_owned())),
+        None => Some(Event::default().event(name).data(data)),
     }
 }
 
@@ -8116,7 +8115,7 @@ fn sniff_upload_kind(bytes: &[u8]) -> Option<UploadKind> {
 /// uncompressed `mimetype` entry first by specification.
 fn sniff_office_upload_kind(bytes: &[u8]) -> Option<UploadKind> {
     let names = zip_entry_names(bytes)?;
-    let has = |needle: &str| names.iter().any(|name| *name == needle);
+    let has = |needle: &str| names.contains(&needle);
     let ooxml_root = has("[Content_Types].xml") && has("_rels/.rels");
     let mut ooxml = Vec::new();
     if ooxml_root && has("word/document.xml") {
@@ -10591,8 +10590,7 @@ fn write_secret_file(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()>
     // The sequence number matters as much as the pid: two threads of one
     // process writing the same file would otherwise pick the same temporary
     // and rename each other's half-written copy into place.
-    static TEMPORARY_SEQUENCE: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(0);
+    static TEMPORARY_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let temporary = directory.join(format!(
         ".{name}.tmp-{}-{}",
         std::process::id(),
@@ -12152,7 +12150,10 @@ mod tests {
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .filter(|name| name.contains(".tmp-"))
             .collect();
-        assert!(leftovers.is_empty(), "left a temporary behind: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "left a temporary behind: {leftovers:?}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -12217,7 +12218,8 @@ mod tests {
     /// and be overwritten a moment later.
     #[test]
     fn a_device_list_change_owns_the_directory_from_its_read_to_its_write() {
-        let dir = std::env::temp_dir().join(format!("gateway-devices-rmw-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("gateway-devices-rmw-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         write_devices_at(&dir, &[device_fixture("phone"), device_fixture("tablet")]).unwrap();
 
@@ -12271,7 +12273,8 @@ mod tests {
     /// A bad list is survivable as long as the one it replaced is still there.
     #[test]
     fn writing_the_device_list_keeps_the_generation_it_replaced() {
-        let dir = std::env::temp_dir().join(format!("gateway-devices-bak-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("gateway-devices-bak-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
 
         write_devices_at(&dir, &[device_fixture("phone"), device_fixture("tablet")]).unwrap();
@@ -12283,7 +12286,9 @@ mod tests {
 
         let kept = read_devices_at(&dir.join(DEVICES_BACKUP_FILE)).unwrap();
         assert_eq!(
-            kept.iter().map(|device| device.id.as_str()).collect::<Vec<_>>(),
+            kept.iter()
+                .map(|device| device.id.as_str())
+                .collect::<Vec<_>>(),
             vec!["phone", "tablet"],
             "the replaced pairings were not recoverable"
         );
@@ -14273,7 +14278,10 @@ mod tests {
         assert_eq!(found.session_id, "default");
 
         // No uploads directory resolved leaves the roots untouched.
-        assert_eq!(with_uploads_root(pane_roots.clone(), "default", None).len(), 1);
+        assert_eq!(
+            with_uploads_root(pane_roots.clone(), "default", None).len(),
+            1
+        );
 
         std::fs::remove_dir_all(&base).ok();
     }

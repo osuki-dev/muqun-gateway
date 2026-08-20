@@ -229,7 +229,10 @@ fn enable(unit: &Path) -> Result<()> {
     // Reinstalling over a live agent: bootstrap refuses a label that is already
     // loaded, so the old one goes first. A failure here is the ordinary "it was
     // not loaded" case, which is why it is not checked.
-    run_quiet("launchctl", &["bootout", &format!("{domain}/{SERVICE_LABEL}")]);
+    run_quiet(
+        "launchctl",
+        &["bootout", &format!("{domain}/{SERVICE_LABEL}")],
+    );
     let status = ProcessCommand::new("launchctl")
         .arg("bootstrap")
         .arg(&domain)
@@ -272,7 +275,10 @@ fn enable(_unit: &Path) -> Result<()> {
         .args(["--user", "enable", "--now", &unit_name])
         .status()
         .context("failed to run systemctl --user enable")?;
-    anyhow::ensure!(status.success(), "systemctl --user enable failed ({status})");
+    anyhow::ensure!(
+        status.success(),
+        "systemctl --user enable failed ({status})"
+    );
 
     // Without lingering, the user manager -- and the gateway with it -- is torn
     // down when the last session ends, so a phone can reach the machine only
@@ -297,7 +303,10 @@ fn disable(_unit: &Path) {
 #[cfg(not(target_os = "macos"))]
 fn loaded() -> bool {
     let unit_name = format!("{SERVICE_LABEL}.service");
-    run_quiet("systemctl", &["--user", "is-enabled", "--quiet", &unit_name])
+    run_quiet(
+        "systemctl",
+        &["--user", "is-enabled", "--quiet", &unit_name],
+    )
 }
 
 fn run_quiet(program: &str, args: &[&str]) -> bool {
@@ -384,6 +393,11 @@ mod tests {
         // no administrator password -- is only true if this stays inside $HOME.
         let unit = unit_path().expect("home directory");
         let home = dirs::home_dir().expect("home directory");
-        assert!(unit.starts_with(&home), "{} escaped {}", unit.display(), home.display());
+        assert!(
+            unit.starts_with(&home),
+            "{} escaped {}",
+            unit.display(),
+            home.display()
+        );
     }
 }

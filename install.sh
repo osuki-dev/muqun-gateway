@@ -155,7 +155,10 @@ if [ "$have_herdr" = 1 ] && [ "$have_tmux" = 0 ]; then
     fi
     if [ -n "$systemd_unit" ]; then
       info "Reloading through the systemd unit $systemd_unit..."
-      systemctl --user restart "$systemd_unit" || true
+      if ! systemctl --user restart "$systemd_unit"; then
+        die "The gateway was updated and configured, but systemd could not restart it.
+Retry with: systemctl --user restart $systemd_unit"
+      fi
     else
       herdr plugin action invoke "$PLUGIN_ID.stop"  >/dev/null 2>&1 || true
       sleep 1
@@ -248,6 +251,18 @@ port_args=""
 tmux_socket_args=""
 [ -n "${MUQUN_GATEWAY_TMUX_SOCKET:-}" ] && tmux_socket_args="--socket-path ${MUQUN_GATEWAY_TMUX_SOCKET}"
 
+# Remember who owns an existing gateway before changing its configuration.
+# A supervised process must be reloaded through the same supervisor: calling
+# `muqun-gateway stop` is intentionally refused for it, and following that with
+# `muqun-gateway start` only tries to create a second process beside the first.
+# Capture this once and reuse it below so an update cannot observe two different
+# service states halfway through its own work.
+service_state="$("$binary" service status 2>/dev/null | head -n 1 || true)"
+case "$service_state" in
+  "service: installed"*) already_installed=1 ;;
+  *) already_installed=0 ;;
+esac
+
 if [ "$have_herdr" = 1 ]; then
   # A machine that went through step 3 on an earlier run (Herdr-only, back
   # then) may have real paired devices sitting in that Herdr-plugin config.
@@ -295,15 +310,35 @@ else
   [ -n "$tmux_id" ] && "$binary" backend default "$tmux_id" >/dev/null
 fi
 
-"$binary" stop  >/dev/null 2>&1 || true
-"$binary" start
+if [ "$already_installed" = 1 ]; then
+  service_label="dev.osuki.muqun-gateway.service"
+  if [ "$os" = "Linux" ]; then
+    info "Restarting the existing systemd service..."
+    if ! systemctl --user restart "$service_label"; then
+      die "The gateway was updated and configured, but systemd could not restart it.
+Retry with: systemctl --user restart $service_label"
+    fi
+  else
+    launchd_label="dev.osuki.muqun-gateway"
+    launchd_target="gui/$(id -u)/$launchd_label"
+    info "Restarting the existing LaunchAgent..."
+    if ! launchctl kickstart -k "$launchd_target"; then
+      die "The gateway was updated and configured, but launchd could not restart it.
+Retry with: launchctl kickstart -k $launchd_target"
+    fi
+  fi
+else
+  "$binary" stop  >/dev/null 2>&1 || true
+  "$binary" start
+fi
 
 # Autostart, asked rather than assumed.
 #
-# `start` above spawns a detached child. It outlives this terminal, and that is
-# all it was ever asked to do -- it does not outlive a reboot. So without this
-# step the phone stops reaching the machine the next time it restarts, with no
-# signal on either side saying why.
+# On an unmanaged install, `start` above spawns a detached child. It outlives
+# this terminal, and that is all it was ever asked to do -- it does not outlive
+# a reboot. So without this step the phone stops reaching the machine the next
+# time it restarts, with no signal on either side saying why. A supervised
+# update skips this prompt because it kept the service that was already there.
 #
 # Asking is deliberate. This writes a file into the reader's home directory and
 # leaves something running on their computer indefinitely; that is not a default
@@ -318,12 +353,6 @@ fi
 # Anchored at the front, not a substring match: "not installed" contains
 # "installed", so `*installed*` answers yes to both states. It did, and the
 # prompt this whole block exists for never appeared.
-service_state="$("$binary" service status 2>/dev/null | head -n 1 || true)"
-case "$service_state" in
-  "service: installed"*) already_installed=1 ;;
-  *) already_installed=0 ;;
-esac
-
 if [ "$already_installed" = 1 ]; then
   info "Autostart is already set up; leaving it alone."
 elif (exec 3< /dev/tty) 2>/dev/null; then
@@ -371,7 +400,11 @@ else
 fi
 
 echo
-green "Muqun Gateway is configured and running."
+if [ "$config_existed" = 1 ]; then
+  green "Muqun Gateway is updated and running (pairings kept)."
+else
+  green "Muqun Gateway is configured and running."
+fi
 echo "Backends configured:"
 "$binary" backend list | awk -F'\t' '{ printf "  %s %s (%s)\n", (NR == 1 ? "*" : " "), $1, $2 }'
 echo "(* default)"

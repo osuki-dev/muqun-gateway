@@ -1665,7 +1665,8 @@ mod tests {
         // from one that did not. The recorder asks for bracketed paste mode the
         // way a real TUI does, because that is the condition tmux gates the
         // markers on.
-        let recording = std::env::temp_dir().join(format!("gateway-paste-{}", uuid::Uuid::new_v4()));
+        let recording =
+            std::env::temp_dir().join(format!("gateway-paste-{}", uuid::Uuid::new_v4()));
         let recorder = format!(
             "printf '\\033[?2004h'; stty raw -echo; timeout 10 cat > {}; stty sane",
             shell_word(&recording.to_string_lossy())
