@@ -53,6 +53,10 @@ pub struct ServicePaths {
     pub log: PathBuf,
     /// The account the unit is pinned to. See `launch_agent_plist`.
     pub home: PathBuf,
+    /// The `PATH` the supervised gateway runs with. See `launch_agent_plist`.
+    pub path: String,
+    /// The character encoding it runs with, for the same reason.
+    pub lc_ctype: String,
 }
 
 pub fn install(paths: &ServicePaths) -> Result<()> {
@@ -141,11 +145,28 @@ fn unit_contents(paths: &ServicePaths) -> String {
 /// simply cannot reach it with nothing anywhere saying why. Observed exactly
 /// once, in a test whose installer ran under an overridden `HOME` while launchd
 /// started the agent under the real one.
+///
+/// `PATH` and `LC_CTYPE` are pinned for the same reason and were missed for
+/// longer. launchd hands a user agent `/usr/bin:/bin:/usr/sbin:/sbin` and no
+/// locale at all, and both of those break the tmux backend on their own:
+///
+/// - `/opt/homebrew/bin` is not on that `PATH`, so a Homebrew tmux cannot be
+///   spawned, and the backend reports itself unavailable with tmux plainly
+///   running two feet away.
+/// - With no UTF-8 locale, tmux replaces every byte it will not print with `_`
+///   -- including the `\u{1f}` the adapter joins its `-F` fields with, so every
+///   list parse fails, and every non-ASCII pane title along with it.
+///
+/// `setup` catches neither, because `setup` runs in the user's shell and the
+/// agent does not. Anything else spawned by name has the same exposure: `git`
+/// for worktrees, and every agent executable in the catalog.
 fn launch_agent_plist(paths: &ServicePaths) -> String {
     let exe = xml(&paths.exe);
     let config = xml(&paths.config);
     let log = xml(&paths.log);
     let home = xml(&paths.home);
+    let path = xml_text(&paths.path);
+    let lc_ctype = xml_text(&paths.lc_ctype);
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -170,6 +191,10 @@ fn launch_agent_plist(paths: &ServicePaths) -> String {
   <dict>
     <key>HOME</key>
     <string>{home}</string>
+    <key>PATH</key>
+    <string>{path}</string>
+    <key>LC_CTYPE</key>
+    <string>{lc_ctype}</string>
   </dict>
   <key>StandardOutPath</key>
   <string>{log}</string>
@@ -192,6 +217,11 @@ fn systemd_unit(paths: &ServicePaths) -> String {
     let exe = paths.exe.display();
     let config = paths.config.display();
     let home = paths.home.display();
+    // Quoted: a `PATH` entry may contain a space, and an unquoted
+    // `Environment=` line stops at the first one -- which would not fail, it
+    // would silently truncate the search path.
+    let path = &paths.path;
+    let lc_ctype = &paths.lc_ctype;
     format!(
         "[Unit]\n\
          Description=Muqun Gateway\n\
@@ -201,6 +231,8 @@ fn systemd_unit(paths: &ServicePaths) -> String {
          [Service]\n\
          Type=simple\n\
          Environment=HOME={home}\n\
+         Environment=\"PATH={path}\"\n\
+         Environment=\"LC_CTYPE={lc_ctype}\"\n\
          ExecStart={exe} run --config {config}\n\
          Restart=always\n\
          RestartSec=3\n\
@@ -214,8 +246,13 @@ fn systemd_unit(paths: &ServicePaths) -> String {
 /// `&` or `<`. Unescaped, one of those does not misrender -- it makes the file
 /// unparseable, and `launchctl` rejects the whole agent.
 fn xml(path: &Path) -> String {
-    path.display()
-        .to_string()
+    xml_text(&path.display().to_string())
+}
+
+/// The same escaping for a value that was never a path -- `PATH` is a list of
+/// them, and one entry containing `&` would take the whole agent down with it.
+fn xml_text(value: &str) -> String {
+    value
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -328,6 +365,8 @@ mod tests {
             config: PathBuf::from("/home/a b/.config/muqun-gateway/config.json"),
             log: PathBuf::from("/home/a b/.local/share/muqun-gateway/gateway.log"),
             home: PathBuf::from("/home/a b"),
+            path: String::from("/opt/homebrew/bin:/usr/bin:/bin"),
+            lc_ctype: String::from("zh_CN.UTF-8"),
         }
     }
 
@@ -358,10 +397,34 @@ mod tests {
             config: PathBuf::from("/Users/a&b/config.json"),
             log: PathBuf::from("/Users/a<b>/gateway.log"),
             home: PathBuf::from("/Users/a&b"),
+            path: String::from("/Users/a&b/bin:/usr/bin"),
+            lc_ctype: String::from("UTF-8"),
         });
         assert!(plist.contains("/Users/a&amp;b/bin/muqun-gateway"));
         assert!(!plist.contains("/Users/a&b/bin"));
         assert!(plist.contains("/Users/a&lt;b&gt;/gateway.log"));
+        assert!(plist.contains("<string>/Users/a&amp;b/bin:/usr/bin</string>"));
+    }
+
+    #[test]
+    fn both_units_carry_the_environment_the_gateway_has_to_spawn_with() {
+        // The two bugs this exists to prevent, both from launchd handing a user
+        // agent an environment the user never sees: a `PATH` a Homebrew tmux
+        // lives outside of, so the backend reports itself unavailable forever
+        // while tmux is plainly running; and no locale at all, under which tmux
+        // replaces the `\u{1f}` field separator with `_` and every list parse
+        // fails. `setup` catches neither -- setup runs in the user's shell, the
+        // agent does not.
+        let plist = launch_agent_plist(&paths());
+        assert!(plist.contains("<key>PATH</key>"));
+        assert!(plist.contains("<string>/opt/homebrew/bin:/usr/bin:/bin</string>"));
+        assert!(plist.contains("<key>LC_CTYPE</key>"));
+        assert!(plist.contains("<string>zh_CN.UTF-8</string>"));
+        // Quoted on the systemd side, because a PATH entry may contain a space
+        // and an unquoted `Environment=` truncates at it rather than failing.
+        let unit = systemd_unit(&paths());
+        assert!(unit.contains("Environment=\"PATH=/opt/homebrew/bin:/usr/bin:/bin\""));
+        assert!(unit.contains("Environment=\"LC_CTYPE=zh_CN.UTF-8\""));
     }
 
     #[test]

@@ -25,6 +25,10 @@ the gateway itself (see the last line of this file).
 - `src/scrollback.rs`: bounded scrollback retention and the application policy
   for observing frames and serving row-bounded reads. Callers do not assemble
   cache keys or compare output byte lengths.
+- `src/login_env.rs`: the `PATH` and `LC_CTYPE` a backend actually needs,
+  recovered from a login shell. An init system starts the gateway with neither,
+  and the tmux adapter cannot spawn tmux without the first or parse its output
+  without the second. Read at startup and written into the unit file.
 - `docs/architecture.md`: Clean/Hexagonal boundaries and compatibility rules.
 - `herdr-plugin.toml`, `install.sh`, `scripts/`: plugin packaging and releases.
 

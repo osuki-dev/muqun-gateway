@@ -45,6 +45,7 @@ mod authority;
 mod backend;
 mod composer;
 mod i18n;
+mod login_env;
 mod native;
 mod parts;
 mod scrollback;
@@ -65,7 +66,7 @@ use backend::{
     PaneId as BackendPaneId, ReadPane as BackendReadPane, SplitDirection as BackendSplitDirection,
     SplitPane as BackendSplitPane, StartAgent as BackendStartAgent, TabId as BackendTabId,
     TerminalBackend, TmuxWireIds, WorkspaceId as BackendWorkspaceId,
-    WorktreeRequest as BackendWorktreeRequest,
+    WorktreeRequest as BackendWorktreeRequest, TMUX_PROGRAM,
 };
 
 const CONFIG_FILE: &str = "config.json";
@@ -833,6 +834,17 @@ struct AgentSendBody {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    // Before any subcommand, because every one of them either spawns a backend
+    // program or writes down how to. An init system starts this process with an
+    // environment that is not the user's -- and so does `ssh host muqun-gateway
+    // setup`, and a `cron` line. See `login_env`.
+    //
+    // On stderr rather than stdout: for `run` this is the gateway log, which is
+    // where it is wanted, and for a command a human is watching it says nothing
+    // at all, because a shell has already given the process everything.
+    for note in login_env::adopt() {
+        eprintln!("environment repaired from the login shell -- {note}");
+    }
     match cli.command {
         Command::Setup {
             public_url,
@@ -1598,11 +1610,14 @@ fn run_service_command(command: ServiceCommand) -> anyhow::Result<()> {
 }
 
 fn service_paths() -> anyhow::Result<service::ServicePaths> {
+    let (path, lc_ctype) = login_env::for_unit_file();
     Ok(service::ServicePaths {
         exe: std::env::current_exe().context("failed to find current executable")?,
         config: config_dir()?.join(CONFIG_FILE),
         log: state_dir()?.join(LOG_FILE),
         home: dirs::home_dir().context("failed to locate the home directory")?,
+        path,
+        lc_ctype,
     })
 }
 
@@ -1763,6 +1778,7 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     let _state_lock = state_lock::StateLock::acquire(&state_dir()?)?;
     ensure_pairing_transport_key()?;
     let config = load_config(config_path)?;
+    warn_about_missing_backend_programs(&config);
     let addr: SocketAddr = config
         .listen
         .parse()
@@ -3061,6 +3077,52 @@ async fn send_test_notification(
     ))
 }
 
+/// The program a session's backend has to spawn, and whether this process can
+/// see it.
+///
+/// Reported because "unavailable" is not a diagnosis. A tmux backend has
+/// exactly two ways to be unreachable -- no tmux server, or no tmux -- and only
+/// one of them is visible to the person reading, since `tmux -V` in their own
+/// shell answers happily while the daemon's `PATH` cannot find it at all. herdr
+/// has nothing to look up: it is a socket, and the endpoint column already
+/// names it.
+fn backend_program_state(session: &SessionConfig) -> String {
+    if session.backend != BackendKind::Tmux {
+        return String::new();
+    }
+    let path = std::env::var("PATH").unwrap_or_default();
+    match login_env::lookup(TMUX_PROGRAM, &path) {
+        Some(found) => format!("tmux={}", found.display()),
+        None => format!("tmux=NOT FOUND on PATH={path}"),
+    }
+}
+
+/// Say so at startup when a configured backend's program cannot be found.
+///
+/// Without this the only symptom is one "terminal backend is unavailable" line
+/// per poll, forever, naming a session id and nothing else -- which is what
+/// this failure looked like for the whole time it went undiagnosed. It is a
+/// warning and not a refusal: a gateway with a reachable herdr session and an
+/// unreachable tmux one is still worth starting, and the app orders the
+/// unreachable one last anyway.
+fn warn_about_missing_backend_programs(config: &Config) {
+    let path = std::env::var("PATH").unwrap_or_default();
+    for session in &config.sessions {
+        if session.backend != BackendKind::Tmux {
+            continue;
+        }
+        if login_env::lookup(TMUX_PROGRAM, &path).is_none() {
+            eprintln!(
+                "session {}: backend=tmux, but no `tmux` on PATH={path}\n  \
+                 This gateway cannot drive tmux until it can find it. If tmux works in your\n  \
+                 shell but not here, the service is running with a different PATH: reinstall\n  \
+                 it with `muqun-gateway service install`.",
+                session.id
+            );
+        }
+    }
+}
+
 fn status() -> anyhow::Result<()> {
     let config = load_config(None)?;
     println!("server_id: {}", config.server_id);
@@ -3074,9 +3136,10 @@ fn status() -> anyhow::Result<()> {
     for session in config.sessions {
         let endpoint = backend_endpoint(&session);
         println!(
-            "session {}: backend={} endpoint={endpoint}",
+            "session {}: backend={} endpoint={endpoint} {}",
             session.id,
-            session.backend.as_str()
+            session.backend.as_str(),
+            backend_program_state(&session)
         );
     }
     match read_pid()? {
@@ -4324,7 +4387,12 @@ async fn session_metadata(session: &SessionConfig) -> (Value, Value) {
             )
         }
         Err(err) => {
-            eprintln!("terminal metadata request failed: {err}");
+            eprintln!(
+                "terminal metadata request failed for session {} (backend={}, endpoint={}): {err}",
+                session.id,
+                session.backend.as_str(),
+                backend_endpoint(session),
+            );
             (
                 json!({ "kind": session.backend, "connected": false }),
                 json!({ "connected": false, "error": "Terminal backend is unavailable" }),
@@ -5122,6 +5190,12 @@ fn spawn_agent_notification_watchers(state: AppState) {
 
 async fn watch_agent_notifications(state: AppState, session: SessionConfig) {
     let mut statuses = seed_agent_statuses(&session).await;
+    // This loop retries every two seconds forever, so a backend that is down
+    // for good -- an uninstalled tmux, a herdr that is not running -- used to
+    // write the same line to the log forty-three thousand times a day. That is
+    // not a log, it is a denial of one: the lines that matter are the ones
+    // around it, and they were unreadable. Only a *change* is news here.
+    let mut last_reported: Option<String> = None;
 
     loop {
         let backend = terminal_backend(&session);
@@ -5153,7 +5227,16 @@ async fn watch_agent_notifications(state: AppState, session: SessionConfig) {
                     }
                     Some(Ok(_)) => {}
                     Some(Err(err)) => {
-                        eprintln!("terminal activity failed for session {}: {err}", session.id);
+                        let report = format!(
+                            "terminal activity failed for session {} (backend={}, endpoint={}): {err}",
+                            session.id,
+                            session.backend.as_str(),
+                            backend_endpoint(&session),
+                        );
+                        if last_reported.as_deref() != Some(report.as_str()) {
+                            eprintln!("{report}");
+                            last_reported = Some(report);
+                        }
                         break;
                     }
                     None => break,

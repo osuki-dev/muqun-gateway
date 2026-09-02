@@ -21,5 +21,5 @@ pub use model::{
     WorktreeRequest,
 };
 pub use registry::BackendRegistry;
-pub use tmux::TmuxBackend;
+pub use tmux::{TmuxBackend, TMUX_PROGRAM};
 pub use tmux_wire::TmuxWireIds;

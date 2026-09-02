@@ -13,6 +13,17 @@ use super::{
     Tab, TabId, TerminalBackend, Workspace, WorkspaceId,
 };
 
+/// ASCII unit separator: the one byte a pane title, a window name or a working
+/// directory will not contain, which is why the `-F` formats are joined with it
+/// rather than with a printable character that a user could type.
+///
+/// It depends on the process running under a UTF-8 locale, and not in a small
+/// way: tmux replaces every byte it will not print with `_`, and with no
+/// `LC_CTYPE` this separator is one of them. The rows then arrive as a single
+/// field and every parse below fails. The environment is repaired at startup
+/// (see `login_env`) rather than defended against here -- a locale that mangles
+/// this separator mangles every non-ASCII pane title too, and no choice of
+/// separator would save those.
 const FIELD_SEPARATOR: char = '\u{1f}';
 
 /// Mirrors `MAX_OUTPUT_LINES` in main. The backend clamps too so a direct
@@ -26,6 +37,11 @@ const MAX_CAPTURE_LINES: u32 = 5000;
 /// smallest window at the cost of one extra `capture-pane` call.
 const WRAP_SNAP_WINDOW: u32 = 64;
 
+/// The program this adapter spawns, named once so that the code which reports
+/// whether it can be found is looking for the same thing the code that runs it
+/// will look for.
+pub const TMUX_PROGRAM: &str = "tmux";
+
 #[derive(Clone)]
 pub struct TmuxBackend {
     binary: PathBuf,
@@ -35,7 +51,7 @@ pub struct TmuxBackend {
 impl TmuxBackend {
     pub fn new(socket_path: Option<PathBuf>) -> Self {
         Self {
-            binary: PathBuf::from("tmux"),
+            binary: PathBuf::from(TMUX_PROGRAM),
             socket_path,
         }
     }
@@ -331,7 +347,17 @@ impl TerminalBackend for TmuxBackend {
                                 });
                             }
                         }
-                        _ => yield Err(BackendError::Unavailable),
+                        // The failure that happened, not a word for all of
+                        // them. Collapsing three different errors into
+                        // `Unavailable` is how "terminal backend is
+                        // unavailable" became the only thing the log could say
+                        // about a tmux that was running perfectly well, and it
+                        // cost days: the message named the one cause -- no tmux
+                        // -- that the reader could see with their own eyes was
+                        // not true, so it read as a lie rather than a clue.
+                        (Err(failure), _, _) | (_, Err(failure), _) | (_, _, Err(failure)) => {
+                            yield Err(failure)
+                        }
                     }
                 }
             };

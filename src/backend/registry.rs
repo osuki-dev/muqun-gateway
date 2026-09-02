@@ -57,10 +57,22 @@ impl BackendRegistry {
         match kind {
             BackendKind::Herdr => Ok(()),
             BackendKind::Tmux => {
-                let output = Command::new("tmux")
-                    .arg("-V")
-                    .output()
-                    .context("tmux backend selected, but tmux was not found on PATH")?;
+                // Resolved rather than spawned by name, so that a failure here
+                // can say which PATH was searched. This check runs in the
+                // installer's shell and the gateway may later run under an init
+                // system with a narrower one; naming the PATH is what makes the
+                // two environments distinguishable to whoever reads the error.
+                let path = std::env::var("PATH").unwrap_or_default();
+                let program =
+                    crate::login_env::lookup(super::TMUX_PROGRAM, &path).with_context(|| {
+                        format!("tmux backend selected, but no `tmux` was found on PATH={path}")
+                    })?;
+                let output = Command::new(&program).arg("-V").output().with_context(|| {
+                    format!(
+                        "tmux backend selected, but {} would not run",
+                        program.display()
+                    )
+                })?;
                 anyhow::ensure!(
                     output.status.success(),
                     "tmux backend selected, but `tmux -V` failed"
