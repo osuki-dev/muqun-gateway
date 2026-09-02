@@ -4471,18 +4471,25 @@ async fn session_liveness(
 }
 
 /// `GET /api/sessions` ordering key: liveness first (has panes, then
-/// empty-but-reachable, then unreachable), tmux before herdr as the
-/// tiebreaker between otherwise-equal entries.
+/// empty-but-reachable, then unreachable), and the order they appear in the
+/// config as the tiebreaker between otherwise-equal entries.
+///
+/// The tiebreaker used to be the backend kind, tmux always ahead of herdr, and
+/// that made `muqun-gateway backend default` a lie: it moves an entry to the
+/// front of `config.sessions`, which nothing then read. On a machine where
+/// both backends are live -- which is what fixing tmux made ordinary -- the
+/// reader had no way at all to say which one their phone should open, and the
+/// answer moved on them whenever a probe was slow.
+///
+/// Config order is the reader's own statement of preference, so it is what
+/// breaks the tie. Liveness still outranks it: a session that is down does not
+/// get to be first just because somebody once preferred it.
 ///
 /// Pure and independent of any backend, so every bucket -- including "every
 /// configured session is unreachable" -- gets a fast, deterministic unit
 /// test instead of depending on a live tmux or Herdr server.
-fn session_order_key(session: &SessionConfig, liveness: SessionLiveness) -> (SessionLiveness, u8) {
-    let backend_rank = match session.backend {
-        BackendKind::Tmux => 0,
-        BackendKind::Herdr => 1,
-    };
-    (liveness, backend_rank)
+fn session_order_key(index: usize, liveness: SessionLiveness) -> (SessionLiveness, usize) {
+    (liveness, index)
 }
 
 /// Every configured session, ordered exactly as `GET /api/sessions` presents
@@ -4547,7 +4554,7 @@ async fn ordered_sessions(state: &AppState) -> Vec<&SessionConfig> {
         }))
         .await;
     let mut order: Vec<usize> = (0..state.config.sessions.len()).collect();
-    order.sort_by_key(|&index| session_order_key(&state.config.sessions[index], liveness[index]));
+    order.sort_by_key(|&index| session_order_key(index, liveness[index]));
     if let Ok(mut cache) = state.session_liveness.lock() {
         cache.record(order.clone(), Instant::now());
     }
@@ -15345,32 +15352,27 @@ mod tests {
         // A reachable-and-populated herdr session outranks an empty or dead
         // tmux one -- liveness is the significant digit, backend kind is only
         // the tiebreaker.
-        let empty_tmux = liveness_session("t", BackendKind::Tmux);
-        let herdr_with_panes = liveness_session("h", BackendKind::Herdr);
-        assert!(
-            session_order_key(&herdr_with_panes, HasPanes) < session_order_key(&empty_tmux, Empty)
-        );
-
-        let dead_tmux = liveness_session("t", BackendKind::Tmux);
-        assert!(
-            session_order_key(&herdr_with_panes, HasPanes)
-                < session_order_key(&dead_tmux, Unreachable)
-        );
-        assert!(session_order_key(&empty_tmux, Empty) < session_order_key(&dead_tmux, Unreachable));
+        // Index 0 is the preferred entry; even so, being down loses to a
+        // live one further down the list.
+        assert!(session_order_key(1, HasPanes) < session_order_key(0, Empty));
+        assert!(session_order_key(1, HasPanes) < session_order_key(0, Unreachable));
+        assert!(session_order_key(1, Empty) < session_order_key(0, Unreachable));
     }
 
+    /// The behaviour `muqun-gateway backend default` promises, and did not
+    /// have: whichever entry the reader put first wins a tie, whatever kind of
+    /// backend it is. Replaces a test that asserted tmux always won, which is
+    /// what made the command a no-op.
     #[test]
-    fn tmux_breaks_ties_ahead_of_herdr_at_every_liveness_level() {
+    fn the_configured_order_breaks_ties_at_every_liveness_level() {
         for liveness in [
             SessionLiveness::HasPanes,
             SessionLiveness::Empty,
             SessionLiveness::Unreachable,
         ] {
-            let tmux = liveness_session("t", BackendKind::Tmux);
-            let herdr = liveness_session("h", BackendKind::Herdr);
             assert!(
-                session_order_key(&tmux, liveness) < session_order_key(&herdr, liveness),
-                "tmux should sort ahead of herdr when both are {liveness:?}"
+                session_order_key(0, liveness) < session_order_key(1, liveness),
+                "the first configured session should win a tie when both are {liveness:?}"
             );
         }
     }
@@ -15393,14 +15395,17 @@ mod tests {
             SessionLiveness::Empty,
         ];
         let mut order: Vec<usize> = (0..sessions.len()).collect();
-        order.sort_by_key(|&index| session_order_key(&sessions[index], liveness[index]));
+        order.sort_by_key(|&index| session_order_key(index, liveness[index]));
         let ids: Vec<&str> = order
             .iter()
             .map(|&index| sessions[index].id.as_str())
             .collect();
+        // Liveness first; among the two equally-empty entries the one
+        // configured earlier wins, which is the reader's stated preference
+        // rather than a rule about backend kinds.
         assert_eq!(
             ids,
-            vec!["herdr-live", "tmux-empty", "herdr-empty", "tmux-dead"]
+            vec!["herdr-live", "herdr-empty", "tmux-empty", "tmux-dead"]
         );
         assert_eq!(
             order.len(),
@@ -15419,17 +15424,15 @@ mod tests {
             liveness_session("c", BackendKind::Herdr),
         ];
         let mut order: Vec<usize> = (0..sessions.len()).collect();
-        order.sort_by_key(|&index| {
-            session_order_key(&sessions[index], SessionLiveness::Unreachable)
-        });
+        order.sort_by_key(|&index| session_order_key(index, SessionLiveness::Unreachable));
         assert_eq!(order.len(), 3);
-        // Tmux still wins the tiebreak; the two herdr entries keep the
-        // relative order they were configured in (stable sort).
+        // All equally unreachable, so the configured order stands -- ordering
+        // must never turn into filtering, and it must not reshuffle either.
         let ids: Vec<&str> = order
             .iter()
             .map(|&index| sessions[index].id.as_str())
             .collect();
-        assert_eq!(ids, vec!["b", "a", "c"]);
+        assert_eq!(ids, vec!["a", "b", "c"]);
     }
 
     #[tokio::test]
@@ -16136,6 +16139,7 @@ mod tests {
             backend: BackendKind::Tmux,
         });
         let configured = state.config.sessions.len();
+        let preferred = state.config.sessions[0].id.clone();
 
         let response = sessions(State(state), bearer_headers("token"))
             .await
@@ -16147,10 +16151,11 @@ mod tests {
         // `probe_reachable` catching the same "no such file or directory"
         // that `list_output` would otherwise fold into an empty topology
         // (see `probe_reachable_tells_no_server_apart_from_list_panes_reporting_empty`
-        // in `backend/tmux.rs`). So this genuinely exercises the tmux/herdr
-        // tiebreak between two unreachable entries, not an accident of tmux
-        // misreporting as merely empty.
-        assert_eq!(ids[0], "tmux-also-dead");
+        // in `backend/tmux.rs`). So this genuinely exercises the tiebreak
+        // between two unreachable entries, not an accident of tmux
+        // misreporting as merely empty -- and the tiebreak is now the order
+        // the reader configured, so the first entry stays first.
+        assert_eq!(ids[0], preferred);
     }
 
     /// The regression `sessions_endpoint_keeps_every_session_when_nothing_is_reachable`
