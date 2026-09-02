@@ -831,13 +831,18 @@ struct AgentSendBody {
     text: String,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     // Before any subcommand, because every one of them either spawns a backend
     // program or writes down how to. An init system starts this process with an
     // environment that is not the user's -- and so does `ssh host muqun-gateway
     // setup`, and a `cron` line. See `login_env`.
+    //
+    // Before the runtime, deliberately. `adopt` writes to the process
+    // environment, and setting an environment variable while another thread
+    // may be reading one is the data race that made `set_var` unsafe in
+    // edition 2024. Here nothing else exists yet: no worker threads, no tasks,
+    // just this one thread and its arguments.
     //
     // On stderr rather than stdout: for `run` this is the gateway log, which is
     // where it is wanted, and for a command a human is watching it says nothing
@@ -845,6 +850,14 @@ async fn main() -> anyhow::Result<()> {
     for note in login_env::adopt() {
         eprintln!("environment repaired from the login shell -- {note}");
     }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to start the async runtime")?
+        .block_on(dispatch(cli))
+}
+
+async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Setup {
             public_url,

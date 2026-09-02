@@ -3,6 +3,8 @@ use std::ffi::OsStr;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -463,8 +465,8 @@ impl TerminalBackend for TmuxBackend {
                 panes.push(pane);
             }
             if !unresolved.is_empty() {
-                let found =
-                    agents_under(&unresolved.iter().map(|(_, pid)| *pid).collect::<Vec<_>>());
+                let pids = unresolved.iter().map(|(_, pid)| *pid).collect::<Vec<_>>();
+                let found = agents_under(&pids).await;
                 for (index, pid) in unresolved {
                     if let Some(agent) = found.get(&pid) {
                         panes[index].agent = Some(agent.clone());
@@ -1235,18 +1237,98 @@ fn detected_agent(command: Option<&str>) -> Option<String> {
 /// searched rather than just the pane's own child: a pane usually holds a shell
 /// and the agent is its child, or its grandchild behind a wrapper script.
 ///
-/// One `ps` for every unresolved pane at once, and only when at least one pane
-/// went unmatched -- a machine whose panes are all shells pays nothing, and a
-/// machine full of agents pays one process per listing rather than one per
-/// pane.
-fn agents_under(pane_pids: &[u32]) -> HashMap<u32, String> {
-    let Ok(output) = std::process::Command::new("ps")
+/// One `ps` for every unresolved pane at once, and the answer is kept for
+/// [`AGENT_LOOKUP_TTL`] before it is asked again. Both halves matter: the
+/// activity stream lists panes twice a second, and a pane holding a plain
+/// shell -- which is most panes, most of the time -- comes back unmatched on
+/// every one of those. Without the cache that was one `ps -ax` every 500ms for
+/// as long as the gateway ran, and a listing of every process on a busy box is
+/// not free. With it, a shell pane costs one `ps` per five seconds however
+/// often it is listed, and an agent that starts or stops shows up within that.
+///
+/// `tokio`'s `Command`, not `std`'s: this runs on a runtime worker, and the
+/// blocking version held that worker for the whole listing.
+async fn agents_under(pane_pids: &[u32]) -> HashMap<u32, String> {
+    let now = Instant::now();
+    let (mut found, stale) = agent_lookups()
+        .lock()
+        .map(|cache| cache.split(pane_pids, now))
+        .unwrap_or_default();
+    if stale.is_empty() {
+        return found;
+    }
+    let listing = match Command::new("ps")
         .args(["-axo", "pid=,ppid=,args="])
         .output()
-    else {
-        return HashMap::new();
+        .await
+    {
+        Ok(output) => String::from_utf8_lossy(&output.stdout).into_owned(),
+        // No `ps`, or it failed: answer with what the cache had and try again
+        // next time. Not remembered as "no agent" -- that would turn one
+        // failed listing into five seconds of every agent pane looking like a
+        // shell.
+        Err(_) => return found,
     };
-    agents_in_listing(&String::from_utf8_lossy(&output.stdout), pane_pids)
+    let fresh = agents_in_listing(&listing, &stale);
+    if let Ok(mut cache) = agent_lookups().lock() {
+        cache.record(&stale, &fresh, now);
+    }
+    found.extend(fresh);
+    found
+}
+
+/// How long a pane's resolved agent is trusted before `ps` is asked again.
+///
+/// Long enough that the twice-a-second activity poll amortises to nothing;
+/// short enough that an agent starting in a shell pane is recognised before
+/// the reader has finished typing their first prompt to it.
+const AGENT_LOOKUP_TTL: Duration = Duration::from_secs(5);
+
+/// Process-wide, because a `TmuxBackend` is built fresh for every request and
+/// would otherwise forget each answer as soon as it had it.
+fn agent_lookups() -> &'static Mutex<AgentLookupCache> {
+    static CACHE: OnceLock<Mutex<AgentLookupCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(AgentLookupCache::default()))
+}
+
+/// `pane_pid → (when it was resolved, what was found)`. A `None` is remembered
+/// too: "this pane is a shell" is the common answer and the one worth not
+/// re-deriving twice a second.
+#[derive(Default)]
+struct AgentLookupCache {
+    entries: HashMap<u32, (Instant, Option<String>)>,
+}
+
+impl AgentLookupCache {
+    /// The pids this cache can still answer for, and the ones it cannot.
+    fn split(&self, pane_pids: &[u32], now: Instant) -> (HashMap<u32, String>, Vec<u32>) {
+        let mut found = HashMap::new();
+        let mut stale = Vec::new();
+        for &pid in pane_pids {
+            match self.entries.get(&pid) {
+                Some((at, agent)) if now.duration_since(*at) < AGENT_LOOKUP_TTL => {
+                    if let Some(agent) = agent {
+                        found.insert(pid, agent.clone());
+                    }
+                }
+                _ => stale.push(pid),
+            }
+        }
+        (found, stale)
+    }
+
+    /// Remember one listing's answer for every pid it was asked about --
+    /// including the pids it found nothing for.
+    fn record(&mut self, asked: &[u32], fresh: &HashMap<u32, String>, now: Instant) {
+        for &pid in asked {
+            self.entries.insert(pid, (now, fresh.get(&pid).cloned()));
+        }
+        // A pane that is gone would otherwise sit here forever. Pruned on
+        // write, so the map is bounded by the number of panes that existed
+        // in the last TTL rather than the number that ever did.
+        self.entries
+            .retain(|_, (at, _)| now.duration_since(*at) < AGENT_LOOKUP_TTL);
+    }
 }
 
 /// The tree walk, given a `ps` listing. Separated so it can be tested against a
@@ -1368,6 +1450,46 @@ mod tests {
         assert_eq!(found.get(&6539).map(String::as_str), Some("claude"));
         // A pane running something else stays a pane running something else.
         assert_eq!(found.get(&7000), None);
+    }
+
+    #[test]
+    fn a_resolved_pane_is_not_asked_about_again_until_the_answer_is_stale() {
+        // The activity stream lists panes twice a second and a shell pane
+        // comes back unmatched every time. Without this, that was one `ps -ax`
+        // every 500ms for the life of the gateway.
+        let mut cache = AgentLookupCache::default();
+        let t0 = Instant::now();
+        let mut fresh = HashMap::new();
+        fresh.insert(1, "claude".to_owned());
+        // Asked about 1 (an agent) and 2 (a shell); told about both.
+        cache.record(&[1, 2], &fresh, t0);
+
+        let (found, stale) = cache.split(&[1, 2, 3], t0 + Duration::from_secs(1));
+        assert_eq!(found.get(&1).map(String::as_str), Some("claude"));
+        // 2 is answered too -- "no agent" is an answer -- so only the pane the
+        // cache has never seen needs `ps`.
+        assert_eq!(stale, vec![3]);
+
+        // Past the TTL, both are asked about again: an agent may have started
+        // in 2 or exited in 1.
+        let (found, stale) = cache.split(&[1, 2], t0 + AGENT_LOOKUP_TTL + Duration::from_millis(1));
+        assert!(found.is_empty());
+        assert_eq!(stale, vec![1, 2]);
+    }
+
+    #[test]
+    fn panes_that_are_gone_fall_out_of_the_cache() {
+        let mut cache = AgentLookupCache::default();
+        let t0 = Instant::now();
+        cache.record(&[1, 2, 3], &HashMap::new(), t0);
+        // A later write prunes what the TTL has already expired.
+        cache.record(
+            &[4],
+            &HashMap::new(),
+            t0 + AGENT_LOOKUP_TTL + Duration::from_secs(1),
+        );
+        assert_eq!(cache.entries.len(), 1);
+        assert!(cache.entries.contains_key(&4));
     }
 
     #[test]
