@@ -29,7 +29,7 @@
 //! Every list parse then fails with "terminal backend returned an invalid
 //! session", which is true and useless. Non-ASCII pane titles and working
 //! directories are mangled the same way and, unlike the separator, silently:
-//! `✳ 启动本机simfarm` arrives as `_ ________simfarm`.
+//! a pane titled `✳ 修复 gateway` arrives as `_ __ _______`.
 //!
 //! ## Two halves, because either one alone leaves a hole
 //!

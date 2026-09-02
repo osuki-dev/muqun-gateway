@@ -1643,10 +1643,10 @@ mod tests {
         // still says what it is.
         let listing = "\
  6327     1 -zsh
- 6452  6327 /Users/okk/.local/bin/claude --allow-dangerously-skip-permissions
+ 6452  6327 /opt/agents/bin/claude --print
  6539     1 -zsh
  6540  6539 /bin/sh /usr/local/bin/agent-wrapper
-65231  6540 claude --dangerously-skip-permissions
+65231  6540 claude --resume
  7000     1 -zsh
  7001  7000 vim README.md
 ";
