@@ -49,8 +49,10 @@ use serde_json::{json, Value};
 /// `composer.rs`, so this endpoint and the pane composer descriptor answer out
 /// of one table, and added the opencode profile. 5 adds `interrupt` to every
 /// profile and to this endpoint's answer: which key stops this particular
-/// agent, which is not `ctrl+c` on any of them.
-pub const KEYMAP_VERSION: u32 = 5;
+/// agent, which is not `ctrl+c` on any of them. 6 drops `shift+enter` from the
+/// base keys -- a client holding a cached 5 would otherwise keep offering a key
+/// that no tmux pane can press.
+pub const KEYMAP_VERSION: u32 = 6;
 
 /// Overlay file, read from the gateway's config directory on every request.
 /// Re-read rather than cached so an edit takes effect on the next pane switch
@@ -185,14 +187,16 @@ const fn cmd(name: &'static str, description: &'static str) -> SlashCommand {
     }
 }
 
-/// Answering a prompt, getting out of one, and deleting. Every pane needs
-/// these. `shift+enter` is the only way to write a multi-line message from a
-/// phone, so it is not optional.
-const PRIMARY: &[Shortcut] = &[
-    key("↵", "enter", "Enter"),
-    key("⇧↵", "shift+enter", "Newline without sending"),
-    key("ESC", "esc", "Escape"),
-];
+/// Answering a prompt and getting out of one. Every pane needs these.
+///
+/// `shift+enter` used to sit between them, for writing a multi-line message.
+/// It is gone because it never worked on tmux and did not need to: tmux has no
+/// portable name for Shift+Enter -- whether the terminal even distinguishes it
+/// from Enter depends on extended-keys mode -- and multi-line text from the
+/// composer already reaches the pane as a bracketed paste rather than as a
+/// stream of Enters. A key row that advertises a key one backend cannot press
+/// is worse than a shorter row.
+const PRIMARY: &[Shortcut] = &[key("↵", "enter", "Enter"), key("ESC", "esc", "Escape")];
 
 /// Still needed everywhere, but reached for less often than what the agent
 /// itself advertises, so they sit after it.
@@ -1022,8 +1026,8 @@ mod tests {
         assert_eq!(value["profile"], "opencode");
         assert_eq!(value["configured"], true);
         let keys = key_names(&value);
-        assert_eq!(&keys[..3], &["enter", "shift+enter", "esc"]);
-        assert_eq!(keys[3], "shift+tab");
+        assert_eq!(&keys[..2], &["enter", "esc"]);
+        assert_eq!(keys[2], "shift+tab");
         let commands = value["commands"].as_array().unwrap();
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0]["command"], "/model");
@@ -1070,9 +1074,9 @@ mod tests {
     #[test]
     fn the_key_row_leads_with_the_agents_own_actions() {
         let keys = key_names(&resolve(Some("claude"), None, None));
-        // enter / shift+enter / esc, then what Claude Code itself advertises.
-        assert_eq!(&keys[..3], &["enter", "shift+enter", "esc"]);
-        assert_eq!(keys[3], "shift+tab");
+        // enter / esc, then what Claude Code itself advertises.
+        assert_eq!(&keys[..2], &["enter", "esc"]);
+        assert_eq!(keys[2], "shift+tab");
         assert!(
             keys.iter().position(|k| k == "ctrl+t").unwrap()
                 < keys.iter().position(|k| k == "tab").unwrap(),
@@ -1170,7 +1174,11 @@ mod tests {
         for agent in [Some("claude"), Some("codex"), Some("qodercli"), None] {
             let keys = key_names(&resolve(agent, None, None));
             assert_eq!(keys[0], "enter");
-            assert_eq!(keys[1], "shift+enter");
+            assert_eq!(keys[1], "esc");
+            // shift+enter is deliberately absent: tmux has no portable name
+            // for it, so advertising it put a key on the row that one backend
+            // could never press.
+            assert!(!keys.contains(&"shift+enter".to_string()));
             assert_eq!(keys.last().unwrap(), "alt+right");
         }
     }

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
@@ -440,14 +441,37 @@ impl TerminalBackend for TmuxBackend {
                 "#{pane_current_command}",
                 "#{history_size}",
                 "#{alternate_on}",
+                "#{pane_pid}",
             ]);
             let output = self
                 .list_output(["list-panes", "-a", "-F", &format])
                 .await?;
-            parse_rows(&output, 13, "pane")?
-                .into_iter()
-                .map(pane_from_fields)
-                .collect()
+            let rows = parse_rows(&output, 14, "pane")?;
+            let mut panes = Vec::with_capacity(rows.len());
+            let mut unresolved = Vec::new();
+            for fields in rows {
+                // Kept before the row is consumed. A pane whose foreground
+                // process named itself needs a second look, and this is the
+                // only place the pid and the pane are in the same hand.
+                let pid = fields[13].parse::<u32>().ok();
+                let pane = pane_from_fields(fields)?;
+                if pane.agent.is_none() {
+                    if let Some(pid) = pid {
+                        unresolved.push((panes.len(), pid));
+                    }
+                }
+                panes.push(pane);
+            }
+            if !unresolved.is_empty() {
+                let found =
+                    agents_under(&unresolved.iter().map(|(_, pid)| *pid).collect::<Vec<_>>());
+                for (index, pid) in unresolved {
+                    if let Some(agent) = found.get(&pid) {
+                        panes[index].agent = Some(agent.clone());
+                    }
+                }
+            }
+            Ok(panes)
         })
     }
 
@@ -969,12 +993,23 @@ fn means_no_tmux_server(message: &str) -> bool {
         || message.contains("no such file or directory")
 }
 
+/// A key name from a shortcut table, in tmux's spelling.
+///
+/// Unknown names are refused rather than passed through, and that is
+/// load-bearing: `tmux send-keys` treats a name it does not recognise as
+/// literal text, so handing it `shift+tab` types those nine characters into the
+/// pane instead of failing. Refusing turns a wrong key into an error the caller
+/// can see rather than into text in somebody's prompt.
 fn tmux_key(value: &str) -> Result<String, BackendError> {
     let lower = value.to_ascii_lowercase();
     let mapped = match lower.as_str() {
         "enter" => "Enter".to_owned(),
         "escape" | "esc" => "Escape".to_owned(),
         "tab" => "Tab".to_owned(),
+        // Back-tab, which is what Shift+Tab is on the wire (`CSI Z`). tmux
+        // spells it `BTab` and accepts neither `shift+tab` nor `S-Tab` for it:
+        // the first becomes literal text and the second lands as a plain Tab.
+        "shift+tab" => "BTab".to_owned(),
         "backspace" => "BSpace".to_owned(),
         "up" | "arrowup" => "Up".to_owned(),
         "down" | "arrowdown" => "Down".to_owned(),
@@ -1175,15 +1210,89 @@ fn text_revision(text: &str) -> u64 {
     hasher.finish()
 }
 
+const AGENTS: &[&str] = &[
+    "claude", "codex", "opencode", "qodercli", "gemini", "amp", "cursor", "pi",
+];
+
 fn detected_agent(command: Option<&str>) -> Option<String> {
-    const AGENTS: &[&str] = &[
-        "claude", "codex", "opencode", "qodercli", "gemini", "amp", "cursor", "pi",
-    ];
     let command = command?.rsplit('/').next()?.to_ascii_lowercase();
     AGENTS
         .iter()
         .find(|agent| command == **agent || command.starts_with(&format!("{agent}-")))
         .map(|agent| (*agent).to_owned())
+}
+
+/// The agent running somewhere under each of these pane pids.
+///
+/// `#{pane_current_command}` is the *name* of the foreground process, and an
+/// agent that renames itself is invisible to it. Claude Code is exactly that
+/// case: it sets its process name to its own version, so tmux reports
+/// `2.1.239` where the argv still plainly says `claude`. The pane then has no
+/// agent, which costs it the agent key row -- no Shift+Tab on a Claude pane --
+/// its status, and its place in the agent list.
+///
+/// So the name is asked of `ps`, which reports argv, and the whole subtree is
+/// searched rather than just the pane's own child: a pane usually holds a shell
+/// and the agent is its child, or its grandchild behind a wrapper script.
+///
+/// One `ps` for every unresolved pane at once, and only when at least one pane
+/// went unmatched -- a machine whose panes are all shells pays nothing, and a
+/// machine full of agents pays one process per listing rather than one per
+/// pane.
+fn agents_under(pane_pids: &[u32]) -> HashMap<u32, String> {
+    let Ok(output) = std::process::Command::new("ps")
+        .args(["-axo", "pid=,ppid=,args="])
+        .output()
+    else {
+        return HashMap::new();
+    };
+    agents_in_listing(&String::from_utf8_lossy(&output.stdout), pane_pids)
+}
+
+/// The tree walk, given a `ps` listing. Separated so it can be tested against a
+/// captured one -- including the shape that started this, where the process
+/// name is a version number and only the argv still says `claude`.
+fn agents_in_listing(listing: &str, pane_pids: &[u32]) -> HashMap<u32, String> {
+    let mut found = HashMap::new();
+    let mut children: HashMap<u32, Vec<(u32, String)>> = HashMap::new();
+    for line in listing.lines() {
+        let mut parts = line.split_whitespace();
+        let (Some(pid), Some(parent), Some(program)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let (Ok(pid), Ok(parent)) = (pid.parse::<u32>(), parent.parse::<u32>()) else {
+            continue;
+        };
+        children
+            .entry(parent)
+            .or_default()
+            .push((pid, program.to_owned()));
+    }
+
+    for &root in pane_pids {
+        let mut queue = vec![root];
+        // A pid appears once as a child of one parent, so the walk terminates
+        // on the tree's own shape. The bound is belt and braces against a
+        // `ps` listing that contradicts itself mid-read, which it can: it is
+        // sampled, not atomic.
+        let mut budget = 256;
+        while let Some(pid) = queue.pop() {
+            budget -= 1;
+            if budget == 0 {
+                break;
+            }
+            for (child, program) in children.get(&pid).into_iter().flatten() {
+                if let Some(agent) = detected_agent(Some(program)) {
+                    found.insert(root, agent);
+                    queue.clear();
+                    break;
+                }
+                queue.push(*child);
+            }
+        }
+    }
+    found
 }
 
 #[cfg(test)]
@@ -1220,6 +1329,57 @@ mod tests {
         assert_eq!(pane.max_offset_from_bottom, Some(12));
         assert_eq!(pane.viewport_rows, Some(41));
         assert_eq!(pane.alternate_on, Some(true));
+    }
+
+    #[test]
+    fn shift_tab_reaches_tmux_as_back_tab() {
+        // `BTab` and nothing else. `S-Tab` lands as a plain Tab, and an
+        // unrecognised name is not an error to tmux at all -- `send-keys`
+        // types it, so passing `shift+tab` through would put those nine
+        // characters in the pane.
+        assert_eq!(tmux_key("shift+tab").unwrap(), "BTab");
+        assert_eq!(tmux_key("Shift+Tab").unwrap(), "BTab");
+        assert_eq!(tmux_key("tab").unwrap(), "Tab");
+        // Still refused, rather than guessed at from the `shift+` prefix.
+        assert!(tmux_key("shift+enter").is_err());
+        assert!(tmux_key("shift+f5").is_err());
+    }
+
+    #[test]
+    fn an_agent_that_renamed_itself_is_still_found_under_its_pane() {
+        // The listing that started this, near enough verbatim. tmux reports
+        // `#{pane_current_command}` as `2.1.239` for the first pane, because
+        // Claude Code sets its process name to its own version -- so the pane
+        // has no agent, no agent key row, and no Shift+Tab. Only the argv
+        // still says what it is.
+        let listing = "\
+ 6327     1 -zsh
+ 6452  6327 /Users/okk/.local/bin/claude --allow-dangerously-skip-permissions
+ 6539     1 -zsh
+ 6540  6539 /bin/sh /usr/local/bin/agent-wrapper
+65231  6540 claude --dangerously-skip-permissions
+ 7000     1 -zsh
+ 7001  7000 vim README.md
+";
+        let found = agents_in_listing(listing, &[6327, 6539, 7000]);
+        assert_eq!(found.get(&6327).map(String::as_str), Some("claude"));
+        // Found two levels down, behind a wrapper script: a pane holds a
+        // shell, and what the shell started is not always the agent itself.
+        assert_eq!(found.get(&6539).map(String::as_str), Some("claude"));
+        // A pane running something else stays a pane running something else.
+        assert_eq!(found.get(&7000), None);
+    }
+
+    #[test]
+    fn a_listing_that_contradicts_itself_does_not_hang_the_walk() {
+        // `ps` is sampled, not atomic, so a parent and child can disagree
+        // about who owns whom. The budget is what keeps that from being an
+        // infinite descent rather than a missing agent.
+        let listing = "\
+ 100   200 -zsh
+ 200   100 -zsh
+";
+        assert_eq!(agents_in_listing(listing, &[100]), HashMap::new());
     }
 
     #[test]
