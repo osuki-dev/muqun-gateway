@@ -16,6 +16,35 @@ use super::{
     Tab, TabId, TerminalBackend, Workspace, WorkspaceId,
 };
 
+/// Record separator, marking where one pane's screen ends and the next
+/// begins inside a batched `capture-pane`. Distinct from
+/// [`FIELD_SEPARATOR`], which separates fields inside one row.
+const BATCH_SEPARATOR: char = '\u{1e}';
+
+/// The one-at-a-time reading the port defaults to, reachable from the tmux
+/// override so it has somewhere to fall back to.
+async fn default_read_visible_batch(
+    backend: &TmuxBackend,
+    panes: &[PaneId],
+    lines: u32,
+) -> Result<Vec<(PaneId, String)>, BackendError> {
+    let mut read = Vec::with_capacity(panes.len());
+    for pane in panes {
+        let request = ReadPane {
+            pane_id: pane.clone(),
+            source: OutputSource::Visible,
+            format: OutputFormat::Text,
+            lines,
+            start: None,
+            end: None,
+        };
+        if let Ok(output) = backend.read_pane(&request).await {
+            read.push((pane.clone(), output.text));
+        }
+    }
+    Ok(read)
+}
+
 /// ASCII unit separator: the one byte a pane title, a window name or a working
 /// directory will not contain, which is why the `-F` formats are joined with it
 /// rather than with a printable character that a user could type.
@@ -301,6 +330,65 @@ impl TmuxBackend {
         let height = parse_u32(parts.next().unwrap_or_default(), "pane")?;
         Ok((history, height))
     }
+
+    /// A string that changes when the topology does, in one tmux invocation.
+    ///
+    /// The activity poll only ever asks "did anything move?", so it does not
+    /// need entities and must not pay for them. It used to call
+    /// `list_workspaces` + `list_tabs` + `list_panes`, which is three processes
+    /// every tick -- and `list_panes` additionally resolves each pane's agent,
+    /// so a poll that wanted a yes/no answer was walking the process table.
+    ///
+    /// tmux runs several commands per invocation when they are separated by a
+    /// literal `;` argument, so all three listings come back down the one
+    /// connection tmux was going to open anyway. The raw output *is* the
+    /// fingerprint: parsing it only to format it again would be work done to
+    /// throw away.
+    ///
+    /// The fields are chosen to cover what a client would redraw for -- ids,
+    /// names, titles, the active flags, sizes, and the foreground command, so
+    /// that a program starting in a pane counts as a change.
+    async fn topology_fingerprint(&self) -> Result<String, BackendError> {
+        let sessions = Self::format(&[
+            "S",
+            "#{session_id}",
+            "#{session_name}",
+            "#{session_windows}",
+        ]);
+        let windows = Self::format(&[
+            "W",
+            "#{window_id}",
+            "#{window_name}",
+            "#{window_active}",
+            "#{window_panes}",
+        ]);
+        let panes = Self::format(&[
+            "P",
+            "#{pane_id}",
+            "#{pane_title}",
+            "#{pane_current_path}",
+            "#{pane_active}",
+            "#{pane_width}",
+            "#{pane_height}",
+            "#{pane_current_command}",
+        ]);
+        self.list_output([
+            "list-sessions",
+            "-F",
+            &sessions,
+            ";",
+            "list-windows",
+            "-a",
+            "-F",
+            &windows,
+            ";",
+            "list-panes",
+            "-a",
+            "-F",
+            &panes,
+        ])
+        .await
+    }
 }
 
 impl TerminalBackend for TmuxBackend {
@@ -331,13 +419,8 @@ impl TerminalBackend for TmuxBackend {
                 let mut previous = None;
                 loop {
                     interval.tick().await;
-                    match (
-                        backend.list_workspaces().await,
-                        backend.list_tabs().await,
-                        backend.list_panes().await,
-                    ) {
-                        (Ok(workspaces), Ok(tabs), Ok(panes)) => {
-                            let fingerprint = format!("{workspaces:?}{tabs:?}{panes:?}");
+                    match backend.topology_fingerprint().await {
+                        Ok(fingerprint) => {
                             let changed = previous.as_ref().is_some_and(|last| last != &fingerprint);
                             previous = Some(fingerprint);
                             if changed {
@@ -351,16 +434,14 @@ impl TerminalBackend for TmuxBackend {
                             }
                         }
                         // The failure that happened, not a word for all of
-                        // them. Collapsing three different errors into
-                        // `Unavailable` is how "terminal backend is
-                        // unavailable" became the only thing the log could say
-                        // about a tmux that was running perfectly well, and it
-                        // cost days: the message named the one cause -- no tmux
-                        // -- that the reader could see with their own eyes was
-                        // not true, so it read as a lie rather than a clue.
-                        (Err(failure), _, _) | (_, Err(failure), _) | (_, _, Err(failure)) => {
-                            yield Err(failure)
-                        }
+                        // them. Collapsing different errors into `Unavailable`
+                        // is how "terminal backend is unavailable" became the
+                        // only thing the log could say about a tmux that was
+                        // running perfectly well, and it cost days: the message
+                        // named the one cause -- no tmux -- that the reader
+                        // could see with their own eyes was not true, so it
+                        // read as a lie rather than a clue.
+                        Err(failure) => yield Err(failure),
                     }
                 }
             };
@@ -582,6 +663,70 @@ impl TerminalBackend for TmuxBackend {
                 text,
                 range,
             })
+        })
+    }
+
+    /// Every pane's visible text in one tmux invocation.
+    ///
+    /// The approvals watcher reads each agent pane every 1.5 seconds, and on
+    /// this adapter each read was its own process. Measured on a machine with
+    /// three agent panes, `capture-pane` was the single largest source of
+    /// process churn in the gateway -- larger than the activity poll it sits
+    /// beside.
+    ///
+    /// tmux runs several commands per invocation when a literal `;` separates
+    /// them, so the reads are chained and a `display-message` between each one
+    /// writes a record separator into the same stdout. The chunks come back in
+    /// the order they were asked for, which is how they are matched up: the
+    /// obvious alternative -- printing the pane id in the marker -- does not
+    /// survive tmux's format parser, which eats the leading `%`.
+    ///
+    /// Anything unexpected falls back to reading them one at a time. A chained
+    /// invocation fails as a whole if any one command fails, and a pane that
+    /// closed mid-tick must not cost the rest of the session its reading.
+    fn read_visible_batch<'a>(
+        &'a self,
+        panes: &'a [PaneId],
+        lines: u32,
+    ) -> BackendFuture<'a, Vec<(PaneId, String)>> {
+        Box::pin(async move {
+            if panes.len() < 2 {
+                return default_read_visible_batch(self, panes, lines).await;
+            }
+            let mut args: Vec<String> = Vec::with_capacity(panes.len() * 8);
+            for (index, pane) in panes.iter().enumerate() {
+                validate_tmux_id(pane.as_str(), '%', "pane")?;
+                if index > 0 {
+                    args.push(";".to_owned());
+                }
+                args.push("display-message".to_owned());
+                args.push("-p".to_owned());
+                args.push(BATCH_SEPARATOR.to_string());
+                args.push(";".to_owned());
+                args.push("capture-pane".to_owned());
+                args.push("-p".to_owned());
+                args.push("-t".to_owned());
+                args.push(pane.as_str().to_owned());
+            }
+            let Ok(output) = self.output(&args).await else {
+                return default_read_visible_batch(self, panes, lines).await;
+            };
+            let chunks: Vec<&str> = output.split(BATCH_SEPARATOR).skip(1).collect();
+            if chunks.len() != panes.len() {
+                return default_read_visible_batch(self, panes, lines).await;
+            }
+            Ok(panes
+                .iter()
+                .zip(chunks)
+                .map(|(pane, chunk)| {
+                    // The marker's own newline leads every chunk; the rest is
+                    // put through exactly what the single-pane path does, so
+                    // the two produce the same text for the same screen.
+                    let body = chunk.strip_prefix('\n').unwrap_or(chunk);
+                    let captured = strip_grid_padding(body);
+                    (pane.clone(), tail_lines(&captured, lines as usize))
+                })
+                .collect())
         })
     }
 
@@ -2120,6 +2265,63 @@ mod tests {
         assert_eq!(visible.text.lines().count(), height as usize);
 
         backend.close_workspace(&workspace.id).await.unwrap();
+    }
+
+    /// The batch must be the same reading as the loop it replaces, pane for
+    /// pane. This is what would catch the chained invocation drifting: a
+    /// marker landing in the wrong place, a chunk keeping the separator's own
+    /// newline, or `strip_grid_padding` applied on one path and not the other.
+    #[tokio::test]
+    #[ignore = "requires permission to create a local tmux Unix socket"]
+    async fn a_batched_read_says_exactly_what_reading_each_pane_says() {
+        if Command::new("tmux").arg("-V").output().await.is_err() {
+            return;
+        }
+        let (backend, workspace) = contract_workspace().await;
+        let first = backend.list_panes().await.unwrap()[0].id.clone();
+        // Three panes, so the batch has something to interleave and get wrong.
+        for _ in 0..2 {
+            backend
+                .split_pane(&SplitPane {
+                    pane_id: first.clone(),
+                    direction: SplitDirection::Down,
+                    ratio: None,
+                    cwd: None,
+                    env: None,
+                })
+                .await
+                .unwrap();
+        }
+        let ids: Vec<PaneId> = backend
+            .list_panes()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|pane| pane.id)
+            .collect();
+        assert!(ids.len() >= 3, "expected three panes, got {}", ids.len());
+        // Something distinguishable on each screen, so a swapped chunk fails.
+        for (index, id) in ids.iter().enumerate() {
+            backend
+                .send_text(id, &format!("marker-for-pane-{index}"))
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let batched = backend.read_visible_batch(&ids, 200).await.unwrap();
+        let one_at_a_time = default_read_visible_batch(&backend, &ids, 200)
+            .await
+            .unwrap();
+        assert_eq!(batched.len(), ids.len());
+        assert_eq!(batched, one_at_a_time);
+        for (index, (_, text)) in batched.iter().enumerate() {
+            assert!(
+                text.contains(&format!("marker-for-pane-{index}")),
+                "pane {index} got another pane's screen: {text:?}"
+            );
+        }
+        backend.close_workspace(&workspace.id).await.ok();
     }
 
     #[tokio::test]
