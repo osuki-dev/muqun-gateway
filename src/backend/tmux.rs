@@ -16,6 +16,18 @@ use super::{
     Tab, TabId, TerminalBackend, Workspace, WorkspaceId,
 };
 
+/// How often the topology poll runs when something is happening, and the
+/// ceiling it backs off to when nothing is.
+///
+/// The floor is what the poll always ran at. The ceiling is a judgement about
+/// what a layout change is worth: pane *content* reaches a client through its
+/// own output poll, so what waits on this is structural -- a pane split, a
+/// window renamed, a session created. Two seconds to notice one of those on a
+/// session that has been still is not a delay anybody can feel, and it is the
+/// difference between two invocations a second and half of one.
+const ACTIVITY_POLL_MIN: Duration = Duration::from_millis(500);
+const ACTIVITY_POLL_MAX: Duration = Duration::from_secs(2);
+
 /// Record separator, marking where one pane's screen ends and the next
 /// begins inside a batched `capture-pane`. Distinct from
 /// [`FIELD_SEPARATOR`], which separates fields inside one row.
@@ -414,15 +426,28 @@ impl TerminalBackend for TmuxBackend {
         let backend = self.clone();
         Box::pin(async move {
             let activity = async_stream::stream! {
-                let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
-                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let mut delay = ACTIVITY_POLL_MIN;
                 let mut previous = None;
                 loop {
-                    interval.tick().await;
+                    tokio::time::sleep(delay).await;
                     match backend.topology_fingerprint().await {
                         Ok(fingerprint) => {
                             let changed = previous.as_ref().is_some_and(|last| last != &fingerprint);
                             previous = Some(fingerprint);
+                            // A terminal's layout is still almost all of the
+                            // time. Polling it at a fixed 500ms means the
+                            // overwhelming majority of invocations exist to
+                            // report that nothing happened -- so the interval
+                            // backs off while that stays true and snaps back
+                            // the instant it does not. Someone splitting a
+                            // pane gets the same responsiveness they always
+                            // had from the second event onward, and an idle
+                            // machine stops paying for their absence.
+                            delay = if changed {
+                                ACTIVITY_POLL_MIN
+                            } else {
+                                (delay * 2).min(ACTIVITY_POLL_MAX)
+                            };
                             if changed {
                                 yield Ok(BackendActivity {
                                     name: "layout_updated".into(),
@@ -1556,6 +1581,43 @@ mod tests {
         assert_eq!(pane.max_offset_from_bottom, Some(12));
         assert_eq!(pane.viewport_rows, Some(41));
         assert_eq!(pane.alternate_on, Some(true));
+    }
+
+    #[test]
+    fn the_topology_poll_backs_off_while_nothing_moves() {
+        // The rule the stream applies, stated on its own so it can be checked
+        // without standing up a tmux server: double while still, snap back the
+        // moment something changes, never exceed the ceiling.
+        let next = |delay: Duration, changed: bool| {
+            if changed {
+                ACTIVITY_POLL_MIN
+            } else {
+                (delay * 2).min(ACTIVITY_POLL_MAX)
+            }
+        };
+
+        let mut delay = ACTIVITY_POLL_MIN;
+        // A still session walks up to the ceiling and stays there.
+        let mut seen = vec![delay];
+        for _ in 0..6 {
+            delay = next(delay, false);
+            seen.push(delay);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                Duration::from_millis(500),
+                Duration::from_millis(1000),
+                Duration::from_millis(2000),
+                Duration::from_millis(2000),
+                Duration::from_millis(2000),
+                Duration::from_millis(2000),
+                Duration::from_millis(2000),
+            ]
+        );
+        // And one change puts it straight back to the floor, so the second
+        // event of a burst is as prompt as it ever was.
+        assert_eq!(next(delay, true), ACTIVITY_POLL_MIN);
     }
 
     #[test]

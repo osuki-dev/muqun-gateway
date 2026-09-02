@@ -738,6 +738,9 @@ struct AppState {
     /// One activity stream per session, shared by everyone who wants it. See
     /// [`subscribe_activity`].
     activity: Arc<Mutex<HashMap<String, tokio::sync::broadcast::Sender<SessionActivity>>>>,
+    /// The last backend liveness ordering, reused briefly so a burst of
+    /// clients asking at once is answered once. See [`SESSION_LIVENESS_TTL`].
+    session_liveness: Arc<Mutex<SessionLivenessCache>>,
 }
 
 /// The scrollback store, or nothing if a previous holder panicked while it was
@@ -1822,6 +1825,7 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         agent_events: Arc::new(Mutex::new(agent_events::AgentEventLog::default())),
         approval_events: tokio::sync::broadcast::channel(APPROVAL_EVENT_CAPACITY).0,
         activity: Arc::new(Mutex::new(HashMap::new())),
+        session_liveness: Arc::new(Mutex::new(SessionLivenessCache::default())),
     };
     spawn_agent_notification_watchers(state.clone());
     spawn_approval_watchers(state.clone());
@@ -4494,7 +4498,35 @@ fn session_order_key(session: &SessionConfig, liveness: SessionLiveness) -> (Ses
 /// Orders, never filters: every configured session stays in the result, even
 /// when nothing is reachable, so a client that reads only the first entry
 /// never sees `undefined` where it used to see a session.
+/// How long a liveness verdict is reused before the backends are probed again.
+///
+/// `GET /api/sessions` and `/health` both order by liveness, every phone asks
+/// on its own schedule, and every ask costs each configured backend two
+/// commands -- which on tmux are two processes. Five devices polling twelve
+/// seconds apart therefore probed roughly twice a second between them, for an
+/// answer that is the same answer.
+///
+/// Short enough that a backend going down is reflected within a second, which
+/// is far inside the window any client would notice; long enough that a burst
+/// of clients asking at once is answered once.
+const SESSION_LIVENESS_TTL: Duration = Duration::from_millis(1000);
+
 async fn ordered_sessions(state: &AppState) -> Vec<&SessionConfig> {
+    if let Some(order) = state
+        .session_liveness
+        .lock()
+        .ok()
+        .and_then(|cache| cache.fresh(Instant::now(), SESSION_LIVENESS_TTL))
+    {
+        // Recorded as indices rather than ids so a config reload cannot make a
+        // stale entry name a session that is no longer there.
+        if order.len() == state.config.sessions.len() {
+            return order
+                .into_iter()
+                .filter_map(|index| state.config.sessions.get(index))
+                .collect();
+        }
+    }
     let liveness =
         futures::future::join_all(state.config.sessions.iter().map(|session| async move {
             let backend = terminal_backend(session);
@@ -4516,10 +4548,33 @@ async fn ordered_sessions(state: &AppState) -> Vec<&SessionConfig> {
         .await;
     let mut order: Vec<usize> = (0..state.config.sessions.len()).collect();
     order.sort_by_key(|&index| session_order_key(&state.config.sessions[index], liveness[index]));
+    if let Ok(mut cache) = state.session_liveness.lock() {
+        cache.record(order.clone(), Instant::now());
+    }
     order
         .into_iter()
         .map(|index| &state.config.sessions[index])
         .collect()
+}
+
+/// The last liveness ordering and when it was taken. See
+/// [`SESSION_LIVENESS_TTL`].
+#[derive(Default)]
+struct SessionLivenessCache {
+    taken: Option<(Instant, Vec<usize>)>,
+}
+
+impl SessionLivenessCache {
+    fn fresh(&self, now: Instant, ttl: Duration) -> Option<Vec<usize>> {
+        self.taken
+            .as_ref()
+            .filter(|(at, _)| now.duration_since(*at) < ttl)
+            .map(|(_, order)| order.clone())
+    }
+
+    fn record(&mut self, order: Vec<usize>, now: Instant) {
+        self.taken = Some((now, order));
+    }
 }
 
 async fn sessions(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
@@ -11926,6 +11981,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_liveness_verdict_is_reused_only_inside_its_window() {
+        // Five phones polling on their own schedules asked every backend the
+        // same question about twice a second between them, and on tmux each
+        // ask is two processes.
+        let mut cache = SessionLivenessCache::default();
+        let t0 = Instant::now();
+        assert_eq!(cache.fresh(t0, SESSION_LIVENESS_TTL), None);
+
+        cache.record(vec![1, 0], t0);
+        assert_eq!(
+            cache.fresh(t0 + Duration::from_millis(500), SESSION_LIVENESS_TTL),
+            Some(vec![1, 0])
+        );
+        // Past the window the backends are asked again, so a session that
+        // actually went down is reflected rather than remembered.
+        assert_eq!(
+            cache.fresh(t0 + SESSION_LIVENESS_TTL, SESSION_LIVENESS_TTL),
+            None
+        );
+    }
+
     /// The defect this hub exists for: `activity_stream()` used to be built
     /// once per subscriber, so N phones watching one tmux session meant N
     /// independent polls -- and a tmux poll costs processes, not just sockets.
@@ -12016,6 +12093,7 @@ mod tests {
             agent_events: Arc::new(Mutex::new(agent_events::AgentEventLog::default())),
             approval_events: tokio::sync::broadcast::channel(APPROVAL_EVENT_CAPACITY).0,
             activity: Arc::new(Mutex::new(HashMap::new())),
+            session_liveness: Arc::new(Mutex::new(SessionLivenessCache::default())),
         }
     }
 
