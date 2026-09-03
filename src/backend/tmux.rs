@@ -1409,12 +1409,13 @@ fn detected_agent(command: Option<&str>) -> Option<String> {
 ///
 /// One `ps` for every unresolved pane at once, and the answer is kept for
 /// [`AGENT_LOOKUP_TTL`] before it is asked again. Both halves matter: the
-/// activity stream lists panes twice a second, and a pane holding a plain
-/// shell -- which is most panes, most of the time -- comes back unmatched on
-/// every one of those. Without the cache that was one `ps -ax` every 500ms for
-/// as long as the gateway ran, and a listing of every process on a busy box is
-/// not free. With it, a shell pane costs one `ps` per five seconds however
-/// often it is listed, and an agent that starts or stops shows up within that.
+/// approval watcher lists this session's panes every 1.5s for as long as the
+/// gateway runs, and a pane holding a plain shell -- which is most panes, most
+/// of the time -- comes back unmatched on every one of those. Without the
+/// cache that was a listing of every process on the box three times a
+/// two-second window, and that listing is not free. With it, a shell pane
+/// costs one `ps` per five seconds however often it is listed, and an agent
+/// that starts or stops shows up within that.
 ///
 /// `tokio`'s `Command`, not `std`'s: this runs on a runtime worker, and the
 /// blocking version held that worker for the whole listing.
@@ -1463,7 +1464,7 @@ fn agent_lookups() -> &'static Mutex<AgentLookupCache> {
 
 /// `pane_pid → (when it was resolved, what was found)`. A `None` is remembered
 /// too: "this pane is a shell" is the common answer and the one worth not
-/// re-deriving twice a second.
+/// re-deriving on every pane listing.
 #[derive(Default)]
 struct AgentLookupCache {
     entries: HashMap<u32, (Instant, Option<String>)>,
@@ -1661,9 +1662,9 @@ mod tests {
 
     #[test]
     fn a_resolved_pane_is_not_asked_about_again_until_the_answer_is_stale() {
-        // The activity stream lists panes twice a second and a shell pane
-        // comes back unmatched every time. Without this, that was one `ps -ax`
-        // every 500ms for the life of the gateway.
+        // The approval watcher lists this session's panes every 1.5s and a
+        // shell pane comes back unmatched every time. Without this, that was a
+        // `ps -ax` every 1.5s for the life of the gateway.
         let mut cache = AgentLookupCache::default();
         let t0 = Instant::now();
         let mut fresh = HashMap::new();

@@ -1173,19 +1173,18 @@ fn upsert_backend_session(
         socket_path: socket_path.unwrap_or_else(|| default_backend_socket(backend)),
         backend,
     });
-    // Neither `GET /api/sessions` nor `gateway_metadata`'s "primary" session
-    // for `/health` and `/api/meta` serve in this stored order any more --
-    // both reorder every request by which backend actually has something
-    // live in it (see `session_order_key` / `ordered_sessions`). What this
-    // stored order still governs: the order `configure_backend list` and
-    // `config.json` present to a human. Stable, so two sessions of the same
-    // backend keep the order they were added in.
-    config
-        .sessions
-        .sort_by_key(|session| match session.backend {
-            BackendKind::Tmux => 0,
-            BackendKind::Herdr => 1,
-        });
+    // Appended, and nothing already in the list is moved.
+    //
+    // This used to re-sort every entry tmux-first on each add, which was
+    // harmless while the stored order decided nothing. It is not harmless any
+    // more: `session_order_key` breaks a liveness tie by config position, so
+    // position 0 is the session the app opens. A reader who ran
+    // `muqun-gateway backend default herdr-1` and then added a tmux backend
+    // had the tmux entry sorted in front of their stated default, and their
+    // phone quietly changed which backend it opened.
+    //
+    // Adding a backend is not a statement about which one should be first.
+    // `backend default` is, and it is the only thing that reorders now.
     Ok(id)
 }
 
@@ -4503,19 +4502,6 @@ fn session_order_key(index: usize, liveness: SessionLiveness) -> (SessionLivenes
     (liveness, index)
 }
 
-/// Every configured session, ordered exactly as `GET /api/sessions` presents
-/// them: liveness first, tmux ahead of herdr as the tiebreaker.
-///
-/// Shared with `gateway_metadata` so the "primary" session it describes for
-/// `/health` and `/api/meta` is always the same one a client that reads
-/// `sessions[0]` from `/api/sessions` actually connects to. Two copies of
-/// this ordering agreeing by construction is the only way to keep them
-/// agreeing at all -- a second, independently-written rank is a second place
-/// for the two endpoints to drift apart.
-///
-/// Orders, never filters: every configured session stays in the result, even
-/// when nothing is reachable, so a client that reads only the first entry
-/// never sees `undefined` where it used to see a session.
 /// How long a liveness verdict is reused before the backends are probed again.
 ///
 /// `GET /api/sessions` and `/health` both order by liveness, every phone asks
@@ -4529,6 +4515,19 @@ fn session_order_key(index: usize, liveness: SessionLiveness) -> (SessionLivenes
 /// of clients asking at once is answered once.
 const SESSION_LIVENESS_TTL: Duration = Duration::from_millis(1000);
 
+/// Every configured session, ordered exactly as `GET /api/sessions` presents
+/// them: liveness first, config position as the tiebreaker.
+///
+/// Shared with `gateway_metadata` so the "primary" session it describes for
+/// `/health` and `/api/meta` is always the same one a client that reads
+/// `sessions[0]` from `/api/sessions` actually connects to. Two copies of
+/// this ordering agreeing by construction is the only way to keep them
+/// agreeing at all -- a second, independently-written rank is a second place
+/// for the two endpoints to drift apart.
+///
+/// Orders, never filters: every configured session stays in the result, even
+/// when nothing is reachable, so a client that reads only the first entry
+/// never sees `undefined` where it used to see a session.
 async fn ordered_sessions(state: &AppState) -> Vec<&SessionConfig> {
     if let Some(order) = state
         .session_liveness
@@ -15383,22 +15382,44 @@ mod tests {
         assert_eq!(serde_json::to_value(tmux).unwrap()["backend"], "tmux");
     }
 
+    /// Config position is what breaks a liveness tie in `session_order_key`,
+    /// so position 0 is the session the app opens. Adding a backend must
+    /// therefore leave the existing order alone: it appends.
     #[test]
-    fn tmux_sessions_sort_ahead_of_herdr_whatever_order_they_were_added() {
+    fn adding_a_backend_appends_and_never_reorders_the_existing_ones() {
         let mut config = test_config("token");
         config.sessions.clear();
         upsert_backend_session(&mut config, BackendKind::Herdr, None, None, None).unwrap();
         upsert_backend_session(&mut config, BackendKind::Tmux, None, None, None).unwrap();
-        // Neither `GET /api/sessions` nor `gateway_metadata`'s "primary"
-        // session for `/health` and `/api/meta` serve in this order any more
-        // -- both reorder by liveness on every request (see
-        // `session_order_key` / `ordered_sessions`). This stable storage
-        // order is what's left to matter: the order `configure_backend list`
-        // prints. Keeping tmux first there too is the harmless,
-        // previously-established default, not a competing ordering rule for
-        // the app.
-        assert_eq!(config.sessions[0].backend, BackendKind::Tmux);
-        assert_eq!(config.sessions[1].backend, BackendKind::Herdr);
+        assert_eq!(config.sessions[0].backend, BackendKind::Herdr);
+        assert_eq!(config.sessions[1].backend, BackendKind::Tmux);
+    }
+
+    /// The bug this closes: `backend default` moves an entry to position 0,
+    /// and the next `backend add` used to sort tmux back in front of it --
+    /// silently changing which backend the reader's phone opens.
+    #[test]
+    fn a_chosen_default_survives_adding_another_backend() {
+        let mut config = test_config("token");
+        config.sessions.clear();
+        let herdr =
+            upsert_backend_session(&mut config, BackendKind::Herdr, None, None, None).unwrap();
+        upsert_backend_session(&mut config, BackendKind::Tmux, None, None, None).unwrap();
+        make_backend_default(&mut config, &herdr).unwrap();
+        assert_eq!(config.sessions[0].id, herdr);
+
+        upsert_backend_session(
+            &mut config,
+            BackendKind::Tmux,
+            Some("tmux-late".into()),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            config.sessions[0].id, herdr,
+            "adding a backend must not overrule `backend default`"
+        );
     }
 
     fn liveness_session(id: &str, backend: BackendKind) -> SessionConfig {
@@ -15411,13 +15432,11 @@ mod tests {
     }
 
     #[test]
-    fn liveness_outranks_backend_kind_in_the_sessions_ordering_key() {
+    fn liveness_outranks_config_position_in_the_sessions_ordering_key() {
         use SessionLiveness::{Empty, HasPanes, Unreachable};
-        // A reachable-and-populated herdr session outranks an empty or dead
-        // tmux one -- liveness is the significant digit, backend kind is only
-        // the tiebreaker.
-        // Index 0 is the preferred entry; even so, being down loses to a
-        // live one further down the list.
+        // Liveness is the significant digit and config position is only the
+        // tiebreaker: index 0 is the reader's preferred entry, and even so,
+        // being down loses to a live session further down the list.
         assert!(session_order_key(1, HasPanes) < session_order_key(0, Empty));
         assert!(session_order_key(1, HasPanes) < session_order_key(0, Unreachable));
         assert!(session_order_key(1, Empty) < session_order_key(0, Unreachable));
@@ -15950,8 +15969,12 @@ mod tests {
                 .unwrap();
         assert_eq!(merged.server_id, "paired-herdr");
         assert_eq!(merged.sessions.len(), 2);
-        assert_eq!(merged.sessions[0].backend, BackendKind::Tmux);
-        assert_eq!(merged.sessions[1].backend, BackendKind::Herdr);
+        // The install being imported *into* keeps position 0, because that is
+        // the session the reader's phone already opens (`session_order_key`
+        // breaks a liveness tie by config position). Importing a plugin's
+        // backend adds one; it does not re-point the app at it.
+        assert_eq!(merged.sessions[0].backend, BackendKind::Herdr);
+        assert_eq!(merged.sessions[1].backend, BackendKind::Tmux);
         assert!(target_config_dir.join(HERDR_PLUGIN_IMPORT_MARKER).exists());
         std::fs::remove_dir_all(root).ok();
     }
