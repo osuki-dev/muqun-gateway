@@ -74,9 +74,14 @@ pub fn managing_gateway_unit(pid: u32) -> Option<SystemdUnit> {
     }
 }
 
-/// Pure parse of `/proc/<pid>/cgroup` contents. Handles both the unified v2
+/// Pure parse of `/proc/<pid>/cgroup` contents.
+///
+/// Only Linux reads a cgroup, so a non-Linux build has no caller for this
+/// outside its own tests -- which do run everywhere, and are the reason the
+/// parse is a separate function at all. Handles both the unified v2
 /// layout (one `0::/...` line) and legacy v1 (one line per controller); the
 /// first line whose leaf is a muqun-gateway `.service` wins.
+#[cfg(any(target_os = "linux", test))]
 fn gateway_unit_from_cgroup(contents: &str) -> Option<SystemdUnit> {
     for line in contents.lines() {
         // "hierarchy:controllers:path" in both v1 and v2; the path itself

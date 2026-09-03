@@ -150,11 +150,22 @@ impl Decision {
                 || text.starts_with(&format!("{word} "))
                 || text.starts_with(&format!("{word},"))
         };
+        // Every way an agent has been seen to say "and stop asking". The
+        // contractions were here from the start; the spelled-out forms were
+        // not, so `Yes, and do not ask again` -- which Claude Code writes
+        // whenever its style setting prefers full words -- was read as a
+        // one-off Allow, and the reader who chose "stop asking" was asked
+        // again.
         let permanent = [
             "don't ask",
             "don’t ask",
             "dont ask",
+            "do not ask",
+            "never ask",
+            "stop asking",
             "always",
+            "remember this",
+            "remember my",
             "this session",
             "all edits",
             "auto-accept",
@@ -675,6 +686,40 @@ mod tests {
             .iter()
             .map(|option| option.label.as_str())
             .collect()
+    }
+
+    /// The wording an agent chooses must not decide whether "stop asking"
+    /// means it. Contractions were covered from the start; the spelled-out
+    /// forms were not, and read as a one-off Allow.
+    #[test]
+    fn every_way_of_saying_stop_asking_is_permanent() {
+        for label in [
+            "Yes, and don't ask again",
+            "Yes, and don’t ask again",
+            "Yes, and dont ask again",
+            "Yes, and do not ask again",
+            "Yes, and never ask again",
+            "Yes, and stop asking",
+            "Yes, always",
+            "Yes, and remember this choice",
+            "Yes, and remember my answer",
+            "Yes, allow all edits this session",
+            "Yes, auto-accept edits",
+        ] {
+            assert_eq!(
+                Decision::classify(label),
+                Decision::AllowAlways,
+                "{label:?} means stop asking"
+            );
+        }
+        // A plain yes is still a one-off, and a no is still a no however it
+        // is worded.
+        assert_eq!(Decision::classify("Yes"), Decision::Allow);
+        assert_eq!(Decision::classify("Yes, proceed"), Decision::Allow);
+        assert_eq!(
+            Decision::classify("No, and do not ask again"),
+            Decision::Deny
+        );
     }
 
     fn decisions(approval: &Approval) -> Vec<&'static str> {

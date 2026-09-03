@@ -60,8 +60,8 @@ use authority::{hash_token, identify_device, DeviceRecord, PairingCodeError, Pen
 
 use crate::i18n::Locale;
 use backend::{
-    AgentStatus as BackendAgentStatus, BackendError, BackendFuture, BackendKind, BackendRegistry,
-    CreateTab as BackendCreateTab, CreateWorkspace as BackendCreateWorkspace,
+    AgentStatus as BackendAgentStatus, BackendActivity, BackendError, BackendFuture, BackendKind,
+    BackendRegistry, CreateTab as BackendCreateTab, CreateWorkspace as BackendCreateWorkspace,
     OutputFormat as BackendOutputFormat, OutputSource as BackendOutputSource, Pane,
     PaneId as BackendPaneId, ReadPane as BackendReadPane, SplitDirection as BackendSplitDirection,
     SplitPane as BackendSplitPane, StartAgent as BackendStartAgent, TabId as BackendTabId,
@@ -157,6 +157,14 @@ const APPROVAL_READ_LINES: u32 = 60;
 /// whatever event streams happen to be open. A slow client falls behind rather
 /// than holding the watcher up.
 const APPROVAL_EVENT_CAPACITY: usize = 64;
+
+/// How many activity events one session's hub buffers for a slow subscriber.
+///
+/// Generous, because a subscriber that falls behind is dropped events, not
+/// backpressure on the producer: a phone on a bad connection would otherwise
+/// miss layout changes during a burst. Small enough that a session nobody is
+/// reading holds nothing worth counting.
+const ACTIVITY_EVENT_CAPACITY: usize = 128;
 const MAX_PUSH_TOKENS: usize = 64;
 const MAX_DEVICES: usize = 32;
 const MAX_DEVICE_NAME_CHARS: usize = 80;
@@ -727,6 +735,12 @@ struct AppState {
     /// `agent_events`.
     agent_events: Arc<Mutex<agent_events::AgentEventLog>>,
     approval_events: tokio::sync::broadcast::Sender<ApprovalEvent>,
+    /// One activity stream per session, shared by everyone who wants it. See
+    /// [`subscribe_activity`].
+    activity: Arc<Mutex<HashMap<String, tokio::sync::broadcast::Sender<SessionActivity>>>>,
+    /// The last backend liveness ordering, reused briefly so a burst of
+    /// clients asking at once is answered once. See [`SESSION_LIVENESS_TTL`].
+    session_liveness: Arc<Mutex<SessionLivenessCache>>,
 }
 
 /// The scrollback store, or nothing if a previous holder panicked while it was
@@ -831,13 +845,18 @@ struct AgentSendBody {
     text: String,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     // Before any subcommand, because every one of them either spawns a backend
     // program or writes down how to. An init system starts this process with an
     // environment that is not the user's -- and so does `ssh host muqun-gateway
     // setup`, and a `cron` line. See `login_env`.
+    //
+    // Before the runtime, deliberately. `adopt` writes to the process
+    // environment, and setting an environment variable while another thread
+    // may be reading one is the data race that made `set_var` unsafe in
+    // edition 2024. Here nothing else exists yet: no worker threads, no tasks,
+    // just this one thread and its arguments.
     //
     // On stderr rather than stdout: for `run` this is the gateway log, which is
     // where it is wanted, and for a command a human is watching it says nothing
@@ -845,6 +864,14 @@ async fn main() -> anyhow::Result<()> {
     for note in login_env::adopt() {
         eprintln!("environment repaired from the login shell -- {note}");
     }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to start the async runtime")?
+        .block_on(dispatch(cli))
+}
+
+async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Setup {
             public_url,
@@ -1146,19 +1173,18 @@ fn upsert_backend_session(
         socket_path: socket_path.unwrap_or_else(|| default_backend_socket(backend)),
         backend,
     });
-    // Neither `GET /api/sessions` nor `gateway_metadata`'s "primary" session
-    // for `/health` and `/api/meta` serve in this stored order any more --
-    // both reorder every request by which backend actually has something
-    // live in it (see `session_order_key` / `ordered_sessions`). What this
-    // stored order still governs: the order `configure_backend list` and
-    // `config.json` present to a human. Stable, so two sessions of the same
-    // backend keep the order they were added in.
-    config
-        .sessions
-        .sort_by_key(|session| match session.backend {
-            BackendKind::Tmux => 0,
-            BackendKind::Herdr => 1,
-        });
+    // Appended, and nothing already in the list is moved.
+    //
+    // This used to re-sort every entry tmux-first on each add, which was
+    // harmless while the stored order decided nothing. It is not harmless any
+    // more: `session_order_key` breaks a liveness tie by config position, so
+    // position 0 is the session the app opens. A reader who ran
+    // `muqun-gateway backend default herdr-1` and then added a tmux backend
+    // had the tmux entry sorted in front of their stated default, and their
+    // phone quietly changed which backend it opened.
+    //
+    // Adding a backend is not a statement about which one should be first.
+    // `backend default` is, and it is the only thing that reorders now.
     Ok(id)
 }
 
@@ -1797,6 +1823,8 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         scrollback: Arc::new(Mutex::new(scrollback::ScrollbackStore::default())),
         agent_events: Arc::new(Mutex::new(agent_events::AgentEventLog::default())),
         approval_events: tokio::sync::broadcast::channel(APPROVAL_EVENT_CAPACITY).0,
+        activity: Arc::new(Mutex::new(HashMap::new())),
+        session_liveness: Arc::new(Mutex::new(SessionLivenessCache::default())),
     };
     spawn_agent_notification_watchers(state.clone());
     spawn_approval_watchers(state.clone());
@@ -2013,6 +2041,17 @@ async fn encrypted_transport(
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    // The proof header is this middleware's own signal to the handlers below:
+    // "this request really arrived sealed, and here is the key it was sealed
+    // with". Only the decryption path may set it. A client could otherwise
+    // send it itself on the cleartext path and be taken for the encrypted
+    // device it is claiming to be -- and, worse, would have put the transport
+    // key on the wire in the clear to do so, which is the one thing the
+    // encrypted transport exists to prevent. Strip it on the way in, always,
+    // before anything else looks at the request.
+    let mut request = request;
+    request.headers_mut().remove(TRANSPORT_PROOF_HEADER);
+
     if request
         .headers()
         .get(TRANSPORT_HEADER)
@@ -4442,22 +4481,42 @@ async fn session_liveness(
 }
 
 /// `GET /api/sessions` ordering key: liveness first (has panes, then
-/// empty-but-reachable, then unreachable), tmux before herdr as the
-/// tiebreaker between otherwise-equal entries.
+/// empty-but-reachable, then unreachable), and the order they appear in the
+/// config as the tiebreaker between otherwise-equal entries.
+///
+/// The tiebreaker used to be the backend kind, tmux always ahead of herdr, and
+/// that made `muqun-gateway backend default` a lie: it moves an entry to the
+/// front of `config.sessions`, which nothing then read. On a machine where
+/// both backends are live -- which is what fixing tmux made ordinary -- the
+/// reader had no way at all to say which one their phone should open, and the
+/// answer moved on them whenever a probe was slow.
+///
+/// Config order is the reader's own statement of preference, so it is what
+/// breaks the tie. Liveness still outranks it: a session that is down does not
+/// get to be first just because somebody once preferred it.
 ///
 /// Pure and independent of any backend, so every bucket -- including "every
 /// configured session is unreachable" -- gets a fast, deterministic unit
 /// test instead of depending on a live tmux or Herdr server.
-fn session_order_key(session: &SessionConfig, liveness: SessionLiveness) -> (SessionLiveness, u8) {
-    let backend_rank = match session.backend {
-        BackendKind::Tmux => 0,
-        BackendKind::Herdr => 1,
-    };
-    (liveness, backend_rank)
+fn session_order_key(index: usize, liveness: SessionLiveness) -> (SessionLiveness, usize) {
+    (liveness, index)
 }
 
+/// How long a liveness verdict is reused before the backends are probed again.
+///
+/// `GET /api/sessions` and `/health` both order by liveness, every phone asks
+/// on its own schedule, and every ask costs each configured backend two
+/// commands -- which on tmux are two processes. Five devices polling twelve
+/// seconds apart therefore probed roughly twice a second between them, for an
+/// answer that is the same answer.
+///
+/// Short enough that a backend going down is reflected within a second, which
+/// is far inside the window any client would notice; long enough that a burst
+/// of clients asking at once is answered once.
+const SESSION_LIVENESS_TTL: Duration = Duration::from_millis(1000);
+
 /// Every configured session, ordered exactly as `GET /api/sessions` presents
-/// them: liveness first, tmux ahead of herdr as the tiebreaker.
+/// them: liveness first, config position as the tiebreaker.
 ///
 /// Shared with `gateway_metadata` so the "primary" session it describes for
 /// `/health` and `/api/meta` is always the same one a client that reads
@@ -4470,6 +4529,21 @@ fn session_order_key(session: &SessionConfig, liveness: SessionLiveness) -> (Ses
 /// when nothing is reachable, so a client that reads only the first entry
 /// never sees `undefined` where it used to see a session.
 async fn ordered_sessions(state: &AppState) -> Vec<&SessionConfig> {
+    if let Some(order) = state
+        .session_liveness
+        .lock()
+        .ok()
+        .and_then(|cache| cache.fresh(Instant::now(), SESSION_LIVENESS_TTL))
+    {
+        // Recorded as indices rather than ids so a config reload cannot make a
+        // stale entry name a session that is no longer there.
+        if order.len() == state.config.sessions.len() {
+            return order
+                .into_iter()
+                .filter_map(|index| state.config.sessions.get(index))
+                .collect();
+        }
+    }
     let liveness =
         futures::future::join_all(state.config.sessions.iter().map(|session| async move {
             let backend = terminal_backend(session);
@@ -4490,11 +4564,34 @@ async fn ordered_sessions(state: &AppState) -> Vec<&SessionConfig> {
         }))
         .await;
     let mut order: Vec<usize> = (0..state.config.sessions.len()).collect();
-    order.sort_by_key(|&index| session_order_key(&state.config.sessions[index], liveness[index]));
+    order.sort_by_key(|&index| session_order_key(index, liveness[index]));
+    if let Ok(mut cache) = state.session_liveness.lock() {
+        cache.record(order.clone(), Instant::now());
+    }
     order
         .into_iter()
         .map(|index| &state.config.sessions[index])
         .collect()
+}
+
+/// The last liveness ordering and when it was taken. See
+/// [`SESSION_LIVENESS_TTL`].
+#[derive(Default)]
+struct SessionLivenessCache {
+    taken: Option<(Instant, Vec<usize>)>,
+}
+
+impl SessionLivenessCache {
+    fn fresh(&self, now: Instant, ttl: Duration) -> Option<Vec<usize>> {
+        self.taken
+            .as_ref()
+            .filter(|(at, _)| now.duration_since(*at) < ttl)
+            .map(|(_, order)| order.clone())
+    }
+
+    fn record(&mut self, order: Vec<usize>, now: Instant) {
+        self.taken = Some((now, order));
+    }
 }
 
 async fn sessions(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
@@ -4898,15 +4995,15 @@ async fn events(
     let assets = state.assets.clone();
     let scrollback_store = state.scrollback.clone();
     let backend = terminal_backend(&session);
-    let mut activity = backend.activity_stream().await.map_err(backend_api_error)?;
+    let mut activity = subscribe_activity(&state, &session);
     let stream = async_stream::stream! {
         let mut output_interval = tokio::time::interval(STREAM_OUTPUT_POLL_INTERVAL);
         output_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_stream_output: Option<String> = None;
         loop {
             tokio::select! {
-                next = activity.next() => match next {
-                    Some(Ok(activity)) => {
+                next = activity.recv() => match next {
+                    Ok(SessionActivity::Event(activity)) => {
                         let data = activity.payload.to_string();
                         let keep = wanted.as_ref().is_none_or(|set| {
                             activity.name.is_empty() || set.contains(&activity.name)
@@ -4950,14 +5047,20 @@ async fn events(
                             }
                         }
                     }
-                    Some(Err(err)) => {
-                        eprintln!("terminal activity stream failed: {err}");
+                    Ok(SessionActivity::Failed) => {
+                        // The hub logs why and rebuilds the stream itself. This
+                        // connection closes, which is the signal the app already
+                        // knows how to act on.
                         if let Some(event) = stream_event(&mut sealer, "gateway.error", "Terminal activity stream unavailable") {
                             yield Ok(event);
                         }
                         break;
                     }
-                    None => break,
+                    // Lagged: this subscriber fell behind a burst of layout
+                    // changes. The next full refresh reconciles it, and closing
+                    // a working connection over a missed redraw would be worse.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 },
                 _ = output_interval.tick(), if stream_opts.pane.is_some() && pane_events => {
                     if let Some(frame) = poll_stream_pane_update(backend.as_ref(), &stream_opts).await {
@@ -5030,17 +5133,36 @@ async fn watch_pane_approvals(state: AppState, session: SessionConfig) {
             store.observe(&session.id, &backend::compat::pane_list(panes.clone()));
         }
 
+        // Every agent pane's screen in one request. On a socket backend this
+        // is the same handful of reads it always was; on tmux it is one
+        // process instead of one per pane, and this poll runs every 1.5
+        // seconds for as long as the gateway is up.
+        let agent_panes: Vec<(BackendPaneId, String)> = panes
+            .iter()
+            .filter_map(|pane| {
+                let agent = pane.agent.as_deref().filter(|agent| !agent.is_empty())?;
+                Some((pane.id.clone(), agent.to_owned()))
+            })
+            .collect();
+        let ids: Vec<BackendPaneId> = agent_panes.iter().map(|(id, _)| id.clone()).collect();
+        let screens: HashMap<String, String> = terminal_backend(&session)
+            .read_visible_batch(&ids, APPROVAL_READ_LINES)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(id, text)| (id.as_str().to_owned(), text))
+            .collect();
+
         let mut seen: Vec<String> = Vec::new();
-        for pane in &panes {
-            let pane_id = pane.id.as_str();
-            let agent = pane.agent.as_deref().filter(|agent| !agent.is_empty());
-            let Some(agent) = agent else { continue };
+        for (pane_id, agent) in &agent_panes {
+            let pane_id = pane_id.as_str();
+            let agent = agent.as_str();
             seen.push(pane_id.to_owned());
 
-            let Ok(text) = read_pane_visible_text(&session, pane_id).await else {
+            let Some(text) = screens.get(pane_id) else {
                 continue;
             };
-            match approvals::detect(&text) {
+            match approvals::detect(text) {
                 Some(approval) => {
                     if pending.get(pane_id) == Some(&approval.fingerprint) {
                         continue;
@@ -5179,6 +5301,130 @@ fn approval_notification(
     }
 }
 
+/// What one session's activity hub broadcasts.
+///
+/// `Arc` because every subscriber gets a copy and the payload is a whole JSON
+/// document; the point of the hub is that the work is done once.
+#[derive(Clone, Debug)]
+enum SessionActivity {
+    Event(Arc<BackendActivity>),
+    /// The underlying stream failed. Subscribers close their connection and
+    /// the client reconnects; the hub rebuilds the stream on its own.
+    Failed,
+}
+
+/// How long the hub waits before rebuilding a stream that failed.
+const ACTIVITY_REBUILD_DELAY: Duration = Duration::from_secs(2);
+
+/// Subscribe to a session's activity, starting the one stream that feeds it if
+/// nobody had asked yet.
+///
+/// This exists because `activity_stream()` used to be called once per
+/// subscriber: once by the notification watcher, and once more by every SSE
+/// connection. For Herdr that is one socket subscription per phone. For tmux --
+/// whose adapter polls, by a deliberate architectural choice recorded in
+/// `docs/architecture.md` -- it was a whole independent poll per phone, and the
+/// cost is processes: three `tmux` invocations every 500ms, times the number of
+/// people looking. Five devices watching one session spawned thirty-six
+/// processes a second, forever.
+///
+/// One stream per session, fanned out, is what "publish changes" was always
+/// meant to be: the conversion happens once and the result is shared. The
+/// gateway already does exactly this for approvals; activity was the odd one
+/// out.
+fn subscribe_activity(
+    state: &AppState,
+    session: &SessionConfig,
+) -> tokio::sync::broadcast::Receiver<SessionActivity> {
+    let mut hubs = match state.activity.lock() {
+        Ok(hubs) => hubs,
+        // A poisoned map must not take the stream down with it: fall back to
+        // a private hub for this one subscriber, which is the old behaviour.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(sender) = hubs.get(&session.id) {
+        return sender.subscribe();
+    }
+    let (sender, receiver) = tokio::sync::broadcast::channel(ACTIVITY_EVENT_CAPACITY);
+    hubs.insert(session.id.clone(), sender.clone());
+    tokio::spawn(run_activity_hub(state.clone(), session.clone(), sender));
+    receiver
+}
+
+/// Feed one session's hub for as long as anyone is listening.
+///
+/// Ends when the last subscriber goes away, and is started again by the next
+/// `subscribe_activity`. That is what keeps a gateway nobody is talking to from
+/// polling tmux forever.
+async fn run_activity_hub(
+    state: AppState,
+    session: SessionConfig,
+    sender: tokio::sync::broadcast::Sender<SessionActivity>,
+) {
+    loop {
+        match terminal_backend(&session).activity_stream().await {
+            Ok(mut stream) => {
+                while let Some(item) = stream.next().await {
+                    match item {
+                        Ok(activity) => {
+                            // `send` fails only when nobody is listening, which
+                            // is the condition this loop ends on anyway.
+                            let _ = sender.send(SessionActivity::Event(Arc::new(activity)));
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "terminal activity failed for session {} (backend={}, endpoint={}): {err}",
+                                session.id,
+                                session.backend.as_str(),
+                                backend_endpoint(&session),
+                            );
+                            let _ = sender.send(SessionActivity::Failed);
+                            break;
+                        }
+                    }
+                    if sender.receiver_count() == 0 {
+                        break;
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "terminal activity stream could not be opened for session {} (backend={}): {err}",
+                    session.id,
+                    session.backend.as_str(),
+                );
+                let _ = sender.send(SessionActivity::Failed);
+            }
+        }
+        if retire_activity_hub(&state, &session.id) {
+            return;
+        }
+        tokio::time::sleep(ACTIVITY_REBUILD_DELAY).await;
+    }
+}
+
+/// Drop a session's hub if nothing is listening any more, under the same lock
+/// `subscribe_activity` takes.
+///
+/// The lock is the whole point: checking the count and removing the entry have
+/// to be one step, or a subscriber arriving in between gets a receiver on a
+/// hub whose producer has already decided to leave.
+fn retire_activity_hub(state: &AppState, session_id: &str) -> bool {
+    let mut hubs = match state.activity.lock() {
+        Ok(hubs) => hubs,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match hubs.get(session_id) {
+        Some(sender) if sender.receiver_count() == 0 => {
+            hubs.remove(session_id);
+            true
+        }
+        // Someone else replaced the entry; that hub owns itself now.
+        None => true,
+        _ => false,
+    }
+}
+
 fn spawn_agent_notification_watchers(state: AppState) {
     for session in state.config.sessions.clone() {
         let state = state.clone();
@@ -5195,17 +5441,15 @@ async fn watch_agent_notifications(state: AppState, session: SessionConfig) {
     // write the same line to the log forty-three thousand times a day. That is
     // not a log, it is a denial of one: the lines that matter are the ones
     // around it, and they were unreadable. Only a *change* is news here.
-    let mut last_reported: Option<String> = None;
+    // One subscription to the session's shared hub, held for the life of the
+    // process. It used to build a stream of its own, which on tmux meant this
+    // watcher polled independently of every phone that was also polling.
+    let mut activity = subscribe_activity(&state, &session);
+    let mut poll = tokio::time::interval(Duration::from_secs(2));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
-        let backend = terminal_backend(&session);
-        let Ok(mut activity) = backend.activity_stream().await else {
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            continue;
-        };
-        let mut poll = tokio::time::interval(Duration::from_secs(2));
-        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
+        {
             tokio::select! {
                 _ = poll.tick() => {
                     for mut notification in poll_agent_notifications(&state, &session, &mut statuses).await {
@@ -5213,8 +5457,8 @@ async fn watch_agent_notifications(state: AppState, session: SessionConfig) {
                         deliver_agent_notification(&state, notification).await;
                     }
                 }
-                next = activity.next() => match next {
-                    Some(Ok(event)) if event.name == "pane_agent_status_changed" => {
+                next = activity.recv() => match next {
+                    Ok(SessionActivity::Event(event)) if event.name == "pane_agent_status_changed" => {
                         if let Some(mut notification) = absorb_agent_status_event(
                             &state,
                             &session.id,
@@ -5225,25 +5469,20 @@ async fn watch_agent_notifications(state: AppState, session: SessionConfig) {
                             deliver_agent_notification(&state, notification).await;
                         }
                     }
-                    Some(Ok(_)) => {}
-                    Some(Err(err)) => {
-                        let report = format!(
-                            "terminal activity failed for session {} (backend={}, endpoint={}): {err}",
-                            session.id,
-                            session.backend.as_str(),
-                            backend_endpoint(&session),
-                        );
-                        if last_reported.as_deref() != Some(report.as_str()) {
-                            eprintln!("{report}");
-                            last_reported = Some(report);
-                        }
-                        break;
+                    // The hub logs the failure and rebuilds the stream. This
+                    // watcher keeps its two-second poll going meanwhile, which
+                    // is what actually drives notifications on a backend whose
+                    // activity carries no agent status at all.
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    // The hub retired while this watcher was the last holder.
+                    // Take a new subscription, which starts it again.
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        activity = subscribe_activity(&state, &session);
                     }
-                    None => break,
                 }
             }
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
 
@@ -11759,6 +11998,146 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_liveness_verdict_is_reused_only_inside_its_window() {
+        // Five phones polling on their own schedules asked every backend the
+        // same question about twice a second between them, and on tmux each
+        // ask is two processes.
+        let mut cache = SessionLivenessCache::default();
+        let t0 = Instant::now();
+        assert_eq!(cache.fresh(t0, SESSION_LIVENESS_TTL), None);
+
+        cache.record(vec![1, 0], t0);
+        assert_eq!(
+            cache.fresh(t0 + Duration::from_millis(500), SESSION_LIVENESS_TTL),
+            Some(vec![1, 0])
+        );
+        // Past the window the backends are asked again, so a session that
+        // actually went down is reflected rather than remembered.
+        assert_eq!(
+            cache.fresh(t0 + SESSION_LIVENESS_TTL, SESSION_LIVENESS_TTL),
+            None
+        );
+    }
+
+    /// The defect this hub exists for: `activity_stream()` used to be built
+    /// once per subscriber, so N phones watching one tmux session meant N
+    /// independent polls -- and a tmux poll costs processes, not just sockets.
+    #[tokio::test]
+    async fn many_subscribers_share_one_activity_stream() {
+        let state = test_state("admin", Vec::new());
+        let session = state.config.sessions[0].clone();
+
+        let a = subscribe_activity(&state, &session);
+        let b = subscribe_activity(&state, &session);
+        let c = subscribe_activity(&state, &session);
+
+        let hubs = state.activity.lock().unwrap();
+        assert_eq!(hubs.len(), 1, "three subscribers must not make three hubs");
+        assert_eq!(hubs.get(&session.id).unwrap().receiver_count(), 3);
+        drop(hubs);
+        drop((a, b, c));
+    }
+
+    /// The proof header is the encrypted-transport middleware talking to the
+    /// handlers below it, and nothing else may put words in its mouth.
+    ///
+    /// Before this was stripped on the way in, a client could send
+    /// `x-muqun-internal-device-proof` itself over cleartext and be taken for
+    /// the encrypted device whose transport key it named -- having just put
+    /// that key on the wire in the clear to do it, which is precisely what the
+    /// encrypted transport exists to prevent.
+    #[tokio::test]
+    async fn a_client_cannot_forge_the_transport_proof_header() {
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        let state = test_state("admin", Vec::new());
+        let app = Router::new()
+            .route(
+                "/probe",
+                get(|headers: axum::http::HeaderMap| async move {
+                    // What the handlers below the middleware would see.
+                    headers
+                        .get(TRANSPORT_PROOF_HEADER)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("absent")
+                        .to_string()
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                encrypted_transport,
+            ))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/probe")
+                    .header(TRANSPORT_PROOF_HEADER, "a-transport-key-i-do-not-own")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "absent",
+            "a client-supplied device proof must never reach a handler"
+        );
+    }
+
+    /// Two sessions are two streams; the hub is per session, not global.
+    #[tokio::test]
+    async fn each_session_gets_its_own_hub() {
+        let mut state = test_state("admin", Vec::new());
+        let mut second = state.config.sessions[0].clone();
+        second.id = "second".into();
+        state.config.sessions.push(second.clone());
+        let first = state.config.sessions[0].clone();
+
+        let a = subscribe_activity(&state, &first);
+        let b = subscribe_activity(&state, &second);
+        assert_eq!(state.activity.lock().unwrap().len(), 2);
+        drop((a, b));
+    }
+
+    /// And the other half of sharing: when the last subscriber goes, the hub
+    /// is retired, so a gateway nobody is talking to stops polling.
+    #[tokio::test]
+    async fn the_hub_retires_when_the_last_subscriber_leaves() {
+        let state = test_state("admin", Vec::new());
+        let session = state.config.sessions[0].clone();
+
+        let subscriber = subscribe_activity(&state, &session);
+        assert_eq!(state.activity.lock().unwrap().len(), 1);
+        drop(subscriber);
+
+        // `retire_activity_hub` is what the producer calls between streams;
+        // with nothing listening it removes the entry and reports that it
+        // should stop.
+        assert!(retire_activity_hub(&state, &session.id));
+        assert!(state.activity.lock().unwrap().is_empty());
+    }
+
+    /// A subscriber arriving while the producer is deciding to leave must not
+    /// be handed a receiver on a hub that then exits.
+    #[tokio::test]
+    async fn a_hub_with_a_live_subscriber_is_not_retired() {
+        let state = test_state("admin", Vec::new());
+        let session = state.config.sessions[0].clone();
+        let subscriber = subscribe_activity(&state, &session);
+
+        assert!(!retire_activity_hub(&state, &session.id));
+        assert_eq!(state.activity.lock().unwrap().len(), 1);
+        drop(subscriber);
+    }
+
     fn test_device(id: &str, token: &str) -> DeviceRecord {
         DeviceRecord {
             id: id.into(),
@@ -11783,6 +12162,8 @@ mod tests {
             scrollback: Arc::new(Mutex::new(scrollback::ScrollbackStore::default())),
             agent_events: Arc::new(Mutex::new(agent_events::AgentEventLog::default())),
             approval_events: tokio::sync::broadcast::channel(APPROVAL_EVENT_CAPACITY).0,
+            activity: Arc::new(Mutex::new(HashMap::new())),
+            session_liveness: Arc::new(Mutex::new(SessionLivenessCache::default())),
         }
     }
 
@@ -15001,22 +15382,44 @@ mod tests {
         assert_eq!(serde_json::to_value(tmux).unwrap()["backend"], "tmux");
     }
 
+    /// Config position is what breaks a liveness tie in `session_order_key`,
+    /// so position 0 is the session the app opens. Adding a backend must
+    /// therefore leave the existing order alone: it appends.
     #[test]
-    fn tmux_sessions_sort_ahead_of_herdr_whatever_order_they_were_added() {
+    fn adding_a_backend_appends_and_never_reorders_the_existing_ones() {
         let mut config = test_config("token");
         config.sessions.clear();
         upsert_backend_session(&mut config, BackendKind::Herdr, None, None, None).unwrap();
         upsert_backend_session(&mut config, BackendKind::Tmux, None, None, None).unwrap();
-        // Neither `GET /api/sessions` nor `gateway_metadata`'s "primary"
-        // session for `/health` and `/api/meta` serve in this order any more
-        // -- both reorder by liveness on every request (see
-        // `session_order_key` / `ordered_sessions`). This stable storage
-        // order is what's left to matter: the order `configure_backend list`
-        // prints. Keeping tmux first there too is the harmless,
-        // previously-established default, not a competing ordering rule for
-        // the app.
-        assert_eq!(config.sessions[0].backend, BackendKind::Tmux);
-        assert_eq!(config.sessions[1].backend, BackendKind::Herdr);
+        assert_eq!(config.sessions[0].backend, BackendKind::Herdr);
+        assert_eq!(config.sessions[1].backend, BackendKind::Tmux);
+    }
+
+    /// The bug this closes: `backend default` moves an entry to position 0,
+    /// and the next `backend add` used to sort tmux back in front of it --
+    /// silently changing which backend the reader's phone opens.
+    #[test]
+    fn a_chosen_default_survives_adding_another_backend() {
+        let mut config = test_config("token");
+        config.sessions.clear();
+        let herdr =
+            upsert_backend_session(&mut config, BackendKind::Herdr, None, None, None).unwrap();
+        upsert_backend_session(&mut config, BackendKind::Tmux, None, None, None).unwrap();
+        make_backend_default(&mut config, &herdr).unwrap();
+        assert_eq!(config.sessions[0].id, herdr);
+
+        upsert_backend_session(
+            &mut config,
+            BackendKind::Tmux,
+            Some("tmux-late".into()),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            config.sessions[0].id, herdr,
+            "adding a backend must not overrule `backend default`"
+        );
     }
 
     fn liveness_session(id: &str, backend: BackendKind) -> SessionConfig {
@@ -15029,37 +15432,30 @@ mod tests {
     }
 
     #[test]
-    fn liveness_outranks_backend_kind_in_the_sessions_ordering_key() {
+    fn liveness_outranks_config_position_in_the_sessions_ordering_key() {
         use SessionLiveness::{Empty, HasPanes, Unreachable};
-        // A reachable-and-populated herdr session outranks an empty or dead
-        // tmux one -- liveness is the significant digit, backend kind is only
-        // the tiebreaker.
-        let empty_tmux = liveness_session("t", BackendKind::Tmux);
-        let herdr_with_panes = liveness_session("h", BackendKind::Herdr);
-        assert!(
-            session_order_key(&herdr_with_panes, HasPanes) < session_order_key(&empty_tmux, Empty)
-        );
-
-        let dead_tmux = liveness_session("t", BackendKind::Tmux);
-        assert!(
-            session_order_key(&herdr_with_panes, HasPanes)
-                < session_order_key(&dead_tmux, Unreachable)
-        );
-        assert!(session_order_key(&empty_tmux, Empty) < session_order_key(&dead_tmux, Unreachable));
+        // Liveness is the significant digit and config position is only the
+        // tiebreaker: index 0 is the reader's preferred entry, and even so,
+        // being down loses to a live session further down the list.
+        assert!(session_order_key(1, HasPanes) < session_order_key(0, Empty));
+        assert!(session_order_key(1, HasPanes) < session_order_key(0, Unreachable));
+        assert!(session_order_key(1, Empty) < session_order_key(0, Unreachable));
     }
 
+    /// The behaviour `muqun-gateway backend default` promises, and did not
+    /// have: whichever entry the reader put first wins a tie, whatever kind of
+    /// backend it is. Replaces a test that asserted tmux always won, which is
+    /// what made the command a no-op.
     #[test]
-    fn tmux_breaks_ties_ahead_of_herdr_at_every_liveness_level() {
+    fn the_configured_order_breaks_ties_at_every_liveness_level() {
         for liveness in [
             SessionLiveness::HasPanes,
             SessionLiveness::Empty,
             SessionLiveness::Unreachable,
         ] {
-            let tmux = liveness_session("t", BackendKind::Tmux);
-            let herdr = liveness_session("h", BackendKind::Herdr);
             assert!(
-                session_order_key(&tmux, liveness) < session_order_key(&herdr, liveness),
-                "tmux should sort ahead of herdr when both are {liveness:?}"
+                session_order_key(0, liveness) < session_order_key(1, liveness),
+                "the first configured session should win a tie when both are {liveness:?}"
             );
         }
     }
@@ -15082,14 +15478,17 @@ mod tests {
             SessionLiveness::Empty,
         ];
         let mut order: Vec<usize> = (0..sessions.len()).collect();
-        order.sort_by_key(|&index| session_order_key(&sessions[index], liveness[index]));
+        order.sort_by_key(|&index| session_order_key(index, liveness[index]));
         let ids: Vec<&str> = order
             .iter()
             .map(|&index| sessions[index].id.as_str())
             .collect();
+        // Liveness first; among the two equally-empty entries the one
+        // configured earlier wins, which is the reader's stated preference
+        // rather than a rule about backend kinds.
         assert_eq!(
             ids,
-            vec!["herdr-live", "tmux-empty", "herdr-empty", "tmux-dead"]
+            vec!["herdr-live", "herdr-empty", "tmux-empty", "tmux-dead"]
         );
         assert_eq!(
             order.len(),
@@ -15108,17 +15507,15 @@ mod tests {
             liveness_session("c", BackendKind::Herdr),
         ];
         let mut order: Vec<usize> = (0..sessions.len()).collect();
-        order.sort_by_key(|&index| {
-            session_order_key(&sessions[index], SessionLiveness::Unreachable)
-        });
+        order.sort_by_key(|&index| session_order_key(index, SessionLiveness::Unreachable));
         assert_eq!(order.len(), 3);
-        // Tmux still wins the tiebreak; the two herdr entries keep the
-        // relative order they were configured in (stable sort).
+        // All equally unreachable, so the configured order stands -- ordering
+        // must never turn into filtering, and it must not reshuffle either.
         let ids: Vec<&str> = order
             .iter()
             .map(|&index| sessions[index].id.as_str())
             .collect();
-        assert_eq!(ids, vec!["b", "a", "c"]);
+        assert_eq!(ids, vec!["a", "b", "c"]);
     }
 
     #[tokio::test]
@@ -15572,8 +15969,12 @@ mod tests {
                 .unwrap();
         assert_eq!(merged.server_id, "paired-herdr");
         assert_eq!(merged.sessions.len(), 2);
-        assert_eq!(merged.sessions[0].backend, BackendKind::Tmux);
-        assert_eq!(merged.sessions[1].backend, BackendKind::Herdr);
+        // The install being imported *into* keeps position 0, because that is
+        // the session the reader's phone already opens (`session_order_key`
+        // breaks a liveness tie by config position). Importing a plugin's
+        // backend adds one; it does not re-point the app at it.
+        assert_eq!(merged.sessions[0].backend, BackendKind::Herdr);
+        assert_eq!(merged.sessions[1].backend, BackendKind::Tmux);
         assert!(target_config_dir.join(HERDR_PLUGIN_IMPORT_MARKER).exists());
         std::fs::remove_dir_all(root).ok();
     }
@@ -15825,6 +16226,7 @@ mod tests {
             backend: BackendKind::Tmux,
         });
         let configured = state.config.sessions.len();
+        let preferred = state.config.sessions[0].id.clone();
 
         let response = sessions(State(state), bearer_headers("token"))
             .await
@@ -15836,10 +16238,11 @@ mod tests {
         // `probe_reachable` catching the same "no such file or directory"
         // that `list_output` would otherwise fold into an empty topology
         // (see `probe_reachable_tells_no_server_apart_from_list_panes_reporting_empty`
-        // in `backend/tmux.rs`). So this genuinely exercises the tmux/herdr
-        // tiebreak between two unreachable entries, not an accident of tmux
-        // misreporting as merely empty.
-        assert_eq!(ids[0], "tmux-also-dead");
+        // in `backend/tmux.rs`). So this genuinely exercises the tiebreak
+        // between two unreachable entries, not an accident of tmux
+        // misreporting as merely empty -- and the tiebreak is now the order
+        // the reader configured, so the first entry stays first.
+        assert_eq!(ids[0], preferred);
     }
 
     /// The regression `sessions_endpoint_keeps_every_session_when_nothing_is_reachable`

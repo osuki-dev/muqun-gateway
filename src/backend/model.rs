@@ -406,6 +406,42 @@ pub trait TerminalBackend: Send + Sync {
     fn probe_reachable(&self) -> BackendFuture<'_, bool> {
         Box::pin(async { Ok(true) })
     }
+
+    /// The visible text of several panes at once.
+    ///
+    /// One caller needs this and it is a hot one: the approvals watcher reads
+    /// every agent pane in the session every 1.5 seconds, looking for a
+    /// permission menu. On a socket backend that is a handful of messages and
+    /// the default below -- read them one at a time -- is exactly right. On
+    /// tmux each read is a process, so the adapter overrides this to ask for
+    /// all of them in a single invocation.
+    ///
+    /// Panes that cannot be read are dropped rather than failing the batch: a
+    /// pane closing between the listing and the read is ordinary, and it must
+    /// not cost the other panes their turn.
+    fn read_visible_batch<'a>(
+        &'a self,
+        panes: &'a [PaneId],
+        lines: u32,
+    ) -> BackendFuture<'a, Vec<(PaneId, String)>> {
+        Box::pin(async move {
+            let mut read = Vec::with_capacity(panes.len());
+            for pane in panes {
+                let request = ReadPane {
+                    pane_id: pane.clone(),
+                    source: OutputSource::Visible,
+                    format: OutputFormat::Text,
+                    lines,
+                    start: None,
+                    end: None,
+                };
+                if let Ok(output) = self.read_pane(&request).await {
+                    read.push((pane.clone(), output.text));
+                }
+            }
+            Ok(read)
+        })
+    }
 }
 
 #[cfg(test)]

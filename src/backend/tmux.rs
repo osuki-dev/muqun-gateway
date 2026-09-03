@@ -3,6 +3,8 @@ use std::ffi::OsStr;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -13,6 +15,47 @@ use super::{
     PaneId, PaneOutput, PaneRange, ReadPane, SplitDirection, SplitPane, StartAgent, StartedAgent,
     Tab, TabId, TerminalBackend, Workspace, WorkspaceId,
 };
+
+/// How often the topology poll runs when something is happening, and the
+/// ceiling it backs off to when nothing is.
+///
+/// The floor is what the poll always ran at. The ceiling is a judgement about
+/// what a layout change is worth: pane *content* reaches a client through its
+/// own output poll, so what waits on this is structural -- a pane split, a
+/// window renamed, a session created. Two seconds to notice one of those on a
+/// session that has been still is not a delay anybody can feel, and it is the
+/// difference between two invocations a second and half of one.
+const ACTIVITY_POLL_MIN: Duration = Duration::from_millis(500);
+const ACTIVITY_POLL_MAX: Duration = Duration::from_secs(2);
+
+/// Record separator, marking where one pane's screen ends and the next
+/// begins inside a batched `capture-pane`. Distinct from
+/// [`FIELD_SEPARATOR`], which separates fields inside one row.
+const BATCH_SEPARATOR: char = '\u{1e}';
+
+/// The one-at-a-time reading the port defaults to, reachable from the tmux
+/// override so it has somewhere to fall back to.
+async fn default_read_visible_batch(
+    backend: &TmuxBackend,
+    panes: &[PaneId],
+    lines: u32,
+) -> Result<Vec<(PaneId, String)>, BackendError> {
+    let mut read = Vec::with_capacity(panes.len());
+    for pane in panes {
+        let request = ReadPane {
+            pane_id: pane.clone(),
+            source: OutputSource::Visible,
+            format: OutputFormat::Text,
+            lines,
+            start: None,
+            end: None,
+        };
+        if let Ok(output) = backend.read_pane(&request).await {
+            read.push((pane.clone(), output.text));
+        }
+    }
+    Ok(read)
+}
 
 /// ASCII unit separator: the one byte a pane title, a window name or a working
 /// directory will not contain, which is why the `-F` formats are joined with it
@@ -299,6 +342,65 @@ impl TmuxBackend {
         let height = parse_u32(parts.next().unwrap_or_default(), "pane")?;
         Ok((history, height))
     }
+
+    /// A string that changes when the topology does, in one tmux invocation.
+    ///
+    /// The activity poll only ever asks "did anything move?", so it does not
+    /// need entities and must not pay for them. It used to call
+    /// `list_workspaces` + `list_tabs` + `list_panes`, which is three processes
+    /// every tick -- and `list_panes` additionally resolves each pane's agent,
+    /// so a poll that wanted a yes/no answer was walking the process table.
+    ///
+    /// tmux runs several commands per invocation when they are separated by a
+    /// literal `;` argument, so all three listings come back down the one
+    /// connection tmux was going to open anyway. The raw output *is* the
+    /// fingerprint: parsing it only to format it again would be work done to
+    /// throw away.
+    ///
+    /// The fields are chosen to cover what a client would redraw for -- ids,
+    /// names, titles, the active flags, sizes, and the foreground command, so
+    /// that a program starting in a pane counts as a change.
+    async fn topology_fingerprint(&self) -> Result<String, BackendError> {
+        let sessions = Self::format(&[
+            "S",
+            "#{session_id}",
+            "#{session_name}",
+            "#{session_windows}",
+        ]);
+        let windows = Self::format(&[
+            "W",
+            "#{window_id}",
+            "#{window_name}",
+            "#{window_active}",
+            "#{window_panes}",
+        ]);
+        let panes = Self::format(&[
+            "P",
+            "#{pane_id}",
+            "#{pane_title}",
+            "#{pane_current_path}",
+            "#{pane_active}",
+            "#{pane_width}",
+            "#{pane_height}",
+            "#{pane_current_command}",
+        ]);
+        self.list_output([
+            "list-sessions",
+            "-F",
+            &sessions,
+            ";",
+            "list-windows",
+            "-a",
+            "-F",
+            &windows,
+            ";",
+            "list-panes",
+            "-a",
+            "-F",
+            &panes,
+        ])
+        .await
+    }
 }
 
 impl TerminalBackend for TmuxBackend {
@@ -324,20 +426,28 @@ impl TerminalBackend for TmuxBackend {
         let backend = self.clone();
         Box::pin(async move {
             let activity = async_stream::stream! {
-                let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
-                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let mut delay = ACTIVITY_POLL_MIN;
                 let mut previous = None;
                 loop {
-                    interval.tick().await;
-                    match (
-                        backend.list_workspaces().await,
-                        backend.list_tabs().await,
-                        backend.list_panes().await,
-                    ) {
-                        (Ok(workspaces), Ok(tabs), Ok(panes)) => {
-                            let fingerprint = format!("{workspaces:?}{tabs:?}{panes:?}");
+                    tokio::time::sleep(delay).await;
+                    match backend.topology_fingerprint().await {
+                        Ok(fingerprint) => {
                             let changed = previous.as_ref().is_some_and(|last| last != &fingerprint);
                             previous = Some(fingerprint);
+                            // A terminal's layout is still almost all of the
+                            // time. Polling it at a fixed 500ms means the
+                            // overwhelming majority of invocations exist to
+                            // report that nothing happened -- so the interval
+                            // backs off while that stays true and snaps back
+                            // the instant it does not. Someone splitting a
+                            // pane gets the same responsiveness they always
+                            // had from the second event onward, and an idle
+                            // machine stops paying for their absence.
+                            delay = if changed {
+                                ACTIVITY_POLL_MIN
+                            } else {
+                                (delay * 2).min(ACTIVITY_POLL_MAX)
+                            };
                             if changed {
                                 yield Ok(BackendActivity {
                                     name: "layout_updated".into(),
@@ -349,16 +459,14 @@ impl TerminalBackend for TmuxBackend {
                             }
                         }
                         // The failure that happened, not a word for all of
-                        // them. Collapsing three different errors into
-                        // `Unavailable` is how "terminal backend is
-                        // unavailable" became the only thing the log could say
-                        // about a tmux that was running perfectly well, and it
-                        // cost days: the message named the one cause -- no tmux
-                        // -- that the reader could see with their own eyes was
-                        // not true, so it read as a lie rather than a clue.
-                        (Err(failure), _, _) | (_, Err(failure), _) | (_, _, Err(failure)) => {
-                            yield Err(failure)
-                        }
+                        // them. Collapsing different errors into `Unavailable`
+                        // is how "terminal backend is unavailable" became the
+                        // only thing the log could say about a tmux that was
+                        // running perfectly well, and it cost days: the message
+                        // named the one cause -- no tmux -- that the reader
+                        // could see with their own eyes was not true, so it
+                        // read as a lie rather than a clue.
+                        Err(failure) => yield Err(failure),
                     }
                 }
             };
@@ -463,8 +571,8 @@ impl TerminalBackend for TmuxBackend {
                 panes.push(pane);
             }
             if !unresolved.is_empty() {
-                let found =
-                    agents_under(&unresolved.iter().map(|(_, pid)| *pid).collect::<Vec<_>>());
+                let pids = unresolved.iter().map(|(_, pid)| *pid).collect::<Vec<_>>();
+                let found = agents_under(&pids).await;
                 for (index, pid) in unresolved {
                     if let Some(agent) = found.get(&pid) {
                         panes[index].agent = Some(agent.clone());
@@ -580,6 +688,70 @@ impl TerminalBackend for TmuxBackend {
                 text,
                 range,
             })
+        })
+    }
+
+    /// Every pane's visible text in one tmux invocation.
+    ///
+    /// The approvals watcher reads each agent pane every 1.5 seconds, and on
+    /// this adapter each read was its own process. Measured on a machine with
+    /// three agent panes, `capture-pane` was the single largest source of
+    /// process churn in the gateway -- larger than the activity poll it sits
+    /// beside.
+    ///
+    /// tmux runs several commands per invocation when a literal `;` separates
+    /// them, so the reads are chained and a `display-message` between each one
+    /// writes a record separator into the same stdout. The chunks come back in
+    /// the order they were asked for, which is how they are matched up: the
+    /// obvious alternative -- printing the pane id in the marker -- does not
+    /// survive tmux's format parser, which eats the leading `%`.
+    ///
+    /// Anything unexpected falls back to reading them one at a time. A chained
+    /// invocation fails as a whole if any one command fails, and a pane that
+    /// closed mid-tick must not cost the rest of the session its reading.
+    fn read_visible_batch<'a>(
+        &'a self,
+        panes: &'a [PaneId],
+        lines: u32,
+    ) -> BackendFuture<'a, Vec<(PaneId, String)>> {
+        Box::pin(async move {
+            if panes.len() < 2 {
+                return default_read_visible_batch(self, panes, lines).await;
+            }
+            let mut args: Vec<String> = Vec::with_capacity(panes.len() * 8);
+            for (index, pane) in panes.iter().enumerate() {
+                validate_tmux_id(pane.as_str(), '%', "pane")?;
+                if index > 0 {
+                    args.push(";".to_owned());
+                }
+                args.push("display-message".to_owned());
+                args.push("-p".to_owned());
+                args.push(BATCH_SEPARATOR.to_string());
+                args.push(";".to_owned());
+                args.push("capture-pane".to_owned());
+                args.push("-p".to_owned());
+                args.push("-t".to_owned());
+                args.push(pane.as_str().to_owned());
+            }
+            let Ok(output) = self.output(&args).await else {
+                return default_read_visible_batch(self, panes, lines).await;
+            };
+            let chunks: Vec<&str> = output.split(BATCH_SEPARATOR).skip(1).collect();
+            if chunks.len() != panes.len() {
+                return default_read_visible_batch(self, panes, lines).await;
+            }
+            Ok(panes
+                .iter()
+                .zip(chunks)
+                .map(|(pane, chunk)| {
+                    // The marker's own newline leads every chunk; the rest is
+                    // put through exactly what the single-pane path does, so
+                    // the two produce the same text for the same screen.
+                    let body = chunk.strip_prefix('\n').unwrap_or(chunk);
+                    let captured = strip_grid_padding(body);
+                    (pane.clone(), tail_lines(&captured, lines as usize))
+                })
+                .collect())
         })
     }
 
@@ -1235,18 +1407,99 @@ fn detected_agent(command: Option<&str>) -> Option<String> {
 /// searched rather than just the pane's own child: a pane usually holds a shell
 /// and the agent is its child, or its grandchild behind a wrapper script.
 ///
-/// One `ps` for every unresolved pane at once, and only when at least one pane
-/// went unmatched -- a machine whose panes are all shells pays nothing, and a
-/// machine full of agents pays one process per listing rather than one per
-/// pane.
-fn agents_under(pane_pids: &[u32]) -> HashMap<u32, String> {
-    let Ok(output) = std::process::Command::new("ps")
+/// One `ps` for every unresolved pane at once, and the answer is kept for
+/// [`AGENT_LOOKUP_TTL`] before it is asked again. Both halves matter: the
+/// approval watcher lists this session's panes every 1.5s for as long as the
+/// gateway runs, and a pane holding a plain shell -- which is most panes, most
+/// of the time -- comes back unmatched on every one of those. Without the
+/// cache that was a listing of every process on the box three times a
+/// two-second window, and that listing is not free. With it, a shell pane
+/// costs one `ps` per five seconds however often it is listed, and an agent
+/// that starts or stops shows up within that.
+///
+/// `tokio`'s `Command`, not `std`'s: this runs on a runtime worker, and the
+/// blocking version held that worker for the whole listing.
+async fn agents_under(pane_pids: &[u32]) -> HashMap<u32, String> {
+    let now = Instant::now();
+    let (mut found, stale) = agent_lookups()
+        .lock()
+        .map(|cache| cache.split(pane_pids, now))
+        .unwrap_or_default();
+    if stale.is_empty() {
+        return found;
+    }
+    let listing = match Command::new("ps")
         .args(["-axo", "pid=,ppid=,args="])
         .output()
-    else {
-        return HashMap::new();
+        .await
+    {
+        Ok(output) => String::from_utf8_lossy(&output.stdout).into_owned(),
+        // No `ps`, or it failed: answer with what the cache had and try again
+        // next time. Not remembered as "no agent" -- that would turn one
+        // failed listing into five seconds of every agent pane looking like a
+        // shell.
+        Err(_) => return found,
     };
-    agents_in_listing(&String::from_utf8_lossy(&output.stdout), pane_pids)
+    let fresh = agents_in_listing(&listing, &stale);
+    if let Ok(mut cache) = agent_lookups().lock() {
+        cache.record(&stale, &fresh, now);
+    }
+    found.extend(fresh);
+    found
+}
+
+/// How long a pane's resolved agent is trusted before `ps` is asked again.
+///
+/// Long enough that the twice-a-second activity poll amortises to nothing;
+/// short enough that an agent starting in a shell pane is recognised before
+/// the reader has finished typing their first prompt to it.
+const AGENT_LOOKUP_TTL: Duration = Duration::from_secs(5);
+
+/// Process-wide, because a `TmuxBackend` is built fresh for every request and
+/// would otherwise forget each answer as soon as it had it.
+fn agent_lookups() -> &'static Mutex<AgentLookupCache> {
+    static CACHE: OnceLock<Mutex<AgentLookupCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(AgentLookupCache::default()))
+}
+
+/// `pane_pid → (when it was resolved, what was found)`. A `None` is remembered
+/// too: "this pane is a shell" is the common answer and the one worth not
+/// re-deriving on every pane listing.
+#[derive(Default)]
+struct AgentLookupCache {
+    entries: HashMap<u32, (Instant, Option<String>)>,
+}
+
+impl AgentLookupCache {
+    /// The pids this cache can still answer for, and the ones it cannot.
+    fn split(&self, pane_pids: &[u32], now: Instant) -> (HashMap<u32, String>, Vec<u32>) {
+        let mut found = HashMap::new();
+        let mut stale = Vec::new();
+        for &pid in pane_pids {
+            match self.entries.get(&pid) {
+                Some((at, agent)) if now.duration_since(*at) < AGENT_LOOKUP_TTL => {
+                    if let Some(agent) = agent {
+                        found.insert(pid, agent.clone());
+                    }
+                }
+                _ => stale.push(pid),
+            }
+        }
+        (found, stale)
+    }
+
+    /// Remember one listing's answer for every pid it was asked about --
+    /// including the pids it found nothing for.
+    fn record(&mut self, asked: &[u32], fresh: &HashMap<u32, String>, now: Instant) {
+        for &pid in asked {
+            self.entries.insert(pid, (now, fresh.get(&pid).cloned()));
+        }
+        // A pane that is gone would otherwise sit here forever. Pruned on
+        // write, so the map is bounded by the number of panes that existed
+        // in the last TTL rather than the number that ever did.
+        self.entries
+            .retain(|_, (at, _)| now.duration_since(*at) < AGENT_LOOKUP_TTL);
+    }
 }
 
 /// The tree walk, given a `ps` listing. Separated so it can be tested against a
@@ -1332,6 +1585,43 @@ mod tests {
     }
 
     #[test]
+    fn the_topology_poll_backs_off_while_nothing_moves() {
+        // The rule the stream applies, stated on its own so it can be checked
+        // without standing up a tmux server: double while still, snap back the
+        // moment something changes, never exceed the ceiling.
+        let next = |delay: Duration, changed: bool| {
+            if changed {
+                ACTIVITY_POLL_MIN
+            } else {
+                (delay * 2).min(ACTIVITY_POLL_MAX)
+            }
+        };
+
+        let mut delay = ACTIVITY_POLL_MIN;
+        // A still session walks up to the ceiling and stays there.
+        let mut seen = vec![delay];
+        for _ in 0..6 {
+            delay = next(delay, false);
+            seen.push(delay);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                Duration::from_millis(500),
+                Duration::from_millis(1000),
+                Duration::from_millis(2000),
+                Duration::from_millis(2000),
+                Duration::from_millis(2000),
+                Duration::from_millis(2000),
+                Duration::from_millis(2000),
+            ]
+        );
+        // And one change puts it straight back to the floor, so the second
+        // event of a burst is as prompt as it ever was.
+        assert_eq!(next(delay, true), ACTIVITY_POLL_MIN);
+    }
+
+    #[test]
     fn shift_tab_reaches_tmux_as_back_tab() {
         // `BTab` and nothing else. `S-Tab` lands as a plain Tab, and an
         // unrecognised name is not an error to tmux at all -- `send-keys`
@@ -1354,10 +1644,10 @@ mod tests {
         // still says what it is.
         let listing = "\
  6327     1 -zsh
- 6452  6327 /Users/okk/.local/bin/claude --allow-dangerously-skip-permissions
+ 6452  6327 /opt/agents/bin/claude --print
  6539     1 -zsh
  6540  6539 /bin/sh /usr/local/bin/agent-wrapper
-65231  6540 claude --dangerously-skip-permissions
+65231  6540 claude --resume
  7000     1 -zsh
  7001  7000 vim README.md
 ";
@@ -1368,6 +1658,46 @@ mod tests {
         assert_eq!(found.get(&6539).map(String::as_str), Some("claude"));
         // A pane running something else stays a pane running something else.
         assert_eq!(found.get(&7000), None);
+    }
+
+    #[test]
+    fn a_resolved_pane_is_not_asked_about_again_until_the_answer_is_stale() {
+        // The approval watcher lists this session's panes every 1.5s and a
+        // shell pane comes back unmatched every time. Without this, that was a
+        // `ps -ax` every 1.5s for the life of the gateway.
+        let mut cache = AgentLookupCache::default();
+        let t0 = Instant::now();
+        let mut fresh = HashMap::new();
+        fresh.insert(1, "claude".to_owned());
+        // Asked about 1 (an agent) and 2 (a shell); told about both.
+        cache.record(&[1, 2], &fresh, t0);
+
+        let (found, stale) = cache.split(&[1, 2, 3], t0 + Duration::from_secs(1));
+        assert_eq!(found.get(&1).map(String::as_str), Some("claude"));
+        // 2 is answered too -- "no agent" is an answer -- so only the pane the
+        // cache has never seen needs `ps`.
+        assert_eq!(stale, vec![3]);
+
+        // Past the TTL, both are asked about again: an agent may have started
+        // in 2 or exited in 1.
+        let (found, stale) = cache.split(&[1, 2], t0 + AGENT_LOOKUP_TTL + Duration::from_millis(1));
+        assert!(found.is_empty());
+        assert_eq!(stale, vec![1, 2]);
+    }
+
+    #[test]
+    fn panes_that_are_gone_fall_out_of_the_cache() {
+        let mut cache = AgentLookupCache::default();
+        let t0 = Instant::now();
+        cache.record(&[1, 2, 3], &HashMap::new(), t0);
+        // A later write prunes what the TTL has already expired.
+        cache.record(
+            &[4],
+            &HashMap::new(),
+            t0 + AGENT_LOOKUP_TTL + Duration::from_secs(1),
+        );
+        assert_eq!(cache.entries.len(), 1);
+        assert!(cache.entries.contains_key(&4));
     }
 
     #[test]
@@ -1998,6 +2328,63 @@ mod tests {
         assert_eq!(visible.text.lines().count(), height as usize);
 
         backend.close_workspace(&workspace.id).await.unwrap();
+    }
+
+    /// The batch must be the same reading as the loop it replaces, pane for
+    /// pane. This is what would catch the chained invocation drifting: a
+    /// marker landing in the wrong place, a chunk keeping the separator's own
+    /// newline, or `strip_grid_padding` applied on one path and not the other.
+    #[tokio::test]
+    #[ignore = "requires permission to create a local tmux Unix socket"]
+    async fn a_batched_read_says_exactly_what_reading_each_pane_says() {
+        if Command::new("tmux").arg("-V").output().await.is_err() {
+            return;
+        }
+        let (backend, workspace) = contract_workspace().await;
+        let first = backend.list_panes().await.unwrap()[0].id.clone();
+        // Three panes, so the batch has something to interleave and get wrong.
+        for _ in 0..2 {
+            backend
+                .split_pane(&SplitPane {
+                    pane_id: first.clone(),
+                    direction: SplitDirection::Down,
+                    ratio: None,
+                    cwd: None,
+                    env: None,
+                })
+                .await
+                .unwrap();
+        }
+        let ids: Vec<PaneId> = backend
+            .list_panes()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|pane| pane.id)
+            .collect();
+        assert!(ids.len() >= 3, "expected three panes, got {}", ids.len());
+        // Something distinguishable on each screen, so a swapped chunk fails.
+        for (index, id) in ids.iter().enumerate() {
+            backend
+                .send_text(id, &format!("marker-for-pane-{index}"))
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let batched = backend.read_visible_batch(&ids, 200).await.unwrap();
+        let one_at_a_time = default_read_visible_batch(&backend, &ids, 200)
+            .await
+            .unwrap();
+        assert_eq!(batched.len(), ids.len());
+        assert_eq!(batched, one_at_a_time);
+        for (index, (_, text)) in batched.iter().enumerate() {
+            assert!(
+                text.contains(&format!("marker-for-pane-{index}")),
+                "pane {index} got another pane's screen: {text:?}"
+            );
+        }
+        backend.close_workspace(&workspace.id).await.ok();
     }
 
     #[tokio::test]

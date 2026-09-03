@@ -29,7 +29,7 @@
 //! Every list parse then fails with "terminal backend returned an invalid
 //! session", which is true and useless. Non-ASCII pane titles and working
 //! directories are mangled the same way and, unlike the separator, silently:
-//! `✳ 启动本机simfarm` arrives as `_ ________simfarm`.
+//! a pane titled `✳ 修复 gateway` arrives as `_ __ _______`.
 //!
 //! ## Two halves, because either one alone leaves a hole
 //!
@@ -102,7 +102,7 @@ struct LoginEnvironment {
 /// it takes too long, or it says nothing useful. Every one of those is a reason
 /// to keep what is already in hand, never a reason to fail.
 fn probe_login_shell() -> Option<LoginEnvironment> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned());
+    let shell = probe_shell_for(std::env::var("SHELL").ok().as_deref());
     // `printf` rather than `echo`: `echo` is a builtin with three incompatible
     // dialects across shells, and one of them would eat a `\` in a directory
     // name. The locale is whichever of the three the shell would itself obey,
@@ -143,6 +143,23 @@ fn probe_login_shell() -> Option<LoginEnvironment> {
     let mut stdout = String::new();
     child.stdout.take()?.read_to_string(&mut stdout).ok()?;
     Some(parse_probe(&stdout))
+}
+
+/// Which shell to ask.
+///
+/// `$SHELL` when it speaks POSIX, because that is where the user's own profile
+/// lives. Otherwise `/bin/sh`: the probe script is POSIX -- `${LC_ALL:-…}` is
+/// a syntax error to fish, which would answer with nothing and cost a fish user
+/// the whole repair -- and `/bin/sh -l` still reads `/etc/profile`, which on
+/// macOS runs the same `path_helper` that puts Homebrew on the path.
+fn probe_shell_for(shell: Option<&str>) -> String {
+    const POSIX_SHELLS: &[&str] = &["sh", "bash", "zsh", "ksh", "mksh", "dash", "ash"];
+    match shell {
+        Some(shell) if POSIX_SHELLS.contains(&shell.rsplit('/').next().unwrap_or_default()) => {
+            shell.to_owned()
+        }
+        _ => "/bin/sh".to_owned(),
+    }
 }
 
 /// The fenced values out of whatever the profile printed.
@@ -299,7 +316,7 @@ fn is_executable(candidate: &std::path::Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        return metadata.permissions().mode() & 0o111 != 0;
+        metadata.permissions().mode() & 0o111 != 0
     }
     #[cfg(not(unix))]
     true
@@ -340,6 +357,21 @@ mod tests {
         assert_eq!(
             parse_probe(&format!("{PATH_FENCE}\n{CTYPE_FENCE}\n")),
             LoginEnvironment::default()
+        );
+    }
+
+    #[test]
+    fn only_a_posix_shell_is_asked_and_anything_else_falls_back_to_sh() {
+        // fish is the one people actually use, and `${LC_ALL:-…}` is a syntax
+        // error to it. Asking it would look like a machine with no profile.
+        assert_eq!(probe_shell_for(Some("/opt/homebrew/bin/fish")), "/bin/sh");
+        assert_eq!(probe_shell_for(Some("/usr/bin/nu")), "/bin/sh");
+        assert_eq!(probe_shell_for(None), "/bin/sh");
+        assert_eq!(probe_shell_for(Some("")), "/bin/sh");
+        assert_eq!(probe_shell_for(Some("/bin/zsh")), "/bin/zsh");
+        assert_eq!(
+            probe_shell_for(Some("/opt/homebrew/bin/bash")),
+            "/opt/homebrew/bin/bash"
         );
     }
 

@@ -26,6 +26,7 @@
 //! is rejected with [`BackendError::InvalidTarget`] rather than coerced into
 //! whatever native id it might resemble.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use super::{
@@ -384,6 +385,42 @@ impl TerminalBackend for TmuxWireIds {
         // No id on either side of this call -- nothing to translate, just
         // forward to the wrapped tmux backend's own answer.
         self.inner.probe_reachable()
+    }
+
+    /// Translate both ways and let the wrapped backend batch.
+    ///
+    /// Forwarding matters here in a way it does not for a method with a
+    /// default that merely loops: the default would loop over *this* wrapper's
+    /// `read_pane`, which is one tmux process per pane -- exactly the cost the
+    /// batch exists to remove. A wrapper that silently declines an
+    /// optimisation is worse than one that never had it, because the
+    /// measurement says the optimisation is there.
+    ///
+    /// A pane id that is not wire-shaped is dropped rather than failing the
+    /// batch, matching what the port promises about unreadable panes.
+    fn read_visible_batch<'a>(
+        &'a self,
+        panes: &'a [PaneId],
+        lines: u32,
+    ) -> BackendFuture<'a, Vec<(PaneId, String)>> {
+        Box::pin(async move {
+            let mut native = Vec::with_capacity(panes.len());
+            let mut back: HashMap<String, PaneId> = HashMap::new();
+            for pane in panes {
+                let Ok(decoded) = decode_wire(pane.as_str(), "pane") else {
+                    continue;
+                };
+                back.insert(decoded.clone(), pane.clone());
+                native.push(PaneId::new(decoded));
+            }
+            Ok(self
+                .inner
+                .read_visible_batch(&native, lines)
+                .await?
+                .into_iter()
+                .filter_map(|(id, text)| back.get(id.as_str()).map(|wire| (wire.clone(), text)))
+                .collect())
+        })
     }
 }
 
