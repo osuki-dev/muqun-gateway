@@ -181,6 +181,24 @@ const MANAGE_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 /// every pane or sending unchanged terminal frames over the network.
 const STREAM_OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(150);
 const STREAM_OUTPUT_READ_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// How often a live event stream re-checks that the device holding it is
+/// still paired.
+///
+/// Every other route is authorised once, per request, and that is enough
+/// because the request is over in milliseconds. An event stream is not: it is
+/// authorised once and then runs for as long as the phone keeps it open,
+/// which for a phone on a charger is days. So `DELETE /api/pairings/{id}` --
+/// the button whose entire purpose is cutting off a device somebody no longer
+/// controls -- removed the record while the revoked device carried on
+/// receiving that session's terminal output, keystrokes and all, through the
+/// stream it already had. Nothing timed it out either: the 15s keep-alive is
+/// the gateway writing to the socket, so an idle connection never lapses.
+///
+/// Short enough that revocation is effective while somebody is still looking
+/// at the screen they pressed it on; long enough that a stream costs one
+/// mutex acquisition every few seconds and nothing else.
+const STREAM_DEVICE_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
 const GATEWAY_API_VERSION: &str = "1.7.0";
 const GATEWAY_API_MAJOR: u64 = 1;
 /// The oldest Herdr socket protocol this gateway knows how to speak.
@@ -4941,7 +4959,7 @@ async fn events(
     stream_crypto: Option<Extension<EncryptedStreamContext>>,
     headers: HeaderMap,
 ) -> Result<Response, (StatusCode, Json<Value>)> {
-    require_device(&state, &headers)?;
+    let device_id = require_device(&state, &headers)?;
     // Present exactly when the request arrived through the encrypted
     // transport. From here on every event this connection emits is sealed;
     // a device paired without a transport key keeps the plaintext stream.
@@ -4992,6 +5010,7 @@ async fn events(
         .as_ref()
         .is_none_or(|set| set.contains("pane_updated"));
     let mut approvals_rx = state.approval_events.subscribe();
+    let devices = state.clone();
     let assets = state.assets.clone();
     let scrollback_store = state.scrollback.clone();
     let backend = terminal_backend(&session);
@@ -4999,9 +5018,24 @@ async fn events(
     let stream = async_stream::stream! {
         let mut output_interval = tokio::time::interval(STREAM_OUTPUT_POLL_INTERVAL);
         output_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The authorisation this connection was opened on has to be rechecked
+        // for as long as it is open. See `STREAM_DEVICE_RECHECK_INTERVAL`.
+        let mut device_recheck = tokio::time::interval(STREAM_DEVICE_RECHECK_INTERVAL);
+        device_recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // `interval`'s first tick is immediate, and that one is not a recheck
+        // -- `require_device` just ran.
+        device_recheck.tick().await;
         let mut last_stream_output: Option<String> = None;
         loop {
             tokio::select! {
+                _ = device_recheck.tick() => {
+                    if !still_paired(&devices, &device_id) {
+                        // Closed without an event. A revoked device is not owed
+                        // an explanation, and a legitimate client learns the
+                        // same thing from the 403 its reconnect earns.
+                        break;
+                    }
+                },
                 next = activity.recv() => match next {
                     Ok(SessionActivity::Event(activity)) => {
                         let data = activity.payload.to_string();
@@ -10082,6 +10116,22 @@ fn require_device(state: &AppState, headers: &HeaderMap) -> ApiResult<String> {
     Ok(device_id)
 }
 
+/// Whether a device authorised earlier is still authorised now.
+///
+/// For a long-lived connection, which is authorised once and then outlives the
+/// decision by hours. A poisoned lock answers "still paired": this decides
+/// whether to *cut* a stream the gateway already accepted, and dropping every
+/// open connection because an unrelated mutex was poisoned would be a worse
+/// failure than the one it is guarding against. A revoked device stays cut off
+/// from everything else regardless -- `require_device` fails closed on the same
+/// lock, so it cannot open a new stream or make any other request.
+fn still_paired(state: &AppState, device_id: &str) -> bool {
+    match state.devices.lock() {
+        Ok(devices) => devices.iter().any(|device| device.id == device_id),
+        Err(_) => true,
+    }
+}
+
 /// The local manage UI's credential, which authorises nothing but reading the
 /// pending pairing code.
 fn require_admin(config: &Config, headers: &HeaderMap) -> ApiResult<()> {
@@ -12104,6 +12154,114 @@ mod tests {
             String::from_utf8_lossy(&body),
             "absent",
             "a client-supplied device proof must never reach a handler"
+        );
+    }
+
+    /// `DELETE /api/pairings/{id}` exists to cut off a device somebody no
+    /// longer controls. Until this, it cut off everything except the one
+    /// channel that actually carries the terminal: the event stream the
+    /// device already had open, which was authorised once at connect and then
+    /// ran for as long as the phone kept it.
+    #[test]
+    fn revoking_a_device_makes_the_stream_recheck_fail() {
+        let state = test_state("admin", vec![test_device("phone-1", "device-token")]);
+        assert!(still_paired(&state, "phone-1"));
+
+        state
+            .devices
+            .lock()
+            .unwrap()
+            .retain(|device| device.id != "phone-1");
+        assert!(
+            !still_paired(&state, "phone-1"),
+            "a revoked device must not keep a stream it already had"
+        );
+    }
+
+    /// A device that was never paired is not paired now either -- the recheck
+    /// is an identity test, not a "did anything change" test.
+    #[test]
+    fn a_device_that_was_never_paired_is_not_still_paired() {
+        let state = test_state("admin", vec![test_device("phone-1", "device-token")]);
+        assert!(!still_paired(&state, "phone-2"));
+        assert!(!still_paired(&state, ""));
+    }
+
+    /// End to end: a real event stream, over a live tmux so the stream has a
+    /// working backend and cannot end for any other reason, closed by the
+    /// revoke route itself.
+    ///
+    /// `to_bytes` finishes exactly when the body ends, so it is the assertion:
+    /// before this change it ran until the timeout, because nothing in the
+    /// stream ever asked again whether the device was still allowed to hold
+    /// it.
+    #[tokio::test]
+    #[ignore = "requires a tmux server"]
+    async fn revoking_a_device_closes_the_event_stream_it_already_had() {
+        use tower::ServiceExt as _;
+
+        let socket = std::path::PathBuf::from(format!(
+            "/tmp/gw-revoke-{}.sock",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
+        let tmux = backend::TmuxBackend::new(Some(socket.clone()));
+        let workspace = tmux
+            .create_workspace(&BackendCreateWorkspace {
+                cwd: Some(std::env::temp_dir()),
+                label: Some("gateway-revoke".into()),
+                focus: true,
+            })
+            .await
+            .unwrap();
+
+        let token = "device-token";
+        let mut state = test_state("admin", vec![test_device("phone-1", token)]);
+        state.config.sessions = vec![SessionConfig {
+            id: "default".into(),
+            label: "Default".into(),
+            socket_path: socket.to_string_lossy().into_owned(),
+            backend: BackendKind::Tmux,
+        }];
+
+        let app = Router::new()
+            .route("/api/sessions/{session_id}/events", get(events))
+            .with_state(state.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/default/events")
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let revoking = tokio::spawn({
+            let state = state.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                revoke_paired_device(
+                    State(state),
+                    Path("phone-1".to_owned()),
+                    bearer_headers(token),
+                )
+                .await
+                .expect("the revoke route should accept a paired device")
+            }
+        });
+
+        let ended = tokio::time::timeout(
+            STREAM_DEVICE_RECHECK_INTERVAL * 3,
+            axum::body::to_bytes(response.into_body(), 1 << 20),
+        )
+        .await;
+        drop(revoking.await.unwrap());
+        tmux.close_workspace(&workspace.id).await.ok();
+        assert!(
+            ended.is_ok(),
+            "the stream outlived the revocation of the device holding it"
         );
     }
 
