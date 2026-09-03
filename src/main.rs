@@ -4364,13 +4364,32 @@ fn render_qr(code: &QrCode) -> String {
 }
 
 async fn health(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
-    require_device(&state, &headers)?;
-    Ok(Json(gateway_metadata(&state).await?))
+    let device_id = require_device(&state, &headers)?;
+    let sealed = device_seals_its_transport(&state, &device_id);
+    Ok(Json(gateway_metadata(&state, sealed).await?))
 }
 
 async fn api_meta(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
-    require_device(&state, &headers)?;
-    Ok(Json(gateway_metadata(&state).await?))
+    let device_id = require_device(&state, &headers)?;
+    let sealed = device_seals_its_transport(&state, &device_id);
+    Ok(Json(gateway_metadata(&state, sealed).await?))
+}
+
+/// Whether this device's requests are sealed by the application-layer
+/// transport.
+///
+/// It is a property of the device, not of the gateway: a device paired while
+/// `transport_encryption` was `disabled` holds no transport key and is
+/// authorised on its bearer token alone, and stays that way after the setting
+/// changes -- `require_device` demands the proof header from exactly the
+/// devices that have a key. So the honest answer to "is this connection
+/// encrypted at the application layer" is about the device asking.
+fn device_seals_its_transport(state: &AppState, device_id: &str) -> bool {
+    state.devices.lock().is_ok_and(|devices| {
+        devices
+            .iter()
+            .any(|device| device.id == device_id && device.transport_key.is_some())
+    })
 }
 
 #[derive(Deserialize)]
@@ -4392,7 +4411,10 @@ async fn api_set_label(
     Ok(Json(json!({ "label": label })))
 }
 
-async fn gateway_metadata(state: &AppState) -> ApiResult<Value> {
+async fn gateway_metadata(
+    state: &AppState,
+    application_layer_encryption: bool,
+) -> ApiResult<Value> {
     // The primary session described below must be the one `GET /api/sessions`
     // leads with, not merely the first configured one: with tmux dead or
     // empty and herdr live, the app connects to whichever session
@@ -4438,7 +4460,12 @@ async fn gateway_metadata(state: &AppState) -> ApiResult<Value> {
         "label": state.config.label,
         "transportSecurity": {
             "protection": transport_protection(&state.config),
-            "applicationLayerEncryption": false,
+            // Was hardcoded `false`, on a gateway whose default is
+            // `transport_encryption: required` and which had just decrypted
+            // the request asking. A client that reads this field to decide
+            // whether it needs to seal would have read a gateway that does
+            // seal as one that does not, and downgraded itself.
+            "applicationLayerEncryption": application_layer_encryption,
             "httpsRecommended": !state.config.public_url.starts_with("https://")
         },
         "backend": primary_metadata.unwrap_or(Value::Null),
@@ -12419,6 +12446,37 @@ mod tests {
         assert!(notes.is_news(down));
     }
 
+    /// `transportSecurity.applicationLayerEncryption` was hardcoded `false`,
+    /// on a gateway whose default is `transport_encryption: required` and
+    /// which had just decrypted the request asking the question. A client
+    /// reading this field to decide whether it needs to seal would have read
+    /// a gateway that does seal as one that does not.
+    ///
+    /// It is a property of the *device*: one paired while encryption was
+    /// disabled holds no transport key, is authorised on its bearer token
+    /// alone, and stays that way after the setting changes.
+    #[tokio::test]
+    async fn the_metadata_says_whether_this_device_actually_seals_its_requests() {
+        let sealed_token = "sealed-device";
+        let plain_token = "plain-device";
+        let mut sealed = test_device("phone-sealed", sealed_token);
+        sealed.transport_key = Some(generate_token());
+        let plain = test_device("phone-plain", plain_token);
+        let state = test_state("admin", vec![sealed, plain]);
+
+        assert!(device_seals_its_transport(&state, "phone-sealed"));
+        assert!(!device_seals_its_transport(&state, "phone-plain"));
+        assert!(!device_seals_its_transport(&state, "phone-gone"));
+
+        for encrypted in [true, false] {
+            let metadata = gateway_metadata(&state, encrypted).await.unwrap();
+            assert_eq!(
+                metadata["transportSecurity"]["applicationLayerEncryption"],
+                json!(encrypted)
+            );
+        }
+    }
+
     /// Two sessions are two streams; the hub is per session, not global.
     #[tokio::test]
     async fn each_session_gets_its_own_hub() {
@@ -16655,7 +16713,7 @@ mod tests {
             herdr.session("herdr-live"),
         ];
 
-        let metadata = gateway_metadata(&state).await.unwrap();
+        let metadata = gateway_metadata(&state, false).await.unwrap();
         assert_eq!(metadata["backend"]["sessionId"], "herdr-live");
         assert_eq!(metadata["backend"]["kind"], json!(BackendKind::Herdr));
     }
