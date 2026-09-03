@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::Context as _;
 use serde_json::{json, Value};
@@ -14,14 +15,46 @@ use super::{
     TerminalBackend, Workspace, WorkspaceId, Worktree, WorktreePlacement, WorktreeRequest,
 };
 
+/// How long one herdr request may take, end to end.
+///
+/// A Unix socket read has no timeout of its own. So a herdr that accepts the
+/// connection and then never answers -- wedged, deadlocked, stopped in a
+/// debugger, or simply in the middle of something it will not come back from
+/// -- held the task and the file descriptor forever, and every request that
+/// landed on it did the same. The gateway leaked a task and an fd per request
+/// for as long as the condition lasted, and the phone got a spinner that never
+/// resolved instead of an error it could retry.
+///
+/// Deliberately generous: this is not a latency budget, it is the line between
+/// "slow" and "never". Herdr answers these calls out of its own memory in
+/// milliseconds, so a request still outstanding at thirty seconds is not
+/// coming, and a bound that tried to be tight would start failing real calls
+/// on a loaded machine -- which is worse than the leak.
+///
+/// Bounds `request_transport` only. See `activity_stream`, which must not have
+/// one and says why.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct HerdrBackend {
     socket_path: PathBuf,
+    /// Overridable so a test can prove the timeout fires without waiting out
+    /// the real one.
+    request_timeout: Duration,
 }
 
 impl HerdrBackend {
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self {
             socket_path: socket_path.into(),
+            request_timeout: REQUEST_TIMEOUT,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_request_timeout(socket_path: impl Into<PathBuf>, request_timeout: Duration) -> Self {
+        Self {
+            socket_path: socket_path.into(),
+            request_timeout,
         }
     }
 
@@ -49,22 +82,19 @@ impl HerdrBackend {
     async fn request_transport(&self, method: &str, params: Value) -> anyhow::Result<Value> {
         #[cfg(unix)]
         {
-            let mut stream = UnixStream::connect(&self.socket_path)
+            // The whole exchange is inside the bound, not just the read: a
+            // connect can hang too, on a socket whose listener is alive but
+            // no longer accepting. Elapsing drops the future, which closes
+            // the stream and releases the descriptor -- the point of the
+            // bound is as much the fd as the task.
+            tokio::time::timeout(self.request_timeout, self.exchange(method, params))
                 .await
-                .with_context(|| format!("failed to connect {}", self.socket_path.display()))?;
-            let request = json!({
-                "id": format!("gateway:{}", uuid::Uuid::new_v4()),
-                "method": method,
-                "params": params,
-            });
-            stream.write_all(request.to_string().as_bytes()).await?;
-            stream.write_all(b"\n").await?;
-            stream.flush().await?;
-
-            let mut reader = BufReader::new(stream);
-            let mut line = String::new();
-            reader.read_line(&mut line).await?;
-            Ok(serde_json::from_str(&line)?)
+                .with_context(|| {
+                    format!(
+                        "herdr did not answer {method} within {}s",
+                        self.request_timeout.as_secs()
+                    )
+                })?
         }
 
         #[cfg(not(unix))]
@@ -72,6 +102,28 @@ impl HerdrBackend {
             let _ = (method, params);
             anyhow::bail!("Herdr socket transport is unavailable on this platform")
         }
+    }
+
+    /// One request written and one response read back, with no bound of its
+    /// own -- `request_transport` is the only caller and it supplies one.
+    #[cfg(unix)]
+    async fn exchange(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+        let mut stream = UnixStream::connect(&self.socket_path)
+            .await
+            .with_context(|| format!("failed to connect {}", self.socket_path.display()))?;
+        let request = json!({
+            "id": format!("gateway:{}", uuid::Uuid::new_v4()),
+            "method": method,
+            "params": params,
+        });
+        stream.write_all(request.to_string().as_bytes()).await?;
+        stream.write_all(b"\n").await?;
+        stream.flush().await?;
+
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).await?;
+        Ok(serde_json::from_str(&line)?)
     }
 }
 
@@ -91,6 +143,21 @@ impl TerminalBackend for HerdrBackend {
         })
     }
 
+    /// Deliberately has no read timeout, and must not be given one.
+    ///
+    /// `request_transport` is bounded by `REQUEST_TIMEOUT` because a request
+    /// that has not been answered in thirty seconds is never going to be. This
+    /// is the opposite shape: a subscription that is *supposed* to sit idle.
+    /// A terminal nobody is typing into produces no events for hours, and that
+    /// silence is the healthy state, not a symptom -- so any read bound here
+    /// would tear down a working stream on a quiet session and reconnect it
+    /// forever.
+    ///
+    /// The setup calls are still bounded: `list_panes` below goes through
+    /// `request_transport`, so a herdr that will not answer cannot hang this
+    /// function either. Only the `read_line` loop is exempt, and only because
+    /// waiting is what it is for. A stream that has genuinely died surfaces as
+    /// `Ok(0)` or a read error, both of which end it.
     fn activity_stream(&self) -> BackendFuture<'_, BackendActivityStream> {
         Box::pin(async move {
             #[cfg(unix)]
@@ -1120,5 +1187,117 @@ mod tests {
             .unwrap();
         assert_eq!(split["params"]["target_pane_id"], "p1");
         assert_eq!(split["params"]["direction"], "down");
+    }
+
+    /// A herdr that accepts the connection and then never answers used to
+    /// hold this task and its file descriptor forever, and every request that
+    /// landed on it did the same.
+    #[tokio::test]
+    async fn a_herdr_that_never_answers_is_given_up_on() {
+        let socket_path = crate::short_test_socket("gw-herdr-mute");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        // Accepts, reads nothing, answers nothing, and -- crucially -- holds
+        // the connection open, so the gateway sees neither EOF nor an error.
+        let held = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let keep = std::sync::Arc::clone(&held);
+        let task = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                keep.lock().unwrap().push(stream);
+            }
+        });
+
+        let backend = HerdrBackend::with_request_timeout(&socket_path, Duration::from_millis(250));
+        let started = std::time::Instant::now();
+        let refused = backend.list_panes().await;
+        let waited = started.elapsed();
+
+        task.abort();
+        let _ = std::fs::remove_file(&socket_path);
+
+        assert!(
+            matches!(refused, Err(BackendError::Unavailable)),
+            "a mute herdr should surface as an unavailable backend, got {refused:?}"
+        );
+        assert!(
+            waited < Duration::from_secs(5),
+            "gave up only after {waited:?}; without the bound it never gives up at all"
+        );
+    }
+
+    /// The bound is on the request path only. An event subscription is
+    /// supposed to sit idle -- a terminal nobody is typing into produces
+    /// nothing for hours -- so a read bound here would tear down a healthy
+    /// stream on a quiet session and reconnect it forever.
+    #[tokio::test]
+    async fn a_quiet_event_stream_is_not_torn_down_for_being_quiet() {
+        let socket_path = crate::short_test_socket("gw-herdr-idle");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        // Answers the setup calls, then holds the subscription connection open
+        // and says nothing on it -- a session nobody is typing into.
+        let held = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let keep = std::sync::Arc::clone(&held);
+        let task = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    continue;
+                }
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let method = request["method"].as_str().unwrap_or_default().to_owned();
+                let mut stream = reader.into_inner();
+                if method == "events.subscribe" {
+                    keep.lock().unwrap().push(stream);
+                    continue;
+                }
+                let response = json!({ "id": request["id"], "result": fake_result(&method) });
+                stream
+                    .write_all(response.to_string().as_bytes())
+                    .await
+                    .unwrap();
+                stream.write_all(b"\n").await.unwrap();
+            }
+        });
+
+        let backend = HerdrBackend::with_request_timeout(&socket_path, Duration::from_millis(250));
+        let mut stream = backend.activity_stream().await.unwrap();
+
+        // Nothing happens for three times the request timeout. The stream must
+        // still be waiting, not have ended or errored.
+        let quiet = tokio::time::timeout(Duration::from_millis(750), stream.next()).await;
+
+        task.abort();
+        let _ = std::fs::remove_file(&socket_path);
+
+        assert!(
+            quiet.is_err(),
+            "the stream ended or errored while merely being idle: {:?}",
+            quiet.ok().flatten()
+        );
+    }
+
+    /// The setup call inside `activity_stream` is *not* exempt: it goes
+    /// through `request_transport`, so a herdr that will not answer cannot
+    /// hang the stream constructor either.
+    #[tokio::test]
+    async fn opening_a_stream_against_a_mute_herdr_still_gives_up() {
+        let socket_path = crate::short_test_socket("gw-herdr-open");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let held = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let keep = std::sync::Arc::clone(&held);
+        let task = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                keep.lock().unwrap().push(stream);
+            }
+        });
+
+        let backend = HerdrBackend::with_request_timeout(&socket_path, Duration::from_millis(250));
+        let opened = tokio::time::timeout(Duration::from_secs(5), backend.activity_stream()).await;
+
+        task.abort();
+        let _ = std::fs::remove_file(&socket_path);
+
+        let opened = opened.expect("activity_stream hung on a herdr that never answers");
+        assert!(matches!(opened.err(), Some(BackendError::Unavailable)));
     }
 }
