@@ -270,6 +270,13 @@ const ASSET_LIST_MAX_LIMIT: usize = 200;
 /// the oldest entries are dropped so a long-lived gateway cannot grow without
 /// end.
 const MAX_INDEXED_ASSETS: usize = 4_000;
+/// How many `(session, scope)` root listings the asset index remembers.
+///
+/// These are only a fallback: `session_asset_roots` uses them when the live
+/// pane list has nothing for the scope, which means the tab or workspace has
+/// closed. Evicting the oldest costs a long-closed tab its last-known roots
+/// and nothing else, and the alternative was keeping every scope forever.
+const MAX_REMEMBERED_ROOT_SCOPES: usize = 64;
 /// A worktree event re-scans that root, but only files written around the event
 /// are announced: the first scan of an old checkout is not "just created".
 const ASSET_EVENT_MAX_AGE_MS: u128 = 10 * 60 * 1000;
@@ -5223,7 +5230,9 @@ async fn watch_pane_approvals(state: AppState, session: SessionConfig) {
         // the buffer knows what to keep before the reader ever opens the pane,
         // and costs Herdr nothing extra.
         if let Some(mut store) = lock_scrollback(&state) {
-            store.observe(&session.id, &backend::compat::pane_list(panes.clone()));
+            // The complete listing for this session, so it can also forget
+            // the panes that have gone.
+            store.observe_listing(&session.id, &backend::compat::pane_list(panes.clone()));
         }
 
         // Every agent pane's screen in one request. On a socket backend this
@@ -9041,7 +9050,17 @@ struct AssetIndex {
     /// Keyed on `(session_id, scope)`. `scope` is `None` for the whole-session
     /// callers and `Some` for a scoped one, so the two never share a slot --
     /// see `session_asset_roots`.
+    ///
+    /// Bounded, because the key space is not. A tmux tab id is a window id,
+    /// which counts up for the life of the tmux server and is never reused, so
+    /// this took one permanent entry -- holding that tab's whole `Vec` of
+    /// root paths -- for every tab whose assets anybody ever opened. Nothing
+    /// removed from it: `forget_under` and `prune` both touch `entries` only.
     roots: HashMap<(String, Option<AssetScope>), Vec<AssetRoot>>,
+    /// Insertion order for `roots`, so the cap evicts the oldest scope rather
+    /// than whichever one the hasher happens to land on. An entry is here
+    /// exactly while its key is in `roots`.
+    roots_order: VecDeque<(String, Option<AssetScope>)>,
 }
 
 impl AssetIndex {
@@ -9082,8 +9101,15 @@ impl AssetIndex {
         scope: Option<&AssetScope>,
         roots: Vec<AssetRoot>,
     ) {
-        self.roots
-            .insert((session_id.to_owned(), scope.cloned()), roots);
+        let key = (session_id.to_owned(), scope.cloned());
+        if self.roots.insert(key.clone(), roots).is_none() {
+            self.roots_order.push_back(key);
+        }
+        while self.roots_order.len() > MAX_REMEMBERED_ROOT_SCOPES {
+            if let Some(oldest) = self.roots_order.pop_front() {
+                self.roots.remove(&oldest);
+            }
+        }
     }
 
     fn known_roots(&self, session_id: &str, scope: Option<&AssetScope>) -> Vec<AssetRoot> {
@@ -16777,6 +16803,47 @@ mod tests {
             .0,
             StatusCode::FORBIDDEN
         );
+    }
+
+    /// A tmux tab id is a window id: it counts up for the life of the server
+    /// and is never reused, so browsing assets across tabs used to add one
+    /// permanent entry each, holding that tab's whole `Vec` of root paths.
+    #[test]
+    fn the_remembered_root_scopes_are_bounded_and_evict_the_oldest() {
+        let mut index = AssetIndex::default();
+        let root = |path: &str| AssetRoot {
+            path: PathBuf::from(path),
+            session_id: "default".into(),
+            workspace_id: None,
+            tab_id: None,
+            pane_id: None,
+        };
+        let scope = |tab: usize| AssetScope::Tab(format!("@{tab}"));
+
+        for tab in 0..MAX_REMEMBERED_ROOT_SCOPES * 3 {
+            index.remember_roots("default", Some(&scope(tab)), vec![root("/tmp")]);
+            assert!(index.roots.len() <= MAX_REMEMBERED_ROOT_SCOPES);
+            assert_eq!(index.roots.len(), index.roots_order.len());
+        }
+        assert_eq!(index.roots.len(), MAX_REMEMBERED_ROOT_SCOPES);
+        // The oldest went, the newest stayed.
+        assert!(index.known_roots("default", Some(&scope(0))).is_empty());
+        assert!(!index
+            .known_roots("default", Some(&scope(MAX_REMEMBERED_ROOT_SCOPES * 3 - 1)))
+            .is_empty());
+
+        // Rewriting a scope already held replaces it rather than filling a
+        // second slot, or the cap would evict live scopes on a busy session.
+        let before = index.roots.len();
+        for _ in 0..10 {
+            index.remember_roots(
+                "default",
+                Some(&scope(MAX_REMEMBERED_ROOT_SCOPES * 3 - 1)),
+                vec![root("/tmp/again")],
+            );
+        }
+        assert_eq!(index.roots.len(), before);
+        assert_eq!(index.roots.len(), index.roots_order.len());
     }
 
     #[tokio::test]

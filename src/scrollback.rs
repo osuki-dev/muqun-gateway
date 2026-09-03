@@ -193,6 +193,7 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 
@@ -623,6 +624,44 @@ impl ScrollbackStore {
                 );
             }
         });
+    }
+
+    /// The same, for a listing that is known to be every pane in the session
+    /// -- and which therefore also says which panes are *gone*.
+    ///
+    /// `kept` and `owns_screen` were insert-only. Their key is
+    /// `session/pane`, a tmux pane id counts up for the life of the server and
+    /// is never reused, and nothing ever removed from either map -- `evict`
+    /// bounds `buffers` and only `buffers`. So a gateway left running
+    /// accumulated one permanent entry per map for every pane that had ever
+    /// existed, which on a machine using tasks is a pane per task, forever.
+    ///
+    /// `observe` cannot prune, because it is also handed a single `pane.get`,
+    /// where an absent pane means nothing. A complete listing is the one
+    /// caller that can tell "gone" from "not mentioned", so it is the one that
+    /// prunes. The approval watcher calls it every 1500ms with exactly that.
+    pub fn observe_listing(&mut self, session_id: &str, value: &Value) {
+        self.observe(session_id, value);
+        let mut live = HashSet::new();
+        visit_panes(value, &mut |pane_id, _| {
+            live.insert(pane_key(session_id, pane_id));
+        });
+        let prefix = format!("{session_id}/");
+        self.kept
+            .retain(|key, _| !key.starts_with(&prefix) || live.contains(key));
+        self.owns_screen
+            .retain(|key, _| !key.starts_with(&prefix) || live.contains(key));
+    }
+
+    /// How many panes this store is holding facts about, for the tests that
+    /// prove those maps are bounded.
+    #[cfg(test)]
+    fn remembered_pane_count(&self) -> usize {
+        self.kept
+            .keys()
+            .chain(self.owns_screen.keys())
+            .collect::<HashSet<_>>()
+            .len()
     }
 
     /// Whether this pane is one the gateway keeps rows for.
@@ -1539,6 +1578,60 @@ mod tests {
         );
         assert!(store.observed_as_kept("default", "h1"));
         assert!(!store.observed_as_kept("default", "h2"));
+    }
+
+    /// `kept` and `owns_screen` were insert-only and keyed by a pane id that
+    /// is never reused, so a long-running gateway accumulated one entry per
+    /// map for every pane that had ever existed.
+    #[test]
+    fn a_complete_listing_forgets_the_panes_that_are_gone() {
+        let mut store = ScrollbackStore::default();
+        let listing = |ids: &[&str]| {
+            json!({
+                "result": {
+                    "panes": ids
+                        .iter()
+                        .map(|id| json!({
+                            "pane_id": id,
+                            "scroll": { "max_offset_from_bottom": 0, "viewport_rows": 60 },
+                            "foreground_command": "vim"
+                        }))
+                        .collect::<Vec<_>>()
+                }
+            })
+        };
+
+        store.observe_listing("s", &listing(&["p1", "p2", "p3"]));
+        assert_eq!(store.remembered_pane_count(), 3);
+
+        // p2 closed.
+        store.observe_listing("s", &listing(&["p1", "p3"]));
+        assert_eq!(store.remembered_pane_count(), 2);
+        assert!(store.observed_as_kept("s", "p1"));
+        assert!(!store.observed_as_kept("s", "p2"));
+
+        // Another session's panes are not this listing's business.
+        store.observe_listing("other", &listing(&["q1"]));
+        assert_eq!(store.remembered_pane_count(), 3);
+        assert!(store.observed_as_kept("s", "p1"));
+    }
+
+    /// A single `pane.get` is not a statement about which panes exist, so it
+    /// must not be allowed to forget the ones it does not mention.
+    #[test]
+    fn a_single_pane_answer_never_forgets_the_others() {
+        let mut store = ScrollbackStore::default();
+        let one = |id: &str| {
+            json!({
+                "pane_id": id,
+                "scroll": { "max_offset_from_bottom": 0, "viewport_rows": 60 }
+            })
+        };
+        store.observe("s", &one("p1"));
+        store.observe("s", &one("p2"));
+        assert_eq!(store.remembered_pane_count(), 2);
+        store.observe("s", &one("p1"));
+        assert_eq!(store.remembered_pane_count(), 2);
     }
 
     #[test]
