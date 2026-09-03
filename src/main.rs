@@ -10361,6 +10361,21 @@ fn state_dir() -> anyhow::Result<std::path::PathBuf> {
     Ok(test_state_dir())
 }
 
+/// A unique socket path short enough to bind.
+///
+/// `sockaddr_un.sun_path` is 104 bytes on macOS and 108 on Linux, and the
+/// limit is on the whole path. `std::env::temp_dir()` on macOS is a per-user
+/// `/var/folders/<...>/T/` directory 49 characters long, so a name with a UUID
+/// in it landed at about 112 -- and every integration test that binds a tmux
+/// or herdr socket failed with "File name too long" on the maintainer's own
+/// platform. Those are the tests that exist to prove the adapters work against
+/// a real server, so they are exactly the ones that must be runnable there.
+#[cfg(test)]
+fn short_test_socket(prefix: &str) -> std::path::PathBuf {
+    let unique = uuid::Uuid::new_v4().simple().to_string();
+    std::path::PathBuf::from("/tmp").join(format!("{prefix}-{}.sock", &unique[..12]))
+}
+
 #[cfg(not(test))]
 fn state_dir() -> anyhow::Result<std::path::PathBuf> {
     let standalone_config = standalone_config_dir()?;
@@ -16327,10 +16342,7 @@ mod tests {
             eprintln!("skipping: no tmux on PATH");
             return;
         }
-        let socket_path = std::env::temp_dir().join(format!(
-            "gateway-sessions-live-{}.sock",
-            uuid::Uuid::new_v4()
-        ));
+        let socket_path = short_test_socket("gw-live");
         let tmux = backend::TmuxBackend::new(Some(socket_path.clone()));
         let workspace = tmux
             .create_workspace(&BackendCreateWorkspace {
