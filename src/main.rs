@@ -5453,33 +5453,75 @@ fn subscribe_activity(
     receiver
 }
 
+/// Whether a backend failure is worth a log line, or is the one already on
+/// screen saying itself again.
+///
+/// `run_activity_hub` rebuilds every `ACTIVITY_REBUILD_DELAY` forever, so a
+/// backend that is down for good -- an uninstalled tmux, a herdr that is not
+/// running -- wrote the same line about thirty-four thousand times a day. That
+/// is not a log, it is a denial of one: the lines that matter are the ones
+/// around it, and they were unreadable. Only a *change* is news.
+///
+/// A stream that produces an event has recovered, and `recovered()` makes the
+/// next failure news again even if it is the same failure -- so the log tells
+/// "down, up, down" rather than falling silent after the first word.
+#[derive(Default)]
+struct FailureNotes {
+    reported: Option<String>,
+}
+
+impl FailureNotes {
+    fn is_news(&mut self, failure: &str) -> bool {
+        if self.reported.as_deref() == Some(failure) {
+            return false;
+        }
+        self.reported = Some(failure.to_owned());
+        true
+    }
+
+    fn recovered(&mut self) {
+        self.reported = None;
+    }
+}
+
 /// Feed one session's hub for as long as anyone is listening.
 ///
-/// Ends when the last subscriber goes away, and is started again by the next
-/// `subscribe_activity`. That is what keeps a gateway nobody is talking to from
-/// polling tmux forever.
+/// In practice that is the life of the process, and the retirement path below
+/// is a safety net rather than the normal case: `watch_agent_notifications`
+/// subscribes at startup, one per configured session, and holds it for as long
+/// as the gateway runs so that a phone which is not connected still gets push
+/// notifications. So `receiver_count()` never reaches zero and
+/// `retire_activity_hub` never fires. That is deliberate -- the alternative is
+/// no notifications until somebody opens the app -- but it does mean a
+/// configured session is polled from startup whether or not anyone is looking,
+/// and the comment that used to sit here promised the opposite.
 async fn run_activity_hub(
     state: AppState,
     session: SessionConfig,
     sender: tokio::sync::broadcast::Sender<SessionActivity>,
 ) {
+    let mut notes = FailureNotes::default();
     loop {
         match terminal_backend(&session).activity_stream().await {
             Ok(mut stream) => {
                 while let Some(item) = stream.next().await {
                     match item {
                         Ok(activity) => {
+                            notes.recovered();
                             // `send` fails only when nobody is listening, which
                             // is the condition this loop ends on anyway.
                             let _ = sender.send(SessionActivity::Event(Arc::new(activity)));
                         }
                         Err(err) => {
-                            eprintln!(
+                            let failure = format!(
                                 "terminal activity failed for session {} (backend={}, endpoint={}): {err}",
                                 session.id,
                                 session.backend.as_str(),
                                 backend_endpoint(&session),
                             );
+                            if notes.is_news(&failure) {
+                                eprintln!("{failure}");
+                            }
                             let _ = sender.send(SessionActivity::Failed);
                             break;
                         }
@@ -5490,11 +5532,14 @@ async fn run_activity_hub(
                 }
             }
             Err(err) => {
-                eprintln!(
+                let failure = format!(
                     "terminal activity stream could not be opened for session {} (backend={}): {err}",
                     session.id,
                     session.backend.as_str(),
                 );
+                if notes.is_news(&failure) {
+                    eprintln!("{failure}");
+                }
                 let _ = sender.send(SessionActivity::Failed);
             }
         }
@@ -5538,14 +5583,13 @@ fn spawn_agent_notification_watchers(state: AppState) {
 
 async fn watch_agent_notifications(state: AppState, session: SessionConfig) {
     let mut statuses = seed_agent_statuses(&session).await;
-    // This loop retries every two seconds forever, so a backend that is down
-    // for good -- an uninstalled tmux, a herdr that is not running -- used to
-    // write the same line to the log forty-three thousand times a day. That is
-    // not a log, it is a denial of one: the lines that matter are the ones
-    // around it, and they were unreadable. Only a *change* is news here.
     // One subscription to the session's shared hub, held for the life of the
-    // process. It used to build a stream of its own, which on tmux meant this
+    // process -- which is what lets a phone that is not connected still get a
+    // push. It used to build a stream of its own, which on tmux meant this
     // watcher polled independently of every phone that was also polling.
+    //
+    // The "only a change is news" dedup this comment used to describe went
+    // with the logging, into `FailureNotes` in the hub.
     let mut activity = subscribe_activity(&state, &session);
     let mut poll = tokio::time::interval(Duration::from_secs(2));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -12348,6 +12392,31 @@ mod tests {
             ended.is_ok(),
             "the stream outlived the revocation of the device holding it"
         );
+    }
+
+    /// A backend that is down for good rebuilds every `ACTIVITY_REBUILD_DELAY`
+    /// forever. Logging each attempt is about thirty-four thousand identical
+    /// lines a day, which buries every line that matters.
+    #[test]
+    fn a_failure_that_is_still_the_same_failure_is_not_news_again() {
+        let mut notes = FailureNotes::default();
+        let down = "terminal activity failed for session default: no server running";
+
+        assert!(notes.is_news(down), "the first time is always news");
+        for _ in 0..10_000 {
+            assert!(!notes.is_news(down));
+        }
+
+        // A different failure is a different thing to know.
+        let other = "terminal activity failed for session default: connection refused";
+        assert!(notes.is_news(other));
+        assert!(!notes.is_news(other));
+        assert!(notes.is_news(down), "and back again");
+
+        // Recovered: the same failure recurring is news, or the log says
+        // "down" once and never mentions the next three outages.
+        notes.recovered();
+        assert!(notes.is_news(down));
     }
 
     /// Two sessions are two streams; the hub is per session, not global.
