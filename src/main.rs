@@ -2042,6 +2042,17 @@ async fn encrypted_transport(
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    // The proof header is this middleware's own signal to the handlers below:
+    // "this request really arrived sealed, and here is the key it was sealed
+    // with". Only the decryption path may set it. A client could otherwise
+    // send it itself on the cleartext path and be taken for the encrypted
+    // device it is claiming to be -- and, worse, would have put the transport
+    // key on the wire in the clear to do so, which is the one thing the
+    // encrypted transport exists to prevent. Strip it on the way in, always,
+    // before anything else looks at the request.
+    let mut request = request;
+    request.headers_mut().remove(TRANSPORT_PROOF_HEADER);
+
     if request
         .headers()
         .get(TRANSPORT_HEADER)
@@ -5152,7 +5163,7 @@ async fn watch_pane_approvals(state: AppState, session: SessionConfig) {
             let Some(text) = screens.get(pane_id) else {
                 continue;
             };
-            match approvals::detect(&text) {
+            match approvals::detect(text) {
                 Some(approval) => {
                     if pending.get(pane_id) == Some(&approval.fingerprint) {
                         continue;
@@ -12027,6 +12038,59 @@ mod tests {
         assert_eq!(hubs.get(&session.id).unwrap().receiver_count(), 3);
         drop(hubs);
         drop((a, b, c));
+    }
+
+    /// The proof header is the encrypted-transport middleware talking to the
+    /// handlers below it, and nothing else may put words in its mouth.
+    ///
+    /// Before this was stripped on the way in, a client could send
+    /// `x-muqun-internal-device-proof` itself over cleartext and be taken for
+    /// the encrypted device whose transport key it named -- having just put
+    /// that key on the wire in the clear to do it, which is precisely what the
+    /// encrypted transport exists to prevent.
+    #[tokio::test]
+    async fn a_client_cannot_forge_the_transport_proof_header() {
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        let state = test_state("admin", Vec::new());
+        let app = Router::new()
+            .route(
+                "/probe",
+                get(|headers: axum::http::HeaderMap| async move {
+                    // What the handlers below the middleware would see.
+                    headers
+                        .get(TRANSPORT_PROOF_HEADER)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("absent")
+                        .to_string()
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                encrypted_transport,
+            ))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/probe")
+                    .header(TRANSPORT_PROOF_HEADER, "a-transport-key-i-do-not-own")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "absent",
+            "a client-supplied device proof must never reach a handler"
+        );
     }
 
     /// Two sessions are two streams; the hub is per session, not global.

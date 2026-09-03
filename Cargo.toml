@@ -36,3 +36,7 @@ tokio = { version = "1.53.0", features = ["fs", "macros", "net", "process", "rt-
 tokio-stream = "0.1.18"
 uuid = { version = "1.24.0", features = ["v4"] }
 argon2 = { version = "0.5.3", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+# Only for driving a Router in tests (`ServiceExt::oneshot`).
+tower = { version = "0.5", default-features = false, features = ["util"] }
