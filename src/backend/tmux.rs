@@ -114,6 +114,17 @@ impl TmuxBackend {
         S: AsRef<OsStr>,
     {
         let mut command = Command::new(&self.binary);
+        // Every child this adapter starts dies with the future that started
+        // it. The futures here are routinely dropped rather than awaited:
+        // `STREAM_OUTPUT_READ_TIMEOUT` gives a pane read 100ms and the SSE
+        // loop polls every 150ms, `SESSION_PROBE_TIMEOUT` gives a liveness
+        // probe two seconds, and a phone that walks out of range drops the
+        // whole handler mid-request. Without this, dropping the future only
+        // stopped *waiting* for the child -- the process itself carried on,
+        // and tokio's orphan reaper collected it whenever it happened to
+        // exit. That is a reaper doing cleanup rather than a guarantee, and
+        // on a tmux that is slow to answer it is a process per poll.
+        command.kill_on_drop(true);
         if let Some(socket_path) = &self.socket_path {
             command.arg("-S").arg(socket_path);
         }
@@ -143,6 +154,8 @@ impl TmuxBackend {
         S: AsRef<OsStr>,
     {
         let mut command = Command::new(&self.binary);
+        // Same as `output` above, and for the same reason.
+        command.kill_on_drop(true);
         if let Some(socket_path) = &self.socket_path {
             command.arg("-S").arg(socket_path);
         }
@@ -1476,6 +1489,10 @@ async fn agents_under(pane_pids: &[u32]) -> HashMap<u32, String> {
     // shell" the fallback exists to prevent, only permanent.
     let listing = match Command::new("ps")
         .args(["-axo", "pid=,ppid=,args="])
+        // A listing of every process on the box, started from a poll that
+        // anything upstream may stop waiting for. Same rule as the tmux
+        // invocations: the child goes when the future does.
+        .kill_on_drop(true)
         .output()
         .await
     {
@@ -1873,6 +1890,76 @@ mod tests {
             paste_buffer_args("gateway-buf", "%9"),
             ["paste-buffer", "-b", "gateway-buf", "-t", "%9", "-d", "-p"]
         );
+    }
+
+    /// The reads this adapter does are routinely abandoned rather than
+    /// awaited -- `STREAM_OUTPUT_READ_TIMEOUT` gives a pane read 100ms, the
+    /// SSE loop polls every 150ms, `SESSION_PROBE_TIMEOUT` gives a liveness
+    /// probe two seconds, and a phone that walks out of range drops the whole
+    /// handler. Dropping the future has to take the process with it.
+    ///
+    /// Driven through `output` itself, pointed at a shell instead of tmux, so
+    /// what is under test is the real code path rather than a hand-built
+    /// `Command` that happens to be configured the same way.
+    ///
+    /// The child reports its own pid and then `exec`s, so the pid in the file
+    /// *is* the surviving process rather than a shell that has already been
+    /// replaced by one. Matching on an argv marker instead would prove
+    /// nothing: `sh -c "sleep 120 # marker"` execs the sleep and the marker
+    /// disappears with the shell, so the search never matches and the test
+    /// passes whether or not the child is still running.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_child_dies_with_the_future_that_started_it() {
+        let pid_file = crate::short_test_socket("gw-kod").with_extension("pid");
+        let backend = TmuxBackend::with_binary("/bin/sh", None);
+        let script = format!("echo $$ > {}; exec sleep 120", pid_file.to_string_lossy());
+
+        // Abandoned well before it could finish.
+        let abandoned =
+            tokio::time::timeout(Duration::from_millis(500), backend.output(["-c", &script])).await;
+        assert!(
+            abandoned.is_err(),
+            "the probe should have outlived its bound"
+        );
+
+        let pid = std::fs::read_to_string(&pid_file)
+            .expect("the child should have reported its pid")
+            .trim()
+            .to_owned();
+        let _ = std::fs::remove_file(&pid_file);
+        assert!(!pid.is_empty());
+
+        // Alive means listed by `ps` and not already a zombie: tokio kills on
+        // drop and reaps separately, and a process waiting to be reaped is
+        // not one that is still running.
+        let alive = || {
+            let pid = pid.clone();
+            async move {
+                let state = Command::new("ps")
+                    .args(["-p", &pid, "-o", "state="])
+                    .output()
+                    .await
+                    .expect("ps should run");
+                let state = String::from_utf8_lossy(&state.stdout).trim().to_owned();
+                !state.is_empty() && !state.starts_with('Z')
+            }
+        };
+
+        // The kill and the reap are not instantaneous, so give them a moment
+        // rather than asserting on the first look.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if !alive().await {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                // Do not leave a two-minute sleep behind on the way out.
+                let _ = Command::new("kill").args(["-9", &pid]).output().await;
+                panic!("child {pid} outlived the future that started it");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     #[test]
