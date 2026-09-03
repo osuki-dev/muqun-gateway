@@ -1421,24 +1421,38 @@ fn detected_agent(command: Option<&str>) -> Option<String> {
 /// blocking version held that worker for the whole listing.
 async fn agents_under(pane_pids: &[u32]) -> HashMap<u32, String> {
     let now = Instant::now();
+    // `into_inner` rather than `unwrap_or_default`: a poisoned lock used to
+    // yield an *empty* `stale`, which the early return below reads as "every
+    // pane was answered from cache" -- so `agents_under` returned nothing and
+    // every pane in the session looked like a plain shell. Not once, either:
+    // the lock stays poisoned, so that was permanent. The cache is a
+    // `HashMap` of pids to names and a panic mid-update cannot make it unsafe
+    // to read, only possibly stale, which is what a cache is.
     let (mut found, stale) = agent_lookups()
         .lock()
-        .map(|cache| cache.split(pane_pids, now))
-        .unwrap_or_default();
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .split(pane_pids, now);
     if stale.is_empty() {
         return found;
     }
+    // A `ps` that ran and failed is not a `ps` that answered "no agents".
+    // Only a spawn failure used to take the fallback, so a `ps` that exits
+    // non-zero -- a wrapper, a hardened host, a container that restricts the
+    // process table -- returned `Ok` with empty stdout, matched nothing, and
+    // was cached as "no agent" for every pane. Re-probed five seconds later,
+    // failed again, cached again: exactly the "every agent pane looks like a
+    // shell" the fallback exists to prevent, only permanent.
     let listing = match Command::new("ps")
         .args(["-axo", "pid=,ppid=,args="])
         .output()
         .await
     {
-        Ok(output) => String::from_utf8_lossy(&output.stdout).into_owned(),
-        // No `ps`, or it failed: answer with what the cache had and try again
-        // next time. Not remembered as "no agent" -- that would turn one
-        // failed listing into five seconds of every agent pane looking like a
-        // shell.
-        Err(_) => return found,
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        }
+        // No `ps`, or it ran and failed: answer with what the cache had and
+        // try again next time. Not remembered as "no agent".
+        _ => return found,
     };
     let fresh = agents_in_listing(&listing, &stale);
     if let Ok(mut cache) = agent_lookups().lock() {
@@ -1658,6 +1672,77 @@ mod tests {
         assert_eq!(found.get(&6539).map(String::as_str), Some("claude"));
         // A pane running something else stays a pane running something else.
         assert_eq!(found.get(&7000), None);
+    }
+
+    /// A poisoned cache must still answer from what it holds.
+    ///
+    /// `unwrap_or_default()` on the `Result` of `lock()` yielded a *default*
+    /// `(found, stale)` -- an empty `stale`, which `agents_under` reads as
+    /// "every pane was answered from cache" and so returns nothing for every
+    /// pane. Every agent in the session looks like a plain shell, and because
+    /// a poisoned lock stays poisoned, permanently.
+    #[test]
+    fn a_poisoned_lookup_cache_still_answers_from_what_it_holds() {
+        let cache = Mutex::new(AgentLookupCache::default());
+        let mut fresh = HashMap::new();
+        fresh.insert(1, "claude".to_owned());
+        cache
+            .lock()
+            .unwrap()
+            .record(&[1, 2], &fresh, Instant::now());
+
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let poisoning = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = cache.lock().unwrap();
+            panic!("a holder panicked");
+        }));
+        std::panic::set_hook(previous);
+        assert!(poisoning.is_err());
+        assert!(cache.lock().is_err(), "the lock should be poisoned now");
+
+        // What the old recovery produced: nothing found, and nothing to look
+        // up either, so the caller returns "no agent" for both panes.
+        let (found, stale) = cache
+            .lock()
+            .map(|entries| entries.split(&[1, 2], Instant::now()))
+            .unwrap_or_default();
+        assert!(found.is_empty() && stale.is_empty());
+
+        // What it produces now.
+        let (found, stale) = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .split(&[1, 2], Instant::now());
+        assert_eq!(found.get(&1).map(String::as_str), Some("claude"));
+        assert!(stale.is_empty(), "pane 2 is cached as a shell, not stale");
+    }
+
+    /// A `ps` that ran and failed is not a `ps` that answered "no agents".
+    ///
+    /// Only a spawn failure used to take the fallback, so a `ps` that exits
+    /// non-zero -- a wrapper, a hardened host, a container that restricts the
+    /// process table -- came back `Ok` with empty stdout and was cached as
+    /// "no agent" for every pane, re-probed, and cached again.
+    #[test]
+    fn a_ps_that_ran_and_failed_is_not_an_empty_process_table() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let failed = std::process::Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: b"ps: permission denied".to_vec(),
+        };
+        assert!(!failed.status.success());
+        // The listing a successful `ps` would have produced resolves the pane;
+        // the failed one must not be allowed to stand in for it.
+        assert!(agents_in_listing(&String::from_utf8_lossy(&failed.stdout), &[100]).is_empty());
+        assert_eq!(
+            agents_in_listing("100 1 -zsh\n200 100 claude --print\n", &[100])
+                .get(&100)
+                .map(String::as_str),
+            Some("claude")
+        );
     }
 
     #[test]
