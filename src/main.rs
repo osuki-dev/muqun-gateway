@@ -203,6 +203,10 @@ const GATEWAY_API_MAJOR: u64 = 1;
 /// stream of unrelated errors from every workspace, pane, and event request.
 const HERDR_PROTOCOL_MIN: u64 = 17;
 const MAX_REQUEST_BODY_BYTES: usize = 128 * 1024;
+/// The one route allowed a body bigger than [`MAX_REQUEST_BODY_BYTES`]. Named
+/// so the router and the encrypted transport cannot disagree about which route
+/// that is.
+const UPLOADS_PATH: &str = "/api/uploads";
 const UPLOADS_DIR: &str = "uploads";
 /// Ceiling on one upload body, enforced by the framework's body limit so an
 /// oversized request is cut off mid-stream instead of being buffered first.
@@ -1963,7 +1967,7 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         // A route-level limit is applied inside the router-wide one, so uploads
         // get their own ceiling while every JSON route keeps the small one.
         .route(
-            "/api/uploads",
+            UPLOADS_PATH,
             post(upload_file).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
         )
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
@@ -2004,6 +2008,48 @@ const TRANSPORT_HEADER: &str = "x-muqun-transport";
 const TRANSPORT_DEVICE_HEADER: &str = "x-muqun-device";
 const TRANSPORT_ENVELOPE_HEADER: &str = "x-muqun-envelope";
 const TRANSPORT_PROOF_HEADER: &str = "x-muqun-internal-device-proof";
+
+/// Base64 without padding, in bytes.
+const fn base64_len(bytes: usize) -> usize {
+    bytes.div_ceil(3) * 4
+}
+
+/// Room for the JSON around a sealed body: the envelope's keys, its nonce and
+/// timestamp, the payload's own keys, the bearer token, a content type, and
+/// the AEAD tag. Deliberately generous -- it is slack on a ceiling, not a
+/// budget anything spends.
+const SEALED_SCAFFOLD_BYTES: usize = 4096;
+
+/// What an encrypted request carrying `plaintext` bytes of body weighs on the
+/// wire.
+///
+/// The body is base64'd into a JSON payload, that payload is sealed, and the
+/// ciphertext is base64'd again into a JSON envelope -- so what arrives runs
+/// about 16/9 of what it carries. The middleware buffers the *outer* bytes, so
+/// this, and not the plaintext limit, is what its ceiling has to be.
+///
+/// It was `MAX_UPLOAD_BYTES + MAX_REQUEST_BODY_BYTES`, the plaintext limits
+/// added together, which is both too small and too large. Too small for the
+/// route it was sized for: 25 MiB of file is about 44 MiB on the wire, so
+/// uploads died above roughly 14 MiB -- and died as a bare `invalid_envelope`,
+/// because an over-limit read and a corrupt envelope came back the same way.
+/// (The app carries a 10 MiB cap and a comment measuring that cliff at "about
+/// 14MB"; this is the gateway end of that workaround.) Too large for every
+/// other route, which the router holds to 128 KiB in the clear and which the
+/// middleware, sitting outside that limit, let buffer 25 MiB.
+const fn sealed_body_ceiling(plaintext: usize) -> usize {
+    base64_len(base64_len(plaintext) + SEALED_SCAFFOLD_BYTES) + SEALED_SCAFFOLD_BYTES
+}
+
+/// The plaintext a route is allowed to carry, matching what the router's own
+/// body limits allow it in the clear.
+fn plaintext_body_limit(path: &str) -> usize {
+    if path == UPLOADS_PATH {
+        MAX_UPLOAD_BYTES
+    } else {
+        MAX_REQUEST_BODY_BYTES
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 struct EncryptedRequestPayload {
@@ -2135,15 +2181,20 @@ async fn decrypt_transport_request(
             .path_and_query()
             .map_or(parts.uri.path(), |value| value.as_str())
     );
-    let body_bytes = to_bytes(body, MAX_UPLOAD_BYTES + MAX_REQUEST_BODY_BYTES)
-        .await
-        .map_err(|_| {
-            api_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_envelope",
-                "invalid encrypted request",
-            )
-        })?;
+    // Sized to the route, because this read happens outside the router's own
+    // body limits and is therefore the only thing bounding them.
+    let body_bytes = to_bytes(
+        body,
+        sealed_body_ceiling(plaintext_body_limit(parts.uri.path())),
+    )
+    .await
+    .map_err(|_| {
+        api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "body_too_large",
+            "the request body is too large",
+        )
+    })?;
     let envelope_bytes = match parts.headers.get(TRANSPORT_ENVELOPE_HEADER) {
         Some(value) => transport::decode_key(value.to_str().unwrap_or_default()).map_err(|_| {
             api_error(
@@ -2278,7 +2329,15 @@ async fn encrypt_transport_response(
     request_nonce: &str,
 ) -> Response {
     let (parts, body) = response.into_parts();
-    let body = match to_bytes(body, MAX_UPLOAD_BYTES + MAX_REQUEST_BODY_BYTES).await {
+    // A response is buffered as plaintext and sealed afterwards, so the bound
+    // is on what a handler can produce: an asset preview is the largest, and
+    // every other route answers JSON well under the request limit.
+    let body = match to_bytes(
+        body,
+        MAX_ASSET_CONTENT_BYTES as usize + MAX_REQUEST_BODY_BYTES,
+    )
+    .await
+    {
         Ok(body) => body,
         Err(_) => {
             return api_error(
@@ -12197,6 +12256,129 @@ mod tests {
             .header(TRANSPORT_DEVICE_HEADER, device_id)
             .body(Body::from(serde_json::to_vec(&envelope).unwrap()))
             .unwrap()
+    }
+
+    /// Seal a body of `size` bytes for `path` exactly the way the app does,
+    /// and answer how many bytes that puts on the wire.
+    fn sealed_wire_len(material: &[u8], token: &str, path: &str, size: usize) -> usize {
+        let payload = EncryptedRequestPayload {
+            token: token.into(),
+            content_type: Some("multipart/form-data; boundary=x".into()),
+            body: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(vec![0_u8; size]),
+        };
+        let envelope = transport::seal(
+            material,
+            transport::Direction::Request,
+            format!("POST {path}").as_bytes(),
+            &serde_json::to_vec(&payload).unwrap(),
+            now_unix_ms(),
+        )
+        .unwrap();
+        serde_json::to_vec(&envelope).unwrap().len()
+    }
+
+    /// The gateway advertises a 25 MiB upload limit and answers 413 with "the
+    /// upload must be at most 25 MiB". Over its own encrypted transport --
+    /// which is on by default -- it could not actually accept one: the
+    /// middleware buffered the sealed bytes against a ceiling sized for the
+    /// plaintext, and a 25 MiB file is about 44 MiB sealed.
+    #[test]
+    fn a_maximum_upload_fits_through_the_encrypted_transport() {
+        let transport_key = generate_token();
+        let material = transport::decode_key(&transport_key).unwrap();
+
+        // Measured at a size that is quick to seal rather than at the ceiling
+        // itself. The expansion is affine -- base64, JSON, seal, base64 -- so
+        // one sample fixes the slope, and `MAX_UPLOAD_BYTES` is exactly 25 of
+        // these. The exact version is
+        // `a_literal_maximum_upload_seals_within_the_ceiling`, kept ignored
+        // because sealing 25 MiB in a debug build takes twelve seconds.
+        const SAMPLE: usize = 1024 * 1024;
+        let sampled = sealed_wire_len(&material, "device-token", UPLOADS_PATH, SAMPLE);
+        assert!(sampled <= sealed_body_ceiling(SAMPLE));
+
+        let at_maximum = sampled * (MAX_UPLOAD_BYTES / SAMPLE);
+        let previous = MAX_UPLOAD_BYTES + MAX_REQUEST_BODY_BYTES;
+        assert!(
+            at_maximum > previous,
+            "a {MAX_UPLOAD_BYTES}-byte upload seals to about {at_maximum} bytes, \
+             which the old {previous}-byte ceiling should not have fit"
+        );
+        assert!(
+            at_maximum <= sealed_body_ceiling(MAX_UPLOAD_BYTES),
+            "sealed about {at_maximum} bytes against a ceiling of {}",
+            sealed_body_ceiling(MAX_UPLOAD_BYTES)
+        );
+    }
+
+    #[test]
+    #[ignore = "seals 25 MiB; slow in a debug build"]
+    fn a_literal_maximum_upload_seals_within_the_ceiling() {
+        let transport_key = generate_token();
+        let material = transport::decode_key(&transport_key).unwrap();
+        let wire = sealed_wire_len(&material, "device-token", UPLOADS_PATH, MAX_UPLOAD_BYTES);
+        assert!(
+            wire > MAX_UPLOAD_BYTES + MAX_REQUEST_BODY_BYTES,
+            "sealed to {wire} bytes"
+        );
+        assert!(
+            wire <= sealed_body_ceiling(MAX_UPLOAD_BYTES),
+            "sealed {wire} bytes against a ceiling of {}",
+            sealed_body_ceiling(MAX_UPLOAD_BYTES)
+        );
+    }
+
+    /// And the other half: every route that is not the upload route is held to
+    /// the same 128 KiB the router holds it to in the clear. The middleware
+    /// runs outside those limits, so before this it let any encrypted request
+    /// on any route buffer 25 MiB.
+    #[test]
+    fn every_other_route_is_held_to_the_small_body_limit() {
+        assert_eq!(plaintext_body_limit(UPLOADS_PATH), MAX_UPLOAD_BYTES);
+        for path in [
+            "/api/sessions/default/panes/%1/send-text",
+            "/api/pair/claim",
+            "/api/uploads/",
+            "/api/uploadsx",
+            "/health",
+        ] {
+            assert_eq!(
+                plaintext_body_limit(path),
+                MAX_REQUEST_BODY_BYTES,
+                "{path} should get the small limit"
+            );
+        }
+        assert!(
+            sealed_body_ceiling(MAX_REQUEST_BODY_BYTES) < MAX_UPLOAD_BYTES,
+            "the non-upload ceiling must be far under what it used to be"
+        );
+    }
+
+    /// An over-limit body says so, instead of arriving as a corrupt envelope.
+    #[tokio::test]
+    async fn an_oversized_encrypted_body_is_refused_as_too_large() {
+        let token = "device-token";
+        let transport_key = generate_token();
+        let mut device = test_device("phone-1", token);
+        device.transport_key = Some(transport_key);
+        let state = test_state("admin-token", vec![device]);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/sessions/default/panes/%1/send-text")
+            .header(TRANSPORT_HEADER, "1")
+            .header(TRANSPORT_DEVICE_HEADER, "phone-1")
+            .body(Body::from(vec![
+                b'x';
+                sealed_body_ceiling(MAX_REQUEST_BODY_BYTES)
+                    + 1
+            ]))
+            .unwrap();
+        let (status, body) = decrypt_transport_request(&state, request)
+            .await
+            .expect_err("an over-limit body must be refused");
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(body.0["error"]["code"], "body_too_large");
     }
 
     #[tokio::test]
