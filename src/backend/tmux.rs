@@ -427,7 +427,24 @@ impl TerminalBackend for TmuxBackend {
         Box::pin(async move {
             let activity = async_stream::stream! {
                 let mut delay = ACTIVITY_POLL_MIN;
-                let mut previous = None;
+                // The baseline is taken before the first sleep, not after it.
+                //
+                // A fingerprint is only news against a previous one, so the
+                // first poll of a stream can never yield -- it establishes the
+                // baseline. Sleeping first therefore took that baseline a
+                // whole interval late, and every layout change inside that
+                // window was absorbed into it and never announced: a phone
+                // that opened its stream and split a pane a moment later was
+                // told nothing, and stayed wrong until some *other* change
+                // came along. The window used to be zero, because
+                // `tokio::time::interval` fires its first tick immediately;
+                // swapping it for `sleep(delay)` to get the backoff is what
+                // opened it, and the backoff then widens it to two seconds on
+                // a stream that reconnects onto an idle session.
+                //
+                // Seeding here costs one extra fingerprint per stream and
+                // leaves the backoff exactly as it was.
+                let mut previous = backend.topology_fingerprint().await.ok();
                 loop {
                     tokio::time::sleep(delay).await;
                     match backend.topology_fingerprint().await {
@@ -2213,6 +2230,54 @@ mod tests {
             "the pane received {:?}",
             String::from_utf8_lossy(&received)
         );
+    }
+
+    /// A layout change made just after a stream opens must still be
+    /// announced. The first poll can never yield -- it has nothing to compare
+    /// against -- so if the baseline is taken a whole interval late, anything
+    /// that happened inside that interval is absorbed into it and the client
+    /// is never told. This is the narrow, named version of what
+    /// `isolated_tmux_server_satisfies_the_read_write_contract` also covers.
+    #[tokio::test]
+    #[ignore = "requires a tmux server"]
+    async fn a_change_made_right_after_the_stream_opens_is_still_announced() {
+        let backend = fresh_backend();
+        // A workspace already exists, so the change under test is a second
+        // one rather than the server starting up.
+        let first = backend
+            .create_workspace(&CreateWorkspace {
+                cwd: Some(std::env::temp_dir()),
+                label: Some("gateway-seeded".into()),
+                focus: true,
+            })
+            .await
+            .unwrap();
+
+        let mut activity = backend.activity_stream().await.unwrap();
+        let waiting = tokio::spawn(async move {
+            tokio::time::timeout(std::time::Duration::from_secs(3), activity.next()).await
+        });
+        // Well inside the first poll interval, which is where the change used
+        // to disappear.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let second = backend
+            .create_workspace(&CreateWorkspace {
+                cwd: Some(std::env::temp_dir()),
+                label: Some("gateway-late".into()),
+                focus: true,
+            })
+            .await
+            .unwrap();
+
+        let event = waiting
+            .await
+            .unwrap()
+            .expect("a change inside the first poll interval must still be reported")
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.name, "layout_updated");
+        backend.close_workspace(&second.id).await.ok();
+        backend.close_workspace(&first.id).await.ok();
     }
 
     #[tokio::test]
