@@ -785,10 +785,7 @@ mod tests {
 
     impl FakeHerdr {
         fn start() -> Self {
-            let socket_path = std::env::temp_dir().join(format!(
-                "gateway-herdr-contract-{}.sock",
-                uuid::Uuid::new_v4().simple()
-            ));
+            let socket_path = crate::short_test_socket("gw-herdr");
             let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
             let calls = Arc::new(Mutex::new(Vec::new()));
             let recorded = Arc::clone(&calls);

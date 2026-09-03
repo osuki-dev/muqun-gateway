@@ -491,8 +491,7 @@ mod tests {
     /// Fresh wrapped backend on a private tmux socket, isolated from any real
     /// server, mirroring `tmux::tests::fresh_backend`.
     fn fresh_wrapped_backend() -> TmuxWireIds {
-        let socket =
-            std::env::temp_dir().join(format!("gateway-wire-test-{}.sock", uuid::Uuid::new_v4()));
+        let socket = crate::short_test_socket("gw-wire");
         TmuxWireIds::new(Box::new(super::super::TmuxBackend::new(Some(socket))))
     }
 

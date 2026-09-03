@@ -1116,11 +1116,13 @@ fn shell_word(value: &str) -> String {
 /// `-p` does two separate jobs, and both are load-bearing. Do not drop it for
 /// either one alone.
 ///
-/// It keeps a multi-line message one message. `paste-buffer` rewrites every LF
-/// in the buffer to CR, and CR is byte-for-byte what the Enter key sends, so
-/// without `-p` a line-submitting TUI submits at the first embedded newline and
-/// reads the rest as a second, interrupting prompt. `-p` wraps the payload in
-/// the bracketed-paste markers, which say "all of this is content".
+/// It keeps a multi-line message one message. A line-submitting TUI submits on
+/// the byte the Enter key sends, so without `-p` an embedded newline ends the
+/// message and the rest arrives as a second, interrupting prompt. `-p` wraps
+/// the payload in the bracketed-paste markers, which say "all of this is
+/// content". Which byte an embedded LF arrives as is tmux's business and has
+/// changed across versions -- it rewrote LF to CR for years and 3.7 delivers
+/// the LF unchanged -- so `-p` is what this relies on, not the rewrite.
 ///
 /// It is also the only channel by which an agent can recognise an attachment.
 /// Claude Code converts an image path to an `[Image #N]` reference inside its
@@ -1183,6 +1185,19 @@ fn tmux_key(value: &str) -> Result<String, BackendError> {
         // the first becomes literal text and the second lands as a plain Tab.
         "shift+tab" => "BTab".to_owned(),
         "backspace" => "BSpace".to_owned(),
+        // tmux separates the commands in one invocation at a bare `;`
+        // argument, and that split happens before `send-keys` ever sees its
+        // own arguments. So a `;` passed through as a key is not typed at
+        // all: it ends the send-keys command, and every key after it is read
+        // as a further tmux command to run. Measured against tmux 3.x:
+        // `send-keys -t %0 ';'` types nothing and exits 0, and
+        // `send-keys -t %0 ';' 'list-sessions'` prints a session listing.
+        //
+        // Escaping it is what tmux documents for exactly this, and it types
+        // the character: `send-keys -t %0 '\;'` puts a semicolon in the pane.
+        // `;` is the only character this applies to -- every other ASCII
+        // punctuation mark, `{` and `}` and `\` included, arrives literally.
+        ";" => "\\;".to_owned(),
         "up" | "arrowup" => "Up".to_owned(),
         "down" | "arrowdown" => "Down".to_owned(),
         "left" | "arrowleft" => "Left".to_owned(),
@@ -1767,6 +1782,39 @@ mod tests {
         assert!(tmux_key("C-x;kill-server").is_err());
     }
 
+    /// A bare `;` argument ends the command tmux is currently reading, so a
+    /// semicolon handed straight to `send-keys` is not typed -- and whatever
+    /// keys follow it are run as tmux commands instead. Escaped, it types.
+    ///
+    /// The reachable damage was bounded, because every other key in the same
+    /// request has to pass this same allow-list and so is one character or a
+    /// named key: `[";", "i", "x", "y"]` reaches `if-shell` with a one-letter
+    /// shell command, which is not an escalation for a caller who already
+    /// holds a device token and can type into the pane. The dropped keystroke
+    /// is the part a person actually meets.
+    #[test]
+    fn a_semicolon_is_escaped_so_tmux_types_it_instead_of_reading_a_command() {
+        assert_eq!(tmux_key(";").unwrap(), "\\;");
+    }
+
+    /// Every other printable ASCII character is passed through untouched.
+    /// Confirmed against tmux by typing all of them into a live pane: `;` was
+    /// the only one that did not arrive.
+    #[test]
+    fn every_other_printable_ascii_key_is_passed_through_verbatim() {
+        for byte in b' '..=b'~' {
+            let key = (byte as char).to_string();
+            if key == ";" {
+                continue;
+            }
+            assert_eq!(
+                tmux_key(&key).unwrap(),
+                key,
+                "{key:?} should reach tmux as itself"
+            );
+        }
+    }
+
     #[test]
     fn capture_is_trimmed_to_the_requested_rows() {
         assert_eq!(tail_lines("one\ntwo\nthree\nfour\n", 2), "three\nfour");
@@ -1888,8 +1936,7 @@ mod tests {
     /// tell those two apart can.
     #[tokio::test]
     async fn probe_reachable_tells_no_server_apart_from_list_panes_reporting_empty() {
-        let socket =
-            std::env::temp_dir().join(format!("gateway-probe-{}.sock", uuid::Uuid::new_v4()));
+        let socket = crate::short_test_socket("gw-probe");
         let backend = TmuxBackend::new(Some(socket));
         assert!(!backend.probe_reachable().await.unwrap());
         assert_eq!(backend.list_panes().await.unwrap(), Vec::new());
@@ -2086,8 +2133,7 @@ mod tests {
 
     /// Fresh backend on a private tmux socket, isolated from any real server.
     fn fresh_backend() -> TmuxBackend {
-        let socket =
-            std::env::temp_dir().join(format!("gateway-test-{}.sock", uuid::Uuid::new_v4()));
+        let socket = crate::short_test_socket("gw-test");
         TmuxBackend::new(Some(socket))
     }
 
@@ -2183,8 +2229,12 @@ mod tests {
         // markers on.
         let recording =
             std::env::temp_dir().join(format!("gateway-paste-{}", uuid::Uuid::new_v4()));
+        // `head -c` rather than `timeout cat`: the recorder stops itself once
+        // the payload has arrived, so this needs no `timeout`, which is GNU
+        // coreutils and is not on a stock macOS -- where this test could not
+        // pass at all. The count is the length of the expected recording.
         let recorder = format!(
-            "printf '\\033[?2004h'; stty raw -echo; timeout 10 cat > {}; stty sane",
+            "printf '\\033[?2004h'; stty raw -echo; head -c 34 > {}; stty sane",
             shell_word(&recording.to_string_lossy())
         );
         backend.send_text(&pane.id, &recorder).await.unwrap();
@@ -2207,9 +2257,65 @@ mod tests {
         let received = read_when_complete(&recording, b"\x1b[201~").await;
         let _ = std::fs::remove_file(&recording);
         backend.close_workspace(&workspace.id).await.unwrap();
+        // Either separator passes, and which one arrives is tmux's business,
+        // not this gateway's. The old assertion pinned `\r`, which is what
+        // tmux rewrote LF to for years; tmux 3.7 delivers the LF unchanged, so
+        // the assertion failed on a newer tmux for a change that is strictly
+        // in the safe direction -- `\r` is the byte Enter sends and `\n` is
+        // not. What must hold either way is the part this test exists for:
+        // the payload arrives wrapped in the bracketed-paste markers, as one
+        // message, with nothing between the two lines that ends it.
+        assert!(
+            received == b"\x1b[200~first line\rsecond line\x1b[201~".to_vec()
+                || received == b"\x1b[200~first line\nsecond line\x1b[201~".to_vec(),
+            "the pane received {:?}",
+            String::from_utf8_lossy(&received)
+        );
+    }
+
+    /// The end-to-end proof for the `;` escape: read the pane's own tty, so
+    /// what is asserted is the bytes that reached the program, not a screen
+    /// capture that might render a dropped key as blank space anyway.
+    ///
+    /// Before the escape this test recorded `ab`: the `;` ended the send-keys
+    /// command and `b` was handed to tmux as a command name to run.
+    #[tokio::test]
+    #[ignore = "requires a tmux server"]
+    async fn a_semicolon_key_reaches_the_pane_as_a_typed_character() {
+        let (backend, workspace) = contract_workspace().await;
+        let panes = backend.list_panes().await.unwrap();
+        let pane = panes
+            .iter()
+            .find(|p| p.workspace_id == workspace.id)
+            .unwrap()
+            .clone();
+
+        let recording =
+            std::env::temp_dir().join(format!("gateway-semicolon-{}", uuid::Uuid::new_v4()));
+        let recorder = format!(
+            "printf '\\033[?2004h'; stty raw -echo; head -c 3 > {}; stty sane",
+            shell_word(&recording.to_string_lossy())
+        );
+        backend.send_text(&pane.id, &recorder).await.unwrap();
+        backend
+            .send_keys(&pane.id, &["Enter".to_owned()])
+            .await
+            .unwrap();
+        wait_for_pane_flag(&backend, &pane.id, "#{bracket_paste_flag}", "1").await;
+
+        // `b` after the `;` is the second half of the defect: unescaped, it
+        // was not typed either -- it was read as a tmux command name.
+        backend
+            .send_keys(&pane.id, &["a".to_owned(), ";".to_owned(), "b".to_owned()])
+            .await
+            .unwrap();
+
+        let received = read_when_complete(&recording, b"a;b").await;
+        let _ = std::fs::remove_file(&recording);
+        backend.close_workspace(&workspace.id).await.unwrap();
         assert_eq!(
             received,
-            b"\x1b[200~first line\rsecond line\x1b[201~".to_vec(),
+            b"a;b".to_vec(),
             "the pane received {:?}",
             String::from_utf8_lossy(&received)
         );
