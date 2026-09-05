@@ -676,13 +676,42 @@ fn pane_from_json(value: &Value) -> Result<Pane, BackendError> {
             .get("focused")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        // herdr's pane payload has no `width`, and its `PaneInfo` schema has
+        // never declared one; this read stays because a future herdr may add
+        // it, and costs nothing until then. Nothing here derives one:
+        //
+        // - `pane.layout` does report a per-pane `rect`, but that is the box
+        //   drawn on screen, not the grid the program sees. Measured live at
+        //   protocol 20 against a split pane: `rect` was 47x39 while the shell
+        //   inside it reported `stty size` = 37 rows by 44 columns. The
+        //   vertical overhead is 2 and the horizontal 3, so there is no single
+        //   border width to subtract -- and herdr has four independent knobs
+        //   (`pane_borders`, `pane_outer_borders`, `pane_gaps`,
+        //   `pane_scrollbars`) that move it. Subtracting a guess would put the
+        //   wrong column count on a real pane, which is worse than none.
+        // - The padded row length of a read is exact, because herdr right-pads
+        //   rows, but that is one `pane.read` per pane and `list_panes` runs
+        //   every 1.5s for the approval watcher alone.
+        //
+        // So a client still measures its own columns from the read it already
+        // has. See the card's report for the recommendation.
         width: value
             .get("width")
             .and_then(Value::as_u64)
             .and_then(|v| u32::try_from(v).ok()),
+        // `scroll.viewport_rows` *is* the height, and it is already in this
+        // payload. Measured live: a pane whose shell reported 37 rows came
+        // back with `viewport_rows: 37`, while `pane.layout`'s rect said 39.
+        // Reading `height` first keeps the field honest if herdr ever sends
+        // one of its own.
         height: value
             .get("height")
             .and_then(Value::as_u64)
+            .or_else(|| {
+                value
+                    .pointer("/scroll/viewport_rows")
+                    .and_then(Value::as_u64)
+            })
             .and_then(|v| u32::try_from(v).ok()),
         revision: value.get("revision").and_then(Value::as_u64),
         foreground_command: value
@@ -708,8 +737,20 @@ fn pane_from_json(value: &Value) -> Result<Pane, BackendError> {
                     .and_then(Value::as_u64)
                     .and_then(|rows| u32::try_from(rows).ok())
             }),
-        // Herdr's own envelope has never carried this; nothing to read.
+        // Herdr's own envelope has never carried this; nothing to read, and
+        // nothing to derive it from either -- its published schema at protocol
+        // 20 has no alternate-screen flag on any pane shape, and the
+        // `InputState` that does track one is handoff state rather than API
+        // state. A reader that needs to know whether a pane's program owns the
+        // screen has to fall back on `foreground_command`, which is what
+        // `ScrollbackStore::is_editor_command` already does.
         alternate_on: None,
+        // herdr's socket API exposes no cursor position at all: the only
+        // `cursor` in its protocol-20 schema is the Cursor editor as an
+        // integration target. Absence is part of the contract for these two
+        // fields, so this is a supported answer rather than a gap.
+        cursor_x: None,
+        cursor_y: None,
     })
 }
 
@@ -1048,6 +1089,83 @@ mod tests {
         assert_eq!(pane["foreground_cwd"], "/work/muqun");
         assert_eq!(pane["scroll"]["max_offset_from_bottom"], 908);
         assert_eq!(pane["scroll"]["viewport_rows"], 64);
+    }
+
+    /// A herdr pane payload as herdr actually sends one -- no `width`, no
+    /// `height`, no alternate-screen flag -- must still come back with a
+    /// height, because `scroll.viewport_rows` is that height.
+    ///
+    /// Measured against a live herdr at protocol 20: a pane whose shell
+    /// reported `stty size` = `37 44` came back with `viewport_rows: 37`.
+    #[test]
+    fn a_herdr_pane_gets_its_height_from_the_viewport_rows_herdr_does_send() {
+        let pane = pane_from_json(&json!({
+            "pane_id": "w1:p1",
+            "workspace_id": "w1",
+            "tab_id": "w1:t1",
+            "focused": true,
+            "scroll": { "offset_from_bottom": 0, "max_offset_from_bottom": 0, "viewport_rows": 37 }
+        }))
+        .unwrap();
+        assert_eq!(pane.height, Some(37));
+        assert_eq!(pane.viewport_rows, Some(37));
+
+        // The three herdr genuinely does not have. Each is checked here so
+        // that a herdr which starts sending one fails this test rather than
+        // silently keeping the workaround alive on the app side.
+        assert_eq!(pane.width, None, "herdr has no pane width to give");
+        assert_eq!(pane.alternate_on, None, "herdr has no alt-screen flag");
+        assert_eq!(pane.cursor_x, None, "herdr exposes no cursor");
+        assert_eq!(pane.cursor_y, None);
+
+        // And on the wire.
+        let envelope = super::super::compat::pane_list(vec![pane]);
+        let pane = &envelope["result"]["panes"][0];
+        assert_eq!(pane["height"], 37);
+        assert!(pane["width"].is_null());
+        assert!(pane["cursor_x"].is_null());
+    }
+
+    /// A `height` herdr sends itself wins over the derived one, so this stays
+    /// correct if herdr ever starts reporting the field.
+    #[test]
+    fn a_height_herdr_sends_itself_is_preferred_to_the_viewport_rows() {
+        let pane = pane_from_json(&json!({
+            "pane_id": "w1:p1",
+            "workspace_id": "w1",
+            "tab_id": "w1:t1",
+            "height": 41,
+            "scroll": { "max_offset_from_bottom": 0, "viewport_rows": 37 }
+        }))
+        .unwrap();
+        assert_eq!(pane.height, Some(41));
+    }
+
+    /// The app now sends every typed character as its own `send-keys`, so the
+    /// single character has to survive this adapter untouched.
+    ///
+    /// Verified end to end against a live herdr and a real nvim: `i`, then
+    /// `h` `e` `l` `l` `o` one call each, then `Escape`, `:` `w` `q`, `Enter`
+    /// -- nvim obeyed every one and wrote a file containing exactly `hello`.
+    /// So herdr's `pane.send_keys` types rather than pastes, and needs no
+    /// per-character translation here.
+    #[tokio::test]
+    async fn single_characters_reach_herdr_send_keys_unchanged() {
+        let herdr = FakeHerdr::start();
+        let backend = HerdrBackend::new(&herdr.socket_path);
+        for key in ["i", "h", ":", ";", "Escape", "Enter"] {
+            backend
+                .send_keys(&PaneId::new("w1:p1"), &[key.to_owned()])
+                .await
+                .unwrap();
+        }
+        let calls = herdr.calls.lock().unwrap().clone();
+        let sent: Vec<String> = calls
+            .iter()
+            .filter(|call| call["method"] == "pane.send_keys")
+            .map(|call| call["params"]["keys"][0].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(sent, ["i", "h", ":", ";", "Escape", "Enter"]);
     }
 
     #[test]

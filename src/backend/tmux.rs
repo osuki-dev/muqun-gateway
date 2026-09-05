@@ -580,11 +580,13 @@ impl TerminalBackend for TmuxBackend {
                 "#{history_size}",
                 "#{alternate_on}",
                 "#{pane_pid}",
+                "#{cursor_x}",
+                "#{cursor_y}",
             ]);
             let output = self
                 .list_output(["list-panes", "-a", "-F", &format])
                 .await?;
-            let rows = parse_rows(&output, 14, "pane")?;
+            let rows = parse_rows(&output, 16, "pane")?;
             let mut panes = Vec::with_capacity(rows.len());
             let mut unresolved = Vec::new();
             for fields in rows {
@@ -1133,6 +1135,12 @@ fn pane_from_fields(fields: Vec<String>) -> Result<Pane, BackendError> {
             "0" => Some(false),
             _ => None,
         },
+        // Lenient for the same reason as `alternate_on`: an optional field a
+        // client is required to cope with the absence of must not be able to
+        // fail the whole pane list. tmux reports these zero-based from the top
+        // left of the viewport, which is exactly what the app wants.
+        cursor_x: fields[14].parse().ok(),
+        cursor_y: fields[15].parse().ok(),
     })
 }
 
@@ -1681,15 +1689,20 @@ mod tests {
             "claude",
             "12",
             "1",
+            "4242",
+            "17",
+            "5",
         ]
         .join(&FIELD_SEPARATOR.to_string());
-        let fields = parse_rows(&row, 13, "pane").unwrap().remove(0);
+        let fields = parse_rows(&row, 16, "pane").unwrap().remove(0);
         let pane = pane_from_fields(fields).unwrap();
 
         assert_eq!(pane.workspace_id.as_str(), "$0");
         assert_eq!(pane.tab_id.as_str(), "@2");
         assert_eq!(pane.id.as_str(), "%9");
         assert_eq!(pane.agent.as_deref(), Some("claude"));
+        assert_eq!(pane.cursor_x, Some(17));
+        assert_eq!(pane.cursor_y, Some(5));
         assert_eq!(pane.cwd, Some(PathBuf::from("/work/project")));
         assert_eq!(pane.max_offset_from_bottom, Some(12));
         assert_eq!(pane.viewport_rows, Some(41));
@@ -1916,11 +1929,18 @@ mod tests {
             "claude",
             "12",
             "",
+            "4242",
+            "",
+            "",
         ]
         .join(&FIELD_SEPARATOR.to_string());
-        let fields = parse_rows(&row, 13, "pane").unwrap().remove(0);
+        let fields = parse_rows(&row, 16, "pane").unwrap().remove(0);
         let pane = pane_from_fields(fields).unwrap();
         assert_eq!(pane.alternate_on, None);
+        // Same leniency for the cursor: a tmux that does not report it leaves
+        // the fields absent rather than failing the whole pane list.
+        assert_eq!(pane.cursor_x, None);
+        assert_eq!(pane.cursor_y, None);
     }
 
     #[test]
@@ -2751,6 +2771,61 @@ mod tests {
             written.trim_end_matches('\n'),
             "hello",
             "nvim received the keystrokes as a paste and put them in the buffer"
+        );
+    }
+
+    /// Against a real tmux, not a fixture: every geometry field the app reads
+    /// off a listed pane has to actually arrive, and the cursor has to move
+    /// when something types.
+    #[tokio::test]
+    #[ignore = "requires a tmux server"]
+    async fn a_listed_tmux_pane_carries_its_geometry_and_cursor() {
+        let (backend, workspace) = contract_workspace().await;
+        let pane = backend
+            .list_panes()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|pane| pane.workspace_id == workspace.id)
+            .unwrap();
+
+        assert!(pane.width.is_some_and(|w| w > 0), "width: {:?}", pane.width);
+        assert!(
+            pane.height.is_some_and(|h| h > 0),
+            "height: {:?}",
+            pane.height
+        );
+        assert!(pane.alternate_on.is_some(), "alternate_on was not reported");
+        let before = (pane.cursor_x, pane.cursor_y);
+        assert!(
+            before.0.is_some() && before.1.is_some(),
+            "cursor: {before:?}"
+        );
+
+        // The cursor is a live position, not a constant: typing has to move
+        // it. A field wired to the wrong tmux variable would sit still.
+        backend
+            .send_text(&pane.id, "some typed text", SendTextMode::Keys)
+            .await
+            .unwrap();
+        let moved = {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let now = backend.get_pane(&pane.id).await.unwrap();
+                if (now.cursor_x, now.cursor_y) != before {
+                    break (now.cursor_x, now.cursor_y);
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the cursor never moved from {before:?}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        };
+        backend.close_workspace(&workspace.id).await.ok();
+        assert!(
+            moved.0.is_some_and(|x| x < pane.width.unwrap()),
+            "cursor_x {moved:?} should be inside the pane"
         );
     }
 

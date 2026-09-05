@@ -162,6 +162,19 @@ pub struct Pane {
     /// already walks (`compat::pane_list`), as a raw signal a future reader
     /// may still want.
     pub alternate_on: Option<bool>,
+    /// Where the cursor sits in the pane's grid, zero-based, column then row,
+    /// counted from the top-left of the *viewport* rather than of the
+    /// scrollback.
+    ///
+    /// The app opens a large editor over a pane and wants it anchored where
+    /// the person is working rather than at the top-left corner. Optional
+    /// because not every backend has one to give: tmux reports `#{cursor_x}`
+    /// and `#{cursor_y}` directly, and herdr's socket API exposes no cursor at
+    /// all (checked against its published schema at protocol 20 -- the only
+    /// `cursor` in it is the Cursor editor as an integration target). A client
+    /// has to treat absence as "put it wherever you would have".
+    pub cursor_x: Option<u32>,
+    pub cursor_y: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

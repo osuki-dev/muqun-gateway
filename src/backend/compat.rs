@@ -154,6 +154,11 @@ fn pane(value: Pane) -> Value {
         "focused": value.focused,
         "width": value.width,
         "height": value.height,
+        // Zero-based, column then row, from the top left of the viewport. Null
+        // wherever the backend has no cursor to report (herdr), which a client
+        // has to treat as "put it wherever you would have".
+        "cursor_x": value.cursor_x,
+        "cursor_y": value.cursor_y,
         "revision": value.revision,
         "foreground_command": value.foreground_command,
         "agent": value.agent,
@@ -235,6 +240,8 @@ mod tests {
             max_offset_from_bottom: Some(42),
             viewport_rows: Some(40),
             alternate_on: Some(true),
+            cursor_x: Some(3),
+            cursor_y: Some(7),
         }]);
 
         assert_eq!(response["result"]["type"], "pane_list");
@@ -263,6 +270,8 @@ mod tests {
             max_offset_from_bottom: Some(0),
             viewport_rows: Some(24),
             alternate_on: Some(false),
+            cursor_x: None,
+            cursor_y: None,
         };
         let tab = Tab {
             id: TabId::new("@1"),
