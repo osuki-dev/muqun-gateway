@@ -11,8 +11,9 @@ use tokio::net::UnixStream;
 use super::{
     Agent, AgentStatus, BackendActivity, BackendActivityStream, BackendError, BackendFuture,
     BackendKind, BackendMetadata, CreateTab, CreateWorkspace, OutputFormat, OutputSource, Pane,
-    PaneId, PaneOutput, ReadPane, SplitDirection, SplitPane, StartAgent, StartedAgent, Tab, TabId,
-    TerminalBackend, Workspace, WorkspaceId, Worktree, WorktreePlacement, WorktreeRequest,
+    PaneId, PaneOutput, ReadPane, SendTextMode, SplitDirection, SplitPane, StartAgent,
+    StartedAgent, Tab, TabId, TerminalBackend, Workspace, WorkspaceId, Worktree, WorktreePlacement,
+    WorktreeRequest,
 };
 
 /// How long one herdr request may take, end to end.
@@ -439,7 +440,48 @@ impl TerminalBackend for HerdrBackend {
         })
     }
 
-    fn send_text<'a>(&'a self, id: &'a PaneId, text: &'a str) -> BackendFuture<'a, ()> {
+    /// herdr types; it does not paste. Both modes take the same call, and that
+    /// is not an oversight.
+    ///
+    /// Measured against a live herdr (protocol 20) by recording the pane's own
+    /// tty, with the recorder holding bracketed-paste mode on so markers would
+    /// have shown if there were any:
+    ///
+    /// | call | delivered |
+    /// |------|-----------|
+    /// | `pane.send_text` with `abc`      | `abc` |
+    /// | `pane.send_text` with `one\ntwo` | `one\ntwo` |
+    /// | `pane.send_input` with `xyz`     | `ESC[200~xyz ESC[201~` |
+    ///
+    /// So `pane.send_text` is already the keystroke path, which is why the bug
+    /// this card fixes -- an editor key row that types into the buffer instead
+    /// of driving the editor -- was tmux-only. Sending `Keys` here needs no
+    /// change and gets one anyway in the shape of this note, because the next
+    /// person to read it will assume a method called `send_text` pastes.
+    ///
+    /// `Paste` deliberately keeps the same call rather than moving to
+    /// `pane.send_input`. Two reasons, and the first is the ordinary one: this
+    /// is what every herdr client gets today, and a patch release fixing a
+    /// keystroke bug is not where a paste changes shape. The second is that
+    /// `pane.send_input` is not in the protocol floor this gateway supports
+    /// (`HERDR_PROTOCOL_MIN`, 17) as far as anything here can establish, and a
+    /// call an older herdr rejects would turn a working composer into an
+    /// error.
+    ///
+    /// It does mean `Paste` on herdr is not bracketed, so a multi-line
+    /// composer message can submit at its first newline and an attachment path
+    /// does not become an `[Image #N]` reference -- both of which `-p` gives
+    /// the tmux backend. That is a real gap, it predates this card, and it
+    /// wants its own change: `pane.send_input` gates its markers on the
+    /// program's own DECSET 2004 exactly as tmux's `-p` does (verified: into a
+    /// pane that never asked, it delivered a bare `xyz`), so it is the right
+    /// call to move to once the protocol floor is settled.
+    fn send_text<'a>(
+        &'a self,
+        id: &'a PaneId,
+        text: &'a str,
+        _mode: SendTextMode,
+    ) -> BackendFuture<'a, ()> {
         self.command(
             "pane.send_text",
             json!({ "pane_id": id.as_str(), "text": text }),
@@ -1156,7 +1198,10 @@ mod tests {
             })
             .await
             .unwrap();
-        backend.send_text(&pane.id, "hello").await.unwrap();
+        backend
+            .send_text(&pane.id, "hello", SendTextMode::Paste)
+            .await
+            .unwrap();
         backend
             .send_keys(&pane.id, &["Enter".into()])
             .await

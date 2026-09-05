@@ -16,8 +16,8 @@ pub use herdr::HerdrBackend;
 pub use model::{
     Agent, AgentStatus, BackendActivity, BackendActivityStream, BackendError, BackendFuture,
     BackendKind, BackendMetadata, CreateTab, CreateWorkspace, OutputFormat, OutputSource, Pane,
-    PaneId, PaneOutput, PaneRange, ReadPane, SplitDirection, SplitPane, StartAgent, StartedAgent,
-    Tab, TabId, TerminalBackend, Workspace, WorkspaceId, Worktree, WorktreePlacement,
+    PaneId, PaneOutput, PaneRange, ReadPane, SendTextMode, SplitDirection, SplitPane, StartAgent,
+    StartedAgent, Tab, TabId, TerminalBackend, Workspace, WorkspaceId, Worktree, WorktreePlacement,
     WorktreeRequest,
 };
 pub use registry::BackendRegistry;

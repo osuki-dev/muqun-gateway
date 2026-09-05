@@ -31,8 +31,9 @@ use std::path::PathBuf;
 
 use super::{
     Agent, BackendActivityStream, BackendError, BackendFuture, BackendMetadata, CreateTab,
-    CreateWorkspace, Pane, PaneId, PaneOutput, ReadPane, SplitPane, StartAgent, StartedAgent, Tab,
-    TabId, TerminalBackend, Workspace, WorkspaceId, Worktree, WorktreePlacement, WorktreeRequest,
+    CreateWorkspace, Pane, PaneId, PaneOutput, ReadPane, SendTextMode, SplitPane, StartAgent,
+    StartedAgent, Tab, TabId, TerminalBackend, Workspace, WorkspaceId, Worktree, WorktreePlacement,
+    WorktreeRequest,
 };
 
 /// Wraps a tmux [`TerminalBackend`] so every id crossing it is in wire form.
@@ -314,10 +315,15 @@ impl TerminalBackend for TmuxWireIds {
         })
     }
 
-    fn send_text<'a>(&'a self, id: &'a PaneId, text: &'a str) -> BackendFuture<'a, ()> {
+    fn send_text<'a>(
+        &'a self,
+        id: &'a PaneId,
+        text: &'a str,
+        mode: SendTextMode,
+    ) -> BackendFuture<'a, ()> {
         Box::pin(async move {
             let native = decode_wire(id.as_str(), "pane")?;
-            self.inner.send_text(&PaneId::new(native), text).await
+            self.inner.send_text(&PaneId::new(native), text, mode).await
         })
     }
 
@@ -565,7 +571,7 @@ mod tests {
         );
 
         backend
-            .send_text(&pane.id, "printf gateway_wire_probe")
+            .send_text(&pane.id, "printf gateway_wire_probe", SendTextMode::Paste)
             .await
             .unwrap();
         backend

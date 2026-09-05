@@ -342,6 +342,32 @@ pub type BackendActivityStream =
 /// Implementations own transport details and translate their native IDs and
 /// output into this model. They must not expose Herdr JSON or tmux format
 /// strings to callers.
+/// How a text send should reach the program in the pane.
+///
+/// The distinction is the whole of card #0's bug. A terminal program cannot
+/// tell a keystroke from a paste by the characters alone -- it tells them
+/// apart by the bracketed-paste markers around them (DECSET 2004) -- and it
+/// acts on the difference. nvim in Normal mode *executes* a typed `i` and
+/// *inserts* a pasted one. So the sender has to say which it meant, and until
+/// now this API only ever said "paste".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SendTextMode {
+    /// Wrapped in bracketed-paste markers where the program asked for them.
+    ///
+    /// The default, and what `send-text` has always meant. A composer line
+    /// with newlines in it has to arrive as one message rather than submitting
+    /// at the first newline, and an agent that rewrites an attachment path
+    /// into an image reference only does so inside its paste handler.
+    #[default]
+    Paste,
+    /// Delivered as the bytes a keyboard would have produced, with no
+    /// bracketed-paste markers.
+    ///
+    /// What a virtual keyboard and an editor key row need: the program has to
+    /// see `i` as the Insert command, not as a character to insert.
+    Keys,
+}
+
 pub trait TerminalBackend: Send + Sync {
     fn metadata(&self) -> BackendFuture<'_, BackendMetadata>;
     fn activity_stream(&self) -> BackendFuture<'_, BackendActivityStream>;
@@ -366,7 +392,12 @@ pub trait TerminalBackend: Send + Sync {
     fn rename_pane<'a>(&'a self, id: &'a PaneId, label: &'a str) -> BackendFuture<'a, ()>;
     fn close_pane<'a>(&'a self, id: &'a PaneId) -> BackendFuture<'a, ()>;
     fn split_pane<'a>(&'a self, request: &'a SplitPane) -> BackendFuture<'a, Pane>;
-    fn send_text<'a>(&'a self, id: &'a PaneId, text: &'a str) -> BackendFuture<'a, ()>;
+    fn send_text<'a>(
+        &'a self,
+        id: &'a PaneId,
+        text: &'a str,
+        mode: SendTextMode,
+    ) -> BackendFuture<'a, ()>;
     fn send_keys<'a>(&'a self, id: &'a PaneId, keys: &'a [String]) -> BackendFuture<'a, ()>;
     fn focus_agent<'a>(&'a self, target: &'a str) -> BackendFuture<'a, ()>;
     fn prompt_agent<'a>(&'a self, target: &'a str, text: &'a str) -> BackendFuture<'a, ()>;
