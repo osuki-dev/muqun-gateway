@@ -63,10 +63,10 @@ use backend::{
     AgentStatus as BackendAgentStatus, BackendActivity, BackendError, BackendFuture, BackendKind,
     BackendRegistry, CreateTab as BackendCreateTab, CreateWorkspace as BackendCreateWorkspace,
     OutputFormat as BackendOutputFormat, OutputSource as BackendOutputSource, Pane,
-    PaneId as BackendPaneId, ReadPane as BackendReadPane, SplitDirection as BackendSplitDirection,
-    SplitPane as BackendSplitPane, StartAgent as BackendStartAgent, TabId as BackendTabId,
-    TerminalBackend, TmuxWireIds, WorkspaceId as BackendWorkspaceId,
-    WorktreeRequest as BackendWorktreeRequest, TMUX_PROGRAM,
+    PaneId as BackendPaneId, ReadPane as BackendReadPane, SendTextMode as BackendSendTextMode,
+    SplitDirection as BackendSplitDirection, SplitPane as BackendSplitPane,
+    StartAgent as BackendStartAgent, TabId as BackendTabId, TerminalBackend, TmuxWireIds,
+    WorkspaceId as BackendWorkspaceId, WorktreeRequest as BackendWorktreeRequest, TMUX_PROGRAM,
 };
 
 const CONFIG_FILE: &str = "config.json";
@@ -797,6 +797,40 @@ struct OutputQuery {
 #[derive(Deserialize)]
 struct SendTextBody {
     text: String,
+    /// Whether this is a paste or a keyboard.
+    ///
+    /// Absent means paste, which is what `send-text` has always done, so an
+    /// app built against any earlier gateway keeps exactly the behaviour it
+    /// was written for. An unknown value is also a paste rather than a 400:
+    /// a client sending a mode this gateway has never heard of is a client
+    /// running ahead of it, and the two ship independently.
+    #[serde(default)]
+    mode: SendTextRequestMode,
+}
+
+/// The wire spelling of [`BackendSendTextMode`].
+///
+/// Its own type rather than the backend enum with serde on it, because this
+/// one has to absorb a value it does not recognise and the backend enum must
+/// not have a variant meaning "something else".
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum SendTextRequestMode {
+    #[default]
+    Paste,
+    Keys,
+    /// Anything this gateway does not know, taken as the default.
+    #[serde(other)]
+    Unknown,
+}
+
+impl From<SendTextRequestMode> for BackendSendTextMode {
+    fn from(mode: SendTextRequestMode) -> Self {
+        match mode {
+            SendTextRequestMode::Keys => Self::Keys,
+            SendTextRequestMode::Paste | SendTextRequestMode::Unknown => Self::Paste,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -6225,7 +6259,7 @@ async fn split_pane(
         .map_err(backend_api_error)?;
     if let Some(text) = command {
         backend
-            .send_text(&pane.id, &text)
+            .send_text(&pane.id, &text, BackendSendTextMode::Paste)
             .await
             .map_err(backend_api_error)?;
         backend
@@ -8384,7 +8418,7 @@ async fn send_text(
     validate_text(&body.text)?;
     let session = find_session(&state.config, &session_id)?;
     terminal_backend(session)
-        .send_text(&BackendPaneId::new(pane_id), &body.text)
+        .send_text(&BackendPaneId::new(pane_id), &body.text, body.mode.into())
         .await
         .map_err(backend_api_error)?;
     Ok(Json(backend::compat::command_ok("pane_text_sent")))
@@ -11687,12 +11721,21 @@ fn openapi_spec() -> Value {
             },
             "/api/sessions/{sessionId}/panes/{paneId}/send-text": {
                 "post": {
-                    "summary": "Send text to a pane",
+                    "summary": "Send text to a pane, as a paste or as keystrokes",
+                    "description": "`mode` says how the text should reach the program in the pane, because a terminal program acts on the difference. `paste` (the default, and what this route did before the field existed) wraps the text in bracketed-paste markers where the program asked for them: a multi-line composer message then arrives as one message instead of submitting at its first newline, and an agent that rewrites an attachment path into an image reference only does so inside its paste handler. `keys` delivers the bytes a keyboard would have produced, with no markers, which is what a virtual keyboard and an editor key row need -- nvim in Normal mode executes a typed `i` and inserts a pasted one. Omit the field and nothing changes; a value this gateway does not recognise is also treated as `paste` rather than refused, so a newer app and an older gateway keep working together.",
                     "parameters": [path_param("sessionId"), path_param("paneId")],
                     "requestBody": json_body(json!({
                         "type": "object",
                         "required": ["text"],
-                        "properties": { "text": { "type": "string" } }
+                        "properties": {
+                            "text": { "type": "string" },
+                            "mode": {
+                                "type": "string",
+                                "enum": ["paste", "keys"],
+                                "default": "paste",
+                                "description": "How the text reaches the program: as a bracketed paste, or as keystrokes."
+                            }
+                        }
                     })),
                     "responses": ok_response()
                 }
@@ -15698,6 +15741,52 @@ mod tests {
         assert_eq!(header_safe_name("\u{202e}"), "asset");
     }
 
+    /// The compatibility contract this field ships under: the app that sends
+    /// it and the gateway that understands it are released separately, so both
+    /// directions of the mismatch have to be harmless.
+    #[test]
+    fn the_send_text_mode_defaults_to_paste_and_tolerates_what_it_does_not_know() {
+        let parse = |body: &str| serde_json::from_str::<SendTextBody>(body).unwrap();
+
+        // An app built against any earlier gateway sends no mode at all.
+        assert_eq!(parse(r#"{"text":"hi"}"#).mode, SendTextRequestMode::Paste);
+        assert_eq!(
+            BackendSendTextMode::from(parse(r#"{"text":"hi"}"#).mode),
+            BackendSendTextMode::Paste
+        );
+
+        assert_eq!(
+            parse(r#"{"text":"i","mode":"keys"}"#).mode,
+            SendTextRequestMode::Keys
+        );
+        assert_eq!(
+            BackendSendTextMode::from(parse(r#"{"text":"i","mode":"keys"}"#).mode),
+            BackendSendTextMode::Keys
+        );
+        assert_eq!(
+            parse(r#"{"text":"hi","mode":"paste"}"#).mode,
+            SendTextRequestMode::Paste
+        );
+
+        // A newer app naming a mode this gateway has never heard of is a
+        // client running ahead of it, not a bad request. It gets the old
+        // behaviour rather than a 400.
+        for unknown in [
+            r#"{"text":"hi","mode":"literal"}"#,
+            r#"{"text":"hi","mode":"KEYS"}"#,
+            r#"{"text":"hi","mode":""}"#,
+        ] {
+            assert_eq!(
+                BackendSendTextMode::from(parse(unknown).mode),
+                BackendSendTextMode::Paste,
+                "{unknown} should fall back to a paste"
+            );
+        }
+
+        // A mode of the wrong shape is still a malformed body.
+        assert!(serde_json::from_str::<SendTextBody>(r#"{"text":"hi","mode":5}"#).is_err());
+    }
+
     #[test]
     fn openapi_spec_contains_docs_routes_and_auth() {
         let spec = openapi_spec();
@@ -15718,6 +15807,20 @@ mod tests {
         assert!(spec["paths"]["/api/devices/push-token"]["delete"].is_object());
         assert!(spec["paths"]["/api/sessions/{sessionId}/workspaces/{workspaceId}"].is_object());
         assert!(spec["paths"]["/api/sessions/{sessionId}/agents/{target}/send"].is_object());
+        // The mode has to be in the spec or a client has no way to learn the
+        // field exists, and no way to know that leaving it out is a paste.
+        let send_text =
+            &spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/send-text"]["post"];
+        let mode = &send_text["requestBody"]["content"]["application/json"]["schema"]["properties"]
+            ["mode"];
+        assert_eq!(mode["enum"], json!(["paste", "keys"]));
+        assert_eq!(mode["default"], "paste");
+        // Required stays exactly `text`: adding the field must not make every
+        // existing client's body invalid.
+        assert_eq!(
+            send_text["requestBody"]["content"]["application/json"]["schema"]["required"],
+            json!(["text"])
+        );
         assert!(
             spec["paths"]["/api/uploads"]["post"]["requestBody"]["content"]["multipart/form-data"]
                 .is_object()

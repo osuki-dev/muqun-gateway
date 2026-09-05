@@ -12,8 +12,8 @@ use tokio::process::Command;
 use super::{
     Agent, AgentStatus, BackendActivity, BackendActivityStream, BackendError, BackendFuture,
     BackendKind, BackendMetadata, CreateTab, CreateWorkspace, OutputFormat, OutputSource, Pane,
-    PaneId, PaneOutput, PaneRange, ReadPane, SplitDirection, SplitPane, StartAgent, StartedAgent,
-    Tab, TabId, TerminalBackend, Workspace, WorkspaceId,
+    PaneId, PaneOutput, PaneRange, ReadPane, SendTextMode, SplitDirection, SplitPane, StartAgent,
+    StartedAgent, Tab, TabId, TerminalBackend, Workspace, WorkspaceId,
 };
 
 /// How often the topology poll runs when something is happening, and the
@@ -980,13 +980,20 @@ impl TerminalBackend for TmuxBackend {
         })
     }
 
-    fn send_text<'a>(&'a self, id: &'a PaneId, text: &'a str) -> BackendFuture<'a, ()> {
+    fn send_text<'a>(
+        &'a self,
+        id: &'a PaneId,
+        text: &'a str,
+        mode: SendTextMode,
+    ) -> BackendFuture<'a, ()> {
         Box::pin(async move {
             validate_tmux_id(id.as_str(), '%', "pane")?;
             let buffer = format!("gateway-{}", uuid::Uuid::new_v4());
             self.output_with_stdin(["load-buffer", "-b", &buffer, "-"], text.as_bytes())
                 .await?;
-            let pasted = self.output(paste_buffer_args(&buffer, id.as_str())).await;
+            let pasted = self
+                .output(paste_buffer_args(&buffer, id.as_str(), mode))
+                .await;
             if pasted.is_err() {
                 let _ = self.output(["delete-buffer", "-b", &buffer]).await;
             }
@@ -1017,7 +1024,13 @@ impl TerminalBackend for TmuxBackend {
     }
 
     fn prompt_agent<'a>(&'a self, target: &'a str, text: &'a str) -> BackendFuture<'a, ()> {
-        Box::pin(async move { self.send_text(&PaneId::new(target), text).await })
+        // A prompt is a message, not typing: it can carry newlines and it can
+        // carry an attachment path the agent only rewrites inside its paste
+        // handler. See `paste_buffer_args`.
+        Box::pin(async move {
+            self.send_text(&PaneId::new(target), text, SendTextMode::Paste)
+                .await
+        })
     }
 
     fn start_agent<'a>(&'a self, request: &'a StartAgent) -> BackendFuture<'a, StartedAgent> {
@@ -1036,7 +1049,10 @@ impl TerminalBackend for TmuxBackend {
                 .map(|argument| shell_word(argument))
                 .collect::<Vec<_>>()
                 .join(" ");
-            self.send_text(&request.pane_id, &command_line).await?;
+            // The shell command that launches the agent, delivered the way it
+            // always has been.
+            self.send_text(&request.pane_id, &command_line, SendTextMode::Paste)
+                .await?;
             self.send_keys(&request.pane_id, &["Enter".to_owned()])
                 .await?;
 
@@ -1143,31 +1159,64 @@ fn shell_word(value: &str) -> String {
 
 /// The argv that delivers a loaded buffer into a pane.
 ///
-/// `-p` does two separate jobs, and both are load-bearing. Do not drop it for
-/// either one alone.
+/// `-p` is what separates a paste from a keystroke, and it is the whole of
+/// this card. It wraps the payload in the bracketed-paste markers, and a
+/// terminal program acts on those markers: nvim in Normal mode *executes* a
+/// typed `i` and *inserts* a pasted one. Sending everything with `-p` -- which
+/// this did unconditionally -- meant the app's virtual keyboard and editor key
+/// row typed into the buffer instead of driving the editor.
 ///
-/// It keeps a multi-line message one message. A line-submitting TUI submits on
-/// the byte the Enter key sends, so without `-p` an embedded newline ends the
-/// message and the rest arrives as a second, interrupting prompt. `-p` wraps
-/// the payload in the bracketed-paste markers, which say "all of this is
-/// content". Which byte an embedded LF arrives as is tmux's business and has
-/// changed across versions -- it rewrote LF to CR for years and 3.7 delivers
-/// the LF unchanged -- so `-p` is what this relies on, not the rewrite.
+/// `SendTextMode::Paste` keeps `-p` and everything it is there for:
 ///
-/// It is also the only channel by which an agent can recognise an attachment.
-/// Claude Code converts an image path to an `[Image #N]` reference inside its
-/// paste handler, which typed input never reaches: character-by-character input
-/// and an unbracketed paste both leave the raw path in the prompt. There is no
-/// fallback to lose it to -- the terminal image protocols (Kitty, Sixel, OSC
-/// 1337) are output-only and OSC 52 carries text -- so without `-p` a phone that
-/// attaches a photo sends a long uploads path instead of the picture.
+/// - It keeps a multi-line message one message. A line-submitting TUI submits
+///   on the byte the Enter key sends, so without `-p` an embedded newline ends
+///   the message and the rest arrives as a second, interrupting prompt.
+/// - It is the only channel by which an agent can recognise an attachment.
+///   Claude Code converts an image path to an `[Image #N]` reference inside its
+///   paste handler, which typed input never reaches. There is no fallback to
+///   lose it to -- the terminal image protocols (Kitty, Sixel, OSC 1337) are
+///   output-only and OSC 52 carries text -- so without `-p` a phone that
+///   attaches a photo sends a long uploads path instead of the picture.
 ///
-/// It is safe to pass unconditionally: tmux emits the markers only for a pane
-/// whose program has requested bracketed paste mode (DECSET 2004), so a program
-/// that never asked receives exactly the bytes it received before, and no
-/// program can be handed markers it would print as text.
-fn paste_buffer_args<'a>(buffer: &'a str, pane_id: &'a str) -> [&'a str; 7] {
-    ["paste-buffer", "-b", buffer, "-t", pane_id, "-d", "-p"]
+/// `-p` is safe to pass whenever it is passed at all: tmux emits the markers
+/// only for a pane whose program has requested bracketed paste mode (DECSET
+/// 2004), so a program that never asked receives exactly the bytes it would
+/// have anyway.
+///
+/// ## Why keystrokes go through the buffer too, rather than `send-keys -l`
+///
+/// `send-keys -l -t <pane> -- <text>` is the obvious spelling and it loses
+/// characters. tmux splits its argument list into commands at `;` *before*
+/// `send-keys` parses its own options, so `--` does not protect one. Measured
+/// against tmux 3.7c, one argument at a time, exactly as an argv would arrive:
+///
+/// | argument | typed |
+/// |----------|-------|
+/// | `;`      | nothing -- and the next argument runs as a tmux command |
+/// | `ls;`    | `ls` -- the trailing `;` is eaten |
+/// | `a;b`    | `a;b` -- a `;` in the middle is safe |
+/// | `ls\;`   | `ls;` -- escaping works, but only at the end |
+/// | `a\;b`   | `a\;b` -- mid-string the backslash is literal |
+///
+/// So an escape rule would have to know where in the string it is, and it
+/// still could not round-trip: text that genuinely ends in a backslash and a
+/// semicolon arrives as a bare semicolon. That is data loss in the one field
+/// whose entire job is to carry what somebody typed.
+///
+/// The buffer path has no argument lexer in it at all. The bytes go in over
+/// stdin and come out unchanged -- `;`, `ls;`, `-n` and `i` all verified
+/// against a live tmux -- so it is byte-exact by construction rather than by
+/// keeping up with tmux's parser. It costs one extra process per send, which
+/// is what `send-text` already cost before this card.
+///
+/// Without `-p`, `paste-buffer` still rewrites an embedded LF to CR. For a
+/// keystroke that is right: a newline typed on a keyboard *is* Enter.
+fn paste_buffer_args<'a>(buffer: &'a str, pane_id: &'a str, mode: SendTextMode) -> Vec<&'a str> {
+    let mut args = vec!["paste-buffer", "-b", buffer, "-t", pane_id, "-d"];
+    if mode == SendTextMode::Paste {
+        args.push("-p");
+    }
+    args
 }
 
 fn refused(stderr: &[u8]) -> BackendError {
@@ -1887,8 +1936,14 @@ mod tests {
         // Without `-p` tmux turns each LF into a CR, which a pane's program
         // cannot tell from Enter -- a two-line message then arrives as two.
         assert_eq!(
-            paste_buffer_args("gateway-buf", "%9"),
+            paste_buffer_args("gateway-buf", "%9", SendTextMode::Paste),
             ["paste-buffer", "-b", "gateway-buf", "-t", "%9", "-d", "-p"]
+        );
+        // Keystrokes take the same path without `-p`, so the bytes arrive
+        // unwrapped and a program reads them as typing.
+        assert_eq!(
+            paste_buffer_args("gateway-buf", "%9", SendTextMode::Keys),
+            ["paste-buffer", "-b", "gateway-buf", "-t", "%9", "-d"]
         );
     }
 
@@ -2426,7 +2481,10 @@ mod tests {
             "printf '\\033[?2004h'; stty raw -echo; head -c 34 > {}; stty sane",
             shell_word(&recording.to_string_lossy())
         );
-        backend.send_text(&pane.id, &recorder).await.unwrap();
+        backend
+            .send_text(&pane.id, &recorder, SendTextMode::Paste)
+            .await
+            .unwrap();
         backend
             .send_keys(&pane.id, &["Enter".to_owned()])
             .await
@@ -2439,7 +2497,7 @@ mod tests {
         // has the mode off -- which is the very thing under test.
         wait_for_pane_flag(&backend, &pane.id, "#{bracket_paste_flag}", "1").await;
         backend
-            .send_text(&pane.id, "first line\nsecond line")
+            .send_text(&pane.id, "first line\nsecond line", SendTextMode::Paste)
             .await
             .unwrap();
 
@@ -2485,7 +2543,10 @@ mod tests {
             "printf '\\033[?2004h'; stty raw -echo; head -c 3 > {}; stty sane",
             shell_word(&recording.to_string_lossy())
         );
-        backend.send_text(&pane.id, &recorder).await.unwrap();
+        backend
+            .send_text(&pane.id, &recorder, SendTextMode::Paste)
+            .await
+            .unwrap();
         backend
             .send_keys(&pane.id, &["Enter".to_owned()])
             .await
@@ -2558,6 +2619,141 @@ mod tests {
         backend.close_workspace(&first.id).await.ok();
     }
 
+    /// The bug this card fixes, against the program it was reported on.
+    ///
+    /// The app routes every letter of its virtual keyboard and every editor
+    /// command from its key row through `send-text`. Delivered as a paste,
+    /// nvim in Normal mode does not *execute* `i` -- it inserts it, because
+    /// bracketed-paste markers are exactly how a program tells a paste from
+    /// typing. The maintainer's report was that the editor keyboard "does
+    /// nothing", and this is why.
+    ///
+    /// Asserts what a person would look at: the file nvim wrote holds `hello`
+    /// and nothing else, which can only happen if `i` entered Insert mode,
+    /// `hello` was typed into the buffer, and Escape left Insert again so that
+    /// `:wq` was read as a command rather than as four more characters.
+    #[tokio::test]
+    #[ignore = "requires a tmux server and nvim"]
+    async fn keys_mode_drives_nvim_instead_of_typing_into_its_buffer() {
+        if Command::new("nvim")
+            .arg("--version")
+            .output()
+            .await
+            .is_err()
+        {
+            eprintln!("skipping: no nvim on PATH");
+            return;
+        }
+        let backend = fresh_backend();
+        let edited = crate::short_test_socket("gw-nvim").with_extension("txt");
+        let _ = std::fs::remove_file(&edited);
+
+        let workspace = backend
+            .create_workspace(&CreateWorkspace {
+                cwd: Some(std::env::temp_dir()),
+                label: Some("gateway-nvim".into()),
+                focus: true,
+            })
+            .await
+            .unwrap();
+        let pane = backend
+            .list_panes()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|pane| pane.workspace_id == workspace.id)
+            .unwrap()
+            .id;
+
+        // `-u NONE` so this reads the maintainer's init.lua no more than it
+        // reads mine: the test is about the bytes reaching nvim.
+        backend
+            .send_text(
+                &pane,
+                &format!("nvim -u NONE {}", shell_word(&edited.to_string_lossy())),
+                SendTextMode::Paste,
+            )
+            .await
+            .unwrap();
+        backend
+            .send_keys(&pane, &["Enter".to_owned()])
+            .await
+            .unwrap();
+        // Wait for nvim to own the screen rather than guessing at how long it
+        // takes to start.
+        wait_for_pane_flag(&backend, &pane, "#{alternate_on}", "1").await;
+
+        // Exactly what the app does: an editor command from the key row and a
+        // letter from the virtual keyboard are characters and go through
+        // `send-text`; a named key goes through `send-keys`.
+        //
+        // The pauses are not decoration. With `-u NONE`, `ttimeout` is off, so
+        // nvim waits `timeoutlen` (1s) to see whether an Escape begins a
+        // longer sequence -- send the next byte inside that window and the
+        // Escape is taken as the start of one and inserted as `^[` instead of
+        // leaving Insert mode. A person tapping keys never hits this; a test
+        // firing them back to back does.
+        let settle = || tokio::time::sleep(std::time::Duration::from_millis(1_200));
+        for typed in ["i", "hello"] {
+            backend
+                .send_text(&pane, typed, SendTextMode::Keys)
+                .await
+                .unwrap();
+            settle().await;
+        }
+        backend
+            .send_keys(&pane, &["Escape".to_owned()])
+            .await
+            .unwrap();
+        settle().await;
+        backend
+            .send_text(&pane, ":wq", SendTextMode::Keys)
+            .await
+            .unwrap();
+        settle().await;
+        backend
+            .send_keys(&pane, &["Enter".to_owned()])
+            .await
+            .unwrap();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let written = loop {
+            if let Ok(contents) = std::fs::read_to_string(&edited) {
+                if !contents.trim().is_empty() {
+                    break contents;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "nvim never wrote {}; the pane holds {:?}",
+                edited.display(),
+                backend
+                    .read_pane(&ReadPane {
+                        pane_id: pane.clone(),
+                        source: OutputSource::Visible,
+                        format: OutputFormat::Text,
+                        lines: 40,
+                        start: None,
+                        end: None,
+                    })
+                    .await
+                    .map(|output| output.text)
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        };
+        let _ = std::fs::remove_file(&edited);
+        backend.close_workspace(&workspace.id).await.ok();
+
+        // Exactly the typed text: an `i` that was inserted rather than obeyed
+        // would leave `ihello` here, and an Escape that was inserted rather
+        // than obeyed would leave the escape byte too.
+        assert_eq!(
+            written.trim_end_matches('\n'),
+            "hello",
+            "nvim received the keystrokes as a paste and put them in the buffer"
+        );
+    }
+
     #[tokio::test]
     #[ignore = "requires a tmux server"]
     async fn probe_reachable_is_true_against_a_genuinely_live_server() {
@@ -2576,7 +2772,10 @@ mod tests {
             .find(|p| p.workspace_id == workspace.id)
             .unwrap()
             .clone();
-        backend.send_text(&pane.id, "seq 1 500").await.unwrap();
+        backend
+            .send_text(&pane.id, "seq 1 500", SendTextMode::Paste)
+            .await
+            .unwrap();
         backend
             .send_keys(&pane.id, &["Enter".to_owned()])
             .await
@@ -2709,7 +2908,7 @@ mod tests {
         // Something distinguishable on each screen, so a swapped chunk fails.
         for (index, id) in ids.iter().enumerate() {
             backend
-                .send_text(id, &format!("marker-for-pane-{index}"))
+                .send_text(id, &format!("marker-for-pane-{index}"), SendTextMode::Paste)
                 .await
                 .unwrap();
         }
@@ -2783,7 +2982,11 @@ mod tests {
             .await
             .unwrap();
         backend
-            .send_text(&split.id, "printf gateway_contract_probe")
+            .send_text(
+                &split.id,
+                "printf gateway_contract_probe",
+                SendTextMode::Paste,
+            )
             .await
             .unwrap();
         backend
@@ -2804,7 +3007,10 @@ mod tests {
             .unwrap();
         assert!(output.text.contains("gateway_contract_probe"));
 
-        backend.send_text(&split.id, "seq 1 800").await.unwrap();
+        backend
+            .send_text(&split.id, "seq 1 800", SendTextMode::Paste)
+            .await
+            .unwrap();
         backend
             .send_keys(&split.id, &["Enter".to_owned()])
             .await
@@ -2915,6 +3121,7 @@ mod tests {
                 &format!(
                     "clear; for i in $(seq 1 {LOGICAL_LINES}); do printf 'line %03d %s\\n' \"$i\" \"$(printf 'x%.0s' {{1..120}})\"; done"
                 ),
+                SendTextMode::Paste,
             )
             .await
             .unwrap();
@@ -3060,6 +3267,7 @@ mod tests {
             .send_text(
                 &pane.id,
                 "clear; printf 'wraprun %s\\n' \"$(printf 'x%.0s' {1..221})\"",
+                SendTextMode::Paste,
             )
             .await
             .unwrap();
