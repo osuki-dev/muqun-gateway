@@ -11535,9 +11535,21 @@ fn openapi_spec() -> Value {
                 },
                 "delete": resource_endpoint("Close a tab", "tabId")
             },
-            "/api/sessions/{sessionId}/panes": { "get": session_endpoint("List panes") },
+            "/api/sessions/{sessionId}/panes": {
+                "get": {
+                    "summary": "List panes",
+                    "description": PANE_GEOMETRY_DOC,
+                    "parameters": [path_param("sessionId")],
+                    "responses": pane_geometry_response()
+                }
+            },
             "/api/sessions/{sessionId}/panes/{paneId}": {
-                "get": resource_endpoint("Get a pane", "paneId"),
+                "get": {
+                    "summary": "Get a pane",
+                    "description": PANE_GEOMETRY_DOC,
+                    "parameters": [path_param("sessionId"), path_param("paneId")],
+                    "responses": pane_geometry_response()
+                },
                 "patch": {
                     "summary": "Rename a pane",
                     "parameters": [path_param("sessionId"), path_param("paneId")],
@@ -11842,6 +11854,45 @@ fn simple_endpoint(summary: &str) -> Value {
     json!({
         "summary": summary,
         "responses": ok_response()
+    })
+}
+
+/// What a client can rely on from a pane's geometry, and what it cannot.
+///
+/// Written once and attached to both pane routes, because a reader who finds
+/// `width: null` on one of them needs the same explanation on the other.
+const PANE_GEOMETRY_DOC: &str = "Geometry fields are optional and differ by backend, so a client has to cope with `null` on any of them. tmux reports `width`, `height`, `alternate_on`, `cursor_x` and `cursor_y` for every pane. herdr reports `height` (its `scroll.viewport_rows`, which is the pane's real row count) and nothing else: its socket API has no pane width, no alternate-screen flag and no cursor position at protocol 20, so those four arrive `null` and a client that needs columns must still measure them from the text it reads. `cursor_x` and `cursor_y` are zero-based, column then row, from the top left of the viewport rather than of the scrollback.";
+
+/// The geometry half of a pane, for the two routes that answer with panes.
+/// Not the whole pane -- only the fields whose nullability a client has to
+/// dispatch on.
+fn pane_geometry_response() -> Value {
+    json!({
+        "200": {
+            "description": "OK",
+            "content": { "application/json": { "schema": {
+                "type": "object",
+                "properties": { "result": { "type": "object", "properties": { "panes": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "pane_id": { "type": "string" },
+                            "width": { "type": ["integer", "null"], "description": "Columns. Null on herdr." },
+                            "height": { "type": ["integer", "null"], "description": "Rows." },
+                            "cursor_x": { "type": ["integer", "null"], "description": "Zero-based cursor column. Null where the backend has no cursor to report." },
+                            "cursor_y": { "type": ["integer", "null"], "description": "Zero-based cursor row." },
+                            "scroll": { "type": "object", "properties": {
+                                "viewport_rows": { "type": ["integer", "null"] },
+                                "max_offset_from_bottom": { "type": ["integer", "null"] },
+                                "alternate_on": { "type": ["boolean", "null"], "description": "Whether the pane's program owns an alternate screen. Null on herdr." }
+                            } }
+                        },
+                        "required": ["pane_id"]
+                    }
+                } } } }
+            } } }
+        }
     })
 }
 
@@ -15807,6 +15858,35 @@ mod tests {
         assert!(spec["paths"]["/api/devices/push-token"]["delete"].is_object());
         assert!(spec["paths"]["/api/sessions/{sessionId}/workspaces/{workspaceId}"].is_object());
         assert!(spec["paths"]["/api/sessions/{sessionId}/agents/{target}/send"].is_object());
+        // The cursor and the geometry have to be in the spec, and so does
+        // which backend leaves which of them null: a client that assumes
+        // `width` is always there measures a herdr pane wrong.
+        for route in [
+            "/api/sessions/{sessionId}/panes",
+            "/api/sessions/{sessionId}/panes/{paneId}",
+        ] {
+            let pane = &spec["paths"][route]["get"];
+            let described = pane["description"].as_str().unwrap_or_default();
+            assert!(described.contains("cursor_x"), "{route} omits the cursor");
+            assert!(
+                described.contains("herdr"),
+                "{route} does not say which backend leaves these null"
+            );
+            let item = &pane["responses"]["200"]["content"]["application/json"]["schema"]
+                ["properties"]["result"]["properties"]["panes"]["items"]["properties"];
+            for field in ["width", "height", "cursor_x", "cursor_y"] {
+                assert_eq!(
+                    item[field]["type"],
+                    json!(["integer", "null"]),
+                    "{route}.{field} must be documented as nullable"
+                );
+            }
+            assert_eq!(
+                item["scroll"]["properties"]["alternate_on"]["type"],
+                json!(["boolean", "null"])
+            );
+        }
+
         // The mode has to be in the spec or a client has no way to learn the
         // field exists, and no way to know that leaving it out is a paste.
         let send_text =
@@ -16149,6 +16229,8 @@ mod tests {
             max_offset_from_bottom: None,
             viewport_rows: None,
             alternate_on: None,
+            cursor_x: None,
+            cursor_y: None,
         }];
         let outcome = session_liveness(
             Box::pin(async move { Ok(panes) }),
