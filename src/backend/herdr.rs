@@ -1,4 +1,7 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -41,21 +44,29 @@ pub struct HerdrBackend {
     /// Overridable so a test can prove the timeout fires without waiting out
     /// the real one.
     request_timeout: Duration,
+    /// Whether this herdr answers `pane.process_info`. Assumed until the
+    /// first refusal, then remembered: a herdr below the method's protocol
+    /// is asked once per pane listing, not once per pane per listing, and
+    /// its panes come back exactly as they did before the call existed.
+    process_info: AtomicBool,
+    /// The controlling terminal of each pane's shell, by shell pid -- the
+    /// device it was found to be and the path it was found at. Resolving one
+    /// is a scan of `/dev`; asking whether the cached answer still holds is
+    /// one syscall, which is what every listing pays instead.
+    terminals: Mutex<HashMap<u32, (u64, PathBuf)>>,
 }
 
 impl HerdrBackend {
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
-        Self {
-            socket_path: socket_path.into(),
-            request_timeout: REQUEST_TIMEOUT,
-        }
+        Self::with_request_timeout(socket_path, REQUEST_TIMEOUT)
     }
 
-    #[cfg(test)]
     fn with_request_timeout(socket_path: impl Into<PathBuf>, request_timeout: Duration) -> Self {
         Self {
             socket_path: socket_path.into(),
             request_timeout,
+            process_info: AtomicBool::new(true),
+            terminals: Mutex::new(HashMap::new()),
         }
     }
 
@@ -248,13 +259,21 @@ impl TerminalBackend for HerdrBackend {
     fn list_panes(&self) -> BackendFuture<'_, Vec<Pane>> {
         Box::pin(async move {
             let response = self.request("pane.list", json!({})).await?;
-            response
+            let panes = response
                 .pointer("/result/panes")
                 .and_then(Value::as_array)
                 .ok_or(BackendError::InvalidResponse("pane list"))?
                 .iter()
                 .map(pane_from_json)
-                .collect()
+                .collect::<Result<Vec<Pane>, BackendError>>()?;
+            // One `pane.process_info` per pane, all in flight at once: the
+            // approval watcher lists every 1.5s, and N round trips of 0.1ms
+            // each are cheap in parallel and still cheap in series, but there
+            // is no reason to pay the series.
+            Ok(
+                futures::future::join_all(panes.into_iter().map(|pane| self.complete_pane(pane)))
+                    .await,
+            )
         })
     }
 
@@ -277,7 +296,7 @@ impl TerminalBackend for HerdrBackend {
                 .request("pane.get", json!({ "pane_id": id.as_str() }))
                 .await?;
             let pane = response.pointer("/result/pane").unwrap_or(&response);
-            pane_from_json(pane)
+            Ok(self.complete_pane(pane_from_json(pane)?).await)
         })
     }
 
@@ -436,7 +455,7 @@ impl TerminalBackend for HerdrBackend {
                 .pointer("/result/pane")
                 .or_else(|| response.pointer("/result/root_pane"))
                 .ok_or(BackendError::InvalidResponse("split pane"))?;
-            pane_from_json(pane)
+            Ok(self.complete_pane(pane_from_json(pane)?).await)
         })
     }
 
@@ -582,6 +601,249 @@ impl HerdrBackend {
             Ok(())
         })
     }
+
+    /// The two facts a pane payload does not carry and `pane.process_info`
+    /// does: what the pane is running, and how wide it is.
+    ///
+    /// herdr's pane payload names no foreground program -- its `PaneInfo`
+    /// schema has `agent`, a title the program may or may not set, and
+    /// nothing else -- so `foreground_command` was `None` for every herdr
+    /// pane, and a client keyed on it (the app's editor detection, this
+    /// gateway's own `ScrollbackStore::is_editor_command`) treated an nvim
+    /// pane as a shell: read it unwrapped, folded it as scrollback, and drew a
+    /// 32-column screen as thirteen 178-column lines. Measured live on herdr
+    /// 0.8.2 (protocol 20): `pane.list` says nothing for the nvim pane, and
+    /// `pane.process_info` for the same pane answers `foreground_processes:
+    /// [{ argv0: "nvim", ... }]`, `shell_pid: 28305`, in 0.11ms.
+    ///
+    /// The width comes off the same answer, one step removed. herdr reports
+    /// no columns, and the note on `pane_from_json` says why the layout rect
+    /// cannot stand in for them (re-measured today: rects of 67, 34 and 33
+    /// were grids of 64, 32 and 30). The shell's controlling terminal knows,
+    /// though: it is the pty herdr sized, and `TIOCGWINSZ` on it is exactly
+    /// the `stty size` the shell would print. See `pane_grid`.
+    ///
+    /// Total, in both directions: a refusal, an old herdr without the method,
+    /// a pane whose shell has no terminal this process may open -- each leaves
+    /// the pane as it was parsed, which is the pane every client got before
+    /// this existed. herdr's own `foreground_command`, should it ever send
+    /// one, is kept over the derived one.
+    async fn complete_pane(&self, mut pane: Pane) -> Pane {
+        if !self.process_info.load(Ordering::Relaxed) {
+            return pane;
+        }
+        let info = match self
+            .request("pane.process_info", json!({ "pane_id": pane.id.as_str() }))
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                if unknown_method(&error) {
+                    self.process_info.store(false, Ordering::Relaxed);
+                }
+                return pane;
+            }
+        };
+        let info = info.pointer("/result/process_info").unwrap_or(&info);
+        if pane.foreground_command.is_none() {
+            pane.foreground_command = foreground_command_from_process_info(info);
+        }
+        let shell = info
+            .get("shell_pid")
+            .and_then(Value::as_u64)
+            .and_then(|pid| u32::try_from(pid).ok());
+        if let Some((columns, rows)) = shell.and_then(|pid| self.pane_grid(pid)) {
+            if pane.width.is_none() {
+                pane.width = Some(columns);
+            }
+            if pane.height.is_none() {
+                pane.height = Some(rows);
+            }
+        }
+        pane
+    }
+
+    /// The grid of the terminal `pid` is running on, columns then rows.
+    ///
+    /// Two steps. The pid's controlling terminal is a device number (macOS:
+    /// `proc_pidinfo`; Linux: `/proc/<pid>/stat`), and the device number is
+    /// found under `/dev` by scanning for the character device that carries
+    /// it -- once, because the answer is cached against the device number
+    /// and re-checked on every call: a pid the kernel has handed to a new
+    /// process with a new terminal fails the check and is scanned again,
+    /// rather than reported at the old terminal's width.
+    ///
+    /// The device is opened read-only with `O_NOCTTY | O_NONBLOCK`, asked
+    /// its size, and closed. Nothing is read from it and it never becomes this
+    /// process's terminal. It is a pty slave owned by the same user herdr and
+    /// this gateway run as, which is the only reason the open succeeds.
+    fn pane_grid(&self, pid: u32) -> Option<(u32, u32)> {
+        let device = tty::controlling_terminal(pid)?;
+        let path = {
+            let mut terminals = self.terminals.lock().ok()?;
+            match terminals.get(&pid) {
+                Some((known, path)) if *known == device => path.clone(),
+                _ => {
+                    let path = tty::device_path(device)?;
+                    terminals.insert(pid, (device, path.clone()));
+                    path
+                }
+            }
+        };
+        let grid = tty::window_size(&path);
+        if grid.is_none() {
+            if let Ok(mut terminals) = self.terminals.lock() {
+                terminals.remove(&pid);
+            }
+        }
+        grid
+    }
+}
+
+/// The program at the front of a pane, as tmux's `pane_current_command`
+/// would name it, from a `pane.process_info` answer.
+///
+/// The process group leader is the one that owns the terminal, so it is the
+/// one named when herdr lists several (`cat | less` is `less`, as tmux says);
+/// the first listed stands in where the leader is not among them. `argv0`
+/// over `name`: for Claude Code herdr's `name` is the node binary's own
+/// (`2.1.263`, measured) while `argv0` is `claude`. A login shell announces
+/// itself as `-zsh`; the dash is the shell's, not the program's, and tmux
+/// strips it too.
+fn foreground_command_from_process_info(info: &Value) -> Option<String> {
+    let processes = info.get("foreground_processes")?.as_array()?;
+    let leader = info
+        .get("foreground_process_group_id")
+        .and_then(Value::as_u64);
+    let process = processes
+        .iter()
+        .find(|process| leader.is_some() && process.get("pid").and_then(Value::as_u64) == leader)
+        .or_else(|| processes.first())?;
+    let name = process
+        .get("argv0")
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| process.get("name").and_then(Value::as_str))?;
+    let name = name.trim().trim_start_matches('-');
+    let name = name.rsplit('/').next().unwrap_or(name);
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// Whether herdr refused a call because it does not know the method -- a
+/// herdr older than the method, which the protocol floor (`HERDR_PROTOCOL_MIN`)
+/// admits. Shared by every optional call so they age the same way.
+fn unknown_method(error: &BackendError) -> bool {
+    match error {
+        BackendError::Refused { code, message } => code.as_deref().is_some_and(|code| {
+            matches!(code, "method_not_found" | "unknown_method" | "-32601")
+                || (code == "invalid_request" && message.contains("unknown variant"))
+        }),
+        _ => false,
+    }
+}
+
+/// A pty's size, asked of the pty itself.
+#[cfg(unix)]
+mod tty {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, OpenOptionsExt as _};
+    use std::path::{Path, PathBuf};
+
+    /// The device number of `pid`'s controlling terminal, or `None` for a
+    /// process without one -- or one this process may not ask about.
+    #[cfg(target_os = "macos")]
+    pub fn controlling_terminal(pid: u32) -> Option<u64> {
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        // SAFETY: the buffer is exactly `proc_bsdinfo` and the kernel writes
+        // at most `size` bytes into it; the result is read only when the
+        // kernel says it filled the whole struct.
+        let read = unsafe {
+            libc::proc_pidinfo(
+                pid as libc::c_int,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        if read != size {
+            return None;
+        }
+        // SAFETY: `proc_pidinfo` returned the full struct size, so every field
+        // has been written.
+        let info = unsafe { info.assume_init() };
+        (info.e_tdev != u32::MAX).then_some(u64::from(info.e_tdev))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn controlling_terminal(pid: u32) -> Option<u64> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // The command name is parenthesised and may itself hold spaces and
+        // parentheses; every field after it is fixed, so count from the last
+        // closing parenthesis: state, ppid, pgrp, session, tty_nr.
+        let rest = &stat[stat.rfind(')')? + 1..];
+        let tty: u64 = rest.split_whitespace().nth(4)?.parse().ok()?;
+        (tty != 0).then_some(tty)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    pub fn controlling_terminal(_pid: u32) -> Option<u64> {
+        None
+    }
+
+    /// The character device under `/dev` carrying `device`. Linux keeps its
+    /// ptys in `/dev/pts`; macOS names them `/dev/ttysNNN` in `/dev` itself.
+    /// Both are looked in, the smaller first.
+    pub fn device_path(device: u64) -> Option<PathBuf> {
+        ["/dev/pts", "/dev"].into_iter().find_map(|directory| {
+            std::fs::read_dir(directory).ok()?.find_map(|entry| {
+                let entry = entry.ok()?;
+                let metadata = entry.metadata().ok()?;
+                (metadata.file_type().is_char_device() && metadata.rdev() == device)
+                    .then(|| entry.path())
+            })
+        })
+    }
+
+    /// `TIOCGWINSZ` on the terminal at `path`: columns then rows, or `None`
+    /// where it cannot be opened, is not a terminal, or has no size yet.
+    pub fn window_size(path: &Path) -> Option<(u32, u32)> {
+        let terminal = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
+            .open(path)
+            .ok()?;
+        let mut size = libc::winsize {
+            ws_row: 0,
+            ws_col: 0,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: `TIOCGWINSZ` writes one `winsize` through the pointer it is
+        // handed, and `size` is exactly that and outlives the call.
+        let answered =
+            unsafe { libc::ioctl(terminal.as_raw_fd(), libc::TIOCGWINSZ as _, &mut size) };
+        (answered == 0 && size.ws_col > 0 && size.ws_row > 0)
+            .then(|| (u32::from(size.ws_col), u32::from(size.ws_row)))
+    }
+}
+
+#[cfg(not(unix))]
+mod tty {
+    use std::path::{Path, PathBuf};
+
+    pub fn controlling_terminal(_pid: u32) -> Option<u64> {
+        None
+    }
+
+    pub fn device_path(_device: u64) -> Option<PathBuf> {
+        None
+    }
+
+    pub fn window_size(_path: &Path) -> Option<(u32, u32)> {
+        None
+    }
 }
 
 fn workspace_from_json(value: &Value) -> Result<Workspace, BackendError> {
@@ -678,7 +940,7 @@ fn pane_from_json(value: &Value) -> Result<Pane, BackendError> {
             .unwrap_or(false),
         // herdr's pane payload has no `width`, and its `PaneInfo` schema has
         // never declared one; this read stays because a future herdr may add
-        // it, and costs nothing until then. Nothing here derives one:
+        // it, and costs nothing until then. Nothing HERE derives one:
         //
         // - `pane.layout` does report a per-pane `rect`, but that is the box
         //   drawn on screen, not the grid the program sees. Measured live at
@@ -687,14 +949,17 @@ fn pane_from_json(value: &Value) -> Result<Pane, BackendError> {
         //   vertical overhead is 2 and the horizontal 3, so there is no single
         //   border width to subtract -- and herdr has four independent knobs
         //   (`pane_borders`, `pane_outer_borders`, `pane_gaps`,
-        //   `pane_scrollbars`) that move it. Subtracting a guess would put the
-        //   wrong column count on a real pane, which is worse than none.
-        // - The padded row length of a read is exact, because herdr right-pads
-        //   rows, but that is one `pane.read` per pane and `list_panes` runs
-        //   every 1.5s for the approval watcher alone.
+        //   `pane_scrollbars`) that move it. Re-measured on herdr 0.8.2 with
+        //   three columns side by side: rects 67, 34 and 33 wide were grids of
+        //   64, 32 and 30. Subtracting a guess would put the wrong column
+        //   count on a real pane, which is worse than none.
+        // - A read cannot say either: herdr trims each row, so the widest row
+        //   of a `visible` read is the pane's width only when something
+        //   happened to fill a row, and a quiet shell measures as wide as its
+        //   prompt.
         //
-        // So a client still measures its own columns from the read it already
-        // has. See the card's report for the recommendation.
+        // The width is filled in afterwards by `complete_pane`, off the size
+        // of the terminal the pane's shell is actually running on.
         width: value
             .get("width")
             .and_then(Value::as_u64)
@@ -815,16 +1080,10 @@ fn worktree_placement_from_json(response: &Value) -> Result<WorktreePlacement, B
 }
 
 fn worktree_error(error: BackendError) -> BackendError {
-    match &error {
-        BackendError::Refused { code, message }
-            if code.as_deref().is_some_and(|code| {
-                matches!(code, "method_not_found" | "unknown_method" | "-32601")
-                    || (code == "invalid_request" && message.contains("unknown variant"))
-            }) =>
-        {
-            BackendError::Unsupported("worktrees")
-        }
-        _ => error,
+    if unknown_method(&error) {
+        BackendError::Unsupported("worktrees")
+    } else {
+        error
     }
 }
 
@@ -935,6 +1194,12 @@ mod tests {
 
     impl FakeHerdr {
         fn start() -> Self {
+            Self::start_refusing(&[])
+        }
+
+        /// A herdr that does not know `refused` -- the shape of one older
+        /// than a method this gateway asks for optionally.
+        fn start_refusing(refused: &'static [&'static str]) -> Self {
             let socket_path = crate::short_test_socket("gw-herdr");
             let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
             let calls = Arc::new(Mutex::new(Vec::new()));
@@ -948,9 +1213,15 @@ mod tests {
                     }
                     let request: Value = serde_json::from_str(&line).unwrap();
                     let method = request["method"].as_str().unwrap_or_default();
-                    let result = fake_result(method);
                     recorded.lock().unwrap().push(request.clone());
-                    let response = json!({ "id": request["id"], "result": result });
+                    let response = if refused.contains(&method) {
+                        json!({
+                            "id": request["id"],
+                            "error": { "code": "method_not_found", "message": format!("unknown method {method}") }
+                        })
+                    } else {
+                        json!({ "id": request["id"], "result": fake_result(method) })
+                    };
                     let mut stream = reader.into_inner();
                     stream
                         .write_all(response.to_string().as_bytes())
@@ -1004,6 +1275,19 @@ mod tests {
             "pane.get" => json!({ "pane": pane }),
             "agent.get" => json!({ "agent": agent }),
             "pane.read" => json!({ "read": { "text": "contract output", "revision": 9 } }),
+            // As herdr 0.8.2 answered for a real nvim pane, minus the shell
+            // pid: a test has no pty of that pid's to be measured.
+            "pane.process_info" => json!({
+                "process_info": {
+                    "pane_id": "p1",
+                    "foreground_process_group_id": 36692,
+                    "foreground_processes": [{
+                        "pid": 36692, "name": "nvim", "argv0": "nvim",
+                        "argv": ["nvim", "notes.md"], "cmdline": "nvim notes.md",
+                        "cwd": "/work/task"
+                    }]
+                }
+            }),
             "workspace.create" => json!({ "workspace": workspace }),
             "tab.create" => json!({ "tab": tab }),
             "pane.split" => json!({ "pane": pane }),
@@ -1018,6 +1302,197 @@ mod tests {
             }),
             _ => json!({ "ok": true }),
         }
+    }
+
+    /// herdr's pane payload names no foreground program, so the one thing
+    /// the app's editor detection keys on was `None` for every herdr pane
+    /// and an nvim pane was read, folded and drawn as a shell (the joined
+    /// 178-column rows in the card). `pane.process_info` knows, and a pane
+    /// listing now carries its answer -- once per pane, per listing.
+    #[tokio::test]
+    async fn a_herdr_pane_names_its_foreground_program_from_process_info() {
+        let herdr = FakeHerdr::start();
+        let backend = HerdrBackend::new(&herdr.socket_path);
+
+        let panes = backend.list_panes().await.unwrap();
+        assert_eq!(panes[0].foreground_command.as_deref(), Some("nvim"));
+        let pane = backend.get_pane(&PaneId::new("p1")).await.unwrap();
+        assert_eq!(pane.foreground_command.as_deref(), Some("nvim"));
+        // And it reaches the wire the app reads, where `ScrollbackStore`
+        // and the app's `isFullScreenTuiPane` both look for it.
+        let envelope = super::super::compat::pane_list(panes);
+        assert_eq!(envelope["result"]["panes"][0]["foreground_command"], "nvim");
+
+        let calls = herdr.calls.lock().unwrap().clone();
+        let asked: Vec<&str> = calls
+            .iter()
+            .filter(|call| call["method"] == "pane.process_info")
+            .map(|call| call["params"]["pane_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(asked, ["p1", "p1"], "one process_info per pane per call");
+    }
+
+    /// The protocol floor admits a herdr older than `pane.process_info`.
+    /// Its panes must come back exactly as they did before the call existed,
+    /// and it must not be asked again on every listing.
+    #[tokio::test]
+    async fn a_herdr_without_process_info_is_asked_once_and_left_alone() {
+        let herdr = FakeHerdr::start_refusing(&["pane.process_info"]);
+        let backend = HerdrBackend::new(&herdr.socket_path);
+
+        for _ in 0..3 {
+            let panes = backend.list_panes().await.unwrap();
+            assert_eq!(panes[0].foreground_command, None);
+            assert_eq!(panes[0].width, Some(120), "the parsed pane is untouched");
+        }
+        let calls = herdr.calls.lock().unwrap().clone();
+        let asked = calls
+            .iter()
+            .filter(|call| call["method"] == "pane.process_info")
+            .count();
+        assert_eq!(asked, 1);
+    }
+
+    #[test]
+    fn the_foreground_command_is_the_group_leader_named_as_tmux_would() {
+        // `cat | less`: the leader owns the terminal and is what tmux reports.
+        let info = json!({
+            "foreground_process_group_id": 20,
+            "foreground_processes": [
+                { "pid": 21, "name": "cat", "argv0": "cat" },
+                { "pid": 20, "name": "less", "argv0": "/usr/bin/less" }
+            ]
+        });
+        assert_eq!(
+            foreground_command_from_process_info(&info).as_deref(),
+            Some("less")
+        );
+        // Claude Code, as herdr 0.8.2 reports it: the node binary's own name
+        // under `name`, the program under `argv0`.
+        let info = json!({
+            "foreground_process_group_id": 36694,
+            "foreground_processes": [{ "pid": 36694, "name": "2.1.263", "argv0": "claude" }]
+        });
+        assert_eq!(
+            foreground_command_from_process_info(&info).as_deref(),
+            Some("claude")
+        );
+        // A login shell's dash is not part of its name.
+        let info = json!({
+            "foreground_process_group_id": 22270,
+            "foreground_processes": [{ "pid": 22270, "name": "zsh", "argv0": "zsh", "cmdline": "-zsh" }]
+        });
+        assert_eq!(
+            foreground_command_from_process_info(&info).as_deref(),
+            Some("zsh")
+        );
+        let info =
+            json!({ "foreground_processes": [{ "pid": 1, "name": "bash", "argv0": "-bash" }] });
+        assert_eq!(
+            foreground_command_from_process_info(&info).as_deref(),
+            Some("bash")
+        );
+        // No leader among them: the first listed stands in. No `argv0`: the
+        // name does. Nothing listed: nothing claimed.
+        let info = json!({
+            "foreground_process_group_id": 99,
+            "foreground_processes": [{ "pid": 5, "name": "vim" }, { "pid": 6, "name": "sh" }]
+        });
+        assert_eq!(
+            foreground_command_from_process_info(&info).as_deref(),
+            Some("vim")
+        );
+        assert_eq!(
+            foreground_command_from_process_info(&json!({ "foreground_processes": [] })),
+            None
+        );
+        assert_eq!(foreground_command_from_process_info(&json!({})), None);
+    }
+
+    /// The width comes off the pty the shell runs on, which is the one herdr
+    /// sized: a pty made here and set to 59 rows by 31 columns -- the grid
+    /// of the narrow pane in the card -- answers exactly that, both asked
+    /// by path and asked by the pid of a process it is the terminal of.
+    #[cfg(unix)]
+    #[test]
+    fn a_pane_is_as_wide_as_the_terminal_its_shell_runs_on() {
+        use std::os::fd::FromRawFd as _;
+        use std::os::unix::process::CommandExt as _;
+
+        let mut master: libc::c_int = -1;
+        let mut slave: libc::c_int = -1;
+        let mut size = libc::winsize {
+            ws_row: 59,
+            ws_col: 31,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: `openpty` writes two descriptors and reads the winsize it
+        // is handed; every pointer is to a live local.
+        let opened = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut size,
+            )
+        };
+        assert_eq!(opened, 0, "openpty failed");
+        // SAFETY: `master` is the descriptor `openpty` just returned, and
+        // `ptsname` answers with a static buffer copied out before any other
+        // pty call.
+        let slave_path = unsafe {
+            PathBuf::from(
+                std::ffi::CStr::from_ptr(libc::ptsname(master))
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        };
+        assert_eq!(tty::window_size(&slave_path), Some((31, 59)));
+
+        // A child whose controlling terminal is that pty, the way a shell in
+        // a pane has herdr's pty: a session of its own, with the slave as its
+        // terminal.
+        // SAFETY: `slave` is the descriptor `openpty` returned and this is
+        // its only owner from here on.
+        let stdin = unsafe { std::fs::File::from_raw_fd(slave) };
+        let mut command = std::process::Command::new("/bin/sleep");
+        command
+            .arg("30")
+            .stdin(std::process::Stdio::from(stdin))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        // SAFETY: `setsid` and one ioctl on fd 0, both async-signal-safe,
+        // and nothing allocated between fork and exec.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().expect("spawn a child on the pty");
+
+        let backend = HerdrBackend::new("/nonexistent/herdr.sock");
+        let grid = backend.pane_grid(child.id());
+        // Asked twice: the second answer comes through the cache and must be
+        // the same one.
+        let again = backend.pane_grid(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        // SAFETY: `master` is still open and owned here.
+        unsafe { libc::close(master) };
+        assert_eq!(grid, Some((31, 59)));
+        assert_eq!(again, Some((31, 59)));
+
+        // A pid without a terminal -- or one this process may not ask about
+        // -- is not a width.
+        assert_eq!(backend.pane_grid(u32::MAX - 1), None);
     }
 
     #[test]
