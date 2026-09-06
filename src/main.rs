@@ -569,7 +569,7 @@ struct PushTokenRecord {
     platform: String,
     device_name: Option<String>,
     /// The language this device asked to be notified in, as the exact code the
-    /// app persists (`en` or `zh-TW`).
+    /// app persists (`en`, `zh-TW`, `zh-CN`, `ru` and so on; see `i18n.rs`).
     ///
     /// A push is built in a watcher spawned at startup, where there is no
     /// request and therefore no header to read, so the language has to have
@@ -11384,7 +11384,7 @@ fn openapi_spec() -> Value {
         "info": {
             "title": "Terminal Gateway API",
             "version": env!("CARGO_PKG_VERSION"),
-            "description": "Token-protected mobile API for controlling local terminal workspaces through a configured tmux or Herdr backend. Human-readable text is localized: send X-Muqun-Locale (or Accept-Language) with `en` or `zh-TW`. Error `code` values, decision names and other wire vocabulary are the same bytes in every locale."
+            "description": "Token-protected mobile API for controlling local terminal workspaces through a configured tmux or Herdr backend. Human-readable text is localized: send X-Muqun-Locale (or Accept-Language) with one of `en`, `zh-TW`, `zh-CN`, `ja`, `ko`, `de`, `fr`, `es`, `pt`, `ru`, `vi`. Error `code` values, decision names and other wire vocabulary are the same bytes in every locale."
         },
         "components": {
             "securitySchemes": {
@@ -13088,7 +13088,7 @@ mod tests {
         // either -- the device simply gets English.
         let odd: Vec<PushTokenRecord> = serde_json::from_str(
             r#"[{ "token": "ExponentPushToken[abc]", "platform": "ios",
-                  "locale": "zh-Hans", "updated_unix_ms": 1 }]"#,
+                  "locale": "tlh", "updated_unix_ms": 1 }]"#,
         )
         .unwrap();
         assert_eq!(odd[0].locale(), Locale::En);

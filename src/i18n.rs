@@ -1,20 +1,21 @@
 //! Which language the gateway is answering in, and the table it answers from.
 //!
-//! Eight locales exist and their codes are literals, not a naming scheme:
-//! `en`, `zh-TW`, `ja`, `ko`, `de`, `fr`, `es`, `pt`. Lowercase primary tag,
-//! and where there is a region, a hyphen and an uppercase region. The app
-//! already uses those exact strings as the names of its catalog directories, as
-//! the value it persists when the user picks a language, and as the value it
-//! puts on the wire -- so a gateway that answered `zh-Hant`, `zh_TW` or `pt-BR`
-//! would be answering with a code no client has a catalog for. There is
-//! deliberately no alias for any code anywhere in this file's *output*;
-//! tolerance lives only in [`Locale::from_code`], which reads what a client
-//! sent and never writes.
+//! Eleven locales exist and their codes are literals, not a naming scheme:
+//! `en`, `zh-TW`, `zh-CN`, `ja`, `ko`, `de`, `fr`, `es`, `pt`, `ru`, `vi`.
+//! Lowercase primary tag, and where there is a region, a hyphen and an
+//! uppercase region. The app already uses those exact strings as the names of
+//! its catalog directories, as the value it persists when the user picks a
+//! language, and as the value it puts on the wire -- so a gateway that answered
+//! `zh-Hant`, `zh-Hans`, `zh_TW` or `pt-BR` would be answering with a code no
+//! client has a catalog for. There is deliberately no alias for any code
+//! anywhere in this file's *output*; tolerance lives only in
+//! [`Locale::from_code`], which reads what a client sent and never writes.
 //!
 //! Chinese is the only language split by script, and it is therefore the only
-//! one with a rule of its own below. The other six are one catalog per
+//! one with a rule of its own below: two tables, `zh-TW` and `zh-CN`, and
+//! neither ever stands in for the other. The other eight are one catalog per
 //! language: `pt` answers Brazil and Portugal, `es` answers Spain and Latin
-//! America.
+//! America, `vi` answers every Vietnamese reader.
 //!
 //! Resolution order is `X-Muqun-Locale`, then `Accept-Language`, then `en`. The
 //! app sends both headers with the same single code on every request including
@@ -51,12 +52,15 @@ pub enum Locale {
     #[default]
     En,
     ZhTw,
+    ZhCn,
     Ja,
     Ko,
     De,
     Fr,
     Es,
     Pt,
+    Ru,
+    Vi,
 }
 
 impl Locale {
@@ -70,12 +74,15 @@ impl Locale {
     pub const ALL: &'static [Locale] = &[
         Locale::En,
         Locale::ZhTw,
+        Locale::ZhCn,
         Locale::Ja,
         Locale::Ko,
         Locale::De,
         Locale::Fr,
         Locale::Es,
         Locale::Pt,
+        Locale::Ru,
+        Locale::Vi,
     ];
 
     /// The wire spelling. These strings are shared verbatim with the app and
@@ -84,12 +91,15 @@ impl Locale {
         match self {
             Locale::En => "en",
             Locale::ZhTw => "zh-TW",
+            Locale::ZhCn => "zh-CN",
             Locale::Ja => "ja",
             Locale::Ko => "ko",
             Locale::De => "de",
             Locale::Fr => "fr",
             Locale::Es => "es",
             Locale::Pt => "pt",
+            Locale::Ru => "ru",
+            Locale::Vi => "vi",
         }
     }
 
@@ -101,53 +111,97 @@ impl Locale {
         match self {
             Locale::En => &[],
             Locale::ZhTw => ZH_TW,
+            Locale::ZhCn => ZH_CN,
             Locale::Ja => JA,
             Locale::Ko => KO,
             Locale::De => DE,
             Locale::Fr => FR,
             Locale::Es => ES,
             Locale::Pt => PT,
+            Locale::Ru => RU,
+            Locale::Vi => VI,
         }
     }
 
     /// The locale a single BCP-47 tag asks for, if it is one the gateway can
     /// serve.
     ///
-    /// Traditional Chinese is served to the tags that mean Traditional Chinese:
-    /// `zh-Hant` in any of its regional spellings, plus `zh-HK` and `zh-MO`,
-    /// whose readers read Traditional. `zh-Hans`, `zh-CN` and `zh-SG` are
-    /// deliberately *not* folded onto it -- serving Traditional to a Simplified
-    /// reader is a worse answer than serving English, so they fall through.
-    /// Bare `zh` says only "Chinese" and is left to fall through for the same
-    /// reason: the script is exactly the thing it does not say.
+    /// Chinese is split by script, so a `zh` tag is read by
+    /// [`Locale::chinese`]: a script subtag decides outright, a region decides
+    /// when there is no script, and a tag that says neither is Simplified.
+    /// The two Chinese tables never substitute for each other -- serving
+    /// Traditional to a Simplified reader, or the reverse, is a worse answer
+    /// than serving English would be, which is why the rule is spelled out
+    /// instead of "whichever Chinese we have".
     ///
     /// Every other language is served on its primary subtag alone, whatever
-    /// region follows: `de-AT`, `fr-CA`, `pt-BR`, `pt-PT`, `es-419` and
-    /// `es-MX` all have exactly one catalog here to land in, and a Brazilian
-    /// reader served the `pt` table is still being served Portuguese. Splitting
-    /// any of them would mean emitting a code the app has no catalog directory
-    /// for.
+    /// region follows: `de-AT`, `fr-CA`, `pt-BR`, `pt-PT`, `es-419`, `es-MX`
+    /// and `vi-VN` all have exactly one catalog here to land in, and a
+    /// Brazilian reader served the `pt` table is still being served
+    /// Portuguese. Splitting any of them would mean emitting a code the app
+    /// has no catalog directory for.
+    ///
+    /// A subtag is letters and digits, nothing else. A value with anything
+    /// else in it -- `zh-TW;q=0.9` pasted whole into the app header, a stray
+    /// emoji -- is not a language tag and is read as none, which matters now
+    /// that bare `zh` has an answer: the junk after a mangled `zh-` would
+    /// otherwise be swallowed and the request served Simplified on the
+    /// strength of two letters.
     pub fn from_code(code: &str) -> Option<Self> {
-        let mut subtags = code
+        let subtags: Vec<String> = code
             .trim()
             .split(['-', '_'])
             .filter(|subtag| !subtag.is_empty())
-            .map(str::to_ascii_lowercase);
-        let primary = subtags.next()?;
-        let rest: Vec<String> = subtags.collect();
-        let has = |names: &[&str]| rest.iter().any(|subtag| names.contains(&subtag.as_str()));
+            .map(str::to_ascii_lowercase)
+            .collect();
+        let (primary, rest) = subtags.split_first()?;
+        if !subtags
+            .iter()
+            .all(|subtag| subtag.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+        {
+            return None;
+        }
         match primary.as_str() {
             "en" => Some(Locale::En),
-            "zh" if has(&["hans", "cn", "sg"]) => None,
-            "zh" if has(&["hant", "tw", "hk", "mo"]) => Some(Locale::ZhTw),
+            "zh" => Some(Locale::chinese(rest)),
             "ja" => Some(Locale::Ja),
             "ko" => Some(Locale::Ko),
             "de" => Some(Locale::De),
             "fr" => Some(Locale::Fr),
             "es" => Some(Locale::Es),
             "pt" => Some(Locale::Pt),
+            "ru" => Some(Locale::Ru),
+            "vi" => Some(Locale::Vi),
             _ => None,
         }
+    }
+
+    /// Which Chinese table the subtags after `zh` ask for.
+    ///
+    /// Script outranks region, because the script is the thing the two tables
+    /// differ by and a region is only a hint about it: `zh-Hans-TW` is a
+    /// Simplified reader who happens to be in Taiwan and `zh-Hant-CN` a
+    /// Traditional reader on the mainland, and both get the script they named.
+    /// With no script, the regions that read Traditional -- `TW`, `HK`, `MO`
+    /// -- select `zh-TW`, and `CN`, `SG` and `MY` select `zh-CN`.
+    ///
+    /// Bare `zh`, and `zh` with a region that says nothing about script, is
+    /// Simplified. That is what the tag means in practice: it is where the
+    /// large majority of Chinese readers are, it is what every likely-subtags
+    /// table expands `zh` to, and it is what an operating system reports for
+    /// a mainland user who never picked anything more specific.
+    fn chinese(subtags: &[String]) -> Self {
+        let by_script = subtags.iter().find_map(|subtag| match subtag.as_str() {
+            "hant" => Some(Locale::ZhTw),
+            "hans" => Some(Locale::ZhCn),
+            _ => None,
+        });
+        let by_region = subtags.iter().find_map(|subtag| match subtag.as_str() {
+            "tw" | "hk" | "mo" => Some(Locale::ZhTw),
+            "cn" | "sg" | "my" => Some(Locale::ZhCn),
+            _ => None,
+        });
+        by_script.or(by_region).unwrap_or(Locale::ZhCn)
     }
 
     /// The best servable locale in an `Accept-Language` list.
@@ -272,7 +326,7 @@ pub fn t_slots(locale: Locale, source: &str, slots: &[(&str, &str)]) -> String {
 // The catalogs.
 //
 // One table per language, all keyed by the same English source strings and all
-// carrying the same seventy-five entries in the same order, so that a diff
+// carrying the same seventy-nine entries in the same order, so that a diff
 // between two of them is a diff of wording and nothing else. The tests hold
 // every table to the same invariants -- no duplicate key, no entry left as its
 // English source, every `{slot}` surviving into the translation -- by walking
@@ -286,9 +340,10 @@ pub fn t_slots(locale: Locale, source: &str, slots: &[(&str, &str)]) -> String {
 //    `detection`, every field name, and the route `GET /api/agents/catalog` are
 //    values a client sends back to us. Only the sentence around them moves.
 //  * **Product names stay in Latin script.** Herdr, Gateway and Expo are names,
-//    not words. Muqun is the exception in ZH_TW and JA: the app is called 牧群
-//    there, matching the localisation already published on osuki.dev, so those
-//    two tables spell it that way instead of leaving it Latin.
+//    not words. Muqun is the exception in ZH_TW, ZH_CN and JA: the app is
+//    called 牧群 there, matching the localisation already published on
+//    osuki.dev, so those three tables spell it that way instead of leaving it
+//    Latin.
 //  * **Each table agrees with the app catalog of the same language.** The two
 //    halves are read by the same person on the same screen: the gateway writes
 //    the approval prompt, the app writes the button under it.
@@ -484,6 +539,179 @@ const ZH_TW: &[(&str, &str)] = &[
         "branch_name must not end with .lock",
         "branch_name 不得以 .lock 結尾",
     ),
+];
+
+/// Mainland-normative Simplified Chinese, keyed by the English source.
+///
+/// The register is the mainland's, not Traditional Chinese transcribed: 设置,
+/// 终端, 文件, 服务器, 网络, 保存, 默认, 代码, 连接, 请求头. The app's own
+/// `zh-CN` catalog is the other half of this vocabulary and these agree with
+/// it: 批准, 拒绝, 代理, 面板, 工作区, 会话, 配对 -- and Gateway, which stays in
+/// Latin script because it is the product's name. Muqun itself is 牧群 here,
+/// the same word the app and osuki.dev use in this language.
+///
+/// This table and [`ZH_TW`] never stand in for each other: a Simplified reader
+/// served 核准 and 檔案 is being served the wrong script, and the rule in
+/// [`Locale::from_code`] exists so that neither table ever is.
+const ZH_CN: &[(&str, &str)] = &[
+    // -- approval labels the gateway writes for itself -----------------------
+    ("Approve", "批准"),
+    ("Approve and don't ask again", "批准且不再询问"),
+    ("Deny", "拒绝"),
+    ("Option {index}", "选项 {index}"),
+    ("Allow {action}?", "允许 {action}？"),
+    // -- push notifications --------------------------------------------------
+    ("Agent", "代理"),
+    ("Approval needed", "需要批准"),
+    ("Agent blocked", "代理等待中"),
+    ("Agent done", "代理已完成"),
+    ("{name} is waiting for your approval.", "{name} 正在等待你的批准。"),
+    ("{name} needs your input.", "{name} 需要你的输入。"),
+    ("{name} finished running.", "{name} 已运行完毕。"),
+    ("Muqun push notifications are connected.", "牧群推送通知已连接。"),
+    // -- API error messages --------------------------------------------------
+    ("Expo push service request failed", "Expo 推送服务请求失败"),
+    ("Herdr did not return the created pane id", "Herdr 没有返回所创建面板的 id"),
+    ("Herdr is unavailable", "无法连接到 Herdr"),
+    (
+        "agent is not one this gateway offers; see GET /api/agents/catalog",
+        "这个 Gateway 未提供该代理；请参阅 GET /api/agents/catalog",
+    ),
+    (
+        "another pairing request is awaiting confirmation",
+        "已有另一个配对请求正在等待确认",
+    ),
+    ("answer with an option number or a decision", "请以选项编号或决定作答"),
+    (
+        "asset not found in a session workspace",
+        "在这个会话的工作区中找不到该文件",
+    ),
+    (
+        "cwd must be a directory inside a workspace this session has open",
+        "cwd 必须是这个会话已打开的工作区下的目录",
+    ),
+    (
+        "decision must be allow, allow_always, or deny",
+        "decision 必须是 allow、allow_always 或 deny",
+    ),
+    ("device not found", "找不到这个设备"),
+    (
+        "device_name must be at most 80 characters and contain no control characters",
+        "device_name 最多 80 个字符，且不得包含控制字符",
+    ),
+    ("direction must be right or down", "direction 必须是 right 或 down"),
+    ("executables and scripts are not accepted", "不接受可执行文件和脚本"),
+    ("expected Bearer token", "需要 Bearer token"),
+    (
+        "expected a multipart/form-data body with a file field",
+        "需要含有 file 字段的 multipart/form-data 请求体",
+    ),
+    ("failed to check pairing request limit", "无法检查配对请求的次数上限"),
+    ("failed to lock device state", "无法锁定设备状态"),
+    ("failed to lock pending pairing state", "无法锁定待处理的配对状态"),
+    ("failed to lock push token state", "无法锁定推送 token 状态"),
+    ("failed to lock the asset index", "无法锁定文件索引"),
+    ("failed to read recent agent activity", "无法读取最近的代理活动"),
+    ("failed to read the asset", "无法读取这个文件"),
+    (
+        "failed to remove push notification registration",
+        "无法移除推送通知的注册",
+    ),
+    ("failed to revoke the device token", "无法吊销这个设备的 token"),
+    (
+        "failed to save push notification registration",
+        "无法保存推送通知的注册",
+    ),
+    ("failed to save the new device token", "无法保存新的设备 token"),
+    ("failed to store the upload", "无法保存上传的文件"),
+    ("format must be text or ansi", "format 必须是 text 或 ansi"),
+    ("invalid Authorization header", "Authorization 请求头无效"),
+    ("invalid pairing code", "配对码无效"),
+    ("invalid token", "token 无效"),
+    ("keys must contain 1 to 32 entries", "keys 必须包含 1 到 32 个条目"),
+    ("missing Authorization header", "缺少 Authorization 请求头"),
+    ("mode must be on, off, or toggle", "mode 必须是 on、off 或 toggle"),
+    ("no pending pairing request", "没有待处理的配对请求"),
+    (
+        "only png, jpeg, gif, webp, and heic images are accepted",
+        "只接受 png、jpeg、gif、webp 和 heic 图片",
+    ),
+    (
+        "pairing code expired; request a new code",
+        "配对码已过期，请重新获取新的配对码",
+    ),
+    ("platform must be ios or android", "platform 必须是 ios 或 android"),
+    (
+        "repo_path is not a git checkout, so a branch cannot be made in it",
+        "repo_path 不是 git 工作目录，因此无法在其中创建分支",
+    ),
+    (
+        "repo_path must be a directory inside a workspace this session has open",
+        "repo_path 必须是这个会话已打开的工作区下的目录",
+    ),
+    (
+        "request_id must be 1-80 chars using letters, digits, dot, underscore, or hyphen",
+        "request_id 必须是 1 到 80 个字符，且只能使用英文字母、数字、点、下划线或连字符",
+    ),
+    ("session not found", "找不到这个会话"),
+    (
+        "source must be visible, recent, recent-unwrapped, or detection",
+        "source 必须是 visible、recent、recent-unwrapped 或 detection",
+    ),
+    (
+        "startup_timeout_ms must be between 3001 and 300000",
+        "startup_timeout_ms 必须介于 3001 和 300000 之间",
+    ),
+    ("text must be at most 65536 bytes", "text 最多 65536 个字节"),
+    ("that tab has no pane to split", "这个标签页没有可分割的面板"),
+    (
+        "the agent no longer has that request pending",
+        "代理已不再等待这个请求",
+    ),
+    ("the asset is larger than 10 MiB", "这个文件超过 10 MiB"),
+    ("the file field is empty", "file 字段为空"),
+    ("the file field must carry a filename", "file 字段必须带有文件名"),
+    ("the pane is not waiting on an approval", "这个面板并未在等待批准"),
+    (
+        "the pane is waiting on a different approval",
+        "这个面板正在等待的是另一个批准",
+    ),
+    ("the upload must be at most 25 MiB", "上传的文件最多 25 MiB"),
+    (
+        "this approval has no option with that number",
+        "这个批准没有该编号的选项",
+    ),
+    (
+        "this approval offers no option with that meaning",
+        "这个批准没有代表该决定的选项",
+    ),
+    ("token must be an Expo push token", "token 必须是 Expo 推送 token"),
+    (
+        "too many pairing requests; try again later",
+        "配对请求次数过多，请稍后再试",
+    ),
+    (
+        "transport encryption is disabled on this gateway; scan its current QR code",
+        "这个 Gateway 已禁用传输加密，请扫描它当前的二维码",
+    ),
+    (
+        "workspace_label must be at most 120 printable characters",
+        "workspace_label 最多 120 个可打印字符",
+    ),
+    // -- branch names --------------------------------------------------------
+    ("branch_name must not be empty", "branch_name 不能为空"),
+    ("branch_name must be at most 200 characters", "branch_name 最多 200 个字符"),
+    (
+        "branch_name may only contain letters, digits, dot, underscore, dash and slash",
+        "branch_name 只能包含英文字母、数字、点、下划线、连字符和斜杠",
+    ),
+    ("branch_name must not contain ..", "branch_name 不能包含 .."),
+    ("branch_name must not start with a dash", "branch_name 不能以连字符开头"),
+    (
+        "branch_name must not have an empty path segment or a segment starting or ending with a dot",
+        "branch_name 不能有空的路径段，路径段也不能以点开头或结尾",
+    ),
+    ("branch_name must not end with .lock", "branch_name 不能以 .lock 结尾"),
 ];
 
 /// Japanese, keyed by the English source.
@@ -1478,6 +1706,343 @@ const PT: &[(&str, &str)] = &[
     ("branch_name must not end with .lock", "branch_name não pode terminar em .lock"),
 ];
 
+/// Russian, keyed by the English source.
+///
+/// The register is formal: вы, never ты, and the imperative in its polite
+/// plural (укажите, повторите, отсканируйте). API error messages start in
+/// lowercase like the English they translate. The nouns are the app catalog's:
+/// агент, панель, пространство for a workspace, сеанс, привязка for pairing,
+/// токен -- and Разрешить / Отклонить for the approval pair, so "approval" as
+/// a noun is разрешение throughout. Gateway and Muqun stay in Latin script
+/// because they are names.
+const RU: &[(&str, &str)] = &[
+    // -- approval labels the gateway writes for itself -----------------------
+    ("Approve", "Разрешить"),
+    ("Approve and don't ask again", "Разрешить и больше не спрашивать"),
+    ("Deny", "Отклонить"),
+    ("Option {index}", "Вариант {index}"),
+    ("Allow {action}?", "Разрешить {action}?"),
+    // -- push notifications --------------------------------------------------
+    ("Agent", "Агент"),
+    ("Approval needed", "Требуется разрешение"),
+    ("Agent blocked", "Агент ожидает"),
+    ("Agent done", "Агент завершил работу"),
+    ("{name} is waiting for your approval.", "{name} ожидает вашего разрешения."),
+    ("{name} needs your input.", "{name} ожидает вашего ввода."),
+    ("{name} finished running.", "{name} завершил выполнение."),
+    ("Muqun push notifications are connected.", "Push-уведомления Muqun подключены."),
+    // -- API error messages --------------------------------------------------
+    ("Expo push service request failed", "запрос к push-сервису Expo не выполнен"),
+    ("Herdr did not return the created pane id", "Herdr не вернул id созданной панели"),
+    ("Herdr is unavailable", "Herdr недоступен"),
+    (
+        "agent is not one this gateway offers; see GET /api/agents/catalog",
+        "agent не входит в число агентов, которые предлагает этот Gateway; см. GET /api/agents/catalog",
+    ),
+    (
+        "another pairing request is awaiting confirmation",
+        "другой запрос на привязку уже ожидает подтверждения",
+    ),
+    ("answer with an option number or a decision", "укажите номер варианта или решение"),
+    ("asset not found in a session workspace", "файл не найден в пространстве этого сеанса"),
+    (
+        "cwd must be a directory inside a workspace this session has open",
+        "cwd должен быть каталогом внутри пространства, открытого в этом сеансе",
+    ),
+    (
+        "decision must be allow, allow_always, or deny",
+        "decision должен быть allow, allow_always или deny",
+    ),
+    ("device not found", "устройство не найдено"),
+    (
+        "device_name must be at most 80 characters and contain no control characters",
+        "device_name должен содержать не более 80 символов и не содержать управляющих символов",
+    ),
+    ("direction must be right or down", "direction должен быть right или down"),
+    ("executables and scripts are not accepted", "исполняемые файлы и скрипты не принимаются"),
+    ("expected Bearer token", "ожидался токен Bearer"),
+    (
+        "expected a multipart/form-data body with a file field",
+        "ожидалось тело multipart/form-data с полем file",
+    ),
+    ("failed to check pairing request limit", "не удалось проверить лимит запросов на привязку"),
+    ("failed to lock device state", "не удалось заблокировать состояние устройств"),
+    (
+        "failed to lock pending pairing state",
+        "не удалось заблокировать состояние ожидающей привязки",
+    ),
+    ("failed to lock push token state", "не удалось заблокировать состояние push-токенов"),
+    ("failed to lock the asset index", "не удалось заблокировать индекс файлов"),
+    ("failed to read recent agent activity", "не удалось прочитать недавнюю активность агентов"),
+    ("failed to read the asset", "не удалось прочитать файл"),
+    (
+        "failed to remove push notification registration",
+        "не удалось удалить регистрацию push-уведомлений",
+    ),
+    ("failed to revoke the device token", "не удалось отозвать токен устройства"),
+    (
+        "failed to save push notification registration",
+        "не удалось сохранить регистрацию push-уведомлений",
+    ),
+    ("failed to save the new device token", "не удалось сохранить новый токен устройства"),
+    ("failed to store the upload", "не удалось сохранить загруженный файл"),
+    ("format must be text or ansi", "format должен быть text или ansi"),
+    ("invalid Authorization header", "недопустимый заголовок Authorization"),
+    ("invalid pairing code", "недопустимый код привязки"),
+    ("invalid token", "недопустимый токен"),
+    ("keys must contain 1 to 32 entries", "keys должен содержать от 1 до 32 элементов"),
+    ("missing Authorization header", "отсутствует заголовок Authorization"),
+    ("mode must be on, off, or toggle", "mode должен быть on, off или toggle"),
+    ("no pending pairing request", "нет ожидающего запроса на привязку"),
+    (
+        "only png, jpeg, gif, webp, and heic images are accepted",
+        "принимаются только изображения png, jpeg, gif, webp и heic",
+    ),
+    (
+        "pairing code expired; request a new code",
+        "срок действия кода привязки истёк; запросите новый код",
+    ),
+    ("platform must be ios or android", "platform должен быть ios или android"),
+    (
+        "repo_path is not a git checkout, so a branch cannot be made in it",
+        "repo_path не является рабочей копией git, поэтому создать в нём ветку нельзя",
+    ),
+    (
+        "repo_path must be a directory inside a workspace this session has open",
+        "repo_path должен быть каталогом внутри пространства, открытого в этом сеансе",
+    ),
+    (
+        "request_id must be 1-80 chars using letters, digits, dot, underscore, or hyphen",
+        "request_id должен содержать от 1 до 80 символов: латинские буквы, цифры, точка, подчёркивание или дефис",
+    ),
+    ("session not found", "сеанс не найден"),
+    (
+        "source must be visible, recent, recent-unwrapped, or detection",
+        "source должен быть visible, recent, recent-unwrapped или detection",
+    ),
+    (
+        "startup_timeout_ms must be between 3001 and 300000",
+        "startup_timeout_ms должен быть в диапазоне от 3001 до 300000",
+    ),
+    ("text must be at most 65536 bytes", "text должен занимать не более 65536 байт"),
+    ("that tab has no pane to split", "в этой вкладке нет панели, которую можно разделить"),
+    (
+        "the agent no longer has that request pending",
+        "агент больше не ожидает ответа на этот запрос",
+    ),
+    ("the asset is larger than 10 MiB", "файл больше 10 МиБ"),
+    ("the file field is empty", "поле file пустое"),
+    ("the file field must carry a filename", "поле file должно содержать имя файла"),
+    ("the pane is not waiting on an approval", "панель не ожидает разрешения"),
+    ("the pane is waiting on a different approval", "панель ожидает другого разрешения"),
+    ("the upload must be at most 25 MiB", "размер загружаемого файла не должен превышать 25 МиБ"),
+    (
+        "this approval has no option with that number",
+        "в этом запросе на разрешение нет варианта с таким номером",
+    ),
+    (
+        "this approval offers no option with that meaning",
+        "в этом запросе на разрешение нет варианта с таким значением",
+    ),
+    ("token must be an Expo push token", "token должен быть push-токеном Expo"),
+    (
+        "too many pairing requests; try again later",
+        "слишком много запросов на привязку; повторите попытку позже",
+    ),
+    (
+        "transport encryption is disabled on this gateway; scan its current QR code",
+        "на этом Gateway отключено транспортное шифрование; отсканируйте его текущий QR-код",
+    ),
+    (
+        "workspace_label must be at most 120 printable characters",
+        "workspace_label должен содержать не более 120 печатных символов",
+    ),
+    // -- branch names --------------------------------------------------------
+    ("branch_name must not be empty", "branch_name не должен быть пустым"),
+    ("branch_name must be at most 200 characters", "branch_name должен содержать не более 200 символов"),
+    (
+        "branch_name may only contain letters, digits, dot, underscore, dash and slash",
+        "branch_name может содержать только латинские буквы, цифры, точку, подчёркивание, дефис и косую черту",
+    ),
+    ("branch_name must not contain ..", "branch_name не должен содержать .."),
+    ("branch_name must not start with a dash", "branch_name не должен начинаться с дефиса"),
+    (
+        "branch_name must not have an empty path segment or a segment starting or ending with a dot",
+        "branch_name не должен содержать пустой сегмент пути или сегмент, начинающийся или заканчивающийся точкой",
+    ),
+    ("branch_name must not end with .lock", "branch_name не должен заканчиваться на .lock"),
+];
+
+/// Vietnamese, keyed by the English source.
+///
+/// Standard Northern orthography and vocabulary, the register of a developer
+/// tool: tệp for a file, thư mục, máy chủ, mã hóa, and a polite `hãy` in front
+/// of anything that asks the reader to do something. The nouns are the app
+/// catalog's: tác tử for an agent, ngăn for a pane, không gian làm việc, phiên,
+/// ghép nối for pairing, thiết bị, and Chấp thuận / Từ chối for the approval
+/// pair. Token, header, gateway, Muqun and the format names stay in Latin
+/// script, as they do in the app.
+const VI: &[(&str, &str)] = &[
+    // -- approval labels the gateway writes for itself -----------------------
+    ("Approve", "Chấp thuận"),
+    ("Approve and don't ask again", "Chấp thuận và không hỏi lại"),
+    ("Deny", "Từ chối"),
+    ("Option {index}", "Lựa chọn {index}"),
+    ("Allow {action}?", "Cho phép {action}?"),
+    // -- push notifications --------------------------------------------------
+    ("Agent", "Tác tử"),
+    ("Approval needed", "Cần chấp thuận"),
+    ("Agent blocked", "Tác tử đang chờ"),
+    ("Agent done", "Tác tử đã xong"),
+    ("{name} is waiting for your approval.", "{name} đang chờ bạn chấp thuận."),
+    ("{name} needs your input.", "{name} cần bạn nhập liệu."),
+    ("{name} finished running.", "{name} đã chạy xong."),
+    ("Muqun push notifications are connected.", "Thông báo đẩy của Muqun đã được kết nối."),
+    // -- API error messages --------------------------------------------------
+    ("Expo push service request failed", "yêu cầu tới dịch vụ thông báo đẩy của Expo thất bại"),
+    ("Herdr did not return the created pane id", "Herdr không trả về id của ngăn vừa tạo"),
+    ("Herdr is unavailable", "không kết nối được với Herdr"),
+    (
+        "agent is not one this gateway offers; see GET /api/agents/catalog",
+        "agent không nằm trong số tác tử mà gateway này cung cấp; xem GET /api/agents/catalog",
+    ),
+    (
+        "another pairing request is awaiting confirmation",
+        "một yêu cầu ghép nối khác đang chờ xác nhận",
+    ),
+    (
+        "answer with an option number or a decision",
+        "hãy trả lời bằng số thứ tự của lựa chọn hoặc một quyết định",
+    ),
+    (
+        "asset not found in a session workspace",
+        "không tìm thấy tệp trong không gian làm việc của phiên này",
+    ),
+    (
+        "cwd must be a directory inside a workspace this session has open",
+        "cwd phải là một thư mục bên trong không gian làm việc mà phiên này đã mở",
+    ),
+    (
+        "decision must be allow, allow_always, or deny",
+        "decision phải là allow, allow_always hoặc deny",
+    ),
+    ("device not found", "không tìm thấy thiết bị"),
+    (
+        "device_name must be at most 80 characters and contain no control characters",
+        "device_name tối đa 80 ký tự và không được chứa ký tự điều khiển",
+    ),
+    ("direction must be right or down", "direction phải là right hoặc down"),
+    ("executables and scripts are not accepted", "không chấp nhận tệp thực thi và tập lệnh"),
+    ("expected Bearer token", "cần token Bearer"),
+    (
+        "expected a multipart/form-data body with a file field",
+        "cần phần thân multipart/form-data có trường file",
+    ),
+    ("failed to check pairing request limit", "không thể kiểm tra giới hạn yêu cầu ghép nối"),
+    ("failed to lock device state", "không thể khóa trạng thái thiết bị"),
+    ("failed to lock pending pairing state", "không thể khóa trạng thái ghép nối đang chờ"),
+    ("failed to lock push token state", "không thể khóa trạng thái token thông báo đẩy"),
+    ("failed to lock the asset index", "không thể khóa chỉ mục tệp"),
+    ("failed to read recent agent activity", "không thể đọc hoạt động gần đây của tác tử"),
+    ("failed to read the asset", "không thể đọc tệp"),
+    (
+        "failed to remove push notification registration",
+        "không thể gỡ đăng ký thông báo đẩy",
+    ),
+    ("failed to revoke the device token", "không thể thu hồi token của thiết bị"),
+    (
+        "failed to save push notification registration",
+        "không thể lưu đăng ký thông báo đẩy",
+    ),
+    ("failed to save the new device token", "không thể lưu token mới của thiết bị"),
+    ("failed to store the upload", "không thể lưu tệp đã tải lên"),
+    ("format must be text or ansi", "format phải là text hoặc ansi"),
+    ("invalid Authorization header", "header Authorization không hợp lệ"),
+    ("invalid pairing code", "mã ghép nối không hợp lệ"),
+    ("invalid token", "token không hợp lệ"),
+    ("keys must contain 1 to 32 entries", "keys phải chứa từ 1 đến 32 mục"),
+    ("missing Authorization header", "thiếu header Authorization"),
+    ("mode must be on, off, or toggle", "mode phải là on, off hoặc toggle"),
+    ("no pending pairing request", "không có yêu cầu ghép nối nào đang chờ"),
+    (
+        "only png, jpeg, gif, webp, and heic images are accepted",
+        "chỉ chấp nhận ảnh png, jpeg, gif, webp và heic",
+    ),
+    (
+        "pairing code expired; request a new code",
+        "mã ghép nối đã hết hạn; hãy yêu cầu mã mới",
+    ),
+    ("platform must be ios or android", "platform phải là ios hoặc android"),
+    (
+        "repo_path is not a git checkout, so a branch cannot be made in it",
+        "repo_path không phải là một bản checkout git, nên không thể tạo nhánh trong đó",
+    ),
+    (
+        "repo_path must be a directory inside a workspace this session has open",
+        "repo_path phải là một thư mục bên trong không gian làm việc mà phiên này đã mở",
+    ),
+    (
+        "request_id must be 1-80 chars using letters, digits, dot, underscore, or hyphen",
+        "request_id phải dài từ 1 đến 80 ký tự và chỉ gồm chữ cái Latinh, chữ số, dấu chấm, gạch dưới hoặc gạch nối",
+    ),
+    ("session not found", "không tìm thấy phiên"),
+    (
+        "source must be visible, recent, recent-unwrapped, or detection",
+        "source phải là visible, recent, recent-unwrapped hoặc detection",
+    ),
+    (
+        "startup_timeout_ms must be between 3001 and 300000",
+        "startup_timeout_ms phải nằm trong khoảng từ 3001 đến 300000",
+    ),
+    ("text must be at most 65536 bytes", "text tối đa 65536 byte"),
+    ("that tab has no pane to split", "thẻ này không có ngăn nào để chia"),
+    (
+        "the agent no longer has that request pending",
+        "tác tử không còn chờ yêu cầu đó nữa",
+    ),
+    ("the asset is larger than 10 MiB", "tệp lớn hơn 10 MiB"),
+    ("the file field is empty", "trường file đang trống"),
+    ("the file field must carry a filename", "trường file phải kèm tên tệp"),
+    ("the pane is not waiting on an approval", "ngăn này không đang chờ chấp thuận"),
+    ("the pane is waiting on a different approval", "ngăn này đang chờ một chấp thuận khác"),
+    ("the upload must be at most 25 MiB", "tệp tải lên tối đa 25 MiB"),
+    (
+        "this approval has no option with that number",
+        "yêu cầu chấp thuận này không có lựa chọn mang số đó",
+    ),
+    (
+        "this approval offers no option with that meaning",
+        "yêu cầu chấp thuận này không có lựa chọn mang ý nghĩa đó",
+    ),
+    ("token must be an Expo push token", "token phải là token thông báo đẩy của Expo"),
+    (
+        "too many pairing requests; try again later",
+        "quá nhiều yêu cầu ghép nối; hãy thử lại sau",
+    ),
+    (
+        "transport encryption is disabled on this gateway; scan its current QR code",
+        "gateway này đã tắt mã hóa truyền tải; hãy quét mã QR hiện tại của nó",
+    ),
+    (
+        "workspace_label must be at most 120 printable characters",
+        "workspace_label tối đa 120 ký tự in được",
+    ),
+    // -- branch names --------------------------------------------------------
+    ("branch_name must not be empty", "branch_name không được để trống"),
+    ("branch_name must be at most 200 characters", "branch_name tối đa 200 ký tự"),
+    (
+        "branch_name may only contain letters, digits, dot, underscore, dash and slash",
+        "branch_name chỉ được chứa chữ cái Latinh, chữ số, dấu chấm, gạch dưới, gạch nối và dấu gạch chéo",
+    ),
+    ("branch_name must not contain ..", "branch_name không được chứa .."),
+    ("branch_name must not start with a dash", "branch_name không được bắt đầu bằng gạch nối"),
+    (
+        "branch_name must not have an empty path segment or a segment starting or ending with a dot",
+        "branch_name không được có đoạn đường dẫn trống hoặc đoạn bắt đầu hay kết thúc bằng dấu chấm",
+    ),
+    ("branch_name must not end with .lock", "branch_name không được kết thúc bằng .lock"),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1495,12 +2060,16 @@ mod tests {
     }
 
     #[test]
-    fn the_eight_codes_are_the_literals_the_app_and_the_site_already_use() {
-        // Not `zh-Hant`, not `zh-Hant-TW`, not `zh_TW`, and not `pt-BR`. The app
-        // names its catalog directories and persists its setting with these
-        // exact strings, so a change here silently un-localizes every client.
+    fn the_eleven_codes_are_the_literals_the_app_and_the_site_already_use() {
+        // Not `zh-Hant`, not `zh-Hant-TW`, not `zh_TW`, not `zh-Hans` and not
+        // `pt-BR`. The app names its catalog directories and persists its
+        // setting with these exact strings, so a change here silently
+        // un-localizes every client.
         let codes: Vec<&str> = Locale::ALL.iter().map(|locale| locale.as_str()).collect();
-        assert_eq!(codes, ["en", "zh-TW", "ja", "ko", "de", "fr", "es", "pt"]);
+        assert_eq!(
+            codes,
+            ["en", "zh-TW", "zh-CN", "ja", "ko", "de", "fr", "es", "pt", "ru", "vi"]
+        );
         assert_eq!(Locale::default(), Locale::En);
     }
 
@@ -1536,6 +2105,18 @@ mod tests {
             Locale::from_headers(&headers(&[("X-Muqun-Locale", "zh-TW")])),
             Locale::ZhTw
         );
+        // The three codes the app added together, each as the app sends it.
+        for (code, expected) in [
+            ("zh-CN", Locale::ZhCn),
+            ("ru", Locale::Ru),
+            ("vi", Locale::Vi),
+        ] {
+            assert_eq!(
+                Locale::from_headers(&headers(&[("X-Muqun-Locale", code)])),
+                expected,
+                "{code}"
+            );
+        }
     }
 
     #[test]
@@ -1623,7 +2204,7 @@ mod tests {
     }
 
     #[test]
-    fn traditional_tags_fold_onto_zh_tw_and_simplified_ones_never_do() {
+    fn traditional_tags_fold_onto_zh_tw_and_simplified_ones_onto_zh_cn() {
         for tag in [
             "zh-TW",
             "zh-tw",
@@ -1636,14 +2217,58 @@ mod tests {
         ] {
             assert_eq!(Locale::from_code(tag), Some(Locale::ZhTw), "{tag}");
         }
-        // Serving Traditional to a Simplified reader is a worse answer than
-        // serving English, so these fall through rather than folding. Bare `zh`
-        // does not say which script it wants, which is the whole question.
-        for tag in ["zh-Hans", "zh-CN", "zh-cn", "zh-SG", "zh-Hans-CN", "zh"] {
+        for tag in [
+            "zh-CN",
+            "zh-cn",
+            "zh_CN",
+            "zh-Hans",
+            "zh-hans",
+            "zh-Hans-CN",
+            "zh-SG",
+            "zh-MY",
+        ] {
+            assert_eq!(Locale::from_code(tag), Some(Locale::ZhCn), "{tag}");
+        }
+        // Bare `zh` is Simplified: it is what the tag expands to everywhere
+        // else, and what a mainland device reports when the user never chose
+        // a region. A region that says nothing about script gets the same
+        // answer.
+        assert_eq!(Locale::from_code("zh"), Some(Locale::ZhCn));
+        assert_eq!(Locale::from_code("zh-XX"), Some(Locale::ZhCn));
+        // But a mangled tag is not a bare `zh` with noise after it: it is not
+        // a tag, and English is the answer for a header that is not one.
+        for tag in ["zh-TW;q=0.9", "zh;q=1", "zh-🙂", "zh-T W"] {
             assert_eq!(Locale::from_code(tag), None, "{tag}");
         }
         assert_eq!(Locale::from_code("en-US"), Some(Locale::En));
         assert_eq!(Locale::from_code("en-GB"), Some(Locale::En));
+    }
+
+    #[test]
+    fn a_chinese_script_subtag_outranks_the_region_beside_it() {
+        // The script is the thing the two tables differ by; the region is only
+        // a hint about it, and a tag that names both has already answered.
+        assert_eq!(Locale::from_code("zh-Hans-TW"), Some(Locale::ZhCn));
+        assert_eq!(Locale::from_code("zh-Hans-HK"), Some(Locale::ZhCn));
+        assert_eq!(Locale::from_code("zh-Hant-CN"), Some(Locale::ZhTw));
+        assert_eq!(Locale::from_code("zh-Hant-SG"), Some(Locale::ZhTw));
+        // Subtag order does not matter to the answer; the script still wins.
+        assert_eq!(Locale::from_code("zh-TW-Hans"), Some(Locale::ZhCn));
+    }
+
+    #[test]
+    fn neither_chinese_table_ever_answers_for_the_other() {
+        // The same key, two scripts, two different answers -- and each one is
+        // its own script, not the other's. A shared entry would be a reader of
+        // one script being served the other, which is the bug the split exists
+        // to prevent.
+        assert_eq!(t(Locale::ZhTw, "Deny"), "拒絕");
+        assert_eq!(t(Locale::ZhCn, "Deny"), "拒绝");
+        assert_eq!(t(Locale::ZhTw, "Approve"), "核准");
+        assert_eq!(t(Locale::ZhCn, "Approve"), "批准");
+        assert_eq!(t(Locale::ZhTw, "device not found"), "找不到這個裝置");
+        assert_eq!(t(Locale::ZhCn, "device not found"), "找不到这个设备");
+        assert_ne!(ZH_TW, ZH_CN);
     }
 
     #[test]
@@ -1668,18 +2293,25 @@ mod tests {
             ("pt-BR", Locale::Pt),
             ("pt-PT", Locale::Pt),
             ("PT", Locale::Pt),
+            ("ru-RU", Locale::Ru),
+            ("ru-BY", Locale::Ru),
+            ("ru", Locale::Ru),
+            ("vi-VN", Locale::Vi),
+            ("vi", Locale::Vi),
         ] {
             assert_eq!(Locale::from_code(tag), Some(expected), "{tag}");
         }
         // On the website but not here, which is the interesting negative: a
         // code existing somewhere in the product is not a table existing in it.
-        for tag in ["it", "it-IT", "ar", "nl-NL", "ru", "gl", "ca"] {
+        // `ru` used to be on this list and stopped being a negative the day
+        // Russian became a language we have.
+        for tag in ["it", "it-IT", "ar", "nl-NL", "uk", "gl", "ca", "th"] {
             assert_eq!(Locale::from_code(tag), None, "{tag}");
         }
     }
 
     #[test]
-    fn a_weighted_accept_language_still_picks_among_eight() {
+    fn a_weighted_accept_language_still_picks_among_eleven() {
         // A browser in Quebec, ranking French above English.
         assert_eq!(
             Locale::from_headers(&headers(&[("accept-language", "fr-CA,fr;q=0.9,en;q=0.8")])),
@@ -1694,13 +2326,32 @@ mod tests {
             )])),
             Locale::Pt
         );
+        // A mainland browser: the exact code first, then the bare language,
+        // and both land on the same table.
+        assert_eq!(
+            Locale::from_headers(&headers(&[("accept-language", "zh-CN,zh;q=0.9,en;q=0.8")])),
+            Locale::ZhCn
+        );
+        // A Vietnamese browser ranking English above its own language still
+        // gets English: the weights are the reader's, not ours.
+        assert_eq!(
+            Locale::from_headers(&headers(&[("accept-language", "en-US,en;q=0.9,vi;q=0.8")])),
+            Locale::En
+        );
+        assert_eq!(
+            Locale::from_headers(&headers(&[("accept-language", "ru-RU,ru;q=0.9,en;q=0.8")])),
+            Locale::Ru
+        );
     }
 
     #[test]
     fn a_message_with_no_translation_falls_back_to_the_english_string() {
         assert_eq!(t(Locale::ZhTw, "Deny"), "拒絕");
+        assert_eq!(t(Locale::ZhCn, "Deny"), "拒绝");
         assert_eq!(t(Locale::Ja, "Deny"), "拒否");
         assert_eq!(t(Locale::De, "Deny"), "Ablehnen");
+        assert_eq!(t(Locale::Ru, "Deny"), "Отклонить");
+        assert_eq!(t(Locale::Vi, "Deny"), "Từ chối");
         // The failure mode a half-finished catalog should have: English, not a
         // blank and not a panic. Asserted for every language, because "we will
         // add the entry later" is a thing that happens in all of them.
@@ -1762,7 +2413,7 @@ mod tests {
 
     #[test]
     fn every_catalog_covers_exactly_the_same_english_strings() {
-        // The tables are hand-written and there are seven of them. Without this,
+        // The tables are hand-written and there are ten of them. Without this,
         // a language quietly missing four sentences is four screens that switch
         // back to English mid-paragraph, and nothing says which four.
         let reference: Vec<&str> = ZH_TW.iter().map(|(english, _)| *english).collect();

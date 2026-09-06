@@ -240,8 +240,8 @@ shape with `"prompt": "允許 bash？"` and labels `核准`, `核准，且不再
 Nothing else moves: `decision`, `approval_id`, `tool` and `context` are wire
 vocabulary or the agent's own text, and `fallback_text` is rendered from whatever
 the labels resolved to, so it stays consistent with them. See `src/i18n.rs` for
-the resolution order and for why `zh-Hans` and `zh-CN` deliberately do not fold
-onto `zh-TW`.
+the resolution order, for the other nine languages, and for why `zh-Hans` and
+`zh-CN` land on their own Simplified table and never on `zh-TW`.
 
 It is emitted **where an agent exposes approval state**, which today means the
 native path. A pane read through a marker dictionary keeps its menu on
