@@ -1,3 +1,38 @@
+fn herdr_owns_prompt_submission(version: Option<&str>) -> bool {
+    let Some(version) = version else { return false };
+    let core = version
+        .trim_start_matches('v')
+        .split('+')
+        .next()
+        .unwrap_or("");
+    if core.contains('-') {
+        return false;
+    }
+    let numbers: Option<Vec<u64>> = core.split('.').map(|part| part.parse().ok()).collect();
+    numbers.is_some_and(|parts| parts.len() == 3 && (parts[0], parts[1], parts[2]) >= (0, 9, 0))
+}
+
+#[cfg(test)]
+mod collaboration_submission_tests {
+    use super::*;
+
+    #[test]
+    fn modern_herdr_never_gets_the_legacy_extra_enter() {
+        for version in ["0.9.0", "v0.9.1", "0.10.0", "1.0.0", "0.9.0+build"] {
+            assert!(herdr_owns_prompt_submission(Some(version)), "{version}");
+        }
+        for version in [
+            None,
+            Some("0.8.9"),
+            Some("0.9.0-rc.1"),
+            Some("0.9"),
+            Some("unknown"),
+        ] {
+            assert!(!herdr_owns_prompt_submission(version), "{version:?}");
+        }
+    }
+}
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,6 +73,53 @@ use super::{
 /// Bounds `request_transport` only. See `activity_stream`, which must not have
 /// one and says why.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn startup_refusal(code: &str, message: &str) -> BackendError {
+    BackendError::Refused {
+        code: Some(code.to_owned()),
+        message: message.to_owned(),
+    }
+}
+
+fn can_retry_agent_start(error: &BackendError) -> bool {
+    // Herdr returns this before writing any input. A newly created shell may
+    // still be running its startup scripts; socket failures are never retried.
+    matches!(error, BackendError::Refused { code: Some(code), .. } if code == "agent_pane_busy")
+}
+
+fn startup_ready(
+    agent: &Value,
+    name: &str,
+    terminal_id: &str,
+    kind: &str,
+) -> Result<bool, BackendError> {
+    if agent["terminal_id"].as_str() != Some(terminal_id) || agent["name"].as_str() != Some(name) {
+        return Err(startup_refusal(
+            "agent_name_lost",
+            "the assistant's terminal occupant changed during startup",
+        ));
+    }
+    if agent["agent"].as_str().is_some_and(|actual| actual != kind) {
+        return Err(startup_refusal(
+            "agent_kind_mismatch",
+            "a different agent appeared during startup",
+        ));
+    }
+    match agent["agent_status"].as_str() {
+        Some("blocked") => Err(startup_refusal(
+            "agent_not_ready",
+            "assistant needs attention in its terminal before receiving a task",
+        )),
+        Some("idle" | "done") if agent["interactive_ready"].as_bool() == Some(true) => Ok(true),
+        Some("idle" | "done") if agent["launch_pending"].as_bool() != Some(true) => {
+            Err(startup_refusal(
+                "agent_start_failed",
+                "assistant exited before becoming interactive",
+            ))
+        }
+        _ => Ok(false),
+    }
+}
 
 pub struct HerdrBackend {
     socket_path: PathBuf,
@@ -508,6 +590,13 @@ impl TerminalBackend for HerdrBackend {
     }
 
     fn send_keys<'a>(&'a self, id: &'a PaneId, keys: &'a [String]) -> BackendFuture<'a, ()> {
+        // Herdr parses key names after trimming whitespace, so a literal
+        // space is rejected. Keep the neutral API literal and translate only
+        // at this boundary, preserving order and repeated spaces in one call.
+        let keys: Vec<&str> = keys
+            .iter()
+            .map(|key| if key == " " { "space" } else { key.as_str() })
+            .collect();
         self.command(
             "pane.send_keys",
             json!({ "pane_id": id.as_str(), "keys": keys }),
@@ -522,17 +611,73 @@ impl TerminalBackend for HerdrBackend {
         self.command("agent.prompt", json!({ "target": target, "text": text }))
     }
 
+    fn needs_submit_keypress(&self) -> BackendFuture<'_, bool> {
+        Box::pin(async move {
+            let metadata = self.metadata().await?;
+            Ok(!herdr_owns_prompt_submission(metadata.version.as_deref()))
+        })
+    }
+
     fn start_agent<'a>(&'a self, request: &'a StartAgent) -> BackendFuture<'a, StartedAgent> {
         Box::pin(async move {
             let mut params = serde_json::Map::new();
-            params.insert("name".into(), json!(request.kind));
+            // Names are unique among live agents, even for the same kind.
+            let name = format!("muqun-{}", &uuid::Uuid::new_v4().simple().to_string()[..20]);
+            params.insert("name".into(), json!(name));
             params.insert("kind".into(), json!(request.kind));
             params.insert("pane_id".into(), json!(request.pane_id.as_str()));
             params.insert("timeout_ms".into(), json!(request.timeout_ms));
             if !request.args.is_empty() {
                 params.insert("args".into(), json!(request.args));
             }
-            let response = self.request("agent.start", Value::Object(params)).await?;
+            let shell_deadline =
+                tokio::time::Instant::now() + Duration::from_millis(request.timeout_ms.min(3000));
+            let response = loop {
+                match self
+                    .request("agent.start", Value::Object(params.clone()))
+                    .await
+                {
+                    Err(error)
+                        if can_retry_agent_start(&error)
+                            && tokio::time::Instant::now() < shell_deadline =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                    result => break result?,
+                }
+            };
+            // The socket acknowledges launching; Herdr's CLI adds its own
+            // readiness wait. Mirror that here, pinned to this occupant, so
+            // callers never send a task into a startup or approval dialog.
+            let instance_id = if let Some(terminal_id) = response
+                .pointer("/result/agent/terminal_id")
+                .and_then(Value::as_str)
+            {
+                tokio::time::timeout(Duration::from_millis(request.timeout_ms), async {
+                    loop {
+                        let current = self.request("agent.get", json!({ "target": name })).await?;
+                        let agent = current
+                            .pointer("/result/agent")
+                            .ok_or(BackendError::InvalidResponse("agent startup"))?;
+                        if startup_ready(agent, &name, terminal_id, &request.kind)? {
+                            // The launch alias precedes optional session hooks.
+                            if let Some(instance_id) = agent_instance_id(agent) {
+                                return Ok::<_, BackendError>(Some(instance_id));
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                })
+                .await
+                .map_err(|_| {
+                    startup_refusal(
+                        "agent_start_timeout",
+                        "assistant did not become ready before the startup deadline",
+                    )
+                })??
+            } else {
+                None
+            };
             let argv = response
                 .pointer("/result/argv")
                 .and_then(Value::as_array)
@@ -543,7 +688,11 @@ impl TerminalBackend for HerdrBackend {
                         .map(str::to_owned)
                         .collect()
                 });
-            Ok(StartedAgent { argv })
+            Ok(StartedAgent {
+                argv,
+                instance_id,
+                target: Some(name),
+            })
         })
     }
 
@@ -1019,11 +1168,38 @@ fn pane_from_json(value: &Value) -> Result<Pane, BackendError> {
     })
 }
 
+fn agent_instance_id(value: &Value) -> Option<String> {
+    let terminal = value.get("terminal_id")?.as_str()?;
+    if terminal.is_empty() {
+        return None;
+    }
+    // Herdr clears aliases when their agent exits or is replaced. Gateway
+    // launch aliases are fresh random tokens, never reused by a later launch.
+    // Session hooks may arrive only after the first prompt; other supported
+    // agents have no session integration. Neither changes the launch identity.
+    if let Some(name) = value.get("name").and_then(Value::as_str) {
+        if name.strip_prefix("muqun-").is_some_and(|token| {
+            token.len() == 20 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }) {
+            return Some(json!([terminal, "launch", name]).to_string());
+        }
+    }
+    let conversation = value
+        .pointer("/agent_session/value")
+        .and_then(Value::as_str)?;
+    if terminal.is_empty() || conversation.is_empty() {
+        return None;
+    }
+    Some(json!([terminal, conversation]).to_string())
+}
+
 fn agent_from_json(value: &Value) -> Result<Agent, BackendError> {
     let pane_id = required_string(value, "pane_id", "agent")?;
     Ok(Agent {
+        instance_id: agent_instance_id(value),
         target: value
             .get("target")
+            .or_else(|| value.get("name"))
             .and_then(Value::as_str)
             .unwrap_or(pane_id)
             .to_owned(),
@@ -1181,15 +1357,133 @@ fn required_string<'a>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn agent_identity_is_conversation_scoped_not_pane_scoped() {
+        let first = serde_json::json!({"terminal_id":"term", "agent_session":{"value":"first"}});
+        let replacement =
+            serde_json::json!({"terminal_id":"term", "agent_session":{"value":"second"}});
+        assert_ne!(
+            super::agent_instance_id(&first),
+            super::agent_instance_id(&replacement)
+        );
+        assert!(super::agent_instance_id(&first).is_some());
+        assert!(super::agent_instance_id(
+            &serde_json::json!({"pane_id":"w1:p1", "terminal_id":"term"})
+        )
+        .is_none());
+        assert!(super::agent_instance_id(
+            &serde_json::json!({"terminal_id":"", "agent_session":{"value":"first"}})
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn launch_identity_survives_late_session_metadata_but_not_another_launch() {
+        let mut agent =
+            serde_json::json!({ "terminal_id": "term", "name": "muqun-0123456789abcdef0123" });
+        let first = super::agent_instance_id(&agent).unwrap();
+        agent["agent_session"] = serde_json::json!({ "value": "reported-later" });
+        assert_eq!(
+            super::agent_instance_id(&agent).as_deref(),
+            Some(first.as_str())
+        );
+        agent["name"] = serde_json::json!("muqun-0123456789abcdef0124");
+        assert_ne!(
+            super::agent_instance_id(&agent).as_deref(),
+            Some(first.as_str())
+        );
+        agent["name"] = serde_json::json!("reviewer");
+        assert_ne!(
+            super::agent_instance_id(&agent).as_deref(),
+            Some(first.as_str())
+        );
+    }
     use std::sync::{Arc, Mutex};
 
     use super::*;
     use tokio_stream::StreamExt as _;
 
+    #[test]
+    fn startup_requires_interactive_readiness_and_the_original_occupant() {
+        let ready = json!({ "name": "helper", "terminal_id": "term", "agent": "claude", "agent_status": "idle", "interactive_ready": true });
+        assert!(startup_ready(&ready, "helper", "term", "claude").unwrap());
+        for status in ["working", "unknown"] {
+            let mut waiting = ready.clone();
+            waiting["agent_status"] = json!(status);
+            assert!(!startup_ready(&waiting, "helper", "term", "claude").unwrap());
+        }
+        for (key, value) in [
+            ("agent_status", "blocked"),
+            ("name", "replaced"),
+            ("terminal_id", "replaced"),
+            ("agent", "codex"),
+        ] {
+            let mut changed = ready.clone();
+            changed[key] = json!(value);
+            assert!(startup_ready(&changed, "helper", "term", "claude").is_err());
+        }
+        let mut launching = ready.clone();
+        launching["interactive_ready"] = json!(false);
+        launching["launch_pending"] = json!(true);
+        assert!(!startup_ready(&launching, "helper", "term", "claude").unwrap());
+        launching["launch_pending"] = json!(false);
+        assert!(startup_ready(&launching, "helper", "term", "claude").is_err());
+    }
+
+    #[test]
+    fn startup_retry_requires_an_explicit_pre_input_shell_refusal() {
+        assert!(can_retry_agent_start(&startup_refusal(
+            "agent_pane_busy",
+            "shell starting"
+        )));
+        for code in [
+            "agent_start_input_failed",
+            "agent_not_ready",
+            "timeout",
+            "agent_pane_unavailable",
+        ] {
+            assert!(!can_retry_agent_start(&startup_refusal(code, "failure")));
+        }
+        assert!(!can_retry_agent_start(&BackendError::Unavailable));
+    }
+
     struct FakeHerdr {
         socket_path: PathBuf,
         calls: Arc<Mutex<Vec<Value>>>,
         task: tokio::task::JoinHandle<()>,
+    }
+
+    #[tokio::test]
+    async fn two_assistants_of_one_kind_receive_distinct_live_names() {
+        let fake = FakeHerdr::start();
+        let backend = HerdrBackend::new(fake.socket_path.clone());
+        for pane in ["w1:p2", "w1:p3"] {
+            backend
+                .start_agent(&StartAgent {
+                    pane_id: PaneId::new(pane),
+                    kind: "claude".into(),
+                    command: "claude".into(),
+                    executable: None,
+                    args: vec![],
+                    timeout_ms: 30_000,
+                })
+                .await
+                .unwrap();
+        }
+        let calls = fake.calls.lock().unwrap();
+        let names: Vec<_> = calls
+            .iter()
+            .filter(|call| call["method"] == "agent.start")
+            .map(|call| {
+                assert_eq!(call["params"]["kind"], "claude");
+                call["params"]["name"].as_str().unwrap()
+            })
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert_ne!(names[0], names[1]);
+        assert!(names
+            .iter()
+            .all(|name| name.starts_with("muqun-") && name.len() <= 32));
     }
 
     impl FakeHerdr {
@@ -1200,11 +1494,20 @@ mod tests {
         /// A herdr that does not know `refused` -- the shape of one older
         /// than a method this gateway asks for optionally.
         fn start_refusing(refused: &'static [&'static str]) -> Self {
+            Self::start_scripted(refused, None)
+        }
+
+        fn start_scripted(
+            refused: &'static [&'static str],
+            startup: Option<Vec<&'static str>>,
+        ) -> Self {
             let socket_path = crate::short_test_socket("gw-herdr");
             let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
             let calls = Arc::new(Mutex::new(Vec::new()));
             let recorded = Arc::clone(&calls);
             let task = tokio::spawn(async move {
+                let mut startup = startup.map(std::collections::VecDeque::from);
+                let mut started = Value::Null;
                 while let Ok((stream, _)) = listener.accept().await {
                     let mut reader = BufReader::new(stream);
                     let mut line = String::new();
@@ -1214,13 +1517,49 @@ mod tests {
                     let request: Value = serde_json::from_str(&line).unwrap();
                     let method = request["method"].as_str().unwrap_or_default();
                     recorded.lock().unwrap().push(request.clone());
-                    let response = if refused.contains(&method) {
+                    let response = if method == "agent.start"
+                        && startup
+                            .as_ref()
+                            .is_some_and(|states| states.front() == Some(&"shell-busy"))
+                    {
+                        startup.as_mut().unwrap().pop_front();
+                        json!({ "id": request["id"], "error": { "code": "agent_pane_busy", "message": "shell is starting" } })
+                    } else if refused.contains(&method) {
                         json!({
                             "id": request["id"],
                             "error": { "code": "method_not_found", "message": format!("unknown method {method}") }
                         })
                     } else {
-                        json!({ "id": request["id"], "result": fake_result(method) })
+                        let result = if startup.is_some() && method == "agent.start" {
+                            started = json!({
+                                "name": request["params"]["name"],
+                                "pane_id": request["params"]["pane_id"],
+                                "agent": request["params"]["kind"],
+                                "terminal_id": "startup-terminal",
+                                "agent_status": "unknown", "launch_pending": true,
+                            });
+                            json!({ "agent": started })
+                        } else if let Some(states) =
+                            startup.as_mut().filter(|_| method == "agent.get")
+                        {
+                            assert_eq!(request["params"]["target"], started["name"]);
+                            let status = states.pop_front().unwrap_or("unknown");
+                            started["agent_status"] = json!(if status == "idle-without-identity" {
+                                "idle"
+                            } else {
+                                status
+                            });
+                            started["interactive_ready"] =
+                                json!(status == "idle" || status == "idle-without-identity");
+                            if status == "idle" {
+                                started["agent_session"] =
+                                    json!({ "value": "startup-conversation" });
+                            }
+                            json!({ "agent": started })
+                        } else {
+                            fake_result(method)
+                        };
+                        json!({ "id": request["id"], "result": result })
                     };
                     let mut stream = reader.into_inner();
                     stream
@@ -1242,6 +1581,64 @@ mod tests {
         fn drop(&mut self) {
             self.task.abort();
             let _ = std::fs::remove_file(&self.socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_start_acknowledgement_is_not_interactive_readiness() {
+        for (states, timeout_ms, expected_error) in [
+            (vec!["unknown", "idle"], 1000, None),
+            (vec!["shell-busy", "idle"], 1000, None),
+            (vec!["idle-without-identity", "idle"], 1000, None),
+            (vec!["idle-without-identity"], 1000, None),
+            (vec!["blocked"], 1000, Some("agent_not_ready")),
+            (vec!["unknown"], 20, Some("agent_start_timeout")),
+        ] {
+            let expected_starts = if states.first() == Some(&"shell-busy") {
+                2
+            } else {
+                1
+            };
+            let fake = FakeHerdr::start_scripted(&[], Some(states));
+            let backend = HerdrBackend::new(fake.socket_path.clone());
+            let result = backend
+                .start_agent(&StartAgent {
+                    pane_id: PaneId::new("w1:p2"),
+                    kind: "claude".into(),
+                    command: "claude".into(),
+                    executable: None,
+                    args: vec![],
+                    timeout_ms,
+                })
+                .await;
+            match expected_error {
+                None => {
+                    let started = result.unwrap();
+                    let identity: Value =
+                        serde_json::from_str(&started.instance_id.unwrap()).unwrap();
+                    assert_eq!(identity[0], "startup-terminal");
+                    assert_eq!(identity[1], "launch");
+                    assert_eq!(identity[2].as_str(), started.target.as_deref());
+                }
+                Some(expected) => assert!(
+                    matches!(result, Err(BackendError::Refused { code: Some(code), .. }) if code == expected)
+                ),
+            }
+            let calls = fake.calls.lock().unwrap();
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|call| call["method"] == "agent.start")
+                    .count(),
+                expected_starts
+            );
+            assert!(calls.iter().any(|call| call["method"] == "agent.get"));
+            assert!(
+                !calls
+                    .iter()
+                    .any(|call| call["method"] == "agent.prompt"
+                        || call["method"] == "pane.send_keys")
+            );
         }
     }
 
@@ -1623,7 +2020,7 @@ mod tests {
     /// `h` `e` `l` `l` `o` one call each, then `Escape`, `:` `w` `q`, `Enter`
     /// -- nvim obeyed every one and wrote a file containing exactly `hello`.
     /// So herdr's `pane.send_keys` types rather than pastes, and needs no
-    /// per-character translation here.
+    /// translation for these characters (literal spaces need a named key).
     #[tokio::test]
     async fn single_characters_reach_herdr_send_keys_unchanged() {
         let herdr = FakeHerdr::start();
@@ -1641,6 +2038,27 @@ mod tests {
             .map(|call| call["params"]["keys"][0].as_str().unwrap().to_owned())
             .collect();
         assert_eq!(sent, ["i", "h", ":", ";", "Escape", "Enter"]);
+    }
+
+    #[tokio::test]
+    async fn literal_spaces_use_named_keys_without_splitting_the_request() {
+        let herdr = FakeHerdr::start();
+        let backend = HerdrBackend::new(&herdr.socket_path);
+        let keys = [" ", "a", " ", " ", "b", " ", "enter"].map(str::to_owned);
+        backend
+            .send_keys(&PaneId::new("w1:p1"), &keys)
+            .await
+            .unwrap();
+        let calls = herdr.calls.lock().unwrap();
+        let sent: Vec<_> = calls
+            .iter()
+            .filter(|call| call["method"] == "pane.send_keys")
+            .collect();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0]["params"]["keys"],
+            json!(["space", "a", "space", "space", "b", "space", "enter"])
+        );
     }
 
     #[test]

@@ -299,6 +299,7 @@ const ASSET_SKIP_DIRS: &[&str] = &[
     "coverage",
 ];
 const API_CAPABILITIES: &[&str] = &[
+    "agent_collaboration",
     "agent_catalog",
     "agent_events",
     "agent_lifecycle_notifications",
@@ -6352,7 +6353,13 @@ async fn submit_agent_prompt(
         .prompt_agent(target, text)
         .await
         .map(|_| backend::compat::command_ok("agent_prompted"))
-        .map_err(|err| HerdrCallError::Unavailable(err.to_string()))
+        .map_err(|err| match err {
+            BackendError::Refused { code, message } => HerdrCallError::Herdr {
+                method: "agent.prompt".to_owned(),
+                error: json!({ "code": code, "message": message }),
+            },
+            other => HerdrCallError::Unavailable(other.to_string()),
+        })
 }
 
 async fn start_backend_agent(
@@ -6373,8 +6380,10 @@ async fn start_backend_agent(
             timeout_ms,
         })
         .await
-        .map_err(|err| HerdrCallError::Unavailable(err.to_string()))?;
-    Ok(json!({ "result": { "argv": started.argv } }))
+        .map_err(|err| backend_call_error("agent.start", err))?;
+    Ok(
+        json!({ "result": { "argv": started.argv, "instance_id": started.instance_id, "target": started.target } }),
+    )
 }
 
 /// Belt and braces for a paste-vs-keypress race in agent TUIs: when the prompt
@@ -6395,6 +6404,15 @@ async fn start_backend_agent(
 /// confirm uses.
 fn schedule_submit_keypress(session: SessionConfig, pane_id: String) {
     tokio::spawn(async move {
+        // Herdr 0.9 owns paste + delayed Enter. Another Enter can answer a
+        // subsequent dialog, so the legacy workaround must not run there.
+        if !terminal_backend(&session)
+            .needs_submit_keypress()
+            .await
+            .unwrap_or(false)
+        {
+            return;
+        }
         submit_keypress(&session, &pane_id).await;
     });
 }
@@ -6713,6 +6731,7 @@ async fn create_task(
         "prompt_submitted": false
     });
 
+    let mut prompt_target = place.pane_id.clone();
     let agent_command = tasks::agent_command(&body.agent, &state.config.agent_commands);
     match start_backend_agent(
         &session,
@@ -6734,6 +6753,13 @@ async fn create_task(
                 }),
             );
             payload["agent_started"] = json!(true);
+            if let Some(target) = value.pointer("/result/target").and_then(Value::as_str) {
+                prompt_target = target.to_owned();
+            }
+            payload["agent_instance_id"] = value
+                .pointer("/result/instance_id")
+                .cloned()
+                .unwrap_or(Value::Null);
         }
         Err(err) => {
             steps.failed("agent", err.code(), &err.message());
@@ -6758,8 +6784,8 @@ async fn create_task(
                 if attempt > 0 {
                     tokio::time::sleep(SPAWN_PROMPT_INTERVAL).await;
                 }
-                submitted = submit_agent_prompt(&session, &place.pane_id, prompt).await;
-                if submitted.is_ok() {
+                submitted = submit_agent_prompt(&session, &prompt_target, prompt).await;
+                if !submitted.as_ref().is_err_and(|err| err.can_retry_prompt()) {
                     break;
                 }
             }
@@ -6917,6 +6943,7 @@ async fn spawn_agent(
         "prompt_submitted": false,
     });
 
+    let mut prompt_target = place.pane_id.clone();
     let agent_command = tasks::agent_command(&body.agent, &state.config.agent_commands);
     match start_backend_agent(
         &session,
@@ -6938,6 +6965,13 @@ async fn spawn_agent(
                 }),
             );
             payload["agent_started"] = json!(true);
+            if let Some(target) = value.pointer("/result/target").and_then(Value::as_str) {
+                prompt_target = target.to_owned();
+            }
+            payload["agent_instance_id"] = value
+                .pointer("/result/instance_id")
+                .cloned()
+                .unwrap_or(Value::Null);
         }
         Err(err) => {
             steps.failed("agent", err.code(), &err.message());
@@ -6964,8 +6998,8 @@ async fn spawn_agent(
                 if attempt > 0 {
                     tokio::time::sleep(SPAWN_PROMPT_INTERVAL).await;
                 }
-                submitted = submit_agent_prompt(&session, &place.pane_id, prompt).await;
-                if submitted.is_ok() {
+                submitted = submit_agent_prompt(&session, &prompt_target, prompt).await;
+                if !submitted.as_ref().is_err_and(|err| err.can_retry_prompt()) {
                     break;
                 }
             }
@@ -7003,7 +7037,7 @@ async fn spawn_place(
     steps: &mut tasks::StepLog,
 ) -> ApiResult<SpawnPlace> {
     let Some(tab_id) = tab_id else {
-        return spawn_in_new_tab(session, cwd, steps).await;
+        return spawn_in_new_tab(session, cwd, None, steps).await;
     };
     spawn_beside(session, tab_id, cwd, steps).await
 }
@@ -7013,12 +7047,13 @@ async fn spawn_place(
 async fn spawn_in_new_tab(
     session: &SessionConfig,
     cwd: Option<&str>,
+    workspace_id: Option<&str>,
     steps: &mut tasks::StepLog,
 ) -> ApiResult<SpawnPlace> {
     let backend = terminal_backend(session);
     let tab = backend
         .create_tab(&BackendCreateTab {
-            workspace_id: None,
+            workspace_id: workspace_id.map(BackendWorkspaceId::new),
             cwd: cwd.map(PathBuf::from),
             label: None,
             focus: false,
@@ -7058,6 +7093,17 @@ async fn spawn_beside(
             "that tab has no pane to split",
         )
     })?;
+    // Repeated downward splits can leave an assistant only five rows tall:
+    // even its own transcript no longer renders the response there. Keep a
+    // normal 24-row terminal for both halves, or use a background tab in the
+    // same workspace. Neither path changes the user's current focus.
+    if !can_split_agent_pane(host.viewport_rows) {
+        steps.skipped(
+            "split",
+            "not enough terminal rows; using a tab in the same workspace",
+        );
+        return spawn_in_new_tab(session, cwd, Some(host.workspace_id.as_str()), steps).await;
+    }
     // A split that Ghostty refuses -- a tab already carrying as many panes as
     // its layout will hold, which is the ordinary state of a tab someone works
     // in -- must not lose the task. The tab was a preference, not the request:
@@ -7066,7 +7112,7 @@ async fn spawn_beside(
     // asked for.
     let split = terminal_backend(session)
         .split_pane(&BackendSplitPane {
-            pane_id: BackendPaneId::new(&host),
+            pane_id: host.id.clone(),
             direction: BackendSplitDirection::Down,
             ratio: None,
             cwd: cwd.map(PathBuf::from),
@@ -7080,13 +7126,13 @@ async fn spawn_beside(
                 "split",
                 &format!("{err} -- starting in a tab of its own instead"),
             );
-            return spawn_in_new_tab(session, cwd, steps).await;
+            return spawn_in_new_tab(session, cwd, Some(host.workspace_id.as_str()), steps).await;
         }
     };
     let pane_id = pane.id.as_str().to_owned();
     steps.ok(
         "pane",
-        json!({ "pane_id": pane_id, "tab_id": tab_id, "split_from": host }),
+        json!({ "pane_id": pane_id, "tab_id": tab_id, "split_from": host.id.as_str() }),
     );
     Ok(SpawnPlace {
         pane_id,
@@ -7095,7 +7141,11 @@ async fn spawn_beside(
 }
 
 /// A pane to split in the named tab, preferring the one that has focus.
-async fn pane_in_tab(session: &SessionConfig, tab_id: &str) -> Option<String> {
+fn can_split_agent_pane(viewport_rows: Option<u32>) -> bool {
+    viewport_rows.is_none_or(|rows| rows >= 48)
+}
+
+async fn pane_in_tab(session: &SessionConfig, tab_id: &str) -> Option<Pane> {
     terminal_backend(session)
         .list_panes()
         .await
@@ -7103,7 +7153,6 @@ async fn pane_in_tab(session: &SessionConfig, tab_id: &str) -> Option<String> {
         .into_iter()
         .filter(|pane| pane.tab_id.as_str() == tab_id)
         .max_by_key(|pane| pane.focused)
-        .map(|pane| pane.id.as_str().to_owned())
 }
 
 /// The directories this session is already working in, for a spawn picker.
@@ -7472,6 +7521,14 @@ enum HerdrCallError {
 }
 
 impl HerdrCallError {
+    /// Only an explicit pre-submission refusal is safe to repeat. A lost
+    /// socket response can follow a successful write; repeating it duplicates
+    /// the user's instruction. Blocked dialogs must never be auto-answered.
+    fn can_retry_prompt(&self) -> bool {
+        matches!(self, Self::Herdr { error, .. }
+            if error.get("code").and_then(Value::as_str) == Some("agent_not_found"))
+    }
+
     fn malformed(method: &str) -> Self {
         Self::Malformed(method.to_owned())
     }
@@ -11798,6 +11855,7 @@ fn task_result_schema() -> Value {
             "agent": { "type": "string" },
             "reused_worktree": { "type": "boolean", "description": "True when the branch already had a checkout, which is what makes a retry safe" },
             "agent_started": { "type": "boolean" },
+            "agent_instance_id": { "type": ["string", "null"], "description": "Opaque identity of the ready agent conversation. Never correlate assignment history by pane id alone." },
             "prompt_submitted": { "type": "boolean" },
             "steps": task_steps_schema()
         }
@@ -12293,6 +12351,59 @@ mod tests {
     use super::*;
     use axum::http::HeaderValue;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    #[test]
+    fn agent_splits_preserve_a_readable_terminal() {
+        for rows in [0, 5, 20, 40, 47] {
+            assert!(!can_split_agent_pane(Some(rows)));
+        }
+        for rows in [48, 80, 120] {
+            assert!(can_split_agent_pane(Some(rows)));
+        }
+        assert!(can_split_agent_pane(None)); // Preserve older backend behavior.
+    }
+
+    #[test]
+    fn startup_refusals_keep_their_actionable_codes() {
+        for code in [
+            "agent_not_ready",
+            "agent_start_failed",
+            "agent_start_timeout",
+        ] {
+            let error = backend_call_error(
+                "agent.start",
+                BackendError::Refused {
+                    code: Some(code.to_owned()),
+                    message: "startup detail".to_owned(),
+                },
+            );
+            assert_eq!(error.code(), code);
+            assert!(!error.can_retry_prompt());
+        }
+    }
+
+    #[test]
+    fn prompt_retry_requires_proof_nothing_was_submitted() {
+        assert!(!HerdrCallError::Unavailable("response lost".into()).can_retry_prompt());
+        assert!(!HerdrCallError::Malformed("agent.prompt".into()).can_retry_prompt());
+        for code in [
+            "agent_blocked",
+            "timeout",
+            "agent_prompt_stalled",
+            "unknown",
+        ] {
+            assert!(!HerdrCallError::Herdr {
+                method: "agent.prompt".into(),
+                error: json!({ "code": code }),
+            }
+            .can_retry_prompt());
+        }
+        assert!(HerdrCallError::Herdr {
+            method: "agent.prompt".into(),
+            error: json!({ "code": "agent_not_found" }),
+        }
+        .can_retry_prompt());
+    }
 
     fn test_config(token: &str) -> Config {
         Config {

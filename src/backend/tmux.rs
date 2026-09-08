@@ -1069,7 +1069,11 @@ impl TerminalBackend for TmuxBackend {
                     let recognized = current.agent.as_deref() == Some(request.kind.as_str())
                         || current.foreground_command.as_deref() == Some(executable_name);
                     if recognized {
-                        return Ok(StartedAgent { argv: Some(argv) });
+                        return Ok(StartedAgent {
+                            target: None,
+                            argv: Some(argv),
+                            instance_id: None,
+                        });
                     }
                 }
                 if tokio::time::Instant::now() >= deadline {
@@ -1147,6 +1151,7 @@ fn pane_from_fields(fields: Vec<String>) -> Result<Pane, BackendError> {
 fn agent_from_pane(pane: Pane) -> Option<Agent> {
     let kind = pane.agent.clone()?;
     Some(Agent {
+        instance_id: None,
         target: pane.id.as_str().to_owned(),
         pane_id: pane.id,
         workspace_id: Some(pane.workspace_id),

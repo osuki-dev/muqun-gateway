@@ -97,8 +97,9 @@ pairing mode; changing the gateway setting governs newly paired devices.
 Run `cargo fmt --check`, `cargo test --offline`, `cargo clippy --offline --all-targets
 -- -D warnings`, and `cargo build --release --offline`. The ignored Herdr and
 tmux contracts use isolated sockets and should be run when adapter behavior
-changes. Live Herdr integration checks should remain read-only; write checks
-belong on isolated adapter fixtures. The tmux contract test now also asserts
+changes. Never mutate a user's active Herdr session in a test. Startup/delivery
+changes additionally require real paired App checks on an explicitly isolated
+QA session, following the trust/approval and proxy rules in `AGENTS.md`. The tmux contract test now also asserts
 that disjoint absolute ranges tile a pane exactly; it needs a real tmux
 server, so it stays behind `--ignored`.
 

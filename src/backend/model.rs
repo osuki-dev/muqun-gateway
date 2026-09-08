@@ -179,6 +179,8 @@ pub struct Pane {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Agent {
+    /// Opaque identity of this process/conversation, never a reusable pane id.
+    pub instance_id: Option<String>,
     pub target: String,
     pub pane_id: PaneId,
     pub workspace_id: Option<WorkspaceId>,
@@ -201,6 +203,9 @@ pub struct StartAgent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartedAgent {
+    /// A launch-scoped target when the backend can provide one.
+    pub target: Option<String>,
+    pub instance_id: Option<String>,
     pub argv: Option<Vec<String>>,
 }
 
@@ -414,6 +419,11 @@ pub trait TerminalBackend: Send + Sync {
     fn send_keys<'a>(&'a self, id: &'a PaneId, keys: &'a [String]) -> BackendFuture<'a, ()>;
     fn focus_agent<'a>(&'a self, target: &'a str) -> BackendFuture<'a, ()>;
     fn prompt_agent<'a>(&'a self, target: &'a str, text: &'a str) -> BackendFuture<'a, ()>;
+    /// A backend decides whether its prompt operation needs the legacy Enter
+    /// workaround. On errors callers must not send blind follow-up keys.
+    fn needs_submit_keypress(&self) -> BackendFuture<'_, bool> {
+        Box::pin(async { Ok(true) })
+    }
     fn start_agent<'a>(&'a self, request: &'a StartAgent) -> BackendFuture<'a, StartedAgent>;
     fn list_worktrees<'a>(&'a self, _cwd: &'a PathBuf) -> BackendFuture<'a, Vec<Worktree>> {
         Box::pin(async { Err(BackendError::Unsupported("worktrees")) })
