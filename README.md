@@ -21,7 +21,8 @@ It downloads a prebuilt, statically linked binary for your platform, so no Rust
 toolchain is needed.
 
 tmux is all it needs — Herdr is optional. The installer configures whichever
-backends are actually present: tmux always, and Herdr too when it is on `PATH`.
+backends are actually present: tmux, Herdr, or both. Herdr-only installs also use
+the standalone gateway so it can start independently at login/boot.
 Re-running it is safe: it never duplicates a backend, never loses a paired
 device, and never flips a default an earlier install chose.
 
@@ -90,6 +91,34 @@ says so.
 With a service installed, `muqun-gateway stop` stops the process but the service
 starts it again — that is what it is for. `service uninstall` is how you stop it
 for good.
+
+### Optional terminal startup
+
+The installer separately asks whether configured terminal backends should start
+with the gateway. Only an explicit **yes** enables this; Enter, no terminal, and
+existing configurations retain their settings (off for a new install).
+
+```sh
+muqun-gateway backend list
+muqun-gateway backend autostart tmux on
+muqun-gateway backend autostart herdr on
+muqun-gateway backend autostart herdr off
+```
+
+Use the IDs from `backend list`. On each gateway start, opted-in backends get
+one background startup attempt. Running servers are reused. A stopped tmux
+backend gets a detached `muqun` shell session; Herdr starts headless using its
+configured default or named session. Custom Herdr socket paths whose session
+store cannot be identified must still be started manually. Herdr may restore
+its own persisted workspace state; Muqun does not submit agent prompts or answer
+trust dialogs.
+
+A startup failure is logged once and does not block the gateway or create a
+restart loop. Start the backend manually, or restart the gateway to retry.
+Disabling the option affects future starts, not existing terminal processes.
+Reinstall the service after upgrading to apply the child-process lifetime rules:
+gateway restarts must not kill persistent terminal servers. On macOS this is
+login startup; on Linux boot startup requires the user service and lingering.
 
 ## Reaching it from outside your network
 

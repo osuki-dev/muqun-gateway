@@ -43,8 +43,11 @@ mod agent_events;
 mod approvals;
 mod authority;
 mod backend;
+mod backend_startup;
 mod composer;
 mod i18n;
+#[cfg(all(test, unix))]
+mod installer_tests;
 mod login_env;
 mod native;
 mod parts;
@@ -324,6 +327,7 @@ const API_CAPABILITIES: &[&str] = &[
     "tasks",
     "terminal_backends",
     "multiple_terminal_backends",
+    "terminal_session_liveness",
     "terminal_input",
 ];
 
@@ -373,6 +377,10 @@ enum Command {
     },
     /// Adopt an existing Herdr plugin pairing into the standalone gateway.
     ImportHerdrPlugin {
+        /// Installer mode: skip absent or already imported plugin state, but
+        /// never ignore malformed pairing files.
+        #[arg(long)]
+        if_present: bool,
         #[arg(long)]
         config_dir: Option<PathBuf>,
         #[arg(long)]
@@ -407,6 +415,12 @@ enum ServiceCommand {
 #[derive(Subcommand)]
 enum BackendCommand {
     List,
+    /// Opt a configured backend in/out of startup with the gateway.
+    Autostart {
+        id: String,
+        #[arg(value_enum)]
+        mode: BackendAutostartMode,
+    },
     Add {
         #[arg(value_enum)]
         backend: SetupBackend,
@@ -424,6 +438,12 @@ enum BackendCommand {
     Default {
         id: String,
     },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum BackendAutostartMode {
+    On,
+    Off,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -472,6 +492,9 @@ struct Config {
     #[serde(default, skip_serializing_if = "is_required_transport")]
     transport_encryption: TransportEncryptionMode,
     sessions: Vec<SessionConfig>,
+    /// Explicit opt-in by session ID; adding a backend never enables startup.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    autostart_backends: Vec<String>,
     /// Agent kind -> the executable `GET /api/agents/catalog` looks for on
     /// `PATH`. Only needed when a kind's binary is named something else on this
     /// machine; absent, every kind probes for its own name. Optional and
@@ -958,11 +981,21 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Service { command } => run_service_command(command)?,
         Command::Backend { command } => configure_backend(command)?,
         Command::ImportHerdrPlugin {
+            if_present,
             config_dir,
             state_dir,
             target_config_dir,
             target_state_dir,
-        } => import_herdr_plugin(config_dir, state_dir, target_config_dir, target_state_dir)?,
+        } => {
+            let source = config_dir.unwrap_or(default_herdr_plugin_config_dir()?);
+            let target = target_config_dir.unwrap_or(standalone_config_dir()?);
+            let absent = !source.join(CONFIG_FILE).try_exists()?
+                && !source.join(PAIRING_FILE).try_exists()?;
+            let imported = target.join(HERDR_PLUGIN_IMPORT_MARKER).try_exists()?;
+            if !if_present || (!absent && !imported) {
+                import_herdr_plugin(Some(source), state_dir, Some(target), target_state_dir)?;
+            }
+        }
         Command::Devices => list_devices()?,
         Command::Revoke { device_id, all } => revoke_device(device_id, all)?,
     }
@@ -1065,6 +1098,7 @@ fn setup(
             token_hash,
             transport_encryption: TransportEncryptionMode::Required,
             sessions: Vec::new(),
+            autostart_backends: Vec::new(),
             agent_commands: BTreeMap::new(),
             rich_agent_pushes: false,
         },
@@ -1274,6 +1308,30 @@ fn configure_backend(command: BackendCommand) -> anyhow::Result<()> {
     let path = config_dir()?.join(CONFIG_FILE);
     let mut config = load_config(None)?;
     match command {
+        BackendCommand::Autostart { id, mode } => {
+            let session = config
+                .sessions
+                .iter()
+                .find(|session| session.id == id)
+                .with_context(|| format!("backend {id} not found"))?;
+            if matches!(mode, BackendAutostartMode::On) {
+                backend_startup::validate(session)?;
+                if !config.autostart_backends.contains(&id) {
+                    config.autostart_backends.push(id.clone());
+                }
+            } else {
+                config.autostart_backends.retain(|item| item != &id);
+            }
+            write_config(&path, &config)?;
+            println!(
+                "backend {id} autostart {}; applies on the next gateway start",
+                if matches!(mode, BackendAutostartMode::On) {
+                    "on"
+                } else {
+                    "off"
+                }
+            );
+        }
         BackendCommand::List => {
             for session in &config.sessions {
                 let endpoint = backend_endpoint(session);
@@ -1302,6 +1360,7 @@ fn configure_backend(command: BackendCommand) -> anyhow::Result<()> {
             anyhow::ensure!(config.sessions.len() > 1, "cannot remove the only backend");
             let previous_len = config.sessions.len();
             config.sessions.retain(|session| session.id != id);
+            config.autostart_backends.retain(|item| item != &id);
             anyhow::ensure!(
                 config.sessions.len() != previous_len,
                 "backend {id} not found"
@@ -1406,6 +1465,18 @@ fn import_herdr_plugin(
                 .or_insert_with(|| command.clone());
         }
         merged.rich_agent_pushes |= target.config.rich_agent_pushes;
+        for session in &target.config.sessions {
+            if !target.config.autostart_backends.contains(&session.id) {
+                continue;
+            }
+            if let Some(imported) = merged.sessions.iter().find(|item| {
+                item.backend == session.backend && item.socket_path == session.socket_path
+            }) {
+                if !merged.autostart_backends.contains(&imported.id) {
+                    merged.autostart_backends.push(imported.id.clone());
+                }
+            }
+        }
     }
 
     backup_secret_file(&target_config_path)?;
@@ -1626,7 +1697,9 @@ fn proxy_targets_port(proxy: &str, port: u16) -> bool {
 fn run_service_command(command: ServiceCommand) -> anyhow::Result<()> {
     match command {
         ServiceCommand::Install => {
-            stop_background_inner(false)?;
+            if !matches!(service::state()?, service::ServiceState::Installed) {
+                stop_background_inner(false)?;
+            }
             service::install(&service_paths()?)?;
             println!("The gateway now starts when you log in, and restarts if it stops.");
             println!("Undo it with: muqun-gateway service uninstall");
@@ -1877,6 +1950,11 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     // are built so it is the last thing on screen rather than the first.
     let listen_warning = unreachable_listen_warning(&config.listen, &config.public_url);
 
+    // Bind successfully before starting anything on the user's behalf.
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    // One background attempt per opted-in backend; no restart/logging loop.
+    backend_startup::spawn(&config);
+
     let state = AppState {
         config,
         pending_pairing: Arc::new(Mutex::new(None)),
@@ -2047,7 +2125,6 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         eprintln!("{warning}");
     }
     println!("terminal gateway listening on http://{addr}");
-    let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -4712,6 +4789,13 @@ async fn ordered_sessions(state: &AppState) -> Vec<&SessionConfig> {
     let mut order: Vec<usize> = (0..state.config.sessions.len()).collect();
     order.sort_by_key(|&index| session_order_key(index, liveness[index]));
     if let Ok(mut cache) = state.session_liveness.lock() {
+        cache.reachable = state
+            .config
+            .sessions
+            .iter()
+            .zip(&liveness)
+            .map(|(session, live)| (session.id.clone(), *live != SessionLiveness::Unreachable))
+            .collect();
         cache.record(order.clone(), Instant::now());
     }
     order
@@ -4725,6 +4809,7 @@ async fn ordered_sessions(state: &AppState) -> Vec<&SessionConfig> {
 #[derive(Default)]
 struct SessionLivenessCache {
     taken: Option<(Instant, Vec<usize>)>,
+    reachable: HashMap<String, bool>,
 }
 
 impl SessionLivenessCache {
@@ -4743,6 +4828,22 @@ impl SessionLivenessCache {
 async fn sessions(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
     let sessions = ordered_sessions(&state).await;
+    let reachable = state
+        .session_liveness
+        .lock()
+        .ok()
+        .map(|cache| cache.reachable.clone())
+        .unwrap_or_default();
+    let sessions: Vec<Value> = sessions
+        .into_iter()
+        .map(|session| {
+            let mut value = json!(session);
+            if let Some(connected) = reachable.get(&session.id) {
+                value["connected"] = json!(connected);
+            }
+            value
+        })
+        .collect();
     Ok(Json(json!({ "sessions": sessions })))
 }
 
@@ -9809,6 +9910,41 @@ fn with_uploads_root(
     roots
 }
 
+/// Extra roots are used ONLY for an explicit file lookup, never a directory
+/// scan. Platform cache/temp paths are configuration, not terminal output.
+fn preview_lookup_roots(
+    mut roots: Vec<AssetRoot>,
+    session_id: &str,
+    home: Option<&FsPath>,
+    candidates: impl IntoIterator<Item = PathBuf>,
+) -> Vec<AssetRoot> {
+    let canonical_home = home.and_then(|path| std::fs::canonicalize(path).ok());
+    for candidate in candidates {
+        let Ok(path) = std::fs::canonicalize(candidate) else {
+            continue;
+        };
+        // An overly broad XDG_CACHE_HOME/TMPDIR must not expose the account
+        // or filesystem root. Resolve aliases such as macOS /tmp first.
+        if !path.is_dir()
+            || path.parent().is_none()
+            || canonical_home
+                .as_ref()
+                .is_some_and(|home| home.starts_with(&path))
+            || roots.iter().any(|root| root.path == path)
+        {
+            continue;
+        }
+        roots.push(AssetRoot {
+            path,
+            session_id: session_id.to_owned(),
+            workspace_id: None,
+            tab_id: None,
+            pane_id: None,
+        });
+    }
+    roots
+}
+
 fn asset_entry_for_path(raw: &str, roots: &[AssetRoot]) -> Option<AssetEntry> {
     let path = std::fs::canonicalize(raw).ok()?;
     if !path.is_file() {
@@ -10003,6 +10139,21 @@ async fn session_assets(
         // one path the lookup could never answer. Serving it widens nothing:
         // the directory is the gateway's own.
         let lookup_roots = with_uploads_root(roots.clone(), &session_id, uploads_dir().ok());
+        let home = dirs::home_dir();
+        let mut candidates = vec![std::env::temp_dir(), PathBuf::from("/tmp")];
+        candidates.extend(dirs::cache_dir());
+        candidates.extend(home.as_ref().map(|home| home.join(".cache")));
+        let lookup_roots =
+            preview_lookup_roots(lookup_roots, &session_id, home.as_deref(), candidates);
+        // Expand only the current account's ~/ form, never shell syntax or
+        // another account. Canonical containment is still checked below.
+        let wanted = if let Some(relative) = wanted.strip_prefix("~/") {
+            home.as_ref()
+                .map(|home| home.join(relative).to_string_lossy().into_owned())
+                .unwrap_or(wanted)
+        } else {
+            wanted
+        };
         let entry = tokio::task::spawn_blocking(move || {
             let entry = asset_entry_for_path(&wanted, &lookup_roots)?;
             let asset_type = sniff_asset_type(&read_asset_head(&entry.path), &entry.name);
@@ -10753,18 +10904,19 @@ fn default_herdr_plugin_config_dir() -> anyhow::Result<PathBuf> {
     if let Ok(path) = std::env::var("HERDR_PLUGIN_CONFIG_DIR") {
         return Ok(path.into());
     }
-    Ok(dirs::config_dir()
-        .context("failed to locate config directory")?
-        .join("herdr/plugins/config/herdr.gateway"))
+    Ok(PathBuf::from(default_socket_path())
+        .parent()
+        .context("failed to locate Herdr config directory")?
+        .join("plugins/config/herdr.gateway"))
 }
 
 fn default_herdr_plugin_state_dir() -> anyhow::Result<PathBuf> {
     if let Ok(path) = std::env::var("HERDR_PLUGIN_STATE_DIR") {
         return Ok(path.into());
     }
-    Ok(dirs::state_dir()
-        .or_else(dirs::data_dir)
-        .or_else(dirs::config_dir)
+    Ok(std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".local/state")))
         .context("failed to locate state directory")?
         .join("herdr/plugins/herdr.gateway"))
 }
@@ -11270,7 +11422,9 @@ fn write_secret_file(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()>
 }
 
 fn default_socket_path() -> String {
-    dirs::config_dir()
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".config")))
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("herdr")
         .join("herdr.sock")
@@ -11529,7 +11683,7 @@ fn openapi_spec() -> Value {
                     "responses": asset_content_responses()
                 }
             },
-            "/api/sessions": { "get": simple_endpoint("List configured terminal backend sessions") },
+            "/api/sessions": { "get": simple_endpoint("List configured terminal backend sessions with a current connected flag; unreachable sessions remain configured but should not appear as switch targets") },
             "/api/sessions/{sessionId}/events": {
                 "get": {
                     "summary": "Stream Herdr lifecycle events as Server-Sent Events",
@@ -12409,6 +12563,7 @@ mod tests {
         Config {
             server_id: "server-1".into(),
             label: "test".into(),
+            autostart_backends: Vec::new(),
             listen: "127.0.0.1:23100".into(),
             public_url: "http://127.0.0.1:23100".into(),
             token_hash: hash_token(token),
@@ -12422,6 +12577,21 @@ mod tests {
             agent_commands: BTreeMap::new(),
             rich_agent_pushes: false,
         }
+    }
+
+    #[test]
+    fn backend_autostart_is_explicit_and_old_configs_stay_off() {
+        let mut config = test_config("test");
+        let old = serde_json::to_value(&config).unwrap();
+        assert!(old.get("autostart_backends").is_none());
+        assert!(serde_json::from_value::<Config>(old)
+            .unwrap()
+            .autostart_backends
+            .is_empty());
+        config.autostart_backends.push("default".into());
+        let loaded: Config =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert_eq!(loaded.autostart_backends, ["default"]);
     }
 
     #[test]
@@ -16976,6 +17146,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(session_ids(&response.0), vec!["herdr-live", "tmux-dead"]);
+        assert_eq!(response.0["sessions"][0]["connected"], true);
+        assert_eq!(response.0["sessions"][1]["connected"], false);
     }
 
     /// The dual-backend defect the final review caught: with tmux dead (or
