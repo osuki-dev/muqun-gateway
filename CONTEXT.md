@@ -25,6 +25,11 @@ the gateway itself (see the last line of this file).
 - `src/scrollback.rs`: bounded scrollback retention and the application policy
   for observing frames and serving row-bounded reads. Callers do not assemble
   cache keys or compare output byte lengths.
+- `src/git.rs`: read-only, bounded `git` for one pane's checkout -- the
+  branch line, the changed-file list with totals, and one file's unified patch
+  a page at a time -- behind the `pane_context` and `git_diff` capabilities.
+  Fixed argument lists, one validated path after `--`, a timeout and an output
+  cap, `--no-optional-locks` so the agent's index lock is never taken.
 - `src/login_env.rs`: the `PATH` and `LC_CTYPE` a backend actually needs,
   recovered from a login shell. An init system starts the gateway with neither,
   and the tmux adapter cannot spawn tmux without the first or parse its output
