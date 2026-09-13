@@ -316,8 +316,14 @@ staged and unstaged together, because "what did the agent change" is one
 question. The list is structured JSON; the patch is the raw unified text, on
 purpose — measured in the app repository, a line-oriented parser on the phone is
 cheaper than `JSON.parse` of the same rows pre-structured, on a payload half
-the size. A patch is paged by `from`/`lines` (4000 at most) and every page is
-cut back to a hunk or file boundary, so a page parses on its own.
+the size. A patch is paged by `from`/`lines` (4000 at most). A page is cut back to
+the nearest hunk or file boundary when one lies past the middle of the page, so
+a page normally starts on `@@` and parses on its own; a single hunk longer than
+a page (every third line of a file changed is one hunk) is cut raw, and the
+reader carries the line counters from one page into the next rather than being
+handed four header lines and a "more" button. A rename is diffed with both
+paths named (`old_path`), because with the new path alone as the pathspec git
+renders a brand-new file.
 
 The rules that keep it safe are the ones the file search already has: the
 directory is the pane's fenced root, never a client value; the checkout is
