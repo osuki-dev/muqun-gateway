@@ -60,12 +60,14 @@ pub struct ServicePaths {
 }
 
 pub fn install(paths: &ServicePaths) -> Result<()> {
+    // Validate before creating directories or replacing an existing unit.
+    let contents = unit_contents(paths)?;
     let unit = unit_path()?;
     if let Some(parent) = unit.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    std::fs::write(&unit, unit_contents(paths))
+    std::fs::write(&unit, contents)
         .with_context(|| format!("failed to write {}", unit.display()))?;
     enable(&unit)?;
     println!("service installed: {}", unit.display());
@@ -120,9 +122,9 @@ pub fn unit_path() -> Result<PathBuf> {
 
 // ---------------------------------------------------------------- unit files
 
-fn unit_contents(paths: &ServicePaths) -> String {
+fn unit_contents(paths: &ServicePaths) -> Result<String> {
     if cfg!(target_os = "macos") {
-        launch_agent_plist(paths)
+        Ok(launch_agent_plist(paths))
     } else {
         systemd_unit(paths)
     }
@@ -185,6 +187,8 @@ fn launch_agent_plist(paths: &ServicePaths) -> String {
   <true/>
   <key>KeepAlive</key>
   <true/>
+  <key>AbandonProcessGroup</key>
+  <true/>
   <key>ProcessType</key>
   <string>Background</string>
   <key>EnvironmentVariables</key>
@@ -213,16 +217,19 @@ fn launch_agent_plist(paths: &ServicePaths) -> String {
 /// Output is left to the journal instead of being redirected at the log file
 /// the way the plist does it -- systemd already captures stdout, and pointing
 /// two writers at one file is how a log ends up interleaved mid-line.
-fn systemd_unit(paths: &ServicePaths) -> String {
-    let exe = paths.exe.display();
-    let config = paths.config.display();
-    let home = paths.home.display();
-    // Quoted: a `PATH` entry may contain a space, and an unquoted
-    // `Environment=` line stops at the first one -- which would not fail, it
-    // would silently truncate the search path.
-    let path = &paths.path;
-    let lc_ctype = &paths.lc_ctype;
-    format!(
+fn systemd_unit(paths: &ServicePaths) -> Result<String> {
+    let path_text = |path: &Path| -> Result<String> {
+        Ok(path
+            .to_str()
+            .context("systemd service paths must be valid UTF-8")?
+            .to_owned())
+    };
+    let exe = systemd_word(&format!(":{}", path_text(&paths.exe)?))?;
+    let config = systemd_word(&path_text(&paths.config)?)?;
+    let home = systemd_word(&format!("HOME={}", path_text(&paths.home)?))?;
+    let path = systemd_word(&format!("PATH={}", paths.path))?;
+    let lc_ctype = systemd_word(&format!("LC_CTYPE={}", paths.lc_ctype))?;
+    Ok(format!(
         "[Unit]\n\
          Description=Muqun Gateway\n\
          Documentation=https://github.com/osuki-dev/muqun-gateway\n\
@@ -230,16 +237,40 @@ fn systemd_unit(paths: &ServicePaths) -> String {
          \n\
          [Service]\n\
          Type=simple\n\
-         Environment=HOME={home}\n\
-         Environment=\"PATH={path}\"\n\
-         Environment=\"LC_CTYPE={lc_ctype}\"\n\
+         Environment={home}\n\
+         Environment={path}\n\
+         Environment={lc_ctype}\n\
          ExecStart={exe} run --config {config}\n\
          Restart=always\n\
          RestartSec=3\n\
+         KillMode=process\n\
          \n\
          [Install]\n\
          WantedBy=default.target\n"
-    )
+    ))
+}
+
+/// systemd.syntax quoting is not shell quoting. Both directives expand `%`
+/// specifiers. Environment leaves `$` literal; ExecStart's `:` prefix disables
+/// variable expansion explicitly, including argv[0], so literal dollar signs
+/// in executable paths and arguments agree (systemd.service/systemd.exec).
+/// Reject controls instead of allowing injected directives.
+fn systemd_word(value: &str) -> Result<String> {
+    anyhow::ensure!(
+        !value.chars().any(char::is_control),
+        "systemd service values must not contain control characters"
+    );
+    let mut quoted = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '\\' => quoted.push_str("\\\\"),
+            '"' => quoted.push_str("\\\""),
+            '%' => quoted.push_str("%%"),
+            _ => quoted.push(ch),
+        }
+    }
+    quoted.push('"');
+    Ok(quoted)
 }
 
 /// Paths reach the plist as XML text, and a home directory may legally contain
@@ -416,21 +447,23 @@ mod tests {
         // fails. `setup` catches neither -- setup runs in the user's shell, the
         // agent does not.
         let plist = launch_agent_plist(&paths());
+        assert!(plist.contains("<key>AbandonProcessGroup</key>"));
+        assert!(systemd_unit(&paths()).unwrap().contains("KillMode=process"));
         assert!(plist.contains("<key>PATH</key>"));
         assert!(plist.contains("<string>/opt/homebrew/bin:/usr/bin:/bin</string>"));
         assert!(plist.contains("<key>LC_CTYPE</key>"));
         assert!(plist.contains("<string>zh_CN.UTF-8</string>"));
         // Quoted on the systemd side, because a PATH entry may contain a space
         // and an unquoted `Environment=` truncates at it rather than failing.
-        let unit = systemd_unit(&paths());
+        let unit = systemd_unit(&paths()).unwrap();
         assert!(unit.contains("Environment=\"PATH=/opt/homebrew/bin:/usr/bin:/bin\""));
         assert!(unit.contains("Environment=\"LC_CTYPE=zh_CN.UTF-8\""));
     }
 
     #[test]
     fn systemd_unit_restarts_and_installs_into_the_user_target() {
-        let unit = systemd_unit(&paths());
-        assert!(unit.contains("ExecStart=/home/a b/.local/bin/muqun-gateway run --config /home/a b/.config/muqun-gateway/config.json"));
+        let unit = systemd_unit(&paths()).unwrap();
+        assert!(unit.contains("ExecStart=\":/home/a b/.local/bin/muqun-gateway\" run --config \"/home/a b/.config/muqun-gateway/config.json\""));
         assert!(unit.contains("Restart=always"));
         // `default.target`, not `multi-user.target`: a user manager reaches the
         // former on login and never the latter.
@@ -447,7 +480,57 @@ mod tests {
         assert!(plist.contains("<key>EnvironmentVariables</key>"));
         assert!(plist.contains("<key>HOME</key>"));
         assert!(plist.contains("<string>/home/a b</string>"));
-        assert!(systemd_unit(&paths()).contains("Environment=HOME=/home/a b"));
+        assert!(systemd_unit(&paths())
+            .unwrap()
+            .contains("Environment=\"HOME=/home/a b\""));
+    }
+
+    #[test]
+    fn systemd_escapes_commands_and_environment_with_distinct_dollar_rules() {
+        let value = "/home/a b/\"quoted\"/back\\slash/$HOME/${USER}/%h/单引号'";
+        let escaped = "/home/a b/\\\"quoted\\\"/back\\\\slash/$HOME/${USER}/%%h/单引号'";
+        let mut paths = paths();
+        paths.exe = value.into();
+        paths.config = value.into();
+        paths.home = value.into();
+        paths.path = value.into();
+        paths.lc_ctype = value.into();
+        let unit = systemd_unit(&paths).unwrap();
+        assert!(unit.contains(&format!(
+            "ExecStart=\":{escaped}\" run --config \"{escaped}\"\n"
+        )));
+        for key in ["HOME", "PATH", "LC_CTYPE"] {
+            assert!(unit.contains(&format!("Environment=\"{key}={escaped}\"\n")));
+        }
+        assert_eq!(systemd_word("").unwrap(), "\"\"");
+        assert_eq!(systemd_word("\\").unwrap(), "\"\\\\\"");
+    }
+
+    #[test]
+    fn systemd_rejects_controls_in_every_interpolated_field() {
+        for control in ['\n', '\r', '\0', '\t', '\u{7f}'] {
+            for field in 0..5 {
+                let mut paths = paths();
+                let invalid = format!("/safe{control}ExecStart=/unwanted");
+                match field {
+                    0 => paths.exe = invalid.into(),
+                    1 => paths.config = invalid.into(),
+                    2 => paths.home = invalid.into(),
+                    3 => paths.path = invalid,
+                    _ => paths.lc_ctype = invalid,
+                }
+                assert!(systemd_unit(&paths).is_err(), "field {field}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemd_rejects_non_utf8_paths_instead_of_changing_their_identity() {
+        use std::os::unix::ffi::OsStringExt;
+        let mut paths = paths();
+        paths.exe = std::ffi::OsString::from_vec(b"/bin/invalid-\xff".to_vec()).into();
+        assert!(systemd_unit(&paths).is_err());
     }
 
     #[test]

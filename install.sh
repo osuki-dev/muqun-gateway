@@ -9,13 +9,9 @@
 # backends" list) -- so this installer configures whichever of them is
 # actually present, independently:
 #
-#   - Herdr present, tmux absent: installed as a Herdr plugin, same as
-#     always. Setup/start/the pairing QR are driven through plugin actions
-#     inside a herdr session.
-#   - tmux present (with or without Herdr): the standalone binary is
-#     installed and configures every backend that is present. tmux is always
-#     the default when it is one of them; a pre-existing Herdr-plugin
-#     pairing, if there is one, is adopted rather than orphaned.
+# Every detected backend is configured in one standalone gateway, so optional
+# backend startup does not depend on Herdr already running. tmux is the default
+# on a fresh install when present; existing defaults and pairings are retained.
 #
 # On a first install it also configures, starts, and opens the pairing QR for
 # you. Re-running updates the binary, runs idempotent setup, and reloads it
@@ -25,7 +21,6 @@
 set -eu
 
 REPO="osuki-dev/muqun-gateway"
-PLUGIN_ID="herdr.gateway"
 MIN_HERDR_VERSION="0.7.5"
 # Where the standalone (non-Herdr) binary lands. Overridable for anyone who
 # does not want it on their PATH by default.
@@ -79,130 +74,19 @@ if [ "$have_herdr" = 0 ] && [ "$have_tmux" = 0 ]; then
   die "Neither Herdr (https://herdr.dev) nor tmux was found. Install one of them, then retry."
 fi
 
-# 3. Herdr alone: install as a Herdr plugin, exactly as this script has
-#    always done. Unchanged so a Herdr-only machine keeps behaving exactly
-#    as it does today. When tmux is *also* present this is not the path
-#    taken -- see step 4, which configures both backends on one standalone
-#    install instead of two separate ones.
-if [ "$have_herdr" = 1 ] && [ "$have_tmux" = 0 ]; then
-  # 3a. Older Herdr versions parse the plugin manifest before checking its
-  #     declared minimum version. Check here first so users get an actionable
-  #     upgrade message instead of a TOML error for newer manifest fields.
-  herdr_version="$(herdr --version 2>/dev/null | awk 'NR == 1 && $1 == "herdr" { print $2 }')"
-  [ -n "$herdr_version" ] \
-    || die "Could not determine the installed Herdr version. Run 'herdr --version' and update Herdr before retrying."
-
-  if ! version_at_least "$herdr_version" "$MIN_HERDR_VERSION"; then
-    warn "Herdr $herdr_version is too old. Muqun Gateway requires Herdr $MIN_HERDR_VERSION or newer."
-    echo
-    echo "Update Herdr first:"
-    echo "  herdr update --handoff"
-    echo
-    echo "Then run this installer again."
-    exit 1
-  fi
-  info "Detected Herdr $herdr_version"
-
-  # 3b. Install downloads a prebuilt, statically linked binary, so Rust is
-  #     optional -- only needed as a fallback when no release binary matches
-  #     this OS/arch.
-  if ! command -v cargo >/dev/null 2>&1; then
-    warn "Rust (cargo) not found. That is fine -- a prebuilt binary will be used."
-    echo "   (If none matches your platform, install Rust from https://rustup.rs and retry.)"
-  fi
-
-  # 3c. Install or update. Reinstalling a GitHub-managed plugin replaces its
-  #     checkout in place -- no uninstall needed. A local dev link is the one
-  #     case Herdr refuses to install over, so detect it and explain instead
-  #     of failing. `existing` (captured before install) also tells
-  #     first-install from update.
-  existing="$(herdr plugin list 2>/dev/null | grep "$PLUGIN_ID" || true)"
-  if printf '%s' "$existing" | grep -q '\[local:'; then
-    warn "Muqun Gateway is installed as a local dev link, not a GitHub plugin."
-    echo "   Update that checkout in place:"
-    echo "     git -C <your-checkout> pull && cargo build --release"
-    echo "   Or switch to the GitHub-managed version:"
-    echo "     herdr plugin unlink $PLUGIN_ID && herdr plugin install $REPO --yes"
-    exit 0
-  elif [ -n "$existing" ]; then
-    info "Muqun Gateway is already installed -- updating to the latest..."
-  else
-    info "Installing Muqun Gateway..."
-  fi
-  herdr plugin install "$REPO" --yes
-
-  # 3d. Configure, (re)load, and show the pairing QR. setup is idempotent --
-  #     it keeps an existing server id, token, and URL, so running it every
-  #     time is safe (paired devices survive) and also repairs an install
-  #     whose earlier setup never completed. stop+start then reloads the
-  #     freshly downloaded binary. All of this goes through herdr plugin
-  #     actions and needs a live herdr session, so if that fails we print the
-  #     manual commands instead of leaving a half-finished install.
-  auto_done=0
-  info "Configuring and starting the gateway..."
-  if herdr plugin action invoke "$PLUGIN_ID.setup" >/dev/null 2>&1; then
-    sleep 2   # setup runs in a herdr pane; let it write the config first
-    # A gateway an operator wired into systemd must be reloaded through its
-    # supervisor. The plugin's stop kills by pid and port, and against a
-    # Restart=always unit that only starts a lock race the unit then loses
-    # every few seconds (see src/supervision.rs for the incident this comes
-    # from). Linux-only by construction: macOS has no systemctl, so it and
-    # any machine without a matching unit keep the plugin stop/start path.
-    systemd_unit=""
-    if command -v systemctl >/dev/null 2>&1; then
-      systemd_unit="$(systemctl --user list-units --type=service --all --plain --no-legend 2>/dev/null \
-        | awk '$1 ~ /muqun-gateway/ {print $1; exit}')"
-    fi
-    if [ -n "$systemd_unit" ]; then
-      info "Reloading through the systemd unit $systemd_unit..."
-      if ! systemctl --user restart "$systemd_unit"; then
-        die "The gateway was updated and configured, but systemd could not restart it.
-Retry with: systemctl --user restart $systemd_unit"
-      fi
-    else
-      herdr plugin action invoke "$PLUGIN_ID.stop"  >/dev/null 2>&1 || true
-      sleep 1
-      herdr plugin action invoke "$PLUGIN_ID.start" >/dev/null 2>&1 || true
-    fi
-    sleep 1
-    herdr plugin pane open --plugin "$PLUGIN_ID" --entrypoint manage >/dev/null 2>&1 || true
-    auto_done=1
-    if [ -z "$existing" ]; then
-      green "Muqun Gateway is configured, running, and showing the pairing QR."
-    else
-      green "Muqun Gateway updated, reloaded, and showing the pairing QR (pairings kept)."
-    fi
-  else
-    warn "Couldn't reach a herdr session to configure the gateway."
-  fi
-
-  echo
-  if [ "$auto_done" = "1" ]; then
-    echo "The pairing QR is open in the herdr 'Gateway Manager' pane."
-    echo "Scan it from the Muqun app on a device on the same Tailscale network."
-    echo
-    echo "Re-open the QR any time with:"
-    echo "  herdr plugin pane open --plugin $PLUGIN_ID --entrypoint manage"
-  else
-    warn "Run these from INSIDE herdr to finish:"
-    echo "  herdr plugin action invoke $PLUGIN_ID.setup"
-    echo "  herdr plugin action invoke $PLUGIN_ID.start"
-    echo "  herdr plugin pane open --plugin $PLUGIN_ID --entrypoint manage"
-  fi
-  exit 0
-fi
-
-# 4. tmux is present (Herdr may or may not also be). One standalone install,
-#    configured with every backend that is present -- tmux always, and Herdr
-#    too when it is on PATH. This is also where a machine that used to be
-#    Herdr-only (and went through step 3 on some earlier run) gets its
-#    existing pairing adopted rather than left behind: see the
-#    import-herdr-plugin call below.
-if [ "$have_herdr" = 1 ]; then
-  info "Herdr and tmux both found; installing standalone and configuring both backends."
+# All detected backends use one standalone gateway, including Herdr-only hosts.
+# A plugin-owned gateway cannot start Herdr after reboot: it depends on Herdr
+# already running. Existing plugin pairings are imported below.
+if [ "$have_tmux" = 1 ]; then
+  setup_backend=tmux
 else
-  info "Herdr not found; installing standalone with the tmux backend."
+  setup_backend=herdr
+  herdr_version="$(herdr --version 2>/dev/null | awk 'NR == 1 && $1 == "herdr" { print $2 }')"
+  if [ -z "$herdr_version" ] || ! version_at_least "$herdr_version" "$MIN_HERDR_VERSION"; then
+    die "Herdr $MIN_HERDR_VERSION or newer is required. Update Herdr, then retry."
+  fi
 fi
+info "Installing standalone with every detected terminal backend."
 
 os="$(uname -s)"
 arch="$(uname -m)"
@@ -229,7 +113,7 @@ else
   git clone https://github.com/$REPO.git
   cd $(basename "$REPO")
   cargo build --release
-  ./target/release/muqun-gateway setup --backend tmux
+  ./target/release/muqun-gateway setup --backend $setup_backend
   ./target/release/muqun-gateway start
   ./target/release/muqun-gateway manage"
 fi
@@ -246,10 +130,6 @@ esac
 # XDG_CONFIG_HOME/XDG_DATA_HOME/INSTALL_DIR) without touching a gateway
 # already bound to the default port, or a tmux backend that would otherwise
 # poll whatever the ambient default tmux server happens to be.
-port_args=""
-[ -n "${MUQUN_GATEWAY_PORT:-}" ] && port_args="--port ${MUQUN_GATEWAY_PORT}"
-tmux_socket_args=""
-[ -n "${MUQUN_GATEWAY_TMUX_SOCKET:-}" ] && tmux_socket_args="--socket-path ${MUQUN_GATEWAY_TMUX_SOCKET}"
 
 # Remember who owns an existing gateway before changing its configuration.
 # A supervised process must be reloaded through the same supervisor: calling
@@ -269,7 +149,7 @@ if [ "$have_herdr" = 1 ]; then
   # Adopt it into the standalone install below instead of leaving it behind.
   # A no-op, not an error, when there is nothing to adopt -- a fresh machine,
   # or one already adopted on an earlier run of this script.
-  "$binary" import-herdr-plugin >/dev/null 2>&1 || true
+  "$binary" import-herdr-plugin --if-present
 fi
 
 # Snapshot what this install already has -- before adding anything -- so an
@@ -286,11 +166,19 @@ fi
 # setup is idempotent -- it keeps an existing server id, token, and URL, so
 # running it on every install/update is safe and also repairs an install
 # whose earlier setup never completed.
-info "Configuring the tmux backend..."
-# shellcheck disable=SC2086 # each *_args is either empty or one flag + one plain value
-"$binary" setup --backend tmux $port_args $tmux_socket_args
+info "Configuring the $setup_backend backend..."
+# POSIX positional parameters preserve exact argument boundaries. Never build a
+# shell command string: socket paths may contain spaces, quotes or glob syntax.
+set -- setup --backend "$setup_backend"
+if [ -n "${MUQUN_GATEWAY_PORT:-}" ]; then
+  set -- "$@" --port "$MUQUN_GATEWAY_PORT"
+fi
+if [ "$have_tmux" = 1 ] && [ -n "${MUQUN_GATEWAY_TMUX_SOCKET:-}" ]; then
+  set -- "$@" --socket-path "$MUQUN_GATEWAY_TMUX_SOCKET"
+fi
+"$binary" "$@"
 
-if [ "$have_herdr" = 1 ]; then
+if [ "$have_herdr" = 1 ] && [ "$have_tmux" = 1 ]; then
   info "Configuring the Herdr backend..."
   "$binary" backend add herdr >/dev/null
 fi
@@ -305,27 +193,46 @@ if [ "$config_existed" = 1 ]; then
     restore_id="$("$binary" backend list | awk -F'\t' -v want="$previous_default" '$2 == want { print $1; exit }')"
     [ -n "$restore_id" ] && "$binary" backend default "$restore_id" >/dev/null
   fi
-else
+elif [ "$have_tmux" = 1 ]; then
   tmux_id="$("$binary" backend list | awk -F'\t' '$2 == "tmux" { print $1; exit }')"
   [ -n "$tmux_id" ] && "$binary" backend default "$tmux_id" >/dev/null
 fi
 
+# Backend startup is separate from registering the gateway with the OS. An
+# empty answer or a noninteractive install preserves the existing preference.
+echo
+echo "Start configured terminal backends when the gateway starts?"
+echo "  Existing tmux/Herdr sessions are reused, never replaced."
+echo "  If stopped, tmux opens a detached shell and Herdr starts headless."
+echo "  Herdr may restore its saved workspace; no agent prompts or trust"
+echo "  approvals are submitted by the gateway."
+echo "  Default: keep your current settings (new installs: off)."
+if (exec 3< /dev/tty) 2>/dev/null; then
+  printf "Enable backend startup? [y/N] "
+  backend_answer=n
+  if read -r backend_answer < /dev/tty 2>/dev/null; then :; else backend_answer=n; fi
+  case "$backend_answer" in
+    y|Y|yes|YES|Yes)
+      "$binary" backend list | cut -f1 | while IFS= read -r backend_id; do
+        if ! "$binary" backend autostart "$backend_id" on; then
+          warn "Could not enable startup for $backend_id; it will need manual startup."
+        fi
+      done
+      ;;
+    *) info "Backend startup settings unchanged." ;;
+  esac
+else
+  info "No terminal to ask on; backend startup settings unchanged."
+fi
+echo "  Change later: $binary backend autostart <backend-id> on|off"
+
 if [ "$already_installed" = 1 ]; then
-  service_label="dev.osuki.muqun-gateway.service"
+  # Refresh the unit as well as the binary, including child-process lifetime
+  # rules that keep persistent terminals alive across gateway restarts.
+  "$binary" service install
   if [ "$os" = "Linux" ]; then
-    info "Restarting the existing systemd service..."
-    if ! systemctl --user restart "$service_label"; then
-      die "The gateway was updated and configured, but systemd could not restart it.
-Retry with: systemctl --user restart $service_label"
-    fi
-  else
-    launchd_label="dev.osuki.muqun-gateway"
-    launchd_target="gui/$(id -u)/$launchd_label"
-    info "Restarting the existing LaunchAgent..."
-    if ! launchctl kickstart -k "$launchd_target"; then
-      die "The gateway was updated and configured, but launchd could not restart it.
-Retry with: launchctl kickstart -k $launchd_target"
-    fi
+    # enable --now does not restart an already active systemd service.
+    systemctl --user restart dev.osuki.muqun-gateway.service
   fi
 else
   "$binary" stop  >/dev/null 2>&1 || true

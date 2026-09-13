@@ -191,6 +191,7 @@ fn agent_from_pane(value: &Pane) -> Option<Value> {
 
 fn agent(value: &Agent) -> Value {
     json!({
+        "instance_id": value.instance_id,
         "target": value.target,
         "pane_id": value.pane_id.as_str(),
         "workspace_id": value.workspace_id.as_ref().map(|id| id.as_str()),

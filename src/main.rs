@@ -43,8 +43,11 @@ mod agent_events;
 mod approvals;
 mod authority;
 mod backend;
+mod backend_startup;
 mod composer;
 mod i18n;
+#[cfg(all(test, unix))]
+mod installer_tests;
 mod login_env;
 mod native;
 mod parts;
@@ -299,6 +302,7 @@ const ASSET_SKIP_DIRS: &[&str] = &[
     "coverage",
 ];
 const API_CAPABILITIES: &[&str] = &[
+    "agent_collaboration",
     "agent_catalog",
     "agent_events",
     "agent_lifecycle_notifications",
@@ -323,6 +327,7 @@ const API_CAPABILITIES: &[&str] = &[
     "tasks",
     "terminal_backends",
     "multiple_terminal_backends",
+    "terminal_session_liveness",
     "terminal_input",
 ];
 
@@ -372,6 +377,10 @@ enum Command {
     },
     /// Adopt an existing Herdr plugin pairing into the standalone gateway.
     ImportHerdrPlugin {
+        /// Installer mode: skip absent or already imported plugin state, but
+        /// never ignore malformed pairing files.
+        #[arg(long)]
+        if_present: bool,
         #[arg(long)]
         config_dir: Option<PathBuf>,
         #[arg(long)]
@@ -406,6 +415,12 @@ enum ServiceCommand {
 #[derive(Subcommand)]
 enum BackendCommand {
     List,
+    /// Opt a configured backend in/out of startup with the gateway.
+    Autostart {
+        id: String,
+        #[arg(value_enum)]
+        mode: BackendAutostartMode,
+    },
     Add {
         #[arg(value_enum)]
         backend: SetupBackend,
@@ -423,6 +438,12 @@ enum BackendCommand {
     Default {
         id: String,
     },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum BackendAutostartMode {
+    On,
+    Off,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -471,6 +492,9 @@ struct Config {
     #[serde(default, skip_serializing_if = "is_required_transport")]
     transport_encryption: TransportEncryptionMode,
     sessions: Vec<SessionConfig>,
+    /// Explicit opt-in by session ID; adding a backend never enables startup.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    autostart_backends: Vec<String>,
     /// Agent kind -> the executable `GET /api/agents/catalog` looks for on
     /// `PATH`. Only needed when a kind's binary is named something else on this
     /// machine; absent, every kind probes for its own name. Optional and
@@ -957,11 +981,21 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Service { command } => run_service_command(command)?,
         Command::Backend { command } => configure_backend(command)?,
         Command::ImportHerdrPlugin {
+            if_present,
             config_dir,
             state_dir,
             target_config_dir,
             target_state_dir,
-        } => import_herdr_plugin(config_dir, state_dir, target_config_dir, target_state_dir)?,
+        } => {
+            let source = config_dir.unwrap_or(default_herdr_plugin_config_dir()?);
+            let target = target_config_dir.unwrap_or(standalone_config_dir()?);
+            let absent = !source.join(CONFIG_FILE).try_exists()?
+                && !source.join(PAIRING_FILE).try_exists()?;
+            let imported = target.join(HERDR_PLUGIN_IMPORT_MARKER).try_exists()?;
+            if !if_present || (!absent && !imported) {
+                import_herdr_plugin(Some(source), state_dir, Some(target), target_state_dir)?;
+            }
+        }
         Command::Devices => list_devices()?,
         Command::Revoke { device_id, all } => revoke_device(device_id, all)?,
     }
@@ -1064,6 +1098,7 @@ fn setup(
             token_hash,
             transport_encryption: TransportEncryptionMode::Required,
             sessions: Vec::new(),
+            autostart_backends: Vec::new(),
             agent_commands: BTreeMap::new(),
             rich_agent_pushes: false,
         },
@@ -1273,6 +1308,30 @@ fn configure_backend(command: BackendCommand) -> anyhow::Result<()> {
     let path = config_dir()?.join(CONFIG_FILE);
     let mut config = load_config(None)?;
     match command {
+        BackendCommand::Autostart { id, mode } => {
+            let session = config
+                .sessions
+                .iter()
+                .find(|session| session.id == id)
+                .with_context(|| format!("backend {id} not found"))?;
+            if matches!(mode, BackendAutostartMode::On) {
+                backend_startup::validate(session)?;
+                if !config.autostart_backends.contains(&id) {
+                    config.autostart_backends.push(id.clone());
+                }
+            } else {
+                config.autostart_backends.retain(|item| item != &id);
+            }
+            write_config(&path, &config)?;
+            println!(
+                "backend {id} autostart {}; applies on the next gateway start",
+                if matches!(mode, BackendAutostartMode::On) {
+                    "on"
+                } else {
+                    "off"
+                }
+            );
+        }
         BackendCommand::List => {
             for session in &config.sessions {
                 let endpoint = backend_endpoint(session);
@@ -1301,6 +1360,7 @@ fn configure_backend(command: BackendCommand) -> anyhow::Result<()> {
             anyhow::ensure!(config.sessions.len() > 1, "cannot remove the only backend");
             let previous_len = config.sessions.len();
             config.sessions.retain(|session| session.id != id);
+            config.autostart_backends.retain(|item| item != &id);
             anyhow::ensure!(
                 config.sessions.len() != previous_len,
                 "backend {id} not found"
@@ -1405,6 +1465,18 @@ fn import_herdr_plugin(
                 .or_insert_with(|| command.clone());
         }
         merged.rich_agent_pushes |= target.config.rich_agent_pushes;
+        for session in &target.config.sessions {
+            if !target.config.autostart_backends.contains(&session.id) {
+                continue;
+            }
+            if let Some(imported) = merged.sessions.iter().find(|item| {
+                item.backend == session.backend && item.socket_path == session.socket_path
+            }) {
+                if !merged.autostart_backends.contains(&imported.id) {
+                    merged.autostart_backends.push(imported.id.clone());
+                }
+            }
+        }
     }
 
     backup_secret_file(&target_config_path)?;
@@ -1625,7 +1697,9 @@ fn proxy_targets_port(proxy: &str, port: u16) -> bool {
 fn run_service_command(command: ServiceCommand) -> anyhow::Result<()> {
     match command {
         ServiceCommand::Install => {
-            stop_background_inner(false)?;
+            if !matches!(service::state()?, service::ServiceState::Installed) {
+                stop_background_inner(false)?;
+            }
             service::install(&service_paths()?)?;
             println!("The gateway now starts when you log in, and restarts if it stops.");
             println!("Undo it with: muqun-gateway service uninstall");
@@ -1876,6 +1950,11 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     // are built so it is the last thing on screen rather than the first.
     let listen_warning = unreachable_listen_warning(&config.listen, &config.public_url);
 
+    // Bind successfully before starting anything on the user's behalf.
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    // One background attempt per opted-in backend; no restart/logging loop.
+    backend_startup::spawn(&config);
+
     let state = AppState {
         config,
         pending_pairing: Arc::new(Mutex::new(None)),
@@ -2046,7 +2125,6 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         eprintln!("{warning}");
     }
     println!("terminal gateway listening on http://{addr}");
-    let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -4711,6 +4789,13 @@ async fn ordered_sessions(state: &AppState) -> Vec<&SessionConfig> {
     let mut order: Vec<usize> = (0..state.config.sessions.len()).collect();
     order.sort_by_key(|&index| session_order_key(index, liveness[index]));
     if let Ok(mut cache) = state.session_liveness.lock() {
+        cache.reachable = state
+            .config
+            .sessions
+            .iter()
+            .zip(&liveness)
+            .map(|(session, live)| (session.id.clone(), *live != SessionLiveness::Unreachable))
+            .collect();
         cache.record(order.clone(), Instant::now());
     }
     order
@@ -4724,6 +4809,7 @@ async fn ordered_sessions(state: &AppState) -> Vec<&SessionConfig> {
 #[derive(Default)]
 struct SessionLivenessCache {
     taken: Option<(Instant, Vec<usize>)>,
+    reachable: HashMap<String, bool>,
 }
 
 impl SessionLivenessCache {
@@ -4742,6 +4828,22 @@ impl SessionLivenessCache {
 async fn sessions(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
     let sessions = ordered_sessions(&state).await;
+    let reachable = state
+        .session_liveness
+        .lock()
+        .ok()
+        .map(|cache| cache.reachable.clone())
+        .unwrap_or_default();
+    let sessions: Vec<Value> = sessions
+        .into_iter()
+        .map(|session| {
+            let mut value = json!(session);
+            if let Some(connected) = reachable.get(&session.id) {
+                value["connected"] = json!(connected);
+            }
+            value
+        })
+        .collect();
     Ok(Json(json!({ "sessions": sessions })))
 }
 
@@ -6352,7 +6454,13 @@ async fn submit_agent_prompt(
         .prompt_agent(target, text)
         .await
         .map(|_| backend::compat::command_ok("agent_prompted"))
-        .map_err(|err| HerdrCallError::Unavailable(err.to_string()))
+        .map_err(|err| match err {
+            BackendError::Refused { code, message } => HerdrCallError::Herdr {
+                method: "agent.prompt".to_owned(),
+                error: json!({ "code": code, "message": message }),
+            },
+            other => HerdrCallError::Unavailable(other.to_string()),
+        })
 }
 
 async fn start_backend_agent(
@@ -6373,8 +6481,10 @@ async fn start_backend_agent(
             timeout_ms,
         })
         .await
-        .map_err(|err| HerdrCallError::Unavailable(err.to_string()))?;
-    Ok(json!({ "result": { "argv": started.argv } }))
+        .map_err(|err| backend_call_error("agent.start", err))?;
+    Ok(
+        json!({ "result": { "argv": started.argv, "instance_id": started.instance_id, "target": started.target } }),
+    )
 }
 
 /// Belt and braces for a paste-vs-keypress race in agent TUIs: when the prompt
@@ -6395,6 +6505,15 @@ async fn start_backend_agent(
 /// confirm uses.
 fn schedule_submit_keypress(session: SessionConfig, pane_id: String) {
     tokio::spawn(async move {
+        // Herdr 0.9 owns paste + delayed Enter. Another Enter can answer a
+        // subsequent dialog, so the legacy workaround must not run there.
+        if !terminal_backend(&session)
+            .needs_submit_keypress()
+            .await
+            .unwrap_or(false)
+        {
+            return;
+        }
         submit_keypress(&session, &pane_id).await;
     });
 }
@@ -6713,6 +6832,7 @@ async fn create_task(
         "prompt_submitted": false
     });
 
+    let mut prompt_target = place.pane_id.clone();
     let agent_command = tasks::agent_command(&body.agent, &state.config.agent_commands);
     match start_backend_agent(
         &session,
@@ -6734,6 +6854,13 @@ async fn create_task(
                 }),
             );
             payload["agent_started"] = json!(true);
+            if let Some(target) = value.pointer("/result/target").and_then(Value::as_str) {
+                prompt_target = target.to_owned();
+            }
+            payload["agent_instance_id"] = value
+                .pointer("/result/instance_id")
+                .cloned()
+                .unwrap_or(Value::Null);
         }
         Err(err) => {
             steps.failed("agent", err.code(), &err.message());
@@ -6758,8 +6885,8 @@ async fn create_task(
                 if attempt > 0 {
                     tokio::time::sleep(SPAWN_PROMPT_INTERVAL).await;
                 }
-                submitted = submit_agent_prompt(&session, &place.pane_id, prompt).await;
-                if submitted.is_ok() {
+                submitted = submit_agent_prompt(&session, &prompt_target, prompt).await;
+                if !submitted.as_ref().is_err_and(|err| err.can_retry_prompt()) {
                     break;
                 }
             }
@@ -6917,6 +7044,7 @@ async fn spawn_agent(
         "prompt_submitted": false,
     });
 
+    let mut prompt_target = place.pane_id.clone();
     let agent_command = tasks::agent_command(&body.agent, &state.config.agent_commands);
     match start_backend_agent(
         &session,
@@ -6938,6 +7066,13 @@ async fn spawn_agent(
                 }),
             );
             payload["agent_started"] = json!(true);
+            if let Some(target) = value.pointer("/result/target").and_then(Value::as_str) {
+                prompt_target = target.to_owned();
+            }
+            payload["agent_instance_id"] = value
+                .pointer("/result/instance_id")
+                .cloned()
+                .unwrap_or(Value::Null);
         }
         Err(err) => {
             steps.failed("agent", err.code(), &err.message());
@@ -6964,8 +7099,8 @@ async fn spawn_agent(
                 if attempt > 0 {
                     tokio::time::sleep(SPAWN_PROMPT_INTERVAL).await;
                 }
-                submitted = submit_agent_prompt(&session, &place.pane_id, prompt).await;
-                if submitted.is_ok() {
+                submitted = submit_agent_prompt(&session, &prompt_target, prompt).await;
+                if !submitted.as_ref().is_err_and(|err| err.can_retry_prompt()) {
                     break;
                 }
             }
@@ -7003,7 +7138,7 @@ async fn spawn_place(
     steps: &mut tasks::StepLog,
 ) -> ApiResult<SpawnPlace> {
     let Some(tab_id) = tab_id else {
-        return spawn_in_new_tab(session, cwd, steps).await;
+        return spawn_in_new_tab(session, cwd, None, steps).await;
     };
     spawn_beside(session, tab_id, cwd, steps).await
 }
@@ -7013,12 +7148,13 @@ async fn spawn_place(
 async fn spawn_in_new_tab(
     session: &SessionConfig,
     cwd: Option<&str>,
+    workspace_id: Option<&str>,
     steps: &mut tasks::StepLog,
 ) -> ApiResult<SpawnPlace> {
     let backend = terminal_backend(session);
     let tab = backend
         .create_tab(&BackendCreateTab {
-            workspace_id: None,
+            workspace_id: workspace_id.map(BackendWorkspaceId::new),
             cwd: cwd.map(PathBuf::from),
             label: None,
             focus: false,
@@ -7058,6 +7194,17 @@ async fn spawn_beside(
             "that tab has no pane to split",
         )
     })?;
+    // Repeated downward splits can leave an assistant only five rows tall:
+    // even its own transcript no longer renders the response there. Keep a
+    // normal 24-row terminal for both halves, or use a background tab in the
+    // same workspace. Neither path changes the user's current focus.
+    if !can_split_agent_pane(host.viewport_rows) {
+        steps.skipped(
+            "split",
+            "not enough terminal rows; using a tab in the same workspace",
+        );
+        return spawn_in_new_tab(session, cwd, Some(host.workspace_id.as_str()), steps).await;
+    }
     // A split that Ghostty refuses -- a tab already carrying as many panes as
     // its layout will hold, which is the ordinary state of a tab someone works
     // in -- must not lose the task. The tab was a preference, not the request:
@@ -7066,7 +7213,7 @@ async fn spawn_beside(
     // asked for.
     let split = terminal_backend(session)
         .split_pane(&BackendSplitPane {
-            pane_id: BackendPaneId::new(&host),
+            pane_id: host.id.clone(),
             direction: BackendSplitDirection::Down,
             ratio: None,
             cwd: cwd.map(PathBuf::from),
@@ -7080,13 +7227,13 @@ async fn spawn_beside(
                 "split",
                 &format!("{err} -- starting in a tab of its own instead"),
             );
-            return spawn_in_new_tab(session, cwd, steps).await;
+            return spawn_in_new_tab(session, cwd, Some(host.workspace_id.as_str()), steps).await;
         }
     };
     let pane_id = pane.id.as_str().to_owned();
     steps.ok(
         "pane",
-        json!({ "pane_id": pane_id, "tab_id": tab_id, "split_from": host }),
+        json!({ "pane_id": pane_id, "tab_id": tab_id, "split_from": host.id.as_str() }),
     );
     Ok(SpawnPlace {
         pane_id,
@@ -7095,7 +7242,11 @@ async fn spawn_beside(
 }
 
 /// A pane to split in the named tab, preferring the one that has focus.
-async fn pane_in_tab(session: &SessionConfig, tab_id: &str) -> Option<String> {
+fn can_split_agent_pane(viewport_rows: Option<u32>) -> bool {
+    viewport_rows.is_none_or(|rows| rows >= 48)
+}
+
+async fn pane_in_tab(session: &SessionConfig, tab_id: &str) -> Option<Pane> {
     terminal_backend(session)
         .list_panes()
         .await
@@ -7103,7 +7254,6 @@ async fn pane_in_tab(session: &SessionConfig, tab_id: &str) -> Option<String> {
         .into_iter()
         .filter(|pane| pane.tab_id.as_str() == tab_id)
         .max_by_key(|pane| pane.focused)
-        .map(|pane| pane.id.as_str().to_owned())
 }
 
 /// The directories this session is already working in, for a spawn picker.
@@ -7472,6 +7622,14 @@ enum HerdrCallError {
 }
 
 impl HerdrCallError {
+    /// Only an explicit pre-submission refusal is safe to repeat. A lost
+    /// socket response can follow a successful write; repeating it duplicates
+    /// the user's instruction. Blocked dialogs must never be auto-answered.
+    fn can_retry_prompt(&self) -> bool {
+        matches!(self, Self::Herdr { error, .. }
+            if error.get("code").and_then(Value::as_str) == Some("agent_not_found"))
+    }
+
     fn malformed(method: &str) -> Self {
         Self::Malformed(method.to_owned())
     }
@@ -9752,6 +9910,41 @@ fn with_uploads_root(
     roots
 }
 
+/// Extra roots are used ONLY for an explicit file lookup, never a directory
+/// scan. Platform cache/temp paths are configuration, not terminal output.
+fn preview_lookup_roots(
+    mut roots: Vec<AssetRoot>,
+    session_id: &str,
+    home: Option<&FsPath>,
+    candidates: impl IntoIterator<Item = PathBuf>,
+) -> Vec<AssetRoot> {
+    let canonical_home = home.and_then(|path| std::fs::canonicalize(path).ok());
+    for candidate in candidates {
+        let Ok(path) = std::fs::canonicalize(candidate) else {
+            continue;
+        };
+        // An overly broad XDG_CACHE_HOME/TMPDIR must not expose the account
+        // or filesystem root. Resolve aliases such as macOS /tmp first.
+        if !path.is_dir()
+            || path.parent().is_none()
+            || canonical_home
+                .as_ref()
+                .is_some_and(|home| home.starts_with(&path))
+            || roots.iter().any(|root| root.path == path)
+        {
+            continue;
+        }
+        roots.push(AssetRoot {
+            path,
+            session_id: session_id.to_owned(),
+            workspace_id: None,
+            tab_id: None,
+            pane_id: None,
+        });
+    }
+    roots
+}
+
 fn asset_entry_for_path(raw: &str, roots: &[AssetRoot]) -> Option<AssetEntry> {
     let path = std::fs::canonicalize(raw).ok()?;
     if !path.is_file() {
@@ -9946,6 +10139,21 @@ async fn session_assets(
         // one path the lookup could never answer. Serving it widens nothing:
         // the directory is the gateway's own.
         let lookup_roots = with_uploads_root(roots.clone(), &session_id, uploads_dir().ok());
+        let home = dirs::home_dir();
+        let mut candidates = vec![std::env::temp_dir(), PathBuf::from("/tmp")];
+        candidates.extend(dirs::cache_dir());
+        candidates.extend(home.as_ref().map(|home| home.join(".cache")));
+        let lookup_roots =
+            preview_lookup_roots(lookup_roots, &session_id, home.as_deref(), candidates);
+        // Expand only the current account's ~/ form, never shell syntax or
+        // another account. Canonical containment is still checked below.
+        let wanted = if let Some(relative) = wanted.strip_prefix("~/") {
+            home.as_ref()
+                .map(|home| home.join(relative).to_string_lossy().into_owned())
+                .unwrap_or(wanted)
+        } else {
+            wanted
+        };
         let entry = tokio::task::spawn_blocking(move || {
             let entry = asset_entry_for_path(&wanted, &lookup_roots)?;
             let asset_type = sniff_asset_type(&read_asset_head(&entry.path), &entry.name);
@@ -10696,18 +10904,19 @@ fn default_herdr_plugin_config_dir() -> anyhow::Result<PathBuf> {
     if let Ok(path) = std::env::var("HERDR_PLUGIN_CONFIG_DIR") {
         return Ok(path.into());
     }
-    Ok(dirs::config_dir()
-        .context("failed to locate config directory")?
-        .join("herdr/plugins/config/herdr.gateway"))
+    Ok(PathBuf::from(default_socket_path())
+        .parent()
+        .context("failed to locate Herdr config directory")?
+        .join("plugins/config/herdr.gateway"))
 }
 
 fn default_herdr_plugin_state_dir() -> anyhow::Result<PathBuf> {
     if let Ok(path) = std::env::var("HERDR_PLUGIN_STATE_DIR") {
         return Ok(path.into());
     }
-    Ok(dirs::state_dir()
-        .or_else(dirs::data_dir)
-        .or_else(dirs::config_dir)
+    Ok(std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".local/state")))
         .context("failed to locate state directory")?
         .join("herdr/plugins/herdr.gateway"))
 }
@@ -11213,7 +11422,9 @@ fn write_secret_file(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()>
 }
 
 fn default_socket_path() -> String {
-    dirs::config_dir()
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".config")))
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("herdr")
         .join("herdr.sock")
@@ -11472,7 +11683,7 @@ fn openapi_spec() -> Value {
                     "responses": asset_content_responses()
                 }
             },
-            "/api/sessions": { "get": simple_endpoint("List configured terminal backend sessions") },
+            "/api/sessions": { "get": simple_endpoint("List configured terminal backend sessions with a current connected flag; unreachable sessions remain configured but should not appear as switch targets") },
             "/api/sessions/{sessionId}/events": {
                 "get": {
                     "summary": "Stream Herdr lifecycle events as Server-Sent Events",
@@ -11798,6 +12009,7 @@ fn task_result_schema() -> Value {
             "agent": { "type": "string" },
             "reused_worktree": { "type": "boolean", "description": "True when the branch already had a checkout, which is what makes a retry safe" },
             "agent_started": { "type": "boolean" },
+            "agent_instance_id": { "type": ["string", "null"], "description": "Opaque identity of the ready agent conversation. Never correlate assignment history by pane id alone." },
             "prompt_submitted": { "type": "boolean" },
             "steps": task_steps_schema()
         }
@@ -12294,10 +12506,64 @@ mod tests {
     use axum::http::HeaderValue;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+    #[test]
+    fn agent_splits_preserve_a_readable_terminal() {
+        for rows in [0, 5, 20, 40, 47] {
+            assert!(!can_split_agent_pane(Some(rows)));
+        }
+        for rows in [48, 80, 120] {
+            assert!(can_split_agent_pane(Some(rows)));
+        }
+        assert!(can_split_agent_pane(None)); // Preserve older backend behavior.
+    }
+
+    #[test]
+    fn startup_refusals_keep_their_actionable_codes() {
+        for code in [
+            "agent_not_ready",
+            "agent_start_failed",
+            "agent_start_timeout",
+        ] {
+            let error = backend_call_error(
+                "agent.start",
+                BackendError::Refused {
+                    code: Some(code.to_owned()),
+                    message: "startup detail".to_owned(),
+                },
+            );
+            assert_eq!(error.code(), code);
+            assert!(!error.can_retry_prompt());
+        }
+    }
+
+    #[test]
+    fn prompt_retry_requires_proof_nothing_was_submitted() {
+        assert!(!HerdrCallError::Unavailable("response lost".into()).can_retry_prompt());
+        assert!(!HerdrCallError::Malformed("agent.prompt".into()).can_retry_prompt());
+        for code in [
+            "agent_blocked",
+            "timeout",
+            "agent_prompt_stalled",
+            "unknown",
+        ] {
+            assert!(!HerdrCallError::Herdr {
+                method: "agent.prompt".into(),
+                error: json!({ "code": code }),
+            }
+            .can_retry_prompt());
+        }
+        assert!(HerdrCallError::Herdr {
+            method: "agent.prompt".into(),
+            error: json!({ "code": "agent_not_found" }),
+        }
+        .can_retry_prompt());
+    }
+
     fn test_config(token: &str) -> Config {
         Config {
             server_id: "server-1".into(),
             label: "test".into(),
+            autostart_backends: Vec::new(),
             listen: "127.0.0.1:23100".into(),
             public_url: "http://127.0.0.1:23100".into(),
             token_hash: hash_token(token),
@@ -12311,6 +12577,21 @@ mod tests {
             agent_commands: BTreeMap::new(),
             rich_agent_pushes: false,
         }
+    }
+
+    #[test]
+    fn backend_autostart_is_explicit_and_old_configs_stay_off() {
+        let mut config = test_config("test");
+        let old = serde_json::to_value(&config).unwrap();
+        assert!(old.get("autostart_backends").is_none());
+        assert!(serde_json::from_value::<Config>(old)
+            .unwrap()
+            .autostart_backends
+            .is_empty());
+        config.autostart_backends.push("default".into());
+        let loaded: Config =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert_eq!(loaded.autostart_backends, ["default"]);
     }
 
     #[test]
@@ -16865,6 +17146,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(session_ids(&response.0), vec!["herdr-live", "tmux-dead"]);
+        assert_eq!(response.0["sessions"][0]["connected"], true);
+        assert_eq!(response.0["sessions"][1]["connected"], false);
     }
 
     /// The dual-backend defect the final review caught: with tmux dead (or
