@@ -45,6 +45,7 @@ mod authority;
 mod backend;
 mod backend_startup;
 mod composer;
+mod git;
 mod i18n;
 #[cfg(all(test, unix))]
 mod installer_tests;
@@ -202,7 +203,7 @@ const STREAM_OUTPUT_READ_TIMEOUT: Duration = Duration::from_millis(100);
 /// at the screen they pressed it on; long enough that a stream costs one
 /// mutex acquisition every few seconds and nothing else.
 const STREAM_DEVICE_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
-const GATEWAY_API_VERSION: &str = "1.7.0";
+const GATEWAY_API_VERSION: &str = "1.8.0";
 const GATEWAY_API_MAJOR: u64 = 1;
 /// The oldest Herdr socket protocol this gateway knows how to speak.
 ///
@@ -253,7 +254,10 @@ const UPLOAD_GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// `parts: "native"` -- a third value of an enum that already had two -- and the
 /// closed part set gains `approval`, which an old client renders through
 /// `fallback_text` like any type it does not know. Again nothing existing moved.
-const CONTENT_SCHEMA_VERSION: &str = "1.4.0";
+/// 1.5.0 adds three read-only pane routes in the same envelope -- `context`,
+/// `git/status` and `git/diff` -- behind the `pane_context` and `git_diff`
+/// capabilities; no existing payload changes.
+const CONTENT_SCHEMA_VERSION: &str = "1.5.0";
 /// A phone previews artifacts, it does not download archives. Anything larger
 /// is refused rather than streamed, so one request can never tie up the host.
 const MAX_ASSET_CONTENT_BYTES: u64 = 10 * 1024 * 1024;
@@ -310,7 +314,9 @@ const API_CAPABILITIES: &[&str] = &[
     "assets",
     "device_revocation",
     "file_uploads",
+    "git_diff",
     "one_time_pairing_codes",
+    "pane_context",
     "pane_approvals",
     "pane_composer",
     "pane_file_search",
@@ -2084,6 +2090,18 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         .route(
             "/api/sessions/{session_id}/panes/{pane_id}/files",
             get(pane_files),
+        )
+        .route(
+            "/api/sessions/{session_id}/panes/{pane_id}/context",
+            get(pane_context),
+        )
+        .route(
+            "/api/sessions/{session_id}/panes/{pane_id}/git/status",
+            get(pane_git_status),
+        )
+        .route(
+            "/api/sessions/{session_id}/panes/{pane_id}/git/diff",
+            get(pane_git_diff),
         )
         .route(
             "/api/sessions/{session_id}/panes/{pane_id}/approval",
@@ -8061,6 +8079,224 @@ async fn pane_files(
     }))))
 }
 
+/// The pane's working directory as the fence sees it: the root the asset
+/// listing reports for exactly this pane, canonicalized. `None` is "no
+/// workspace the gateway will look in", the same answer `pane_files` gives.
+async fn pane_fenced_cwd(
+    state: &AppState,
+    session: &SessionConfig,
+    pane_id: &str,
+) -> Option<PathBuf> {
+    let roots = session_asset_roots(state, session, None).await;
+    roots
+        .iter()
+        .find(|root| root.pane_id.as_deref() == Some(pane_id))
+        .and_then(|root| std::fs::canonicalize(&root.path).ok())
+}
+
+/// The checkout a fenced directory belongs to, when that checkout is itself
+/// inside the fence. A home directory that is a dotfiles repository has a
+/// toplevel `is_scannable_root` refuses, and so answers "not a checkout".
+async fn checkout_of(cwd: &FsPath) -> Option<PathBuf> {
+    let toplevel = git::toplevel(cwd).await?;
+    is_scannable_root(&toplevel).then_some(toplevel)
+}
+
+fn git_error(err: git::GitError) -> (StatusCode, Json<Value>) {
+    // The detail goes to the log; the client gets a bounded, generic sentence,
+    // never git's stderr.
+    eprintln!("git: {err}");
+    match err {
+        git::GitError::Timeout => api_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            "git_timeout",
+            "git took too long to answer",
+        ),
+        git::GitError::NotInstalled => api_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "git_missing",
+            "git is not installed on this host",
+        ),
+        git::GitError::Failed(_) => api_error(StatusCode::BAD_GATEWAY, "git_failed", "git failed"),
+    }
+}
+
+/// Where this pane is and what runs in it, in one answer.
+///
+/// The join the app used to make itself out of the pane, `recent-cwds` and
+/// the shortcuts: the directory, whether it is inside the fence, the checkout
+/// it belongs to with its branch line and changed-file count, and the agent
+/// with its declared profile. Capabilities stay on `/api/health`; these are
+/// facts about one pane, read on demand and never pushed.
+///
+/// `git` is `null` for a pane outside any checkout, outside the fence, or
+/// whose cwd the backend does not report; `agent` is `null` for a plain
+/// shell. Neither is an error: a phone asks this to decide which icons to
+/// show, and "nothing to show" is an ordinary answer.
+async fn pane_context(
+    State(state): State<AppState>,
+    Path((session_id, pane_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let session = find_session(&state.config, &session_id)?.clone();
+
+    let pane = terminal_backend(&session)
+        .get_pane(&BackendPaneId::new(&pane_id))
+        .await
+        .ok();
+    let fenced = pane_fenced_cwd(&state, &session, &pane_id).await;
+    let cwd = pane
+        .as_ref()
+        .and_then(|pane| pane.cwd.clone())
+        .or_else(|| fenced.clone());
+
+    let git = match &fenced {
+        Some(dir) => match checkout_of(dir).await {
+            Some(toplevel) => git::summary(&toplevel)
+                .await
+                .map(|summary| summary.to_json())
+                .unwrap_or(Value::Null),
+            None => Value::Null,
+        },
+        None => Value::Null,
+    };
+
+    let agent = pane
+        .filter(|pane| pane.agent.is_some())
+        .map(backend::compat::pane_get)
+        .map(|pane| {
+            let kind = pane["agent"].as_str().unwrap_or("").to_owned();
+            json!({
+                "kind": kind,
+                "status": pane["agent_status"],
+                "foreground_command": pane["foreground_command"],
+                "profile": shortcuts::is_known_agent(&kind),
+            })
+        })
+        .unwrap_or(Value::Null);
+
+    Ok(Json(content_envelope(json!({
+        "session_id": session_id,
+        "pane_id": pane_id,
+        "cwd": cwd.map(|path| path.to_string_lossy().to_string()),
+        "cwd_in_fence": fenced.is_some(),
+        "git": git,
+        "agent": agent,
+    }))))
+}
+
+/// What changed in the pane's checkout: the branch line and one entry per
+/// file, with line totals, working tree against `HEAD`.
+async fn pane_git_status(
+    State(state): State<AppState>,
+    Path((session_id, pane_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let session = find_session(&state.config, &session_id)?.clone();
+
+    let checkout = match pane_fenced_cwd(&state, &session, &pane_id).await {
+        Some(cwd) => checkout_of(&cwd).await,
+        None => None,
+    };
+    let Some(toplevel) = checkout else {
+        return Ok(Json(content_envelope(json!({
+            "session_id": session_id,
+            "pane_id": pane_id,
+            "repo": Value::Null,
+            "truncated": false,
+            "files": [],
+        }))));
+    };
+
+    let status = git::status(&toplevel).await.map_err(git_error)?;
+    Ok(Json(content_envelope(json!({
+        "session_id": session_id,
+        "pane_id": pane_id,
+        "repo": status.summary.to_json(),
+        "truncated": status.truncated,
+        "files": status.files.iter().map(git::FileChange::to_json).collect::<Vec<Value>>(),
+    }))))
+}
+
+#[derive(Debug, Deserialize)]
+struct GitDiffQuery {
+    path: Option<String>,
+    /// Absent: working tree against `HEAD`. `true`: the index against `HEAD`.
+    /// `false`: the working tree against the index.
+    staged: Option<bool>,
+    context: Option<u32>,
+    from: Option<usize>,
+    lines: Option<usize>,
+}
+
+/// One file's unified patch, one page at a time.
+///
+/// The path is the only client-supplied value that reaches git, validated
+/// first and placed after `--`; see `git::file_patch`. Every number is
+/// clamped. A page is cut on a hunk boundary so the next one parses alone.
+async fn pane_git_diff(
+    State(state): State<AppState>,
+    Path((session_id, pane_id)): Path<(String, String)>,
+    Query(query): Query<GitDiffQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let session = find_session(&state.config, &session_id)?.clone();
+
+    let path = query.path.unwrap_or_default();
+    if git::validate_relative_path(&path).is_none() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_path",
+            "path must be relative to the checkout",
+        ));
+    }
+    let side = match query.staged {
+        None => git::PatchSide::WorkingTreeVsHead,
+        Some(true) => git::PatchSide::Staged,
+        Some(false) => git::PatchSide::Unstaged,
+    };
+    let context = query
+        .context
+        .unwrap_or(git::DEFAULT_CONTEXT_LINES)
+        .min(git::MAX_CONTEXT_LINES);
+    let from = query.from.unwrap_or(0);
+    let lines = query
+        .lines
+        .unwrap_or(git::FILE_PATCH_MAX_LINES)
+        .clamp(1, git::FILE_PATCH_MAX_LINES);
+
+    let checkout = match pane_fenced_cwd(&state, &session, &pane_id).await {
+        Some(cwd) => checkout_of(&cwd).await,
+        None => None,
+    };
+    let Some(toplevel) = checkout else {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            "no_repository",
+            "this pane is not inside a git checkout",
+        ));
+    };
+
+    let patch = git::file_patch(&toplevel, &path, side, context, from, lines)
+        .await
+        .map_err(git_error)?;
+    let Some(patch) = patch else {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            "no_such_path",
+            "nothing in the checkout has that path",
+        ));
+    };
+
+    let mut data = patch.to_json();
+    data["session_id"] = json!(session_id);
+    data["pane_id"] = json!(pane_id);
+    Ok(Json(content_envelope(data)))
+}
+
 /// Which agents have a key row and command list, and where to add one. Lets a
 /// client tell "this agent has no profile yet" from "the gateway is old".
 async fn keymaps(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
@@ -11919,6 +12155,38 @@ fn openapi_spec() -> Value {
                     "responses": file_search_responses()
                 }
             },
+            "/api/sessions/{sessionId}/panes/{paneId}/context": {
+                "get": {
+                    "summary": "Where the pane is and what runs in it",
+                    "description": "One read-only answer for the questions a client used to assemble from the pane, recent-cwds and the shortcuts: the working directory, whether it is inside the fence the asset and file routes use, the git checkout it belongs to (branch, upstream, ahead/behind, head, changed-file count) or null, and the agent running there (kind, status, foreground command, whether this gateway has a profile for it) or null for a plain shell. Facts about one pane, read on demand; capabilities stay on /api/health. Announced as pane_context.",
+                    "parameters": [path_param("sessionId"), path_param("paneId")],
+                    "responses": pane_context_responses()
+                }
+            },
+            "/api/sessions/{sessionId}/panes/{paneId}/git/status": {
+                "get": {
+                    "summary": "What changed in the pane's checkout",
+                    "description": "git status --porcelain=v2 plus git diff --numstat HEAD, run read-only (--no-optional-locks, so the agent working in the checkout never loses index.lock) inside the checkout the pane's fenced working directory belongs to. One entry per changed file -- staged, unstaged and untracked together, which is what 'what did the agent change' means -- with line totals; binary files carry null totals. The list stops at 2000 files and says so with truncated; repo.changed_files is still the full count. A pane outside any checkout answers repo: null and an empty list, not an error. Announced as git_diff.",
+                    "parameters": [path_param("sessionId"), path_param("paneId")],
+                    "responses": git_status_responses()
+                }
+            },
+            "/api/sessions/{sessionId}/panes/{paneId}/git/diff": {
+                "get": {
+                    "summary": "One file's unified patch, one page at a time",
+                    "description": "git diff -M -U<context> HEAD -- <path>, with an untracked file rendered against /dev/null. path is the only client value that reaches git: relative, no .. components, not starting with -, placed after a literal --; an untracked path must additionally be a regular file (not a symlink) inside the checkout. from is a 0-based line offset into the whole patch and lines (at most 4000) the page size; a page is cut back to the nearest hunk or file boundary so every page after the first starts on @@ or diff --git and parses on its own, and truncated says whether another page follows from end. binary is true for a change git prints no hunks for. 400 for a path that is not a relative path, 404 no_repository for a pane outside a checkout, 404 no_such_path for a path nothing in the checkout has, 504 when git takes more than five seconds.",
+                    "parameters": [
+                        path_param("sessionId"),
+                        path_param("paneId"),
+                        query_param("path", "The file, relative to the checkout's top level"),
+                        query_param("staged", "Absent: working tree against HEAD. true: index against HEAD. false: working tree against index"),
+                        query_param("context", "Context lines per hunk, 0 to 25, default 3"),
+                        query_param("from", "0-based line offset into the whole patch, default 0"),
+                        query_param("lines", "Page size in patch lines, 1 to 4000, default 4000")
+                    ],
+                    "responses": git_diff_responses()
+                }
+            },
             "/api/sessions/{sessionId}/panes/{paneId}/approval": {
                 "get": {
                     "summary": "Read whether the pane is blocked on an approval, and what it asks",
@@ -12336,6 +12604,119 @@ fn file_search_responses() -> Value {
         })) } }
     });
     responses["404"] = json!({ "description": "Unknown session" });
+    responses
+}
+
+fn repo_summary_schema() -> Value {
+    json!({
+        "type": ["object", "null"],
+        "description": "The checkout's branch line, or null when the pane is not inside one",
+        "required": ["toplevel", "detached", "changed_files"],
+        "properties": {
+            "toplevel": { "type": "string" },
+            "branch": { "type": ["string", "null"] },
+            "upstream": { "type": ["string", "null"] },
+            "ahead": { "type": ["integer", "null"] },
+            "behind": { "type": ["integer", "null"] },
+            "detached": { "type": "boolean" },
+            "head": { "type": ["string", "null"], "description": "Abbreviated commit id; null on an unborn branch" },
+            "changed_files": { "type": "integer", "description": "Every changed file, before any list cap" }
+        }
+    })
+}
+
+fn pane_context_responses() -> Value {
+    let mut responses = ok_response();
+    responses["200"] = json!({
+        "description": "Where the pane is and what runs in it",
+        "content": { "application/json": { "schema": content_envelope_schema(json!({
+            "type": "object",
+            "required": ["session_id", "pane_id", "cwd", "cwd_in_fence", "git", "agent"],
+            "properties": {
+                "session_id": { "type": "string" },
+                "pane_id": { "type": "string" },
+                "cwd": { "type": ["string", "null"] },
+                "cwd_in_fence": { "type": "boolean", "description": "Whether the file and asset routes will look inside cwd" },
+                "git": repo_summary_schema(),
+                "agent": {
+                    "type": ["object", "null"],
+                    "required": ["kind", "status", "profile"],
+                    "properties": {
+                        "kind": { "type": "string" },
+                        "status": { "type": "string", "enum": ["starting", "working", "idle", "blocked", "done", "unknown"] },
+                        "foreground_command": { "type": ["string", "null"] },
+                        "profile": { "type": "boolean", "description": "Whether this gateway has a key row and interrupt key for the agent" }
+                    }
+                }
+            }
+        })) } }
+    });
+    responses["404"] = json!({ "description": "Unknown session" });
+    responses
+}
+
+fn git_status_responses() -> Value {
+    let mut responses = ok_response();
+    responses["200"] = json!({
+        "description": "The checkout's changed files, working tree against HEAD",
+        "content": { "application/json": { "schema": content_envelope_schema(json!({
+            "type": "object",
+            "required": ["session_id", "pane_id", "repo", "truncated", "files"],
+            "properties": {
+                "session_id": { "type": "string" },
+                "pane_id": { "type": "string" },
+                "repo": repo_summary_schema(),
+                "truncated": { "type": "boolean", "description": "The list stopped at the cap" },
+                "files": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["path", "status", "staged", "unstaged", "binary"],
+                        "properties": {
+                            "path": { "type": "string", "description": "Relative to toplevel" },
+                            "old_path": { "type": ["string", "null"], "description": "For a rename or copy" },
+                            "status": { "type": "string", "enum": ["added", "modified", "deleted", "renamed", "copied", "untracked", "conflicted", "type_changed"] },
+                            "staged": { "type": "boolean" },
+                            "unstaged": { "type": "boolean" },
+                            "binary": { "type": "boolean" },
+                            "added": { "type": ["integer", "null"] },
+                            "removed": { "type": ["integer", "null"] }
+                        }
+                    }
+                }
+            }
+        })) } }
+    });
+    responses["404"] = json!({ "description": "Unknown session" });
+    responses["502"] = json!({ "description": "git failed" });
+    responses["504"] = json!({ "description": "git took more than five seconds" });
+    responses
+}
+
+fn git_diff_responses() -> Value {
+    let mut responses = ok_response();
+    responses["200"] = json!({
+        "description": "One page of one file's unified patch",
+        "content": { "application/json": { "schema": content_envelope_schema(json!({
+            "type": "object",
+            "required": ["session_id", "pane_id", "path", "binary", "from", "end", "total_lines", "truncated", "patch"],
+            "properties": {
+                "session_id": { "type": "string" },
+                "pane_id": { "type": "string" },
+                "path": { "type": "string" },
+                "binary": { "type": "boolean" },
+                "from": { "type": "integer" },
+                "end": { "type": "integer", "description": "One past the last line in this page; pass as from for the next" },
+                "total_lines": { "type": "integer" },
+                "truncated": { "type": "boolean", "description": "Another page follows" },
+                "patch": { "type": "string", "description": "Unified diff text, a/ b/ prefixes, no colour" }
+            }
+        })) } }
+    });
+    responses["400"] = json!({ "description": "path is not a relative path inside the checkout" });
+    responses["404"] = json!({ "description": "Unknown session, no checkout (no_repository), or nothing at that path (no_such_path)" });
+    responses["502"] = json!({ "description": "git failed" });
+    responses["504"] = json!({ "description": "git took more than five seconds" });
     responses
 }
 
@@ -15897,7 +16278,7 @@ mod tests {
         // One envelope and one version across the content model: a client reads
         // the version once and knows both endpoints answer it.
         let envelope = content_envelope(json!({}));
-        assert_eq!(envelope["schema_version"], "1.4.0");
+        assert_eq!(envelope["schema_version"], "1.5.0");
         assert_eq!(envelope["capabilities"]["parts"], true);
         assert_eq!(envelope["capabilities"]["assets"], true);
         assert_eq!(envelope["capabilities"]["image_upload"], true);
@@ -16278,12 +16659,276 @@ mod tests {
         // A minor bump: the routes are additive, so an older client keeps
         // working, and a newer one can gate on the capability rather than on
         // probing for a 404.
-        assert!(GATEWAY_API_VERSION.starts_with("1.7."));
+        assert!(GATEWAY_API_VERSION.starts_with("1.8."));
         assert_eq!(GATEWAY_API_MAJOR, 1);
         assert!(API_CAPABILITIES.contains(&"tasks"));
         assert!(API_CAPABILITIES.contains(&"agent_catalog"));
         assert!(API_CAPABILITIES.contains(&"terminal_backends"));
         assert!(API_CAPABILITIES.contains(&"multiple_terminal_backends"));
+    }
+
+    #[test]
+    fn the_pane_context_and_git_routes_are_documented_and_announced() {
+        let spec = openapi_spec();
+        for path in [
+            "/api/sessions/{sessionId}/panes/{paneId}/context",
+            "/api/sessions/{sessionId}/panes/{paneId}/git/status",
+            "/api/sessions/{sessionId}/panes/{paneId}/git/diff",
+        ] {
+            assert!(
+                spec["paths"][path]["get"].is_object(),
+                "{path} is not documented"
+            );
+        }
+        let names: Vec<&str> = spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/git/diff"]
+            ["get"]["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|parameter| parameter["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "sessionId",
+                "paneId",
+                "path",
+                "staged",
+                "context",
+                "from",
+                "lines"
+            ]
+        );
+        for capability in ["pane_context", "git_diff"] {
+            assert!(
+                API_CAPABILITIES.contains(&capability),
+                "{capability} is not announced"
+            );
+        }
+        assert!(CONTENT_SCHEMA_VERSION.starts_with("1.5."));
+    }
+
+    fn git_test_repo(name: &str) -> (PathBuf, PathBuf) {
+        let root = asset_test_dir(name);
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        for args in [
+            vec!["init", "--initial-branch", "main"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+            vec!["config", "commit.gpgsign", "false"],
+        ] {
+            let output = ProcessCommand::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(&args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?} failed");
+        }
+        std::fs::write(repo.join("src/a.ts"), "const a = 1;\nconst b = 2;\n").unwrap();
+        for args in [vec!["add", "."], vec!["commit", "-q", "-m", "init"]] {
+            let output = ProcessCommand::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(&args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?} failed");
+        }
+        std::fs::write(repo.join("src/a.ts"), "const a = 1;\nconst B = 2;\n").unwrap();
+        std::fs::write(repo.join("notes.md"), "new\n").unwrap();
+        (root, repo)
+    }
+
+    fn remember_pane_root(state: &AppState, pane_id: &str, path: PathBuf) {
+        state.assets.lock().unwrap().remember_roots(
+            "default",
+            None,
+            vec![AssetRoot {
+                path,
+                session_id: "default".into(),
+                workspace_id: Some("wA".into()),
+                tab_id: Some("wA:t1".into()),
+                pane_id: Some(pane_id.into()),
+            }],
+        );
+    }
+
+    #[tokio::test]
+    async fn git_status_lists_the_checkout_of_the_panes_fenced_directory() {
+        let (root, repo) = git_test_repo("git-status");
+        let state = unreachable_state();
+        // The pane sits in a subdirectory; the checkout is found above it.
+        remember_pane_root(&state, "wA:p1", repo.join("src"));
+
+        let answer = pane_git_status(
+            State(state.clone()),
+            Path(("default".into(), "wA:p1".into())),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(answer["schema_version"], CONTENT_SCHEMA_VERSION);
+        let data = &answer["data"];
+        assert_eq!(data["repo"]["branch"], "main");
+        assert_eq!(data["repo"]["changed_files"], 2);
+        assert_eq!(data["truncated"], false);
+        let files = data["files"].as_array().unwrap();
+        let modified = files
+            .iter()
+            .find(|file| file["path"] == "src/a.ts")
+            .unwrap();
+        assert_eq!(modified["status"], "modified");
+        assert_eq!(modified["added"], 1);
+        assert_eq!(modified["removed"], 1);
+        let untracked = files
+            .iter()
+            .find(|file| file["path"] == "notes.md")
+            .unwrap();
+        assert_eq!(untracked["status"], "untracked");
+        assert_eq!(untracked["added"], 1);
+
+        // A wrong token is refused before anything runs.
+        assert_eq!(
+            pane_git_status(
+                State(state.clone()),
+                Path(("default".into(), "wA:p1".into())),
+                bearer_headers("not-a-token"),
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::FORBIDDEN
+        );
+
+        // A pane the fence knows nothing about is "no repository", not an error.
+        let none = pane_git_status(
+            State(state),
+            Path(("default".into(), "wB:p9".into())),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(none["data"]["repo"].is_null());
+        assert_eq!(none["data"]["files"].as_array().unwrap().len(), 0);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn git_diff_answers_one_file_and_refuses_what_is_not_a_path() {
+        let (root, repo) = git_test_repo("git-diff");
+        let state = unreachable_state();
+        remember_pane_root(&state, "wA:p1", repo.clone());
+
+        let query = |path: &str| GitDiffQuery {
+            path: Some(path.into()),
+            staged: None,
+            context: Some(3),
+            from: None,
+            lines: None,
+        };
+        let answer = pane_git_diff(
+            State(state.clone()),
+            Path(("default".into(), "wA:p1".into())),
+            Query(query("src/a.ts")),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap()
+        .0;
+        let data = &answer["data"];
+        assert_eq!(data["path"], "src/a.ts");
+        assert_eq!(data["binary"], false);
+        assert_eq!(data["truncated"], false);
+        assert!(data["patch"]
+            .as_str()
+            .unwrap()
+            .contains("\n-const b = 2;\n+const B = 2;\n"));
+
+        for bad in ["--cached", "../repo/src/a.ts", "/etc/passwd", ""] {
+            let status = pane_git_diff(
+                State(state.clone()),
+                Path(("default".into(), "wA:p1".into())),
+                Query(query(bad)),
+                bearer_headers("token"),
+            )
+            .await
+            .unwrap_err()
+            .0;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad:?}");
+        }
+
+        let missing = pane_git_diff(
+            State(state.clone()),
+            Path(("default".into(), "wA:p1".into())),
+            Query(query("nope.txt")),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing.0, StatusCode::NOT_FOUND);
+        assert_eq!(missing.1["error"]["code"], "no_such_path");
+
+        let no_repo = pane_git_diff(
+            State(state),
+            Path(("default".into(), "wB:p9".into())),
+            Query(query("src/a.ts")),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(no_repo.0, StatusCode::NOT_FOUND);
+        assert_eq!(no_repo.1["error"]["code"], "no_repository");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn pane_context_answers_git_and_cwd_without_a_backend() {
+        let (root, repo) = git_test_repo("pane-context");
+        let state = unreachable_state();
+        remember_pane_root(&state, "wA:p1", repo.clone());
+
+        let answer = pane_context(
+            State(state.clone()),
+            Path(("default".into(), "wA:p1".into())),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap()
+        .0;
+        let data = &answer["data"];
+        assert_eq!(data["cwd_in_fence"], true);
+        assert_eq!(
+            data["cwd"],
+            std::fs::canonicalize(&repo)
+                .unwrap()
+                .to_string_lossy()
+                .as_ref()
+        );
+        assert_eq!(data["git"]["branch"], "main");
+        assert_eq!(data["git"]["changed_files"], 2);
+        // The backend is unreachable, so nothing is known about an agent --
+        // and nothing is guessed.
+        assert!(data["agent"].is_null());
+
+        let unknown = pane_context(
+            State(state),
+            Path(("default".into(), "wB:p9".into())),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(unknown["data"]["cwd"].is_null());
+        assert_eq!(unknown["data"]["cwd_in_fence"], false);
+        assert!(unknown["data"]["git"].is_null());
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
