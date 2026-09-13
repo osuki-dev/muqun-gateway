@@ -291,6 +291,46 @@ skipped — and it is capped at 64 commands and 64 KiB per file. A workspace
 command shadows a builtin of the same name: the file is what the agent actually
 reads.
 
+## Pane context and git (v1.5)
+
+Three read-only pane routes in the same envelope, behind two capabilities on
+`/api/health`: `pane_context` and `git_diff`. They are facts about one pane,
+read on demand; nothing about them is pushed over the stream.
+
+`GET .../panes/{paneId}/context` is the join a client used to make for itself
+out of the pane, `recent-cwds` and the shortcuts: the working directory, whether
+it is inside the fence the asset and file routes use, the checkout it belongs to
+— branch, upstream, ahead/behind, abbreviated head, changed-file count — or
+`null`, and the agent running there — kind, status, foreground command, whether
+this gateway has a profile for it — or `null` for a plain shell. A capability is
+a static promise about the API and lives on `/api/health`; a fact is something
+observed about one pane and lives here. A working directory is a fact, so there
+is no per-directory capability, and whether a client shows a diff icon is its
+own decision from `git_diff` being announced and `git` being non-null.
+
+`GET .../panes/{paneId}/git/status` and `GET .../panes/{paneId}/git/diff` are
+`src/git.rs`: `git status --porcelain=v2 -z --branch` plus `git diff --numstat
+HEAD` for the list, `git diff -M -U<n> HEAD -- <path>` for one file, an
+untracked file rendered against `/dev/null`. Working tree against `HEAD`,
+staged and unstaged together, because "what did the agent change" is one
+question. The list is structured JSON; the patch is the raw unified text, on
+purpose — measured in the app repository, a line-oriented parser on the phone is
+cheaper than `JSON.parse` of the same rows pre-structured, on a payload half
+the size. A patch is paged by `from`/`lines` (4000 at most) and every page is
+cut back to a hunk or file boundary, so a page parses on its own.
+
+The rules that keep it safe are the ones the file search already has: the
+directory is the pane's fenced root, never a client value; the checkout is
+`rev-parse --show-toplevel` from there and must itself pass the fence, so a home
+directory that is a dotfiles repository is not a checkout; `path` is the one
+client value that reaches git — relative, no `.` or `..` components, not
+starting with `-`, after a literal `--` — and an untracked path must be a
+regular file (not a symlink, which `--no-index` would read through) canonicalizing
+inside the checkout. Every process has a five-second timeout, an 8 MiB stdout
+cap and `kill_on_drop`; `--no-optional-locks` keeps a status from taking
+`index.lock` from the agent working in the same checkout; git's stderr goes to
+the log and never to a client.
+
 ## Asset
 
 Anything the agent produced that exists as a file and the user may want to see.
@@ -366,6 +406,10 @@ will stream something renderable.
    captured output — but it is stdio JSON-RPC per process rather than one HTTP
    server per host, so attaching to the app-server a pane is already talking to
    is an open question the opencode adapter did not have to answer.
+6. **v1.5 — pane context and git.** One route that says where a pane is and
+   what runs in it, and two that read the checkout it is in: the changed-file
+   list and one file's patch a page at a time. Additive: two capability strings
+   and three routes, no existing payload changed shape.
 
 ## Non-goals (v1)
 
