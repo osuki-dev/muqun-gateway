@@ -305,6 +305,7 @@ async fn porcelain(toplevel: &Path) -> Result<(RepoSummary, Vec<Entry>), GitErro
 pub async fn file_patch(
     toplevel: &Path,
     path: &str,
+    old_path: Option<&str>,
     side: PatchSide,
     context: u32,
     from: usize,
@@ -314,6 +315,16 @@ pub async fn file_patch(
         return Ok(None);
     };
     let relative_str = relative.to_string_lossy().into_owned();
+    // A rename is only a rename when git can see both sides: with the new
+    // path alone as the pathspec, the file is a brand-new one. The old path
+    // is validated exactly as the new one and rides after the same `--`.
+    let old_relative = match old_path {
+        Some(old) => match validate_relative_path(old) {
+            Some(old) => Some(old.to_string_lossy().into_owned()),
+            None => return Ok(None),
+        },
+        None => None,
+    };
     let context = context.min(MAX_CONTEXT_LINES);
     let unified = format!("-U{context}");
     let lines = lines.clamp(1, FILE_PATCH_MAX_LINES);
@@ -333,6 +344,9 @@ pub async fn file_patch(
     }
     args.push("--");
     args.push(&relative_str);
+    if let Some(old) = &old_relative {
+        args.push(old);
+    }
 
     let mut text = match run(toplevel, &args, &[0, 1]).await {
         Ok(output) => String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -769,13 +783,16 @@ fn is_binary_patch(text: &str) -> bool {
     !text.contains("\n@@") && text.lines().any(|line| line.starts_with("Binary files "))
 }
 
-/// One page of a patch, cut so that a page never starts inside a hunk.
+/// One page of a patch, cut on a hunk boundary when there is one to cut on.
 ///
 /// `from` is a line offset into the whole patch. The page ends at
 /// `from + lines`, moved back to the nearest hunk (`@@`) or file (`diff
-/// --git`) boundary so the next page starts on one and parses on its own; a
-/// single hunk longer than a whole page is cut raw rather than never delivered.
-/// Returns `(from, end, total_lines, truncated, text)`.
+/// --git`) boundary so the next page starts on one and parses on its own --
+/// but only to a boundary past the middle of the page. A hunk longer than a
+/// page (a file where every third line changed is one hunk) would otherwise
+/// leave the first page holding four header lines and nothing to read; such
+/// a hunk is cut raw, and the reader continues it from the line counters of
+/// the page before. Returns `(from, end, total_lines, truncated, text)`.
 fn page_lines(text: &str, from: usize, lines: usize) -> (usize, usize, usize, bool, String) {
     let all: Vec<&str> = if text.is_empty() {
         Vec::new()
@@ -789,7 +806,10 @@ fn page_lines(text: &str, from: usize, lines: usize) -> (usize, usize, usize, bo
     let from = from.min(total);
     let mut end = (from + lines).min(total);
     if end < total {
-        let boundary = (from + 1..end)
+        // Strictly past the middle: a boundary sitting exactly there would
+        // still hand back half a page.
+        let floor = from + lines / 2 + 1;
+        let boundary = (floor.max(from + 1)..end)
             .rev()
             .find(|index| all[*index].starts_with("@@") || all[*index].starts_with("diff --git "));
         if let Some(boundary) = boundary {
@@ -939,18 +959,31 @@ mod tests {
     #[test]
     fn a_page_ends_on_a_hunk_boundary_and_the_next_starts_on_one() {
         let text = sample_patch();
-        let (from, end, total, truncated, page) = page_lines(&text, 0, 7);
-        assert_eq!((from, end, total, truncated), (0, 3, 17, true));
-        assert_eq!(page, "diff --git a/f b/f\n--- a/f\n+++ b/f\n");
+        // Page of 10 from 0: the cut at 10 backs up to the `@@` at 8, which is
+        // past the middle of the page.
+        let (from, end, total, truncated, page) = page_lines(&text, 0, 10);
+        assert_eq!((from, end, total, truncated), (0, 8, 17, true));
+        assert!(page.ends_with(" c\n"));
 
         let (from, end, _, truncated, page) = page_lines(&text, end, 7);
-        assert_eq!((from, end, truncated), (3, 8, true));
-        assert!(page.starts_with("@@ -1,3"));
+        assert_eq!((from, end, truncated), (8, 13, true));
+        assert!(page.starts_with("@@ -10,3"));
 
         let (from, end, _, truncated, page) = page_lines(&text, end, 100);
-        assert_eq!((from, end, truncated), (8, 17, false));
-        assert!(page.starts_with("@@ -10,3"));
+        assert_eq!((from, end, truncated), (13, 17, false));
+        assert!(page.starts_with("@@ -20,2"));
         assert!(page.ends_with("+Q\n"));
+    }
+
+    #[test]
+    fn a_boundary_before_the_middle_of_the_page_is_not_worth_cutting_to() {
+        // Header, then one hunk far longer than the page: the `@@` at line 3
+        // is before the middle of a 10-line page, so the page is cut raw at 10
+        // rather than delivering three header lines.
+        let text = sample_patch();
+        let (from, end, _, truncated, page) = page_lines(&text, 0, 6);
+        assert_eq!((from, end, truncated), (0, 6, true));
+        assert_eq!(page.lines().count(), 6);
     }
 
     #[test]
@@ -1096,10 +1129,18 @@ mod tests {
         .unwrap();
         std::fs::write(repo.join("notes.md"), "one\ntwo\n").unwrap();
 
-        let patch = file_patch(&repo, "src/a.ts", PatchSide::WorkingTreeVsHead, 3, 0, 4000)
-            .await
-            .unwrap()
-            .unwrap();
+        let patch = file_patch(
+            &repo,
+            "src/a.ts",
+            None,
+            PatchSide::WorkingTreeVsHead,
+            3,
+            0,
+            4000,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(patch
             .patch
             .starts_with("diff --git a/src/a.ts b/src/a.ts\n"));
@@ -1108,22 +1149,39 @@ mod tests {
         assert!(!patch.truncated);
         assert_eq!(patch.end, patch.total_lines);
 
-        let untracked = file_patch(&repo, "notes.md", PatchSide::WorkingTreeVsHead, 3, 0, 4000)
-            .await
-            .unwrap()
-            .unwrap();
+        let untracked = file_patch(
+            &repo,
+            "notes.md",
+            None,
+            PatchSide::WorkingTreeVsHead,
+            3,
+            0,
+            4000,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(untracked.patch.contains("--- /dev/null\n"));
         assert!(untracked.patch.contains("\n+one\n+two\n"));
 
         // Paged: two lines a page, every page starts where the last one ended.
-        let first = file_patch(&repo, "src/a.ts", PatchSide::WorkingTreeVsHead, 0, 0, 2)
-            .await
-            .unwrap()
-            .unwrap();
+        let first = file_patch(
+            &repo,
+            "src/a.ts",
+            None,
+            PatchSide::WorkingTreeVsHead,
+            0,
+            0,
+            2,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(first.truncated);
         let second = file_patch(
             &repo,
             "src/a.ts",
+            None,
             PatchSide::WorkingTreeVsHead,
             0,
             first.end,
@@ -1147,22 +1205,92 @@ mod tests {
         std::os::unix::fs::symlink(&outside, repo.join("link.txt")).unwrap();
 
         for bad in ["--cached", "-U0", "../secret.txt", "/etc/passwd", ""] {
-            let answer = file_patch(&repo, bad, PatchSide::WorkingTreeVsHead, 3, 0, 4000)
+            let answer = file_patch(&repo, bad, None, PatchSide::WorkingTreeVsHead, 3, 0, 4000)
                 .await
                 .unwrap();
             assert!(answer.is_none(), "{bad:?} should be refused");
         }
         // An untracked symlink is refused outright; `--no-index` would read
         // through it.
-        let link = file_patch(&repo, "link.txt", PatchSide::WorkingTreeVsHead, 3, 0, 4000)
-            .await
-            .unwrap();
+        let link = file_patch(
+            &repo,
+            "link.txt",
+            None,
+            PatchSide::WorkingTreeVsHead,
+            3,
+            0,
+            4000,
+        )
+        .await
+        .unwrap();
         assert!(link.is_none());
         // A path that names nothing is an empty patch, not an error.
-        let missing = file_patch(&repo, "nope.txt", PatchSide::WorkingTreeVsHead, 3, 0, 4000)
-            .await
-            .unwrap();
+        let missing = file_patch(
+            &repo,
+            "nope.txt",
+            None,
+            PatchSide::WorkingTreeVsHead,
+            3,
+            0,
+            4000,
+        )
+        .await
+        .unwrap();
         assert!(missing.is_none());
+
+        std::fs::remove_dir_all(repo.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn a_rename_is_a_rename_only_when_both_paths_are_named() {
+        let repo = temp_repo("rename");
+        git_ok(&repo, &["mv", "README.md", "docs.md"]);
+        std::fs::write(repo.join("docs.md"), "hello\nworld\nmore\n").unwrap();
+
+        let alone = file_patch(
+            &repo,
+            "docs.md",
+            None,
+            PatchSide::WorkingTreeVsHead,
+            3,
+            0,
+            4000,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(alone.patch.contains("new file mode"));
+
+        let both = file_patch(
+            &repo,
+            "docs.md",
+            Some("README.md"),
+            PatchSide::WorkingTreeVsHead,
+            3,
+            0,
+            4000,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(both
+            .patch
+            .contains("rename from README.md\nrename to docs.md\n"));
+        assert!(both.patch.contains("\n+more\n"));
+
+        // The old path is validated like the new one.
+        let bad = file_patch(
+            &repo,
+            "docs.md",
+            Some("../README.md"),
+            PatchSide::WorkingTreeVsHead,
+            3,
+            0,
+            4000,
+        )
+        .await
+        .unwrap();
+        assert!(bad.is_none());
 
         std::fs::remove_dir_all(repo.parent().unwrap()).ok();
     }
@@ -1184,10 +1312,18 @@ mod tests {
         assert!(blob.binary);
         assert_eq!((blob.added, blob.removed), (None, None));
 
-        let patch = file_patch(&repo, "blob.bin", PatchSide::WorkingTreeVsHead, 3, 0, 4000)
-            .await
-            .unwrap()
-            .unwrap();
+        let patch = file_patch(
+            &repo,
+            "blob.bin",
+            None,
+            PatchSide::WorkingTreeVsHead,
+            3,
+            0,
+            4000,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(patch.binary);
         assert!(!patch.patch.contains("@@"));
 

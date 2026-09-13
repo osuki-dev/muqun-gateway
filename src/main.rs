@@ -8223,6 +8223,8 @@ async fn pane_git_status(
 #[derive(Debug, Deserialize)]
 struct GitDiffQuery {
     path: Option<String>,
+    /// The path before a rename or copy, so git sees both sides.
+    old_path: Option<String>,
     /// Absent: working tree against `HEAD`. `true`: the index against `HEAD`.
     /// `false`: the working tree against the index.
     staged: Option<bool>,
@@ -8246,7 +8248,12 @@ async fn pane_git_diff(
     let session = find_session(&state.config, &session_id)?.clone();
 
     let path = query.path.unwrap_or_default();
-    if git::validate_relative_path(&path).is_none() {
+    let old_path = query.old_path.filter(|old| !old.is_empty());
+    let valid = git::validate_relative_path(&path).is_some()
+        && old_path
+            .as_deref()
+            .is_none_or(|old| git::validate_relative_path(old).is_some());
+    if !valid {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
             "invalid_path",
@@ -8280,9 +8287,17 @@ async fn pane_git_diff(
         ));
     };
 
-    let patch = git::file_patch(&toplevel, &path, side, context, from, lines)
-        .await
-        .map_err(git_error)?;
+    let patch = git::file_patch(
+        &toplevel,
+        &path,
+        old_path.as_deref(),
+        side,
+        context,
+        from,
+        lines,
+    )
+    .await
+    .map_err(git_error)?;
     let Some(patch) = patch else {
         return Err(api_error(
             StatusCode::NOT_FOUND,
@@ -12174,11 +12189,12 @@ fn openapi_spec() -> Value {
             "/api/sessions/{sessionId}/panes/{paneId}/git/diff": {
                 "get": {
                     "summary": "One file's unified patch, one page at a time",
-                    "description": "git diff -M -U<context> HEAD -- <path>, with an untracked file rendered against /dev/null. path is the only client value that reaches git: relative, no .. components, not starting with -, placed after a literal --; an untracked path must additionally be a regular file (not a symlink) inside the checkout. from is a 0-based line offset into the whole patch and lines (at most 4000) the page size; a page is cut back to the nearest hunk or file boundary so every page after the first starts on @@ or diff --git and parses on its own, and truncated says whether another page follows from end. binary is true for a change git prints no hunks for. 400 for a path that is not a relative path, 404 no_repository for a pane outside a checkout, 404 no_such_path for a path nothing in the checkout has, 504 when git takes more than five seconds.",
+                    "description": "git diff -M -U<context> HEAD -- <path> [<old_path>], with an untracked file rendered against /dev/null. path (and old_path, for a rename) is the only client value that reaches git: relative, no .. components, not starting with -, placed after a literal --; an untracked path must additionally be a regular file (not a symlink) inside the checkout. from is a 0-based line offset into the whole patch and lines (at most 4000) the page size; a page is cut back to the nearest hunk or file boundary past its middle, so a page normally starts on @@ or diff --git; a single hunk longer than a page is cut raw and the next page continues it, so a reader carries the line counters from one page to the next. truncated says whether another page follows from end. binary is true for a change git prints no hunks for. 400 for a path that is not a relative path, 404 no_repository for a pane outside a checkout, 404 no_such_path for a path nothing in the checkout has, 504 when git takes more than five seconds.",
                     "parameters": [
                         path_param("sessionId"),
                         path_param("paneId"),
                         query_param("path", "The file, relative to the checkout's top level"),
+                        query_param("old_path", "For a renamed or copied file, the path before, so git renders the rename rather than a new file"),
                         query_param("staged", "Absent: working tree against HEAD. true: index against HEAD. false: working tree against index"),
                         query_param("context", "Context lines per hunk, 0 to 25, default 3"),
                         query_param("from", "0-based line offset into the whole patch, default 0"),
@@ -16693,6 +16709,7 @@ mod tests {
                 "sessionId",
                 "paneId",
                 "path",
+                "old_path",
                 "staged",
                 "context",
                 "from",
@@ -16826,6 +16843,7 @@ mod tests {
 
         let query = |path: &str| GitDiffQuery {
             path: Some(path.into()),
+            old_path: None,
             staged: None,
             context: Some(3),
             from: None,
