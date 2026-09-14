@@ -1808,7 +1808,7 @@ mod tests {
 
         let mut master: libc::c_int = -1;
         let mut slave: libc::c_int = -1;
-        let mut size = libc::winsize {
+        let size = libc::winsize {
             ws_row: 59,
             ws_col: 31,
             ws_xpixel: 0,
@@ -1822,7 +1822,7 @@ mod tests {
                 &mut slave,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut size,
+                &size,
             )
         };
         assert_eq!(opened, 0, "openpty failed");
