@@ -42,6 +42,28 @@ pub enum BackendKind {
     Tmux,
 }
 
+/// Whether a backend's self-reported version is at least `minimum`.
+///
+/// Deliberately strict, because the answer gates a feature rather than merely
+/// labelling one: `v` and `+build` are cosmetic and are stripped, but a
+/// pre-release (`0.9.0-rc.1`), a two-part version (`0.9`), a missing version
+/// and anything unparseable all answer `false`. A build that is not yet the
+/// release is not the release, and a version nobody can read is not evidence
+/// of anything.
+pub fn version_at_least(version: Option<&str>, minimum: (u64, u64, u64)) -> bool {
+    let Some(version) = version else { return false };
+    let core = version
+        .trim_start_matches('v')
+        .split('+')
+        .next()
+        .unwrap_or("");
+    if core.contains('-') {
+        return false;
+    }
+    let numbers: Option<Vec<u64>> = core.split('.').map(|part| part.parse().ok()).collect();
+    numbers.is_some_and(|parts| parts.len() == 3 && (parts[0], parts[1], parts[2]) >= minimum)
+}
+
 impl BackendKind {
     pub fn is_herdr(&self) -> bool {
         *self == Self::Herdr
