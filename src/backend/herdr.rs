@@ -1,15 +1,5 @@
 fn herdr_owns_prompt_submission(version: Option<&str>) -> bool {
-    let Some(version) = version else { return false };
-    let core = version
-        .trim_start_matches('v')
-        .split('+')
-        .next()
-        .unwrap_or("");
-    if core.contains('-') {
-        return false;
-    }
-    let numbers: Option<Vec<u64>> = core.split('.').map(|part| part.parse().ok()).collect();
-    numbers.is_some_and(|parts| parts.len() == 3 && (parts[0], parts[1], parts[2]) >= (0, 9, 0))
+    super::model::version_at_least(version, (0, 9, 0))
 }
 
 #[cfg(test)]

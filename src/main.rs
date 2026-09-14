@@ -305,8 +305,13 @@ const ASSET_SKIP_DIRS: &[&str] = &[
     "venv",
     "coverage",
 ];
+/// What this gateway *build* can do, independent of which terminal it is
+/// attached to. Every entry here is announced unconditionally: the endpoint
+/// exists, the code path is compiled in, and no backend can take it away.
+///
+/// A feature whose availability depends on the terminal on the other side does
+/// not belong in this list -- see [`AGENT_COLLABORATION_CAPABILITY`].
 const API_CAPABILITIES: &[&str] = &[
-    "agent_collaboration",
     "agent_catalog",
     "agent_events",
     "agent_lifecycle_notifications",
@@ -336,6 +341,78 @@ const API_CAPABILITIES: &[&str] = &[
     "terminal_session_liveness",
     "terminal_input",
 ];
+
+/// Handing a task to an agent the app did not start, and following it home.
+///
+/// Not in [`API_CAPABILITIES`], because this gateway build implementing the
+/// endpoints is not what decides whether the feature works. Two things the
+/// gateway does not control decide it:
+///
+///  1. **The backend must be Herdr.** An assignment is bound to an agent
+///     *instance* -- the identity of a process and its conversation -- and only
+///     the Herdr adapter has one to bind to. `TmuxBackend::start_agent` returns
+///     `instance_id: None`, and a pane id is not a substitute: panes are reused
+///     and renumbered, so a task bound to one can be delivered to whoever took
+///     the pane over. tmux sessions keep every ordinary terminal capability;
+///     they simply never see this one.
+///  2. **That Herdr must be 0.9.0 or newer.** Below it there is no instance
+///     identity on the wire at all.
+///
+/// Announcing it anyway -- which is what the static list did -- told a phone
+/// attached to a tmux session that collaboration was available, and left the
+/// only honest refusal to happen after the reader had written the task.
+///
+/// It is answered in two places, and they mean different things:
+///
+///  * `backends[].capabilities` in `/health` is the precise answer, per
+///    session. A client that has chosen a session should read that one.
+///  * the gateway-wide `capabilities` array carries it when *any* configured
+///    session qualifies. That is what an app too old to read the per-session
+///    list sees, and it is the weaker claim on purpose: "somewhere on this
+///    machine", not "on the session you are looking at".
+const AGENT_COLLABORATION_CAPABILITY: &str = "agent_collaboration";
+
+/// The first Herdr that puts an opaque agent instance id on the wire.
+///
+/// The same floor `herdr_owns_prompt_submission` uses, and not a coincidence:
+/// 0.9.0 is the release that made an agent addressable as something other than
+/// the pane it happens to occupy.
+const HERDR_COLLABORATION_MIN: (u64, u64, u64) = (0, 9, 0);
+
+/// What one session offers beyond what the build offers, from the three facts
+/// `/health` already has about it.
+///
+/// Pure, so every combination -- including the ones that need a real Herdr or a
+/// real tmux server to reach -- is a unit test rather than a manual check.
+fn session_capabilities(
+    kind: BackendKind,
+    connected: bool,
+    version: Option<&str>,
+) -> Vec<&'static str> {
+    if connected
+        && kind == BackendKind::Herdr
+        && backend::version_at_least(version, HERDR_COLLABORATION_MIN)
+    {
+        vec![AGENT_COLLABORATION_CAPABILITY]
+    } else {
+        Vec::new()
+    }
+}
+
+/// The gateway-wide list: the build's own capabilities, plus collaboration if
+/// at least one configured session can actually deliver it.
+///
+/// Nothing else in the list is conditional, and nothing else should become
+/// conditional without the same justification: a capability that comes and goes
+/// with a socket is a capability a client has to re-check, and every entry in
+/// [`API_CAPABILITIES`] is true for as long as this binary is running.
+fn gateway_capabilities(collaboration_somewhere: bool) -> Vec<&'static str> {
+    let mut capabilities: Vec<&'static str> = API_CAPABILITIES.to_vec();
+    if collaboration_somewhere {
+        capabilities.push(AGENT_COLLABORATION_CAPABILITY);
+    }
+    capabilities
+}
 
 #[derive(Parser)]
 #[command(name = "gateway", about = "Mobile gateway for terminal workspaces")]
@@ -4562,8 +4639,21 @@ async fn gateway_metadata(
     let mut backends = Vec::with_capacity(state.config.sessions.len());
     let mut primary_metadata = None;
     let mut legacy_herdr = None;
+    // Set by any session that can deliver a collaboration task, which is what
+    // the gateway-wide list gets to claim. See `AGENT_COLLABORATION_CAPABILITY`
+    // for why that claim is weaker than the per-session one beside it.
+    let mut collaboration_somewhere = false;
     for session in &state.config.sessions {
         let (metadata, compatibility) = session_metadata(session).await;
+        let capabilities = session_capabilities(
+            session.backend,
+            metadata
+                .get("connected")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            metadata.get("version").and_then(Value::as_str),
+        );
+        collaboration_somewhere |= !capabilities.is_empty();
         let metadata = json!({
             "sessionId": session.id,
             "label": session.label,
@@ -4571,6 +4661,12 @@ async fn gateway_metadata(
             "connected": metadata.get("connected").cloned().unwrap_or(json!(false)),
             "version": metadata.get("version").cloned().unwrap_or(Value::Null),
             "protocol": metadata.get("protocol").cloned().unwrap_or(Value::Null),
+            // Always present, empty included: an app that finds the key knows
+            // this gateway answers per session, and can stop guessing at the
+            // backend's version itself. An app that does not find it is talking
+            // to a gateway that predates the field and falls back to the
+            // gateway-wide list.
+            "capabilities": capabilities,
         });
         if session.id == primary.id {
             primary_metadata = Some(metadata.clone());
@@ -4585,7 +4681,7 @@ async fn gateway_metadata(
         "apiMajor": GATEWAY_API_MAJOR,
         "minimumCompatibleApiVersion": "1.0.0",
         "legacyUnversionedApi": true,
-        "capabilities": API_CAPABILITIES,
+        "capabilities": gateway_capabilities(collaboration_somewhere),
         "serverId": state.config.server_id,
         "label": state.config.label,
         "transportSecurity": {
@@ -16681,6 +16777,80 @@ mod tests {
         assert!(API_CAPABILITIES.contains(&"agent_catalog"));
         assert!(API_CAPABILITIES.contains(&"terminal_backends"));
         assert!(API_CAPABILITIES.contains(&"multiple_terminal_backends"));
+    }
+
+    /// Collaboration is the one capability that is not a property of this
+    /// build, so it is the one capability that has to be earned per session.
+    #[test]
+    fn collaboration_is_announced_only_for_a_connected_modern_herdr() {
+        assert_eq!(
+            session_capabilities(BackendKind::Herdr, true, Some("0.9.0")),
+            vec![AGENT_COLLABORATION_CAPABILITY]
+        );
+        for version in ["v0.9.1", "0.10.0", "1.0.0", "0.9.0+build"] {
+            assert_eq!(
+                session_capabilities(BackendKind::Herdr, true, Some(version)),
+                vec![AGENT_COLLABORATION_CAPABILITY],
+                "{version} should carry collaboration"
+            );
+        }
+
+        // A Herdr too old to put an instance id on the wire, and a version
+        // string nobody can read, are both refused rather than guessed at.
+        for version in [
+            Some("0.8.9"),
+            Some("0.9.0-rc.1"),
+            Some("0.9"),
+            Some("x"),
+            None,
+        ] {
+            assert!(
+                session_capabilities(BackendKind::Herdr, true, version).is_empty(),
+                "{version:?} should not carry collaboration"
+            );
+        }
+
+        // tmux keeps every other capability and never gains this one: it has no
+        // agent instance identity to bind an assignment to.
+        for version in [Some("3.6"), Some("99.0.0"), None] {
+            assert!(
+                session_capabilities(BackendKind::Tmux, true, version).is_empty(),
+                "tmux {version:?} should not carry collaboration"
+            );
+        }
+
+        // A backend that is not answering cannot deliver anything, whatever
+        // version it reported the last time it did.
+        assert!(session_capabilities(BackendKind::Herdr, false, Some("0.9.0")).is_empty());
+    }
+
+    /// The gateway-wide list is the weaker, older-app-facing claim: it says
+    /// "somewhere on this machine", and it must not disturb anything else.
+    #[test]
+    fn the_gateway_wide_list_adds_collaboration_and_changes_nothing_else() {
+        let without = gateway_capabilities(false);
+        let with = gateway_capabilities(true);
+
+        assert!(!without.contains(&AGENT_COLLABORATION_CAPABILITY));
+        assert!(with.contains(&AGENT_COLLABORATION_CAPABILITY));
+        assert!(
+            !API_CAPABILITIES.contains(&AGENT_COLLABORATION_CAPABILITY),
+            "collaboration must not be static: a tmux-only gateway would announce it"
+        );
+
+        // Every other capability is unconditional, and a tmux-only machine must
+        // lose exactly one thing by being tmux-only.
+        for capability in API_CAPABILITIES {
+            assert!(without.contains(capability), "{capability} went missing");
+            assert!(with.contains(capability), "{capability} went missing");
+        }
+        assert_eq!(without.len(), API_CAPABILITIES.len());
+        assert_eq!(with.len(), API_CAPABILITIES.len() + 1);
+
+        // Spawning is not collaboration. It runs on tmux -- `start_agent` there
+        // types the command and waits for the pane to show the agent -- so it
+        // stays in the static list and a tmux-only gateway still offers it.
+        assert!(without.contains(&"agent_spawn"));
     }
 
     #[test]

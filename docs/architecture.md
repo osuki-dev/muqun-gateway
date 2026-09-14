@@ -101,6 +101,36 @@ and `backends` metadata plus the `multiple_terminal_backends` capability expose
 the new abstraction to newer clients. Backend order is therefore compatibility
 state, not presentation-only state.
 
+## Capabilities
+
+`/health` answers two capability lists, and they are different claims.
+
+`capabilities` at the top level describes this *build*: the endpoint exists and
+its code is compiled in. Every entry is unconditional and stays true for as long
+as the process runs, so a client may read it once. Adding a conditional entry
+here would make the whole list something a client has to re-check.
+
+`backends[].capabilities` describes one *session*, and carries what the build
+can do only where the terminal on the other side can do it too. It is always
+present, empty included: a client that finds the key knows this gateway answers
+per session; a client that does not is talking to a gateway that predates the
+field.
+
+One capability is currently session-scoped. `agent_collaboration` requires the
+session's backend to be a connected Herdr 0.9.0 or newer, because an assignment
+binds to an opaque agent instance id and only Herdr, from that release, has one.
+`TmuxBackend::start_agent` returns no instance id, and a pane id is not a
+substitute -- panes are reused, so a task bound to one can reach whoever took the
+pane over. tmux sessions keep every other capability, including `agent_spawn`,
+which runs on both backends.
+
+The top-level list carries `agent_collaboration` when *any* configured session
+qualifies. That is the weaker claim on purpose -- "somewhere on this machine",
+not "on the session you are looking at" -- and it exists for apps too old to read
+the per-session list. A newer app should read `backends[].capabilities` for the
+session it has chosen, and distinguish "this Gateway cannot" from "this Herdr
+cannot" so the upgrade it names is the one that would help.
+
 The Manager is a gateway UI. It edits the shared backend registry and lifecycle
 configuration; it does not belong to Herdr or tmux and never owns or terminates
 their terminal sessions. Configuration changes require an explicit gateway

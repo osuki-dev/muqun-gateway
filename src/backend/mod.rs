@@ -13,6 +13,7 @@ mod tmux_wire;
 pub mod compat;
 
 pub use herdr::HerdrBackend;
+pub use model::version_at_least;
 pub use model::{
     Agent, AgentStatus, BackendActivity, BackendActivityStream, BackendError, BackendFuture,
     BackendKind, BackendMetadata, CreateTab, CreateWorkspace, OutputFormat, OutputSource, Pane,
