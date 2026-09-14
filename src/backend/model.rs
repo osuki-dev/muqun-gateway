@@ -79,6 +79,11 @@ impl BackendKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendMetadata {
+    /// None means unavailable/unknown, an empty list means no eligible profile.
+    pub bound_agent_kinds: Option<Vec<String>>,
+    /// Optional session capabilities established by this adapter.
+    /// These do not imply atomic instance-bound delivery.
+    pub capabilities: Vec<&'static str>,
     pub kind: BackendKind,
     pub version: Option<String>,
     pub protocol: Option<u64>,
@@ -201,6 +206,9 @@ pub struct Pane {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Agent {
+    /// Immutable native process generation, only for bound submission backends.
+    /// Legacy instance ids and launch aliases must never populate this field.
+    pub launch_id: Option<String>,
     /// Opaque identity of this process/conversation, never a reusable pane id.
     pub instance_id: Option<String>,
     pub target: String,
@@ -223,12 +231,62 @@ pub struct StartAgent {
     pub timeout_ms: u64,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReportingMcp {
+    pub executable: String,
+    pub sha256: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartedAgent {
+    pub owner_epoch: Option<String>,
+    pub launch_id: Option<String>,
     /// A launch-scoped target when the backend can provide one.
     pub target: Option<String>,
     pub instance_id: Option<String>,
     pub argv: Option<Vec<String>>,
+}
+
+/// Submit only to the native process generation that owns this identifier.
+/// The backend must enforce it through queued input and delayed submission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundPrompt {
+    pub expected_launch_id: String,
+    pub operation_id: String,
+    pub text: String,
+}
+
+/// Native submission acknowledgement, not evidence of task completion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundPromptReceipt {
+    pub operation_id: String,
+    pub launch_id: String,
+}
+
+/// One cancellation key addressed to an immutable native owner, without a pane fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundInterrupt {
+    pub operation_id: String,
+    pub expected_launch_id: String,
+    pub expected_owner_epoch: String,
+}
+
+/// Validated key-write evidence, never evidence of cancellation or process exit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundInterruptReceipt {
+    pub operation_id: String,
+    pub launch_id: String,
+    pub owner_epoch: String,
+    pub receipt_id: String,
+    pub key: String,
+    pub bytes_written: u64,
+    pub input_disposition: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoundLifecycle {
+    Live,
+    Exited { receipt_id: String },
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -342,6 +400,12 @@ pub struct SplitPane {
 
 #[derive(Debug)]
 pub enum BackendError {
+    StartNotStarted {
+        code: Option<String>,
+        operation_id: String,
+        owner_epoch: String,
+        receipt_id: String,
+    },
     Unavailable,
     Unsupported(&'static str),
     InvalidResponse(&'static str),
@@ -355,6 +419,9 @@ pub enum BackendError {
 impl fmt::Display for BackendError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::StartNotStarted { .. } => {
+                formatter.write_str("native startup refused before process creation")
+            }
             Self::Unavailable => formatter.write_str("terminal backend is unavailable"),
             Self::Unsupported(capability) => {
                 write!(formatter, "terminal backend does not support {capability}")
@@ -441,12 +508,48 @@ pub trait TerminalBackend: Send + Sync {
     fn send_keys<'a>(&'a self, id: &'a PaneId, keys: &'a [String]) -> BackendFuture<'a, ()>;
     fn focus_agent<'a>(&'a self, target: &'a str) -> BackendFuture<'a, ()>;
     fn prompt_agent<'a>(&'a self, target: &'a str, text: &'a str) -> BackendFuture<'a, ()>;
+    /// Read-only readiness/identity check; the eventual native submission still rechecks.
+    fn preflight_bound_prompt<'a>(&'a self, _launch_id: &'a str) -> BackendFuture<'a, ()> {
+        Box::pin(async { Err(BackendError::Unsupported("instance_bound_prompt")) })
+    }
+    /// Optional atomic launch-bound submission. Never fall back to pane writes
+    /// or lookup-then-send when this operation is unsupported.
+    fn prompt_bound_agent<'a>(
+        &'a self,
+        _request: &'a BoundPrompt,
+    ) -> BackendFuture<'a, BoundPromptReceipt> {
+        Box::pin(async { Err(BackendError::Unsupported("instance_bound_prompt")) })
+    }
+    fn interrupt_bound_agent<'a>(
+        &'a self,
+        _request: &'a BoundInterrupt,
+    ) -> BackendFuture<'a, BoundInterruptReceipt> {
+        Box::pin(async { Err(BackendError::Unsupported("instance_bound_interrupt")) })
+    }
     /// A backend decides whether its prompt operation needs the legacy Enter
     /// workaround. On errors callers must not send blind follow-up keys.
     fn needs_submit_keypress(&self) -> BackendFuture<'_, bool> {
         Box::pin(async { Ok(true) })
     }
+    /// Direct native startup with a backend-owned immutable launch generation.
+    /// Prompt capability alone is not evidence that shell-based startup is safe.
+    fn start_bound_agent<'a>(
+        &'a self,
+        _request: &'a StartAgent,
+        _operation_id: &'a str,
+        _work_context_file: Option<&'a str>,
+        _reporting_mcp: Option<&'a ReportingMcp>,
+    ) -> BackendFuture<'a, StartedAgent> {
+        Box::pin(async { Err(BackendError::Unsupported("instance_bound_start")) })
+    }
     fn start_agent<'a>(&'a self, request: &'a StartAgent) -> BackendFuture<'a, StartedAgent>;
+    fn lifecycle_bound<'a>(
+        &'a self,
+        _launch_id: &'a str,
+        _owner_epoch: &'a str,
+    ) -> BackendFuture<'a, BoundLifecycle> {
+        Box::pin(async { Ok(BoundLifecycle::Unknown) })
+    }
     fn list_worktrees<'a>(&'a self, _cwd: &'a PathBuf) -> BackendFuture<'a, Vec<Worktree>> {
         Box::pin(async { Err(BackendError::Unsupported("worktrees")) })
     }
@@ -523,6 +626,44 @@ pub trait TerminalBackend: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn tmux_backends_refuse_bound_prompts_without_native_input() {
+        let missing_socket = std::env::temp_dir().join(format!(
+            "muqun-bound-refusal-{}.sock",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let backends: Vec<Box<dyn TerminalBackend>> = vec![
+            Box::new(crate::backend::TmuxBackend::new(Some(
+                missing_socket.clone(),
+            ))),
+            Box::new(crate::backend::TmuxWireIds::new(Box::new(
+                crate::backend::TmuxBackend::new(Some(missing_socket.clone())),
+            ))),
+        ];
+        let request = BoundPrompt {
+            expected_launch_id: "immutable-generation".into(),
+            operation_id: "operation-1".into(),
+            text: "must never reach a terminal".into(),
+        };
+        for backend in backends {
+            assert!(matches!(
+                backend.prompt_bound_agent(&request).await,
+                Err(BackendError::Unsupported("instance_bound_prompt"))
+            ));
+            assert!(matches!(
+                backend
+                    .interrupt_bound_agent(&BoundInterrupt {
+                        operation_id: "interrupt".into(),
+                        expected_launch_id: "launch".into(),
+                        expected_owner_epoch: "owner".into(),
+                    })
+                    .await,
+                Err(BackendError::Unsupported("instance_bound_interrupt"))
+            ));
+        }
+        assert!(!missing_socket.exists());
+    }
 
     #[test]
     fn backend_kind_defaults_to_herdr_for_old_configs() {

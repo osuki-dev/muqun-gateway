@@ -13,13 +13,13 @@ mod tmux_wire;
 pub mod compat;
 
 pub use herdr::HerdrBackend;
-pub use model::version_at_least;
 pub use model::{
     Agent, AgentStatus, BackendActivity, BackendActivityStream, BackendError, BackendFuture,
-    BackendKind, BackendMetadata, CreateTab, CreateWorkspace, OutputFormat, OutputSource, Pane,
-    PaneId, PaneOutput, PaneRange, ReadPane, SendTextMode, SplitDirection, SplitPane, StartAgent,
-    StartedAgent, Tab, TabId, TerminalBackend, Workspace, WorkspaceId, Worktree, WorktreePlacement,
-    WorktreeRequest,
+    BackendKind, BackendMetadata, BoundInterrupt, BoundInterruptReceipt, BoundLifecycle,
+    BoundPrompt, BoundPromptReceipt, CreateTab, CreateWorkspace, OutputFormat, OutputSource, Pane,
+    PaneId, PaneOutput, PaneRange, ReadPane, ReportingMcp, SendTextMode, SplitDirection, SplitPane,
+    StartAgent, StartedAgent, Tab, TabId, TerminalBackend, Workspace, WorkspaceId, Worktree,
+    WorktreePlacement, WorktreeRequest,
 };
 pub use registry::BackendRegistry;
 pub use tmux::{TmuxBackend, TMUX_PROGRAM};

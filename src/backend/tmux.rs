@@ -421,7 +421,9 @@ impl TerminalBackend for TmuxBackend {
         Box::pin(async move {
             let version = self.output(["-V"]).await?;
             Ok(BackendMetadata {
+                bound_agent_kinds: None,
                 kind: BackendKind::Tmux,
+                capabilities: Vec::new(),
                 version: Some(
                     version
                         .trim()
@@ -1070,6 +1072,8 @@ impl TerminalBackend for TmuxBackend {
                         || current.foreground_command.as_deref() == Some(executable_name);
                     if recognized {
                         return Ok(StartedAgent {
+                            owner_epoch: None,
+                            launch_id: None,
                             target: None,
                             argv: Some(argv),
                             instance_id: None,
@@ -1151,6 +1155,7 @@ fn pane_from_fields(fields: Vec<String>) -> Result<Pane, BackendError> {
 fn agent_from_pane(pane: Pane) -> Option<Agent> {
     let kind = pane.agent.clone()?;
     Some(Agent {
+        launch_id: None,
         instance_id: None,
         target: pane.id.as_str().to_owned(),
         pane_id: pane.id,
@@ -1294,17 +1299,51 @@ fn tmux_key(value: &str) -> Result<String, BackendError> {
         "down" | "arrowdown" => "Down".to_owned(),
         "left" | "arrowleft" => "Left".to_owned(),
         "right" | "arrowright" => "Right".to_owned(),
-        _ if lower.starts_with("ctrl+") && lower.len() == 6 => {
-            let key = lower.as_bytes()[5] as char;
-            if !key.is_ascii_alphabetic() {
-                return Err(BackendError::InvalidResponse("key name"));
-            }
-            format!("C-{key}")
-        }
+        _ if lower.contains('+') && lower.len() > 1 => tmux_modified_key(&lower)?,
         _ if value.chars().count() == 1 && !value.chars().any(char::is_control) => value.to_owned(),
         _ => return Err(BackendError::InvalidResponse("key name")),
     };
     Ok(mapped)
+}
+
+fn tmux_modified_key(value: &str) -> Result<String, BackendError> {
+    let invalid = || BackendError::InvalidResponse("key name");
+    let mut parts = value.rsplitn(2, '+');
+    let base = parts.next().ok_or_else(invalid)?;
+    let modifiers = parts.next().ok_or_else(invalid)?;
+    let mut mask = 0u8;
+    for modifier in modifiers.split('+') {
+        let flag = match modifier {
+            "ctrl" => 1,
+            "alt" => 2,
+            "shift" => 4,
+            _ => return Err(invalid()),
+        };
+        if mask & flag != 0 {
+            return Err(invalid());
+        }
+        mask |= flag;
+    }
+    let key = match base {
+        "up" | "arrowup" => "Up",
+        "down" | "arrowdown" => "Down",
+        "left" | "arrowleft" => "Left",
+        "right" | "arrowright" => "Right",
+        "space" => "Space",
+        letter if letter.len() == 1 && letter.as_bytes()[0].is_ascii_alphabetic() => letter,
+        _ => return Err(invalid()),
+    };
+    // Preserve modifier intent in tmux's key vocabulary. Its negotiated
+    // terminal mode decides the byte encoding; never collapse Shift+Ctrl to
+    // a control byte or pass unknown names through as literal input.
+    let mut result = String::new();
+    for (flag, prefix) in [(1, "C-"), (2, "M-"), (4, "S-")] {
+        if mask & flag != 0 {
+            result.push_str(prefix);
+        }
+    }
+    result.push_str(key);
+    Ok(result)
 }
 
 fn parse_rows(
@@ -1763,6 +1802,36 @@ mod tests {
         // Still refused, rather than guessed at from the `shift+` prefix.
         assert!(tmux_key("shift+enter").is_err());
         assert!(tmux_key("shift+f5").is_err());
+    }
+
+    #[test]
+    fn modifier_chords_keep_their_exact_tmux_key_intent() {
+        for (input, expected) in [
+            ("Alt+ArrowLeft", "M-Left"),
+            ("ctrl+shift+ArrowRight", "C-S-Right"),
+            ("Shift+Alt+Ctrl+ArrowUp", "C-M-S-Up"),
+            ("ctrl+space", "C-Space"),
+            ("Ctrl+Shift+A", "C-S-a"),
+            ("Alt+Shift+Ctrl+z", "C-M-S-z"),
+            ("shift+down", "S-Down"),
+            ("alt+x", "M-x"),
+        ] {
+            assert_eq!(tmux_key(input).unwrap(), expected, "{input}");
+        }
+        for rejected in [
+            "ctrl+ctrl+a",
+            "alt++left",
+            "ctrl+",
+            "+left",
+            "meta+up",
+            "ctrl+shift+enter",
+            "alt+-t",
+            "ctrl+;",
+            "alt+left;kill-server",
+        ] {
+            assert!(tmux_key(rejected).is_err(), "{rejected}");
+        }
+        assert_eq!(tmux_key("+").unwrap(), "+");
     }
 
     #[test]

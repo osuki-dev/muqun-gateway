@@ -38,10 +38,10 @@ use tokio::net::UnixStream;
 
 use super::{
     Agent, AgentStatus, BackendActivity, BackendActivityStream, BackendError, BackendFuture,
-    BackendKind, BackendMetadata, CreateTab, CreateWorkspace, OutputFormat, OutputSource, Pane,
-    PaneId, PaneOutput, ReadPane, SendTextMode, SplitDirection, SplitPane, StartAgent,
-    StartedAgent, Tab, TabId, TerminalBackend, Workspace, WorkspaceId, Worktree, WorktreePlacement,
-    WorktreeRequest,
+    BackendKind, BackendMetadata, BoundInterrupt, BoundInterruptReceipt, BoundPrompt,
+    BoundPromptReceipt, CreateTab, CreateWorkspace, OutputFormat, OutputSource, Pane, PaneId,
+    PaneOutput, ReadPane, SendTextMode, SplitDirection, SplitPane, StartAgent, StartedAgent, Tab,
+    TabId, TerminalBackend, Workspace, WorkspaceId, Worktree, WorktreePlacement, WorktreeRequest,
 };
 
 /// How long one herdr request may take, end to end.
@@ -142,6 +142,31 @@ impl HerdrBackend {
         }
     }
 
+    async fn wait_bound_ready(&self, launch_id: &str) -> Result<(), BackendError> {
+        tokio::time::timeout(self.request_timeout, async {
+            loop {
+                let response = self
+                    .request(
+                        "agent.get_bound",
+                        json!({ "expected_launch_id": launch_id }),
+                    )
+                    .await
+                    .map_err(bound_error)?;
+                if bound_agent_ready(&response, launch_id)? {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            startup_refusal(
+                "agent_not_ready",
+                "assistant did not become ready before the deadline",
+            )
+        })?
+    }
+
     async fn request(&self, method: &str, params: Value) -> Result<Value, BackendError> {
         let response = self
             .request_transport(method, params)
@@ -211,12 +236,323 @@ impl HerdrBackend {
     }
 }
 
+/// Legacy collaboration eligibility belongs to the adapter interpreting ping.
+/// This does not advertise atomic instance-bound prompt delivery.
+fn collaboration_capabilities(version: Option<&str>) -> Vec<&'static str> {
+    if super::model::version_at_least(version, (0, 9, 0)) {
+        vec!["agent_collaboration"]
+    } else {
+        Vec::new()
+    }
+}
+
+fn metadata_capabilities(response: &Value) -> Vec<&'static str> {
+    let mut capabilities =
+        collaboration_capabilities(response.pointer("/result/version").and_then(Value::as_str));
+    // Interruption is independent of prompt readiness and screen observation.
+    let native = &response["result"]["capabilities"];
+    if native["agent_interrupt_bound"].as_bool() == Some(true)
+        && native["agent_lifecycle_bound"].as_bool() == Some(true)
+        && bound_identity(&native["owner_epoch"]).is_ok()
+    {
+        capabilities.push("instance_bound_interrupt");
+    }
+    // Managed delivery needs identity-scoped readiness and a snapshot for the
+    // shared approval detector as well as the corresponding mutation method.
+    if response
+        .pointer("/result/capabilities/agent_get_bound")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        return capabilities;
+    }
+    for (native, capability) in [
+        ("agent_start_bound", "instance_bound_start"),
+        ("agent_prompt_bound", "instance_bound_prompt"),
+        ("agent_lifecycle_bound", "instance_bound_lifecycle"),
+    ] {
+        if response
+            .pointer("/result/capabilities")
+            .and_then(|value| value.get(native))
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            if native == "agent_lifecycle_bound"
+                && bound_identity(&response["result"]["capabilities"]["owner_epoch"]).is_err()
+            {
+                continue;
+            }
+            capabilities.push(capability);
+        }
+    }
+    if native["agent_reporting_mcp_codex"].as_bool() == Some(true)
+        && capabilities.contains(&"instance_bound_start")
+        && capabilities.contains(&"instance_bound_lifecycle")
+    {
+        capabilities.push("reporting_mcp_codex");
+    }
+    capabilities
+}
+
+fn metadata_bound_agent_kinds(response: &Value) -> Option<Vec<String>> {
+    if !metadata_capabilities(response).contains(&"instance_bound_start") {
+        return None;
+    }
+    let values = response
+        .pointer("/result/capabilities/bound_agent_kinds")?
+        .as_array()?;
+    if values.len() > 64 {
+        return None;
+    }
+    let mut kinds = Vec::with_capacity(values.len());
+    for value in values {
+        let kind = value.as_str()?;
+        if kind.is_empty()
+            || kind.len() > 64
+            || !kind
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_'))
+            || kinds.iter().any(|item| item == kind)
+        {
+            return None;
+        }
+        kinds.push(kind.to_owned());
+    }
+    Some(kinds)
+}
+
+fn bound_agent_ready(response: &Value, expected_launch_id: &str) -> Result<bool, BackendError> {
+    let result = &response["result"];
+    if result["type"] != "agent_bound_info" {
+        return Err(BackendError::InvalidResponse("bound agent status"));
+    }
+    if result["launch_id"].as_str() != Some(expected_launch_id) {
+        return Err(startup_refusal(
+            "instance_changed",
+            "assistant launch has changed",
+        ));
+    }
+    let visible = result["visible_text"]
+        .as_str()
+        .filter(|text| text.len() <= 512 * 1024)
+        .ok_or(BackendError::InvalidResponse(
+            "bound agent visible snapshot",
+        ))?;
+    let agent = &result["agent"];
+    if agent["agent_status"] == "blocked" || crate::approvals::detect(visible).is_some() {
+        return Err(startup_refusal(
+            "agent_blocked",
+            "assistant requires interactive approval before receiving a prompt",
+        ));
+    }
+    Ok(
+        matches!(agent["agent_status"].as_str(), Some("idle" | "done"))
+            && agent["interactive_ready"].as_bool() == Some(true)
+            && agent["launch_pending"].as_bool() != Some(true),
+    )
+}
+
+fn bound_error(error: BackendError) -> BackendError {
+    match error {
+        // Only documented zero-write refusals may invite a later explicit
+        // attempt. Unknown failures and partial writes remain unconfirmed.
+        BackendError::Refused {
+            code: Some(code),
+            message,
+        } if matches!(
+            code.as_str(),
+            "instance_changed" | "agent_not_ready" | "agent_blocked" | "unsupported_agent_kind"
+        ) =>
+        {
+            BackendError::Refused {
+                code: Some(code),
+                message,
+            }
+        }
+        BackendError::Refused { .. } => BackendError::Unavailable,
+        other => other,
+    }
+}
+
+fn bound_identity(value: &Value) -> Result<&str, BackendError> {
+    value
+        .as_str()
+        .filter(|id| !id.is_empty() && id.len() <= 256 && !id.chars().any(char::is_control))
+        .ok_or(BackendError::InvalidResponse("bound agent identity"))
+}
+fn lifecycle_receipt(
+    response: &Value,
+    launch_id: &str,
+    owner_epoch: &str,
+) -> Result<super::BoundLifecycle, BackendError> {
+    let result = &response["result"];
+    if result["type"] != "agent_bound_lifecycle"
+        || result["launch_id"] != launch_id
+        || result["owner_epoch"] != owner_epoch
+    {
+        return Ok(super::BoundLifecycle::Unknown);
+    }
+    match result["state"].as_str() {
+        Some("live") => Ok(super::BoundLifecycle::Live),
+        Some("exited") => Ok(super::BoundLifecycle::Exited {
+            receipt_id: bound_identity(&result["receipt_id"])?.into(),
+        }),
+        _ => Ok(super::BoundLifecycle::Unknown),
+    }
+}
+
+fn started_bound_agent(
+    response: &Value,
+    request: &StartAgent,
+    operation_id: &str,
+) -> Result<StartedAgent, BackendError> {
+    let result = &response["result"];
+    if result["type"] != "agent_started_bound" || result["operation_id"] != operation_id {
+        return Err(BackendError::InvalidResponse(
+            "bound agent start acknowledgement",
+        ));
+    }
+    let launch_id = bound_identity(&result["launch_id"])?;
+    let agent = agent_from_json(&result["agent"])?;
+    // Direct creation precedes runtime agent detection. The immutable receipt
+    // declares the requested profile independently of observed pane metadata.
+    let declared_kind = result.get("agent_kind").map(bound_identity).transpose()?;
+    let profile_matches = match declared_kind {
+        Some(kind) => kind == request.kind,
+        None => {
+            result.get("owner_epoch").is_none()
+                && agent.kind.as_deref() == Some(request.kind.as_str())
+        }
+    };
+    if agent.pane_id != request.pane_id
+        || !profile_matches
+        || agent
+            .kind
+            .as_deref()
+            .is_some_and(|kind| kind != request.kind)
+    {
+        return Err(BackendError::InvalidResponse(
+            "bound agent start destination",
+        ));
+    }
+    let argv = result["argv"]
+        .as_array()
+        .filter(|argv| !argv.is_empty())
+        .ok_or(BackendError::InvalidResponse("bound agent argv"))?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .ok_or(BackendError::InvalidResponse("bound agent argv"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut expected_argv = vec![request
+        .executable
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| request.command.clone())];
+    expected_argv.extend(request.args.iter().cloned());
+    if argv != expected_argv {
+        return Err(BackendError::InvalidResponse(
+            "bound agent launched command",
+        ));
+    }
+    Ok(StartedAgent {
+        owner_epoch: result
+            .get("owner_epoch")
+            .map(bound_identity)
+            .transpose()?
+            .map(str::to_owned),
+        launch_id: Some(launch_id.to_owned()),
+        target: Some(agent.target),
+        instance_id: agent.instance_id,
+        argv: Some(argv),
+    })
+}
+
+fn bound_prompt_receipt(
+    response: &Value,
+    request: &BoundPrompt,
+) -> Result<BoundPromptReceipt, BackendError> {
+    let result = &response["result"];
+    if result["type"] != "agent_prompted_bound"
+        || result["operation_id"] != request.operation_id
+        || result["launch_id"] != request.expected_launch_id
+        || result["input_disposition"] != "written"
+        || result["bytes_written"].as_u64() != Some(request.text.len() as u64)
+    {
+        return Err(BackendError::InvalidResponse(
+            "bound prompt acknowledgement",
+        ));
+    }
+    Ok(BoundPromptReceipt {
+        operation_id: request.operation_id.clone(),
+        launch_id: request.expected_launch_id.clone(),
+    })
+}
+
+fn interrupt_error(error: BackendError) -> BackendError {
+    match error {
+        BackendError::Refused {
+            code: Some(code),
+            message,
+        } if matches!(
+            code.as_str(),
+            "instance_changed"
+                | "unsupported"
+                | "invalid_request"
+                | "request_key_conflict"
+                | "resource_limit"
+                | "agent_not_ready"
+        ) =>
+        {
+            BackendError::Refused {
+                code: Some(code),
+                message,
+            }
+        }
+        BackendError::Refused { .. } => BackendError::Unavailable,
+        other => other,
+    }
+}
+
+fn bound_interrupt_receipt(
+    response: &Value,
+    request: &BoundInterrupt,
+) -> Result<BoundInterruptReceipt, BackendError> {
+    let result = &response["result"];
+    if result["type"] != "agent_interrupted_bound"
+        || result["operation_id"] != request.operation_id
+        || result["launch_id"] != request.expected_launch_id
+        || result["owner_epoch"] != request.expected_owner_epoch
+        || result["key"] != "Escape"
+        || result["bytes_written"].as_u64() != Some(1)
+        || result["input_disposition"] != "written"
+    {
+        return Err(BackendError::InvalidResponse(
+            "bound interruption acknowledgement",
+        ));
+    }
+    Ok(BoundInterruptReceipt {
+        operation_id: request.operation_id.clone(),
+        launch_id: request.expected_launch_id.clone(),
+        owner_epoch: request.expected_owner_epoch.clone(),
+        receipt_id: bound_identity(&result["receipt_id"])?.into(),
+        key: "Escape".into(),
+        bytes_written: 1,
+        input_disposition: "written".into(),
+    })
+}
+
 impl TerminalBackend for HerdrBackend {
     fn metadata(&self) -> BackendFuture<'_, BackendMetadata> {
         Box::pin(async move {
             let response = self.request("ping", json!({})).await?;
             Ok(BackendMetadata {
+                bound_agent_kinds: metadata_bound_agent_kinds(&response),
                 kind: BackendKind::Herdr,
+                capabilities: metadata_capabilities(&response),
                 version: response
                     .pointer("/result/version")
                     .and_then(Value::as_str)
@@ -601,6 +937,179 @@ impl TerminalBackend for HerdrBackend {
         self.command("agent.prompt", json!({ "target": target, "text": text }))
     }
 
+    fn start_bound_agent<'a>(
+        &'a self,
+        request: &'a StartAgent,
+        operation_id: &'a str,
+        work_context_file: Option<&'a str>,
+        reporting_mcp: Option<&'a super::ReportingMcp>,
+    ) -> BackendFuture<'a, StartedAgent> {
+        Box::pin(async move {
+            let discovery = self.request("ping", json!({})).await?;
+            if !metadata_capabilities(&discovery).contains(&"instance_bound_start") {
+                return Err(BackendError::Unsupported("instance_bound_start"));
+            }
+            if reporting_mcp.is_some()
+                && (request.kind != "codex"
+                    || work_context_file.is_none()
+                    || !metadata_capabilities(&discovery).contains(&"reporting_mcp_codex"))
+            {
+                return Err(BackendError::Unsupported("reporting_mcp_codex"));
+            }
+            let expected_epoch = if discovery
+                .pointer("/result/capabilities/agent_lifecycle_bound")
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                Some(
+                    bound_identity(&discovery["result"]["capabilities"]["owner_epoch"])?.to_owned(),
+                )
+            } else {
+                None
+            };
+            let response = self.request_transport("agent.start_bound", json!({
+                "operation_id": operation_id, "pane_id": request.pane_id.as_str(), "kind": request.kind,
+                "command": request.executable.as_ref().map(|path| path.to_string_lossy().into_owned()).unwrap_or_else(|| request.command.clone()),
+                "args": request.args, "timeout_ms": request.timeout_ms,
+                "work_context_file": work_context_file,
+                "reporting_mcp": reporting_mcp,
+            })).await.map_err(|_| BackendError::Unavailable)?;
+            if response.get("error").is_some() {
+                if let Some(epoch) = expected_epoch.as_deref() {
+                    let receipt = &response["start_receipt"];
+                    if receipt["effect"] == "not_started"
+                        && receipt["operation_id"] == operation_id
+                        && receipt["owner_epoch"] == epoch
+                    {
+                        return Err(BackendError::StartNotStarted {
+                            code: response["error"]["code"]
+                                .as_str()
+                                .filter(|code| code.len() <= 128)
+                                .map(str::to_owned),
+                            operation_id: operation_id.into(),
+                            owner_epoch: epoch.into(),
+                            receipt_id: bound_identity(&receipt["receipt_id"])?.into(),
+                        });
+                    }
+                }
+                // Generic refusal after claiming native dispatch proves no lifecycle fact.
+                return Err(BackendError::InvalidResponse(
+                    "unproven native startup refusal",
+                ));
+            }
+            if reporting_mcp.is_some() && response["result"]["reporting_mcp"] != "codex_stdio_v1" {
+                return Err(BackendError::InvalidResponse(
+                    "native reporting configuration receipt",
+                ));
+            }
+            let started = started_bound_agent(&response, request, operation_id)?;
+            if expected_epoch.is_some() && started.owner_epoch != expected_epoch {
+                return Err(BackendError::InvalidResponse("native startup owner epoch"));
+            }
+            Ok(started)
+        })
+    }
+    fn lifecycle_bound<'a>(
+        &'a self,
+        launch_id: &'a str,
+        owner_epoch: &'a str,
+    ) -> BackendFuture<'a, super::BoundLifecycle> {
+        Box::pin(async move {
+            if !self
+                .metadata()
+                .await?
+                .capabilities
+                .contains(&"instance_bound_lifecycle")
+            {
+                return Ok(super::BoundLifecycle::Unknown);
+            }
+            let response = self
+                .request(
+                    "agent.lifecycle_bound",
+                    json!({"expected_launch_id":launch_id,"expected_owner_epoch":owner_epoch}),
+                )
+                .await?;
+            lifecycle_receipt(&response, launch_id, owner_epoch)
+        })
+    }
+
+    fn interrupt_bound_agent<'a>(
+        &'a self,
+        request: &'a BoundInterrupt,
+    ) -> BackendFuture<'a, BoundInterruptReceipt> {
+        Box::pin(async move {
+            if [
+                &request.operation_id,
+                &request.expected_launch_id,
+                &request.expected_owner_epoch,
+            ]
+            .iter()
+            .any(|id| id.is_empty() || id.len() > 128 || id.chars().any(char::is_control))
+            {
+                return Err(startup_refusal(
+                    "invalid_request",
+                    "invalid bound interruption identity",
+                ));
+            }
+            if !self
+                .metadata()
+                .await?
+                .capabilities
+                .contains(&"instance_bound_interrupt")
+            {
+                return Err(BackendError::Unsupported("instance_bound_interrupt"));
+            }
+            // No idle wait, mutable pane lookup, key fallback or retry: native
+            // admission owns the exact epoch/launch comparison and one write.
+            let response = self
+                .request(
+                    "agent.interrupt_bound",
+                    json!({
+                        "operation_id": request.operation_id,
+                        "expected_launch_id": request.expected_launch_id,
+                        "expected_owner_epoch": request.expected_owner_epoch,
+                    }),
+                )
+                .await
+                .map_err(interrupt_error)?;
+            bound_interrupt_receipt(&response, request)
+        })
+    }
+
+    fn prompt_bound_agent<'a>(
+        &'a self,
+        request: &'a BoundPrompt,
+    ) -> BackendFuture<'a, BoundPromptReceipt> {
+        Box::pin(async move {
+            if !self
+                .metadata()
+                .await?
+                .capabilities
+                .contains(&"instance_bound_prompt")
+            {
+                return Err(BackendError::Unsupported("instance_bound_prompt"));
+            }
+            self.wait_bound_ready(&request.expected_launch_id).await?;
+            let response = self.request("agent.prompt_bound", json!({
+                "operation_id": request.operation_id, "expected_launch_id": request.expected_launch_id, "text": request.text,
+            })).await.map_err(bound_error)?;
+            bound_prompt_receipt(&response, request)
+        })
+    }
+    fn preflight_bound_prompt<'a>(&'a self, launch_id: &'a str) -> BackendFuture<'a, ()> {
+        Box::pin(async move {
+            if !self
+                .metadata()
+                .await?
+                .capabilities
+                .contains(&"instance_bound_prompt")
+            {
+                return Err(BackendError::Unsupported("instance_bound_prompt"));
+            }
+            self.wait_bound_ready(launch_id).await
+        })
+    }
+
     fn needs_submit_keypress(&self) -> BackendFuture<'_, bool> {
         Box::pin(async move {
             let metadata = self.metadata().await?;
@@ -679,6 +1188,8 @@ impl TerminalBackend for HerdrBackend {
                         .collect()
                 });
             Ok(StartedAgent {
+                owner_epoch: None,
+                launch_id: None,
                 argv,
                 instance_id,
                 target: Some(name),
@@ -1159,6 +1670,12 @@ fn pane_from_json(value: &Value) -> Result<Pane, BackendError> {
 }
 
 fn agent_instance_id(value: &Value) -> Option<String> {
+    // A present bound identity must validate as a pair; malformed native
+    // evidence never falls back to a reusable alias or conversation.
+    if value.get("launch_id").is_some_and(|id| !id.is_null()) {
+        bound_identity(&value["owner_epoch"]).ok()?;
+        return bound_identity(&value["launch_id"]).ok().map(str::to_owned);
+    }
     let terminal = value.get("terminal_id")?.as_str()?;
     if terminal.is_empty() {
         return None;
@@ -1185,7 +1702,14 @@ fn agent_instance_id(value: &Value) -> Option<String> {
 
 fn agent_from_json(value: &Value) -> Result<Agent, BackendError> {
     let pane_id = required_string(value, "pane_id", "agent")?;
+    let launch_id = if value.get("launch_id").is_some_and(|id| !id.is_null()) {
+        bound_identity(&value["owner_epoch"])?;
+        Some(bound_identity(&value["launch_id"])?.to_owned())
+    } else {
+        None
+    };
     Ok(Agent {
+        launch_id,
         instance_id: agent_instance_id(value),
         target: value
             .get("target")
@@ -1348,6 +1872,245 @@ fn required_string<'a>(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn created_only_launch_receipt_preserves_identity_without_claiming_readiness() {
+        let request = StartAgent {
+            pane_id: PaneId::new("w2:p1"),
+            kind: "codex".into(),
+            command: "/fixture/codex".into(),
+            executable: None,
+            args: vec![],
+            timeout_ms: 5000,
+        };
+        // Shape captured from the real native socket immediately after spawn;
+        // declared agent_kind is the additive immutable receipt contract.
+        let captured = json!({"result":{"type":"agent_started_bound","agent_kind":"codex","owner_epoch":"owner-fixture","operation_id":"fixture-start","launch_id":"launch-fixture","argv":["/fixture/codex"],"agent":{"terminal_id":"term-fixture","name":"bound-fixture","agent_status":"unknown","workspace_id":"w2","tab_id":"w2:t1","pane_id":"w2:p1","focused":true,"launch_pending":true,"state_change_seq":0,"cwd":"/fixture","foreground_cwd":"/fixture","revision":0}}});
+        let started = started_bound_agent(&captured, &request, "fixture-start").unwrap();
+        assert_eq!(started.launch_id.as_deref(), Some("launch-fixture"));
+        assert_eq!(started.owner_epoch.as_deref(), Some("owner-fixture"));
+        let readiness = json!({"result":{"type":"agent_bound_info","launch_id":"launch-fixture","visible_text":"","agent":captured["result"]["agent"]}});
+        assert!(!bound_agent_ready(&readiness, "launch-fixture").unwrap());
+        let mut missing = captured.clone();
+        missing["result"]
+            .as_object_mut()
+            .unwrap()
+            .remove("agent_kind");
+        assert!(started_bound_agent(&missing, &request, "fixture-start").is_err());
+        let mut wrong_declared = captured.clone();
+        wrong_declared["result"]["agent_kind"] = json!("claude");
+        assert!(started_bound_agent(&wrong_declared, &request, "fixture-start").is_err());
+        let mut wrong_observed = captured;
+        wrong_observed["result"]["agent"]["agent"] = json!("claude");
+        assert!(started_bound_agent(&wrong_observed, &request, "fixture-start").is_err());
+    }
+    #[test]
+    fn lifecycle_requires_exact_epoch_and_reaped_receipt() {
+        let valid = serde_json::json!({"result":{"type":"agent_bound_lifecycle","launch_id":"generation","owner_epoch":"epoch","state":"exited","receipt_id":"reaped"}});
+        assert_eq!(
+            super::lifecycle_receipt(&valid, "generation", "epoch").unwrap(),
+            crate::backend::BoundLifecycle::Exited {
+                receipt_id: "reaped".into()
+            }
+        );
+        assert_eq!(
+            super::lifecycle_receipt(&valid, "generation", "old-epoch").unwrap(),
+            crate::backend::BoundLifecycle::Unknown
+        );
+        assert_eq!(
+            super::lifecycle_receipt(&valid, "other-generation", "epoch").unwrap(),
+            crate::backend::BoundLifecycle::Unknown
+        );
+        let mut missing = valid.clone();
+        missing["result"]
+            .as_object_mut()
+            .unwrap()
+            .remove("receipt_id");
+        assert!(super::lifecycle_receipt(&missing, "generation", "epoch").is_err());
+        let mut unavailable = valid;
+        unavailable["result"]["state"] = serde_json::json!("unknown");
+        assert_eq!(
+            super::lifecycle_receipt(&unavailable, "generation", "epoch").unwrap(),
+            crate::backend::BoundLifecycle::Unknown
+        );
+    }
+    #[test]
+    fn lifecycle_capability_requires_current_owner_evidence() {
+        let mut metadata = serde_json::json!({"result":{"capabilities":{"agent_get_bound":true,"agent_lifecycle_bound":true}}});
+        assert!(!super::metadata_capabilities(&metadata).contains(&"instance_bound_lifecycle"));
+        metadata["result"]["capabilities"]["owner_epoch"] = serde_json::json!("owner");
+        assert!(super::metadata_capabilities(&metadata).contains(&"instance_bound_lifecycle"));
+    }
+    #[test]
+    fn bound_capabilities_require_explicit_native_boolean_evidence() {
+        for response in [
+            json!({"result":{"version":"99.0.0"}}),
+            json!({"result":{"capabilities":{"agent_start_bound":"true","agent_prompt_bound":1}}}),
+            json!({"result":{"capabilities":{"agent_start_bound":false,"agent_prompt_bound":false}}}),
+            json!({"result":{"capabilities":{"agent_start_bound":true,"agent_prompt_bound":true}}}),
+        ] {
+            let capabilities = super::metadata_capabilities(&response);
+            assert!(!capabilities.contains(&"instance_bound_start"));
+            assert!(!capabilities.contains(&"instance_bound_prompt"));
+        }
+        assert_eq!(
+            super::metadata_capabilities(
+                &json!({"result":{"capabilities":{"agent_start_bound":true,"agent_prompt_bound":true,"agent_get_bound":true}}})
+            ),
+            vec!["instance_bound_start", "instance_bound_prompt"]
+        );
+    }
+
+    #[test]
+    fn bound_prompt_acknowledgements_match_operation_generation_and_utf8_bytes() {
+        let request = BoundPrompt {
+            operation_id: "op".into(),
+            expected_launch_id: "launch".into(),
+            text: "你好".into(),
+        };
+        let response = json!({"result":{"type":"agent_prompted_bound","operation_id":"op","launch_id":"launch","input_disposition":"written","bytes_written":6}});
+        assert_eq!(
+            bound_prompt_receipt(&response, &request).unwrap().launch_id,
+            "launch"
+        );
+        for (key, value) in [
+            ("operation_id", json!("other")),
+            ("launch_id", json!("replacement")),
+            ("input_disposition", json!("partial")),
+            ("bytes_written", json!(2)),
+            ("type", json!("agent_prompted")),
+        ] {
+            let mut invalid = response.clone();
+            invalid["result"][key] = value;
+            assert!(matches!(
+                bound_prompt_receipt(&invalid, &request),
+                Err(BackendError::InvalidResponse(_))
+            ));
+        }
+        assert!(matches!(
+            bound_error(startup_refusal("delivery_unconfirmed", "partial input")),
+            BackendError::Unavailable
+        ));
+        assert!(
+            matches!(bound_error(startup_refusal("instance_changed","replaced")),BackendError::Refused {code:Some(code),..} if code=="instance_changed")
+        );
+        assert!(matches!(
+            bound_error(startup_refusal("unknown_failure", "unknown outcome")),
+            BackendError::Unavailable
+        ));
+    }
+
+    #[test]
+    fn bound_unsupported_profile_is_a_definitive_prelaunch_refusal() {
+        let error = bound_error(startup_refusal(
+            "unsupported_agent_kind",
+            "Strict startup does not support this shell or script profile",
+        ));
+        assert!(
+            matches!(error, BackendError::Refused { code: Some(code), .. }
+            if code == "unsupported_agent_kind")
+        );
+        assert!(matches!(
+            bound_error(startup_refusal(
+                "unsupported_unknown",
+                "undocumented outcome"
+            )),
+            BackendError::Unavailable
+        ));
+    }
+
+    #[test]
+    fn bound_start_receipts_cannot_change_operation_or_pane() {
+        let request = StartAgent {
+            pane_id: PaneId::new("w1:p1"),
+            kind: "codex".into(),
+            command: "codex".into(),
+            executable: None,
+            args: vec![],
+            timeout_ms: 5000,
+        };
+        let response = json!({"result":{"type":"agent_started_bound","operation_id":"op","launch_id":"immutable","agent":{"pane_id":"w1:p1","agent":"codex"},"argv":["codex"]}});
+        assert_eq!(
+            started_bound_agent(&response, &request, "op")
+                .unwrap()
+                .launch_id
+                .as_deref(),
+            Some("immutable")
+        );
+        for (pointer, value) in [
+            ("/result/operation_id", json!("wrong")),
+            ("/result/launch_id", json!("")),
+            ("/result/agent/pane_id", json!("w2:p2")),
+            ("/result/agent/agent", json!("claude")),
+            ("/result/argv", json!([42])),
+        ] {
+            let mut invalid = response.clone();
+            *invalid.pointer_mut(pointer).unwrap() = value;
+            assert!(started_bound_agent(&invalid, &request, "op").is_err());
+        }
+    }
+    #[test]
+    fn collaboration_capability_requires_a_released_supported_version() {
+        for version in ["0.9.0", "v0.9.1", "0.10.0", "1.0.0", "0.9.0+build"] {
+            assert_eq!(
+                super::collaboration_capabilities(Some(version)),
+                vec!["agent_collaboration"]
+            );
+        }
+        for version in [
+            Some("0.8.9"),
+            Some("0.9.0-rc.1"),
+            Some("0.9"),
+            Some("x"),
+            None,
+        ] {
+            assert!(super::collaboration_capabilities(version).is_empty());
+        }
+    }
+    #[test]
+    fn managed_profile_discovery_distinguishes_empty_unknown_and_invalid() {
+        let mut response = json!({"result":{"capabilities":{"agent_start_bound":true,"agent_get_bound":true,"bound_agent_kinds":["codex","opencode"]}}});
+        assert_eq!(
+            metadata_bound_agent_kinds(&response),
+            Some(vec!["codex".into(), "opencode".into()])
+        );
+        response["result"]["capabilities"]["bound_agent_kinds"] = json!([]);
+        assert_eq!(metadata_bound_agent_kinds(&response), Some(vec![]));
+        for invalid in [
+            Value::Null,
+            json!("codex"),
+            json!(["codex", "codex"]),
+            json!(["/bin/sh"]),
+            json!([1]),
+        ] {
+            response["result"]["capabilities"]["bound_agent_kinds"] = invalid;
+            assert!(metadata_bound_agent_kinds(&response).is_none());
+        }
+        response["result"]["capabilities"]["bound_agent_kinds"] = json!(["codex"]);
+        response["result"]["capabilities"]["agent_start_bound"] = json!(false);
+        assert!(metadata_bound_agent_kinds(&response).is_none());
+    }
+
+    #[test]
+    fn bound_discovery_identity_survives_status_and_changes_with_runtime() {
+        let mut value = json!({"pane_id":"w1:p1", "terminal_id":"term", "launch_id":"launch-one", "owner_epoch":"owner", "name":"bound-name", "agent":"codex", "agent_status":"idle"});
+        for status in ["idle", "working", "done", "blocked"] {
+            value["agent_status"] = json!(status);
+            let agent = agent_from_json(&value).unwrap();
+            assert_eq!(agent.launch_id.as_deref(), Some("launch-one"));
+            assert_eq!(agent.instance_id.as_deref(), Some("launch-one"));
+        }
+        value["launch_id"] = json!("launch-two");
+        assert_eq!(
+            agent_from_json(&value).unwrap().instance_id.as_deref(),
+            Some("launch-two")
+        );
+        value["owner_epoch"] = Value::Null;
+        assert!(agent_from_json(&value).is_err());
+        assert!(agent_instance_id(&value).is_none());
+        value.as_object_mut().unwrap().remove("launch_id");
+        assert!(agent_from_json(&value).unwrap().instance_id.is_none());
+    }
+
+    #[test]
     fn agent_identity_is_conversation_scoped_not_pane_scoped() {
         let first = serde_json::json!({"terminal_id":"term", "agent_session":{"value":"first"}});
         let replacement =
@@ -1477,6 +2240,37 @@ mod tests {
     }
 
     impl FakeHerdr {
+        fn start_responses(responses: Vec<Value>) -> Self {
+            let socket_path = crate::short_test_socket("gw-bound-herdr");
+            let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&calls);
+            let task = tokio::spawn(async move {
+                let mut responses = std::collections::VecDeque::from(responses);
+                while let Ok((stream, _)) = listener.accept().await {
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        continue;
+                    }
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    recorded.lock().unwrap().push(request.clone());
+                    let mut response = responses.pop_front().expect("unexpected native RPC");
+                    response["id"] = request["id"].clone();
+                    let mut stream = reader.into_inner();
+                    stream
+                        .write_all(response.to_string().as_bytes())
+                        .await
+                        .unwrap();
+                    stream.write_all(b"\n").await.unwrap();
+                }
+            });
+            Self {
+                socket_path,
+                calls,
+                task,
+            }
+        }
         fn start() -> Self {
             Self::start_refusing(&[])
         }
@@ -1571,6 +2365,423 @@ mod tests {
         fn drop(&mut self) {
             self.task.abort();
             let _ = std::fs::remove_file(&self.socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn old_native_metadata_never_receives_a_bound_mutation() {
+        let fake = FakeHerdr::start_responses(vec![json!({"result":{"version":"99.0.0"}})]);
+        let backend = HerdrBackend::new(&fake.socket_path);
+        let request = BoundPrompt {
+            operation_id: "op".into(),
+            expected_launch_id: "launch".into(),
+            text: "hello".into(),
+        };
+        assert!(matches!(
+            backend.prompt_bound_agent(&request).await,
+            Err(BackendError::Unsupported("instance_bound_prompt"))
+        ));
+        assert_eq!(
+            fake.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|call| call["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["ping"]
+        );
+    }
+
+    fn interrupt_request() -> BoundInterrupt {
+        BoundInterrupt {
+            operation_id: "interrupt-op".into(),
+            expected_launch_id: "launch".into(),
+            expected_owner_epoch: "owner".into(),
+        }
+    }
+
+    fn interrupt_metadata() -> Value {
+        json!({"result":{"capabilities":{"agent_interrupt_bound":true,"agent_lifecycle_bound":true,"owner_epoch":"owner"}}})
+    }
+
+    fn interrupt_ack() -> Value {
+        json!({"result":{"type":"agent_interrupted_bound","operation_id":"interrupt-op","launch_id":"launch","owner_epoch":"owner","receipt_id":"receipt","key":"Escape","bytes_written":1,"input_disposition":"written"}})
+    }
+
+    #[tokio::test]
+    async fn bound_interrupt_invalid_identity_never_contacts_native() {
+        let absent =
+            std::env::temp_dir().join(format!("absent-interrupt-{}.sock", uuid::Uuid::new_v4()));
+        let backend = HerdrBackend::new(&absent);
+        for invalid in [String::new(), "x".repeat(129), "bad\nidentity".into()] {
+            let mut request = interrupt_request();
+            request.expected_launch_id = invalid;
+            assert!(
+                matches!(backend.interrupt_bound_agent(&request).await, Err(BackendError::Refused {code:Some(code),..}) if code=="invalid_request")
+            );
+        }
+        assert!(!absent.exists());
+    }
+
+    #[tokio::test]
+    async fn bound_interrupt_uses_only_exact_native_control_without_readiness_or_keys() {
+        let fake = FakeHerdr::start_responses(vec![interrupt_metadata(), interrupt_ack()]);
+        let result = HerdrBackend::new(&fake.socket_path)
+            .interrupt_bound_agent(&interrupt_request())
+            .await
+            .unwrap();
+        assert_eq!(result.receipt_id, "receipt");
+        assert_eq!(result.bytes_written, 1);
+        let calls = fake.calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| call["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["ping", "agent.interrupt_bound"]
+        );
+        assert_eq!(
+            calls[1]["params"],
+            json!({"operation_id":"interrupt-op","expected_launch_id":"launch","expected_owner_epoch":"owner"})
+        );
+    }
+
+    #[tokio::test]
+    async fn bound_interrupt_malformed_receipt_is_uncertain_and_never_retried() {
+        for (field, value) in [
+            ("type", json!("agent_prompted_bound")),
+            ("operation_id", json!("other")),
+            ("launch_id", json!("other")),
+            ("owner_epoch", json!("other")),
+            ("receipt_id", json!("")),
+            ("receipt_id", json!("bad\nreceipt")),
+            ("key", json!("Enter")),
+            ("bytes_written", json!(2)),
+            ("bytes_written", json!(0)),
+            ("bytes_written", json!("1")),
+            ("input_disposition", json!("queued")),
+        ] {
+            let mut ack = interrupt_ack();
+            ack["result"][field] = value;
+            let fake = FakeHerdr::start_responses(vec![interrupt_metadata(), ack]);
+            let result = HerdrBackend::new(&fake.socket_path)
+                .interrupt_bound_agent(&interrupt_request())
+                .await;
+            assert!(
+                matches!(result, Err(BackendError::InvalidResponse(_))),
+                "{field}: {result:?}"
+            );
+            assert_eq!(fake.calls.lock().unwrap().len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn bound_interrupt_requires_boolean_capability_and_owner_evidence() {
+        for metadata in [
+            json!({"result":{"version":"999.0.0"}}),
+            json!({"result":{"capabilities":{"agent_interrupt_bound":"true","agent_lifecycle_bound":true,"owner_epoch":"owner"}}}),
+            json!({"result":{"capabilities":{"agent_interrupt_bound":true,"agent_lifecycle_bound":false,"owner_epoch":"owner"}}}),
+            json!({"result":{"capabilities":{"agent_interrupt_bound":true,"agent_lifecycle_bound":true,"owner_epoch":""}}}),
+        ] {
+            let fake = FakeHerdr::start_responses(vec![metadata]);
+            assert!(matches!(
+                HerdrBackend::new(&fake.socket_path)
+                    .interrupt_bound_agent(&interrupt_request())
+                    .await,
+                Err(BackendError::Unsupported("instance_bound_interrupt"))
+            ));
+            assert_eq!(fake.calls.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn bound_interrupt_capacity_refusal_is_distinct_from_unknown_effects() {
+        for code in [
+            "resource_limit",
+            "instance_changed",
+            "unsupported",
+            "request_key_conflict",
+            "delivery_unconfirmed",
+            "unknown_error",
+        ] {
+            let fake = FakeHerdr::start_responses(vec![
+                interrupt_metadata(),
+                json!({"error":{"code":code,"message":"bounded failure"}}),
+            ]);
+            let result = HerdrBackend::new(&fake.socket_path)
+                .interrupt_bound_agent(&interrupt_request())
+                .await;
+            if matches!(code, "delivery_unconfirmed" | "unknown_error") {
+                assert!(matches!(result, Err(BackendError::Unavailable)));
+            } else {
+                assert!(
+                    matches!(result, Err(BackendError::Refused {code:Some(ref actual),..}) if actual==code)
+                );
+            }
+            assert_eq!(fake.calls.lock().unwrap().len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn native_bound_start_and_prompt_use_new_methods_and_validate_receipts() {
+        let metadata = json!({"result":{"capabilities":{"agent_start_bound":true,"agent_prompt_bound":true,"agent_get_bound":true}}});
+        let fake = FakeHerdr::start_responses(vec![
+            metadata.clone(),
+            json!({"result":{
+                "type":"agent_started_bound","operation_id":"start-op","launch_id":"new-launch",
+                "agent":{"pane_id":"w1:p1","agent":"codex","agent_status":"idle"},"argv":["/bin/codex"]
+            }}),
+            metadata,
+            json!({"result":{"type":"agent_bound_info","launch_id":"new-launch","visible_text":"> Ask Codex anything","agent":{"agent_status":"idle","interactive_ready":true}}}),
+            json!({"result":{"type":"agent_prompted_bound","operation_id":"prompt-op","launch_id":"new-launch","bytes_written":5,"input_disposition":"written"}}),
+        ]);
+        let backend = HerdrBackend::new(&fake.socket_path);
+        let request = StartAgent {
+            pane_id: PaneId::new("w1:p1"),
+            kind: "codex".into(),
+            command: "codex".into(),
+            executable: Some(PathBuf::from("/bin/codex")),
+            args: vec![],
+            timeout_ms: 5000,
+        };
+        let started = backend
+            .start_bound_agent(
+                &request,
+                "start-op",
+                Some("/private/work/context.json"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.launch_id.as_deref(), Some("new-launch"));
+        assert!(started.instance_id.is_none());
+        let receipt = backend
+            .prompt_bound_agent(&BoundPrompt {
+                expected_launch_id: started.launch_id.unwrap(),
+                operation_id: "prompt-op".into(),
+                text: "hello".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(receipt.operation_id, "prompt-op");
+        let calls = fake.calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| call["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                "ping",
+                "agent.start_bound",
+                "ping",
+                "agent.get_bound",
+                "agent.prompt_bound"
+            ]
+        );
+        assert_eq!(calls[1]["params"]["command"], "/bin/codex");
+        assert_eq!(
+            calls[1]["params"]["work_context_file"],
+            "/private/work/context.json"
+        );
+        assert!(calls[4]["params"].get("target").is_none());
+    }
+    #[tokio::test]
+    async fn reporting_start_requires_native_capability_and_configuration_receipt() {
+        for (capability, receipt) in [(false, false), (true, false), (true, true)] {
+            let metadata = json!({"result":{"capabilities":{"agent_start_bound":true,"agent_get_bound":true,"agent_lifecycle_bound":true,"agent_reporting_mcp_codex":capability,"owner_epoch":"epoch"}}});
+            let mut response = json!({"result":{"type":"agent_started_bound","operation_id":"start-op","launch_id":"launch","owner_epoch":"epoch","agent_kind":"codex","argv":["codex"],"agent":{"pane_id":"w1:p1","terminal_id":"term","agent":"codex"}}});
+            if receipt {
+                response["result"]["reporting_mcp"] = json!("codex_stdio_v1");
+            }
+            let fake = FakeHerdr::start_responses(vec![metadata, response]);
+            let backend = HerdrBackend::new(&fake.socket_path);
+            let request = StartAgent {
+                pane_id: PaneId::new("w1:p1"),
+                kind: "codex".into(),
+                command: "codex".into(),
+                executable: None,
+                args: vec![],
+                timeout_ms: 5000,
+            };
+            let reporting = super::super::ReportingMcp {
+                executable: "/private/reporter".into(),
+                sha256: "a".repeat(64),
+            };
+            let result = backend
+                .start_bound_agent(
+                    &request,
+                    "start-op",
+                    Some("/private/context.json"),
+                    Some(&reporting),
+                )
+                .await;
+            if !capability {
+                assert!(matches!(
+                    result,
+                    Err(BackendError::Unsupported("reporting_mcp_codex"))
+                ));
+            } else if !receipt {
+                assert!(matches!(result, Err(BackendError::InvalidResponse(_))));
+            } else {
+                assert_eq!(result.unwrap().launch_id.as_deref(), Some("launch"));
+            }
+            let calls = fake.calls.lock().unwrap();
+            assert_eq!(calls.len(), if capability { 2 } else { 1 });
+            if capability {
+                assert_eq!(calls[1]["method"], "agent.start_bound");
+                assert_eq!(
+                    calls[1]["params"]["reporting_mcp"]["executable"],
+                    reporting.executable
+                );
+                assert!(calls[1]["params"].get("config").is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_no_process_proof_requires_matching_operation_and_discovered_epoch() {
+        for (matching, code) in [
+            (true, "unsupported_agent_kind"),
+            (true, "agent_not_ready"),
+            (false, "unsupported_agent_kind"),
+        ] {
+            let metadata = json!({"result":{"capabilities":{"agent_start_bound":true,"agent_get_bound":true,"agent_lifecycle_bound":true,"owner_epoch":"epoch"}}});
+            let response = json!({"error":{"code":code,"message":"No child"},"start_receipt":{"effect":"not_started","operation_id":if matching {"start-op"}else{"other-op"},"owner_epoch":"epoch","receipt_id":"refusal-proof"}});
+            let fake = FakeHerdr::start_responses(vec![metadata, response]);
+            let backend = HerdrBackend::new(&fake.socket_path);
+            let request = StartAgent {
+                pane_id: PaneId::new("w1:p1"),
+                kind: "codex".into(),
+                command: "codex".into(),
+                executable: None,
+                args: vec![],
+                timeout_ms: 5000,
+            };
+            let result = backend
+                .start_bound_agent(&request, "start-op", None, None)
+                .await;
+            assert_eq!(
+                matches!(&result, Err(BackendError::StartNotStarted { .. })),
+                matching
+            );
+            if matching {
+                assert!(
+                    matches!(result, Err(BackendError::StartNotStarted {code: Some(actual), ..}) if actual == code)
+                );
+            }
+            let calls = fake.calls.lock().unwrap();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[1]["method"], "agent.start_bound");
+        }
+    }
+    #[tokio::test]
+    async fn prompt_preflight_checks_exact_launch_and_approval_without_writing_input() {
+        for (launch, status, ready) in [
+            ("original", "idle", true),
+            ("replaced", "idle", true),
+            ("original", "blocked", false),
+        ] {
+            let metadata = json!({"result":{"capabilities":{"agent_get_bound":true,"agent_prompt_bound":true}}});
+            let observation = json!({"result":{"type":"agent_bound_info","launch_id":launch,"visible_text":"","agent":{"agent_status":status,"interactive_ready":ready,"launch_pending":false}}});
+            let fake = FakeHerdr::start_responses(vec![metadata, observation]);
+            let backend = HerdrBackend::new(&fake.socket_path);
+            assert_eq!(
+                backend.preflight_bound_prompt("original").await.is_ok(),
+                launch == "original" && ready
+            );
+            let calls = fake.calls.lock().unwrap();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[1]["method"], "agent.get_bound");
+            assert_eq!(calls[1]["params"]["expected_launch_id"], "original");
+        }
+    }
+
+    #[tokio::test]
+    async fn bound_native_idle_with_codex_trust_never_receives_a_prompt() {
+        let screen = include_str!("../../tests/fixtures/approval-codex-0154-trust.txt");
+        let fake = FakeHerdr::start_responses(vec![
+            json!({"result":{"capabilities":{"agent_prompt_bound":true,"agent_get_bound":true}}}),
+            json!({"result":{"type":"agent_bound_info","launch_id":"launch","visible_text":screen,"agent":{"agent_status":"idle","interactive_ready":true}}}),
+        ]);
+        let backend = HerdrBackend::new(&fake.socket_path);
+        let result = backend
+            .prompt_bound_agent(&BoundPrompt {
+                expected_launch_id: "launch".into(),
+                operation_id: "op".into(),
+                text: "never approve".into(),
+            })
+            .await;
+        assert!(
+            matches!(result,Err(BackendError::Refused {code:Some(code),..}) if code=="agent_blocked")
+        );
+        assert_eq!(
+            fake.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|call| call["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["ping", "agent.get_bound"]
+        );
+    }
+
+    #[tokio::test]
+    async fn bound_readiness_timeout_and_replacement_never_submit() {
+        for (launch, status, expected) in [
+            ("launch", "unknown", "agent_not_ready"),
+            ("replacement", "idle", "instance_changed"),
+        ] {
+            let fake = FakeHerdr::start_responses(vec![
+                json!({"result":{"capabilities":{"agent_prompt_bound":true,"agent_get_bound":true}}}),
+                json!({"result":{"type":"agent_bound_info","launch_id":launch,"visible_text":"starting","agent":{"agent_status":status,"interactive_ready":false}}}),
+            ]);
+            let backend =
+                HerdrBackend::with_request_timeout(&fake.socket_path, Duration::from_millis(50));
+            let result = backend
+                .prompt_bound_agent(&BoundPrompt {
+                    expected_launch_id: "launch".into(),
+                    operation_id: "op".into(),
+                    text: "hello".into(),
+                })
+                .await;
+            assert!(
+                matches!(result,Err(BackendError::Refused {code:Some(code),..}) if code==expected)
+            );
+            assert_eq!(fake.calls.lock().unwrap().len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn bound_prompt_ambiguous_acknowledgement_is_never_retried() {
+        for response in [
+            json!({"result":{"type":"agent_prompted_bound","operation_id":"wrong-op","launch_id":"launch","bytes_written":5,"input_disposition":"written"}}),
+            json!({"error":{"code":"delivery_unconfirmed","message":"partial submission"}}),
+        ] {
+            let fake = FakeHerdr::start_responses(vec![
+                json!({"result":{"capabilities":{"agent_prompt_bound":true,"agent_get_bound":true}}}),
+                json!({"result":{"type":"agent_bound_info","launch_id":"launch","visible_text":"> Ask anything","agent":{"agent_status":"idle","interactive_ready":true}}}),
+                response,
+            ]);
+            let result = HerdrBackend::new(&fake.socket_path)
+                .prompt_bound_agent(&BoundPrompt {
+                    expected_launch_id: "launch".into(),
+                    operation_id: "op".into(),
+                    text: "hello".into(),
+                })
+                .await;
+            assert!(matches!(
+                result,
+                Err(BackendError::InvalidResponse(_) | BackendError::Unavailable)
+            ));
+            assert_eq!(
+                fake.calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|call| call["method"] == "agent.prompt_bound")
+                    .count(),
+                1
+            );
         }
     }
 
