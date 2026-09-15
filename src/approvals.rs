@@ -816,6 +816,21 @@ mod tests {
     }
 
     #[test]
+    fn codex_0154_directory_trust_is_detected_despite_native_idle_status() {
+        // Captured read-only from the isolated real Codex 0.154 QA session.
+        // Herdr 0.9.0 reported idle and interactive_ready for this screen.
+        let screen = include_str!("../tests/fixtures/approval-codex-0154-trust.txt");
+        let approval = detect(screen).expect("directory trust requires a human answer");
+        assert!(approval
+            .prompt
+            .starts_with("Do you trust the contents of this directory?"));
+        assert_eq!(labels(&approval), ["Yes, continue", "No, quit"]);
+        assert_eq!(decisions(&approval), ["allow", "deny"]);
+        assert!(approval.options[0].selected);
+        assert_eq!(approval.hint.as_deref(), Some("Press enter to continue"));
+    }
+
+    #[test]
     fn the_cursor_is_reported_wherever_the_agent_put_it() {
         // This menu opens with the cursor on the second answer, so a client that
         // assumed "the first one is selected" would show the wrong default.

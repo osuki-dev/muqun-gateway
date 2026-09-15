@@ -1,0 +1,4263 @@
+From e42a1a1d4a5b249033085f02b1fbcf872785b5ab Mon Sep 17 00:00:00 2001
+From: ryu <213640356+ryuhzk@users.noreply.github.com>
+Date: Mon, 14 Sep 2026 19:47:30 +0800
+Subject: [PATCH] feat: add immutable agent lifecycle and scoped reporting
+
+---
+ docs/next/api/bound-interruption.md |  51 +++
+ docs/next/api/bound-lifecycle.md    |  68 +++
+ docs/next/api/bound-reporting.md    |  46 ++
+ docs/next/api/herdr-api.schema.json | 537 ++++++++++++++++++++++
+ src/api/mod.rs                      |   3 +
+ src/api/schema.rs                   |  10 +
+ src/api/schema/agents.rs            |  64 +++
+ src/api/schema/response.rs          |  68 +++
+ src/api/schema/server.rs            |  18 +
+ src/api/schema/tests.rs             |  87 ++++
+ src/api/server.rs                   |  28 ++
+ src/app/actions.rs                  |   4 +-
+ src/app/agents.rs                   | 318 +++++++++++++
+ src/app/api.rs                      |  66 +++
+ src/app/api/agents.rs               | 667 +++++++++++++++++++++++++++-
+ src/app/mod.rs                      |   2 +-
+ src/app/popup.rs                    |   1 +
+ src/app/reporting.rs                | 185 ++++++++
+ src/cli/status.rs                   |   8 +
+ src/events.rs                       |   6 +
+ src/pane.rs                         | 161 ++++++-
+ src/pty/actor/unix.rs               | 276 +++++++++++-
+ src/pty/bound_interrupt.rs          | 143 ++++++
+ src/pty/bound_lifecycle.rs          | 195 ++++++++
+ src/pty/bound_submission.rs         | 350 +++++++++++++++
+ src/pty/mod.rs                      |   3 +
+ src/server/headless.rs              |   7 +-
+ src/server/headless/tests/mod.rs    |  22 +
+ src/terminal/runtime.rs             |  34 ++
+ src/update.rs                       |  24 +
+ src/workspace/tab.rs                |   2 +
+ tests/cli/surface.rs                |   7 +-
+ 32 files changed, 3450 insertions(+), 11 deletions(-)
+ create mode 100644 docs/next/api/bound-interruption.md
+ create mode 100644 docs/next/api/bound-lifecycle.md
+ create mode 100644 docs/next/api/bound-reporting.md
+ create mode 100644 src/app/reporting.rs
+ create mode 100644 src/pty/bound_interrupt.rs
+ create mode 100644 src/pty/bound_lifecycle.rs
+ create mode 100644 src/pty/bound_submission.rs
+
+diff --git a/docs/next/api/bound-interruption.md b/docs/next/api/bound-interruption.md
+new file mode 100644
+index 0000000..dcbc105
+--- /dev/null
++++ b/docs/next/api/bound-interruption.md
+@@ -0,0 +1,51 @@
++# Bound interruption
++
++Unix servers advertise `ping.capabilities.agent_interrupt_bound` when the native
++writer supports `agent.interrupt_bound`. Windows advertises false. This method
++is independent of request-bound approvals, which remain unsupported.
++
++The request contains `operation_id`, `expected_launch_id`, and
++`expected_owner_epoch`. It accepts only an exact managed direct-process runtime
++whose immutable launch profile has a supported interruption key. The initial
++Codex, Claude, and OpenCode profiles use one Escape byte. Ordinary terminals,
++unsupported profiles, changed owners, and missing launches are not redirected
++to another pane or a shell. Existing terminal controls retain their semantics.
++
++A success result has type `agent_interrupted_bound` and includes the same
++operation, launch and owner epoch, an opaque `receipt_id`, `key: "Escape"`,
++`bytes_written: 1`, and `input_disposition: "written"`. It proves that one byte
++was written, not that the provider cancelled work, approved anything, or exited.
++Escape during an incomplete bracketed paste may be consumed as paste data.
++Only the separate successful-child-wait lifecycle receipt proves process exit.
++
++Control permits depend on permanent process ownership, not prompt readiness.
++The actor serializes the single write with ownership invalidation and revokes
++earlier queued prompt permits. It removes an active bound prompt's remaining
++chunks, including delayed Enter. Its completion reports zero-byte refusal or
++partial-delivery uncertainty according to bytes already written. There is no
++automatic retry, extra Enter, signal escalation, or process replacement.
++Queued-input suppression covers managed bound submissions. Independent legacy
++terminal/raw input retains its existing behavior and is not atomically coordinated
++with this control action; callers must not claim otherwise.
++
++An epoch-local registry reserves an operation before enqueueing. It retains up
++to 4096 operations without eviction. Matching repeated operations return their
++original outcome; a changed identity conflicts; pending/lost acknowledgements
++remain unconfirmed and never dispatch a second write. Exhaustion refuses new
++dispatch with `resource_limit`, a pre-admission no-write refusal. A duplicate
++pending operation remains `delivery_unconfirmed`, which is a different outcome.
++Restart changes owner epoch; stale requests cannot acquire a new
++destination. This is bounded in-memory native evidence, not durable task history.
++The Gateway must persist its own admission and receipt before allowing recovery.
++
++Actor tests cover interrupted partial prompts, revoked queued prompts, blocked
++readiness, and exit before the syscall. Registry/schema tests cover replay,
++capacity and identity. Simulated process proof establishes byte transport only;
++it does not establish real-provider cancellation or mobile integration.
++
++Agent discovery also includes optional `launch_id` and `owner_epoch` on the
++`AgentInfo` returned by list/get and bound lookup. They identify the current
++native directly owned runtime, never its pane, display name or conversation.
++The pair survives readiness/status changes and is omitted for legacy runtimes,
++retired owners and unknown ownership. This observation is not an exit receipt;
++capacity release still requires the separate exact lifecycle evidence.
+diff --git a/docs/next/api/bound-lifecycle.md b/docs/next/api/bound-lifecycle.md
+new file mode 100644
+index 0000000..6c22358
+--- /dev/null
++++ b/docs/next/api/bound-lifecycle.md
+@@ -0,0 +1,68 @@
++# Bound assistant lifecycle evidence
++
++These Unix-only JSON methods describe directly owned child processes. They do not
++prove task completion, agent-native approval identity, or descendant cleanup.
++Windows does not advertise the capabilities.
++
++`ping.result.capabilities` advertises `agent_lifecycle_bound` and an opaque
++`owner_epoch`. Every supervisor process creates a fresh epoch. Successful
++`agent.start_bound` replies additionally carry this epoch beside the launch and
++operation IDs. Only the canonical native executable for the requested agent on
++the server's trusted PATH is eligible. Shell overrides and script wrappers are
++unsupported; ordinary agent APIs retain their existing behavior.
++
++The startup receipt also carries `agent_kind`, the validated declared launch
++profile. Its nested `agent` remains observational: immediately after creation,
++`agent.agent` may be absent, `agent_status` unknown, and `launch_pending` true.
++Validate the declared profile and immutable receipt first, then poll readiness
++through `agent.get_bound`; creation alone never proves interactive readiness.
++
++Call `agent.lifecycle_bound` with `expected_launch_id` and
++`expected_owner_epoch`. Its `agent_bound_lifecycle` result includes `launch_id`,
++the current `owner_epoch`, and `state`:
++
++- `live`: this supervisor owns the exact unreaped generation.
++- `exited`: its child waiter observed successful exit/reaping. An immutable
++  `receipt_id` is present. Nonzero exit is still exit, not successful work.
++- `unknown`: no retained matching proof is available. This includes epoch
++  mismatch, restart, imported ownership without a waiter, wait failure, and
++  tombstone eviction. No exit receipt is present.
++
++The waiter records exit before delivering pane events. Removing or replacing a
++pane cannot discard that receipt. Invalidating input ownership, requesting
++shutdown, missing a pane, or observing an idle screen never establishes exit.
++
++The in-memory registry retains at most 1024 unreaped or uncertain launches and
++4096 exit tombstones. It refuses new bound launches before spawning when owner
++capacity is full. Live and uncertain owners are never evicted. Oldest exit
++tombstones are evicted by count; their later queries become unknown. There is no
++automatic force release or filesystem cleanup.
++
++A start refusal before any spawn attempt adds a top-level `start_receipt` beside
++the existing `id` and `error` fields:
++
++```json
++{
++  "id": "request",
++  "error": {"code": "resource_limit", "message": "native lifecycle capacity exhausted before spawn"},
++  "start_receipt": {
++    "operation_id": "start-operation",
++    "owner_epoch": "opaque-epoch",
++    "receipt_id": "opaque-receipt",
++    "effect": "not_started"
++  }
++}
++```
++
++Failures after spawn was attempted carry no such receipt, even if an OS error
++suggests startup failed. The supervisor remembers up to 4096 start operation IDs
++per incarnation without eviction. Reusing an ID, or exhausting this operation
++capacity, returns `delivery_unconfirmed` without starting a process or minting a
++new refusal receipt. This prevents a later rejection from being mistaken for
++proof that an earlier request never started. Clients must retain their original
++receipt and never automatically retry uncertain startup. Operation receipt
++lookup is not implemented.
++
++Consumers release execution reservations only from an exact matching no-process
++receipt or retained exit proof. Unknown observations preserve reservations.
++Release does not stop a process, remove a workspace, or complete a task.
+diff --git a/docs/next/api/bound-reporting.md b/docs/next/api/bound-reporting.md
+new file mode 100644
+index 0000000..8b0edf7
+--- /dev/null
++++ b/docs/next/api/bound-reporting.md
+@@ -0,0 +1,46 @@
++# Managed Codex reporting
++
++`agent_reporting_mcp_codex` advertises the Unix native configuration adapter.
++It is not a claim that every installed Codex release supports the configuration,
++that MCP initialization succeeded, or that a result was submitted.
++
++`agent.start_bound` accepts optional `reporting_mcp: {executable, sha256}` with a
++private `work_context_file`, only for the canonical Codex profile without custom
++arguments. The reporter must be the digest-named native executable in the context
++file's sibling `reporting-binaries` directory. The adapter verifies its bounded
++bytes and private mode, then appends a generated per-invocation config override.
++This uses the trusted local installation boundary, not signed attestation against
++another process running as the same user.
++
++The unique server namespace is `muqun_reporting_` plus an operation-derived suffix.
++The only enabled tools are `context`, `submit_result`, and `result_receipt`, each
++with approval mode `approve`; other tools default to `prompt`. The fixed stdio
++command is the pinned executable with `work reporting-mcp`. Only the context path
++is explicitly forwarded through `MUQUN_WORK_CONTEXT_FILE`. No token is in argv.
++No global configuration, authentication, general shell approval policy or sandbox
++permission is changed. Codex strict config and required MCP startup fail closed
++when unsupported. The additive start receipt `reporting_mcp: "codex_stdio_v1"`
++confirms this configuration was applied to the created child, not readiness.
++
++Other agents retain their existing explicit reporting path; this capability does
++not grant them automatic reporting permission. A missing MCP tool in managed Codex
++must produce a reporting-unavailable explanation, never silent shell escalation.
++The reporting adapter delegates existing Gateway task/attempt/grant/revision and
++immutable-artifact checks. Human review, merge, publication, and interruption are
++separate actions and are not exposed by these reporting tools.
++
++Verified locally against Codex CLI 0.154.0: generated config parses into the exact
++transport, environment allowlist, tool allowlist and per-tool approval values.
++Model-driven no-prompt reporting still requires the paired integration gate.
++Configuration fields follow the [official MCP documentation](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)
++and [configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).
++
++## Managed profile discovery
++
++On each explicit ping, optional `capabilities.bound_agent_kinds` lists profiles
++that pass the same canonical PATH/native executable admission check used for
++bound startup. An empty list means no eligible installed profiles; absent means
++unknown compatibility. It is not a promise of readiness or task completion.
++Dispatch revalidates after executable upgrades or replacement. Ordinary terminal
++and legacy agent catalogs are unaffected; Codex reporting support remains the
++separate reporting capability.
+diff --git a/docs/next/api/herdr-api.schema.json b/docs/next/api/herdr-api.schema.json
+index b3990e9..4a27f0e 100644
+--- a/docs/next/api/herdr-api.schema.json
++++ b/docs/next/api/herdr-api.schema.json
+@@ -3,6 +3,73 @@
+   "protocol": 22,
+   "schema_version": 1,
+   "schemas": {
++    "bound_start_error_response": {
++      "$defs": {
++        "BoundStartEffect": {
++          "enum": [
++            "not_started"
++          ],
++          "type": "string"
++        },
++        "BoundStartRefusalReceipt": {
++          "properties": {
++            "effect": {
++              "$ref": "#/schemas/bound_start_error_response/$defs/BoundStartEffect"
++            },
++            "operation_id": {
++              "type": "string"
++            },
++            "owner_epoch": {
++              "type": "string"
++            },
++            "receipt_id": {
++              "type": "string"
++            }
++          },
++          "required": [
++            "operation_id",
++            "owner_epoch",
++            "receipt_id",
++            "effect"
++          ],
++          "type": "object"
++        },
++        "ErrorBody": {
++          "properties": {
++            "code": {
++              "type": "string"
++            },
++            "message": {
++              "type": "string"
++            }
++          },
++          "required": [
++            "code",
++            "message"
++          ],
++          "type": "object"
++        }
++      },
++      "$schema": "https://json-schema.org/draft/2020-12/schema",
++      "properties": {
++        "error": {
++          "$ref": "#/schemas/bound_start_error_response/$defs/ErrorBody"
++        },
++        "id": {
++          "type": "string"
++        },
++        "start_receipt": {
++          "$ref": "#/schemas/bound_start_error_response/$defs/BoundStartRefusalReceipt"
++        }
++      },
++      "required": [
++        "id",
++        "error",
++        "start_receipt"
++      ],
++      "title": "BoundStartErrorResponse",
++      "type": "object"
++    },
+     "error_response": {
+       "$defs": {
+         "ErrorBody": {
+@@ -1222,6 +1289,75 @@
+     },
+     "request": {
+       "$defs": {
++        "AgentGetBoundParams": {
++          "additionalProperties": false,
++          "properties": {
++            "expected_launch_id": {
++              "type": "string"
++            }
++          },
++          "required": [
++            "expected_launch_id"
++          ],
++          "type": "object"
++        },
++        "AgentInterruptBoundParams": {
++          "additionalProperties": false,
++          "description": "Writes only the immutable launch profile's interruption key to an exact owner.",
++          "properties": {
++            "expected_launch_id": {
++              "type": "string"
++            },
++            "expected_owner_epoch": {
++              "type": "string"
++            },
++            "operation_id": {
++              "type": "string"
++            }
++          },
++          "required": [
++            "operation_id",
++            "expected_launch_id",
++            "expected_owner_epoch"
++          ],
++          "type": "object"
++        },
++        "AgentLifecycleBoundParams": {
++          "additionalProperties": false,
++          "properties": {
++            "expected_launch_id": {
++              "type": "string"
++            },
++            "expected_owner_epoch": {
++              "type": "string"
++            }
++          },
++          "required": [
++            "expected_launch_id",
++            "expected_owner_epoch"
++          ],
++          "type": "object"
++        },
++        "AgentPromptBoundParams": {
++          "additionalProperties": false,
++          "properties": {
++            "expected_launch_id": {
++              "type": "string"
++            },
++            "operation_id": {
++              "type": "string"
++            },
++            "text": {
++              "type": "string"
++            }
++          },
++          "required": [
++            "operation_id",
++            "expected_launch_id",
++            "text"
++          ],
++          "type": "object"
++        },
+         "AgentPromptParams": {
+           "properties": {
+             "target": {
+@@ -1332,6 +1468,76 @@
+           ],
+           "type": "object"
+         },
++        "AgentStartBoundParams": {
++          "additionalProperties": false,
++          "description": "Launches a direct argv-owned runtime, never input typed into an existing shell.",
++          "properties": {
++            "args": {
++              "default": [],
++              "items": {
++                "type": "string"
++              },
++              "type": "array"
++            },
++            "command": {
++              "default": null,
++              "type": [
++                "string",
++                "null"
++              ]
++            },
++            "kind": {
++              "type": "string"
++            },
++            "name": {
++              "default": null,
++              "type": [
++                "string",
++                "null"
++              ]
++            },
++            "operation_id": {
++              "type": "string"
++            },
++            "pane_id": {
++              "type": "string"
++            },
++            "reporting_mcp": {
++              "anyOf": [
++                {
++                  "$ref": "#/schemas/request/$defs/BoundReportingMcp"
++                },
++                {
++                  "type": "null"
++                }
++              ],
++              "default": null
++            },
++            "timeout_ms": {
++              "default": null,
++              "format": "uint64",
++              "minimum": 0,
++              "type": [
++                "integer",
++                "null"
++              ]
++            },
++            "work_context_file": {
++              "default": null,
++              "description": "Absolute path to a Gateway-managed grant context; only this named environment variable is set.",
++              "type": [
++                "string",
++                "null"
++              ]
++            }
++          },
++          "required": [
++            "operation_id",
++            "pane_id",
++            "kind"
++          ],
++          "type": "object"
++        },
+         "AgentStartParams": {
+           "properties": {
+             "args": {
+@@ -1689,6 +1895,22 @@
+           ],
+           "type": "object"
+         },
++        "BoundReportingMcp": {
++          "additionalProperties": false,
++          "properties": {
++            "executable": {
++              "type": "string"
++            },
++            "sha256": {
++              "type": "string"
++            }
++          },
++          "required": [
++            "executable",
++            "sha256"
++          ],
++          "type": "object"
++        },
+         "ClientShellSurfaceSetParams": {
+           "description": "Updates whether the requesting client shell receives and controls pane presentation.",
+           "properties": {
+@@ -5451,6 +5673,86 @@
+           ],
+           "type": "object"
+         },
++        {
++          "properties": {
++            "method": {
++              "const": "agent.start_bound",
++              "type": "string"
++            },
++            "params": {
++              "$ref": "#/schemas/request/$defs/AgentStartBoundParams"
++            }
++          },
++          "required": [
++            "method",
++            "params"
++          ],
++          "type": "object"
++        },
++        {
++          "properties": {
++            "method": {
++              "const": "agent.get_bound",
++              "type": "string"
++            },
++            "params": {
++              "$ref": "#/schemas/request/$defs/AgentGetBoundParams"
++            }
++          },
++          "required": [
++            "method",
++            "params"
++          ],
++          "type": "object"
++        },
++        {
++          "properties": {
++            "method": {
++              "const": "agent.lifecycle_bound",
++              "type": "string"
++            },
++            "params": {
++              "$ref": "#/schemas/request/$defs/AgentLifecycleBoundParams"
++            }
++          },
++          "required": [
++            "method",
++            "params"
++          ],
++          "type": "object"
++        },
++        {
++          "properties": {
++            "method": {
++              "const": "agent.prompt_bound",
++              "type": "string"
++            },
++            "params": {
++              "$ref": "#/schemas/request/$defs/AgentPromptBoundParams"
++            }
++          },
++          "required": [
++            "method",
++            "params"
++          ],
++          "type": "object"
++        },
++        {
++          "properties": {
++            "method": {
++              "const": "agent.interrupt_bound",
++              "type": "string"
++            },
++            "params": {
++              "$ref": "#/schemas/request/$defs/AgentInterruptBoundParams"
++            }
++          },
++          "required": [
++            "method",
++            "params"
++          ],
++          "type": "object"
++        },
+         {
+           "properties": {
+             "method": {
+@@ -6651,6 +6953,13 @@
+             "interactive_ready": {
+               "type": "boolean"
+             },
++            "launch_id": {
++              "description": "Exact current directly owned process; absent for legacy or retired runtimes.",
++              "type": [
++                "string",
++                "null"
++              ]
++            },
+             "launch_pending": {
+               "type": "boolean"
+             },
+@@ -6660,6 +6969,12 @@
+                 "null"
+               ]
+             },
++            "owner_epoch": {
++              "type": [
++                "string",
++                "null"
++              ]
++            },
+             "pane_id": {
+               "type": "string"
+             },
+@@ -6833,6 +7148,14 @@
+           ],
+           "type": "string"
+         },
++        "BoundLifecycleState": {
++          "enum": [
++            "live",
++            "exited",
++            "unknown"
++          ],
++          "type": "string"
++        },
+         "ClientWindowTitleReason": {
+           "enum": [
+             "set",
+@@ -9498,6 +9821,179 @@
+               ],
+               "type": "object"
+             },
++            {
++              "properties": {
++                "agent": {
++                  "$ref": "#/schemas/success_response/$defs/AgentInfo"
++                },
++                "launch_id": {
++                  "type": "string"
++                },
++                "type": {
++                  "const": "agent_bound_info",
++                  "type": "string"
++                },
++                "visible_text": {
++                  "description": "Bottom-buffer observation, independent of the reader viewport. Not approval identity.",
++                  "type": "string"
++                }
++              },
++              "required": [
++                "type",
++                "visible_text",
++                "agent",
++                "launch_id"
++              ],
++              "type": "object"
++            },
++            {
++              "properties": {
++                "agent": {
++                  "$ref": "#/schemas/success_response/$defs/AgentInfo"
++                },
++                "agent_kind": {
++                  "description": "Validated launch profile; independent of the agent's observed screen identity.",
++                  "type": "string"
++                },
++                "argv": {
++                  "items": {
++                    "type": "string"
++                  },
++                  "type": "array"
++                },
++                "launch_id": {
++                  "type": "string"
++                },
++                "operation_id": {
++                  "type": "string"
++                },
++                "owner_epoch": {
++                  "type": "string"
++                },
++                "reporting_mcp": {
++                  "type": [
++                    "string",
++                    "null"
++                  ]
++                },
++                "type": {
++                  "const": "agent_started_bound",
++                  "type": "string"
++                }
++              },
++              "required": [
++                "type",
++                "agent_kind",
++                "owner_epoch",
++                "agent",
++                "argv",
++                "launch_id",
++                "operation_id"
++              ],
++              "type": "object"
++            },
++            {
++              "properties": {
++                "bytes_written": {
++                  "format": "uint",
++                  "minimum": 0,
++                  "type": "integer"
++                },
++                "input_disposition": {
++                  "type": "string"
++                },
++                "launch_id": {
++                  "type": "string"
++                },
++                "operation_id": {
++                  "type": "string"
++                },
++                "type": {
++                  "const": "agent_prompted_bound",
++                  "type": "string"
++                }
++              },
++              "required": [
++                "type",
++                "launch_id",
++                "operation_id",
++                "bytes_written",
++                "input_disposition"
++              ],
++              "type": "object"
++            },
++            {
++              "properties": {
++                "bytes_written": {
++                  "format": "uint",
++                  "minimum": 0,
++                  "type": "integer"
++                },
++                "input_disposition": {
++                  "type": "string"
++                },
++                "key": {
++                  "type": "string"
++                },
++                "launch_id": {
++                  "type": "string"
++                },
++                "operation_id": {
++                  "type": "string"
++                },
++                "owner_epoch": {
++                  "type": "string"
++                },
++                "receipt_id": {
++                  "type": "string"
++                },
++                "type": {
++                  "const": "agent_interrupted_bound",
++                  "type": "string"
++                }
++              },
++              "required": [
++                "type",
++                "operation_id",
++                "launch_id",
++                "owner_epoch",
++                "receipt_id",
++                "key",
++                "bytes_written",
++                "input_disposition"
++              ],
++              "type": "object"
++            },
++            {
++              "properties": {
++                "launch_id": {
++                  "type": "string"
++                },
++                "owner_epoch": {
++                  "type": "string"
++                },
++                "receipt_id": {
++                  "type": [
++                    "string",
++                    "null"
++                  ]
++                },
++                "state": {
++                  "$ref": "#/schemas/success_response/$defs/BoundLifecycleState"
++                },
++                "type": {
++                  "const": "agent_bound_lifecycle",
++                  "type": "string"
++                }
++              },
++              "required": [
++                "type",
++                "launch_id",
++                "owner_epoch",
++                "state"
++              ],
++              "type": "object"
++            },
+             {
+               "properties": {
+                 "agent": {
+@@ -10525,6 +11021,41 @@
+         },
+         "ServerCapabilities": {
+           "properties": {
++            "agent_get_bound": {
++              "default": false,
++              "type": "boolean"
++            },
++            "agent_interrupt_bound": {
++              "default": false,
++              "type": "boolean"
++            },
++            "agent_lifecycle_bound": {
++              "default": false,
++              "type": "boolean"
++            },
++            "agent_prompt_bound": {
++              "default": false,
++              "type": "boolean"
++            },
++            "agent_reporting_mcp_codex": {
++              "default": false,
++              "type": "boolean"
++            },
++            "agent_start_bound": {
++              "default": false,
++              "description": "Direct-process lifetime-bound startup and input; not native approval identity.",
++              "type": "boolean"
++            },
++            "bound_agent_kinds": {
++              "description": "Current canonical native profiles; discovery only, revalidated at dispatch.",
++              "items": {
++                "type": "string"
++              },
++              "type": [
++                "array",
++                "null"
++              ]
++            },
+             "detached_server_daemon": {
+               "default": false,
+               "type": "boolean"
+@@ -10546,6 +11077,12 @@
+             "live_handoff": {
+               "type": "boolean"
+             },
++            "owner_epoch": {
++              "type": [
++                "string",
++                "null"
++              ]
++            },
+             "surface_interest": {
+               "default": false,
+               "description": "Whether this server supports explicit client-shell surface interest.",
+diff --git a/src/api/mod.rs b/src/api/mod.rs
+index d28a82a..79e9335 100644
+--- a/src/api/mod.rs
++++ b/src/api/mod.rs
+@@ -50,6 +50,9 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
+             | Method::AgentViewClear(_)
+             | Method::AgentFocus(_)
+             | Method::AgentStart(_)
++            | Method::AgentStartBound(_)
++            | Method::AgentPromptBound(_)
++            | Method::AgentInterruptBound(_)
+             | Method::AgentPrompt(_)
+             | Method::AgentSendKeys(_)
+             | Method::PaneSplit(_)
+diff --git a/src/api/schema.rs b/src/api/schema.rs
+index ba9f0c3..5ef1310 100644
+--- a/src/api/schema.rs
++++ b/src/api/schema.rs
+@@ -133,6 +133,16 @@ pub enum Method {
+     AgentFocus(AgentTarget),
+     #[serde(rename = "agent.start")]
+     AgentStart(AgentStartParams),
++    #[serde(rename = "agent.start_bound")]
++    AgentStartBound(AgentStartBoundParams),
++    #[serde(rename = "agent.get_bound")]
++    AgentGetBound(AgentGetBoundParams),
++    #[serde(rename = "agent.lifecycle_bound")]
++    AgentLifecycleBound(AgentLifecycleBoundParams),
++    #[serde(rename = "agent.prompt_bound")]
++    AgentPromptBound(AgentPromptBoundParams),
++    #[serde(rename = "agent.interrupt_bound")]
++    AgentInterruptBound(AgentInterruptBoundParams),
+     #[serde(rename = "agent.prompt")]
+     AgentPrompt(AgentPromptParams),
+     #[serde(rename = "agent.wait")]
+diff --git a/src/api/schema/agents.rs b/src/api/schema/agents.rs
+index ee496d5..b134c6c 100644
+--- a/src/api/schema/agents.rs
++++ b/src/api/schema/agents.rs
+@@ -185,6 +185,11 @@ pub struct AgentPromptParams {
+ 
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+ pub struct AgentInfo {
++    /// Exact current directly owned process; absent for legacy or retired runtimes.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub launch_id: Option<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub owner_epoch: Option<String>,
+     pub terminal_id: String,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub name: Option<String>,
+@@ -232,3 +237,62 @@ pub struct AgentSessionInfo {
+     pub kind: crate::agent_resume::AgentSessionRefKind,
+     pub value: String,
+ }
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
++#[serde(deny_unknown_fields)]
++pub struct BoundReportingMcp {
++    pub executable: String,
++    pub sha256: String,
++}
++
++/// Launches a direct argv-owned runtime, never input typed into an existing shell.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
++#[serde(deny_unknown_fields)]
++pub struct AgentStartBoundParams {
++    #[serde(default)]
++    pub reporting_mcp: Option<BoundReportingMcp>,
++    pub operation_id: String,
++    /// Absolute path to a Gateway-managed grant context; only this named environment variable is set.
++    #[serde(default)]
++    pub work_context_file: Option<String>,
++    pub pane_id: String,
++    pub kind: String,
++    #[serde(default)]
++    pub name: Option<String>,
++    #[serde(default)]
++    pub command: Option<String>,
++    #[serde(default)]
++    pub args: Vec<String>,
++    #[serde(default)]
++    pub timeout_ms: Option<u64>,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
++#[serde(deny_unknown_fields)]
++pub struct AgentPromptBoundParams {
++    pub operation_id: String,
++    pub expected_launch_id: String,
++    pub text: String,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
++#[serde(deny_unknown_fields)]
++pub struct AgentGetBoundParams {
++    pub expected_launch_id: String,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
++#[serde(deny_unknown_fields)]
++pub struct AgentLifecycleBoundParams {
++    pub expected_launch_id: String,
++    pub expected_owner_epoch: String,
++}
++
++/// Writes only the immutable launch profile's interruption key to an exact owner.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
++#[serde(deny_unknown_fields)]
++pub struct AgentInterruptBoundParams {
++    pub operation_id: String,
++    pub expected_launch_id: String,
++    pub expected_owner_epoch: String,
++}
+diff --git a/src/api/schema/response.rs b/src/api/schema/response.rs
+index e6d4de4..1712365 100644
+--- a/src/api/schema/response.rs
++++ b/src/api/schema/response.rs
+@@ -33,6 +33,35 @@ pub struct ErrorResponse {
+     pub error: ErrorBody,
+ }
+ 
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
++pub struct BoundStartErrorResponse {
++    pub id: String,
++    pub error: ErrorBody,
++    pub start_receipt: BoundStartRefusalReceipt,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
++pub struct BoundStartRefusalReceipt {
++    pub operation_id: String,
++    pub owner_epoch: String,
++    pub receipt_id: String,
++    pub effect: BoundStartEffect,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
++#[serde(rename_all = "snake_case")]
++pub enum BoundStartEffect {
++    NotStarted,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
++#[serde(rename_all = "snake_case")]
++pub enum BoundLifecycleState {
++    Live,
++    Exited,
++    Unknown,
++}
++
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+ pub struct ErrorBody {
+     pub code: String,
+@@ -101,6 +130,45 @@ pub enum ResponseResult {
+         agent: AgentInfo,
+         argv: Vec<String>,
+     },
++    AgentBoundInfo {
++        /// Bottom-buffer observation, independent of the reader viewport. Not approval identity.
++        visible_text: String,
++        agent: AgentInfo,
++        launch_id: String,
++    },
++    AgentStartedBound {
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        reporting_mcp: Option<String>,
++        /// Validated launch profile; independent of the agent's observed screen identity.
++        agent_kind: String,
++        owner_epoch: String,
++        agent: AgentInfo,
++        argv: Vec<String>,
++        launch_id: String,
++        operation_id: String,
++    },
++    AgentPromptedBound {
++        launch_id: String,
++        operation_id: String,
++        bytes_written: usize,
++        input_disposition: String,
++    },
++    AgentInterruptedBound {
++        operation_id: String,
++        launch_id: String,
++        owner_epoch: String,
++        receipt_id: String,
++        key: String,
++        bytes_written: usize,
++        input_disposition: String,
++    },
++    AgentBoundLifecycle {
++        launch_id: String,
++        owner_epoch: String,
++        state: BoundLifecycleState,
++        #[serde(skip_serializing_if = "Option::is_none")]
++        receipt_id: Option<String>,
++    },
+     AgentPrompted {
+         agent: AgentInfo,
+     },
+diff --git a/src/api/schema/server.rs b/src/api/schema/server.rs
+index b274bc9..4647699 100644
+--- a/src/api/schema/server.rs
++++ b/src/api/schema/server.rs
+@@ -27,4 +27,22 @@ pub struct ServerCapabilities {
+     /// Whether this server supports endpoint health probes.
+     #[serde(default)]
+     pub health_check: bool,
++    /// Direct-process lifetime-bound startup and input; not native approval identity.
++    #[serde(default)]
++    pub agent_start_bound: bool,
++    #[serde(default)]
++    pub agent_get_bound: bool,
++    #[serde(default)]
++    pub agent_prompt_bound: bool,
++    #[serde(default)]
++    pub agent_lifecycle_bound: bool,
++    #[serde(default)]
++    pub agent_interrupt_bound: bool,
++    #[serde(default)]
++    pub agent_reporting_mcp_codex: bool,
++    /// Current canonical native profiles; discovery only, revalidated at dispatch.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub bound_agent_kinds: Option<Vec<String>>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub owner_epoch: Option<String>,
+ }
+diff --git a/src/api/schema/tests.rs b/src/api/schema/tests.rs
+index b566e8f..2984cf1 100644
+--- a/src/api/schema/tests.rs
++++ b/src/api/schema/tests.rs
+@@ -39,6 +39,7 @@ fn protocol_schema_document() -> serde_json::Value {
+             "request": protocol_schema_entry::<Request>("request"),
+             "success_response": protocol_schema_entry::<SuccessResponse>("success_response"),
+             "error_response": protocol_schema_entry::<ErrorResponse>("error_response"),
++            "bound_start_error_response": protocol_schema_entry::<BoundStartErrorResponse>("bound_start_error_response"),
+             "event": protocol_schema_entry::<EventEnvelope>("event"),
+             "subscription_event": protocol_schema_entry::<SubscriptionEventEnvelope>("subscription_event"),
+         },
+@@ -207,6 +208,35 @@ fn generated_protocol_schema_artifact_is_current() {
+     );
+ }
+ 
++#[test]
++fn bound_created_receipt_separates_declared_profile_from_observed_identity() {
++    let agent: AgentInfo = serde_json::from_value(serde_json::json!({
++        "terminal_id":"terminal", "agent_status":"unknown", "workspace_id":"w1",
++        "tab_id":"w1:t1", "pane_id":"w1:p1", "focused":false, "revision":0,
++        "launch_pending":true
++    }))
++    .unwrap();
++    let response = ResponseResult::AgentStartedBound {
++        reporting_mcp: None,
++        agent_kind: "codex".into(),
++        owner_epoch: "owner".into(),
++        agent,
++        argv: vec!["codex".into()],
++        launch_id: "launch".into(),
++        operation_id: "operation".into(),
++    };
++    let value = serde_json::to_value(&response).unwrap();
++    assert_eq!(value["agent_kind"], "codex");
++    assert_eq!(value["agent"]["agent_status"], "unknown");
++    assert_eq!(value["agent"]["launch_pending"], true);
++    assert!(value["agent"].get("agent").is_none());
++    assert!(value["agent"].get("interactive_ready").is_none());
++    assert_eq!(
++        serde_json::from_value::<ResponseResult>(value).unwrap(),
++        response
++    );
++}
++
+ #[test]
+ fn request_round_trips_for_server_stop() {
+     let request = Request {
+@@ -727,6 +757,14 @@ fn success_response_round_trips() {
+                 endpoint_protocol_generation: Some(1),
+                 surface_interest: true,
+                 health_check: true,
++                agent_start_bound: false,
++                agent_get_bound: false,
++                agent_prompt_bound: false,
++                agent_lifecycle_bound: false,
++                agent_interrupt_bound: false,
++                agent_reporting_mcp_codex: false,
++                bound_agent_kinds: None,
++                owner_epoch: None,
+             }),
+         },
+     };
+@@ -1433,3 +1471,52 @@ fn popup_close_request_round_trips() {
+     assert_eq!(json["method"], "popup.close");
+     assert_eq!(json["params"], serde_json::json!({}));
+ }
++
++#[test]
++fn bound_agent_requests_require_immutable_identity_and_reject_extra_authority() {
++    let prompt = serde_json::json!({"id":"prompt","method":"agent.prompt_bound","params":{"operation_id":"op","expected_launch_id":"launch","text":"work"}});
++    assert!(matches!(
++        serde_json::from_value::<Request>(prompt.clone())
++            .unwrap()
++            .method,
++        Method::AgentPromptBound(_)
++    ));
++    let mut legacy = prompt;
++    legacy["params"]
++        .as_object_mut()
++        .unwrap()
++        .remove("expected_launch_id");
++    legacy["params"]["target"] = serde_json::json!("w1:p1");
++    assert!(serde_json::from_value::<Request>(legacy).is_err());
++    let start = serde_json::json!({"id":"start","method":"agent.start_bound","params":{"operation_id":"op","pane_id":"w1:p1","kind":"codex","work_context_file":"/private/context.json"}});
++    assert!(matches!(
++        serde_json::from_value::<Request>(start.clone())
++            .unwrap()
++            .method,
++        Method::AgentStartBound(_)
++    ));
++    let mut extra = start;
++    extra["params"]["env"] = serde_json::json!({"ANYTHING":"value"});
++    assert!(serde_json::from_value::<Request>(extra).is_err());
++}
++
++#[test]
++fn bound_interrupt_schema_requires_exact_owner_and_rejects_generic_keys() {
++    let value = serde_json::json!({"id":"one", "method":"agent.interrupt_bound", "params":{
++        "operation_id":"operation", "expected_launch_id":"launch", "expected_owner_epoch":"epoch"
++    }});
++    let request: super::Request = serde_json::from_value(value.clone()).unwrap();
++    assert!(matches!(
++        request.method,
++        super::Method::AgentInterruptBound(_)
++    ));
++    let mut extra = value.clone();
++    extra["params"]["key"] = serde_json::json!("Enter");
++    assert!(serde_json::from_value::<super::Request>(extra).is_err());
++    let mut missing = value;
++    missing["params"]
++        .as_object_mut()
++        .unwrap()
++        .remove("expected_owner_epoch");
++    assert!(serde_json::from_value::<super::Request>(missing).is_err());
++}
+diff --git a/src/api/server.rs b/src/api/server.rs
+index b8ef7c3..eac0fee 100644
+--- a/src/api/server.rs
++++ b/src/api/server.rs
+@@ -71,6 +71,14 @@ fn default_capabilities() -> Option<ServerCapabilities> {
+         endpoint_protocol_generation: Some(crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION),
+         surface_interest: true,
+         health_check: true,
++        agent_start_bound: cfg!(unix),
++        agent_get_bound: cfg!(unix),
++        agent_prompt_bound: cfg!(unix),
++        agent_lifecycle_bound: cfg!(unix),
++        agent_interrupt_bound: cfg!(unix),
++        agent_reporting_mcp_codex: cfg!(unix),
++        bound_agent_kinds: None,
++        owner_epoch: cfg!(unix).then(crate::pty::bound_lifecycle::owner_epoch),
+     })
+ }
+ 
+@@ -340,6 +348,13 @@ fn handle_request(
+     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
+ ) -> String {
+     if matches!(&request.method, Method::Ping(_)) {
++        // Bounded catalog/filesystem inspection belongs to explicit metadata,
++        // never pane rendering or screen detection. Recompute after upgrades.
++        let mut capabilities = capabilities;
++        if let Some(capabilities) = &mut capabilities {
++            capabilities.bound_agent_kinds =
++                (cfg!(unix) && capabilities.agent_start_bound).then(crate::app::bound_agent_kinds);
++        }
+         return serde_json::to_string(&SuccessResponse {
+             id: request.id,
+             result: ResponseResult::Pong {
+@@ -428,6 +443,11 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
+         Method::AgentViewClear(_) => "agent.view.clear",
+         Method::AgentFocus(_) => "agent.focus",
+         Method::AgentStart(_) => "agent.start",
++        Method::AgentStartBound(_) => "agent.start_bound",
++        Method::AgentGetBound(_) => "agent.get_bound",
++        Method::AgentLifecycleBound(_) => "agent.lifecycle_bound",
++        Method::AgentPromptBound(_) => "agent.prompt_bound",
++        Method::AgentInterruptBound(_) => "agent.interrupt_bound",
+         Method::AgentPrompt(_) => "agent.prompt",
+         Method::AgentWait(_) => "agent.wait",
+         Method::PaneSplit(_) => "pane.split",
+@@ -1149,6 +1169,14 @@ mod tests {
+                 ),
+                 surface_interest: true,
+                 health_check: true,
++                agent_start_bound: false,
++                agent_get_bound: false,
++                agent_prompt_bound: false,
++                agent_lifecycle_bound: false,
++                agent_interrupt_bound: false,
++                agent_reporting_mcp_codex: false,
++                bound_agent_kinds: None,
++                owner_epoch: None,
+             }),
+             None,
+             None,
+diff --git a/src/app/actions.rs b/src/app/actions.rs
+index ca6f670..5d3fe7f 100644
+--- a/src/app/actions.rs
++++ b/src/app/actions.rs
+@@ -1579,7 +1579,9 @@ impl AppState {
+                 self.handle_pane_died(pane_id);
+                 Vec::new()
+             }
+-            AppEvent::WorktreeRuntimeRestoreFailed { .. } => Vec::new(),
++            AppEvent::WorktreeRuntimeRestoreFailed { .. } | AppEvent::RuntimeDied { .. } => {
++                Vec::new()
++            }
+             AppEvent::UpdateReady {
+                 version,
+                 install_command,
+diff --git a/src/app/agents.rs b/src/app/agents.rs
+index 5033505..b7aa8a5 100644
+--- a/src/app/agents.rs
++++ b/src/app/agents.rs
+@@ -1,6 +1,8 @@
+ use std::time::{Duration, Instant};
+ 
+ use bytes::Bytes;
++#[path = "reporting.rs"]
++mod reporting;
+ 
+ use super::{terminal_targets::TerminalTargetError, App};
+ use crate::api::schema::AgentStartParams;
+@@ -19,6 +21,92 @@ fn valid_agent_name(name: &str) -> bool {
+         && chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '-' | '_'))
+ }
+ 
++// The server's configured PATH selects the installed agent profile. A request
++// may name that exact native executable, never substitute a shell or wrapper.
++// This is a trusted local installation boundary, not signed binary attestation.
++pub(crate) fn bound_agent_kinds() -> Vec<String> {
++    std::env::var_os("PATH")
++        .map(|path| bound_agent_kinds_in_path(&path))
++        .unwrap_or_default()
++}
++fn bound_agent_kinds_in_path(path: &std::ffi::OsStr) -> Vec<String> {
++    crate::detect::Agent::ALL
++        .into_iter()
++        .filter_map(|kind| {
++            let executable = crate::detect::interactive_agent_executable(kind);
++            resolve_bound_agent_profile_in_path(executable, executable, path)
++                .map(|_| crate::detect::agent_label(kind).to_string())
++        })
++        .collect()
++}
++
++fn resolve_bound_agent_profile(
++    kind: crate::detect::Agent,
++    command: &str,
++) -> Option<std::path::PathBuf> {
++    let path = std::env::var_os("PATH")?;
++    resolve_bound_agent_profile_in_path(
++        crate::detect::interactive_agent_executable(kind),
++        command,
++        &path,
++    )
++}
++
++fn resolve_bound_agent_profile_in_path(
++    name: &str,
++    command: &str,
++    search: &std::ffi::OsStr,
++) -> Option<std::path::PathBuf> {
++    use std::io::Read;
++    let profile = std::env::split_paths(search)
++        .filter(|directory| directory.is_absolute())
++        .map(|directory| directory.join(name))
++        .find(|candidate| candidate.is_file())?
++        .canonicalize()
++        .ok()?;
++    let requested = if command == name {
++        profile.clone()
++    } else {
++        let requested = std::path::Path::new(command);
++        if !requested.is_absolute() {
++            return None;
++        }
++        requested.canonicalize().ok()?
++    };
++    if requested != profile {
++        return None;
++    }
++    let mut file = std::fs::File::open(&profile).ok()?;
++    let metadata = file.metadata().ok()?;
++    if !metadata.is_file() {
++        return None;
++    }
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::PermissionsExt;
++        if metadata.permissions().mode() & 0o111 == 0 {
++            return None;
++        }
++    }
++    let mut magic = [0; 4];
++    file.read_exact(&mut magic).ok()?;
++    // Native ELF and Mach-O (including universal binaries). Script launchers
++    // need their own audited lifetime contract before strict mode supports them.
++    matches!(
++        magic,
++        [0x7f, b'E', b'L', b'F']
++            | [0xfe, 0xed, 0xfa, 0xce]
++            | [0xce, 0xfa, 0xed, 0xfe]
++            | [0xfe, 0xed, 0xfa, 0xcf]
++            | [0xcf, 0xfa, 0xed, 0xfe]
++            | [0xca, 0xfe, 0xba, 0xbe]
++            | [0xbe, 0xba, 0xfe, 0xca]
++            | [0xca, 0xfe, 0xba, 0xbf]
++            | [0xbf, 0xba, 0xfe, 0xca]
++    )
++    .then_some(profile)
++}
++
+ impl App {
+     pub(super) fn collect_agent_infos(&self) -> Vec<crate::api::schema::AgentInfo> {
+         self.state
+@@ -231,11 +319,191 @@ impl App {
+         Ok((agent, argv))
+     }
+ 
++    pub(super) fn start_bound_agent(
++        &mut self,
++        params: crate::api::schema::AgentStartBoundParams,
++    ) -> Result<(crate::api::schema::AgentInfo, Vec<String>, String), AgentStartError> {
++        if params.operation_id.is_empty()
++            || params.operation_id.len() > 128
++            || params.operation_id.chars().any(char::is_control)
++        {
++            return Err(AgentStartError::InvalidArgument);
++        }
++        let name = params.name.unwrap_or_else(|| {
++            format!(
++                "bound-{}",
++                crate::terminal::TerminalId::alloc()
++                    .as_str()
++                    .chars()
++                    .skip(5)
++                    .take(26)
++                    .collect::<String>()
++            )
++        });
++        if !valid_agent_name(&name) {
++            return Err(AgentStartError::InvalidName);
++        }
++        let kind = crate::detect::parse_agent_label(&params.kind)
++            .ok_or_else(|| AgentStartError::UnsupportedKind(params.kind.clone()))?;
++        let command = params
++            .command
++            .unwrap_or_else(|| crate::detect::interactive_agent_executable(kind).to_string());
++        if command.is_empty()
++            || command.len() > 4096
++            || command.chars().any(char::is_control)
++            || params.args.len() > 128
++            || params
++                .args
++                .iter()
++                .any(|arg| arg.len() > 65536 || arg.chars().any(char::is_control))
++        {
++            return Err(AgentStartError::InvalidArgument);
++        }
++        let executable = resolve_bound_agent_profile(kind, &command)
++            .ok_or_else(|| AgentStartError::UnsupportedKind(format!("{} bound profile: use the canonical native executable; scripts and command overrides are unsupported", params.kind)))?;
++        let reporting_config = if let Some(reporting) = &params.reporting_mcp {
++            if kind != crate::detect::Agent::Codex
++                || params.work_context_file.is_none()
++                || !params.args.is_empty()
++            {
++                return Err(AgentStartError::UnsupportedKind("managed reporting requires the supported Codex profile without custom arguments".into()));
++            }
++            Some(
++                reporting::config(
++                    reporting,
++                    &params.operation_id,
++                    params.work_context_file.as_deref().unwrap(),
++                )
++                .ok_or(AgentStartError::InvalidArgument)?,
++            )
++        } else {
++            None
++        };
++        let conflicts = self.agent_name_conflicts(&name, "");
++        if !conflicts.is_empty() {
++            return Err(AgentStartError::DuplicateName {
++                name,
++                candidates: conflicts,
++            });
++        }
++        let (ws_idx, pane_id) = self
++            .parse_current_public_pane_id(&params.pane_id)
++            .ok_or_else(|| AgentStartError::TargetNotFound(params.pane_id.clone()))?;
++        let terminal_id = self
++            .state
++            .workspaces
++            .get(ws_idx)
++            .and_then(|workspace| workspace.terminal_id(pane_id))
++            .cloned()
++            .ok_or_else(|| AgentStartError::TargetNotFound(params.pane_id.clone()))?;
++        let terminal = self
++            .state
++            .terminals
++            .get(&terminal_id)
++            .ok_or_else(|| AgentStartError::TargetNotFound(params.pane_id.clone()))?;
++        if terminal.is_agent_terminal() || terminal.managed_agent_kind().is_some() {
++            return Err(AgentStartError::TargetBusy(params.pane_id));
++        }
++        let old = self
++            .terminal_runtimes
++            .get(&terminal_id)
++            .ok_or_else(|| AgentStartError::TargetUnavailable(params.pane_id.clone()))?;
++        // Existing ordinary APIs keep shell injection. This method replaces only
++        // an available shell with an argv child whose PTY ends when that child exits.
++        if available_shell_name(old).is_none() {
++            return Err(AgentStartError::TargetBusy(params.pane_id));
++        }
++        let (rows, cols) = old.current_size();
++        let cwd = terminal.cwd.clone();
++        let timeout = Duration::from_millis(
++            params
++                .timeout_ms
++                .unwrap_or(DEFAULT_AGENT_START_TIMEOUT.as_millis() as u64),
++        );
++        if timeout <= AGENT_START_SETTLE_DELAY || timeout > MAX_AGENT_START_TIMEOUT {
++            return Err(AgentStartError::InvalidTimeout);
++        }
++        let mut extra = Vec::new();
++        if let Some(path) = params.work_context_file {
++            if path.len() > 4096
++                || !std::path::Path::new(&path).is_absolute()
++                || path.chars().any(char::is_control)
++            {
++                return Err(AgentStartError::InvalidArgument);
++            }
++            extra.push(("MUQUN_WORK_CONTEXT_FILE".to_string(), path));
++        }
++        let launch_env = self
++            .pane_launch_env(ws_idx, pane_id, extra)
++            .ok_or_else(|| AgentStartError::TargetUnavailable(params.pane_id.clone()))?;
++        let mut argv = vec![command];
++        argv.extend(params.args);
++        let mut spawn_argv = argv.clone();
++        spawn_argv[0] = executable.to_string_lossy().into_owned();
++        if let Some(config) = reporting_config {
++            spawn_argv.extend(["--strict-config".into(), "-c".into(), config]);
++        }
++        let mut runtime = crate::terminal::TerminalRuntime::spawn_argv_command(
++            pane_id,
++            rows,
++            cols,
++            cwd,
++            &spawn_argv,
++            &launch_env,
++            crate::pane::AgentDetection::Enabled,
++            true,
++            self.state.pane_scrollback_limit_bytes,
++            self.state.host_terminal_theme,
++            self.state.host_terminal_appearance,
++            self.event_tx.clone(),
++            self.render_notify.clone(),
++            self.render_dirty.clone(),
++        )
++        .map_err(|error| {
++            if error
++                .get_ref()
++                .is_some_and(|e| e.is::<crate::pty::bound_lifecycle::CapacityExceeded>())
++            {
++                AgentStartError::BoundCapacity
++            } else {
++                AgentStartError::InputFailed(error.to_string())
++            }
++        })?;
++        runtime.set_bound_interrupt_profile(kind);
++        let launch_id = runtime
++            .bound_launch_id()
++            .ok_or_else(|| {
++                AgentStartError::InputFailed("spawned child identity unavailable".into())
++            })?
++            .to_string();
++        self.terminal_runtimes.insert(terminal_id.clone(), runtime);
++        let terminal = self.state.terminals.get_mut(&terminal_id).ok_or_else(|| {
++            AgentStartError::InputFailed("spawned child terminal unavailable".into())
++        })?;
++        terminal.begin_managed_agent(
++            name,
++            kind,
++            Instant::now(),
++            AGENT_START_SETTLE_DELAY,
++            timeout,
++        );
++        terminal.respawn_shell_on_exit = false;
++        self.state.mark_session_dirty();
++        self.schedule_session_save();
++        let agent = self.agent_info(ws_idx, pane_id).ok_or_else(|| {
++            AgentStartError::InputFailed("spawned child metadata unavailable".into())
++        })?;
++        Ok((agent, argv, launch_id))
++    }
++
+     pub(super) fn agent_start_error_body(
+         &self,
+         err: AgentStartError,
+     ) -> crate::api::schema::ErrorBody {
+         match err {
++            AgentStartError::BoundCapacity => crate::api::schema::ErrorBody {
++                code: "resource_limit".into(), message: "native lifecycle capacity exhausted before spawn".into(),
++            },
+             AgentStartError::InvalidName => crate::api::schema::ErrorBody {
+                 code: "invalid_agent_name".into(),
+                 message: INVALID_AGENT_NAME_MESSAGE.into(),
+@@ -375,7 +643,22 @@ impl App {
+             return None;
+         }
+         let pane = self.pane_info(ws_idx, pane_id)?;
++        let owner_epoch = crate::pty::bound_lifecycle::owner_epoch();
++        let launch_id = self
++            .terminal_runtimes
++            .get(&pane_state.attached_terminal_id)
++            .and_then(|runtime| runtime.bound_launch_id())
++            .filter(|launch| {
++                matches!(
++                    crate::pty::bound_lifecycle::observe(&owner_epoch, launch),
++                    crate::pty::bound_lifecycle::Observation::Live
++                )
++            })
++            .map(str::to_owned);
++        let owner_epoch = launch_id.as_ref().map(|_| owner_epoch);
+         Some(crate::api::schema::AgentInfo {
++            launch_id,
++            owner_epoch,
+             terminal_id: pane.terminal_id,
+             name: terminal.agent_name.clone(),
+             agent: pane.agent,
+@@ -446,6 +729,7 @@ fn live_runtime_agent(runtime: &crate::terminal::TerminalRuntime) -> Option<crat
+ }
+ 
+ pub(super) enum AgentStartError {
++    BoundCapacity,
+     InvalidName,
+     UnsupportedKind(String),
+     InvalidArgument,
+@@ -473,6 +757,40 @@ pub(super) enum AgentRenameError {
+ 
+ #[cfg(test)]
+ mod tests {
++    #[cfg(unix)]
++    #[test]
++    fn bound_profile_requires_exact_native_catalog_executable() {
++        use std::os::unix::fs::PermissionsExt;
++        let dir = std::env::temp_dir().join(format!(
++            "herdr-bound-profile-{}",
++            crate::terminal::TerminalId::alloc()
++        ));
++        std::fs::create_dir(&dir).unwrap();
++        let profile = dir.join("codex");
++        std::fs::copy("/bin/cat", &profile).unwrap();
++        let search = dir.as_os_str();
++        assert!(super::resolve_bound_agent_profile_in_path("codex", "codex", search).is_some());
++        assert_eq!(super::bound_agent_kinds_in_path(search), vec!["codex"]);
++        let script = dir.join("claude");
++        std::fs::write(&script, "#!/bin/sh\nexec claude-real\n").unwrap();
++        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
++        assert_eq!(super::bound_agent_kinds_in_path(search), vec!["codex"]);
++
++        assert!(super::resolve_bound_agent_profile_in_path(
++            "codex",
++            profile.to_str().unwrap(),
++            search
++        )
++        .is_some());
++        for command in ["/bin/sh", "/bin/bash", "/bin/cat", "sh", "unknown-wrapper"] {
++            assert!(super::resolve_bound_agent_profile_in_path("codex", command, search).is_none());
++        }
++        std::fs::write(&profile, "#!/bin/sh\nexec /bin/cat\n").unwrap();
++        std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o700)).unwrap();
++        assert!(super::resolve_bound_agent_profile_in_path("codex", "codex", search).is_none());
++        std::fs::remove_dir_all(dir).unwrap();
++    }
++
+     use super::valid_agent_name;
+ 
+     #[test]
+diff --git a/src/app/api.rs b/src/app/api.rs
+index 8470818..dd9b95c 100644
+--- a/src/app/api.rs
++++ b/src/app/api.rs
+@@ -83,6 +83,36 @@ impl App {
+         &mut self,
+         ev: AppEvent,
+     ) -> Vec<crate::app::actions::PaneStateUpdate> {
++        let ev = match ev {
++            AppEvent::RuntimeDied {
++                pane_id,
++                runtime_id,
++                exit_reason,
++            } => {
++                let current = self
++                    .find_pane(pane_id)
++                    .and_then(|(_, pane)| self.terminal_runtimes.get(&pane.attached_terminal_id))
++                    .or_else(|| {
++                        self.state
++                            .popup_pane
++                            .as_ref()
++                            .filter(|popup| popup.pane_id == pane_id)
++                            .and_then(|popup| self.terminal_runtimes.get(&popup.terminal_id))
++                    });
++                if current.is_none_or(|runtime| runtime.runtime_lifetime_id() != runtime_id)
++                    && !self
++                        .pending_worktree_remove_runtime_exits
++                        .contains_key(&pane_id)
++                {
++                    return Vec::new();
++                }
++                AppEvent::PaneDied {
++                    pane_id,
++                    exit_reason,
++                }
++            }
++            ev => ev,
++        };
+         let mut worktree_restore_failed = false;
+         let ev = match ev {
+             AppEvent::WorktreeRuntimeRestoreFailed {
+@@ -640,6 +670,26 @@ impl App {
+     }
+ 
+     pub(crate) fn emit_pane_state_update(&mut self, update: &crate::app::actions::PaneStateUpdate) {
++        if let Some(terminal_id) = self
++            .state
++            .workspaces
++            .get(update.ws_idx)
++            .and_then(|workspace| workspace.terminal_id(update.pane_id))
++        {
++            if let (Some(runtime), Some(terminal)) = (
++                self.terminal_runtimes.get(terminal_id),
++                self.state.terminals.get(terminal_id),
++            ) {
++                runtime.set_bound_input_ready(
++                    !terminal.managed_agent_launch_pending()
++                        && terminal.effective_known_agent().is_some()
++                        && !matches!(
++                            terminal.state,
++                            crate::detect::AgentState::Blocked | crate::detect::AgentState::Unknown
++                        ),
++                );
++            }
++        }
+         let Some(pane_id) = self.public_pane_id(update.ws_idx, update.pane_id) else {
+             return;
+         };
+@@ -1062,6 +1112,22 @@ impl App {
+                 return self.handle_agent_view_clear(request.id, params)
+             }
+             Method::AgentStart(params) => return self.handle_agent_start(request.id, params),
++            Method::AgentStartBound(params) => {
++                return self.handle_agent_start_bound(request.id, params)
++            }
++            Method::AgentLifecycleBound(params) => {
++                return self.handle_agent_lifecycle_bound(request.id, params)
++            }
++            Method::AgentGetBound(params) => {
++                return self.handle_agent_get_bound(request.id, params)
++            }
++            Method::AgentPromptBound(_) | Method::AgentInterruptBound(_) => {
++                return super::api::responses::encode_error(
++                    request.id,
++                    "delivery_unconfirmed",
++                    "bound prompt requires deferred dispatch",
++                )
++            }
+             Method::AgentPrompt(_) => {
+                 return responses::encode_error(
+                     request.id,
+diff --git a/src/app/api/agents.rs b/src/app/api/agents.rs
+index cf3e5fa..63f3804 100644
+--- a/src/app/api/agents.rs
++++ b/src/app/api/agents.rs
+@@ -71,13 +71,409 @@ impl App {
+         encode_success(id, ResponseResult::AgentStarted { agent, argv })
+     }
+ 
++    pub(super) fn handle_agent_get_bound(
++        &mut self,
++        id: String,
++        params: crate::api::schema::AgentGetBoundParams,
++    ) -> String {
++        if !cfg!(unix) {
++            return encode_error(id, "unsupported", "bound launch lookup is unavailable");
++        }
++        if params.expected_launch_id.is_empty() || params.expected_launch_id.len() > 128 {
++            return encode_error(id, "invalid_request", "invalid launch identity");
++        }
++        let found = self
++            .state
++            .workspaces
++            .iter()
++            .enumerate()
++            .find_map(|(ws_idx, workspace)| {
++                workspace
++                    .tabs
++                    .iter()
++                    .flat_map(|tab| tab.layout.pane_ids())
++                    .find_map(|pane_id| {
++                        let runtime = self
++                            .terminal_runtimes
++                            .get(workspace.terminal_id(pane_id)?)?;
++                        (runtime.bound_launch_id() == Some(params.expected_launch_id.as_str()))
++                            .then_some((ws_idx, pane_id))
++                    })
++            });
++        let Some((ws_idx, pane_id)) = found else {
++            return encode_error(id, "instance_changed", "agent launch is no longer present");
++        };
++        if let Some(target) = self.public_pane_id(ws_idx, pane_id) {
++            self.reconcile_managed_agent_target(&target);
++        }
++        let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
++            return encode_error(id, "instance_changed", "agent runtime disappeared");
++        };
++        let mut visible_text = crate::app::api_helpers::read_terminal_snapshot(
++            runtime,
++            crate::api::schema::ReadSource::Detection,
++            crate::api::schema::ReadFormat::Text,
++            Some(80),
++        )
++        .text;
++        if visible_text.len() > 65536 {
++            let mut start = visible_text.len() - 65536;
++            while !visible_text.is_char_boundary(start) {
++                start += 1;
++            }
++            visible_text = visible_text[start..].to_string();
++        }
++        match self.agent_info(ws_idx, pane_id) {
++            Some(agent) => encode_success(
++                id,
++                ResponseResult::AgentBoundInfo {
++                    visible_text,
++                    agent,
++                    launch_id: params.expected_launch_id,
++                },
++            ),
++            None => encode_error(id, "instance_changed", "agent launch is no longer present"),
++        }
++    }
++
++    pub(super) fn handle_agent_start_bound(
++        &mut self,
++        id: String,
++        params: crate::api::schema::AgentStartBoundParams,
++    ) -> String {
++        if !cfg!(unix) {
++            return encode_error(id, "unsupported", "bound agent startup is unavailable");
++        }
++        let operation_id = params.operation_id.clone();
++        let agent_kind = params.kind.clone();
++        let reporting_mcp = params
++            .reporting_mcp
++            .as_ref()
++            .map(|_| "codex_stdio_v1".to_string());
++        if operation_id.is_empty()
++            || operation_id.len() > 128
++            || operation_id.chars().any(char::is_control)
++        {
++            return encode_error(id, "invalid_request", "invalid start operation identity");
++        }
++        if !crate::pty::bound_lifecycle::begin_operation(&operation_id) {
++            return encode_error(
++                id,
++                "delivery_unconfirmed",
++                "start operation is already observed or native operation capacity is exhausted",
++            );
++        }
++        match self.start_bound_agent(params) {
++            Ok((agent, argv, launch_id)) => encode_success(
++                id,
++                ResponseResult::AgentStartedBound {
++                    reporting_mcp,
++                    agent_kind,
++                    owner_epoch: crate::pty::bound_lifecycle::owner_epoch(),
++                    agent,
++                    argv,
++                    launch_id,
++                    operation_id,
++                },
++            ),
++            Err(crate::app::agents::AgentStartError::InputFailed(_)) => encode_error(
++                id,
++                "delivery_unconfirmed",
++                "agent startup was not confirmed",
++            ),
++            Err(error) => serde_json::to_string(&crate::api::schema::BoundStartErrorResponse {
++                id,
++                error: self.agent_start_error_body(error),
++                start_receipt: crate::api::schema::BoundStartRefusalReceipt {
++                    operation_id,
++                    owner_epoch: crate::pty::bound_lifecycle::owner_epoch(),
++                    receipt_id: crate::pty::bound_lifecycle::receipt_id(),
++                    effect: crate::api::schema::BoundStartEffect::NotStarted,
++                },
++            })
++            .expect("bound start receipt contains serializable values"),
++        }
++    }
++
++    pub(super) fn handle_agent_lifecycle_bound(
++        &self,
++        id: String,
++        params: crate::api::schema::AgentLifecycleBoundParams,
++    ) -> String {
++        if !cfg!(unix) {
++            return encode_error(id, "unsupported", "bound lifecycle evidence is unavailable");
++        }
++        for value in [&params.expected_launch_id, &params.expected_owner_epoch] {
++            if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
++                return encode_error(id, "invalid_request", "invalid lifecycle identity");
++            }
++        }
++        use crate::api::schema::BoundLifecycleState;
++        use crate::pty::bound_lifecycle::Observation;
++        let (state, receipt_id) = match crate::pty::bound_lifecycle::observe(
++            &params.expected_owner_epoch,
++            &params.expected_launch_id,
++        ) {
++            Observation::Live => (BoundLifecycleState::Live, None),
++            Observation::Exited { receipt_id } => (BoundLifecycleState::Exited, Some(receipt_id)),
++            Observation::Unknown => (BoundLifecycleState::Unknown, None),
++        };
++        encode_success(
++            id,
++            ResponseResult::AgentBoundLifecycle {
++                launch_id: params.expected_launch_id,
++                owner_epoch: crate::pty::bound_lifecycle::owner_epoch(),
++                state,
++                receipt_id,
++            },
++        )
++    }
++
++    fn handle_bound_interrupt_deferred(
++        &mut self,
++        id: String,
++        params: crate::api::schema::AgentInterruptBoundParams,
++        respond_to: std::sync::mpsc::Sender<String>,
++    ) {
++        use crate::pty::bound_interrupt::{self, Admission, Outcome};
++        let refuse = |code: &str, message: &str| {
++            let _ = respond_to.send(encode_error(id.clone(), code, message));
++        };
++        if !cfg!(unix) {
++            refuse("unsupported", "bound interruption is unavailable");
++            return;
++        }
++        if [
++            &params.operation_id,
++            &params.expected_launch_id,
++            &params.expected_owner_epoch,
++        ]
++        .iter()
++        .any(|value| value.is_empty() || value.len() > 128 || value.chars().any(char::is_control))
++        {
++            refuse("invalid_request", "invalid bound interruption identity");
++            return;
++        }
++        if params.expected_owner_epoch != crate::pty::bound_lifecycle::owner_epoch() {
++            refuse("instance_changed", "owner epoch changed");
++            return;
++        }
++        match bound_interrupt::reserve(
++            &params.operation_id,
++            &params.expected_owner_epoch,
++            &params.expected_launch_id,
++        ) {
++            Admission::Fresh => {}
++            Admission::Replay(outcome) => {
++                let _ = respond_to.send(encode_bound_interrupt(id, &params, outcome));
++                return;
++            }
++            Admission::Conflict => {
++                refuse("request_key_conflict", "operation identity payload changed");
++                return;
++            }
++            Admission::Pending => {
++                refuse(
++                    "delivery_unconfirmed",
++                    "interruption acknowledgement is pending",
++                );
++                return;
++            }
++            Admission::Full => {
++                refuse(
++                    "resource_limit",
++                    "interruption operation capacity exhausted",
++                );
++                return;
++            }
++        }
++        let finish = |outcome: Outcome| {
++            bound_interrupt::complete(&params.operation_id, outcome.clone());
++            let _ = respond_to.send(encode_bound_interrupt(id.clone(), &params, outcome));
++        };
++        let runtime = self.state.workspaces.iter().find_map(|workspace| {
++            workspace
++                .tabs
++                .iter()
++                .flat_map(|tab| tab.layout.pane_ids())
++                .find_map(|pane_id| {
++                    let terminal_id = workspace.terminal_id(pane_id)?;
++                    let runtime = self.terminal_runtimes.get(terminal_id)?;
++                    (runtime.bound_launch_id() == Some(params.expected_launch_id.as_str()))
++                        .then_some(runtime)
++                })
++        });
++        let Some(runtime) = runtime else {
++            finish(Outcome::Refused {
++                code: "instance_changed".into(),
++                message: "agent launch is no longer present".into(),
++            });
++            return;
++        };
++        if runtime.bound_interrupt_key() != Some(0x1b) {
++            finish(Outcome::Refused {
++                code: "unsupported".into(),
++                message: "launch profile has no validated interruption key".into(),
++            });
++            return;
++        }
++        match runtime.queue_bound_interrupt(&params.expected_launch_id) {
++            Ok(completion) => {
++                std::thread::spawn(move || {
++                    let outcome = match completion.recv() {
++                        Ok(Ok(())) => bound_interrupt::written(),
++                        Ok(Err(error)) => interrupt_error(&error),
++                        Err(_) => Outcome::Refused {
++                            code: "delivery_unconfirmed".into(),
++                            message: "PTY acknowledgement was lost".into(),
++                        },
++                    };
++                    bound_interrupt::complete(&params.operation_id, outcome.clone());
++                    let _ = respond_to.send(encode_bound_interrupt(id, &params, outcome));
++                });
++            }
++            Err(error) => finish(interrupt_error(&error)),
++        }
++    }
++
++    fn handle_bound_prompt_deferred(
++        &mut self,
++        id: String,
++        params: crate::api::schema::AgentPromptBoundParams,
++        respond_to: std::sync::mpsc::Sender<String>,
++    ) {
++        let fail = |code: &str, message: &str| {
++            let _ = respond_to.send(encode_error(id.clone(), code, message));
++        };
++        if !cfg!(unix) {
++            fail("unsupported", "bound prompt submission is unavailable");
++            return;
++        }
++        if params.text.is_empty()
++            || params.text.len() > 262144
++            || params.operation_id.is_empty()
++            || params.operation_id.len() > 128
++            || params.expected_launch_id.is_empty()
++            || params.expected_launch_id.len() > 128
++            || params.operation_id.chars().any(char::is_control)
++        {
++            fail("invalid_request", "invalid bound prompt");
++            return;
++        }
++        let found = self
++            .state
++            .workspaces
++            .iter()
++            .enumerate()
++            .find_map(|(ws_idx, workspace)| {
++                workspace
++                    .tabs
++                    .iter()
++                    .flat_map(|tab| tab.layout.pane_ids())
++                    .find_map(|pane_id| {
++                        let terminal_id = workspace.terminal_id(pane_id)?;
++                        let runtime = self.terminal_runtimes.get(terminal_id)?;
++                        (runtime.bound_launch_id() == Some(params.expected_launch_id.as_str()))
++                            .then_some((ws_idx, pane_id, terminal_id.clone()))
++                    })
++            });
++        let Some((ws_idx, pane_id, terminal_id)) = found else {
++            fail("instance_changed", "agent launch is no longer present");
++            return;
++        };
++        let Some(terminal) = self.state.terminals.get(&terminal_id) else {
++            fail("instance_changed", "agent launch is no longer present");
++            return;
++        };
++        let runtime = self
++            .terminal_runtimes
++            .get(&terminal_id)
++            .expect("runtime resolved above");
++        if terminal.state == crate::detect::AgentState::Blocked {
++            runtime.set_bound_input_ready(false);
++            fail("agent_blocked", "agent requires interactive input");
++            return;
++        }
++        if terminal.state != crate::detect::AgentState::Idle
++            || !terminal.managed_agent_interactive_ready()
++        {
++            fail("agent_not_ready", "agent is not ready for a new prompt");
++            return;
++        }
++        let Some(expected_agent) = terminal.effective_known_agent() else {
++            fail("agent_not_ready", "agent is not identified");
++            return;
++        };
++        if !crate::app::agents::runtime_hosts_agent(runtime, expected_agent) {
++            runtime.set_bound_input_ready(false);
++            fail(
++                "agent_not_ready",
++                "agent no longer owns the foreground process",
++            );
++            return;
++        }
++        runtime.set_bound_input_ready(true);
++        let (mut text, enter) =
++            crate::app::api_helpers::encode_api_submission_parts(runtime, &params.text);
++        if expected_agent == crate::detect::Agent::GithubCopilot {
++            let Ok(mut focus) = crate::ghostty::encode_focus(crate::ghostty::FocusEvent::Gained)
++            else {
++                fail("agent_not_ready", "focus encoding failed");
++                return;
++            };
++            focus.append(&mut text);
++            text = focus;
++        }
++        let _ = (ws_idx, pane_id);
++        let result = runtime.queue_bound_input_submission(
++            &params.expected_launch_id,
++            Bytes::from(text),
++            Bytes::from(enter),
++            agent_prompt_submit_delay(expected_agent, params.text.len()),
++        );
++        match result {
++            Ok(completion) => {
++                std::thread::spawn(move || {
++                    let response = match completion.recv() {
++                        Ok(Ok(())) => encode_success(
++                            id,
++                            ResponseResult::AgentPromptedBound {
++                                launch_id: params.expected_launch_id,
++                                operation_id: params.operation_id,
++                                bytes_written: params.text.len(),
++                                input_disposition: "written".into(),
++                            },
++                        ),
++                        Ok(Err(error)) => bound_prompt_error(id, &error),
++                        Err(_) => {
++                            encode_error(id, "delivery_unconfirmed", "PTY acknowledgement was lost")
++                        }
++                    };
++                    let _ = respond_to.send(response);
++                });
++            }
++            Err(error) => {
++                let _ = respond_to.send(bound_prompt_error(id, &error));
++            }
++        }
++    }
++
+     pub(crate) fn handle_deferred_agent_api_request(
+         &mut self,
+         request: crate::api::schema::Request,
+         respond_to: std::sync::mpsc::Sender<String>,
+     ) -> bool {
+-        let crate::api::schema::Method::AgentPrompt(params) = request.method else {
+-            return false;
++        let params = match request.method {
++            crate::api::schema::Method::AgentInterruptBound(params) => {
++                self.handle_bound_interrupt_deferred(request.id, params, respond_to);
++                return true;
++            }
++            crate::api::schema::Method::AgentPromptBound(params) => {
++                self.handle_bound_prompt_deferred(request.id, params, respond_to);
++                return true;
++            }
++            crate::api::schema::Method::AgentPrompt(params) => params,
++            _ => return false,
+         };
+         match self.queue_agent_prompt(request.id, params) {
+             Ok((id, agent, completion)) => {
+@@ -374,8 +770,175 @@ fn agent_not_found(id: String, target: &str) -> String {
+     )
+ }
+ 
++fn encode_bound_interrupt(
++    id: String,
++    params: &crate::api::schema::AgentInterruptBoundParams,
++    outcome: crate::pty::bound_interrupt::Outcome,
++) -> String {
++    match outcome {
++        crate::pty::bound_interrupt::Outcome::Written { receipt_id } => encode_success(
++            id,
++            ResponseResult::AgentInterruptedBound {
++                operation_id: params.operation_id.clone(),
++                launch_id: params.expected_launch_id.clone(),
++                owner_epoch: params.expected_owner_epoch.clone(),
++                receipt_id,
++                key: "Escape".into(),
++                bytes_written: 1,
++                input_disposition: "written".into(),
++            },
++        ),
++        crate::pty::bound_interrupt::Outcome::Refused { code, message } => {
++            encode_error(id, &code, message)
++        }
++    }
++}
++fn interrupt_error(error: &std::io::Error) -> crate::pty::bound_interrupt::Outcome {
++    let (code, message) = bound_input_error_parts(error);
++    crate::pty::bound_interrupt::Outcome::Refused {
++        code: code.into(),
++        message: message.into(),
++    }
++}
++fn bound_prompt_error(id: String, error: &std::io::Error) -> String {
++    let (code, message) = bound_input_error_parts(error);
++    encode_error(id, code, message)
++}
++fn bound_input_error_parts(error: &std::io::Error) -> (&'static str, &'static str) {
++    if let Some(detail) = error
++        .get_ref()
++        .and_then(|error| error.downcast_ref::<crate::pty::bound_submission::BoundInputError>())
++    {
++        if detail.bytes_written == 0 {
++            let code = if detail.reason.contains("identity") || detail.reason.contains("exited") {
++                "instance_changed"
++            } else {
++                "agent_not_ready"
++            };
++            return (code, "bound input was refused before writing");
++        }
++    }
++    (
++        "delivery_unconfirmed",
++        "bound input may have been partially written",
++    )
++}
++
+ #[cfg(test)]
+ mod tests {
++    #[test]
++    fn bound_interrupt_receipt_replay_uses_current_request_id() {
++        let params = crate::api::schema::AgentInterruptBoundParams {
++            operation_id: "op".into(),
++            expected_launch_id: "launch".into(),
++            expected_owner_epoch: "epoch".into(),
++        };
++        let outcome = crate::pty::bound_interrupt::written();
++        let first: serde_json::Value = serde_json::from_str(&super::encode_bound_interrupt(
++            "first".into(),
++            &params,
++            outcome.clone(),
++        ))
++        .unwrap();
++        let replay: serde_json::Value = serde_json::from_str(&super::encode_bound_interrupt(
++            "second".into(),
++            &params,
++            outcome,
++        ))
++        .unwrap();
++        assert_eq!(first["result"], replay["result"]);
++        assert_eq!(replay["id"], "second");
++        assert_eq!(replay["result"]["bytes_written"], 1);
++        assert_eq!(replay["result"]["key"], "Escape");
++    }
++
++    #[cfg(unix)]
++    #[tokio::test]
++    async fn bound_lifecycle_records_nonzero_exit_without_ui_event_delivery() {
++        let mut app = app_with_agent();
++        let pane = app.state.workspaces[0].tabs[0].root_pane;
++        // Test-only process fixture bypasses production agent profile admission.
++        let runtime = crate::terminal::TerminalRuntime::spawn_argv_command(
++            pane,
++            24,
++            80,
++            std::env::temp_dir(),
++            &["/bin/sh".into(), "-c".into(), "exit 7".into()],
++            &crate::pane::PaneLaunchEnv::default(),
++            crate::pane::AgentDetection::Disabled,
++            true,
++            app.state.pane_scrollback_limit_bytes,
++            app.state.host_terminal_theme,
++            app.state.host_terminal_appearance,
++            app.event_tx.clone(),
++            app.render_notify.clone(),
++            app.render_dirty.clone(),
++        )
++        .unwrap();
++        let launch = runtime.bound_launch_id().unwrap().to_string();
++        let epoch = crate::pty::bound_lifecycle::owner_epoch();
++        let terminal_id = app.state.workspaces[0].terminal_id(pane).unwrap().clone();
++        app.state
++            .terminals
++            .get_mut(&terminal_id)
++            .unwrap()
++            .set_detected_state(Some(Agent::Codex), AgentState::Idle);
++        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
++        let mut proof = None;
++        for _ in 0..100 {
++            if let crate::pty::bound_lifecycle::Observation::Exited { receipt_id } =
++                crate::pty::bound_lifecycle::observe(&epoch, &launch)
++            {
++                proof = Some(receipt_id);
++                break;
++            }
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++        assert!(
++            proof.is_some(),
++            "owned waiter must record exit before UI consumes event"
++        );
++        let info = app.agent_info(0, pane).unwrap();
++        assert!(info.launch_id.is_none());
++        assert!(info.owner_epoch.is_none());
++        app.terminal_runtimes.remove(&terminal_id);
++        assert_eq!(
++            crate::pty::bound_lifecycle::observe(&epoch, &launch),
++            crate::pty::bound_lifecycle::Observation::Exited {
++                receipt_id: proof.unwrap()
++            }
++        );
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn bound_start_no_process_receipt_cannot_be_minted_again_for_same_operation() {
++        let mut app = app_with_agent();
++        let operation_id = format!("refusal-{}", crate::terminal::TerminalId::alloc());
++        let params = crate::api::schema::AgentStartBoundParams {
++            reporting_mcp: None,
++            operation_id: operation_id.clone(),
++            pane_id: "missing".into(),
++            kind: "codex".into(),
++            name: None,
++            command: Some("/bin/sh".into()),
++            args: vec!["-c".into(), "echo never".into()],
++            timeout_ms: None,
++            work_context_file: None,
++        };
++        let first: serde_json::Value =
++            serde_json::from_str(&app.handle_agent_start_bound("a".into(), params.clone()))
++                .unwrap();
++        assert_eq!(first["start_receipt"]["operation_id"], operation_id);
++        assert_eq!(first["start_receipt"]["effect"], "not_started");
++        assert!(first["start_receipt"]["receipt_id"]
++            .as_str()
++            .is_some_and(|id| !id.is_empty()));
++        let second: serde_json::Value =
++            serde_json::from_str(&app.handle_agent_start_bound("b".into(), params)).unwrap();
++        assert_eq!(second["error"]["code"], "delivery_unconfirmed");
++        assert!(second.get("start_receipt").is_none());
++    }
+     use super::*;
+     use crate::{
+         api::schema::{AgentStatus, SuccessResponse},
+@@ -424,6 +987,106 @@ mod tests {
+             .expect("agent prompt responds after submission")
+     }
+ 
++    #[cfg(unix)]
++    #[tokio::test]
++    async fn bound_start_replaces_only_target_runtime_and_stale_exit_cannot_close_it() {
++        let mut app = app_with_agent();
++        let pane = app.state.workspaces[0].tabs[0].root_pane;
++        let terminal_id = app.state.workspaces[0].terminal_id(pane).unwrap().clone();
++        app.state.terminals.get_mut(&terminal_id).unwrap().cwd = std::env::temp_dir();
++        let (old, _) = crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 4);
++        let old_lifetime = old.runtime_lifetime_id().to_string();
++        app.terminal_runtimes.insert(terminal_id.clone(), old);
++        let focused = app.state.workspaces[0].focused_pane_id();
++        // Explicit transport fixture bypasses profile admission; production
++        // start_bound never permits /bin/cat as a Codex executable.
++        let runtime = crate::terminal::TerminalRuntime::spawn_argv_command(
++            pane,
++            24,
++            80,
++            std::env::temp_dir(),
++            &["/bin/cat".into()],
++            &crate::pane::PaneLaunchEnv::default(),
++            crate::pane::AgentDetection::Enabled,
++            true,
++            app.state.pane_scrollback_limit_bytes,
++            app.state.host_terminal_theme,
++            app.state.host_terminal_appearance,
++            app.event_tx.clone(),
++            app.render_notify.clone(),
++            app.render_dirty.clone(),
++        )
++        .unwrap();
++        let launch = runtime.bound_launch_id().unwrap().to_string();
++        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
++        assert_ne!(launch, old_lifetime);
++        for status in [AgentState::Idle, AgentState::Working] {
++            app.state
++                .terminals
++                .get_mut(&terminal_id)
++                .unwrap()
++                .set_detected_state(Some(Agent::Codex), status);
++            let info = app.agent_info(0, pane).unwrap();
++            assert_eq!(info.launch_id.as_deref(), Some(launch.as_str()));
++            assert_eq!(
++                info.owner_epoch.as_deref(),
++                Some(crate::pty::bound_lifecycle::owner_epoch().as_str())
++            );
++        }
++        assert_eq!(app.state.workspaces[0].focused_pane_id(), focused);
++        app.handle_internal_event(crate::events::AppEvent::RuntimeDied {
++            pane_id: pane,
++            runtime_id: old_lifetime,
++            exit_reason: crate::platform::ChildExitReason::Exited,
++        });
++        assert_eq!(
++            app.terminal_runtimes
++                .get(&terminal_id)
++                .unwrap()
++                .bound_launch_id(),
++            Some(launch.as_str())
++        );
++        assert_eq!(app.state.workspaces[0].tabs[0].layout.pane_count(), 1);
++        app.state.assert_invariants_for_test();
++        let missing = app.handle_agent_get_bound(
++            "get".into(),
++            crate::api::schema::AgentGetBoundParams {
++                expected_launch_id: "different-owner".into(),
++            },
++        );
++        let missing: serde_json::Value = serde_json::from_str(&missing).unwrap();
++        assert_eq!(missing["error"]["code"], "instance_changed");
++        // Retiring the owner suppresses discovery even before the UI handles exit.
++        crate::pty::bound_lifecycle::waited(&launch, true);
++        let info = app.agent_info(0, pane).unwrap();
++        assert!(info.launch_id.is_none());
++        assert!(info.owner_epoch.is_none());
++        let (replacement, _) =
++            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 4);
++        app.terminal_runtimes.insert(terminal_id, replacement);
++        assert!(app.agent_info(0, pane).unwrap().launch_id.is_none());
++    }
++
++    #[test]
++    fn bound_prompt_receipts_never_report_partial_input_as_definite_refusal() {
++        let owner = crate::pty::bound_submission::BoundInputOwner::new("launch".into());
++        owner.set_ready(true);
++        let permit = owner.permit("launch").unwrap();
++        permit.write(|| Ok(3)).unwrap();
++        owner.invalidate();
++        let error = permit
++            .write(|| panic!("revoked write must not run"))
++            .unwrap_err();
++        let response: serde_json::Value =
++            serde_json::from_str(&bound_prompt_error("partial".into(), &error)).unwrap();
++        assert_eq!(response["error"]["code"], "delivery_unconfirmed");
++        let owner = crate::pty::bound_submission::BoundInputOwner::new("new".into());
++        let error = owner.permit("old").unwrap_err();
++        let response: serde_json::Value =
++            serde_json::from_str(&bound_prompt_error("stale".into(), &error)).unwrap();
++        assert_eq!(response["error"]["code"], "instance_changed");
++    }
++
+     #[test]
+     fn prompt_delay_only_scales_for_windows_codex() {
+         let codex_delay = agent_prompt_submit_delay(Agent::Codex, 4_096);
+diff --git a/src/app/mod.rs b/src/app/mod.rs
+index b327b5b..5f53efa 100644
+--- a/src/app/mod.rs
++++ b/src/app/mod.rs
+@@ -7,7 +7,7 @@ pub(crate) mod actions;
+ mod agent_resume;
+ pub(crate) mod agent_view;
+ mod agents;
+-pub(crate) use agents::{AGENT_START_SETTLE_DELAY, MAX_AGENT_START_TIMEOUT};
++pub(crate) use agents::{bound_agent_kinds, AGENT_START_SETTLE_DELAY, MAX_AGENT_START_TIMEOUT};
+ mod api;
+ #[cfg(test)]
+ pub(crate) use api::test_support::exiting_test_command;
+diff --git a/src/app/popup.rs b/src/app/popup.rs
+index 0643ea8..7df569d 100644
+--- a/src/app/popup.rs
++++ b/src/app/popup.rs
+@@ -84,6 +84,7 @@ impl App {
+                     argv,
+                     launch_env,
+                     crate::pane::AgentDetection::Disabled,
++                    false,
+                     app.state.pane_scrollback_limit_bytes,
+                     app.state.host_terminal_theme,
+                     app.state.host_terminal_appearance,
+diff --git a/src/app/reporting.rs b/src/app/reporting.rs
+new file mode 100644
+index 0000000..5257bde
+--- /dev/null
++++ b/src/app/reporting.rs
+@@ -0,0 +1,185 @@
++//! Per-launch Codex reporting configuration; never changes user config or shell policy.
++use sha2::{Digest, Sha256};
++use std::io::Read;
++
++pub(super) fn config(
++    request: &crate::api::schema::BoundReportingMcp,
++    operation_id: &str,
++    context_file: &str,
++) -> Option<String> {
++    let path = std::path::Path::new(&request.executable);
++    let context = std::path::Path::new(context_file);
++    let expected = context
++        .parent()?
++        .join("reporting-binaries")
++        .join(format!("muqun-gateway-{}", request.sha256));
++    if path != expected || !std::fs::symlink_metadata(context).ok()?.is_file() {
++        return None;
++    }
++
++    if !path.is_absolute()
++        || request.executable.len() > 4096
++        || request.executable.chars().any(char::is_control)
++        || request.sha256.len() != 64
++        || !request
++            .sha256
++            .bytes()
++            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
++        || path.canonicalize().ok()?.as_path() != path
++    {
++        return None;
++    }
++    let metadata = std::fs::symlink_metadata(path).ok()?;
++    if !metadata.is_file() || metadata.len() > 512 * 1024 * 1024 {
++        return None;
++    }
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::{MetadataExt, PermissionsExt};
++        if metadata.permissions().mode() & 0o077 != 0
++            || metadata.permissions().mode() & 0o100 == 0
++            || metadata.nlink() != 1
++        {
++            return None;
++        }
++    }
++    let mut options = std::fs::OpenOptions::new();
++    options.read(true);
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::OpenOptionsExt;
++        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
++    }
++    let mut file = options.open(path).ok()?;
++    let actual = file.metadata().ok()?;
++    if !actual.is_file() || actual.len() != metadata.len() {
++        return None;
++    }
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::MetadataExt;
++        if actual.dev() != metadata.dev() || actual.ino() != metadata.ino() {
++            return None;
++        }
++    }
++    let mut magic = [0; 4];
++    file.read_exact(&mut magic).ok()?;
++    if !matches!(
++        magic,
++        [0x7f, b'E', b'L', b'F']
++            | [0xfe, 0xed, 0xfa, 0xce]
++            | [0xce, 0xfa, 0xed, 0xfe]
++            | [0xfe, 0xed, 0xfa, 0xcf]
++            | [0xcf, 0xfa, 0xed, 0xfe]
++            | [0xca, 0xfe, 0xba, 0xbe]
++            | [0xbe, 0xba, 0xfe, 0xca]
++            | [0xca, 0xfe, 0xba, 0xbf]
++            | [0xbf, 0xba, 0xfe, 0xca]
++    ) {
++        return None;
++    }
++    let mut hash = Sha256::new();
++    hash.update(magic);
++    let mut bytes = [0; 65536];
++    let mut size = 4u64;
++    loop {
++        let n = file.read(&mut bytes).ok()?;
++        if n == 0 {
++            break;
++        }
++        size += n as u64;
++        if size > 512 * 1024 * 1024 {
++            return None;
++        }
++        hash.update(&bytes[..n]);
++    }
++    if format!("{:x}", hash.finalize()) != request.sha256 {
++        return None;
++    }
++    Some(config_value(&request.executable, operation_id))
++}
++
++fn config_value(executable: &str, operation_id: &str) -> String {
++    let suffix = format!("{:x}", Sha256::digest(operation_id.as_bytes()));
++    let server = serde_json::json!({
++        "command":executable,"args":["work","reporting-mcp"],
++        "env_vars":["MUQUN_WORK_CONTEXT_FILE"],
++        "enabled":true,"required":true,"experimental_environment":"local",
++        "enabled_tools":["context","submit_result","result_receipt"],
++        "default_tools_approval_mode":"prompt",
++        "tools":{
++            "context":{"approval_mode":"approve"},
++            "submit_result":{"approval_mode":"approve"},
++            "result_receipt":{"approval_mode":"approve"}
++        }
++    });
++    // TOML serializes the path as data, including quotes/backslashes. The
++    // operation namespace avoids merging another server's transport or env.
++    let table = toml::Value::try_from(server).expect("fixed reporting config is TOML");
++    format!("mcp_servers.muqun_reporting_{}={table}", &suffix[..16])
++}
++
++#[cfg(test)]
++mod tests {
++    #[cfg(unix)]
++    #[test]
++    fn reporting_binary_is_private_digest_bound_and_context_scoped() {
++        use sha2::{Digest, Sha256};
++        use std::os::unix::fs::PermissionsExt;
++        let root = std::env::temp_dir().join(format!(
++            "reporting-native-{}-{}",
++            std::process::id(),
++            std::time::SystemTime::now()
++                .duration_since(std::time::UNIX_EPOCH)
++                .unwrap()
++                .as_nanos()
++        ));
++        std::fs::create_dir_all(root.join("reporting-binaries")).unwrap();
++        let context = root.join("context.json");
++        std::fs::write(&context, b"test fixture, no credentials").unwrap();
++        // Magic/hash fixture only: no executable is launched by this test.
++        let content = b"\x7fELFfixture";
++        let digest = format!("{:x}", Sha256::digest(content));
++        let binary = root
++            .join("reporting-binaries")
++            .join(format!("muqun-gateway-{digest}"));
++        std::fs::write(&binary, content).unwrap();
++        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o500)).unwrap();
++        let request = crate::api::schema::BoundReportingMcp {
++            executable: binary.to_str().unwrap().into(),
++            sha256: digest,
++        };
++        assert!(super::config(&request, "op", context.to_str().unwrap()).is_some());
++        assert!(
++            super::config(&request, "op", root.join("other/context").to_str().unwrap()).is_none()
++        );
++        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
++        std::fs::write(&binary, b"#!script").unwrap();
++        assert!(super::config(&request, "op", context.to_str().unwrap()).is_none());
++        std::fs::remove_dir_all(root).unwrap();
++    }
++
++    #[test]
++    fn config_is_exact_scoped_and_escaped() {
++        let value = super::config_value("/private/a\"b\\c", "operation-one");
++        let parsed: toml::Value = value.parse().unwrap();
++        let servers = parsed["mcp_servers"].as_table().unwrap();
++        assert_eq!(servers.len(), 1);
++        let server = servers.values().next().unwrap();
++        assert_eq!(server["command"].as_str(), Some("/private/a\"b\\c"));
++        assert_eq!(server["args"].as_array().unwrap().len(), 2);
++        assert_eq!(server["env_vars"].as_array().unwrap().len(), 1);
++        assert_eq!(server["enabled_tools"].as_array().unwrap().len(), 3);
++        assert_eq!(server["tools"].as_table().unwrap().len(), 3);
++        assert_eq!(
++            server["default_tools_approval_mode"].as_str(),
++            Some("prompt")
++        );
++        assert!(!value.contains("approval_policy"));
++        assert!(!value.contains("CODEX_HOME"));
++        assert_ne!(
++            value,
++            super::config_value("/private/a\"b\\c", "operation-two")
++        );
++    }
++}
+diff --git a/src/cli/status.rs b/src/cli/status.rs
+index c6dda46..4c16348 100644
+--- a/src/cli/status.rs
++++ b/src/cli/status.rs
+@@ -416,6 +416,14 @@ mod tests {
+                 endpoint_protocol_generation: endpoint_generation,
+                 surface_interest: true,
+                 health_check: true,
++                agent_start_bound: false,
++                agent_get_bound: false,
++                agent_prompt_bound: false,
++                agent_lifecycle_bound: false,
++                agent_interrupt_bound: false,
++                agent_reporting_mcp_codex: false,
++                bound_agent_kinds: None,
++                owner_epoch: None,
+             }),
+         }
+     }
+diff --git a/src/events.rs b/src/events.rs
+index 9563899..dc2c4b6 100644
+--- a/src/events.rs
++++ b/src/events.rs
+@@ -56,6 +56,12 @@ pub struct WorktreeRemoveResult {
+ #[derive(Debug)]
+ pub enum AppEvent {
+     /// A pane's child process exited.
++    /// Internal runtime epoch; a replaced process cannot close its successor's pane.
++    RuntimeDied {
++        pane_id: PaneId,
++        runtime_id: String,
++        exit_reason: crate::platform::ChildExitReason,
++    },
+     PaneDied {
+         pane_id: PaneId,
+         exit_reason: crate::platform::ChildExitReason,
+diff --git a/src/pane.rs b/src/pane.rs
+index aa6acb5..116beeb 100644
+--- a/src/pane.rs
++++ b/src/pane.rs
+@@ -168,6 +168,7 @@ struct PendingAgentRelease {
+ 
+ #[derive(Clone, Copy, Default)]
+ struct SpawnInitialState<'a> {
++    bound_lifecycle: bool,
+     detected_agent: Option<Agent>,
+     history_ansi: Option<&'a str>,
+     windows_powershell_prompt_cwd_reporting: bool,
+@@ -1233,6 +1234,14 @@ async fn run_terminal_compression_task(
+ /// PTY runtime for a pane. Owns the terminal, I/O channels, and background tasks.
+ /// Dropping this aborts async tasks and closes the PTY. An already-running bounded
+ /// compression step may finish before releasing its terminal reference.
++fn new_bound_owner() -> crate::pty::bound_submission::BoundInputOwner {
++    crate::pty::bound_submission::BoundInputOwner::new(format!(
++        "launch_{}_{}",
++        std::process::id(),
++        crate::terminal::TerminalId::alloc()
++    ))
++}
++
+ pub struct PaneRuntime {
+     pane_id: PaneId,
+     terminal: Arc<PaneTerminal>,
+@@ -1241,6 +1250,9 @@ pub struct PaneRuntime {
+     child_pid: Arc<AtomicU32>,
+     reported_cwd: Arc<Mutex<Option<std::path::PathBuf>>>,
+     child_wait_completed: Option<Arc<AtomicBool>>,
++    bound_owner: crate::pty::bound_submission::BoundInputOwner,
++    direct_argv_launch: bool,
++    bound_interrupt_key: Option<u8>,
+     kitty_keyboard_flags: Arc<AtomicU16>,
+     content_seq: Arc<AtomicU64>,
+     content_write_lock: Arc<Mutex<()>>,
+@@ -1434,6 +1446,8 @@ pub enum WheelRouting {
+ 
+ impl Drop for PaneRuntime {
+     fn drop(&mut self) {
++        crate::pty::bound_lifecycle::invalidate(self.bound_owner.launch_id());
++        self.bound_owner.invalidate();
+         // Abort detection task immediately and terminate the owned session.
+         // The PTY actor shuts down before the process/session policy runs.
+         if let Some(handle) = &self.detect_handle {
+@@ -1803,6 +1817,8 @@ fn publish_reported_cwd(
+ 
+ impl PaneRuntime {
+     pub fn shutdown(mut self) {
++        crate::pty::bound_lifecycle::invalidate(self.bound_owner.launch_id());
++        self.bound_owner.invalidate();
+         if let Some(handle) = self.detect_handle.take() {
+             handle.abort();
+         }
+@@ -1978,6 +1994,7 @@ impl PaneRuntime {
+                 detected_agent: None,
+                 history_ansi: initial_history_ansi,
+                 windows_powershell_prompt_cwd_reporting,
++                bound_lifecycle: false,
+             },
+             AgentDetection::Enabled,
+         )
+@@ -2031,6 +2048,7 @@ impl PaneRuntime {
+         argv: &[String],
+         launch_env: &PaneLaunchEnv,
+         agent_detection: AgentDetection,
++        bound_lifecycle: bool,
+         scrollback_limit_bytes: usize,
+         host_terminal_theme: crate::terminal_theme::TerminalTheme,
+         host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
+@@ -2051,7 +2069,7 @@ impl PaneRuntime {
+         cmd.cwd(cwd);
+         apply_pane_terminal_env(&mut cmd);
+         apply_pane_launch_env(&mut cmd, launch_env);
+-        Self::spawn_command_builder(
++        let mut runtime = Self::spawn_command_builder(
+             pane_id,
+             rows,
+             cols,
+@@ -2063,9 +2081,14 @@ impl PaneRuntime {
+             render_dirty,
+             cmd,
+             "failed to spawn argv command pane",
+-            SpawnInitialState::default(),
++            SpawnInitialState {
++                bound_lifecycle,
++                ..SpawnInitialState::default()
++            },
+             agent_detection,
+-        )
++        )?;
++        runtime.direct_argv_launch = true;
++        Ok(runtime)
+     }
+ 
+     #[cfg(unix)]
+@@ -2229,6 +2252,9 @@ impl PaneRuntime {
+             child_pid,
+             reported_cwd,
+             child_wait_completed: None,
++            bound_owner: new_bound_owner(),
++            direct_argv_launch: false,
++            bound_interrupt_key: None,
+             kitty_keyboard_flags,
+             content_seq,
+             content_write_lock,
+@@ -2283,6 +2309,14 @@ impl PaneRuntime {
+         let kitty_keyboard_flags = Arc::new(AtomicU16::new(0));
+         let content_write_lock = Arc::new(Mutex::new(()));
+ 
++        let bound_owner = new_bound_owner();
++        if initial_state.bound_lifecycle
++            && !crate::pty::bound_lifecycle::reserve(bound_owner.launch_id())
++        {
++            return Err(io::Error::other(
++                crate::pty::bound_lifecycle::CapacityExceeded,
++            ));
++        }
+         let spawned = crate::pty::backend::spawn_with_portable_pty(rows, cols, cmd)
+             .inspect_err(|err| error!(pane = pane_id.raw(), err = %err, "{spawn_error_message}"))?;
+ 
+@@ -2290,12 +2324,16 @@ impl PaneRuntime {
+         let child_pid = Arc::new(AtomicU32::new(0));
+         let reported_cwd = Arc::new(Mutex::new(None));
+         let child_wait_completed = Arc::new(AtomicBool::new(false));
++        if initial_state.bound_lifecycle {
++            crate::pty::bound_lifecycle::spawned(bound_owner.launch_id());
++        }
+         let content_seq = Arc::new(AtomicU64::new(0));
+         let detection_content_seq = Arc::new(AtomicU64::new(0));
+         let full_lifecycle_authority_active = Arc::new(AtomicBool::new(false));
+         {
+             let child_pid = child_pid.clone();
+             let child_wait_completed = child_wait_completed.clone();
++            let bound_owner = bound_owner.clone();
+             let events = events.clone();
+             let rt = tokio::runtime::Handle::current();
+             let mut child = spawned.child;
+@@ -2316,10 +2354,16 @@ impl PaneRuntime {
+                         crate::platform::ChildExitReason::WaitFailed
+                     }
+                 };
++                crate::pty::bound_lifecycle::waited(
++                    bound_owner.launch_id(),
++                    !matches!(exit_reason, crate::platform::ChildExitReason::WaitFailed),
++                );
++                bound_owner.invalidate();
+                 child_wait_completed.store(true, Ordering::Release);
+                 // Use blocking send — PaneDied is critical, must not be dropped
+-                if let Err(e) = rt.block_on(events.send(AppEvent::PaneDied {
++                if let Err(e) = rt.block_on(events.send(AppEvent::RuntimeDied {
+                     pane_id,
++                    runtime_id: bound_owner.launch_id().to_string(),
+                     exit_reason,
+                 })) {
+                     error!(pane = pane_id.raw(), err = %e, "failed to send PaneDied event");
+@@ -2805,6 +2849,9 @@ impl PaneRuntime {
+             child_pid,
+             reported_cwd,
+             child_wait_completed: Some(child_wait_completed),
++            bound_owner,
++            direct_argv_launch: false,
++            bound_interrupt_key: None,
+             kitty_keyboard_flags,
+             content_seq,
+             content_write_lock,
+@@ -3145,6 +3192,103 @@ impl PaneRuntime {
+             .queue_user_input_submission(text, enter, delay, deadline)
+     }
+ 
++    pub(crate) fn runtime_lifetime_id(&self) -> &str {
++        self.bound_owner.launch_id()
++    }
++
++    pub(crate) fn bound_launch_id(&self) -> Option<&str> {
++        self.direct_argv_launch
++            .then(|| self.bound_owner.launch_id())
++    }
++
++    pub(crate) fn set_bound_interrupt_profile(&mut self, kind: crate::detect::Agent) {
++        self.bound_interrupt_key = match kind {
++            crate::detect::Agent::Codex
++            | crate::detect::Agent::Claude
++            | crate::detect::Agent::OpenCode => Some(0x1b),
++            _ => None,
++        };
++    }
++
++    pub(crate) fn bound_interrupt_key(&self) -> Option<u8> {
++        self.direct_argv_launch
++            .then_some(self.bound_interrupt_key)
++            .flatten()
++    }
++
++    pub(crate) fn queue_bound_interrupt(
++        &self,
++        expected_launch_id: &str,
++    ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
++        let key = self.bound_interrupt_key().ok_or_else(|| {
++            std::io::Error::new(
++                std::io::ErrorKind::Unsupported,
++                "unsupported bound interrupt profile",
++            )
++        })?;
++        let permit = self.bound_owner.control_permit(expected_launch_id)?;
++        #[cfg(unix)]
++        {
++            match &self.io {
++                PaneRuntimeIo::Actor(actor) => actor.queue_bound_interrupt(key, permit),
++                #[cfg(test)]
++                PaneRuntimeIo::TestChannel { .. } => Err(std::io::Error::new(
++                    std::io::ErrorKind::Unsupported,
++                    "no PTY control writer",
++                )),
++            }
++        }
++        #[cfg(not(unix))]
++        {
++            let _ = (key, permit);
++            Err(std::io::Error::new(
++                std::io::ErrorKind::Unsupported,
++                "bound interrupt unavailable",
++            ))
++        }
++    }
++
++    pub(crate) fn set_bound_input_ready(&self, ready: bool) {
++        self.bound_owner.set_ready(ready);
++    }
++
++    pub(crate) fn queue_bound_input_submission(
++        &self,
++        expected_launch_id: &str,
++        text: Bytes,
++        enter: Bytes,
++        delay: std::time::Duration,
++    ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
++        if !self.direct_argv_launch {
++            return Err(std::io::Error::new(
++                std::io::ErrorKind::Unsupported,
++                "runtime is not a direct agent launch",
++            ));
++        }
++        let permit = self.bound_owner.permit(expected_launch_id)?;
++        #[cfg(unix)]
++        {
++            match &self.io {
++                PaneRuntimeIo::Actor(actor) => {
++                    actor.queue_bound_user_input_submission(text, enter, delay, permit)
++                }
++                #[cfg(test)]
++                PaneRuntimeIo::TestChannel { .. } => Err(std::io::Error::new(
++                    std::io::ErrorKind::Unsupported,
++                    "test runtime has no bound PTY writer",
++                )),
++            }
++        }
++        #[cfg(not(unix))]
++        {
++            let _ = (text, enter, delay, permit);
++            Err(std::io::Error::new(
++                std::io::ErrorKind::Unsupported,
++                "bound submission is unavailable",
++            ))
++        }
++    }
++
+     pub fn try_send_paste(&self, text: String) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+         self.try_send_bytes(self.paste_payload(text))
+     }
+@@ -3380,6 +3524,9 @@ impl PaneRuntime {
+                 child_pid: Arc::new(AtomicU32::new(0)),
+                 reported_cwd: Arc::new(Mutex::new(None)),
+                 child_wait_completed: None,
++                bound_owner: new_bound_owner(),
++                direct_argv_launch: false,
++                bound_interrupt_key: None,
+                 kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
+                 content_seq: Arc::new(AtomicU64::new(0)),
+                 content_write_lock: Arc::new(Mutex::new(())),
+@@ -4044,6 +4191,9 @@ mod tests {
+             child_pid: Arc::new(AtomicU32::new(0)),
+             reported_cwd: Arc::new(Mutex::new(None)),
+             child_wait_completed: None,
++            bound_owner: new_bound_owner(),
++            direct_argv_launch: false,
++            bound_interrupt_key: None,
+             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
+             content_seq: Arc::new(AtomicU64::new(0)),
+             content_write_lock: Arc::new(Mutex::new(())),
+@@ -4081,6 +4231,9 @@ mod tests {
+             child_pid: Arc::new(AtomicU32::new(0)),
+             reported_cwd: Arc::new(Mutex::new(None)),
+             child_wait_completed: None,
++            bound_owner: new_bound_owner(),
++            direct_argv_launch: false,
++            bound_interrupt_key: None,
+             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
+             content_seq: Arc::new(AtomicU64::new(0)),
+             content_write_lock: Arc::new(Mutex::new(())),
+diff --git a/src/pty/actor/unix.rs b/src/pty/actor/unix.rs
+index 4d57dd1..c68b73d 100644
+--- a/src/pty/actor/unix.rs
++++ b/src/pty/actor/unix.rs
+@@ -10,6 +10,7 @@ use bytes::Bytes;
+ use tokio::sync::mpsc::{self, error::TryRecvError as DataTryRecvError};
+ use tracing::{debug, warn};
+ 
++use crate::pty::bound_submission::{BoundControlPermit, BoundInputPermit};
+ use crate::pty::fd;
+ 
+ // Actor handle methods must call wake_actor() after queuing work. The idle
+@@ -77,11 +78,17 @@ enum PtyIoDataCommand {
+         text: Bytes,
+         enter: Bytes,
+         delay: Duration,
++        bound: Option<BoundInputPermit>,
+         reply: std_mpsc::Sender<std::io::Result<()>>,
+     },
+ }
+ 
+ enum PtyIoControlCommand {
++    BoundInterrupt {
++        key: u8,
++        permit: BoundControlPermit,
++        reply: std_mpsc::Sender<std::io::Result<()>>,
++    },
+     BeginHandoff(std_mpsc::Sender<std::io::Result<()>>),
+     DuplicateForHandoff(std_mpsc::Sender<std::io::Result<RawFd>>),
+     ForegroundProcessGroup(std_mpsc::Sender<Option<u32>>),
+@@ -145,6 +152,41 @@ impl PtyIoActorHandle {
+         text: Bytes,
+         enter: Bytes,
+         delay: Duration,
++    ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
++        self.queue_submission(text, enter, delay, None)
++    }
++
++    pub(crate) fn queue_bound_user_input_submission(
++        &self,
++        text: Bytes,
++        enter: Bytes,
++        delay: Duration,
++        permit: BoundInputPermit,
++    ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
++        self.queue_submission(text, enter, delay, Some(permit))
++    }
++
++    pub(crate) fn queue_bound_interrupt(
++        &self,
++        key: u8,
++        permit: BoundControlPermit,
++    ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
++        let (reply, receiver) = std_mpsc::channel();
++        self.control_tx
++            .send(PtyIoControlCommand::BoundInterrupt { key, permit, reply })
++            .map_err(|_| {
++                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "PTY control queue closed")
++            })?;
++        self.wake_actor();
++        Ok(receiver)
++    }
++
++    fn queue_submission(
++        &self,
++        text: Bytes,
++        enter: Bytes,
++        delay: Duration,
++        bound: Option<BoundInputPermit>,
+     ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
+         let user_writes = self
+             .user_writes
+@@ -162,6 +204,7 @@ impl PtyIoActorHandle {
+                 text,
+                 enter,
+                 delay,
++                bound,
+                 reply: reply_tx,
+             })
+             .map_err(|err| match err {
+@@ -459,6 +502,7 @@ struct PtyIoActorRunner {
+ }
+ 
+ struct ActiveSubmission {
++    bound: Option<BoundInputPermit>,
+     enter: Bytes,
+     delay: Duration,
+     phase: SubmissionPhase,
+@@ -645,6 +689,7 @@ impl PtyIoActorRunner {
+                 text,
+                 enter,
+                 delay,
++                bound,
+                 reply,
+             } => {
+                 if self.state == ActorState::Running {
+@@ -655,6 +700,7 @@ impl PtyIoActorRunner {
+                         SubmissionPhase::WritingText
+                     };
+                     self.active_submission = Some(ActiveSubmission {
++                        bound,
+                         enter,
+                         delay,
+                         phase,
+@@ -673,6 +719,37 @@ impl PtyIoActorRunner {
+ 
+     fn handle_control_command(&mut self, command: PtyIoControlCommand) -> bool {
+         match command {
++            PtyIoControlCommand::BoundInterrupt { key, permit, reply } => {
++                let result = if self.state == ActorState::Running {
++                    // A single syscall under the owner fence revokes queued
++                    // prompt permits. No retry or delayed Enter follows it.
++                    let result = permit.write(|| self.file.write(&[key]));
++                    if self
++                        .active_submission
++                        .as_ref()
++                        .is_some_and(|s| s.bound.is_some())
++                    {
++                        let removed_front = self
++                            .pending_writes
++                            .front()
++                            .is_some_and(|w| w.boundary.is_some());
++                        self.pending_writes.retain(|w| w.boundary.is_none());
++                        if removed_front {
++                            self.current_write_offset = 0;
++                        }
++                        self.fail_active_submission(std::io::Error::other(
++                            "prompt cancelled by interrupt",
++                        ));
++                    }
++                    result
++                } else {
++                    Err(std::io::Error::new(
++                        std::io::ErrorKind::BrokenPipe,
++                        "PTY actor unavailable",
++                    ))
++                };
++                let _ = reply.send(result);
++            }
+             PtyIoControlCommand::BeginHandoff(reply) => {
+                 self.defer_or_begin_handoff(reply);
+             }
+@@ -914,6 +991,9 @@ impl PtyIoActorRunner {
+ 
+     fn fail_active_submission(&mut self, err: std::io::Error) {
+         if let Some(submission) = self.active_submission.take() {
++            let err = submission.bound.as_ref().map_or(err, |permit| {
++                permit.failure("bound submission did not finish")
++            });
+             let _ = submission.reply.send(Err(err));
+         }
+     }
+@@ -931,7 +1011,20 @@ impl PtyIoActorRunner {
+     fn flush_pending_writes_once(&mut self) -> std::io::Result<Option<SubmissionBoundary>> {
+         while let Some(write) = self.pending_writes.front() {
+             let chunk = &write.bytes[self.current_write_offset..];
+-            match self.file.write(chunk) {
++            let result = if write.boundary.is_some() {
++                if let Some(permit) = self
++                    .active_submission
++                    .as_ref()
++                    .and_then(|s| s.bound.as_ref())
++                {
++                    permit.write(|| self.file.write(chunk))
++                } else {
++                    self.file.write(chunk)
++                }
++            } else {
++                self.file.write(chunk)
++            };
++            match result {
+                 Ok(0) => {
+                     return Err(std::io::Error::new(
+                         std::io::ErrorKind::WriteZero,
+@@ -949,6 +1042,18 @@ impl PtyIoActorRunner {
+                         }
+                     }
+                 }
++                Err(err)
++                    if err.get_ref().is_some_and(|inner| {
++                        inner.is::<crate::pty::bound_submission::BoundInputError>()
++                    }) =>
++                {
++                    // Revocation refuses only this submission; keep the PTY
++                    // reader and unrelated queued terminal responses alive.
++                    self.pending_writes.retain(|write| write.boundary.is_none());
++                    self.current_write_offset = 0;
++                    self.fail_active_submission(err);
++                    return Ok(None);
++                }
+                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => return Ok(None),
+                 Err(err) => {
+@@ -1116,6 +1221,175 @@ mod tests {
+         (runner, peer)
+     }
+ 
++    fn bound_test_submission(
++        runner: &mut PtyIoActorRunner,
++    ) -> (
++        crate::pty::bound_submission::BoundInputOwner,
++        std_mpsc::Receiver<std::io::Result<()>>,
++    ) {
++        let owner = crate::pty::bound_submission::BoundInputOwner::new("test-launch".into());
++        owner.set_ready(true);
++        let permit = owner.permit("test-launch").unwrap();
++        let (reply, receiver) = std_mpsc::channel();
++        runner.handle_data_command(PtyIoDataCommand::SubmitUserInput {
++            text: Bytes::from_static(b"prompt"),
++            enter: Bytes::from_static(b"\r"),
++            delay: Duration::ZERO,
++            bound: Some(permit),
++            reply,
++        });
++        (owner, receiver)
++    }
++
++    fn bound_error_bytes(receiver: std_mpsc::Receiver<std::io::Result<()>>) -> usize {
++        let error = receiver.try_recv().unwrap().unwrap_err();
++        error
++            .get_ref()
++            .unwrap()
++            .downcast_ref::<crate::pty::bound_submission::BoundInputError>()
++            .unwrap()
++            .bytes_written
++    }
++
++    #[test]
++    fn bound_submission_revoked_before_drain_writes_nothing() {
++        let (mut runner, mut peer) = actor_runner_for_unit_test();
++        peer.set_nonblocking(true).unwrap();
++        let (owner, receiver) = bound_test_submission(&mut runner);
++        owner.invalidate();
++        assert_eq!(runner.flush_pending_writes_once().unwrap(), None);
++        assert_eq!(bound_error_bytes(receiver), 0);
++        assert!(runner.active_submission.is_none());
++        assert_eq!(
++            peer.read(&mut [0; 16]).unwrap_err().kind(),
++            std::io::ErrorKind::WouldBlock
++        );
++    }
++
++    #[test]
++    fn bound_submission_refuses_delayed_enter_after_readiness_change() {
++        let (mut runner, mut peer) = actor_runner_for_unit_test();
++        peer.set_nonblocking(true).unwrap();
++        let (owner, receiver) = bound_test_submission(&mut runner);
++        let boundary = runner.flush_pending_writes_once().unwrap().unwrap();
++        runner.complete_submission_boundary(boundary);
++        let mut text = [0; 6];
++        peer.read_exact(&mut text).unwrap();
++        assert_eq!(&text, b"prompt");
++        owner.set_ready(false);
++        owner.set_ready(true);
++        runner.schedule_submission_enter();
++        assert_eq!(runner.flush_pending_writes_once().unwrap(), None);
++        assert_eq!(bound_error_bytes(receiver), 6);
++        assert_eq!(
++            peer.read(&mut [0; 16]).unwrap_err().kind(),
++            std::io::ErrorKind::WouldBlock
++        );
++        // Refusal must not tear down the reader or poison unrelated responses.
++        runner.enqueue_write(Bytes::from_static(b"response"));
++        runner.flush_pending_writes_once().unwrap();
++        let mut response = [0; 8];
++        peer.read_exact(&mut response).unwrap();
++        assert_eq!(&response, b"response");
++    }
++
++    #[test]
++    fn bound_submission_success_receipt_follows_enter_write() {
++        let (mut runner, mut peer) = actor_runner_for_unit_test();
++        let (_owner, receiver) = bound_test_submission(&mut runner);
++        let boundary = runner.flush_pending_writes_once().unwrap().unwrap();
++        runner.complete_submission_boundary(boundary);
++        assert!(receiver.try_recv().is_err());
++        runner.schedule_submission_enter();
++        let boundary = runner.flush_pending_writes_once().unwrap().unwrap();
++        runner.complete_submission_boundary(boundary);
++        receiver.try_recv().unwrap().unwrap();
++        let mut received = [0; 7];
++        peer.read_exact(&mut received).unwrap();
++        assert_eq!(&received, b"prompt\r");
++    }
++
++    #[test]
++    fn bound_interrupt_cancels_partial_prompt_and_never_writes_old_enter() {
++        let (mut runner, mut peer) = actor_runner_for_unit_test();
++        let (owner, receiver) = bound_test_submission(&mut runner);
++        let boundary = runner.flush_pending_writes_once().unwrap().unwrap();
++        runner.complete_submission_boundary(boundary);
++        owner.set_ready(false); // Control remains valid while working/blocked.
++        let (reply, done) = std_mpsc::channel();
++        runner.handle_control_command(PtyIoControlCommand::BoundInterrupt {
++            key: 0x1b,
++            permit: owner.control_permit("test-launch").unwrap(),
++            reply,
++        });
++        done.try_recv().unwrap().unwrap();
++        assert_eq!(bound_error_bytes(receiver), 6);
++        runner.schedule_submission_enter();
++        runner.flush_pending_writes_once().unwrap();
++        let mut actual = [0; 7];
++        peer.read_exact(&mut actual).unwrap();
++        assert_eq!(&actual, b"prompt\x1b");
++        peer.set_nonblocking(true).unwrap();
++        assert_eq!(
++            peer.read(&mut actual).unwrap_err().kind(),
++            std::io::ErrorKind::WouldBlock
++        );
++        assert!(runner.active_submission.is_none());
++    }
++
++    #[test]
++    fn bound_interrupt_after_exit_writes_nothing() {
++        let (mut runner, mut peer) = actor_runner_for_unit_test();
++        let owner = crate::pty::bound_submission::BoundInputOwner::new("gone".into());
++        let permit = owner.control_permit("gone").unwrap();
++        owner.invalidate();
++        let (reply, receiver) = std_mpsc::channel();
++        runner.handle_control_command(PtyIoControlCommand::BoundInterrupt {
++            key: 0x1b,
++            permit,
++            reply,
++        });
++        assert_eq!(bound_error_bytes(receiver), 0);
++        peer.set_nonblocking(true).unwrap();
++        assert_eq!(
++            peer.read(&mut [0]).unwrap_err().kind(),
++            std::io::ErrorKind::WouldBlock
++        );
++    }
++
++    #[test]
++    fn interrupt_revokes_prompt_waiting_in_data_queue_before_any_text() {
++        let (mut runner, mut peer) = actor_runner_for_unit_test();
++        let owner = crate::pty::bound_submission::BoundInputOwner::new("same".into());
++        owner.set_ready(true);
++        let stale = owner.permit("same").unwrap();
++        let (reply, done) = std_mpsc::channel();
++        runner.handle_control_command(PtyIoControlCommand::BoundInterrupt {
++            key: 0x1b,
++            permit: owner.control_permit("same").unwrap(),
++            reply,
++        });
++        done.try_recv().unwrap().unwrap();
++        let (reply, receiver) = std_mpsc::channel();
++        runner.handle_data_command(PtyIoDataCommand::SubmitUserInput {
++            text: Bytes::from_static(b"must not write"),
++            enter: Bytes::from_static(b"\r"),
++            delay: Duration::ZERO,
++            bound: Some(stale),
++            reply,
++        });
++        runner.flush_pending_writes_once().unwrap();
++        assert_eq!(bound_error_bytes(receiver), 0);
++        let mut actual = [0];
++        peer.read_exact(&mut actual).unwrap();
++        assert_eq!(actual, [0x1b]);
++        peer.set_nonblocking(true).unwrap();
++        assert_eq!(
++            peer.read(&mut actual).unwrap_err().kind(),
++            std::io::ErrorKind::WouldBlock
++        );
++    }
++
+     #[test]
+     fn actor_ignores_empty_user_input_write() {
+         let (mut runner, _peer) = actor_runner_for_unit_test();
+diff --git a/src/pty/bound_interrupt.rs b/src/pty/bound_interrupt.rs
+new file mode 100644
+index 0000000..313a65c
+--- /dev/null
++++ b/src/pty/bound_interrupt.rs
+@@ -0,0 +1,143 @@
++//! Epoch-local, bounded interruption admission. Never evict or redispatch an operation.
++use std::collections::HashMap;
++use std::hash::{BuildHasher, Hasher};
++use std::sync::{Mutex, OnceLock};
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub(crate) enum Outcome {
++    Written { receipt_id: String },
++    Refused { code: String, message: String },
++}
++#[derive(Debug, PartialEq, Eq)]
++pub(crate) enum Admission {
++    Fresh,
++    Replay(Outcome),
++    Pending,
++    Conflict,
++    Full,
++}
++struct Record {
++    epoch: String,
++    launch: String,
++    outcome: Option<Outcome>,
++}
++struct Registry {
++    records: HashMap<String, Record>,
++    capacity: usize,
++}
++impl Registry {
++    fn reserve(&mut self, operation: &str, epoch: &str, launch: &str) -> Admission {
++        if let Some(record) = self.records.get(operation) {
++            if record.epoch != epoch || record.launch != launch {
++                return Admission::Conflict;
++            }
++            return record
++                .outcome
++                .clone()
++                .map_or(Admission::Pending, Admission::Replay);
++        }
++        if self.records.len() >= self.capacity {
++            return Admission::Full;
++        }
++        self.records.insert(
++            operation.into(),
++            Record {
++                epoch: epoch.into(),
++                launch: launch.into(),
++                outcome: None,
++            },
++        );
++        Admission::Fresh
++    }
++    fn complete(&mut self, operation: &str, outcome: Outcome) {
++        if let Some(record) = self.records.get_mut(operation) {
++            if record.outcome.is_none() {
++                record.outcome = Some(outcome);
++            }
++        }
++    }
++}
++fn registry() -> &'static Mutex<Registry> {
++    static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
++    REGISTRY.get_or_init(|| {
++        Mutex::new(Registry {
++            records: HashMap::new(),
++            capacity: 4096,
++        })
++    })
++}
++pub(crate) fn reserve(operation: &str, epoch: &str, launch: &str) -> Admission {
++    registry().lock().map_or(Admission::Full, |mut registry| {
++        registry.reserve(operation, epoch, launch)
++    })
++}
++pub(crate) fn complete(operation: &str, outcome: Outcome) {
++    if let Ok(mut registry) = registry().lock() {
++        registry.complete(operation, outcome);
++    }
++}
++pub(crate) fn written() -> Outcome {
++    let a = std::collections::hash_map::RandomState::new()
++        .build_hasher()
++        .finish();
++    let b = std::collections::hash_map::RandomState::new()
++        .build_hasher()
++        .finish();
++    Outcome::Written {
++        receipt_id: format!("interrupt_{a:016x}{b:016x}"),
++    }
++}
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn bound_interrupt_replay_is_immutable_and_never_evicts() {
++        let mut registry = Registry {
++            records: HashMap::new(),
++            capacity: 1,
++        };
++        assert_eq!(registry.reserve("op", "epoch", "launch"), Admission::Fresh);
++        assert_eq!(
++            registry.reserve("op", "epoch", "launch"),
++            Admission::Pending
++        );
++        assert_eq!(
++            registry.reserve("op", "epoch", "other"),
++            Admission::Conflict
++        );
++        assert_eq!(
++            registry.reserve("op", "other", "launch"),
++            Admission::Conflict
++        );
++        let outcome = written();
++        registry.complete("op", outcome.clone());
++        registry.complete("op", written());
++        assert_eq!(
++            registry.reserve("op", "epoch", "launch"),
++            Admission::Replay(outcome)
++        );
++        assert_eq!(registry.reserve("new", "epoch", "launch"), Admission::Full);
++        assert!(
++            !registry.records.contains_key("new"),
++            "capacity refusal never admits a new operation"
++        );
++        assert_eq!(registry.records.len(), 1);
++    }
++    #[test]
++    fn bound_interrupt_refusals_are_cached() {
++        let mut registry = Registry {
++            records: HashMap::new(),
++            capacity: 1,
++        };
++        registry.reserve("op", "epoch", "launch");
++        let outcome = Outcome::Refused {
++            code: "instance_changed".into(),
++            message: "gone".into(),
++        };
++        registry.complete("op", outcome.clone());
++        assert_eq!(
++            registry.reserve("op", "epoch", "launch"),
++            Admission::Replay(outcome)
++        );
++    }
++}
+diff --git a/src/pty/bound_lifecycle.rs b/src/pty/bound_lifecycle.rs
+new file mode 100644
+index 0000000..8db511b
+--- /dev/null
++++ b/src/pty/bound_lifecycle.rs
+@@ -0,0 +1,195 @@
++//! Exact child ownership evidence, independent of readiness and pane lifetime.
++//! Retain at most 1024 unreaped/uncertain owners and 4096 exit tombstones.
++use std::collections::{HashMap, HashSet, VecDeque};
++use std::hash::{BuildHasher, Hasher};
++use std::sync::{Mutex, OnceLock};
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub(crate) enum Observation {
++    Live,
++    Exited { receipt_id: String },
++    Unknown,
++}
++struct Registry {
++    epoch: String,
++    owned: HashMap<String, Observation>,
++    exited: VecDeque<(String, String)>,
++    max_owned: usize,
++    max_exited: usize,
++    operations: HashSet<String>,
++}
++fn opaque_id(prefix: &str) -> String {
++    let a = std::collections::hash_map::RandomState::new()
++        .build_hasher()
++        .finish();
++    let b = std::collections::hash_map::RandomState::new()
++        .build_hasher()
++        .finish();
++    format!("{prefix}_{a:016x}{b:016x}")
++}
++impl Registry {
++    fn new(max_owned: usize, max_exited: usize) -> Self {
++        Self {
++            epoch: opaque_id("owner"),
++            owned: HashMap::new(),
++            exited: VecDeque::new(),
++            max_owned,
++            max_exited,
++            operations: HashSet::new(),
++        }
++    }
++    fn reserve(&mut self, launch: &str) -> bool {
++        if self.owned.len() >= self.max_owned || self.owned.contains_key(launch) {
++            return false;
++        }
++        self.owned.insert(launch.into(), Observation::Unknown);
++        true
++    }
++    fn spawned(&mut self, launch: &str) {
++        if let Some(state) = self.owned.get_mut(launch) {
++            *state = Observation::Live;
++        }
++    }
++    fn invalidate(&mut self, launch: &str) {
++        if let Some(state) = self.owned.get_mut(launch) {
++            *state = Observation::Unknown;
++        }
++    }
++    fn waited(&mut self, launch: &str, success: bool) {
++        if !success {
++            self.invalidate(launch);
++            return;
++        }
++        if self.owned.remove(launch).is_none() {
++            return;
++        }
++        self.exited.push_back((launch.into(), opaque_id("exit")));
++        while self.exited.len() > self.max_exited {
++            self.exited.pop_front();
++        }
++    }
++    fn observe(&self, epoch: &str, launch: &str) -> Observation {
++        if epoch != self.epoch {
++            return Observation::Unknown;
++        }
++        if let Some(state) = self.owned.get(launch) {
++            return state.clone();
++        }
++        self.exited
++            .iter()
++            .find(|(id, _)| id == launch)
++            .map(|(_, receipt_id)| Observation::Exited {
++                receipt_id: receipt_id.clone(),
++            })
++            .unwrap_or(Observation::Unknown)
++    }
++}
++fn registry() -> &'static Mutex<Registry> {
++    static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
++    REGISTRY.get_or_init(|| Mutex::new(Registry::new(1024, 4096)))
++}
++pub(crate) fn owner_epoch() -> String {
++    registry()
++        .lock()
++        .unwrap_or_else(|p| p.into_inner())
++        .epoch
++        .clone()
++}
++/// Never mint a no-process receipt for a repeated operation that might have spawned.
++/// Operations are not evicted in this incarnation; capacity exhaustion is unknown.
++pub(crate) fn begin_operation(operation: &str) -> bool {
++    let mut registry = registry().lock().unwrap_or_else(|p| p.into_inner());
++    if registry.operations.len() >= 4096 {
++        return false;
++    }
++    registry.operations.insert(operation.into())
++}
++#[derive(Debug)]
++pub(crate) struct CapacityExceeded;
++impl std::fmt::Display for CapacityExceeded {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.write_str("bound lifecycle capacity exhausted before spawn")
++    }
++}
++impl std::error::Error for CapacityExceeded {}
++pub(crate) fn receipt_id() -> String {
++    opaque_id("refusal")
++}
++pub(crate) fn reserve(launch: &str) -> bool {
++    registry()
++        .lock()
++        .unwrap_or_else(|p| p.into_inner())
++        .reserve(launch)
++}
++pub(crate) fn spawned(launch: &str) {
++    registry()
++        .lock()
++        .unwrap_or_else(|p| p.into_inner())
++        .spawned(launch);
++}
++pub(crate) fn invalidate(launch: &str) {
++    registry()
++        .lock()
++        .unwrap_or_else(|p| p.into_inner())
++        .invalidate(launch);
++}
++pub(crate) fn waited(launch: &str, success: bool) {
++    registry()
++        .lock()
++        .unwrap_or_else(|p| p.into_inner())
++        .waited(launch, success);
++}
++pub(crate) fn observe(epoch: &str, launch: &str) -> Observation {
++    registry()
++        .lock()
++        .unwrap_or_else(|p| p.into_inner())
++        .observe(epoch, launch)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn bound_lifecycle_requires_successful_wait_and_preserves_receipt() {
++        let mut r = Registry::new(2, 2);
++        let epoch = r.epoch.clone();
++        assert!(r.reserve("a"));
++        r.spawned("a");
++        assert_eq!(r.observe(&epoch, "a"), Observation::Live);
++        r.invalidate("a");
++        assert_eq!(r.observe(&epoch, "a"), Observation::Unknown);
++        r.waited("a", false);
++        assert_eq!(r.observe(&epoch, "a"), Observation::Unknown);
++        r.waited("a", true);
++        let proof = r.observe(&epoch, "a");
++        assert!(matches!(proof, Observation::Exited { .. }));
++        r.waited("a", true);
++        r.invalidate("a");
++        assert_eq!(r.observe(&epoch, "a"), proof);
++        assert_eq!(r.observe("new-epoch", "a"), Observation::Unknown);
++        assert_eq!(
++            r.observe(&epoch, "imported-without-waiter"),
++            Observation::Unknown
++        );
++    }
++    #[test]
++    fn bound_lifecycle_capacity_never_evicts_live_or_uncertain_owners() {
++        let mut r = Registry::new(1, 1);
++        let epoch = r.epoch.clone();
++        assert!(r.reserve("a"));
++        assert!(!r.reserve("b"));
++        r.spawned("a");
++        assert!(!r.reserve("b"));
++        r.waited("a", false);
++        assert!(!r.reserve("b"));
++        r.waited("a", true);
++        assert!(r.reserve("b"));
++        r.spawned("b");
++        r.waited("b", true);
++        assert_eq!(r.observe(&epoch, "a"), Observation::Unknown);
++        assert!(matches!(r.observe(&epoch, "b"), Observation::Exited { .. }));
++        let replacement = Registry::new(1, 1);
++        assert_ne!(replacement.epoch, epoch);
++        assert_eq!(replacement.observe(&epoch, "b"), Observation::Unknown);
++    }
++}
+diff --git a/src/pty/bound_submission.rs b/src/pty/bound_submission.rs
+new file mode 100644
+index 0000000..97fc5db
+--- /dev/null
++++ b/src/pty/bound_submission.rs
+@@ -0,0 +1,350 @@
++//! Input ownership for a directly spawned agent process.
++//!
++//! The gate serializes observed ownership/readiness changes with each PTY write.
++//! It does not establish an agent-native approval protocol: callers must not
++//! advertise approval identity based on terminal screen detection.
++use std::io;
++use std::sync::{Arc, Mutex};
++
++#[derive(Clone, Debug)]
++pub(crate) struct BoundInputOwner {
++    launch_id: Arc<str>,
++    state: Arc<Mutex<OwnerState>>,
++}
++
++#[derive(Debug)]
++struct OwnerState {
++    revision: u64,
++    ready: bool,
++    invalidated: bool,
++}
++
++#[derive(Clone, Debug)]
++#[cfg_attr(
++    not(unix),
++    allow(
++        dead_code,
++        reason = "bound PTY writes are unsupported on this platform"
++    )
++)]
++pub(crate) struct BoundInputPermit {
++    owner: BoundInputOwner,
++    revision: u64,
++    written: Arc<Mutex<usize>>,
++}
++
++/// A control action depends on lifetime ownership, never prompt readiness.
++#[derive(Clone, Debug)]
++#[cfg_attr(
++    not(unix),
++    allow(
++        dead_code,
++        reason = "bound control writes are unavailable on this platform"
++    )
++)]
++pub(crate) struct BoundControlPermit {
++    owner: BoundInputOwner,
++}
++
++#[cfg_attr(
++    not(unix),
++    allow(
++        dead_code,
++        reason = "bound control writes are unavailable on this platform"
++    )
++)]
++impl BoundControlPermit {
++    /// Linearize cancellation of old prompt permits with one control syscall.
++    pub(crate) fn write(&self, write: impl FnOnce() -> io::Result<usize>) -> io::Result<()> {
++        let mut state = self.owner.state.lock().unwrap_or_else(|p| p.into_inner());
++        if state.invalidated {
++            return Err(refusal("agent launch exited or was replaced", 0));
++        }
++        state.revision = state.revision.saturating_add(1);
++        match write() {
++            Ok(1) => Ok(()),
++            Ok(0) => Err(refusal("interrupt wrote no bytes", 0)),
++            Ok(_) => Err(io::Error::other("unexpected interrupt write count")),
++            Err(error) => Err(error),
++        }
++    }
++}
++
++/// A refusal is definitely unwritten only when `bytes_written == 0`.
++/// Partial text followed by a revoked Enter must never be retried automatically.
++#[derive(Debug)]
++pub(crate) struct BoundInputError {
++    pub bytes_written: usize,
++    pub reason: &'static str,
++}
++
++impl std::fmt::Display for BoundInputError {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        write!(f, "{} ({} bytes written)", self.reason, self.bytes_written)
++    }
++}
++
++impl std::error::Error for BoundInputError {}
++
++impl BoundInputOwner {
++    pub(crate) fn control_permit(
++        &self,
++        expected_launch_id: &str,
++    ) -> io::Result<BoundControlPermit> {
++        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
++        if self.launch_id() != expected_launch_id || state.invalidated {
++            return Err(refusal("agent launch exited or was replaced", 0));
++        }
++        Ok(BoundControlPermit {
++            owner: self.clone(),
++        })
++    }
++    pub(crate) fn new(launch_id: String) -> Self {
++        Self {
++            launch_id: launch_id.into(),
++            state: Arc::new(Mutex::new(OwnerState {
++                revision: 0,
++                ready: false,
++                invalidated: false,
++            })),
++        }
++    }
++
++    pub(crate) fn launch_id(&self) -> &str {
++        &self.launch_id
++    }
++
++    /// Readiness changes revoke already queued submissions, even if the agent
++    /// becomes ready again before those submissions reach the writer.
++    pub(crate) fn set_ready(&self, ready: bool) {
++        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
++        if state.ready != ready {
++            state.revision = state.revision.saturating_add(1);
++            state.ready = ready;
++        }
++    }
++
++    /// Permanent for this owner. A replacement process needs a new owner/id.
++    pub(crate) fn invalidate(&self) {
++        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
++        state.invalidated = true;
++        state.ready = false;
++    }
++
++    pub(crate) fn permit(&self, expected_launch_id: &str) -> io::Result<BoundInputPermit> {
++        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
++        let reason = if expected_launch_id != self.launch_id() {
++            Some("agent launch identity changed")
++        } else if state.invalidated {
++            Some("agent launch exited or was replaced")
++        } else if !state.ready {
++            Some("agent is not ready for bound input")
++        } else {
++            None
++        };
++        if let Some(reason) = reason {
++            return Err(refusal(reason, 0));
++        }
++        Ok(BoundInputPermit {
++            owner: self.clone(),
++            revision: state.revision,
++            written: Arc::new(Mutex::new(0)),
++        })
++    }
++}
++
++#[cfg_attr(
++    not(unix),
++    allow(
++        dead_code,
++        reason = "bound PTY writes are unsupported on this platform"
++    )
++)]
++impl BoundInputPermit {
++    pub(crate) fn bytes_written(&self) -> usize {
++        *self.written.lock().unwrap_or_else(|p| p.into_inner())
++    }
++
++    /// Keep the owner lock held through the actual write, not only the queue
++    /// insertion. This is also used for a delayed Enter and each partial write.
++    pub(crate) fn write(&self, write: impl FnOnce() -> io::Result<usize>) -> io::Result<usize> {
++        let state = self.owner.state.lock().unwrap_or_else(|p| p.into_inner());
++        if state.invalidated || !state.ready || state.revision != self.revision {
++            return Err(refusal(
++                "agent input ownership or readiness changed",
++                self.bytes_written(),
++            ));
++        }
++        let result = write();
++        if let Ok(count) = result {
++            let mut written = self.written.lock().unwrap_or_else(|p| p.into_inner());
++            *written = written.saturating_add(count);
++        }
++        result
++    }
++
++    pub(crate) fn failure(&self, reason: &'static str) -> io::Error {
++        refusal(reason, self.bytes_written())
++    }
++}
++
++fn refusal(reason: &'static str, bytes_written: usize) -> io::Error {
++    io::Error::new(
++        io::ErrorKind::PermissionDenied,
++        BoundInputError {
++            bytes_written,
++            reason,
++        },
++    )
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn control_admission_ignores_readiness_but_not_lifetime_or_identity() {
++        let owner = BoundInputOwner::new("owned".into());
++        assert!(owner.control_permit("replacement").is_err());
++        let control = owner.control_permit("owned").unwrap();
++        control.write(|| Ok(1)).unwrap();
++        owner.invalidate();
++        assert!(owner.control_permit("owned").is_err());
++        assert!(control
++            .write(|| panic!("exit must fence the syscall"))
++            .is_err());
++    }
++
++    #[test]
++    fn control_syscall_and_exit_have_one_owner_lock_order() {
++        let owner = BoundInputOwner::new("owned".into());
++        let control = owner.control_permit("owned").unwrap();
++        let barrier = Arc::new(std::sync::Barrier::new(2));
++        let thread_barrier = barrier.clone();
++        let exit_owner = owner.clone();
++        let (tx, rx) = std::sync::mpsc::channel();
++        let exit = std::thread::spawn(move || {
++            thread_barrier.wait();
++            exit_owner.invalidate();
++            tx.send(()).unwrap();
++        });
++        control
++            .write(|| {
++                barrier.wait();
++                assert!(
++                    rx.try_recv().is_err(),
++                    "invalidation cannot pass active syscall"
++                );
++                Ok(1)
++            })
++            .unwrap();
++        exit.join().unwrap();
++        rx.recv().unwrap();
++        assert!(control
++            .write(|| panic!("no second syscall after exit"))
++            .is_err());
++    }
++
++    fn ready_owner() -> BoundInputOwner {
++        let owner = BoundInputOwner::new("launch-one".into());
++        owner.set_ready(true);
++        owner
++    }
++
++    fn written_count(error: io::Error) -> usize {
++        error
++            .get_ref()
++            .unwrap()
++            .downcast_ref::<BoundInputError>()
++            .unwrap()
++            .bytes_written
++    }
++
++    #[test]
++    fn a_reused_target_cannot_authorize_another_launch() {
++        let owner = ready_owner();
++        assert_eq!(written_count(owner.permit("launch-two").unwrap_err()), 0);
++    }
++
++    #[test]
++    fn exit_before_queue_drain_prevents_every_byte() {
++        let owner = ready_owner();
++        let permit = owner.permit("launch-one").unwrap();
++        owner.invalidate();
++        assert_eq!(
++            written_count(permit.write(|| panic!("must not write")).unwrap_err()),
++            0
++        );
++    }
++
++    #[test]
++    fn blocked_then_ready_does_not_revive_an_old_permit() {
++        let owner = ready_owner();
++        let permit = owner.permit("launch-one").unwrap();
++        owner.set_ready(false);
++        owner.set_ready(true);
++        assert_eq!(
++            written_count(permit.write(|| panic!("must not write")).unwrap_err()),
++            0
++        );
++        assert!(owner.permit("launch-one").is_ok());
++    }
++
++    #[test]
++    fn exit_after_text_suppresses_enter_and_reports_partial_delivery() {
++        let owner = ready_owner();
++        let permit = owner.permit("launch-one").unwrap();
++        permit.write(|| Ok(12)).unwrap();
++        owner.invalidate();
++        assert_eq!(
++            written_count(permit.write(|| panic!("Enter must not write")).unwrap_err()),
++            12
++        );
++    }
++
++    #[test]
++    fn invalidated_owner_cannot_be_reenabled() {
++        let owner = ready_owner();
++        owner.invalidate();
++        owner.set_ready(true);
++        assert_eq!(written_count(owner.permit("launch-one").unwrap_err()), 0);
++    }
++
++    #[test]
++    fn invalidation_serializes_with_the_actual_write() {
++        let owner = ready_owner();
++        let permit = owner.permit("launch-one").unwrap();
++        let writer_permit = permit.clone();
++        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
++        let (release_tx, release_rx) = std::sync::mpsc::channel();
++        let writer = std::thread::spawn(move || {
++            writer_permit.write(|| {
++                entered_tx.send(()).unwrap();
++                release_rx.recv().unwrap();
++                Ok(3)
++            })
++        });
++        entered_rx.recv().unwrap();
++        // The writer holds the exact gate used by invalidation until the
++        // syscall finishes, so there is no check-then-write unlocked interval.
++        assert!(owner.state.try_lock().is_err());
++        release_tx.send(()).unwrap();
++        assert_eq!(writer.join().unwrap().unwrap(), 3);
++        owner.invalidate();
++        assert_eq!(
++            written_count(permit.write(|| panic!("later write refused")).unwrap_err()),
++            3
++        );
++    }
++
++    #[test]
++    fn a_partial_write_is_counted_and_would_block_is_not() {
++        let owner = ready_owner();
++        let permit = owner.permit("launch-one").unwrap();
++        permit.write(|| Ok(2)).unwrap();
++        assert!(permit
++            .write(|| Err(io::ErrorKind::WouldBlock.into()))
++            .is_err());
++        assert_eq!(permit.bytes_written(), 2);
++    }
++}
+diff --git a/src/pty/mod.rs b/src/pty/mod.rs
+index ce83867..7e8de68 100644
+--- a/src/pty/mod.rs
++++ b/src/pty/mod.rs
+@@ -1,4 +1,7 @@
+ pub(crate) mod actor;
+ pub(crate) mod backend;
++pub(crate) mod bound_interrupt;
++pub(crate) mod bound_lifecycle;
++pub(crate) mod bound_submission;
+ #[cfg(unix)]
+ pub(crate) mod fd;
+diff --git a/src/server/headless.rs b/src/server/headless.rs
+index 2d65237..5855d6a 100644
+--- a/src/server/headless.rs
++++ b/src/server/headless.rs
+@@ -3041,7 +3041,12 @@ impl HeadlessServer {
+             return changed;
+         }
+         let alt_screen_read_spec = self.alt_screen_read_spec(&msg.request);
+-        if matches!(&msg.request.method, api::schema::Method::AgentPrompt(_)) {
++        if matches!(
++            &msg.request.method,
++            api::schema::Method::AgentPrompt(_)
++                | api::schema::Method::AgentPromptBound(_)
++                | api::schema::Method::AgentInterruptBound(_)
++        ) {
+             let deferred_changed = self
+                 .app
+                 .handle_deferred_agent_api_request(msg.request, msg.respond_to);
+diff --git a/src/server/headless/tests/mod.rs b/src/server/headless/tests/mod.rs
+index 63f7264..16a0649 100644
+--- a/src/server/headless/tests/mod.rs
++++ b/src/server/headless/tests/mod.rs
+@@ -6306,3 +6306,25 @@ fn no_handle_internal_event_bypass_in_module() {
+         bypass_lines.join("\n  ")
+     );
+ }
++
++#[test]
++fn headless_bound_prompt_uses_deferred_admission() {
++    let mut server = test_headless_server();
++    let (respond_to, response_rx) = std::sync::mpsc::channel();
++    server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
++        request: api::schema::Request {
++            id: "bound-dispatch".into(),
++            method: api::schema::Method::AgentPromptBound(api::schema::AgentPromptBoundParams {
++                operation_id: "operation".into(),
++                expected_launch_id: "missing".into(),
++                text: "test".into(),
++            }),
++        },
++        respond_to,
++        response_write_complete: None,
++        stream_active: None,
++    });
++    let response: serde_json::Value =
++        serde_json::from_str(&response_rx.recv_timeout(Duration::from_secs(1)).unwrap()).unwrap();
++    assert_eq!(response["error"]["code"], "instance_changed");
++}
+diff --git a/src/terminal/runtime.rs b/src/terminal/runtime.rs
+index 57d45b9..7b06bf3 100644
+--- a/src/terminal/runtime.rs
++++ b/src/terminal/runtime.rs
+@@ -17,6 +17,38 @@ use crate::layout::PaneId;
+ pub struct TerminalRuntime(crate::pane::PaneRuntime);
+ 
+ impl TerminalRuntime {
++    pub(crate) fn runtime_lifetime_id(&self) -> &str {
++        self.0.runtime_lifetime_id()
++    }
++    pub(crate) fn bound_launch_id(&self) -> Option<&str> {
++        self.0.bound_launch_id()
++    }
++    pub(crate) fn set_bound_interrupt_profile(&mut self, kind: crate::detect::Agent) {
++        self.0.set_bound_interrupt_profile(kind);
++    }
++    pub(crate) fn bound_interrupt_key(&self) -> Option<u8> {
++        self.0.bound_interrupt_key()
++    }
++    pub(crate) fn queue_bound_interrupt(
++        &self,
++        expected_launch_id: &str,
++    ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
++        self.0.queue_bound_interrupt(expected_launch_id)
++    }
++    pub(crate) fn set_bound_input_ready(&self, ready: bool) {
++        self.0.set_bound_input_ready(ready);
++    }
++    pub(crate) fn queue_bound_input_submission(
++        &self,
++        expected_launch_id: &str,
++        text: Bytes,
++        enter: Bytes,
++        delay: std::time::Duration,
++    ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
++        self.0
++            .queue_bound_input_submission(expected_launch_id, text, enter, delay)
++    }
++
+     pub fn shutdown(self) {
+         self.0.shutdown();
+     }
+@@ -194,6 +226,7 @@ impl TerminalRuntime {
+         argv: &[String],
+         launch_env: &crate::pane::PaneLaunchEnv,
+         agent_detection: crate::pane::AgentDetection,
++        bound_lifecycle: bool,
+         scrollback_limit_bytes: usize,
+         host_terminal_theme: crate::terminal_theme::TerminalTheme,
+         host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
+@@ -209,6 +242,7 @@ impl TerminalRuntime {
+             argv,
+             launch_env,
+             agent_detection,
++            bound_lifecycle,
+             scrollback_limit_bytes,
+             host_terminal_theme,
+             host_terminal_appearance,
+diff --git a/src/update.rs b/src/update.rs
+index f836fb8..a6b68fe 100644
+--- a/src/update.rs
++++ b/src/update.rs
+@@ -2854,6 +2854,14 @@ mod tests {
+                 ),
+                 surface_interest: true,
+                 health_check: true,
++                agent_start_bound: false,
++                agent_get_bound: false,
++                agent_prompt_bound: false,
++                agent_lifecycle_bound: false,
++                agent_interrupt_bound: false,
++                agent_reporting_mcp_codex: false,
++                bound_agent_kinds: None,
++                owner_epoch: None,
+             }),
+         };
+         let missing_baseline = crate::api::RuntimeStatus {
+@@ -2928,6 +2936,14 @@ mod tests {
+                     ),
+                     surface_interest: true,
+                     health_check: true,
++                    agent_start_bound: false,
++                    agent_get_bound: false,
++                    agent_prompt_bound: false,
++                    agent_lifecycle_bound: false,
++                    agent_interrupt_bound: false,
++                    agent_reporting_mcp_codex: false,
++                    bound_agent_kinds: None,
++                    owner_epoch: None,
+                 }),
+             },
+         };
+@@ -3186,6 +3202,14 @@ mod tests {
+                     ),
+                     surface_interest: true,
+                     health_check: true,
++                    agent_start_bound: false,
++                    agent_get_bound: false,
++                    agent_prompt_bound: false,
++                    agent_lifecycle_bound: false,
++                    agent_interrupt_bound: false,
++                    agent_reporting_mcp_codex: false,
++                    bound_agent_kinds: None,
++                    owner_epoch: None,
+                 }),
+             },
+         };
+diff --git a/src/workspace/tab.rs b/src/workspace/tab.rs
+index 79d7f94..779132c 100644
+--- a/src/workspace/tab.rs
++++ b/src/workspace/tab.rs
+@@ -144,6 +144,7 @@ impl Tab {
+                 argv,
+                 launch_env,
+                 crate::pane::AgentDetection::Enabled,
++                false,
+                 scrollback_limit_bytes,
+                 host_terminal_theme,
+                 host_terminal_appearance,
+@@ -369,6 +370,7 @@ impl Tab {
+                 argv,
+                 launch_env,
+                 crate::pane::AgentDetection::Enabled,
++                false,
+                 scrollback_limit_bytes,
+                 host_terminal_theme,
+                 host_terminal_appearance,
+diff --git a/tests/cli/surface.rs b/tests/cli/surface.rs
+index b48baf5..cb4c7d7 100644
+--- a/tests/cli/surface.rs
++++ b/tests/cli/surface.rs
+@@ -519,7 +519,12 @@ fn api_schema_json_prints_bundled_schema() {
+             .get("schemas")
+             .and_then(serde_json::Value::as_object)
+             .map(serde_json::Map::len),
+-        Some(5)
++        Some(6)
++    );
++    assert!(
++        schema["schemas"]["bound_start_error_response"]["properties"]
++            .get("start_receipt")
++            .is_some()
+     );
+ }
+ 
+-- 
+2.55.0
+

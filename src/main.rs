@@ -16,7 +16,7 @@ use anyhow::Context as _;
 use axum::body::{to_bytes, Body};
 use axum::extract::multipart::{MultipartError, MultipartRejection};
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
-use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse as _, Response};
@@ -59,6 +59,22 @@ mod state_lock;
 mod supervision;
 mod tasks;
 mod transport;
+use muqun_gateway::work;
+mod work_actor;
+mod work_artifacts;
+mod work_authority;
+mod work_delegation;
+mod work_events;
+mod work_execution;
+mod work_http;
+mod work_inputs;
+mod work_interrupt;
+mod work_local;
+mod work_prompt;
+mod work_reporting_binary;
+mod work_reporting_mcp;
+mod work_results;
+mod work_schema;
 
 use authority::{hash_token, identify_device, DeviceRecord, PairingCodeError, PendingPairing};
 
@@ -342,61 +358,70 @@ const API_CAPABILITIES: &[&str] = &[
     "terminal_input",
 ];
 
-/// Handing a task to an agent the app did not start, and following it home.
-///
-/// Not in [`API_CAPABILITIES`], because this gateway build implementing the
-/// endpoints is not what decides whether the feature works. Two things the
-/// gateway does not control decide it:
-///
-///  1. **The backend must be Herdr.** An assignment is bound to an agent
-///     *instance* -- the identity of a process and its conversation -- and only
-///     the Herdr adapter has one to bind to. `TmuxBackend::start_agent` returns
-///     `instance_id: None`, and a pane id is not a substitute: panes are reused
-///     and renumbered, so a task bound to one can be delivered to whoever took
-///     the pane over. tmux sessions keep every ordinary terminal capability;
-///     they simply never see this one.
-///  2. **That Herdr must be 0.9.0 or newer.** Below it there is no instance
-///     identity on the wire at all.
-///
-/// Announcing it anyway -- which is what the static list did -- told a phone
-/// attached to a tmux session that collaboration was available, and left the
-/// only honest refusal to happen after the reader had written the task.
-///
-/// It is answered in two places, and they mean different things:
-///
-///  * `backends[].capabilities` in `/health` is the precise answer, per
-///    session. A client that has chosen a session should read that one.
-///  * the gateway-wide `capabilities` array carries it when *any* configured
-///    session qualifies. That is what an app too old to read the per-session
-///    list sees, and it is the weaker claim on purpose: "somewhere on this
-///    machine", not "on the session you are looking at".
+/// Legacy collaboration eligibility is supplied by the selected adapter.
+/// The top-level list preserves the weaker claim that some session offers it;
+/// `backends[].capabilities` describes the selected session. Neither promises
+/// atomic instance-bound prompt delivery.
 const AGENT_COLLABORATION_CAPABILITY: &str = "agent_collaboration";
 
-/// The first Herdr that puts an opaque agent instance id on the wire.
-///
-/// The same floor `herdr_owns_prompt_submission` uses, and not a coincidence:
-/// 0.9.0 is the release that made an agent addressable as something other than
-/// the pane it happens to occupy.
-const HERDR_COLLABORATION_MIN: (u64, u64, u64) = (0, 9, 0);
-
-/// What one session offers beyond what the build offers, from the three facts
-/// `/health` already has about it.
-///
-/// Pure, so every combination -- including the ones that need a real Herdr or a
-/// real tmux server to reach -- is a unit test rather than a manual check.
-fn session_capabilities(
-    kind: BackendKind,
-    connected: bool,
-    version: Option<&str>,
-) -> Vec<&'static str> {
-    if connected
-        && kind == BackendKind::Herdr
-        && backend::version_at_least(version, HERDR_COLLABORATION_MIN)
+/// Expose known optional capabilities established by a connected adapter.
+/// Version interpretation and backend eligibility belong to that adapter.
+fn session_capabilities(metadata: &Value) -> Vec<&'static str> {
+    if metadata.get("connected").and_then(Value::as_bool) == Some(true)
+        && metadata
+            .get("capabilities")
+            .and_then(Value::as_array)
+            .is_some_and(|capabilities| {
+                capabilities
+                    .iter()
+                    .any(|capability| capability.as_str() == Some(AGENT_COLLABORATION_CAPABILITY))
+            })
     {
         vec![AGENT_COLLABORATION_CAPABILITY]
     } else {
         Vec::new()
     }
+}
+
+/// Record storage survives native disconnection. Execution additionally needs
+/// the local result channel and the adapter's actual bound-operation evidence.
+fn work_capabilities(
+    metadata: &Value,
+    records_ready: bool,
+    local_ready: bool,
+) -> Vec<&'static str> {
+    if !records_ready {
+        return Vec::new();
+    }
+    // records_ready includes the immutable input/artifact store. These APIs
+    // remain useful while native execution is disconnected.
+    let mut capabilities = vec!["work_tasks_v1", "work_inputs_v1"];
+    if local_ready {
+        // These advertise the control/recovery contracts, not an active lead
+        // grant or proof of exit. Handlers revalidate those facts per request.
+        capabilities.extend(["work_delegation_v1", "work_attempt_reconciliation_v1"]);
+    }
+    let native = metadata.get("capabilities").and_then(Value::as_array);
+    let has = |name: &str| {
+        native.is_some_and(|items| items.iter().any(|item| item.as_str() == Some(name)))
+    };
+    if local_ready
+        && metadata.get("connected").and_then(Value::as_bool) == Some(true)
+        && has("instance_bound_start")
+        && has("instance_bound_prompt")
+    {
+        capabilities.push("work_execution_v1");
+        if has("reporting_mcp_codex") {
+            capabilities.push("work_reporting_mcp_codex_v1");
+        }
+    }
+    if local_ready
+        && metadata.get("connected").and_then(Value::as_bool) == Some(true)
+        && has("instance_bound_interrupt")
+    {
+        capabilities.push("work_interrupt_v1");
+    }
+    capabilities
 }
 
 /// The gateway-wide list: the build's own capabilities, plus collaboration if
@@ -423,6 +448,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Use the current assistant's scoped local task context; result JSON is read from stdin.
+    Work {
+        #[command(subcommand)]
+        command: work_local::LocalCommand,
+    },
     Setup {
         #[arg(long)]
         public_url: Option<String>,
@@ -858,6 +888,9 @@ impl AgentPushNotice {
 #[derive(Clone)]
 struct AppState {
     config: Config,
+    work: Option<Arc<Mutex<work::store::WorkStore>>>,
+    work_artifacts: Option<PathBuf>,
+    work_local: Option<work_local::LocalState>,
     pending_pairing: Arc<Mutex<Option<PendingPairing>>>,
     pairing_requests: Arc<Mutex<VecDeque<u128>>>,
     push_tokens: Arc<Mutex<Vec<PushTokenRecord>>>,
@@ -1043,6 +1076,7 @@ fn main() -> anyhow::Result<()> {
 
 async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
+        Command::Work { command } => work_local::client(command).await?,
         Command::Setup {
             public_url,
             port,
@@ -2038,8 +2072,25 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     // One background attempt per opted-in backend; no restart/logging loop.
     backend_startup::spawn(&config);
 
+    #[cfg(unix)]
+    let local_service = work_local::prepare(&state_dir()?.join("work/local")).ok();
+    #[cfg(unix)]
+    let local_state = local_service.as_ref().map(|(local, _)| local.clone());
+    #[cfg(not(unix))]
+    let local_state = None;
     let state = AppState {
         config,
+        work_local: local_state,
+        work_artifacts: Some(state_dir()?.join("work/artifacts")),
+        work: match work::store::WorkStore::open(&state_dir()?.join("work/tasks.sqlite3")) {
+            Ok(store) => Some(Arc::new(Mutex::new(store))),
+            Err(_) => {
+                eprintln!(
+                    "Task storage is unavailable; ordinary terminal access remains available."
+                );
+                None
+            }
+        },
         pending_pairing: Arc::new(Mutex::new(None)),
         pairing_requests: Arc::new(Mutex::new(VecDeque::new())),
         push_tokens: Arc::new(Mutex::new(load_push_tokens_for_service())),
@@ -2051,6 +2102,10 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         activity: Arc::new(Mutex::new(HashMap::new())),
         session_liveness: Arc::new(Mutex::new(SessionLivenessCache::default())),
     };
+    #[cfg(unix)]
+    if let Some((_, listener)) = local_service {
+        work_local::serve(state.clone(), listener);
+    }
     spawn_agent_notification_watchers(state.clone());
     spawn_approval_watchers(state.clone());
     spawn_upload_gc();
@@ -2107,6 +2162,68 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
             get(session_agent_events),
         )
         .route("/api/sessions/{session_id}/tasks", post(create_task))
+        .route("/api/sessions/{session_id}/work/tasks/{task_id}/attempts/{attempt_id}/reconciliations", post(work_http::reconcile_attempt))
+        .route("/api/sessions/{session_id}/work/inputs", post(work_inputs::upload).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)))
+        .route("/api/sessions/{session_id}/work/input-receipts", get(work_inputs::receipt))
+        .route(
+            "/api/sessions/{session_id}/work/tasks",
+            get(work_http::list_tasks).post(work_http::create_task),
+        )
+        .route("/api/sessions/{session_id}/work/task-summaries", get(work_http::task_summaries))
+        .route(
+            "/api/sessions/{session_id}/work/tasks/{task_id}",
+            get(work_http::task_detail),
+        )
+        .route("/api/sessions/{session_id}/work/tasks/{task_id}/records", get(work_http::task_records))
+        .route("/api/sessions/{session_id}/work/tasks/{task_id}/results/{submission_id}", get(work_http::get_result))
+        .route("/api/sessions/{session_id}/work/tasks/{task_id}/reviews/{review_id}", get(work_http::get_review))
+        .route(
+            "/api/sessions/{session_id}/work/tasks/{task_id}/attempts",
+            post(work_http::start_attempt),
+        )
+        .route("/api/sessions/{session_id}/work/tasks/{task_id}/attempts/{attempt_id}/local-authority/revoke", post(work_http::revoke_local_authority))
+        .route(
+            "/api/sessions/{session_id}/work/tasks/{task_id}/attempts/{attempt_id}/deliveries",
+            post(work_http::deliver_prompt),
+        )
+        .route(
+            "/api/sessions/{session_id}/work/tasks/{task_id}/attempts/{attempt_id}/interruptions",
+            post(work_interrupt::interrupt_attempt),
+        )
+        .route(
+            "/api/sessions/{session_id}/work/tasks/{task_id}/results",
+            post(work_http::submit_result),
+        )
+        .route(
+            "/api/sessions/{session_id}/work/tasks/{task_id}/reviews",
+            post(work_http::review_result),
+        )
+        .route(
+            "/api/sessions/{session_id}/work/tasks/{task_id}/delegation",
+            post(work_http::set_paused),
+        )
+        .route(
+            "/api/sessions/{session_id}/work/tasks/{task_id}/delegation-config",
+            post(work_delegation::configure),
+        )
+        .route(
+            "/api/sessions/{session_id}/work/tasks/{task_id}/dependencies",
+            post(work_delegation::set_dependencies),
+        )
+        .route(
+            "/api/sessions/{session_id}/work/tasks/{task_id}/results/{submission_id}/artifacts/{index}",
+            get(work_http::artifact_content),
+        )
+        .route("/api/sessions/{session_id}/work/receipts", get(work_http::receipt))
+        .route(
+            "/api/sessions/{session_id}/work/operations/{operation_id}",
+            get(work_http::get_operation),
+        )
+        .route("/api/sessions/{session_id}/work/events", get(work_events::events))
+        .route(
+            "/api/sessions/{session_id}/work/changes",
+            get(work_http::changes),
+        )
         // Two spellings, one handler. The card said `agents/spawn` and the
         // route said `spawn`, so New Task 404'd against every real gateway
         // while both halves' tests passed against their own idea of the path.
@@ -2275,8 +2392,16 @@ const fn sealed_body_ceiling(plaintext: usize) -> usize {
 
 /// The plaintext a route is allowed to carry, matching what the router's own
 /// body limits allow it in the clear.
+fn scoped_input_path(path: &str) -> bool {
+    let parts: Vec<_> = path.split('/').collect();
+    matches!(parts.as_slice(), ["", "api", "sessions", session, "work", "inputs"] if !session.is_empty())
+}
+#[cfg(test)]
 fn plaintext_body_limit(path: &str) -> usize {
-    if path == UPLOADS_PATH {
+    plaintext_method_body_limit(&Method::POST, path)
+}
+fn plaintext_method_body_limit(method: &Method, path: &str) -> usize {
+    if path == UPLOADS_PATH || (*method == Method::POST && scoped_input_path(path)) {
         MAX_UPLOAD_BYTES
     } else {
         MAX_REQUEST_BODY_BYTES
@@ -2417,7 +2542,7 @@ async fn decrypt_transport_request(
     // body limits and is therefore the only thing bounding them.
     let body_bytes = to_bytes(
         body,
-        sealed_body_ceiling(plaintext_body_limit(parts.uri.path())),
+        sealed_body_ceiling(plaintext_method_body_limit(&parts.method, parts.uri.path())),
     )
     .await
     .map_err(|_| {
@@ -4643,17 +4768,21 @@ async fn gateway_metadata(
     // the gateway-wide list gets to claim. See `AGENT_COLLABORATION_CAPABILITY`
     // for why that claim is weaker than the per-session one beside it.
     let mut collaboration_somewhere = false;
+    let summaries_ready = work_http::with_store(state, |store| Ok(store.summaries_ready()))
+        .await
+        .unwrap_or(false);
     for session in &state.config.sessions {
         let (metadata, compatibility) = session_metadata(session).await;
-        let capabilities = session_capabilities(
-            session.backend,
-            metadata
-                .get("connected")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            metadata.get("version").and_then(Value::as_str),
-        );
-        collaboration_somewhere |= !capabilities.is_empty();
+        let mut capabilities = session_capabilities(&metadata);
+        collaboration_somewhere |= capabilities.contains(&AGENT_COLLABORATION_CAPABILITY);
+        capabilities.extend(work_capabilities(
+            &metadata,
+            cfg!(unix) && state.work.is_some() && state.work_artifacts.is_some(),
+            state.work_local.is_some(),
+        ));
+        if summaries_ready && capabilities.contains(&"work_tasks_v1") {
+            capabilities.push("work_task_summaries_v1");
+        }
         let metadata = json!({
             "sessionId": session.id,
             "label": session.label,
@@ -4667,6 +4796,7 @@ async fn gateway_metadata(
             // to a gateway that predates the field and falls back to the
             // gateway-wide list.
             "capabilities": capabilities,
+            "bound_agent_kinds": metadata.get("bound_agent_kinds").cloned().unwrap_or(Value::Null),
         });
         if session.id == primary.id {
             primary_metadata = Some(metadata.clone());
@@ -4758,6 +4888,8 @@ async fn session_metadata(session: &SessionConfig) -> (Value, Value) {
                     "connected": true,
                     "version": metadata.version,
                     "protocol": metadata.protocol,
+                    "capabilities": metadata.capabilities,
+                    "bound_agent_kinds": metadata.bound_agent_kinds,
                 }),
                 compatibility,
             )
@@ -6564,17 +6696,71 @@ async fn submit_agent_prompt(
     target: &str,
     text: &str,
 ) -> Result<Value, HerdrCallError> {
+    let backend = terminal_backend(session);
+    async {
+        let agent = backend.get_agent(target).await?;
+        let visible = backend
+            .read_pane(&BackendReadPane {
+                pane_id: agent.pane_id,
+                source: BackendOutputSource::Visible,
+                format: BackendOutputFormat::Text,
+                lines: 80,
+                start: None,
+                end: None,
+            })
+            .await?;
+        // Native idle/ready can misclassify startup trust menus. A detected
+        // menu is a definite reason to refuse; absence is not proof of safe
+        // instance-bound delivery. Read failures also prevent submission.
+        if agent.status == BackendAgentStatus::Blocked || approvals::detect(&visible.text).is_some()
+        {
+            return Err(BackendError::Refused {
+                code: Some("agent_blocked".into()),
+                message: "assistant requires interactive approval before receiving a prompt".into(),
+            });
+        }
+        backend.prompt_agent(target, text).await
+    }
+    .await
+    .map(|_| backend::compat::command_ok("agent_prompted"))
+    .map_err(|err| match err {
+        BackendError::Refused { code, message } => HerdrCallError::Herdr {
+            method: "agent.prompt".to_owned(),
+            error: json!({ "code": code, "message": message }),
+        },
+        other => HerdrCallError::Unavailable(other.to_string()),
+    })
+}
+
+async fn start_backend_agent_native(
+    session: &SessionConfig,
+    pane_id: &str,
+    kind: &str,
+    command: &str,
+    args: &[String],
+    timeout_ms: u64,
+) -> Result<backend::StartedAgent, BackendError> {
     terminal_backend(session)
-        .prompt_agent(target, text)
+        .start_agent(&backend_start_request(
+            pane_id, kind, command, args, timeout_ms,
+        ))
         .await
-        .map(|_| backend::compat::command_ok("agent_prompted"))
-        .map_err(|err| match err {
-            BackendError::Refused { code, message } => HerdrCallError::Herdr {
-                method: "agent.prompt".to_owned(),
-                error: json!({ "code": code, "message": message }),
-            },
-            other => HerdrCallError::Unavailable(other.to_string()),
-        })
+}
+fn backend_start_request(
+    pane_id: &str,
+    kind: &str,
+    command: &str,
+    args: &[String],
+    timeout_ms: u64,
+) -> BackendStartAgent {
+    BackendStartAgent {
+        pane_id: BackendPaneId::new(pane_id),
+        kind: kind.to_owned(),
+        command: command.to_owned(),
+        executable: tasks::find_on_path(command),
+        args: args.to_vec(),
+        timeout_ms,
+    }
 }
 
 async fn start_backend_agent(
@@ -6585,15 +6771,7 @@ async fn start_backend_agent(
     args: &[String],
     timeout_ms: u64,
 ) -> Result<Value, HerdrCallError> {
-    let started = terminal_backend(session)
-        .start_agent(&BackendStartAgent {
-            pane_id: BackendPaneId::new(pane_id),
-            kind: kind.to_owned(),
-            command: command.to_owned(),
-            executable: tasks::find_on_path(command),
-            args: args.to_vec(),
-            timeout_ms,
-        })
+    let started = start_backend_agent_native(session, pane_id, kind, command, args, timeout_ms)
         .await
         .map_err(|err| backend_call_error("agent.start", err))?;
     Ok(
@@ -6668,6 +6846,11 @@ async fn submit_keypress(session: &SessionConfig, pane_id: &str) {
             eprintln!("agent submit for pane {pane_id} gave up: the pane never settled");
             return;
         };
+        // A trust or permission menu can appear after the paste. The legacy
+        // delayed Enter must not accept it on the user's behalf.
+        if approvals::detect(&settled).is_some() {
+            return;
+        }
         let sent = terminal_backend(session)
             .send_keys(&BackendPaneId::new(pane_id), &["Enter".to_owned()])
             .await;
@@ -7026,6 +7209,27 @@ struct TaskPlace {
     reused: bool,
 }
 
+async fn create_task_workspace(
+    session: &SessionConfig,
+    repo_path: &FsPath,
+    label: Option<&str>,
+) -> Result<backend::Workspace, BackendError> {
+    terminal_backend(session)
+        .create_workspace(&BackendCreateWorkspace {
+            cwd: Some(repo_path.to_owned()),
+            label: label.map(str::to_owned),
+            focus: false,
+        })
+        .await
+}
+
+async fn create_task_worktree(
+    session: &SessionConfig,
+    request: &BackendWorktreeRequest,
+) -> Result<backend::WorktreePlacement, BackendError> {
+    terminal_backend(session).create_worktree(request).await
+}
+
 /// The no-branch case: a workspace on the repo as it stands.
 async fn prepare_workspace(
     session: &SessionConfig,
@@ -7035,14 +7239,7 @@ async fn prepare_workspace(
 ) -> Result<TaskPlace, HerdrCallError> {
     steps.skipped("worktree", "no branch_name was given");
     let backend = terminal_backend(session);
-    let workspace = match backend
-        .create_workspace(&BackendCreateWorkspace {
-            cwd: Some(repo_path.to_owned()),
-            label: label.map(str::to_owned),
-            focus: false,
-        })
-        .await
-    {
+    let workspace = match create_task_workspace(session, repo_path, label).await {
         Ok(workspace) => workspace,
         Err(err) => {
             let err = HerdrCallError::Unavailable(err.to_string());
@@ -7510,7 +7707,7 @@ async fn prepare_worktree(
         }
     }
 
-    match backend.create_worktree(&request).await {
+    match create_task_worktree(session, &request).await {
         Ok(placement) => {
             let path = placement
                 .path
@@ -7789,6 +7986,7 @@ impl HerdrCallError {
 
 fn backend_call_error(method: &str, error: BackendError) -> HerdrCallError {
     match error {
+        BackendError::StartNotStarted { .. } => HerdrCallError::malformed(method),
         BackendError::Refused { code, message } => HerdrCallError::Herdr {
             method: method.to_owned(),
             error: json!({ "code": code, "message": message }),
@@ -9010,34 +9208,7 @@ async fn upload_file(
             "the file field must carry a filename",
         ));
     };
-    if bytes.is_empty() {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "empty_file",
-            "the file field is empty",
-        ));
-    }
-
-    // Executables are checked separately from the content allow-list so the
-    // refusal says what it means, and so adding a document format cannot
-    // accidentally make an executable acceptable.
-    if looks_executable(&bytes) {
-        return Err(api_error(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "executable_rejected",
-            "executables and scripts are not accepted",
-        ));
-    }
-    let Some(kind) = sniff_upload_kind(&bytes)
-        .or_else(|| sniff_office_upload_kind(&bytes))
-        .or_else(|| sniff_document_upload_kind(&bytes, &client_name))
-    else {
-        return Err(api_error(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "unsupported_file_type",
-            "only supported images, office documents, PDF, and UTF-8 text are accepted",
-        ));
-    };
+    let kind = validate_upload_content(&client_name, &bytes)?;
 
     let dir = ensure_uploads_dir().map_err(|err| {
         eprintln!("failed to prepare the upload directory: {err:#}");
@@ -9063,6 +9234,40 @@ async fn upload_file(
         "size": bytes.len(),
         "mime": kind.mime
     })))
+}
+
+/// Shared content validation; scoped inputs retain the legacy allowlist exactly.
+fn validate_upload_content(client_name: &str, bytes: &[u8]) -> ApiResult<UploadKind> {
+    if bytes.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "empty_file",
+            "the file field is empty",
+        ));
+    }
+
+    // Executables are checked separately from the content allow-list so the
+    // refusal says what it means, and so adding a document format cannot
+    // accidentally make an executable acceptable.
+    if looks_executable(bytes) {
+        return Err(api_error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "executable_rejected",
+            "executables and scripts are not accepted",
+        ));
+    }
+    let Some(kind) = sniff_upload_kind(bytes)
+        .or_else(|| sniff_office_upload_kind(bytes))
+        .or_else(|| sniff_document_upload_kind(bytes, client_name))
+    else {
+        return Err(api_error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_file_type",
+            "only supported images, office documents, PDF, and UTF-8 text are accepted",
+        ));
+    };
+
+    Ok(kind)
 }
 
 /// The body limit is enforced by the framework while the body streams, so an
@@ -10777,6 +10982,7 @@ fn backend_api_error(error: BackendError) -> (StatusCode, Json<Value>) {
             "terminal backend is unavailable",
         ),
         BackendError::InvalidResponse(_)
+        | BackendError::StartNotStarted { .. }
         | BackendError::Refused { .. }
         | BackendError::Unsupported(_) => (
             StatusCode::BAD_GATEWAY,
@@ -11937,7 +12143,7 @@ fn now_unix_ms() -> u128 {
 }
 
 fn openapi_spec() -> Value {
-    json!({
+    let mut spec = json!({
         "openapi": "3.1.0",
         "info": {
             "title": "Terminal Gateway API",
@@ -12356,7 +12562,9 @@ fn openapi_spec() -> Value {
                 }
             }
         }
-    })
+    });
+    work_schema::extend(&mut spec);
+    spec
 }
 
 fn task_steps_schema() -> Value {
@@ -13391,7 +13599,7 @@ mod tests {
         drop(subscriber);
     }
 
-    fn test_device(id: &str, token: &str) -> DeviceRecord {
+    pub(super) fn test_device(id: &str, token: &str) -> DeviceRecord {
         DeviceRecord {
             id: id.into(),
             name: format!("device {id}"),
@@ -13404,9 +13612,14 @@ mod tests {
         }
     }
 
-    fn test_state(admin_token: &str, devices: Vec<DeviceRecord>) -> AppState {
+    pub(super) fn test_state(admin_token: &str, devices: Vec<DeviceRecord>) -> AppState {
         AppState {
             config: test_config(admin_token),
+            work_artifacts: None,
+            work_local: None,
+            work: Some(Arc::new(Mutex::new(
+                work::store::WorkStore::in_memory().unwrap(),
+            ))),
             pending_pairing: Arc::new(Mutex::new(None)),
             pairing_requests: Arc::new(Mutex::new(VecDeque::new())),
             push_tokens: Arc::new(Mutex::new(Vec::new())),
@@ -16779,49 +16992,85 @@ mod tests {
         assert!(API_CAPABILITIES.contains(&"multiple_terminal_backends"));
     }
 
-    /// Collaboration is the one capability that is not a property of this
-    /// build, so it is the one capability that has to be earned per session.
     #[test]
-    fn collaboration_is_announced_only_for_a_connected_modern_herdr() {
+    fn work_interruption_requires_connected_native_evidence_and_local_storage() {
+        let supported = json!({"connected": true, "capabilities": ["instance_bound_interrupt"]});
+        assert!(work_capabilities(&supported, true, true).contains(&"work_interrupt_v1"));
+        for metadata in [
+            json!({"connected": false, "capabilities": ["instance_bound_interrupt"]}),
+            json!({"connected": true, "capabilities": ["pane_interrupt"]}),
+            json!({"connected": true, "capabilities": "instance_bound_interrupt"}),
+            json!({"connected": true, "version": "99.0.0"}),
+        ] {
+            assert!(!work_capabilities(&metadata, true, true).contains(&"work_interrupt_v1"));
+        }
+        assert!(!work_capabilities(&supported, true, false).contains(&"work_interrupt_v1"));
+        assert!(work_capabilities(&supported, false, true).is_empty());
+    }
+
+    #[test]
+    fn work_records_remain_available_without_native_execution() {
+        let offline = json!({"connected": false, "capabilities": ["instance_bound_start", "instance_bound_prompt"]});
         assert_eq!(
-            session_capabilities(BackendKind::Herdr, true, Some("0.9.0")),
+            work_capabilities(&offline, true, true),
+            vec![
+                "work_tasks_v1",
+                "work_inputs_v1",
+                "work_delegation_v1",
+                "work_attempt_reconciliation_v1"
+            ]
+        );
+        let complete = json!({"connected": true, "capabilities": ["instance_bound_start", "instance_bound_prompt"]});
+        assert_eq!(
+            work_capabilities(&complete, true, true),
+            vec![
+                "work_tasks_v1",
+                "work_inputs_v1",
+                "work_delegation_v1",
+                "work_attempt_reconciliation_v1",
+                "work_execution_v1"
+            ]
+        );
+        assert_eq!(
+            work_capabilities(&complete, true, false),
+            vec!["work_tasks_v1", "work_inputs_v1"]
+        );
+        assert!(work_capabilities(&complete, false, true).is_empty());
+        for incomplete in [
+            json!({"connected": true, "capabilities": ["instance_bound_prompt"]}),
+            json!({"connected": true, "capabilities": ["instance_bound_start"]}),
+            json!({"connected": true, "version": "99.0.0", "kind": "herdr"}),
+        ] {
+            assert_eq!(
+                work_capabilities(&incomplete, true, true),
+                vec![
+                    "work_tasks_v1",
+                    "work_inputs_v1",
+                    "work_delegation_v1",
+                    "work_attempt_reconciliation_v1"
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn collaboration_uses_adapter_evidence_only_while_connected() {
+        assert_eq!(
+            session_capabilities(&json!({
+                "connected": true,
+                "capabilities": [AGENT_COLLABORATION_CAPABILITY],
+            })),
             vec![AGENT_COLLABORATION_CAPABILITY]
         );
-        for version in ["v0.9.1", "0.10.0", "1.0.0", "0.9.0+build"] {
-            assert_eq!(
-                session_capabilities(BackendKind::Herdr, true, Some(version)),
-                vec![AGENT_COLLABORATION_CAPABILITY],
-                "{version} should carry collaboration"
-            );
-        }
-
-        // A Herdr too old to put an instance id on the wire, and a version
-        // string nobody can read, are both refused rather than guessed at.
-        for version in [
-            Some("0.8.9"),
-            Some("0.9.0-rc.1"),
-            Some("0.9"),
-            Some("x"),
-            None,
+        for evidence in [
+            json!({"connected": false, "capabilities": [AGENT_COLLABORATION_CAPABILITY]}),
+            json!({"capabilities": [AGENT_COLLABORATION_CAPABILITY]}),
+            json!({"connected": true, "capabilities": []}),
+            json!({"connected": true, "kind": "herdr", "version": "99.0.0"}),
+            json!({"connected": true, "capabilities": ["managed_task_delivery"]}),
         ] {
-            assert!(
-                session_capabilities(BackendKind::Herdr, true, version).is_empty(),
-                "{version:?} should not carry collaboration"
-            );
+            assert!(session_capabilities(&evidence).is_empty(), "{evidence}");
         }
-
-        // tmux keeps every other capability and never gains this one: it has no
-        // agent instance identity to bind an assignment to.
-        for version in [Some("3.6"), Some("99.0.0"), None] {
-            assert!(
-                session_capabilities(BackendKind::Tmux, true, version).is_empty(),
-                "tmux {version:?} should not carry collaboration"
-            );
-        }
-
-        // A backend that is not answering cannot deliver anything, whatever
-        // version it reported the last time it did.
-        assert!(session_capabilities(BackendKind::Herdr, false, Some("0.9.0")).is_empty());
     }
 
     /// The gateway-wide list is the weaker, older-app-facing claim: it says
@@ -18498,6 +18747,14 @@ mod tests {
         /// state sequence to move; `None` makes `agent.list` come back empty,
         /// which is a pane running no agent Herdr knows.
         fn start(screens: Vec<&str>, advance_after: Option<usize>) -> Self {
+            Self::start_with_read_failure(screens, advance_after, false)
+        }
+
+        fn start_with_read_failure(
+            screens: Vec<&str>,
+            advance_after: Option<usize>,
+            read_failure: bool,
+        ) -> Self {
             let socket_path = std::env::temp_dir().join(format!(
                 "herdr-submit-{}.sock",
                 uuid::Uuid::new_v4().simple()
@@ -18518,6 +18775,12 @@ mod tests {
                     let request: Value = serde_json::from_str(&line).unwrap();
                     let method = request["method"].as_str().unwrap_or_default().to_owned();
                     let result = match method.as_str() {
+                        "agent.get" => json!({ "agent": {
+                            "pane_id": "w1:p1",
+                            "agent": "codex",
+                            "agent_status": "idle",
+                            "interactive_ready": true,
+                        }}),
                         "pane.read" => {
                             let screen = screens
                                 .get(reads)
@@ -18552,7 +18815,14 @@ mod tests {
                         _ => json!({ "ok": true }),
                     };
                     recorded.lock().unwrap().push(request.clone());
-                    let response = json!({ "id": request["id"], "result": result }).to_string();
+                    let response = if read_failure && method == "pane.read" {
+                        json!({ "id": request["id"], "error": {
+                            "code": "pane_unavailable", "message": "pane read failed"
+                        }})
+                    } else {
+                        json!({ "id": request["id"], "result": result })
+                    }
+                    .to_string();
                     let mut stream = reader.into_inner();
                     stream.write_all(response.as_bytes()).await.unwrap();
                     stream.write_all(b"\n").await.unwrap();
@@ -18599,6 +18869,49 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.socket_path);
         }
+    }
+
+    #[tokio::test]
+    async fn a_codex_trust_menu_refuses_prompt_even_when_the_native_agent_is_ready() {
+        let screen = include_str!("../tests/fixtures/approval-codex-0154-trust.txt");
+        let herdr = FakeHerdr::start(vec![screen], Some(1));
+        let error = submit_agent_prompt(&herdr.session(), "echo-codex", "work now")
+            .await
+            .expect_err("trust screen must refuse before submission");
+        assert!(matches!(error, HerdrCallError::Herdr { error, .. }
+            if error["code"] == "agent_blocked"));
+        assert_eq!(herdr.pane_methods(), vec!["agent.get", "pane.read"]);
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_idle_prompt_still_reaches_the_native_agent() {
+        let herdr = FakeHerdr::start(vec!["> Ask Codex to do anything"], Some(1));
+        submit_agent_prompt(&herdr.session(), "echo-codex", "work now")
+            .await
+            .unwrap();
+        assert_eq!(
+            herdr.pane_methods(),
+            vec!["agent.get", "pane.read", "agent.prompt"]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_prompt_screen_prevents_native_submission() {
+        let herdr = FakeHerdr::start_with_read_failure(vec![], Some(1), true);
+        assert!(
+            submit_agent_prompt(&herdr.session(), "echo-codex", "work now")
+                .await
+                .is_err()
+        );
+        assert_eq!(herdr.pane_methods(), vec!["agent.get", "pane.read"]);
+    }
+
+    #[tokio::test]
+    async fn a_delayed_submit_enter_does_not_answer_codex_directory_trust() {
+        let screen = include_str!("../tests/fixtures/approval-codex-0154-trust.txt");
+        let herdr = FakeHerdr::start(vec![screen], Some(1));
+        submit_keypress(&herdr.session(), "w1:p1").await;
+        assert!(herdr.enters().is_empty());
     }
 
     #[tokio::test]
