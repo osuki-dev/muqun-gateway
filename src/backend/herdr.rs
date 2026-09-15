@@ -1808,12 +1808,15 @@ mod tests {
 
         let mut master: libc::c_int = -1;
         let mut slave: libc::c_int = -1;
-        let size = libc::winsize {
+        let mut size = libc::winsize {
             ws_row: 59,
             ws_col: 31,
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
+        // libc declares the winsize pointer `*const` on Linux and `*mut` on
+        // macOS; a `*mut` coerces to either, so the test builds on both.
+        let size_ptr = std::ptr::addr_of_mut!(size);
         // SAFETY: `openpty` writes two descriptors and reads the winsize it
         // is handed; every pointer is to a live local.
         let opened = unsafe {
@@ -1822,7 +1825,7 @@ mod tests {
                 &mut slave,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &size,
+                size_ptr,
             )
         };
         assert_eq!(opened, 0, "openpty failed");
