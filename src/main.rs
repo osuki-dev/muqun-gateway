@@ -39,6 +39,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio_stream::{Stream, StreamExt as _};
 
+mod agent;
 mod agent_events;
 mod approvals;
 mod authority;
@@ -314,8 +315,15 @@ const ASSET_SKIP_DIRS: &[&str] = &[
 const API_CAPABILITIES: &[&str] = &[
     "agent_catalog",
     "agent_events",
+    "agent_forms",
     "agent_lifecycle_notifications",
+    "agent_mcp",
+    "agent_models",
+    "agent_permissions",
+    "agent_sessions",
     "agent_spawn",
+    "agent_timeline",
+    "agent_vcs",
     "assets",
     "device_revocation",
     "file_uploads",
@@ -856,27 +864,28 @@ impl AgentPushNotice {
 }
 
 #[derive(Clone)]
-struct AppState {
-    config: Config,
-    pending_pairing: Arc<Mutex<Option<PendingPairing>>>,
-    pairing_requests: Arc<Mutex<VecDeque<u128>>>,
-    push_tokens: Arc<Mutex<Vec<PushTokenRecord>>>,
-    devices: Arc<Mutex<Vec<DeviceRecord>>>,
-    assets: Arc<Mutex<AssetIndex>>,
+pub(crate) struct AppState {
+    pub(crate) config: Config,
+    pub(crate) pending_pairing: Arc<Mutex<Option<PendingPairing>>>,
+    pub(crate) pairing_requests: Arc<Mutex<VecDeque<u128>>>,
+    pub(crate) push_tokens: Arc<Mutex<Vec<PushTokenRecord>>>,
+    pub(crate) devices: Arc<Mutex<Vec<DeviceRecord>>>,
+    pub(crate) assets: Arc<Mutex<AssetIndex>>,
     /// What panes with no scrollback of their own showed while the gateway was
     /// watching. Memory only, and only for those panes; see `scrollback`.
-    scrollback: Arc<Mutex<scrollback::ScrollbackStore>>,
+    pub(crate) scrollback: Arc<Mutex<scrollback::ScrollbackStore>>,
     /// The agent status transitions this gateway saw, so a phone coming back
     /// after a while can be told what happened. Memory only; see
     /// `agent_events`.
-    agent_events: Arc<Mutex<agent_events::AgentEventLog>>,
-    approval_events: tokio::sync::broadcast::Sender<ApprovalEvent>,
+    pub(crate) agent_events: Arc<Mutex<agent_events::AgentEventLog>>,
+    pub(crate) approval_events: tokio::sync::broadcast::Sender<ApprovalEvent>,
     /// One activity stream per session, shared by everyone who wants it. See
     /// [`subscribe_activity`].
-    activity: Arc<Mutex<HashMap<String, tokio::sync::broadcast::Sender<SessionActivity>>>>,
+    pub(crate) activity: Arc<Mutex<HashMap<String, tokio::sync::broadcast::Sender<SessionActivity>>>>,
     /// The last backend liveness ordering, reused briefly so a burst of
     /// clients asking at once is answered once. See [`SESSION_LIVENESS_TTL`].
-    session_liveness: Arc<Mutex<SessionLivenessCache>>,
+    pub(crate) session_liveness: Arc<Mutex<SessionLivenessCache>>,
+    pub(crate) agent_manager: Option<Arc<agent::AgentManager>>,
 }
 
 /// The scrollback store, or nothing if a previous holder panicked while it was
@@ -2038,6 +2047,8 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     // One background attempt per opted-in backend; no restart/logging loop.
     backend_startup::spawn(&config);
 
+    let agent_manager = agent::AgentManager::discover().await.map(Arc::new);
+
     let state = AppState {
         config,
         pending_pairing: Arc::new(Mutex::new(None)),
@@ -2050,12 +2061,14 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         approval_events: tokio::sync::broadcast::channel(APPROVAL_EVENT_CAPACITY).0,
         activity: Arc::new(Mutex::new(HashMap::new())),
         session_liveness: Arc::new(Mutex::new(SessionLivenessCache::default())),
+        agent_manager,
     };
     spawn_agent_notification_watchers(state.clone());
+    spawn_agent_engine_watchers(state.clone());
     spawn_approval_watchers(state.clone());
     spawn_upload_gc();
 
-    let app = Router::new()
+    let app = agent::routes::mount(Router::new())
         .route("/docs", get(docs))
         .route("/openapi.json", get(openapi_json))
         .route("/api/pair/request", post(pair_request))
@@ -5358,6 +5371,7 @@ async fn events(
     let scrollback_store = state.scrollback.clone();
     let backend = terminal_backend(&session);
     let mut activity = subscribe_activity(&state, &session);
+    let mut agent_events_rx = state.agent_manager.as_ref().map(|m| m.subscribe_events());
     let stream = async_stream::stream! {
         let mut output_interval = tokio::time::interval(STREAM_OUTPUT_POLL_INTERVAL);
         output_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -5466,6 +5480,31 @@ async fn events(
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                },
+                agent_ev = async {
+                    if let Some(ref mut rx) = agent_events_rx {
+                        rx.recv().await
+                    } else {
+                        futures::future::pending().await
+                    }
+                } => {
+                    if let Ok(ev) = agent_ev {
+                        let ev_name = match &ev {
+                            agent::AgentDomainEvent::SessionUpdated { .. } => "agent.session.updated",
+                            agent::AgentDomainEvent::TimelineUpsert { .. } => "agent.timeline.upsert",
+                            agent::AgentDomainEvent::TimelineRemoved { .. } => "agent.timeline.removed",
+                            agent::AgentDomainEvent::StatusChanged { .. } => "agent.status.changed",
+                            agent::AgentDomainEvent::PermissionPending { .. } => "agent.permission.pending",
+                            agent::AgentDomainEvent::PermissionResolved { .. } => "agent.permission.resolved",
+                            agent::AgentDomainEvent::FormPending { .. } => "agent.form.pending",
+                            agent::AgentDomainEvent::FormResolved { .. } => "agent.form.resolved",
+                            agent::AgentDomainEvent::Resync { .. } => "agent.resync",
+                        };
+                        let payload = serde_json::to_string(&ev).unwrap_or_default();
+                        if let Some(event) = stream_event(&mut sealer, ev_name, &payload) {
+                            yield Ok(event);
+                        }
                     }
                 },
             }
@@ -5856,6 +5895,45 @@ fn spawn_agent_notification_watchers(state: AppState) {
             watch_agent_notifications(state, session).await;
         });
     }
+}
+
+fn spawn_agent_engine_watchers(state: AppState) {
+    let Some(ref manager) = state.agent_manager else {
+        return;
+    };
+    let mut rx = manager.subscribe_events();
+    let state = state.clone();
+
+    tokio::spawn(async move {
+        while let Ok(event) = rx.recv().await {
+            match event {
+                agent::AgentDomainEvent::PermissionPending { ref asid, ref request, .. } => {
+                    let tokens = match state.push_tokens.lock() {
+                        Ok(guard) => guard.clone(),
+                        Err(_) => Vec::new(),
+                    };
+                    if !tokens.is_empty() {
+                        let mut data = serde_json::Map::new();
+                        data.insert("type".to_string(), json!("approval"));
+                        data.insert("category".to_string(), json!("approval"));
+                        data.insert("session_id".to_string(), json!("default"));
+                        data.insert("asid".to_string(), json!(asid.0));
+                        data.insert("approval_id".to_string(), json!(request.id));
+                        data.insert("fingerprint".to_string(), json!(request.id));
+
+                        let _ = send_expo_push_notifications(
+                            &tokens,
+                            "Approval Required".to_string(),
+                            request.prompt.clone(),
+                            data,
+                        )
+                        .await;
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
 }
 
 async fn watch_agent_notifications(state: AppState, session: SessionConfig) {
@@ -8576,6 +8654,7 @@ fn native_approval_data(
             let request = &pending.request;
             json!({
                 "approval_id": request.id,
+                "fingerprint": request.id,
                 "prompt": request.prompt,
                 "tool": request.tool,
                 "context": request.context,
@@ -10363,7 +10442,7 @@ fn asset_json(entry: &AssetEntry, asset_type: AssetType) -> Value {
 }
 
 /// The versioned envelope every content-model response carries.
-fn content_envelope(data: Value) -> Value {
+pub(crate) fn content_envelope(data: Value) -> Value {
     json!({
         "schema_version": CONTENT_SCHEMA_VERSION,
         "capabilities": {
@@ -10790,7 +10869,7 @@ fn backend_api_error(error: BackendError) -> (StatusCode, Json<Value>) {
     api_error(status, code, message)
 }
 
-type ApiResult<T> = Result<T, (StatusCode, Json<Value>)>;
+pub(crate) type ApiResult<T> = Result<T, (StatusCode, Json<Value>)>;
 
 fn bearer_token(headers: &HeaderMap) -> ApiResult<&str> {
     let Some(value) = headers.get(axum::http::header::AUTHORIZATION) else {
@@ -10820,7 +10899,7 @@ fn bearer_token(headers: &HeaderMap) -> ApiResult<&str> {
 /// Control routes are for paired devices only. The admin token deliberately
 /// does not authorise these: it sits in plaintext on disk for the manage UI,
 /// and these routes can run commands on the host.
-fn require_device(state: &AppState, headers: &HeaderMap) -> ApiResult<String> {
+pub(crate) fn require_device(state: &AppState, headers: &HeaderMap) -> ApiResult<String> {
     let token = bearer_token(headers)?;
     let mut devices = lock_devices(state)?;
     let Some(device_id) = identify_device(&devices, token) else {
@@ -10962,7 +11041,7 @@ async fn revoke_paired_device(
     ))
 }
 
-fn validate_text(text: &str) -> ApiResult<()> {
+pub(crate) fn validate_text(text: &str) -> ApiResult<()> {
     if text.len() > MAX_SEND_TEXT_BYTES {
         return Err(api_error(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -11059,7 +11138,7 @@ async fn send_expo_push_notifications(
     Ok(response.json().await?)
 }
 
-fn find_session<'a>(config: &'a Config, session_id: &str) -> ApiResult<&'a SessionConfig> {
+pub(crate) fn find_session<'a>(config: &'a Config, session_id: &str) -> ApiResult<&'a SessionConfig> {
     config
         .sessions
         .iter()
@@ -11086,7 +11165,7 @@ fn find_session<'a>(config: &'a Config, session_id: &str) -> ApiResult<&'a Sessi
 /// handler that have no business knowing a request exists. See
 /// [`request_locale`] for the scope it is set in and [`i18n::current`] for what
 /// happens outside one.
-fn api_error(status: StatusCode, code: &str, message: &str) -> (StatusCode, Json<Value>) {
+pub(crate) fn api_error(status: StatusCode, code: &str, message: &str) -> (StatusCode, Json<Value>) {
     api_error_in(i18n::current(), status, code, message)
 }
 
@@ -13417,6 +13496,7 @@ mod tests {
             approval_events: tokio::sync::broadcast::channel(APPROVAL_EVENT_CAPACITY).0,
             activity: Arc::new(Mutex::new(HashMap::new())),
             session_liveness: Arc::new(Mutex::new(SessionLivenessCache::default())),
+            agent_manager: None,
         }
     }
 
