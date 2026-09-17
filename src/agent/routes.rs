@@ -423,7 +423,6 @@ async fn do_switch_agent_mode(
         ));
     };
 
-    use crate::agent::ports::engine::AgentEnginePort;
     manager
         .engine()
         .switch_agent(asid, agent)
@@ -449,7 +448,6 @@ async fn do_find_agent_files(
         ));
     };
 
-    use crate::agent::ports::engine::AgentEnginePort;
     let files = manager
         .engine()
         .find_files(query, limit)
@@ -690,7 +688,6 @@ async fn do_list_agent_projects(
         ));
     };
 
-    use crate::agent::ports::engine::AgentEnginePort;
     let projects = manager
         .engine()
         .list_projects()

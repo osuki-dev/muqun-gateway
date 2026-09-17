@@ -1,3 +1,5 @@
+#![allow(unused_imports)]
+
 pub mod client;
 pub mod discovery;
 pub mod driver;

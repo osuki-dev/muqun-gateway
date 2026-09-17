@@ -1,3 +1,5 @@
+#![allow(unused_imports)]
+
 pub mod memory_mirror;
 pub mod opencode;
 

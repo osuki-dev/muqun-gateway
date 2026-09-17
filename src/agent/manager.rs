@@ -5,7 +5,6 @@ use super::adapters::memory_mirror::MemoryMirror;
 use super::adapters::opencode::{OpencodeDriver, OpencodeEndpoint, OpencodeRawEvent, OpencodeSseListener};
 use super::domain::{AgentDomainEvent, AgentSessionId};
 use super::ports::engine::AgentEnginePort;
-use super::ports::mirror::SessionMirrorPort;
 use super::use_cases::{InteractionService, PromptService, SessionService};
 
 pub struct AgentManager {

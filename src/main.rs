@@ -5907,31 +5907,28 @@ fn spawn_agent_engine_watchers(state: AppState) {
 
     tokio::spawn(async move {
         while let Ok(event) = rx.recv().await {
-            match event {
-                agent::AgentDomainEvent::PermissionPending { ref asid, ref request, .. } => {
-                    let tokens = match state.push_tokens.lock() {
-                        Ok(guard) => guard.clone(),
-                        Err(_) => Vec::new(),
-                    };
-                    if !tokens.is_empty() {
-                        let mut data = serde_json::Map::new();
-                        data.insert("type".to_string(), json!("approval"));
-                        data.insert("category".to_string(), json!("approval"));
-                        data.insert("session_id".to_string(), json!("default"));
-                        data.insert("asid".to_string(), json!(asid.0));
-                        data.insert("approval_id".to_string(), json!(request.id));
-                        data.insert("fingerprint".to_string(), json!(request.id));
+            if let agent::AgentDomainEvent::PermissionPending { ref asid, ref request, .. } = event {
+                let tokens = match state.push_tokens.lock() {
+                    Ok(guard) => guard.clone(),
+                    Err(_) => Vec::new(),
+                };
+                if !tokens.is_empty() {
+                    let mut data = serde_json::Map::new();
+                    data.insert("type".to_string(), json!("approval"));
+                    data.insert("category".to_string(), json!("approval"));
+                    data.insert("session_id".to_string(), json!("default"));
+                    data.insert("asid".to_string(), json!(asid.0));
+                    data.insert("approval_id".to_string(), json!(request.id));
+                    data.insert("fingerprint".to_string(), json!(request.id));
 
-                        let _ = send_expo_push_notifications(
-                            &tokens,
-                            "Approval Required".to_string(),
-                            request.prompt.clone(),
-                            data,
-                        )
-                        .await;
-                    }
+                    let _ = send_expo_push_notifications(
+                        &tokens,
+                        "Approval Required".to_string(),
+                        request.prompt.clone(),
+                        data,
+                    )
+                    .await;
                 }
-                _ => {}
             }
         }
     });

@@ -262,7 +262,7 @@ impl MemoryMirror {
         };
 
         let current_seq = state.current_seq;
-        let status = Some(state.info.status.clone());
+        let status = Some(state.info.status);
 
         if let Some(first) = state.event_log.front() {
             if after_seq < first.seq() && after_seq > 0 {

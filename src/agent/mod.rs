@@ -1,3 +1,6 @@
+#![allow(dead_code)]
+#![allow(unused_imports)]
+
 pub mod adapters;
 pub mod domain;
 pub mod manager;

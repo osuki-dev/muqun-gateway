@@ -38,14 +38,12 @@ pub fn map_session(val: &Value) -> Option<AgentSessionInfo> {
         });
 
     let cost = item.get("cost").and_then(Value::as_f64);
-    let tokens = item.get("tokens").and_then(|t| {
-        Some(TokensUsage {
-            input: t.get("input").and_then(Value::as_u64).unwrap_or(0),
-            output: t.get("output").and_then(Value::as_u64).unwrap_or(0),
-            reasoning: t.get("reasoning").and_then(Value::as_u64),
-            cache_read: t.pointer("/cache/read").and_then(Value::as_u64),
-            cache_write: t.pointer("/cache/write").and_then(Value::as_u64),
-        })
+    let tokens = item.get("tokens").map(|t| TokensUsage {
+        input: t.get("input").and_then(Value::as_u64).unwrap_or(0),
+        output: t.get("output").and_then(Value::as_u64).unwrap_or(0),
+        reasoning: t.get("reasoning").and_then(Value::as_u64),
+        cache_read: t.pointer("/cache/read").and_then(Value::as_u64),
+        cache_write: t.pointer("/cache/write").and_then(Value::as_u64),
     });
     let limit = item.get("limit").cloned();
 
@@ -210,22 +208,20 @@ pub fn map_messages_to_timeline(messages: &[Value], asid: &AgentSessionId) -> Ve
 
         // Check top-level "text" (standard for user messages)
         if let Some(text) = msg.get("text").and_then(Value::as_str) {
-            if !text.trim().is_empty() {
-                if !is_duplicate_tool_text(text, items.last()) {
-                    let item_id = format!("{msg_id}:0");
-                    items.push(TimelineItem {
-                        id: item_id,
-                        message_id: msg_id.to_string(),
-                        role,
-                        part: AgentPart::Text {
-                            text: text.to_string(),
-                        },
-                        seq,
-                        updated_ms,
-                        attachments: attachments.clone(),
-                    });
-                    seq += 1;
-                }
+            if !text.trim().is_empty() && !is_duplicate_tool_text(text, items.last()) {
+                let item_id = format!("{msg_id}:0");
+                items.push(TimelineItem {
+                    id: item_id,
+                    message_id: msg_id.to_string(),
+                    role,
+                    part: AgentPart::Text {
+                        text: text.to_string(),
+                    },
+                    seq,
+                    updated_ms,
+                    attachments: attachments.clone(),
+                });
+                seq += 1;
             }
         }
 

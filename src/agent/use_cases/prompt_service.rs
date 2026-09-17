@@ -6,12 +6,12 @@ use crate::agent::ports::mirror::SessionMirrorPort;
 
 pub struct PromptService {
     engine: Arc<dyn AgentEnginePort>,
-    mirror: Arc<dyn SessionMirrorPort>,
+    _mirror: Arc<dyn SessionMirrorPort>,
 }
 
 impl PromptService {
-    pub fn new(engine: Arc<dyn AgentEnginePort>, mirror: Arc<dyn SessionMirrorPort>) -> Self {
-        Self { engine, mirror }
+    pub fn new(engine: Arc<dyn AgentEnginePort>, _mirror: Arc<dyn SessionMirrorPort>) -> Self {
+        Self { engine, _mirror }
     }
 
     pub async fn send_prompt(
