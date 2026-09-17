@@ -1,12 +1,16 @@
 use axum::{
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
-    response::sse::{Event, KeepAlive, Sse},
+    http::{header, HeaderMap, StatusCode},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     routing::{get, post},
     Json, Router,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use super::domain::{AgentDomainEvent, AgentSessionId, ModelRef, PermissionDecision};
 use crate::{api_error, content_envelope, require_device, validate_text, ApiResult, AppState};
@@ -674,10 +678,43 @@ async fn do_get_agent_vcs_diff(
     Ok(Json(content_envelope(json!(diffs))))
 }
 
+pub(crate) fn json_etag_response(headers: &HeaderMap, payload: Value) -> Response {
+    let body_bytes = serde_json::to_vec(&payload).unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(&body_bytes);
+    let hash = hasher.finalize();
+    let etag = format!("\"{:x}\"", hash);
+
+    if let Some(if_none_match) = headers.get(header::IF_NONE_MATCH).and_then(|h| h.to_str().ok()) {
+        let trimmed = if_none_match.trim();
+        if trimmed == etag || trimmed == "*" || trimmed == format!("W/{}", etag) {
+            return (
+                StatusCode::NOT_MODIFIED,
+                [
+                    (header::ETAG, etag),
+                    (header::CACHE_CONTROL, "private, must-revalidate".to_string()),
+                ],
+            )
+                .into_response();
+        }
+    }
+
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/json".to_string()),
+            (header::ETAG, etag),
+            (header::CACHE_CONTROL, "private, must-revalidate".to_string()),
+        ],
+        body_bytes,
+    )
+        .into_response()
+}
+
 async fn do_list_agent_projects(
     state: &AppState,
     headers: &HeaderMap,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Response> {
     require_device(state, headers)?;
 
     let Some(ref manager) = state.agent_manager else {
@@ -694,7 +731,7 @@ async fn do_list_agent_projects(
         .await
         .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "agent_engine_error", &e.to_string()))?;
 
-    Ok(Json(content_envelope(json!(projects))))
+    Ok(json_etag_response(headers, content_envelope(json!(projects))))
 }
 
 async fn do_list_agent_directories(
@@ -823,7 +860,7 @@ pub async fn get_global_agent_catalog(
     State(state): State<AppState>,
     Query(query): Query<AgentSessionsQuery>,
     headers: HeaderMap,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Response> {
     require_device(&state, &headers)?;
 
     let Some(ref manager) = state.agent_manager else {
@@ -840,7 +877,7 @@ pub async fn get_global_agent_catalog(
         .await
         .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "agent_engine_error", &e.to_string()))?;
 
-    Ok(Json(content_envelope(json!(catalog))))
+    Ok(json_etag_response(&headers, content_envelope(json!(catalog))))
 }
 
 // ---------------------------------------------------------------------------
@@ -1117,7 +1154,7 @@ async fn get_pane_agent_catalog(
     Path((_session_id, _pane_id)): Path<(String, String)>,
     Query(query): Query<AgentSessionsQuery>,
     headers: HeaderMap,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Response> {
     get_global_agent_catalog(State(state), Query(query), headers).await
 }
 
@@ -1126,14 +1163,14 @@ async fn get_session_agent_catalog(
     Path(_session_id): Path<String>,
     Query(query): Query<AgentSessionsQuery>,
     headers: HeaderMap,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Response> {
     get_global_agent_catalog(State(state), Query(query), headers).await
 }
 
 async fn list_agent_projects_global(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Response> {
     do_list_agent_projects(&state, &headers).await
 }
 
@@ -1141,7 +1178,7 @@ async fn list_agent_projects_legacy(
     State(state): State<AppState>,
     Path(_session_id): Path<String>,
     headers: HeaderMap,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Response> {
     do_list_agent_projects(&state, &headers).await
 }
 
