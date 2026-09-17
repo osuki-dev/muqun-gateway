@@ -2791,10 +2791,16 @@ fn host_name(host: &str) -> String {
 async fn security_headers(request: Request<Body>, next: Next) -> Response {
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
-    headers.insert(
-        "cache-control",
-        HeaderValue::from_static("no-store, max-age=0"),
-    );
+    // A floor, not an override: a handler that has something more specific to
+    // say about its own body keeps it. `upload_content` is the one that does,
+    // and it only ever adds to this -- `private` on top of `no-store`. Nothing
+    // here can weaken the blanket, because a handler that says nothing gets it.
+    if !headers.contains_key("cache-control") {
+        headers.insert(
+            "cache-control",
+            HeaderValue::from_static("no-store, max-age=0"),
+        );
+    }
     headers.insert("pragma", HeaderValue::from_static("no-cache"));
     headers.insert(
         "x-content-type-options",
@@ -9256,9 +9262,10 @@ async fn upload_content(
         .header("content-type", kind.mime)
         .header("content-length", metadata.len())
         .header("content-disposition", format!("inline; filename=\"{name}\""))
-        // An upload is one device's own file, never a shared one: it must not
-        // land in a proxy's cache on the way back.
-        .header("cache-control", "private, max-age=0, no-store")
+        // An upload is one device's own file, never a shared one: `private`
+        // on top of the blanket `no-store` the security headers apply, so it
+        // cannot land in a shared cache on the way back either.
+        .header("cache-control", "private, no-store, max-age=0")
         .body(Body::from_stream(stream))
         .map_err(|err| {
             eprintln!("failed to build upload response: {err}");
@@ -15730,7 +15737,7 @@ mod tests {
         assert_eq!(response.headers()["content-type"], "image/png");
         assert_eq!(
             response.headers()["cache-control"],
-            "private, max-age=0, no-store"
+            "private, no-store, max-age=0"
         );
         let served = axum::body::to_bytes(response.into_body(), 1 << 16)
             .await
@@ -15770,6 +15777,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// The blanket `cache-control` is a floor. Every handler that says nothing
+    /// still gets `no-store`; the one that says something says more, not less,
+    /// and must reach the client as it wrote it.
+    #[tokio::test]
+    async fn the_blanket_cache_control_is_a_floor_a_handler_can_only_tighten() {
+        use axum::routing::get;
+        use tower::ServiceExt as _;
+
+        let app = Router::new()
+            .route("/quiet", get(|| async { "body" }))
+            .route(
+                "/specific",
+                get(|| async {
+                    Response::builder()
+                        .header("cache-control", "private, no-store, max-age=0")
+                        .body(Body::from("body"))
+                        .unwrap()
+                }),
+            )
+            .layer(middleware::from_fn(security_headers));
+
+        let quiet = app
+            .clone()
+            .oneshot(Request::builder().uri("/quiet").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(quiet.headers()["cache-control"], "no-store, max-age=0");
+
+        let specific = app
+            .oneshot(
+                Request::builder()
+                    .uri("/specific")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            specific.headers()["cache-control"],
+            "private, no-store, max-age=0",
+            "the middleware must not overwrite a handler's own, stricter value"
+        );
+        // The rest of the blanket still applies either way.
+        assert_eq!(specific.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(specific.headers()["pragma"], "no-cache");
     }
 
     /// Retention is a property of the file's age, not of whether the hourly

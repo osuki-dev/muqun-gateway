@@ -228,7 +228,7 @@ symlink, an expired file and an unknown name all answer the same
 with `404`, so a caller cannot map the host by asking. The content type is
 sniffed from the bytes again on every read, in the same order the upload used,
 so the stored extension never decides on its own. The response carries
-`cache-control: private, max-age=0, no-store` — an upload is one device's own
+`cache-control: private, no-store, max-age=0` — an upload is one device's own
 file and must not sit in an intermediary's cache — and the body is streamed
 rather than buffered.
 
