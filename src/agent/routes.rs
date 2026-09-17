@@ -865,32 +865,12 @@ async fn do_stream_agent_session(
         loop {
             match rx.recv().await {
                 Ok(ev) => {
-                    let matches = match &ev {
-                        AgentDomainEvent::TimelineUpsert { asid, .. } => asid == &target_asid,
-                        AgentDomainEvent::TimelineRemoved { asid, .. } => asid == &target_asid,
-                        AgentDomainEvent::StatusChanged { asid, .. } => asid == &target_asid,
-                        AgentDomainEvent::SessionUpdated { asid, .. } => asid == &target_asid,
-                        AgentDomainEvent::PermissionPending { asid, .. } => asid == &target_asid,
-                        AgentDomainEvent::PermissionResolved { asid, .. } => asid == &target_asid,
-                        AgentDomainEvent::FormPending { asid, .. } => asid == &target_asid,
-                        AgentDomainEvent::FormResolved { asid, .. } => asid == &target_asid,
-                        AgentDomainEvent::Resync { asid, .. } => asid == &target_asid,
-                    };
-                    if !matches {
+                    // An event with no session -- a global resync -- reaches
+                    // every stream.
+                    if !ev.asid().0.is_empty() && ev.asid() != &target_asid {
                         continue;
                     }
-
-                    let ev_name = match &ev {
-                        AgentDomainEvent::TimelineUpsert { .. } => "agent.timeline.upsert",
-                        AgentDomainEvent::TimelineRemoved { .. } => "agent.timeline.removed",
-                        AgentDomainEvent::StatusChanged { .. } => "agent.status.changed",
-                        AgentDomainEvent::SessionUpdated { .. } => "agent.session.updated",
-                        AgentDomainEvent::PermissionPending { .. } => "agent.permission.pending",
-                        AgentDomainEvent::PermissionResolved { .. } => "agent.permission.resolved",
-                        AgentDomainEvent::FormPending { .. } => "agent.form.pending",
-                        AgentDomainEvent::FormResolved { .. } => "agent.form.resolved",
-                        AgentDomainEvent::Resync { .. } => "agent.resync",
-                    };
+                    let ev_name = ev.event_name();
 
                     let payload = serde_json::to_string(&ev).unwrap_or_default();
                     yield Ok(Event::default().event(ev_name).data(payload));

@@ -1,0 +1,1 @@
+data: {"id":"evt_0aee9f613001rRb7b2UK1qGGPE","created":1789640963603,"type":"session.execution.failed","data":{"sessionID":"ses_f511626fdffe0ncuGo6c1jS5Yk","error":{"type":"unknown","message":"Agent not found: \"Build\""}},"durable":{"aggregateID":"ses_f511626fdffe0ncuGo6c1jS5Yk","seq":3,"version":1}}

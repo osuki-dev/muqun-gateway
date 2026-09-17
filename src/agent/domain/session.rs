@@ -63,6 +63,29 @@ pub struct TokensUsage {
     pub cache_write: Option<u64>,
 }
 
+/// `Session.Info.revert`: a staged rollback the user can still cancel.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionRevertInfo {
+    pub message_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub part_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
+    /// `FileDiff.Info[]` verbatim, when the stage carried file changes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files: Option<serde_json::Value>,
+}
+
+/// `Session.Info.fork`: where a forked session was copied from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionForkInfo {
+    pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boundary_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentSessionInfo {
     pub asid: AgentSessionId,
@@ -85,7 +108,32 @@ pub struct AgentSessionInfo {
     pub parent_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
+    /// `Session.Info.outcome`: `succeeded`, `failed` or `interrupted`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    /// The error behind a `failed` status, when one was reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<AgentErrorInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revert: Option<SessionRevertInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork: Option<SessionForkInfo>,
+    /// `time.idle`: when the session last went idle. With `time_viewed`, this
+    /// is the unread rule -- unread when `time_idle > time_viewed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_idle: Option<u64>,
+    /// `time.viewed`: when the user last acknowledged the session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_viewed: Option<u64>,
+    /// Set once OpenCode reports the session gone, so a client holding it open
+    /// is told rather than left polling a 404.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub deleted: bool,
     pub updated_ms: u64,
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

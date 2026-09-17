@@ -58,6 +58,7 @@ impl SessionService {
                 timeline,
                 permissions: Vec::new(),
                 forms: Vec::new(),
+                inbox: Vec::new(),
                 seq: 1,
             })
         }

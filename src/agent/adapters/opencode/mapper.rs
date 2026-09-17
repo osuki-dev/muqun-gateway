@@ -1,9 +1,10 @@
 use serde_json::Value;
 use crate::agent::domain::{
-    AgentInfo, AgentPart, AgentProject, AgentSessionId, AgentSessionInfo, AgentSessionStatus,
-    FormField, FormOption, FormRequest, McpServerInfo, ModelInfo, ModelRef,
-    ModelVariantInfo, PermissionDecision, PermissionOption, PermissionRequest, SkillInfo, TimelineItem,
-    TimelineRole, TodoItem, TokensUsage, ToolCallStatus,
+    part_item_id, reasoning_item_id, text_item_id, tool_item_id, AgentErrorInfo, AgentInfo,
+    AgentPart, AgentProject, AgentSessionId, AgentSessionInfo, AgentSessionStatus, CompactionStatus,
+    FormField, FormOption, FormRequest, McpServerInfo, ModelInfo, ModelRef, ModelVariantInfo,
+    PermissionDecision, PermissionOption, PermissionRequest, SessionForkInfo, SessionRevertInfo,
+    SkillInfo, TimelineItem, TimelineRole, TodoItem, TokensUsage, ToolCall, ToolCallStatus, ToolTime,
 };
 
 /// `Model.Ref` as v2 spells it: `{id, providerID, variant?}`. `modelID` is
@@ -25,6 +26,68 @@ pub fn map_model_ref(val: &Value) -> Option<ModelRef> {
     })
 }
 
+/// `Session.StructuredError {type, message, status?}`.
+pub fn map_error(val: &Value) -> Option<AgentErrorInfo> {
+    let obj = val.as_object()?;
+    let name = obj
+        .get("type")
+        .or_else(|| obj.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("error")
+        .to_string();
+    let message = obj
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if message.is_empty() && name == "error" {
+        return None;
+    }
+    Some(AgentErrorInfo {
+        name,
+        message,
+        status: obj
+            .get("status")
+            .and_then(Value::as_u64)
+            .and_then(|s| u16::try_from(s).ok()),
+    })
+}
+
+fn map_tokens(val: &Value) -> TokensUsage {
+    TokensUsage {
+        input: val.get("input").and_then(Value::as_u64).unwrap_or(0),
+        output: val.get("output").and_then(Value::as_u64).unwrap_or(0),
+        reasoning: val.get("reasoning").and_then(Value::as_u64),
+        cache_read: val.pointer("/cache/read").and_then(Value::as_u64),
+        cache_write: val.pointer("/cache/write").and_then(Value::as_u64),
+    }
+}
+
+fn map_revert(val: &Value) -> Option<SessionRevertInfo> {
+    let message_id = val.get("messageID").and_then(Value::as_str)?;
+    Some(SessionRevertInfo {
+        message_id: message_id.to_string(),
+        part_id: val.get("partID").and_then(Value::as_str).map(str::to_string),
+        snapshot: val.get("snapshot").and_then(Value::as_str).map(str::to_string),
+        files: val.get("files").cloned(),
+    })
+}
+
+fn map_fork(val: &Value) -> Option<SessionForkInfo> {
+    let session_id = val.get("sessionID").and_then(Value::as_str)?;
+    Some(SessionForkInfo {
+        session_id: session_id.to_string(),
+        boundary_type: val
+            .pointer("/boundary/type")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        message_id: val
+            .pointer("/boundary/messageID")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    })
+}
+
 pub fn map_session(val: &Value) -> Option<AgentSessionInfo> {
     let item = val.get("data").unwrap_or(val);
     let id = item.get("id").and_then(Value::as_str)?;
@@ -41,13 +104,7 @@ pub fn map_session(val: &Value) -> Option<AgentSessionInfo> {
     let model = item.get("model").and_then(map_model_ref);
 
     let cost = item.get("cost").and_then(Value::as_f64);
-    let tokens = item.get("tokens").map(|t| TokensUsage {
-        input: t.get("input").and_then(Value::as_u64).unwrap_or(0),
-        output: t.get("output").and_then(Value::as_u64).unwrap_or(0),
-        reasoning: t.get("reasoning").and_then(Value::as_u64),
-        cache_read: t.pointer("/cache/read").and_then(Value::as_u64),
-        cache_write: t.pointer("/cache/write").and_then(Value::as_u64),
-    });
+    let tokens = item.get("tokens").map(map_tokens);
     let limit = item.get("limit").cloned();
 
     let directory = item
@@ -74,19 +131,35 @@ pub fn map_session(val: &Value) -> Option<AgentSessionInfo> {
         .and_then(Value::as_str)
         .map(str::to_string);
 
+    let outcome = item.get("outcome").and_then(Value::as_str).map(str::to_string);
+    // v2 has no session status field; the last outcome is the closest thing a
+    // read of `Session.Info` can say, and the event stream corrects it live.
+    let status = match outcome.as_deref() {
+        Some("failed") => AgentSessionStatus::Failed,
+        Some("interrupted") => AgentSessionStatus::Interrupted,
+        _ => AgentSessionStatus::Idle,
+    };
+
     Some(AgentSessionInfo {
         asid: AgentSessionId(id.to_string()),
         backend_session_id: id.to_string(),
         title,
         agent,
         model,
-        status: AgentSessionStatus::Idle,
+        status,
         directory,
         cost,
         tokens,
         limit,
         parent_id,
         project_id,
+        outcome,
+        error: None,
+        revert: item.get("revert").and_then(map_revert),
+        fork: item.get("fork").and_then(map_fork),
+        time_idle: item.pointer("/time/idle").and_then(Value::as_u64),
+        time_viewed: item.pointer("/time/viewed").and_then(Value::as_u64),
+        deleted: false,
         updated_ms,
     })
 }
@@ -125,149 +198,313 @@ pub fn map_project(val: &Value) -> Option<AgentProject> {
     })
 }
 
+/// Assistant prose that only repeats the tool result immediately above it.
+///
+/// Only an exact match counts: the previous rule also dropped text that merely
+/// *contained* or was contained by the output, which threw away real prose
+/// whenever a tool returned something short.
 fn is_duplicate_tool_text(text: &str, prev_item: Option<&TimelineItem>) -> bool {
     let Some(prev) = prev_item else {
         return false;
     };
-    if let AgentPart::Tool { ref output, .. } = prev.part {
-        let clean_text = text
-            .trim()
+    let AgentPart::Tool(ref call) = prev.part else {
+        return false;
+    };
+
+    let clean = |s: &str| {
+        s.trim()
             .trim_start_matches("```")
             .trim_end_matches("```")
             .replace("Command exited with code 0.", "")
             .replace("Command exited with code 0", "")
             .trim()
-            .to_string();
+            .to_string()
+    };
 
-        let tool_out_str = match output {
-            Some(Value::String(s)) => s.clone(),
-            Some(other) => other.to_string(),
-            None => String::new(),
-        };
-        let clean_tool = tool_out_str
-            .replace("Command exited with code 0.", "")
-            .replace("Command exited with code 0", "")
-            .trim()
-            .to_string();
-
-        if clean_text.is_empty()
-            || (!clean_tool.is_empty()
-                && (clean_text == clean_tool
-                    || clean_tool.contains(&clean_text)
-                    || clean_text.contains(&clean_tool)))
-        {
-            return true;
-        }
+    let clean_text = clean(text);
+    if clean_text.is_empty() {
+        return true;
     }
-    false
+    let tool_out = match call.output {
+        Some(Value::String(ref s)) => s.clone(),
+        Some(ref other) => other.to_string(),
+        None => String::new(),
+    };
+    !tool_out.is_empty() && clean_text == clean(&tool_out)
 }
 
+fn message_attachments(msg: &Value) -> Option<Vec<String>> {
+    msg.get("files")
+        .or_else(|| msg.get("attachments"))
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|f| {
+                    if let Some(s) = f.as_str() {
+                        return Some(s.to_string());
+                    }
+                    f.get("uri")
+                        .or_else(|| f.pointer("/source/uri"))
+                        .or_else(|| f.get("name"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .filter(|v: &Vec<String>| !v.is_empty())
+}
+
+/// Turn OpenCode's flat list of typed messages into timeline items.
+///
+/// v2 messages are `user | assistant | compaction | skill | shell |
+/// model-switched | agent-switched | synthetic | system | location-switched`.
+/// Everything but `assistant` is a single row; `assistant` expands into its
+/// `content` array.
 pub fn map_messages_to_timeline(messages: &[Value], asid: &AgentSessionId) -> Vec<TimelineItem> {
-    let mut items = Vec::new();
-    let mut seq = 1;
+    let mut items: Vec<TimelineItem> = Vec::new();
+    let mut seq = 1u64;
 
     // The list arrives in the order the caller asked for (`order=asc`); the
     // gateway does not re-derive it from timestamps.
     for msg in messages {
-        let msg_id = msg.get("id").and_then(Value::as_str).unwrap_or("unknown");
-        let role = match msg.get("type").and_then(Value::as_str) {
-            Some("user") => TimelineRole::User,
-            Some("system") => TimelineRole::System,
-            _ => TimelineRole::Assistant,
-        };
-
-        let updated_ms = msg
-            .pointer("/time/completed")
-            .or_else(|| msg.pointer("/time/created"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-
-        let attachments: Option<Vec<String>> = msg
-            .get("files")
-            .or_else(|| msg.get("attachments"))
-            .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|f| {
-                        if let Some(s) = f.as_str() {
-                            return Some(s.to_string());
-                        }
-                        f.get("uri")
-                            .or_else(|| f.pointer("/source/uri"))
-                            .or_else(|| f.get("name"))
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                    })
-                    .collect()
-            })
-            .filter(|v: &Vec<String>| !v.is_empty());
-
-        // Check top-level "text" (standard for user messages)
-        if let Some(text) = msg.get("text").and_then(Value::as_str) {
-            if !text.trim().is_empty() && !is_duplicate_tool_text(text, items.last()) {
-                let item_id = format!("{msg_id}:0");
-                items.push(TimelineItem {
-                    id: item_id,
-                    message_id: msg_id.to_string(),
-                    role,
-                    part: AgentPart::Text {
-                        text: text.to_string(),
-                    },
-                    seq,
-                    updated_ms,
-                    attachments: attachments.clone(),
-                });
-                seq += 1;
-            }
-        }
-
-        // In OpenCode V2, parts are in `content` or `parts`
-        let content_parts = msg
-            .get("content")
-            .or_else(|| msg.get("parts"))
-            .and_then(Value::as_array);
-
-        if let Some(parts) = content_parts {
-            for (idx, part) in parts.iter().enumerate() {
-                if let Some(agent_part) = map_part(part, role, asid) {
-                    if let AgentPart::Text { ref text } = &agent_part {
-                        if is_duplicate_tool_text(text, items.last()) {
-                            continue;
-                        }
-                    }
-
-                    if let AgentPart::Reasoning { .. } = &agent_part {
-                        if let Some(last_item) = items.last_mut() {
-                            if last_item.message_id == msg_id {
-                                if let AgentPart::Reasoning { .. } = &last_item.part {
-                                    last_item.part = agent_part;
-                                    last_item.updated_ms = updated_ms;
-                                    continue;
-                                }
-                            }
-                        }
-                    }
-
-                    let item_id = format!("{msg_id}:{idx}");
-                    items.push(TimelineItem {
-                        id: item_id,
-                        message_id: msg_id.to_string(),
-                        role,
-                        part: agent_part,
-                        seq,
-                        updated_ms,
-                        attachments: if idx == 0 { attachments.clone() } else { None },
-                    });
-                    seq += 1;
+        for mut item in map_message(msg, asid) {
+            if let AgentPart::Text { ref text } = item.part {
+                if is_duplicate_tool_text(text, items.last()) {
+                    continue;
                 }
             }
+            item.seq = seq;
+            seq += 1;
+            items.push(item);
         }
     }
 
     items
 }
 
+/// One message, expanded into the rows it contributes.
+pub fn map_message(msg: &Value, asid: &AgentSessionId) -> Vec<TimelineItem> {
+    let msg_id = msg.get("id").and_then(Value::as_str).unwrap_or("unknown");
+    let msg_type = msg.get("type").and_then(Value::as_str).unwrap_or("assistant");
+    let updated_ms = msg
+        .pointer("/time/completed")
+        .or_else(|| msg.pointer("/time/streamed"))
+        .or_else(|| msg.pointer("/time/created"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
+    let role = match msg_type {
+        "user" => TimelineRole::User,
+        "assistant" => TimelineRole::Assistant,
+        _ => TimelineRole::System,
+    };
+
+    let mut out: Vec<TimelineItem> = Vec::new();
+    macro_rules! push {
+        ($id:expr, $ordinal:expr, $part:expr, $attachments:expr $(,)?) => {
+            out.push(TimelineItem {
+                id: $id,
+                message_id: msg_id.to_string(),
+                role,
+                part: $part,
+                seq: 0,
+                updated_ms,
+                ordinal: $ordinal,
+                attachments: $attachments,
+            })
+        };
+    }
+
+    match msg_type {
+        "user" | "synthetic" | "system" => {
+            let text = msg.get("text").and_then(Value::as_str).unwrap_or("");
+            let description = msg
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if !text.trim().is_empty() {
+                let part = match msg_type {
+                    "synthetic" => AgentPart::Synthetic {
+                        text: text.to_string(),
+                        description,
+                    },
+                    "system" => AgentPart::System {
+                        text: text.to_string(),
+                        description,
+                    },
+                    _ => AgentPart::Text {
+                        text: text.to_string(),
+                    },
+                };
+                push!(text_item_id(msg_id, 0), 0, part, message_attachments(msg));
+            }
+        }
+        "compaction" => {
+            push!(
+                part_item_id(msg_id, 0),
+                0,
+                map_compaction_message(msg),
+                None,
+            );
+        }
+        "skill" => {
+            push!(
+                part_item_id(msg_id, 0),
+                0,
+                AgentPart::Skill {
+                    skill: msg.get("skill").and_then(Value::as_str).unwrap_or("").to_string(),
+                    name: msg.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
+                    text: msg.get("text").and_then(Value::as_str).unwrap_or("").to_string(),
+                },
+                None,
+            );
+        }
+        "shell" => {
+            push!(part_item_id(msg_id, 0), 0, map_shell_message(msg), None);
+        }
+        "model-switched" => {
+            if let Some(model) = msg.get("model").and_then(map_model_ref) {
+                push!(
+                    part_item_id(msg_id, 0),
+                    0,
+                    AgentPart::ModelSwitched {
+                        model,
+                        previous: msg.get("previous").and_then(map_model_ref),
+                    },
+                    None,
+                );
+            }
+        }
+        "agent-switched" => {
+            if let Some(agent) = msg.get("agent").and_then(Value::as_str) {
+                push!(
+                    part_item_id(msg_id, 0),
+                    0,
+                    AgentPart::AgentSwitched {
+                        agent: agent.to_string(),
+                        previous: msg.get("previous").and_then(Value::as_str).map(str::to_string),
+                    },
+                    None,
+                );
+            }
+        }
+        "location-switched" => {
+            if let Some(dir) = msg.pointer("/location/directory").and_then(Value::as_str) {
+                push!(
+                    part_item_id(msg_id, 0),
+                    0,
+                    AgentPart::LocationSwitched {
+                        directory: dir.to_string(),
+                        previous: msg
+                            .pointer("/previous/location/directory")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                    },
+                    None,
+                );
+            }
+        }
+        _ => {}
+    }
+
+    // `user` messages also carry an explicit top-level text, handled above.
+    // `assistant` content is the interleaved text/reasoning/tool array.
+    let attachments = message_attachments(msg);
+    if msg_type == "assistant" || msg_type == "user" {
+        // `content` is the v2 name and `parts` the v1 one.
+        let content_parts = msg
+            .get("content")
+            .or_else(|| msg.get("parts"))
+            .and_then(Value::as_array);
+        if let Some(parts) = content_parts {
+            let mut text_n = 0u64;
+            let mut reasoning_n = 0u64;
+            for (idx, part) in parts.iter().enumerate() {
+                let Some(agent_part) = map_part(part, role, asid) else {
+                    continue;
+                };
+                let ordinal = idx as u64;
+                let id = match &agent_part {
+                    AgentPart::Text { .. } => {
+                        let id = text_item_id(msg_id, text_n);
+                        text_n += 1;
+                        id
+                    }
+                    AgentPart::Reasoning { .. } => {
+                        let id = reasoning_item_id(msg_id, reasoning_n);
+                        reasoning_n += 1;
+                        id
+                    }
+                    AgentPart::Tool(call) => tool_item_id(msg_id, &call.id),
+                    _ => part_item_id(msg_id, ordinal),
+                };
+                if out.iter().any(|existing| existing.id == id) {
+                    continue;
+                }
+                let att = if idx == 0 { attachments.clone() } else { None };
+                push!(id, ordinal, agent_part, att);
+            }
+        }
+    }
+
+    out
+}
+
+fn map_compaction_message(msg: &Value) -> AgentPart {
+    let status = match msg.get("status").and_then(Value::as_str) {
+        Some("completed") => CompactionStatus::Completed,
+        Some("failed") => CompactionStatus::Failed,
+        _ => CompactionStatus::Running,
+    };
+    AgentPart::Compaction {
+        status,
+        reason: msg.get("reason").and_then(Value::as_str).map(str::to_string),
+        summary: msg.get("summary").and_then(Value::as_str).map(str::to_string),
+        recent: msg.get("recent").and_then(Value::as_str).map(str::to_string),
+        tokens: msg.get("tokens").map(map_tokens),
+        cost: msg.get("cost").and_then(Value::as_f64),
+        error: msg.get("error").and_then(map_error),
+    }
+}
+
+fn map_shell_message(msg: &Value) -> AgentPart {
+    AgentPart::Shell {
+        shell_id: msg.get("shellID").and_then(Value::as_str).unwrap_or("").to_string(),
+        command: msg.get("command").and_then(Value::as_str).unwrap_or("").to_string(),
+        status: msg
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("running")
+            .to_string(),
+        exit: msg.get("exit").and_then(Value::as_f64),
+        output: msg
+            .pointer("/output/output")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        truncated: msg
+            .pointer("/output/truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    }
+}
+
 fn extract_todo_items(val: &Value) -> Option<Vec<TodoItem>> {
+    let read_items = |arr: &Vec<Value>| -> Vec<TodoItem> {
+        arr.iter()
+            .filter_map(|it| {
+                let text = it
+                    .get("content")
+                    .or_else(|| it.get("text"))
+                    .or_else(|| it.get("title"))
+                    .and_then(Value::as_str)?
+                    .to_string();
+                let done = it.get("status").and_then(Value::as_str) == Some("completed")
+                    || it.get("done").and_then(Value::as_bool).unwrap_or(false);
+                Some(TodoItem { text, done })
+            })
+            .collect()
+    };
+
     let raw_items = val
         .get("items")
         .or_else(|| val.pointer("/state/input/todos"))
@@ -276,20 +513,7 @@ fn extract_todo_items(val: &Value) -> Option<Vec<TodoItem>> {
         .or_else(|| val.get("todos"));
 
     if let Some(arr) = raw_items.and_then(Value::as_array) {
-        let items: Vec<TodoItem> = arr
-            .iter()
-            .filter_map(|it| {
-                let text = it
-                    .get("content")
-                    .or_else(|| it.get("text"))
-                    .or_else(|| it.get("title"))
-                    .and_then(Value::as_str)?
-                    .to_string();
-                let done = it.get("status").and_then(Value::as_str) == Some("completed")
-                    || it.get("done").and_then(Value::as_bool).unwrap_or(false);
-                Some(TodoItem { text, done })
-            })
-            .collect();
+        let items = read_items(arr);
         if !items.is_empty() {
             return Some(items);
         }
@@ -297,39 +521,13 @@ fn extract_todo_items(val: &Value) -> Option<Vec<TodoItem>> {
 
     let output = val.pointer("/state/output").or_else(|| val.get("output"));
     if let Some(arr) = output.and_then(Value::as_array) {
-        let items: Vec<TodoItem> = arr
-            .iter()
-            .filter_map(|it| {
-                let text = it
-                    .get("content")
-                    .or_else(|| it.get("text"))
-                    .or_else(|| it.get("title"))
-                    .and_then(Value::as_str)?
-                    .to_string();
-                let done = it.get("status").and_then(Value::as_str) == Some("completed")
-                    || it.get("done").and_then(Value::as_bool).unwrap_or(false);
-                Some(TodoItem { text, done })
-            })
-            .collect();
+        let items = read_items(arr);
         if !items.is_empty() {
             return Some(items);
         }
     } else if let Some(s) = output.and_then(Value::as_str) {
         if let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(s) {
-            let items: Vec<TodoItem> = arr
-                .iter()
-                .filter_map(|it| {
-                    let text = it
-                        .get("content")
-                        .or_else(|| it.get("text"))
-                        .or_else(|| it.get("title"))
-                        .and_then(Value::as_str)?
-                        .to_string();
-                    let done = it.get("status").and_then(Value::as_str) == Some("completed")
-                        || it.get("done").and_then(Value::as_bool).unwrap_or(false);
-                    Some(TodoItem { text, done })
-                })
-                .collect();
+            let items = read_items(&arr);
             if !items.is_empty() {
                 return Some(items);
             }
@@ -339,37 +537,171 @@ fn extract_todo_items(val: &Value) -> Option<Vec<TodoItem>> {
     None
 }
 
-fn normalize_tool_output(output: Option<Value>) -> Option<Value> {
-    let val = output?;
-    match val {
+/// Flatten `Tool.Content[]` into the single string the previous release's
+/// `output` field carried. File items are represented by their uri, because a
+/// client that only reads `output` still needs to know something was returned.
+pub fn tool_content_to_output(content: &Value) -> Option<Value> {
+    match content {
         Value::Array(arr) => {
             let mut parts = Vec::new();
-            let mut all_text = true;
-            for item in &arr {
+            let mut all_known = true;
+            for item in arr {
                 if let Some(t) = item.get("text").and_then(Value::as_str) {
                     parts.push(t.to_string());
                 } else if let Some(s) = item.as_str() {
                     parts.push(s.to_string());
+                } else if item.get("type").and_then(Value::as_str) == Some("file") {
+                    if let Some(uri) = item.get("uri").and_then(Value::as_str) {
+                        parts.push(uri.to_string());
+                    }
                 } else {
-                    all_text = false;
+                    all_known = false;
                     break;
                 }
             }
-            if all_text && !parts.is_empty() {
+            if all_known && !parts.is_empty() {
                 Some(Value::String(parts.join("\n")))
             } else {
-                Some(Value::Array(arr))
+                Some(content.clone())
             }
         }
         Value::String(s) => {
-            if let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(&s) {
-                normalize_tool_output(Some(Value::Array(arr)))
+            if let Ok(parsed @ Value::Array(_)) = serde_json::from_str::<Value>(s) {
+                tool_content_to_output(&parsed)
             } else {
-                Some(Value::String(s))
+                Some(Value::String(s.clone()))
             }
         }
-        other => Some(other),
+        Value::Null => None,
+        other => Some(other.clone()),
     }
+}
+
+fn normalize_tool_output(output: Option<Value>) -> Option<Value> {
+    tool_content_to_output(&output?)
+}
+
+/// A card header for a tool call. OpenCode has no `title`, so this mirrors what
+/// the TUI does: the tool name plus the most identifying part of its input.
+pub fn tool_title(name: &str, input: &Value) -> Option<String> {
+    let s = |key: &str| input.get(key).and_then(Value::as_str);
+    let title = match name {
+        "read" | "write" | "edit" | "patch" => s("path")
+            .map(|p| {
+                std::path::Path::new(p)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(p)
+                    .to_string()
+            })?,
+        "shell" | "bash" => s("command")?.lines().next().unwrap_or("").to_string(),
+        "glob" => s("pattern")?.to_string(),
+        "grep" | "search" => s("pattern").or_else(|| s("query"))?.to_string(),
+        "subagent" | "task" => {
+            let agent = s("agent").unwrap_or("agent");
+            let description = s("description").unwrap_or("");
+            if description.is_empty() {
+                agent.to_string()
+            } else {
+                format!("{agent}: {description}")
+            }
+        }
+        "skill" => s("id").or_else(|| s("skill"))?.to_string(),
+        "webfetch" => s("url")?.to_string(),
+        _ => return None,
+    };
+    if title.trim().is_empty() {
+        None
+    } else {
+        Some(title)
+    }
+}
+
+fn tool_state_from_str(status: Option<&str>) -> ToolCallStatus {
+    match status {
+        Some("completed") => ToolCallStatus::Completed,
+        Some("failed") | Some("error") => ToolCallStatus::Failed,
+        Some("streaming") => ToolCallStatus::Streaming,
+        Some("pending") => ToolCallStatus::Pending,
+        _ => ToolCallStatus::Running,
+    }
+}
+
+/// Fill in everything that is derived from `metadata`: the truncation flag, a
+/// backgrounded shell, and the child session of a `subagent` call.
+pub fn apply_tool_metadata(call: &mut ToolCall) {
+    let Some(ref metadata) = call.metadata else {
+        return;
+    };
+    if metadata.get("truncated").and_then(Value::as_bool) == Some(true) {
+        call.truncated = true;
+    }
+    if metadata.get("background").and_then(Value::as_bool) == Some(true) {
+        call.background = true;
+    }
+    if let Some(child) = metadata.get("sessionID").and_then(Value::as_str) {
+        call.child_session_id = Some(child.to_string());
+    }
+}
+
+/// A tool part out of an assistant message's `content` array.
+pub fn map_tool_call(val: &Value) -> ToolCall {
+    let id = val.get("id").and_then(Value::as_str).unwrap_or("unknown");
+    let name = val
+        .get("name")
+        .or_else(|| val.get("tool"))
+        .and_then(Value::as_str)
+        .unwrap_or("tool");
+
+    let state = val.get("state");
+    let status = tool_state_from_str(state.and_then(|s| s.get("status")).and_then(Value::as_str));
+
+    let input = state
+        .and_then(|s| s.get("input"))
+        .or_else(|| val.get("input"))
+        .cloned()
+        .unwrap_or(Value::Null);
+
+    let content = state
+        .and_then(|s| s.get("content"))
+        .or_else(|| val.get("content"))
+        .cloned();
+    let raw_output = state
+        .and_then(|s| s.get("output"))
+        .or_else(|| val.get("output"))
+        .cloned()
+        .or_else(|| content.clone());
+
+    let metadata = state
+        .and_then(|s| s.get("metadata"))
+        .or_else(|| val.get("metadata"))
+        .cloned()
+        .filter(|m| !m.is_null());
+
+    let time = ToolTime {
+        created: val.pointer("/time/created").and_then(Value::as_u64),
+        ran: val.pointer("/time/ran").and_then(Value::as_u64),
+        completed: val.pointer("/time/completed").and_then(Value::as_u64),
+    };
+
+    let mut call = ToolCall {
+        id: id.to_string(),
+        name: name.to_string(),
+        title: tool_title(name, &input),
+        input,
+        output: normalize_tool_output(raw_output),
+        content,
+        metadata,
+        state: status,
+        status,
+        error: state.and_then(|s| s.get("error")).and_then(map_error),
+        child_session_id: None,
+        background: false,
+        truncated: false,
+        time,
+    };
+    apply_tool_metadata(&mut call);
+    call
 }
 
 pub fn map_part(val: &Value, _role: TimelineRole, asid: &AgentSessionId) -> Option<AgentPart> {
@@ -408,54 +740,32 @@ pub fn map_part(val: &Value, _role: TimelineRole, asid: &AgentSessionId) -> Opti
             if text.trim().is_empty() {
                 return None;
             }
-            let duration_ms = val.get("durationMs").and_then(Value::as_u64);
-            Some(AgentPart::Reasoning {
-                text,
-                duration_ms,
-            })
+            let duration_ms = val.get("durationMs").and_then(Value::as_u64).or_else(|| {
+                let created = val.pointer("/time/created").and_then(Value::as_u64)?;
+                let completed = val.pointer("/time/completed").and_then(Value::as_u64)?;
+                completed.checked_sub(created)
+            });
+            Some(AgentPart::Reasoning { text, duration_ms })
         }
         "tool" | "tool_use" | "tool_call" | "tool-call" => {
-            let id = val.get("id").and_then(Value::as_str).unwrap_or("unknown");
             let name = val
                 .get("name")
                 .or_else(|| val.get("tool"))
                 .and_then(Value::as_str)
                 .unwrap_or("tool");
 
-            if name == "todowrite" || name == "todo" || name == "task" || name == "tasks" {
+            // `todowrite` is still folded into a checklist -- it has no other
+            // representation. `task`/`subagent` is not: it is a real tool call
+            // whose child session the app needs to be able to open.
+            if name == "todowrite" || name == "todo" || name == "tasks" {
                 if let Some(items) = extract_todo_items(val) {
                     return Some(AgentPart::Todo { items });
                 }
             }
 
-            let state = val.get("state");
-            let status = match state.and_then(|s| s.get("status")).and_then(Value::as_str) {
-                Some("completed") => ToolCallStatus::Completed,
-                Some("failed") | Some("error") => ToolCallStatus::Failed,
-                _ => ToolCallStatus::Running,
-            };
-
-            let input = state
-                .and_then(|s| s.get("input"))
-                .or_else(|| val.get("input"))
-                .cloned()
-                .unwrap_or(Value::Null);
-
-            let raw_output = state
-                .and_then(|s| s.get("output"))
-                .or_else(|| val.get("output"))
-                .or_else(|| state.and_then(|s| s.get("content")))
-                .cloned();
-            let output = normalize_tool_output(raw_output);
-
-            Some(AgentPart::Tool {
-                id: id.to_string(),
-                name: name.to_string(),
-                input,
-                output,
-                status,
-            })
+            Some(AgentPart::Tool(map_tool_call(val)))
         }
+        "compaction" => Some(map_compaction_message(val)),
         "diff" | "patch" => {
             let file = val.get("file").and_then(Value::as_str).unwrap_or("");
             let diff = val
@@ -492,19 +802,51 @@ pub fn map_permission_request(val: &Value, asid: &AgentSessionId) -> Option<Perm
         .unwrap_or("permission")
         .to_string();
 
-    let resources: Vec<String> = val
-        .get("resources")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
+    let string_list = |key: &str| -> Vec<String> {
+        val.get(key)
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    let resources = string_list("resources");
+    // `save` is the set of patterns an "always" reply would persist -- without
+    // it the app cannot tell the user what it is about to whitelist.
+    let save = string_list("save");
+    // v1-compat payloads spell the same thing `patterns`.
+    let save = if save.is_empty() {
+        string_list("patterns")
+    } else {
+        save
+    };
 
     let message = val.get("message").and_then(Value::as_str).map(str::to_string);
-    let tool = val.get("tool").and_then(Value::as_str).map(str::to_string);
+    // `Permission.Request` has no `tool` field: the tool is `source`, which is
+    // `{type:"tool", messageID, id}`. v1-compat payloads do carry `tool`.
+    let source_message_id = val
+        .pointer("/source/messageID")
+        .or_else(|| val.pointer("/tool/messageID"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let source_tool_call_id = val
+        .pointer("/source/id")
+        .or_else(|| val.pointer("/tool/callID"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let tool = val
+        .get("tool")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            val.pointer("/source/type")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
 
     let prompt = if let Some(ref msg) = message {
         msg.clone()
@@ -514,6 +856,9 @@ pub fn map_permission_request(val: &Value, asid: &AgentSessionId) -> Option<Perm
         format!("Allow {action}?")
     };
 
+    // All three replies are always valid (`Permission.Reply` is a closed enum
+    // of `once | always | reject`). What `save` adds is *what* an "always"
+    // would whitelist, which the app shows next to the option.
     let options = vec![
         PermissionOption {
             index: 0,
@@ -537,11 +882,32 @@ pub fn map_permission_request(val: &Value, asid: &AgentSessionId) -> Option<Perm
         asid: asid.clone(),
         action,
         resources,
+        save,
         prompt,
         tool,
+        source_message_id,
+        source_tool_call_id,
+        metadata: val.get("metadata").cloned().filter(|m| !m.is_null()),
         message,
         options,
     })
+}
+
+fn map_form_conditions(val: &Value) -> Vec<crate::agent::domain::FormWhen> {
+    val.get("when")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|w| {
+                    Some(crate::agent::domain::FormWhen {
+                        key: w.get("key").and_then(Value::as_str)?.to_string(),
+                        op: w.get("op").and_then(Value::as_str).unwrap_or("eq").to_string(),
+                        value: w.get("value").cloned().unwrap_or(Value::Null),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub fn map_form_request(val: &Value, asid: &AgentSessionId) -> Option<FormRequest> {
@@ -564,6 +930,7 @@ pub fn map_form_request(val: &Value, asid: &AgentSessionId) -> Option<FormReques
             .to_string();
         let description = f.get("description").and_then(Value::as_str).map(str::to_string);
         let required = f.get("required").and_then(Value::as_bool).unwrap_or(false);
+        let when = map_form_conditions(f);
 
         let field_type = f.get("type").and_then(Value::as_str).unwrap_or("string");
         match field_type {
@@ -576,9 +943,15 @@ pub fn map_form_request(val: &Value, asid: &AgentSessionId) -> Option<FormReques
                     title: field_title,
                     description,
                     required,
+                    when,
                     placeholder,
                     default,
                     options,
+                    format: f.get("format").and_then(Value::as_str).map(str::to_string),
+                    min_length: f.get("minLength").and_then(Value::as_u64),
+                    max_length: f.get("maxLength").and_then(Value::as_u64),
+                    pattern: f.get("pattern").and_then(Value::as_str).map(str::to_string),
+                    custom: f.get("custom").and_then(Value::as_bool).unwrap_or(false),
                 });
             }
             "number" | "integer" => {
@@ -590,6 +963,7 @@ pub fn map_form_request(val: &Value, asid: &AgentSessionId) -> Option<FormReques
                     title: field_title,
                     description,
                     required,
+                    when,
                     min,
                     max,
                     default,
@@ -602,6 +976,7 @@ pub fn map_form_request(val: &Value, asid: &AgentSessionId) -> Option<FormReques
                     title: field_title,
                     description,
                     required,
+                    when,
                     default,
                 });
             }
@@ -617,6 +992,7 @@ pub fn map_form_request(val: &Value, asid: &AgentSessionId) -> Option<FormReques
                     title: field_title,
                     description,
                     required,
+                    when,
                     options,
                     default,
                 });
@@ -627,6 +1003,7 @@ pub fn map_form_request(val: &Value, asid: &AgentSessionId) -> Option<FormReques
                     key,
                     title: field_title,
                     description,
+                    when,
                     url,
                 });
             }
@@ -634,6 +1011,7 @@ pub fn map_form_request(val: &Value, asid: &AgentSessionId) -> Option<FormReques
                 fields.push(FormField::Unknown {
                     key,
                     title: field_title,
+                    when,
                     raw_type: field_type.to_string(),
                 });
             }
@@ -730,6 +1108,7 @@ pub fn map_agents(data: &[Value]) -> Vec<AgentInfo> {
                 description,
                 mode,
                 color,
+                hidden: a.get("hidden").and_then(Value::as_bool).unwrap_or(false),
             })
         })
         .collect()
@@ -767,7 +1146,6 @@ pub fn map_skills(data: &[Value]) -> Vec<SkillInfo> {
         })
         .collect()
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -879,11 +1257,16 @@ mod tests {
         assert_eq!(timeline[2].role, TimelineRole::Assistant);
 
         match &timeline[2].part {
-            AgentPart::Tool { name, status, input, output, .. } => {
-                assert_eq!(name, "bash");
-                assert_eq!(*status, ToolCallStatus::Completed);
-                assert_eq!(input.get("command").unwrap(), "cargo check");
-                assert_eq!(output.as_ref().unwrap().as_str(), Some("Finished dev profile"));
+            AgentPart::Tool(call) => {
+                assert_eq!(call.name, "bash");
+                assert_eq!(call.status, ToolCallStatus::Completed);
+                assert_eq!(call.state, ToolCallStatus::Completed);
+                assert_eq!(call.input.get("command").unwrap(), "cargo check");
+                assert_eq!(
+                    call.output.as_ref().unwrap().as_str(),
+                    Some("Finished dev profile")
+                );
+                assert_eq!(call.title.as_deref(), Some("cargo check"));
             }
             _ => panic!("expected Tool part"),
         }
@@ -1078,9 +1461,9 @@ mod tests {
 
         let part = map_part(&part_raw, TimelineRole::Assistant, &asid).expect("part mapped");
         match part {
-            AgentPart::Tool { output, .. } => {
+            AgentPart::Tool(call) => {
                 assert_eq!(
-                    output.as_ref().and_then(Value::as_str),
+                    call.output.as_ref().and_then(Value::as_str),
                     Some("file1.txt\nfile2.txt\nCommand exited with code 0.")
                 );
             }

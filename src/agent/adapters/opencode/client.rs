@@ -124,19 +124,28 @@ impl OpencodeClient {
 
     pub async fn get_messages(&self, session_id: &str, limit: usize) -> Result<Vec<Value>, AgentEngineError> {
         let limit_str = limit.to_string();
-        // `order=asc` is explicit: the server default is newest-first, and
-        // guessing the direction from two timestamps is not a decision the
-        // gateway should be making.
+        // `order` is sent explicitly rather than inferred from two timestamps.
+        // It has to be `desc`: verified against 2.0.1, `limit` is applied from
+        // the *start* of the requested order, so `order=asc&limit=100` returns
+        // the first hundred messages of a long session instead of the hundred
+        // the reader is looking at. The page is reversed here, so callers
+        // always receive oldest-first.
         let res = self
             .get(
                 &format!("/api/session/{session_id}/message"),
-                &[("limit", limit_str.as_str()), ("order", "asc")],
+                &[("limit", limit_str.as_str()), ("order", "desc")],
             )
             .await?;
-        if let Some(arr) = res.as_array() {
-            return Ok(arr.clone());
-        }
-        Ok(res.get("data").and_then(Value::as_array).cloned().unwrap_or_default())
+        let mut items = match res.as_array() {
+            Some(arr) => arr.clone(),
+            None => res
+                .get("data")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+        };
+        items.reverse();
+        Ok(items)
     }
 
     pub async fn send_prompt(

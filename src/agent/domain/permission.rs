@@ -26,15 +26,29 @@ pub struct PermissionOption {
     pub decision: PermissionDecision,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PermissionRequest {
     pub id: String,
     pub asid: AgentSessionId,
     pub action: String,
     pub resources: Vec<String>,
+    /// The patterns an "always" reply would persist project-wide
+    /// (`Permission.Request.save`). Empty means OpenCode offered no such reply.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub save: Vec<String>,
     pub prompt: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
+    /// `Permission.Request.source.messageID`: the message the prompting tool
+    /// call belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_message_id: Option<String>,
+    /// `Permission.Request.source.id`: the tool call id, so the app can attach
+    /// the prompt to the exact tool card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     pub options: Vec<PermissionOption>,

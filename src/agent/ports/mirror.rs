@@ -14,6 +14,10 @@ pub struct AgentSessionSnapshot {
     pub timeline: Vec<TimelineItem>,
     pub permissions: Vec<PermissionRequest>,
     pub forms: Vec<FormRequest>,
+    /// Queued and steered items waiting for the agent loop, `Session.Inbox.Info`
+    /// verbatim.
+    #[serde(default)]
+    pub inbox: Vec<serde_json::Value>,
     pub seq: u64,
 }
 

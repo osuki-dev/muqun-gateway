@@ -1,0 +1,1 @@
+data: {"id":"evt_0aef3eaa2001oDvRKkIzsHagBT","created":1789641616034,"type":"session.deleted","data":{"sessionID":"ses_f511626fdffe0ncuGo6c1jS5Yk"},"durable":{"aggregateID":"ses_f511626fdffe0ncuGo6c1jS5Yk","seq":81,"version":2}}

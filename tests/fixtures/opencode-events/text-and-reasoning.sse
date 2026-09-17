@@ -1,0 +1,11 @@
+data: {"id":"evt_r1","created":1789641048000,"type":"session.reasoning.started","location":{"directory":"/tmp/probe"},"data":{"sessionID":"ses_f511626fdffe0ncuGo6c1jS5Yk","assistantMessageID":"msg_0aeeb1b5a0016g1G7cWlN3qcn4","ordinal":0,"state":{"reasoningField":"reasoning_content"}}}
+
+data: {"id":"evt_r2","created":1789641048100,"type":"session.reasoning.delta","location":{"directory":"/tmp/probe"},"data":{"sessionID":"ses_f511626fdffe0ncuGo6c1jS5Yk","assistantMessageID":"msg_0aeeb1b5a0016g1G7cWlN3qcn4","ordinal":0,"delta":"Thinking "}}
+
+data: {"id":"evt_r3","created":1789641048200,"type":"session.reasoning.ended","location":{"directory":"/tmp/probe"},"data":{"sessionID":"ses_f511626fdffe0ncuGo6c1jS5Yk","assistantMessageID":"msg_0aeeb1b5a0016g1G7cWlN3qcn4","ordinal":0,"text":"Thinking about it."}}
+
+data: {"id":"evt_t1","created":1789641048700,"type":"session.text.started","location":{"directory":"/tmp/probe"},"data":{"sessionID":"ses_f511626fdffe0ncuGo6c1jS5Yk","assistantMessageID":"msg_0aeeb1b5a0016g1G7cWlN3qcn4","ordinal":0}}
+
+data: {"id":"evt_t2","created":1789641048800,"type":"session.text.delta","location":{"directory":"/tmp/probe"},"data":{"sessionID":"ses_f511626fdffe0ncuGo6c1jS5Yk","assistantMessageID":"msg_0aeeb1b5a0016g1G7cWlN3qcn4","ordinal":0,"delta":"Done"}}
+
+data: {"id":"evt_t3","created":1789641048900,"type":"session.text.ended","location":{"directory":"/tmp/probe"},"data":{"sessionID":"ses_f511626fdffe0ncuGo6c1jS5Yk","assistantMessageID":"msg_0aeeb1b5a0016g1G7cWlN3qcn4","ordinal":0,"text":"Done."}}

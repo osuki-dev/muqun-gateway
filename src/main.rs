@@ -5514,17 +5514,7 @@ async fn events(
                     }
                 } => {
                     if let Ok(ev) = agent_ev {
-                        let ev_name = match &ev {
-                            agent::AgentDomainEvent::SessionUpdated { .. } => "agent.session.updated",
-                            agent::AgentDomainEvent::TimelineUpsert { .. } => "agent.timeline.upsert",
-                            agent::AgentDomainEvent::TimelineRemoved { .. } => "agent.timeline.removed",
-                            agent::AgentDomainEvent::StatusChanged { .. } => "agent.status.changed",
-                            agent::AgentDomainEvent::PermissionPending { .. } => "agent.permission.pending",
-                            agent::AgentDomainEvent::PermissionResolved { .. } => "agent.permission.resolved",
-                            agent::AgentDomainEvent::FormPending { .. } => "agent.form.pending",
-                            agent::AgentDomainEvent::FormResolved { .. } => "agent.form.resolved",
-                            agent::AgentDomainEvent::Resync { .. } => "agent.resync",
-                        };
+                        let ev_name = ev.event_name();
                         let payload = serde_json::to_string(&ev).unwrap_or_default();
                         if let Some(event) = stream_event(&mut sealer, ev_name, &payload) {
                             yield Ok(event);

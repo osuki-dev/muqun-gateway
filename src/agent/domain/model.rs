@@ -32,6 +32,10 @@ pub struct AgentInfo {
     pub mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
+    /// `Agent.Info.hidden`: built-ins like `title` and `compaction` that a
+    /// picker must not offer.
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
