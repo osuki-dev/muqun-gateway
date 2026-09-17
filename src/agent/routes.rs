@@ -242,6 +242,7 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
             "/api/agent-sessions/{asid}/inbox/{inbox_id}/queue",
             post(queue_agent_inbox_item),
         )
+        .route("/api/agent-engine", get(get_agent_engine_status))
         .route("/api/agent-shells", get(list_agent_shells))
         .route(
             "/api/agent-shells/{shell_id}",
@@ -421,7 +422,7 @@ async fn do_list_agent_sessions(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let Some(ref manager) = state.agent_manager else {
+    let Some(manager) = state.agent_runtime.manager().await else {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_unavailable",
@@ -445,7 +446,7 @@ async fn do_create_agent_session(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let Some(ref manager) = state.agent_manager else {
+    let Some(manager) = state.agent_runtime.manager().await else {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_unavailable",
@@ -502,7 +503,7 @@ async fn do_get_agent_session(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let Some(ref manager) = state.agent_manager else {
+    let Some(manager) = state.agent_runtime.manager().await else {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_unavailable",
@@ -527,7 +528,7 @@ async fn do_get_agent_session_events(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let Some(ref manager) = state.agent_manager else {
+    let Some(manager) = state.agent_runtime.manager().await else {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_unavailable",
@@ -557,7 +558,7 @@ async fn do_get_agent_session_timeline(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let Some(ref manager) = state.agent_manager else {
+    let Some(manager) = state.agent_runtime.manager().await else {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_unavailable",
@@ -588,7 +589,7 @@ async fn do_switch_agent_mode(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let Some(ref manager) = state.agent_manager else {
+    let Some(manager) = state.agent_runtime.manager().await else {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_unavailable",
@@ -614,7 +615,7 @@ async fn do_find_agent_files(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let Some(ref manager) = state.agent_manager else {
+    let Some(manager) = state.agent_runtime.manager().await else {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_unavailable",
@@ -653,7 +654,7 @@ async fn do_send_agent_prompt(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let Some(ref manager) = state.agent_manager else {
+    let Some(manager) = state.agent_runtime.manager().await else {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_unavailable",
@@ -686,7 +687,7 @@ async fn do_revert_agent_session(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let Some(ref manager) = state.agent_manager else {
+    let Some(manager) = state.agent_runtime.manager().await else {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_unavailable",
@@ -713,7 +714,7 @@ async fn do_interrupt_agent_session(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let Some(ref manager) = state.agent_manager else {
+    let Some(manager) = state.agent_runtime.manager().await else {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_unavailable",
@@ -738,7 +739,7 @@ async fn do_switch_agent_model(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let Some(ref manager) = state.agent_manager else {
+    let Some(manager) = state.agent_runtime.manager().await else {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_unavailable",
@@ -764,7 +765,7 @@ async fn do_reply_agent_permission(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let Some(ref manager) = state.agent_manager else {
+    let Some(manager) = state.agent_runtime.manager().await else {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_unavailable",
@@ -808,7 +809,7 @@ async fn do_reply_agent_form(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let Some(ref manager) = state.agent_manager else {
+    let Some(manager) = state.agent_runtime.manager().await else {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_unavailable",
@@ -837,7 +838,7 @@ async fn do_get_agent_vcs_diff(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let Some(ref manager) = state.agent_manager else {
+    let Some(manager) = state.agent_runtime.manager().await else {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_unavailable",
@@ -904,7 +905,7 @@ async fn do_list_agent_projects(
 ) -> ApiResult<Response> {
     require_device(state, headers)?;
 
-    let Some(ref manager) = state.agent_manager else {
+    let Some(manager) = state.agent_runtime.manager().await else {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_unavailable",
@@ -983,7 +984,7 @@ async fn do_stream_agent_session(
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>> + Send>, (StatusCode, Json<Value>)> {
     require_device(state, headers)?;
 
-    let Some(ref manager) = state.agent_manager else {
+    let Some(manager) = state.agent_runtime.manager().await else {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_unavailable",
@@ -992,7 +993,8 @@ async fn do_stream_agent_session(
     };
 
     let target_asid = AgentSessionId(asid.to_string());
-    let mut rx = manager.subscribe_events();
+    let mut rx = state.agent_runtime.subscribe_events();
+    drop(manager);
 
     let stream = async_stream::stream! {
         yield Ok(Event::default().event("connected").data(serde_json::to_string(&json!({ "asid": target_asid.0 })).unwrap_or_default()));
@@ -1030,7 +1032,7 @@ pub async fn get_global_agent_catalog(
 ) -> ApiResult<Response> {
     require_device(&state, &headers)?;
 
-    let Some(ref manager) = state.agent_manager else {
+    let Some(manager) = state.agent_runtime.manager().await else {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_unavailable",
@@ -1424,7 +1426,7 @@ async fn stream_agent_session_legacy(
 macro_rules! manager_or_unavailable {
     ($state:expr, $headers:expr) => {{
         require_device($state, $headers)?;
-        match $state.agent_manager.clone() {
+        match $state.agent_runtime.manager().await {
             Some(manager) => manager,
             None => {
                 return Err(api_error(
@@ -1732,6 +1734,18 @@ async fn set_inbox_delivery(
     Ok(Json(content_envelope(
         json!({ "delivery": delivery, "inbox_id": inbox_id }),
     )))
+}
+
+/// What engine, if any, the gateway currently has. Unlike every other agent
+/// route this one answers 200 with `available: false` rather than 503 -- the
+/// app asks it precisely to find out why the others are refusing.
+async fn get_agent_engine_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let status = state.agent_runtime.status().await;
+    Ok(Json(content_envelope(json!(status))))
 }
 
 async fn list_agent_shells(

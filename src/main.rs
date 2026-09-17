@@ -607,6 +607,17 @@ struct Config {
     /// round-trips untouched.
     #[serde(default, skip_serializing_if = "is_false")]
     rich_agent_pushes: bool,
+    /// How this gateway gets an OpenCode engine to talk to. Absent, it starts
+    /// one when it cannot find a running service, which is the behaviour the
+    /// owner asked for; `{"autostart": false}` leaves that to them.
+    #[serde(default, skip_serializing_if = "is_default_opencode")]
+    opencode: agent::OpencodeConfig,
+}
+
+/// `skip_serializing_if` for the OpenCode block, so an existing `config.json`
+/// round-trips untouched until someone changes something.
+fn is_default_opencode(config: &agent::OpencodeConfig) -> bool {
+    config.autostart && config.binary.is_none()
 }
 
 fn is_required_transport(mode: &TransportEncryptionMode) -> bool {
@@ -885,7 +896,10 @@ pub(crate) struct AppState {
     /// The last backend liveness ordering, reused briefly so a burst of
     /// clients asking at once is answered once. See [`SESSION_LIVENESS_TTL`].
     pub(crate) session_liveness: Arc<Mutex<SessionLivenessCache>>,
-    pub(crate) agent_manager: Option<Arc<agent::AgentManager>>,
+    /// The OpenCode engine, which comes and goes: it is discovered, adopted or
+    /// started, and re-attached whenever it moves. Routes ask it for the
+    /// current manager rather than holding one.
+    pub(crate) agent_runtime: Arc<agent::AgentRuntime>,
 }
 
 /// The scrollback store, or nothing if a previous holder panicked while it was
@@ -1216,6 +1230,7 @@ fn setup(
             autostart_backends: Vec::new(),
             agent_commands: BTreeMap::new(),
             rich_agent_pushes: false,
+            opencode: agent::OpencodeConfig::default(),
         },
     };
     config.listen = listen;
@@ -2070,7 +2085,8 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     // One background attempt per opted-in backend; no restart/logging loop.
     backend_startup::spawn(&config);
 
-    let agent_manager = agent::AgentManager::discover().await.map(Arc::new);
+    let agent_runtime = agent::AgentRuntime::new(config.opencode.clone());
+    agent_runtime.spawn_supervisor();
 
     let state = AppState {
         config,
@@ -2084,7 +2100,7 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         approval_events: tokio::sync::broadcast::channel(APPROVAL_EVENT_CAPACITY).0,
         activity: Arc::new(Mutex::new(HashMap::new())),
         session_liveness: Arc::new(Mutex::new(SessionLivenessCache::default())),
-        agent_manager,
+        agent_runtime,
     };
     spawn_agent_notification_watchers(state.clone());
     spawn_agent_engine_watchers(state.clone());
@@ -5395,7 +5411,9 @@ async fn events(
     let scrollback_store = state.scrollback.clone();
     let backend = terminal_backend(&session);
     let mut activity = subscribe_activity(&state, &session);
-    let mut agent_events_rx = state.agent_manager.as_ref().map(|m| m.subscribe_events());
+    // The runtime's channel, not a manager's: a client's stream has to survive
+    // OpenCode restarting underneath it.
+    let mut agent_events_rx = Some(state.agent_runtime.subscribe_events());
     let stream = async_stream::stream! {
         let mut output_interval = tokio::time::interval(STREAM_OUTPUT_POLL_INTERVAL);
         output_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -5912,10 +5930,7 @@ fn spawn_agent_notification_watchers(state: AppState) {
 }
 
 fn spawn_agent_engine_watchers(state: AppState) {
-    let Some(ref manager) = state.agent_manager else {
-        return;
-    };
-    let mut rx = manager.subscribe_events();
+    let mut rx = state.agent_runtime.subscribe_events();
     let state = state.clone();
 
     tokio::spawn(async move {
@@ -13181,6 +13196,7 @@ mod tests {
             }],
             agent_commands: BTreeMap::new(),
             rich_agent_pushes: false,
+            opencode: agent::OpencodeConfig::default(),
         }
     }
 
@@ -13529,7 +13545,7 @@ mod tests {
             approval_events: tokio::sync::broadcast::channel(APPROVAL_EVENT_CAPACITY).0,
             activity: Arc::new(Mutex::new(HashMap::new())),
             session_liveness: Arc::new(Mutex::new(SessionLivenessCache::default())),
-            agent_manager: None,
+            agent_runtime: agent::AgentRuntime::disabled(),
         }
     }
 

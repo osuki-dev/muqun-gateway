@@ -643,3 +643,118 @@ pub(crate) fn model_ref_json(model: &crate::agent::domain::ModelRef) -> Value {
     }
     obj
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The URL these parameters produce, spelled exactly as it goes on the
+    /// wire. `reqwest` does the encoding, so the test asks it.
+    fn query_url<K, V>(path: &str, params: &[(K, V)]) -> String
+    where
+        K: AsRef<str> + serde::Serialize,
+        V: AsRef<str> + serde::Serialize,
+    {
+        reqwest::Client::new()
+            .get(format!("http://127.0.0.1:1{path}"))
+            .query(params)
+            .build()
+            .expect("request builds")
+            .url()
+            .to_string()
+    }
+
+    #[test]
+    fn a_directory_is_sent_as_the_deep_object_location() {
+        let url = query_url("/api/model", &location_query(Some("/home/ryu/Work/muqun/app")));
+        assert!(
+            url.contains("location%5Bdirectory%5D=%2Fhome%2Fryu%2FWork%2Fmuqun%2Fapp"),
+            "expected location[directory], got {url}"
+        );
+        assert!(
+            !url.contains("directory=%2Fhome") || url.contains("location%5Bdirectory%5D"),
+            "a flat directory= is not a parameter these endpoints define: {url}"
+        );
+    }
+
+    #[test]
+    fn no_directory_means_no_location_parameter() {
+        assert!(location_query(None).is_empty());
+        assert!(location_query(Some("   ")).is_empty());
+        let url = query_url("/api/model", &location_query(None));
+        assert_eq!(url, "http://127.0.0.1:1/api/model");
+    }
+
+    #[test]
+    fn a_vcs_diff_always_carries_its_required_mode() {
+        let mut query = location_query(Some("/repo"));
+        query.push(("mode".to_string(), "working".to_string()));
+        let url = query_url("/api/vcs/diff", &query);
+        assert!(url.contains("mode=working"), "got {url}");
+        assert!(url.contains("location%5Bdirectory%5D=%2Frepo"), "got {url}");
+    }
+
+    #[test]
+    fn messages_are_requested_newest_first_and_reversed_locally() {
+        // `limit` counts from the start of the requested order, so the page has
+        // to be `desc` for the tail of a long session to come back.
+        let url = query_url("/api/session/ses_1/message", &[("limit", "100"), ("order", "desc")]);
+        assert!(url.contains("order=desc"), "got {url}");
+        assert!(url.contains("limit=100"), "got {url}");
+    }
+
+    #[test]
+    fn a_session_list_carries_every_filter_it_was_given() {
+        let filter = SessionListFilter {
+            parent_id: Some("null"),
+            limit: Some(25),
+            order: Some("desc"),
+            search: Some("gateway"),
+            cursor: Some("abc"),
+        };
+        let mut query: Vec<(String, String)> = vec![("directory".to_string(), "/repo".to_string())];
+        if let Some(parent) = filter.parent_id {
+            query.push(("parentID".to_string(), parent.to_string()));
+        }
+        if let Some(limit) = filter.limit {
+            query.push(("limit".to_string(), limit.to_string()));
+        }
+        if let Some(order) = filter.order {
+            query.push(("order".to_string(), order.to_string()));
+        }
+        if let Some(search) = filter.search {
+            query.push(("search".to_string(), search.to_string()));
+        }
+        if let Some(cursor) = filter.cursor {
+            query.push(("cursor".to_string(), cursor.to_string()));
+        }
+        let url = query_url("/api/session", &query);
+        // `GET /api/session` is the one endpoint that takes a flat directory.
+        assert!(url.contains("directory=%2Frepo"), "got {url}");
+        assert!(url.contains("parentID=null"), "roots-only is a literal null: {url}");
+        assert!(url.contains("search=gateway"), "got {url}");
+        assert!(url.contains("cursor=abc"), "got {url}");
+    }
+
+    #[test]
+    fn a_model_ref_omits_the_variant_rather_than_sending_null() {
+        let bare = model_ref_json(&crate::agent::domain::ModelRef {
+            provider_id: "opencode".to_string(),
+            model_id: "union-alpha".to_string(),
+            variant: None,
+        });
+        assert_eq!(bare["providerID"], "opencode");
+        assert_eq!(bare["id"], "union-alpha");
+        assert!(
+            bare.get("variant").is_none(),
+            "Model.Ref declares additionalProperties:false and variant as a string"
+        );
+
+        let with_variant = model_ref_json(&crate::agent::domain::ModelRef {
+            provider_id: "opencode".to_string(),
+            model_id: "union-alpha".to_string(),
+            variant: Some("thinking".to_string()),
+        });
+        assert_eq!(with_variant["variant"], "thinking");
+    }
+}
