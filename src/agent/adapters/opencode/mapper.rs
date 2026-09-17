@@ -4,7 +4,8 @@ use crate::agent::domain::{
     AgentPart, AgentProject, AgentSessionId, AgentSessionInfo, AgentSessionStatus, CompactionStatus,
     FormField, FormOption, FormRequest, McpServerInfo, ModelInfo, ModelRef, ModelVariantInfo,
     PermissionDecision, PermissionOption, PermissionRequest, SessionForkInfo, SessionRevertInfo,
-    SkillInfo, TimelineItem, TimelineRole, TodoItem, TokensUsage, ToolCall, ToolCallStatus, ToolTime,
+    CatalogDefaults, CommandInfo, ProviderInfo, ProviderModelInfo, SkillInfo, TimelineItem,
+    TimelineRole, TodoItem, TokensUsage, ToolCall, ToolCallStatus, ToolTime,
 };
 
 /// `Model.Ref` as v2 spells it: `{id, providerID, variant?}`. `modelID` is
@@ -1089,6 +1090,8 @@ pub fn map_models(data: &[Value]) -> Vec<ModelInfo> {
                 limit,
                 variants,
                 cost,
+                enabled: m.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+                status: m.get("status").and_then(Value::as_str).map(str::to_string),
             })
         })
         .collect()
@@ -1146,6 +1149,113 @@ pub fn map_skills(data: &[Value]) -> Vec<SkillInfo> {
         })
         .collect()
 }
+/// Group the model list by provider. `/api/provider` describes the providers
+/// themselves; the models come from `/api/model`, which is the same list the
+/// picker already uses.
+pub fn map_providers(data: &[Value], models: &[ModelInfo]) -> Vec<ProviderInfo> {
+    let mut providers: Vec<ProviderInfo> = data
+        .iter()
+        .filter_map(|p| {
+            let id = p.get("id").and_then(Value::as_str)?.to_string();
+            let name = p.get("name").and_then(Value::as_str).unwrap_or(&id).to_string();
+            Some(ProviderInfo {
+                id,
+                name,
+                // Carried through so the app can grey a provider out with a
+                // "configure OpenCode on the host" hint. The gateway never
+                // writes provider auth.
+                activation: p.get("activation").and_then(Value::as_str).map(str::to_string),
+                models: Vec::new(),
+            })
+        })
+        .collect();
+
+    for model in models {
+        let entry = ProviderModelInfo {
+            id: model.id.clone(),
+            name: model.name.clone(),
+            enabled: model.enabled,
+            variants: model.variants.clone().unwrap_or_default(),
+            limit: model.limit.clone(),
+            status: model.status.clone(),
+        };
+        match providers.iter_mut().find(|p| p.id == model.provider_id) {
+            Some(provider) => provider.models.push(entry),
+            None => providers.push(ProviderInfo {
+                id: model.provider_id.clone(),
+                name: model.provider_id.clone(),
+                activation: None,
+                models: vec![entry],
+            }),
+        }
+    }
+
+    providers
+}
+
+pub fn map_commands(data: &[Value]) -> Vec<CommandInfo> {
+    data.iter()
+        .filter_map(|c| {
+            let name = c.get("name").and_then(Value::as_str)?.to_string();
+            Some(CommandInfo {
+                name,
+                description: c.get("description").and_then(Value::as_str).map(str::to_string),
+                agent: c.get("agent").and_then(Value::as_str).map(str::to_string),
+                template: c.get("template").and_then(Value::as_str).map(str::to_string),
+            })
+        })
+        .collect()
+}
+
+/// What OpenCode itself would pick: `GET /api/model/default` for the model and
+/// `Config.Info.default_agent` for the agent. `/api/config` answers with the
+/// documents the configuration was assembled from, so the last one that names
+/// a default wins, which is the merge order OpenCode itself uses.
+pub fn map_catalog_defaults(default_model: Option<&Value>, config: &[Value]) -> CatalogDefaults {
+    let model = default_model.and_then(map_model_ref).or_else(|| {
+        config
+            .iter()
+            .rev()
+            .find_map(|doc| config_model_ref(doc.pointer("/config/model").or_else(|| doc.get("model"))?))
+    });
+
+    let agent = config.iter().rev().find_map(|doc| {
+        doc.pointer("/config/default_agent")
+            .or_else(|| doc.get("default_agent"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    });
+
+    CatalogDefaults { model, agent }
+}
+
+/// `Config.Info.model` is either `"provider/model"` (with an optional
+/// `#variant`) or `{providerID, model, variant?}`.
+fn config_model_ref(val: &Value) -> Option<ModelRef> {
+    if let Some(text) = val.as_str() {
+        let (provider, rest) = text.split_once('/')?;
+        let (model, variant) = match rest.split_once('#') {
+            Some((m, v)) => (m, Some(v.to_string())),
+            None => (rest, None),
+        };
+        return Some(ModelRef {
+            provider_id: provider.to_string(),
+            model_id: model.to_string(),
+            variant,
+        });
+    }
+    let provider_id = val.get("providerID").and_then(Value::as_str)?;
+    let model_id = val
+        .get("model")
+        .or_else(|| val.get("id"))
+        .and_then(Value::as_str)?;
+    Some(ModelRef {
+        provider_id: provider_id.to_string(),
+        model_id: model_id.to_string(),
+        variant: val.get("variant").and_then(Value::as_str).map(str::to_string),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1538,3 +1648,244 @@ mod tests {
 }
 
 
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn providers_carry_activation_and_their_models() {
+        let raw_providers = vec![
+            json!({ "id": "opencode", "name": "OpenCode Zen", "activation": "auto" }),
+            json!({ "id": "anthropic", "name": "Anthropic", "activation": "disabled" }),
+        ];
+        let models = map_models(&[
+            json!({
+                "id": "union-alpha", "modelID": "union-alpha", "providerID": "opencode",
+                "name": "Union Alpha", "enabled": true, "status": "active",
+                "limit": { "context": 200000, "output": 32000 },
+                "variants": [ { "id": "default" }, { "id": "thinking" } ]
+            }),
+            json!({
+                "id": "claude-x", "modelID": "claude-x", "providerID": "anthropic",
+                "name": "Claude X", "enabled": false, "status": "beta"
+            }),
+        ]);
+
+        let providers = map_providers(&raw_providers, &models);
+        assert_eq!(providers.len(), 2);
+
+        let opencode = providers.iter().find(|p| p.id == "opencode").unwrap();
+        assert_eq!(opencode.activation.as_deref(), Some("auto"));
+        assert_eq!(opencode.models.len(), 1);
+        assert!(opencode.models[0].enabled);
+        assert_eq!(opencode.models[0].variants.len(), 2);
+        assert_eq!(
+            opencode.models[0]
+                .limit
+                .as_ref()
+                .and_then(|l| l.get("context"))
+                .and_then(Value::as_u64),
+            Some(200000)
+        );
+
+        let anthropic = providers.iter().find(|p| p.id == "anthropic").unwrap();
+        assert_eq!(anthropic.activation.as_deref(), Some("disabled"));
+        assert!(
+            !anthropic.models[0].enabled,
+            "a disabled model is carried through, not hidden"
+        );
+    }
+
+    #[test]
+    fn a_model_from_an_unlisted_provider_still_appears() {
+        let models = map_models(&[json!({
+            "id": "m", "modelID": "m", "providerID": "custom", "name": "M"
+        })]);
+        let providers = map_providers(&[], &models);
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].id, "custom");
+    }
+
+    #[test]
+    fn commands_map_name_and_description() {
+        let commands = map_commands(&[
+            json!({ "name": "init", "description": "guided AGENTS.md setup" }),
+            json!({ "name": "review" }),
+            json!({ "description": "no name, skipped" }),
+        ]);
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0].name, "init");
+        assert_eq!(commands[0].description.as_deref(), Some("guided AGENTS.md setup"));
+        assert!(commands[1].description.is_none());
+    }
+
+    #[test]
+    fn defaults_come_from_model_default_then_config() {
+        let default_model = json!({
+            "id": "union-alpha", "modelID": "union-alpha", "providerID": "opencode"
+        });
+        let config = vec![json!({ "config": { "default_agent": "plan" } })];
+        let defaults = map_catalog_defaults(Some(&default_model), &config);
+        assert_eq!(defaults.agent.as_deref(), Some("plan"));
+        let model = defaults.model.expect("a default model");
+        assert_eq!(model.provider_id, "opencode");
+        assert_eq!(model.model_id, "union-alpha");
+    }
+
+    #[test]
+    fn a_config_model_string_is_parsed_into_a_model_ref() {
+        let config = vec![json!({ "config": { "model": "opencode/glm-5.3-flash#thinking" } })];
+        let defaults = map_catalog_defaults(None, &config);
+        let model = defaults.model.expect("a default model");
+        assert_eq!(model.provider_id, "opencode");
+        assert_eq!(model.model_id, "glm-5.3-flash");
+        assert_eq!(model.variant.as_deref(), Some("thinking"));
+    }
+
+    #[test]
+    fn defaults_are_empty_when_opencode_says_nothing() {
+        let defaults = map_catalog_defaults(None, &[]);
+        assert!(defaults.model.is_none());
+        assert!(defaults.agent.is_none());
+    }
+
+    #[test]
+    fn a_permission_request_carries_save_patterns_and_its_tool_call() {
+        let asid = AgentSessionId("ses-1".to_string());
+        let raw = json!({
+            "id": "per_1",
+            "sessionID": "ses-1",
+            "action": "external_directory",
+            "resources": ["/etc/hosts"],
+            "save": ["/etc/*"],
+            "source": { "type": "tool", "messageID": "msg_1", "id": "call_1" },
+            "metadata": { "why": "probe" }
+        });
+        let req = map_permission_request(&raw, &asid).expect("maps");
+        assert_eq!(req.save, vec!["/etc/*".to_string()]);
+        assert_eq!(req.source_message_id.as_deref(), Some("msg_1"));
+        assert_eq!(req.source_tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(req.options.len(), 3);
+    }
+
+    #[test]
+    fn a_form_field_carries_its_conditions_and_constraints() {
+        let asid = AgentSessionId("ses-1".to_string());
+        let raw = json!({
+            "id": "frm_1",
+            "sessionID": "ses-1",
+            "title": "Deploy",
+            "fields": [{
+                "key": "tag", "title": "Tag", "type": "string", "required": true,
+                "when": [{ "key": "env", "op": "eq", "value": "prod" }],
+                "format": "uri", "minLength": 2, "maxLength": 40, "pattern": "^v",
+                "custom": true
+            }]
+        });
+        let form = map_form_request(&raw, &asid).expect("maps");
+        match &form.fields[0] {
+            FormField::String {
+                when,
+                format,
+                min_length,
+                max_length,
+                pattern,
+                custom,
+                ..
+            } => {
+                assert_eq!(when.len(), 1);
+                assert_eq!(when[0].key, "env");
+                assert_eq!(when[0].op, "eq");
+                assert_eq!(format.as_deref(), Some("uri"));
+                assert_eq!(*min_length, Some(2));
+                assert_eq!(*max_length, Some(40));
+                assert_eq!(pattern.as_deref(), Some("^v"));
+                assert!(*custom);
+            }
+            other => panic!("expected a string field, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_compaction_message_becomes_a_boundary_row() {
+        let asid = AgentSessionId("ses-1".to_string());
+        let msg = json!({
+            "id": "msg_c", "type": "compaction", "status": "completed", "reason": "manual",
+            "summary": "the summary", "recent": "the tail",
+            "time": { "created": 10 },
+            "tokens": { "input": 5, "output": 6, "reasoning": 0, "cache": { "read": 0, "write": 0 } },
+            "cost": 0.25
+        });
+        let items = map_message(&msg, &asid);
+        assert_eq!(items.len(), 1);
+        match &items[0].part {
+            AgentPart::Compaction {
+                status,
+                reason,
+                summary,
+                recent,
+                tokens,
+                cost,
+                ..
+            } => {
+                assert_eq!(*status, CompactionStatus::Completed);
+                assert_eq!(reason.as_deref(), Some("manual"));
+                assert_eq!(summary.as_deref(), Some("the summary"));
+                assert_eq!(recent.as_deref(), Some("the tail"));
+                assert_eq!(tokens.as_ref().map(|t| t.input), Some(5));
+                assert_eq!(*cost, Some(0.25));
+            }
+            other => panic!("expected a compaction part, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_subagent_tool_is_a_tool_row_not_a_todo_list() {
+        let asid = AgentSessionId("ses-1".to_string());
+        let part = map_part(
+            &json!({
+                "type": "tool", "id": "call_1", "name": "subagent",
+                "state": {
+                    "status": "completed",
+                    "input": { "agent": "explore", "description": "count files" },
+                    "content": [{ "type": "text", "text": "2" }],
+                    "metadata": { "sessionID": "ses_child", "status": "completed" }
+                }
+            }),
+            TimelineRole::Assistant,
+            &asid,
+        )
+        .expect("maps");
+        match part {
+            AgentPart::Tool(call) => {
+                assert_eq!(call.name, "subagent");
+                assert_eq!(call.child_session_id.as_deref(), Some("ses_child"));
+                assert_eq!(call.title.as_deref(), Some("explore: count files"));
+            }
+            other => panic!("expected a tool part, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_shell_message_becomes_a_shell_row() {
+        let asid = AgentSessionId("ses-1".to_string());
+        let items = map_message(
+            &json!({
+                "id": "msg_s", "type": "shell", "shellID": "sh_1", "command": "sleep 60",
+                "status": "running", "time": { "created": 1 }
+            }),
+            &asid,
+        );
+        assert_eq!(items.len(), 1);
+        match &items[0].part {
+            AgentPart::Shell { shell_id, command, status, .. } => {
+                assert_eq!(shell_id, "sh_1");
+                assert_eq!(command, "sleep 60");
+                assert_eq!(status, "running");
+            }
+            other => panic!("expected a shell part, got {other:?}"),
+        }
+    }
+}

@@ -5,14 +5,16 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use super::domain::{AgentDomainEvent, AgentSessionId, ModelRef, PermissionDecision};
+use super::domain::{
+    AgentDomainEvent, AgentSessionId, ModelRef, PermissionDecision, SessionQuery,
+};
 use crate::{api_error, content_envelope, require_device, validate_text, ApiResult, AppState};
 
 #[derive(Debug, Deserialize)]
@@ -24,6 +26,76 @@ pub struct AgentDirectoriesQuery {
 #[derive(Debug, Deserialize)]
 pub struct AgentSessionsQuery {
     pub directory: Option<String>,
+    /// List the children of one session.
+    pub parent_id: Option<String>,
+    /// `true` lists top-level sessions only, leaving out every subagent
+    /// session the `subagent` tool created.
+    pub roots: Option<bool>,
+    pub limit: Option<usize>,
+    /// `asc` or `desc`.
+    pub order: Option<String>,
+    pub search: Option<String>,
+    pub cursor: Option<String>,
+}
+
+impl AgentSessionsQuery {
+    fn to_session_query(&self) -> SessionQuery {
+        SessionQuery {
+            directory: self.directory.clone(),
+            // OpenCode takes the literal string `null` for "roots only".
+            parent_id: match (self.parent_id.as_deref(), self.roots) {
+                (Some(parent), _) if !parent.trim().is_empty() => Some(parent.to_string()),
+                (_, Some(true)) => Some("null".to_string()),
+                _ => None,
+            },
+            limit: self.limit,
+            order: self.order.clone(),
+            search: self.search.clone(),
+            cursor: self.cursor.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AgentCatalogQuery {
+    pub directory: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ShellOutputQuery {
+    pub cursor: Option<u64>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ExportQuery {
+    /// Defaults to true: an exported transcript leaves the device.
+    pub sanitize: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CompactBody {
+    /// `steer` (the default) or `queue`.
+    pub delivery: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RenameSessionBody {
+    pub title: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RunCommandBody {
+    pub name: String,
+    /// The argument string that fills `$ARGUMENTS`.
+    pub arguments: Option<String>,
+    pub delivery: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ViewSessionBody {
+    /// The idle timestamp being acknowledged; defaults to now.
+    pub idle: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -103,6 +175,8 @@ pub struct RevertSessionBody {
 #[derive(Debug, Deserialize)]
 pub struct ReplyPermissionBody {
     pub decision: String,
+    /// An optional reason, forwarded to OpenCode with a rejection.
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -119,7 +193,63 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
         )
         .route(
             "/api/agent-sessions/{asid}",
-            get(get_agent_session_global),
+            get(get_agent_session_global).delete(delete_agent_session_global),
+        )
+        .route(
+            "/api/agent-sessions/{asid}/children",
+            get(list_agent_session_children),
+        )
+        .route(
+            "/api/agent-sessions/{asid}/rename",
+            post(rename_agent_session),
+        )
+        .route(
+            "/api/agent-sessions/{asid}/revert/clear",
+            post(clear_agent_session_revert),
+        )
+        .route(
+            "/api/agent-sessions/{asid}/compact",
+            post(compact_agent_session),
+        )
+        .route(
+            "/api/agent-sessions/{asid}/context",
+            get(get_agent_session_context),
+        )
+        .route(
+            "/api/agent-sessions/{asid}/background",
+            post(background_agent_session),
+        )
+        .route("/api/agent-sessions/{asid}/wait", post(wait_agent_session))
+        .route("/api/agent-sessions/{asid}/view", post(view_agent_session))
+        .route(
+            "/api/agent-sessions/{asid}/export",
+            get(export_agent_session),
+        )
+        .route(
+            "/api/agent-sessions/{asid}/command",
+            post(run_agent_session_command),
+        )
+        .route("/api/agent-sessions/{asid}/inbox", get(get_agent_inbox))
+        .route(
+            "/api/agent-sessions/{asid}/inbox/{inbox_id}",
+            delete(cancel_agent_inbox_item),
+        )
+        .route(
+            "/api/agent-sessions/{asid}/inbox/{inbox_id}/steer",
+            post(steer_agent_inbox_item),
+        )
+        .route(
+            "/api/agent-sessions/{asid}/inbox/{inbox_id}/queue",
+            post(queue_agent_inbox_item),
+        )
+        .route("/api/agent-shells", get(list_agent_shells))
+        .route(
+            "/api/agent-shells/{shell_id}",
+            get(get_agent_shell).delete(kill_agent_shell),
+        )
+        .route(
+            "/api/agent-shells/{shell_id}/output",
+            get(get_agent_shell_output),
         )
         .route(
             "/api/agent-sessions/{asid}/events",
@@ -286,7 +416,7 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
 
 async fn do_list_agent_sessions(
     state: &AppState,
-    directory: Option<&str>,
+    query: &SessionQuery,
     headers: &HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
@@ -301,7 +431,7 @@ async fn do_list_agent_sessions(
 
     let sessions = manager
         .sessions()
-        .list_sessions(directory)
+        .list_sessions(query)
         .await
         .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "agent_engine_error", &e.to_string()))?;
 
@@ -657,7 +787,12 @@ async fn do_reply_agent_permission(
 
     manager
         .interactions()
-        .reply_permission(&AgentSessionId(asid.to_string()), req_id, decision)
+        .reply_permission(
+            &AgentSessionId(asid.to_string()),
+            req_id,
+            decision,
+            body.message.as_deref(),
+        )
         .await
         .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "agent_engine_error", &e.to_string()))?;
 
@@ -921,7 +1056,7 @@ async fn list_agent_sessions_global(
     Query(query): Query<AgentSessionsQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    do_list_agent_sessions(&state, query.directory.as_deref(), &headers).await
+    do_list_agent_sessions(&state, &query.to_session_query(), &headers).await
 }
 
 async fn create_agent_session_global(
@@ -1070,7 +1205,7 @@ async fn list_agent_sessions_legacy(
     Query(query): Query<AgentSessionsQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    do_list_agent_sessions(&state, query.directory.as_deref(), &headers).await
+    do_list_agent_sessions(&state, &query.to_session_query(), &headers).await
 }
 
 async fn create_agent_session_legacy(
@@ -1277,6 +1412,388 @@ async fn stream_agent_session_legacy(
     do_stream_agent_session(&state, &asid, &headers).await
 }
 
+
+
+// ---------------------------------------------------------------------------
+// Session operations added for OpenCode v2 parity. These are additive: every
+// route that existed before behaves exactly as it did.
+// ---------------------------------------------------------------------------
+
+/// The manager, or the 503 every agent route answers with when OpenCode is not
+/// reachable.
+macro_rules! manager_or_unavailable {
+    ($state:expr, $headers:expr) => {{
+        require_device($state, $headers)?;
+        match $state.agent_manager.clone() {
+            Some(manager) => manager,
+            None => {
+                return Err(api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "agent_unavailable",
+                    "Agent engine is not available",
+                ));
+            }
+        }
+    }};
+}
+
+fn engine_error(err: super::ports::engine::AgentEngineError) -> (StatusCode, Json<Value>) {
+    api_error(StatusCode::BAD_GATEWAY, "agent_engine_error", &err.to_string())
+}
+
+async fn list_agent_session_children(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    Query(query): Query<AgentSessionsQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    let mut session_query = query.to_session_query();
+    session_query.parent_id = Some(asid);
+    do_list_agent_sessions(&state, &session_query, &headers).await
+}
+
+async fn delete_agent_session_global(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    let manager = manager_or_unavailable!(&state, &headers);
+    manager
+        .driver()
+        .client()
+        .delete_session(&asid)
+        .await
+        .map_err(engine_error)?;
+    // OpenCode deletes the children too, but it also announces each one on the
+    // stream, so the mirror only has to forget this session here.
+    manager
+        .mirror()
+        .remove_session(&AgentSessionId(asid.clone()))
+        .await;
+    Ok(Json(content_envelope(json!({ "deleted": true }))))
+}
+
+async fn rename_agent_session(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<RenameSessionBody>,
+) -> ApiResult<Json<Value>> {
+    let manager = manager_or_unavailable!(&state, &headers);
+    validate_text(&body.title)?;
+    manager
+        .driver()
+        .client()
+        .rename_session(&asid, &body.title)
+        .await
+        .map_err(engine_error)?;
+    Ok(Json(content_envelope(
+        json!({ "renamed": true, "title": body.title }),
+    )))
+}
+
+async fn clear_agent_session_revert(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    let manager = manager_or_unavailable!(&state, &headers);
+    manager
+        .driver()
+        .client()
+        .clear_revert(&asid)
+        .await
+        .map_err(engine_error)?;
+    Ok(Json(content_envelope(json!({ "cleared": true }))))
+}
+
+async fn compact_agent_session(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    headers: HeaderMap,
+    body: Option<Json<CompactBody>>,
+) -> ApiResult<Json<Value>> {
+    let manager = manager_or_unavailable!(&state, &headers);
+    let delivery = body.and_then(|Json(b)| b.delivery);
+    let res = manager
+        .driver()
+        .client()
+        .compact_session(&asid, delivery.as_deref())
+        .await
+        .map_err(engine_error)?;
+    // The reply is the inbox item the request was admitted as.
+    Ok(Json(content_envelope(json!({
+        "requested": true,
+        "item": res.get("data").cloned().unwrap_or(Value::Null),
+    }))))
+}
+
+async fn get_agent_session_context(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    let manager = manager_or_unavailable!(&state, &headers);
+    let messages = manager
+        .driver()
+        .client()
+        .get_context(&asid)
+        .await
+        .map_err(engine_error)?;
+
+    // The context window's token totals are the last assistant message's, which
+    // is what "context used" is measured against.
+    let tokens = messages
+        .iter()
+        .rev()
+        .find_map(|m| m.get("tokens").cloned())
+        .filter(|t| !t.is_null());
+
+    Ok(Json(content_envelope(json!({
+        "messages": messages.len(),
+        "tokens": tokens,
+    }))))
+}
+
+async fn background_agent_session(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    let manager = manager_or_unavailable!(&state, &headers);
+    manager
+        .driver()
+        .client()
+        .background_session(&asid)
+        .await
+        .map_err(engine_error)?;
+    // OpenCode has no event for this, so the tool cards are marked here.
+    manager
+        .mirror()
+        .mark_running_tools_backgrounded(&AgentSessionId(asid))
+        .await;
+    Ok(Json(content_envelope(json!({ "backgrounded": true }))))
+}
+
+async fn wait_agent_session(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    let manager = manager_or_unavailable!(&state, &headers);
+    manager
+        .driver()
+        .client()
+        .wait_session(&asid)
+        .await
+        .map_err(engine_error)?;
+    Ok(Json(content_envelope(json!({ "idle": true }))))
+}
+
+async fn view_agent_session(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    headers: HeaderMap,
+    body: Option<Json<ViewSessionBody>>,
+) -> ApiResult<Json<Value>> {
+    let manager = manager_or_unavailable!(&state, &headers);
+    let idle = body.and_then(|Json(b)| b.idle).unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    });
+    manager
+        .driver()
+        .client()
+        .view_session(&asid, idle)
+        .await
+        .map_err(engine_error)?;
+    Ok(Json(content_envelope(json!({ "viewed": idle }))))
+}
+
+async fn export_agent_session(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    Query(query): Query<ExportQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    let manager = manager_or_unavailable!(&state, &headers);
+    // Sanitized by default: an export leaves the device.
+    let sanitize = query.sanitize.unwrap_or(true);
+    let res = manager
+        .driver()
+        .client()
+        .export_session(&asid, sanitize)
+        .await
+        .map_err(engine_error)?;
+    Ok(Json(content_envelope(
+        res.get("data").cloned().unwrap_or(res),
+    )))
+}
+
+async fn run_agent_session_command(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<RunCommandBody>,
+) -> ApiResult<Json<Value>> {
+    let manager = manager_or_unavailable!(&state, &headers);
+    let name = body.name.trim().trim_start_matches('/');
+    if name.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_command",
+            "name must not be empty",
+        ));
+    }
+    let arguments = body.arguments.unwrap_or_default();
+    if !arguments.is_empty() {
+        validate_text(&arguments)?;
+    }
+    manager
+        .driver()
+        .client()
+        .run_command(&asid, name, &arguments, body.delivery.as_deref())
+        .await
+        .map_err(engine_error)?;
+    Ok(Json(content_envelope(json!({ "submitted": true }))))
+}
+
+async fn get_agent_inbox(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    let manager = manager_or_unavailable!(&state, &headers);
+    let items = manager
+        .driver()
+        .client()
+        .get_inbox(&asid)
+        .await
+        .map_err(engine_error)?;
+    // Refresh the mirror so a later snapshot and the stream agree.
+    manager
+        .mirror()
+        .set_inbox(&AgentSessionId(asid), items.clone())
+        .await;
+    Ok(Json(content_envelope(json!({ "items": items }))))
+}
+
+async fn cancel_agent_inbox_item(
+    State(state): State<AppState>,
+    Path((asid, inbox_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    let manager = manager_or_unavailable!(&state, &headers);
+    manager
+        .driver()
+        .client()
+        .cancel_inbox_item(&asid, &inbox_id)
+        .await
+        .map_err(engine_error)?;
+    manager
+        .mirror()
+        .upsert_inbox_item(&AgentSessionId(asid), &inbox_id, None)
+        .await;
+    Ok(Json(content_envelope(json!({ "cancelled": true }))))
+}
+
+async fn steer_agent_inbox_item(
+    State(state): State<AppState>,
+    Path((asid, inbox_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    set_inbox_delivery(state, asid, inbox_id, "steer", headers).await
+}
+
+async fn queue_agent_inbox_item(
+    State(state): State<AppState>,
+    Path((asid, inbox_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    set_inbox_delivery(state, asid, inbox_id, "queue", headers).await
+}
+
+async fn set_inbox_delivery(
+    state: AppState,
+    asid: String,
+    inbox_id: String,
+    delivery: &str,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    let manager = manager_or_unavailable!(&state, &headers);
+    manager
+        .driver()
+        .client()
+        .set_inbox_delivery(&asid, &inbox_id, delivery)
+        .await
+        .map_err(engine_error)?;
+    Ok(Json(content_envelope(
+        json!({ "delivery": delivery, "inbox_id": inbox_id }),
+    )))
+}
+
+async fn list_agent_shells(
+    State(state): State<AppState>,
+    Query(query): Query<AgentCatalogQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    let manager = manager_or_unavailable!(&state, &headers);
+    let shells = manager
+        .driver()
+        .client()
+        .list_shells(query.directory.as_deref())
+        .await
+        .map_err(engine_error)?;
+    Ok(Json(content_envelope(json!(shells))))
+}
+
+async fn get_agent_shell(
+    State(state): State<AppState>,
+    Path(shell_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    let manager = manager_or_unavailable!(&state, &headers);
+    let shell = manager
+        .driver()
+        .client()
+        .get_shell(&shell_id)
+        .await
+        .map_err(engine_error)?;
+    Ok(Json(content_envelope(shell)))
+}
+
+async fn get_agent_shell_output(
+    State(state): State<AppState>,
+    Path(shell_id): Path<String>,
+    Query(query): Query<ShellOutputQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    let manager = manager_or_unavailable!(&state, &headers);
+    let output = manager
+        .driver()
+        .client()
+        .get_shell_output(&shell_id, query.cursor, query.limit)
+        .await
+        .map_err(engine_error)?;
+    Ok(Json(content_envelope(output)))
+}
+
+async fn kill_agent_shell(
+    State(state): State<AppState>,
+    Path(shell_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    let manager = manager_or_unavailable!(&state, &headers);
+    manager
+        .driver()
+        .client()
+        .kill_shell(&shell_id)
+        .await
+        .map_err(engine_error)?;
+    Ok(Json(content_envelope(json!({ "killed": true }))))
+}
 
 #[cfg(test)]
 mod tests {

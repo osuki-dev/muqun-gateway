@@ -63,6 +63,20 @@ pub struct TokensUsage {
     pub cache_write: Option<u64>,
 }
 
+/// The filters `GET /api/session` accepts, in the gateway's own vocabulary.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionQuery {
+    pub directory: Option<String>,
+    /// A session id to list the children of, or `Some("null")` for top-level
+    /// sessions only. OpenCode takes the literal string `null` for that.
+    pub parent_id: Option<String>,
+    pub limit: Option<usize>,
+    /// `asc` or `desc`.
+    pub order: Option<String>,
+    pub search: Option<String>,
+    pub cursor: Option<String>,
+}
+
 /// `Session.Info.revert`: a staged rollback the user can still cancel.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionRevertInfo {

@@ -3,7 +3,8 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::agent::domain::{
-    AgentCatalog, AgentProject, AgentSessionInfo, ModelRef, PermissionDecision, TimelineItem,
+    AgentCatalog, AgentProject, AgentSessionInfo, FormRequest, ModelRef, PermissionDecision,
+    PermissionRequest, SessionQuery, TimelineItem,
 };
 
 pub type EngineFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, AgentEngineError>> + Send + 'a>>;
@@ -49,8 +50,9 @@ pub trait AgentEnginePort: Send + Sync {
     /// List known projects / workspaces
     fn list_projects(&self) -> EngineFuture<'_, Vec<AgentProject>>;
 
-    /// List active sessions, optionally filtered by directory
-    fn list_sessions<'a>(&'a self, directory: Option<&'a str>) -> EngineFuture<'a, Vec<AgentSessionInfo>>;
+    /// List sessions, optionally filtered by directory, parent and search
+    fn list_sessions<'a>(&'a self, query: &'a SessionQuery)
+        -> EngineFuture<'a, Vec<AgentSessionInfo>>;
 
     /// Create a new session
     fn create_session<'a>(
@@ -104,12 +106,13 @@ pub trait AgentEnginePort: Send + Sync {
         directory: Option<&'a str>,
     ) -> EngineFuture<'a, Vec<serde_json::Value>>;
 
-    /// Reply to a permission request
+    /// Reply to a permission request, optionally with a rejection reason
     fn reply_permission<'a>(
         &'a self,
         session_id: &'a str,
         request_id: &'a str,
         decision: PermissionDecision,
+        message: Option<&'a str>,
     ) -> EngineFuture<'a, ()>;
 
     /// Reply to an interactive form
@@ -130,6 +133,17 @@ pub trait AgentEnginePort: Send + Sync {
         session_id: &'a str,
         mode: &'a str,
     ) -> EngineFuture<'a, Vec<FileDiffItem>>;
+
+    /// Permission requests still pending for a session. Used to catch up on
+    /// anything raised while the event stream was down -- `/api/event` is
+    /// volatile by contract and events during a disconnect are lost.
+    fn get_pending_permissions<'a>(
+        &'a self,
+        session_id: &'a str,
+    ) -> EngineFuture<'a, Vec<PermissionRequest>>;
+
+    /// Forms still pending for a session, for the same reason.
+    fn get_pending_forms<'a>(&'a self, session_id: &'a str) -> EngineFuture<'a, Vec<FormRequest>>;
 
     /// Fetch historical timeline items for a session
     fn get_timeline<'a>(

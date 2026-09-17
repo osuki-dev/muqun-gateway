@@ -19,8 +19,11 @@ impl InteractionService {
         asid: &AgentSessionId,
         request_id: &str,
         decision: PermissionDecision,
+        message: Option<&str>,
     ) -> Result<(), AgentEngineError> {
-        self.engine.reply_permission(&asid.0, request_id, decision).await?;
+        self.engine
+            .reply_permission(&asid.0, request_id, decision, message)
+            .await?;
         self.mirror.resolve_permission(asid, request_id).await;
         Ok(())
     }

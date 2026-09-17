@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use crate::agent::domain::{
-    AgentCatalog, AgentProject, AgentSessionInfo, ModelRef, PermissionDecision,
+    AgentCatalog, AgentProject, AgentSessionInfo, ModelRef, PermissionDecision, SessionQuery,
 };
+use super::client::SessionListFilter;
 use crate::agent::ports::engine::{AgentEngineError, AgentEnginePort, EngineFuture, FileDiffItem};
 use super::client::OpencodeClient;
 use super::discovery::OpencodeEndpoint;
@@ -44,9 +45,22 @@ impl AgentEnginePort for OpencodeDriver {
         })
     }
 
-    fn list_sessions<'a>(&'a self, directory: Option<&'a str>) -> EngineFuture<'a, Vec<AgentSessionInfo>> {
+    fn list_sessions<'a>(
+        &'a self,
+        query: &'a SessionQuery,
+    ) -> EngineFuture<'a, Vec<AgentSessionInfo>> {
         Box::pin(async move {
-            let raw_sessions = self.client.list_sessions(directory).await?;
+            let filter = SessionListFilter {
+                parent_id: query.parent_id.as_deref(),
+                limit: query.limit,
+                order: query.order.as_deref(),
+                search: query.search.as_deref(),
+                cursor: query.cursor.as_deref(),
+            };
+            let raw_sessions = self
+                .client
+                .list_sessions(query.directory.as_deref(), &filter)
+                .await?;
             let sessions = raw_sessions.iter().filter_map(mapper::map_session).collect();
             Ok(sessions)
         })
@@ -144,6 +158,7 @@ impl AgentEnginePort for OpencodeDriver {
         session_id: &'a str,
         request_id: &'a str,
         decision: PermissionDecision,
+        message: Option<&'a str>,
     ) -> EngineFuture<'a, ()> {
         Box::pin(async move {
             let reply_str = match decision {
@@ -151,7 +166,9 @@ impl AgentEnginePort for OpencodeDriver {
                 PermissionDecision::AllowAlways => "always",
                 PermissionDecision::Deny => "reject",
             };
-            self.client.reply_permission(session_id, request_id, reply_str).await?;
+            self.client
+                .reply_permission(session_id, request_id, reply_str, message)
+                .await?;
             Ok(())
         })
     }
@@ -170,16 +187,69 @@ impl AgentEnginePort for OpencodeDriver {
 
     fn get_catalog<'a>(&'a self, directory: Option<&'a str>) -> EngineFuture<'a, AgentCatalog> {
         Box::pin(async move {
-            let raw_models = self.client.get_models(directory).await.unwrap_or_default();
-            let raw_agents = self.client.get_agents(directory).await.unwrap_or_default();
-            let raw_mcp = self.client.get_mcp(directory).await.unwrap_or_default();
-            let raw_skills = self.client.get_skills(directory).await.unwrap_or_default();
+            // One failing fan-out arm must not empty the whole catalog, but it
+            // is worth saying which one failed.
+            let log = |what: &str, err: &AgentEngineError| {
+                tracing::warn!(surface = what, %err, "catalog fan-out arm failed");
+            };
+            let raw_models = self
+                .client
+                .get_models(directory)
+                .await
+                .inspect_err(|e| log("model", e))
+                .unwrap_or_default();
+            let raw_agents = self
+                .client
+                .get_agents(directory)
+                .await
+                .inspect_err(|e| log("agent", e))
+                .unwrap_or_default();
+            let raw_mcp = self
+                .client
+                .get_mcp(directory)
+                .await
+                .inspect_err(|e| log("mcp", e))
+                .unwrap_or_default();
+            let raw_skills = self
+                .client
+                .get_skills(directory)
+                .await
+                .inspect_err(|e| log("skill", e))
+                .unwrap_or_default();
+            let raw_providers = self
+                .client
+                .get_providers(directory)
+                .await
+                .inspect_err(|e| log("provider", e))
+                .unwrap_or_default();
+            let raw_commands = self
+                .client
+                .get_commands(directory)
+                .await
+                .inspect_err(|e| log("command", e))
+                .unwrap_or_default();
+            let default_model = self
+                .client
+                .get_default_model(directory)
+                .await
+                .inspect_err(|e| log("model/default", e))
+                .unwrap_or_default();
+            let config = self
+                .client
+                .get_config(directory)
+                .await
+                .inspect_err(|e| log("config", e))
+                .unwrap_or_default();
 
+            let models = mapper::map_models(&raw_models);
             Ok(AgentCatalog {
-                models: mapper::map_models(&raw_models),
                 agents: mapper::map_agents(&raw_agents),
                 mcp: mapper::map_mcp(&raw_mcp),
                 skills: mapper::map_skills(&raw_skills),
+                providers: mapper::map_providers(&raw_providers, &models),
+                commands: mapper::map_commands(&raw_commands),
+                defaults: mapper::map_catalog_defaults(default_model.as_ref(), &config),
+                models,
             })
         })
     }
@@ -223,6 +293,34 @@ impl AgentEnginePort for OpencodeDriver {
                 });
             }
             Ok(diffs)
+        })
+    }
+
+    fn get_pending_permissions<'a>(
+        &'a self,
+        session_id: &'a str,
+    ) -> EngineFuture<'a, Vec<crate::agent::domain::PermissionRequest>> {
+        Box::pin(async move {
+            let raw = self.client.get_session_permissions(session_id).await?;
+            let asid = crate::agent::domain::AgentSessionId(session_id.to_string());
+            Ok(raw
+                .iter()
+                .filter_map(|p| mapper::map_permission_request(p, &asid))
+                .collect())
+        })
+    }
+
+    fn get_pending_forms<'a>(
+        &'a self,
+        session_id: &'a str,
+    ) -> EngineFuture<'a, Vec<crate::agent::domain::FormRequest>> {
+        Box::pin(async move {
+            let raw = self.client.get_session_forms(session_id).await?;
+            let asid = crate::agent::domain::AgentSessionId(session_id.to_string());
+            Ok(raw
+                .iter()
+                .filter_map(|f| mapper::map_form_request(f, &asid))
+                .collect())
         })
     }
 

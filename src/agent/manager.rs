@@ -220,7 +220,10 @@ impl AgentManager {
         let driver = Arc::new(OpencodeDriver::new(endpoint.clone()));
         let mirror = Arc::new(MemoryMirror::new());
 
-        let session_service = Arc::new(SessionService::new(driver.clone(), mirror.clone()));
+        let session_service = Arc::new(SessionService::with_memory_mirror(
+            driver.clone(),
+            mirror.clone(),
+        ));
         let prompt_service = Arc::new(PromptService::new(driver.clone(), mirror.clone()));
         let interaction_service = Arc::new(InteractionService::new(driver.clone(), mirror.clone()));
 
