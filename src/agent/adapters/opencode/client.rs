@@ -101,6 +101,16 @@ impl OpencodeClient {
         self.handle_resp(resp).await
     }
 
+    pub async fn put(&self, path: &str, body: &Value) -> Result<Value, AgentEngineError> {
+        let url = format!("{}{path}", self.endpoint.url);
+        let req = self.authed_req(self.http.put(&url).json(body));
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| AgentEngineError::Network(e.to_string()))?;
+        self.handle_resp(resp).await
+    }
+
     pub async fn list_projects(&self) -> Result<Vec<Value>, AgentEngineError> {
         let res = self.get_plain("/api/project").await?;
         if let Some(arr) = res.as_array() {
@@ -505,6 +515,43 @@ impl OpencodeClient {
             .get_plain(&format!("/api/session/{session_id}/permission"))
             .await?;
         Ok(res.get("data").and_then(Value::as_array).cloned().unwrap_or_default())
+    }
+
+    // -----------------------------------------------------------------
+    // Session-scoped permission rules
+    // -----------------------------------------------------------------
+
+    /// The rules currently attached to a session, as `Session.Info` carries
+    /// them. There is no endpoint that reads the ruleset on its own -- the
+    /// session document is where it lives -- and a session with no rules omits
+    /// the field entirely, which reads the same as an empty ruleset.
+    pub async fn get_session_permission_rules(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<Value>, AgentEngineError> {
+        let raw = self.get_session(session_id).await?;
+        let info = raw.get("data").unwrap_or(&raw);
+        Ok(info
+            .get("permissions")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// `PUT /api/session/{id}/permission/rules` **replaces** the session's
+    /// ruleset, so anything already on the session has to be sent back with
+    /// whatever is being added. Answers `204`.
+    pub async fn set_session_permission_rules(
+        &self,
+        session_id: &str,
+        rules: &[Value],
+    ) -> Result<(), AgentEngineError> {
+        self.put(
+            &format!("/api/session/{session_id}/permission/rules"),
+            &json!({ "permissions": rules }),
+        )
+        .await?;
+        Ok(())
     }
 
     pub async fn get_session_forms(&self, session_id: &str) -> Result<Vec<Value>, AgentEngineError> {
