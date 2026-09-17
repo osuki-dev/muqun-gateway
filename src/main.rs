@@ -582,6 +582,18 @@ struct Config {
     /// Existing encrypted device records keep working after this changes.
     #[serde(default, skip_serializing_if = "is_required_transport")]
     transport_encryption: TransportEncryptionMode,
+    /// Answer every device route without asking for a token at all.
+    ///
+    /// For a mock or harness that has no pairing to offer and talks to a
+    /// gateway bound to loopback. It is not a transport setting and is not
+    /// implied by `transport_encryption: disabled`: cleartext means no
+    /// envelope, never no authentication. Off unless the owner writes it, and
+    /// said loudly at startup when it is on.
+    ///
+    /// Omitted from a written config when false, so an existing `config.json`
+    /// round-trips untouched.
+    #[serde(default, skip_serializing_if = "is_false")]
+    dev_unauthenticated: bool,
     sessions: Vec<SessionConfig>,
     /// Explicit opt-in by session ID; adding a backend never enables startup.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1226,6 +1238,7 @@ fn setup(
             public_url: public_url.clone(),
             token_hash,
             transport_encryption: TransportEncryptionMode::Required,
+            dev_unauthenticated: false,
             sessions: Vec::new(),
             autostart_backends: Vec::new(),
             agent_commands: BTreeMap::new(),
@@ -2079,6 +2092,8 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     // Read before `config` moves into the state, and printed after the routes
     // are built so it is the last thing on screen rather than the first.
     let listen_warning = unreachable_listen_warning(&config.listen, &config.public_url);
+    // Same reason: read before `config` moves, said after the routes are up.
+    let dev_unauthenticated = config.dev_unauthenticated;
 
     // Bind successfully before starting anything on the user's behalf.
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -2274,6 +2289,16 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
 
     if let Some(warning) = listen_warning {
         eprintln!("{warning}");
+    }
+    if dev_unauthenticated {
+        // Said every time, on stderr, unmissably: this is the one setting that
+        // hands the API to anything that can reach the port.
+        eprintln!(
+            "SECURITY WARNING: dev_unauthenticated is on -- every device route \
+             answers WITHOUT a token, to anything that can reach {addr}. This is \
+             for a local mock only. Remove \"dev_unauthenticated\" from config.json \
+             to turn it off."
+        );
     }
     println!("terminal gateway listening on http://{addr}");
     axum::serve(listener, app).await?;
@@ -11071,6 +11096,11 @@ fn backend_api_error(error: BackendError) -> (StatusCode, Json<Value>) {
 
 pub(crate) type ApiResult<T> = Result<T, (StatusCode, Json<Value>)>;
 
+/// The caller identity recorded for a request that was let through without a
+/// token, which only `dev_unauthenticated` can produce. It is deliberately
+/// unlike any real device id.
+const DEV_UNAUTHENTICATED_DEVICE: &str = "dev-unauthenticated-device";
+
 fn bearer_token(headers: &HeaderMap) -> ApiResult<&str> {
     let Some(value) = headers.get(axum::http::header::AUTHORIZATION) else {
         return Err(api_error(
@@ -11101,7 +11131,13 @@ fn bearer_token(headers: &HeaderMap) -> ApiResult<&str> {
 /// and these routes can run commands on the host.
 pub(crate) fn require_device(state: &AppState, headers: &HeaderMap) -> ApiResult<String> {
     if state.config.transport_encryption == TransportEncryptionMode::Disabled {
-        if let Ok(token) = bearer_token(headers) {
+        // Cleartext mode drops the envelope and the per-device transport
+        // proof; it does not drop authentication. A device paired while
+        // encryption was on still holds a `transport_key` and will never send
+        // a proof over cleartext, so the proof check is the part that is
+        // skipped here -- the token is still the token.
+        let token = bearer_token(headers);
+        if let Ok(token) = token {
             let mut devices = lock_devices(state)?;
             if let Some(device_id) = identify_device(&devices, token) {
                 let _ = authority::touch_device(
@@ -11116,7 +11152,17 @@ pub(crate) fn require_device(state: &AppState, headers: &HeaderMap) -> ApiResult
                 return Ok("admin".to_string());
             }
         }
-        return Ok("dev-unencrypted-device".to_string());
+        if state.config.dev_unauthenticated {
+            return Ok(DEV_UNAUTHENTICATED_DEVICE.to_string());
+        }
+        // Absent or malformed is 401 and a wrong token is 403, exactly as in
+        // the encrypted mode: the two answers must not diverge by mode.
+        token?;
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "invalid_token",
+            "invalid token",
+        ));
     }
 
     let token = bearer_token(headers)?;
@@ -13380,6 +13426,7 @@ mod tests {
             public_url: "http://127.0.0.1:23100".into(),
             token_hash: hash_token(token),
             transport_encryption: TransportEncryptionMode::Required,
+            dev_unauthenticated: false,
             sessions: vec![SessionConfig {
                 id: "default".into(),
                 label: "Default".into(),
@@ -15078,6 +15125,110 @@ mod tests {
             now_unix_ms(),
         )
         .is_err());
+    }
+
+    /// Cleartext mode drops the envelope, not the door.
+    ///
+    /// `transport_encryption: disabled` used to make `require_device` answer
+    /// `Ok` for *every* request, including one with no `Authorization` header
+    /// at all -- so on a gateway configured that way the entire device API,
+    /// uploads and agent routes included, answered anyone who could reach the
+    /// port. The mode is about the envelope around a request; it was never
+    /// meant to be about whether the request is authenticated, and the setup
+    /// warning it prints ("a leaked bearer token can call the API") says as
+    /// much.
+    #[test]
+    fn cleartext_mode_still_asks_for_a_token() {
+        let token = "device-token";
+        let mut state = test_state("admin-token", vec![test_device("phone-1", token)]);
+        state.config.transport_encryption = TransportEncryptionMode::Disabled;
+
+        // No header at all: 401, the same answer the encrypted mode gives.
+        let (status, body) = require_device(&state, &HeaderMap::new()).unwrap_err();
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body.0["error"]["code"], "missing_authorization");
+
+        // A token that is not a device's and not the admin's: 403.
+        let (status, body) = require_device(&state, &bearer_headers("guessed")).unwrap_err();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body.0["error"]["code"], "invalid_token");
+
+        // A malformed header is not a way past either.
+        let mut malformed = HeaderMap::new();
+        malformed.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("device-token"),
+        );
+        assert_eq!(
+            require_device(&state, &malformed).unwrap_err().0,
+            StatusCode::UNAUTHORIZED
+        );
+
+        // The paired device still gets in, and is still identified as itself.
+        assert_eq!(require_device(&state, &bearer_headers(token)).unwrap(), "phone-1");
+        // As does the admin token, which this mode has always accepted here.
+        assert_eq!(
+            require_device(&state, &bearer_headers("admin-token")).unwrap(),
+            "admin"
+        );
+
+        // First-run pairing has no token to send and must stay reachable. It
+        // does not come through here at all -- `/api/pair/request` and
+        // `/api/pair/claim` go through `require_pairing_transport` -- and
+        // `manual_pairing_omits_the_transport_key_when_encryption_is_disabled`
+        // drives both with no headers whatsoever in this very mode.
+    }
+
+    /// A device paired while encryption was on keeps a `transport_key` it will
+    /// never prove over cleartext. The proof is the part cleartext skips --
+    /// tightening the token check must not quietly start demanding it.
+    #[test]
+    fn cleartext_mode_admits_a_device_that_was_paired_with_a_transport_key() {
+        let mut device = test_device("phone-1", "device-token");
+        device.transport_key = Some("a-key-from-when-encryption-was-on".into());
+        let mut state = test_state("admin-token", vec![device]);
+        state.config.transport_encryption = TransportEncryptionMode::Disabled;
+
+        assert_eq!(
+            require_device(&state, &bearer_headers("device-token")).unwrap(),
+            "phone-1",
+            "cleartext drops the envelope and the proof, never the token"
+        );
+    }
+
+    /// The old behaviour survives only as a thing the owner writes down.
+    #[test]
+    fn only_an_explicit_opt_in_answers_without_a_token() {
+        let mut state = test_state("admin-token", vec![test_device("phone-1", "device-token")]);
+        state.config.transport_encryption = TransportEncryptionMode::Disabled;
+        state.config.dev_unauthenticated = true;
+
+        assert_eq!(
+            require_device(&state, &HeaderMap::new()).unwrap(),
+            DEV_UNAUTHENTICATED_DEVICE
+        );
+        // A real device is still identified as itself, not as the stand-in:
+        // the opt-in is a fallback, not a replacement for the token check.
+        assert_eq!(
+            require_device(&state, &bearer_headers("device-token")).unwrap(),
+            "phone-1"
+        );
+
+        // It is off unless written, and writing nothing writes nothing.
+        assert!(!test_config("admin-token").dev_unauthenticated);
+        let round_tripped = serde_json::to_value(test_config("admin-token")).unwrap();
+        assert!(
+            round_tripped.get("dev_unauthenticated").is_none(),
+            "an existing config.json must round-trip untouched"
+        );
+
+        // And it grants nothing in the encrypted mode, where there is no
+        // cleartext story to tell in the first place.
+        state.config.transport_encryption = TransportEncryptionMode::Required;
+        assert_eq!(
+            require_device(&state, &HeaderMap::new()).unwrap_err().0,
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     #[tokio::test]

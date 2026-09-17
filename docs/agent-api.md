@@ -11,7 +11,9 @@ verbatim, so their keys stay camelCase.
 ## Conventions
 
 - **Auth.** Every route requires a paired device (`Authorization: Bearer
-  <device token>`); an unpaired or revoked device gets `401`/`403`.
+  <device token>`); a missing or malformed header is `401` and an unpaired or
+  revoked device is `403`. This holds in every transport mode — a gateway with
+  `transport_encryption: disabled` drops the envelope, not the token.
 - **Envelope.** A successful JSON body is wrapped:
   `{"schema_version": "...", "capabilities": {...}, "data": <payload>}`. The
   payload column below describes `data`.
