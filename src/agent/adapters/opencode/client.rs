@@ -1,4 +1,4 @@
-use reqwest::{Client, Response};
+use reqwest::{Client, Response, StatusCode};
 use serde_json::{json, Value};
 use std::time::Duration;
 
@@ -35,8 +35,17 @@ impl OpencodeClient {
                 "HTTP {status}: {err_text}"
             )));
         }
-        resp.json::<Value>()
+        if status == StatusCode::NO_CONTENT {
+            return Ok(json!({ "success": true }));
+        }
+        let bytes = resp
+            .bytes()
             .await
+            .map_err(|e| AgentEngineError::Network(e.to_string()))?;
+        if bytes.is_empty() {
+            return Ok(json!({ "success": true }));
+        }
+        serde_json::from_slice::<Value>(&bytes)
             .map_err(|e| AgentEngineError::Protocol(e.to_string()))
     }
 
@@ -58,6 +67,14 @@ impl OpencodeClient {
             .await
             .map_err(|e| AgentEngineError::Network(e.to_string()))?;
         self.handle_resp(resp).await
+    }
+
+    pub async fn list_projects(&self) -> Result<Vec<Value>, AgentEngineError> {
+        let res = self.get("/api/project", &[]).await?;
+        if let Some(arr) = res.as_array() {
+            return Ok(arr.clone());
+        }
+        Ok(res.get("data").and_then(Value::as_array).cloned().unwrap_or_default())
     }
 
     pub async fn list_sessions(&self, directory: Option<&str>) -> Result<Vec<Value>, AgentEngineError> {
@@ -85,6 +102,11 @@ impl OpencodeClient {
                 "id": m.model_id,
                 "variant": m.variant
             });
+        } else {
+            body["model"] = json!({
+                "providerID": "opencode",
+                "id": "big-pickle"
+            });
         }
         if let Some(a) = agent {
             body["agent"] = json!(a);
@@ -104,6 +126,9 @@ impl OpencodeClient {
                 &[("limit", &limit_str)],
             )
             .await?;
+        if let Some(arr) = res.as_array() {
+            return Ok(arr.clone());
+        }
         Ok(res.get("data").and_then(Value::as_array).cloned().unwrap_or_default())
     }
 
@@ -112,12 +137,55 @@ impl OpencodeClient {
         session_id: &str,
         text: &str,
         attachments: &[String],
+        delivery: Option<&str>,
     ) -> Result<Value, AgentEngineError> {
         let mut body = json!({ "text": text });
         if !attachments.is_empty() {
-            body["attachments"] = json!(attachments);
+            let files: Vec<Value> = attachments
+                .iter()
+                .map(|att| {
+                    let name = std::path::Path::new(att)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("attachment");
+                    let uri = if att.starts_with("file://")
+                        || att.starts_with("http://")
+                        || att.starts_with("https://")
+                        || att.starts_with("data:")
+                    {
+                        att.clone()
+                    } else {
+                        format!("file://{att}")
+                    };
+                    json!({
+                        "uri": uri,
+                        "name": name,
+                    })
+                })
+                .collect();
+            body["files"] = json!(files);
+        }
+        if let Some(del) = delivery {
+            if del == "steer" || del == "queue" {
+                body["delivery"] = json!(del);
+            }
         }
         self.post(&format!("/api/session/{session_id}/prompt"), &body)
+            .await
+    }
+
+    pub async fn revert_session(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<Value, AgentEngineError> {
+        let stage_body = json!({
+            "messageID": message_id,
+            "files": true,
+        });
+        self.post(&format!("/api/session/{session_id}/revert/stage"), &stage_body)
+            .await?;
+        self.post(&format!("/api/session/{session_id}/revert/commit"), &json!({}))
             .await
     }
 
@@ -131,12 +199,29 @@ impl OpencodeClient {
         session_id: &str,
         model: &crate::agent::domain::ModelRef,
     ) -> Result<Value, AgentEngineError> {
-        let body = json!({
+        let mut model_obj = json!({
             "providerID": model.provider_id,
             "id": model.model_id,
-            "variant": model.variant
+        });
+        if let Some(ref v) = model.variant {
+            model_obj["variant"] = json!(v);
+        }
+        let body = json!({
+            "model": model_obj,
         });
         self.post(&format!("/api/session/{session_id}/model"), &body)
+            .await
+    }
+
+    pub async fn switch_agent(
+        &self,
+        session_id: &str,
+        agent: &str,
+    ) -> Result<Value, AgentEngineError> {
+        let body = json!({
+            "agent": agent,
+        });
+        self.post(&format!("/api/session/{session_id}/agent"), &body)
             .await
     }
 
@@ -206,5 +291,29 @@ impl OpencodeClient {
         }
         let res = self.get("/api/vcs/diff", &query).await?;
         Ok(res.get("data").and_then(Value::as_array).cloned().unwrap_or_default())
+    }
+
+    pub async fn get_skills(&self, directory: Option<&str>) -> Result<Vec<Value>, AgentEngineError> {
+        let mut query = Vec::new();
+        if let Some(d) = directory {
+            query.push(("directory", d));
+        }
+        let res = self.get("/api/skill", &query).await?;
+        Ok(res.get("data").and_then(Value::as_array).cloned().unwrap_or_default())
+    }
+
+    pub async fn find_files(&self, query: &str, limit: usize) -> Result<Vec<Value>, AgentEngineError> {
+        let limit_str = limit.to_string();
+        if query.trim().is_empty() {
+            let res = self.get("/api/fs/list", &[("limit", limit_str.as_str())]).await?;
+            Ok(res.get("data").and_then(Value::as_array).cloned().unwrap_or_default())
+        } else {
+            let query_params = [
+                ("query", query),
+                ("limit", limit_str.as_str()),
+            ];
+            let res = self.get("/api/fs/find", &query_params).await?;
+            Ok(res.get("data").and_then(Value::as_array).cloned().unwrap_or_default())
+        }
     }
 }

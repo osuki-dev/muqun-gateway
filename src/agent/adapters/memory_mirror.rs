@@ -3,8 +3,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::agent::domain::{
-    AgentDomainEvent, AgentPart, AgentSessionId, AgentSessionInfo, FormRequest,
-    PermissionRequest, TimelineItem,
+    AgentDomainEvent, AgentPart, AgentSessionId, AgentSessionInfo, AgentSessionStatus, FormRequest,
+    PermissionRequest, TimelineItem, TimelineRole,
 };
 use crate::agent::ports::mirror::{AgentSessionSnapshot, MirrorFuture, SessionMirrorPort};
 
@@ -56,6 +56,36 @@ impl MemoryMirror {
         }
     }
 
+    pub async fn update_status(&self, asid: &AgentSessionId, status: AgentSessionStatus) -> Option<u64> {
+        let mut sessions = self.sessions.write().await;
+        let state = sessions.entry(asid.clone()).or_insert_with(|| {
+            SessionState::new(AgentSessionInfo {
+                asid: asid.clone(),
+                backend_session_id: asid.0.clone(),
+                title: "Session".to_string(),
+                agent: Some("build".to_string()),
+                model: None,
+                status: AgentSessionStatus::Idle,
+                directory: None,
+                cost: None,
+                tokens: None,
+                limit: None,
+                parent_id: None,
+                project_id: None,
+                updated_ms: 0,
+            })
+        });
+        state.info.status = status;
+        let seq = state.next_seq();
+        let event = AgentDomainEvent::SessionUpdated {
+            asid: asid.clone(),
+            info: state.info.clone(),
+            seq,
+        };
+        state.push_event(event);
+        Some(seq)
+    }
+
     /// Direct helper to append streaming text/reasoning chunk to existing timeline item
     pub async fn append_text_delta(
         &self,
@@ -65,8 +95,30 @@ impl MemoryMirror {
         is_reasoning: bool,
     ) -> Option<u64> {
         let mut sessions = self.sessions.write().await;
-        let state = sessions.get_mut(asid)?;
+        let state = sessions.entry(asid.clone()).or_insert_with(|| {
+            SessionState::new(AgentSessionInfo {
+                asid: asid.clone(),
+                backend_session_id: asid.0.clone(),
+                title: "Session".to_string(),
+                agent: Some("build".to_string()),
+                model: None,
+                status: AgentSessionStatus::Busy,
+                directory: None,
+                cost: None,
+                tokens: None,
+                limit: None,
+                parent_id: None,
+                project_id: None,
+                updated_ms: 0,
+            })
+        });
 
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let seq = state.next_seq();
         if let Some(item) = state.timeline.get_mut(item_id) {
             match &mut item.part {
                 AgentPart::Text { text } if !is_reasoning => {
@@ -77,13 +129,188 @@ impl MemoryMirror {
                 }
                 _ => {}
             }
-            item.updated_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            return Some(state.current_seq);
+            item.updated_ms = now;
+            item.seq = seq;
+            let event = AgentDomainEvent::TimelineUpsert {
+                asid: asid.clone(),
+                items: vec![item.clone()],
+                seq,
+            };
+            state.push_event(event);
+            Some(seq)
+        } else {
+            let part = if is_reasoning {
+                AgentPart::Reasoning {
+                    text: delta.to_string(),
+                    duration_ms: None,
+                }
+            } else {
+                AgentPart::Text {
+                    text: delta.to_string(),
+                }
+            };
+            let item = TimelineItem {
+                id: item_id.to_string(),
+                message_id: item_id.split(':').next().unwrap_or(item_id).to_string(),
+                seq,
+                updated_ms: now,
+                role: TimelineRole::Assistant,
+                part,
+                attachments: None,
+            };
+            state.timeline.insert(item_id.to_string(), item.clone());
+            let event = AgentDomainEvent::TimelineUpsert {
+                asid: asid.clone(),
+                items: vec![item],
+                seq,
+            };
+            state.push_event(event);
+            Some(seq)
         }
-        None
+    }
+
+    pub async fn set_text_content(
+        &self,
+        asid: &AgentSessionId,
+        item_id: &str,
+        full_text: &str,
+        is_reasoning: bool,
+    ) -> Option<u64> {
+        let mut sessions = self.sessions.write().await;
+        let state = sessions.entry(asid.clone()).or_insert_with(|| {
+            SessionState::new(AgentSessionInfo {
+                asid: asid.clone(),
+                backend_session_id: asid.0.clone(),
+                title: "Session".to_string(),
+                agent: Some("build".to_string()),
+                model: None,
+                status: AgentSessionStatus::Busy,
+                directory: None,
+                cost: None,
+                tokens: None,
+                limit: None,
+                parent_id: None,
+                project_id: None,
+                updated_ms: 0,
+            })
+        });
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let seq = state.next_seq();
+        if let Some(item) = state.timeline.get_mut(item_id) {
+            match &mut item.part {
+                AgentPart::Text { text } if !is_reasoning => {
+                    *text = full_text.to_string();
+                }
+                AgentPart::Reasoning { text, .. } if is_reasoning => {
+                    *text = full_text.to_string();
+                }
+                _ => {}
+            }
+            item.updated_ms = now;
+            item.seq = seq;
+            let event = AgentDomainEvent::TimelineUpsert {
+                asid: asid.clone(),
+                items: vec![item.clone()],
+                seq,
+            };
+            state.push_event(event);
+            Some(seq)
+        } else {
+            let part = if is_reasoning {
+                AgentPart::Reasoning {
+                    text: full_text.to_string(),
+                    duration_ms: None,
+                }
+            } else {
+                AgentPart::Text {
+                    text: full_text.to_string(),
+                }
+            };
+            let item = TimelineItem {
+                id: item_id.to_string(),
+                message_id: item_id.split(':').next().unwrap_or(item_id).to_string(),
+                seq,
+                updated_ms: now,
+                role: TimelineRole::Assistant,
+                part,
+                attachments: None,
+            };
+            state.timeline.insert(item_id.to_string(), item.clone());
+            let event = AgentDomainEvent::TimelineUpsert {
+                asid: asid.clone(),
+                items: vec![item],
+                seq,
+            };
+            state.push_event(event);
+            Some(seq)
+        }
+    }
+
+    pub async fn get_timeline_delta(
+        &self,
+        asid: &AgentSessionId,
+        after_seq: u64,
+    ) -> (Vec<TimelineItem>, Option<AgentSessionStatus>, bool, u64) {
+        let sessions = self.sessions.read().await;
+        let Some(state) = sessions.get(asid) else {
+            return (Vec::new(), None, false, 0);
+        };
+
+        let current_seq = state.current_seq;
+        let status = Some(state.info.status.clone());
+
+        if let Some(first) = state.event_log.front() {
+            if after_seq < first.seq() && after_seq > 0 {
+                return (Vec::new(), status, true, current_seq);
+            }
+        }
+
+        let mut items: Vec<TimelineItem> = state
+            .timeline
+            .values()
+            .filter(|it| it.seq > after_seq)
+            .cloned()
+            .collect();
+        items.sort_by_key(|it| it.seq);
+        (items, status, false, current_seq)
+    }
+
+    pub async fn get_timeline_item(
+        &self,
+        asid: &AgentSessionId,
+        item_id: &str,
+    ) -> Option<TimelineItem> {
+        let sessions = self.sessions.read().await;
+        sessions.get(asid)?.timeline.get(item_id).cloned()
+    }
+
+    pub async fn update_usage(
+        &self,
+        asid: &AgentSessionId,
+        cost: Option<f64>,
+        tokens: Option<crate::agent::domain::TokensUsage>,
+    ) -> Option<(u64, AgentSessionInfo)> {
+        let mut sessions = self.sessions.write().await;
+        let state = sessions.get_mut(asid)?;
+        if cost.is_some() {
+            state.info.cost = cost;
+        }
+        if tokens.is_some() {
+            state.info.tokens = tokens;
+        }
+        let seq = state.next_seq();
+        let event = AgentDomainEvent::SessionUpdated {
+            asid: asid.clone(),
+            info: state.info.clone(),
+            seq,
+        };
+        state.push_event(event);
+        Some((seq, state.info.clone()))
     }
 }
 
@@ -288,6 +515,9 @@ mod tests {
             directory: None,
             cost: None,
             tokens: None,
+            limit: None,
+            parent_id: None,
+            project_id: None,
             updated_ms: 1000,
         };
 
@@ -308,6 +538,7 @@ mod tests {
             part: AgentPart::Text { text: "Hello".to_string() },
             seq: 0,
             updated_ms: 1001,
+            attachments: None,
         };
         let seq2 = mirror.upsert_timeline_items(&asid, vec![item1]).await;
         assert_eq!(seq2, 2);

@@ -36,19 +36,26 @@ impl SessionService {
         asid: &AgentSessionId,
     ) -> Result<AgentSessionSnapshot, AgentEngineError> {
         if let Some(snapshot) = self.mirror.get_snapshot(asid).await {
-            return Ok(snapshot);
+            if !snapshot.timeline.is_empty() {
+                return Ok(snapshot);
+            }
         }
 
-        // Snapshot not yet cached in mirror -> load from engine
+        // Snapshot not yet cached or timeline empty -> load from engine
         let info = self.engine.get_session(&asid.0).await?;
         self.mirror.update_session(info.clone()).await;
+
+        let timeline = self.engine.get_timeline(&asid.0, 100).await.unwrap_or_default();
+        if !timeline.is_empty() {
+            self.mirror.upsert_timeline_items(asid, timeline.clone()).await;
+        }
 
         if let Some(snapshot) = self.mirror.get_snapshot(asid).await {
             Ok(snapshot)
         } else {
             Ok(AgentSessionSnapshot {
                 info,
-                timeline: Vec::new(),
+                timeline,
                 permissions: Vec::new(),
                 forms: Vec::new(),
                 seq: 1,
@@ -75,4 +82,18 @@ impl SessionService {
     pub async fn get_vcs_diff(&self, asid: &AgentSessionId) -> Result<Vec<FileDiffItem>, AgentEngineError> {
         self.engine.get_vcs_diff(&asid.0).await
     }
+
+    pub async fn revert_session(
+        &self,
+        asid: &AgentSessionId,
+        message_id: &str,
+    ) -> Result<(), AgentEngineError> {
+        self.engine.revert_session(&asid.0, message_id).await?;
+        let timeline = self.engine.get_timeline(&asid.0, 100).await.unwrap_or_default();
+        if !timeline.is_empty() {
+            self.mirror.upsert_timeline_items(asid, timeline).await;
+        }
+        Ok(())
+    }
 }
+

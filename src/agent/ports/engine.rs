@@ -3,7 +3,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::agent::domain::{
-    AgentCatalog, AgentSessionInfo, ModelRef, PermissionDecision,
+    AgentCatalog, AgentProject, AgentSessionInfo, ModelRef, PermissionDecision, TimelineItem,
 };
 
 pub type EngineFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, AgentEngineError>> + Send + 'a>>;
@@ -46,6 +46,9 @@ pub trait AgentEnginePort: Send + Sync {
     /// Health check / availability probe
     fn probe(&self) -> EngineFuture<'_, bool>;
 
+    /// List known projects / workspaces
+    fn list_projects(&self) -> EngineFuture<'_, Vec<AgentProject>>;
+
     /// List active sessions, optionally filtered by directory
     fn list_sessions<'a>(&'a self, directory: Option<&'a str>) -> EngineFuture<'a, Vec<AgentSessionInfo>>;
 
@@ -66,6 +69,14 @@ pub trait AgentEnginePort: Send + Sync {
         session_id: &'a str,
         text: &'a str,
         attachments: &'a [String],
+        delivery: Option<&'a str>,
+    ) -> EngineFuture<'a, ()>;
+
+    /// Revert session to a previous message and roll back file changes
+    fn revert_session<'a>(
+        &'a self,
+        session_id: &'a str,
+        message_id: &'a str,
     ) -> EngineFuture<'a, ()>;
 
     /// Interrupt current session execution
@@ -77,6 +88,20 @@ pub trait AgentEnginePort: Send + Sync {
         session_id: &'a str,
         model: &'a ModelRef,
     ) -> EngineFuture<'a, ()>;
+
+    /// Switch session active agent mode
+    fn switch_agent<'a>(
+        &'a self,
+        session_id: &'a str,
+        agent: &'a str,
+    ) -> EngineFuture<'a, ()>;
+
+    /// Search files in workspace
+    fn find_files<'a>(
+        &'a self,
+        query: &'a str,
+        limit: usize,
+    ) -> EngineFuture<'a, Vec<serde_json::Value>>;
 
     /// Reply to a permission request
     fn reply_permission<'a>(
@@ -99,4 +124,11 @@ pub trait AgentEnginePort: Send + Sync {
 
     /// Fetch VCS diff for current session
     fn get_vcs_diff<'a>(&'a self, session_id: &'a str) -> EngineFuture<'a, Vec<FileDiffItem>>;
+
+    /// Fetch historical timeline items for a session
+    fn get_timeline<'a>(
+        &'a self,
+        session_id: &'a str,
+        limit: usize,
+    ) -> EngineFuture<'a, Vec<TimelineItem>>;
 }

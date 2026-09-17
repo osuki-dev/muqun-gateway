@@ -7,7 +7,8 @@ pub mod timeline;
 
 pub use events::AgentDomainEvent;
 pub use form::{FormField, FormOption, FormRequest};
-pub use model::{AgentCatalog, AgentInfo, McpServerInfo, ModelInfo};
+pub use model::{AgentCatalog, AgentInfo, McpServerInfo, ModelInfo, ModelVariantInfo, SkillInfo};
 pub use permission::{PermissionDecision, PermissionOption, PermissionRequest};
-pub use session::{AgentSessionId, AgentSessionInfo, AgentSessionStatus, ModelRef, TokensUsage};
+pub use session::{AgentProject, AgentSessionId, AgentSessionInfo, AgentSessionStatus, ModelRef, TokensUsage};
 pub use timeline::{AgentPart, TimelineItem, TimelineRole, TodoItem, ToolCallStatus};
+

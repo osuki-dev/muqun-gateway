@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::agent::domain::{
-    AgentCatalog, AgentSessionInfo, ModelRef, PermissionDecision,
+    AgentCatalog, AgentProject, AgentSessionInfo, ModelRef, PermissionDecision,
 };
 use crate::agent::ports::engine::{AgentEngineError, AgentEnginePort, EngineFuture, FileDiffItem};
 use super::client::OpencodeClient;
@@ -33,6 +33,14 @@ impl AgentEnginePort for OpencodeDriver {
         Box::pin(async move {
             let req_client = reqwest::Client::new();
             Ok(self.client.endpoint.probe_healthy(&req_client).await)
+        })
+    }
+
+    fn list_projects(&self) -> EngineFuture<'_, Vec<AgentProject>> {
+        Box::pin(async move {
+            let raw_projects = self.client.list_projects().await?;
+            let projects = raw_projects.iter().filter_map(mapper::map_project).collect();
+            Ok(projects)
         })
     }
 
@@ -70,9 +78,21 @@ impl AgentEnginePort for OpencodeDriver {
         session_id: &'a str,
         text: &'a str,
         attachments: &'a [String],
+        delivery: Option<&'a str>,
     ) -> EngineFuture<'a, ()> {
         Box::pin(async move {
-            self.client.send_prompt(session_id, text, attachments).await?;
+            self.client.send_prompt(session_id, text, attachments, delivery).await?;
+            Ok(())
+        })
+    }
+
+    fn revert_session<'a>(
+        &'a self,
+        session_id: &'a str,
+        message_id: &'a str,
+    ) -> EngineFuture<'a, ()> {
+        Box::pin(async move {
+            self.client.revert_session(session_id, message_id).await?;
             Ok(())
         })
     }
@@ -92,6 +112,28 @@ impl AgentEnginePort for OpencodeDriver {
         Box::pin(async move {
             self.client.switch_model(session_id, model).await?;
             Ok(())
+        })
+    }
+
+    fn switch_agent<'a>(
+        &'a self,
+        session_id: &'a str,
+        agent: &'a str,
+    ) -> EngineFuture<'a, ()> {
+        Box::pin(async move {
+            self.client.switch_agent(session_id, agent).await?;
+            Ok(())
+        })
+    }
+
+    fn find_files<'a>(
+        &'a self,
+        query: &'a str,
+        limit: usize,
+    ) -> EngineFuture<'a, Vec<serde_json::Value>> {
+        Box::pin(async move {
+            let files = self.client.find_files(query, limit).await.unwrap_or_default();
+            Ok(files)
         })
     }
 
@@ -129,11 +171,13 @@ impl AgentEnginePort for OpencodeDriver {
             let raw_models = self.client.get_models(directory).await.unwrap_or_default();
             let raw_agents = self.client.get_agents(directory).await.unwrap_or_default();
             let raw_mcp = self.client.get_mcp(directory).await.unwrap_or_default();
+            let raw_skills = self.client.get_skills(directory).await.unwrap_or_default();
 
             Ok(AgentCatalog {
                 models: mapper::map_models(&raw_models),
                 agents: mapper::map_agents(&raw_agents),
                 mcp: mapper::map_mcp(&raw_mcp),
+                skills: mapper::map_skills(&raw_skills),
             })
         })
     }
@@ -155,6 +199,18 @@ impl AgentEnginePort for OpencodeDriver {
                 });
             }
             Ok(diffs)
+        })
+    }
+
+    fn get_timeline<'a>(
+        &'a self,
+        session_id: &'a str,
+        limit: usize,
+    ) -> EngineFuture<'a, Vec<crate::agent::domain::TimelineItem>> {
+        Box::pin(async move {
+            let messages = self.client.get_messages(session_id, limit).await?;
+            let asid = crate::agent::domain::AgentSessionId(session_id.to_string());
+            Ok(mapper::map_messages_to_timeline(&messages, &asid))
         })
     }
 }

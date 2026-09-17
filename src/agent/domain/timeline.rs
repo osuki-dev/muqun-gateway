@@ -69,4 +69,7 @@ pub struct TimelineItem {
     pub part: AgentPart,
     pub seq: u64,
     pub updated_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachments: Option<Vec<String>>,
 }
+
