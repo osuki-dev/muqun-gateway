@@ -1043,11 +1043,34 @@ fn main() -> anyhow::Result<()> {
     for note in login_env::adopt() {
         eprintln!("environment repaired from the login shell -- {note}");
     }
+    init_tracing();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("failed to start the async runtime")?
         .block_on(dispatch(cli))
+}
+
+/// Structured logging for the parts of the gateway that run unattended -- the
+/// OpenCode SSE reader, the event mapper and the HTTP client. Everything goes
+/// to stderr, which is the journal under systemd. `MUQUN_LOG` (or `RUST_LOG`)
+/// overrides the default of `info`.
+fn init_tracing() {
+    use tracing_subscriber::{fmt, EnvFilter};
+
+    let filter = std::env::var("MUQUN_LOG")
+        .or_else(|_| std::env::var("RUST_LOG"))
+        .ok()
+        .and_then(|raw| EnvFilter::try_new(raw).ok())
+        .unwrap_or_else(|| EnvFilter::new("info"));
+
+    // A second initialisation is not an error worth failing a start over: it
+    // only happens in tests that call into `run` more than once.
+    let _ = fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .try_init();
 }
 
 async fn dispatch(cli: Cli) -> anyhow::Result<()> {

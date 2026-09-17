@@ -28,7 +28,19 @@ pub enum AgentSessionStatus {
     Busy,
     Retry,
     Failed,
+    /// The run was aborted by the user (`session.execution.interrupted`).
+    Interrupted,
     Unknown,
+}
+
+/// An error surfaced alongside a status change, from
+/// `session.execution.failed`'s `Session.StructuredError`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentErrorInfo {
+    pub name: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

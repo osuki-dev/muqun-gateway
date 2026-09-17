@@ -10,6 +10,28 @@ use crate::agent::ports::mirror::{AgentSessionSnapshot, MirrorFuture, SessionMir
 
 const MAX_EVENT_LOG_SIZE: usize = 2000;
 
+/// The stand-in used when an event arrives for a session the mirror has never
+/// seen. It carries no title and no agent: a guessed `"Session"` title used to
+/// be broadcast as if OpenCode had said it, and it outlived the real title on
+/// the client. `placeholder` stays set until a real `Session.Info` lands.
+fn placeholder_session(asid: &AgentSessionId, status: AgentSessionStatus) -> AgentSessionInfo {
+    AgentSessionInfo {
+        asid: asid.clone(),
+        backend_session_id: asid.0.clone(),
+        title: String::new(),
+        agent: None,
+        model: None,
+        status,
+        directory: None,
+        cost: None,
+        tokens: None,
+        limit: None,
+        parent_id: None,
+        project_id: None,
+        updated_ms: 0,
+    }
+}
+
 struct SessionState {
     info: AgentSessionInfo,
     timeline: BTreeMap<String, TimelineItem>,
@@ -17,6 +39,9 @@ struct SessionState {
     forms: HashMap<String, FormRequest>,
     event_log: VecDeque<AgentDomainEvent>,
     current_seq: u64,
+    /// True while `info` is the local stand-in rather than something OpenCode
+    /// reported.
+    placeholder: bool,
 }
 
 impl SessionState {
@@ -28,6 +53,7 @@ impl SessionState {
             forms: HashMap::new(),
             event_log: VecDeque::new(),
             current_seq: 0,
+            placeholder: false,
         }
     }
 
@@ -59,27 +85,19 @@ impl MemoryMirror {
     pub async fn update_status(&self, asid: &AgentSessionId, status: AgentSessionStatus) -> Option<u64> {
         let mut sessions = self.sessions.write().await;
         let state = sessions.entry(asid.clone()).or_insert_with(|| {
-            SessionState::new(AgentSessionInfo {
-                asid: asid.clone(),
-                backend_session_id: asid.0.clone(),
-                title: "Session".to_string(),
-                agent: Some("build".to_string()),
-                model: None,
-                status: AgentSessionStatus::Idle,
-                directory: None,
-                cost: None,
-                tokens: None,
-                limit: None,
-                parent_id: None,
-                project_id: None,
-                updated_ms: 0,
-            })
+            let mut fresh = SessionState::new(placeholder_session(asid, AgentSessionStatus::Idle));
+            fresh.placeholder = true;
+            fresh
         });
         state.info.status = status;
         let seq = state.next_seq();
-        let event = AgentDomainEvent::SessionUpdated {
+        // A status change is logged as a status change: replaying it as a
+        // `SessionUpdated` republished whatever `info` happened to be cached,
+        // placeholder included.
+        let event = AgentDomainEvent::StatusChanged {
             asid: asid.clone(),
-            info: state.info.clone(),
+            status,
+            error: None,
             seq,
         };
         state.push_event(event);
@@ -96,21 +114,9 @@ impl MemoryMirror {
     ) -> Option<u64> {
         let mut sessions = self.sessions.write().await;
         let state = sessions.entry(asid.clone()).or_insert_with(|| {
-            SessionState::new(AgentSessionInfo {
-                asid: asid.clone(),
-                backend_session_id: asid.0.clone(),
-                title: "Session".to_string(),
-                agent: Some("build".to_string()),
-                model: None,
-                status: AgentSessionStatus::Busy,
-                directory: None,
-                cost: None,
-                tokens: None,
-                limit: None,
-                parent_id: None,
-                project_id: None,
-                updated_ms: 0,
-            })
+            let mut fresh = SessionState::new(placeholder_session(asid, AgentSessionStatus::Busy));
+            fresh.placeholder = true;
+            fresh
         });
 
         let now = std::time::SystemTime::now()
@@ -178,21 +184,9 @@ impl MemoryMirror {
     ) -> Option<u64> {
         let mut sessions = self.sessions.write().await;
         let state = sessions.entry(asid.clone()).or_insert_with(|| {
-            SessionState::new(AgentSessionInfo {
-                asid: asid.clone(),
-                backend_session_id: asid.0.clone(),
-                title: "Session".to_string(),
-                agent: Some("build".to_string()),
-                model: None,
-                status: AgentSessionStatus::Busy,
-                directory: None,
-                cost: None,
-                tokens: None,
-                limit: None,
-                parent_id: None,
-                project_id: None,
-                updated_ms: 0,
-            })
+            let mut fresh = SessionState::new(placeholder_session(asid, AgentSessionStatus::Busy));
+            fresh.placeholder = true;
+            fresh
         });
 
         let now = std::time::SystemTime::now()
@@ -360,8 +354,11 @@ impl SessionMirrorPort for MemoryMirror {
         Box::pin(async move {
             let mut sessions = self.sessions.write().await;
             let asid = info.asid.clone();
-            let state = sessions.entry(asid.clone()).or_insert_with(|| SessionState::new(info.clone()));
+            let state = sessions
+                .entry(asid.clone())
+                .or_insert_with(|| SessionState::new(info.clone()));
             state.info = info.clone();
+            state.placeholder = false;
             let seq = state.next_seq();
 
             let event = AgentDomainEvent::SessionUpdated {

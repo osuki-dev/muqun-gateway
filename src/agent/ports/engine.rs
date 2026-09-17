@@ -96,11 +96,12 @@ pub trait AgentEnginePort: Send + Sync {
         agent: &'a str,
     ) -> EngineFuture<'a, ()>;
 
-    /// Search files in workspace
+    /// Search files in workspace, optionally scoped to a directory
     fn find_files<'a>(
         &'a self,
         query: &'a str,
         limit: usize,
+        directory: Option<&'a str>,
     ) -> EngineFuture<'a, Vec<serde_json::Value>>;
 
     /// Reply to a permission request
@@ -122,8 +123,13 @@ pub trait AgentEnginePort: Send + Sync {
     /// Fetch available catalog (models, agents, MCP)
     fn get_catalog<'a>(&'a self, directory: Option<&'a str>) -> EngineFuture<'a, AgentCatalog>;
 
-    /// Fetch VCS diff for current session
-    fn get_vcs_diff<'a>(&'a self, session_id: &'a str) -> EngineFuture<'a, Vec<FileDiffItem>>;
+    /// Fetch the VCS diff for a session's directory. `mode` is one of
+    /// `working`, `branch` or `committed`; OpenCode requires it.
+    fn get_vcs_diff<'a>(
+        &'a self,
+        session_id: &'a str,
+        mode: &'a str,
+    ) -> EngineFuture<'a, Vec<FileDiffItem>>;
 
     /// Fetch historical timeline items for a session
     fn get_timeline<'a>(

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use super::session::{AgentSessionId, AgentSessionInfo, AgentSessionStatus};
+use super::session::{AgentErrorInfo, AgentSessionId, AgentSessionInfo, AgentSessionStatus};
 use super::timeline::TimelineItem;
 use super::permission::PermissionRequest;
 use super::form::FormRequest;
@@ -29,6 +29,9 @@ pub enum AgentDomainEvent {
     StatusChanged {
         asid: AgentSessionId,
         status: AgentSessionStatus,
+        /// Set when the status is `failed`; `{name, message}`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<AgentErrorInfo>,
         seq: u64,
     },
     #[serde(rename = "agent.permission.pending")]

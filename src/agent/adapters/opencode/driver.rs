@@ -130,10 +130,12 @@ impl AgentEnginePort for OpencodeDriver {
         &'a self,
         query: &'a str,
         limit: usize,
+        directory: Option<&'a str>,
     ) -> EngineFuture<'a, Vec<serde_json::Value>> {
         Box::pin(async move {
-            let files = self.client.find_files(query, limit).await.unwrap_or_default();
-            Ok(files)
+            // A failed search is an error, not an empty result set: the two
+            // are indistinguishable to the caller otherwise.
+            self.client.find_files(query, limit, directory).await
         })
     }
 
@@ -182,12 +184,34 @@ impl AgentEnginePort for OpencodeDriver {
         })
     }
 
-    fn get_vcs_diff<'a>(&'a self, _session_id: &'a str) -> EngineFuture<'a, Vec<FileDiffItem>> {
+    fn get_vcs_diff<'a>(
+        &'a self,
+        session_id: &'a str,
+        mode: &'a str,
+    ) -> EngineFuture<'a, Vec<FileDiffItem>> {
         Box::pin(async move {
-            let raw_diff = self.client.get_vcs_diff(None).await.unwrap_or_default();
+            // The diff is scoped to the session's own directory; a global diff
+            // is not what the caller asked for.
+            let directory = match self.client.get_session(session_id).await {
+                Ok(raw) => mapper::map_session(&raw).and_then(|s| s.directory),
+                Err(err) => {
+                    tracing::debug!(session_id, %err, "vcs diff: session lookup failed, using server cwd");
+                    None
+                }
+            };
+            let raw_diff = self
+                .client
+                .get_vcs_diff(directory.as_deref(), mode, None)
+                .await?;
             let mut diffs = Vec::new();
             for item in raw_diff {
-                let path = item.get("path").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+                // `FileDiff.Info` names the path `file`; `path` is the v1 name.
+                let path = item
+                    .get("file")
+                    .or_else(|| item.get("path"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
                 let patch = item.get("patch").or_else(|| item.get("diff")).and_then(serde_json::Value::as_str).unwrap_or("").to_string();
                 let additions = item.get("additions").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
                 let deletions = item.get("deletions").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;

@@ -49,7 +49,11 @@ impl OpencodeClient {
             .map_err(|e| AgentEngineError::Protocol(e.to_string()))
     }
 
-    pub async fn get(&self, path: &str, query: &[(&str, &str)]) -> Result<Value, AgentEngineError> {
+    pub async fn get<K, V>(&self, path: &str, query: &[(K, V)]) -> Result<Value, AgentEngineError>
+    where
+        K: AsRef<str> + serde::Serialize,
+        V: AsRef<str> + serde::Serialize,
+    {
         let url = format!("{}{path}", self.endpoint.url);
         let req = self.authed_req(self.http.get(&url).query(query));
         let resp = req
@@ -57,6 +61,11 @@ impl OpencodeClient {
             .await
             .map_err(|e| AgentEngineError::Network(e.to_string()))?;
         self.handle_resp(resp).await
+    }
+
+    /// `get` with no query parameters.
+    pub async fn get_plain(&self, path: &str) -> Result<Value, AgentEngineError> {
+        self.get(path, &[] as &[(&str, &str)]).await
     }
 
     pub async fn post(&self, path: &str, body: &Value) -> Result<Value, AgentEngineError> {
@@ -70,7 +79,7 @@ impl OpencodeClient {
     }
 
     pub async fn list_projects(&self) -> Result<Vec<Value>, AgentEngineError> {
-        let res = self.get("/api/project", &[]).await?;
+        let res = self.get_plain("/api/project").await?;
         if let Some(arr) = res.as_array() {
             return Ok(arr.clone());
         }
@@ -96,17 +105,12 @@ impl OpencodeClient {
         if let Some(d) = directory {
             body["location"] = json!({ "directory": d });
         }
+        // The `model` field is omitted when the caller did not pick one, so
+        // OpenCode resolves the user's configured default itself. `Model.Ref`
+        // declares `additionalProperties: false` with `variant` as a plain
+        // string, so an explicit `variant: null` is never sent either.
         if let Some(m) = model {
-            body["model"] = json!({
-                "providerID": m.provider_id,
-                "id": m.model_id,
-                "variant": m.variant
-            });
-        } else {
-            body["model"] = json!({
-                "providerID": "opencode",
-                "id": "big-pickle"
-            });
+            body["model"] = model_ref_json(m);
         }
         if let Some(a) = agent {
             body["agent"] = json!(a);
@@ -115,15 +119,18 @@ impl OpencodeClient {
     }
 
     pub async fn get_session(&self, id: &str) -> Result<Value, AgentEngineError> {
-        self.get(&format!("/api/session/{id}"), &[]).await
+        self.get_plain(&format!("/api/session/{id}")).await
     }
 
     pub async fn get_messages(&self, session_id: &str, limit: usize) -> Result<Vec<Value>, AgentEngineError> {
         let limit_str = limit.to_string();
+        // `order=asc` is explicit: the server default is newest-first, and
+        // guessing the direction from two timestamps is not a decision the
+        // gateway should be making.
         let res = self
             .get(
                 &format!("/api/session/{session_id}/message"),
-                &[("limit", &limit_str)],
+                &[("limit", limit_str.as_str()), ("order", "asc")],
             )
             .await?;
         if let Some(arr) = res.as_array() {
@@ -199,15 +206,8 @@ impl OpencodeClient {
         session_id: &str,
         model: &crate::agent::domain::ModelRef,
     ) -> Result<Value, AgentEngineError> {
-        let mut model_obj = json!({
-            "providerID": model.provider_id,
-            "id": model.model_id,
-        });
-        if let Some(ref v) = model.variant {
-            model_obj["variant"] = json!(v);
-        }
         let body = json!({
-            "model": model_obj,
+            "model": model_ref_json(model),
         });
         self.post(&format!("/api/session/{session_id}/model"), &body)
             .await
@@ -258,62 +258,92 @@ impl OpencodeClient {
     }
 
     pub async fn get_models(&self, directory: Option<&str>) -> Result<Vec<Value>, AgentEngineError> {
-        let mut query = Vec::new();
-        if let Some(d) = directory {
-            query.push(("directory", d));
-        }
-        let res = self.get("/api/model", &query).await?;
+        let res = self.get("/api/model", &location_query(directory)).await?;
         Ok(res.get("data").and_then(Value::as_array).cloned().unwrap_or_default())
     }
 
     pub async fn get_agents(&self, directory: Option<&str>) -> Result<Vec<Value>, AgentEngineError> {
-        let mut query = Vec::new();
-        if let Some(d) = directory {
-            query.push(("directory", d));
-        }
-        let res = self.get("/api/agent", &query).await?;
+        let res = self.get("/api/agent", &location_query(directory)).await?;
         Ok(res.get("data").and_then(Value::as_array).cloned().unwrap_or_default())
     }
 
     pub async fn get_mcp(&self, directory: Option<&str>) -> Result<Vec<Value>, AgentEngineError> {
-        let mut query = Vec::new();
-        if let Some(d) = directory {
-            query.push(("directory", d));
-        }
-        let res = self.get("/api/mcp", &query).await?;
+        let res = self.get("/api/mcp", &location_query(directory)).await?;
         Ok(res.get("data").and_then(Value::as_array).cloned().unwrap_or_default())
     }
 
-    pub async fn get_vcs_diff(&self, directory: Option<&str>) -> Result<Vec<Value>, AgentEngineError> {
-        let mut query = Vec::new();
-        if let Some(d) = directory {
-            query.push(("directory", d));
+    /// `GET /api/vcs/diff`. `mode` is a required parameter on this endpoint --
+    /// omitting it is a 400, which is how this call used to come back empty.
+    pub async fn get_vcs_diff(
+        &self,
+        directory: Option<&str>,
+        mode: &str,
+        base: Option<&str>,
+    ) -> Result<Vec<Value>, AgentEngineError> {
+        let mut query = location_query(directory);
+        query.push(("mode".to_string(), mode.to_string()));
+        if let Some(b) = base {
+            query.push(("base".to_string(), b.to_string()));
         }
         let res = self.get("/api/vcs/diff", &query).await?;
         Ok(res.get("data").and_then(Value::as_array).cloned().unwrap_or_default())
     }
 
     pub async fn get_skills(&self, directory: Option<&str>) -> Result<Vec<Value>, AgentEngineError> {
-        let mut query = Vec::new();
-        if let Some(d) = directory {
-            query.push(("directory", d));
-        }
-        let res = self.get("/api/skill", &query).await?;
+        let res = self.get("/api/skill", &location_query(directory)).await?;
         Ok(res.get("data").and_then(Value::as_array).cloned().unwrap_or_default())
     }
 
-    pub async fn find_files(&self, query: &str, limit: usize) -> Result<Vec<Value>, AgentEngineError> {
-        let limit_str = limit.to_string();
+    /// `GET /api/fs/find` (or `/api/fs/list` for an empty query). `/api/fs/list`
+    /// takes `location` and `path` only -- it has no `limit`, so the cap is
+    /// applied here instead of being sent and ignored.
+    pub async fn find_files(
+        &self,
+        query: &str,
+        limit: usize,
+        directory: Option<&str>,
+    ) -> Result<Vec<Value>, AgentEngineError> {
         if query.trim().is_empty() {
-            let res = self.get("/api/fs/list", &[("limit", limit_str.as_str())]).await?;
-            Ok(res.get("data").and_then(Value::as_array).cloned().unwrap_or_default())
+            let res = self.get("/api/fs/list", &location_query(directory)).await?;
+            let mut items = res
+                .get("data")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            items.truncate(limit);
+            Ok(items)
         } else {
-            let query_params = [
-                ("query", query),
-                ("limit", limit_str.as_str()),
-            ];
-            let res = self.get("/api/fs/find", &query_params).await?;
+            let mut params = location_query(directory);
+            params.push(("query".to_string(), query.to_string()));
+            params.push(("limit".to_string(), limit.to_string()));
+            let res = self.get("/api/fs/find", &params).await?;
             Ok(res.get("data").and_then(Value::as_array).cloned().unwrap_or_default())
         }
     }
+}
+
+/// Serialize a directory into the deepObject `location` parameter that every
+/// catalog, filesystem and VCS endpoint in v2 declares. A flat `directory=` is
+/// not a parameter those endpoints define, so it was silently ignored and the
+/// catalog always resolved against the server's own cwd.
+pub(crate) fn location_query(directory: Option<&str>) -> Vec<(String, String)> {
+    match directory {
+        Some(d) if !d.trim().is_empty() => {
+            vec![("location[directory]".to_string(), d.to_string())]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// `Model.Ref` as v2 spells it: `{providerID, id, variant?}`, with `variant`
+/// omitted rather than sent as null.
+pub(crate) fn model_ref_json(model: &crate::agent::domain::ModelRef) -> Value {
+    let mut obj = json!({
+        "providerID": model.provider_id,
+        "id": model.model_id,
+    });
+    if let Some(ref v) = model.variant {
+        obj["variant"] = json!(v);
+    }
+    obj
 }

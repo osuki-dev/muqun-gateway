@@ -20,6 +20,8 @@ impl AgentManager {
     /// Attempt to discover and initialize available agent engines (such as OpenCode V2).
     pub async fn discover() -> Option<Self> {
         let endpoint = OpencodeEndpoint::discover().await?;
+        let endpoint_url = endpoint.url.clone();
+        let endpoint_version = endpoint.version.clone();
         let driver = Arc::new(OpencodeDriver::new(endpoint.clone()));
         let mirror = Arc::new(MemoryMirror::new());
 
@@ -39,12 +41,41 @@ impl AgentManager {
         let events_tx_clone = events_tx.clone();
 
         tokio::spawn(async move {
-            while let Ok(raw_event) = sse_rx.recv().await {
-                Self::handle_raw_event(raw_event, &driver_clone, &mirror_clone, &events_tx_clone).await;
+            loop {
+                match sse_rx.recv().await {
+                    Ok(raw_event) => {
+                        Self::handle_raw_event(
+                            raw_event,
+                            &driver_clone,
+                            &mirror_clone,
+                            &events_tx_clone,
+                        )
+                        .await;
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        // Dropping out of the loop here used to stop the
+                        // gateway processing OpenCode events for the rest of
+                        // the process lifetime. Tell the clients to resync and
+                        // keep reading.
+                        tracing::warn!(skipped, "opencode event backlog overflowed, resyncing");
+                        let _ = events_tx_clone.send(AgentDomainEvent::Resync {
+                            asid: AgentSessionId(String::new()),
+                            reason: "event_backlog_overflow".to_string(),
+                        });
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        tracing::warn!("opencode event channel closed, stopping event pump");
+                        break;
+                    }
+                }
             }
         });
 
-        eprintln!("AgentManager initialized with OpenCode engine");
+        tracing::info!(
+            url = %endpoint_url,
+            version = endpoint_version.as_deref().unwrap_or("unknown"),
+            "agent manager initialized with OpenCode engine"
+        );
         Some(Self {
             engine: driver,
             mirror,
@@ -103,6 +134,7 @@ impl AgentManager {
                         let _ = tx.send(AgentDomainEvent::StatusChanged {
                             asid,
                             status: crate::agent::domain::AgentSessionStatus::Busy,
+                            error: None,
                             seq,
                         });
                     }
@@ -115,6 +147,7 @@ impl AgentManager {
                         let _ = tx.send(AgentDomainEvent::StatusChanged {
                             asid: asid.clone(),
                             status: crate::agent::domain::AgentSessionStatus::Idle,
+                            error: None,
                             seq,
                         });
                     }
@@ -135,6 +168,7 @@ impl AgentManager {
                         let _ = tx.send(AgentDomainEvent::StatusChanged {
                             asid: asid.clone(),
                             status: crate::agent::domain::AgentSessionStatus::Failed,
+                            error: None,
                             seq,
                         });
                     }
@@ -175,9 +209,12 @@ impl AgentManager {
                 }
             }
             "form.created" => {
-                if let Some(session_id) = data.get("sessionID").and_then(serde_json::Value::as_str) {
+                // The payload is `{form: Form.Info}`; reading `sessionID` off
+                // the outer object always missed and this handler never ran.
+                let form = data.get("form").unwrap_or(data);
+                if let Some(session_id) = form.get("sessionID").and_then(serde_json::Value::as_str) {
                     let asid = AgentSessionId(session_id.to_string());
-                    if let Some(req) = super::adapters::opencode::mapper::map_form_request(data, &asid) {
+                    if let Some(req) = super::adapters::opencode::mapper::map_form_request(form, &asid) {
                         let seq = mirror.add_form(req.clone()).await;
                         let _ = tx.send(AgentDomainEvent::FormPending {
                             asid,

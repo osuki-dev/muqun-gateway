@@ -6,6 +6,25 @@ use crate::agent::domain::{
     TimelineRole, TodoItem, TokensUsage, ToolCallStatus,
 };
 
+/// `Model.Ref` as v2 spells it: `{id, providerID, variant?}`. `modelID` is
+/// accepted as a v1-compat spelling of `id`.
+pub fn map_model_ref(val: &Value) -> Option<ModelRef> {
+    let model_id = val
+        .get("id")
+        .or_else(|| val.get("modelID"))
+        .and_then(Value::as_str)?;
+    let provider_id = val
+        .get("providerID")
+        .or_else(|| val.get("providerId"))
+        .and_then(Value::as_str)
+        .unwrap_or("opencode");
+    Some(ModelRef {
+        provider_id: provider_id.to_string(),
+        model_id: model_id.to_string(),
+        variant: val.get("variant").and_then(Value::as_str).map(str::to_string),
+    })
+}
+
 pub fn map_session(val: &Value) -> Option<AgentSessionInfo> {
     let item = val.get("data").unwrap_or(val);
     let id = item.get("id").and_then(Value::as_str)?;
@@ -17,25 +36,9 @@ pub fn map_session(val: &Value) -> Option<AgentSessionInfo> {
 
     let agent = item.get("agent").and_then(Value::as_str).map(str::to_string);
 
-    let model = item
-        .get("model")
-        .and_then(|m| {
-            let model_id = m.get("id").or_else(|| m.get("modelID")).and_then(Value::as_str)?;
-            let provider_id = m.get("providerID").and_then(Value::as_str).unwrap_or("opencode");
-            let variant = m.get("variant").and_then(Value::as_str).map(str::to_string);
-            Some(ModelRef {
-                provider_id: provider_id.to_string(),
-                model_id: model_id.to_string(),
-                variant,
-            })
-        })
-        .or_else(|| {
-            Some(ModelRef {
-                provider_id: "opencode".to_string(),
-                model_id: "big-pickle".to_string(),
-                variant: None,
-            })
-        });
+    // No fabricated default: a session whose model OpenCode has not reported
+    // is `None`, and the app shows whatever OpenCode resolves at run time.
+    let model = item.get("model").and_then(map_model_ref);
 
     let cost = item.get("cost").and_then(Value::as_f64);
     let tokens = item.get("tokens").map(|t| TokensUsage {
@@ -163,16 +166,9 @@ pub fn map_messages_to_timeline(messages: &[Value], asid: &AgentSessionId) -> Ve
     let mut items = Vec::new();
     let mut seq = 1;
 
-    let mut ordered: Vec<&Value> = messages.iter().collect();
-    if ordered.len() > 1 {
-        let first_t = ordered.first().and_then(|m| m.pointer("/time/created")).and_then(Value::as_u64).unwrap_or(0);
-        let last_t = ordered.last().and_then(|m| m.pointer("/time/created")).and_then(Value::as_u64).unwrap_or(0);
-        if first_t > last_t {
-            ordered.reverse();
-        }
-    }
-
-    for msg in ordered {
+    // The list arrives in the order the caller asked for (`order=asc`); the
+    // gateway does not re-derive it from timestamps.
+    for msg in messages {
         let msg_id = msg.get("id").and_then(Value::as_str).unwrap_or("unknown");
         let role = match msg.get("type").and_then(Value::as_str) {
             Some("user") => TimelineRole::User,
@@ -942,16 +938,31 @@ mod tests {
     }
 
     #[test]
-    fn test_map_session_model_fallback() {
+    fn test_map_session_without_model_reports_none() {
         let raw_without_model = json!({
             "id": "ses-no-model",
             "title": "Untitled",
             "agent": "build",
         });
         let session = map_session(&raw_without_model).expect("should map");
-        let model = session.model.expect("model should be defaulted");
+        assert!(
+            session.model.is_none(),
+            "a session OpenCode reported no model for must not be given one"
+        );
+    }
+
+    #[test]
+    fn test_map_session_reads_model_ref() {
+        let raw = json!({
+            "id": "ses-model",
+            "title": "Titled",
+            "model": { "id": "glm-5.3-flash", "providerID": "opencode", "variant": "default" },
+        });
+        let session = map_session(&raw).expect("should map");
+        let model = session.model.expect("model present");
         assert_eq!(model.provider_id, "opencode");
-        assert_eq!(model.model_id, "big-pickle");
+        assert_eq!(model.model_id, "glm-5.3-flash");
+        assert_eq!(model.variant.as_deref(), Some("default"));
     }
 
     #[test]

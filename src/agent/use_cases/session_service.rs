@@ -79,8 +79,12 @@ impl SessionService {
         self.engine.get_catalog(directory).await
     }
 
-    pub async fn get_vcs_diff(&self, asid: &AgentSessionId) -> Result<Vec<FileDiffItem>, AgentEngineError> {
-        self.engine.get_vcs_diff(&asid.0).await
+    pub async fn get_vcs_diff(
+        &self,
+        asid: &AgentSessionId,
+        mode: &str,
+    ) -> Result<Vec<FileDiffItem>, AgentEngineError> {
+        self.engine.get_vcs_diff(&asid.0, mode).await
     }
 
     pub async fn revert_session(

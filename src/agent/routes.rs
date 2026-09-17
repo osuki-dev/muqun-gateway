@@ -32,14 +32,53 @@ pub struct AgentEventsQuery {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct AgentFilesQuery {
-    pub query: Option<String>,
-    pub limit: Option<usize>,
+pub struct AgentVcsDiffQuery {
+    /// `working` (default), `branch` or `committed`.
+    pub mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct SwitchAgentBody {
-    pub agent: String,
+pub struct AgentFilesQuery {
+    pub query: Option<String>,
+    pub limit: Option<usize>,
+    pub directory: Option<String>,
+}
+
+/// `POST .../agent` accepts the documented `{"agent": "build"}` object and, as
+/// a convenience, a bare `"build"` string.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum SwitchAgentBody {
+    Wrapped { agent: String },
+    Bare(String),
+}
+
+impl SwitchAgentBody {
+    pub fn into_agent(self) -> String {
+        match self {
+            Self::Wrapped { agent } => agent,
+            Self::Bare(agent) => agent,
+        }
+    }
+}
+
+/// `POST .../model` accepts both `{"model": {...}}` (what the app sends) and a
+/// bare `ModelRef` (what this route used to require). Accepting only the bare
+/// form made every model switch fail with 422.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum SwitchModelBody {
+    Wrapped { model: ModelRef },
+    Bare(ModelRef),
+}
+
+impl SwitchModelBody {
+    pub fn into_model(self) -> ModelRef {
+        match self {
+            Self::Wrapped { model } => model,
+            Self::Bare(model) => model,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -440,6 +479,7 @@ async fn do_find_agent_files(
     state: &AppState,
     query: &str,
     limit: usize,
+    directory: Option<&str>,
     headers: &HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
@@ -454,7 +494,7 @@ async fn do_find_agent_files(
 
     let files = manager
         .engine()
-        .find_files(query, limit)
+        .find_files(query, limit, directory)
         .await
         .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "fs_error", &e.to_string()))?;
 
@@ -657,6 +697,7 @@ async fn do_reply_agent_form(
 async fn do_get_agent_vcs_diff(
     state: &AppState,
     asid: &str,
+    mode: Option<&str>,
     headers: &HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
@@ -669,9 +710,20 @@ async fn do_get_agent_vcs_diff(
         ));
     };
 
+    let mode = match mode.unwrap_or("working") {
+        m @ ("working" | "branch" | "committed") => m,
+        _ => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_mode",
+                "mode must be 'working', 'branch' or 'committed'",
+            ));
+        }
+    };
+
     let diffs = manager
         .sessions()
-        .get_vcs_diff(&AgentSessionId(asid.to_string()))
+        .get_vcs_diff(&AgentSessionId(asid.to_string()), mode)
         .await
         .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "agent_engine_error", &e.to_string()))?;
 
@@ -932,7 +984,7 @@ async fn switch_agent_mode_global(
     headers: HeaderMap,
     Json(body): Json<SwitchAgentBody>,
 ) -> ApiResult<Json<Value>> {
-    do_switch_agent_mode(&state, &asid, &body.agent, &headers).await
+    do_switch_agent_mode(&state, &asid, &body.into_agent(), &headers).await
 }
 
 async fn find_agent_files_root_global(
@@ -940,7 +992,14 @@ async fn find_agent_files_root_global(
     Query(query): Query<AgentFilesQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    do_find_agent_files(&state, query.query.as_deref().unwrap_or(""), query.limit.unwrap_or(20), &headers).await
+    do_find_agent_files(
+        &state,
+        query.query.as_deref().unwrap_or(""),
+        query.limit.unwrap_or(20),
+        query.directory.as_deref(),
+        &headers,
+    )
+    .await
 }
 
 async fn find_agent_files_global(
@@ -949,7 +1008,14 @@ async fn find_agent_files_global(
     Query(query): Query<AgentFilesQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    do_find_agent_files(&state, query.query.as_deref().unwrap_or(""), query.limit.unwrap_or(20), &headers).await
+    do_find_agent_files(
+        &state,
+        query.query.as_deref().unwrap_or(""),
+        query.limit.unwrap_or(20),
+        query.directory.as_deref(),
+        &headers,
+    )
+    .await
 }
 
 async fn send_agent_prompt_global(
@@ -982,9 +1048,9 @@ async fn switch_agent_model_global(
     State(state): State<AppState>,
     Path(asid): Path<String>,
     headers: HeaderMap,
-    Json(model): Json<ModelRef>,
+    Json(body): Json<SwitchModelBody>,
 ) -> ApiResult<Json<Value>> {
-    do_switch_agent_model(&state, &asid, model, &headers).await
+    do_switch_agent_model(&state, &asid, body.into_model(), &headers).await
 }
 
 async fn reply_agent_permission_global(
@@ -1008,9 +1074,10 @@ async fn reply_agent_form_global(
 async fn get_agent_vcs_diff_global(
     State(state): State<AppState>,
     Path(asid): Path<String>,
+    Query(query): Query<AgentVcsDiffQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    do_get_agent_vcs_diff(&state, &asid, &headers).await
+    do_get_agent_vcs_diff(&state, &asid, query.mode.as_deref(), &headers).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1067,7 +1134,7 @@ async fn switch_agent_mode_legacy(
     headers: HeaderMap,
     Json(body): Json<SwitchAgentBody>,
 ) -> ApiResult<Json<Value>> {
-    do_switch_agent_mode(&state, &asid, &body.agent, &headers).await
+    do_switch_agent_mode(&state, &asid, &body.into_agent(), &headers).await
 }
 
 async fn find_agent_files_root_legacy(
@@ -1076,7 +1143,14 @@ async fn find_agent_files_root_legacy(
     Query(query): Query<AgentFilesQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    do_find_agent_files(&state, query.query.as_deref().unwrap_or(""), query.limit.unwrap_or(20), &headers).await
+    do_find_agent_files(
+        &state,
+        query.query.as_deref().unwrap_or(""),
+        query.limit.unwrap_or(20),
+        query.directory.as_deref(),
+        &headers,
+    )
+    .await
 }
 
 async fn find_agent_files_legacy(
@@ -1085,7 +1159,14 @@ async fn find_agent_files_legacy(
     Query(query): Query<AgentFilesQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    do_find_agent_files(&state, query.query.as_deref().unwrap_or(""), query.limit.unwrap_or(20), &headers).await
+    do_find_agent_files(
+        &state,
+        query.query.as_deref().unwrap_or(""),
+        query.limit.unwrap_or(20),
+        query.directory.as_deref(),
+        &headers,
+    )
+    .await
 }
 
 async fn send_agent_prompt_legacy(
@@ -1118,9 +1199,9 @@ async fn switch_agent_model_legacy(
     State(state): State<AppState>,
     Path((_session_id, asid)): Path<(String, String)>,
     headers: HeaderMap,
-    Json(model): Json<ModelRef>,
+    Json(body): Json<SwitchModelBody>,
 ) -> ApiResult<Json<Value>> {
-    do_switch_agent_model(&state, &asid, model, &headers).await
+    do_switch_agent_model(&state, &asid, body.into_model(), &headers).await
 }
 
 async fn reply_agent_permission_legacy(
@@ -1144,9 +1225,10 @@ async fn reply_agent_form_legacy(
 async fn get_agent_vcs_diff_legacy(
     State(state): State<AppState>,
     Path((_session_id, asid)): Path<(String, String)>,
+    Query(query): Query<AgentVcsDiffQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    do_get_agent_vcs_diff(&state, &asid, &headers).await
+    do_get_agent_vcs_diff(&state, &asid, query.mode.as_deref(), &headers).await
 }
 
 async fn get_pane_agent_catalog(
@@ -1215,3 +1297,50 @@ async fn stream_agent_session_legacy(
     do_stream_agent_session(&state, &asid, &headers).await
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn switch_model_body_accepts_the_wrapped_shape_the_app_sends() {
+        let body: SwitchModelBody = serde_json::from_value(json!({
+            "model": { "provider_id": "opencode", "model_id": "glm-5.3-flash", "variant": "default" }
+        }))
+        .expect("wrapped body should parse");
+        let model = body.into_model();
+        assert_eq!(model.provider_id, "opencode");
+        assert_eq!(model.model_id, "glm-5.3-flash");
+        assert_eq!(model.variant.as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn switch_model_body_still_accepts_a_bare_model_ref() {
+        let body: SwitchModelBody = serde_json::from_value(json!({
+            "provider_id": "opencode",
+            "model_id": "glm-5.3-flash"
+        }))
+        .expect("bare body should parse");
+        let model = body.into_model();
+        assert_eq!(model.model_id, "glm-5.3-flash");
+        assert!(model.variant.is_none());
+    }
+
+    #[test]
+    fn switch_model_body_rejects_a_model_with_no_id() {
+        let parsed: Result<SwitchModelBody, _> =
+            serde_json::from_value(json!({ "model": { "provider_id": "opencode" } }));
+        assert!(parsed.is_err(), "a model without an id is not a ModelRef");
+    }
+
+    #[test]
+    fn switch_agent_body_accepts_object_and_bare_string() {
+        let wrapped: SwitchAgentBody =
+            serde_json::from_value(json!({ "agent": "build" })).expect("object should parse");
+        assert_eq!(wrapped.into_agent(), "build");
+
+        let bare: SwitchAgentBody =
+            serde_json::from_value(json!("plan")).expect("bare string should parse");
+        assert_eq!(bare.into_agent(), "plan");
+    }
+}
