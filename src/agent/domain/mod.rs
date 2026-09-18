@@ -14,7 +14,7 @@ pub use model::{
 pub use permission::{PermissionDecision, PermissionOption, PermissionRequest};
 pub use session::{
     AgentErrorInfo, AgentProject, AgentSessionId, AgentSessionInfo, AgentSessionStatus, ModelRef,
-    SessionForkInfo, SessionQuery, SessionRevertInfo, TokensUsage,
+    RevertState, SessionForkInfo, SessionQuery, SessionRevertInfo, TokensUsage,
 };
 pub use timeline::{
     part_item_id, reasoning_item_id, text_item_id, tool_item_id, AgentPart, CompactionStatus,
@@ -98,6 +98,53 @@ mod contract_tests {
         );
     }
 
+    /// `agent.revert.changed` as the app reads it: the event name is the
+    /// payload's own `type`, `state` is one of three words, and `revert` is a
+    /// field that is always there -- `null` rather than absent when nothing is
+    /// staged, so a client can clear its own copy on the same key it set it.
+    #[test]
+    fn the_revert_event_names_its_state_and_always_carries_the_revert_key() {
+        let staged = AgentDomainEvent::RevertChanged {
+            asid: AgentSessionId("ses_1".into()),
+            state: RevertState::Staged,
+            revert: Some(SessionRevertInfo {
+                message_id: "msg_1".into(),
+                part_id: None,
+                snapshot: None,
+                files: Some(json!([{ "file": "a.ts", "patch": "@@", "additions": 1,
+                                     "deletions": 0, "status": "modified" }])),
+            }),
+            seq: 7,
+        };
+        assert_eq!(staged.event_name(), "agent.revert.changed");
+        assert_eq!(staged.seq(), 7);
+        let value = serde_json::to_value(&staged).expect("serializes");
+        assert_eq!(value["type"], "agent.revert.changed");
+        assert_eq!(value["asid"], "ses_1");
+        assert_eq!(value["state"], "staged");
+        assert_eq!(value["revert"]["message_id"], "msg_1");
+        assert_eq!(value["revert"]["files"][0]["file"], "a.ts");
+
+        for (state, word) in [
+            (RevertState::Committed, "committed"),
+            (RevertState::Cleared, "cleared"),
+        ] {
+            let event = AgentDomainEvent::RevertChanged {
+                asid: AgentSessionId("ses_1".into()),
+                state,
+                revert: None,
+                seq: 8,
+            };
+            let value = serde_json::to_value(&event).expect("serializes");
+            assert_eq!(value["state"], word);
+            assert!(
+                keys(&value).contains(&"revert".to_string()),
+                "`revert` is present and null, not missing"
+            );
+            assert!(value["revert"].is_null());
+        }
+    }
+
     #[test]
     fn a_tool_part_keeps_both_state_and_status() {
         let part = AgentPart::Tool(ToolCall {
@@ -167,6 +214,12 @@ mod contract_tests {
                 asid: asid.clone(),
                 items: vec![],
                 seq: 3,
+            },
+            AgentDomainEvent::RevertChanged {
+                asid: asid.clone(),
+                state: RevertState::Cleared,
+                revert: None,
+                seq: 4,
             },
             AgentDomainEvent::Resync {
                 asid,

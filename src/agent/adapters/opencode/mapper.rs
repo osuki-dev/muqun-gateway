@@ -64,7 +64,10 @@ fn map_tokens(val: &Value) -> TokensUsage {
     }
 }
 
-fn map_revert(val: &Value) -> Option<SessionRevertInfo> {
+/// `Session.Revert {messageID, partID?, snapshot?, files?}`, as it appears on
+/// `Session.Info.revert`, on a `POST …/revert/stage` reply and inside a
+/// `session.revert.staged` event -- one shape in all three places.
+pub fn map_revert(val: &Value) -> Option<SessionRevertInfo> {
     let message_id = val.get("messageID").and_then(Value::as_str)?;
     Some(SessionRevertInfo {
         message_id: message_id.to_string(),

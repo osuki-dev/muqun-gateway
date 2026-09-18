@@ -245,17 +245,37 @@ impl OpencodeClient {
             .await
     }
 
+    /// Stage and commit in one call. Kept for the one-shot `POST …/revert`
+    /// the app has always had; the two halves below are the separate steps.
     pub async fn revert_session(
         &self,
         session_id: &str,
         message_id: &str,
     ) -> Result<Value, AgentEngineError> {
-        let stage_body = json!({
-            "messageID": message_id,
-            "files": true,
-        });
-        self.post(&format!("/api/session/{session_id}/revert/stage"), &stage_body)
-            .await?;
+        self.stage_revert(session_id, message_id, Some(true)).await?;
+        self.commit_revert(session_id).await
+    }
+
+    /// `POST /api/session/{id}/revert/stage`: move the reversible boundary to
+    /// a message without applying it. Answers `Session.Revert`. `files` asks
+    /// OpenCode to work out the file changes the rollback would undo and
+    /// return them with it, which is what the app draws in the confirmation.
+    pub async fn stage_revert(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        files: Option<bool>,
+    ) -> Result<Value, AgentEngineError> {
+        let mut body = json!({ "messageID": message_id });
+        if let Some(files) = files {
+            body["files"] = json!(files);
+        }
+        self.post(&format!("/api/session/{session_id}/revert/stage"), &body)
+            .await
+    }
+
+    /// `POST /api/session/{id}/revert/commit`: apply the staged rollback.
+    pub async fn commit_revert(&self, session_id: &str) -> Result<Value, AgentEngineError> {
         self.post(&format!("/api/session/{session_id}/revert/commit"), &json!({}))
             .await
     }

@@ -90,6 +90,19 @@ pub struct SessionRevertInfo {
     pub files: Option<serde_json::Value>,
 }
 
+/// Where a rollback stands, as `agent.revert.changed` reports it.
+///
+/// `staged` is a boundary the user can still cancel, `cleared` is that
+/// cancellation -- redo -- and `committed` is the rollback applied, after
+/// which the session has no staged revert at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RevertState {
+    Staged,
+    Committed,
+    Cleared,
+}
+
 /// `Session.Info.fork`: where a forked session was copied from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionForkInfo {

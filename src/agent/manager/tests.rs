@@ -303,3 +303,129 @@ async fn a_skill_event_with_no_envelope_id_does_not_invent_a_row() {
     // timeline stays empty rather than gaining a row nothing can address.
     assert_eq!(rows, 0);
 }
+
+/// Staging, withdrawing, staging again and committing, as 2.0.1 announced them
+/// on a live session. The app sees one event per step and `info.revert`
+/// follows, so a snapshot taken at any point agrees with the stream.
+#[tokio::test]
+async fn a_revert_reports_every_step_it_goes_through() {
+    let ctx = ctx();
+    let mut rx = ctx.tx.subscribe();
+    replay(&ctx, "revert.sse").await;
+
+    let mut steps: Vec<(RevertState, Option<String>)> = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let AgentDomainEvent::RevertChanged { state, revert, .. } = event {
+            steps.push((state, revert.map(|r| r.message_id)));
+        }
+    }
+    let boundary = "msg_0b274d61b001Mc9InWjER3mRSo".to_string();
+    assert_eq!(
+        steps,
+        vec![
+            (RevertState::Staged, Some(boundary.clone())),
+            (RevertState::Cleared, None),
+            (RevertState::Staged, Some(boundary)),
+            (RevertState::Committed, None),
+        ],
+        "stage, clear, stage, commit -- and only `staged` carries a boundary"
+    );
+
+    let asid = AgentSessionId("ses_f4d8b2dccffeFm6JB0jEWOAHn4".to_string());
+    let snapshot = ctx.mirror.get_snapshot(&asid).await.expect("session known");
+    assert!(
+        snapshot.info.revert.is_none(),
+        "nothing is staged once the rollback is committed"
+    );
+}
+
+/// The staged boundary is carried whole, not just its message id: `files` is
+/// what the app draws in the confirmation before the user commits.
+#[tokio::test]
+async fn a_staged_revert_carries_the_file_list_it_came_with() {
+    let ctx = ctx();
+    let mut rx = ctx.tx.subscribe();
+    let frame = OpencodeSseListener::parse_block(
+        r#"data: {"id":"evt_1","type":"session.revert.staged","data":{"sessionID":"ses_1","revert":{"messageID":"msg_2","partID":"prt_3","snapshot":"abc123","files":[{"file":"a.ts","patch":"@@","additions":1,"deletions":0,"status":"modified"}]}}}"#,
+    )
+    .expect("frame parses");
+    AgentManager::handle_raw_event(frame, &ctx).await;
+
+    let mut seen = None;
+    while let Ok(event) = rx.try_recv() {
+        if let AgentDomainEvent::RevertChanged { revert, .. } = event {
+            seen = revert;
+        }
+    }
+    let revert = seen.expect("the staged boundary reached the client");
+    assert_eq!(revert.message_id, "msg_2");
+    assert_eq!(revert.part_id.as_deref(), Some("prt_3"));
+    assert_eq!(revert.snapshot.as_deref(), Some("abc123"));
+    let files = revert.files.expect("files were asked for and came back");
+    assert_eq!(files[0]["file"], "a.ts");
+
+    // And the mirror agrees, so a refetched snapshot shows the same thing.
+    let asid = AgentSessionId("ses_1".to_string());
+    let snapshot = ctx.mirror.get_snapshot(&asid).await.expect("session known");
+    assert_eq!(
+        snapshot.info.revert.map(|r| r.message_id).as_deref(),
+        Some("msg_2")
+    );
+}
+
+/// A committed rollback deletes the boundary message and everything after it.
+/// 2.0.1 announces no removal of its own, so the mirror has to do it or it
+/// goes on serving rows that no longer exist.
+#[tokio::test]
+async fn committing_a_rollback_takes_the_rows_after_it_off_the_timeline() {
+    let ctx = ctx();
+    let asid = AgentSessionId("ses_1".to_string());
+    let row = |id: &str, message_id: &str| TimelineItem {
+        id: id.to_string(),
+        message_id: message_id.to_string(),
+        role: TimelineRole::Assistant,
+        part: AgentPart::Text {
+            text: "x".to_string(),
+        },
+        seq: 0,
+        updated_ms: 0,
+        ordinal: 0,
+        attachments: None,
+    };
+    ctx.mirror
+        .upsert_timeline_items(
+            &asid,
+            vec![
+                row("msg_1:t0", "msg_1"),
+                row("msg_5:t0", "msg_5"),
+                row("msg_9:t0", "msg_9"),
+                // A detached shell is not a message and is not in the range.
+                row("shell_sh_1", "shell_sh_1"),
+            ],
+        )
+        .await;
+
+    let mut rx = ctx.tx.subscribe();
+    let frame = OpencodeSseListener::parse_block(
+        r#"data: {"id":"evt_1","type":"session.revert.committed","data":{"sessionID":"ses_1","to":"msg_5"}}"#,
+    )
+    .expect("frame parses");
+    AgentManager::handle_raw_event(frame, &ctx).await;
+
+    let mut removed: Vec<String> = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let AgentDomainEvent::TimelineRemoved { ids, .. } = event {
+            removed.extend(ids);
+        }
+    }
+    removed.sort();
+    assert_eq!(
+        removed,
+        vec!["msg_5:t0".to_string(), "msg_9:t0".to_string()],
+        "the boundary goes too, and a shell row is not a message"
+    );
+
+    let snapshot = ctx.mirror.get_snapshot(&asid).await.expect("session known");
+    let left: Vec<&str> = snapshot.timeline.iter().map(|it| it.id.as_str()).collect();
+    assert_eq!(left, vec!["msg_1:t0", "shell_sh_1"]);
+}

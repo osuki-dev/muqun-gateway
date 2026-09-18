@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
-use super::session::{AgentErrorInfo, AgentSessionId, AgentSessionInfo, AgentSessionStatus};
+use super::session::{
+    AgentErrorInfo, AgentSessionId, AgentSessionInfo, AgentSessionStatus, RevertState,
+    SessionRevertInfo,
+};
 use super::timeline::{CompactionStatus, TimelineItem};
 use super::permission::PermissionRequest;
 use super::form::FormRequest;
@@ -74,6 +77,17 @@ pub enum AgentDomainEvent {
         delta: Option<String>,
         seq: u64,
     },
+    /// `session.revert.staged|committed|cleared`: a rollback boundary the user
+    /// can still cancel, that rollback applied, or the staging withdrawn.
+    #[serde(rename = "agent.revert.changed")]
+    RevertChanged {
+        asid: AgentSessionId,
+        state: RevertState,
+        /// The staged boundary on `staged`. Always present as a field, and
+        /// `null` on `committed` and `cleared`, where nothing is staged.
+        revert: Option<SessionRevertInfo>,
+        seq: u64,
+    },
     /// `session.inbox.*`: the queued and steered items waiting for the agent
     /// loop, as a whole list so the app never has to reconcile a diff.
     #[serde(rename = "agent.inbox.changed")]
@@ -102,6 +116,7 @@ impl AgentDomainEvent {
             Self::FormPending { seq, .. } => *seq,
             Self::FormResolved { seq, .. } => *seq,
             Self::CompactionChanged { seq, .. } => *seq,
+            Self::RevertChanged { seq, .. } => *seq,
             Self::InboxChanged { seq, .. } => *seq,
             Self::Resync { .. } => 0,
         }
@@ -120,6 +135,7 @@ impl AgentDomainEvent {
             Self::FormPending { .. } => "agent.form.pending",
             Self::FormResolved { .. } => "agent.form.resolved",
             Self::CompactionChanged { .. } => "agent.compaction.changed",
+            Self::RevertChanged { .. } => "agent.revert.changed",
             Self::InboxChanged { .. } => "agent.inbox.changed",
             Self::Resync { .. } => "agent.resync",
         }
@@ -136,6 +152,7 @@ impl AgentDomainEvent {
             Self::FormPending { asid, .. } => asid,
             Self::FormResolved { asid, .. } => asid,
             Self::CompactionChanged { asid, .. } => asid,
+            Self::RevertChanged { asid, .. } => asid,
             Self::InboxChanged { asid, .. } => asid,
             Self::Resync { asid, .. } => asid,
         }

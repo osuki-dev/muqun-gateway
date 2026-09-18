@@ -4,8 +4,8 @@ use tokio::sync::RwLock;
 
 use crate::agent::domain::{
     tool_item_id, AgentDomainEvent, AgentErrorInfo, AgentPart, AgentSessionId, AgentSessionInfo,
-    AgentSessionStatus, FormRequest, PermissionRequest, TimelineItem, TimelineRole, ToolCall,
-    ToolCallStatus, ToolTime,
+    AgentSessionStatus, FormRequest, PermissionRequest, RevertState, SessionRevertInfo,
+    TimelineItem, TimelineRole, ToolCall, ToolCallStatus, ToolTime,
 };
 use crate::agent::ports::mirror::{AgentSessionSnapshot, MirrorFuture, SessionMirrorPort};
 
@@ -375,6 +375,71 @@ impl MemoryMirror {
         };
         state.push_event(event);
         (seq, items)
+    }
+
+    /// Record where a rollback stands and publish it as
+    /// `agent.revert.changed`. `info.revert` is set in the same call, so a
+    /// snapshot served out of the mirror agrees with what went down the
+    /// stream -- the mirror is what answers `GET /api/agent-sessions/{asid}`
+    /// for a session it already holds.
+    pub async fn record_revert(
+        &self,
+        asid: &AgentSessionId,
+        revert_state: RevertState,
+        revert: Option<SessionRevertInfo>,
+    ) -> (u64, AgentSessionInfo) {
+        let mut sessions = self.sessions.write().await;
+        let state = Self::entry(&mut sessions, asid, AgentSessionStatus::Idle);
+        state.info.revert = revert.clone();
+        state.info.updated_ms = now_ms();
+        let seq = state.next_seq();
+        let event = AgentDomainEvent::RevertChanged {
+            asid: asid.clone(),
+            state: revert_state,
+            revert,
+            seq,
+        };
+        state.push_event(event);
+        (seq, state.info.clone())
+    }
+
+    /// Drop the rows a committed rollback took with it.
+    ///
+    /// OpenCode deletes the boundary message and everything after it and says
+    /// nothing further -- there is no message-removed event in 2.0.1 -- so
+    /// without this the mirror keeps serving rows that no longer exist. Ids
+    /// sort by creation, which is what makes "at or after the boundary" a
+    /// range; rows that are not messages (a detached shell is keyed
+    /// `shell_…`) are left alone.
+    pub async fn remove_timeline_from(
+        &self,
+        asid: &AgentSessionId,
+        message_id: &str,
+    ) -> Option<(u64, Vec<String>)> {
+        let mut sessions = self.sessions.write().await;
+        let state = sessions.get_mut(asid)?;
+        let doomed: Vec<String> = state
+            .timeline
+            .values()
+            .filter(|item| {
+                item.message_id.starts_with("msg_") && item.message_id.as_str() >= message_id
+            })
+            .map(|item| item.id.clone())
+            .collect();
+        if doomed.is_empty() {
+            return None;
+        }
+        for id in &doomed {
+            state.timeline.remove(id);
+        }
+        let seq = state.next_seq();
+        let event = AgentDomainEvent::TimelineRemoved {
+            asid: asid.clone(),
+            ids: doomed.clone(),
+            seq,
+        };
+        state.push_event(event);
+        Some((seq, doomed))
     }
 
     pub async fn record_compaction(

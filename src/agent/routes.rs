@@ -225,6 +225,14 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
             post(clear_agent_session_revert),
         )
         .route(
+            "/api/agent-sessions/{asid}/revert/stage",
+            post(stage_agent_session_revert),
+        )
+        .route(
+            "/api/agent-sessions/{asid}/revert/commit",
+            post(commit_agent_session_revert),
+        )
+        .route(
             "/api/agent-sessions/{asid}/skill",
             post(activate_agent_skill),
         )
@@ -1530,6 +1538,58 @@ async fn clear_agent_session_revert(
     Ok(Json(content_envelope(json!({ "cleared": true }))))
 }
 
+/// Stage a rollback without applying it: the boundary moves, the files stay
+/// as they are, and `info.revert` is set until this is committed or cleared.
+/// The reply is `Session.Revert`, whose `files` is what the app draws in the
+/// confirmation before the user commits.
+async fn stage_agent_session_revert(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<StageRevertBody>,
+) -> ApiResult<Json<Value>> {
+    let manager = manager_or_unavailable!(&state, &headers);
+    let message_id = body.message_id.trim();
+    if message_id.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_message_id",
+            "message_id must not be empty",
+        ));
+    }
+    let res = manager
+        .driver()
+        .client()
+        .stage_revert(&asid, message_id, body.files)
+        .await
+        .map_err(engine_error)?;
+    // `Session.Revert` comes back under `data`; it is mapped rather than
+    // forwarded so the app reads the same snake_case shape it already reads
+    // on `info.revert`.
+    let revert = res
+        .get("data")
+        .and_then(super::adapters::opencode::mapper::map_revert);
+    Ok(Json(content_envelope(json!({ "revert": revert }))))
+}
+
+/// Apply the staged rollback. OpenCode answers `204`; the boundary message and
+/// everything after it are gone once this returns, and the removal reaches the
+/// app as `agent.timeline.removed` off `session.revert.committed`.
+async fn commit_agent_session_revert(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    let manager = manager_or_unavailable!(&state, &headers);
+    manager
+        .driver()
+        .client()
+        .commit_revert(&asid)
+        .await
+        .map_err(engine_error)?;
+    Ok(Json(content_envelope(json!({ "committed": true }))))
+}
+
 /// Activate a skill by id. The activation is a message OpenCode appends to
 /// the session, so what the user sees is a timeline row, not a reply here --
 /// this answers as soon as OpenCode has accepted it.
@@ -1901,6 +1961,25 @@ mod tests {
     #[test]
     fn every_agent_route_mounts_without_a_conflict() {
         let _router: Router<AppState> = mount(Router::new());
+    }
+
+    /// `files` is tri-state on the way in: absent leaves OpenCode's own
+    /// default alone, and `false` is a caller who does not want the diff
+    /// computed -- not the same thing.
+    #[test]
+    fn a_stage_body_keeps_files_optional() {
+        let bare: StageRevertBody =
+            serde_json::from_value(json!({ "message_id": "msg_1" })).expect("id alone parses");
+        assert_eq!(bare.message_id, "msg_1");
+        assert!(bare.files.is_none());
+
+        let with_files: StageRevertBody =
+            serde_json::from_value(json!({ "message_id": "msg_1", "files": false }))
+                .expect("files parses");
+        assert_eq!(with_files.files, Some(false));
+
+        let no_id: Result<StageRevertBody, _> = serde_json::from_value(json!({ "files": true }));
+        assert!(no_id.is_err(), "message_id is required");
     }
 
     #[test]

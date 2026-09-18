@@ -10,7 +10,7 @@ use super::adapters::opencode::{
 };
 use super::domain::{
     reasoning_item_id, text_item_id, AgentDomainEvent, AgentPart, AgentSessionId,
-    AgentSessionStatus, CompactionStatus, TimelineItem, TimelineRole, ToolCallStatus,
+    AgentSessionStatus, CompactionStatus, RevertState, TimelineItem, TimelineRole, ToolCallStatus,
 };
 use super::ports::engine::AgentEnginePort;
 use super::ports::mirror::SessionMirrorPort;
@@ -674,6 +674,51 @@ impl AgentManager {
                 // timeline carries the summary rather than only the event.
                 if matches!(status, CompactionStatus::Completed | CompactionStatus::Failed) {
                     ctx.refetch_tail(&asid).await;
+                }
+            }
+
+            // ---------------------------------------------------------------
+            // Revert: staging a rollback, applying it, and withdrawing it
+            // ---------------------------------------------------------------
+            "session.revert.staged" | "session.revert.committed" | "session.revert.cleared" => {
+                let Some(asid) = session_id.map(str::to_string).map(AgentSessionId) else {
+                    return;
+                };
+                ctx.ensure_session(&asid).await;
+                // Only `staged` carries a boundary; on the other two nothing
+                // is staged any more, which is what `None` says here.
+                let (revert_state, revert) = match event_type {
+                    "session.revert.staged" => (
+                        RevertState::Staged,
+                        data.get("revert").and_then(mapper::map_revert),
+                    ),
+                    "session.revert.committed" => (RevertState::Committed, None),
+                    _ => (RevertState::Cleared, None),
+                };
+                let (seq, _info) = ctx
+                    .mirror
+                    .record_revert(&asid, revert_state, revert.clone())
+                    .await;
+                ctx.emit(AgentDomainEvent::RevertChanged {
+                    asid: asid.clone(),
+                    state: revert_state,
+                    revert,
+                    seq,
+                });
+                // A committed rollback deletes the boundary message and
+                // everything after it. 2.0.1 announces no message removal, so
+                // the mirror would otherwise keep serving rows that are gone;
+                // `to` on this event is the boundary.
+                if let Some(boundary) = data.get("to").and_then(Value::as_str) {
+                    if let Some((seq, ids)) =
+                        ctx.mirror.remove_timeline_from(&asid, boundary).await
+                    {
+                        ctx.emit(AgentDomainEvent::TimelineRemoved {
+                            asid: asid.clone(),
+                            ids,
+                            seq,
+                        });
+                    }
                 }
             }
 

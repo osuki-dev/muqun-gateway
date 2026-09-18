@@ -190,14 +190,48 @@ marked `background: true` and the shells stay readable through
 No body → `{"idle": true}` once the agent loop is idle. For scripted flows, not
 for the UI.
 
-### `POST /api/agent-sessions/{asid}/revert` · `/revert/clear`
+### `POST /api/agent-sessions/{asid}/revert` and its two halves
+
+A rollback is two steps in OpenCode: a boundary is **staged**, which changes
+nothing on disk and can still be withdrawn, and then **committed**, which
+deletes the boundary message and everything after it and puts the files back.
+The app stages, shows the user what would go, and commits or clears.
+
+- `POST …/revert/stage`
+
+  ```json
+  { "message_id": "msg_1", "files": true }
+  ```
+
+  → the staged boundary, `Session.Revert` in the gateway's own snake_case:
+
+  ```json
+  { "revert": { "message_id": "msg_1", "part_id": null, "snapshot": null,
+                "files": [ { "file": "src/a.ts", "patch": "@@ …", "additions": 3,
+                             "deletions": 1, "status": "modified" } ] } }
+  ```
+
+  `files` is optional: `true` asks OpenCode to work out the file changes the
+  rollback would undo and return them as `FileDiff.Info[]`, which is what the
+  confirmation draws. Leave it out and OpenCode decides; `files` then comes back
+  `null` or empty. Staging again with another `message_id` moves the boundary.
+  An unknown message is `404` from OpenCode, and staging while the session is
+  running is `409` — both arrive as `agent_engine_error`.
+
+- `POST …/revert/commit` → `{"committed": true}`. Applies what is staged.
+  OpenCode answers `204`. With nothing staged this is a no-op, not an error.
+
+- `POST …/revert/clear` → `{"cleared": true}`. Withdraws the staging — redo.
 
 - `POST …/revert` `{"message_id": "msg_…"}` → `{"status": "ok", "reverted_to": "msg_…"}`.
-  Stages and commits a rollback to that message.
-- `POST …/revert/clear` → `{"cleared": true}`. Cancels a staged rollback — this
-  is redo.
+  The original one-shot: stage with `files: true` and commit, in one call. It is
+  unchanged and still supported; new work should use the two steps, because a
+  rollback that cannot be previewed cannot be confirmed.
 
-While a rollback is staged, `info.revert` is set.
+While a rollback is staged, `info.revert` is set — on the snapshot as well as on
+the stream, and the mirror is updated from the event, so a refetch taken at any
+point agrees with what was streamed. Every step is announced as
+[`agent.revert.changed`](#agentrevertchanged).
 
 ---
 
@@ -529,6 +563,38 @@ boundary also appears in the timeline as an `AgentPart::Compaction` row.
 
 > This event and `agent.inbox.changed` name the session `session_id`; the older
 > events call the same field `asid`. Both are accepted on the way in.
+
+### `agent.revert.changed`
+
+```json
+{ "type": "agent.revert.changed", "asid": "ses_1", "seq": 22, "state": "staged",
+  "revert": { "message_id": "msg_1", "part_id": null, "snapshot": null,
+              "files": [ { "file": "src/a.ts", "patch": "@@ …", "additions": 3,
+                           "deletions": 1, "status": "modified" } ] } }
+{ "type": "agent.revert.changed", "asid": "ses_1", "seq": 23, "state": "cleared",
+  "revert": null }
+{ "type": "agent.revert.changed", "asid": "ses_1", "seq": 24, "state": "committed",
+  "revert": null }
+```
+
+`state` is `staged | committed | cleared`. `revert` is always present as a key:
+the staged boundary on `staged`, and `null` on the other two, where nothing is
+staged any more. `info.revert` on the session follows the same values.
+
+The three come from OpenCode's own `session.revert.staged`,
+`session.revert.committed` and `session.revert.cleared`, whose payloads on 2.0.1
+are — captured live against the running service:
+
+```json
+{"type":"session.revert.staged",    "data":{"sessionID":"ses_1","revert":{"messageID":"msg_1","files":[]}}}
+{"type":"session.revert.cleared",   "data":{"sessionID":"ses_1"}}
+{"type":"session.revert.committed", "data":{"sessionID":"ses_1","to":"msg_1"}}
+```
+
+`committed` is also the only notice that rows have gone: OpenCode deletes the
+boundary message and everything after it and has no message-removed event, so
+the gateway drops those rows from the mirror and sends
+[`agent.timeline.removed`](#agenttimelineremoved) for them in the same breath.
 
 ### `agent.inbox.changed`
 
