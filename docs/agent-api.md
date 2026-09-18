@@ -236,6 +236,102 @@ point agrees with what was streamed. Every step is announced as
 
 ---
 
+## Worktrees
+
+A worktree is a second checkout of the same repository that OpenCode manages
+for you, so an agent can work on a branch without disturbing the one you have
+open. The gateway proxies OpenCode's inventory and adds nothing of its own.
+
+`directory` on every route here is the **project** directory — the repository
+root whose inventory is being read or changed — and never a worktree's own.
+It goes to OpenCode as the deep-object `location[directory]` these endpoints
+take; omitted, OpenCode falls back to its own default location.
+
+### `GET /api/agent-worktrees`
+
+`?directory=/abs/repo` → `{"items": [Worktree.Directory]}`:
+
+```json
+{ "items": [
+  { "directory": "/home/ryu/repo" },
+  { "directory": "/home/ryu/.local/share/opencode/worktree/016d5f/probe", "strategy": "git" }
+] }
+```
+
+The project's own root is in the list, and it is the entry **without a
+`strategy`**: it is not a worktree OpenCode created, and `DELETE` refuses it.
+Entries OpenCode manages carry `strategy` (`"git"` on 2.0.1).
+
+### `POST /api/agent-worktrees`
+
+```json
+{ "directory": "/abs/repo", "name": "probe", "branch": "main" }
+```
+
+→ `{"worktree": {"directory": "…/worktree/016d5f/probe"}}` (`Worktree.Info`).
+
+Every field is optional, `directory` included — `{}` is a valid create and
+OpenCode names the worktree itself (it picked `sunny-circuit` when asked). The
+two that matter:
+
+- **`name`** is the worktree directory's name.
+- **`branch`** is an **existing ref to branch from**, not a name to create.
+  `{"branch": "probe-branch"}` against a repo without that ref is
+  `fatal: invalid reference: probe-branch`, as a `502 agent_engine_error`.
+
+`from` and `strategy` are passed through as `Worktree.CreateInput` defines
+them; `from` is a directory rather than a ref (`{"from": "main"}` answers
+`Worktree directory unavailable: main`). Fields the caller did not set are left
+out of the request entirely, because the input declares
+`additionalProperties: false` and an explicit `null` is refused.
+
+Creation is synchronous: the route answers when the worktree exists. The
+project's inventory change arrives separately as
+[`agent.worktree.changed`](#agentworktreechanged).
+
+### `DELETE /api/agent-worktrees`
+
+```json
+{ "directory": "/abs/repo", "worktree": "…/worktree/016d5f/probe", "force": true }
+```
+
+→ `{"deleted": true}`. **Two directories, and they are not the same one**:
+`directory` is the project, `worktree` is the checkout being removed.
+
+`force` defaults to `false` here. OpenCode's own `Worktree.RemoveInput` makes it
+required — omitting it is `Missing key at ["force"]` — so the gateway always
+sends it. A worktree with local changes refuses without it, and the refusal
+carries `forceRequired: true`.
+
+### `POST /api/agent-worktrees/refresh`
+
+`{"directory": "/abs/repo"}` (optional body) → `{"refreshed": true}`.
+Rediscovers worktrees on disk and reconciles the project's inventory, for when
+something changed outside OpenCode.
+
+### `POST /api/agent-sessions/{asid}/move`
+
+`{"directory": "/abs/path"}` → the session as it is afterwards
+(`AgentSessionInfo`), read back rather than assembled from the request.
+
+This is what a worktree is for: point an existing session at one. The reply is
+re-read because a move can change more than the directory — see the scope note.
+
+**There is no scope check, because 2.0.1 expresses no scope rule.** The spec
+requires only `directory`; the live service accepts *any* directory that
+exists, including one belonging to another project, and the session then joins
+that directory's project — `project_id` changes with it. A directory that does
+not exist is `400 Directory does not exist: …`, surfaced as
+`agent_engine_error`, and that is the whole of the rule. The gateway does not
+add one of its own: refusing a move OpenCode allows would be the gateway
+inventing policy it was not given. A client that wants to keep a session inside
+one project should offer only that project's
+[worktree list](#get-apiagent-worktrees) as targets.
+
+The move also arrives on the stream as `agent.session.updated` with the new
+`directory` — mapped straight from `session.moved`'s own payload, so it does not
+wait on a refetch.
+
 ## Attachments
 
 A phone cannot hand a local file to an agent that runs on the gateway's host, so
@@ -636,6 +732,61 @@ the gateway drops those rows from the mirror and sends
 ```
 
 The whole queue every time, so there is no diff to reconcile.
+
+### `agent.worktree.changed`
+
+```json
+{ "type": "agent.worktree.changed", "state": "updated",
+  "directory": "/home/ryu/repo", "project_id": "016d5ff1…" }
+{ "type": "agent.worktree.changed", "state": "resolved",
+  "directory": "/home/ryu/repo", "project_id": "016d5ff1…" }
+{ "type": "agent.worktree.changed", "state": "ready", "directory": "/home/ryu/repo",
+  "name": "probe", "branch": "main" }
+{ "type": "agent.worktree.changed", "state": "failed", "directory": "/home/ryu/repo",
+  "error": "fatal: invalid reference: nope" }
+```
+
+A worktree belongs to a project, not a session, so this event **carries no
+`asid`** — which is exactly how it reaches everything: an event with no session
+goes to every `GET /api/agent-sessions/{asid}/stream` as well as the
+device-wide `GET /api/sessions/{id}/stream`, the same way `agent.resync` does.
+There is no `seq`: it is not replayable from a session's ring buffer, and
+`GET …/events?after=` will not hand it back.
+
+`state` is:
+
+| `state` | From | Meaning |
+|---|---|---|
+| `updated` | `worktree.updated` | The project's inventory changed — re-list it. |
+| `resolved` | `worktree.resolved` | A location resolved to this worktree directory. |
+| `ready` | `worktree.ready`, `workspace.ready` | A worktree was prepared; `name` and `branch` describe it. |
+| `failed` | `worktree.failed`, `workspace.failed` | `error` carries the message. |
+
+`directory` is the event's own when it has one (`worktree.resolved`) and
+otherwise the project directory off the event envelope's `location`, because
+`worktree.updated` names only `projectID`.
+
+**There is no `creating`.** Nothing in 2.0.1 announces a creation starting:
+`POST /api/worktree` blocks until the worktree exists, and the inventory change
+follows. A client that wants a spinner should show it around its own request.
+
+What 2.0.1 actually emits, measured by driving a full create / list / refresh /
+move / remove cycle against the live service while tailing `/api/event`:
+
+```json
+{"type":"worktree.resolved","data":{"projectID":"016d5ff1…","directory":"/tmp/muqun-gw-wt","previous":"global"}}
+{"type":"worktree.updated","location":{"directory":"/tmp/muqun-gw-wt"},"data":{"projectID":"016d5ff1…"}}
+```
+
+`worktree.ready`, `worktree.failed` and the `workspace.*` pair did **not**
+appear in any of it. They are in the binary's event registry — with schemas
+`{name, branch?}`, `{message}` and, for `workspace.status`, `{workspaceID,
+status}` — so the first two are mapped here in case a flow that does emit them
+turns up. `workspace.status` is deliberately **not** mapped: it reports a
+remote workspace's *connection* state (`connected` / `connecting` /
+`disconnected` / `error`), names no directory, and has nothing to say about a
+worktree; folding it in would wake a client waiting on its checkout every time
+a socket reconnected.
 
 ### `agent.resync`
 

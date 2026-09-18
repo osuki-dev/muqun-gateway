@@ -15,6 +15,7 @@ pub use permission::{PermissionDecision, PermissionOption, PermissionRequest};
 pub use session::{
     AgentErrorInfo, AgentProject, AgentSessionId, AgentSessionInfo, AgentSessionStatus, ModelRef,
     RevertState, SessionForkInfo, SessionQuery, SessionRevertInfo, TokensUsage,
+    WorktreeState,
 };
 pub use timeline::{
     part_item_id, push_input_partial, reasoning_item_id, text_item_id, tool_item_id, AgentPart,

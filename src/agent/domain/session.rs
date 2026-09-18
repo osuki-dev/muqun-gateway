@@ -103,6 +103,26 @@ pub enum RevertState {
     Cleared,
 }
 
+/// What happened to a project's worktrees, as `agent.worktree.changed`
+/// reports it.
+///
+/// There is no `creating`: nothing in 2.0.1 announces a creation starting.
+/// `POST /api/worktree` blocks until the worktree exists and then the
+/// inventory changes, which is `updated`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreeState {
+    /// `worktree.updated`: the project's inventory changed -- something was
+    /// created or removed. Re-list it.
+    Updated,
+    /// `worktree.resolved`: a location resolved to this worktree directory.
+    Resolved,
+    /// `worktree.ready` / `workspace.ready`.
+    Ready,
+    /// `worktree.failed` / `workspace.failed`; `error` carries the message.
+    Failed,
+}
+
 /// `Session.Info.fork`: where a forked session was copied from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionForkInfo {

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use super::session::{
     AgentErrorInfo, AgentSessionId, AgentSessionInfo, AgentSessionStatus, RevertState,
-    SessionRevertInfo,
+    SessionRevertInfo, WorktreeState,
 };
 use super::timeline::{CompactionStatus, TimelineItem};
 use super::permission::PermissionRequest;
@@ -97,6 +97,31 @@ pub enum AgentDomainEvent {
         items: Vec<serde_json::Value>,
         seq: u64,
     },
+    /// A project's worktrees changed. Not a session's event: like
+    /// `agent.resync` it carries an empty `asid`, which is how it reaches
+    /// every agent-session stream as well as the device-wide session stream.
+    #[serde(rename = "agent.worktree.changed")]
+    WorktreeChanged {
+        #[serde(skip_serializing)]
+        asid: AgentSessionId,
+        state: WorktreeState,
+        /// The project directory the change belongs to, from the event
+        /// envelope's own `location.directory`, or the resolved worktree on
+        /// `worktree.resolved`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        directory: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_id: Option<String>,
+        /// The worktree's name, on `ready`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        /// The ref it was branched from, on `ready`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+        /// The message, on `failed`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     #[serde(rename = "agent.resync")]
     Resync {
         asid: AgentSessionId,
@@ -118,6 +143,7 @@ impl AgentDomainEvent {
             Self::CompactionChanged { seq, .. } => *seq,
             Self::RevertChanged { seq, .. } => *seq,
             Self::InboxChanged { seq, .. } => *seq,
+            Self::WorktreeChanged { .. } => 0,
             Self::Resync { .. } => 0,
         }
     }
@@ -137,6 +163,7 @@ impl AgentDomainEvent {
             Self::CompactionChanged { .. } => "agent.compaction.changed",
             Self::RevertChanged { .. } => "agent.revert.changed",
             Self::InboxChanged { .. } => "agent.inbox.changed",
+            Self::WorktreeChanged { .. } => "agent.worktree.changed",
             Self::Resync { .. } => "agent.resync",
         }
     }
@@ -154,6 +181,7 @@ impl AgentDomainEvent {
             Self::CompactionChanged { asid, .. } => asid,
             Self::RevertChanged { asid, .. } => asid,
             Self::InboxChanged { asid, .. } => asid,
+            Self::WorktreeChanged { asid, .. } => asid,
             Self::Resync { asid, .. } => asid,
         }
     }

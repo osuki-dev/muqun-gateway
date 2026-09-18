@@ -535,3 +535,125 @@ async fn a_snapshot_taken_mid_stream_carries_the_partial_input() {
         "half an argument list is not an input, and must not be served as one"
     );
 }
+
+/// The worktree events, replayed from the cycle that produced them.
+///
+/// They belong to a project, not a session, so they carry an empty asid --
+/// which is what puts them on every agent-session stream and on the
+/// device-wide session stream, the same way a global resync travels.
+#[tokio::test]
+async fn worktree_events_reach_every_stream_with_what_they_carry() {
+    let ctx = ctx();
+    let mut rx = ctx.tx.subscribe();
+    replay(&ctx, "worktree.sse").await;
+
+    let mut changes = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let AgentDomainEvent::WorktreeChanged {
+            asid,
+            state,
+            directory,
+            project_id,
+            ..
+        } = event
+        {
+            assert!(asid.0.is_empty(), "a worktree belongs to no session");
+            changes.push((state, directory, project_id));
+        }
+    }
+
+    assert_eq!(changes.len(), 2, "resolved and updated, got {changes:?}");
+
+    let (state, directory, project_id) = &changes[0];
+    assert_eq!(*state, WorktreeState::Resolved);
+    assert_eq!(directory.as_deref(), Some("/tmp/muqun-gw-wt"), "its own field");
+    assert_eq!(
+        project_id.as_deref(),
+        Some("016d5ff1cc0c2a1c4cb80441b37dbfa45f3b08a6")
+    );
+
+    let (state, directory, project_id) = &changes[1];
+    assert_eq!(*state, WorktreeState::Updated);
+    assert_eq!(
+        directory.as_deref(),
+        Some("/tmp/muqun-gw-wt"),
+        "`worktree.updated` names only the project, so the directory is the \
+         envelope's own location"
+    );
+    assert_eq!(
+        project_id.as_deref(),
+        Some("016d5ff1cc0c2a1c4cb80441b37dbfa45f3b08a6")
+    );
+}
+
+/// A move is the one thing the app draws from `session.moved`, and the event
+/// carries the new directory inline -- so it lands without a refetch, which
+/// matters because the test driver has no OpenCode to refetch from.
+#[tokio::test]
+async fn a_moved_session_reports_its_new_directory() {
+    let ctx = ctx();
+    let mut rx = ctx.tx.subscribe();
+    replay(&ctx, "worktree.sse").await;
+
+    let mut directories = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let AgentDomainEvent::SessionUpdated { info, .. } = event {
+            if let Some(directory) = info.directory.clone() {
+                directories.push(directory);
+            }
+        }
+    }
+    assert_eq!(
+        directories.last().map(String::as_str),
+        Some("/home/ryu/.local/share/opencode/worktree/016d5f/probe-b"),
+        "the app-visible directory follows the move"
+    );
+
+    let asid = AgentSessionId("ses_f4d0d2066ffeYtNIffATgHg0Fw".to_string());
+    let snapshot = ctx.mirror.get_snapshot(&asid).await.expect("session known");
+    assert_eq!(
+        snapshot.info.directory.as_deref(),
+        Some("/home/ryu/.local/share/opencode/worktree/016d5f/probe-b")
+    );
+    assert_eq!(
+        snapshot.info.project_id.as_deref(),
+        Some("016d5ff1cc0c2a1c4cb80441b37dbfa45f3b08a6"),
+        "a move carries the project it lands in"
+    );
+}
+
+/// `worktree.failed` is not emitted by 2.0.1's HTTP worktree flow, but it is
+/// in the binary's event registry, so it is accepted rather than dropped.
+#[tokio::test]
+async fn a_failed_worktree_carries_its_message() {
+    let ctx = ctx();
+    let mut rx = ctx.tx.subscribe();
+    for frame in [
+        r#"data: {"id":"evt_1","type":"worktree.ready","location":{"directory":"/repo"},"data":{"name":"probe","branch":"main"}}"#,
+        r#"data: {"id":"evt_2","type":"worktree.failed","location":{"directory":"/repo"},"data":{"message":"fatal: invalid reference: nope"}}"#,
+    ] {
+        let frame = OpencodeSseListener::parse_block(frame).expect("frame parses");
+        AgentManager::handle_raw_event(frame, &ctx).await;
+    }
+
+    let mut seen = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let AgentDomainEvent::WorktreeChanged {
+            state, name, branch, error, directory, ..
+        } = event
+        {
+            seen.push((state, name, branch, error, directory));
+        }
+    }
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0].0, WorktreeState::Ready);
+    assert_eq!(seen[0].1.as_deref(), Some("probe"));
+    assert_eq!(seen[0].2.as_deref(), Some("main"));
+    assert_eq!(seen[1].0, WorktreeState::Failed);
+    assert_eq!(seen[1].3.as_deref(), Some("fatal: invalid reference: nope"));
+    assert_eq!(
+        seen[1].4.as_deref(),
+        Some("/repo"),
+        "the envelope says which project even when the payload does not"
+    );
+}

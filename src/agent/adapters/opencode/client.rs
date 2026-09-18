@@ -329,6 +329,118 @@ impl OpencodeClient {
         .await
     }
 
+    // -----------------------------------------------------------------
+    // Worktrees
+    // -----------------------------------------------------------------
+
+    /// `GET /api/worktree`: the project's worktree inventory, discovered
+    /// through the location's strategies.
+    ///
+    /// Answers a bare `Worktree.Directory[]`, not the `{data: …}` envelope the
+    /// catalog endpoints use -- checked against 2.0.1, which returns
+    /// `[{"directory": "/repo"}, {"directory": "…/probe", "strategy": "git"}]`.
+    /// The project's own root is in the list and is the one without a
+    /// `strategy`: it is not a worktree OpenCode made and cannot be removed.
+    pub async fn list_worktrees(
+        &self,
+        directory: Option<&str>,
+    ) -> Result<Vec<Value>, AgentEngineError> {
+        let res = self.get("/api/worktree", &location_query(directory)).await?;
+        if let Some(arr) = res.as_array() {
+            return Ok(arr.clone());
+        }
+        Ok(res.get("data").and_then(Value::as_array).cloned().unwrap_or_default())
+    }
+
+    /// `POST /api/worktree`: create one under the location's strategy.
+    ///
+    /// Every field of `Worktree.CreateInput` is optional and an empty body
+    /// works -- 2.0.1 then names the directory itself. Measured against the
+    /// live service: `name` is the directory's name, and `branch` is an
+    /// **existing ref to branch from**, not a name to create; `{"branch":
+    /// "probe-branch"}` on a repo without that ref is
+    /// `fatal: invalid reference: probe-branch`.
+    pub async fn create_worktree(
+        &self,
+        directory: Option<&str>,
+        input: &Value,
+    ) -> Result<Value, AgentEngineError> {
+        let url = format!("{}/api/worktree", self.endpoint.url);
+        let req = self.authed_req(
+            self.http
+                .post(&url)
+                .query(&location_query(directory))
+                .json(input),
+        );
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| AgentEngineError::Network(e.to_string()))?;
+        self.handle_resp(resp).await
+    }
+
+    /// `DELETE /api/worktree`: remove one, by its own directory.
+    ///
+    /// `force` is required by `Worktree.RemoveInput` -- omitting it is a 400
+    /// `Missing key at ["force"]`, not a default -- so it is always sent.
+    pub async fn remove_worktree(
+        &self,
+        directory: Option<&str>,
+        worktree_directory: &str,
+        force: bool,
+    ) -> Result<Value, AgentEngineError> {
+        let url = format!("{}/api/worktree", self.endpoint.url);
+        let req = self.authed_req(
+            self.http
+                .delete(&url)
+                .query(&location_query(directory))
+                .json(&json!({ "directory": worktree_directory, "force": force })),
+        );
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| AgentEngineError::Network(e.to_string()))?;
+        self.handle_resp(resp).await
+    }
+
+    /// `POST /api/worktree/refresh`: rediscover and reconcile the inventory.
+    pub async fn refresh_worktrees(
+        &self,
+        directory: Option<&str>,
+    ) -> Result<Value, AgentEngineError> {
+        let url = format!("{}/api/worktree/refresh", self.endpoint.url);
+        let req = self.authed_req(
+            self.http
+                .post(&url)
+                .query(&location_query(directory))
+                .json(&json!({})),
+        );
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| AgentEngineError::Network(e.to_string()))?;
+        self.handle_resp(resp).await
+    }
+
+    /// `POST /api/session/{id}/move`: move a session to another directory.
+    ///
+    /// `directory` is the only required field. The directory must exist -- a
+    /// missing one is a 400 -- and that is the whole of the rule: 2.0.1
+    /// accepts any existing directory, including one outside the session's
+    /// current project, and the session joins whatever project that directory
+    /// belongs to.
+    pub async fn move_session(
+        &self,
+        session_id: &str,
+        directory: &str,
+    ) -> Result<Value, AgentEngineError> {
+        self.post(
+            &format!("/api/session/{session_id}/move"),
+            &json!({ "directory": directory }),
+        )
+        .await
+    }
+
     /// `GET /api/permission/saved`: the "always allow" decisions OpenCode has
     /// remembered. Scoped to one project when a `projectID` is given; without
     /// one OpenCode answers with every project's.
@@ -850,6 +962,38 @@ mod tests {
         assert!(url.contains("parentID=null"), "roots-only is a literal null: {url}");
         assert!(url.contains("search=gateway"), "got {url}");
         assert!(url.contains("cursor=abc"), "got {url}");
+    }
+
+    /// The worktree routes take the project as the same deep-object
+    /// `location` every catalog endpoint takes, not a flat `directory`.
+    #[test]
+    fn a_worktree_call_names_its_project_as_a_location() {
+        let url = query_url("/api/worktree", &location_query(Some("/tmp/muqun-gw-wt")));
+        assert!(
+            url.contains("location%5Bdirectory%5D=%2Ftmp%2Fmuqun-gw-wt"),
+            "got {url}"
+        );
+        assert!(
+            !url.contains("directory=%2Ftmp") || url.contains("location%5Bdirectory%5D"),
+            "a flat directory= is not what this endpoint reads: {url}"
+        );
+    }
+
+    /// `Worktree.RemoveInput` requires `force`. Leaving it out is a 400 from
+    /// OpenCode -- `Missing key at ["force"]` -- and not a default, so the
+    /// body always carries it.
+    #[test]
+    fn a_worktree_removal_always_spells_out_force() {
+        for force in [false, true] {
+            let body = json!({ "directory": "/w/probe", "force": force });
+            assert_eq!(body["directory"], "/w/probe");
+            assert_eq!(body["force"], force);
+            assert_eq!(
+                body.as_object().unwrap().len(),
+                2,
+                "Worktree.RemoveInput declares additionalProperties:false"
+            );
+        }
     }
 
     /// A saved-permission list that is not scoped is every project's, so the

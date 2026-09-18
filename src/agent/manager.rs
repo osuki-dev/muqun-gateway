@@ -11,6 +11,7 @@ use super::adapters::opencode::{
 use super::domain::{
     reasoning_item_id, text_item_id, AgentDomainEvent, AgentPart, AgentSessionId,
     AgentSessionStatus, CompactionStatus, RevertState, TimelineItem, TimelineRole, ToolCallStatus,
+    WorktreeState,
 };
 use super::ports::engine::AgentEnginePort;
 use super::ports::mirror::SessionMirrorPort;
@@ -356,6 +357,32 @@ impl AgentManager {
                             .get("parentID")
                             .and_then(Value::as_str)
                             .map(str::to_string),
+                        directory: data
+                            .pointer("/location/directory")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        project_id: data
+                            .get("projectID")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        ..SessionPatch::default()
+                    },
+                )
+                .await;
+            }
+            // A move carries the new location inline -- `{sessionID, location,
+            // projectID, subpath}` -- and no `info`, so without this it fell
+            // through to the refetch below. The directory is the one field of
+            // this event the app draws, so it is patched in directly and the
+            // round trip is saved.
+            "session.moved" if data.get("info").is_none() && data.get("session").is_none() => {
+                let Some(asid) = session_id.map(str::to_string).map(AgentSessionId) else {
+                    return;
+                };
+                ctx.ensure_session(&asid).await;
+                ctx.patch_session(
+                    &asid,
+                    SessionPatch {
                         directory: data
                             .pointer("/location/directory")
                             .and_then(Value::as_str)
@@ -792,6 +819,63 @@ impl AgentManager {
                     .upsert_inbox_item(&asid, inbox_id, item)
                     .await;
                 ctx.emit(AgentDomainEvent::InboxChanged { asid, items, seq });
+            }
+
+            // ---------------------------------------------------------------
+            // Worktrees
+            // ---------------------------------------------------------------
+            // None of these belongs to a session, so they carry an empty asid
+            // and reach every stream, the way a global resync does.
+            //
+            // What 2.0.1 actually emits for a worktree created, refreshed or
+            // removed over HTTP is `worktree.updated` and `worktree.resolved`
+            // -- confirmed by driving a full create/list/refresh/remove cycle
+            // against the live service while tailing `/api/event`.
+            // `worktree.ready`, `worktree.failed` and the `workspace.*` pair
+            // are in the binary's event registry with schemas `{name, branch?}`
+            // and `{message}`, and none of them appeared in any of those
+            // flows; they are accepted here so a build or a remote workspace
+            // that does emit them is not silently dropped.
+            "worktree.updated"
+            | "worktree.resolved"
+            | "worktree.ready"
+            | "worktree.failed"
+            | "workspace.ready"
+            | "workspace.failed" => {
+                let state = match event_type {
+                    "worktree.updated" => WorktreeState::Updated,
+                    "worktree.resolved" => WorktreeState::Resolved,
+                    "worktree.ready" | "workspace.ready" => WorktreeState::Ready,
+                    _ => WorktreeState::Failed,
+                };
+                // `worktree.resolved` names the directory it resolved to; the
+                // rest only say which project, and the envelope's own
+                // `location.directory` is the project directory.
+                let directory = data
+                    .get("directory")
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        raw.location
+                            .as_ref()
+                            .and_then(|l| l.get("directory"))
+                            .and_then(Value::as_str)
+                    })
+                    .map(str::to_string);
+                ctx.emit(AgentDomainEvent::WorktreeChanged {
+                    asid: AgentSessionId(String::new()),
+                    state,
+                    directory,
+                    project_id: data
+                        .get("projectID")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    name: data.get("name").and_then(Value::as_str).map(str::to_string),
+                    branch: data.get("branch").and_then(Value::as_str).map(str::to_string),
+                    error: data
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                });
             }
 
             // ---------------------------------------------------------------

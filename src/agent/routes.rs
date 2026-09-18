@@ -15,6 +15,8 @@ use sha2::{Digest, Sha256};
 use super::domain::{
     AgentDomainEvent, AgentSessionId, ModelRef, PermissionDecision, SessionQuery,
 };
+use super::ports::engine::AgentEnginePort;
+use super::ports::mirror::SessionMirrorPort;
 use crate::{api_error, content_envelope, require_device, validate_text, ApiResult, AppState};
 
 #[derive(Debug, Deserialize)]
@@ -180,6 +182,51 @@ pub struct StageRevertBody {
     pub files: Option<bool>,
 }
 
+/// `?directory=` on the worktree routes: the **project** directory whose
+/// inventory is being read or changed, not a worktree's own.
+#[derive(Debug, Deserialize)]
+pub struct AgentWorktreesQuery {
+    pub directory: Option<String>,
+}
+
+/// `POST /api/agent-worktrees`. `directory` is the project; the rest is
+/// `Worktree.CreateInput`, every field of which 2.0.1 makes optional.
+#[derive(Debug, Deserialize)]
+pub struct CreateWorktreeBody {
+    /// The project directory to create the worktree under.
+    pub directory: Option<String>,
+    /// The worktree directory's name. Omitted, OpenCode names it.
+    pub name: Option<String>,
+    /// An **existing** ref to branch from -- not a name to create.
+    pub branch: Option<String>,
+    pub from: Option<String>,
+    pub strategy: Option<String>,
+}
+
+/// `DELETE /api/agent-worktrees`. Two directories, and they are not the same
+/// one: `directory` is the project, `worktree` is the thing being removed.
+#[derive(Debug, Deserialize)]
+pub struct RemoveWorktreeBody {
+    pub directory: Option<String>,
+    pub worktree: String,
+    /// `Worktree.RemoveInput.force` is required by OpenCode; the gateway
+    /// defaults it to false rather than making every caller spell it.
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// `POST /api/agent-worktrees/refresh`.
+#[derive(Debug, Deserialize)]
+pub struct RefreshWorktreesBody {
+    pub directory: Option<String>,
+}
+
+/// `POST /api/agent-sessions/{asid}/move`.
+#[derive(Debug, Deserialize)]
+pub struct MoveSessionBody {
+    pub directory: String,
+}
+
 /// `POST …/skill`. `skill` is a `Skill.Info.id` from the catalog.
 #[derive(Debug, Deserialize)]
 pub struct ActivateSkillBody {
@@ -235,6 +282,20 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
         .route(
             "/api/agent-sessions/{asid}/skill",
             post(activate_agent_skill),
+        )
+        .route(
+            "/api/agent-worktrees",
+            get(list_agent_worktrees)
+                .post(create_agent_worktree)
+                .delete(remove_agent_worktree),
+        )
+        .route(
+            "/api/agent-worktrees/refresh",
+            post(refresh_agent_worktrees),
+        )
+        .route(
+            "/api/agent-sessions/{asid}/move",
+            post(move_agent_session),
         )
         .route(
             "/api/agent-sessions/{asid}/permissions/saved",
@@ -1628,6 +1689,138 @@ async fn forget_saved_agent_permission(
     Ok(Json(content_envelope(json!({ "deleted": true }))))
 }
 
+/// A project's worktrees.
+///
+/// `Worktree.Directory` is already snake_case-clean -- `{directory,
+/// strategy?}` -- so the entries pass through as they are. The project's own
+/// root is in the list without a `strategy`: it is not a worktree OpenCode
+/// made, and `DELETE` refuses it.
+async fn list_agent_worktrees(
+    State(state): State<AppState>,
+    Query(query): Query<AgentWorktreesQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    let manager = manager_or_unavailable!(&state, &headers);
+    let items = manager
+        .driver()
+        .client()
+        .list_worktrees(query.directory.as_deref())
+        .await
+        .map_err(engine_error)?;
+    Ok(Json(content_envelope(json!({ "items": items }))))
+}
+
+async fn create_agent_worktree(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<CreateWorktreeBody>,
+) -> ApiResult<Json<Value>> {
+    let manager = manager_or_unavailable!(&state, &headers);
+    // `Worktree.CreateInput` declares additionalProperties:false, so only the
+    // fields the caller actually set are sent -- an explicit null is refused.
+    let mut input = json!({});
+    for (key, value) in [
+        ("name", &body.name),
+        ("branch", &body.branch),
+        ("from", &body.from),
+        ("strategy", &body.strategy),
+    ] {
+        if let Some(value) = value.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+            input[key] = json!(value);
+        }
+    }
+    let created = manager
+        .driver()
+        .client()
+        .create_worktree(body.directory.as_deref(), &input)
+        .await
+        .map_err(engine_error)?;
+    Ok(Json(content_envelope(json!({ "worktree": created }))))
+}
+
+async fn remove_agent_worktree(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<RemoveWorktreeBody>,
+) -> ApiResult<Json<Value>> {
+    let manager = manager_or_unavailable!(&state, &headers);
+    let worktree = body.worktree.trim();
+    if worktree.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_worktree",
+            "worktree must not be empty",
+        ));
+    }
+    manager
+        .driver()
+        .client()
+        .remove_worktree(body.directory.as_deref(), worktree, body.force)
+        .await
+        .map_err(engine_error)?;
+    Ok(Json(content_envelope(json!({ "deleted": true }))))
+}
+
+async fn refresh_agent_worktrees(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Option<Json<RefreshWorktreesBody>>,
+) -> ApiResult<Json<Value>> {
+    let manager = manager_or_unavailable!(&state, &headers);
+    let directory = body.and_then(|Json(b)| b.directory);
+    manager
+        .driver()
+        .client()
+        .refresh_worktrees(directory.as_deref())
+        .await
+        .map_err(engine_error)?;
+    Ok(Json(content_envelope(json!({ "refreshed": true }))))
+}
+
+/// Move a session to another directory -- the point of a worktree.
+///
+/// The reply is the session as it is afterwards, read back rather than
+/// assembled here, because the move can change more than the directory: a
+/// target outside the current project moves the session into the project that
+/// directory belongs to, and `project_id` changes with it.
+///
+/// There is no scope check, because 2.0.1 expresses no scope rule: the spec
+/// requires only `directory`, and the live service accepts any directory that
+/// exists -- including one in another project -- and refuses a missing one
+/// with a 400. Inventing a narrower rule here would refuse moves OpenCode
+/// itself allows, which is the gateway deciding policy it was not given.
+async fn move_agent_session(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<MoveSessionBody>,
+) -> ApiResult<Json<Value>> {
+    let manager = manager_or_unavailable!(&state, &headers);
+    let directory = body.directory.trim();
+    if directory.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_directory",
+            "directory must not be empty",
+        ));
+    }
+    manager
+        .driver()
+        .client()
+        .move_session(&asid, directory)
+        .await
+        .map_err(engine_error)?;
+    let info = manager
+        .driver()
+        .get_session(&asid)
+        .await
+        .map_err(engine_error)?;
+    manager.mirror().update_session(info.clone()).await;
+    Ok(Json(content_envelope(
+        serde_json::to_value(&info).unwrap_or(Value::Null),
+    )))
+}
+
 /// Stage a rollback without applying it: the boundary moves, the files stay
 /// as they are, and `info.revert` is set until this is committed or cleared.
 /// The reply is `Session.Revert`, whose `files` is what the app draws in the
@@ -2056,6 +2249,61 @@ mod tests {
     /// `files` is tri-state on the way in: absent leaves OpenCode's own
     /// default alone, and `false` is a caller who does not want the diff
     /// computed -- not the same thing.
+    /// Two directories in one body, and confusing them would remove the
+    /// wrong thing: `directory` is the project, `worktree` is what goes.
+    #[test]
+    fn a_worktree_removal_body_separates_the_project_from_the_worktree() {
+        let body: RemoveWorktreeBody = serde_json::from_value(json!({
+            "directory": "/tmp/muqun-gw-wt",
+            "worktree": "/w/016d5f/probe"
+        }))
+        .expect("body parses");
+        assert_eq!(body.directory.as_deref(), Some("/tmp/muqun-gw-wt"));
+        assert_eq!(body.worktree, "/w/016d5f/probe");
+        assert!(!body.force, "force defaults to off, not to on");
+
+        let forced: RemoveWorktreeBody = serde_json::from_value(json!({
+            "worktree": "/w/016d5f/probe", "force": true
+        }))
+        .expect("the project may be left to OpenCode's own default location");
+        assert!(forced.force);
+
+        let no_target: Result<RemoveWorktreeBody, _> =
+            serde_json::from_value(json!({ "directory": "/tmp/muqun-gw-wt" }));
+        assert!(no_target.is_err(), "there is nothing to remove without `worktree`");
+    }
+
+    /// Every field of `Worktree.CreateInput` is optional, so an empty create
+    /// is a real request: OpenCode names the worktree itself.
+    #[test]
+    fn a_worktree_create_body_is_optional_all_the_way_down() {
+        let empty: CreateWorktreeBody = serde_json::from_value(json!({})).expect("empty parses");
+        assert!(empty.directory.is_none());
+        assert!(empty.name.is_none());
+        assert!(empty.branch.is_none());
+
+        let full: CreateWorktreeBody = serde_json::from_value(json!({
+            "directory": "/tmp/muqun-gw-wt", "name": "probe", "branch": "main"
+        }))
+        .expect("body parses");
+        assert_eq!(full.name.as_deref(), Some("probe"));
+        assert_eq!(
+            full.branch.as_deref(),
+            Some("main"),
+            "`branch` is the ref to branch from, not a name to create"
+        );
+    }
+
+    #[test]
+    fn a_move_body_requires_somewhere_to_move_to() {
+        let body: MoveSessionBody =
+            serde_json::from_value(json!({ "directory": "/w/probe" })).expect("body parses");
+        assert_eq!(body.directory, "/w/probe");
+
+        let empty: Result<MoveSessionBody, _> = serde_json::from_value(json!({}));
+        assert!(empty.is_err(), "directory is required");
+    }
+
     #[test]
     fn a_stage_body_keeps_files_optional() {
         let bare: StageRevertBody =
