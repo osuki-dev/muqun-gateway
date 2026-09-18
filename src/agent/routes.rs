@@ -1006,24 +1006,36 @@ async fn do_get_agent_vcs_diff(
     ))))
 }
 
+/// Whether a catalog is one a client should be allowed to keep.
+///
+/// Models, providers and agents all come back empty from a directory OpenCode
+/// has not loaded yet, and any one of them empty makes the catalog useless: a
+/// model picker with no models is as broken as an agent picker with no agents.
+/// The driver waits for all three, and this is the last guard behind it.
+///
+/// Skills and commands are deliberately not in this list -- a project really
+/// can have none of either, and refusing to cache on that would mean never
+/// caching for such a project.
+pub(crate) fn catalog_is_incomplete(catalog: &crate::agent::domain::AgentCatalog) -> bool {
+    catalog.models.is_empty() || catalog.providers.is_empty() || catalog.agents.is_empty()
+}
+
 /// The catalog's answer, and whether the app may cache it.
 ///
-/// A catalog with no agents in it is not a catalog. OpenCode always has its
-/// built-ins, so an empty list means the engine had not settled yet -- the
-/// driver already waits for that, and this is the last guard. Answering an
-/// empty one with an ETag would let the app hold on to a picker with nothing
-/// in it until the bytes changed, which for an empty list may be never; so it
-/// is answered `no-store` and tagless, and the next request asks again.
+/// An incomplete catalog is not a catalog. Answering one with an ETag would
+/// let the app hold on to an empty picker until the bytes changed, which for
+/// an empty list may be never; so it is answered `no-store` and tagless, and
+/// the next request asks again.
 ///
-/// A populated catalog is tagged as usual. The tag is a hash of the whole
-/// body, so two directories that resolve to different catalogs get different
-/// tags on their own, and two that resolve to the same catalog share one.
+/// A complete catalog is tagged as usual. The tag is a hash of the whole body,
+/// so two directories that resolve to different catalogs get different tags on
+/// their own, and two that resolve to the same catalog share one.
 pub(crate) fn catalog_response(
     headers: &HeaderMap,
     catalog: crate::agent::domain::AgentCatalog,
 ) -> Response {
     let payload = content_envelope(json!(catalog));
-    if catalog.agents.is_empty() {
+    if catalog_is_incomplete(&catalog) {
         return (
             StatusCode::OK,
             [
@@ -1265,10 +1277,13 @@ pub async fn get_global_agent_catalog(
         .await
         .map_err(engine_error)?;
 
-    if catalog.agents.is_empty() {
+    if catalog_is_incomplete(&catalog) {
         tracing::warn!(
             directory = query.directory.as_deref().unwrap_or("<none>"),
-            "agent catalog came back with no agents; answering without an ETag"
+            models = catalog.models.len(),
+            providers = catalog.providers.len(),
+            agents = catalog.agents.len(),
+            "agent catalog is incomplete; answering without an ETag"
         );
     }
     Ok(catalog_response(&headers, catalog))
@@ -2437,6 +2452,28 @@ mod tests {
         }
     }
 
+    fn complete_catalog() -> crate::agent::domain::AgentCatalog {
+        let mut catalog = catalog_with(vec![agent("build")]);
+        catalog.models = vec![crate::agent::domain::ModelInfo {
+            id: "union-alpha".into(),
+            name: "Union Alpha".into(),
+            provider_id: "opencode".into(),
+            family: None,
+            limit: None,
+            variants: None,
+            cost: None,
+            enabled: true,
+            status: None,
+        }];
+        catalog.providers = vec![crate::agent::domain::ProviderInfo {
+            id: "opencode".into(),
+            name: "OpenCode".into(),
+            activation: None,
+            models: Vec::new(),
+        }];
+        catalog
+    }
+
     fn agent(id: &str) -> crate::agent::domain::AgentInfo {
         crate::agent::domain::AgentInfo {
             id: id.to_string(),
@@ -2562,8 +2599,8 @@ mod tests {
     }
 
     /// An empty catalog must not become a cached empty catalog. OpenCode
-    /// answers `GET /api/agent` with `[]` for a directory it has not settled
-    /// yet, and an ETag on that would pin a picker with nothing in it.
+    /// answers a directory it has not loaded with `[]` on every arm, and an
+    /// ETag on that would pin an empty picker until the bytes changed.
     #[test]
     fn an_empty_catalog_is_answered_without_an_etag() {
         let response = catalog_response(&HeaderMap::new(), catalog_with(Vec::new()));
@@ -2578,14 +2615,87 @@ mod tests {
         );
     }
 
+    /// Every arm that can come back empty from an unloaded directory, not just
+    /// agents.
+    ///
+    /// This is the bug the app found: a catalog with seven agents and **zero
+    /// models** was answered 200 with an ETag, so a model picker that happened
+    /// to open first was pinned empty. A catalog is only cacheable when all
+    /// three of models, providers and agents have something in them.
+    #[test]
+    fn a_catalog_missing_models_or_providers_is_not_cacheable_either() {
+        let full = complete_catalog();
+        assert!(!catalog_is_incomplete(&full), "the fixture is a real catalog");
+        assert!(
+            catalog_response(&HeaderMap::new(), full)
+                .headers()
+                .get(header::ETAG)
+                .is_some(),
+            "and a real catalog is tagged"
+        );
+
+        for (what, catalog) in [
+            ("models", {
+                let mut c = complete_catalog();
+                c.models.clear();
+                c
+            }),
+            ("providers", {
+                let mut c = complete_catalog();
+                c.providers.clear();
+                c
+            }),
+            ("agents", {
+                let mut c = complete_catalog();
+                c.agents.clear();
+                c
+            }),
+        ] {
+            assert!(
+                catalog_is_incomplete(&catalog),
+                "a catalog with no {what} is not a catalog"
+            );
+            let response = catalog_response(&HeaderMap::new(), catalog);
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                response.headers().get(header::ETAG).is_none(),
+                "no {what} means nothing worth keeping"
+            );
+            assert_eq!(
+                response.headers().get(header::CACHE_CONTROL).unwrap(),
+                "private, no-store",
+                "and the client is told not to keep it ({what})"
+            );
+        }
+
+        // Skills and commands are not in the rule: a project really can have
+        // none of either, and refusing to cache on that would mean never
+        // caching for such a project.
+        let mut bare = complete_catalog();
+        bare.skills.clear();
+        bare.commands.clear();
+        assert!(!catalog_is_incomplete(&bare));
+        assert!(catalog_response(&HeaderMap::new(), bare)
+            .headers()
+            .get(header::ETAG)
+            .is_some());
+    }
+
     /// A real catalog is tagged as before, and the tag follows the body -- so
     /// two directories with different catalogs cannot share one.
     #[test]
     fn a_populated_catalog_is_tagged_per_body() {
-        let one = catalog_response(&HeaderMap::new(), catalog_with(vec![agent("build")]));
+        // Complete catalogs: a catalog missing models or providers is refused
+        // a tag on purpose, which is a different test.
+        let with_agents = |agents: Vec<crate::agent::domain::AgentInfo>| {
+            let mut catalog = complete_catalog();
+            catalog.agents = agents;
+            catalog
+        };
+        let one = catalog_response(&HeaderMap::new(), with_agents(vec![agent("build")]));
         let two = catalog_response(
             &HeaderMap::new(),
-            catalog_with(vec![agent("build"), agent("osuki-coder")]),
+            with_agents(vec![agent("build"), agent("osuki-coder")]),
         );
         let tag = |r: &Response| {
             r.headers()
@@ -2597,7 +2707,7 @@ mod tests {
         assert_ne!(one, two, "a different catalog is a different tag");
 
         // And the same catalog is the same tag, which is what makes 304 work.
-        let again = catalog_response(&HeaderMap::new(), catalog_with(vec![agent("build")]));
+        let again = catalog_response(&HeaderMap::new(), with_agents(vec![agent("build")]));
         assert_eq!(tag(&again).expect("tagged"), one);
     }
 

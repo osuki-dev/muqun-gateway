@@ -366,6 +366,20 @@ impl OpencodeClient {
             .unwrap_or_default()
     }
 
+    pub async fn models_or_empty(&self, directory: Option<&str>) -> Vec<Value> {
+        self.get_models(directory)
+            .await
+            .inspect_err(|e| tracing::warn!(surface = "model", %e, "catalog fan-out arm failed"))
+            .unwrap_or_default()
+    }
+
+    pub async fn providers_or_empty(&self, directory: Option<&str>) -> Vec<Value> {
+        self.get_providers(directory)
+            .await
+            .inspect_err(|e| tracing::warn!(surface = "provider", %e, "catalog fan-out arm failed"))
+            .unwrap_or_default()
+    }
+
     pub async fn commands_or_empty(&self, directory: Option<&str>) -> Vec<Value> {
         self.get_commands(directory)
             .await

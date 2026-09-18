@@ -617,10 +617,18 @@ returns fewer agents than no directory. The gateway enforces that, because
 OpenCode's `GET /api/agent` is a snapshot that fills in over roughly a second
 for a directory nothing has opened yet — first empty, then the built-ins, then
 the user's own agents. A catalog request waits for the scoped list to hold
-everything the unscoped one holds (bounded, about 1.5s) rather than handing
-over whichever stage it caught. A catalog that still has no agents is answered
-`cache-control: private, no-store` and **without an ETag**, so an empty picker
-can never be cached.
+everything the unscoped one holds — `models`, `providers`, `agents`, `skills`
+and `commands` alike (bounded, about 1.5s) — rather than handing over whichever
+stage it caught. **A client must never cache an empty catalog.** A catalog whose `models`,
+`providers` or `agents` is empty is answered `cache-control: private, no-store`
+and **without an ETag**, so there is nothing to hold on to and the next request
+asks again. Any one of the three empty makes the catalog useless — a model
+picker with no models is as broken as an agent picker with no agents — and all
+three come back empty from a directory OpenCode has not loaded yet.
+
+`skills` and `commands` are deliberately not part of that rule: a project really
+can have none of either, and refusing to cache on that would mean never caching
+for such a project.
 
 User-defined agents come from `~/.config/opencode/agents/<name>.md` (global),
 `.opencode/agents/<name>.md` (per project, discovered from the directory up to

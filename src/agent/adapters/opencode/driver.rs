@@ -611,13 +611,7 @@ impl AgentEnginePort for OpencodeDriver {
                 default_model,
                 config,
             ) = tokio::join!(
-                async {
-                    self.client
-                        .get_models(directory)
-                        .await
-                        .inspect_err(|e| log("model", e))
-                        .unwrap_or_default()
-                },
+                self.settled_list("model", directory, |d| self.client.models_or_empty(d)),
                 self.settled_list("agent", directory, |d| self.client.agents_or_empty(d)),
                 async {
                     self.client
@@ -627,13 +621,7 @@ impl AgentEnginePort for OpencodeDriver {
                         .unwrap_or_default()
                 },
                 self.settled_list("skill", directory, |d| self.client.skills_or_empty(d)),
-                async {
-                    self.client
-                        .get_providers(directory)
-                        .await
-                        .inspect_err(|e| log("provider", e))
-                        .unwrap_or_default()
-                },
+                self.settled_list("provider", directory, |d| self.client.providers_or_empty(d)),
                 self.settled_list("command", directory, |d| self.client.commands_or_empty(d)),
                 async {
                     self.client
@@ -661,10 +649,11 @@ impl AgentEnginePort for OpencodeDriver {
                 defaults: mapper::map_catalog_defaults(default_model.as_ref(), &config),
                 models,
             };
-            // Never cache an unsettled answer: an empty agent list is the one
-            // shape that must not be held on to, because the next caller would
-            // be served the same nothing until the entry expired.
-            if !catalog.agents.is_empty() {
+            // Never cache an unsettled answer. Models, providers and agents
+            // all come back empty from a directory OpenCode has not loaded,
+            // and any one of them empty would otherwise be served to every
+            // caller until the entry expired.
+            if !crate::agent::routes::catalog_is_incomplete(&catalog) {
                 self.remember_catalog(key, catalog.clone());
             }
             Ok(catalog)
@@ -795,6 +784,65 @@ mod tests {
         if let Some(home) = home {
             assert!(!home.missing);
         }
+    }
+
+    /// The first catalog for a directory OpenCode has never seen is already a
+    /// real catalog.
+    ///
+    /// This is the defect the app found: the floor covered agents, skills and
+    /// commands but not models or providers, so a cold directory answered with
+    /// seven agents and **zero models** -- and an ETag, which pinned an empty
+    /// model picker. The first answer must already hold everything the
+    /// unscoped list holds, on every arm. Run with
+    /// `cargo test --offline -- --ignored a_cold_catalog_is_complete`.
+    #[tokio::test]
+    #[ignore = "requires a running OpenCode 2.0.1 service"]
+    async fn a_cold_catalog_is_complete_on_the_first_read() {
+        let Some(endpoint) = OpencodeEndpoint::discover().await else {
+            eprintln!("no OpenCode service registered; skipping");
+            return;
+        };
+        let driver = OpencodeDriver::new(endpoint);
+        let floor = driver.get_catalog(None).await.expect("an unscoped catalog");
+        assert!(!floor.models.is_empty() && !floor.providers.is_empty());
+
+        // A directory nothing has opened. Inside the persistent probe
+        // directory, so this does not leave a new project behind -- OpenCode
+        // keeps a project entry for ever and cannot remove one.
+        let directory = std::path::Path::new("/tmp/muqun-gw-c1")
+            .join(format!("cold-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&directory).expect("temp dir");
+        let scoped = driver
+            .get_catalog(directory.to_str())
+            .await
+            .expect("a scoped catalog");
+        let _ = std::fs::remove_dir(&directory);
+
+        // The first read, not the second.
+        assert!(
+            scoped.models.len() >= floor.models.len(),
+            "cold read has {} models, unscoped has {}",
+            scoped.models.len(),
+            floor.models.len()
+        );
+        assert!(
+            scoped.providers.len() >= floor.providers.len(),
+            "cold read has {} providers, unscoped has {}",
+            scoped.providers.len(),
+            floor.providers.len()
+        );
+        assert!(scoped.agents.len() >= floor.agents.len());
+        for expected in &floor.providers {
+            assert!(
+                scoped.providers.iter().any(|p| p.id == expected.id),
+                "{} is missing from the cold catalog",
+                expected.id
+            );
+        }
+        assert!(
+            !crate::agent::routes::catalog_is_incomplete(&scoped),
+            "and it is therefore cacheable, which is the whole point"
+        );
     }
 
     /// Naming a directory must never return fewer agents than not naming one.
