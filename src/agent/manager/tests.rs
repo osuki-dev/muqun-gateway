@@ -240,3 +240,66 @@ async fn an_unknown_event_is_ignored_without_panicking() {
     AgentManager::handle_raw_event(frame, &ctx).await;
     assert_eq!(ctx.mirror.session_count().await, 0);
 }
+
+/// Activating a skill has to show up while the user is looking at the screen.
+/// 2.0.1 announces it with `session.skill.activated` and nothing else -- there
+/// is no `session.message.*` family -- so this arm is the whole live path.
+#[tokio::test]
+async fn an_activated_skill_reaches_the_timeline_from_the_event_alone() {
+    let ctx = ctx();
+    let mut rx = ctx.tx.subscribe();
+    replay(&ctx, "skill-activated.sse").await;
+
+    let asid = AgentSessionId("ses_f4d866f70ffeqEwhLnNlpcFdiF".to_string());
+    let snapshot = ctx.mirror.get_snapshot(&asid).await.expect("session known");
+    let skills: Vec<_> = snapshot
+        .timeline
+        .iter()
+        .filter(|it| matches!(it.part, AgentPart::Skill { .. }))
+        .collect();
+    assert_eq!(skills.len(), 1, "one activation is one row");
+
+    let row = skills[0];
+    // The row is addressed exactly as a read-back of the stored message would
+    // address it: the envelope id is the message id under an `evt_` prefix.
+    assert_eq!(row.id, "msg_0b2799099001haVr31cWxhQSIK:p0");
+    assert_eq!(row.message_id, "msg_0b2799099001haVr31cWxhQSIK");
+    assert_eq!(row.role, TimelineRole::System);
+    let AgentPart::Skill { skill, name, text } = &row.part else {
+        unreachable!("filtered above");
+    };
+    assert_eq!(skill, "docs", "the event's `id` is the skill id");
+    assert_eq!(name, "docs");
+    assert!(text.contains("docs connector"), "the body is carried, got {text:?}");
+
+    let mut upserted = false;
+    while let Ok(event) = rx.try_recv() {
+        if let AgentDomainEvent::TimelineUpsert { items, .. } = event {
+            upserted |= items.iter().any(|it| matches!(it.part, AgentPart::Skill { .. }));
+        }
+    }
+    assert!(upserted, "the row is pushed to the stream, not left for a refetch");
+}
+
+/// An envelope without the id the message id is derived from must not invent
+/// one: a row id that does not match the read-back becomes a duplicate row.
+#[tokio::test]
+async fn a_skill_event_with_no_envelope_id_does_not_invent_a_row() {
+    let ctx = ctx();
+    let frame = OpencodeSseListener::parse_block(
+        r#"data: {"type":"session.skill.activated","data":{"sessionID":"ses_1","id":"docs","name":"docs","text":"x"}}"#,
+    )
+    .expect("frame parses");
+    AgentManager::handle_raw_event(frame, &ctx).await;
+
+    let asid = AgentSessionId("ses_1".to_string());
+    let rows = ctx
+        .mirror
+        .get_snapshot(&asid)
+        .await
+        .map(|s| s.timeline.len())
+        .unwrap_or(0);
+    // The fallback is a refetch, and the test driver's port is dead, so the
+    // timeline stays empty rather than gaining a row nothing can address.
+    assert_eq!(rows, 0);
+}

@@ -1145,6 +1145,11 @@ pub fn map_skills(data: &[Value]) -> Vec<SkillInfo> {
                 id,
                 name,
                 description,
+                // Both flags are optional on `Skill.Info` and are simply
+                // absent on a skill that has neither, which is not the same
+                // as a skill the user switched off.
+                slash: s.get("slash").and_then(Value::as_bool).unwrap_or(false),
+                autoinvoke: s.get("autoinvoke").and_then(Value::as_bool).unwrap_or(false),
             })
         })
         .collect()
@@ -1887,5 +1892,30 @@ mod catalog_tests {
             }
             other => panic!("expected a shell part, got {other:?}"),
         }
+    }
+
+    /// The slash menu is built from `slash`, so the flag has to survive the
+    /// catalog. It is absent on most skills, which is `false` and not unknown.
+    #[test]
+    fn a_skill_carries_the_two_flags_the_slash_menu_reads() {
+        let skills = map_skills(&[
+            json!({
+                "id": "report", "name": "Report", "description": "File an issue",
+                "slash": true, "location": "/builtin/report.md", "content": "..."
+            }),
+            json!({
+                "id": "docs", "name": "docs", "description": "Docs connector",
+                "autoinvoke": true, "location": "/home/ryu/.agents/skills/docs/SKILL.md",
+                "content": "..."
+            }),
+            json!({ "id": "opencode", "name": "OpenCode", "location": "/builtin/opencode.md" }),
+        ]);
+        assert_eq!(skills.len(), 3);
+        assert!(skills[0].slash, "a slash skill is offered in the menu");
+        assert!(!skills[0].autoinvoke);
+        assert!(!skills[1].slash, "an absent flag is false");
+        assert!(skills[1].autoinvoke);
+        assert_eq!(skills[2].description, "", "a skill may have no description");
+        assert!(!skills[2].slash && !skills[2].autoinvoke);
     }
 }

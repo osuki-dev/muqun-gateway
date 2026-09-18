@@ -155,6 +155,29 @@ No body → `{"interrupted": true}`. Status goes to `interrupted`.
 A slash command from the catalog's `commands`. A leading `/` on `name` is
 stripped; `arguments` fills `$ARGUMENTS`. Returns `{"submitted": true}`.
 
+### `POST /api/agent-sessions/{asid}/skill`
+
+```json
+{ "skill": "docs", "resume": true }
+```
+
+`skill` is a `skills[].id` from the catalog. `resume` is optional: left out,
+OpenCode decides whether the agent loop picks up where the skill left it, which
+is what the slash menu wants; `false` appends the skill and leaves the session
+idle. Returns `{"status": "ok"}` — OpenCode answers `204`, and what the user
+sees is the timeline row below, not this reply. An unknown id is `404` from
+OpenCode and comes back as `agent_engine_error`.
+
+The activation is a `skill` message. It reaches the timeline live, from
+`session.skill.activated`, as an `AgentPart::Skill` row under
+`agent.timeline.upsert` — 2.0.1 has no `session.message.*` family, so that one
+event is the whole announcement. The row is addressed `{message_id}:p0` with the
+same `message_id` a refetch gives it, so the streamed row and the read-back row
+are one row.
+
+A slash menu lists the skills with `slash: true` and leaves the rest to the
+agent; see the catalog below.
+
 ### `POST /api/agent-sessions/{asid}/background`
 
 No body → `{"backgrounded": true}`. Detaches the foreground tools blocking the
@@ -342,13 +365,19 @@ it is why this used to come back empty.
   "models":   [ { "id", "name", "provider_id", "family?", "limit?", "variants?": [{"id", "reasoning_effort?"}], "cost?", "enabled", "status?" } ],
   "agents":   [ { "id", "name", "description?", "mode?", "color?", "hidden" } ],
   "mcp":      [ { "name", "status", "error?" } ],
-  "skills":   [ { "id", "name", "description" } ],
+  "skills":   [ { "id", "name", "description", "slash", "autoinvoke" } ],
   "providers":[ { "id", "name", "activation?": "auto"|"enabled"|"disabled",
                   "models": [ { "id", "name", "enabled", "variants": [...], "limit?", "status?" } ] } ],
   "commands": [ { "name", "description?", "agent?", "template?" } ],
   "defaults": { "model?": {"provider_id", "model_id", "variant?"}, "agent?": "build" }
 }
 ```
+
+`skills[].slash` and `skills[].autoinvoke` are `Skill.Info`'s own optional
+flags, and both default to `false` when the payload leaves them out — which most
+skills do. **A slash menu lists only `slash: true`**; the rest exist for the
+agent to reach for, and `autoinvoke: true` says it may do so unasked. Activate
+one with [`POST …/skill`](#post-apiagent-sessionsasidskill).
 
 A picker should hide `agents[].hidden` and `mode == "subagent"` entries.
 A provider with `activation: "disabled"` and a model with `enabled: false` are

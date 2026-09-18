@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use super::adapters::memory_mirror::{MemoryMirror, SessionPatch, ToolPatch};
 use super::adapters::opencode::{
@@ -674,6 +674,53 @@ impl AgentManager {
                 // timeline carries the summary rather than only the event.
                 if matches!(status, CompactionStatus::Completed | CompactionStatus::Failed) {
                     ctx.refetch_tail(&asid).await;
+                }
+            }
+
+            // ---------------------------------------------------------------
+            // Skill activation
+            // ---------------------------------------------------------------
+            // Activating a skill appends a `skill` message, and this event is
+            // the only announcement of it: 2.0.1 has no `session.message.*`
+            // family, so a live capture of an activation shows this frame and
+            // nothing else. Without this arm the row reached the app only on
+            // the next snapshot refetch.
+            //
+            // The payload is `{sessionID, id, name, text}` and carries no
+            // message id. The envelope's own id is that message id under an
+            // `evt_` prefix rather than `msg_` -- checked against 2.0.1 over
+            // five activations in three sessions -- which is what keeps the
+            // row emitted here addressed identically to the one a read-back
+            // produces, so the two upsert onto each other instead of becoming
+            // two rows. An envelope that does not spell its id that way is
+            // read back rather than guessed at.
+            "session.skill.activated" => {
+                let Some(asid) = session_id.map(str::to_string).map(AgentSessionId) else {
+                    return;
+                };
+                ctx.ensure_session(&asid).await;
+                let message_id = raw
+                    .id
+                    .as_deref()
+                    .and_then(|id| id.strip_prefix("evt_"))
+                    .map(|body| format!("msg_{body}"));
+                let Some(message_id) = message_id else {
+                    ctx.refetch_tail(&asid).await;
+                    return;
+                };
+                // Built as the message OpenCode stored and mapped by the one
+                // mapper, so the streamed row and the refetched row are the
+                // same row.
+                let message = json!({
+                    "id": message_id,
+                    "type": "skill",
+                    "skill": data.get("id").cloned().unwrap_or(Value::Null),
+                    "name": data.get("name").cloned().unwrap_or(Value::Null),
+                    "text": data.get("text").cloned().unwrap_or(Value::Null),
+                    "time": { "created": created },
+                });
+                for item in mapper::map_message(&message, &asid) {
+                    ctx.emit_timeline_item(&asid, item).await;
                 }
             }
 

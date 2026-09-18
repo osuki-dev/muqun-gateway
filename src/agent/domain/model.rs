@@ -57,6 +57,14 @@ pub struct SkillInfo {
     pub id: String,
     pub name: String,
     pub description: String,
+    /// `Skill.Info.slash`: the skill is offered as a slash entry. The app's
+    /// slash menu lists only these; the rest are for the agent to find.
+    /// Omitted in the payload means `false`.
+    #[serde(default)]
+    pub slash: bool,
+    /// `Skill.Info.autoinvoke`: the agent may activate this one by itself.
+    #[serde(default)]
+    pub autoinvoke: bool,
 }
 
 /// One model as a provider lists it.

@@ -172,6 +172,23 @@ pub struct RevertSessionBody {
     pub message_id: String,
 }
 
+/// `POST …/revert/stage`. `files` asks OpenCode to work out the file changes
+/// the rollback would undo and return them with the staged boundary.
+#[derive(Debug, Deserialize)]
+pub struct StageRevertBody {
+    pub message_id: String,
+    pub files: Option<bool>,
+}
+
+/// `POST …/skill`. `skill` is a `Skill.Info.id` from the catalog.
+#[derive(Debug, Deserialize)]
+pub struct ActivateSkillBody {
+    pub skill: String,
+    /// Whether OpenCode resumes the agent loop after appending the skill
+    /// message. Omitted leaves OpenCode's own default alone.
+    pub resume: Option<bool>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ReplyPermissionBody {
     pub decision: String,
@@ -206,6 +223,10 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
         .route(
             "/api/agent-sessions/{asid}/revert/clear",
             post(clear_agent_session_revert),
+        )
+        .route(
+            "/api/agent-sessions/{asid}/skill",
+            post(activate_agent_skill),
         )
         .route(
             "/api/agent-sessions/{asid}/compact",
@@ -1509,6 +1530,34 @@ async fn clear_agent_session_revert(
     Ok(Json(content_envelope(json!({ "cleared": true }))))
 }
 
+/// Activate a skill by id. The activation is a message OpenCode appends to
+/// the session, so what the user sees is a timeline row, not a reply here --
+/// this answers as soon as OpenCode has accepted it.
+async fn activate_agent_skill(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<ActivateSkillBody>,
+) -> ApiResult<Json<Value>> {
+    let manager = manager_or_unavailable!(&state, &headers);
+    let skill = body.skill.trim();
+    if skill.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_skill",
+            "skill must not be empty",
+        ));
+    }
+    validate_text(skill)?;
+    manager
+        .driver()
+        .client()
+        .activate_skill(&asid, skill, body.resume)
+        .await
+        .map_err(engine_error)?;
+    Ok(Json(content_envelope(json!({ "status": "ok" }))))
+}
+
 async fn compact_agent_session(
     State(state): State<AppState>,
     Path(asid): Path<String>,
@@ -1842,6 +1891,32 @@ mod tests {
         let parsed: Result<SwitchModelBody, _> =
             serde_json::from_value(json!({ "model": { "provider_id": "opencode" } }));
         assert!(parsed.is_err(), "a model without an id is not a ModelRef");
+    }
+
+    /// Every route in one table, mounted once. `matchit` panics on a routing
+    /// conflict at insertion, so building the router is the assertion: the
+    /// saved-permission paths sit under the same prefix as the reply path
+    /// (`permissions/saved/{id}` beside `permissions/{req_id}/reply`) and a
+    /// conflict there would take the whole gateway down at startup.
+    #[test]
+    fn every_agent_route_mounts_without_a_conflict() {
+        let _router: Router<AppState> = mount(Router::new());
+    }
+
+    #[test]
+    fn a_skill_body_takes_an_id_and_an_optional_resume() {
+        let bare: ActivateSkillBody =
+            serde_json::from_value(json!({ "skill": "docs" })).expect("skill alone parses");
+        assert_eq!(bare.skill, "docs");
+        assert!(bare.resume.is_none(), "an absent resume is OpenCode's default");
+
+        let with_resume: ActivateSkillBody =
+            serde_json::from_value(json!({ "skill": "docs", "resume": false }))
+                .expect("resume parses");
+        assert_eq!(with_resume.resume, Some(false));
+
+        let no_skill: Result<ActivateSkillBody, _> = serde_json::from_value(json!({}));
+        assert!(no_skill.is_err(), "skill is required");
     }
 
     #[test]

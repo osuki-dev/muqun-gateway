@@ -362,6 +362,25 @@ impl OpencodeClient {
         Ok(res.get("data").and_then(Value::as_array).cloned().unwrap_or_default())
     }
 
+    /// `POST /api/session/{id}/skill`: append a skill message to the session
+    /// and resume execution. `skill` is a `Skill.Info.id`; `resume` is left
+    /// out unless the caller asked for one, so OpenCode keeps its own default.
+    /// The optional `id` field the endpoint accepts is a caller-minted message
+    /// id and is never sent -- OpenCode mints its own.
+    pub async fn activate_skill(
+        &self,
+        session_id: &str,
+        skill: &str,
+        resume: Option<bool>,
+    ) -> Result<Value, AgentEngineError> {
+        let mut body = json!({ "skill": skill });
+        if let Some(resume) = resume {
+            body["resume"] = json!(resume);
+        }
+        self.post(&format!("/api/session/{session_id}/skill"), &body)
+            .await
+    }
+
     // -----------------------------------------------------------------
     // Session operations
     // -----------------------------------------------------------------
