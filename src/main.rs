@@ -12495,7 +12495,7 @@ fn openapi_spec() -> Value {
         "info": {
             "title": "Terminal Gateway API",
             "version": env!("CARGO_PKG_VERSION"),
-            "description": "Token-protected mobile API for controlling local terminal workspaces through a configured tmux or Herdr backend. Human-readable text is localized: send X-Muqun-Locale (or Accept-Language) with one of `en`, `zh-TW`, `zh-CN`, `ja`, `ko`, `de`, `fr`, `es`, `pt`, `ru`, `vi`. Error `code` values, decision names and other wire vocabulary are the same bytes in every locale."
+            "description": "Token-protected mobile API for controlling local terminal workspaces through a configured tmux or Herdr backend. Human-readable text is localized: send X-Muqun-Locale (or Accept-Language) with one of `en`, `zh-TW`, `zh-CN`, `ja`, `ko`, `de`, `fr`, `es`, `pt`, `ru`, `vi`, `th`. Error `code` values, decision names and other wire vocabulary are the same bytes in every locale."
         },
         "components": {
             "securitySchemes": {
