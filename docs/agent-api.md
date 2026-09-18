@@ -635,7 +635,29 @@ route: sign-in is done on the host.
 
 ### `GET /api/agent-projects`
 
-ETag + `304`. `[{"id", "canonical", "name", "vcs?", "sandboxes": []}]`.
+ETag + `304`. `[{"id", "canonical", "name", "vcs?", "sandboxes": [], "missing?"}]`.
+
+```json
+[ { "id": "21eedff2…", "canonical": "/home/ryu/Work/muqun/app", "name": "app",
+    "vcs": "git", "sandboxes": [] },
+  { "id": "fcb725e4…", "canonical": "/tmp/muqun-c10/repo", "name": "repo",
+    "sandboxes": [], "missing": true } ]
+```
+
+**`missing: true` means the directory is not on this host any anymore** — the
+gateway stats each project's `canonical` path on every list. It is omitted when
+the folder is there, so an ordinary list is unchanged, and the ETag follows the
+body: a folder being deleted changes the answer and invalidates the cached one.
+
+A picker should hide these, or show them greyed out with an explanation; it must
+not offer to open one.
+
+**There is no way to remove a project.** OpenCode 2.0.1 has exactly three
+project operations — `v2.project.list`, `v2.project.current` and
+`v2.project.update` — and `PATCH /api/project/{id}` accepts only `canonical`,
+`name`, `icon` and `commands`, with `additionalProperties: false`. No delete, no
+archive, no hidden flag. So a project OpenCode has ever seen is in this list for
+good, and `missing` is the whole of what the gateway can say about it.
 
 ### `GET /api/agent-directories`
 

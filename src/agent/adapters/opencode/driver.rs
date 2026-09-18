@@ -414,7 +414,19 @@ impl AgentEnginePort for OpencodeDriver {
     fn list_projects(&self) -> EngineFuture<'_, Vec<AgentProject>> {
         Box::pin(async move {
             let raw_projects = self.client.list_projects().await?;
-            let projects = raw_projects.iter().filter_map(mapper::map_project).collect();
+            let mut projects: Vec<AgentProject> =
+                raw_projects.iter().filter_map(mapper::map_project).collect();
+            // OpenCode remembers a project for ever: there is no remove and no
+            // archive anywhere in its 2.0.1 API, so every throwaway checkout
+            // anyone has ever opened is still in this list. The gateway cannot
+            // take them out, but it can say which of them are not there any
+            // more, so the app can stop offering to open a folder that is gone.
+            //
+            // One `stat` per project, on a route that is already validated and
+            // cached by the client.
+            for project in &mut projects {
+                project.missing = !std::path::Path::new(&project.canonical).is_dir();
+            }
             Ok(projects)
         })
     }
@@ -748,6 +760,42 @@ mod tests {
     use serde_json::json;
 
     const UPLOADS: &str = "/home/ryu/.local/share/muqun-gateway/uploads/*";
+
+    /// Every project OpenCode remembers, checked against the host.
+    ///
+    /// The list only grows -- 2.0.1 has no remove and no archive -- so this is
+    /// the only thing standing between the app and a workspace list full of
+    /// folders that were deleted months ago. Run against a live service with
+    /// `cargo test --offline -- --ignored a_deleted_project_directory`.
+    #[tokio::test]
+    #[ignore = "requires a running OpenCode 2.0.1 service"]
+    async fn a_deleted_project_directory_is_reported_missing() {
+        let Some(endpoint) = OpencodeEndpoint::discover().await else {
+            eprintln!("no OpenCode service registered; skipping");
+            return;
+        };
+        let driver = OpencodeDriver::new(endpoint);
+        let projects = driver.list_projects().await.expect("a project list");
+        assert!(!projects.is_empty(), "this host has opened something");
+
+        for project in &projects {
+            let on_disk = std::path::Path::new(&project.canonical).is_dir();
+            assert_eq!(
+                project.missing, !on_disk,
+                "{} is {} on disk but reported missing = {}",
+                project.canonical,
+                if on_disk { "present" } else { "absent" },
+                project.missing
+            );
+        }
+
+        // A project whose folder is there is never flagged, which is the half
+        // that must not go wrong: flagging a live workspace would hide it.
+        let home = projects.iter().find(|p| p.canonical == "/home/ryu");
+        if let Some(home) = home {
+            assert!(!home.missing);
+        }
+    }
 
     /// Naming a directory must never return fewer agents than not naming one.
     ///

@@ -199,5 +199,18 @@ pub struct AgentProject {
     pub vcs: Option<String>,
     #[serde(default)]
     pub sandboxes: Vec<String>,
+    /// The project's directory is not on this host any more.
+    ///
+    /// OpenCode keeps a project entry for ever -- there is no remove or
+    /// archive in its API -- so a throwaway checkout that has been deleted
+    /// stays in the list and the app drew it as a workspace the user could
+    /// open. Omitted while the directory is there, so an ordinary list is
+    /// unchanged.
+    #[serde(default, skip_serializing_if = "is_not_missing")]
+    pub missing: bool,
+}
+
+fn is_not_missing(missing: &bool) -> bool {
+    !*missing
 }
 

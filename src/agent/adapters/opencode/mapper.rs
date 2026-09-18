@@ -203,6 +203,9 @@ pub fn map_project(val: &Value) -> Option<AgentProject> {
         name,
         vcs,
         sandboxes,
+        // Filled in by the driver, which is where the host filesystem is this
+        // gateway's to look at.
+        missing: false,
     })
 }
 
@@ -1930,6 +1933,38 @@ mod catalog_tests {
             }
             other => panic!("expected a shell part, got {other:?}"),
         }
+    }
+
+    /// A project whose folder has been deleted still comes back from
+    /// OpenCode -- it has no remove and no archive -- so the list says which
+    /// ones are gone rather than letting the app offer to open them.
+    ///
+    /// The flag is off by default and omitted when off, so an ordinary list is
+    /// byte-for-byte what it was.
+    #[test]
+    fn a_project_is_not_missing_until_something_looks() {
+        let project = map_project(&json!({
+            "id": "abc123", "canonical": "/home/ryu/Work/muqun/app", "vcs": "git",
+            "sandboxes": []
+        }))
+        .expect("a project with an id maps");
+        assert_eq!(project.name, "app", "the name is the folder's");
+        assert_eq!(project.vcs.as_deref(), Some("git"));
+        assert!(
+            !project.missing,
+            "the mapper reads a payload; whether the folder is there is the driver's question"
+        );
+
+        let value = serde_json::to_value(&project).expect("serializes");
+        assert!(
+            value.get("missing").is_none(),
+            "a project that is there says nothing, so the common list is unchanged"
+        );
+
+        let mut gone = project;
+        gone.missing = true;
+        let value = serde_json::to_value(&gone).expect("serializes");
+        assert_eq!(value["missing"], true, "and one that is gone says so");
     }
 
     /// A user-defined agent is the whole point of the picker, and it arrives
