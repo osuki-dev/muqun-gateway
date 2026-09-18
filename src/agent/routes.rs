@@ -721,6 +721,8 @@ async fn do_find_agent_files(
         ));
     };
 
+    require_directory(directory)?;
+
     let files = manager
         .engine()
         .find_files(query, limit, directory)
@@ -955,13 +957,37 @@ async fn do_get_agent_vcs_diff(
         }
     };
 
+    // The session's own directory, checked before the read: a session whose
+    // folder has been deleted answered a blank 502, and the useful thing to
+    // say is which folder went.
+    let directory = manager
+        .driver()
+        .client()
+        .get_session(asid)
+        .await
+        .ok()
+        .and_then(|raw| super::adapters::opencode::mapper::map_session(&raw))
+        .and_then(|info| info.directory);
+    require_directory(directory.as_deref())?;
+
     let diffs = manager
         .sessions()
         .get_vcs_diff(&AgentSessionId(asid.to_string()), mode)
         .await
-        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "agent_engine_error", &e.to_string()))?;
+        .map_err(engine_error)?;
 
-    Ok(Json(content_envelope(json!(diffs))))
+    // OpenCode answers `200` with an empty list both for a clean repository
+    // and for a directory that is not a repository at all, so on its own the
+    // app cannot tell "nothing has changed" from "there is nothing here to
+    // change". `vcs` and `reason` are the gateway's answer to that.
+    let is_repo = directory
+        .as_deref()
+        .map(super::adapters::opencode::driver::is_git_worktree)
+        .unwrap_or(true);
+    Ok(Json(content_envelope(vcs_diff_body(
+        json!(diffs),
+        is_repo,
+    ))))
 }
 
 /// The catalog's answer, and whether the app may cache it.
@@ -1169,11 +1195,12 @@ pub async fn get_global_agent_catalog(
         ));
     };
 
+    require_directory(query.directory.as_deref())?;
     let catalog = manager
         .sessions()
         .get_catalog(query.directory.as_deref())
         .await
-        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "agent_engine_error", &e.to_string()))?;
+        .map_err(engine_error)?;
 
     if catalog.agents.is_empty() {
         tracing::warn!(
@@ -1575,7 +1602,49 @@ macro_rules! manager_or_unavailable {
 }
 
 fn engine_error(err: super::ports::engine::AgentEngineError) -> (StatusCode, Json<Value>) {
+    // A folder that is gone is not an engine fault, and answering 502 for it
+    // told the user their agent had broken when their directory had simply
+    // been deleted. It is a 404 that names the folder, and it carries the path
+    // as its own field so the app can offer to forget the session rather than
+    // parse a sentence.
+    if let super::ports::engine::AgentEngineError::WorkspaceMissing(ref directory) = err {
+        return workspace_missing(directory);
+    }
     api_error(StatusCode::BAD_GATEWAY, "agent_engine_error", &err.to_string())
+}
+
+/// The diff, and whether there was anywhere for one to come from.
+///
+/// OpenCode answers `200` with an empty list both for a clean repository and
+/// for a directory that is not a repository at all, so on its own the app
+/// cannot tell "nothing has changed" from "there is nothing here to change" --
+/// and showed an empty diff screen for both. `vcs` and `reason` are the
+/// gateway's answer to that; the files themselves are unchanged.
+pub(crate) fn vcs_diff_body(files: Value, is_repo: bool) -> Value {
+    json!({
+        "files": files,
+        "vcs": if is_repo { Some("git") } else { None },
+        "reason": if is_repo { None } else { Some("not_a_repository") },
+    })
+}
+
+/// `404 workspace_missing`, with the directory alongside the message.
+pub(crate) fn workspace_missing(directory: &str) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({
+            "error": {
+                "code": "workspace_missing",
+                "message": format!("The workspace folder is gone: {directory}"),
+                "directory": directory,
+            }
+        })),
+    )
+}
+
+/// The guard every directory-scoped route runs before proxying.
+fn require_directory(directory: Option<&str>) -> Result<(), (StatusCode, Json<Value>)> {
+    super::adapters::opencode::driver::check_directory(directory).map_err(engine_error)
 }
 
 async fn list_agent_session_children(
@@ -1738,6 +1807,7 @@ async fn list_agent_worktrees(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     let manager = manager_or_unavailable!(&state, &headers);
+    require_directory(query.directory.as_deref())?;
     let items = manager
         .driver()
         .client()
@@ -1753,6 +1823,7 @@ async fn create_agent_worktree(
     Json(body): Json<CreateWorktreeBody>,
 ) -> ApiResult<Json<Value>> {
     let manager = manager_or_unavailable!(&state, &headers);
+    require_directory(body.directory.as_deref())?;
     // `Worktree.CreateInput` declares additionalProperties:false, so only the
     // fields the caller actually set are sent -- an explicit null is refused.
     let mut input = json!({});
@@ -1781,6 +1852,7 @@ async fn remove_agent_worktree(
     Json(body): Json<RemoveWorktreeBody>,
 ) -> ApiResult<Json<Value>> {
     let manager = manager_or_unavailable!(&state, &headers);
+    require_directory(body.directory.as_deref())?;
     let worktree = body.worktree.trim();
     if worktree.is_empty() {
         return Err(api_error(
@@ -1805,6 +1877,7 @@ async fn refresh_agent_worktrees(
 ) -> ApiResult<Json<Value>> {
     let manager = manager_or_unavailable!(&state, &headers);
     let directory = body.and_then(|Json(b)| b.directory);
+    require_directory(directory.as_deref())?;
     manager
         .driver()
         .client()
@@ -1841,6 +1914,7 @@ async fn move_agent_session(
             "directory must not be empty",
         ));
     }
+    require_directory(Some(directory))?;
     manager
         .driver()
         .client()
@@ -2307,6 +2381,62 @@ mod tests {
             color: None,
             hidden: false,
         }
+    }
+
+    /// A folder that has been deleted is a 404 that names it, never a 502 --
+    /// and the path is its own field so the app can offer to forget the
+    /// session rather than parse a sentence out of the message.
+    #[test]
+    fn a_missing_workspace_is_a_404_that_names_the_folder() {
+        let (status, Json(body)) = workspace_missing("/tmp/muqun-c10/repo");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "workspace_missing");
+        assert_eq!(
+            body["error"]["message"],
+            "The workspace folder is gone: /tmp/muqun-c10/repo"
+        );
+        assert_eq!(body["error"]["directory"], "/tmp/muqun-c10/repo");
+    }
+
+    /// And the engine error that stands for it maps to exactly that, rather
+    /// than falling into the 502 every other engine failure takes.
+    #[test]
+    fn a_missing_workspace_never_becomes_a_bad_gateway() {
+        let (status, Json(body)) = engine_error(
+            super::super::ports::engine::AgentEngineError::WorkspaceMissing("/gone".into()),
+        );
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "workspace_missing");
+        assert_eq!(body["error"]["directory"], "/gone");
+
+        // Everything else still is one.
+        let (status, Json(body)) = engine_error(
+            super::super::ports::engine::AgentEngineError::RequestFailed("nope".into()),
+        );
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"]["code"], "agent_engine_error");
+    }
+
+    /// An empty diff from a repository and an empty diff from a directory that
+    /// is not one look identical coming out of OpenCode. They must not look
+    /// identical going into the app.
+    #[test]
+    fn an_empty_diff_says_whether_there_was_a_repository_at_all() {
+        let in_repo = vcs_diff_body(json!([]), true);
+        assert_eq!(in_repo["files"], json!([]));
+        assert_eq!(in_repo["vcs"], "git");
+        assert!(in_repo["reason"].is_null(), "nothing to explain");
+
+        let no_repo = vcs_diff_body(json!([]), false);
+        assert_eq!(no_repo["files"], json!([]));
+        assert!(no_repo["vcs"].is_null());
+        assert_eq!(no_repo["reason"], "not_a_repository");
+
+        // A real diff is carried through untouched.
+        let files = json!([{ "path": "a.rs", "patch": "@@", "additions": 1, "deletions": 0 }]);
+        let real = vcs_diff_body(files.clone(), true);
+        assert_eq!(real["files"], files);
+        assert_eq!(real["vcs"], "git");
     }
 
     /// An empty catalog must not become a cached empty catalog. OpenCode

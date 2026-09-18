@@ -20,8 +20,27 @@ verbatim, so their keys stay camelCase.
 - **Errors.** `{"error": {"code": "...", "message": "..."}}`. The codes used
   here are `agent_unavailable` (503, no engine attached),
   `agent_engine_error` (502, OpenCode refused), `session_not_found` (404),
-  `saved_permission_not_found` (404), `resync_required` (410), and the
-  `invalid_*` family (400).
+  `saved_permission_not_found` (404), `workspace_missing` (404),
+  `resync_required` (410), and the `invalid_*` family (400).
+- **A folder that is gone.** Every route that names a workspace directory —
+  `vcs/diff`, the worktree routes, `agent-catalog?directory=`, the file search,
+  and a session move's target — checks the directory is still on the host
+  before proxying. If it is not, the answer is **`404 workspace_missing`**, and
+  it carries the path as its own field so the app can offer to forget the
+  session rather than read it out of a sentence:
+
+  ```json
+  { "error": { "code": "workspace_missing",
+               "message": "The workspace folder is gone: /tmp/muqun-c10/repo",
+               "directory": "/tmp/muqun-c10/repo" } }
+  ```
+
+  This used to be a `502 agent_engine_error` whose message was empty: OpenCode
+  answers a deleted directory with a bare HTTP 500 and no body, and the gateway
+  relayed it verbatim. It told the user their agent had broken when their
+  folder had simply been deleted. A 502 is now never blank either — an upstream
+  failure with no body reads `OpenCode answered 500 to GET /api/vcs/diff`, so
+  there is always a status and a route to go on.
 - **`asid`** is the OpenCode session id (`ses_…`). The gateway does not mint
   ids of its own.
 - **Legacy paths.** Everything under `/api/agent-*` also exists under
@@ -513,10 +532,30 @@ empty list.
 ### `GET /api/agent-sessions/{asid}/vcs/diff` (also `/vcs-diff`)
 
 `?mode=working|branch|committed` (default `working`) →
-`[{"path": "…", "patch": "…", "additions": 0, "deletions": 0}]`.
+
+```json
+{ "files": [ { "path": "src/a.rs", "patch": "@@ …", "additions": 3, "deletions": 1 } ],
+  "vcs": "git",
+  "reason": null }
+```
+
+> **Shape change.** This used to be a bare array. It is now an object, and the
+> array is under `files`. The two new fields are why — see below.
 
 Scoped to the session's own directory. `mode` is required by OpenCode; omitting
 it is why this used to come back empty.
+
+OpenCode answers `200` with an empty list **both** for a clean repository and
+for a directory that is not a repository at all, so on its own the app could
+not tell "nothing has changed" from "there is nothing here to change", and
+showed the same empty screen for both. So:
+
+- `vcs` is `"git"` when the session's directory is inside a git working tree,
+  and `null` when it is not.
+- `reason` is `"not_a_repository"` in that second case, and `null` otherwise.
+
+A directory that no longer exists is not this case: that is
+[`404 workspace_missing`](#conventions).
 
 ### `GET /api/agent-catalog`
 

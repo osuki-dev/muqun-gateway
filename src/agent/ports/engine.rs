@@ -13,6 +13,16 @@ pub type EngineFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, AgentEngine
 pub enum AgentEngineError {
     NotAvailable(String),
     SessionNotFound(String),
+    /// A workspace directory the caller named is not on the host any more --
+    /// a worktree removed, a throwaway repo deleted, an external drive
+    /// unmounted. It carries the path, because the only useful thing to say
+    /// about it is which folder went.
+    ///
+    /// Its own variant because it is the one engine failure that is not a
+    /// fault: OpenCode answers a bare 500 for it, and relaying that as a 502
+    /// told the user their agent was broken when their folder was simply
+    /// gone.
+    WorkspaceMissing(String),
     RequestFailed(String),
     Network(String),
     Protocol(String),
@@ -23,6 +33,9 @@ impl fmt::Display for AgentEngineError {
         match self {
             Self::NotAvailable(msg) => write!(f, "Agent engine not available: {msg}"),
             Self::SessionNotFound(id) => write!(f, "Agent session not found: {id}"),
+            Self::WorkspaceMissing(path) => {
+                write!(f, "The workspace folder is gone: {path}")
+            }
             Self::RequestFailed(msg) => write!(f, "Agent request failed: {msg}"),
             Self::Network(msg) => write!(f, "Network error communicating with agent engine: {msg}"),
             Self::Protocol(msg) => write!(f, "Protocol error: {msg}"),

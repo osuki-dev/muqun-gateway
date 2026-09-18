@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -16,6 +16,91 @@ use super::mapper;
 /// The permission action OpenCode raises when a tool reaches outside the
 /// session's own directory.
 const EXTERNAL_DIRECTORY_ACTION: &str = "external_directory";
+
+/// How long a missing directory stays quiet in the log after being reported
+/// once. A phone polling a screen whose folder is gone would otherwise write a
+/// line per read, and nothing new is learned after the first.
+const MISSING_DIRECTORY_LOG_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Directories already reported gone, and when.
+static MISSING_REPORTED: std::sync::OnceLock<Mutex<HashMap<String, std::time::Instant>>> =
+    std::sync::OnceLock::new();
+
+/// Is this workspace directory still on the host?
+///
+/// Every directory-scoped read OpenCode offers answers a bare HTTP 500 with an
+/// empty body when the directory has been deleted, which the gateway relayed
+/// as `502 agent_engine_error` with nothing after the colon -- the user was
+/// told the agent had failed when their folder had simply gone. One `stat`
+/// ahead of the call turns that into a 404 that says which folder.
+///
+/// A path that exists but cannot be read is treated as present: the guard is
+/// for "it is not there", not for permissions, and OpenCode's own answer is
+/// the better one for anything else.
+pub(crate) fn check_directory(directory: Option<&str>) -> Result<(), AgentEngineError> {
+    let Some(directory) = directory.map(str::trim).filter(|d| !d.is_empty()) else {
+        return Ok(());
+    };
+    if std::path::Path::new(directory).is_dir() {
+        return Ok(());
+    }
+    report_missing_directory(directory);
+    Err(AgentEngineError::WorkspaceMissing(directory.to_string()))
+}
+
+/// Say it once, at INFO. A folder that is gone is news the first time and
+/// noise every time after, and it is not a warning: nothing is broken.
+fn report_missing_directory(directory: &str) {
+    let seen = MISSING_REPORTED.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut seen) = seen.lock() else {
+        return;
+    };
+    if should_report_missing(&mut seen, directory, std::time::Instant::now()) {
+        tracing::info!(directory, "workspace directory is gone; answering 404");
+    }
+}
+
+/// Whether this directory is due another line, and book-keeping for the next
+/// time. Separated from the logging so the rate limit can be tested without
+/// reading a log.
+fn should_report_missing(
+    seen: &mut HashMap<String, std::time::Instant>,
+    directory: &str,
+    now: std::time::Instant,
+) -> bool {
+    let due = seen
+        .get(directory)
+        .map(|last| now.duration_since(*last) >= MISSING_DIRECTORY_LOG_INTERVAL)
+        .unwrap_or(true);
+    if !due {
+        return false;
+    }
+    // Bounded: a client could otherwise name a new directory every request.
+    if seen.len() > 256 {
+        seen.retain(|_, last| now.duration_since(*last) < MISSING_DIRECTORY_LOG_INTERVAL);
+    }
+    seen.insert(directory.to_string(), now);
+    true
+}
+
+/// Whether a directory is inside a git working tree.
+///
+/// OpenCode does not distinguish: `GET /api/vcs/diff` answers `200` with an
+/// empty list both for a clean repository and for a directory that is not a
+/// repository at all, so the app could not tell "no changes" from "nothing to
+/// have changes in". Walking up for a `.git` entry is what git itself does,
+/// and it covers a subdirectory of a repo and a worktree's `.git` file as well
+/// as a plain `.git` directory.
+pub(crate) fn is_git_worktree(directory: &str) -> bool {
+    let mut current = Some(std::path::Path::new(directory));
+    while let Some(dir) = current {
+        if dir.join(".git").exists() {
+            return true;
+        }
+        current = dir.parent();
+    }
+    false
+}
 
 /// How long to wait between asking `GET /api/agent` again while its answer is
 /// still filling in. About a second and a half in total, which covers the
@@ -428,6 +513,9 @@ impl AgentEnginePort for OpencodeDriver {
             let log = |what: &str, err: &AgentEngineError| {
                 tracing::warn!(surface = what, %err, "catalog fan-out arm failed");
             };
+            // One check for the whole fan-out: without it each of the seven
+            // arms called a dead directory, failed, and logged its own WARN.
+            check_directory(directory)?;
             let raw_models = self
                 .client
                 .get_models(directory)
@@ -618,6 +706,109 @@ mod tests {
                 expected.id
             );
         }
+    }
+
+    /// A folder that is gone is a 404 naming it, not a bare 500 from
+    /// OpenCode relayed as a blank 502.
+    #[test]
+    fn a_directory_that_is_gone_is_its_own_error() {
+        let dir = std::env::temp_dir()
+            .join(format!("muqun-missing-{}", uuid::Uuid::new_v4().simple()));
+        let path = dir.to_str().unwrap().to_string();
+
+        match check_directory(Some(&path)) {
+            Err(AgentEngineError::WorkspaceMissing(reported)) => assert_eq!(reported, path),
+            other => panic!("expected a missing workspace, got {other:?}"),
+        }
+
+        // A directory that is there is simply allowed through.
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        assert!(check_directory(Some(&path)).is_ok());
+        let _ = std::fs::remove_dir(&dir);
+
+        // Naming no directory is not a missing directory: the unscoped reads
+        // are the common case and must not start failing.
+        assert!(check_directory(None).is_ok());
+        assert!(check_directory(Some("")).is_ok());
+        assert!(check_directory(Some("   ")).is_ok());
+
+        // A file is not a workspace.
+        let file = std::env::temp_dir()
+            .join(format!("muqun-missing-{}.txt", uuid::Uuid::new_v4().simple()));
+        std::fs::write(&file, b"x").expect("write");
+        assert!(check_directory(file.to_str()).is_err());
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// The message this becomes is the one the user reads, so it says which
+    /// folder rather than which status code.
+    #[test]
+    fn a_missing_workspace_says_which_folder() {
+        let err = AgentEngineError::WorkspaceMissing("/tmp/muqun-c10/repo".to_string());
+        assert_eq!(err.to_string(), "The workspace folder is gone: /tmp/muqun-c10/repo");
+    }
+
+    /// One line per directory per interval. A phone polling a screen whose
+    /// folder is gone would otherwise write a line per read.
+    #[test]
+    fn a_missing_directory_is_reported_once_not_once_per_read() {
+        let mut seen = HashMap::new();
+        let start = std::time::Instant::now();
+
+        assert!(should_report_missing(&mut seen, "/gone", start), "the first time");
+        assert!(
+            !should_report_missing(&mut seen, "/gone", start),
+            "and not again on the next read"
+        );
+        assert!(
+            !should_report_missing(
+                &mut seen,
+                "/gone",
+                start + MISSING_DIRECTORY_LOG_INTERVAL - Duration::from_secs(1)
+            ),
+            "nor just before the interval is up"
+        );
+        assert!(
+            should_report_missing(&mut seen, "/gone", start + MISSING_DIRECTORY_LOG_INTERVAL),
+            "but once it has passed, it is news again"
+        );
+        // A different folder is different news.
+        assert!(should_report_missing(&mut seen, "/also-gone", start));
+    }
+
+    /// OpenCode answers `200` with an empty list both for a clean repository
+    /// and for a directory that is not one, so the gateway has to know the
+    /// difference itself. Walking up is what git does, so a subdirectory
+    /// counts and a worktree's `.git` file counts.
+    #[test]
+    fn a_git_worktree_is_recognised_from_anywhere_inside_it() {
+        let root = std::env::temp_dir()
+            .join(format!("muqun-git-{}", uuid::Uuid::new_v4().simple()));
+        let nested = root.join("src").join("deep");
+        std::fs::create_dir_all(&nested).expect("temp dirs");
+
+        assert!(
+            !is_git_worktree(root.to_str().unwrap()),
+            "a plain directory is not a repository"
+        );
+
+        std::fs::create_dir_all(root.join(".git")).expect("git dir");
+        assert!(is_git_worktree(root.to_str().unwrap()));
+        assert!(
+            is_git_worktree(nested.to_str().unwrap()),
+            "a subdirectory of a repository is in the repository"
+        );
+
+        // A linked worktree has a `.git` file, not a directory.
+        let linked = std::env::temp_dir()
+            .join(format!("muqun-wt-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&linked).expect("temp dir");
+        assert!(!is_git_worktree(linked.to_str().unwrap()));
+        std::fs::write(linked.join(".git"), b"gitdir: /elsewhere\n").expect("write");
+        assert!(is_git_worktree(linked.to_str().unwrap()));
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&linked);
     }
 
     fn agent(id: &str) -> Value {

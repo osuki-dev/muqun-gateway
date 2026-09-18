@@ -40,10 +40,29 @@ impl OpencodeClient {
         req
     }
 
-    async fn handle_resp(&self, resp: Response) -> Result<Value, AgentEngineError> {
+    async fn handle_resp(
+        &self,
+        resp: Response,
+        method: &str,
+        path: &str,
+    ) -> Result<Value, AgentEngineError> {
         let status = resp.status();
         if !status.is_success() {
             let err_text = resp.text().await.unwrap_or_default();
+            let err_text = err_text.trim();
+            // OpenCode answers some failures with a status and nothing else --
+            // a directory that has been deleted is a bare 500 with an empty
+            // body -- and relaying that produced `HTTP 500 Internal Server
+            // Error: ` with nothing after the colon. A 502 must never be
+            // blank: if OpenCode will not say what went wrong, the gateway at
+            // least says what it asked and what came back.
+            if err_text.is_empty() {
+                return Err(AgentEngineError::RequestFailed(empty_body_failure(
+                    status.as_u16(),
+                    method,
+                    path,
+                )));
+            }
             return Err(AgentEngineError::RequestFailed(format!(
                 "HTTP {status}: {err_text}"
             )));
@@ -73,7 +92,7 @@ impl OpencodeClient {
             .send()
             .await
             .map_err(|e| AgentEngineError::Network(e.to_string()))?;
-        self.handle_resp(resp).await
+        self.handle_resp(resp, "GET", path).await
     }
 
     pub async fn delete(&self, path: &str) -> Result<Value, AgentEngineError> {
@@ -83,7 +102,7 @@ impl OpencodeClient {
             .send()
             .await
             .map_err(|e| AgentEngineError::Network(e.to_string()))?;
-        self.handle_resp(resp).await
+        self.handle_resp(resp, "DELETE", path).await
     }
 
     /// `get` with no query parameters.
@@ -98,7 +117,7 @@ impl OpencodeClient {
             .send()
             .await
             .map_err(|e| AgentEngineError::Network(e.to_string()))?;
-        self.handle_resp(resp).await
+        self.handle_resp(resp, "POST", path).await
     }
 
     pub async fn put(&self, path: &str, body: &Value) -> Result<Value, AgentEngineError> {
@@ -108,7 +127,7 @@ impl OpencodeClient {
             .send()
             .await
             .map_err(|e| AgentEngineError::Network(e.to_string()))?;
-        self.handle_resp(resp).await
+        self.handle_resp(resp, "PUT", path).await
     }
 
     pub async fn list_projects(&self) -> Result<Vec<Value>, AgentEngineError> {
@@ -401,7 +420,7 @@ impl OpencodeClient {
             .send()
             .await
             .map_err(|e| AgentEngineError::Network(e.to_string()))?;
-        self.handle_resp(resp).await
+        self.handle_resp(resp, "POST", "/api/worktree").await
     }
 
     /// `DELETE /api/worktree`: remove one, by its own directory.
@@ -425,7 +444,7 @@ impl OpencodeClient {
             .send()
             .await
             .map_err(|e| AgentEngineError::Network(e.to_string()))?;
-        self.handle_resp(resp).await
+        self.handle_resp(resp, "DELETE", "/api/worktree").await
     }
 
     /// `POST /api/worktree/refresh`: rediscover and reconcile the inventory.
@@ -444,7 +463,7 @@ impl OpencodeClient {
             .send()
             .await
             .map_err(|e| AgentEngineError::Network(e.to_string()))?;
-        self.handle_resp(resp).await
+        self.handle_resp(resp, "POST", "/api/worktree/refresh").await
     }
 
     /// `POST /api/session/{id}/move`: move a session to another directory.
@@ -875,6 +894,16 @@ pub(crate) fn location_query(directory: Option<&str>) -> Vec<(String, String)> {
 
 /// `Model.Ref` as v2 spells it: `{providerID, id, variant?}`, with `variant`
 /// omitted rather than sent as null.
+/// What to say when upstream failed and said nothing.
+///
+/// A status with an empty body is the shape OpenCode uses for a directory that
+/// has been deleted, and relaying it verbatim produced a 502 whose message was
+/// empty after the colon. Naming the status and the route at least tells the
+/// reader which call fell over.
+pub(crate) fn empty_body_failure(status: u16, method: &str, path: &str) -> String {
+    format!("OpenCode answered {status} to {method} {path}")
+}
+
 /// `projectID` scopes the saved-permission list to one project. Without it
 /// OpenCode answers with every project's, which is never what a route hanging
 /// off one session means.
@@ -987,6 +1016,24 @@ mod tests {
         assert!(url.contains("parentID=null"), "roots-only is a literal null: {url}");
         assert!(url.contains("search=gateway"), "got {url}");
         assert!(url.contains("cursor=abc"), "got {url}");
+    }
+
+    /// A 502 must never be blank.
+    ///
+    /// OpenCode answers a directory that has been deleted with a bare 500 and
+    /// an empty body, and the gateway relayed that as `Agent request failed:
+    /// HTTP 500 Internal Server Error: ` -- nothing after the colon, for the
+    /// user and for the log. When upstream will not say what went wrong, the
+    /// message says what was asked and what came back.
+    #[test]
+    fn an_upstream_failure_with_no_body_still_says_what_happened() {
+        let blank = empty_body_failure(500, "GET", "/api/vcs/diff");
+        assert_eq!(blank, "OpenCode answered 500 to GET /api/vcs/diff");
+
+        let with_route = empty_body_failure(503, "POST", "/api/worktree/refresh");
+        assert!(with_route.contains("503"), "the status: {with_route}");
+        assert!(with_route.contains("POST /api/worktree/refresh"), "the route: {with_route}");
+        assert!(!with_route.ends_with(": "), "and never a dangling colon");
     }
 
     /// The worktree routes take the project as the same deep-object
