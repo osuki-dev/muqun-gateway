@@ -147,7 +147,10 @@ pub fn map_session(val: &Value) -> Option<AgentSessionInfo> {
 
     Some(AgentSessionInfo {
         asid: AgentSessionId(id.to_string()),
-        backend_session_id: id.to_string(),
+        // Left empty, and therefore off the wire, whenever it would only
+        // repeat `asid`. It is set for an engine that really does key
+        // sessions differently.
+        backend_session_id: String::new(),
         title,
         agent,
         model,

@@ -136,6 +136,13 @@ pub struct SessionForkInfo {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentSessionInfo {
     pub asid: AgentSessionId,
+    /// The engine's own id for this session.
+    ///
+    /// Omitted when it is the same string as `asid`, which on OpenCode it
+    /// always is -- the gateway mints no ids of its own. It was 1.6 kB of
+    /// every 21.5 kB list. A client that reads it should fall back to `asid`
+    /// when it is absent, which is the rule that was already true in practice.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub backend_session_id: String,
     pub title: String,
     #[serde(skip_serializing_if = "Option::is_none")]

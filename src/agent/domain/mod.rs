@@ -74,7 +74,6 @@ mod contract_tests {
         let value = serde_json::to_value(&info).expect("serializes");
         for key in [
             "asid",
-            "backend_session_id",
             "title",
             "agent",
             "model",
@@ -186,6 +185,46 @@ mod contract_tests {
             !keys(&value).contains(&"input_partial".to_string()),
             "`input_partial` is a streaming preview and is absent once there is a real input"
         );
+    }
+
+    /// `backend_session_id` only earns its place when it says something
+    /// `asid` does not. On OpenCode it never does -- it was the same string
+    /// repeated once per row, 1.6 kB of every 21.5 kB list.
+    #[test]
+    fn a_backend_session_id_that_only_repeats_the_asid_is_left_off() {
+        let mut info = AgentSessionInfo {
+            asid: AgentSessionId("ses_1".into()),
+            backend_session_id: String::new(),
+            title: "t".into(),
+            agent: None,
+            model: None,
+            status: AgentSessionStatus::Idle,
+            directory: None,
+            cost: None,
+            tokens: None,
+            limit: None,
+            parent_id: None,
+            project_id: None,
+            outcome: None,
+            error: None,
+            revert: None,
+            fork: None,
+            time_idle: None,
+            time_viewed: None,
+            deleted: false,
+            updated_ms: 3,
+        };
+        let value = serde_json::to_value(&info).expect("serializes");
+        assert!(
+            !keys(&value).contains(&"backend_session_id".to_string()),
+            "absent means `asid`, which is the rule that was already true"
+        );
+        assert_eq!(value["asid"], "ses_1");
+
+        // An engine that really does key sessions differently still says so.
+        info.backend_session_id = "engine-42".into();
+        let value = serde_json::to_value(&info).expect("serializes");
+        assert_eq!(value["backend_session_id"], "engine-42");
     }
 
     /// The streaming preview is a string on the tool part, and it is bounded:

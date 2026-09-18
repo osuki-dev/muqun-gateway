@@ -59,7 +59,7 @@ verbatim, so their keys stay camelCase.
 | `directory` | Scope to a workspace directory. |
 | `parent_id` | List the children of one session. |
 | `roots` | `true` lists top-level sessions only — no subagent sessions. |
-| `limit`, `order`, `search`, `cursor` | Passed through to OpenCode. `order` is `asc` or `desc`. |
+| `limit`, `order`, `search`, `cursor` | Passed through to OpenCode. `order` is `asc` or `desc`. `limit` defaults to **50**. |
 
 Returns `[AgentSessionInfo]`.
 
@@ -976,8 +976,11 @@ event backlog overflowed.
 }
 ```
 
-Only `asid`, `backend_session_id`, `title`, `status` and `updated_ms` are always
-present; every other field is omitted when unset. `deleted` is omitted unless
+Only `asid`, `title`, `status` and `updated_ms` are always present; every other
+field is omitted when unset. **`backend_session_id` is omitted when it would
+only repeat `asid`** — which on OpenCode is always, since the gateway mints no
+ids of its own; absent means "the same as `asid`", and it is present only for
+an engine that really does key sessions differently. `deleted` is omitted unless
 true. `model` is `null`/absent when OpenCode has not said — the gateway does not
 invent one.
 

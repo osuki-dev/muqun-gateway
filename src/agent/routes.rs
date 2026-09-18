@@ -43,6 +43,13 @@ pub struct AgentSessionsQuery {
     pub cursor: Option<String>,
 }
 
+/// What a session list answers when the caller does not say.
+///
+/// The app already asks for fifty; a caller that asks for nothing used to get
+/// every session the engine had ever seen. A page is the right default for a
+/// list a phone scrolls.
+const DEFAULT_SESSION_LIMIT: usize = 50;
+
 impl AgentSessionsQuery {
     fn to_session_query(&self) -> SessionQuery {
         SessionQuery {
@@ -53,7 +60,7 @@ impl AgentSessionsQuery {
                 (_, Some(true)) => Some("null".to_string()),
                 _ => None,
             },
-            limit: self.limit,
+            limit: Some(self.limit.unwrap_or(DEFAULT_SESSION_LIMIT)),
             order: self.order.clone(),
             search: self.search.clone(),
             cursor: self.cursor.clone(),
