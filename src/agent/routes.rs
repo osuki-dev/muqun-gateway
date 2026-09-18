@@ -520,7 +520,7 @@ async fn do_list_agent_sessions(
     state: &AppState,
     query: &SessionQuery,
     headers: &HeaderMap,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Response> {
     require_device(state, headers)?;
 
     let Some(manager) = state.agent_runtime.manager().await else {
@@ -535,9 +535,13 @@ async fn do_list_agent_sessions(
         .sessions()
         .list_sessions(query)
         .await
-        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "agent_engine_error", &e.to_string()))?;
+        .map_err(engine_error)?;
 
-    Ok(Json(content_envelope(json!(sessions))))
+    // The app has been sending `If-None-Match` on this route all along and
+    // getting a fresh 21 kB body every time -- after every turn, because the
+    // list is what the home screen watches. The list is the same bytes far
+    // more often than it is not.
+    Ok(json_etag_response(headers, content_envelope(json!(sessions))))
 }
 
 async fn do_create_agent_session(
@@ -1024,6 +1028,15 @@ pub(crate) fn catalog_response(
     json_etag_response(headers, payload)
 }
 
+/// What a validated answer depends on.
+///
+/// `accept-encoding` because the same payload is served gzipped or not, and
+/// `accept-language` because every request from the app carries one and the
+/// bodies these routes return are not all locale-free. Without it a cache --
+/// the app's own included -- could hand one client the answer built for
+/// another.
+pub(crate) const VALIDATED_VARY: &str = "accept-encoding, accept-language";
+
 pub(crate) fn json_etag_response(headers: &HeaderMap, payload: Value) -> Response {
     let body_bytes = serde_json::to_vec(&payload).unwrap_or_default();
     let mut hasher = Sha256::new();
@@ -1039,6 +1052,7 @@ pub(crate) fn json_etag_response(headers: &HeaderMap, payload: Value) -> Respons
                 [
                     (header::ETAG, etag),
                     (header::CACHE_CONTROL, "private, must-revalidate".to_string()),
+                    (header::VARY, VALIDATED_VARY.to_string()),
                 ],
             )
                 .into_response();
@@ -1051,6 +1065,7 @@ pub(crate) fn json_etag_response(headers: &HeaderMap, payload: Value) -> Respons
             (header::CONTENT_TYPE, "application/json".to_string()),
             (header::ETAG, etag),
             (header::CACHE_CONTROL, "private, must-revalidate".to_string()),
+            (header::VARY, VALIDATED_VARY.to_string()),
         ],
         body_bytes,
     )
@@ -1258,7 +1273,7 @@ async fn list_agent_sessions_global(
     State(state): State<AppState>,
     Query(query): Query<AgentSessionsQuery>,
     headers: HeaderMap,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Response> {
     do_list_agent_sessions(&state, &query.to_session_query(), &headers).await
 }
 
@@ -1407,7 +1422,7 @@ async fn list_agent_sessions_legacy(
     Path(_session_id): Path<String>,
     Query(query): Query<AgentSessionsQuery>,
     headers: HeaderMap,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Response> {
     do_list_agent_sessions(&state, &query.to_session_query(), &headers).await
 }
 
@@ -1693,7 +1708,7 @@ async fn list_agent_session_children(
     Path(asid): Path<String>,
     Query(query): Query<AgentSessionsQuery>,
     headers: HeaderMap,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Response> {
     let mut session_query = query.to_session_query();
     session_query.parent_id = Some(asid);
     do_list_agent_sessions(&state, &session_query, &headers).await
@@ -2422,6 +2437,63 @@ mod tests {
             color: None,
             hidden: false,
         }
+    }
+
+    /// The validator the app has been sending all along.
+    ///
+    /// It puts `If-None-Match` on the sessions list and the gateway ignored
+    /// it, so every poll after every turn paid for the whole list again. The
+    /// same bytes must produce the same tag, a matching tag must answer 304
+    /// with no body, and different bytes must produce a different tag.
+    #[test]
+    fn a_validated_answer_is_a_304_when_the_client_already_has_it() {
+        let payload = json!({ "sessions": [{ "asid": "ses_1" }] });
+
+        let fresh = json_etag_response(&HeaderMap::new(), payload.clone());
+        assert_eq!(fresh.status(), StatusCode::OK);
+        let tag = fresh
+            .headers()
+            .get(header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .expect("a validated answer carries a tag")
+            .to_string();
+        assert_eq!(
+            fresh.headers().get(header::VARY).and_then(|v| v.to_str().ok()),
+            Some(VALIDATED_VARY),
+            "and says what it varies by, so a cache cannot cross the wires"
+        );
+
+        // The same body, asked for again with the tag the client holds.
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_NONE_MATCH, tag.parse().unwrap());
+        let repeat = json_etag_response(&headers, payload.clone());
+        assert_eq!(repeat.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            repeat.headers().get(header::ETAG).and_then(|v| v.to_str().ok()),
+            Some(tag.as_str())
+        );
+        assert_eq!(
+            repeat.headers().get(header::VARY).and_then(|v| v.to_str().ok()),
+            Some(VALIDATED_VARY),
+            "a 304 has to carry it too, or the cache entry it refreshes loses it"
+        );
+
+        // A weak tag for the same bytes is still the same answer.
+        let mut weak = HeaderMap::new();
+        weak.insert(header::IF_NONE_MATCH, format!("W/{tag}").parse().unwrap());
+        assert_eq!(
+            json_etag_response(&weak, payload.clone()).status(),
+            StatusCode::NOT_MODIFIED
+        );
+
+        // One more session is a different answer, and must not 304.
+        let changed = json!({ "sessions": [{ "asid": "ses_1" }, { "asid": "ses_2" }] });
+        let response = json_etag_response(&headers, changed);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_ne!(
+            response.headers().get(header::ETAG).and_then(|v| v.to_str().ok()),
+            Some(tag.as_str())
+        );
     }
 
     /// A folder that has been deleted is a 404 that names it, never a 502 --

@@ -2866,11 +2866,29 @@ async fn envelope_compression_gate(mut request: Request<Body>, next: Next) -> Re
     }
     let mut response = next.run(request).await;
     // Said whether or not this particular answer was compressed: a cache that
-    // holds one must not serve it to a client that asked differently.
-    response.headers_mut().insert(
-        axum::http::header::VARY,
-        HeaderValue::from_static("accept-encoding"),
-    );
+    // holds one must not serve it to a client that asked differently. A route
+    // that has already named what it varies by keeps it -- the validated
+    // routes name the locale too -- and this only makes sure encoding is in
+    // the list.
+    let headers = response.headers_mut();
+    let existing = headers
+        .get(axum::http::header::VARY)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    match existing {
+        Some(existing) if existing.to_ascii_lowercase().contains("accept-encoding") => {}
+        Some(existing) => {
+            if let Ok(value) = HeaderValue::from_str(&format!("{existing}, accept-encoding")) {
+                headers.insert(axum::http::header::VARY, value);
+            }
+        }
+        None => {
+            headers.insert(
+                axum::http::header::VARY,
+                HeaderValue::from_static("accept-encoding"),
+            );
+        }
+    }
     response
 }
 
