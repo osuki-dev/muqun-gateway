@@ -92,6 +92,41 @@ With a service installed, `muqun-gateway stop` stops the process but the service
 starts it again — that is what it is for. `service uninstall` is how you stop it
 for good.
 
+### The agent engine
+
+The gateway's agent features run on OpenCode 2. It attaches one for as long as
+it is running: if a service is already registered it adopts that, and otherwise
+it starts `opencode serve --service` itself.
+
+**It runs `opencode` as your `PATH` resolves it**, or the file you name:
+
+```json
+{ "opencode": { "autostart": true, "binary": "/absolute/path/to/opencode" } }
+```
+
+in `config.json`. Set `autostart` to `false` to have it only ever adopt a
+service you start yourself. The gateway does not go looking in an install
+directory of its own — where OpenCode lives differs per OS and per install, and
+guessing would run a different binary than your shell does.
+
+That is worth knowing because **the two ways of running the gateway do not
+share a `PATH`**. `muqun-gateway start` inherits the shell you typed it in,
+version managers and all; `service install` runs under your init system with
+its own environment. The same machine can resolve `opencode` to two different
+files depending on which you used. So the gateway logs the file it resolved,
+and its version, every time it starts or adopts one:
+
+```
+INFO no OpenCode service found, starting one binary=/home/you/.opencode/bin/opencode version="opencode v2.0.1"
+INFO adopted the running OpenCode service url=http://127.0.0.1:49374 version="2.0.1" binary=/home/you/.opencode/bin/opencode
+```
+
+If what it finds is older than 2.0 it refuses it — started or adopted — with
+one line saying which file, which version, and that `opencode.binary` is how to
+point it elsewhere. OpenCode 1 is a different API, and half-working with it is
+worse than saying so. `GET /api/agent-engine` reports the same facts to the
+app, including whether the engine was `adopted` or `spawned`.
+
 ### Optional terminal startup
 
 The installer separately asks whether configured terminal backends should start

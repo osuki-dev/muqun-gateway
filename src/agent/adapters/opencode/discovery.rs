@@ -15,6 +15,9 @@ pub struct OpencodeEndpoint {
     pub url: String,
     pub password: Option<String>,
     pub version: Option<String>,
+    /// The service's process id, when its registration named one. Kept so the
+    /// gateway can report which binary an adopted service is actually running.
+    pub pid: Option<u32>,
 }
 
 impl OpencodeEndpoint {
@@ -31,6 +34,7 @@ impl OpencodeEndpoint {
                     url,
                     password,
                     version: None,
+                    pid: None,
                 });
             }
         }
@@ -52,6 +56,7 @@ impl OpencodeEndpoint {
             url,
             password: reg.password,
             version: reg.version,
+            pid: reg.pid,
         })
     }
 

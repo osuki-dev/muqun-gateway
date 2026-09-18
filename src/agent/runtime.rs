@@ -31,6 +31,19 @@ const STARTUP_WAIT: Duration = Duration::from_secs(20);
 const STARTUP_POLL: Duration = Duration::from_millis(400);
 /// Backoff ceiling between failed start attempts.
 const MAX_START_BACKOFF: Duration = Duration::from_secs(120);
+/// How often the supervisor glances at the event stream while the engine is
+/// otherwise healthy. A lost stream *is* the engine going away, and waiting
+/// for the next health poll to notice it cost thirteen seconds of silence in
+/// the app for no reason -- the flag is an atomic read, so this is nearly free.
+const STREAM_WATCH_TICK: Duration = Duration::from_secs(1);
+/// The wait before re-discovering after the stream dropped. Nothing the first
+/// time: look at once. Then doubling, so a stream that flaps cannot spin the
+/// supervisor.
+const STREAM_LOSS_FIRST_WAIT: Duration = Duration::ZERO;
+const STREAM_LOSS_MAX_WAIT: Duration = Duration::from_secs(30);
+/// The engine major version this gateway speaks. v1 is a different API, and
+/// half-working with it is worse than saying so.
+const MIN_OPENCODE_MAJOR: u64 = 2;
 
 /// `opencode` in `config.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,8 +51,13 @@ pub struct OpencodeConfig {
     /// Start `opencode serve --service` when no healthy service is found.
     #[serde(default = "default_true")]
     pub autostart: bool,
-    /// The binary to start. Resolved on `PATH` when absent -- the systemd unit
-    /// already puts `~/.opencode/bin` first, which is where v2 lives.
+    /// The binary to start, when `PATH` is not the right answer.
+    ///
+    /// Absent, the gateway runs whatever `opencode` `PATH` resolves to, and
+    /// says which file that turned out to be. It does not go looking in an
+    /// install directory of its own: where OpenCode lives differs per OS and
+    /// per install, and a gateway guessing at it would quietly run a different
+    /// binary than the one the owner's shell does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary: Option<String>,
 }
@@ -149,11 +167,58 @@ impl AgentRuntime {
         let runtime = self.clone();
         tokio::spawn(async move {
             let mut start_backoff = Duration::from_secs(2);
+            let mut stream_loss_wait = STREAM_LOSS_FIRST_WAIT;
             loop {
                 let healthy = runtime.check_and_repair(&mut start_backoff).await;
-                tokio::time::sleep(if healthy { HEALTHY_POLL } else { UNHEALTHY_POLL }).await;
+                if healthy {
+                    runtime.watch_while_healthy(&mut stream_loss_wait).await;
+                } else {
+                    tokio::time::sleep(UNHEALTHY_POLL).await;
+                }
             }
         });
+    }
+
+    /// Hold until the engine is worth checking again.
+    ///
+    /// Normally that is the next health poll. But the event stream dropping is
+    /// the engine telling us it has gone, and that should not wait: this
+    /// returns within a tick of the stream going down, so the gap between
+    /// OpenCode dying and the gateway re-attaching is about a second rather
+    /// than however much of the poll interval was left.
+    async fn watch_while_healthy(&self, stream_loss_wait: &mut Duration) {
+        let deadline = tokio::time::Instant::now() + HEALTHY_POLL;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                // A full interval with the stream up: whatever flapping there
+                // was has settled, so the next loss is looked at immediately.
+                *stream_loss_wait = STREAM_LOSS_FIRST_WAIT;
+                return;
+            }
+            tokio::time::sleep(STREAM_WATCH_TICK.min(remaining)).await;
+            if self.stream_down().await {
+                tracing::warn!(
+                    wait_s = stream_loss_wait.as_secs(),
+                    "opencode event stream is down, re-discovering"
+                );
+                if !stream_loss_wait.is_zero() {
+                    tokio::time::sleep(*stream_loss_wait).await;
+                }
+                *stream_loss_wait = next_stream_loss_wait(*stream_loss_wait);
+                return;
+            }
+        }
+    }
+
+    /// True when an engine is attached but its event stream has dropped.
+    async fn stream_down(&self) -> bool {
+        self.manager
+            .read()
+            .await
+            .as_ref()
+            .map(|m| !m.stream_connected())
+            .unwrap_or(false)
     }
 
     /// One supervision pass. Returns whether an engine is attached and well.
@@ -181,9 +246,18 @@ impl AgentRuntime {
             *self.origin.write().await = EngineOrigin::None;
         }
 
-        // Adopt anything already healthy before starting anything.
+        // Adopt anything already healthy before starting anything -- but not
+        // a v1 service. Attaching to one used to look like success and then
+        // fail on every route, which is a worse answer than refusing here.
         if let Some(endpoint) = discovered {
             if endpoint.probe_healthy(&probe_client()).await {
+                if let Err(refusal) = check_version(endpoint.version.as_deref()) {
+                    tracing::error!(
+                        "refusing to use the OpenCode service at {}: {refusal}",
+                        endpoint.url
+                    );
+                    return false;
+                }
                 self.attach(endpoint, EngineOrigin::Adopted).await;
                 *start_backoff = Duration::from_secs(2);
                 return true;
@@ -213,18 +287,30 @@ impl AgentRuntime {
     async fn attach(&self, endpoint: OpencodeEndpoint, origin: EngineOrigin) {
         let url = endpoint.url.clone();
         let version = endpoint.version.clone();
+        // Which file is actually serving this. For a service this gateway
+        // started that is the path it resolved; for one it adopted it is read
+        // off the running process, because "which opencode am I talking to" is
+        // the question an operator has after a restart and a bare `opencode`
+        // does not answer it.
+        let path = endpoint
+            .pid
+            .and_then(running_binary_path)
+            .map(|p| p.display().to_string());
         let manager = Arc::new(AgentManager::connect(endpoint, self.events_tx.clone()));
         *self.manager.write().await = Some(manager);
         *self.origin.write().await = origin;
+        let path = path.unwrap_or_else(|| "unknown".to_string());
         match origin {
             EngineOrigin::Adopted => tracing::info!(
                 url = %url,
                 version = version.as_deref().unwrap_or("unknown"),
+                binary = %path,
                 "adopted the running OpenCode service"
             ),
             EngineOrigin::Spawned => tracing::info!(
                 url = %url,
                 version = version.as_deref().unwrap_or("unknown"),
+                binary = %path,
                 "started an OpenCode service and attached to it"
             ),
             EngineOrigin::None => {}
@@ -266,12 +352,30 @@ impl AgentRuntime {
             *slot = None;
         }
 
-        let binary = self
-            .config
-            .binary
-            .clone()
-            .unwrap_or_else(|| "opencode".to_string());
-        tracing::info!(binary = %binary, "no OpenCode service found, starting one");
+        // `opencode.binary` if the owner set one, otherwise whatever `opencode`
+        // means on PATH -- and then the file that resolved to, so the log names
+        // a path rather than a word.
+        let binary = match resolve_binary(self.config.binary.as_deref()) {
+            Ok(path) => path,
+            Err(err) => {
+                anyhow::bail!("{err}");
+            }
+        };
+        let version = binary_version(&binary);
+        if let Err(refusal) = check_version(version.as_deref()) {
+            // One line, naming the file and what it said, because the reader
+            // has to go and fix an install.
+            tracing::error!(
+                "refusing to start {}: {refusal}",
+                binary.display()
+            );
+            anyhow::bail!("{} is not OpenCode 2.x", binary.display());
+        }
+        tracing::info!(
+            binary = %binary.display(),
+            version = version.as_deref().unwrap_or("unknown"),
+            "no OpenCode service found, starting one"
+        );
 
         let mut command = tokio::process::Command::new(&binary);
         command
@@ -285,15 +389,158 @@ impl AgentRuntime {
             .process_group(0)
             .kill_on_drop(false);
 
-        let child = command
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("could not run `{binary} serve --service`: {e}"))?;
+        let child = command.spawn().map_err(|e| {
+            anyhow::anyhow!("could not run `{} serve --service`: {e}", binary.display())
+        })?;
         tracing::info!(pid = child.id(), "OpenCode service starting");
         *slot = Some(child);
         drop(slot);
 
         wait_for_service().await
     }
+}
+
+/// The wait after a stream loss, given the last one.
+///
+/// The first loss is looked at immediately, because that is the common case
+/// and the whole point. Repeated losses without a settled interval in between
+/// mean something is flapping, and the supervisor backs off rather than
+/// re-discovering once a second forever.
+fn next_stream_loss_wait(current: Duration) -> Duration {
+    if current.is_zero() {
+        Duration::from_secs(1)
+    } else {
+        (current * 2).min(STREAM_LOSS_MAX_WAIT)
+    }
+}
+
+/// The major version out of whatever `--version` or a registration said:
+/// `opencode v2.0.1`, `2.0.1`, `v2.0.1-beta.3`.
+fn parse_major(version: &str) -> Option<u64> {
+    version
+        .split_whitespace()
+        .filter_map(|word| {
+            let word = word.trim_start_matches(['v', 'V']);
+            let head = word.split(['.', '-', '+']).next()?;
+            head.parse::<u64>().ok().map(|major| (major, word))
+        })
+        // A bare `2` is not a version string; take the first word that looks
+        // like one, so `opencode v2.0.1` is not read as the `opencode` in it.
+        .find(|(_, word)| word.contains('.'))
+        .map(|(major, _)| major)
+        .or_else(|| version.trim().trim_start_matches(['v', 'V']).parse::<u64>().ok())
+}
+
+/// Whether a version is one this gateway will talk to.
+///
+/// An unreadable or absent version is allowed through: it cannot be shown to
+/// be too old, and refusing on silence would break an install that simply does
+/// not report one. Only a version that is legible *and* below 2.0 is refused.
+fn check_version(version: Option<&str>) -> Result<(), String> {
+    let Some(version) = version.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(());
+    };
+    let Some(major) = parse_major(version) else {
+        return Ok(());
+    };
+    if major >= MIN_OPENCODE_MAJOR {
+        return Ok(());
+    }
+    Err(format!(
+        "it reports version {version}, and this gateway speaks OpenCode \
+         {MIN_OPENCODE_MAJOR}.x only. Install OpenCode 2, or point the gateway \
+         at the right one by setting `opencode.binary` to its absolute path in \
+         config.json"
+    ))
+}
+
+/// `opencode.binary` if the owner set one, else `opencode` as `PATH` resolves
+/// it -- and in both cases the file it actually is.
+///
+/// No install directory is guessed at. Where OpenCode lives differs per OS and
+/// per install, and a gateway reaching into one of its own would quietly run a
+/// different binary than the owner's shell does, which is the confusion this
+/// is here to end.
+fn resolve_binary(configured: Option<&str>) -> anyhow::Result<std::path::PathBuf> {
+    resolve_binary_in(configured, std::env::var_os("PATH").as_deref())
+}
+
+/// The lookup itself, with `PATH` passed in rather than read, so a test can
+/// exercise the order without reaching into the process environment that every
+/// other thread is also using.
+fn resolve_binary_in(
+    configured: Option<&str>,
+    path_var: Option<&std::ffi::OsStr>,
+) -> anyhow::Result<std::path::PathBuf> {
+    let name = configured
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("opencode");
+
+    // Anything with a separator is a path the owner meant literally, and a
+    // missing one is an error naming it rather than a quiet fall back to PATH:
+    // they asked for that file.
+    if name.contains(std::path::MAIN_SEPARATOR) || name.contains('/') {
+        let path = std::path::PathBuf::from(name);
+        if !path.is_file() {
+            anyhow::bail!("`opencode.binary` is set to {name}, and there is no file there");
+        }
+        return Ok(absolute(path));
+    }
+
+    let path_var =
+        path_var.ok_or_else(|| anyhow::anyhow!("PATH is not set, so `{name}` cannot be resolved"))?;
+    for dir in std::env::split_paths(path_var) {
+        let candidate = dir.join(name);
+        if is_executable(&candidate) {
+            return Ok(absolute(candidate));
+        }
+    }
+    anyhow::bail!(
+        "`{name}` is not on PATH. Install OpenCode 2, or set `opencode.binary` \
+         to its absolute path in config.json"
+    )
+}
+
+fn absolute(path: std::path::PathBuf) -> std::path::PathBuf {
+    std::fs::canonicalize(&path).unwrap_or(path)
+}
+
+#[cfg(unix)]
+fn is_executable(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &std::path::Path) -> bool {
+    path.is_file()
+}
+
+/// What `<binary> --version` says, or `None` if it cannot be asked.
+fn binary_version(path: &std::path::Path) -> Option<String> {
+    let output = std::process::Command::new(path).arg("--version").output().ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let text = if text.trim().is_empty() {
+        String::from_utf8_lossy(&output.stderr).to_string()
+    } else {
+        text.to_string()
+    };
+    let line = text.lines().next()?.trim().to_string();
+    (!line.is_empty()).then_some(line)
+}
+
+/// The executable behind a running pid, where the platform will say.
+#[cfg(target_os = "linux")]
+fn running_binary_path(pid: u32) -> Option<std::path::PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn running_binary_path(_pid: u32) -> Option<std::path::PathBuf> {
+    None
 }
 
 fn probe_client() -> reqwest::Client {
@@ -343,6 +590,132 @@ mod tests {
                 .expect("config parses");
         assert!(!config.autostart);
         assert_eq!(config.binary.as_deref(), Some("/opt/opencode"));
+    }
+
+    /// The version gate is about the major number, and the string it reads
+    /// comes from three different places in three different shapes.
+    #[test]
+    fn a_version_is_read_out_of_whatever_shape_it_arrives_in() {
+        assert_eq!(parse_major("opencode v2.0.1"), Some(2));
+        assert_eq!(parse_major("2.0.1"), Some(2));
+        assert_eq!(parse_major("v2.0.1-beta.3"), Some(2));
+        assert_eq!(parse_major("opencode 1.18.4"), Some(1));
+        assert_eq!(parse_major("v10.2.0"), Some(10));
+        assert_eq!(parse_major("2"), Some(2));
+        assert_eq!(parse_major("not a version"), None);
+        assert_eq!(parse_major(""), None);
+    }
+
+    /// v1 is a different API. Attaching to it looked like success and then
+    /// failed on every route, which is a worse answer than refusing.
+    #[test]
+    fn a_v1_engine_is_refused_and_the_refusal_says_what_to_do() {
+        let refusal = check_version(Some("opencode 1.18.4")).expect_err("v1 is refused");
+        assert!(refusal.contains("1.18.4"), "it names what it found: {refusal}");
+        assert!(
+            refusal.contains("opencode.binary"),
+            "and how to point it elsewhere: {refusal}"
+        );
+
+        assert!(check_version(Some("opencode v2.0.1")).is_ok());
+        assert!(check_version(Some("v3.0.0")).is_ok());
+    }
+
+    /// Silence is not evidence of being old. An install that reports no
+    /// version, or one this cannot parse, is allowed through rather than
+    /// refused on a guess.
+    #[test]
+    fn an_unreadable_version_is_not_treated_as_too_old() {
+        assert!(check_version(None).is_ok());
+        assert!(check_version(Some("")).is_ok());
+        assert!(check_version(Some("   ")).is_ok());
+        assert!(check_version(Some("unknown build")).is_ok());
+    }
+
+    /// `opencode.binary` first, then `opencode` as PATH resolves it. No
+    /// install directory is guessed at, so this is the whole order.
+    /// `opencode.binary` first, then `opencode` as PATH resolves it. No
+    /// install directory is guessed at, so this is the whole order.
+    #[test]
+    fn the_binary_is_the_configured_one_or_whatever_path_says() {
+        let dir = std::env::temp_dir()
+            .join(format!("muqun-resolve-{}", uuid::Uuid::new_v4().simple()));
+        let other = dir.join("elsewhere");
+        std::fs::create_dir_all(&other).expect("temp dir");
+
+        let on_path = dir.join("opencode");
+        let configured = other.join("opencode-2");
+        for file in [&on_path, &configured] {
+            std::fs::write(file, "#!/bin/sh\nexit 0\n").expect("write");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod");
+            }
+        }
+        let path_var = std::ffi::OsString::from(&dir);
+        let empty_path = std::ffi::OsString::from(&other);
+
+        // An absolute `opencode.binary` is taken literally, whatever PATH says.
+        assert_eq!(
+            resolve_binary_in(Some(configured.to_str().unwrap()), Some(&path_var))
+                .expect("configured"),
+            std::fs::canonicalize(&configured).unwrap()
+        );
+
+        // A configured path that is not there names itself rather than
+        // silently falling back to PATH.
+        let missing = other.join("not-here");
+        let err = resolve_binary_in(Some(missing.to_str().unwrap()), Some(&path_var))
+            .expect_err("missing");
+        assert!(err.to_string().contains("not-here"), "got {err}");
+
+        // Absent, it is `opencode` on PATH -- and the answer is the file.
+        assert_eq!(
+            resolve_binary_in(None, Some(&path_var)).expect("found on PATH"),
+            std::fs::canonicalize(&on_path).unwrap()
+        );
+        // A bare name is looked up the same way.
+        assert_eq!(
+            resolve_binary_in(Some("opencode"), Some(&path_var)).expect("bare name"),
+            std::fs::canonicalize(&on_path).unwrap()
+        );
+
+        // Nothing named `opencode` anywhere on PATH: an error that says how to
+        // fix it, not a guess at an install directory.
+        let err = resolve_binary_in(None, Some(&empty_path)).expect_err("not there");
+        assert!(err.to_string().contains("not on PATH"), "got {err}");
+        assert!(err.to_string().contains("opencode.binary"), "got {err}");
+
+        let err = resolve_binary_in(None, None).expect_err("no PATH at all");
+        assert!(err.to_string().contains("PATH is not set"), "got {err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A lost stream is the engine going away, so the first one is looked at
+    /// at once; a stream that keeps dropping must not spin the supervisor.
+    #[test]
+    fn a_flapping_stream_backs_off_but_the_first_loss_does_not_wait() {
+        assert_eq!(STREAM_LOSS_FIRST_WAIT, Duration::ZERO);
+        let mut wait = STREAM_LOSS_FIRST_WAIT;
+        wait = next_stream_loss_wait(wait);
+        assert_eq!(wait, Duration::from_secs(1));
+        let mut seen = vec![wait];
+        for _ in 0..8 {
+            wait = next_stream_loss_wait(wait);
+            seen.push(wait);
+        }
+        assert!(
+            seen.windows(2).all(|w| w[1] >= w[0]),
+            "it only grows: {seen:?}"
+        );
+        assert_eq!(*seen.last().unwrap(), STREAM_LOSS_MAX_WAIT, "and it stops");
+        assert!(
+            STREAM_WATCH_TICK < HEALTHY_POLL,
+            "the stream is watched more often than the engine is polled"
+        );
     }
 
     #[tokio::test]

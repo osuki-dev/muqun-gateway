@@ -13,6 +13,7 @@ fn ctx() -> Arc<EventContext> {
         url: "http://127.0.0.1:1".to_string(),
         password: None,
         version: Some("2.0.1".to_string()),
+        pid: None,
     };
     let driver = Arc::new(OpencodeDriver::new(endpoint));
     let mirror = Arc::new(MemoryMirror::new());

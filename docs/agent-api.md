@@ -582,10 +582,74 @@ ETag + `304`. `[{"id", "canonical", "name", "vcs?", "sandboxes": []}]`.
 ```
 
 The one agent route that answers `200` when no engine is attached — it exists to
-explain why the others are returning 503. The gateway re-discovers OpenCode
-whenever the health probe fails or its registration moves, and (unless
-`opencode.autostart` is `false` in `config.json`) starts
-`opencode serve --service` when it cannot find one.
+explain why the others are returning 503.
+
+`origin` is how the engine currently attached was obtained: `adopted` for a
+service that was already running, `spawned` for one this gateway started,
+`none` when nothing is attached.
+
+### Which OpenCode, and who starts it
+
+The gateway keeps an engine attached for its own lifetime. It adopts a healthy
+service if one is registered, and otherwise starts
+`opencode serve --service` — unless `opencode.autostart` is `false` in
+`config.json`.
+
+**The binary is `opencode.binary` from `config.json`, or `opencode` as `PATH`
+resolves it. There is no third place.** The gateway does not look inside an
+install directory of its own: where OpenCode lives differs per OS and per
+install, and a gateway reaching into one would quietly run a different binary
+than the owner's shell does. If `PATH` is not the right answer, name the file:
+
+```json
+{ "opencode": { "autostart": true, "binary": "/absolute/path/to/opencode" } }
+```
+
+A configured path that does not exist is an error naming it, never a quiet fall
+back to `PATH`.
+
+**That matters because the two ways of running the gateway have different
+`PATH`s.** `muqun-gateway service install` runs it under systemd with the
+unit's own environment; `muqun-gateway start` runs it from the shell you typed
+in, and inherits that shell's `PATH` — including any version manager earlier on
+it. The same machine can resolve `opencode` to two different files depending on
+which one you used, so the gateway logs the file it actually resolved, at
+`INFO`, on every start and every adopt:
+
+```
+INFO no OpenCode service found, starting one binary=/home/you/.opencode/bin/opencode version="opencode v2.0.1"
+INFO started an OpenCode service and attached to it url=http://127.0.0.1:49374 version="2.0.1" binary=/home/you/.opencode/bin/opencode
+INFO adopted the running OpenCode service url=http://127.0.0.1:49374 version="2.0.1" binary=/home/you/.opencode/bin/opencode
+```
+
+For an adopted service the path is read off the running process, because *which
+`opencode` am I talking to* is the question after a restart and a bare
+`opencode` does not answer it.
+
+**Anything below 2.0 is refused, started or adopted.** v1 is a different API:
+attaching to one used to look like success and then fail on every route. The
+refusal is one `ERROR` naming the file or URL, the version it reported, and what
+to do:
+
+```
+ERROR refusing to start /usr/local/bin/opencode: it reports version opencode 1.18.4,
+      and this gateway speaks OpenCode 2.x only. Install OpenCode 2, or point the
+      gateway at the right one by setting `opencode.binary` to its absolute path
+      in config.json
+```
+
+A version that cannot be read is allowed through — silence is not evidence of
+being old — so only a legible version below 2.0 is refused.
+
+### Losing the engine
+
+The supervisor re-discovers whenever the health probe fails or the registration
+moves. It also watches the event stream, and **a dropped stream is acted on
+within about a second** rather than at the next health poll: the stream going
+down is the engine telling us it has gone, and waiting out the poll interval
+left the app silent for as long as it had left to run. A stream that keeps
+dropping backs off — immediately the first time, then 1s doubling to 30s — so
+flapping cannot spin the supervisor, and a full healthy interval resets it.
 
 ---
 
