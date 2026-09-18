@@ -53,6 +53,14 @@ impl OpencodeSseListener {
     }
 
     /// True while the reader holds an open `/api/event` stream.
+    /// Whether this listener is still meant to be reading.
+    ///
+    /// False once `stop` has been called, which is how a reader that finds its
+    /// channel closed can tell an orderly hand-over from a real failure.
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
+
     pub fn is_connected(&self) -> bool {
         self.connected.load(Ordering::SeqCst)
     }

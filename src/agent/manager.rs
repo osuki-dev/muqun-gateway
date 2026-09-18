@@ -238,6 +238,7 @@ impl AgentManager {
             events_tx.clone(),
         ));
 
+        let pump_listener = listener.clone();
         tokio::spawn(async move {
             loop {
                 match sse_rx.recv().await {
@@ -256,7 +257,26 @@ impl AgentManager {
                         });
                     }
                     Err(broadcast::error::RecvError::Closed) => {
-                        tracing::warn!("opencode event channel closed, stopping event pump");
+                        // Every manager owns its listener and its channel, so
+                        // a re-discovery stops the old listener and this is
+                        // the old pump noticing. That is the hand-over working
+                        // -- it used to be logged as a warning, half a second
+                        // after the replacement stream had already connected,
+                        // which read like the new engine had failed.
+                        //
+                        // A channel that closes while the listener was still
+                        // meant to be reading is a different thing and keeps
+                        // its warning.
+                        if pump_listener.is_running() {
+                            tracing::warn!(
+                                "opencode event channel closed while still listening, \
+                                 stopping event pump"
+                            );
+                        } else {
+                            tracing::debug!(
+                                "previous opencode event pump wound down after hand-over"
+                            );
+                        }
                         break;
                     }
                 }
