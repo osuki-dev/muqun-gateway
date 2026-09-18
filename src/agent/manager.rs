@@ -989,7 +989,13 @@ impl AgentManager {
                 state: Some(ToolCallStatus::Pending),
                 ..ToolPatch::default()
             },
+            // `delta` is the chunk of argument text that just arrived -- the
+            // schema in the 2.0.1 binary is `{sessionID, assistantMessageID,
+            // id, delta}`, and OpenCode's own TUI and transcript builder both
+            // concatenate it. Throwing it away left a pending card showing
+            // nothing but the tool's name for as long as the arguments took.
             "session.tool.input.delta" => ToolPatch {
+                input_delta: data.get("delta").and_then(Value::as_str).map(str::to_string),
                 state: Some(ToolCallStatus::Streaming),
                 ..ToolPatch::default()
             },

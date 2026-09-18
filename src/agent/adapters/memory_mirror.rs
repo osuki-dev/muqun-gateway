@@ -607,6 +607,7 @@ impl MemoryMirror {
                     error: None,
                     child_session_id: None,
                     background: false,
+                    input_partial: None,
                     truncated: false,
                     time: ToolTime {
                         created: Some(now),
@@ -797,6 +798,10 @@ pub struct ToolPatch {
     pub content: Option<serde_json::Value>,
     pub metadata: Option<serde_json::Value>,
     pub state: Option<ToolCallStatus>,
+    /// One `session.tool.input.delta` chunk, appended to the call's
+    /// `input_partial` rather than replacing it -- the event carries the piece
+    /// that just arrived, not the whole of it so far.
+    pub input_delta: Option<String>,
     pub error: Option<AgentErrorInfo>,
     pub ran_ms: Option<u64>,
     pub completed_ms: Option<u64>,
@@ -807,9 +812,18 @@ impl ToolPatch {
         if let Some(ref name) = self.name {
             call.name = name.clone();
         }
+        if let Some(ref delta) = self.input_delta {
+            crate::agent::domain::push_input_partial(
+                call.input_partial.get_or_insert_with(String::new),
+                delta,
+            );
+        }
         if let Some(ref input) = self.input {
             call.input = input.clone();
             call.title = crate::agent::adapters::opencode::mapper::tool_title(&call.name, input);
+            // The real input is here; the preview it was standing in for has
+            // nothing left to say.
+            call.input_partial = None;
         }
         if let Some(ref output) = self.output {
             call.output = Some(output.clone());

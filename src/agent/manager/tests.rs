@@ -429,3 +429,109 @@ async fn committing_a_rollback_takes_the_rows_after_it_off_the_timeline() {
     let left: Vec<&str> = snapshot.timeline.iter().map(|it| it.id.as_str()).collect();
     assert_eq!(left, vec!["msg_1:t0", "shell_sh_1"]);
 }
+
+/// A tool call's arguments as they arrive.
+///
+/// The card used to show the tool's name and nothing else until the whole
+/// input landed, because the delta frames were read for their state and their
+/// text thrown away. Each frame now grows `input_partial` on the row, and the
+/// full `input` clears it.
+#[tokio::test]
+async fn a_streaming_tool_input_grows_on_the_card_and_is_cleared_when_it_lands() {
+    let ctx = ctx();
+    let mut rx = ctx.tx.subscribe();
+    let asid = AgentSessionId("ses_f4d23e4d4ffeQZ5sBM44YXS24z".to_string());
+
+    let partials = |event: AgentDomainEvent| -> Option<Option<String>> {
+        let AgentDomainEvent::TimelineUpsert { items, .. } = event else {
+            return None;
+        };
+        items.iter().find_map(|it| match &it.part {
+            AgentPart::Tool(call) => Some(call.input_partial.clone()),
+            _ => None,
+        })
+    };
+
+    let mut seen: Vec<Option<String>> = Vec::new();
+    for frame in frames("tool-input-delta.sse") {
+        AgentManager::handle_raw_event(frame, &ctx).await;
+        while let Ok(event) = rx.try_recv() {
+            if let Some(partial) = partials(event) {
+                seen.push(partial);
+            }
+        }
+    }
+
+    // input.started, three deltas, input.ended, tool.called -- six tool frames.
+    assert_eq!(seen.len(), 6, "one upsert per tool frame, got {seen:?}");
+    assert_eq!(seen[0], None, "nothing has streamed yet at input.started");
+    assert_eq!(
+        seen[1].as_deref(),
+        Some(r#"{"command":""#),
+        "the first chunk, on its own"
+    );
+    assert_eq!(
+        seen[2].as_deref(),
+        Some(r#"{"command":"echo muqun-del"#),
+        "the second is appended, not substituted"
+    );
+    assert_eq!(
+        seen[3].as_deref(),
+        Some(r#"{"command":"echo muqun-delta-probe"}"#),
+        "and the third completes it"
+    );
+    assert_eq!(
+        seen[4], None,
+        "input.ended lands the parsed input, so the preview is dropped"
+    );
+    assert_eq!(seen[5], None, "and it does not come back on tool.called");
+
+    // And the mirror agrees, so a snapshot after the call shows the real input.
+    let snapshot = ctx.mirror.get_snapshot(&asid).await.expect("session known");
+    let call = snapshot
+        .timeline
+        .iter()
+        .find_map(|it| match &it.part {
+            AgentPart::Tool(call) => Some(call),
+            _ => None,
+        })
+        .expect("one tool card");
+    assert_eq!(call.name, "shell");
+    assert!(call.input_partial.is_none());
+    assert_eq!(
+        call.input.get("command").and_then(Value::as_str),
+        Some("echo muqun-delta-probe")
+    );
+}
+
+/// Mid-stream, the mirror holds the preview, so a snapshot taken while the
+/// arguments are still arriving says what the stream was saying.
+#[tokio::test]
+async fn a_snapshot_taken_mid_stream_carries_the_partial_input() {
+    let ctx = ctx();
+    let asid = AgentSessionId("ses_f4d23e4d4ffeQZ5sBM44YXS24z".to_string());
+
+    // Everything up to and including the second delta.
+    for frame in frames("tool-input-delta.sse").into_iter().take(4) {
+        AgentManager::handle_raw_event(frame, &ctx).await;
+    }
+
+    let snapshot = ctx.mirror.get_snapshot(&asid).await.expect("session known");
+    let call = snapshot
+        .timeline
+        .iter()
+        .find_map(|it| match &it.part {
+            AgentPart::Tool(call) => Some(call),
+            _ => None,
+        })
+        .expect("one tool card");
+    assert_eq!(call.state, ToolCallStatus::Streaming);
+    assert_eq!(
+        call.input_partial.as_deref(),
+        Some(r#"{"command":"echo muqun-del"#)
+    );
+    assert!(
+        call.input.is_null(),
+        "half an argument list is not an input, and must not be served as one"
+    );
+}

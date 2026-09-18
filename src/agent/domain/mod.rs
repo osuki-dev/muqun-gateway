@@ -17,8 +17,9 @@ pub use session::{
     RevertState, SessionForkInfo, SessionQuery, SessionRevertInfo, TokensUsage,
 };
 pub use timeline::{
-    part_item_id, reasoning_item_id, text_item_id, tool_item_id, AgentPart, CompactionStatus,
-    TimelineItem, TimelineRole, TodoItem, ToolCall, ToolCallStatus, ToolTime,
+    part_item_id, push_input_partial, reasoning_item_id, text_item_id, tool_item_id, AgentPart,
+    CompactionStatus, TimelineItem, TimelineRole, TodoItem, ToolCall, ToolCallStatus, ToolTime,
+    MAX_TOOL_INPUT_PARTIAL_BYTES,
 };
 
 
@@ -160,6 +161,7 @@ mod contract_tests {
             error: None,
             child_session_id: Some("ses_c".into()),
             background: true,
+            input_partial: None,
             truncated: false,
             time: ToolTime {
                 created: Some(1),
@@ -179,6 +181,56 @@ mod contract_tests {
             !keys(&value).contains(&"truncated".to_string()),
             "`truncated` is omitted while false"
         );
+        assert!(
+            !keys(&value).contains(&"input_partial".to_string()),
+            "`input_partial` is a streaming preview and is absent once there is a real input"
+        );
+    }
+
+    /// The streaming preview is a string on the tool part, and it is bounded:
+    /// a tool argument can be a whole file, and the mirror holds every card.
+    #[test]
+    fn a_streaming_tool_input_is_previewed_and_bounded() {
+        let mut buffer = String::new();
+        push_input_partial(&mut buffer, "{\"command\":\"echo ");
+        push_input_partial(&mut buffer, "hello\"}");
+        assert_eq!(buffer, "{\"command\":\"echo hello\"}");
+
+        let mut buffer = String::new();
+        push_input_partial(&mut buffer, &"x".repeat(MAX_TOOL_INPUT_PARTIAL_BYTES + 500));
+        assert_eq!(buffer.len(), MAX_TOOL_INPUT_PARTIAL_BYTES);
+        push_input_partial(&mut buffer, "more");
+        assert_eq!(buffer.len(), MAX_TOOL_INPUT_PARTIAL_BYTES, "the cap holds");
+
+        // A chunk cut by the cap is cut at a character, not inside one.
+        let mut buffer = "y".repeat(MAX_TOOL_INPUT_PARTIAL_BYTES - 1);
+        push_input_partial(&mut buffer, "\u{00e9}");
+        assert_eq!(
+            buffer.len(),
+            MAX_TOOL_INPUT_PARTIAL_BYTES - 1,
+            "a two-byte character with one byte of room is left out whole"
+        );
+
+        let part = AgentPart::Tool(ToolCall {
+            id: "call_1".into(),
+            name: "shell".into(),
+            title: None,
+            input: Value::Null,
+            output: None,
+            content: None,
+            metadata: None,
+            state: ToolCallStatus::Streaming,
+            status: ToolCallStatus::Streaming,
+            error: None,
+            child_session_id: None,
+            background: false,
+            input_partial: Some("{\"command\":\"echo ".into()),
+            truncated: false,
+            time: ToolTime::default(),
+        });
+        let value = serde_json::to_value(&part).expect("serializes");
+        assert_eq!(value["state"], "streaming");
+        assert_eq!(value["input_partial"], "{\"command\":\"echo ");
     }
 
     #[test]

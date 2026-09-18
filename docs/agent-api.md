@@ -735,8 +735,38 @@ Tagged by `type`.
   carries the same value under the name the previous release used; `error` is
   accepted as an input alias for `failed`.
   - `pending` — the name is known (`session.tool.input.started`) but not the input.
-  - `streaming` — the input is still arriving; OpenCode has it as a partial JSON string.
+  - `streaming` — the input is still arriving; read `input_partial`, not `input`.
   - `running` — dispatched.
+- `input_partial` is the card's only content while the arguments are still
+  arriving, so the same call a moment earlier reads:
+
+  ```json
+  { "type": "tool", "id": "call_1", "name": "shell", "state": "streaming",
+    "status": "streaming", "input": null,
+    "input_partial": "{\"command\":\"echo hel", "time": { "created": 1 } }
+  ```
+
+  It is the tool's arguments as they arrive, the concatenation of every
+  `session.tool.input.delta` so far, which is raw text and **not valid JSON
+  until it ends**. It is absent at `pending`, absent again the moment a real
+  `input` lands, and never present alongside one — `input` is `null` while the
+  preview is live, because half an argument list is not an input. It is capped
+  at **8 KiB**; a longer argument stops growing the preview and arrives whole
+  as `input` a moment later.
+
+  The 2.0.1 payload behind it, from the event schema the binary declares:
+
+  ```json
+  {"type":"session.tool.input.started","data":{"sessionID":"ses_1","assistantMessageID":"msg_1","id":"call_1","name":"shell"}}
+  {"type":"session.tool.input.delta",  "data":{"sessionID":"ses_1","assistantMessageID":"msg_1","id":"call_1","delta":"{\"command\":\""}}
+  {"type":"session.tool.input.ended",  "data":{"sessionID":"ses_1","assistantMessageID":"msg_1","id":"call_1","text":"{\"command\":\"echo hello\"}"}}
+  ```
+
+  The chunk is `delta` and the whole of it is `text`; OpenCode's own TUI and
+  transcript builder concatenate the one and then replace it with the other.
+  Whether a call streams at all is the provider's choice — the `opencode` free
+  models send no deltas and jump from `started` to `ended`, so a card that
+  never shows a preview is not a fault.
 - `title` is derived by the gateway from the name and input (OpenCode has no
   title field); absent for a tool it does not recognise.
 - `output` is the text content joined into one string, kept for compatibility.

@@ -1,6 +1,7 @@
 use serde_json::Value;
 use crate::agent::domain::{
-    part_item_id, reasoning_item_id, text_item_id, tool_item_id, AgentErrorInfo, AgentInfo,
+    part_item_id, push_input_partial, reasoning_item_id, text_item_id, tool_item_id,
+    AgentErrorInfo, AgentInfo,
     AgentPart, AgentProject, AgentSessionId, AgentSessionInfo, AgentSessionStatus, CompactionStatus,
     FormField, FormOption, FormRequest, McpServerInfo, ModelInfo, ModelRef, ModelVariantInfo,
     PermissionDecision, PermissionOption, PermissionRequest, SessionForkInfo, SessionRevertInfo,
@@ -660,11 +661,27 @@ pub fn map_tool_call(val: &Value) -> ToolCall {
     let state = val.get("state");
     let status = tool_state_from_str(state.and_then(|s| s.get("status")).and_then(Value::as_str));
 
-    let input = state
-        .and_then(|s| s.get("input"))
-        .or_else(|| val.get("input"))
-        .cloned()
-        .unwrap_or(Value::Null);
+    // While a call is streaming, `state.input` is the raw argument text so far
+    // rather than the parsed object -- OpenCode's own clients concatenate it
+    // the same way. Read back as the preview it is, so a snapshot taken
+    // mid-stream says what the stream was saying, instead of putting a half
+    // written JSON string where an object belongs.
+    let streaming_input = matches!(status, ToolCallStatus::Streaming)
+        .then(|| state.and_then(|s| s.get("input")).and_then(Value::as_str))
+        .flatten();
+    let input = match streaming_input {
+        Some(_) => Value::Null,
+        None => state
+            .and_then(|s| s.get("input"))
+            .or_else(|| val.get("input"))
+            .cloned()
+            .unwrap_or(Value::Null),
+    };
+    let input_partial = streaming_input.map(|raw| {
+        let mut buffer = String::new();
+        push_input_partial(&mut buffer, raw);
+        buffer
+    });
 
     let content = state
         .and_then(|s| s.get("content"))
@@ -701,6 +718,7 @@ pub fn map_tool_call(val: &Value) -> ToolCall {
         error: state.and_then(|s| s.get("error")).and_then(map_error),
         child_session_id: None,
         background: false,
+        input_partial,
         truncated: false,
         time,
     };

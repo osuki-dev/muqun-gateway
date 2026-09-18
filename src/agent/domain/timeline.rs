@@ -85,11 +85,49 @@ pub struct ToolCall {
     /// backgrounded.
     #[serde(default, skip_serializing_if = "is_false")]
     pub background: bool,
+    /// The tool's input as it arrives, before it is valid JSON to parse.
+    ///
+    /// OpenCode streams a tool call's arguments as
+    /// `session.tool.input.delta`, and until this the gateway threw those
+    /// away: a pending card showed the tool's name and nothing else, however
+    /// long the arguments took. This is the concatenation so far, so a card
+    /// can show the command being typed. It exists only while `state` is
+    /// `streaming`, and is dropped the moment a real `input` lands.
+    ///
+    /// Capped at [`MAX_TOOL_INPUT_PARTIAL_BYTES`]; a longer input simply stops
+    /// growing here, and the whole of it arrives as `input` a moment later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_partial: Option<String>,
     /// `metadata.truncated`: the result the user is reading is clipped.
     #[serde(default, skip_serializing_if = "is_false")]
     pub truncated: bool,
     #[serde(default, skip_serializing_if = "ToolTime::is_empty")]
     pub time: ToolTime,
+}
+
+/// How much of a streaming tool input is kept.
+///
+/// It is a preview on a card that is about to be replaced by the parsed
+/// input, not a document: 8 KiB is more than a reader can take in and small
+/// enough that a runaway argument cannot grow the mirror.
+pub const MAX_TOOL_INPUT_PARTIAL_BYTES: usize = 8 * 1024;
+
+/// Append a streamed chunk to a partial input, stopping at the cap and never
+/// splitting a character.
+pub fn push_input_partial(buffer: &mut String, delta: &str) {
+    if buffer.len() >= MAX_TOOL_INPUT_PARTIAL_BYTES {
+        return;
+    }
+    let room = MAX_TOOL_INPUT_PARTIAL_BYTES - buffer.len();
+    if delta.len() <= room {
+        buffer.push_str(delta);
+        return;
+    }
+    let mut cut = room;
+    while cut > 0 && !delta.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    buffer.push_str(&delta[..cut]);
 }
 
 fn is_false(v: &bool) -> bool {
