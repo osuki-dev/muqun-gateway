@@ -50,7 +50,12 @@ JSON line protocol      argv-only tmux CLI
 The use cases are actions meaningful to the app, independent of the terminal
 implementation:
 
-- inspect topology: snapshot and list/get workspace, tab, pane, and agent;
+- inspect topology: snapshot and list/get workspace, tab, pane, and agent. The
+  snapshot is the whole session in one answer, and its `agents` array is the
+  agent list itself -- the same `Agent` values `GET .../agents` serializes,
+  `instance_id` and `target` included -- so a client warming a home screen
+  makes one call rather than four. It is announced as the `session_snapshot`
+  capability;
 - inspect terminal state: read visible/recent output, compose structured parts,
   detect approvals, and find files relative to pane working directories;
 - control topology: create, focus, rename, close, and split;

@@ -65,7 +65,8 @@ use authority::{hash_token, identify_device, DeviceRecord, PairingCodeError, Pen
 
 use crate::i18n::Locale;
 use backend::{
-    AgentStatus as BackendAgentStatus, BackendActivity, BackendError, BackendFuture, BackendKind,
+    Agent, AgentStatus as BackendAgentStatus, BackendActivity, BackendError, BackendFuture,
+    BackendKind,
     BackendRegistry, CreateTab as BackendCreateTab, CreateWorkspace as BackendCreateWorkspace,
     OutputFormat as BackendOutputFormat, OutputSource as BackendOutputSource, Pane,
     PaneId as BackendPaneId, ReadPane as BackendReadPane, SendTextMode as BackendSendTextMode,
@@ -343,6 +344,11 @@ const API_CAPABILITIES: &[&str] = &[
     "push_notifications",
     "push_token_revocation",
     "recent_cwds",
+    // `GET /api/sessions/{id}/snapshot`, whose `agents` array is the same one
+    // `GET .../agents` answers with -- `instance_id` and `target` included --
+    // so a client can prewarm a whole session in one call. Announced so the
+    // app can ask rather than probe for a 404 and guess at the shape.
+    "session_snapshot",
     "tasks",
     "terminal_backends",
     "multiple_terminal_backends",
@@ -5060,7 +5066,11 @@ async fn snapshot(
     let workspaces = backend.list_workspaces().await.map_err(backend_api_error)?;
     let tabs = backend.list_tabs().await.map_err(backend_api_error)?;
     let panes = backend.list_panes().await.map_err(backend_api_error)?;
-    let answer = backend::compat::snapshot(workspaces, tabs, panes);
+    // The same agents `GET .../agents` answers with, off the same call, so a
+    // client that prewarms from the snapshot does not have to ask twice for
+    // `instance_id` and `target`.
+    let agents = backend_agents(session).await.map_err(backend_api_error)?;
+    let answer = backend::compat::snapshot(workspaces, tabs, panes, &agents);
     Ok(Json(note_and_amend_panes(&state, &session_id, answer)))
 }
 
@@ -6128,6 +6138,16 @@ async fn seed_agent_statuses(session: &SessionConfig) -> HashMap<String, String>
 }
 
 async fn backend_agent_list(session: &SessionConfig) -> Result<Value, BackendError> {
+    Ok(backend::compat::agent_list(&backend_agents(session).await?))
+}
+
+/// Every agent the backend reports, with a status inferred for the tmux ones
+/// the backend could not name.
+///
+/// The one source for both `GET .../agents` and the `agents` array inside
+/// `GET .../snapshot`: two spellings of the same list is how the snapshot's
+/// copy came to be missing `instance_id` and `target`.
+async fn backend_agents(session: &SessionConfig) -> Result<Vec<Agent>, BackendError> {
     let terminal = terminal_backend(session);
     let mut agents = terminal.list_agents().await?;
     for agent in agents
@@ -6148,7 +6168,7 @@ async fn backend_agent_list(session: &SessionConfig) -> Result<Value, BackendErr
             agent.status = infer_tmux_agent_status(agent.kind.as_deref(), &output.text);
         }
     }
-    Ok(backend::compat::agent_list(&agents))
+    Ok(agents)
 }
 
 fn infer_tmux_agent_status(agent: Option<&str>, visible: &str) -> backend::AgentStatus {
@@ -12409,7 +12429,14 @@ fn openapi_spec() -> Value {
                     "responses": ok_response()
                 }
             },
-            "/api/sessions/{sessionId}/snapshot": { "get": session_endpoint("Return the session snapshot") },
+            "/api/sessions/{sessionId}/snapshot": {
+                "get": {
+                    "summary": "Return the whole session in one call: workspaces, tabs, panes and agents",
+                    "description": "One answer where a client would otherwise call /workspaces, /tabs, /panes and /agents, which is what a phone does to warm its home screen. `agents` is the same array `GET /api/sessions/{sessionId}/agents` returns, from the same backend call and with every field it has -- `instance_id`, the opaque identity an assignment is bound to, and `target`, the address it is sent to, included. It used to be derived from the panes instead and carried neither, so a client still had to call /agents; a pane id is not a substitute for either, because panes are reused and renumbered. Announced as the `session_snapshot` capability in /health, so a client can ask rather than probe for a 404.",
+                    "parameters": [path_param("sessionId")],
+                    "responses": ok_response()
+                }
+            },
             "/api/sessions/{sessionId}/workspaces": {
                 "get": session_endpoint("List workspaces"),
                 "post": {
@@ -17540,6 +17567,21 @@ mod tests {
         assert!(API_CAPABILITIES.contains(&"agent_catalog"));
         assert!(API_CAPABILITIES.contains(&"terminal_backends"));
         assert!(API_CAPABILITIES.contains(&"multiple_terminal_backends"));
+    }
+
+    /// The snapshot is one call where the app used to make four, and its
+    /// `agents` array is now the real agent list -- so a client can prewarm a
+    /// session from it and drop the separate `/agents` call. It is announced
+    /// because the alternative is the app probing for a 404 and then guessing
+    /// whether the `agents` it got back carry `instance_id` and `target`.
+    #[test]
+    fn the_session_snapshot_is_announced_as_a_capability() {
+        assert!(API_CAPABILITIES.contains(&"session_snapshot"));
+        assert!(
+            gateway_capabilities(false).contains(&"session_snapshot"),
+            "it is a property of this build, not of a session's backend"
+        );
+        assert!(gateway_capabilities(true).contains(&"session_snapshot"));
     }
 
     /// Collaboration is the one capability that is not a property of this

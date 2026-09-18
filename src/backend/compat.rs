@@ -83,15 +83,29 @@ pub fn command_ok(operation: &str) -> Value {
     json!({ "result": { "type": operation, "ok": true } })
 }
 
-pub fn snapshot(workspaces: Vec<Workspace>, tabs: Vec<Tab>, panes: Vec<Pane>) -> Value {
-    let agents = panes.iter().filter_map(agent_from_pane).collect::<Vec<_>>();
+/// The whole session in one answer.
+///
+/// `agents` is the same array `agent_list` produces, from the same `Agent`
+/// values, and not a second thing derived from the panes. It used to be the
+/// latter -- a pane that had an agent on it became `{pane_id, workspace_id,
+/// tab_id, agent, display_agent, agent_status}` -- which left out
+/// `instance_id` and `target`, the two fields an assignment is bound to and
+/// sent to. A client that wanted those had to call `/agents` anyway, so the
+/// snapshot saved it nothing; and a pane id is not a substitute for either,
+/// because panes are reused and renumbered.
+pub fn snapshot(
+    workspaces: Vec<Workspace>,
+    tabs: Vec<Tab>,
+    panes: Vec<Pane>,
+    agents: &[Agent],
+) -> Value {
     json!({
         "result": {
             "type": "session_snapshot",
             "workspaces": workspaces.into_iter().map(workspace).collect::<Vec<_>>(),
             "tabs": tabs.into_iter().map(tab).collect::<Vec<_>>(),
             "panes": panes.into_iter().map(pane).collect::<Vec<_>>(),
-            "agents": agents,
+            "agents": agents.iter().map(agent).collect::<Vec<_>>(),
         }
     })
 }
@@ -177,18 +191,6 @@ fn pane(value: Pane) -> Value {
     })
 }
 
-fn agent_from_pane(value: &Pane) -> Option<Value> {
-    let agent = value.agent.as_deref()?;
-    Some(json!({
-        "pane_id": value.id.as_str(),
-        "workspace_id": value.workspace_id.as_str(),
-        "tab_id": value.tab_id.as_str(),
-        "agent": agent,
-        "display_agent": agent,
-        "agent_status": agent_status(value.agent_status),
-    }))
-}
-
 fn agent(value: &Agent) -> Value {
     json!({
         "instance_id": value.instance_id,
@@ -249,6 +251,104 @@ mod tests {
         assert_eq!(response["result"]["panes"][0]["pane_id"], "%9");
         assert_eq!(response["result"]["panes"][0]["workspace_id"], "$0");
         assert_eq!(response["result"]["panes"][0]["agent"], "claude");
+    }
+
+    /// The snapshot's `agents` and `GET .../agents` are one array, not two
+    /// spellings of one.
+    ///
+    /// They were two: the snapshot derived its copy from the panes, so it had
+    /// no `instance_id` and no `target` -- the opaque instance identity an
+    /// assignment is bound to, and the address it is sent to -- and a client
+    /// prewarming from the snapshot had to call `/agents` anyway. Equality is
+    /// asserted on the whole array rather than field by field, so a field
+    /// added to one and not the other fails here.
+    #[test]
+    fn the_snapshots_agents_are_the_agent_list_itself() {
+        let agents = vec![
+            Agent {
+                instance_id: Some("inst_7f3c".into()),
+                target: "herdr://agent/inst_7f3c".into(),
+                pane_id: PaneId::new("%9"),
+                workspace_id: Some(WorkspaceId::new("$0")),
+                tab_id: Some(TabId::new("@2")),
+                kind: Some("claude".into()),
+                display_agent: Some("Claude".into()),
+                status: AgentStatus::Working,
+                state_change_seq: Some(41),
+            },
+            // A tmux agent: no instance identity, and the keys are present and
+            // null rather than missing, so the app reads one shape.
+            Agent {
+                instance_id: None,
+                target: "%12".into(),
+                pane_id: PaneId::new("%12"),
+                workspace_id: None,
+                tab_id: None,
+                kind: Some("codex".into()),
+                display_agent: None,
+                status: AgentStatus::Unknown,
+                state_change_seq: None,
+            },
+        ];
+
+        let list = agent_list(&agents);
+        let snap = snapshot(Vec::new(), Vec::new(), Vec::new(), &agents);
+        assert_eq!(
+            snap["result"]["agents"], list["result"]["agents"],
+            "the snapshot carries the agent list verbatim"
+        );
+
+        let first = &snap["result"]["agents"][0];
+        assert_eq!(first["instance_id"], "inst_7f3c");
+        assert_eq!(first["target"], "herdr://agent/inst_7f3c");
+        assert_eq!(first["state_change_seq"], 41);
+        assert_eq!(first["agent"], "claude");
+        assert_eq!(first["display_agent"], "Claude");
+        assert_eq!(first["agent_status"], "working");
+
+        let second = &snap["result"]["agents"][1];
+        assert!(second["instance_id"].is_null(), "a tmux agent has no instance");
+        assert_eq!(second["target"], "%12");
+        assert_eq!(
+            second["display_agent"], "codex",
+            "the kind stands in for a display name the backend did not give"
+        );
+    }
+
+    /// A pane with an agent on it is no longer what makes an agent entry: a
+    /// backend that reports no agents answers an empty array, however many
+    /// panes are running one.
+    #[test]
+    fn the_snapshot_does_not_invent_agents_from_panes() {
+        let pane = Pane {
+            id: PaneId::new("%9"),
+            terminal_id: Some("%9".into()),
+            workspace_id: WorkspaceId::new("$0"),
+            tab_id: TabId::new("@2"),
+            label: Some("agent".into()),
+            terminal_title: Some("agent".into()),
+            cwd: Some(PathBuf::from("/work/project")),
+            focused: true,
+            width: Some(120),
+            height: Some(40),
+            revision: None,
+            foreground_command: Some("claude".into()),
+            agent: Some("claude".into()),
+            agent_status: AgentStatus::Working,
+            max_offset_from_bottom: Some(0),
+            viewport_rows: Some(40),
+            alternate_on: Some(false),
+            cursor_x: None,
+            cursor_y: None,
+        };
+        let snap = snapshot(Vec::new(), Vec::new(), vec![pane], &[]);
+        assert_eq!(snap["result"]["type"], "session_snapshot");
+        assert_eq!(snap["result"]["panes"][0]["agent"], "claude");
+        assert_eq!(
+            snap["result"]["agents"].as_array().map(Vec::len),
+            Some(0),
+            "the agent list is the backend's, not a re-reading of the panes"
+        );
     }
 
     #[test]
