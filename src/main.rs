@@ -2392,7 +2392,7 @@ struct EncryptedResponsePayload {
 /// binding it seals under. Injected by `decrypt_transport_request`, so its
 /// presence also proves the request itself authenticated.
 #[derive(Clone)]
-struct EncryptedStreamContext {
+pub(crate) struct EncryptedStreamContext {
     material: Vec<u8>,
     request_aad: String,
     request_nonce: String,
@@ -5329,7 +5329,7 @@ const ENCRYPTED_SSE_EVENT: &str = "muqun.encrypted";
 /// seq. Together: a record that is modified, reordered, replayed -- within
 /// this stream or from any other -- or dropped (the client checks seq
 /// continuity) fails authentication on the phone.
-struct EventStreamSealer {
+pub(crate) struct EventStreamSealer {
     key: [u8; 32],
     stream_id: String,
     request_aad: String,
@@ -5337,7 +5337,7 @@ struct EventStreamSealer {
 }
 
 impl EventStreamSealer {
-    fn new(context: &EncryptedStreamContext) -> anyhow::Result<Self> {
+    pub(crate) fn new(context: &EncryptedStreamContext) -> anyhow::Result<Self> {
         let stream_id = generate_token();
         let key =
             transport::derive_stream_key(&context.material, &stream_id, &context.request_nonce)?;
@@ -5377,7 +5377,11 @@ impl EventStreamSealer {
 /// One event, sealed when this connection is encrypted and plain when it is
 /// not. `None` means the record could not be sealed; the event is dropped
 /// rather than ever leaving in the clear.
-fn stream_event(sealer: &mut Option<EventStreamSealer>, name: &str, data: &str) -> Option<Event> {
+pub(crate) fn stream_event(
+    sealer: &mut Option<EventStreamSealer>,
+    name: &str,
+    data: &str,
+) -> Option<Event> {
     match sealer {
         Some(sealer) => match sealer.seal(name, data) {
             Ok(event) => Some(event),
@@ -14062,6 +14066,84 @@ mod tests {
             "ciphertext": first["ciphertext"].as_str().unwrap(),
         });
         assert!(open(&replayed).is_err());
+    }
+
+    /// The agent stream is sealed on an encrypted deployment, and plain on a
+    /// cleartext one -- the same rule, and the same record shape, as the
+    /// terminal stream.
+    ///
+    /// It used to be neither: the agent stream went out in the clear whatever
+    /// the deployment, so a gateway configured `transport_encryption:
+    /// required` put the device token and every agent event on the wire
+    /// unprotected. `stream_event` is the single decision point for both
+    /// streams, so this asks it both ways.
+    #[tokio::test]
+    async fn the_agent_stream_is_sealed_exactly_when_the_device_is_encrypted() {
+        let token = "device-token";
+        let transport_key = generate_token();
+        let material = transport::decode_key(&transport_key).unwrap();
+        let mut device = test_device("phone-1", token);
+        device.transport_key = Some(transport_key);
+        let state = test_state("admin-token", vec![device]);
+
+        let (request, _, aad, nonce) =
+            decrypt_transport_request(&state, encrypted_test_request("phone-1", &material, token))
+                .await
+                .unwrap();
+        let context = request
+            .extensions()
+            .get::<EncryptedStreamContext>()
+            .expect("an encrypted request carries a stream context")
+            .clone();
+
+        // What the agent stream emits: a `connected` hello, then a domain
+        // event under its own name.
+        let mut sealed = Some(EventStreamSealer::new(&context).unwrap());
+        let hello = sealed
+            .as_mut()
+            .unwrap()
+            .seal_record("connected", r#"{"asid":"ses_1"}"#)
+            .unwrap();
+        let record: Value = serde_json::from_str(&hello).unwrap();
+        assert_eq!(record["seq"], 0);
+        let sid = record["sid"].as_str().unwrap().to_string();
+
+        let upsert = sealed
+            .as_mut()
+            .unwrap()
+            .seal_record("agent.timeline.upsert", r#"{"items":[]}"#)
+            .unwrap();
+        let record: Value = serde_json::from_str(&upsert).unwrap();
+        assert_eq!(record["seq"], 1, "one stream, one counter");
+        assert_eq!(record["sid"].as_str().unwrap(), sid);
+
+        // And it opens to exactly what the plaintext stream would have sent.
+        let key = transport::derive_stream_key(&material, &sid, &nonce).unwrap();
+        let opened = transport::open_stream_event(
+            &key,
+            1,
+            format!("{}\n{}\n{}", aad, sid, 1).as_bytes(),
+            record["ciphertext"].as_str().unwrap(),
+        )
+        .unwrap();
+        let inner: Value = serde_json::from_slice(&opened).unwrap();
+        assert_eq!(inner["event"], "agent.timeline.upsert");
+        assert_eq!(inner["data"], r#"{"items":[]}"#);
+
+        // A device paired without a transport key keeps the plaintext stream,
+        // byte for byte: no sealer, no envelope, the event under its own name.
+        let mut plain: Option<EventStreamSealer> = None;
+        let event = stream_event(&mut plain, "agent.timeline.upsert", r#"{"items":[]}"#)
+            .expect("a cleartext stream still emits");
+        let wire = format!("{event:?}");
+        assert!(
+            wire.contains("agent.timeline.upsert"),
+            "the event keeps its own name on a cleartext deployment: {wire}"
+        );
+        assert!(
+            !wire.contains(ENCRYPTED_SSE_EVENT),
+            "and is not wrapped in the sealed envelope: {wire}"
+        );
     }
 
     /// A paired device's headers with the app's locale header on them, which is

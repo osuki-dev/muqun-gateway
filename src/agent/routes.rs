@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -17,7 +17,10 @@ use super::domain::{
 };
 use super::ports::engine::AgentEnginePort;
 use super::ports::mirror::SessionMirrorPort;
-use crate::{api_error, content_envelope, require_device, validate_text, ApiResult, AppState};
+use crate::{
+    api_error, content_envelope, require_device, stream_event, validate_text, ApiResult,
+    AppState, EncryptedStreamContext, EventStreamSealer,
+};
 
 #[derive(Debug, Deserialize)]
 pub struct AgentDirectoriesQuery {
@@ -1132,12 +1135,38 @@ async fn do_list_agent_directories(
     Ok(Json(content_envelope(json!(dirs_list))))
 }
 
+/// The agent's event stream, sealed exactly like the terminal's.
+///
+/// This stream used to go out in the clear on every deployment, including one
+/// configured `transport_encryption: required` -- the device token in the
+/// header and every agent event in the body. The terminal stream
+/// (`GET /api/sessions/{id}/events`) has always sealed each event
+/// individually, because a response that never ends cannot be authenticated
+/// as a whole; this now does the same, with the same sealer, the same record
+/// shape and the same `ENCRYPTED_SSE_EVENT` name, so a client that can already
+/// read one can read the other.
+///
+/// `stream_crypto` is present exactly when the request itself arrived through
+/// the encrypted transport, so a device paired without a transport key keeps
+/// the plaintext stream byte for byte.
 async fn do_stream_agent_session(
     state: &AppState,
     asid: &str,
+    stream_crypto: Option<Extension<EncryptedStreamContext>>,
     headers: &HeaderMap,
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>> + Send>, (StatusCode, Json<Value>)> {
     require_device(state, headers)?;
+
+    let mut sealer = match stream_crypto {
+        Some(Extension(context)) => Some(EventStreamSealer::new(&context).map_err(|_| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "transport_key_unavailable",
+                "encrypted transport is unavailable",
+            )
+        })?),
+        None => None,
+    };
 
     let Some(manager) = state.agent_runtime.manager().await else {
         return Err(api_error(
@@ -1152,23 +1181,33 @@ async fn do_stream_agent_session(
     drop(manager);
 
     let stream = async_stream::stream! {
-        yield Ok(Event::default().event("connected").data(serde_json::to_string(&json!({ "asid": target_asid.0 })).unwrap_or_default()));
+        let hello = serde_json::to_string(&json!({ "asid": target_asid.0 })).unwrap_or_default();
+        if let Some(event) = stream_event(&mut sealer, "connected", &hello) {
+            yield Ok(event);
+        }
 
         loop {
             match rx.recv().await {
                 Ok(ev) => {
-                    // An event with no session -- a global resync -- reaches
-                    // every stream.
+                    // An event with no session -- a global resync, or a
+                    // worktree change -- reaches every stream.
                     if !ev.asid().0.is_empty() && ev.asid() != &target_asid {
                         continue;
                     }
                     let ev_name = ev.event_name();
 
                     let payload = serde_json::to_string(&ev).unwrap_or_default();
-                    yield Ok(Event::default().event(ev_name).data(payload));
+                    // `None` means the record could not be sealed. It is
+                    // dropped rather than ever leaving in the clear.
+                    if let Some(event) = stream_event(&mut sealer, ev_name, &payload) {
+                        yield Ok(event);
+                    }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    yield Ok(Event::default().event("agent.resync").data(serde_json::to_string(&json!({ "asid": target_asid.0 })).unwrap_or_default()));
+                    let resync = serde_json::to_string(&json!({ "asid": target_asid.0 })).unwrap_or_default();
+                    if let Some(event) = stream_event(&mut sealer, "agent.resync", &resync) {
+                        yield Ok(event);
+                    }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                     break;
@@ -1563,17 +1602,19 @@ async fn list_agent_directories_legacy(
 async fn stream_agent_session_global(
     State(state): State<AppState>,
     Path(asid): Path<String>,
+    stream_crypto: Option<Extension<EncryptedStreamContext>>,
     headers: HeaderMap,
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>> + Send>, (StatusCode, Json<Value>)> {
-    do_stream_agent_session(&state, &asid, &headers).await
+    do_stream_agent_session(&state, &asid, stream_crypto, &headers).await
 }
 
 async fn stream_agent_session_legacy(
     State(state): State<AppState>,
     Path((_session_id, asid)): Path<(String, String)>,
+    stream_crypto: Option<Extension<EncryptedStreamContext>>,
     headers: HeaderMap,
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>> + Send>, (StatusCode, Json<Value>)> {
-    do_stream_agent_session(&state, &asid, &headers).await
+    do_stream_agent_session(&state, &asid, stream_crypto, &headers).await
 }
 
 

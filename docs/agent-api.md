@@ -712,9 +712,38 @@ flapping cannot spin the supervisor, and a full healthy interval resets it.
 
 ### `GET /api/agent-sessions/{asid}/stream`
 
-`text/event-stream`, unencrypted, filtered to one session. First frame is
-`event: connected` with `{"asid": "…"}`; keep-alive every 15 s. Subscription
-survives OpenCode restarting underneath it.
+`text/event-stream`, filtered to one session. First frame is `event: connected`
+with `{"asid": "…"}`; keep-alive every 15 s. Subscription survives OpenCode
+restarting underneath it.
+
+**Sealed when the device's transport is encrypted.** A response that never ends
+cannot be authenticated as a whole, so each event is sealed on its own —
+exactly as `GET /api/sessions/{id}/events` has always done, and with the same
+record shape, so a client that can read one can read the other:
+
+```
+event: <ENCRYPTED_SSE_EVENT>
+data: {"v":1,"sid":"<stream id>","seq":0,"ciphertext":"…"}
+```
+
+The key is derived from the device's transport material, the stream id and the
+request nonce; the AAD is the request AAD, the stream id and the sequence
+number, and the sequence number is also the nonce — so a record moved or
+replayed into another slot never opens. Opened, each record is
+`{"event": "<name>", "data": "<the payload as a string>"}`, where `<name>` is
+the event name the plaintext stream would have used. A record that cannot be
+sealed is **dropped**, never sent in the clear.
+
+A device paired without a transport key — a `transport_encryption: disabled`
+deployment — gets the plaintext stream byte for byte, under the event's own
+name. Nothing about cleartext changed.
+
+> Until this release the stream was never sealed, on any deployment. A gateway
+> configured `transport_encryption: required` still put the device token and
+> every agent event on the wire in the clear. A client that opens this with a
+> bare `Authorization` header rather than the encrypted-stream path will now
+> receive sealed frames it cannot read on such a deployment, and must be
+> updated.
 
 The main session stream (`GET /api/sessions/{id}/stream`) carries the same
 events for every session, encrypted, unfiltered.
