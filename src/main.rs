@@ -4943,7 +4943,43 @@ fn herdr_protocol_supported(protocol: u64) -> bool {
     protocol >= HERDR_PROTOCOL_MIN
 }
 
+/// `metadata()` answers per session, reused for [`SESSION_LIVENESS_TTL`].
+///
+/// `/health` and `/api/meta` both describe every configured backend, and both
+/// asked each one live on every request -- an RPC per backend per call, for an
+/// answer that changes when a backend restarts and not otherwise. Every phone
+/// polls on its own schedule, so the cost multiplied by devices.
+///
+/// Held behind the same one-second window liveness already uses, for the same
+/// reason: short enough that a backend coming or going shows up inside a
+/// second, long enough that a burst of clients asking at once is answered
+/// once.
+/// One session's answer and when it was taken.
+type CachedMetadata = (std::time::Instant, (Value, Value));
+
+static SESSION_METADATA_CACHE: std::sync::OnceLock<Mutex<HashMap<String, CachedMetadata>>> =
+    std::sync::OnceLock::new();
+
 async fn session_metadata(session: &SessionConfig) -> (Value, Value) {
+    let cache = SESSION_METADATA_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(cache) = cache.lock() {
+        if let Some((seen, answer)) = cache.get(&session.id) {
+            if seen.elapsed() < SESSION_LIVENESS_TTL {
+                return answer.clone();
+            }
+        }
+    }
+    let answer = session_metadata_uncached(session).await;
+    if let Ok(mut cache) = cache.lock() {
+        // Bounded by the configured sessions, which is a handful; the sweep is
+        // only here so a config reload cannot leave an entry behind for ever.
+        cache.retain(|_, (seen, _)| seen.elapsed() < SESSION_LIVENESS_TTL);
+        cache.insert(session.id.clone(), (std::time::Instant::now(), answer.clone()));
+    }
+    answer
+}
+
+async fn session_metadata_uncached(session: &SessionConfig) -> (Value, Value) {
     match terminal_backend(session).metadata().await {
         Ok(metadata) => {
             // A backend that does not report a protocol at all is taken at the
@@ -5184,13 +5220,25 @@ async fn snapshot(
     require_device(&state, &headers)?;
     let session = find_session(&state.config, &session_id)?;
     let backend = terminal_backend(session);
-    let workspaces = backend.list_workspaces().await.map_err(backend_api_error)?;
-    let tabs = backend.list_tabs().await.map_err(backend_api_error)?;
-    let panes = backend.list_panes().await.map_err(backend_api_error)?;
-    // The same agents `GET .../agents` answers with, off the same call, so a
-    // client that prewarms from the snapshot does not have to ask twice for
+    // Four reads of the same backend that do not depend on each other. Run in
+    // sequence this was four round trips deep -- and on tmux each one is a
+    // process -- for an answer the client waits on before it can draw
+    // anything. The backend is the same one either way; this only stops
+    // waiting for each before starting the next.
+    //
+    // `agents` is the same list `GET .../agents` answers with, so a client
+    // prewarming from the snapshot does not have to ask twice for
     // `instance_id` and `target`.
-    let agents = backend_agents(session).await.map_err(backend_api_error)?;
+    let (workspaces, tabs, panes, agents) = tokio::join!(
+        backend.list_workspaces(),
+        backend.list_tabs(),
+        backend.list_panes(),
+        backend_agents(session),
+    );
+    let workspaces = workspaces.map_err(backend_api_error)?;
+    let tabs = tabs.map_err(backend_api_error)?;
+    let panes = panes.map_err(backend_api_error)?;
+    let agents = agents.map_err(backend_api_error)?;
     let answer = backend::compat::snapshot(workspaces, tabs, panes, &agents);
     // Hashed after `note_and_amend_panes`, never before: that call is a read
     // that also writes -- it feeds the scrollback store what it just saw and
