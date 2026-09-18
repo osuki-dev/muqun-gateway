@@ -22,6 +22,10 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse as _, Response};
 use axum::routing::{get, patch, post};
 use axum::{Extension, Json, Router};
+use tower_http::compression::{
+    predicate::{DefaultPredicate, Predicate, SizeAbove},
+    CompressionLayer,
+};
 use base64::Engine as _;
 use clap::{Parser, Subcommand, ValueEnum};
 use crossterm::cursor::MoveTo;
@@ -2281,6 +2285,21 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         // path, which a phone cannot open.
         .route("/api/uploads/{file_name}", get(upload_content))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+        // Inside the encrypted transport, so what it compresses is the
+        // plaintext body and not the sealed base64 -- ciphertext does not
+        // compress, and sealing first is why nothing downstream could.
+        //
+        // The default predicate already declines `text/event-stream` (a
+        // compressor would buffer a stream that is supposed to arrive a frame
+        // at a time) and content that is already compressed, such as an
+        // uploaded image. `SizeAbove` keeps it off bodies too small to be
+        // worth a header: below about half a kilobyte gzip usually costs more
+        // than it saves.
+        .layer(
+            CompressionLayer::new()
+                .compress_when(DefaultPredicate::new().and(SizeAbove::new(COMPRESSION_MIN_BYTES))),
+        )
+        .layer(middleware::from_fn(envelope_compression_gate))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             encrypted_transport,
@@ -2817,6 +2836,42 @@ fn host_name(host: &str) -> String {
         .map_or(host, |(name, _)| name)
         .trim_end_matches('.')
         .to_ascii_lowercase()
+}
+
+/// Bodies below this are sent as they are: a gzip header, trailer and the
+/// `content-encoding` line cost more than they save, and every one of them is
+/// a byte on a phone's radio too.
+const COMPRESSION_MIN_BYTES: u16 = 512;
+
+/// Keep compression away from the sealed envelope, and say that the answer
+/// varies by what the client will accept.
+///
+/// A response that is about to be sealed must not also be compressed yet. The
+/// envelope carries its own headers inside the ciphertext, so a
+/// `content-encoding: gzip` on a body the client sees as base64 would have it
+/// try to inflate the ciphertext. Compressing inside the envelope is worth
+/// doing -- it is the one place the gateway's own inflation can be paid back
+/// -- but it needs the client to say it understands the flag, and until it
+/// does, an encrypted request is answered exactly as it is today.
+///
+/// Whether the request arrived encrypted is read from the stream context the
+/// decryption path injects, not from a header, because a header can be sent by
+/// anyone.
+async fn envelope_compression_gate(mut request: Request<Body>, next: Next) -> Response {
+    let sealed = request.extensions().get::<EncryptedStreamContext>().is_some();
+    if sealed {
+        request
+            .headers_mut()
+            .remove(axum::http::header::ACCEPT_ENCODING);
+    }
+    let mut response = next.run(request).await;
+    // Said whether or not this particular answer was compressed: a cache that
+    // holds one must not serve it to a client that asked differently.
+    response.headers_mut().insert(
+        axum::http::header::VARY,
+        HeaderValue::from_static("accept-encoding"),
+    );
+    response
 }
 
 async fn security_headers(request: Request<Body>, next: Next) -> Response {
@@ -14066,6 +14121,120 @@ mod tests {
             "ciphertext": first["ciphertext"].as_str().unwrap(),
         });
         assert!(open(&replayed).is_err());
+    }
+
+    /// What compression will and will not touch.
+    ///
+    /// The two that matter are a stream and an upload. Compressing
+    /// `text/event-stream` would buffer frames that exist to arrive one at a
+    /// time, and an uploaded image is already compressed, so gzip spends CPU
+    /// to make it slightly bigger.
+    #[test]
+    fn compression_leaves_streams_uploads_and_small_bodies_alone() {
+        use tower_http::compression::predicate::Predicate;
+
+        let predicate = DefaultPredicate::new().and(SizeAbove::new(COMPRESSION_MIN_BYTES));
+        // A real body: `SizeAbove` reads the body's own size hint, not the
+        // header, so an empty body with a large content-length is still small.
+        let response = |content_type: &str, len: usize| {
+            Response::builder()
+                .header(axum::http::header::CONTENT_TYPE, content_type)
+                .body(Body::from(vec![b'x'; len]))
+                .unwrap()
+        };
+        let big = COMPRESSION_MIN_BYTES as usize * 40;
+
+        assert!(
+            !predicate.should_compress(&response("text/event-stream", big)),
+            "an SSE stream is never compressed, however long"
+        );
+        for image in ["image/png", "image/jpeg", "image/webp"] {
+            assert!(
+                !predicate.should_compress(&response(image, big)),
+                "{image} is already compressed"
+            );
+        }
+        assert!(
+            !predicate.should_compress(&response("application/json", 64)),
+            "a body under the floor is not worth a gzip header"
+        );
+        assert!(
+            predicate.should_compress(&response("application/json", big)),
+            "a real JSON payload is exactly what this is for"
+        );
+        assert_eq!(COMPRESSION_MIN_BYTES, 512);
+    }
+
+    /// The sealed transport is left exactly as it was.
+    ///
+    /// Compression sits inside the envelope, so without this gate an encrypted
+    /// response would be gzipped and then sealed -- and the client, which sees
+    /// base64 and a `content-encoding: gzip` carried in the envelope's own
+    /// headers, would try to inflate ciphertext. Compressing inside the
+    /// envelope is worth doing, but only once the client says it understands
+    /// the flag; until then an encrypted request is answered as it is today.
+    #[tokio::test]
+    async fn the_gate_keeps_compression_off_a_sealed_response() {
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        // What a handler below the gate sees.
+        let app = Router::new()
+            .route(
+                "/probe",
+                get(|headers: HeaderMap| async move {
+                    headers
+                        .get(axum::http::header::ACCEPT_ENCODING)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("absent")
+                        .to_string()
+                }),
+            )
+            .layer(middleware::from_fn(envelope_compression_gate));
+
+        // A cleartext request keeps its Accept-Encoding: it is compressed the
+        // ordinary way and the client's HTTP stack inflates it.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/probe")
+                    .header(axum::http::header::ACCEPT_ENCODING, "gzip, br")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::VARY)
+                .and_then(|v| v.to_str().ok()),
+            Some("accept-encoding"),
+            "the answer varies by what was asked for, compressed or not"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(String::from_utf8_lossy(&body), "gzip, br");
+
+        // A request that arrived sealed has it taken away, so the compression
+        // layer below declines and the envelope seals plaintext.
+        let mut request = Request::builder()
+            .uri("/probe")
+            .header(axum::http::header::ACCEPT_ENCODING, "gzip, br")
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(EncryptedStreamContext {
+            material: vec![0u8; 32],
+            request_aad: "aad".to_string(),
+            request_nonce: "nonce".to_string(),
+        });
+        let response = app.oneshot(request).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "absent",
+            "a sealed request is answered uncompressed"
+        );
     }
 
     /// The agent stream is sealed on an encrypted deployment, and plain on a
