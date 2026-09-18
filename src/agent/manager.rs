@@ -822,6 +822,22 @@ impl AgentManager {
             }
 
             // ---------------------------------------------------------------
+            // The catalog's own surfaces changed
+            // ---------------------------------------------------------------
+            // A user who edits an agent file, adds a command or installs a
+            // skill expects the picker to show it -- not to show it in thirty
+            // seconds when the cache happens to expire. These events are what
+            // makes caching the catalog honest rather than merely fast.
+            "agent.updated"
+            | "command.updated"
+            | "skill.updated"
+            | "catalog.updated"
+            | "config.updated"
+            | "provider.updated" => {
+                ctx.driver.invalidate_catalog();
+            }
+
+            // ---------------------------------------------------------------
             // Worktrees
             // ---------------------------------------------------------------
             // None of these belongs to a session, so they carry an empty asid

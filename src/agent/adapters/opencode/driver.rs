@@ -134,6 +134,18 @@ fn missing_ids(scoped: &[Value], floor: &[Value]) -> Vec<String> {
         .collect()
 }
 
+/// How long a built catalog is reused.
+///
+/// Rebuilding it is eight calls into OpenCode, and the app asks for it on
+/// every foreground -- the measured cost was the same 16 ms whether the answer
+/// was a 200 or a 304, because the work happened before the tag was compared.
+/// Short, because the honest invalidation is the engine's own events and this
+/// is only the floor under them.
+const CATALOG_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// One directory's catalog and when it was built.
+type CachedCatalog = (std::time::Instant, AgentCatalog);
+
 pub struct OpencodeDriver {
     client: Arc<OpencodeClient>,
     /// Sessions whose ruleset already carries the uploads allowance. The work
@@ -141,6 +153,9 @@ pub struct OpencodeDriver {
     /// rather than on every prompt; a reconnect builds a new driver and primes
     /// again, which is the cheap side to be wrong on.
     primed: Mutex<HashSet<String>>,
+    /// Built catalogs by directory. See [`CATALOG_CACHE_TTL`]; cleared
+    /// outright whenever OpenCode says a catalog surface changed.
+    catalog_cache: Mutex<HashMap<String, CachedCatalog>>,
 }
 
 impl OpencodeDriver {
@@ -148,6 +163,7 @@ impl OpencodeDriver {
         Self {
             client: Arc::new(OpencodeClient::new(endpoint)),
             primed: Mutex::new(HashSet::new()),
+            catalog_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -228,6 +244,54 @@ impl OpencodeDriver {
         if let Ok(mut primed) = self.primed.lock() {
             primed.insert(session_id.to_string());
         }
+    }
+
+    fn cached_catalog(&self, key: &str) -> Option<AgentCatalog> {
+        let cache = self.catalog_cache.lock().ok()?;
+        let (built, catalog) = cache.get(key)?;
+        (built.elapsed() < CATALOG_CACHE_TTL).then(|| catalog.clone())
+    }
+
+    fn remember_catalog(&self, key: String, catalog: AgentCatalog) {
+        if let Ok(mut cache) = self.catalog_cache.lock() {
+            cache.retain(|_, (built, _)| built.elapsed() < CATALOG_CACHE_TTL);
+            cache.insert(key, (std::time::Instant::now(), catalog));
+        }
+    }
+
+    /// Drop every cached catalog.
+    ///
+    /// Called when OpenCode says something in one changed -- an agent,
+    /// command, skill, provider or the config itself. The TTL is the floor;
+    /// this is the part that makes the cache honest, because a user who edits
+    /// an agent file expects to see it in the picker, not in thirty seconds.
+    pub fn invalidate_catalog(&self) {
+        if let Ok(mut cache) = self.catalog_cache.lock() {
+            cache.clear();
+        }
+    }
+
+    /// Seed and inspect the cache, for the tests that check invalidation
+    /// without standing up an engine to build a real catalog from.
+    #[cfg(test)]
+    pub fn remember_test_catalog(&self, key: &str) {
+        self.remember_catalog(
+            key.to_string(),
+            AgentCatalog {
+                models: Vec::new(),
+                agents: Vec::new(),
+                mcp: Vec::new(),
+                skills: Vec::new(),
+                providers: Vec::new(),
+                commands: Vec::new(),
+                defaults: Default::default(),
+            },
+        );
+    }
+
+    #[cfg(test)]
+    pub fn has_cached_catalog(&self, key: &str) -> bool {
+        self.cached_catalog(key).is_some()
     }
 
     /// A catalog list, asked again until the answer has finished arriving.
@@ -508,6 +572,10 @@ impl AgentEnginePort for OpencodeDriver {
 
     fn get_catalog<'a>(&'a self, directory: Option<&'a str>) -> EngineFuture<'a, AgentCatalog> {
         Box::pin(async move {
+            let key = directory.unwrap_or_default().to_string();
+            if let Some(cached) = self.cached_catalog(&key) {
+                return Ok(cached);
+            }
             // One failing fan-out arm must not empty the whole catalog, but it
             // is worth saying which one failed.
             let log = |what: &str, err: &AgentEngineError| {
@@ -516,48 +584,63 @@ impl AgentEnginePort for OpencodeDriver {
             // One check for the whole fan-out: without it each of the seven
             // arms called a dead directory, failed, and logged its own WARN.
             check_directory(directory)?;
-            let raw_models = self
-                .client
-                .get_models(directory)
-                .await
-                .inspect_err(|e| log("model", e))
-                .unwrap_or_default();
-            let raw_agents = self
-                .settled_list("agent", directory, |d| self.client.agents_or_empty(d))
-                .await;
-            let raw_mcp = self
-                .client
-                .get_mcp(directory)
-                .await
-                .inspect_err(|e| log("mcp", e))
-                .unwrap_or_default();
-            let raw_skills = self
-                .settled_list("skill", directory, |d| self.client.skills_or_empty(d))
-                .await;
-            let raw_providers = self
-                .client
-                .get_providers(directory)
-                .await
-                .inspect_err(|e| log("provider", e))
-                .unwrap_or_default();
-            let raw_commands = self
-                .settled_list("command", directory, |d| self.client.commands_or_empty(d))
-                .await;
-            let default_model = self
-                .client
-                .get_default_model(directory)
-                .await
-                .inspect_err(|e| log("model/default", e))
-                .unwrap_or_default();
-            let config = self
-                .client
-                .get_config(directory)
-                .await
-                .inspect_err(|e| log("config", e))
-                .unwrap_or_default();
+            // Eight reads of the same engine that do not depend on each
+            // other. In sequence they were eight round trips the app waited
+            // through before it could open a picker; together they cost the
+            // slowest of them. Three of them settle (see `settled_list`), and
+            // settling concurrently is the same waiting either way.
+            let (
+                raw_models,
+                raw_agents,
+                raw_mcp,
+                raw_skills,
+                raw_providers,
+                raw_commands,
+                default_model,
+                config,
+            ) = tokio::join!(
+                async {
+                    self.client
+                        .get_models(directory)
+                        .await
+                        .inspect_err(|e| log("model", e))
+                        .unwrap_or_default()
+                },
+                self.settled_list("agent", directory, |d| self.client.agents_or_empty(d)),
+                async {
+                    self.client
+                        .get_mcp(directory)
+                        .await
+                        .inspect_err(|e| log("mcp", e))
+                        .unwrap_or_default()
+                },
+                self.settled_list("skill", directory, |d| self.client.skills_or_empty(d)),
+                async {
+                    self.client
+                        .get_providers(directory)
+                        .await
+                        .inspect_err(|e| log("provider", e))
+                        .unwrap_or_default()
+                },
+                self.settled_list("command", directory, |d| self.client.commands_or_empty(d)),
+                async {
+                    self.client
+                        .get_default_model(directory)
+                        .await
+                        .inspect_err(|e| log("model/default", e))
+                        .unwrap_or_default()
+                },
+                async {
+                    self.client
+                        .get_config(directory)
+                        .await
+                        .inspect_err(|e| log("config", e))
+                        .unwrap_or_default()
+                },
+            );
 
             let models = mapper::map_models(&raw_models);
-            Ok(AgentCatalog {
+            let catalog = AgentCatalog {
                 agents: mapper::map_agents(&raw_agents),
                 mcp: mapper::map_mcp(&raw_mcp),
                 skills: mapper::map_skills(&raw_skills),
@@ -565,7 +648,14 @@ impl AgentEnginePort for OpencodeDriver {
                 commands: mapper::map_commands(&raw_commands),
                 defaults: mapper::map_catalog_defaults(default_model.as_ref(), &config),
                 models,
-            })
+            };
+            // Never cache an unsettled answer: an empty agent list is the one
+            // shape that must not be held on to, because the next caller would
+            // be served the same nothing until the entry expired.
+            if !catalog.agents.is_empty() {
+                self.remember_catalog(key, catalog.clone());
+            }
+            Ok(catalog)
         })
     }
 

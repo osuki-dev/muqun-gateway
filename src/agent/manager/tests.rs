@@ -658,3 +658,52 @@ async fn a_failed_worktree_carries_its_message() {
         "the envelope says which project even when the payload does not"
     );
 }
+
+/// The catalog is cached, so the events that change one have to clear it.
+///
+/// A user who edits an agent file, adds a command or installs a skill expects
+/// the picker to show it -- not to show it whenever the cache happens to
+/// expire. These frames are what makes caching the catalog honest.
+#[tokio::test]
+async fn a_changed_catalog_surface_clears_the_cached_catalog() {
+    for event_type in [
+        "agent.updated",
+        "command.updated",
+        "skill.updated",
+        "catalog.updated",
+        "config.updated",
+        "provider.updated",
+    ] {
+        let ctx = ctx();
+        // Something to clear.
+        ctx.driver.remember_test_catalog("/repo");
+        assert!(
+            ctx.driver.has_cached_catalog("/repo"),
+            "{event_type}: the fixture has to start with something cached"
+        );
+
+        let frame = OpencodeSseListener::parse_block(&format!(
+            r#"data: {{"id":"evt_1","type":"{event_type}","data":{{}}}}"#
+        ))
+        .expect("frame parses");
+        AgentManager::handle_raw_event(frame, &ctx).await;
+
+        assert!(
+            !ctx.driver.has_cached_catalog("/repo"),
+            "{event_type} must drop what it invalidates"
+        );
+    }
+
+    // And an unrelated event leaves it alone, or the cache would never hold.
+    let ctx = ctx();
+    ctx.driver.remember_test_catalog("/repo");
+    let frame = OpencodeSseListener::parse_block(
+        r#"data: {"id":"evt_1","type":"session.text.delta","data":{"sessionID":"ses_1"}}"#,
+    )
+    .expect("frame parses");
+    AgentManager::handle_raw_event(frame, &ctx).await;
+    assert!(
+        ctx.driver.has_cached_catalog("/repo"),
+        "a turn's output is not a catalog change"
+    );
+}
