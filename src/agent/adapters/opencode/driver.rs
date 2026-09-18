@@ -1,5 +1,8 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use serde_json::Value;
 
 use crate::agent::domain::{
     AgentCatalog, AgentProject, AgentSessionInfo, ModelRef, PermissionDecision, SessionQuery,
@@ -13,6 +16,38 @@ use super::mapper;
 /// The permission action OpenCode raises when a tool reaches outside the
 /// session's own directory.
 const EXTERNAL_DIRECTORY_ACTION: &str = "external_directory";
+
+/// How long to wait between asking `GET /api/agent` again while its answer is
+/// still filling in. About a second and a half in total, which covers the
+/// settlement measured on 2.0.1 with room to spare, and is bounded because a
+/// catalog request is a user waiting on a picker.
+const AGENT_SETTLE_BACKOFF: &[Duration] = &[
+    Duration::from_millis(120),
+    Duration::from_millis(250),
+    Duration::from_millis(400),
+    Duration::from_millis(750),
+];
+
+/// Every entry in `floor` that `scoped` has not got.
+///
+/// Naming a directory scopes the catalog *up* -- the global entries plus the
+/// project's own -- so anything missing from the scoped answer that the
+/// unscoped one had is an answer that has not finished arriving. Entries are
+/// matched on `id`, or on `name` for the surfaces that use that instead.
+fn missing_ids(scoped: &[Value], floor: &[Value]) -> Vec<String> {
+    let key = |v: &Value| {
+        v.get("id")
+            .or_else(|| v.get("name"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let have: HashSet<String> = scoped.iter().filter_map(key).collect();
+    floor
+        .iter()
+        .filter_map(key)
+        .filter(|id| !have.contains(id))
+        .collect()
+}
 
 pub struct OpencodeDriver {
     client: Arc<OpencodeClient>,
@@ -109,6 +144,80 @@ impl OpencodeDriver {
             primed.insert(session_id.to_string());
         }
     }
+
+    /// A catalog list, asked again until the answer has finished arriving.
+    ///
+    /// These lists are snapshots, and OpenCode's own spec warns a snapshot
+    /// "may precede initial plugin settlement". Measured on 2.0.1, a directory
+    /// nothing has opened yet answers in stages roughly four hundred
+    /// milliseconds apart: agents go `[]`, then the seven built-ins, then the
+    /// user's own; skills go from a handful to all of them. The gateway used
+    /// to hand over whichever stage it happened to catch -- which is why a
+    /// user-defined agent went missing from the picker while the built-ins
+    /// were all present, and why naming a directory could return nothing.
+    ///
+    /// So "not empty" is not the test. The unscoped list is the floor: naming
+    /// a directory scopes the catalog *up*, never down, so the answer is not
+    /// finished until it holds everything the unscoped one holds. That is
+    /// asked again, briefly, and then given up on -- a picker that waits
+    /// forever is worse than one that is a moment stale.
+    async fn settled_list<'a, F, Fut>(
+        &'a self,
+        what: &'static str,
+        directory: Option<&'a str>,
+        fetch: F,
+    ) -> Vec<Value>
+    where
+        F: Fn(Option<&'a str>) -> Fut,
+        Fut: std::future::Future<Output = Vec<Value>>,
+    {
+        let floor = self.once_present(&fetch, None).await;
+        if directory.is_none() {
+            return floor;
+        }
+
+        let mut scoped = self.once_present(&fetch, directory).await;
+        for wait in AGENT_SETTLE_BACKOFF {
+            if missing_ids(&scoped, &floor).is_empty() {
+                return scoped;
+            }
+            tokio::time::sleep(*wait).await;
+            scoped = fetch(directory).await;
+        }
+
+        let missing = missing_ids(&scoped, &floor);
+        if !missing.is_empty() {
+            // Not necessarily wrong -- a project may switch a global entry off
+            // -- but it is what the old bug looked like, so it is said out loud
+            // rather than passed over.
+            tracing::warn!(
+                surface = what,
+                directory = directory.unwrap_or("<none>"),
+                missing = %missing.join(", "),
+                "catalog for this directory is missing entries the unscoped one has"
+            );
+        }
+        scoped
+    }
+
+    /// Ask until there is something to return, or the waits run out. An empty
+    /// list is never a real answer here: the built-ins are always there.
+    async fn once_present<'a, F, Fut>(&'a self, fetch: &F, directory: Option<&'a str>) -> Vec<Value>
+    where
+        F: Fn(Option<&'a str>) -> Fut,
+        Fut: std::future::Future<Output = Vec<Value>>,
+    {
+        let mut last = fetch(directory).await;
+        for wait in AGENT_SETTLE_BACKOFF {
+            if !last.is_empty() {
+                return last;
+            }
+            tokio::time::sleep(*wait).await;
+            last = fetch(directory).await;
+        }
+        last
+    }
+
 }
 
 /// The ruleset to send back, or `None` when the session already allows the
@@ -326,11 +435,8 @@ impl AgentEnginePort for OpencodeDriver {
                 .inspect_err(|e| log("model", e))
                 .unwrap_or_default();
             let raw_agents = self
-                .client
-                .get_agents(directory)
-                .await
-                .inspect_err(|e| log("agent", e))
-                .unwrap_or_default();
+                .settled_list("agent", directory, |d| self.client.agents_or_empty(d))
+                .await;
             let raw_mcp = self
                 .client
                 .get_mcp(directory)
@@ -338,11 +444,8 @@ impl AgentEnginePort for OpencodeDriver {
                 .inspect_err(|e| log("mcp", e))
                 .unwrap_or_default();
             let raw_skills = self
-                .client
-                .get_skills(directory)
-                .await
-                .inspect_err(|e| log("skill", e))
-                .unwrap_or_default();
+                .settled_list("skill", directory, |d| self.client.skills_or_empty(d))
+                .await;
             let raw_providers = self
                 .client
                 .get_providers(directory)
@@ -350,11 +453,8 @@ impl AgentEnginePort for OpencodeDriver {
                 .inspect_err(|e| log("provider", e))
                 .unwrap_or_default();
             let raw_commands = self
-                .client
-                .get_commands(directory)
-                .await
-                .inspect_err(|e| log("command", e))
-                .unwrap_or_default();
+                .settled_list("command", directory, |d| self.client.commands_or_empty(d))
+                .await;
             let default_model = self
                 .client
                 .get_default_model(directory)
@@ -470,6 +570,111 @@ mod tests {
     use serde_json::json;
 
     const UPLOADS: &str = "/home/ryu/.local/share/muqun-gateway/uploads/*";
+
+    /// Naming a directory must never return fewer agents than not naming one.
+    ///
+    /// That is the whole bug this guards: a directory scopes the catalog *up*
+    /// -- the global agents plus the project's own -- and the empty snapshot
+    /// made it scope to nothing. Run against a live OpenCode 2.0.1 with
+    /// `cargo test --offline -- --ignored a_directory_never_narrows`.
+    #[tokio::test]
+    #[ignore = "requires a running OpenCode 2.0.1 service"]
+    async fn a_directory_never_narrows_the_agent_list() {
+        let Some(endpoint) = OpencodeEndpoint::discover().await else {
+            eprintln!("no OpenCode service registered; skipping");
+            return;
+        };
+        let driver = OpencodeDriver::new(endpoint);
+
+        let global = driver.get_catalog(None).await.expect("a global catalog");
+        assert!(
+            !global.agents.is_empty(),
+            "OpenCode always has its built-in agents"
+        );
+
+        // A directory nothing has opened is the cold case that used to answer
+        // with nothing at all.
+        let directory = std::env::temp_dir().join(format!(
+            "muqun-catalog-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&directory).expect("temp dir");
+        let scoped = driver
+            .get_catalog(directory.to_str())
+            .await
+            .expect("a scoped catalog");
+        let _ = std::fs::remove_dir(&directory);
+
+        assert!(
+            scoped.agents.len() >= global.agents.len(),
+            "a directory adds agents, it never takes them away: {} scoped vs {} global",
+            scoped.agents.len(),
+            global.agents.len()
+        );
+        for expected in &global.agents {
+            assert!(
+                scoped.agents.iter().any(|a| a.id == expected.id),
+                "{} is missing from the scoped catalog",
+                expected.id
+            );
+        }
+    }
+
+    fn agent(id: &str) -> Value {
+        json!({ "id": id, "name": id })
+    }
+
+    /// The unscoped list is the floor, and the whole bug is that a scoped
+    /// answer arrives in stages: first nothing, then the built-ins, and only
+    /// then the user's own agents. Anything the floor has and the scoped
+    /// answer has not is an answer that has not finished arriving.
+    #[test]
+    fn what_is_missing_is_measured_against_the_unscoped_list() {
+        let floor = vec![agent("build"), agent("plan"), agent("osuki-coder")];
+
+        // The stage that caused the report: the built-ins are all there, and
+        // the user's own agent is not.
+        let built_ins_only = vec![agent("build"), agent("plan")];
+        assert_eq!(
+            missing_ids(&built_ins_only, &floor),
+            vec!["osuki-coder".to_string()],
+            "a full-looking list can still be missing the one that matters"
+        );
+
+        // The first stage: nothing at all.
+        assert_eq!(missing_ids(&[], &floor).len(), 3);
+
+        // Settled.
+        assert!(missing_ids(&floor, &floor).is_empty());
+
+        // A directory adds its own, and that is not missing anything.
+        let mut with_project = floor.clone();
+        with_project.push(agent("probe-coder"));
+        assert!(missing_ids(&with_project, &floor).is_empty());
+
+        // An entry with no id cannot be matched and is simply not counted.
+        assert!(missing_ids(&[json!({ "name": "nameless" })], &[]).is_empty());
+    }
+
+    /// The waits are bounded: a catalog request is a user waiting on a picker,
+    /// so a list that never settles has to be given up on rather than hung on.
+    #[test]
+    fn the_settle_waits_are_bounded_and_ordered() {
+        assert!(!AGENT_SETTLE_BACKOFF.is_empty());
+        assert!(
+            AGENT_SETTLE_BACKOFF.windows(2).all(|w| w[1] >= w[0]),
+            "the waits only grow"
+        );
+        let total: Duration = AGENT_SETTLE_BACKOFF.iter().sum();
+        assert!(
+            total <= Duration::from_secs(3),
+            "a picker must not wait longer than a person will, got {total:?}"
+        );
+        assert!(
+            total >= Duration::from_millis(1200),
+            "and it has to cover the settlement measured on 2.0.1, got {total:?}"
+        );
+    }
 
     /// The rule the gateway adds is exactly the one OpenCode asked about --
     /// the same action, the gateway's own directory and nothing wider, and

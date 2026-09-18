@@ -964,6 +964,37 @@ async fn do_get_agent_vcs_diff(
     Ok(Json(content_envelope(json!(diffs))))
 }
 
+/// The catalog's answer, and whether the app may cache it.
+///
+/// A catalog with no agents in it is not a catalog. OpenCode always has its
+/// built-ins, so an empty list means the engine had not settled yet -- the
+/// driver already waits for that, and this is the last guard. Answering an
+/// empty one with an ETag would let the app hold on to a picker with nothing
+/// in it until the bytes changed, which for an empty list may be never; so it
+/// is answered `no-store` and tagless, and the next request asks again.
+///
+/// A populated catalog is tagged as usual. The tag is a hash of the whole
+/// body, so two directories that resolve to different catalogs get different
+/// tags on their own, and two that resolve to the same catalog share one.
+pub(crate) fn catalog_response(
+    headers: &HeaderMap,
+    catalog: crate::agent::domain::AgentCatalog,
+) -> Response {
+    let payload = content_envelope(json!(catalog));
+    if catalog.agents.is_empty() {
+        return (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/json".to_string()),
+                (header::CACHE_CONTROL, "private, no-store".to_string()),
+            ],
+            serde_json::to_vec(&payload).unwrap_or_default(),
+        )
+            .into_response();
+    }
+    json_etag_response(headers, payload)
+}
+
 pub(crate) fn json_etag_response(headers: &HeaderMap, payload: Value) -> Response {
     let body_bytes = serde_json::to_vec(&payload).unwrap_or_default();
     let mut hasher = Sha256::new();
@@ -1144,7 +1175,13 @@ pub async fn get_global_agent_catalog(
         .await
         .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "agent_engine_error", &e.to_string()))?;
 
-    Ok(json_etag_response(&headers, content_envelope(json!(catalog))))
+    if catalog.agents.is_empty() {
+        tracing::warn!(
+            directory = query.directory.as_deref().unwrap_or("<none>"),
+            "agent catalog came back with no agents; answering without an ETag"
+        );
+    }
+    Ok(catalog_response(&headers, catalog))
 }
 
 // ---------------------------------------------------------------------------
@@ -2249,6 +2286,69 @@ mod tests {
     /// `files` is tri-state on the way in: absent leaves OpenCode's own
     /// default alone, and `false` is a caller who does not want the diff
     /// computed -- not the same thing.
+    fn catalog_with(agents: Vec<crate::agent::domain::AgentInfo>) -> crate::agent::domain::AgentCatalog {
+        crate::agent::domain::AgentCatalog {
+            models: Vec::new(),
+            agents,
+            mcp: Vec::new(),
+            skills: Vec::new(),
+            providers: Vec::new(),
+            commands: Vec::new(),
+            defaults: Default::default(),
+        }
+    }
+
+    fn agent(id: &str) -> crate::agent::domain::AgentInfo {
+        crate::agent::domain::AgentInfo {
+            id: id.to_string(),
+            name: id.to_string(),
+            description: None,
+            mode: Some("primary".to_string()),
+            color: None,
+            hidden: false,
+        }
+    }
+
+    /// An empty catalog must not become a cached empty catalog. OpenCode
+    /// answers `GET /api/agent` with `[]` for a directory it has not settled
+    /// yet, and an ETag on that would pin a picker with nothing in it.
+    #[test]
+    fn an_empty_catalog_is_answered_without_an_etag() {
+        let response = catalog_response(&HeaderMap::new(), catalog_with(Vec::new()));
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers().get(header::ETAG).is_none(),
+            "nothing to cache"
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "private, no-store"
+        );
+    }
+
+    /// A real catalog is tagged as before, and the tag follows the body -- so
+    /// two directories with different catalogs cannot share one.
+    #[test]
+    fn a_populated_catalog_is_tagged_per_body() {
+        let one = catalog_response(&HeaderMap::new(), catalog_with(vec![agent("build")]));
+        let two = catalog_response(
+            &HeaderMap::new(),
+            catalog_with(vec![agent("build"), agent("osuki-coder")]),
+        );
+        let tag = |r: &Response| {
+            r.headers()
+                .get(header::ETAG)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        let (one, two) = (tag(&one).expect("tagged"), tag(&two).expect("tagged"));
+        assert_ne!(one, two, "a different catalog is a different tag");
+
+        // And the same catalog is the same tag, which is what makes 304 work.
+        let again = catalog_response(&HeaderMap::new(), catalog_with(vec![agent("build")]));
+        assert_eq!(tag(&again).expect("tagged"), one);
+    }
+
     /// Two directories in one body, and confusing them would remove the
     /// wrong thing: `directory` is the project, `worktree` is what goes.
     #[test]

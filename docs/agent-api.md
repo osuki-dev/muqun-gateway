@@ -541,6 +541,22 @@ skills do. **A slash menu lists only `slash: true`**; the rest exist for the
 agent to reach for, and `autoinvoke: true` says it may do so unasked. Activate
 one with [`POST …/skill`](#post-apiagent-sessionsasidskill).
 
+`?directory=` scopes the catalog **up**, never down: the agents, commands and
+skills a project defines are added to the global ones, and a directory never
+returns fewer agents than no directory. The gateway enforces that, because
+OpenCode's `GET /api/agent` is a snapshot that fills in over roughly a second
+for a directory nothing has opened yet — first empty, then the built-ins, then
+the user's own agents. A catalog request waits for the scoped list to hold
+everything the unscoped one holds (bounded, about 1.5s) rather than handing
+over whichever stage it caught. A catalog that still has no agents is answered
+`cache-control: private, no-store` and **without an ETag**, so an empty picker
+can never be cached.
+
+User-defined agents come from `~/.config/opencode/agents/<name>.md` (global),
+`.opencode/agents/<name>.md` (per project, discovered from the directory up to
+the project root) and an `agent` block in `opencode.json`. They arrive with
+`mode`, `description`, `color` and `hidden: false` like any other.
+
 A picker should hide `agents[].hidden` and `mode == "subagent"` entries.
 A provider with `activation: "disabled"` and a model with `enabled: false` are
 carried through rather than filtered — grey them out and say OpenCode on the

@@ -329,6 +329,31 @@ impl OpencodeClient {
         .await
     }
 
+    /// The three catalog lists that settle, each as "whatever came back", so
+    /// the driver can retry one without also having to decide what a failure
+    /// means. A failed call and an unsettled one look the same here on
+    /// purpose: both are "nothing yet", and both are worth asking again.
+    pub async fn agents_or_empty(&self, directory: Option<&str>) -> Vec<Value> {
+        self.get_agents(directory)
+            .await
+            .inspect_err(|e| tracing::warn!(surface = "agent", %e, "catalog fan-out arm failed"))
+            .unwrap_or_default()
+    }
+
+    pub async fn skills_or_empty(&self, directory: Option<&str>) -> Vec<Value> {
+        self.get_skills(directory)
+            .await
+            .inspect_err(|e| tracing::warn!(surface = "skill", %e, "catalog fan-out arm failed"))
+            .unwrap_or_default()
+    }
+
+    pub async fn commands_or_empty(&self, directory: Option<&str>) -> Vec<Value> {
+        self.get_commands(directory)
+            .await
+            .inspect_err(|e| tracing::warn!(surface = "command", %e, "catalog fan-out arm failed"))
+            .unwrap_or_default()
+    }
+
     // -----------------------------------------------------------------
     // Worktrees
     // -----------------------------------------------------------------

@@ -1929,6 +1929,53 @@ mod catalog_tests {
         }
     }
 
+    /// A user-defined agent is the whole point of the picker, and it arrives
+    /// with the fields a built-in leaves null: a description, a mode, a colour.
+    ///
+    /// This fixture is a real `GET /api/agent` row for an agent defined at
+    /// `~/.config/opencode/agents/<name>.md`, beside a built-in and a hidden
+    /// built-in, so the mapping is pinned against all three.
+    #[test]
+    fn a_user_defined_agent_keeps_its_mode_colour_and_description() {
+        let agents = map_agents(&[
+            json!({
+                "id": "build", "name": "Build", "mode": "primary", "hidden": false,
+                "description": "The default agent. Executes tools based on configured permissions.",
+                "color": null, "model": null
+            }),
+            json!({
+                "id": "title", "name": "Title", "mode": "primary", "hidden": true,
+                "description": null, "color": null
+            }),
+            json!({
+                "id": "muqun-probe-global", "name": "muqun-probe-global", "mode": "primary",
+                "hidden": false, "color": "#ff7f50",
+                "description": "A global probe agent, to prove the catalog returns user agents"
+            }),
+            json!({
+                "id": "json-coder", "name": "json-coder", "mode": "primary", "hidden": false,
+                "description": "Probe from opencode.json", "color": null
+            }),
+        ]);
+        assert_eq!(agents.len(), 4, "nothing is filtered out here -- the picker decides");
+
+        let user = agents.iter().find(|a| a.id == "muqun-probe-global").expect("the user agent");
+        assert_eq!(user.name, "muqun-probe-global");
+        assert_eq!(user.mode.as_deref(), Some("primary"));
+        assert_eq!(user.color.as_deref(), Some("#ff7f50"));
+        assert!(!user.hidden, "a user agent is offered, not hidden");
+        assert!(user.description.as_deref().unwrap().contains("global probe"));
+
+        let from_config = agents.iter().find(|a| a.id == "json-coder").expect("the config agent");
+        assert_eq!(from_config.description.as_deref(), Some("Probe from opencode.json"));
+        assert!(from_config.color.is_none(), "a null colour is absent, not empty");
+
+        assert!(
+            agents.iter().find(|a| a.id == "title").expect("a built-in").hidden,
+            "the hidden built-ins stay flagged so a picker can drop them"
+        );
+    }
+
     /// The slash menu is built from `slash`, so the flag has to survive the
     /// catalog. It is absent on most skills, which is `false` and not unknown.
     #[test]
