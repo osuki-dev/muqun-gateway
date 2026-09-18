@@ -41,6 +41,37 @@ verbatim, so their keys stay camelCase.
   folder had simply been deleted. A 502 is now never blank either — an upstream
   failure with no body reads `OpenCode answered 500 to GET /api/vcs/diff`, so
   there is always a status and a route to go on.
+- **Compression.** Responses are gzipped (or brotli'd) when the client asks
+  with `Accept-Encoding` and the body is over 512 bytes. `text/event-stream`
+  and already-compressed content such as an uploaded image are never touched.
+  Every answer carries `Vary: accept-encoding`; a validated one carries
+  `Vary: accept-encoding, accept-language`.
+
+  Compression happens **inside** the encrypted transport, on the plaintext,
+  because ciphertext does not compress.
+
+- **Compression inside the envelope.** An encrypted client is reading a base64
+  body whose real headers are sealed with it, so it cannot use
+  `Content-Encoding` the ordinary way. It opts in by request header instead:
+
+  ```
+  X-Muqun-Envelope-Accept: gzip
+  ```
+
+  and the sealed payload then carries a **top-level `content_encoding` field,
+  beside `headers`** — not a line inside the header map, which is where a
+  `content-encoding` would tell the client to inflate a body it has already
+  inflated:
+
+  ```json
+  { "status": 200, "headers": { … }, "body": "<base64>", "content_encoding": "gzip" }
+  ```
+
+  `gzip` is the only value ever sent, and it is sent only to a client that
+  asked for it by name — a request without the header is answered exactly as
+  it was before this existed, so an older app is unaffected. Absent means the
+  body is the response body.
+
 - **`asid`** is the OpenCode session id (`ses_…`). The gateway does not mint
   ids of its own.
 - **Legacy paths.** Everything under `/api/agent-*` also exists under
@@ -737,6 +768,15 @@ sealed is **dropped**, never sent in the clear.
 A device paired without a transport key — a `transport_encryption: disabled`
 deployment — gets the plaintext stream byte for byte, under the event's own
 name. Nothing about cleartext changed.
+
+The request is the encrypted transport's own: `X-Muqun-Transport: 1`,
+`X-Muqun-Device` and `X-Muqun-Envelope` with the token sealed inside, and no
+`Authorization` header. The response carries `content-type: text/event-stream`
+and `x-muqun-transport: 1`; the frames are `event: muqun.encrypted`. The key is
+HKDF'd under `muqun-transport-v1/sse/{sid}/{request nonce}` — the same
+derivation, AAD and record shape as `GET /api/sessions/{id}/events`, which is
+the point: one reader serves both. Both the global path and the session-scoped
+`/api/sessions/{id}/agent-sessions/{asid}/stream` behave identically.
 
 > Until this release the stream was never sealed, on any deployment. A gateway
 > configured `transport_encryption: required` still put the device token and

@@ -2343,6 +2343,9 @@ async fn request_locale(request: Request<Body>, next: Next) -> Response {
 }
 
 const TRANSPORT_HEADER: &str = "x-muqun-transport";
+/// How a client says it can inflate a compressed sealed body. `gzip` is the
+/// only value that does anything.
+const ENVELOPE_ACCEPT_HEADER: &str = "x-muqun-envelope-accept";
 const TRANSPORT_DEVICE_HEADER: &str = "x-muqun-device";
 const TRANSPORT_ENVELOPE_HEADER: &str = "x-muqun-envelope";
 const TRANSPORT_PROOF_HEADER: &str = "x-muqun-internal-device-proof";
@@ -2402,6 +2405,16 @@ struct EncryptedResponsePayload {
     status: u16,
     headers: BTreeMap<String, String>,
     body: String,
+    /// How `body` is encoded, when it is not plain bytes.
+    ///
+    /// A top-level field rather than a line in `headers`, because it describes
+    /// the sealed payload itself and not the response the client is
+    /// reconstructing -- and because a client has to be able to find it
+    /// without case-folding its way through a header map. Absent means the
+    /// body is the response body. The only value ever sent is `gzip`, and it
+    /// is sent only to a client that asked for it by name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content_encoding: Option<String>,
 }
 
 /// What an encrypted-transport request leaves behind for a handler that
@@ -2686,9 +2699,19 @@ async fn encrypt_transport_response(
             .into_response()
         }
     };
+    // `content-encoding` describes the bytes being sealed, not the response
+    // the client rebuilds -- leaving it in the header map would have the
+    // client try to inflate a body it had already inflated. It moves to the
+    // payload's own field.
+    let content_encoding = parts
+        .headers
+        .get(axum::http::header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     let headers = parts
         .headers
         .iter()
+        .filter(|(name, _)| *name != axum::http::header::CONTENT_ENCODING)
         .filter_map(|(name, value)| {
             value
                 .to_str()
@@ -2700,6 +2723,7 @@ async fn encrypt_transport_response(
         status: parts.status.as_u16(),
         headers,
         body: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(body),
+        content_encoding,
     };
     let plaintext = match serde_json::to_vec(&payload) {
         Ok(value) => value,
@@ -2860,9 +2884,33 @@ const COMPRESSION_MIN_BYTES: u16 = 512;
 async fn envelope_compression_gate(mut request: Request<Body>, next: Next) -> Response {
     let sealed = request.extensions().get::<EncryptedStreamContext>().is_some();
     if sealed {
-        request
-            .headers_mut()
-            .remove(axum::http::header::ACCEPT_ENCODING);
+        // Inside the envelope the client cannot use `content-encoding` -- it
+        // is reading a base64 body, and the real headers are sealed with it --
+        // so it says separately what it can inflate. Only gzip, and only when
+        // asked for by name: a client that says nothing gets exactly what it
+        // got before this existed.
+        let opted_in = request
+            .headers()
+            .get(ENVELOPE_ACCEPT_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("gzip"))
+            });
+        if opted_in {
+            // Pinned to gzip rather than passed through: br is the other thing
+            // the layer can produce, and a client that asked for gzip must not
+            // be handed something it will refuse.
+            request.headers_mut().insert(
+                axum::http::header::ACCEPT_ENCODING,
+                HeaderValue::from_static("gzip"),
+            );
+        } else {
+            request
+                .headers_mut()
+                .remove(axum::http::header::ACCEPT_ENCODING);
+        }
     }
     let mut response = next.run(request).await;
     // Said whether or not this particular answer was compressed: a cache that
@@ -14266,6 +14314,100 @@ mod tests {
             "absent",
             "a sealed request is answered uncompressed"
         );
+    }
+
+    /// Compression inside the envelope, and only for a client that asked.
+    ///
+    /// The envelope inflates what it seals by about 1.78x, and it seals before
+    /// anything could compress -- so this is the one place that cost can be
+    /// paid back. But the client is reading a base64 body whose real headers
+    /// are sealed with it, so it cannot use `content-encoding` the ordinary
+    /// way: it says what it can inflate with its own request header, and the
+    /// payload answers with its own field.
+    #[tokio::test]
+    async fn the_envelope_compresses_only_for_a_client_that_asked_for_gzip() {
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        let app = Router::new()
+            .route(
+                "/probe",
+                get(|headers: HeaderMap| async move {
+                    headers
+                        .get(axum::http::header::ACCEPT_ENCODING)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("absent")
+                        .to_string()
+                }),
+            )
+            .layer(middleware::from_fn(envelope_compression_gate));
+
+        let sealed_request = |accept: Option<&str>| {
+            let mut request = Request::builder().uri("/probe");
+            request = request.header(axum::http::header::ACCEPT_ENCODING, "gzip, br, zstd");
+            if let Some(accept) = accept {
+                request = request.header(ENVELOPE_ACCEPT_HEADER, accept);
+            }
+            let mut request = request.body(Body::empty()).unwrap();
+            request.extensions_mut().insert(EncryptedStreamContext {
+                material: vec![0u8; 32],
+                request_aad: "aad".to_string(),
+                request_nonce: "nonce".to_string(),
+            });
+            request
+        };
+        let seen = |app: Router, request: Request<Body>| async move {
+            let response = app.oneshot(request).await.unwrap();
+            let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+            String::from_utf8_lossy(&body).to_string()
+        };
+
+        // A client that says nothing is answered exactly as before.
+        assert_eq!(seen(app.clone(), sealed_request(None)).await, "absent");
+
+        // One that asks for gzip gets gzip -- and only gzip, though it also
+        // sent br and zstd in the ordinary header: the app fails a response
+        // encoded any other way, so the choice is pinned rather than passed on.
+        assert_eq!(seen(app.clone(), sealed_request(Some("gzip"))).await, "gzip");
+        assert_eq!(
+            seen(app.clone(), sealed_request(Some(" GZIP , br"))).await,
+            "gzip",
+            "the name is matched without case or spacing mattering"
+        );
+
+        // Something else entirely is not an opt-in.
+        assert_eq!(seen(app, sealed_request(Some("br"))).await, "absent");
+    }
+
+    /// Where the flag goes, and what it must not do to the headers map.
+    #[test]
+    fn the_sealed_payload_carries_its_encoding_beside_the_headers() {
+        let payload = EncryptedResponsePayload {
+            status: 200,
+            headers: BTreeMap::from([("content-type".to_string(), "application/json".to_string())]),
+            body: "…".to_string(),
+            content_encoding: Some("gzip".to_string()),
+        };
+        let value = serde_json::to_value(&payload).expect("serializes");
+        assert_eq!(
+            value["content_encoding"], "gzip",
+            "a top-level field, so a client finds it without walking the header map"
+        );
+        assert!(
+            value["headers"].get("content-encoding").is_none(),
+            "and never left in the headers, or the client would inflate twice"
+        );
+
+        // An uncompressed body says nothing at all, so an old client sees the
+        // payload it has always seen.
+        let plain = EncryptedResponsePayload {
+            status: 200,
+            headers: BTreeMap::new(),
+            body: "…".to_string(),
+            content_encoding: None,
+        };
+        let value = serde_json::to_value(&plain).expect("serializes");
+        assert!(value.get("content_encoding").is_none());
     }
 
     /// The agent stream is sealed on an encrypted deployment, and plain on a
