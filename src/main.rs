@@ -5132,7 +5132,7 @@ async fn snapshot(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
     headers: HeaderMap,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Response> {
     require_device(&state, &headers)?;
     let session = find_session(&state.config, &session_id)?;
     let backend = terminal_backend(session);
@@ -5144,7 +5144,14 @@ async fn snapshot(
     // `instance_id` and `target`.
     let agents = backend_agents(session).await.map_err(backend_api_error)?;
     let answer = backend::compat::snapshot(workspaces, tabs, panes, &agents);
-    Ok(Json(note_and_amend_panes(&state, &session_id, answer)))
+    // Hashed after `note_and_amend_panes`, never before: that call is a read
+    // that also writes -- it feeds the scrollback store what it just saw and
+    // then amends the answer from what the store holds. Hashing the answer it
+    // returns is the only version that matches what the client receives, and
+    // running it before the 304 check keeps the store fed even when nothing is
+    // sent back.
+    let answer = note_and_amend_panes(&state, &session_id, answer);
+    Ok(agent::routes::json_etag_response(&headers, answer))
 }
 
 /// Let the scrollback store read a Herdr answer, and answer back for whatever
@@ -5179,7 +5186,7 @@ async fn panes(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
     headers: HeaderMap,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Response> {
     require_device(&state, &headers)?;
     let session = find_session(&state.config, &session_id)?;
     let answer = terminal_backend(session)
@@ -5187,7 +5194,10 @@ async fn panes(
         .await
         .map(backend::compat::pane_list)
         .map_err(backend_api_error)?;
-    Ok(Json(note_and_amend_panes(&state, &session_id, answer)))
+    // Same rule as the snapshot: observe and amend first, hash what that
+    // produced.
+    let answer = note_and_amend_panes(&state, &session_id, answer);
+    Ok(agent::routes::json_etag_response(&headers, answer))
 }
 
 async fn agents(
@@ -8720,7 +8730,7 @@ async fn pane_shortcuts(
     State(state): State<AppState>,
     Path((session_id, pane_id)): Path<(String, String)>,
     headers: HeaderMap,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Response> {
     require_device(&state, &headers)?;
     let session = find_session(&state.config, &session_id)?.clone();
     let pane = pane_get(&session, &pane_id).await?;
@@ -8745,7 +8755,10 @@ async fn pane_shortcuts(
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty());
 
-    Ok(Json(shortcuts::resolve(agent, title, cwd)))
+    Ok(agent::routes::json_etag_response(
+        &headers,
+        shortcuts::resolve(agent, title, cwd),
+    ))
 }
 
 /// Whether the pane is blocked on a permission menu, and what it is asking.

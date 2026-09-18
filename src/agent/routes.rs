@@ -605,7 +605,7 @@ async fn do_get_agent_session(
     state: &AppState,
     asid: &str,
     headers: &HeaderMap,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Response> {
     require_device(state, headers)?;
 
     let Some(manager) = state.agent_runtime.manager().await else {
@@ -622,7 +622,9 @@ async fn do_get_agent_session(
         .await
         .map_err(|e| api_error(StatusCode::NOT_FOUND, "session_not_found", &e.to_string()))?;
 
-    Ok(Json(content_envelope(json!(snapshot))))
+    // A session the reader is sitting on is polled and mostly unchanged; the
+    // whole snapshot is the expensive thing to send twice.
+    Ok(json_etag_response(headers, content_envelope(json!(snapshot))))
 }
 
 async fn do_get_agent_session_events(
@@ -1289,7 +1291,7 @@ async fn get_agent_session_global(
     State(state): State<AppState>,
     Path(asid): Path<String>,
     headers: HeaderMap,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Response> {
     do_get_agent_session(&state, &asid, &headers).await
 }
 
@@ -1439,7 +1441,7 @@ async fn get_agent_session_legacy(
     State(state): State<AppState>,
     Path((_session_id, asid)): Path<(String, String)>,
     headers: HeaderMap,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Response> {
     do_get_agent_session(&state, &asid, &headers).await
 }
 
