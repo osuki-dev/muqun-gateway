@@ -237,6 +237,14 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
             post(activate_agent_skill),
         )
         .route(
+            "/api/agent-sessions/{asid}/permissions/saved",
+            get(list_saved_agent_permissions),
+        )
+        .route(
+            "/api/agent-sessions/{asid}/permissions/saved/{saved_id}",
+            delete(forget_saved_agent_permission),
+        )
+        .route(
             "/api/agent-sessions/{asid}/compact",
             post(compact_agent_session),
         )
@@ -1536,6 +1544,88 @@ async fn clear_agent_session_revert(
         .await
         .map_err(engine_error)?;
     Ok(Json(content_envelope(json!({ "cleared": true }))))
+}
+
+/// The project a session belongs to.
+///
+/// Saved permissions are a project-wide list and the session is the only thing
+/// the app names, so this is the translation between the two. It is read from
+/// OpenCode rather than the mirror: forgetting a permission is a destructive
+/// act on the user's own configuration, and a stale project id would aim it at
+/// the wrong list.
+async fn session_project_id(
+    client: &super::adapters::opencode::OpencodeClient,
+    asid: &str,
+) -> ApiResult<String> {
+    let info = client.get_session(asid).await.map_err(engine_error)?;
+    let item = info.get("data").unwrap_or(&info);
+    item.get("projectID")
+        .and_then(Value::as_str)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                "agent_engine_error",
+                "the session reported no project",
+            )
+        })
+}
+
+/// The decisions the user has answered "always allow" to, for this session's
+/// project. `PermissionSaved.Info`, renamed into the gateway's snake_case.
+async fn list_saved_agent_permissions(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    let manager = manager_or_unavailable!(&state, &headers);
+    let client = manager.driver().client();
+    let project_id = session_project_id(client, &asid).await?;
+    let items = client
+        .list_saved_permissions(Some(&project_id))
+        .await
+        .map_err(engine_error)?;
+    let items: Vec<Value> = items
+        .iter()
+        .filter_map(super::adapters::opencode::mapper::map_saved_permission)
+        .collect();
+    Ok(Json(content_envelope(json!({ "items": items }))))
+}
+
+/// Forget one remembered decision, so the next time the agent asks.
+///
+/// OpenCode's own delete is global -- an id and nothing else. This route is
+/// scoped to a session, so the id is checked against that session's project
+/// first: a device holding one session must not be able to reach into another
+/// project's list through it. An id that is not in that list is `404`,
+/// which is also the answer for an id that was already deleted.
+async fn forget_saved_agent_permission(
+    State(state): State<AppState>,
+    Path((asid, saved_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    let manager = manager_or_unavailable!(&state, &headers);
+    let client = manager.driver().client();
+    let project_id = session_project_id(client, &asid).await?;
+    let known = client
+        .list_saved_permissions(Some(&project_id))
+        .await
+        .map_err(engine_error)?
+        .iter()
+        .any(|item| item.get("id").and_then(Value::as_str) == Some(saved_id.as_str()));
+    if !known {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            "saved_permission_not_found",
+            "no such saved permission in this session's project",
+        ));
+    }
+    client
+        .delete_saved_permission(&saved_id)
+        .await
+        .map_err(engine_error)?;
+    Ok(Json(content_envelope(json!({ "deleted": true }))))
 }
 
 /// Stage a rollback without applying it: the boundary moves, the files stay

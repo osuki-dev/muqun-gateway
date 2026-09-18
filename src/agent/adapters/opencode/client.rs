@@ -329,6 +329,25 @@ impl OpencodeClient {
         .await
     }
 
+    /// `GET /api/permission/saved`: the "always allow" decisions OpenCode has
+    /// remembered. Scoped to one project when a `projectID` is given; without
+    /// one OpenCode answers with every project's.
+    pub async fn list_saved_permissions(
+        &self,
+        project_id: Option<&str>,
+    ) -> Result<Vec<Value>, AgentEngineError> {
+        let res = self
+            .get("/api/permission/saved", &saved_permission_query(project_id))
+            .await?;
+        Ok(res.get("data").and_then(Value::as_array).cloned().unwrap_or_default())
+    }
+
+    /// `DELETE /api/permission/saved/{id}`: forget one remembered decision.
+    /// Answers `204`.
+    pub async fn delete_saved_permission(&self, id: &str) -> Result<Value, AgentEngineError> {
+        self.delete(&format!("/api/permission/saved/{id}")).await
+    }
+
     pub async fn reply_form(
         &self,
         session_id: &str,
@@ -719,6 +738,17 @@ pub(crate) fn location_query(directory: Option<&str>) -> Vec<(String, String)> {
 
 /// `Model.Ref` as v2 spells it: `{providerID, id, variant?}`, with `variant`
 /// omitted rather than sent as null.
+/// `projectID` scopes the saved-permission list to one project. Without it
+/// OpenCode answers with every project's, which is never what a route hanging
+/// off one session means.
+pub(crate) fn saved_permission_query(project_id: Option<&str>) -> Vec<(String, String)> {
+    project_id
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(|p| vec![("projectID".to_string(), p.to_string())])
+        .unwrap_or_default()
+}
+
 pub(crate) fn model_ref_json(model: &crate::agent::domain::ModelRef) -> Value {
     let mut obj = json!({
         "providerID": model.provider_id,
@@ -820,6 +850,23 @@ mod tests {
         assert!(url.contains("parentID=null"), "roots-only is a literal null: {url}");
         assert!(url.contains("search=gateway"), "got {url}");
         assert!(url.contains("cursor=abc"), "got {url}");
+    }
+
+    /// A saved-permission list that is not scoped is every project's, so the
+    /// parameter has to survive the trip.
+    #[test]
+    fn saved_permissions_are_scoped_to_one_project() {
+        let url = query_url(
+            "/api/permission/saved",
+            &saved_permission_query(Some("cb4a45a3")),
+        );
+        assert!(url.contains("projectID=cb4a45a3"), "got {url}");
+
+        assert!(saved_permission_query(None).is_empty());
+        assert!(
+            saved_permission_query(Some("  ")).is_empty(),
+            "a blank project is not a project"
+        );
     }
 
     #[test]

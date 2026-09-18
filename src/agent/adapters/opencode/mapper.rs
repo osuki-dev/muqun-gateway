@@ -798,6 +798,20 @@ pub fn map_part(val: &Value, _role: TimelineRole, asid: &AgentSessionId) -> Opti
     }
 }
 
+/// `PermissionSaved.Info {id, projectID, action, resource}`: one decision the
+/// user made "always" on, as OpenCode remembered it. Renamed into the
+/// gateway's snake_case like every other type the app reads; the id is what
+/// `DELETE …/permissions/saved/{id}` takes.
+pub fn map_saved_permission(val: &Value) -> Option<Value> {
+    let id = val.get("id").and_then(Value::as_str)?;
+    Some(serde_json::json!({
+        "id": id,
+        "project_id": val.get("projectID").and_then(Value::as_str).unwrap_or(""),
+        "action": val.get("action").and_then(Value::as_str).unwrap_or(""),
+        "resource": val.get("resource").and_then(Value::as_str).unwrap_or(""),
+    }))
+}
+
 pub fn map_permission_request(val: &Value, asid: &AgentSessionId) -> Option<PermissionRequest> {
     let id = val.get("id").and_then(Value::as_str)?;
     let action = val
@@ -1920,5 +1934,32 @@ mod catalog_tests {
         assert!(skills[1].autoinvoke);
         assert_eq!(skills[2].description, "", "a skill may have no description");
         assert!(!skills[2].slash && !skills[2].autoinvoke);
+    }
+
+    /// Saved permissions are what an "always allow" left behind, and the app
+    /// lists them so the user can take one back. They are renamed like every
+    /// other type it reads, `projectID` included.
+    #[test]
+    fn a_saved_permission_is_renamed_into_the_gateways_own_spelling() {
+        let mapped = map_saved_permission(&json!({
+            "id": "psv_1",
+            "projectID": "cb4a45a3",
+            "action": "bash",
+            "resource": "git status"
+        }))
+        .expect("an entry with an id maps");
+        assert_eq!(mapped["id"], "psv_1");
+        assert_eq!(mapped["project_id"], "cb4a45a3");
+        assert_eq!(mapped["action"], "bash");
+        assert_eq!(mapped["resource"], "git status");
+        assert!(
+            mapped.get("projectID").is_none(),
+            "the camelCase key does not survive"
+        );
+
+        assert!(
+            map_saved_permission(&json!({ "action": "bash" })).is_none(),
+            "an entry with no id is nothing the delete route could name"
+        );
     }
 }

@@ -20,7 +20,8 @@ verbatim, so their keys stay camelCase.
 - **Errors.** `{"error": {"code": "...", "message": "..."}}`. The codes used
   here are `agent_unavailable` (503, no engine attached),
   `agent_engine_error` (502, OpenCode refused), `session_not_found` (404),
-  `resync_required` (410), and the `invalid_*` family (400).
+  `saved_permission_not_found` (404), `resync_required` (410), and the
+  `invalid_*` family (400).
 - **`asid`** is the OpenCode session id (`ses_…`). The gateway does not mint
   ids of its own.
 - **Legacy paths.** Everything under `/api/agent-*` also exists under
@@ -365,6 +366,37 @@ Items are OpenCode's verbatim, i.e. camelCase:
 `message` is optional and is forwarded with the reply. Returns
 `{"replied": true}`. A `deny` rejects every pending request in the session,
 which is OpenCode's behaviour, not the gateway's.
+
+### `GET /api/agent-sessions/{asid}/permissions/saved`
+
+What an `allow_always` left behind — `PermissionSaved.Info`, scoped to this
+session's project:
+
+```json
+{ "items": [ { "id": "psv_1", "project_id": "cb4a45a3…",
+               "action": "bash", "resource": "git status" } ] }
+```
+
+`action` and `resource` are the pair the permission prompt showed as `save`.
+The list is a project's, not a session's — the session names the project, and
+the gateway reads `projectID` off it on every call rather than trusting a cached
+one. A session whose project OpenCode does not report is `502
+agent_engine_error`, not an unscoped list of everything.
+
+### `DELETE /api/agent-sessions/{asid}/permissions/saved/{id}`
+
+`{"deleted": true}` — the agent asks again next time. OpenCode answers `204`.
+
+`id` is checked against this session's project before anything is deleted: a
+device holding one session must not reach into another project's list through
+it. An id that is not there — including one already deleted — is
+
+```json
+{ "error": { "code": "saved_permission_not_found",
+             "message": "no such saved permission in this session's project" } }
+```
+
+with `404`.
 
 ### `POST /api/agent-sessions/{asid}/forms/{form_id}/reply`
 
@@ -786,7 +818,9 @@ Tagged by `type`.
 ```
 
 `save` is what an "always" would whitelist project-wide — show it next to the
-option. `source_tool_call_id` matches a tool row's `part.id`, so the prompt can
+option, and what the entry in
+[`GET …/permissions/saved`](#get-apiagent-sessionsasidpermissionssaved) is made
+of afterwards. `source_tool_call_id` matches a tool row's `part.id`, so the prompt can
 be attached to the exact card.
 
 ### `FormRequest`
