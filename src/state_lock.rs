@@ -308,10 +308,24 @@ mod tests {
         let _held = acquire_within(&dir, RELEASE_VISIBLE_WITHIN).unwrap();
 
         let error = StateLock::acquire(&dir).unwrap_err().to_string();
-        assert!(
-            error.contains(&format!("pid {}", std::process::id())),
-            "the refusal did not name the holding pid: {error}"
-        );
+        // Who the refusal names depends on where this test runs, because the
+        // holder is this very process. From a plain shell it is a pid. From a
+        // terminal the gateway itself spawned -- a developer working over
+        // Muqun, which is the normal way to work on Muqun -- the process sits
+        // in the gateway unit's cgroup, is correctly read as supervised, and
+        // is named by its unit with the systemctl commands instead. Both are
+        // "names the holder"; asserting only the first made the suite fail on
+        // the machine it is developed on.
+        match crate::supervision::managing_gateway_unit(std::process::id()) {
+            Some(unit) => assert!(
+                error.contains(&unit.unit) && error.contains(&unit.systemctl("stop")),
+                "the refusal did not name the supervising unit: {error}"
+            ),
+            None => assert!(
+                error.contains(&format!("pid {}", std::process::id())),
+                "the refusal did not name the holding pid: {error}"
+            ),
+        }
         assert!(
             error.contains(&dir.display().to_string()),
             "the refusal did not name the state directory: {error}"

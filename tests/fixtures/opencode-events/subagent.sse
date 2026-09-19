@@ -1,0 +1,9 @@
+data: {"id":"evt_s1","created":1789641100000,"type":"session.tool.input.started","location":{"directory":"/tmp/probe"},"data":{"sessionID":"ses_PARENT","assistantMessageID":"msg_0aeeaaaaa001SubAgentParent","id":"call_5608d01d31f24a9fbc901b46","name":"subagent"}}
+
+data: {"id":"evt_s2","created":1789641100100,"type":"session.tool.called","location":{"directory":"/tmp/probe"},"data":{"sessionID":"ses_PARENT","assistantMessageID":"msg_0aeeaaaaa001SubAgentParent","id":"call_5608d01d31f24a9fbc901b46","input":{"agent":"explore","description":"count files","prompt":"List the files in this directory and reply with just the count."},"executed":false}}
+
+data: {"id":"evt_s3","created":1789641100200,"type":"session.created","location":{"directory":"/tmp/probe"},"data":{"sessionID":"ses_CHILD","slug":"calm-sailor","version":"2.0.1","projectID":"p1","parentID":"ses_PARENT","location":{"directory":"/tmp/probe"},"subpath":"","title":"count files","agent":"explore","model":{"id":"glm-5.3-flash","providerID":"opencode","variant":"default"}}}
+
+data: {"id":"evt_s4","created":1789641100300,"type":"session.tool.progress","location":{"directory":"/tmp/probe"},"data":{"sessionID":"ses_PARENT","assistantMessageID":"msg_0aeeaaaaa001SubAgentParent","id":"call_5608d01d31f24a9fbc901b46","metadata":{"sessionID":"ses_CHILD","status":"running"}}}
+
+data: {"id":"evt_s5","created":1789641100900,"type":"session.tool.success","location":{"directory":"/tmp/probe"},"data":{"sessionID":"ses_PARENT","assistantMessageID":"msg_0aeeaaaaa001SubAgentParent","id":"call_5608d01d31f24a9fbc901b46","content":[{"type":"text","text":"<subagent sessionID=\"ses_CHILD\" state=\"completed\">\n2\n</subagent>"}],"metadata":{"sessionID":"ses_CHILD","status":"completed","truncated":false},"executed":false}}

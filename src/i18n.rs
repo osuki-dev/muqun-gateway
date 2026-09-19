@@ -61,6 +61,7 @@ pub enum Locale {
     Pt,
     Ru,
     Vi,
+    Th,
 }
 
 impl Locale {
@@ -83,6 +84,7 @@ impl Locale {
         Locale::Pt,
         Locale::Ru,
         Locale::Vi,
+        Locale::Th,
     ];
 
     /// The wire spelling. These strings are shared verbatim with the app and
@@ -100,6 +102,7 @@ impl Locale {
             Locale::Pt => "pt",
             Locale::Ru => "ru",
             Locale::Vi => "vi",
+            Locale::Th => "th",
         }
     }
 
@@ -120,6 +123,7 @@ impl Locale {
             Locale::Pt => PT,
             Locale::Ru => RU,
             Locale::Vi => VI,
+            Locale::Th => TH,
         }
     }
 
@@ -172,6 +176,7 @@ impl Locale {
             "pt" => Some(Locale::Pt),
             "ru" => Some(Locale::Ru),
             "vi" => Some(Locale::Vi),
+            "th" => Some(Locale::Th),
             _ => None,
         }
     }
@@ -2043,6 +2048,149 @@ const VI: &[(&str, &str)] = &[
     ("branch_name must not end with .lock", "branch_name không được kết thúc bằng .lock"),
 ];
 
+/// Thai.
+///
+/// Terms follow the app's own Thai catalog so one product does not speak
+/// two ways: `Gateway` stays untranslated, an agent is `เอเจนต์`, a device
+/// `อุปกรณ์`, a session `เซสชัน`, a token `โทเคน`. Parameter names a caller
+/// sent -- `direction`, `mode`, `format`, `branch_name` -- stay in Latin
+/// script, because they are the literal field the reader has to correct.
+const TH: &[(&str, &str)] = &[
+    ("Approve", "อนุมัติ"),
+    ("Approve and don't ask again", "อนุมัติและไม่ต้องถามอีก"),
+    ("Deny", "ปฏิเสธ"),
+    ("Option {index}", "ตัวเลือก {index}"),
+    ("Allow {action}?", "อนุญาต {action} หรือไม่"),
+    ("Agent", "เอเจนต์"),
+    ("Approval needed", "ต้องการการอนุมัติ"),
+    ("Agent blocked", "เอเจนต์กำลังรออยู่"),
+    ("Agent done", "เอเจนต์ทำงานเสร็จแล้ว"),
+    ("{name} is waiting for your approval.", "{name} กำลังรอการอนุมัติจากคุณ"),
+    ("{name} needs your input.", "{name} ต้องการข้อมูลจากคุณ"),
+    ("{name} finished running.", "{name} ทำงานเสร็จแล้ว"),
+    ("Muqun push notifications are connected.", "การแจ้งเตือนแบบพุชของ Muqun เชื่อมต่อแล้ว"),
+    ("Expo push service request failed", "คำขอไปยังบริการแจ้งเตือนแบบพุชของ Expo ล้มเหลว"),
+    ("Herdr did not return the created pane id", "Herdr ไม่ได้ส่ง id ของเพนที่สร้างขึ้นกลับมา"),
+    ("Herdr is unavailable", "เชื่อมต่อกับ Herdr ไม่ได้"),
+    (
+        "agent is not one this gateway offers; see GET /api/agents/catalog",
+        "Gateway นี้ไม่ได้ให้บริการเอเจนต์ดังกล่าว ดูที่ GET /api/agents/catalog",
+    ),
+    (
+        "another pairing request is awaiting confirmation",
+        "มีคำขอจับคู่อีกรายการกำลังรอการยืนยันอยู่",
+    ),
+    ("answer with an option number or a decision", "ตอบด้วยหมายเลขตัวเลือกหรือคำตัดสิน"),
+    ("asset not found in a session workspace", "ไม่พบไฟล์ในพื้นที่ทำงานของเซสชัน"),
+    (
+        "cwd must be a directory inside a workspace this session has open",
+        "cwd ต้องเป็นไดเรกทอรีภายในพื้นที่ทำงานที่เซสชันนี้เปิดอยู่",
+    ),
+    (
+        "decision must be allow, allow_always, or deny",
+        "decision ต้องเป็น allow, allow_always หรือ deny",
+    ),
+    ("device not found", "ไม่พบอุปกรณ์"),
+    (
+        "device_name must be at most 80 characters and contain no control characters",
+        "device_name ต้องมีความยาวไม่เกิน 80 ตัวอักษรและต้องไม่มีอักขระควบคุม",
+    ),
+    ("direction must be right or down", "direction ต้องเป็น right หรือ down"),
+    ("executables and scripts are not accepted", "ไม่รับไฟล์โปรแกรมและสคริปต์"),
+    ("expected Bearer token", "ต้องใช้โทเคนแบบ Bearer"),
+    (
+        "expected a multipart/form-data body with a file field",
+        "ต้องเป็นเนื้อหาแบบ multipart/form-data ที่มีฟิลด์ file",
+    ),
+    ("failed to check pairing request limit", "ตรวจสอบขีดจำกัดคำขอจับคู่ไม่สำเร็จ"),
+    ("failed to lock device state", "ล็อกสถานะอุปกรณ์ไม่สำเร็จ"),
+    ("failed to lock pending pairing state", "ล็อกสถานะการจับคู่ที่รออยู่ไม่สำเร็จ"),
+    ("failed to lock push token state", "ล็อกสถานะโทเคนแจ้งเตือนแบบพุชไม่สำเร็จ"),
+    ("failed to lock the asset index", "ล็อกดัชนีไฟล์ไม่สำเร็จ"),
+    ("failed to read recent agent activity", "อ่านกิจกรรมล่าสุดของเอเจนต์ไม่สำเร็จ"),
+    ("failed to read the asset", "อ่านไฟล์ไม่สำเร็จ"),
+    ("failed to remove push notification registration", "ลบการลงทะเบียนแจ้งเตือนแบบพุชไม่สำเร็จ"),
+    ("failed to revoke the device token", "เพิกถอนโทเคนของอุปกรณ์ไม่สำเร็จ"),
+    ("failed to save push notification registration", "บันทึกการลงทะเบียนแจ้งเตือนแบบพุชไม่สำเร็จ"),
+    ("failed to save the new device token", "บันทึกโทเคนใหม่ของอุปกรณ์ไม่สำเร็จ"),
+    ("failed to store the upload", "จัดเก็บไฟล์ที่อัปโหลดไม่สำเร็จ"),
+    ("format must be text or ansi", "format ต้องเป็น text หรือ ansi"),
+    ("invalid Authorization header", "ส่วนหัว Authorization ไม่ถูกต้อง"),
+    ("invalid pairing code", "รหัสจับคู่ไม่ถูกต้อง"),
+    ("invalid token", "โทเคนไม่ถูกต้อง"),
+    ("keys must contain 1 to 32 entries", "keys ต้องมี 1 ถึง 32 รายการ"),
+    ("missing Authorization header", "ไม่มีส่วนหัว Authorization"),
+    ("mode must be on, off, or toggle", "mode ต้องเป็น on, off หรือ toggle"),
+    ("no pending pairing request", "ไม่มีคำขอจับคู่ที่รออยู่"),
+    (
+        "only png, jpeg, gif, webp, and heic images are accepted",
+        "รับเฉพาะรูปภาพแบบ png, jpeg, gif, webp และ heic เท่านั้น",
+    ),
+    ("pairing code expired; request a new code", "รหัสจับคู่หมดอายุแล้ว กรุณาขอรหัสใหม่"),
+    ("platform must be ios or android", "platform ต้องเป็น ios หรือ android"),
+    (
+        "repo_path is not a git checkout, so a branch cannot be made in it",
+        "repo_path ไม่ใช่ที่เก็บโค้ดของ git จึงสร้างสาขาในนั้นไม่ได้",
+    ),
+    (
+        "repo_path must be a directory inside a workspace this session has open",
+        "repo_path ต้องเป็นไดเรกทอรีภายในพื้นที่ทำงานที่เซสชันนี้เปิดอยู่",
+    ),
+    (
+        "request_id must be 1-80 chars using letters, digits, dot, underscore, or hyphen",
+        "request_id ต้องมีความยาว 1-80 ตัวอักษร ประกอบด้วยตัวอักษร ตัวเลข จุด ขีดล่าง หรือขีดกลาง",
+    ),
+    ("session not found", "ไม่พบเซสชัน"),
+    (
+        "source must be visible, recent, recent-unwrapped, or detection",
+        "source ต้องเป็น visible, recent, recent-unwrapped หรือ detection",
+    ),
+    (
+        "startup_timeout_ms must be between 3001 and 300000",
+        "startup_timeout_ms ต้องอยู่ระหว่าง 3001 ถึง 300000",
+    ),
+    ("text must be at most 65536 bytes", "text ต้องมีขนาดไม่เกิน 65536 ไบต์"),
+    ("that tab has no pane to split", "แท็บนี้ไม่มีเพนให้แบ่ง"),
+    ("the agent no longer has that request pending", "เอเจนต์ไม่มีคำขอดังกล่าวค้างอยู่แล้ว"),
+    ("the asset is larger than 10 MiB", "ไฟล์มีขนาดเกิน 10 MiB"),
+    ("the file field is empty", "ฟิลด์ file ว่างเปล่า"),
+    ("the file field must carry a filename", "ฟิลด์ file ต้องมีชื่อไฟล์"),
+    ("the pane is not waiting on an approval", "เพนนี้ไม่ได้กำลังรอการอนุมัติ"),
+    ("the pane is waiting on a different approval", "เพนนี้กำลังรอการอนุมัติรายการอื่น"),
+    ("the upload must be at most 25 MiB", "ไฟล์ที่อัปโหลดต้องมีขนาดไม่เกิน 25 MiB"),
+    (
+        "this approval has no option with that number",
+        "การอนุมัติรายการนี้ไม่มีตัวเลือกหมายเลขดังกล่าว",
+    ),
+    (
+        "this approval offers no option with that meaning",
+        "การอนุมัติรายการนี้ไม่มีตัวเลือกที่มีความหมายดังกล่าว",
+    ),
+    ("token must be an Expo push token", "โทเคนต้องเป็นโทเคนแจ้งเตือนแบบพุชของ Expo"),
+    ("too many pairing requests; try again later", "มีคำขอจับคู่มากเกินไป กรุณาลองใหม่ภายหลัง"),
+    (
+        "transport encryption is disabled on this gateway; scan its current QR code",
+        "Gateway นี้ปิดการเข้ารหัสการรับส่งข้อมูลอยู่ กรุณาสแกนคิวอาร์โค้ดปัจจุบันของเครื่อง",
+    ),
+    (
+        "workspace_label must be at most 120 printable characters",
+        "workspace_label ต้องเป็นอักขระที่พิมพ์ได้และมีความยาวไม่เกิน 120 ตัวอักษร",
+    ),
+    ("branch_name must not be empty", "branch_name ต้องไม่ว่างเปล่า"),
+    ("branch_name must be at most 200 characters", "branch_name ต้องมีความยาวไม่เกิน 200 ตัวอักษร"),
+    (
+        "branch_name may only contain letters, digits, dot, underscore, dash and slash",
+        "branch_name ใช้ได้เฉพาะตัวอักษร ตัวเลข จุด ขีดล่าง ขีดกลาง และทับเท่านั้น",
+    ),
+    ("branch_name must not contain ..", "branch_name ต้องไม่มี .."),
+    ("branch_name must not start with a dash", "branch_name ต้องไม่ขึ้นต้นด้วยเครื่องหมายขีด"),
+    (
+        "branch_name must not have an empty path segment or a segment starting or ending with a dot",
+        "branch_name ต้องไม่มีส่วนของเส้นทางที่ว่างเปล่า หรือส่วนที่ขึ้นต้นหรือลงท้ายด้วยจุด",
+    ),
+    ("branch_name must not end with .lock", "branch_name ต้องไม่ลงท้ายด้วย .lock"),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2060,7 +2208,7 @@ mod tests {
     }
 
     #[test]
-    fn the_eleven_codes_are_the_literals_the_app_and_the_site_already_use() {
+    fn the_twelve_codes_are_the_literals_the_app_and_the_site_already_use() {
         // Not `zh-Hant`, not `zh-Hant-TW`, not `zh_TW`, not `zh-Hans` and not
         // `pt-BR`. The app names its catalog directories and persists its
         // setting with these exact strings, so a change here silently
@@ -2068,7 +2216,7 @@ mod tests {
         let codes: Vec<&str> = Locale::ALL.iter().map(|locale| locale.as_str()).collect();
         assert_eq!(
             codes,
-            ["en", "zh-TW", "zh-CN", "ja", "ko", "de", "fr", "es", "pt", "ru", "vi"]
+            ["en", "zh-TW", "zh-CN", "ja", "ko", "de", "fr", "es", "pt", "ru", "vi", "th"]
         );
         assert_eq!(Locale::default(), Locale::En);
     }
@@ -2298,20 +2446,23 @@ mod tests {
             ("ru", Locale::Ru),
             ("vi-VN", Locale::Vi),
             ("vi", Locale::Vi),
+            ("th-TH", Locale::Th),
+            ("th", Locale::Th),
+            ("TH", Locale::Th),
         ] {
             assert_eq!(Locale::from_code(tag), Some(expected), "{tag}");
         }
         // On the website but not here, which is the interesting negative: a
         // code existing somewhere in the product is not a table existing in it.
-        // `ru` used to be on this list and stopped being a negative the day
-        // Russian became a language we have.
-        for tag in ["it", "it-IT", "ar", "nl-NL", "uk", "gl", "ca", "th"] {
+        // `ru` used to be on this list, and `th` after it -- each stopped being
+        // a negative the day that language became one we have.
+        for tag in ["it", "it-IT", "ar", "nl-NL", "uk", "gl", "ca"] {
             assert_eq!(Locale::from_code(tag), None, "{tag}");
         }
     }
 
     #[test]
-    fn a_weighted_accept_language_still_picks_among_eleven() {
+    fn a_weighted_accept_language_still_picks_among_twelve() {
         // A browser in Quebec, ranking French above English.
         assert_eq!(
             Locale::from_headers(&headers(&[("accept-language", "fr-CA,fr;q=0.9,en;q=0.8")])),
@@ -2352,6 +2503,10 @@ mod tests {
         assert_eq!(t(Locale::De, "Deny"), "Ablehnen");
         assert_eq!(t(Locale::Ru, "Deny"), "Отклонить");
         assert_eq!(t(Locale::Vi, "Deny"), "Từ chối");
+        // Taken verbatim from the app's own Thai catalog, so one product does
+        // not answer the same word two ways.
+        assert_eq!(t(Locale::Th, "Deny"), "ปฏิเสธ");
+        assert_eq!(t(Locale::Th, "Agent"), "เอเจนต์");
         // The failure mode a half-finished catalog should have: English, not a
         // blank and not a panic. Asserted for every language, because "we will
         // add the entry later" is a thing that happens in all of them.

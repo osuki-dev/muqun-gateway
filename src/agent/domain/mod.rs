@@ -1,0 +1,359 @@
+pub mod events;
+pub mod form;
+pub mod model;
+pub mod permission;
+pub mod session;
+pub mod timeline;
+
+pub use events::AgentDomainEvent;
+pub use form::{FormField, FormOption, FormRequest, FormWhen};
+pub use model::{
+    AgentCatalog, AgentInfo, CatalogDefaults, CommandInfo, McpServerInfo, ModelInfo,
+    ModelVariantInfo, ProviderInfo, ProviderModelInfo, SkillInfo,
+};
+pub use permission::{PermissionDecision, PermissionOption, PermissionRequest};
+pub use session::{
+    AgentErrorInfo, AgentProject, AgentSessionId, AgentSessionInfo, AgentSessionStatus, ModelRef,
+    RevertState, SessionForkInfo, SessionQuery, SessionRevertInfo, TokensUsage,
+    WorktreeState,
+};
+pub use timeline::{
+    part_item_id, push_input_partial, reasoning_item_id, text_item_id, tool_item_id, AgentPart,
+    CompactionStatus, TimelineItem, TimelineRole, TodoItem, ToolCall, ToolCallStatus, ToolTime,
+    MAX_TOOL_INPUT_PARTIAL_BYTES,
+};
+
+
+#[cfg(test)]
+mod contract_tests {
+    //! The field names `docs/agent-api.md` promises the app team. A rename
+    //! that does not also update the document fails here.
+    use super::*;
+    use serde_json::{json, Value};
+
+    fn keys(value: &Value) -> Vec<String> {
+        value
+            .as_object()
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn session_info_keys_match_the_contract() {
+        let info = AgentSessionInfo {
+            asid: AgentSessionId("ses_1".into()),
+            backend_session_id: "ses_1".into(),
+            title: "t".into(),
+            agent: Some("build".into()),
+            model: Some(ModelRef {
+                provider_id: "opencode".into(),
+                model_id: "m".into(),
+                variant: None,
+            }),
+            status: AgentSessionStatus::Busy,
+            directory: Some("/d".into()),
+            cost: Some(0.5),
+            tokens: Some(TokensUsage::default()),
+            limit: None,
+            parent_id: Some("ses_0".into()),
+            project_id: Some("p".into()),
+            outcome: Some("succeeded".into()),
+            error: None,
+            revert: Some(SessionRevertInfo {
+                message_id: "msg_1".into(),
+                part_id: None,
+                snapshot: None,
+                files: None,
+            }),
+            fork: None,
+            time_idle: Some(2),
+            time_viewed: Some(1),
+            deleted: false,
+            updated_ms: 3,
+        };
+        let value = serde_json::to_value(&info).expect("serializes");
+        for key in [
+            "asid",
+            "title",
+            "agent",
+            "model",
+            "status",
+            "directory",
+            "parent_id",
+            "project_id",
+            "outcome",
+            "revert",
+            "time_idle",
+            "time_viewed",
+            "updated_ms",
+        ] {
+            assert!(keys(&value).contains(&key.to_string()), "missing {key}");
+        }
+        assert_eq!(value["status"], "busy");
+        assert_eq!(value["asid"], "ses_1", "the session id is a bare string");
+        assert_eq!(value["model"]["provider_id"], "opencode");
+        assert_eq!(value["revert"]["message_id"], "msg_1");
+        assert!(
+            !keys(&value).contains(&"deleted".to_string()),
+            "`deleted` is omitted unless the session is gone"
+        );
+    }
+
+    /// `agent.revert.changed` as the app reads it: the event name is the
+    /// payload's own `type`, `state` is one of three words, and `revert` is a
+    /// field that is always there -- `null` rather than absent when nothing is
+    /// staged, so a client can clear its own copy on the same key it set it.
+    #[test]
+    fn the_revert_event_names_its_state_and_always_carries_the_revert_key() {
+        let staged = AgentDomainEvent::RevertChanged {
+            asid: AgentSessionId("ses_1".into()),
+            state: RevertState::Staged,
+            revert: Some(SessionRevertInfo {
+                message_id: "msg_1".into(),
+                part_id: None,
+                snapshot: None,
+                files: Some(json!([{ "file": "a.ts", "patch": "@@", "additions": 1,
+                                     "deletions": 0, "status": "modified" }])),
+            }),
+            seq: 7,
+        };
+        assert_eq!(staged.event_name(), "agent.revert.changed");
+        assert_eq!(staged.seq(), 7);
+        let value = serde_json::to_value(&staged).expect("serializes");
+        assert_eq!(value["type"], "agent.revert.changed");
+        assert_eq!(value["asid"], "ses_1");
+        assert_eq!(value["state"], "staged");
+        assert_eq!(value["revert"]["message_id"], "msg_1");
+        assert_eq!(value["revert"]["files"][0]["file"], "a.ts");
+
+        for (state, word) in [
+            (RevertState::Committed, "committed"),
+            (RevertState::Cleared, "cleared"),
+        ] {
+            let event = AgentDomainEvent::RevertChanged {
+                asid: AgentSessionId("ses_1".into()),
+                state,
+                revert: None,
+                seq: 8,
+            };
+            let value = serde_json::to_value(&event).expect("serializes");
+            assert_eq!(value["state"], word);
+            assert!(
+                keys(&value).contains(&"revert".to_string()),
+                "`revert` is present and null, not missing"
+            );
+            assert!(value["revert"].is_null());
+        }
+    }
+
+    #[test]
+    fn a_tool_part_keeps_both_state_and_status() {
+        let part = AgentPart::Tool(ToolCall {
+            id: "call_1".into(),
+            name: "glob".into(),
+            title: Some("**/*".into()),
+            input: json!({ "pattern": "**/*" }),
+            output: Some(json!("a.rs")),
+            content: Some(json!([{ "type": "text", "text": "a.rs" }])),
+            metadata: Some(json!({ "sessionID": "ses_c", "truncated": false })),
+            state: ToolCallStatus::Completed,
+            status: ToolCallStatus::Completed,
+            error: None,
+            child_session_id: Some("ses_c".into()),
+            background: true,
+            input_partial: None,
+            truncated: false,
+            time: ToolTime {
+                created: Some(1),
+                ran: Some(2),
+                completed: Some(3),
+            },
+        });
+        let value = serde_json::to_value(&part).expect("serializes");
+        assert_eq!(value["type"], "tool");
+        assert_eq!(value["state"], "completed");
+        assert_eq!(value["status"], "completed", "the legacy name carries the same value");
+        assert_eq!(value["child_session_id"], "ses_c");
+        assert_eq!(value["background"], true);
+        assert_eq!(value["metadata"]["sessionID"], "ses_c", "metadata is verbatim");
+        assert_eq!(value["time"]["ran"], 2);
+        assert!(
+            !keys(&value).contains(&"truncated".to_string()),
+            "`truncated` is omitted while false"
+        );
+        assert!(
+            !keys(&value).contains(&"input_partial".to_string()),
+            "`input_partial` is a streaming preview and is absent once there is a real input"
+        );
+    }
+
+    /// `backend_session_id` only earns its place when it says something
+    /// `asid` does not. On OpenCode it never does -- it was the same string
+    /// repeated once per row, 1.6 kB of every 21.5 kB list.
+    #[test]
+    fn a_backend_session_id_that_only_repeats_the_asid_is_left_off() {
+        let mut info = AgentSessionInfo {
+            asid: AgentSessionId("ses_1".into()),
+            backend_session_id: String::new(),
+            title: "t".into(),
+            agent: None,
+            model: None,
+            status: AgentSessionStatus::Idle,
+            directory: None,
+            cost: None,
+            tokens: None,
+            limit: None,
+            parent_id: None,
+            project_id: None,
+            outcome: None,
+            error: None,
+            revert: None,
+            fork: None,
+            time_idle: None,
+            time_viewed: None,
+            deleted: false,
+            updated_ms: 3,
+        };
+        let value = serde_json::to_value(&info).expect("serializes");
+        assert!(
+            !keys(&value).contains(&"backend_session_id".to_string()),
+            "absent means `asid`, which is the rule that was already true"
+        );
+        assert_eq!(value["asid"], "ses_1");
+
+        // An engine that really does key sessions differently still says so.
+        info.backend_session_id = "engine-42".into();
+        let value = serde_json::to_value(&info).expect("serializes");
+        assert_eq!(value["backend_session_id"], "engine-42");
+    }
+
+    /// The streaming preview is a string on the tool part, and it is bounded:
+    /// a tool argument can be a whole file, and the mirror holds every card.
+    #[test]
+    fn a_streaming_tool_input_is_previewed_and_bounded() {
+        let mut buffer = String::new();
+        push_input_partial(&mut buffer, "{\"command\":\"echo ");
+        push_input_partial(&mut buffer, "hello\"}");
+        assert_eq!(buffer, "{\"command\":\"echo hello\"}");
+
+        let mut buffer = String::new();
+        push_input_partial(&mut buffer, &"x".repeat(MAX_TOOL_INPUT_PARTIAL_BYTES + 500));
+        assert_eq!(buffer.len(), MAX_TOOL_INPUT_PARTIAL_BYTES);
+        push_input_partial(&mut buffer, "more");
+        assert_eq!(buffer.len(), MAX_TOOL_INPUT_PARTIAL_BYTES, "the cap holds");
+
+        // A chunk cut by the cap is cut at a character, not inside one.
+        let mut buffer = "y".repeat(MAX_TOOL_INPUT_PARTIAL_BYTES - 1);
+        push_input_partial(&mut buffer, "\u{00e9}");
+        assert_eq!(
+            buffer.len(),
+            MAX_TOOL_INPUT_PARTIAL_BYTES - 1,
+            "a two-byte character with one byte of room is left out whole"
+        );
+
+        let part = AgentPart::Tool(ToolCall {
+            id: "call_1".into(),
+            name: "shell".into(),
+            title: None,
+            input: Value::Null,
+            output: None,
+            content: None,
+            metadata: None,
+            state: ToolCallStatus::Streaming,
+            status: ToolCallStatus::Streaming,
+            error: None,
+            child_session_id: None,
+            background: false,
+            input_partial: Some("{\"command\":\"echo ".into()),
+            truncated: false,
+            time: ToolTime::default(),
+        });
+        let value = serde_json::to_value(&part).expect("serializes");
+        assert_eq!(value["state"], "streaming");
+        assert_eq!(value["input_partial"], "{\"command\":\"echo ");
+    }
+
+    #[test]
+    fn the_error_tool_state_is_accepted_as_an_alias_for_failed() {
+        let from_failed: ToolCallStatus = serde_json::from_value(json!("failed")).expect("failed");
+        let from_error: ToolCallStatus = serde_json::from_value(json!("error")).expect("error");
+        assert_eq!(from_failed, ToolCallStatus::Failed);
+        assert_eq!(from_error, ToolCallStatus::Failed);
+        assert_eq!(
+            serde_json::to_value(ToolCallStatus::Failed).expect("serializes"),
+            json!("failed")
+        );
+    }
+
+    #[test]
+    fn event_names_match_their_serialized_type() {
+        let asid = AgentSessionId("ses_1".into());
+        let events = vec![
+            AgentDomainEvent::StatusChanged {
+                asid: asid.clone(),
+                status: AgentSessionStatus::Interrupted,
+                error: None,
+                seq: 1,
+            },
+            AgentDomainEvent::CompactionChanged {
+                asid: asid.clone(),
+                status: CompactionStatus::Started,
+                reason: Some("manual".into()),
+                delta: None,
+                seq: 2,
+            },
+            AgentDomainEvent::InboxChanged {
+                asid: asid.clone(),
+                items: vec![],
+                seq: 3,
+            },
+            AgentDomainEvent::RevertChanged {
+                asid: asid.clone(),
+                state: RevertState::Cleared,
+                revert: None,
+                seq: 4,
+            },
+            AgentDomainEvent::Resync {
+                asid,
+                reason: "event_backlog_overflow".into(),
+            },
+        ];
+        for event in &events {
+            let value = serde_json::to_value(event).expect("serializes");
+            assert_eq!(
+                value["type"], event.event_name(),
+                "the SSE event name and the payload's own type must agree"
+            );
+        }
+
+        let compaction = serde_json::to_value(&events[1]).expect("serializes");
+        assert_eq!(
+            compaction["session_id"], "ses_1",
+            "the compaction and inbox events name the session `session_id`"
+        );
+        let status = serde_json::to_value(&events[0]).expect("serializes");
+        assert_eq!(status["status"], "interrupted");
+    }
+
+    #[test]
+    fn a_permission_request_exposes_save_and_its_source() {
+        let request = PermissionRequest {
+            id: "per_1".into(),
+            asid: AgentSessionId("ses_1".into()),
+            action: "shell".into(),
+            resources: vec!["ls".into()],
+            save: vec!["ls *".into()],
+            prompt: "p".into(),
+            tool: None,
+            source_message_id: Some("msg_1".into()),
+            source_tool_call_id: Some("call_1".into()),
+            metadata: None,
+            message: None,
+            options: vec![],
+        };
+        let value = serde_json::to_value(&request).expect("serializes");
+        assert_eq!(value["save"][0], "ls *");
+        assert_eq!(value["source_tool_call_id"], "call_1");
+        assert_eq!(value["source_message_id"], "msg_1");
+    }
+}
