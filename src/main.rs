@@ -8525,11 +8525,46 @@ async fn pane_fenced_cwd(
     session: &SessionConfig,
     pane_id: &str,
 ) -> Option<PathBuf> {
+    // The pane's own directory, read from the pane list, and only then the
+    // fence. It used to be looked up in the asset roots by pane id -- but the
+    // roots are one entry per *directory*, carrying the id of the first pane
+    // found there. Every other pane in the same checkout matched nothing and
+    // was told it was not in a repository: four panes in one repo, one answer
+    // and three `repo: null`, while the pane-context badge (which asks by
+    // directory) went on counting changes for all four.
+    let listed = terminal_backend(session)
+        .list_panes()
+        .await
+        .map(backend::compat::pane_list)
+        .ok()
+        .and_then(|response| pane_cwd_in_list(&response, pane_id));
+    if let Some(path) = listed {
+        return std::fs::canonicalize(&path).ok();
+    }
+    // A backend that could not list its panes just now: what was known before.
     let roots = session_asset_roots(state, session, None).await;
     roots
         .iter()
         .find(|root| root.pane_id.as_deref() == Some(pane_id))
         .and_then(|root| std::fs::canonicalize(&root.path).ok())
+}
+
+/// The directory one pane runs in, when it is inside the fence.
+///
+/// The same two fields and the same fence as `pane_list_roots`, without its
+/// de-duplication: that list answers "which directories are worth scanning",
+/// this answers "where is *this* pane".
+fn pane_cwd_in_list(response: &Value, pane_id: &str) -> Option<PathBuf> {
+    let panes = response.pointer("/result/panes").and_then(Value::as_array)?;
+    let pane = panes
+        .iter()
+        .find(|pane| pane.get("pane_id").and_then(Value::as_str) == Some(pane_id))?;
+    let cwd = pane
+        .get("cwd")
+        .and_then(Value::as_str)
+        .or_else(|| pane.get("foreground_cwd").and_then(Value::as_str))?;
+    let path = PathBuf::from(cwd);
+    is_scannable_root(&path).then_some(path)
 }
 
 /// The checkout a fenced directory belongs to, when that checkout is itself
@@ -13573,6 +13608,25 @@ const DOCS_HTML: &str = r#"<!doctype html>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_pane_in_one_checkout_resolves_to_its_directory() {
+        // Two panes in the same directory. The asset roots keep one entry for
+        // it, under the first pane's id; the second pane must still be found.
+        let list = json!({ "result": { "panes": [
+            { "pane_id": "w1:p1", "cwd": "/work/team/app" },
+            { "pane_id": "w1:p2", "cwd": "/work/team/app" },
+            { "pane_id": "w1:p3", "foreground_cwd": "/work/team/api" },
+            { "pane_id": "w1:p4", "cwd": "/" },
+        ] } });
+        assert_eq!(pane_list_roots("s", &list).len(), 2);
+        assert_eq!(pane_cwd_in_list(&list, "w1:p1"), Some(PathBuf::from("/work/team/app")));
+        assert_eq!(pane_cwd_in_list(&list, "w1:p2"), Some(PathBuf::from("/work/team/app")));
+        assert_eq!(pane_cwd_in_list(&list, "w1:p3"), Some(PathBuf::from("/work/team/api")));
+        // Outside the fence, and unknown: no directory, so no git is run.
+        assert_eq!(pane_cwd_in_list(&list, "w1:p4"), None);
+        assert_eq!(pane_cwd_in_list(&list, "w9:p9"), None);
+    }
+
     use super::*;
     use axum::http::HeaderValue;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
