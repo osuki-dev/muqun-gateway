@@ -222,9 +222,7 @@ impl MemoryMirror {
             sessions.insert(asid.clone(), fresh);
             Self::evict(sessions);
         }
-        sessions
-            .get_mut(asid)
-            .expect("session was just inserted")
+        sessions.get_mut(asid).expect("session was just inserted")
     }
 
     /// True when the cached `info` for this session is still the local
@@ -343,7 +341,10 @@ impl MemoryMirror {
 
     pub async fn inbox(&self, asid: &AgentSessionId) -> Vec<serde_json::Value> {
         let sessions = self.sessions.read().await;
-        sessions.get(asid).map(|s| s.inbox.clone()).unwrap_or_default()
+        sessions
+            .get(asid)
+            .map(|s| s.inbox.clone())
+            .unwrap_or_default()
     }
 
     /// Record an inbox item the stream announced, without a round trip.
@@ -473,8 +474,16 @@ impl MemoryMirror {
         delta: &str,
         is_reasoning: bool,
     ) -> Option<u64> {
-        self.write_text(asid, item_id, message_id, ordinal, delta, is_reasoning, true)
-            .await
+        self.write_text(
+            asid,
+            item_id,
+            message_id,
+            ordinal,
+            delta,
+            is_reasoning,
+            true,
+        )
+        .await
     }
 
     pub async fn set_text_content(
@@ -486,8 +495,16 @@ impl MemoryMirror {
         full_text: &str,
         is_reasoning: bool,
     ) -> Option<u64> {
-        self.write_text(asid, item_id, message_id, ordinal, full_text, is_reasoning, false)
-            .await
+        self.write_text(
+            asid,
+            item_id,
+            message_id,
+            ordinal,
+            full_text,
+            is_reasoning,
+            false,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -750,10 +767,7 @@ impl MemoryMirror {
     ) {
         let mut sessions = self.sessions.write().await;
         let state = Self::entry(&mut sessions, asid, AgentSessionStatus::Idle);
-        state.permissions = permissions
-            .into_iter()
-            .map(|p| (p.id.clone(), p))
-            .collect();
+        state.permissions = permissions.into_iter().map(|p| (p.id.clone(), p)).collect();
         state.forms = forms.into_iter().map(|f| (f.id.clone(), f)).collect();
     }
 
@@ -835,7 +849,23 @@ impl ToolPatch {
             call.metadata = Some(metadata.clone());
         }
         if let Some(state) = self.state {
-            call.set_state(state);
+            // A finished call stays finished. `session.tool.progress` and
+            // `session.tool.called` both say "running", and OpenCode does not
+            // promise they reach us before that call's `success`: when a model
+            // fires several tools at once -- nine parallel `read`s -- a late
+            // progress event for one of them arrives after it has completed,
+            // and nothing ever follows it. The mirror then held a completed
+            // call as `running` for the rest of the session, and the app drew
+            // a spinner beside a file that had been read minutes ago. A
+            // terminal state is only replaced by another terminal state.
+            let finished = matches!(
+                call.state,
+                ToolCallStatus::Completed | ToolCallStatus::Failed
+            );
+            let finishes = matches!(state, ToolCallStatus::Completed | ToolCallStatus::Failed);
+            if !finished || finishes {
+                call.set_state(state);
+            }
         }
         if let Some(ref error) = self.error {
             call.error = Some(error.clone());
@@ -851,7 +881,10 @@ impl ToolPatch {
 }
 
 impl SessionMirrorPort for MemoryMirror {
-    fn get_snapshot<'a>(&'a self, asid: &'a AgentSessionId) -> MirrorFuture<'a, Option<AgentSessionSnapshot>> {
+    fn get_snapshot<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+    ) -> MirrorFuture<'a, Option<AgentSessionSnapshot>> {
         Box::pin(async move {
             let sessions = self.sessions.read().await;
             let state = sessions.get(asid)?;
@@ -911,7 +944,10 @@ impl SessionMirrorPort for MemoryMirror {
             let live_status = state.info.status;
             let mut merged = info.clone();
             if merged.status == AgentSessionStatus::Idle
-                && matches!(live_status, AgentSessionStatus::Busy | AgentSessionStatus::Retry)
+                && matches!(
+                    live_status,
+                    AgentSessionStatus::Busy | AgentSessionStatus::Retry
+                )
             {
                 merged.status = live_status;
             }
@@ -967,13 +1003,11 @@ impl SessionMirrorPort for MemoryMirror {
             // seen used to be dropped on the floor and answered with `seq: 0`.
             let state = Self::entry(&mut sessions, &asid, AgentSessionStatus::Busy);
             let seq = state.next_seq();
-            state.permissions.insert(request.id.clone(), request.clone());
+            state
+                .permissions
+                .insert(request.id.clone(), request.clone());
 
-            let event = AgentDomainEvent::PermissionPending {
-                asid,
-                request,
-                seq,
-            };
+            let event = AgentDomainEvent::PermissionPending { asid, request, seq };
             state.push_event(event);
             seq
         })
@@ -1008,11 +1042,7 @@ impl SessionMirrorPort for MemoryMirror {
             let seq = state.next_seq();
             state.forms.insert(request.id.clone(), request.clone());
 
-            let event = AgentDomainEvent::FormPending {
-                asid,
-                request,
-                seq,
-            };
+            let event = AgentDomainEvent::FormPending { asid, request, seq };
             state.push_event(event);
             seq
         })
@@ -1076,7 +1106,10 @@ mod tests {
         let seq1 = mirror.update_session(info(&asid, "Test Session")).await;
         assert_eq!(seq1, 1);
 
-        let snap = mirror.get_snapshot(&asid).await.expect("snapshot should exist");
+        let snap = mirror
+            .get_snapshot(&asid)
+            .await
+            .expect("snapshot should exist");
         assert_eq!(snap.info.title, "Test Session");
         assert_eq!(snap.timeline.len(), 0);
 
@@ -1209,7 +1242,67 @@ mod tests {
         assert_eq!(call.title.as_deref(), Some("**/*.rs"));
         assert_eq!(call.state, ToolCallStatus::Completed);
         assert_eq!(call.status, ToolCallStatus::Completed);
-        assert_eq!(call.output.as_ref().and_then(|v| v.as_str()), Some("a.rs\nb.rs"));
+        assert_eq!(
+            call.output.as_ref().and_then(|v| v.as_str()),
+            Some("a.rs\nb.rs")
+        );
+    }
+
+    #[tokio::test]
+    async fn late_tool_events_preserve_finished_state_in_events_and_snapshot() {
+        for terminal in [ToolCallStatus::Completed, ToolCallStatus::Failed] {
+            let mirror = MemoryMirror::new();
+            let asid = AgentSessionId("ses-late-tool".to_string());
+            mirror.update_session(info(&asid, "Late tool events")).await;
+            mirror
+                .upsert_tool_call(
+                    &asid,
+                    "msg-1",
+                    "call-1",
+                    ToolPatch {
+                        name: Some("read".to_string()),
+                        state: Some(terminal),
+                        output: Some(serde_json::json!("result")),
+                        completed_ms: Some(200),
+                        ..ToolPatch::default()
+                    },
+                )
+                .await
+                .unwrap();
+            for stale in [
+                ToolCallStatus::Pending,
+                ToolCallStatus::Streaming,
+                ToolCallStatus::Running,
+            ] {
+                let (_, item) = mirror
+                    .upsert_tool_call(
+                        &asid,
+                        "msg-1",
+                        "call-1",
+                        ToolPatch {
+                            state: Some(stale),
+                            metadata: Some(serde_json::json!({"count": 4})),
+                            ..ToolPatch::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let AgentPart::Tool(call) = item.part else {
+                    panic!("expected tool")
+                };
+                assert_eq!(call.state, terminal);
+                assert_eq!(call.status, terminal);
+                assert_eq!(call.output, Some(serde_json::json!("result")));
+                assert_eq!(call.time.completed, Some(200));
+                assert_eq!(call.metadata, Some(serde_json::json!({"count": 4})));
+            }
+            let snapshot = mirror.get_snapshot(&asid).await.unwrap();
+            let AgentPart::Tool(call) = &snapshot.timeline[0].part else {
+                panic!("expected tool")
+            };
+            assert_eq!(call.state, terminal);
+            assert_eq!(call.status, terminal);
+        }
     }
 
     #[tokio::test]
