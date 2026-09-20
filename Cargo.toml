@@ -13,7 +13,10 @@ categories = ["command-line-utilities"]
 anyhow = "1.0.103"
 aes-gcm = "0.10.3"
 async-stream = "0.3.6"
-axum = { version = "0.8.9", features = ["multipart"] }
+axum = { version = "0.8.9", features = ["multipart", "http2"] }
+# Response compression. Already in the tree through reqwest; named here
+# so the compression features are actually on.
+tower-http = { version = "0.6.11", features = ["compression-gzip", "compression-br"] }
 base64 = "0.22.1"
 clap = { version = "4.6.2", features = ["derive"] }
 crossterm = "0.29.0"
@@ -28,12 +31,17 @@ libc = "0.2.178"
 # largest attack surface in this dependency tree -- for a renderer this gateway
 # never calls. The QR code is rendered to unicode half-blocks by the core crate.
 qrcode = { version = "0.14.1", default-features = false }
-reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sha2 = "0.10.9"
 tokio = { version = "1.53.0", features = ["fs", "macros", "net", "process", "rt-multi-thread", "io-util", "sync", "time"] }
 tokio-stream = "0.1.18"
+# Structured logs for the agent engine: the SSE reader, the event mapper and
+# the OpenCode client all run unattended, and `eprintln!` left every failure
+# there indistinguishable from an idle stream.
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", default-features = false, features = ["ansi", "env-filter", "fmt", "smallvec", "std", "tracing-log"] }
 uuid = { version = "1.24.0", features = ["v4"] }
 argon2 = { version = "0.5.3", default-features = false, features = ["alloc"] }
 

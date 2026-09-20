@@ -1,0 +1,4 @@
+data: {"id":"evt_0b27990950014uPfuDObrFqWPE","created":1789700706453,"type":"session.created","location":{"directory":"/tmp/muqun-gw-c1"},"data":{"sessionID":"ses_f4d866f70ffeqEwhLnNlpcFdiF","slug":"playful-moon","version":"2.0.1","projectID":"cb4a45a32f46130a7f53f86b1f49bade1549b6a8","location":{"directory":"/tmp/muqun-gw-c1"},"subpath":""},"durable":{"aggregateID":"ses_f4d866f70ffeqEwhLnNlpcFdiF","seq":0,"version":1}}
+
+data: {"id":"evt_0b2799099001haVr31cWxhQSIK","created":1789700706457,"type":"session.skill.activated","location":{"directory":"/tmp/muqun-gw-c1"},"data":{"sessionID":"ses_f4d866f70ffeqEwhLnNlpcFdiF","id":"docs","name":"docs","text":"\nEverything about docs is served by the docs connector \u2014 follow its instructions (they say what to call first). If no docs tools are present (they may be listed as pages tools on some accounts), say so.\n"},"durable":{"aggregateID":"ses_f4d866f70ffeqEwhLnNlpcFdiF","seq":1,"version":1}}
+

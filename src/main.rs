@@ -22,6 +22,10 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse as _, Response};
 use axum::routing::{get, patch, post};
 use axum::{Extension, Json, Router};
+use tower_http::compression::{
+    predicate::{DefaultPredicate, Predicate, SizeAbove},
+    CompressionLayer,
+};
 use base64::Engine as _;
 use clap::{Parser, Subcommand, ValueEnum};
 use crossterm::cursor::MoveTo;
@@ -39,6 +43,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio_stream::{Stream, StreamExt as _};
 
+mod agent;
 mod agent_events;
 mod approvals;
 mod authority;
@@ -64,7 +69,8 @@ use authority::{hash_token, identify_device, DeviceRecord, PairingCodeError, Pen
 
 use crate::i18n::Locale;
 use backend::{
-    AgentStatus as BackendAgentStatus, BackendActivity, BackendError, BackendFuture, BackendKind,
+    Agent, AgentStatus as BackendAgentStatus, BackendActivity, BackendError, BackendFuture,
+    BackendKind,
     BackendRegistry, CreateTab as BackendCreateTab, CreateWorkspace as BackendCreateWorkspace,
     OutputFormat as BackendOutputFormat, OutputSource as BackendOutputSource, Pane,
     PaneId as BackendPaneId, ReadPane as BackendReadPane, SendTextMode as BackendSendTextMode,
@@ -314,8 +320,15 @@ const ASSET_SKIP_DIRS: &[&str] = &[
 const API_CAPABILITIES: &[&str] = &[
     "agent_catalog",
     "agent_events",
+    "agent_forms",
     "agent_lifecycle_notifications",
+    "agent_mcp",
+    "agent_models",
+    "agent_permissions",
+    "agent_sessions",
     "agent_spawn",
+    "agent_timeline",
+    "agent_vcs",
     "assets",
     "device_revocation",
     "file_uploads",
@@ -335,6 +348,11 @@ const API_CAPABILITIES: &[&str] = &[
     "push_notifications",
     "push_token_revocation",
     "recent_cwds",
+    // `GET /api/sessions/{id}/snapshot`, whose `agents` array is the same one
+    // `GET .../agents` answers with -- `instance_id` and `target` included --
+    // so a client can prewarm a whole session in one call. Announced so the
+    // app can ask rather than probe for a 404 and guess at the shape.
+    "session_snapshot",
     "tasks",
     "terminal_backends",
     "multiple_terminal_backends",
@@ -574,6 +592,18 @@ struct Config {
     /// Existing encrypted device records keep working after this changes.
     #[serde(default, skip_serializing_if = "is_required_transport")]
     transport_encryption: TransportEncryptionMode,
+    /// Answer every device route without asking for a token at all.
+    ///
+    /// For a mock or harness that has no pairing to offer and talks to a
+    /// gateway bound to loopback. It is not a transport setting and is not
+    /// implied by `transport_encryption: disabled`: cleartext means no
+    /// envelope, never no authentication. Off unless the owner writes it, and
+    /// said loudly at startup when it is on.
+    ///
+    /// Omitted from a written config when false, so an existing `config.json`
+    /// round-trips untouched.
+    #[serde(default, skip_serializing_if = "is_false")]
+    dev_unauthenticated: bool,
     sessions: Vec<SessionConfig>,
     /// Explicit opt-in by session ID; adding a backend never enables startup.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -599,6 +629,17 @@ struct Config {
     /// round-trips untouched.
     #[serde(default, skip_serializing_if = "is_false")]
     rich_agent_pushes: bool,
+    /// How this gateway gets an OpenCode engine to talk to. Absent, it starts
+    /// one when it cannot find a running service, which is the behaviour the
+    /// owner asked for; `{"autostart": false}` leaves that to them.
+    #[serde(default, skip_serializing_if = "is_default_opencode")]
+    opencode: agent::OpencodeConfig,
+}
+
+/// `skip_serializing_if` for the OpenCode block, so an existing `config.json`
+/// round-trips untouched until someone changes something.
+fn is_default_opencode(config: &agent::OpencodeConfig) -> bool {
+    config.autostart && config.binary.is_none()
 }
 
 fn is_required_transport(mode: &TransportEncryptionMode) -> bool {
@@ -856,27 +897,31 @@ impl AgentPushNotice {
 }
 
 #[derive(Clone)]
-struct AppState {
-    config: Config,
-    pending_pairing: Arc<Mutex<Option<PendingPairing>>>,
-    pairing_requests: Arc<Mutex<VecDeque<u128>>>,
-    push_tokens: Arc<Mutex<Vec<PushTokenRecord>>>,
-    devices: Arc<Mutex<Vec<DeviceRecord>>>,
-    assets: Arc<Mutex<AssetIndex>>,
+pub(crate) struct AppState {
+    pub(crate) config: Config,
+    pub(crate) pending_pairing: Arc<Mutex<Option<PendingPairing>>>,
+    pub(crate) pairing_requests: Arc<Mutex<VecDeque<u128>>>,
+    pub(crate) push_tokens: Arc<Mutex<Vec<PushTokenRecord>>>,
+    pub(crate) devices: Arc<Mutex<Vec<DeviceRecord>>>,
+    pub(crate) assets: Arc<Mutex<AssetIndex>>,
     /// What panes with no scrollback of their own showed while the gateway was
     /// watching. Memory only, and only for those panes; see `scrollback`.
-    scrollback: Arc<Mutex<scrollback::ScrollbackStore>>,
+    pub(crate) scrollback: Arc<Mutex<scrollback::ScrollbackStore>>,
     /// The agent status transitions this gateway saw, so a phone coming back
     /// after a while can be told what happened. Memory only; see
     /// `agent_events`.
-    agent_events: Arc<Mutex<agent_events::AgentEventLog>>,
-    approval_events: tokio::sync::broadcast::Sender<ApprovalEvent>,
+    pub(crate) agent_events: Arc<Mutex<agent_events::AgentEventLog>>,
+    pub(crate) approval_events: tokio::sync::broadcast::Sender<ApprovalEvent>,
     /// One activity stream per session, shared by everyone who wants it. See
     /// [`subscribe_activity`].
-    activity: Arc<Mutex<HashMap<String, tokio::sync::broadcast::Sender<SessionActivity>>>>,
+    pub(crate) activity: Arc<Mutex<HashMap<String, tokio::sync::broadcast::Sender<SessionActivity>>>>,
     /// The last backend liveness ordering, reused briefly so a burst of
     /// clients asking at once is answered once. See [`SESSION_LIVENESS_TTL`].
-    session_liveness: Arc<Mutex<SessionLivenessCache>>,
+    pub(crate) session_liveness: Arc<Mutex<SessionLivenessCache>>,
+    /// The OpenCode engine, which comes and goes: it is discovered, adopted or
+    /// started, and re-attached whenever it moves. Routes ask it for the
+    /// current manager rather than holding one.
+    pub(crate) agent_runtime: Arc<agent::AgentRuntime>,
 }
 
 /// The scrollback store, or nothing if a previous holder panicked while it was
@@ -1034,11 +1079,34 @@ fn main() -> anyhow::Result<()> {
     for note in login_env::adopt() {
         eprintln!("environment repaired from the login shell -- {note}");
     }
+    init_tracing();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("failed to start the async runtime")?
         .block_on(dispatch(cli))
+}
+
+/// Structured logging for the parts of the gateway that run unattended -- the
+/// OpenCode SSE reader, the event mapper and the HTTP client. Everything goes
+/// to stderr, which is the journal under systemd. `MUQUN_LOG` (or `RUST_LOG`)
+/// overrides the default of `info`.
+fn init_tracing() {
+    use tracing_subscriber::{fmt, EnvFilter};
+
+    let filter = std::env::var("MUQUN_LOG")
+        .or_else(|_| std::env::var("RUST_LOG"))
+        .ok()
+        .and_then(|raw| EnvFilter::try_new(raw).ok())
+        .unwrap_or_else(|| EnvFilter::new("info"));
+
+    // A second initialisation is not an error worth failing a start over: it
+    // only happens in tests that call into `run` more than once.
+    let _ = fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .try_init();
 }
 
 async fn dispatch(cli: Cli) -> anyhow::Result<()> {
@@ -1180,10 +1248,12 @@ fn setup(
             public_url: public_url.clone(),
             token_hash,
             transport_encryption: TransportEncryptionMode::Required,
+            dev_unauthenticated: false,
             sessions: Vec::new(),
             autostart_backends: Vec::new(),
             agent_commands: BTreeMap::new(),
             rich_agent_pushes: false,
+            opencode: agent::OpencodeConfig::default(),
         },
     };
     config.listen = listen;
@@ -2032,11 +2102,16 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     // Read before `config` moves into the state, and printed after the routes
     // are built so it is the last thing on screen rather than the first.
     let listen_warning = unreachable_listen_warning(&config.listen, &config.public_url);
+    // Same reason: read before `config` moves, said after the routes are up.
+    let dev_unauthenticated = config.dev_unauthenticated;
 
     // Bind successfully before starting anything on the user's behalf.
     let listener = tokio::net::TcpListener::bind(addr).await?;
     // One background attempt per opted-in backend; no restart/logging loop.
     backend_startup::spawn(&config);
+
+    let agent_runtime = agent::AgentRuntime::new(config.opencode.clone());
+    agent_runtime.spawn_supervisor();
 
     let state = AppState {
         config,
@@ -2050,12 +2125,14 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         approval_events: tokio::sync::broadcast::channel(APPROVAL_EVENT_CAPACITY).0,
         activity: Arc::new(Mutex::new(HashMap::new())),
         session_liveness: Arc::new(Mutex::new(SessionLivenessCache::default())),
+        agent_runtime,
     };
     spawn_agent_notification_watchers(state.clone());
+    spawn_agent_engine_watchers(state.clone());
     spawn_approval_watchers(state.clone());
     spawn_upload_gc();
 
-    let app = Router::new()
+    let app = agent::routes::mount(Router::new())
         .route("/docs", get(docs))
         .route("/openapi.json", get(openapi_json))
         .route("/api/pair/request", post(pair_request))
@@ -2203,7 +2280,26 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
             UPLOADS_PATH,
             post(upload_file).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
         )
+        // Reading one back. The app needs this to draw the user's own
+        // attachment in the transcript: the timeline item carries the host
+        // path, which a phone cannot open.
+        .route("/api/uploads/{file_name}", get(upload_content))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+        // Inside the encrypted transport, so what it compresses is the
+        // plaintext body and not the sealed base64 -- ciphertext does not
+        // compress, and sealing first is why nothing downstream could.
+        //
+        // The default predicate already declines `text/event-stream` (a
+        // compressor would buffer a stream that is supposed to arrive a frame
+        // at a time) and content that is already compressed, such as an
+        // uploaded image. `SizeAbove` keeps it off bodies too small to be
+        // worth a header: below about half a kilobyte gzip usually costs more
+        // than it saves.
+        .layer(
+            CompressionLayer::new()
+                .compress_when(DefaultPredicate::new().and(SizeAbove::new(COMPRESSION_MIN_BYTES))),
+        )
+        .layer(middleware::from_fn(envelope_compression_gate))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             encrypted_transport,
@@ -2218,6 +2314,16 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
 
     if let Some(warning) = listen_warning {
         eprintln!("{warning}");
+    }
+    if dev_unauthenticated {
+        // Said every time, on stderr, unmissably: this is the one setting that
+        // hands the API to anything that can reach the port.
+        eprintln!(
+            "SECURITY WARNING: dev_unauthenticated is on -- every device route \
+             answers WITHOUT a token, to anything that can reach {addr}. This is \
+             for a local mock only. Remove \"dev_unauthenticated\" from config.json \
+             to turn it off."
+        );
     }
     println!("terminal gateway listening on http://{addr}");
     axum::serve(listener, app).await?;
@@ -2237,6 +2343,9 @@ async fn request_locale(request: Request<Body>, next: Next) -> Response {
 }
 
 const TRANSPORT_HEADER: &str = "x-muqun-transport";
+/// How a client says it can inflate a compressed sealed body. `gzip` is the
+/// only value that does anything.
+const ENVELOPE_ACCEPT_HEADER: &str = "x-muqun-envelope-accept";
 const TRANSPORT_DEVICE_HEADER: &str = "x-muqun-device";
 const TRANSPORT_ENVELOPE_HEADER: &str = "x-muqun-envelope";
 const TRANSPORT_PROOF_HEADER: &str = "x-muqun-internal-device-proof";
@@ -2296,6 +2405,16 @@ struct EncryptedResponsePayload {
     status: u16,
     headers: BTreeMap<String, String>,
     body: String,
+    /// How `body` is encoded, when it is not plain bytes.
+    ///
+    /// A top-level field rather than a line in `headers`, because it describes
+    /// the sealed payload itself and not the response the client is
+    /// reconstructing -- and because a client has to be able to find it
+    /// without case-folding its way through a header map. Absent means the
+    /// body is the response body. The only value ever sent is `gzip`, and it
+    /// is sent only to a client that asked for it by name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content_encoding: Option<String>,
 }
 
 /// What an encrypted-transport request leaves behind for a handler that
@@ -2305,7 +2424,7 @@ struct EncryptedResponsePayload {
 /// binding it seals under. Injected by `decrypt_transport_request`, so its
 /// presence also proves the request itself authenticated.
 #[derive(Clone)]
-struct EncryptedStreamContext {
+pub(crate) struct EncryptedStreamContext {
     material: Vec<u8>,
     request_aad: String,
     request_nonce: String,
@@ -2580,9 +2699,19 @@ async fn encrypt_transport_response(
             .into_response()
         }
     };
+    // `content-encoding` describes the bytes being sealed, not the response
+    // the client rebuilds -- leaving it in the header map would have the
+    // client try to inflate a body it had already inflated. It moves to the
+    // payload's own field.
+    let content_encoding = parts
+        .headers
+        .get(axum::http::header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     let headers = parts
         .headers
         .iter()
+        .filter(|(name, _)| *name != axum::http::header::CONTENT_ENCODING)
         .filter_map(|(name, value)| {
             value
                 .to_str()
@@ -2594,6 +2723,7 @@ async fn encrypt_transport_response(
         status: parts.status.as_u16(),
         headers,
         body: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(body),
+        content_encoding,
     };
     let plaintext = match serde_json::to_vec(&payload) {
         Ok(value) => value,
@@ -2732,13 +2862,97 @@ fn host_name(host: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// Bodies below this are sent as they are: a gzip header, trailer and the
+/// `content-encoding` line cost more than they save, and every one of them is
+/// a byte on a phone's radio too.
+const COMPRESSION_MIN_BYTES: u16 = 512;
+
+/// Keep compression away from the sealed envelope, and say that the answer
+/// varies by what the client will accept.
+///
+/// A response that is about to be sealed must not also be compressed yet. The
+/// envelope carries its own headers inside the ciphertext, so a
+/// `content-encoding: gzip` on a body the client sees as base64 would have it
+/// try to inflate the ciphertext. Compressing inside the envelope is worth
+/// doing -- it is the one place the gateway's own inflation can be paid back
+/// -- but it needs the client to say it understands the flag, and until it
+/// does, an encrypted request is answered exactly as it is today.
+///
+/// Whether the request arrived encrypted is read from the stream context the
+/// decryption path injects, not from a header, because a header can be sent by
+/// anyone.
+async fn envelope_compression_gate(mut request: Request<Body>, next: Next) -> Response {
+    let sealed = request.extensions().get::<EncryptedStreamContext>().is_some();
+    if sealed {
+        // Inside the envelope the client cannot use `content-encoding` -- it
+        // is reading a base64 body, and the real headers are sealed with it --
+        // so it says separately what it can inflate. Only gzip, and only when
+        // asked for by name: a client that says nothing gets exactly what it
+        // got before this existed.
+        let opted_in = request
+            .headers()
+            .get(ENVELOPE_ACCEPT_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("gzip"))
+            });
+        if opted_in {
+            // Pinned to gzip rather than passed through: br is the other thing
+            // the layer can produce, and a client that asked for gzip must not
+            // be handed something it will refuse.
+            request.headers_mut().insert(
+                axum::http::header::ACCEPT_ENCODING,
+                HeaderValue::from_static("gzip"),
+            );
+        } else {
+            request
+                .headers_mut()
+                .remove(axum::http::header::ACCEPT_ENCODING);
+        }
+    }
+    let mut response = next.run(request).await;
+    // Said whether or not this particular answer was compressed: a cache that
+    // holds one must not serve it to a client that asked differently. A route
+    // that has already named what it varies by keeps it -- the validated
+    // routes name the locale too -- and this only makes sure encoding is in
+    // the list.
+    let headers = response.headers_mut();
+    let existing = headers
+        .get(axum::http::header::VARY)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    match existing {
+        Some(existing) if existing.to_ascii_lowercase().contains("accept-encoding") => {}
+        Some(existing) => {
+            if let Ok(value) = HeaderValue::from_str(&format!("{existing}, accept-encoding")) {
+                headers.insert(axum::http::header::VARY, value);
+            }
+        }
+        None => {
+            headers.insert(
+                axum::http::header::VARY,
+                HeaderValue::from_static("accept-encoding"),
+            );
+        }
+    }
+    response
+}
+
 async fn security_headers(request: Request<Body>, next: Next) -> Response {
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
-    headers.insert(
-        "cache-control",
-        HeaderValue::from_static("no-store, max-age=0"),
-    );
+    // A floor, not an override: a handler that has something more specific to
+    // say about its own body keeps it. `upload_content` is the one that does,
+    // and it only ever adds to this -- `private` on top of `no-store`. Nothing
+    // here can weaken the blanket, because a handler that says nothing gets it.
+    if !headers.contains_key("cache-control") {
+        headers.insert(
+            "cache-control",
+            HeaderValue::from_static("no-store, max-age=0"),
+        );
+    }
     headers.insert("pragma", HeaderValue::from_static("no-cache"));
     headers.insert(
         "x-content-type-options",
@@ -3232,7 +3446,8 @@ fn pair_request_response(config: &Config, request_id: &str) -> Value {
         "server_id": config.server_id,
         "server_label": config.label,
         "status": "pending",
-        "expires_in_ms": PAIRING_CODE_TTL_MS
+        "expires_in_ms": PAIRING_CODE_TTL_MS,
+        "transport_encryption": config.transport_encryption.as_str()
     })
 }
 
@@ -4728,7 +4943,43 @@ fn herdr_protocol_supported(protocol: u64) -> bool {
     protocol >= HERDR_PROTOCOL_MIN
 }
 
+/// `metadata()` answers per session, reused for [`SESSION_LIVENESS_TTL`].
+///
+/// `/health` and `/api/meta` both describe every configured backend, and both
+/// asked each one live on every request -- an RPC per backend per call, for an
+/// answer that changes when a backend restarts and not otherwise. Every phone
+/// polls on its own schedule, so the cost multiplied by devices.
+///
+/// Held behind the same one-second window liveness already uses, for the same
+/// reason: short enough that a backend coming or going shows up inside a
+/// second, long enough that a burst of clients asking at once is answered
+/// once.
+/// One session's answer and when it was taken.
+type CachedMetadata = (std::time::Instant, (Value, Value));
+
+static SESSION_METADATA_CACHE: std::sync::OnceLock<Mutex<HashMap<String, CachedMetadata>>> =
+    std::sync::OnceLock::new();
+
 async fn session_metadata(session: &SessionConfig) -> (Value, Value) {
+    let cache = SESSION_METADATA_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(cache) = cache.lock() {
+        if let Some((seen, answer)) = cache.get(&session.id) {
+            if seen.elapsed() < SESSION_LIVENESS_TTL {
+                return answer.clone();
+            }
+        }
+    }
+    let answer = session_metadata_uncached(session).await;
+    if let Ok(mut cache) = cache.lock() {
+        // Bounded by the configured sessions, which is a handful; the sweep is
+        // only here so a config reload cannot leave an entry behind for ever.
+        cache.retain(|_, (seen, _)| seen.elapsed() < SESSION_LIVENESS_TTL);
+        cache.insert(session.id.clone(), (std::time::Instant::now(), answer.clone()));
+    }
+    answer
+}
+
+async fn session_metadata_uncached(session: &SessionConfig) -> (Value, Value) {
     match terminal_backend(session).metadata().await {
         Ok(metadata) => {
             // A backend that does not report a protocol at all is taken at the
@@ -4965,15 +5216,38 @@ async fn snapshot(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
     headers: HeaderMap,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Response> {
     require_device(&state, &headers)?;
     let session = find_session(&state.config, &session_id)?;
     let backend = terminal_backend(session);
-    let workspaces = backend.list_workspaces().await.map_err(backend_api_error)?;
-    let tabs = backend.list_tabs().await.map_err(backend_api_error)?;
-    let panes = backend.list_panes().await.map_err(backend_api_error)?;
-    let answer = backend::compat::snapshot(workspaces, tabs, panes);
-    Ok(Json(note_and_amend_panes(&state, &session_id, answer)))
+    // Four reads of the same backend that do not depend on each other. Run in
+    // sequence this was four round trips deep -- and on tmux each one is a
+    // process -- for an answer the client waits on before it can draw
+    // anything. The backend is the same one either way; this only stops
+    // waiting for each before starting the next.
+    //
+    // `agents` is the same list `GET .../agents` answers with, so a client
+    // prewarming from the snapshot does not have to ask twice for
+    // `instance_id` and `target`.
+    let (workspaces, tabs, panes, agents) = tokio::join!(
+        backend.list_workspaces(),
+        backend.list_tabs(),
+        backend.list_panes(),
+        backend_agents(session),
+    );
+    let workspaces = workspaces.map_err(backend_api_error)?;
+    let tabs = tabs.map_err(backend_api_error)?;
+    let panes = panes.map_err(backend_api_error)?;
+    let agents = agents.map_err(backend_api_error)?;
+    let answer = backend::compat::snapshot(workspaces, tabs, panes, &agents);
+    // Hashed after `note_and_amend_panes`, never before: that call is a read
+    // that also writes -- it feeds the scrollback store what it just saw and
+    // then amends the answer from what the store holds. Hashing the answer it
+    // returns is the only version that matches what the client receives, and
+    // running it before the 304 check keeps the store fed even when nothing is
+    // sent back.
+    let answer = note_and_amend_panes(&state, &session_id, answer);
+    Ok(agent::routes::json_etag_response(&headers, answer))
 }
 
 /// Let the scrollback store read a Herdr answer, and answer back for whatever
@@ -5008,7 +5282,7 @@ async fn panes(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
     headers: HeaderMap,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Response> {
     require_device(&state, &headers)?;
     let session = find_session(&state.config, &session_id)?;
     let answer = terminal_backend(session)
@@ -5016,7 +5290,10 @@ async fn panes(
         .await
         .map(backend::compat::pane_list)
         .map_err(backend_api_error)?;
-    Ok(Json(note_and_amend_panes(&state, &session_id, answer)))
+    // Same rule as the snapshot: observe and amend first, hash what that
+    // produced.
+    let answer = note_and_amend_panes(&state, &session_id, answer);
+    Ok(agent::routes::json_etag_response(&headers, answer))
 }
 
 async fn agents(
@@ -5231,7 +5508,7 @@ const ENCRYPTED_SSE_EVENT: &str = "muqun.encrypted";
 /// seq. Together: a record that is modified, reordered, replayed -- within
 /// this stream or from any other -- or dropped (the client checks seq
 /// continuity) fails authentication on the phone.
-struct EventStreamSealer {
+pub(crate) struct EventStreamSealer {
     key: [u8; 32],
     stream_id: String,
     request_aad: String,
@@ -5239,7 +5516,7 @@ struct EventStreamSealer {
 }
 
 impl EventStreamSealer {
-    fn new(context: &EncryptedStreamContext) -> anyhow::Result<Self> {
+    pub(crate) fn new(context: &EncryptedStreamContext) -> anyhow::Result<Self> {
         let stream_id = generate_token();
         let key =
             transport::derive_stream_key(&context.material, &stream_id, &context.request_nonce)?;
@@ -5279,7 +5556,11 @@ impl EventStreamSealer {
 /// One event, sealed when this connection is encrypted and plain when it is
 /// not. `None` means the record could not be sealed; the event is dropped
 /// rather than ever leaving in the clear.
-fn stream_event(sealer: &mut Option<EventStreamSealer>, name: &str, data: &str) -> Option<Event> {
+pub(crate) fn stream_event(
+    sealer: &mut Option<EventStreamSealer>,
+    name: &str,
+    data: &str,
+) -> Option<Event> {
     match sealer {
         Some(sealer) => match sealer.seal(name, data) {
             Ok(event) => Some(event),
@@ -5358,6 +5639,9 @@ async fn events(
     let scrollback_store = state.scrollback.clone();
     let backend = terminal_backend(&session);
     let mut activity = subscribe_activity(&state, &session);
+    // The runtime's channel, not a manager's: a client's stream has to survive
+    // OpenCode restarting underneath it.
+    let mut agent_events_rx = Some(state.agent_runtime.subscribe_events());
     let stream = async_stream::stream! {
         let mut output_interval = tokio::time::interval(STREAM_OUTPUT_POLL_INTERVAL);
         output_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -5466,6 +5750,21 @@ async fn events(
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                },
+                agent_ev = async {
+                    if let Some(ref mut rx) = agent_events_rx {
+                        rx.recv().await
+                    } else {
+                        futures::future::pending().await
+                    }
+                } => {
+                    if let Ok(ev) = agent_ev {
+                        let ev_name = ev.event_name();
+                        let payload = serde_json::to_string(&ev).unwrap_or_default();
+                        if let Some(event) = stream_event(&mut sealer, ev_name, &payload) {
+                            yield Ok(event);
+                        }
                     }
                 },
             }
@@ -5858,6 +6157,39 @@ fn spawn_agent_notification_watchers(state: AppState) {
     }
 }
 
+fn spawn_agent_engine_watchers(state: AppState) {
+    let mut rx = state.agent_runtime.subscribe_events();
+    let state = state.clone();
+
+    tokio::spawn(async move {
+        while let Ok(event) = rx.recv().await {
+            if let agent::AgentDomainEvent::PermissionPending { ref asid, ref request, .. } = event {
+                let tokens = match state.push_tokens.lock() {
+                    Ok(guard) => guard.clone(),
+                    Err(_) => Vec::new(),
+                };
+                if !tokens.is_empty() {
+                    let mut data = serde_json::Map::new();
+                    data.insert("type".to_string(), json!("approval"));
+                    data.insert("category".to_string(), json!("approval"));
+                    data.insert("session_id".to_string(), json!("default"));
+                    data.insert("asid".to_string(), json!(asid.0));
+                    data.insert("approval_id".to_string(), json!(request.id));
+                    data.insert("fingerprint".to_string(), json!(request.id));
+
+                    let _ = send_expo_push_notifications(
+                        &tokens,
+                        "Approval Required".to_string(),
+                        request.prompt.clone(),
+                        data,
+                    )
+                    .await;
+                }
+            }
+        }
+    });
+}
+
 async fn watch_agent_notifications(state: AppState, session: SessionConfig) {
     let mut statuses = seed_agent_statuses(&session).await;
     // One subscription to the session's shared hub, held for the life of the
@@ -5989,6 +6321,16 @@ async fn seed_agent_statuses(session: &SessionConfig) -> HashMap<String, String>
 }
 
 async fn backend_agent_list(session: &SessionConfig) -> Result<Value, BackendError> {
+    Ok(backend::compat::agent_list(&backend_agents(session).await?))
+}
+
+/// Every agent the backend reports, with a status inferred for the tmux ones
+/// the backend could not name.
+///
+/// The one source for both `GET .../agents` and the `agents` array inside
+/// `GET .../snapshot`: two spellings of the same list is how the snapshot's
+/// copy came to be missing `instance_id` and `target`.
+async fn backend_agents(session: &SessionConfig) -> Result<Vec<Agent>, BackendError> {
     let terminal = terminal_backend(session);
     let mut agents = terminal.list_agents().await?;
     for agent in agents
@@ -6009,7 +6351,7 @@ async fn backend_agent_list(session: &SessionConfig) -> Result<Value, BackendErr
             agent.status = infer_tmux_agent_status(agent.kind.as_deref(), &output.text);
         }
     }
-    Ok(backend::compat::agent_list(&agents))
+    Ok(agents)
 }
 
 fn infer_tmux_agent_status(agent: Option<&str>, visible: &str) -> backend::AgentStatus {
@@ -8183,11 +8525,46 @@ async fn pane_fenced_cwd(
     session: &SessionConfig,
     pane_id: &str,
 ) -> Option<PathBuf> {
+    // The pane's own directory, read from the pane list, and only then the
+    // fence. It used to be looked up in the asset roots by pane id -- but the
+    // roots are one entry per *directory*, carrying the id of the first pane
+    // found there. Every other pane in the same checkout matched nothing and
+    // was told it was not in a repository: four panes in one repo, one answer
+    // and three `repo: null`, while the pane-context badge (which asks by
+    // directory) went on counting changes for all four.
+    let listed = terminal_backend(session)
+        .list_panes()
+        .await
+        .map(backend::compat::pane_list)
+        .ok()
+        .and_then(|response| pane_cwd_in_list(&response, pane_id));
+    if let Some(path) = listed {
+        return std::fs::canonicalize(&path).ok();
+    }
+    // A backend that could not list its panes just now: what was known before.
     let roots = session_asset_roots(state, session, None).await;
     roots
         .iter()
         .find(|root| root.pane_id.as_deref() == Some(pane_id))
         .and_then(|root| std::fs::canonicalize(&root.path).ok())
+}
+
+/// The directory one pane runs in, when it is inside the fence.
+///
+/// The same two fields and the same fence as `pane_list_roots`, without its
+/// de-duplication: that list answers "which directories are worth scanning",
+/// this answers "where is *this* pane".
+fn pane_cwd_in_list(response: &Value, pane_id: &str) -> Option<PathBuf> {
+    let panes = response.pointer("/result/panes").and_then(Value::as_array)?;
+    let pane = panes
+        .iter()
+        .find(|pane| pane.get("pane_id").and_then(Value::as_str) == Some(pane_id))?;
+    let cwd = pane
+        .get("cwd")
+        .and_then(Value::as_str)
+        .or_else(|| pane.get("foreground_cwd").and_then(Value::as_str))?;
+    let path = PathBuf::from(cwd);
+    is_scannable_root(&path).then_some(path)
 }
 
 /// The checkout a fenced directory belongs to, when that checkout is itself
@@ -8484,7 +8861,7 @@ async fn pane_shortcuts(
     State(state): State<AppState>,
     Path((session_id, pane_id)): Path<(String, String)>,
     headers: HeaderMap,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Response> {
     require_device(&state, &headers)?;
     let session = find_session(&state.config, &session_id)?.clone();
     let pane = pane_get(&session, &pane_id).await?;
@@ -8509,7 +8886,10 @@ async fn pane_shortcuts(
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty());
 
-    Ok(Json(shortcuts::resolve(agent, title, cwd)))
+    Ok(agent::routes::json_etag_response(
+        &headers,
+        shortcuts::resolve(agent, title, cwd),
+    ))
 }
 
 /// Whether the pane is blocked on a permission menu, and what it is asking.
@@ -8576,6 +8956,7 @@ fn native_approval_data(
             let request = &pending.request;
             json!({
                 "approval_id": request.id,
+                "fingerprint": request.id,
                 "prompt": request.prompt,
                 "tool": request.tool,
                 "context": request.context,
@@ -9047,7 +9428,8 @@ async fn upload_file(
             "failed to store the upload",
         )
     })?;
-    let path = dir.join(stored_upload_name(kind));
+    let stored_name = stored_upload_name(kind);
+    let path = dir.join(&stored_name);
     write_upload_file(&path, &bytes).map_err(|err| {
         eprintln!("failed to write upload {}: {err:#}", path.display());
         api_error(
@@ -9058,11 +9440,174 @@ async fn upload_file(
     })?;
 
     Ok(Json(json!({
+        // `path` is for the agent, which reads the file off this host.
         "path": path.to_string_lossy(),
+        // `url` is for the app, which cannot. Same file, the two ways of
+        // reaching it, so the transcript can draw what was sent.
+        "url": upload_url(&stored_name),
         "name": sanitize_upload_name(&client_name),
         "size": bytes.len(),
         "mime": kind.mime
     })))
+}
+
+/// Where a stored upload is readable over the API. The stored name is
+/// generated by [`stored_upload_name`] from a UUID and an earned extension, so
+/// it is already URL-safe and needs no escaping.
+fn upload_url(stored_name: &str) -> String {
+    format!("{UPLOADS_PATH}/{stored_name}")
+}
+
+/// Stream one stored upload back to the app, read-only.
+///
+/// The app holds the host path of its own attachment and cannot open it, so
+/// this is the same bytes under a URL. Nothing here trusts the name: it has to
+/// be a single path component of the alphabet the gateway itself generates,
+/// the file has to be a regular file directly inside the upload directory, and
+/// a file the sweeper would already have taken is a miss rather than a read,
+/// so the 48-hour retention holds whether or not the hourly sweep has run.
+async fn upload_content(
+    State(state): State<AppState>,
+    Path(file_name): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    require_device(&state, &headers)?;
+
+    let Some(name) = safe_upload_component(&file_name) else {
+        return Err(upload_not_found());
+    };
+    let dir = uploads_dir().map_err(|err| {
+        eprintln!("failed to resolve the upload directory: {err:#}");
+        upload_not_found()
+    })?;
+    let path = dir.join(&name);
+
+    // `symlink_metadata` rather than `metadata`: a symlink parked in the
+    // upload directory must not become a way to read the rest of the host.
+    let metadata = std::fs::symlink_metadata(&path).map_err(|_| upload_not_found())?;
+    if !metadata.is_file() {
+        return Err(upload_not_found());
+    }
+    let modified = metadata.modified().map_err(|_| upload_not_found())?;
+    if upload_expired(modified, SystemTime::now()) {
+        return Err(upload_not_found());
+    }
+
+    let sniff_path = path.clone();
+    let sniff_name = name.clone();
+    let kind = tokio::task::spawn_blocking(move || sniff_stored_upload(&sniff_path, &sniff_name))
+        .await
+        .unwrap_or_default();
+    let Some(kind) = kind else {
+        return Err(upload_not_found());
+    };
+
+    let file = tokio::fs::File::open(&path).await.map_err(|err| {
+        eprintln!("failed to open upload {}: {err}", path.display());
+        upload_not_found()
+    })?;
+    let stream = async_stream::stream! {
+        let mut file = file;
+        let mut buffer = vec![0u8; ASSET_CONTENT_CHUNK_BYTES];
+        loop {
+            match tokio::io::AsyncReadExt::read(&mut file, &mut buffer).await {
+                Ok(0) => break,
+                Ok(read) => yield Ok::<_, std::io::Error>(
+                    axum::body::Bytes::copy_from_slice(&buffer[..read]),
+                ),
+                Err(err) => {
+                    yield Err(err);
+                    break;
+                }
+            }
+        }
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", kind.mime)
+        .header("content-length", metadata.len())
+        .header("content-disposition", format!("inline; filename=\"{name}\""))
+        // An upload is one device's own file, never a shared one: `private`
+        // on top of the blanket `no-store` the security headers apply, so it
+        // cannot land in a shared cache on the way back either.
+        .header("cache-control", "private, no-store, max-age=0")
+        .body(Body::from_stream(stream))
+        .map_err(|err| {
+            eprintln!("failed to build upload response: {err}");
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "upload_read_failed",
+                "failed to read the upload",
+            )
+        })
+}
+
+/// One answer for every way of missing: an unknown name, a traversal, a
+/// symlink, a swept file, and content this gateway would not have stored are
+/// indistinguishable, so a caller cannot map the host by asking.
+fn upload_not_found() -> (StatusCode, Json<Value>) {
+    api_error(
+        StatusCode::NOT_FOUND,
+        "upload_not_found",
+        "no such upload",
+    )
+}
+
+/// Reduce a path parameter to a name that can only ever mean one file inside
+/// the upload directory, or to nothing.
+///
+/// The gateway generates every stored name itself -- a UUID, a dot, and a
+/// lowercase extension -- so the accepted alphabet is exactly that and the
+/// answer is a whole-name decision, not an escaping one. `..`, a separator, a
+/// NUL, a percent-decoded separator and a leading dot all fail the same way.
+fn safe_upload_component(raw: &str) -> Option<String> {
+    if raw.is_empty() || raw.len() > MAX_UPLOAD_NAME_CHARS {
+        return None;
+    }
+    if !raw
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    {
+        return None;
+    }
+    if raw.starts_with('.') || raw.contains("..") {
+        return None;
+    }
+    // Belt and braces: whatever the alphabet allowed, the name still has to be
+    // one plain component as the platform reads it.
+    let path = FsPath::new(raw);
+    if path.components().count() != 1 || path.file_name()? != raw {
+        return None;
+    }
+    Some(raw.to_string())
+}
+
+/// Decide a stored upload's type from its bytes, the same order `upload_file`
+/// used to accept it: magic numbers first, the office container probe for a
+/// zip, and only then the text probe, where the stored extension -- which the
+/// gateway earned from the content at upload time, never took from the client
+/// -- picks the flavour.
+fn sniff_stored_upload(path: &FsPath, stored_name: &str) -> Option<UploadKind> {
+    let head = read_asset_head(path);
+    if head.is_empty() {
+        return None;
+    }
+    if looks_executable(&head) {
+        return None;
+    }
+    if let Some(kind) = sniff_upload_kind(&head) {
+        return Some(kind);
+    }
+    // A zip's central directory sits at the tail, so the office probe is the
+    // one that needs the whole file -- and only when the head says zip.
+    if head.starts_with(b"PK\x03\x04") {
+        let whole = std::fs::read(path).ok()?;
+        if let Some(kind) = sniff_office_upload_kind(&whole) {
+            return Some(kind);
+        }
+    }
+    sniff_document_upload_kind(&head, stored_name)
 }
 
 /// The body limit is enforced by the framework while the body streams, so an
@@ -10258,7 +10803,9 @@ fn with_uploads_root(
 }
 
 /// Extra roots are used ONLY for an explicit file lookup, never a directory
-/// scan. Platform cache/temp paths are configuration, not terminal output.
+/// scan. Paired devices may explicitly open files in the gateway account's
+/// home, including sibling projects and dotfiles. Platform home/cache/temp
+/// paths are configuration, not terminal output.
 fn preview_lookup_roots(
     mut roots: Vec<AssetRoot>,
     session_id: &str,
@@ -10266,12 +10813,23 @@ fn preview_lookup_roots(
     candidates: impl IntoIterator<Item = PathBuf>,
 ) -> Vec<AssetRoot> {
     let canonical_home = home.and_then(|path| std::fs::canonicalize(path).ok());
+    if let Some(path) = canonical_home.as_ref().filter(|path| {
+        path.is_dir() && path.parent().is_some() && !roots.iter().any(|root| root.path == **path)
+    }) {
+        roots.push(AssetRoot {
+            path: path.clone(),
+            session_id: session_id.to_owned(),
+            workspace_id: None,
+            tab_id: None,
+            pane_id: None,
+        });
+    }
     for candidate in candidates {
         let Ok(path) = std::fs::canonicalize(candidate) else {
             continue;
         };
-        // An overly broad XDG_CACHE_HOME/TMPDIR must not expose the account
-        // or filesystem root. Resolve aliases such as macOS /tmp first.
+        // Cache/temp configuration must not widen access above the account
+        // home or to the filesystem root. Resolve aliases such as macOS /tmp first.
         if !path.is_dir()
             || path.parent().is_none()
             || canonical_home
@@ -10363,7 +10921,7 @@ fn asset_json(entry: &AssetEntry, asset_type: AssetType) -> Value {
 }
 
 /// The versioned envelope every content-model response carries.
-fn content_envelope(data: Value) -> Value {
+pub(crate) fn content_envelope(data: Value) -> Value {
     json!({
         "schema_version": CONTENT_SCHEMA_VERSION,
         "capabilities": {
@@ -10790,7 +11348,12 @@ fn backend_api_error(error: BackendError) -> (StatusCode, Json<Value>) {
     api_error(status, code, message)
 }
 
-type ApiResult<T> = Result<T, (StatusCode, Json<Value>)>;
+pub(crate) type ApiResult<T> = Result<T, (StatusCode, Json<Value>)>;
+
+/// The caller identity recorded for a request that was let through without a
+/// token, which only `dev_unauthenticated` can produce. It is deliberately
+/// unlike any real device id.
+const DEV_UNAUTHENTICATED_DEVICE: &str = "dev-unauthenticated-device";
 
 fn bearer_token(headers: &HeaderMap) -> ApiResult<&str> {
     let Some(value) = headers.get(axum::http::header::AUTHORIZATION) else {
@@ -10820,7 +11383,42 @@ fn bearer_token(headers: &HeaderMap) -> ApiResult<&str> {
 /// Control routes are for paired devices only. The admin token deliberately
 /// does not authorise these: it sits in plaintext on disk for the manage UI,
 /// and these routes can run commands on the host.
-fn require_device(state: &AppState, headers: &HeaderMap) -> ApiResult<String> {
+pub(crate) fn require_device(state: &AppState, headers: &HeaderMap) -> ApiResult<String> {
+    if state.config.transport_encryption == TransportEncryptionMode::Disabled {
+        // Cleartext mode drops the envelope and the per-device transport
+        // proof; it does not drop authentication. A device paired while
+        // encryption was on still holds a `transport_key` and will never send
+        // a proof over cleartext, so the proof check is the part that is
+        // skipped here -- the token is still the token.
+        let token = bearer_token(headers);
+        if let Ok(token) = token {
+            let mut devices = lock_devices(state)?;
+            if let Some(device_id) = identify_device(&devices, token) {
+                let _ = authority::touch_device(
+                    &mut devices,
+                    &device_id,
+                    now_unix_ms(),
+                    DEVICE_LAST_SEEN_FLUSH_MS,
+                );
+                return Ok(device_id);
+            }
+            if authority::authenticates_admin(&state.config.token_hash, token) {
+                return Ok("admin".to_string());
+            }
+        }
+        if state.config.dev_unauthenticated {
+            return Ok(DEV_UNAUTHENTICATED_DEVICE.to_string());
+        }
+        // Absent or malformed is 401 and a wrong token is 403, exactly as in
+        // the encrypted mode: the two answers must not diverge by mode.
+        token?;
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "invalid_token",
+            "invalid token",
+        ));
+    }
+
     let token = bearer_token(headers)?;
     let mut devices = lock_devices(state)?;
     let Some(device_id) = identify_device(&devices, token) else {
@@ -10880,6 +11478,9 @@ fn still_paired(state: &AppState, device_id: &str) -> bool {
 /// The local manage UI's credential, which authorises nothing but reading the
 /// pending pairing code.
 fn require_admin(config: &Config, headers: &HeaderMap) -> ApiResult<()> {
+    if config.transport_encryption == TransportEncryptionMode::Disabled {
+        return Ok(());
+    }
     let token = bearer_token(headers)?;
     if !authority::authenticates_admin(&config.token_hash, token) {
         return Err(api_error(
@@ -10962,7 +11563,7 @@ async fn revoke_paired_device(
     ))
 }
 
-fn validate_text(text: &str) -> ApiResult<()> {
+pub(crate) fn validate_text(text: &str) -> ApiResult<()> {
     if text.len() > MAX_SEND_TEXT_BYTES {
         return Err(api_error(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -11059,7 +11660,7 @@ async fn send_expo_push_notifications(
     Ok(response.json().await?)
 }
 
-fn find_session<'a>(config: &'a Config, session_id: &str) -> ApiResult<&'a SessionConfig> {
+pub(crate) fn find_session<'a>(config: &'a Config, session_id: &str) -> ApiResult<&'a SessionConfig> {
     config
         .sessions
         .iter()
@@ -11086,7 +11687,7 @@ fn find_session<'a>(config: &'a Config, session_id: &str) -> ApiResult<&'a Sessi
 /// handler that have no business knowing a request exists. See
 /// [`request_locale`] for the scope it is set in and [`i18n::current`] for what
 /// happens outside one.
-fn api_error(status: StatusCode, code: &str, message: &str) -> (StatusCode, Json<Value>) {
+pub(crate) fn api_error(status: StatusCode, code: &str, message: &str) -> (StatusCode, Json<Value>) {
     api_error_in(i18n::current(), status, code, message)
 }
 
@@ -11942,7 +12543,7 @@ fn openapi_spec() -> Value {
         "info": {
             "title": "Terminal Gateway API",
             "version": env!("CARGO_PKG_VERSION"),
-            "description": "Token-protected mobile API for controlling local terminal workspaces through a configured tmux or Herdr backend. Human-readable text is localized: send X-Muqun-Locale (or Accept-Language) with one of `en`, `zh-TW`, `zh-CN`, `ja`, `ko`, `de`, `fr`, `es`, `pt`, `ru`, `vi`. Error `code` values, decision names and other wire vocabulary are the same bytes in every locale."
+            "description": "Token-protected mobile API for controlling local terminal workspaces through a configured tmux or Herdr backend. Human-readable text is localized: send X-Muqun-Locale (or Accept-Language) with one of `en`, `zh-TW`, `zh-CN`, `ja`, `ko`, `de`, `fr`, `es`, `pt`, `ru`, `vi`, `th`. Error `code` values, decision names and other wire vocabulary are the same bytes in every locale."
         },
         "components": {
             "securitySchemes": {
@@ -12007,6 +12608,14 @@ fn openapi_spec() -> Value {
                     "responses": upload_responses()
                 }
             },
+            "/api/uploads/{fileName}": {
+                "get": {
+                    "summary": "Stream one stored upload's bytes back, read-only",
+                    "description": "The companion to the upload: `path` in the upload response is for the agent, which reads the file off this host, and `url` -- this route -- is for the app, which cannot. `fileName` is the generated stored name, a single path component of the alphabet the gateway itself mints; a separator, a traversal, a leading dot, a symlink, and an unknown name are all the same 404. The content type is sniffed from the bytes on every read, exactly as the upload sniffed it, so the stored extension never decides on its own. An upload past its 48-hour retention is a 404 whether or not the hourly sweep has already taken it. The response is never cached by an intermediary.",
+                    "parameters": [path_param("fileName")],
+                    "responses": upload_content_responses()
+                }
+            },
             "/api/sessions/{sessionId}/tabs/{tabId}/assets": {
                 "get": {
                     "summary": "List files this tab produced recently, newest first",
@@ -12054,7 +12663,14 @@ fn openapi_spec() -> Value {
                     "responses": ok_response()
                 }
             },
-            "/api/sessions/{sessionId}/snapshot": { "get": session_endpoint("Return the session snapshot") },
+            "/api/sessions/{sessionId}/snapshot": {
+                "get": {
+                    "summary": "Return the whole session in one call: workspaces, tabs, panes and agents",
+                    "description": "One answer where a client would otherwise call /workspaces, /tabs, /panes and /agents, which is what a phone does to warm its home screen. `agents` is the same array `GET /api/sessions/{sessionId}/agents` returns, from the same backend call and with every field it has -- `instance_id`, the opaque identity an assignment is bound to, and `target`, the address it is sent to, included. It used to be derived from the panes instead and carried neither, so a client still had to call /agents; a pane id is not a substitute for either, because panes are reused and renumbered. Announced as the `session_snapshot` capability in /health, so a client can ask rather than probe for a 404.",
+                    "parameters": [path_param("sessionId")],
+                    "responses": ok_response()
+                }
+            },
             "/api/sessions/{sessionId}/workspaces": {
                 "get": session_endpoint("List workspaces"),
                 "post": {
@@ -12553,16 +13169,26 @@ fn multipart_file_body() -> Value {
 fn upload_responses() -> Value {
     let mut responses = ok_response();
     responses["200"] = json!({
-        "description": "Stored upload",
+        "description": "Stored upload: `path` is the host path for the agent to read, `url` the gateway route the app reads the same bytes from",
         "content": { "application/json": { "schema": object_schema(
-            &[("path", "string"), ("name", "string"), ("size", "integer"), ("mime", "string")],
-            &["path", "name", "size", "mime"],
+            &[("path", "string"), ("url", "string"), ("name", "string"), ("size", "integer"), ("mime", "string")],
+            &["path", "url", "name", "size", "mime"],
         ) } }
     });
     responses["400"] =
         json!({ "description": "Malformed multipart body, or no usable file field" });
     responses["413"] = json!({ "description": "Upload is larger than 25 MiB" });
     responses["415"] = json!({ "description": "Content is an executable or script, or not an accepted image type" });
+    responses
+}
+
+fn upload_content_responses() -> Value {
+    let mut responses = ok_response();
+    responses["200"] = json!({
+        "description": "The upload's bytes, with the sniffed type in content-type and `cache-control: private`",
+        "content": { "*/*": { "schema": { "type": "string", "format": "binary" } } }
+    });
+    responses["404"] = json!({ "description": "Unknown, unreadable, expired, or not a plain file directly inside the upload directory" });
     responses
 }
 
@@ -12995,6 +13621,25 @@ const DOCS_HTML: &str = r#"<!doctype html>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_pane_in_one_checkout_resolves_to_its_directory() {
+        // Two panes in the same directory. The asset roots keep one entry for
+        // it, under the first pane's id; the second pane must still be found.
+        let list = json!({ "result": { "panes": [
+            { "pane_id": "w1:p1", "cwd": "/work/team/app" },
+            { "pane_id": "w1:p2", "cwd": "/work/team/app" },
+            { "pane_id": "w1:p3", "foreground_cwd": "/work/team/api" },
+            { "pane_id": "w1:p4", "cwd": "/" },
+        ] } });
+        assert_eq!(pane_list_roots("s", &list).len(), 2);
+        assert_eq!(pane_cwd_in_list(&list, "w1:p1"), Some(PathBuf::from("/work/team/app")));
+        assert_eq!(pane_cwd_in_list(&list, "w1:p2"), Some(PathBuf::from("/work/team/app")));
+        assert_eq!(pane_cwd_in_list(&list, "w1:p3"), Some(PathBuf::from("/work/team/api")));
+        // Outside the fence, and unknown: no directory, so no git is run.
+        assert_eq!(pane_cwd_in_list(&list, "w1:p4"), None);
+        assert_eq!(pane_cwd_in_list(&list, "w9:p9"), None);
+    }
+
     use super::*;
     use axum::http::HeaderValue;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -13061,6 +13706,7 @@ mod tests {
             public_url: "http://127.0.0.1:23100".into(),
             token_hash: hash_token(token),
             transport_encryption: TransportEncryptionMode::Required,
+            dev_unauthenticated: false,
             sessions: vec![SessionConfig {
                 id: "default".into(),
                 label: "Default".into(),
@@ -13069,6 +13715,7 @@ mod tests {
             }],
             agent_commands: BTreeMap::new(),
             rich_agent_pushes: false,
+            opencode: agent::OpencodeConfig::default(),
         }
     }
 
@@ -13417,6 +14064,7 @@ mod tests {
             approval_events: tokio::sync::broadcast::channel(APPROVAL_EVENT_CAPACITY).0,
             activity: Arc::new(Mutex::new(HashMap::new())),
             session_liveness: Arc::new(Mutex::new(SessionLivenessCache::default())),
+            agent_runtime: agent::AgentRuntime::disabled(),
         }
     }
 
@@ -13667,6 +14315,292 @@ mod tests {
             "ciphertext": first["ciphertext"].as_str().unwrap(),
         });
         assert!(open(&replayed).is_err());
+    }
+
+    /// What compression will and will not touch.
+    ///
+    /// The two that matter are a stream and an upload. Compressing
+    /// `text/event-stream` would buffer frames that exist to arrive one at a
+    /// time, and an uploaded image is already compressed, so gzip spends CPU
+    /// to make it slightly bigger.
+    #[test]
+    fn compression_leaves_streams_uploads_and_small_bodies_alone() {
+        use tower_http::compression::predicate::Predicate;
+
+        let predicate = DefaultPredicate::new().and(SizeAbove::new(COMPRESSION_MIN_BYTES));
+        // A real body: `SizeAbove` reads the body's own size hint, not the
+        // header, so an empty body with a large content-length is still small.
+        let response = |content_type: &str, len: usize| {
+            Response::builder()
+                .header(axum::http::header::CONTENT_TYPE, content_type)
+                .body(Body::from(vec![b'x'; len]))
+                .unwrap()
+        };
+        let big = COMPRESSION_MIN_BYTES as usize * 40;
+
+        assert!(
+            !predicate.should_compress(&response("text/event-stream", big)),
+            "an SSE stream is never compressed, however long"
+        );
+        for image in ["image/png", "image/jpeg", "image/webp"] {
+            assert!(
+                !predicate.should_compress(&response(image, big)),
+                "{image} is already compressed"
+            );
+        }
+        assert!(
+            !predicate.should_compress(&response("application/json", 64)),
+            "a body under the floor is not worth a gzip header"
+        );
+        assert!(
+            predicate.should_compress(&response("application/json", big)),
+            "a real JSON payload is exactly what this is for"
+        );
+        assert_eq!(COMPRESSION_MIN_BYTES, 512);
+    }
+
+    /// The sealed transport is left exactly as it was.
+    ///
+    /// Compression sits inside the envelope, so without this gate an encrypted
+    /// response would be gzipped and then sealed -- and the client, which sees
+    /// base64 and a `content-encoding: gzip` carried in the envelope's own
+    /// headers, would try to inflate ciphertext. Compressing inside the
+    /// envelope is worth doing, but only once the client says it understands
+    /// the flag; until then an encrypted request is answered as it is today.
+    #[tokio::test]
+    async fn the_gate_keeps_compression_off_a_sealed_response() {
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        // What a handler below the gate sees.
+        let app = Router::new()
+            .route(
+                "/probe",
+                get(|headers: HeaderMap| async move {
+                    headers
+                        .get(axum::http::header::ACCEPT_ENCODING)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("absent")
+                        .to_string()
+                }),
+            )
+            .layer(middleware::from_fn(envelope_compression_gate));
+
+        // A cleartext request keeps its Accept-Encoding: it is compressed the
+        // ordinary way and the client's HTTP stack inflates it.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/probe")
+                    .header(axum::http::header::ACCEPT_ENCODING, "gzip, br")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::VARY)
+                .and_then(|v| v.to_str().ok()),
+            Some("accept-encoding"),
+            "the answer varies by what was asked for, compressed or not"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(String::from_utf8_lossy(&body), "gzip, br");
+
+        // A request that arrived sealed has it taken away, so the compression
+        // layer below declines and the envelope seals plaintext.
+        let mut request = Request::builder()
+            .uri("/probe")
+            .header(axum::http::header::ACCEPT_ENCODING, "gzip, br")
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(EncryptedStreamContext {
+            material: vec![0u8; 32],
+            request_aad: "aad".to_string(),
+            request_nonce: "nonce".to_string(),
+        });
+        let response = app.oneshot(request).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "absent",
+            "a sealed request is answered uncompressed"
+        );
+    }
+
+    /// Compression inside the envelope, and only for a client that asked.
+    ///
+    /// The envelope inflates what it seals by about 1.78x, and it seals before
+    /// anything could compress -- so this is the one place that cost can be
+    /// paid back. But the client is reading a base64 body whose real headers
+    /// are sealed with it, so it cannot use `content-encoding` the ordinary
+    /// way: it says what it can inflate with its own request header, and the
+    /// payload answers with its own field.
+    #[tokio::test]
+    async fn the_envelope_compresses_only_for_a_client_that_asked_for_gzip() {
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        let app = Router::new()
+            .route(
+                "/probe",
+                get(|headers: HeaderMap| async move {
+                    headers
+                        .get(axum::http::header::ACCEPT_ENCODING)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("absent")
+                        .to_string()
+                }),
+            )
+            .layer(middleware::from_fn(envelope_compression_gate));
+
+        let sealed_request = |accept: Option<&str>| {
+            let mut request = Request::builder().uri("/probe");
+            request = request.header(axum::http::header::ACCEPT_ENCODING, "gzip, br, zstd");
+            if let Some(accept) = accept {
+                request = request.header(ENVELOPE_ACCEPT_HEADER, accept);
+            }
+            let mut request = request.body(Body::empty()).unwrap();
+            request.extensions_mut().insert(EncryptedStreamContext {
+                material: vec![0u8; 32],
+                request_aad: "aad".to_string(),
+                request_nonce: "nonce".to_string(),
+            });
+            request
+        };
+        let seen = |app: Router, request: Request<Body>| async move {
+            let response = app.oneshot(request).await.unwrap();
+            let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+            String::from_utf8_lossy(&body).to_string()
+        };
+
+        // A client that says nothing is answered exactly as before.
+        assert_eq!(seen(app.clone(), sealed_request(None)).await, "absent");
+
+        // One that asks for gzip gets gzip -- and only gzip, though it also
+        // sent br and zstd in the ordinary header: the app fails a response
+        // encoded any other way, so the choice is pinned rather than passed on.
+        assert_eq!(seen(app.clone(), sealed_request(Some("gzip"))).await, "gzip");
+        assert_eq!(
+            seen(app.clone(), sealed_request(Some(" GZIP , br"))).await,
+            "gzip",
+            "the name is matched without case or spacing mattering"
+        );
+
+        // Something else entirely is not an opt-in.
+        assert_eq!(seen(app, sealed_request(Some("br"))).await, "absent");
+    }
+
+    /// Where the flag goes, and what it must not do to the headers map.
+    #[test]
+    fn the_sealed_payload_carries_its_encoding_beside_the_headers() {
+        let payload = EncryptedResponsePayload {
+            status: 200,
+            headers: BTreeMap::from([("content-type".to_string(), "application/json".to_string())]),
+            body: "…".to_string(),
+            content_encoding: Some("gzip".to_string()),
+        };
+        let value = serde_json::to_value(&payload).expect("serializes");
+        assert_eq!(
+            value["content_encoding"], "gzip",
+            "a top-level field, so a client finds it without walking the header map"
+        );
+        assert!(
+            value["headers"].get("content-encoding").is_none(),
+            "and never left in the headers, or the client would inflate twice"
+        );
+
+        // An uncompressed body says nothing at all, so an old client sees the
+        // payload it has always seen.
+        let plain = EncryptedResponsePayload {
+            status: 200,
+            headers: BTreeMap::new(),
+            body: "…".to_string(),
+            content_encoding: None,
+        };
+        let value = serde_json::to_value(&plain).expect("serializes");
+        assert!(value.get("content_encoding").is_none());
+    }
+
+    /// The agent stream is sealed on an encrypted deployment, and plain on a
+    /// cleartext one -- the same rule, and the same record shape, as the
+    /// terminal stream.
+    ///
+    /// It used to be neither: the agent stream went out in the clear whatever
+    /// the deployment, so a gateway configured `transport_encryption:
+    /// required` put the device token and every agent event on the wire
+    /// unprotected. `stream_event` is the single decision point for both
+    /// streams, so this asks it both ways.
+    #[tokio::test]
+    async fn the_agent_stream_is_sealed_exactly_when_the_device_is_encrypted() {
+        let token = "device-token";
+        let transport_key = generate_token();
+        let material = transport::decode_key(&transport_key).unwrap();
+        let mut device = test_device("phone-1", token);
+        device.transport_key = Some(transport_key);
+        let state = test_state("admin-token", vec![device]);
+
+        let (request, _, aad, nonce) =
+            decrypt_transport_request(&state, encrypted_test_request("phone-1", &material, token))
+                .await
+                .unwrap();
+        let context = request
+            .extensions()
+            .get::<EncryptedStreamContext>()
+            .expect("an encrypted request carries a stream context")
+            .clone();
+
+        // What the agent stream emits: a `connected` hello, then a domain
+        // event under its own name.
+        let mut sealed = Some(EventStreamSealer::new(&context).unwrap());
+        let hello = sealed
+            .as_mut()
+            .unwrap()
+            .seal_record("connected", r#"{"asid":"ses_1"}"#)
+            .unwrap();
+        let record: Value = serde_json::from_str(&hello).unwrap();
+        assert_eq!(record["seq"], 0);
+        let sid = record["sid"].as_str().unwrap().to_string();
+
+        let upsert = sealed
+            .as_mut()
+            .unwrap()
+            .seal_record("agent.timeline.upsert", r#"{"items":[]}"#)
+            .unwrap();
+        let record: Value = serde_json::from_str(&upsert).unwrap();
+        assert_eq!(record["seq"], 1, "one stream, one counter");
+        assert_eq!(record["sid"].as_str().unwrap(), sid);
+
+        // And it opens to exactly what the plaintext stream would have sent.
+        let key = transport::derive_stream_key(&material, &sid, &nonce).unwrap();
+        let opened = transport::open_stream_event(
+            &key,
+            1,
+            format!("{}\n{}\n{}", aad, sid, 1).as_bytes(),
+            record["ciphertext"].as_str().unwrap(),
+        )
+        .unwrap();
+        let inner: Value = serde_json::from_slice(&opened).unwrap();
+        assert_eq!(inner["event"], "agent.timeline.upsert");
+        assert_eq!(inner["data"], r#"{"items":[]}"#);
+
+        // A device paired without a transport key keeps the plaintext stream,
+        // byte for byte: no sealer, no envelope, the event under its own name.
+        let mut plain: Option<EventStreamSealer> = None;
+        let event = stream_event(&mut plain, "agent.timeline.upsert", r#"{"items":[]}"#)
+            .expect("a cleartext stream still emits");
+        let wire = format!("{event:?}");
+        assert!(
+            wire.contains("agent.timeline.upsert"),
+            "the event keeps its own name on a cleartext deployment: {wire}"
+        );
+        assert!(
+            !wire.contains(ENCRYPTED_SSE_EVENT),
+            "and is not wrapped in the sealed envelope: {wire}"
+        );
     }
 
     /// A paired device's headers with the app's locale header on them, which is
@@ -14759,6 +15693,110 @@ mod tests {
         .is_err());
     }
 
+    /// Cleartext mode drops the envelope, not the door.
+    ///
+    /// `transport_encryption: disabled` used to make `require_device` answer
+    /// `Ok` for *every* request, including one with no `Authorization` header
+    /// at all -- so on a gateway configured that way the entire device API,
+    /// uploads and agent routes included, answered anyone who could reach the
+    /// port. The mode is about the envelope around a request; it was never
+    /// meant to be about whether the request is authenticated, and the setup
+    /// warning it prints ("a leaked bearer token can call the API") says as
+    /// much.
+    #[test]
+    fn cleartext_mode_still_asks_for_a_token() {
+        let token = "device-token";
+        let mut state = test_state("admin-token", vec![test_device("phone-1", token)]);
+        state.config.transport_encryption = TransportEncryptionMode::Disabled;
+
+        // No header at all: 401, the same answer the encrypted mode gives.
+        let (status, body) = require_device(&state, &HeaderMap::new()).unwrap_err();
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body.0["error"]["code"], "missing_authorization");
+
+        // A token that is not a device's and not the admin's: 403.
+        let (status, body) = require_device(&state, &bearer_headers("guessed")).unwrap_err();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body.0["error"]["code"], "invalid_token");
+
+        // A malformed header is not a way past either.
+        let mut malformed = HeaderMap::new();
+        malformed.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("device-token"),
+        );
+        assert_eq!(
+            require_device(&state, &malformed).unwrap_err().0,
+            StatusCode::UNAUTHORIZED
+        );
+
+        // The paired device still gets in, and is still identified as itself.
+        assert_eq!(require_device(&state, &bearer_headers(token)).unwrap(), "phone-1");
+        // As does the admin token, which this mode has always accepted here.
+        assert_eq!(
+            require_device(&state, &bearer_headers("admin-token")).unwrap(),
+            "admin"
+        );
+
+        // First-run pairing has no token to send and must stay reachable. It
+        // does not come through here at all -- `/api/pair/request` and
+        // `/api/pair/claim` go through `require_pairing_transport` -- and
+        // `manual_pairing_omits_the_transport_key_when_encryption_is_disabled`
+        // drives both with no headers whatsoever in this very mode.
+    }
+
+    /// A device paired while encryption was on keeps a `transport_key` it will
+    /// never prove over cleartext. The proof is the part cleartext skips --
+    /// tightening the token check must not quietly start demanding it.
+    #[test]
+    fn cleartext_mode_admits_a_device_that_was_paired_with_a_transport_key() {
+        let mut device = test_device("phone-1", "device-token");
+        device.transport_key = Some("a-key-from-when-encryption-was-on".into());
+        let mut state = test_state("admin-token", vec![device]);
+        state.config.transport_encryption = TransportEncryptionMode::Disabled;
+
+        assert_eq!(
+            require_device(&state, &bearer_headers("device-token")).unwrap(),
+            "phone-1",
+            "cleartext drops the envelope and the proof, never the token"
+        );
+    }
+
+    /// The old behaviour survives only as a thing the owner writes down.
+    #[test]
+    fn only_an_explicit_opt_in_answers_without_a_token() {
+        let mut state = test_state("admin-token", vec![test_device("phone-1", "device-token")]);
+        state.config.transport_encryption = TransportEncryptionMode::Disabled;
+        state.config.dev_unauthenticated = true;
+
+        assert_eq!(
+            require_device(&state, &HeaderMap::new()).unwrap(),
+            DEV_UNAUTHENTICATED_DEVICE
+        );
+        // A real device is still identified as itself, not as the stand-in:
+        // the opt-in is a fallback, not a replacement for the token check.
+        assert_eq!(
+            require_device(&state, &bearer_headers("device-token")).unwrap(),
+            "phone-1"
+        );
+
+        // It is off unless written, and writing nothing writes nothing.
+        assert!(!test_config("admin-token").dev_unauthenticated);
+        let round_tripped = serde_json::to_value(test_config("admin-token")).unwrap();
+        assert!(
+            round_tripped.get("dev_unauthenticated").is_none(),
+            "an existing config.json must round-trip untouched"
+        );
+
+        // And it grants nothing in the encrypted mode, where there is no
+        // cleartext story to tell in the first place.
+        state.config.transport_encryption = TransportEncryptionMode::Required;
+        assert_eq!(
+            require_device(&state, &HeaderMap::new()).unwrap_err().0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
     #[tokio::test]
     async fn manual_pairing_omits_the_transport_key_when_encryption_is_disabled() {
         let mut state = test_state("admin-token", vec![]);
@@ -15297,6 +16335,283 @@ mod tests {
                 .extension,
             "heic"
         );
+    }
+
+    /// Every way of asking for something other than one plain file inside the
+    /// upload directory. The app only ever sends back a name this gateway
+    /// minted, so anything else is an attempt.
+    #[test]
+    fn an_upload_name_that_is_not_one_plain_component_is_refused() {
+        for attempt in [
+            "../config.json",
+            "..",
+            ".",
+            "../../.local/share/muqun-gateway/devices.json",
+            "sub/dir.webp",
+            "sub\\dir.webp",
+            "/etc/passwd",
+            "a/../b.webp",
+            ".hidden.webp",
+            "with space.webp",
+            "semi;colon.webp",
+            "quote\".webp",
+            "nul\0.webp",
+            "unicode\u{2215}.webp",
+            "",
+        ] {
+            assert!(
+                safe_upload_component(attempt).is_none(),
+                "{attempt:?} must not resolve to an upload"
+            );
+        }
+        // A percent-encoded separator is decoded before the handler sees it,
+        // so it arrives as the separator and fails on the same rule.
+        assert!(safe_upload_component("..%2fconfig.json").is_none());
+
+        // What the gateway actually generates passes, unchanged.
+        let minted = stored_upload_name(UploadKind {
+            extension: "webp",
+            mime: "image/webp",
+        });
+        assert_eq!(safe_upload_component(&minted).as_deref(), Some(&*minted));
+        assert_eq!(upload_url(&minted), format!("/api/uploads/{minted}"));
+    }
+
+    /// The round trip the app needs: it posts a file, gets back the host path
+    /// for the agent *and* a URL for itself, and reads the same bytes back
+    /// under the type the content earned rather than the one a name claimed.
+    #[tokio::test]
+    async fn an_upload_answers_with_a_url_the_app_can_read_the_same_bytes_from() {
+        use tower::ServiceExt as _;
+
+        let token = "device-token";
+        let state = test_state("admin", vec![test_device("phone-1", token)]);
+        let app = Router::new()
+            .route(UPLOADS_PATH, post(upload_file))
+            .route("/api/uploads/{file_name}", get(upload_content))
+            .with_state(state);
+
+        // A png announced as a `.txt`: the stored type must come from the
+        // bytes at write time and be re-derived from the bytes at read time.
+        let boundary = "muqun-upload-boundary";
+        let mut body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; \
+             filename=\"screenshot.txt\"\r\n\r\n"
+        )
+        .into_bytes();
+        body.extend_from_slice(&png_bytes());
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(UPLOADS_PATH)
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(
+                        axum::http::header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let stored: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1 << 16)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(stored["mime"], "image/png");
+        // The client name is echoed for the label only; it never became a path.
+        assert_eq!(stored["name"], "screenshot.txt");
+        let host_path = stored["path"].as_str().unwrap().to_string();
+        let url = stored["url"].as_str().unwrap().to_string();
+        let file_name = FsPath::new(&host_path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(file_name.ends_with(".png"), "got {file_name}");
+        assert_eq!(url, format!("/api/uploads/{file_name}"));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&url)
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "image/png");
+        assert_eq!(
+            response.headers()["cache-control"],
+            "private, no-store, max-age=0"
+        );
+        let served = axum::body::to_bytes(response.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        assert_eq!(served.as_ref(), png_bytes().as_slice());
+
+        // A name that was never minted, and a traversal spelled out in full,
+        // are the same miss -- neither says whether the target exists.
+        for miss in [
+            "/api/uploads/deadbeef-0000-0000-0000-000000000000.png",
+            "/api/uploads/..%2f..%2fconfig.json",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(miss)
+                        .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{miss}");
+            let body: Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 1 << 16)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["error"]["code"], "upload_not_found");
+        }
+
+        // And an unpaired caller gets nothing at all.
+        let response = app
+            .oneshot(Request::builder().uri(&url).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// The blanket `cache-control` is a floor. Every handler that says nothing
+    /// still gets `no-store`; the one that says something says more, not less,
+    /// and must reach the client as it wrote it.
+    #[tokio::test]
+    async fn the_blanket_cache_control_is_a_floor_a_handler_can_only_tighten() {
+        use axum::routing::get;
+        use tower::ServiceExt as _;
+
+        let app = Router::new()
+            .route("/quiet", get(|| async { "body" }))
+            .route(
+                "/specific",
+                get(|| async {
+                    Response::builder()
+                        .header("cache-control", "private, no-store, max-age=0")
+                        .body(Body::from("body"))
+                        .unwrap()
+                }),
+            )
+            .layer(middleware::from_fn(security_headers));
+
+        let quiet = app
+            .clone()
+            .oneshot(Request::builder().uri("/quiet").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(quiet.headers()["cache-control"], "no-store, max-age=0");
+
+        let specific = app
+            .oneshot(
+                Request::builder()
+                    .uri("/specific")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            specific.headers()["cache-control"],
+            "private, no-store, max-age=0",
+            "the middleware must not overwrite a handler's own, stricter value"
+        );
+        // The rest of the blanket still applies either way.
+        assert_eq!(specific.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(specific.headers()["pragma"], "no-cache");
+    }
+
+    /// Retention is a property of the file's age, not of whether the hourly
+    /// sweep happened to have run: a file the sweeper would take reads as gone.
+    #[test]
+    fn an_upload_past_its_retention_reads_as_gone_before_the_sweep_takes_it() {
+        let dir = asset_test_dir("upload-retention");
+        let path = dir.join("expired.png");
+        std::fs::write(&path, png_bytes()).unwrap();
+        let now = SystemTime::now();
+        assert!(!upload_expired(now, now));
+        assert!(upload_expired(now - UPLOAD_RETENTION, now));
+        // Still typed from its bytes while it lives.
+        assert_eq!(
+            sniff_stored_upload(&path, "expired.png").unwrap().mime,
+            "image/png"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The read path types a stored file the way the write path did: magic
+    /// numbers, then the office container, then text with the earned
+    /// extension deciding the flavour -- never the extension on its own.
+    #[test]
+    fn a_stored_upload_is_typed_by_its_bytes_on_the_way_out_too() {
+        let dir = asset_test_dir("upload-readback-types");
+
+        let png = dir.join("a.png");
+        std::fs::write(&png, png_bytes()).unwrap();
+        assert_eq!(sniff_stored_upload(&png, "a.png").unwrap().mime, "image/png");
+
+        // The extension lies; the bytes do not.
+        let mislabelled = dir.join("b.md");
+        std::fs::write(&mislabelled, png_bytes()).unwrap();
+        assert_eq!(
+            sniff_stored_upload(&mislabelled, "b.md").unwrap().mime,
+            "image/png"
+        );
+
+        let docx = dir.join("c.docx");
+        std::fs::write(
+            &docx,
+            test_zip(&[
+                ("[Content_Types].xml", b"<Types/>"),
+                ("_rels/.rels", b"<Relationships/>"),
+                ("word/document.xml", b"<document/>"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            sniff_stored_upload(&docx, "c.docx").unwrap().extension,
+            "docx"
+        );
+
+        let markdown = dir.join("d.md");
+        std::fs::write(&markdown, b"# notes\n\nplain\n").unwrap();
+        assert_eq!(
+            sniff_stored_upload(&markdown, "d.md").unwrap().mime,
+            "text/markdown; charset=utf-8"
+        );
+
+        // Nothing the gateway would have refused at upload time is served.
+        let elf = dir.join("e.png");
+        std::fs::write(&elf, b"\x7fELF\x02\x01\x01\x00and the rest").unwrap();
+        assert!(sniff_stored_upload(&elf, "e.png").is_none());
+
+        let empty = dir.join("f.png");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(sniff_stored_upload(&empty, "f.png").is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -16127,6 +17442,56 @@ mod tests {
     }
 
     #[test]
+    fn explicit_preview_accepts_home_files_without_widening_scan_roots() {
+        let base = asset_test_dir("home-preview");
+        let home = base.join("home");
+        let workspace = home.join("app");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(home.join("docs")).unwrap();
+        std::fs::create_dir_all(home.join(".config")).unwrap();
+        let report = home.join("docs/report.md");
+        let config = home.join(".config/example.txt");
+        let outside = base.join("outside.txt");
+        std::fs::write(&report, b"report").unwrap();
+        std::fs::write(&config, b"configuration").unwrap();
+        std::fs::write(&outside, b"outside").unwrap();
+        let scan_roots = vec![AssetRoot {
+            path: workspace,
+            session_id: "default".into(),
+            workspace_id: Some("wA".into()),
+            tab_id: None,
+            pane_id: None,
+        }];
+        let roots = preview_lookup_roots(
+            scan_roots.clone(),
+            "default",
+            Some(&home),
+            [base.clone(), home.clone(), PathBuf::from("/")],
+        );
+        assert_eq!(scan_roots.len(), 1);
+        assert!(asset_entry_for_path(&report.to_string_lossy(), &scan_roots).is_none());
+        assert_eq!(roots.len(), 2);
+        for path in [&report, &config] {
+            let entry = asset_entry_for_path(&path.to_string_lossy(), &roots).unwrap();
+            assert_eq!(entry.session_id, "default");
+            assert_eq!(
+                resolve_indexed_asset_path(&entry.path, &[]),
+                Some(entry.path)
+            );
+        }
+        assert!(asset_entry_for_path(&outside.to_string_lossy(), &roots).is_none());
+        assert!(asset_entry_for_path(&home.to_string_lossy(), &roots).is_none());
+        #[cfg(unix)]
+        {
+            let link = home.join("escape.txt");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            assert!(asset_entry_for_path(&link.to_string_lossy(), &roots).is_none());
+        }
+        assert!(preview_lookup_roots(vec![], "default", Some(FsPath::new("/")), []).is_empty());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
     fn an_exact_path_lookup_answers_one_asset_or_none_and_never_leaves_the_roots() {
         let base = asset_test_dir("lookup");
         let workspace = base.join("workspace");
@@ -16747,6 +18112,20 @@ mod tests {
         );
         assert!(spec["paths"]["/api/uploads"]["post"]["responses"]["413"].is_object());
         assert!(spec["paths"]["/api/uploads"]["post"]["responses"]["415"].is_object());
+        // The upload answers with both ways of reaching the file, and both are
+        // required: a client that only got `path` could not draw the
+        // attachment it just sent.
+        let stored = &spec["paths"]["/api/uploads"]["post"]["responses"]["200"]["content"]
+            ["application/json"]["schema"];
+        assert_eq!(
+            stored["required"],
+            json!(["path", "url", "name", "size", "mime"])
+        );
+        assert!(stored["properties"]["url"].is_object());
+        let upload_read = &spec["paths"]["/api/uploads/{fileName}"]["get"];
+        assert!(upload_read.is_object());
+        assert_eq!(upload_read["parameters"][0]["name"], "fileName");
+        assert!(upload_read["responses"]["404"].is_object());
         assert_eq!(
             spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/output"]["get"]["parameters"]
                 [6]["name"],
@@ -16777,6 +18156,21 @@ mod tests {
         assert!(API_CAPABILITIES.contains(&"agent_catalog"));
         assert!(API_CAPABILITIES.contains(&"terminal_backends"));
         assert!(API_CAPABILITIES.contains(&"multiple_terminal_backends"));
+    }
+
+    /// The snapshot is one call where the app used to make four, and its
+    /// `agents` array is now the real agent list -- so a client can prewarm a
+    /// session from it and drop the separate `/agents` call. It is announced
+    /// because the alternative is the app probing for a 404 and then guessing
+    /// whether the `agents` it got back carry `instance_id` and `target`.
+    #[test]
+    fn the_session_snapshot_is_announced_as_a_capability() {
+        assert!(API_CAPABILITIES.contains(&"session_snapshot"));
+        assert!(
+            gateway_capabilities(false).contains(&"session_snapshot"),
+            "it is a property of this build, not of a session's backend"
+        );
+        assert!(gateway_capabilities(true).contains(&"session_snapshot"));
     }
 
     /// Collaboration is the one capability that is not a property of this

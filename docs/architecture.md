@@ -50,7 +50,12 @@ JSON line protocol      argv-only tmux CLI
 The use cases are actions meaningful to the app, independent of the terminal
 implementation:
 
-- inspect topology: snapshot and list/get workspace, tab, pane, and agent;
+- inspect topology: snapshot and list/get workspace, tab, pane, and agent. The
+  snapshot is the whole session in one answer, and its `agents` array is the
+  agent list itself -- the same `Agent` values `GET .../agents` serializes,
+  `instance_id` and `target` included -- so a client warming a home screen
+  makes one call rather than four. It is announced as the `session_snapshot`
+  capability;
 - inspect terminal state: read visible/recent output, compose structured parts,
   detect approvals, and find files relative to pane working directories;
 - control topology: create, focus, rename, close, and split;
@@ -163,7 +168,18 @@ cache. A bearer token alone therefore cannot use an encrypted device record.
 
 `disabled` is an explicit compatibility mode. Its QR carries no bootstrap key,
 new devices receive no transport key, and their bearer token is sufficient for
-API access. Existing device records retain the mode in which they paired.
+API access. Existing device records retain the mode in which they paired. A
+device that paired while encryption was on keeps its transport key and will
+never present a proof over cleartext, so `disabled` skips the proof check — and
+only the proof check. A valid device token, or the admin token, is still
+required on every device route: the mode is about the envelope around a
+request, never about whether the request is authenticated.
+
+`dev_unauthenticated: true` is the one way to turn that off, for a local mock
+or harness that has no pairing to offer. It is a separate, explicitly written
+config key rather than anything `transport_encryption` implies, it defaults to
+false, it is omitted from a written config when false, and a gateway started
+with it on says so on stderr every time.
 
 Application encryption hides credentials and payloads, but route names, query
 strings, sizes, timing, device id, and availability remain visible. It has no
@@ -177,3 +193,17 @@ transport, translate failures into `BackendError`, and add contract tests for
 topology, capture, input, and lifecycle commands. Do not add native response
 fields to HTTP handlers; extend the backend-neutral model and compatibility
 mapper only when the app contract genuinely needs new information.
+
+### Explicit file previews
+
+Authenticated paired devices may resolve an exact file path anywhere under the
+Gateway account's canonical home directory, including sibling projects and
+hidden configuration directories. This is a deliberate device trust boundary:
+it includes private files readable by that account. The existing upload,
+workspace, cache and temporary roots remain supported. This does not enable
+recursive scanning of the home directory; ordinary artifact lists keep their
+workspace/tab scope. Canonical path containment rejects symlink escapes to paths
+outside all permitted roots, and directories are not returned as file assets.
+The home is obtained from the Gateway process environment, never from a client
+request. Successful lookups are indexed for the existing authenticated content
+endpoint; no App API change is required.

@@ -1,0 +1,10 @@
+data: {"id":"evt_0b274d235001WkWYpr4AOkHIET","created":1789700395573,"type":"session.created","location":{"directory":"/tmp/muqun-gw-c1"},"data":{"sessionID":"ses_f4d8b2dccffeFm6JB0jEWOAHn4","slug":"tidy-island","version":"2.0.1","projectID":"cb4a45a32f46130a7f53f86b1f49bade1549b6a8","location":{"directory":"/tmp/muqun-gw-c1"},"subpath":"","model":{"id":"nemotron-3.5-lightning-free","providerID":"opencode"}},"durable":{"aggregateID":"ses_f4d8b2dccffeFm6JB0jEWOAHn4","seq":0,"version":1}}
+
+data: {"id":"evt_0b274e68d001TfkxIx35Ku3l6r","created":1789700400781,"type":"session.revert.staged","location":{"directory":"/tmp/muqun-gw-c1"},"data":{"sessionID":"ses_f4d8b2dccffeFm6JB0jEWOAHn4","revert":{"messageID":"msg_0b274d61b001Mc9InWjER3mRSo","files":[]}},"durable":{"aggregateID":"ses_f4d8b2dccffeFm6JB0jEWOAHn4","seq":15,"version":1}}
+
+data: {"id":"evt_0b274ea7d0013YEhp1I5NLdw82","created":1789700401789,"type":"session.revert.cleared","location":{"directory":"/tmp/muqun-gw-c1"},"data":{"sessionID":"ses_f4d8b2dccffeFm6JB0jEWOAHn4"},"durable":{"aggregateID":"ses_f4d8b2dccffeFm6JB0jEWOAHn4","seq":16,"version":1}}
+
+data: {"id":"evt_0b274ee69001HxvtvxY4vYU0JB","created":1789700402793,"type":"session.revert.staged","location":{"directory":"/tmp/muqun-gw-c1"},"data":{"sessionID":"ses_f4d8b2dccffeFm6JB0jEWOAHn4","revert":{"messageID":"msg_0b274d61b001Mc9InWjER3mRSo","files":[]}},"durable":{"aggregateID":"ses_f4d8b2dccffeFm6JB0jEWOAHn4","seq":19,"version":1}}
+
+data: {"id":"evt_0b274f060001ZmBaCFCQUHLLKc","created":1789700403296,"type":"session.revert.committed","location":{"directory":"/tmp/muqun-gw-c1"},"data":{"sessionID":"ses_f4d8b2dccffeFm6JB0jEWOAHn4","to":"msg_0b274d61b001Mc9InWjER3mRSo"},"durable":{"aggregateID":"ses_f4d8b2dccffeFm6JB0jEWOAHn4","seq":20,"version":1}}
+

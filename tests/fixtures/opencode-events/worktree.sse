@@ -1,0 +1,18 @@
+: worktree.resolved, worktree.updated and session.moved, captured from
+: OpenCode 2.0.1 while driving a full worktree cycle against the live
+: service: list, create, refresh, move a session onto the worktree, and
+: remove it. These three are what that cycle actually publishes on
+: /api/event.
+: 
+: worktree.ready, worktree.failed and workspace.status are NOT here and
+: were not emitted by any of it. They exist in the binary's event
+: registry with schemas {name, branch?}, {message} and {workspaceID,
+: status}, and the gateway accepts the first two so a flow that does emit
+: them is not dropped.
+
+data: {"id":"evt_0b2f17672001n4qdZ9080xGXwI","created":1789708564082,"type":"worktree.resolved","data":{"projectID":"016d5ff1cc0c2a1c4cb80441b37dbfa45f3b08a6","directory":"/tmp/muqun-gw-wt","previous":"global"},"durable":{"aggregateID":"016d5ff1cc0c2a1c4cb80441b37dbfa45f3b08a6","seq":0,"version":1}}
+
+data: {"id":"evt_0b2f1eaf9001u5F4ozzZH2lH3S","created":1789708593913,"type":"worktree.updated","location":{"directory":"/tmp/muqun-gw-wt"},"data":{"projectID":"016d5ff1cc0c2a1c4cb80441b37dbfa45f3b08a6"}}
+
+data: {"id":"evt_0b2f2dfc8002HfbjaEUCqe4N51","created":1789708656584,"type":"session.moved","location":{"directory":"/tmp/muqun-gw-wt"},"data":{"sessionID":"ses_f4d0d2066ffeYtNIffATgHg0Fw","location":{"directory":"/home/ryu/.local/share/opencode/worktree/016d5f/probe-b"},"projectID":"016d5ff1cc0c2a1c4cb80441b37dbfa45f3b08a6","subpath":""},"durable":{"aggregateID":"ses_f4d0d2066ffeYtNIffATgHg0Fw","seq":4,"version":1}}
+

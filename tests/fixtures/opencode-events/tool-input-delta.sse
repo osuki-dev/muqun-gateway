@@ -1,0 +1,34 @@
+: session.tool.input.delta, carrying a tool call's arguments as they arrive.
+: 
+: Everything but the three delta frames is a live capture from OpenCode
+: 2.0.1 -- a `shell` call in /tmp/muqun-gw-c1 on a free model. The deltas
+: are written to the schema the 2.0.1 binary declares, because neither free
+: model streams tool arguments; both jump from input.started to input.ended.
+: The binary declares the three events as:
+: 
+:   let r = {...e, assistantMessageID: ot, id: t}
+:   Started = ({type:"session.tool.input.started", schema:{...r, name: t}})
+:   Delta   = ({type:"session.tool.input.delta",   schema:{...r, delta: t}})
+:   Ended   = ({type:"session.tool.input.ended",   schema:{...r, text: t}})
+: 
+: and both of its own consumers concatenate the chunks and then replace the
+: result with `text` when the call ends:
+: 
+:   o.raw = (o.raw ?? "") + t.data.delta
+:   input: t.type === "session.tool.input.ended"
+:            ? t.data.text : s.part.state.input + t.data.delta
+
+data: {"id":"evt_0b2dc1b30001dG6Sgpqwds0qSH","created":1789707164464,"type":"session.created","location":{"directory":"/tmp/muqun-gw-c1"},"data":{"sessionID":"ses_f4d23e4d4ffeQZ5sBM44YXS24z","slug":"sunny-meadow","version":"2.0.1","projectID":"cb4a45a32f46130a7f53f86b1f49bade1549b6a8","location":{"directory":"/tmp/muqun-gw-c1"},"subpath":"","model":{"id":"nemotron-3.5-lightning-free","providerID":"opencode"}},"durable":{"aggregateID":"ses_f4d23e4d4ffeQZ5sBM44YXS24z","seq":0,"version":1}}
+
+data: {"id":"evt_0b2dc2746001111Yl6YVKg4foZ","created":1789707167558,"type":"session.tool.input.started","location":{"directory":"/tmp/muqun-gw-c1"},"data":{"sessionID":"ses_f4d23e4d4ffeQZ5sBM44YXS24z","assistantMessageID":"msg_0b2dc1dfd001oHqTP7n1zQZqO4","id":"call-c2aaf5ae-f8b4-41d6-b961-548dcf1bf653","name":"shell"},"durable":{"aggregateID":"ses_f4d23e4d4ffeQZ5sBM44YXS24z","seq":9,"version":1}}
+
+data: {"id":"evt_delta0","created":1789707167568,"type":"session.tool.input.delta","location":{"directory":"/tmp/muqun-gw-c1"},"data":{"sessionID":"ses_f4d23e4d4ffeQZ5sBM44YXS24z","assistantMessageID":"msg_0b2dc1dfd001oHqTP7n1zQZqO4","id":"call-c2aaf5ae-f8b4-41d6-b961-548dcf1bf653","delta":"{\"command\":\""}}
+
+data: {"id":"evt_delta1","created":1789707167578,"type":"session.tool.input.delta","location":{"directory":"/tmp/muqun-gw-c1"},"data":{"sessionID":"ses_f4d23e4d4ffeQZ5sBM44YXS24z","assistantMessageID":"msg_0b2dc1dfd001oHqTP7n1zQZqO4","id":"call-c2aaf5ae-f8b4-41d6-b961-548dcf1bf653","delta":"echo muqun-del"}}
+
+data: {"id":"evt_delta2","created":1789707167588,"type":"session.tool.input.delta","location":{"directory":"/tmp/muqun-gw-c1"},"data":{"sessionID":"ses_f4d23e4d4ffeQZ5sBM44YXS24z","assistantMessageID":"msg_0b2dc1dfd001oHqTP7n1zQZqO4","id":"call-c2aaf5ae-f8b4-41d6-b961-548dcf1bf653","delta":"ta-probe\"}"}}
+
+data: {"id":"evt_0b2dc2790001tpu5vQzV54PGcD","created":1789707167632,"type":"session.tool.input.ended","location":{"directory":"/tmp/muqun-gw-c1"},"data":{"sessionID":"ses_f4d23e4d4ffeQZ5sBM44YXS24z","assistantMessageID":"msg_0b2dc1dfd001oHqTP7n1zQZqO4","id":"call-c2aaf5ae-f8b4-41d6-b961-548dcf1bf653","text":"{\"command\":\"echo muqun-delta-probe\"}"},"durable":{"aggregateID":"ses_f4d23e4d4ffeQZ5sBM44YXS24z","seq":11,"version":1}}
+
+data: {"id":"evt_0b2dc2791001UA0yHX9C6GHZmO","created":1789707167633,"type":"session.tool.called","location":{"directory":"/tmp/muqun-gw-c1"},"data":{"sessionID":"ses_f4d23e4d4ffeQZ5sBM44YXS24z","assistantMessageID":"msg_0b2dc1dfd001oHqTP7n1zQZqO4","id":"call-c2aaf5ae-f8b4-41d6-b961-548dcf1bf653","input":{"command":"echo muqun-delta-probe"},"executed":false},"durable":{"aggregateID":"ses_f4d23e4d4ffeQZ5sBM44YXS24z","seq":12,"version":1}}
+
