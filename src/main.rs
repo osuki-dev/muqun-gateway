@@ -10803,7 +10803,9 @@ fn with_uploads_root(
 }
 
 /// Extra roots are used ONLY for an explicit file lookup, never a directory
-/// scan. Platform cache/temp paths are configuration, not terminal output.
+/// scan. Paired devices may explicitly open files in the gateway account's
+/// home, including sibling projects and dotfiles. Platform home/cache/temp
+/// paths are configuration, not terminal output.
 fn preview_lookup_roots(
     mut roots: Vec<AssetRoot>,
     session_id: &str,
@@ -10811,12 +10813,23 @@ fn preview_lookup_roots(
     candidates: impl IntoIterator<Item = PathBuf>,
 ) -> Vec<AssetRoot> {
     let canonical_home = home.and_then(|path| std::fs::canonicalize(path).ok());
+    if let Some(path) = canonical_home.as_ref().filter(|path| {
+        path.is_dir() && path.parent().is_some() && !roots.iter().any(|root| root.path == **path)
+    }) {
+        roots.push(AssetRoot {
+            path: path.clone(),
+            session_id: session_id.to_owned(),
+            workspace_id: None,
+            tab_id: None,
+            pane_id: None,
+        });
+    }
     for candidate in candidates {
         let Ok(path) = std::fs::canonicalize(candidate) else {
             continue;
         };
-        // An overly broad XDG_CACHE_HOME/TMPDIR must not expose the account
-        // or filesystem root. Resolve aliases such as macOS /tmp first.
+        // Cache/temp configuration must not widen access above the account
+        // home or to the filesystem root. Resolve aliases such as macOS /tmp first.
         if !path.is_dir()
             || path.parent().is_none()
             || canonical_home
@@ -17426,6 +17439,56 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn explicit_preview_accepts_home_files_without_widening_scan_roots() {
+        let base = asset_test_dir("home-preview");
+        let home = base.join("home");
+        let workspace = home.join("app");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(home.join("docs")).unwrap();
+        std::fs::create_dir_all(home.join(".config")).unwrap();
+        let report = home.join("docs/report.md");
+        let config = home.join(".config/example.txt");
+        let outside = base.join("outside.txt");
+        std::fs::write(&report, b"report").unwrap();
+        std::fs::write(&config, b"configuration").unwrap();
+        std::fs::write(&outside, b"outside").unwrap();
+        let scan_roots = vec![AssetRoot {
+            path: workspace,
+            session_id: "default".into(),
+            workspace_id: Some("wA".into()),
+            tab_id: None,
+            pane_id: None,
+        }];
+        let roots = preview_lookup_roots(
+            scan_roots.clone(),
+            "default",
+            Some(&home),
+            [base.clone(), home.clone(), PathBuf::from("/")],
+        );
+        assert_eq!(scan_roots.len(), 1);
+        assert!(asset_entry_for_path(&report.to_string_lossy(), &scan_roots).is_none());
+        assert_eq!(roots.len(), 2);
+        for path in [&report, &config] {
+            let entry = asset_entry_for_path(&path.to_string_lossy(), &roots).unwrap();
+            assert_eq!(entry.session_id, "default");
+            assert_eq!(
+                resolve_indexed_asset_path(&entry.path, &[]),
+                Some(entry.path)
+            );
+        }
+        assert!(asset_entry_for_path(&outside.to_string_lossy(), &roots).is_none());
+        assert!(asset_entry_for_path(&home.to_string_lossy(), &roots).is_none());
+        #[cfg(unix)]
+        {
+            let link = home.join("escape.txt");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            assert!(asset_entry_for_path(&link.to_string_lossy(), &roots).is_none());
+        }
+        assert!(preview_lookup_roots(vec![], "default", Some(FsPath::new("/")), []).is_empty());
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

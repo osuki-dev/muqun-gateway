@@ -193,3 +193,17 @@ transport, translate failures into `BackendError`, and add contract tests for
 topology, capture, input, and lifecycle commands. Do not add native response
 fields to HTTP handlers; extend the backend-neutral model and compatibility
 mapper only when the app contract genuinely needs new information.
+
+### Explicit file previews
+
+Authenticated paired devices may resolve an exact file path anywhere under the
+Gateway account's canonical home directory, including sibling projects and
+hidden configuration directories. This is a deliberate device trust boundary:
+it includes private files readable by that account. The existing upload,
+workspace, cache and temporary roots remain supported. This does not enable
+recursive scanning of the home directory; ordinary artifact lists keep their
+workspace/tab scope. Canonical path containment rejects symlink escapes to paths
+outside all permitted roots, and directories are not returned as file assets.
+The home is obtained from the Gateway process environment, never from a client
+request. Successful lookups are indexed for the existing authenticated content
+endpoint; no App API change is required.
