@@ -88,9 +88,23 @@ pub enum EngineOrigin {
     None,
 }
 
+/// Whether this gateway can establish that OpenCode is installed locally.
+///
+/// This deliberately says nothing about whether a service is currently
+/// reachable. An externally configured endpoint is not necessarily local, so
+/// its installation cannot be determined from this process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EngineInstallation {
+    Installed,
+    NotFound,
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineStatus {
     pub available: bool,
+    pub installation: EngineInstallation,
     pub origin: EngineOrigin,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
@@ -149,6 +163,11 @@ impl AgentRuntime {
         let manager = self.manager.read().await.clone();
         EngineStatus {
             available: manager.is_some(),
+            installation: if manager.is_some() {
+                EngineInstallation::Installed
+            } else {
+                local_installation_status(&self.config)
+            },
             origin: *self.origin.read().await,
             url: manager.as_ref().map(|m| m.endpoint_url().to_string()),
             version: manager
@@ -472,10 +491,7 @@ fn resolve_binary_in(
     configured: Option<&str>,
     path_var: Option<&std::ffi::OsStr>,
 ) -> anyhow::Result<std::path::PathBuf> {
-    let name = configured
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .unwrap_or("opencode");
+    let name = binary_name(configured);
 
     // Anything with a separator is a path the owner meant literally, and a
     // missing one is an error naming it rather than a quiet fall back to PATH:
@@ -502,21 +518,102 @@ fn resolve_binary_in(
     )
 }
 
+fn binary_name(configured: Option<&str>) -> &str {
+    configured
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("opencode")
+}
+
+/// Classify installation without starting OpenCode or contacting an endpoint.
+/// The inputs are injected to keep lookup tests independent of global process
+/// environment.
+fn installation_status_in(
+    configured: Option<&str>,
+    path_var: Option<&std::ffi::OsStr>,
+    external_endpoint_configured: bool,
+) -> EngineInstallation {
+    if external_endpoint_configured {
+        return EngineInstallation::Unknown;
+    }
+
+    let name = binary_name(configured);
+    if name.contains(std::path::MAIN_SEPARATOR) || name.contains('/') {
+        return match std::fs::metadata(name) {
+            Ok(metadata) if metadata_is_executable(&metadata) => EngineInstallation::Installed,
+            Ok(_) => EngineInstallation::NotFound,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => EngineInstallation::NotFound,
+            Err(_) => EngineInstallation::Unknown,
+        };
+    }
+
+    let Some(path_var) = path_var else {
+        return EngineInstallation::Unknown;
+    };
+    let mut ambiguous = false;
+    for directory in std::env::split_paths(path_var) {
+        let candidate = directory.join(name);
+        match std::fs::metadata(&candidate) {
+            Ok(metadata) if metadata_is_executable(&metadata) => {
+                return EngineInstallation::Installed;
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => ambiguous = true,
+        }
+    }
+    if ambiguous {
+        EngineInstallation::Unknown
+    } else {
+        EngineInstallation::NotFound
+    }
+}
+
+fn local_installation_status(config: &OpencodeConfig) -> EngineInstallation {
+    let Ok(external_endpoint_configured) =
+        external_endpoint_configured_with(|name| std::env::var(name))
+    else {
+        return EngineInstallation::Unknown;
+    };
+    installation_status_in(
+        config.binary.as_deref(),
+        std::env::var_os("PATH").as_deref(),
+        external_endpoint_configured,
+    )
+}
+
+fn external_endpoint_configured_with(
+    mut read: impl FnMut(&str) -> Result<String, std::env::VarError>,
+) -> Result<bool, ()> {
+    for name in ["OPENCODE_URL", "HERDR_GATEWAY_OPENCODE_URL"] {
+        match read(name) {
+            Ok(url) => return Ok(!url.trim().is_empty()),
+            Err(std::env::VarError::NotPresent) => {}
+            Err(std::env::VarError::NotUnicode(_)) => return Err(()),
+        }
+    }
+    Ok(false)
+}
+
 fn absolute(path: std::path::PathBuf) -> std::path::PathBuf {
     std::fs::canonicalize(&path).unwrap_or(path)
 }
 
 #[cfg(unix)]
-fn is_executable(path: &std::path::Path) -> bool {
+fn metadata_is_executable(metadata: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
+    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
 }
 
 #[cfg(not(unix))]
+fn metadata_is_executable(metadata: &std::fs::Metadata) -> bool {
+    metadata.is_file()
+}
+
 fn is_executable(path: &std::path::Path) -> bool {
-    path.is_file()
+    std::fs::metadata(path)
+        .map(|metadata| metadata_is_executable(&metadata))
+        .unwrap_or(false)
 }
 
 /// What `<binary> --version` says, or `None` if it cannot be asked.
@@ -692,6 +789,105 @@ mod tests {
         assert!(err.to_string().contains("PATH is not set"), "got {err}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn installation_status_distinguishes_local_lookup_from_service_readiness() {
+        let dir = std::env::temp_dir().join(format!(
+            "muqun-installation-status-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let binary = dir.join("opencode");
+        std::fs::write(&binary, "#!/bin/sh\nexit 0\n").expect("write binary");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        let path_var = std::ffi::OsString::from(&dir);
+        let empty_path = std::ffi::OsString::from(dir.join("empty"));
+        let missing = dir.join("missing-opencode");
+        let non_executable = dir.join("not-executable");
+        std::fs::write(&non_executable, "not a program\n").expect("write non-executable");
+
+        assert_eq!(
+            installation_status_in(None, Some(&path_var), false),
+            EngineInstallation::Installed,
+            "a local executable is installed even while its service is down"
+        );
+        assert_eq!(
+            installation_status_in(Some(missing.to_str().unwrap()), Some(&path_var), false),
+            EngineInstallation::NotFound,
+            "a broken explicit path does not fall back to PATH"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            installation_status_in(
+                Some(non_executable.to_str().unwrap()),
+                Some(&path_var),
+                false
+            ),
+            EngineInstallation::NotFound,
+            "an explicit regular file must also be executable"
+        );
+        assert_eq!(
+            installation_status_in(None, Some(&empty_path), false),
+            EngineInstallation::NotFound
+        );
+        assert_eq!(
+            installation_status_in(None, None, false),
+            EngineInstallation::Unknown,
+            "without PATH the local lookup is inconclusive"
+        );
+        assert_eq!(
+            installation_status_in(None, Some(&path_var), true),
+            EngineInstallation::Unknown,
+            "the local PATH cannot establish installation for an external endpoint"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn endpoint_environment_errors_make_installation_inconclusive() {
+        let unreadable = std::ffi::OsString::from("unreadable");
+        assert_eq!(
+            external_endpoint_configured_with(|name| match name {
+                "OPENCODE_URL" => Err(std::env::VarError::NotUnicode(unreadable.clone())),
+                _ => Err(std::env::VarError::NotPresent),
+            }),
+            Err(())
+        );
+        assert_eq!(
+            external_endpoint_configured_with(|name| match name {
+                "OPENCODE_URL" => Err(std::env::VarError::NotPresent),
+                "HERDR_GATEWAY_OPENCODE_URL" => Ok(" http://127.0.0.1:4096 ".to_string()),
+                _ => unreachable!(),
+            }),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn engine_status_serializes_the_additive_installation_field() {
+        let status = EngineStatus {
+            available: false,
+            installation: EngineInstallation::NotFound,
+            origin: EngineOrigin::None,
+            url: None,
+            version: None,
+            stream_connected: false,
+            autostart: true,
+        };
+        let value = serde_json::to_value(status).expect("status serializes");
+        assert_eq!(value["installation"], "not_found");
+        assert_eq!(value["available"], false);
+        assert_eq!(value["origin"], "none");
+        assert_eq!(value["autostart"], true);
+        assert!(value.get("url").is_none());
+        assert!(value.get("version").is_none());
     }
 
     /// A lost stream is the engine going away, so the first one is looked at
