@@ -1,7 +1,7 @@
-use serde::{Deserialize, Serialize};
 use super::form::FormRequest;
 use super::permission::PermissionRequest;
 use super::session::{AgentErrorInfo, ModelRef, TokensUsage};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

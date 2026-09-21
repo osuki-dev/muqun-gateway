@@ -11,6 +11,6 @@ pub mod use_cases;
 
 pub use domain::*;
 pub use manager::AgentManager;
-pub use runtime::{AgentRuntime, EngineInstallation, EngineOrigin, EngineStatus, OpencodeConfig};
 pub use ports::*;
+pub use runtime::{AgentRuntime, EngineInstallation, EngineOrigin, EngineStatus, OpencodeConfig};
 pub use use_cases::*;

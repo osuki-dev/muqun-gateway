@@ -307,7 +307,10 @@ mod tests {
         assert_eq!(first["agent_status"], "working");
 
         let second = &snap["result"]["agents"][1];
-        assert!(second["instance_id"].is_null(), "a tmux agent has no instance");
+        assert!(
+            second["instance_id"].is_null(),
+            "a tmux agent has no instance"
+        );
         assert_eq!(second["target"], "%12");
         assert_eq!(
             second["display_agent"], "codex",

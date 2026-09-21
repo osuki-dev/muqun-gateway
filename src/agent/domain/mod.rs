@@ -14,15 +14,13 @@ pub use model::{
 pub use permission::{PermissionDecision, PermissionOption, PermissionRequest};
 pub use session::{
     AgentErrorInfo, AgentProject, AgentSessionId, AgentSessionInfo, AgentSessionStatus, ModelRef,
-    RevertState, SessionForkInfo, SessionQuery, SessionRevertInfo, TokensUsage,
-    WorktreeState,
+    RevertState, SessionForkInfo, SessionQuery, SessionRevertInfo, TokensUsage, WorktreeState,
 };
 pub use timeline::{
     part_item_id, push_input_partial, reasoning_item_id, text_item_id, tool_item_id, AgentPart,
     CompactionStatus, TimelineItem, TimelineRole, TodoItem, ToolCall, ToolCallStatus, ToolTime,
     MAX_TOOL_INPUT_PARTIAL_BYTES,
 };
-
 
 #[cfg(test)]
 mod contract_tests {
@@ -172,10 +170,16 @@ mod contract_tests {
         let value = serde_json::to_value(&part).expect("serializes");
         assert_eq!(value["type"], "tool");
         assert_eq!(value["state"], "completed");
-        assert_eq!(value["status"], "completed", "the legacy name carries the same value");
+        assert_eq!(
+            value["status"], "completed",
+            "the legacy name carries the same value"
+        );
         assert_eq!(value["child_session_id"], "ses_c");
         assert_eq!(value["background"], true);
-        assert_eq!(value["metadata"]["sessionID"], "ses_c", "metadata is verbatim");
+        assert_eq!(
+            value["metadata"]["sessionID"], "ses_c",
+            "metadata is verbatim"
+        );
         assert_eq!(value["time"]["ran"], 2);
         assert!(
             !keys(&value).contains(&"truncated".to_string()),
@@ -321,7 +325,8 @@ mod contract_tests {
         for event in &events {
             let value = serde_json::to_value(event).expect("serializes");
             assert_eq!(
-                value["type"], event.event_name(),
+                value["type"],
+                event.event_name(),
                 "the SSE event name and the payload's own type must agree"
             );
         }

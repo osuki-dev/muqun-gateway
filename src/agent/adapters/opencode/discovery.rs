@@ -1,5 +1,5 @@
-use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpencodeServiceRegistration {
@@ -24,7 +24,9 @@ impl OpencodeEndpoint {
     /// Discover OpenCode service configuration from standard state files or environment.
     pub async fn discover() -> Option<Self> {
         // 1. Check environment variables first if manually configured
-        if let Ok(url) = std::env::var("OPENCODE_URL").or_else(|_| std::env::var("HERDR_GATEWAY_OPENCODE_URL")) {
+        if let Ok(url) =
+            std::env::var("OPENCODE_URL").or_else(|_| std::env::var("HERDR_GATEWAY_OPENCODE_URL"))
+        {
             let url = url.trim().trim_end_matches('/').to_string();
             if !url.is_empty() {
                 let password = std::env::var("OPENCODE_SERVER_PASSWORD")

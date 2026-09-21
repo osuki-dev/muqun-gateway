@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use super::session::AgentSessionId;
+use serde::{Deserialize, Serialize};
 
 fn is_false(v: &bool) -> bool {
     !*v

@@ -1,13 +1,13 @@
-use serde_json::Value;
 use crate::agent::domain::{
     part_item_id, push_input_partial, reasoning_item_id, text_item_id, tool_item_id,
-    AgentErrorInfo, AgentInfo,
-    AgentPart, AgentProject, AgentSessionId, AgentSessionInfo, AgentSessionStatus, CompactionStatus,
-    FormField, FormOption, FormRequest, McpServerInfo, ModelInfo, ModelRef, ModelVariantInfo,
-    PermissionDecision, PermissionOption, PermissionRequest, SessionForkInfo, SessionRevertInfo,
-    CatalogDefaults, CommandInfo, ProviderInfo, ProviderModelInfo, SkillInfo, TimelineItem,
-    TimelineRole, TodoItem, TokensUsage, ToolCall, ToolCallStatus, ToolTime,
+    AgentErrorInfo, AgentInfo, AgentPart, AgentProject, AgentSessionId, AgentSessionInfo,
+    AgentSessionStatus, CatalogDefaults, CommandInfo, CompactionStatus, FormField, FormOption,
+    FormRequest, McpServerInfo, ModelInfo, ModelRef, ModelVariantInfo, PermissionDecision,
+    PermissionOption, PermissionRequest, ProviderInfo, ProviderModelInfo, SessionForkInfo,
+    SessionRevertInfo, SkillInfo, TimelineItem, TimelineRole, TodoItem, TokensUsage, ToolCall,
+    ToolCallStatus, ToolTime,
 };
+use serde_json::Value;
 
 /// `Model.Ref` as v2 spells it: `{id, providerID, variant?}`. `modelID` is
 /// accepted as a v1-compat spelling of `id`.
@@ -24,7 +24,10 @@ pub fn map_model_ref(val: &Value) -> Option<ModelRef> {
     Some(ModelRef {
         provider_id: provider_id.to_string(),
         model_id: model_id.to_string(),
-        variant: val.get("variant").and_then(Value::as_str).map(str::to_string),
+        variant: val
+            .get("variant")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     })
 }
 
@@ -72,8 +75,14 @@ pub fn map_revert(val: &Value) -> Option<SessionRevertInfo> {
     let message_id = val.get("messageID").and_then(Value::as_str)?;
     Some(SessionRevertInfo {
         message_id: message_id.to_string(),
-        part_id: val.get("partID").and_then(Value::as_str).map(str::to_string),
-        snapshot: val.get("snapshot").and_then(Value::as_str).map(str::to_string),
+        part_id: val
+            .get("partID")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        snapshot: val
+            .get("snapshot")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         files: val.get("files").cloned(),
     })
 }
@@ -102,7 +111,10 @@ pub fn map_session(val: &Value) -> Option<AgentSessionInfo> {
         .unwrap_or(id)
         .to_string();
 
-    let agent = item.get("agent").and_then(Value::as_str).map(str::to_string);
+    let agent = item
+        .get("agent")
+        .and_then(Value::as_str)
+        .map(str::to_string);
 
     // No fabricated default: a session whose model OpenCode has not reported
     // is `None`, and the app shows whatever OpenCode resolves at run time.
@@ -136,7 +148,10 @@ pub fn map_session(val: &Value) -> Option<AgentSessionInfo> {
         .and_then(Value::as_str)
         .map(str::to_string);
 
-    let outcome = item.get("outcome").and_then(Value::as_str).map(str::to_string);
+    let outcome = item
+        .get("outcome")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     // v2 has no session status field; the last outcome is the closest thing a
     // read of `Session.Info` can say, and the event stream corrects it live.
     let status = match outcome.as_deref() {
@@ -296,7 +311,10 @@ pub fn map_messages_to_timeline(messages: &[Value], asid: &AgentSessionId) -> Ve
 /// One message, expanded into the rows it contributes.
 pub fn map_message(msg: &Value, asid: &AgentSessionId) -> Vec<TimelineItem> {
     let msg_id = msg.get("id").and_then(Value::as_str).unwrap_or("unknown");
-    let msg_type = msg.get("type").and_then(Value::as_str).unwrap_or("assistant");
+    let msg_type = msg
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("assistant");
     let updated_ms = msg
         .pointer("/time/completed")
         .or_else(|| msg.pointer("/time/streamed"))
@@ -363,9 +381,21 @@ pub fn map_message(msg: &Value, asid: &AgentSessionId) -> Vec<TimelineItem> {
                 part_item_id(msg_id, 0),
                 0,
                 AgentPart::Skill {
-                    skill: msg.get("skill").and_then(Value::as_str).unwrap_or("").to_string(),
-                    name: msg.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
-                    text: msg.get("text").and_then(Value::as_str).unwrap_or("").to_string(),
+                    skill: msg
+                        .get("skill")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    name: msg
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    text: msg
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
                 },
                 None,
             );
@@ -393,7 +423,10 @@ pub fn map_message(msg: &Value, asid: &AgentSessionId) -> Vec<TimelineItem> {
                     0,
                     AgentPart::AgentSwitched {
                         agent: agent.to_string(),
-                        previous: msg.get("previous").and_then(Value::as_str).map(str::to_string),
+                        previous: msg
+                            .get("previous")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
                     },
                     None,
                 );
@@ -469,9 +502,18 @@ fn map_compaction_message(msg: &Value) -> AgentPart {
     };
     AgentPart::Compaction {
         status,
-        reason: msg.get("reason").and_then(Value::as_str).map(str::to_string),
-        summary: msg.get("summary").and_then(Value::as_str).map(str::to_string),
-        recent: msg.get("recent").and_then(Value::as_str).map(str::to_string),
+        reason: msg
+            .get("reason")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        summary: msg
+            .get("summary")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        recent: msg
+            .get("recent")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         tokens: msg.get("tokens").map(map_tokens),
         cost: msg.get("cost").and_then(Value::as_f64),
         error: msg.get("error").and_then(map_error),
@@ -480,8 +522,16 @@ fn map_compaction_message(msg: &Value) -> AgentPart {
 
 fn map_shell_message(msg: &Value) -> AgentPart {
     AgentPart::Shell {
-        shell_id: msg.get("shellID").and_then(Value::as_str).unwrap_or("").to_string(),
-        command: msg.get("command").and_then(Value::as_str).unwrap_or("").to_string(),
+        shell_id: msg
+            .get("shellID")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        command: msg
+            .get("command")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
         status: msg
             .get("status")
             .and_then(Value::as_str)
@@ -597,14 +647,13 @@ fn normalize_tool_output(output: Option<Value>) -> Option<Value> {
 pub fn tool_title(name: &str, input: &Value) -> Option<String> {
     let s = |key: &str| input.get(key).and_then(Value::as_str);
     let title = match name {
-        "read" | "write" | "edit" | "patch" => s("path")
-            .map(|p| {
-                std::path::Path::new(p)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(p)
-                    .to_string()
-            })?,
+        "read" | "write" | "edit" | "patch" => s("path").map(|p| {
+            std::path::Path::new(p)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(p)
+                .to_string()
+        })?,
         "shell" | "bash" => s("command")?.lines().next().unwrap_or("").to_string(),
         "glob" => s("pattern")?.to_string(),
         "grep" | "search" => s("pattern").or_else(|| s("query"))?.to_string(),
@@ -757,7 +806,10 @@ pub fn map_part(val: &Value, _role: TimelineRole, asid: &AgentSessionId) -> Opti
                 .unwrap_or("")
                 .to_string();
             if text.is_empty() {
-                if let Some(details) = val.pointer("/state/reasoningDetails").and_then(Value::as_array) {
+                if let Some(details) = val
+                    .pointer("/state/reasoningDetails")
+                    .and_then(Value::as_array)
+                {
                     for d in details {
                         if let Some(t) = d.get("text").and_then(Value::as_str) {
                             text.push_str(t);
@@ -867,7 +919,10 @@ pub fn map_permission_request(val: &Value, asid: &AgentSessionId) -> Option<Perm
         save
     };
 
-    let message = val.get("message").and_then(Value::as_str).map(str::to_string);
+    let message = val
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     // `Permission.Request` has no `tool` field: the tool is `source`, which is
     // `{type:"tool", messageID, id}`. v1-compat payloads do carry `tool`.
     let source_message_id = val
@@ -943,7 +998,11 @@ fn map_form_conditions(val: &Value) -> Vec<crate::agent::domain::FormWhen> {
                 .filter_map(|w| {
                     Some(crate::agent::domain::FormWhen {
                         key: w.get("key").and_then(Value::as_str)?.to_string(),
-                        op: w.get("op").and_then(Value::as_str).unwrap_or("eq").to_string(),
+                        op: w
+                            .get("op")
+                            .and_then(Value::as_str)
+                            .unwrap_or("eq")
+                            .to_string(),
                         value: w.get("value").cloned().unwrap_or(Value::Null),
                     })
                 })
@@ -964,20 +1023,30 @@ pub fn map_form_request(val: &Value, asid: &AgentSessionId) -> Option<FormReques
     let mut fields = Vec::new();
 
     for f in raw_fields {
-        let key = f.get("key").and_then(Value::as_str).unwrap_or("").to_string();
+        let key = f
+            .get("key")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let field_title = f
             .get("title")
             .and_then(Value::as_str)
             .unwrap_or(&key)
             .to_string();
-        let description = f.get("description").and_then(Value::as_str).map(str::to_string);
+        let description = f
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         let required = f.get("required").and_then(Value::as_bool).unwrap_or(false);
         let when = map_form_conditions(f);
 
         let field_type = f.get("type").and_then(Value::as_str).unwrap_or("string");
         match field_type {
             "string" => {
-                let placeholder = f.get("placeholder").and_then(Value::as_str).map(str::to_string);
+                let placeholder = f
+                    .get("placeholder")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
                 let default = f.get("default").and_then(Value::as_str).map(str::to_string);
                 let options = parse_form_options(f.get("options"));
                 fields.push(FormField::String {
@@ -1027,7 +1096,12 @@ pub fn map_form_request(val: &Value, asid: &AgentSessionId) -> Option<FormReques
                 let default = f
                     .get("default")
                     .and_then(Value::as_array)
-                    .map(|arr| arr.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
                     .unwrap_or_default();
                 fields.push(FormField::Multiselect {
                     key,
@@ -1040,7 +1114,11 @@ pub fn map_form_request(val: &Value, asid: &AgentSessionId) -> Option<FormReques
                 });
             }
             "external" => {
-                let url = f.get("url").and_then(Value::as_str).unwrap_or("").to_string();
+                let url = f
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
                 fields.push(FormField::External {
                     key,
                     title: field_title,
@@ -1097,8 +1175,16 @@ fn parse_form_options(val: Option<&Value>) -> Vec<FormOption> {
 pub fn map_models(data: &[Value]) -> Vec<ModelInfo> {
     data.iter()
         .filter_map(|m| {
-            let id = m.get("id").or_else(|| m.get("modelID")).and_then(Value::as_str)?.to_string();
-            let name = m.get("name").and_then(Value::as_str).unwrap_or(&id).to_string();
+            let id = m
+                .get("id")
+                .or_else(|| m.get("modelID"))
+                .and_then(Value::as_str)?
+                .to_string();
+            let name = m
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(&id)
+                .to_string();
             let provider_id = m
                 .get("providerID")
                 .and_then(Value::as_str)
@@ -1142,8 +1228,15 @@ pub fn map_agents(data: &[Value]) -> Vec<AgentInfo> {
     data.iter()
         .filter_map(|a| {
             let id = a.get("id").and_then(Value::as_str)?.to_string();
-            let name = a.get("name").and_then(Value::as_str).unwrap_or(&id).to_string();
-            let description = a.get("description").and_then(Value::as_str).map(str::to_string);
+            let name = a
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(&id)
+                .to_string();
+            let description = a
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             let mode = a.get("mode").and_then(Value::as_str).map(str::to_string);
             let color = a.get("color").and_then(Value::as_str).map(str::to_string);
             Some(AgentInfo {
@@ -1171,7 +1264,11 @@ pub fn map_mcp(data: &[Value]) -> Vec<McpServerInfo> {
                 .pointer("/status/error")
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            Some(McpServerInfo { name, status, error })
+            Some(McpServerInfo {
+                name,
+                status,
+                error,
+            })
         })
         .collect()
 }
@@ -1180,8 +1277,16 @@ pub fn map_skills(data: &[Value]) -> Vec<SkillInfo> {
     data.iter()
         .filter_map(|s| {
             let id = s.get("id").and_then(Value::as_str)?.to_string();
-            let name = s.get("name").and_then(Value::as_str).unwrap_or(&id).to_string();
-            let description = s.get("description").and_then(Value::as_str).unwrap_or("").to_string();
+            let name = s
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(&id)
+                .to_string();
+            let description = s
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
             Some(SkillInfo {
                 id,
                 name,
@@ -1190,7 +1295,10 @@ pub fn map_skills(data: &[Value]) -> Vec<SkillInfo> {
                 // absent on a skill that has neither, which is not the same
                 // as a skill the user switched off.
                 slash: s.get("slash").and_then(Value::as_bool).unwrap_or(false),
-                autoinvoke: s.get("autoinvoke").and_then(Value::as_bool).unwrap_or(false),
+                autoinvoke: s
+                    .get("autoinvoke")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             })
         })
         .collect()
@@ -1203,14 +1311,21 @@ pub fn map_providers(data: &[Value], models: &[ModelInfo]) -> Vec<ProviderInfo> 
         .iter()
         .filter_map(|p| {
             let id = p.get("id").and_then(Value::as_str)?.to_string();
-            let name = p.get("name").and_then(Value::as_str).unwrap_or(&id).to_string();
+            let name = p
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(&id)
+                .to_string();
             Some(ProviderInfo {
                 id,
                 name,
                 // Carried through so the app can grey a provider out with a
                 // "configure OpenCode on the host" hint. The gateway never
                 // writes provider auth.
-                activation: p.get("activation").and_then(Value::as_str).map(str::to_string),
+                activation: p
+                    .get("activation")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 models: Vec::new(),
             })
         })
@@ -1245,9 +1360,15 @@ pub fn map_commands(data: &[Value]) -> Vec<CommandInfo> {
             let name = c.get("name").and_then(Value::as_str)?.to_string();
             Some(CommandInfo {
                 name,
-                description: c.get("description").and_then(Value::as_str).map(str::to_string),
+                description: c
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 agent: c.get("agent").and_then(Value::as_str).map(str::to_string),
-                template: c.get("template").and_then(Value::as_str).map(str::to_string),
+                template: c
+                    .get("template")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
             })
         })
         .collect()
@@ -1259,10 +1380,9 @@ pub fn map_commands(data: &[Value]) -> Vec<CommandInfo> {
 /// a default wins, which is the merge order OpenCode itself uses.
 pub fn map_catalog_defaults(default_model: Option<&Value>, config: &[Value]) -> CatalogDefaults {
     let model = default_model.and_then(map_model_ref).or_else(|| {
-        config
-            .iter()
-            .rev()
-            .find_map(|doc| config_model_ref(doc.pointer("/config/model").or_else(|| doc.get("model"))?))
+        config.iter().rev().find_map(|doc| {
+            config_model_ref(doc.pointer("/config/model").or_else(|| doc.get("model"))?)
+        })
     });
 
     let agent = config.iter().rev().find_map(|doc| {
@@ -1298,7 +1418,10 @@ fn config_model_ref(val: &Value) -> Option<ModelRef> {
     Some(ModelRef {
         provider_id: provider_id.to_string(),
         model_id: model_id.to_string(),
-        variant: val.get("variant").and_then(Value::as_str).map(str::to_string),
+        variant: val
+            .get("variant")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     })
 }
 
@@ -1403,7 +1526,7 @@ mod tests {
                         }
                     }
                 ]
-            })
+            }),
         ];
 
         let timeline = map_messages_to_timeline(&messages, &asid);
@@ -1566,25 +1689,26 @@ mod tests {
         assert_eq!(t.reasoning, Some(50));
         assert_eq!(t.cache_read, Some(12000));
         assert_eq!(t.cache_write, Some(100));
-        assert_eq!(s.limit.unwrap().get("context").unwrap().as_u64(), Some(1048576));
+        assert_eq!(
+            s.limit.unwrap().get("context").unwrap().as_u64(),
+            Some(1048576)
+        );
     }
 
     #[test]
     fn test_map_models_with_variants_and_cost() {
-        let models_raw = vec![
-            json!({
-                "id": "muse-spark-1.3-contributor-free",
-                "name": "Muse Spark 1.3 Free",
-                "providerID": "opencode",
-                "family": "muse",
-                "variants": [
-                    { "id": "minimal", "settings": { "reasoningEffort": "minimal" } },
-                    { "id": "high", "settings": { "reasoningEffort": "high" } }
-                ],
-                "cost": [{ "input": 0, "output": 0 }],
-                "limit": { "context": 1048576 }
-            })
-        ];
+        let models_raw = vec![json!({
+            "id": "muse-spark-1.3-contributor-free",
+            "name": "Muse Spark 1.3 Free",
+            "providerID": "opencode",
+            "family": "muse",
+            "variants": [
+                { "id": "minimal", "settings": { "reasoningEffort": "minimal" } },
+                { "id": "high", "settings": { "reasoningEffort": "high" } }
+            ],
+            "cost": [{ "input": 0, "output": 0 }],
+            "limit": { "context": 1048576 }
+        })];
 
         let models = map_models(&models_raw);
         assert_eq!(models.len(), 1);
@@ -1672,7 +1796,10 @@ mod tests {
         let timeline = map_messages_to_timeline(&messages, &asid);
         assert_eq!(timeline.len(), 1);
         let item = &timeline[0];
-        let atts = item.attachments.as_ref().expect("attachments should be present");
+        let atts = item
+            .attachments
+            .as_ref()
+            .expect("attachments should be present");
         assert_eq!(atts.len(), 1);
         assert_eq!(atts[0], "file:///tmp/screen.png");
     }
@@ -1692,8 +1819,6 @@ mod tests {
         assert_eq!(agents[0].color.as_deref(), Some("blue"));
     }
 }
-
-
 
 #[cfg(test)]
 mod catalog_tests {
@@ -1763,7 +1888,10 @@ mod catalog_tests {
         ]);
         assert_eq!(commands.len(), 2);
         assert_eq!(commands[0].name, "init");
-        assert_eq!(commands[0].description.as_deref(), Some("guided AGENTS.md setup"));
+        assert_eq!(
+            commands[0].description.as_deref(),
+            Some("guided AGENTS.md setup")
+        );
         assert!(commands[1].description.is_none());
     }
 
@@ -1926,7 +2054,12 @@ mod catalog_tests {
         );
         assert_eq!(items.len(), 1);
         match &items[0].part {
-            AgentPart::Shell { shell_id, command, status, .. } => {
+            AgentPart::Shell {
+                shell_id,
+                command,
+                status,
+                ..
+            } => {
                 assert_eq!(shell_id, "sh_1");
                 assert_eq!(command, "sleep 60");
                 assert_eq!(status, "running");
@@ -1995,21 +2128,45 @@ mod catalog_tests {
                 "description": "Probe from opencode.json", "color": null
             }),
         ]);
-        assert_eq!(agents.len(), 4, "nothing is filtered out here -- the picker decides");
+        assert_eq!(
+            agents.len(),
+            4,
+            "nothing is filtered out here -- the picker decides"
+        );
 
-        let user = agents.iter().find(|a| a.id == "muqun-probe-global").expect("the user agent");
+        let user = agents
+            .iter()
+            .find(|a| a.id == "muqun-probe-global")
+            .expect("the user agent");
         assert_eq!(user.name, "muqun-probe-global");
         assert_eq!(user.mode.as_deref(), Some("primary"));
         assert_eq!(user.color.as_deref(), Some("#ff7f50"));
         assert!(!user.hidden, "a user agent is offered, not hidden");
-        assert!(user.description.as_deref().unwrap().contains("global probe"));
+        assert!(user
+            .description
+            .as_deref()
+            .unwrap()
+            .contains("global probe"));
 
-        let from_config = agents.iter().find(|a| a.id == "json-coder").expect("the config agent");
-        assert_eq!(from_config.description.as_deref(), Some("Probe from opencode.json"));
-        assert!(from_config.color.is_none(), "a null colour is absent, not empty");
+        let from_config = agents
+            .iter()
+            .find(|a| a.id == "json-coder")
+            .expect("the config agent");
+        assert_eq!(
+            from_config.description.as_deref(),
+            Some("Probe from opencode.json")
+        );
+        assert!(
+            from_config.color.is_none(),
+            "a null colour is absent, not empty"
+        );
 
         assert!(
-            agents.iter().find(|a| a.id == "title").expect("a built-in").hidden,
+            agents
+                .iter()
+                .find(|a| a.id == "title")
+                .expect("a built-in")
+                .hidden,
             "the hidden built-ins stay flagged so a picker can drop them"
         );
     }

@@ -173,7 +173,10 @@ impl AgentRuntime {
             version: manager
                 .as_ref()
                 .and_then(|m| m.driver().client().endpoint.version.clone()),
-            stream_connected: manager.as_ref().map(|m| m.stream_connected()).unwrap_or(false),
+            stream_connected: manager
+                .as_ref()
+                .map(|m| m.stream_connected())
+                .unwrap_or(false),
             autostart: self.config.autostart,
         }
     }
@@ -384,10 +387,7 @@ impl AgentRuntime {
         if let Err(refusal) = check_version(version.as_deref()) {
             // One line, naming the file and what it said, because the reader
             // has to go and fix an install.
-            tracing::error!(
-                "refusing to start {}: {refusal}",
-                binary.display()
-            );
+            tracing::error!("refusing to start {}: {refusal}", binary.display());
             anyhow::bail!("{} is not OpenCode 2.x", binary.display());
         }
         tracing::info!(
@@ -447,7 +447,13 @@ fn parse_major(version: &str) -> Option<u64> {
         // like one, so `opencode v2.0.1` is not read as the `opencode` in it.
         .find(|(_, word)| word.contains('.'))
         .map(|(major, _)| major)
-        .or_else(|| version.trim().trim_start_matches(['v', 'V']).parse::<u64>().ok())
+        .or_else(|| {
+            version
+                .trim()
+                .trim_start_matches(['v', 'V'])
+                .parse::<u64>()
+                .ok()
+        })
 }
 
 /// Whether a version is one this gateway will talk to.
@@ -504,8 +510,8 @@ fn resolve_binary_in(
         return Ok(absolute(path));
     }
 
-    let path_var =
-        path_var.ok_or_else(|| anyhow::anyhow!("PATH is not set, so `{name}` cannot be resolved"))?;
+    let path_var = path_var
+        .ok_or_else(|| anyhow::anyhow!("PATH is not set, so `{name}` cannot be resolved"))?;
     for dir in std::env::split_paths(path_var) {
         let candidate = dir.join(name);
         if is_executable(&candidate) {
@@ -618,7 +624,10 @@ fn is_executable(path: &std::path::Path) -> bool {
 
 /// What `<binary> --version` says, or `None` if it cannot be asked.
 fn binary_version(path: &std::path::Path) -> Option<String> {
-    let output = std::process::Command::new(path).arg("--version").output().ok()?;
+    let output = std::process::Command::new(path)
+        .arg("--version")
+        .output()
+        .ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
     let text = if text.trim().is_empty() {
         String::from_utf8_lossy(&output.stderr).to_string()
@@ -708,7 +717,10 @@ mod tests {
     #[test]
     fn a_v1_engine_is_refused_and_the_refusal_says_what_to_do() {
         let refusal = check_version(Some("opencode 1.18.4")).expect_err("v1 is refused");
-        assert!(refusal.contains("1.18.4"), "it names what it found: {refusal}");
+        assert!(
+            refusal.contains("1.18.4"),
+            "it names what it found: {refusal}"
+        );
         assert!(
             refusal.contains("opencode.binary"),
             "and how to point it elsewhere: {refusal}"
@@ -735,8 +747,8 @@ mod tests {
     /// install directory is guessed at, so this is the whole order.
     #[test]
     fn the_binary_is_the_configured_one_or_whatever_path_says() {
-        let dir = std::env::temp_dir()
-            .join(format!("muqun-resolve-{}", uuid::Uuid::new_v4().simple()));
+        let dir =
+            std::env::temp_dir().join(format!("muqun-resolve-{}", uuid::Uuid::new_v4().simple()));
         let other = dir.join("elsewhere");
         std::fs::create_dir_all(&other).expect("temp dir");
 
