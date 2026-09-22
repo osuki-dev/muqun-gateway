@@ -21,7 +21,9 @@ impl PromptService {
         attachments: &[String],
         delivery: Option<&str>,
     ) -> Result<(), AgentEngineError> {
-        self.engine.send_prompt(&asid.0, text, attachments, delivery).await
+        self.engine
+            .send_prompt(&asid.0, text, attachments, delivery)
+            .await
     }
 
     pub async fn interrupt(&self, asid: &AgentSessionId) -> Result<(), AgentEngineError> {

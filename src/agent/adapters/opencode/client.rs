@@ -135,7 +135,11 @@ impl OpencodeClient {
         if let Some(arr) = res.as_array() {
             return Ok(arr.clone());
         }
-        Ok(res.get("data").and_then(Value::as_array).cloned().unwrap_or_default())
+        Ok(res
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
     }
 
     /// `GET /api/session`. Unlike the catalog endpoints this one takes a flat
@@ -166,7 +170,11 @@ impl OpencodeClient {
             query.push(("cursor".to_string(), cursor.to_string()));
         }
         let res = self.get("/api/session", &query).await?;
-        Ok(res.get("data").and_then(Value::as_array).cloned().unwrap_or_default())
+        Ok(res
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
     }
 
     pub async fn create_session(
@@ -196,7 +204,11 @@ impl OpencodeClient {
         self.get_plain(&format!("/api/session/{id}")).await
     }
 
-    pub async fn get_messages(&self, session_id: &str, limit: usize) -> Result<Vec<Value>, AgentEngineError> {
+    pub async fn get_messages(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<Value>, AgentEngineError> {
         let limit_str = limit.to_string();
         // `order` is sent explicitly rather than inferred from two timestamps.
         // It has to be `desc`: verified against 2.0.1, `limit` is applied from
@@ -271,7 +283,8 @@ impl OpencodeClient {
         session_id: &str,
         message_id: &str,
     ) -> Result<Value, AgentEngineError> {
-        self.stage_revert(session_id, message_id, Some(true)).await?;
+        self.stage_revert(session_id, message_id, Some(true))
+            .await?;
         self.commit_revert(session_id).await
     }
 
@@ -295,8 +308,11 @@ impl OpencodeClient {
 
     /// `POST /api/session/{id}/revert/commit`: apply the staged rollback.
     pub async fn commit_revert(&self, session_id: &str) -> Result<Value, AgentEngineError> {
-        self.post(&format!("/api/session/{session_id}/revert/commit"), &json!({}))
-            .await
+        self.post(
+            &format!("/api/session/{session_id}/revert/commit"),
+            &json!({}),
+        )
+        .await
     }
 
     pub async fn interrupt(&self, session_id: &str) -> Result<Value, AgentEngineError> {
@@ -403,11 +419,17 @@ impl OpencodeClient {
         &self,
         directory: Option<&str>,
     ) -> Result<Vec<Value>, AgentEngineError> {
-        let res = self.get("/api/worktree", &location_query(directory)).await?;
+        let res = self
+            .get("/api/worktree", &location_query(directory))
+            .await?;
         if let Some(arr) = res.as_array() {
             return Ok(arr.clone());
         }
-        Ok(res.get("data").and_then(Value::as_array).cloned().unwrap_or_default())
+        Ok(res
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
     }
 
     /// `POST /api/worktree`: create one under the location's strategy.
@@ -477,7 +499,8 @@ impl OpencodeClient {
             .send()
             .await
             .map_err(|e| AgentEngineError::Network(e.to_string()))?;
-        self.handle_resp(resp, "POST", "/api/worktree/refresh").await
+        self.handle_resp(resp, "POST", "/api/worktree/refresh")
+            .await
     }
 
     /// `POST /api/session/{id}/move`: move a session to another directory.
@@ -509,7 +532,11 @@ impl OpencodeClient {
         let res = self
             .get("/api/permission/saved", &saved_permission_query(project_id))
             .await?;
-        Ok(res.get("data").and_then(Value::as_array).cloned().unwrap_or_default())
+        Ok(res
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
     }
 
     /// `DELETE /api/permission/saved/{id}`: forget one remembered decision.
@@ -534,19 +561,37 @@ impl OpencodeClient {
         .await
     }
 
-    pub async fn get_models(&self, directory: Option<&str>) -> Result<Vec<Value>, AgentEngineError> {
+    pub async fn get_models(
+        &self,
+        directory: Option<&str>,
+    ) -> Result<Vec<Value>, AgentEngineError> {
         let res = self.get("/api/model", &location_query(directory)).await?;
-        Ok(res.get("data").and_then(Value::as_array).cloned().unwrap_or_default())
+        Ok(res
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
     }
 
-    pub async fn get_agents(&self, directory: Option<&str>) -> Result<Vec<Value>, AgentEngineError> {
+    pub async fn get_agents(
+        &self,
+        directory: Option<&str>,
+    ) -> Result<Vec<Value>, AgentEngineError> {
         let res = self.get("/api/agent", &location_query(directory)).await?;
-        Ok(res.get("data").and_then(Value::as_array).cloned().unwrap_or_default())
+        Ok(res
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
     }
 
     pub async fn get_mcp(&self, directory: Option<&str>) -> Result<Vec<Value>, AgentEngineError> {
         let res = self.get("/api/mcp", &location_query(directory)).await?;
-        Ok(res.get("data").and_then(Value::as_array).cloned().unwrap_or_default())
+        Ok(res
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
     }
 
     /// `GET /api/vcs/diff`. `mode` is a required parameter on this endpoint --
@@ -563,12 +608,23 @@ impl OpencodeClient {
             query.push(("base".to_string(), b.to_string()));
         }
         let res = self.get("/api/vcs/diff", &query).await?;
-        Ok(res.get("data").and_then(Value::as_array).cloned().unwrap_or_default())
+        Ok(res
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
     }
 
-    pub async fn get_skills(&self, directory: Option<&str>) -> Result<Vec<Value>, AgentEngineError> {
+    pub async fn get_skills(
+        &self,
+        directory: Option<&str>,
+    ) -> Result<Vec<Value>, AgentEngineError> {
         let res = self.get("/api/skill", &location_query(directory)).await?;
-        Ok(res.get("data").and_then(Value::as_array).cloned().unwrap_or_default())
+        Ok(res
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
     }
 
     /// `POST /api/session/{id}/skill`: append a skill message to the session
@@ -615,7 +671,11 @@ impl OpencodeClient {
         let res = self
             .get_plain(&format!("/api/session/{session_id}/context"))
             .await?;
-        Ok(res.get("data").and_then(Value::as_array).cloned().unwrap_or_default())
+        Ok(res
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
     }
 
     /// `POST /api/session/{id}/background`: detach the foreground tools that
@@ -649,8 +709,11 @@ impl OpencodeClient {
 
     /// `POST /api/session/{id}/revert/clear`: cancel a staged rollback.
     pub async fn clear_revert(&self, session_id: &str) -> Result<Value, AgentEngineError> {
-        self.post(&format!("/api/session/{session_id}/revert/clear"), &json!({}))
-            .await
+        self.post(
+            &format!("/api/session/{session_id}/revert/clear"),
+            &json!({}),
+        )
+        .await
     }
 
     /// `POST /api/session/{id}/view {idle}`: mark the session read up to a
@@ -705,7 +768,11 @@ impl OpencodeClient {
         let res = self
             .get_plain(&format!("/api/session/{session_id}/inbox"))
             .await?;
-        Ok(res.get("data").and_then(Value::as_array).cloned().unwrap_or_default())
+        Ok(res
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
     }
 
     pub async fn cancel_inbox_item(
@@ -742,7 +809,11 @@ impl OpencodeClient {
         let res = self
             .get_plain(&format!("/api/session/{session_id}/permission"))
             .await?;
-        Ok(res.get("data").and_then(Value::as_array).cloned().unwrap_or_default())
+        Ok(res
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
     }
 
     // -----------------------------------------------------------------
@@ -782,11 +853,18 @@ impl OpencodeClient {
         Ok(())
     }
 
-    pub async fn get_session_forms(&self, session_id: &str) -> Result<Vec<Value>, AgentEngineError> {
+    pub async fn get_session_forms(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<Value>, AgentEngineError> {
         let res = self
             .get_plain(&format!("/api/session/{session_id}/form"))
             .await?;
-        Ok(res.get("data").and_then(Value::as_array).cloned().unwrap_or_default())
+        Ok(res
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
     }
 
     // -----------------------------------------------------------------
@@ -795,7 +873,10 @@ impl OpencodeClient {
 
     /// `GET /api/config` returns the merged configuration as the list of
     /// documents it was assembled from.
-    pub async fn get_config(&self, directory: Option<&str>) -> Result<Vec<Value>, AgentEngineError> {
+    pub async fn get_config(
+        &self,
+        directory: Option<&str>,
+    ) -> Result<Vec<Value>, AgentEngineError> {
         let res = self.get("/api/config", &location_query(directory)).await?;
         match res {
             Value::Array(arr) => Ok(arr),
@@ -818,23 +899,46 @@ impl OpencodeClient {
         Ok(res.get("data").cloned().filter(|d| !d.is_null()))
     }
 
-    pub async fn get_providers(&self, directory: Option<&str>) -> Result<Vec<Value>, AgentEngineError> {
-        let res = self.get("/api/provider", &location_query(directory)).await?;
-        Ok(res.get("data").and_then(Value::as_array).cloned().unwrap_or_default())
+    pub async fn get_providers(
+        &self,
+        directory: Option<&str>,
+    ) -> Result<Vec<Value>, AgentEngineError> {
+        let res = self
+            .get("/api/provider", &location_query(directory))
+            .await?;
+        Ok(res
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
     }
 
-    pub async fn get_commands(&self, directory: Option<&str>) -> Result<Vec<Value>, AgentEngineError> {
+    pub async fn get_commands(
+        &self,
+        directory: Option<&str>,
+    ) -> Result<Vec<Value>, AgentEngineError> {
         let res = self.get("/api/command", &location_query(directory)).await?;
-        Ok(res.get("data").and_then(Value::as_array).cloned().unwrap_or_default())
+        Ok(res
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
     }
 
     // -----------------------------------------------------------------
     // Background shells
     // -----------------------------------------------------------------
 
-    pub async fn list_shells(&self, directory: Option<&str>) -> Result<Vec<Value>, AgentEngineError> {
+    pub async fn list_shells(
+        &self,
+        directory: Option<&str>,
+    ) -> Result<Vec<Value>, AgentEngineError> {
         let res = self.get("/api/shell", &location_query(directory)).await?;
-        Ok(res.get("data").and_then(Value::as_array).cloned().unwrap_or_default())
+        Ok(res
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
     }
 
     pub async fn get_shell(&self, shell_id: &str) -> Result<Value, AgentEngineError> {
@@ -888,7 +992,11 @@ impl OpencodeClient {
             params.push(("query".to_string(), query.to_string()));
             params.push(("limit".to_string(), limit.to_string()));
             let res = self.get("/api/fs/find", &params).await?;
-            Ok(res.get("data").and_then(Value::as_array).cloned().unwrap_or_default())
+            Ok(res
+                .get("data")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default())
         }
     }
 }
@@ -962,7 +1070,10 @@ mod tests {
 
     #[test]
     fn a_directory_is_sent_as_the_deep_object_location() {
-        let url = query_url("/api/model", &location_query(Some("/home/ryu/Work/muqun/app")));
+        let url = query_url(
+            "/api/model",
+            &location_query(Some("/home/ryu/Work/muqun/app")),
+        );
         assert!(
             url.contains("location%5Bdirectory%5D=%2Fhome%2Fryu%2FWork%2Fmuqun%2Fapp"),
             "expected location[directory], got {url}"
@@ -994,7 +1105,10 @@ mod tests {
     fn messages_are_requested_newest_first_and_reversed_locally() {
         // `limit` counts from the start of the requested order, so the page has
         // to be `desc` for the tail of a long session to come back.
-        let url = query_url("/api/session/ses_1/message", &[("limit", "100"), ("order", "desc")]);
+        let url = query_url(
+            "/api/session/ses_1/message",
+            &[("limit", "100"), ("order", "desc")],
+        );
         assert!(url.contains("order=desc"), "got {url}");
         assert!(url.contains("limit=100"), "got {url}");
     }
@@ -1027,7 +1141,10 @@ mod tests {
         let url = query_url("/api/session", &query);
         // `GET /api/session` is the one endpoint that takes a flat directory.
         assert!(url.contains("directory=%2Frepo"), "got {url}");
-        assert!(url.contains("parentID=null"), "roots-only is a literal null: {url}");
+        assert!(
+            url.contains("parentID=null"),
+            "roots-only is a literal null: {url}"
+        );
         assert!(url.contains("search=gateway"), "got {url}");
         assert!(url.contains("cursor=abc"), "got {url}");
     }
@@ -1046,7 +1163,10 @@ mod tests {
 
         let with_route = empty_body_failure(503, "POST", "/api/worktree/refresh");
         assert!(with_route.contains("503"), "the status: {with_route}");
-        assert!(with_route.contains("POST /api/worktree/refresh"), "the route: {with_route}");
+        assert!(
+            with_route.contains("POST /api/worktree/refresh"),
+            "the route: {with_route}"
+        );
         assert!(!with_route.ends_with(": "), "and never a dangling colon");
     }
 

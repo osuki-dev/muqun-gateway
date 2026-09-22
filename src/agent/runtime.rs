@@ -26,7 +26,7 @@ use super::manager::AgentManager;
 const HEALTHY_POLL: Duration = Duration::from_secs(15);
 /// How soon it retries after finding none.
 const UNHEALTHY_POLL: Duration = Duration::from_secs(3);
-/// How long a freshly spawned `opencode serve --service` is given to register.
+/// How long service startup and registration may each take.
 const STARTUP_WAIT: Duration = Duration::from_secs(20);
 const STARTUP_POLL: Duration = Duration::from_millis(400);
 /// Backoff ceiling between failed start attempts.
@@ -48,7 +48,7 @@ const MIN_OPENCODE_MAJOR: u64 = 2;
 /// `opencode` in `config.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpencodeConfig {
-    /// Start `opencode serve --service` when no healthy service is found.
+    /// Run `opencode service start` when no healthy service is found.
     #[serde(default = "default_true")]
     pub autostart: bool,
     /// The binary to start, when `PATH` is not the right answer.
@@ -88,9 +88,23 @@ pub enum EngineOrigin {
     None,
 }
 
+/// Whether this gateway can establish that OpenCode is installed locally.
+///
+/// This deliberately says nothing about whether a service is currently
+/// reachable. An externally configured endpoint is not necessarily local, so
+/// its installation cannot be determined from this process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EngineInstallation {
+    Installed,
+    NotFound,
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineStatus {
     pub available: bool,
+    pub installation: EngineInstallation,
     pub origin: EngineOrigin,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
@@ -107,9 +121,8 @@ pub struct AgentRuntime {
     events_tx: broadcast::Sender<AgentDomainEvent>,
     config: OpencodeConfig,
     origin: RwLock<EngineOrigin>,
-    /// The child this gateway started, if any. Held so a second one is never
-    /// spawned while the first is alive.
-    child: Mutex<Option<tokio::process::Child>>,
+    /// Serialize startup commands; OpenCode owns the background service.
+    start_lock: Mutex<()>,
     supervising: AtomicBool,
 }
 
@@ -121,7 +134,7 @@ impl AgentRuntime {
             events_tx,
             config,
             origin: RwLock::new(EngineOrigin::None),
-            child: Mutex::new(None),
+            start_lock: Mutex::new(()),
             supervising: AtomicBool::new(false),
         })
     }
@@ -149,12 +162,20 @@ impl AgentRuntime {
         let manager = self.manager.read().await.clone();
         EngineStatus {
             available: manager.is_some(),
+            installation: if manager.is_some() {
+                EngineInstallation::Installed
+            } else {
+                local_installation_status(&self.config)
+            },
             origin: *self.origin.read().await,
             url: manager.as_ref().map(|m| m.endpoint_url().to_string()),
             version: manager
                 .as_ref()
                 .and_then(|m| m.driver().client().endpoint.version.clone()),
-            stream_connected: manager.as_ref().map(|m| m.stream_connected()).unwrap_or(false),
+            stream_connected: manager
+                .as_ref()
+                .map(|m| m.stream_connected())
+                .unwrap_or(false),
             autostart: self.config.autostart,
         }
     }
@@ -328,29 +349,10 @@ impl AgentRuntime {
         endpoint.probe_healthy(&probe_client()).await
     }
 
-    /// Start `opencode serve --service`, detached, and wait for it to register.
-    ///
-    /// Never more than one: a child this gateway started and has not reaped is
-    /// given the benefit of the doubt, and a service someone else is running is
-    /// adopted before this is ever reached.
+    /// Let OpenCode load its saved service configuration and start or reuse
+    /// its background server, then verify the registered endpoint.
     async fn start_service(&self) -> anyhow::Result<OpencodeEndpoint> {
-        let mut slot = self.child.lock().await;
-        if let Some(ref mut child) = *slot {
-            match child.try_wait() {
-                // Still running: it simply has not registered yet.
-                Ok(None) => {
-                    drop(slot);
-                    return wait_for_service().await;
-                }
-                Ok(Some(status)) => {
-                    tracing::warn!(%status, "the OpenCode service this gateway started has exited");
-                }
-                Err(err) => {
-                    tracing::warn!(%err, "could not check the spawned OpenCode service");
-                }
-            }
-            *slot = None;
-        }
+        let _start = self.start_lock.lock().await;
 
         // `opencode.binary` if the owner set one, otherwise whatever `opencode`
         // means on PATH -- and then the file that resolved to, so the log names
@@ -365,10 +367,7 @@ impl AgentRuntime {
         if let Err(refusal) = check_version(version.as_deref()) {
             // One line, naming the file and what it said, because the reader
             // has to go and fix an install.
-            tracing::error!(
-                "refusing to start {}: {refusal}",
-                binary.display()
-            );
+            tracing::error!("refusing to start {}: {refusal}", binary.display());
             anyhow::bail!("{} is not OpenCode 2.x", binary.display());
         }
         tracing::info!(
@@ -377,27 +376,28 @@ impl AgentRuntime {
             "no OpenCode service found, starting one"
         );
 
-        let mut command = tokio::process::Command::new(&binary);
-        command
-            .arg("serve")
-            .arg("--service")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            // Its own process group, so it survives this gateway and does not
-            // take a terminal signal meant for it.
-            .process_group(0)
-            .kill_on_drop(false);
-
-        let child = command.spawn().map_err(|e| {
-            anyhow::anyhow!("could not run `{} serve --service`: {e}", binary.display())
-        })?;
-        tracing::info!(pid = child.id(), "OpenCode service starting");
-        *slot = Some(child);
-        drop(slot);
-
+        launch_service(tokio::process::Command::new(&binary)).await?;
         wait_for_service().await
     }
+}
+
+async fn launch_service(mut command: tokio::process::Command) -> anyhow::Result<()> {
+    // `serve --service` bypasses saved service env; the CLI owns that setup.
+    command
+        .args(["service", "start"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let status = tokio::time::timeout(STARTUP_WAIT, command.status())
+        .await
+        .map_err(|_| anyhow::anyhow!("`opencode service start` timed out"))?
+        .map_err(|err| anyhow::anyhow!("could not run `opencode service start`: {err}"))?;
+    anyhow::ensure!(
+        status.success(),
+        "`opencode service start` exited with {status}"
+    );
+    Ok(())
 }
 
 /// The wait after a stream loss, given the last one.
@@ -428,7 +428,13 @@ fn parse_major(version: &str) -> Option<u64> {
         // like one, so `opencode v2.0.1` is not read as the `opencode` in it.
         .find(|(_, word)| word.contains('.'))
         .map(|(major, _)| major)
-        .or_else(|| version.trim().trim_start_matches(['v', 'V']).parse::<u64>().ok())
+        .or_else(|| {
+            version
+                .trim()
+                .trim_start_matches(['v', 'V'])
+                .parse::<u64>()
+                .ok()
+        })
 }
 
 /// Whether a version is one this gateway will talk to.
@@ -472,10 +478,7 @@ fn resolve_binary_in(
     configured: Option<&str>,
     path_var: Option<&std::ffi::OsStr>,
 ) -> anyhow::Result<std::path::PathBuf> {
-    let name = configured
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .unwrap_or("opencode");
+    let name = binary_name(configured);
 
     // Anything with a separator is a path the owner meant literally, and a
     // missing one is an error naming it rather than a quiet fall back to PATH:
@@ -488,8 +491,8 @@ fn resolve_binary_in(
         return Ok(absolute(path));
     }
 
-    let path_var =
-        path_var.ok_or_else(|| anyhow::anyhow!("PATH is not set, so `{name}` cannot be resolved"))?;
+    let path_var = path_var
+        .ok_or_else(|| anyhow::anyhow!("PATH is not set, so `{name}` cannot be resolved"))?;
     for dir in std::env::split_paths(path_var) {
         let candidate = dir.join(name);
         if is_executable(&candidate) {
@@ -502,26 +505,110 @@ fn resolve_binary_in(
     )
 }
 
+fn binary_name(configured: Option<&str>) -> &str {
+    configured
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("opencode")
+}
+
+/// Classify installation without starting OpenCode or contacting an endpoint.
+/// The inputs are injected to keep lookup tests independent of global process
+/// environment.
+fn installation_status_in(
+    configured: Option<&str>,
+    path_var: Option<&std::ffi::OsStr>,
+    external_endpoint_configured: bool,
+) -> EngineInstallation {
+    if external_endpoint_configured {
+        return EngineInstallation::Unknown;
+    }
+
+    let name = binary_name(configured);
+    if name.contains(std::path::MAIN_SEPARATOR) || name.contains('/') {
+        return match std::fs::metadata(name) {
+            Ok(metadata) if metadata_is_executable(&metadata) => EngineInstallation::Installed,
+            Ok(_) => EngineInstallation::NotFound,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => EngineInstallation::NotFound,
+            Err(_) => EngineInstallation::Unknown,
+        };
+    }
+
+    let Some(path_var) = path_var else {
+        return EngineInstallation::Unknown;
+    };
+    let mut ambiguous = false;
+    for directory in std::env::split_paths(path_var) {
+        let candidate = directory.join(name);
+        match std::fs::metadata(&candidate) {
+            Ok(metadata) if metadata_is_executable(&metadata) => {
+                return EngineInstallation::Installed;
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => ambiguous = true,
+        }
+    }
+    if ambiguous {
+        EngineInstallation::Unknown
+    } else {
+        EngineInstallation::NotFound
+    }
+}
+
+fn local_installation_status(config: &OpencodeConfig) -> EngineInstallation {
+    let Ok(external_endpoint_configured) =
+        external_endpoint_configured_with(|name| std::env::var(name))
+    else {
+        return EngineInstallation::Unknown;
+    };
+    installation_status_in(
+        config.binary.as_deref(),
+        std::env::var_os("PATH").as_deref(),
+        external_endpoint_configured,
+    )
+}
+
+fn external_endpoint_configured_with(
+    mut read: impl FnMut(&str) -> Result<String, std::env::VarError>,
+) -> Result<bool, ()> {
+    for name in ["OPENCODE_URL", "HERDR_GATEWAY_OPENCODE_URL"] {
+        match read(name) {
+            Ok(url) => return Ok(!url.trim().is_empty()),
+            Err(std::env::VarError::NotPresent) => {}
+            Err(std::env::VarError::NotUnicode(_)) => return Err(()),
+        }
+    }
+    Ok(false)
+}
+
 fn absolute(path: std::path::PathBuf) -> std::path::PathBuf {
     std::fs::canonicalize(&path).unwrap_or(path)
 }
 
 #[cfg(unix)]
-fn is_executable(path: &std::path::Path) -> bool {
+fn metadata_is_executable(metadata: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
+    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
 }
 
 #[cfg(not(unix))]
+fn metadata_is_executable(metadata: &std::fs::Metadata) -> bool {
+    metadata.is_file()
+}
+
 fn is_executable(path: &std::path::Path) -> bool {
-    path.is_file()
+    std::fs::metadata(path)
+        .map(|metadata| metadata_is_executable(&metadata))
+        .unwrap_or(false)
 }
 
 /// What `<binary> --version` says, or `None` if it cannot be asked.
 fn binary_version(path: &std::path::Path) -> Option<String> {
-    let output = std::process::Command::new(path).arg("--version").output().ok()?;
+    let output = std::process::Command::new(path)
+        .arg("--version")
+        .output()
+        .ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
     let text = if text.trim().is_empty() {
         String::from_utf8_lossy(&output.stderr).to_string()
@@ -576,6 +663,139 @@ async fn wait_for_service() -> anyhow::Result<OpencodeEndpoint> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_uses_the_service_cli_and_waits_for_its_exit() {
+        let mut command = tokio::process::Command::new("sh");
+        command.args([
+            "-c",
+            "test \"$#\" -eq 2 && test \"$1\" = service && test \"$2\" = start",
+            "opencode",
+        ]);
+        launch_service(command)
+            .await
+            .expect("service start arguments");
+
+        let mut failing = tokio::process::Command::new("sh");
+        failing.args(["-c", "exit 7", "opencode"]);
+        let err = launch_service(failing).await.expect_err("failed startup");
+        assert!(err.to_string().contains("exited with"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn startup_reports_a_missing_executable() {
+        let missing =
+            std::env::temp_dir().join(format!("missing-opencode-{}", uuid::Uuid::new_v4()));
+        let err = launch_service(tokio::process::Command::new(missing))
+            .await
+            .expect_err("missing binary");
+        assert!(
+            err.to_string()
+                .contains("could not run `opencode service start`"),
+            "{err}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "Requires installed OpenCode 2; starts and stops a private service"]
+    async fn installed_service_loads_saved_env_and_reuses_the_background_process() {
+        struct PrivateService {
+            root: std::path::PathBuf,
+            binary: std::path::PathBuf,
+        }
+        impl PrivateService {
+            fn command(&self) -> std::process::Command {
+                let mut command = std::process::Command::new(&self.binary);
+                for (key, path) in [
+                    ("XDG_CONFIG_HOME", "config"),
+                    ("XDG_STATE_HOME", "state"),
+                    ("XDG_DATA_HOME", "data"),
+                    ("XDG_CACHE_HOME", "cache"),
+                    ("OPENCODE_DB", "opencode.db"),
+                ] {
+                    command.env(key, self.root.join(path));
+                }
+                for key in [
+                    "OPENCODE_CONFIG",
+                    "OPENCODE_CONFIG_CONTENT",
+                    "OPENCODE_SERVER_PASSWORD",
+                    "MUQUN_STARTUP_TEST",
+                ] {
+                    command.env_remove(key);
+                }
+                command.current_dir(&self.root);
+                command
+            }
+        }
+        impl Drop for PrivateService {
+            fn drop(&mut self) {
+                // Stop only the service registered under this fixture's XDG paths.
+                let mut command = self.command();
+                command
+                    .args(["service", "stop"])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+                if command.status().is_ok_and(|status| status.success())
+                    && !std::thread::panicking()
+                {
+                    let _ = std::fs::remove_dir_all(&self.root);
+                } else {
+                    eprintln!(
+                        "Private OpenCode test files retained at {}",
+                        self.root.display()
+                    );
+                }
+            }
+        }
+        let service = PrivateService {
+            root: std::env::temp_dir()
+                .join(format!("muqun-opencode-start-{}", uuid::Uuid::new_v4())),
+            binary: resolve_binary(None).expect("installed OpenCode"),
+        };
+        let config = service.root.join("config/opencode");
+        std::fs::create_dir_all(&config).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        std::fs::write(
+            config.join("service.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "hostname": "127.0.0.1", "port": port,
+                "env": { "MUQUN_STARTUP_TEST": "saved-service-env" }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        launch_service(service.command().into())
+            .await
+            .expect("start private service");
+        let registration_path = service.root.join("state/opencode/service.json");
+        let first: super::super::adapters::opencode::OpencodeServiceRegistration =
+            serde_json::from_slice(&std::fs::read(&registration_path).unwrap()).unwrap();
+        let pid = first.pid.expect("background daemon PID");
+        let environment = std::fs::read(format!("/proc/{pid}/environ")).unwrap();
+        assert!(environment
+            .split(|byte| *byte == 0)
+            .any(|entry| entry == b"MUQUN_STARTUP_TEST=saved-service-env"));
+        let endpoint = OpencodeEndpoint {
+            url: first.url.clone(),
+            password: first.password,
+            version: first.version,
+            pid: Some(pid),
+        };
+        assert!(endpoint.probe_healthy(&probe_client()).await);
+
+        launch_service(service.command().into())
+            .await
+            .expect("reuse private service");
+        let second: super::super::adapters::opencode::OpencodeServiceRegistration =
+            serde_json::from_slice(&std::fs::read(registration_path).unwrap()).unwrap();
+        assert_eq!(second.pid, Some(pid));
+        assert_eq!(second.url, first.url);
+    }
+
     #[test]
     fn autostart_defaults_to_on_and_the_binary_is_optional() {
         let config: OpencodeConfig = serde_json::from_str("{}").expect("empty config parses");
@@ -611,7 +831,10 @@ mod tests {
     #[test]
     fn a_v1_engine_is_refused_and_the_refusal_says_what_to_do() {
         let refusal = check_version(Some("opencode 1.18.4")).expect_err("v1 is refused");
-        assert!(refusal.contains("1.18.4"), "it names what it found: {refusal}");
+        assert!(
+            refusal.contains("1.18.4"),
+            "it names what it found: {refusal}"
+        );
         assert!(
             refusal.contains("opencode.binary"),
             "and how to point it elsewhere: {refusal}"
@@ -638,8 +861,8 @@ mod tests {
     /// install directory is guessed at, so this is the whole order.
     #[test]
     fn the_binary_is_the_configured_one_or_whatever_path_says() {
-        let dir = std::env::temp_dir()
-            .join(format!("muqun-resolve-{}", uuid::Uuid::new_v4().simple()));
+        let dir =
+            std::env::temp_dir().join(format!("muqun-resolve-{}", uuid::Uuid::new_v4().simple()));
         let other = dir.join("elsewhere");
         std::fs::create_dir_all(&other).expect("temp dir");
 
@@ -692,6 +915,105 @@ mod tests {
         assert!(err.to_string().contains("PATH is not set"), "got {err}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn installation_status_distinguishes_local_lookup_from_service_readiness() {
+        let dir = std::env::temp_dir().join(format!(
+            "muqun-installation-status-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let binary = dir.join("opencode");
+        std::fs::write(&binary, "#!/bin/sh\nexit 0\n").expect("write binary");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        let path_var = std::ffi::OsString::from(&dir);
+        let empty_path = std::ffi::OsString::from(dir.join("empty"));
+        let missing = dir.join("missing-opencode");
+        let non_executable = dir.join("not-executable");
+        std::fs::write(&non_executable, "not a program\n").expect("write non-executable");
+
+        assert_eq!(
+            installation_status_in(None, Some(&path_var), false),
+            EngineInstallation::Installed,
+            "a local executable is installed even while its service is down"
+        );
+        assert_eq!(
+            installation_status_in(Some(missing.to_str().unwrap()), Some(&path_var), false),
+            EngineInstallation::NotFound,
+            "a broken explicit path does not fall back to PATH"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            installation_status_in(
+                Some(non_executable.to_str().unwrap()),
+                Some(&path_var),
+                false
+            ),
+            EngineInstallation::NotFound,
+            "an explicit regular file must also be executable"
+        );
+        assert_eq!(
+            installation_status_in(None, Some(&empty_path), false),
+            EngineInstallation::NotFound
+        );
+        assert_eq!(
+            installation_status_in(None, None, false),
+            EngineInstallation::Unknown,
+            "without PATH the local lookup is inconclusive"
+        );
+        assert_eq!(
+            installation_status_in(None, Some(&path_var), true),
+            EngineInstallation::Unknown,
+            "the local PATH cannot establish installation for an external endpoint"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn endpoint_environment_errors_make_installation_inconclusive() {
+        let unreadable = std::ffi::OsString::from("unreadable");
+        assert_eq!(
+            external_endpoint_configured_with(|name| match name {
+                "OPENCODE_URL" => Err(std::env::VarError::NotUnicode(unreadable.clone())),
+                _ => Err(std::env::VarError::NotPresent),
+            }),
+            Err(())
+        );
+        assert_eq!(
+            external_endpoint_configured_with(|name| match name {
+                "OPENCODE_URL" => Err(std::env::VarError::NotPresent),
+                "HERDR_GATEWAY_OPENCODE_URL" => Ok(" http://127.0.0.1:4096 ".to_string()),
+                _ => unreachable!(),
+            }),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn engine_status_serializes_the_additive_installation_field() {
+        let status = EngineStatus {
+            available: false,
+            installation: EngineInstallation::NotFound,
+            origin: EngineOrigin::None,
+            url: None,
+            version: None,
+            stream_connected: false,
+            autostart: true,
+        };
+        let value = serde_json::to_value(status).expect("status serializes");
+        assert_eq!(value["installation"], "not_found");
+        assert_eq!(value["available"], false);
+        assert_eq!(value["origin"], "none");
+        assert_eq!(value["autostart"], true);
+        assert!(value.get("url").is_none());
+        assert!(value.get("version").is_none());
     }
 
     /// A lost stream is the engine going away, so the first one is looked at

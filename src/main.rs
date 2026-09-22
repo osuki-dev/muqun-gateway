@@ -22,10 +22,6 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse as _, Response};
 use axum::routing::{get, patch, post};
 use axum::{Extension, Json, Router};
-use tower_http::compression::{
-    predicate::{DefaultPredicate, Predicate, SizeAbove},
-    CompressionLayer,
-};
 use base64::Engine as _;
 use clap::{Parser, Subcommand, ValueEnum};
 use crossterm::cursor::MoveTo;
@@ -42,6 +38,10 @@ use qrcode::{EcLevel, QrCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio_stream::{Stream, StreamExt as _};
+use tower_http::compression::{
+    predicate::{DefaultPredicate, Predicate, SizeAbove},
+    CompressionLayer,
+};
 
 mod agent;
 mod agent_events;
@@ -50,6 +50,7 @@ mod authority;
 mod backend;
 mod backend_startup;
 mod composer;
+mod gateway_listener;
 mod git;
 mod i18n;
 #[cfg(all(test, unix))]
@@ -70,10 +71,10 @@ use authority::{hash_token, identify_device, DeviceRecord, PairingCodeError, Pen
 use crate::i18n::Locale;
 use backend::{
     Agent, AgentStatus as BackendAgentStatus, BackendActivity, BackendError, BackendFuture,
-    BackendKind,
-    BackendRegistry, CreateTab as BackendCreateTab, CreateWorkspace as BackendCreateWorkspace,
-    OutputFormat as BackendOutputFormat, OutputSource as BackendOutputSource, Pane,
-    PaneId as BackendPaneId, ReadPane as BackendReadPane, SendTextMode as BackendSendTextMode,
+    BackendKind, BackendRegistry, CreateTab as BackendCreateTab,
+    CreateWorkspace as BackendCreateWorkspace, OutputFormat as BackendOutputFormat,
+    OutputSource as BackendOutputSource, Pane, PaneId as BackendPaneId,
+    ReadPane as BackendReadPane, SendTextMode as BackendSendTextMode,
     SplitDirection as BackendSplitDirection, SplitPane as BackendSplitPane,
     StartAgent as BackendStartAgent, TabId as BackendTabId, TerminalBackend, TmuxWireIds,
     WorkspaceId as BackendWorkspaceId, WorktreeRequest as BackendWorktreeRequest, TMUX_PROGRAM,
@@ -914,7 +915,8 @@ pub(crate) struct AppState {
     pub(crate) approval_events: tokio::sync::broadcast::Sender<ApprovalEvent>,
     /// One activity stream per session, shared by everyone who wants it. See
     /// [`subscribe_activity`].
-    pub(crate) activity: Arc<Mutex<HashMap<String, tokio::sync::broadcast::Sender<SessionActivity>>>>,
+    pub(crate) activity:
+        Arc<Mutex<HashMap<String, tokio::sync::broadcast::Sender<SessionActivity>>>>,
     /// The last backend liveness ordering, reused briefly so a burst of
     /// clients asking at once is answered once. See [`SESSION_LIVENESS_TTL`].
     pub(crate) session_liveness: Arc<Mutex<SessionLivenessCache>>,
@@ -2106,7 +2108,7 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     let dev_unauthenticated = config.dev_unauthenticated;
 
     // Bind successfully before starting anything on the user's behalf.
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = gateway_listener::bind(addr).await?;
     // One background attempt per opted-in backend; no restart/logging loop.
     backend_startup::spawn(&config);
 
@@ -2882,7 +2884,10 @@ const COMPRESSION_MIN_BYTES: u16 = 512;
 /// decryption path injects, not from a header, because a header can be sent by
 /// anyone.
 async fn envelope_compression_gate(mut request: Request<Body>, next: Next) -> Response {
-    let sealed = request.extensions().get::<EncryptedStreamContext>().is_some();
+    let sealed = request
+        .extensions()
+        .get::<EncryptedStreamContext>()
+        .is_some();
     if sealed {
         // Inside the envelope the client cannot use `content-encoding` -- it
         // is reading a base64 body, and the real headers are sealed with it --
@@ -4974,7 +4979,10 @@ async fn session_metadata(session: &SessionConfig) -> (Value, Value) {
         // Bounded by the configured sessions, which is a handful; the sweep is
         // only here so a config reload cannot leave an entry behind for ever.
         cache.retain(|_, (seen, _)| seen.elapsed() < SESSION_LIVENESS_TTL);
-        cache.insert(session.id.clone(), (std::time::Instant::now(), answer.clone()));
+        cache.insert(
+            session.id.clone(),
+            (std::time::Instant::now(), answer.clone()),
+        );
     }
     answer
 }
@@ -6163,7 +6171,12 @@ fn spawn_agent_engine_watchers(state: AppState) {
 
     tokio::spawn(async move {
         while let Ok(event) = rx.recv().await {
-            if let agent::AgentDomainEvent::PermissionPending { ref asid, ref request, .. } = event {
+            if let agent::AgentDomainEvent::PermissionPending {
+                ref asid,
+                ref request,
+                ..
+            } = event
+            {
                 let tokens = match state.push_tokens.lock() {
                     Ok(guard) => guard.clone(),
                     Err(_) => Vec::new(),
@@ -8555,7 +8568,9 @@ async fn pane_fenced_cwd(
 /// de-duplication: that list answers "which directories are worth scanning",
 /// this answers "where is *this* pane".
 fn pane_cwd_in_list(response: &Value, pane_id: &str) -> Option<PathBuf> {
-    let panes = response.pointer("/result/panes").and_then(Value::as_array)?;
+    let panes = response
+        .pointer("/result/panes")
+        .and_then(Value::as_array)?;
     let pane = panes
         .iter()
         .find(|pane| pane.get("pane_id").and_then(Value::as_str) == Some(pane_id))?;
@@ -9527,7 +9542,10 @@ async fn upload_content(
         .status(StatusCode::OK)
         .header("content-type", kind.mime)
         .header("content-length", metadata.len())
-        .header("content-disposition", format!("inline; filename=\"{name}\""))
+        .header(
+            "content-disposition",
+            format!("inline; filename=\"{name}\""),
+        )
         // An upload is one device's own file, never a shared one: `private`
         // on top of the blanket `no-store` the security headers apply, so it
         // cannot land in a shared cache on the way back either.
@@ -9547,11 +9565,7 @@ async fn upload_content(
 /// symlink, a swept file, and content this gateway would not have stored are
 /// indistinguishable, so a caller cannot map the host by asking.
 fn upload_not_found() -> (StatusCode, Json<Value>) {
-    api_error(
-        StatusCode::NOT_FOUND,
-        "upload_not_found",
-        "no such upload",
-    )
+    api_error(StatusCode::NOT_FOUND, "upload_not_found", "no such upload")
 }
 
 /// Reduce a path parameter to a name that can only ever mean one file inside
@@ -11660,7 +11674,10 @@ async fn send_expo_push_notifications(
     Ok(response.json().await?)
 }
 
-pub(crate) fn find_session<'a>(config: &'a Config, session_id: &str) -> ApiResult<&'a SessionConfig> {
+pub(crate) fn find_session<'a>(
+    config: &'a Config,
+    session_id: &str,
+) -> ApiResult<&'a SessionConfig> {
     config
         .sessions
         .iter()
@@ -11687,7 +11704,11 @@ pub(crate) fn find_session<'a>(config: &'a Config, session_id: &str) -> ApiResul
 /// handler that have no business knowing a request exists. See
 /// [`request_locale`] for the scope it is set in and [`i18n::current`] for what
 /// happens outside one.
-pub(crate) fn api_error(status: StatusCode, code: &str, message: &str) -> (StatusCode, Json<Value>) {
+pub(crate) fn api_error(
+    status: StatusCode,
+    code: &str,
+    message: &str,
+) -> (StatusCode, Json<Value>) {
     api_error_in(i18n::current(), status, code, message)
 }
 
@@ -13632,9 +13653,18 @@ mod tests {
             { "pane_id": "w1:p4", "cwd": "/" },
         ] } });
         assert_eq!(pane_list_roots("s", &list).len(), 2);
-        assert_eq!(pane_cwd_in_list(&list, "w1:p1"), Some(PathBuf::from("/work/team/app")));
-        assert_eq!(pane_cwd_in_list(&list, "w1:p2"), Some(PathBuf::from("/work/team/app")));
-        assert_eq!(pane_cwd_in_list(&list, "w1:p3"), Some(PathBuf::from("/work/team/api")));
+        assert_eq!(
+            pane_cwd_in_list(&list, "w1:p1"),
+            Some(PathBuf::from("/work/team/app"))
+        );
+        assert_eq!(
+            pane_cwd_in_list(&list, "w1:p2"),
+            Some(PathBuf::from("/work/team/app"))
+        );
+        assert_eq!(
+            pane_cwd_in_list(&list, "w1:p3"),
+            Some(PathBuf::from("/work/team/api"))
+        );
         // Outside the fence, and unknown: no directory, so no git is run.
         assert_eq!(pane_cwd_in_list(&list, "w1:p4"), None);
         assert_eq!(pane_cwd_in_list(&list, "w9:p9"), None);
@@ -14407,7 +14437,9 @@ mod tests {
             Some("accept-encoding"),
             "the answer varies by what was asked for, compressed or not"
         );
-        let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
         assert_eq!(String::from_utf8_lossy(&body), "gzip, br");
 
         // A request that arrived sealed has it taken away, so the compression
@@ -14423,7 +14455,9 @@ mod tests {
             request_nonce: "nonce".to_string(),
         });
         let response = app.oneshot(request).await.unwrap();
-        let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
         assert_eq!(
             String::from_utf8_lossy(&body),
             "absent",
@@ -14473,7 +14507,9 @@ mod tests {
         };
         let seen = |app: Router, request: Request<Body>| async move {
             let response = app.oneshot(request).await.unwrap();
-            let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
             String::from_utf8_lossy(&body).to_string()
         };
 
@@ -14483,7 +14519,10 @@ mod tests {
         // One that asks for gzip gets gzip -- and only gzip, though it also
         // sent br and zstd in the ordinary header: the app fails a response
         // encoded any other way, so the choice is pinned rather than passed on.
-        assert_eq!(seen(app.clone(), sealed_request(Some("gzip"))).await, "gzip");
+        assert_eq!(
+            seen(app.clone(), sealed_request(Some("gzip"))).await,
+            "gzip"
+        );
         assert_eq!(
             seen(app.clone(), sealed_request(Some(" GZIP , br"))).await,
             "gzip",
@@ -15731,7 +15770,10 @@ mod tests {
         );
 
         // The paired device still gets in, and is still identified as itself.
-        assert_eq!(require_device(&state, &bearer_headers(token)).unwrap(), "phone-1");
+        assert_eq!(
+            require_device(&state, &bearer_headers(token)).unwrap(),
+            "phone-1"
+        );
         // As does the admin token, which this mode has always accepted here.
         assert_eq!(
             require_device(&state, &bearer_headers("admin-token")).unwrap(),
@@ -16519,7 +16561,12 @@ mod tests {
 
         let quiet = app
             .clone()
-            .oneshot(Request::builder().uri("/quiet").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/quiet")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(quiet.headers()["cache-control"], "no-store, max-age=0");
@@ -16570,7 +16617,10 @@ mod tests {
 
         let png = dir.join("a.png");
         std::fs::write(&png, png_bytes()).unwrap();
-        assert_eq!(sniff_stored_upload(&png, "a.png").unwrap().mime, "image/png");
+        assert_eq!(
+            sniff_stored_upload(&png, "a.png").unwrap().mime,
+            "image/png"
+        );
 
         // The extension lies; the bytes do not.
         let mislabelled = dir.join("b.md");

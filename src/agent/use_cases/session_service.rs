@@ -78,9 +78,15 @@ impl SessionService {
         let info = self.engine.get_session(&asid.0).await?;
         self.mirror.update_session(info.clone()).await;
 
-        let timeline = self.engine.get_timeline(&asid.0, 100).await.unwrap_or_default();
+        let timeline = self
+            .engine
+            .get_timeline(&asid.0, 100)
+            .await
+            .unwrap_or_default();
         if !timeline.is_empty() {
-            self.mirror.upsert_timeline_items(asid, timeline.clone()).await;
+            self.mirror
+                .upsert_timeline_items(asid, timeline.clone())
+                .await;
         }
 
         // Anything raised while the stream was down is read back here:
@@ -134,11 +140,18 @@ impl SessionService {
         self.mirror.get_events_after(asid, after_seq).await
     }
 
-    pub async fn switch_model(&self, asid: &AgentSessionId, model: &ModelRef) -> Result<(), AgentEngineError> {
+    pub async fn switch_model(
+        &self,
+        asid: &AgentSessionId,
+        model: &ModelRef,
+    ) -> Result<(), AgentEngineError> {
         self.engine.switch_model(&asid.0, model).await
     }
 
-    pub async fn get_catalog(&self, directory: Option<&str>) -> Result<AgentCatalog, AgentEngineError> {
+    pub async fn get_catalog(
+        &self,
+        directory: Option<&str>,
+    ) -> Result<AgentCatalog, AgentEngineError> {
         self.engine.get_catalog(directory).await
     }
 
@@ -156,11 +169,14 @@ impl SessionService {
         message_id: &str,
     ) -> Result<(), AgentEngineError> {
         self.engine.revert_session(&asid.0, message_id).await?;
-        let timeline = self.engine.get_timeline(&asid.0, 100).await.unwrap_or_default();
+        let timeline = self
+            .engine
+            .get_timeline(&asid.0, 100)
+            .await
+            .unwrap_or_default();
         if !timeline.is_empty() {
             self.mirror.upsert_timeline_items(asid, timeline).await;
         }
         Ok(())
     }
 }
-

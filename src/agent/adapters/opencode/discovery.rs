@@ -1,5 +1,5 @@
-use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpencodeServiceRegistration {
@@ -24,7 +24,9 @@ impl OpencodeEndpoint {
     /// Discover OpenCode service configuration from standard state files or environment.
     pub async fn discover() -> Option<Self> {
         // 1. Check environment variables first if manually configured
-        if let Ok(url) = std::env::var("OPENCODE_URL").or_else(|_| std::env::var("HERDR_GATEWAY_OPENCODE_URL")) {
+        if let Ok(url) =
+            std::env::var("OPENCODE_URL").or_else(|_| std::env::var("HERDR_GATEWAY_OPENCODE_URL"))
+        {
             let url = url.trim().trim_end_matches('/').to_string();
             if !url.is_empty() {
                 let password = std::env::var("OPENCODE_SERVER_PASSWORD")
@@ -62,22 +64,44 @@ impl OpencodeEndpoint {
 
     /// Health check probe to verify the service is running and responsive
     pub async fn probe_healthy(&self, client: &reqwest::Client) -> bool {
-        let health_url = format!("{}/api/health", self.url);
-        let mut req = client.get(&health_url);
-        if let Some(ref pwd) = self.password {
-            req = req.basic_auth("opencode", Some(pwd));
-        }
-
-        match req.send().await {
-            Ok(resp) if resp.status().is_success() => {
-                if let Ok(body) = resp.json::<serde_json::Value>().await {
-                    body.get("healthy").and_then(|v| v.as_bool()) == Some(true)
-                } else {
-                    false
-                }
+        // Current v2 exposes server identity at /api/info. Early v2 releases
+        // used /api/health; only a missing route warrants that fallback.
+        for path in ["/api/info", "/api/health"] {
+            let mut req = client.get(format!("{}{path}", self.url));
+            if let Some(ref pwd) = self.password {
+                req = req.basic_auth("opencode", Some(pwd));
             }
-            _ => false,
+            let Ok(resp) = req.send().await else {
+                return false;
+            };
+            if path == "/api/info" && resp.status() == reqwest::StatusCode::NOT_FOUND {
+                continue;
+            }
+            if !resp.status().is_success() {
+                return false;
+            }
+            let Ok(body) = resp.json::<serde_json::Value>().await else {
+                return false;
+            };
+            return if path == "/api/info" {
+                body.get("version")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|v| !v.is_empty())
+                    && body
+                        .get("pid")
+                        .and_then(|v| v.as_u64())
+                        .is_some_and(|pid| pid > 0)
+                    && body
+                        .get("urls")
+                        .and_then(|v| v.as_array())
+                        .is_some_and(|urls| {
+                            !urls.is_empty() && urls.iter().all(|url| url.as_str().is_some())
+                        })
+            } else {
+                body.get("healthy").and_then(|v| v.as_bool()) == Some(true)
+            };
         }
+        false
     }
 }
 
@@ -93,6 +117,68 @@ fn service_registration_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn probe(info_status: axum::http::StatusCode, info: serde_json::Value) -> bool {
+        use axum::{routing::get, Json, Router};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = OpencodeEndpoint {
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            password: None,
+            version: None,
+            pid: None,
+        };
+        let app = Router::new()
+            .route(
+                "/api/info",
+                get(move || async move { (info_status, Json(info)) }),
+            )
+            .route(
+                "/api/health",
+                get(|| async { Json(serde_json::json!({"healthy":true})) }),
+            );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let healthy = endpoint.probe_healthy(&client).await;
+        server.abort();
+        healthy
+    }
+
+    #[tokio::test]
+    async fn supports_current_server_info_and_early_v2_health() {
+        use axum::http::StatusCode;
+        assert!(
+            probe(
+                StatusCode::OK,
+                serde_json::json!({"version":"2.0.12","pid":123,"urls":["http://127.0.0.1:4096"]})
+            )
+            .await
+        );
+        assert!(probe(StatusCode::NOT_FOUND, serde_json::Value::Null).await);
+    }
+
+    #[tokio::test]
+    async fn does_not_hide_failed_auth_or_accept_an_unrelated_json_response() {
+        use axum::http::StatusCode;
+        for status in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            assert!(!probe(status, serde_json::Value::Null).await);
+        }
+        assert!(!probe(StatusCode::OK, serde_json::json!({"healthy":true})).await);
+        assert!(
+            !probe(
+                StatusCode::OK,
+                serde_json::json!({"version":"2.0.12","pid":0,"urls":[]})
+            )
+            .await
+        );
+    }
 
     #[test]
     fn test_service_registration_parse() {

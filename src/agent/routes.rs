@@ -12,14 +12,12 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use super::domain::{
-    AgentDomainEvent, AgentSessionId, ModelRef, PermissionDecision, SessionQuery,
-};
+use super::domain::{AgentDomainEvent, AgentSessionId, ModelRef, PermissionDecision, SessionQuery};
 use super::ports::engine::AgentEnginePort;
 use super::ports::mirror::SessionMirrorPort;
 use crate::{
-    api_error, content_envelope, require_device, stream_event, validate_text, ApiResult,
-    AppState, EncryptedStreamContext, EventStreamSealer,
+    api_error, content_envelope, require_device, stream_event, validate_text, ApiResult, AppState,
+    EncryptedStreamContext, EventStreamSealer,
 };
 
 #[derive(Debug, Deserialize)]
@@ -303,10 +301,7 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
             "/api/agent-worktrees/refresh",
             post(refresh_agent_worktrees),
         )
-        .route(
-            "/api/agent-sessions/{asid}/move",
-            post(move_agent_session),
-        )
+        .route("/api/agent-sessions/{asid}/move", post(move_agent_session))
         .route(
             "/api/agent-sessions/{asid}/permissions/saved",
             get(list_saved_agent_permissions),
@@ -372,10 +367,7 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
             "/api/agent-sessions/{asid}/agent",
             post(switch_agent_mode_global),
         )
-        .route(
-            "/api/agent-files",
-            get(find_agent_files_root_global),
-        )
+        .route("/api/agent-files", get(find_agent_files_root_global))
         .route(
             "/api/agent-sessions/{asid}/files",
             get(find_agent_files_global),
@@ -416,18 +408,9 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
             "/api/agent-sessions/{asid}/revert",
             post(revert_agent_session_global),
         )
-        .route(
-            "/api/agent-catalog",
-            get(get_global_agent_catalog),
-        )
-        .route(
-            "/api/agent-projects",
-            get(list_agent_projects_global),
-        )
-        .route(
-            "/api/agent-directories",
-            get(list_agent_directories_global),
-        )
+        .route("/api/agent-catalog", get(get_global_agent_catalog))
+        .route("/api/agent-projects", get(list_agent_projects_global))
+        .route("/api/agent-directories", get(list_agent_directories_global))
         .route(
             "/api/agent-sessions/{asid}/stream",
             get(stream_agent_session_global),
@@ -548,7 +531,10 @@ async fn do_list_agent_sessions(
     // getting a fresh 21 kB body every time -- after every turn, because the
     // list is what the home screen watches. The list is the same bytes far
     // more often than it is not.
-    Ok(json_etag_response(headers, content_envelope(json!(sessions))))
+    Ok(json_etag_response(
+        headers,
+        content_envelope(json!(sessions)),
+    ))
 }
 
 async fn do_create_agent_session(
@@ -603,7 +589,13 @@ async fn do_create_agent_session(
             body.agent.as_deref(),
         )
         .await
-        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "agent_engine_error", &e.to_string()))?;
+        .map_err(|e| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                "agent_engine_error",
+                &e.to_string(),
+            )
+        })?;
 
     Ok(Json(content_envelope(json!(session))))
 }
@@ -631,7 +623,10 @@ async fn do_get_agent_session(
 
     // A session the reader is sitting on is polled and mostly unchanged; the
     // whole snapshot is the expensive thing to send twice.
-    Ok(json_etag_response(headers, content_envelope(json!(snapshot))))
+    Ok(json_etag_response(
+        headers,
+        content_envelope(json!(snapshot)),
+    ))
 }
 
 async fn do_get_agent_session_events(
@@ -715,7 +710,13 @@ async fn do_switch_agent_mode(
         .engine()
         .switch_agent(asid, agent)
         .await
-        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "agent_engine_error", &e.to_string()))?;
+        .map_err(|e| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                "agent_engine_error",
+                &e.to_string(),
+            )
+        })?;
 
     Ok(Json(content_envelope(json!({ "ok": true }))))
 }
@@ -745,19 +746,22 @@ async fn do_find_agent_files(
         .await
         .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "fs_error", &e.to_string()))?;
 
-    let hits: Vec<Value> = files.iter().filter_map(|f| {
-        let path = f.get("path").and_then(Value::as_str)?;
-        let name = std::path::Path::new(path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(path);
-        let kind = f.get("type").and_then(Value::as_str).unwrap_or("file");
-        Some(json!({
-            "path": path,
-            "name": name,
-            "kind": kind,
-        }))
-    }).collect();
+    let hits: Vec<Value> = files
+        .iter()
+        .filter_map(|f| {
+            let path = f.get("path").and_then(Value::as_str)?;
+            let name = std::path::Path::new(path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(path);
+            let kind = f.get("type").and_then(Value::as_str).unwrap_or("file");
+            Some(json!({
+                "path": path,
+                "name": name,
+                "kind": kind,
+            }))
+        })
+        .collect();
 
     Ok(Json(content_envelope(json!(hits))))
 }
@@ -790,7 +794,13 @@ async fn do_send_agent_prompt(
             body.delivery.as_deref(),
         )
         .await
-        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "agent_engine_error", &e.to_string()))?;
+        .map_err(|e| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                "agent_engine_error",
+                &e.to_string(),
+            )
+        })?;
 
     Ok(Json(content_envelope(json!({ "submitted": true }))))
 }
@@ -815,7 +825,13 @@ async fn do_revert_agent_session(
         .sessions()
         .revert_session(&AgentSessionId(asid.to_string()), &body.message_id)
         .await
-        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "agent_engine_error", &e.to_string()))?;
+        .map_err(|e| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                "agent_engine_error",
+                &e.to_string(),
+            )
+        })?;
 
     Ok(Json(content_envelope(json!({
         "status": "ok",
@@ -842,7 +858,13 @@ async fn do_interrupt_agent_session(
         .prompts()
         .interrupt(&AgentSessionId(asid.to_string()))
         .await
-        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "agent_engine_error", &e.to_string()))?;
+        .map_err(|e| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                "agent_engine_error",
+                &e.to_string(),
+            )
+        })?;
 
     Ok(Json(content_envelope(json!({ "interrupted": true }))))
 }
@@ -867,7 +889,13 @@ async fn do_switch_agent_model(
         .sessions()
         .switch_model(&AgentSessionId(asid.to_string()), &model)
         .await
-        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "agent_engine_error", &e.to_string()))?;
+        .map_err(|e| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                "agent_engine_error",
+                &e.to_string(),
+            )
+        })?;
 
     Ok(Json(content_envelope(json!({ "switched": true }))))
 }
@@ -911,7 +939,13 @@ async fn do_reply_agent_permission(
             body.message.as_deref(),
         )
         .await
-        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "agent_engine_error", &e.to_string()))?;
+        .map_err(|e| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                "agent_engine_error",
+                &e.to_string(),
+            )
+        })?;
 
     Ok(Json(content_envelope(json!({ "replied": true }))))
 }
@@ -941,7 +975,13 @@ async fn do_reply_agent_form(
             serde_json::Value::Object(body.answers),
         )
         .await
-        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "agent_engine_error", &e.to_string()))?;
+        .map_err(|e| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                "agent_engine_error",
+                &e.to_string(),
+            )
+        })?;
 
     Ok(Json(content_envelope(json!({ "replied": true }))))
 }
@@ -1000,10 +1040,7 @@ async fn do_get_agent_vcs_diff(
         .as_deref()
         .map(super::adapters::opencode::driver::is_git_worktree)
         .unwrap_or(true);
-    Ok(Json(content_envelope(vcs_diff_body(
-        json!(diffs),
-        is_repo,
-    ))))
+    Ok(Json(content_envelope(vcs_diff_body(json!(diffs), is_repo))))
 }
 
 /// Whether a catalog is one a client should be allowed to keep.
@@ -1065,14 +1102,20 @@ pub(crate) fn json_etag_response(headers: &HeaderMap, payload: Value) -> Respons
     let hash = hasher.finalize();
     let etag = format!("\"{:x}\"", hash);
 
-    if let Some(if_none_match) = headers.get(header::IF_NONE_MATCH).and_then(|h| h.to_str().ok()) {
+    if let Some(if_none_match) = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|h| h.to_str().ok())
+    {
         let trimmed = if_none_match.trim();
         if trimmed == etag || trimmed == "*" || trimmed == format!("W/{}", etag) {
             return (
                 StatusCode::NOT_MODIFIED,
                 [
                     (header::ETAG, etag),
-                    (header::CACHE_CONTROL, "private, must-revalidate".to_string()),
+                    (
+                        header::CACHE_CONTROL,
+                        "private, must-revalidate".to_string(),
+                    ),
                     (header::VARY, VALIDATED_VARY.to_string()),
                 ],
             )
@@ -1085,7 +1128,10 @@ pub(crate) fn json_etag_response(headers: &HeaderMap, payload: Value) -> Respons
         [
             (header::CONTENT_TYPE, "application/json".to_string()),
             (header::ETAG, etag),
-            (header::CACHE_CONTROL, "private, must-revalidate".to_string()),
+            (
+                header::CACHE_CONTROL,
+                "private, must-revalidate".to_string(),
+            ),
             (header::VARY, VALIDATED_VARY.to_string()),
         ],
         body_bytes,
@@ -1093,10 +1139,7 @@ pub(crate) fn json_etag_response(headers: &HeaderMap, payload: Value) -> Respons
         .into_response()
 }
 
-async fn do_list_agent_projects(
-    state: &AppState,
-    headers: &HeaderMap,
-) -> ApiResult<Response> {
+async fn do_list_agent_projects(state: &AppState, headers: &HeaderMap) -> ApiResult<Response> {
     require_device(state, headers)?;
 
     let Some(manager) = state.agent_runtime.manager().await else {
@@ -1107,13 +1150,18 @@ async fn do_list_agent_projects(
         ));
     };
 
-    let projects = manager
-        .engine()
-        .list_projects()
-        .await
-        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "agent_engine_error", &e.to_string()))?;
+    let projects = manager.engine().list_projects().await.map_err(|e| {
+        api_error(
+            StatusCode::BAD_GATEWAY,
+            "agent_engine_error",
+            &e.to_string(),
+        )
+    })?;
 
-    Ok(json_etag_response(headers, content_envelope(json!(projects))))
+    Ok(json_etag_response(
+        headers,
+        content_envelope(json!(projects)),
+    ))
 }
 
 async fn do_list_agent_directories(
@@ -1142,7 +1190,10 @@ async fn do_list_agent_directories(
     let target = if expanded.is_dir() {
         expanded
     } else {
-        expanded.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| std::path::PathBuf::from("/"))
+        expanded
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("/"))
     };
 
     if let Ok(mut entries) = tokio::fs::read_dir(&target).await {
@@ -1150,7 +1201,13 @@ async fn do_list_agent_directories(
             if let Ok(file_type) = entry.file_type().await {
                 if file_type.is_dir() {
                     let name = entry.file_name().to_string_lossy().to_string();
-                    if !name.starts_with('.') || query.query.as_deref().map(|q| q.starts_with('.')).unwrap_or(false) {
+                    if !name.starts_with('.')
+                        || query
+                            .query
+                            .as_deref()
+                            .map(|q| q.starts_with('.'))
+                            .unwrap_or(false)
+                    {
                         let full_path = entry.path().to_string_lossy().to_string();
                         dirs_list.push(json!({
                             "name": name,
@@ -1162,7 +1219,10 @@ async fn do_list_agent_directories(
         }
     }
     dirs_list.sort_by(|a, b| {
-        a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or(""))
+        a["name"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["name"].as_str().unwrap_or(""))
     });
     if dirs_list.len() > 50 {
         dirs_list.truncate(50);
@@ -1190,7 +1250,10 @@ async fn do_stream_agent_session(
     asid: &str,
     stream_crypto: Option<Extension<EncryptedStreamContext>>,
     headers: &HeaderMap,
-) -> Result<Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>> + Send>, (StatusCode, Json<Value>)> {
+) -> Result<
+    Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>> + Send>,
+    (StatusCode, Json<Value>),
+> {
     require_device(state, headers)?;
 
     let mut sealer = match stream_crypto {
@@ -1643,7 +1706,10 @@ async fn stream_agent_session_global(
     Path(asid): Path<String>,
     stream_crypto: Option<Extension<EncryptedStreamContext>>,
     headers: HeaderMap,
-) -> Result<Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>> + Send>, (StatusCode, Json<Value>)> {
+) -> Result<
+    Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>> + Send>,
+    (StatusCode, Json<Value>),
+> {
     do_stream_agent_session(&state, &asid, stream_crypto, &headers).await
 }
 
@@ -1652,11 +1718,12 @@ async fn stream_agent_session_legacy(
     Path((_session_id, asid)): Path<(String, String)>,
     stream_crypto: Option<Extension<EncryptedStreamContext>>,
     headers: HeaderMap,
-) -> Result<Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>> + Send>, (StatusCode, Json<Value>)> {
+) -> Result<
+    Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>> + Send>,
+    (StatusCode, Json<Value>),
+> {
     do_stream_agent_session(&state, &asid, stream_crypto, &headers).await
 }
-
-
 
 // ---------------------------------------------------------------------------
 // Session operations added for OpenCode v2 parity. These are additive: every
@@ -1690,7 +1757,11 @@ fn engine_error(err: super::ports::engine::AgentEngineError) -> (StatusCode, Jso
     if let super::ports::engine::AgentEngineError::WorkspaceMissing(ref directory) = err {
         return workspace_missing(directory);
     }
-    api_error(StatusCode::BAD_GATEWAY, "agent_engine_error", &err.to_string())
+    api_error(
+        StatusCode::BAD_GATEWAY,
+        "agent_engine_error",
+        &err.to_string(),
+    )
 }
 
 /// The diff, and whether there was anywhere for one to come from.
@@ -2440,7 +2511,9 @@ mod tests {
     /// `files` is tri-state on the way in: absent leaves OpenCode's own
     /// default alone, and `false` is a caller who does not want the diff
     /// computed -- not the same thing.
-    fn catalog_with(agents: Vec<crate::agent::domain::AgentInfo>) -> crate::agent::domain::AgentCatalog {
+    fn catalog_with(
+        agents: Vec<crate::agent::domain::AgentInfo>,
+    ) -> crate::agent::domain::AgentCatalog {
         crate::agent::domain::AgentCatalog {
             models: Vec::new(),
             agents,
@@ -2504,7 +2577,10 @@ mod tests {
             .expect("a validated answer carries a tag")
             .to_string();
         assert_eq!(
-            fresh.headers().get(header::VARY).and_then(|v| v.to_str().ok()),
+            fresh
+                .headers()
+                .get(header::VARY)
+                .and_then(|v| v.to_str().ok()),
             Some(VALIDATED_VARY),
             "and says what it varies by, so a cache cannot cross the wires"
         );
@@ -2515,11 +2591,17 @@ mod tests {
         let repeat = json_etag_response(&headers, payload.clone());
         assert_eq!(repeat.status(), StatusCode::NOT_MODIFIED);
         assert_eq!(
-            repeat.headers().get(header::ETAG).and_then(|v| v.to_str().ok()),
+            repeat
+                .headers()
+                .get(header::ETAG)
+                .and_then(|v| v.to_str().ok()),
             Some(tag.as_str())
         );
         assert_eq!(
-            repeat.headers().get(header::VARY).and_then(|v| v.to_str().ok()),
+            repeat
+                .headers()
+                .get(header::VARY)
+                .and_then(|v| v.to_str().ok()),
             Some(VALIDATED_VARY),
             "a 304 has to carry it too, or the cache entry it refreshes loses it"
         );
@@ -2537,7 +2619,10 @@ mod tests {
         let response = json_etag_response(&headers, changed);
         assert_eq!(response.status(), StatusCode::OK);
         assert_ne!(
-            response.headers().get(header::ETAG).and_then(|v| v.to_str().ok()),
+            response
+                .headers()
+                .get(header::ETAG)
+                .and_then(|v| v.to_str().ok()),
             Some(tag.as_str())
         );
     }
@@ -2625,7 +2710,10 @@ mod tests {
     #[test]
     fn a_catalog_missing_models_or_providers_is_not_cacheable_either() {
         let full = complete_catalog();
-        assert!(!catalog_is_incomplete(&full), "the fixture is a real catalog");
+        assert!(
+            !catalog_is_incomplete(&full),
+            "the fixture is a real catalog"
+        );
         assert!(
             catalog_response(&HeaderMap::new(), full)
                 .headers()
@@ -2732,7 +2820,10 @@ mod tests {
 
         let no_target: Result<RemoveWorktreeBody, _> =
             serde_json::from_value(json!({ "directory": "/tmp/muqun-gw-wt" }));
-        assert!(no_target.is_err(), "there is nothing to remove without `worktree`");
+        assert!(
+            no_target.is_err(),
+            "there is nothing to remove without `worktree`"
+        );
     }
 
     /// Every field of `Worktree.CreateInput` is optional, so an empty create
@@ -2787,7 +2878,10 @@ mod tests {
         let bare: ActivateSkillBody =
             serde_json::from_value(json!({ "skill": "docs" })).expect("skill alone parses");
         assert_eq!(bare.skill, "docs");
-        assert!(bare.resume.is_none(), "an absent resume is OpenCode's default");
+        assert!(
+            bare.resume.is_none(),
+            "an absent resume is OpenCode's default"
+        );
 
         let with_resume: ActivateSkillBody =
             serde_json::from_value(json!({ "skill": "docs", "resume": false }))

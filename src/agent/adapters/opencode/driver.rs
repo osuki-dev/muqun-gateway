@@ -4,14 +4,14 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+use super::client::OpencodeClient;
+use super::client::SessionListFilter;
+use super::discovery::OpencodeEndpoint;
+use super::mapper;
 use crate::agent::domain::{
     AgentCatalog, AgentProject, AgentSessionInfo, ModelRef, PermissionDecision, SessionQuery,
 };
-use super::client::SessionListFilter;
 use crate::agent::ports::engine::{AgentEngineError, AgentEnginePort, EngineFuture, FileDiffItem};
-use super::client::OpencodeClient;
-use super::discovery::OpencodeEndpoint;
-use super::mapper;
 
 /// The permission action OpenCode raises when a tool reaches outside the
 /// session's own directory.
@@ -215,7 +215,11 @@ impl OpencodeDriver {
         };
 
         let Some(rules) = merge_uploads_rule(&existing, &resource) else {
-            tracing::debug!(session_id, resource, "uploads already allowed for this session");
+            tracing::debug!(
+                session_id,
+                resource,
+                "uploads already allowed for this session"
+            );
             self.mark_primed(session_id);
             return;
         };
@@ -366,7 +370,6 @@ impl OpencodeDriver {
         }
         last
     }
-
 }
 
 /// The ruleset to send back, or `None` when the session already allows the
@@ -376,7 +379,10 @@ impl OpencodeDriver {
 /// OpenCode evaluates session rules last and lets the last match win, so
 /// appending is what makes this an addition rather than a replacement of
 /// whatever the owner set up.
-fn merge_uploads_rule(existing: &[serde_json::Value], resource: &str) -> Option<Vec<serde_json::Value>> {
+fn merge_uploads_rule(
+    existing: &[serde_json::Value],
+    resource: &str,
+) -> Option<Vec<serde_json::Value>> {
     let field = |rule: &serde_json::Value, key: &str| {
         rule.get(key)
             .and_then(serde_json::Value::as_str)
@@ -414,8 +420,10 @@ impl AgentEnginePort for OpencodeDriver {
     fn list_projects(&self) -> EngineFuture<'_, Vec<AgentProject>> {
         Box::pin(async move {
             let raw_projects = self.client.list_projects().await?;
-            let mut projects: Vec<AgentProject> =
-                raw_projects.iter().filter_map(mapper::map_project).collect();
+            let mut projects: Vec<AgentProject> = raw_projects
+                .iter()
+                .filter_map(mapper::map_project)
+                .collect();
             // OpenCode remembers a project for ever: there is no remove and no
             // archive anywhere in its 2.0.1 API, so every throwaway checkout
             // anyone has ever opened is still in this list. The gateway cannot
@@ -447,7 +455,10 @@ impl AgentEnginePort for OpencodeDriver {
                 .client
                 .list_sessions(query.directory.as_deref(), &filter)
                 .await?;
-            let sessions = raw_sessions.iter().filter_map(mapper::map_session).collect();
+            let sessions = raw_sessions
+                .iter()
+                .filter_map(mapper::map_session)
+                .collect();
             Ok(sessions)
         })
     }
@@ -492,7 +503,9 @@ impl AgentEnginePort for OpencodeDriver {
             if !attachments.is_empty() {
                 self.prime_uploads_permission(session_id).await;
             }
-            self.client.send_prompt(session_id, text, attachments, delivery).await?;
+            self.client
+                .send_prompt(session_id, text, attachments, delivery)
+                .await?;
             Ok(())
         })
     }
@@ -526,11 +539,7 @@ impl AgentEnginePort for OpencodeDriver {
         })
     }
 
-    fn switch_agent<'a>(
-        &'a self,
-        session_id: &'a str,
-        agent: &'a str,
-    ) -> EngineFuture<'a, ()> {
+    fn switch_agent<'a>(&'a self, session_id: &'a str, agent: &'a str) -> EngineFuture<'a, ()> {
         Box::pin(async move {
             self.client.switch_agent(session_id, agent).await?;
             Ok(())
@@ -577,7 +586,9 @@ impl AgentEnginePort for OpencodeDriver {
         answers: serde_json::Value,
     ) -> EngineFuture<'a, ()> {
         Box::pin(async move {
-            self.client.reply_form(session_id, form_id, &answers).await?;
+            self.client
+                .reply_form(session_id, form_id, &answers)
+                .await?;
             Ok(())
         })
     }
@@ -688,9 +699,20 @@ impl AgentEnginePort for OpencodeDriver {
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                let patch = item.get("patch").or_else(|| item.get("diff")).and_then(serde_json::Value::as_str).unwrap_or("").to_string();
-                let additions = item.get("additions").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
-                let deletions = item.get("deletions").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
+                let patch = item
+                    .get("patch")
+                    .or_else(|| item.get("diff"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let additions = item
+                    .get("additions")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as usize;
+                let deletions = item
+                    .get("deletions")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as usize;
                 diffs.push(FileDiffItem {
                     path,
                     patch,
@@ -770,7 +792,8 @@ mod tests {
         for project in &projects {
             let on_disk = std::path::Path::new(&project.canonical).is_dir();
             assert_eq!(
-                project.missing, !on_disk,
+                project.missing,
+                !on_disk,
                 "{} is {} on disk but reported missing = {}",
                 project.canonical,
                 if on_disk { "present" } else { "absent" },
@@ -868,10 +891,8 @@ mod tests {
 
         // A directory nothing has opened is the cold case that used to answer
         // with nothing at all.
-        let directory = std::env::temp_dir().join(format!(
-            "muqun-catalog-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
+        let directory =
+            std::env::temp_dir().join(format!("muqun-catalog-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&directory).expect("temp dir");
         let scoped = driver
             .get_catalog(directory.to_str())
@@ -898,8 +919,8 @@ mod tests {
     /// OpenCode relayed as a blank 502.
     #[test]
     fn a_directory_that_is_gone_is_its_own_error() {
-        let dir = std::env::temp_dir()
-            .join(format!("muqun-missing-{}", uuid::Uuid::new_v4().simple()));
+        let dir =
+            std::env::temp_dir().join(format!("muqun-missing-{}", uuid::Uuid::new_v4().simple()));
         let path = dir.to_str().unwrap().to_string();
 
         match check_directory(Some(&path)) {
@@ -919,8 +940,10 @@ mod tests {
         assert!(check_directory(Some("   ")).is_ok());
 
         // A file is not a workspace.
-        let file = std::env::temp_dir()
-            .join(format!("muqun-missing-{}.txt", uuid::Uuid::new_v4().simple()));
+        let file = std::env::temp_dir().join(format!(
+            "muqun-missing-{}.txt",
+            uuid::Uuid::new_v4().simple()
+        ));
         std::fs::write(&file, b"x").expect("write");
         assert!(check_directory(file.to_str()).is_err());
         let _ = std::fs::remove_file(&file);
@@ -931,7 +954,10 @@ mod tests {
     #[test]
     fn a_missing_workspace_says_which_folder() {
         let err = AgentEngineError::WorkspaceMissing("/tmp/muqun-c10/repo".to_string());
-        assert_eq!(err.to_string(), "The workspace folder is gone: /tmp/muqun-c10/repo");
+        assert_eq!(
+            err.to_string(),
+            "The workspace folder is gone: /tmp/muqun-c10/repo"
+        );
     }
 
     /// One line per directory per interval. A phone polling a screen whose
@@ -941,7 +967,10 @@ mod tests {
         let mut seen = HashMap::new();
         let start = std::time::Instant::now();
 
-        assert!(should_report_missing(&mut seen, "/gone", start), "the first time");
+        assert!(
+            should_report_missing(&mut seen, "/gone", start),
+            "the first time"
+        );
         assert!(
             !should_report_missing(&mut seen, "/gone", start),
             "and not again on the next read"
@@ -968,8 +997,8 @@ mod tests {
     /// counts and a worktree's `.git` file counts.
     #[test]
     fn a_git_worktree_is_recognised_from_anywhere_inside_it() {
-        let root = std::env::temp_dir()
-            .join(format!("muqun-git-{}", uuid::Uuid::new_v4().simple()));
+        let root =
+            std::env::temp_dir().join(format!("muqun-git-{}", uuid::Uuid::new_v4().simple()));
         let nested = root.join("src").join("deep");
         std::fs::create_dir_all(&nested).expect("temp dirs");
 
@@ -986,8 +1015,8 @@ mod tests {
         );
 
         // A linked worktree has a `.git` file, not a directory.
-        let linked = std::env::temp_dir()
-            .join(format!("muqun-wt-{}", uuid::Uuid::new_v4().simple()));
+        let linked =
+            std::env::temp_dir().join(format!("muqun-wt-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&linked).expect("temp dir");
         assert!(!is_git_worktree(linked.to_str().unwrap()));
         std::fs::write(linked.join(".git"), b"gitdir: /elsewhere\n").expect("write");

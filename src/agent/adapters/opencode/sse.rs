@@ -232,7 +232,11 @@ mod tests {
         assert_eq!(event.event_type, "session.created");
         assert_eq!(event.created, Some(1789640956167));
         assert_eq!(
-            event.location.as_ref().and_then(|l| l.get("directory")).and_then(Value::as_str),
+            event
+                .location
+                .as_ref()
+                .and_then(|l| l.get("directory"))
+                .and_then(Value::as_str),
             Some("/tmp")
         );
         assert_eq!(
@@ -258,7 +262,8 @@ mod tests {
 
     #[test]
     fn a_comment_between_data_lines_is_skipped() {
-        let block = ": ping\ndata: {\"type\":\"session.idle\",\"data\":{\"sessionID\":\"ses_2\"}}\n: ping";
+        let block =
+            ": ping\ndata: {\"type\":\"session.idle\",\"data\":{\"sessionID\":\"ses_2\"}}\n: ping";
         let event = OpencodeSseListener::parse_block(block).expect("frame parses");
         assert_eq!(event.event_type, "session.idle");
     }

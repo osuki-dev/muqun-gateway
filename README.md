@@ -96,7 +96,9 @@ for good.
 
 The gateway's agent features run on OpenCode 2. It attaches one for as long as
 it is running: if a service is already registered it adopts that, and otherwise
-it starts `opencode serve --service` itself.
+it runs `opencode service start`. OpenCode starts the background server and loads
+the environment saved by `opencode service set env`; the gateway does not copy
+credentials or manage a second service.
 
 **It runs `opencode` as your `PATH` resolves it**, or the file you name:
 
@@ -126,6 +128,11 @@ one line saying which file, which version, and that `opencode.binary` is how to
 point it elsewhere. OpenCode 1 is a different API, and half-working with it is
 worse than saying so. `GET /api/agent-engine` reports the same facts to the
 app, including whether the engine was `adopted` or `spawned`.
+
+If the configured listen IP changes or is unavailable, startup reports the
+address and asks you to update `listen` in the gateway's `config.json`, then
+restart. It never switches addresses automatically. If the pairing URL contains
+the old IP too, update that URL through `muqun-gateway manage`.
 
 ### Optional terminal startup
 

@@ -7,7 +7,8 @@ use crate::agent::domain::{
     PermissionRequest, SessionQuery, TimelineItem,
 };
 
-pub type EngineFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, AgentEngineError>> + Send + 'a>>;
+pub type EngineFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, AgentEngineError>> + Send + 'a>>;
 
 #[derive(Debug, Clone)]
 pub enum AgentEngineError {
@@ -64,8 +65,10 @@ pub trait AgentEnginePort: Send + Sync {
     fn list_projects(&self) -> EngineFuture<'_, Vec<AgentProject>>;
 
     /// List sessions, optionally filtered by directory, parent and search
-    fn list_sessions<'a>(&'a self, query: &'a SessionQuery)
-        -> EngineFuture<'a, Vec<AgentSessionInfo>>;
+    fn list_sessions<'a>(
+        &'a self,
+        query: &'a SessionQuery,
+    ) -> EngineFuture<'a, Vec<AgentSessionInfo>>;
 
     /// Create a new session
     fn create_session<'a>(
@@ -98,18 +101,11 @@ pub trait AgentEnginePort: Send + Sync {
     fn interrupt<'a>(&'a self, session_id: &'a str) -> EngineFuture<'a, ()>;
 
     /// Switch session active model
-    fn switch_model<'a>(
-        &'a self,
-        session_id: &'a str,
-        model: &'a ModelRef,
-    ) -> EngineFuture<'a, ()>;
+    fn switch_model<'a>(&'a self, session_id: &'a str, model: &'a ModelRef)
+        -> EngineFuture<'a, ()>;
 
     /// Switch session active agent mode
-    fn switch_agent<'a>(
-        &'a self,
-        session_id: &'a str,
-        agent: &'a str,
-    ) -> EngineFuture<'a, ()>;
+    fn switch_agent<'a>(&'a self, session_id: &'a str, agent: &'a str) -> EngineFuture<'a, ()>;
 
     /// Search files in workspace, optionally scoped to a directory
     fn find_files<'a>(

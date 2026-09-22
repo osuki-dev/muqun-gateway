@@ -1,11 +1,11 @@
-use serde::{Deserialize, Serialize};
+use super::form::FormRequest;
+use super::permission::PermissionRequest;
 use super::session::{
     AgentErrorInfo, AgentSessionId, AgentSessionInfo, AgentSessionStatus, RevertState,
     SessionRevertInfo, WorktreeState,
 };
 use super::timeline::{CompactionStatus, TimelineItem};
-use super::permission::PermissionRequest;
-use super::form::FormRequest;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

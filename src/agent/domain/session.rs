@@ -213,4 +213,3 @@ pub struct AgentProject {
 fn is_not_missing(missing: &bool) -> bool {
     !*missing
 }
-

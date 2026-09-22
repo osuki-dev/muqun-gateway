@@ -72,7 +72,10 @@ async fn a_tool_run_becomes_one_completed_card() {
             .contains("sample.txt"),
         "the result comes from tool.success"
     );
-    assert!(call.content.is_some(), "Tool.Content[] is forwarded verbatim");
+    assert!(
+        call.content.is_some(),
+        "Tool.Content[] is forwarded verbatim"
+    );
     assert_eq!(
         call.metadata
             .as_ref()
@@ -89,7 +92,11 @@ async fn a_subagent_call_exposes_its_child_session() {
     replay(&ctx, "subagent.sse").await;
 
     let parent = AgentSessionId("ses_PARENT".to_string());
-    let snapshot = ctx.mirror.get_snapshot(&parent).await.expect("parent known");
+    let snapshot = ctx
+        .mirror
+        .get_snapshot(&parent)
+        .await
+        .expect("parent known");
     let call = snapshot
         .timeline
         .iter()
@@ -271,15 +278,23 @@ async fn an_activated_skill_reaches_the_timeline_from_the_event_alone() {
     };
     assert_eq!(skill, "docs", "the event's `id` is the skill id");
     assert_eq!(name, "docs");
-    assert!(text.contains("docs connector"), "the body is carried, got {text:?}");
+    assert!(
+        text.contains("docs connector"),
+        "the body is carried, got {text:?}"
+    );
 
     let mut upserted = false;
     while let Ok(event) = rx.try_recv() {
         if let AgentDomainEvent::TimelineUpsert { items, .. } = event {
-            upserted |= items.iter().any(|it| matches!(it.part, AgentPart::Skill { .. }));
+            upserted |= items
+                .iter()
+                .any(|it| matches!(it.part, AgentPart::Skill { .. }));
         }
     }
-    assert!(upserted, "the row is pushed to the stream, not left for a refetch");
+    assert!(
+        upserted,
+        "the row is pushed to the stream, not left for a refetch"
+    );
 }
 
 /// An envelope without the id the message id is derived from must not invent
@@ -567,7 +582,11 @@ async fn worktree_events_reach_every_stream_with_what_they_carry() {
 
     let (state, directory, project_id) = &changes[0];
     assert_eq!(*state, WorktreeState::Resolved);
-    assert_eq!(directory.as_deref(), Some("/tmp/muqun-gw-wt"), "its own field");
+    assert_eq!(
+        directory.as_deref(),
+        Some("/tmp/muqun-gw-wt"),
+        "its own field"
+    );
     assert_eq!(
         project_id.as_deref(),
         Some("016d5ff1cc0c2a1c4cb80441b37dbfa45f3b08a6")
@@ -640,7 +659,12 @@ async fn a_failed_worktree_carries_its_message() {
     let mut seen = Vec::new();
     while let Ok(event) = rx.try_recv() {
         if let AgentDomainEvent::WorktreeChanged {
-            state, name, branch, error, directory, ..
+            state,
+            name,
+            branch,
+            error,
+            directory,
+            ..
         } = event
         {
             seen.push((state, name, branch, error, directory));

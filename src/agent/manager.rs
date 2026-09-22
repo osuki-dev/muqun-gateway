@@ -357,7 +357,10 @@ impl AgentManager {
             .get("sessionID")
             .and_then(Value::as_str)
             .or_else(|| data.pointer("/form/sessionID").and_then(Value::as_str))
-            .or_else(|| data.pointer("/info/metadata/sessionID").and_then(Value::as_str));
+            .or_else(|| {
+                data.pointer("/info/metadata/sessionID")
+                    .and_then(Value::as_str)
+            });
 
         match event_type {
             // ---------------------------------------------------------------
@@ -370,8 +373,14 @@ impl AgentManager {
                 ctx.patch_session(
                     &asid,
                     SessionPatch {
-                        title: data.get("title").and_then(Value::as_str).map(str::to_string),
-                        agent: data.get("agent").and_then(Value::as_str).map(str::to_string),
+                        title: data
+                            .get("title")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        agent: data
+                            .get("agent")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
                         model: data.get("model").and_then(mapper::map_model_ref),
                         parent_id: data
                             .get("parentID")
@@ -451,7 +460,10 @@ impl AgentManager {
                 ctx.patch_session(
                     &asid,
                     SessionPatch {
-                        title: data.get("title").and_then(Value::as_str).map(str::to_string),
+                        title: data
+                            .get("title")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
                         ..SessionPatch::default()
                     },
                 )
@@ -493,7 +505,10 @@ impl AgentManager {
                 ctx.patch_session(
                     &asid,
                     SessionPatch {
-                        agent: data.get("agent").and_then(Value::as_str).map(str::to_string),
+                        agent: data
+                            .get("agent")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
                         ..SessionPatch::default()
                     },
                 )
@@ -528,7 +543,8 @@ impl AgentManager {
                     error = error.as_ref().map(|e| e.message.as_str()).unwrap_or("unknown"),
                     "opencode reported a session failure"
                 );
-                ctx.set_status(&asid, AgentSessionStatus::Failed, error).await;
+                ctx.set_status(&asid, AgentSessionStatus::Failed, error)
+                    .await;
                 ctx.refetch_tail(&asid).await;
             }
             "session.execution.interrupted" => {
@@ -550,7 +566,8 @@ impl AgentManager {
                     return;
                 };
                 let error = data.get("error").and_then(mapper::map_error);
-                ctx.set_status(&asid, AgentSessionStatus::Retry, error).await;
+                ctx.set_status(&asid, AgentSessionStatus::Retry, error)
+                    .await;
             }
             // Not emitted by 2.0.1, but its shape is documented and harmless to
             // accept from a newer server.
@@ -669,7 +686,9 @@ impl AgentManager {
             // ---------------------------------------------------------------
             // Streaming assistant output
             // ---------------------------------------------------------------
-            "session.text.delta" | "session.text.ended" | "session.reasoning.delta"
+            "session.text.delta"
+            | "session.text.ended"
+            | "session.reasoning.delta"
             | "session.reasoning.ended" => {
                 Self::handle_stream_text(ctx, event_type, data, session_id).await;
             }
@@ -704,7 +723,10 @@ impl AgentManager {
                     "session.compaction.failed" => CompactionStatus::Failed,
                     _ => CompactionStatus::Completed,
                 };
-                let reason = data.get("reason").and_then(Value::as_str).map(str::to_string);
+                let reason = data
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
                 let delta = data.get("text").and_then(Value::as_str).map(str::to_string);
                 let seq = ctx
                     .mirror
@@ -719,7 +741,10 @@ impl AgentManager {
                 });
                 // The finished boundary is a real message; read it back so the
                 // timeline carries the summary rather than only the event.
-                if matches!(status, CompactionStatus::Completed | CompactionStatus::Failed) {
+                if matches!(
+                    status,
+                    CompactionStatus::Completed | CompactionStatus::Failed
+                ) {
                     ctx.refetch_tail(&asid).await;
                 }
             }
@@ -757,8 +782,7 @@ impl AgentManager {
                 // the mirror would otherwise keep serving rows that are gone;
                 // `to` on this event is the boundary.
                 if let Some(boundary) = data.get("to").and_then(Value::as_str) {
-                    if let Some((seq, ids)) =
-                        ctx.mirror.remove_timeline_from(&asid, boundary).await
+                    if let Some((seq, ids)) = ctx.mirror.remove_timeline_from(&asid, boundary).await
                     {
                         ctx.emit(AgentDomainEvent::TimelineRemoved {
                             asid: asid.clone(),
@@ -834,10 +858,7 @@ impl AgentManager {
                 } else {
                     None
                 };
-                let (seq, items) = ctx
-                    .mirror
-                    .upsert_inbox_item(&asid, inbox_id, item)
-                    .await;
+                let (seq, items) = ctx.mirror.upsert_inbox_item(&asid, inbox_id, item).await;
                 ctx.emit(AgentDomainEvent::InboxChanged { asid, items, seq });
             }
 
@@ -848,12 +869,8 @@ impl AgentManager {
             // skill expects the picker to show it -- not to show it in thirty
             // seconds when the cache happens to expire. These events are what
             // makes caching the catalog honest rather than merely fast.
-            "agent.updated"
-            | "command.updated"
-            | "skill.updated"
-            | "catalog.updated"
-            | "config.updated"
-            | "provider.updated" => {
+            "agent.updated" | "command.updated" | "skill.updated" | "catalog.updated"
+            | "config.updated" | "provider.updated" => {
                 ctx.driver.invalidate_catalog();
             }
 
@@ -872,12 +889,8 @@ impl AgentManager {
             // and `{message}`, and none of them appeared in any of those
             // flows; they are accepted here so a build or a remote workspace
             // that does emit them is not silently dropped.
-            "worktree.updated"
-            | "worktree.resolved"
-            | "worktree.ready"
-            | "worktree.failed"
-            | "workspace.ready"
-            | "workspace.failed" => {
+            "worktree.updated" | "worktree.resolved" | "worktree.ready" | "worktree.failed"
+            | "workspace.ready" | "workspace.failed" => {
                 let state = match event_type {
                     "worktree.updated" => WorktreeState::Updated,
                     "worktree.resolved" => WorktreeState::Resolved,
@@ -906,7 +919,10 @@ impl AgentManager {
                         .and_then(Value::as_str)
                         .map(str::to_string),
                     name: data.get("name").and_then(Value::as_str).map(str::to_string),
-                    branch: data.get("branch").and_then(Value::as_str).map(str::to_string),
+                    branch: data
+                        .get("branch")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
                     error: data
                         .get("message")
                         .and_then(Value::as_str)
@@ -1115,7 +1131,10 @@ impl AgentManager {
             // concatenate it. Throwing it away left a pending card showing
             // nothing but the tool's name for as long as the arguments took.
             "session.tool.input.delta" => ToolPatch {
-                input_delta: data.get("delta").and_then(Value::as_str).map(str::to_string),
+                input_delta: data
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 state: Some(ToolCallStatus::Streaming),
                 ..ToolPatch::default()
             },
