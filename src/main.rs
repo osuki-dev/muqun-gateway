@@ -50,6 +50,7 @@ mod authority;
 mod backend;
 mod backend_startup;
 mod composer;
+mod gateway_listener;
 mod git;
 mod i18n;
 #[cfg(all(test, unix))]
@@ -2107,7 +2108,7 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     let dev_unauthenticated = config.dev_unauthenticated;
 
     // Bind successfully before starting anything on the user's behalf.
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = gateway_listener::bind(addr).await?;
     // One background attempt per opted-in backend; no restart/logging loop.
     backend_startup::spawn(&config);
 

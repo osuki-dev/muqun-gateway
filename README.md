@@ -129,6 +129,11 @@ point it elsewhere. OpenCode 1 is a different API, and half-working with it is
 worse than saying so. `GET /api/agent-engine` reports the same facts to the
 app, including whether the engine was `adopted` or `spawned`.
 
+If the configured listen IP changes or is unavailable, startup reports the
+address and asks you to update `listen` in the gateway's `config.json`, then
+restart. It never switches addresses automatically. If the pairing URL contains
+the old IP too, update that URL through `muqun-gateway manage`.
+
 ### Optional terminal startup
 
 The installer separately asks whether configured terminal backends should start
