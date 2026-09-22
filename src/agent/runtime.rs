@@ -26,7 +26,7 @@ use super::manager::AgentManager;
 const HEALTHY_POLL: Duration = Duration::from_secs(15);
 /// How soon it retries after finding none.
 const UNHEALTHY_POLL: Duration = Duration::from_secs(3);
-/// How long a freshly spawned `opencode serve --service` is given to register.
+/// How long service startup and registration may each take.
 const STARTUP_WAIT: Duration = Duration::from_secs(20);
 const STARTUP_POLL: Duration = Duration::from_millis(400);
 /// Backoff ceiling between failed start attempts.
@@ -48,7 +48,7 @@ const MIN_OPENCODE_MAJOR: u64 = 2;
 /// `opencode` in `config.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpencodeConfig {
-    /// Start `opencode serve --service` when no healthy service is found.
+    /// Run `opencode service start` when no healthy service is found.
     #[serde(default = "default_true")]
     pub autostart: bool,
     /// The binary to start, when `PATH` is not the right answer.
@@ -121,9 +121,8 @@ pub struct AgentRuntime {
     events_tx: broadcast::Sender<AgentDomainEvent>,
     config: OpencodeConfig,
     origin: RwLock<EngineOrigin>,
-    /// The child this gateway started, if any. Held so a second one is never
-    /// spawned while the first is alive.
-    child: Mutex<Option<tokio::process::Child>>,
+    /// Serialize startup commands; OpenCode owns the background service.
+    start_lock: Mutex<()>,
     supervising: AtomicBool,
 }
 
@@ -135,7 +134,7 @@ impl AgentRuntime {
             events_tx,
             config,
             origin: RwLock::new(EngineOrigin::None),
-            child: Mutex::new(None),
+            start_lock: Mutex::new(()),
             supervising: AtomicBool::new(false),
         })
     }
@@ -350,29 +349,10 @@ impl AgentRuntime {
         endpoint.probe_healthy(&probe_client()).await
     }
 
-    /// Start `opencode serve --service`, detached, and wait for it to register.
-    ///
-    /// Never more than one: a child this gateway started and has not reaped is
-    /// given the benefit of the doubt, and a service someone else is running is
-    /// adopted before this is ever reached.
+    /// Let OpenCode load its saved service configuration and start or reuse
+    /// its background server, then verify the registered endpoint.
     async fn start_service(&self) -> anyhow::Result<OpencodeEndpoint> {
-        let mut slot = self.child.lock().await;
-        if let Some(ref mut child) = *slot {
-            match child.try_wait() {
-                // Still running: it simply has not registered yet.
-                Ok(None) => {
-                    drop(slot);
-                    return wait_for_service().await;
-                }
-                Ok(Some(status)) => {
-                    tracing::warn!(%status, "the OpenCode service this gateway started has exited");
-                }
-                Err(err) => {
-                    tracing::warn!(%err, "could not check the spawned OpenCode service");
-                }
-            }
-            *slot = None;
-        }
+        let _start = self.start_lock.lock().await;
 
         // `opencode.binary` if the owner set one, otherwise whatever `opencode`
         // means on PATH -- and then the file that resolved to, so the log names
@@ -396,27 +376,28 @@ impl AgentRuntime {
             "no OpenCode service found, starting one"
         );
 
-        let mut command = tokio::process::Command::new(&binary);
-        command
-            .arg("serve")
-            .arg("--service")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            // Its own process group, so it survives this gateway and does not
-            // take a terminal signal meant for it.
-            .process_group(0)
-            .kill_on_drop(false);
-
-        let child = command.spawn().map_err(|e| {
-            anyhow::anyhow!("could not run `{} serve --service`: {e}", binary.display())
-        })?;
-        tracing::info!(pid = child.id(), "OpenCode service starting");
-        *slot = Some(child);
-        drop(slot);
-
+        launch_service(tokio::process::Command::new(&binary)).await?;
         wait_for_service().await
     }
+}
+
+async fn launch_service(mut command: tokio::process::Command) -> anyhow::Result<()> {
+    // `serve --service` bypasses saved service env; the CLI owns that setup.
+    command
+        .args(["service", "start"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let status = tokio::time::timeout(STARTUP_WAIT, command.status())
+        .await
+        .map_err(|_| anyhow::anyhow!("`opencode service start` timed out"))?
+        .map_err(|err| anyhow::anyhow!("could not run `opencode service start`: {err}"))?;
+    anyhow::ensure!(
+        status.success(),
+        "`opencode service start` exited with {status}"
+    );
+    Ok(())
 }
 
 /// The wait after a stream loss, given the last one.
@@ -681,6 +662,139 @@ async fn wait_for_service() -> anyhow::Result<OpencodeEndpoint> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_uses_the_service_cli_and_waits_for_its_exit() {
+        let mut command = tokio::process::Command::new("sh");
+        command.args([
+            "-c",
+            "test \"$#\" -eq 2 && test \"$1\" = service && test \"$2\" = start",
+            "opencode",
+        ]);
+        launch_service(command)
+            .await
+            .expect("service start arguments");
+
+        let mut failing = tokio::process::Command::new("sh");
+        failing.args(["-c", "exit 7", "opencode"]);
+        let err = launch_service(failing).await.expect_err("failed startup");
+        assert!(err.to_string().contains("exited with"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn startup_reports_a_missing_executable() {
+        let missing =
+            std::env::temp_dir().join(format!("missing-opencode-{}", uuid::Uuid::new_v4()));
+        let err = launch_service(tokio::process::Command::new(missing))
+            .await
+            .expect_err("missing binary");
+        assert!(
+            err.to_string()
+                .contains("could not run `opencode service start`"),
+            "{err}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "Requires installed OpenCode 2; starts and stops a private service"]
+    async fn installed_service_loads_saved_env_and_reuses_the_background_process() {
+        struct PrivateService {
+            root: std::path::PathBuf,
+            binary: std::path::PathBuf,
+        }
+        impl PrivateService {
+            fn command(&self) -> std::process::Command {
+                let mut command = std::process::Command::new(&self.binary);
+                for (key, path) in [
+                    ("XDG_CONFIG_HOME", "config"),
+                    ("XDG_STATE_HOME", "state"),
+                    ("XDG_DATA_HOME", "data"),
+                    ("XDG_CACHE_HOME", "cache"),
+                    ("OPENCODE_DB", "opencode.db"),
+                ] {
+                    command.env(key, self.root.join(path));
+                }
+                for key in [
+                    "OPENCODE_CONFIG",
+                    "OPENCODE_CONFIG_CONTENT",
+                    "OPENCODE_SERVER_PASSWORD",
+                    "MUQUN_STARTUP_TEST",
+                ] {
+                    command.env_remove(key);
+                }
+                command.current_dir(&self.root);
+                command
+            }
+        }
+        impl Drop for PrivateService {
+            fn drop(&mut self) {
+                // Stop only the service registered under this fixture's XDG paths.
+                let mut command = self.command();
+                command
+                    .args(["service", "stop"])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+                if command.status().is_ok_and(|status| status.success())
+                    && !std::thread::panicking()
+                {
+                    let _ = std::fs::remove_dir_all(&self.root);
+                } else {
+                    eprintln!(
+                        "Private OpenCode test files retained at {}",
+                        self.root.display()
+                    );
+                }
+            }
+        }
+        let service = PrivateService {
+            root: std::env::temp_dir()
+                .join(format!("muqun-opencode-start-{}", uuid::Uuid::new_v4())),
+            binary: resolve_binary(None).expect("installed OpenCode"),
+        };
+        let config = service.root.join("config/opencode");
+        std::fs::create_dir_all(&config).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        std::fs::write(
+            config.join("service.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "hostname": "127.0.0.1", "port": port,
+                "env": { "MUQUN_STARTUP_TEST": "saved-service-env" }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        launch_service(service.command().into())
+            .await
+            .expect("start private service");
+        let registration_path = service.root.join("state/opencode/service.json");
+        let first: super::super::adapters::opencode::OpencodeServiceRegistration =
+            serde_json::from_slice(&std::fs::read(&registration_path).unwrap()).unwrap();
+        let pid = first.pid.expect("background daemon PID");
+        let environment = std::fs::read(format!("/proc/{pid}/environ")).unwrap();
+        assert!(environment
+            .split(|byte| *byte == 0)
+            .any(|entry| entry == b"MUQUN_STARTUP_TEST=saved-service-env"));
+        let endpoint = OpencodeEndpoint {
+            url: first.url.clone(),
+            password: first.password,
+            version: first.version,
+            pid: Some(pid),
+        };
+        assert!(endpoint.probe_healthy(&probe_client()).await);
+
+        launch_service(service.command().into())
+            .await
+            .expect("reuse private service");
+        let second: super::super::adapters::opencode::OpencodeServiceRegistration =
+            serde_json::from_slice(&std::fs::read(registration_path).unwrap()).unwrap();
+        assert_eq!(second.pid, Some(pid));
+        assert_eq!(second.url, first.url);
+    }
 
     #[test]
     fn autostart_defaults_to_on_and_the_binary_is_optional() {

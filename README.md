@@ -96,7 +96,9 @@ for good.
 
 The gateway's agent features run on OpenCode 2. It attaches one for as long as
 it is running: if a service is already registered it adopts that, and otherwise
-it starts `opencode serve --service` itself.
+it runs `opencode service start`. OpenCode starts the background server and loads
+the environment saved by `opencode service set env`; the gateway does not copy
+credentials or manage a second service.
 
 **It runs `opencode` as your `PATH` resolves it**, or the file you name:
 
