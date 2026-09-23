@@ -120,14 +120,14 @@ impl OpencodeClient {
         self.handle_resp(resp, "POST", path).await
     }
 
-    pub async fn put(&self, path: &str, body: &Value) -> Result<Value, AgentEngineError> {
+    pub async fn patch(&self, path: &str, body: &Value) -> Result<Value, AgentEngineError> {
         let url = format!("{}{path}", self.endpoint.url);
-        let req = self.authed_req(self.http.put(&url).json(body));
+        let req = self.authed_req(self.http.patch(&url).json(body));
         let resp = req
             .send()
             .await
             .map_err(|e| AgentEngineError::Network(e.to_string()))?;
-        self.handle_resp(resp, "PUT", path).await
+        self.handle_resp(resp, "PATCH", path).await
     }
 
     pub async fn list_projects(&self) -> Result<Vec<Value>, AgentEngineError> {
@@ -627,23 +627,24 @@ impl OpencodeClient {
             .unwrap_or_default())
     }
 
-    /// `POST /api/session/{id}/skill`: append a skill message to the session
-    /// and resume execution. `skill` is a `Skill.Info.id`; `resume` is left
+    /// `POST /api/experimental/session/{id}/skill`: append a skill message
+    /// and resume execution. `id` is a `Skill.Info.id`; `resume` is left
     /// out unless the caller asked for one, so OpenCode keeps its own default.
-    /// The optional `id` field the endpoint accepts is a caller-minted message
-    /// id and is never sent -- OpenCode mints its own.
     pub async fn activate_skill(
         &self,
         session_id: &str,
         skill: &str,
         resume: Option<bool>,
     ) -> Result<Value, AgentEngineError> {
-        let mut body = json!({ "skill": skill });
+        let mut body = json!({ "id": skill });
         if let Some(resume) = resume {
             body["resume"] = json!(resume);
         }
-        self.post(&format!("/api/session/{session_id}/skill"), &body)
-            .await
+        self.post(
+            &format!("/api/experimental/session/{session_id}/skill"),
+            &body,
+        )
+        .await
     }
 
     // -----------------------------------------------------------------
@@ -685,10 +686,13 @@ impl OpencodeClient {
             .await
     }
 
-    /// `POST /api/session/{id}/wait`: resolves when the agent loop is idle.
+    /// `POST /api/experimental/session/{id}/wait`: resolves when the agent loop is idle.
     pub async fn wait_session(&self, session_id: &str) -> Result<Value, AgentEngineError> {
-        self.post(&format!("/api/session/{session_id}/wait"), &json!({}))
-            .await
+        self.post(
+            &format!("/api/experimental/session/{session_id}/wait"),
+            &json!({}),
+        )
+        .await
     }
 
     pub async fn rename_session(
@@ -696,41 +700,21 @@ impl OpencodeClient {
         session_id: &str,
         title: &str,
     ) -> Result<Value, AgentEngineError> {
-        let path = format!("/api/session/{session_id}");
-        let body = json!({ "title": title });
-        let response = self
-            .authed_req(
-                self.http
-                    .patch(format!("{}{path}", self.endpoint.url))
-                    .json(&body),
-            )
-            .send()
-            .await
-            .map_err(|error| AgentEngineError::Network(error.to_string()))?;
-        // Current OpenCode v2 updates mutable session fields with PATCH.
-        // Early v2 builds exposed a dedicated rename action instead. Only a
-        // missing/unsupported route permits falling back; never retry a
-        // possibly applied mutation after a timeout or upstream failure.
-        if matches!(
-            response.status(),
-            StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
-        ) {
-            return self.post(&format!("{path}/rename"), &body).await;
-        }
-        self.handle_resp(response, "PATCH", &path).await
+        self.patch(
+            &format!("/api/session/{session_id}"),
+            &json!({ "title": title }),
+        )
+        .await
     }
 
     pub async fn delete_session(&self, session_id: &str) -> Result<Value, AgentEngineError> {
         self.delete(&format!("/api/session/{session_id}")).await
     }
 
-    /// `POST /api/session/{id}/revert/clear`: cancel a staged rollback.
+    /// `DELETE /api/session/{id}/revert`: cancel a staged rollback.
     pub async fn clear_revert(&self, session_id: &str) -> Result<Value, AgentEngineError> {
-        self.post(
-            &format!("/api/session/{session_id}/revert/clear"),
-            &json!({}),
-        )
-        .await
+        self.delete(&format!("/api/session/{session_id}/revert"))
+            .await
     }
 
     /// `POST /api/session/{id}/view {idle}`: mark the session read up to a
@@ -747,14 +731,14 @@ impl OpencodeClient {
         .await
     }
 
-    /// `GET /api/session/{id}/export`.
+    /// `GET /api/experimental/session/{id}/export`.
     pub async fn export_session(
         &self,
         session_id: &str,
         sanitize: bool,
     ) -> Result<Value, AgentEngineError> {
         self.get(
-            &format!("/api/session/{session_id}/export"),
+            &format!("/api/experimental/session/{session_id}/export"),
             &[("sanitize", if sanitize { "true" } else { "false" })],
         )
         .await
@@ -808,9 +792,9 @@ impl OpencodeClient {
         inbox_id: &str,
         delivery: &str,
     ) -> Result<Value, AgentEngineError> {
-        self.post(
-            &format!("/api/session/{session_id}/inbox/{inbox_id}/{delivery}"),
-            &json!({}),
+        self.patch(
+            &format!("/api/session/{session_id}/inbox/{inbox_id}"),
+            &json!({ "delivery": delivery }),
         )
         .await
     }
@@ -854,7 +838,7 @@ impl OpencodeClient {
             .unwrap_or_default())
     }
 
-    /// `PUT /api/session/{id}/permission/rules` **replaces** the session's
+    /// `PATCH /api/session/{id}` with `permissions` **replaces** the session's
     /// ruleset, so anything already on the session has to be sent back with
     /// whatever is being added. Answers `204`.
     pub async fn set_session_permission_rules(
@@ -862,8 +846,8 @@ impl OpencodeClient {
         session_id: &str,
         rules: &[Value],
     ) -> Result<(), AgentEngineError> {
-        self.put(
-            &format!("/api/session/{session_id}/permission/rules"),
+        self.patch(
+            &format!("/api/session/{session_id}"),
             &json!({ "permissions": rules }),
         )
         .await?;
@@ -1127,23 +1111,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rename_supports_early_v2_only_when_update_route_is_missing() {
-        for status in [StatusCode::NOT_FOUND, StatusCode::METHOD_NOT_ALLOWED] {
-            let (result, calls) = rename_against_upstream(status).await;
-            assert!(result.is_ok());
-            assert_eq!(
-                calls,
-                vec![
-                    ("PATCH".into(), json!({ "title": "New title 日本語" })),
-                    ("POST rename".into(), json!({ "title": "New title 日本語" })),
-                ]
-            );
-        }
-    }
-
-    #[tokio::test]
     async fn rename_does_not_retry_rejected_or_ambiguous_updates() {
         for status in [
+            StatusCode::NOT_FOUND,
+            StatusCode::METHOD_NOT_ALLOWED,
             StatusCode::BAD_REQUEST,
             StatusCode::UNAUTHORIZED,
             StatusCode::FORBIDDEN,
@@ -1153,6 +1124,90 @@ mod tests {
             assert!(result.is_err());
             assert_eq!(calls.len(), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn session_operations_follow_the_2_0_15_http_contract() {
+        use axum::{body::to_bytes, extract::Request, Json, Router};
+        use std::sync::{Arc, Mutex};
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let app = Router::new().fallback(move |request: Request| {
+            let recorded = recorded.clone();
+            async move {
+                let method = request.method().to_string();
+                let uri = request.uri().to_string();
+                let bytes = to_bytes(request.into_body(), 4096).await.unwrap();
+                let body = if bytes.is_empty() {
+                    Value::Null
+                } else {
+                    serde_json::from_slice(&bytes).unwrap()
+                };
+                recorded.lock().unwrap().push((method, uri, body));
+                Json(json!({ "data": [] }))
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = OpencodeClient::new(OpencodeEndpoint {
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            password: None,
+            version: None,
+            pid: None,
+        });
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        client
+            .activate_skill("ses_QA", "review", Some(false))
+            .await
+            .unwrap();
+        client.wait_session("ses_QA").await.unwrap();
+        client.export_session("ses_QA", true).await.unwrap();
+        client.clear_revert("ses_QA").await.unwrap();
+        client
+            .set_inbox_delivery("ses_QA", "msg_QA", "steer")
+            .await
+            .unwrap();
+        client
+            .set_session_permission_rules("ses_QA", &[])
+            .await
+            .unwrap();
+        task.abort();
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            *calls,
+            vec![
+                (
+                    "POST".into(),
+                    "/api/experimental/session/ses_QA/skill".into(),
+                    json!({ "id": "review", "resume": false })
+                ),
+                (
+                    "POST".into(),
+                    "/api/experimental/session/ses_QA/wait".into(),
+                    json!({})
+                ),
+                (
+                    "GET".into(),
+                    "/api/experimental/session/ses_QA/export?sanitize=true".into(),
+                    Value::Null
+                ),
+                (
+                    "DELETE".into(),
+                    "/api/session/ses_QA/revert".into(),
+                    Value::Null
+                ),
+                (
+                    "PATCH".into(),
+                    "/api/session/ses_QA/inbox/msg_QA".into(),
+                    json!({ "delivery": "steer" })
+                ),
+                (
+                    "PATCH".into(),
+                    "/api/session/ses_QA".into(),
+                    json!({ "permissions": [] })
+                ),
+            ]
+        );
     }
 
     /// The URL these parameters produce, spelled exactly as it goes on the
