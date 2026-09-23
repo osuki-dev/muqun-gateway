@@ -62,46 +62,34 @@ impl OpencodeEndpoint {
         })
     }
 
-    /// Health check probe to verify the service is running and responsive
+    /// Verify the current OpenCode service is running and responsive.
     pub async fn probe_healthy(&self, client: &reqwest::Client) -> bool {
-        // Current v2 exposes server identity at /api/info. Early v2 releases
-        // used /api/health; only a missing route warrants that fallback.
-        for path in ["/api/info", "/api/health"] {
-            let mut req = client.get(format!("{}{path}", self.url));
-            if let Some(ref pwd) = self.password {
-                req = req.basic_auth("opencode", Some(pwd));
-            }
-            let Ok(resp) = req.send().await else {
-                return false;
-            };
-            if path == "/api/info" && resp.status() == reqwest::StatusCode::NOT_FOUND {
-                continue;
-            }
-            if !resp.status().is_success() {
-                return false;
-            }
-            let Ok(body) = resp.json::<serde_json::Value>().await else {
-                return false;
-            };
-            return if path == "/api/info" {
-                body.get("version")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|v| !v.is_empty())
-                    && body
-                        .get("pid")
-                        .and_then(|v| v.as_u64())
-                        .is_some_and(|pid| pid > 0)
-                    && body
-                        .get("urls")
-                        .and_then(|v| v.as_array())
-                        .is_some_and(|urls| {
-                            !urls.is_empty() && urls.iter().all(|url| url.as_str().is_some())
-                        })
-            } else {
-                body.get("healthy").and_then(|v| v.as_bool()) == Some(true)
-            };
+        let mut req = client.get(format!("{}/api/info", self.url));
+        if let Some(ref pwd) = self.password {
+            req = req.basic_auth("opencode", Some(pwd));
         }
-        false
+        let Ok(resp) = req.send().await else {
+            return false;
+        };
+        if !resp.status().is_success() {
+            return false;
+        }
+        let Ok(body) = resp.json::<serde_json::Value>().await else {
+            return false;
+        };
+        body.get("version")
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| !v.is_empty())
+            && body
+                .get("pid")
+                .and_then(|v| v.as_u64())
+                .is_some_and(|pid| pid > 0)
+            && body
+                .get("urls")
+                .and_then(|v| v.as_array())
+                .is_some_and(|urls| {
+                    !urls.is_empty() && urls.iter().all(|url| url.as_str().is_some())
+                })
     }
 }
 
@@ -127,15 +115,10 @@ mod tests {
             version: None,
             pid: None,
         };
-        let app = Router::new()
-            .route(
-                "/api/info",
-                get(move || async move { (info_status, Json(info)) }),
-            )
-            .route(
-                "/api/health",
-                get(|| async { Json(serde_json::json!({"healthy":true})) }),
-            );
+        let app = Router::new().route(
+            "/api/info",
+            get(move || async move { (info_status, Json(info)) }),
+        );
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let client = reqwest::Client::builder()
             .no_proxy()
@@ -148,7 +131,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn supports_current_server_info_and_early_v2_health() {
+    async fn requires_current_server_info() {
         use axum::http::StatusCode;
         assert!(
             probe(
@@ -157,7 +140,7 @@ mod tests {
             )
             .await
         );
-        assert!(probe(StatusCode::NOT_FOUND, serde_json::Value::Null).await);
+        assert!(!probe(StatusCode::NOT_FOUND, serde_json::Value::Null).await);
     }
 
     #[tokio::test]

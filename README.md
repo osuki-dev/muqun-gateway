@@ -94,9 +94,9 @@ for good.
 
 ### The agent engine
 
-The gateway's agent features run on OpenCode 2. It attaches one for as long as
-it is running: if a service is already registered it adopts that, and otherwise
-it runs `opencode service start`. OpenCode starts the background server and loads
+The gateway's agent features require OpenCode 2 with `GET /api/info`. While the
+gateway runs, it adopts a registered service or runs `opencode service start`.
+OpenCode starts the background server and loads
 the environment saved by `opencode service set env`; the gateway does not copy
 credentials or manage a second service.
 
@@ -119,8 +119,8 @@ files depending on which you used. So the gateway logs the file it resolved,
 and its version, every time it starts or adopts one:
 
 ```
-INFO no OpenCode service found, starting one binary=/home/you/.opencode/bin/opencode version="opencode v2.0.1"
-INFO adopted the running OpenCode service url=http://127.0.0.1:49374 version="2.0.1" binary=/home/you/.opencode/bin/opencode
+INFO no OpenCode service found, starting one binary=/home/you/.opencode/bin/opencode version="opencode v2.0.14"
+INFO adopted the running OpenCode service url=http://127.0.0.1:49374 version="2.0.14" binary=/home/you/.opencode/bin/opencode
 ```
 
 If what it finds is older than 2.0 it refuses it — started or adopted — with
