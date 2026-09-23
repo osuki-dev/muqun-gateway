@@ -696,11 +696,28 @@ impl OpencodeClient {
         session_id: &str,
         title: &str,
     ) -> Result<Value, AgentEngineError> {
-        self.post(
-            &format!("/api/session/{session_id}/rename"),
-            &json!({ "title": title }),
-        )
-        .await
+        let path = format!("/api/session/{session_id}");
+        let body = json!({ "title": title });
+        let response = self
+            .authed_req(
+                self.http
+                    .patch(format!("{}{path}", self.endpoint.url))
+                    .json(&body),
+            )
+            .send()
+            .await
+            .map_err(|error| AgentEngineError::Network(error.to_string()))?;
+        // Current OpenCode v2 updates mutable session fields with PATCH.
+        // Early v2 builds exposed a dedicated rename action instead. Only a
+        // missing/unsupported route permits falling back; never retry a
+        // possibly applied mutation after a timeout or upstream failure.
+        if matches!(
+            response.status(),
+            StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+        ) {
+            return self.post(&format!("{path}/rename"), &body).await;
+        }
+        self.handle_resp(response, "PATCH", &path).await
     }
 
     pub async fn delete_session(&self, session_id: &str) -> Result<Value, AgentEngineError> {
@@ -1051,6 +1068,92 @@ pub(crate) fn model_ref_json(model: &crate::agent::domain::ModelRef) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn rename_against_upstream(
+        patch_status: StatusCode,
+    ) -> (Result<Value, AgentEngineError>, Vec<(String, Value)>) {
+        use axum::{
+            routing::{patch, post},
+            Json, Router,
+        };
+        use std::sync::{Arc, Mutex};
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let patch_calls = calls.clone();
+        let legacy_calls = calls.clone();
+        let app = Router::new()
+            .route(
+                "/api/session/ses_QA",
+                patch(move |Json(body): Json<Value>| async move {
+                    patch_calls
+                        .lock()
+                        .unwrap()
+                        .push(("PATCH".to_string(), body));
+                    patch_status
+                }),
+            )
+            .route(
+                "/api/session/ses_QA/rename",
+                post(move |Json(body): Json<Value>| async move {
+                    legacy_calls
+                        .lock()
+                        .unwrap()
+                        .push(("POST rename".to_string(), body));
+                    StatusCode::NO_CONTENT
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = OpencodeClient::new(OpencodeEndpoint {
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            password: None,
+            version: None,
+            pid: None,
+        });
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let result = client.rename_session("ses_QA", "New title 日本語").await;
+        task.abort();
+        let recorded = calls.lock().unwrap().clone();
+        (result, recorded)
+    }
+
+    #[tokio::test]
+    async fn rename_uses_session_update_and_accepts_no_content() {
+        let (result, calls) = rename_against_upstream(StatusCode::NO_CONTENT).await;
+        assert_eq!(result.unwrap(), json!({ "success": true }));
+        assert_eq!(
+            calls,
+            vec![("PATCH".into(), json!({ "title": "New title 日本語" }))]
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_supports_early_v2_only_when_update_route_is_missing() {
+        for status in [StatusCode::NOT_FOUND, StatusCode::METHOD_NOT_ALLOWED] {
+            let (result, calls) = rename_against_upstream(status).await;
+            assert!(result.is_ok());
+            assert_eq!(
+                calls,
+                vec![
+                    ("PATCH".into(), json!({ "title": "New title 日本語" })),
+                    ("POST rename".into(), json!({ "title": "New title 日本語" })),
+                ]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rename_does_not_retry_rejected_or_ambiguous_updates() {
+        for status in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            let (result, calls) = rename_against_upstream(status).await;
+            assert!(result.is_err());
+            assert_eq!(calls.len(), 1);
+        }
+    }
 
     /// The URL these parameters produce, spelled exactly as it goes on the
     /// wire. `reqwest` does the encoding, so the test asks it.
