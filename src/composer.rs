@@ -1,51 +1,16 @@
-//! What a pane's composer can offer: the slash commands the agent understands,
-//! the commands and skills this workspace added on top, and whether an `@` file
-//! mention makes sense.
+//! Terminal composer capabilities and file mention search.
 //!
-//! Same discipline as `parts.rs`. One versioned table per agent kind, matched
-//! against the agent name Herdr reports, pinned by a snapshot so that an agent
-//! that renames a command shows up as a reviewable diff rather than as a
-//! composer offering something the pane will reject. An agent with no table is
-//! a supported answer: the pane simply carries no `composer` descriptor, and a
-//! client falls back to typing.
-//!
-//! # Where the tables come from
-//!
-//! Every command below was read off the program actually installed on the
-//! machine this gateway was developed on, never from memory:
-//!
-//! - **Claude Code 2.1.220** -- the shipped binary's own command definitions
-//!   (`name`/`description`/`argumentHint`). `claude --help` does not list slash
-//!   commands and there is no non-interactive way to ask for them.
-//! - **Codex CLI 0.145.0** -- `SlashCommand` in `codex-rs/tui/src/slash_command.rs`
-//!   at tag `rust-v0.145.0`, cross-checked against the installed binary, which
-//!   carries the same names (`setup-default-sandbox`, `debug-m-drop`, …) and the
-//!   same description strings.
-//! - **opencode 1.18.0** -- the installed binary's command palette, whose
-//!   entries carry `slash: { name, aliases }`, plus the four the composer draws
-//!   itself (`/new`, `/editor`, `/skills`, `/exit`).
-//! - **Qoder CLI 1.1.5** -- the shipped binary's own command definitions, same
-//!   shape as Claude Code's.
-//!
-//! Debug-only, removed, and platform-specific commands are left out: the table
-//! is what a phone should offer on a tap, not the agent's full surface.
-//!
-//! # Workspace discovery
-//!
-//! Beyond the table, a repository adds commands of its own -- `.claude/skills`,
-//! `.agents/skills`, `.claude/commands` and their per-agent equivalents. Those
-//! are read here, read-only, under exactly the fence the assets API uses: the
-//! directory and every file inside it must canonicalize inside the pane's
-//! workspace root, so a symlinked skill directory pointing out of the repo is
-//! not read.
+//! Slash commands come exclusively from the downloaded agent-command catalog.
+//! Workspace skills and commands are not merged into the command suggestions.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 
 use serde_json::{json, Value};
 
-/// Bumped whenever a table below changes, so a client can cache a descriptor
-/// and know when to drop it.
-pub const COMPOSER_VERSION: u32 = 1;
+/// Bumped when the descriptor's source or shape changes.
+pub const COMPOSER_VERSION: u32 = 3;
 
 /// One command the agent understands out of the box.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,7 +60,9 @@ pub enum Layout {
 /// its extra commands from.
 #[derive(Debug, Clone, Copy)]
 pub struct WorkspaceDir {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub path: &'static str,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub layout: Layout,
 }
 
@@ -125,8 +92,10 @@ pub struct CommandTable {
     /// version it was captured from, and saying which one makes the drift
     /// reviewable.
     pub captured_from: &'static str,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub commands: &'static [BuiltinCommand],
     /// Where this agent reads workspace-local commands and skills from.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub workspace: &'static [WorkspaceDir],
     /// Whether `@` in the composer means "mention a file" to this agent. False
     /// would mean a client should not offer the file picker at all.
@@ -521,6 +490,7 @@ pub fn table_for(agent: Option<&str>) -> Option<&'static CommandTable> {
 }
 
 /// The table with this id, for callers that already resolved an agent profile.
+#[cfg(test)]
 pub fn table_with_id(id: &str) -> Option<&'static CommandTable> {
     TABLES.iter().find(|table| table.id == id)
 }
@@ -534,15 +504,18 @@ pub fn table_with_id(id: &str) -> Option<&'static CommandTable> {
 // ---------------------------------------------------------------------------
 
 /// A stray directory cannot turn one request into thousands of file reads.
+#[cfg(test)]
 const MAX_WORKSPACE_COMMANDS: usize = 64;
 /// Front matter is at the head of the file, so refusing to read further loses
 /// nothing. Without a cap, a symlink to `/dev/zero` in a skills directory turns
 /// one request into an unbounded read.
+#[cfg(test)]
 const MAX_COMMAND_FILE_BYTES: u64 = 64 * 1024;
 pub const MAX_DESCRIPTION_CHARS: usize = 160;
 
 /// A command a workspace added, as it goes out on the wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 pub struct WorkspaceCommand {
     pub name: String,
     pub description: String,
@@ -557,6 +530,7 @@ pub struct WorkspaceCommand {
 /// still be inside `root`, so a symlinked `.claude/skills` pointing at another
 /// checkout, or a skill directory that is a link out of the repo, is skipped
 /// rather than read.
+#[cfg(test)]
 pub fn workspace_commands(root: &Path, dirs: &[WorkspaceDir]) -> Vec<WorkspaceCommand> {
     let mut found: Vec<WorkspaceCommand> = Vec::new();
     for dir in dirs {
@@ -582,11 +556,13 @@ pub fn workspace_commands(root: &Path, dirs: &[WorkspaceDir]) -> Vec<WorkspaceCo
 /// claimed, it has to canonicalize to something inside the root. Canonicalizing
 /// first is what closes symlink escapes -- a link inside the root that points
 /// outside it resolves to the outside path, and fails here.
+#[cfg(test)]
 fn fenced(path: &Path, root: &Path) -> Option<PathBuf> {
     let canonical = std::fs::canonicalize(path).ok()?;
     (canonical != root && canonical.starts_with(root)).then_some(canonical)
 }
 
+#[cfg(test)]
 fn collect_skills(dir: &Path, root: &Path, out: &mut Vec<WorkspaceCommand>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -629,6 +605,7 @@ fn collect_skills(dir: &Path, root: &Path, out: &mut Vec<WorkspaceCommand>) {
     }
 }
 
+#[cfg(test)]
 fn collect_commands(dir: &Path, root: &Path, out: &mut Vec<WorkspaceCommand>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -668,6 +645,7 @@ fn collect_commands(dir: &Path, root: &Path, out: &mut Vec<WorkspaceCommand>) {
 }
 
 /// A name typed into a live agent, so it may only be a name.
+#[cfg(test)]
 fn command_name(value: &str) -> Option<String> {
     let value = value.trim();
     if value.is_empty()
@@ -683,6 +661,7 @@ fn command_name(value: &str) -> Option<String> {
 
 /// Regular files only, and small ones. A fifo here would block the request
 /// forever, and the workspace root is chosen by whoever created the pane.
+#[cfg(test)]
 fn read_head(path: &Path) -> Option<String> {
     let meta = std::fs::metadata(path).ok()?;
     if !meta.is_file() || meta.len() > MAX_COMMAND_FILE_BYTES {
@@ -694,6 +673,7 @@ fn read_head(path: &Path) -> Option<String> {
 /// Reads one flat string key out of a file's YAML front matter. Deliberately
 /// not a YAML parser: these are flat string keys, and pulling in a parser to
 /// read them would be the larger risk.
+#[cfg(test)]
 pub fn field(text: &str, key: &str) -> Option<String> {
     let rest = text.strip_prefix("---")?;
     for line in rest.lines() {
@@ -736,45 +716,36 @@ pub fn sanitize(value: &str) -> String {
 /// `root` is the pane's canonical workspace root; without one -- a pane sitting
 /// at `/`, or one whose cwd Herdr did not report -- the builtin table still
 /// answers and workspace discovery is simply skipped.
-pub fn descriptor(agent: Option<&str>, root: Option<&Path>) -> Option<Value> {
-    let table = table_for(agent)?;
-    let mut slash_commands: Vec<Value> = table
-        .commands
-        .iter()
-        .map(|command| {
-            json!({
-                "name": command.name,
-                "description": command.description,
-                "args_hint": command.args_hint,
-                "source": "builtin",
-            })
-        })
-        .collect();
-    if let Some(root) = root {
-        // A workspace command with the same name as a builtin one is the file
-        // the agent actually reads, so it replaces the builtin entry.
-        for found in workspace_commands(root, table.workspace) {
-            let entry = json!({
-                "name": found.name,
-                "description": found.description,
-                "args_hint": found.args_hint,
-                "source": "workspace",
-            });
-            match slash_commands
-                .iter()
-                .position(|existing| existing["name"] == found.name.as_str())
-            {
-                Some(index) => slash_commands[index] = entry,
-                None => slash_commands.push(entry),
-            }
-        }
+pub fn descriptor(agent: Option<&str>, _root: Option<&Path>) -> Option<Value> {
+    let table = table_for(agent);
+    let snapshot = agent
+        .and_then(crate::command_catalog::profile_for)
+        .and_then(crate::command_catalog::load);
+    if table.is_none() && snapshot.is_none() {
+        return None;
     }
+    let slash_commands: Vec<Value> = if let Some(snapshot) = &snapshot {
+        snapshot
+            .commands
+            .iter()
+            .map(|command| {
+                json!({
+                    "name": command.name,
+                    "description": command.description,
+                    "args_hint": command.args_hint,
+                    "source": "catalog",
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     Some(json!({
         "version": COMPOSER_VERSION,
-        "table": table.id,
-        "captured_from": table.captured_from,
+        "table": table.map_or_else(|| snapshot.as_ref().map_or("", |entry| entry.agent.as_str()), |entry| entry.id),
+        "captured_from": snapshot.as_ref().map_or_else(|| table.map_or("", |entry| entry.captured_from).to_owned(), |entry| format!("{} {}", entry.agent, entry.version)),
         "slash_commands": slash_commands,
-        "file_mentions": table.file_mentions,
+        "file_mentions": table.is_none_or(|entry| entry.file_mentions),
     }))
 }
 
@@ -1355,7 +1326,7 @@ mod tests {
     }
 
     #[test]
-    fn a_workspace_command_replaces_the_builtin_of_the_same_name() {
+    fn workspace_commands_do_not_enter_the_catalog_descriptor() {
         let root = workspace("descriptor");
         skill(
             &root,
@@ -1367,27 +1338,17 @@ mod tests {
         assert_eq!(value["table"], "claude");
         assert_eq!(value["file_mentions"], true);
         let commands = value["slash_commands"].as_array().unwrap();
-        let review: Vec<&Value> = commands
-            .iter()
-            .filter(|entry| entry["name"] == "/review")
-            .collect();
-        assert_eq!(review.len(), 1);
-        assert_eq!(review[0]["source"], "workspace");
-        assert_eq!(review[0]["description"], "This repo's own review");
-        assert!(commands
-            .iter()
-            .any(|entry| entry["name"] == "/clear" && entry["source"] == "builtin"));
+        assert!(commands.iter().all(|entry| entry["source"] == "catalog"));
         std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
-    fn a_descriptor_without_a_root_is_the_builtin_table_alone() {
+    fn a_descriptor_without_a_root_uses_only_the_catalog() {
         let value = descriptor(Some("codex"), None).unwrap();
         let commands = value["slash_commands"].as_array().unwrap();
-        assert_eq!(commands.len(), CODEX_COMMANDS.len());
         assert!(commands
             .iter()
-            .all(|entry| entry["source"] == "builtin" && entry["name"].is_string()));
+            .all(|entry| entry["source"] == "catalog" && entry["name"].is_string()));
     }
 
     // -- file search --------------------------------------------------------

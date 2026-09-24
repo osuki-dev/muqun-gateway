@@ -26,6 +26,18 @@ the standalone gateway so it can start independently at login/boot.
 Re-running it is safe: it never duplicates a backend, never loses a paired
 device, and never flips a default an earlier install chose.
 
+The installer downloads the [agent command catalog](https://agent-commands.muqun.dev/)
+once for terminal slash-command suggestions. It does not run a refresh service.
+To refresh the local copy later, run:
+
+```sh
+muqun-gateway commands update
+```
+
+If the catalog site is unavailable during installation, command suggestions
+remain empty until the command above succeeds. OpenCode's live command API
+remains the source for native OpenCode sessions.
+
 With Herdr, version 0.7.5 or newer is required.
 
 ## Pair your phone

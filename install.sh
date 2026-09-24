@@ -178,6 +178,12 @@ if [ "$have_tmux" = 1 ] && [ -n "${MUQUN_GATEWAY_TMUX_SOCKET:-}" ]; then
 fi
 "$binary" "$@"
 
+# Cache the published command suggestions once. A network outage must not
+# break pairing or service setup; suggestions remain empty until retry.
+if ! "$binary" commands update --if-missing; then
+  warn "Command catalog unavailable. Retry later with: $binary commands update"
+fi
+
 if [ "$have_herdr" = 1 ] && [ "$have_tmux" = 1 ]; then
   info "Configuring the Herdr backend..."
   "$binary" backend add herdr >/dev/null

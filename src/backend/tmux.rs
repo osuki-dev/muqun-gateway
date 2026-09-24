@@ -1296,7 +1296,7 @@ fn tmux_key(value: &str) -> Result<String, BackendError> {
         "right" | "arrowright" => "Right".to_owned(),
         _ if lower.starts_with("ctrl+") && lower.len() == 6 => {
             let key = lower.as_bytes()[5] as char;
-            if !key.is_ascii_alphabetic() {
+            if !key.is_ascii_alphabetic() && key != '[' && key != ']' {
                 return Err(BackendError::InvalidResponse("key name"));
             }
             format!("C-{key}")
@@ -2046,6 +2046,8 @@ mod tests {
     fn mobile_key_names_are_mapped_without_becoming_tmux_options() {
         assert_eq!(tmux_key("Enter").unwrap(), "Enter");
         assert_eq!(tmux_key("ctrl+c").unwrap(), "C-c");
+        assert_eq!(tmux_key("ctrl+[").unwrap(), "C-[");
+        assert_eq!(tmux_key("ctrl+]").unwrap(), "C-]");
         assert_eq!(tmux_key("ArrowUp").unwrap(), "Up");
         assert!(tmux_key("-t").is_err());
         assert!(tmux_key("C-x;kill-server").is_err());

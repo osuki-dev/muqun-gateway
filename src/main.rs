@@ -49,6 +49,7 @@ mod approvals;
 mod authority;
 mod backend;
 mod backend_startup;
+mod command_catalog;
 mod composer;
 mod gateway_listener;
 mod git;
@@ -477,6 +478,11 @@ enum Command {
         #[command(subcommand)]
         command: BackendCommand,
     },
+    /// Refresh the locally cached agent slash-command catalog.
+    Commands {
+        #[command(subcommand)]
+        command: CommandsCommand,
+    },
     /// Adopt an existing Herdr plugin pairing into the standalone gateway.
     ImportHerdrPlugin {
         /// Installer mode: skip absent or already imported plugin state, but
@@ -512,6 +518,16 @@ enum ServiceCommand {
     Uninstall,
     /// Whether an init system is currently managing the gateway.
     Status,
+}
+
+#[derive(Subcommand)]
+enum CommandsCommand {
+    /// Download the latest supported command snapshots once, on demand.
+    Update {
+        /// Fetch only when the initial local cache is missing or invalid.
+        #[arg(long)]
+        if_missing: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1133,6 +1149,16 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Manage => manage()?,
         Command::Service { command } => run_service_command(command)?,
         Command::Backend { command } => configure_backend(command)?,
+        Command::Commands { command } => match command {
+            CommandsCommand::Update { if_missing } => {
+                if if_missing && command_catalog::is_cached() {
+                    println!("Agent command catalogs are already cached.");
+                } else {
+                    let count = command_catalog::update().await?;
+                    println!("Updated {count} agent command catalogs.");
+                }
+            }
+        },
         Command::ImportHerdrPlugin {
             if_present,
             config_dir,
@@ -6205,6 +6231,7 @@ fn spawn_agent_engine_watchers(state: AppState) {
 
 async fn watch_agent_notifications(state: AppState, session: SessionConfig) {
     let mut statuses = seed_agent_statuses(&session).await;
+    let mut completions = CompletionGate::default();
     // One subscription to the session's shared hub, held for the life of the
     // process -- which is what lets a phone that is not connected still get a
     // push. It used to build a stream of its own, which on tmux meant this
@@ -6220,18 +6247,32 @@ async fn watch_agent_notifications(state: AppState, session: SessionConfig) {
         {
             tokio::select! {
                 _ = poll.tick() => {
-                    for mut notification in poll_agent_notifications(&state, &session, &mut statuses).await {
-                        enrich_blocked_notification(&state, &session, &mut notification).await;
-                        deliver_agent_notification(&state, notification).await;
+                    if let Some(events) = poll_agent_statuses(&session).await {
+                        let present: std::collections::HashSet<String> = events.iter()
+                            .filter_map(|event| event.pointer("/data/pane_id").and_then(Value::as_str))
+                            .map(str::to_owned)
+                            .collect();
+                        for event in events {
+                            if let Some(mut notification) = observe_agent_notification(
+                                &state, &session.id, &event, &mut statuses, &mut completions,
+                            ) {
+                                enrich_blocked_notification(&state, &session, &mut notification).await;
+                                deliver_agent_notification(&state, notification).await;
+                            }
+                        }
+                        for notification in completions.ready(&statuses, &present, Instant::now()) {
+                            deliver_agent_notification(&state, notification).await;
+                        }
                     }
                 }
                 next = activity.recv() => match next {
                     Ok(SessionActivity::Event(event)) if event.name == "pane_agent_status_changed" => {
-                        if let Some(mut notification) = absorb_agent_status_event(
+                        if let Some(mut notification) = observe_agent_notification(
                             &state,
                             &session.id,
                             &event.payload,
                             &mut statuses,
+                            &mut completions,
                         ) {
                             enrich_blocked_notification(&state, &session, &mut notification).await;
                             deliver_agent_notification(&state, notification).await;
@@ -6254,31 +6295,114 @@ async fn watch_agent_notifications(state: AppState, session: SessionConfig) {
     }
 }
 
-async fn poll_agent_notifications(
-    state: &AppState,
-    session: &SessionConfig,
-    statuses: &mut HashMap<String, String>,
-) -> Vec<AgentPushNotice> {
+async fn poll_agent_statuses(session: &SessionConfig) -> Option<Vec<Value>> {
     let Ok(value) = backend_agent_list(session).await else {
-        return Vec::new();
+        return None;
     };
-    value
-        .pointer("/result/agents")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|agent| {
-            absorb_agent_status_event(
-                state,
-                &session.id,
-                &json!({
+    Some(
+        value
+            .pointer("/result/agents")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|agent| {
+                json!({
                     "event": "pane.agent_status_changed",
                     "data": agent
-                }),
-                statuses,
-            )
-        })
-        .collect()
+                })
+            })
+            .collect(),
+    )
+}
+
+const COMPLETION_GRACE: Duration = Duration::from_secs(30);
+const COMPLETION_COOLDOWN: Duration = Duration::from_secs(120);
+
+#[derive(Default)]
+struct CompletionGate {
+    pending: HashMap<String, (Instant, AgentPushNotice)>,
+    last_sent: HashMap<String, Instant>,
+}
+
+impl CompletionGate {
+    fn observe(
+        &mut self,
+        pane_id: &str,
+        status: &str,
+        notice: Option<AgentPushNotice>,
+        now: Instant,
+    ) -> Option<AgentPushNotice> {
+        if status != "idle" {
+            self.pending.remove(pane_id);
+        }
+        let notice = notice?;
+        if notice.notice != AgentNotice::AgentCompleted {
+            return Some(notice);
+        }
+        if status == "idle" {
+            self.pending.insert(pane_id.to_owned(), (now, notice));
+            return None;
+        }
+        if self.in_cooldown(pane_id, now) {
+            return None;
+        }
+        self.last_sent.insert(pane_id.to_owned(), now);
+        Some(notice)
+    }
+
+    fn ready(
+        &mut self,
+        statuses: &HashMap<String, String>,
+        present: &std::collections::HashSet<String>,
+        now: Instant,
+    ) -> Vec<AgentPushNotice> {
+        let ready: Vec<String> = self
+            .pending
+            .iter()
+            .filter(|(pane_id, (since, _))| {
+                present.contains(*pane_id)
+                    && statuses
+                        .get(*pane_id)
+                        .is_some_and(|status| status == "idle")
+                    && now.saturating_duration_since(*since) >= COMPLETION_GRACE
+            })
+            .map(|(pane_id, _)| pane_id.clone())
+            .collect();
+        let mut notices = Vec::new();
+        for pane_id in ready {
+            if let Some((_, notice)) = self.pending.remove(&pane_id) {
+                if !self.in_cooldown(&pane_id, now) {
+                    self.last_sent.insert(pane_id, now);
+                    notices.push(notice);
+                }
+            }
+        }
+        self.pending.retain(|pane_id, _| {
+            present.contains(pane_id)
+                && statuses.get(pane_id).is_some_and(|status| status == "idle")
+        });
+        notices
+    }
+
+    fn in_cooldown(&self, pane_id: &str, now: Instant) -> bool {
+        self.last_sent
+            .get(pane_id)
+            .is_some_and(|sent| now.saturating_duration_since(*sent) < COMPLETION_COOLDOWN)
+    }
+}
+
+fn observe_agent_notification(
+    state: &AppState,
+    session_id: &str,
+    event: &Value,
+    statuses: &mut HashMap<String, String>,
+    completions: &mut CompletionGate,
+) -> Option<AgentPushNotice> {
+    let data = event.get("data").unwrap_or(event);
+    let pane_id = data.get("pane_id")?.as_str()?;
+    let status = data.get("agent_status")?.as_str()?.to_ascii_lowercase();
+    let notice = absorb_agent_status_event(state, session_id, event, statuses);
+    completions.observe(pane_id, &status, notice, Instant::now())
 }
 
 /// Send one notice to every registered device, each in its own language.
@@ -6451,7 +6575,7 @@ fn notification_for_transition(
     let pane_id = transition.pane_id.as_str();
     let (event_type, notice) = match (transition.to.as_str(), transition.from.as_deref()) {
         ("blocked", _) => ("agent.blocked", AgentNotice::AgentBlocked),
-        ("idle" | "done" | "completed", Some("working")) => {
+        ("idle", Some("working")) | ("done" | "completed", Some("working" | "idle")) => {
             ("agent.completed", AgentNotice::AgentCompleted)
         }
         _ => return None,
@@ -16043,6 +16167,118 @@ mod tests {
         assert_eq!(chinese.body, "codex 已執行完畢。");
     }
 
+    #[test]
+    fn a_temporary_idle_does_not_send_a_completion_push() {
+        let pane = "w1:p2";
+        let now = Instant::now();
+        let mut gate = CompletionGate::default();
+        let mut statuses = HashMap::from([(pane.to_owned(), "idle".to_owned())]);
+        let present = std::collections::HashSet::from([pane.to_owned()]);
+        let notice = notification_for_transition(
+            &AgentTransition {
+                pane_id: pane.to_owned(),
+                agent: Some("codex".to_owned()),
+                from: Some("working".to_owned()),
+                to: "idle".to_owned(),
+            },
+            "server-1",
+            "Studio",
+            "default",
+        );
+        assert!(gate.observe(pane, "idle", notice, now).is_none());
+        assert!(gate
+            .ready(&statuses, &present, now + COMPLETION_GRACE / 2)
+            .is_empty());
+
+        statuses.insert(pane.to_owned(), "working".to_owned());
+        gate.observe(pane, "working", None, now + COMPLETION_GRACE / 2);
+        assert!(gate
+            .ready(&statuses, &present, now + COMPLETION_GRACE)
+            .is_empty());
+    }
+
+    #[test]
+    fn stable_idle_is_confirmed_once_and_a_quick_second_cycle_is_suppressed() {
+        let pane = "w1:p2";
+        let now = Instant::now();
+        let mut gate = CompletionGate::default();
+        let mut statuses = HashMap::from([(pane.to_owned(), "idle".to_owned())]);
+        let present = std::collections::HashSet::from([pane.to_owned()]);
+        let transition = AgentTransition {
+            pane_id: pane.to_owned(),
+            agent: Some("codex".to_owned()),
+            from: Some("working".to_owned()),
+            to: "idle".to_owned(),
+        };
+        let notice = || notification_for_transition(&transition, "server-1", "Studio", "default");
+        gate.observe(pane, "idle", notice(), now);
+        assert!(gate
+            .ready(
+                &statuses,
+                &present,
+                now + COMPLETION_GRACE - Duration::from_secs(1)
+            )
+            .is_empty());
+        assert_eq!(
+            gate.ready(&statuses, &present, now + COMPLETION_GRACE)
+                .len(),
+            1
+        );
+        assert!(gate
+            .ready(&statuses, &present, now + COMPLETION_GRACE)
+            .is_empty());
+
+        statuses.insert(pane.to_owned(), "working".to_owned());
+        gate.observe(
+            pane,
+            "working",
+            None,
+            now + COMPLETION_GRACE + Duration::from_secs(1),
+        );
+        statuses.insert(pane.to_owned(), "idle".to_owned());
+        gate.observe(
+            pane,
+            "idle",
+            notice(),
+            now + COMPLETION_GRACE + Duration::from_secs(2),
+        );
+        assert!(gate
+            .ready(
+                &statuses,
+                &present,
+                now + COMPLETION_GRACE * 2 + Duration::from_secs(2)
+            )
+            .is_empty());
+    }
+
+    #[test]
+    fn missing_pane_cancels_a_pending_completion() {
+        let pane = "w1:p2";
+        let now = Instant::now();
+        let mut gate = CompletionGate::default();
+        let statuses = HashMap::from([(pane.to_owned(), "idle".to_owned())]);
+        let notice = notification_for_transition(
+            &AgentTransition {
+                pane_id: pane.to_owned(),
+                agent: None,
+                from: Some("working".to_owned()),
+                to: "idle".to_owned(),
+            },
+            "server-1",
+            "Studio",
+            "default",
+        );
+        gate.observe(pane, "idle", notice, now);
+        assert!(gate
+            .ready(
+                &statuses,
+                &std::collections::HashSet::new(),
+                now + COMPLETION_GRACE
+            )
+            .is_empty());
+        assert!(gate.pending.is_empty());
+    }
+
     /// The agent's name goes where the sentence wants it, not where the English
     /// happened to put it.
     ///
@@ -17912,7 +18148,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .any(|entry| entry["name"] == "/compact" && entry["source"] == "builtin"));
+            .all(|entry| entry["source"] == "catalog"));
 
         // An agent with no table carries no key at all -- not a null, which a
         // client would have to tell apart from "no commands".
