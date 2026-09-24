@@ -2551,6 +2551,7 @@ mod tests {
         crate::agent::domain::AgentInfo {
             id: id.to_string(),
             name: id.to_string(),
+            model: None,
             description: None,
             mode: Some("primary".to_string()),
             color: None,

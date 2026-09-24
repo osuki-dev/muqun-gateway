@@ -1242,6 +1242,7 @@ pub fn map_agents(data: &[Value]) -> Vec<AgentInfo> {
             Some(AgentInfo {
                 id,
                 name,
+                model: a.get("model").and_then(config_model_ref),
                 description,
                 mode,
                 color,
@@ -1414,6 +1415,7 @@ fn config_model_ref(val: &Value) -> Option<ModelRef> {
     let model_id = val
         .get("model")
         .or_else(|| val.get("id"))
+        .or_else(|| val.get("modelID"))
         .and_then(Value::as_str)?;
     Some(ModelRef {
         provider_id: provider_id.to_string(),
@@ -1817,6 +1819,30 @@ mod tests {
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].mode.as_deref(), Some("subagent"));
         assert_eq!(agents[0].color.as_deref(), Some("blue"));
+    }
+
+    #[test]
+    fn test_map_agents_model_and_variant() {
+        let raw = vec![
+            json!({
+                "id": "osuki",
+                "model": { "providerID": "openai", "modelID": "gpt-6-sol", "variant": "medium" }
+            }),
+            json!({ "id": "build", "model": "openai/gpt-6-luna#low" }),
+        ];
+        let agents = map_agents(&raw);
+        assert_eq!(
+            agents[0].model,
+            Some(ModelRef {
+                provider_id: "openai".to_string(),
+                model_id: "gpt-6-sol".to_string(),
+                variant: Some("medium".to_string()),
+            })
+        );
+        assert_eq!(
+            agents[1].model.as_ref().and_then(|m| m.variant.as_deref()),
+            Some("low")
+        );
     }
 }
 
