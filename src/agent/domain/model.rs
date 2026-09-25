@@ -32,6 +32,9 @@ pub struct ModelInfo {
 pub struct AgentInfo {
     pub id: String,
     pub name: String,
+    /// The agent's configured model, distinct from the session's selected model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<super::ModelRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
