@@ -22,3 +22,12 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Test
         run: cargo test --locked
+      # Not a release: a binary to try on a real Windows machine while the
+      # agent-only work lands. Download it from the run's Artifacts section.
+      - name: Build release binary
+        run: cargo build --release --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: muqun-gateway-x86_64-pc-windows-msvc
+          path: target/release/muqun-gateway.exe
+          retention-days: 14
