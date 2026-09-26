@@ -1175,7 +1175,7 @@ dependencies = [
 
 [[package]]
 name = "muqun-gateway"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
