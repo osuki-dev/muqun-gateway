@@ -1171,8 +1171,42 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             let absent = !source.join(CONFIG_FILE).try_exists()?
                 && !source.join(PAIRING_FILE).try_exists()?;
             let imported = target.join(HERDR_PLUGIN_IMPORT_MARKER).try_exists()?;
-            if !if_present || (!absent && !imported) {
+            if !if_present {
                 import_herdr_plugin(Some(source), state_dir, Some(target), target_state_dir)?;
+            } else if !absent && !imported {
+                let target_state = match &target_state_dir {
+                    Some(path) => path.clone(),
+                    None => standalone_state_dir()?,
+                };
+                match auto_import_skip_reason(&source, &target, &target_state) {
+                    Some(reason) => {
+                        let source_state = match &state_dir {
+                            Some(path) => path.clone(),
+                            None => default_herdr_plugin_state_dir()?,
+                        };
+                        let plugin_devices = read_devices_at(&source_state.join(DEVICES_FILE))
+                            .map_or_else(
+                                |_| String::from("an unreadable list of"),
+                                |devices| devices.len().to_string(),
+                            );
+                        println!(
+                            "==> Left the Herdr plugin pairing at {} alone: {reason}.\n    \
+                             The plugin pairing has {plugin_devices} paired device(s). If those \
+                             are the devices you use, stop the gateway\n    \
+                             (`muqun-gateway service uninstall`, then `muqun-gateway stop`), \
+                             run `muqun-gateway import-herdr-plugin`,\n    \
+                             and re-run this installer. If it is a leftover, move that directory \
+                             aside and this notice goes away.",
+                            source.display()
+                        );
+                    }
+                    None => import_herdr_plugin(
+                        Some(source),
+                        state_dir,
+                        Some(target),
+                        target_state_dir,
+                    )?,
+                }
             }
         }
         Command::Devices => list_devices()?,
@@ -1572,6 +1606,58 @@ fn make_backend_default(config: &mut Config, id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Why the installer must not adopt a plugin pairing over this standalone
+/// install, if it must not.
+///
+/// An explicit import makes the plugin identity authoritative. The installer
+/// runs the same import unattended on every update, though, and a standalone
+/// install that has since paired devices under its own server id would have
+/// every one of them re-pointed at an identity they never saw -- typically a
+/// plugin install left over from before the standalone one existed. Only an
+/// install nothing is paired to yet, or one that already carries the plugin
+/// identity, is safe to adopt without being asked, and only while no gateway
+/// is using it: stopping a service is not the installer's call to make here.
+///
+/// Never an error. This runs mid-install, where anything unreadable is a
+/// reason to leave both identities alone, not to abort the update.
+fn auto_import_skip_reason(
+    source_config_dir: &std::path::Path,
+    target_config_dir: &std::path::Path,
+    target_state_dir: &std::path::Path,
+) -> Option<String> {
+    let target = load_existing_install(
+        &target_config_dir.join(CONFIG_FILE),
+        &target_config_dir.join(PAIRING_FILE),
+    )?;
+    let same_identity = load_existing_install(
+        &source_config_dir.join(CONFIG_FILE),
+        &source_config_dir.join(PAIRING_FILE),
+    )
+    .is_some_and(|source| source.config.server_id == target.config.server_id);
+    if same_identity {
+        return None;
+    }
+    match read_devices_at(&target_state_dir.join(DEVICES_FILE)) {
+        Err(_) => {
+            return Some(String::from(
+                "the standalone device file could not be read, so devices may be paired to it",
+            ))
+        }
+        Ok(devices) if !devices.is_empty() => {
+            return Some(format!(
+                "the standalone gateway (server id {}) already has {} paired device(s)",
+                target.config.server_id,
+                devices.len()
+            ))
+        }
+        Ok(_) => {}
+    }
+    if state_lock::StateLock::acquire(target_state_dir).is_err() {
+        return Some(String::from("the standalone gateway is running"));
+    }
+    None
+}
+
 fn import_herdr_plugin(
     source_config_dir: Option<PathBuf>,
     source_state_dir: Option<PathBuf>,
@@ -1593,22 +1679,26 @@ fn import_herdr_plugin(
             .any(|session| session.backend == BackendKind::Herdr),
         "the source installation does not configure a Herdr backend"
     );
-    let running = gateway_listener_pids(source.config.port()).unwrap_or_default();
-    anyhow::ensure!(
-        running.is_empty(),
-        "stop the running gateway before importing its pairing identity"
-    );
-
     let target_config_dir = target_config_dir.unwrap_or(standalone_config_dir()?);
     let target_state_dir = target_state_dir.unwrap_or(standalone_state_dir()?);
     std::fs::create_dir_all(&target_config_dir)?;
-    std::fs::create_dir_all(&target_state_dir)?;
     // This merges records into the target's device file. A gateway running
     // against that directory holds the pre-merge list in memory and would
     // write it back over the merge at its next pairing, so the import has to
-    // own the directory outright while it runs.
-    let _target_lock = state_lock::StateLock::acquire(&target_state_dir)
-        .context("cannot import into a state directory a gateway is using")?;
+    // own the directory outright while it runs. Taken before the port check:
+    // both installs default to the same port, so what answers there is often
+    // the standalone gateway itself, and the lock names it exactly.
+    let _target_lock = state_lock::StateLock::acquire(&target_state_dir).context(
+        "cannot import into a state directory a gateway is using. If it runs as a service, \
+         stop it with `muqun-gateway service uninstall` followed by `muqun-gateway stop`, \
+         and run `muqun-gateway service install` again after importing",
+    )?;
+    anyhow::ensure!(
+        gateway_listener_pids(source.config.port())
+            .unwrap_or_default()
+            .is_empty(),
+        "stop the running Herdr plugin gateway before importing its pairing identity"
+    );
     let target_config_path = target_config_dir.join(CONFIG_FILE);
     let target_pairing_path = target_config_dir.join(PAIRING_FILE);
     let target = if target_config_path.exists() || target_pairing_path.exists() {
@@ -19463,6 +19553,70 @@ mod tests {
         assert_eq!(merged.sessions[0].backend, BackendKind::Herdr);
         assert_eq!(merged.sessions[1].backend, BackendKind::Tmux);
         assert!(target_config_dir.join(HERDR_PLUGIN_IMPORT_MARKER).exists());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    fn write_test_install(dir: &std::path::Path, server_id: &str, token: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        let mut config = test_config(token);
+        config.server_id = server_id.into();
+        let pairing = PairingFile {
+            payload: PairingPayload {
+                kind: "muqun-gateway".into(),
+                server_id: server_id.into(),
+                label: config.label.clone(),
+                url: config.public_url.clone(),
+                token: token.into(),
+                transport_key: format!("{token}-transport-key"),
+            },
+        };
+        write_config(&dir.join(CONFIG_FILE), &config).unwrap();
+        write_secret_file(
+            &dir.join(PAIRING_FILE),
+            &serde_json::to_vec(&pairing).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_installer_never_swaps_the_identity_of_a_standalone_install_with_devices() {
+        let root = std::env::temp_dir().join(format!("gateway-import-{}", uuid::Uuid::new_v4()));
+        let plugin = root.join("plugin-config");
+        let standalone = root.join("standalone-config");
+        let state = root.join("standalone-state");
+        std::fs::create_dir_all(&state).unwrap();
+        write_test_install(&plugin, "stale-plugin", "plugin-token");
+
+        // Nothing standalone yet: adopting the plugin is the migration.
+        assert!(auto_import_skip_reason(&plugin, &standalone, &state).is_none());
+
+        // A standalone identity nothing is paired to loses nothing.
+        write_test_install(&standalone, "standalone", "standalone-token");
+        assert!(auto_import_skip_reason(&plugin, &standalone, &state).is_none());
+
+        // ...unless a gateway is using it: stopping that is not the installer's call.
+        {
+            let _running = state_lock::StateLock::acquire(&state).unwrap();
+            let reason = auto_import_skip_reason(&plugin, &standalone, &state)
+                .expect("a running standalone gateway must be left alone");
+            assert!(reason.contains("running"), "{reason}");
+        }
+
+        // Once a device is paired to it, the installer must leave it alone.
+        write_devices_at(&state, &[test_device("phone", "phone-token")]).unwrap();
+        let reason = auto_import_skip_reason(&plugin, &standalone, &state)
+            .expect("paired standalone identity must be kept");
+        assert!(reason.contains("1 paired device"), "{reason}");
+
+        // An unreadable device file is a reason to skip, never to abort the install.
+        std::fs::write(state.join(DEVICES_FILE), b"not json").unwrap();
+        let reason = auto_import_skip_reason(&plugin, &standalone, &state)
+            .expect("unreadable device file must be kept");
+        assert!(reason.contains("could not be read"), "{reason}");
+
+        // Unless it already is the plugin identity, where import changes nothing.
+        write_test_install(&standalone, "stale-plugin", "plugin-token");
+        assert!(auto_import_skip_reason(&plugin, &standalone, &state).is_none());
         std::fs::remove_dir_all(root).ok();
     }
 
