@@ -1840,6 +1840,7 @@ mod tests {
     /// non-zero -- a wrapper, a hardened host, a container that restricts the
     /// process table -- came back `Ok` with empty stdout and was cached as
     /// "no agent" for every pane, re-probed, and cached again.
+    #[cfg(unix)]
     #[test]
     fn a_ps_that_ran_and_failed_is_not_an_empty_process_table() {
         use std::os::unix::process::ExitStatusExt as _;

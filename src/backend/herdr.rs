@@ -1443,6 +1443,7 @@ mod tests {
         task: tokio::task::JoinHandle<()>,
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn two_assistants_of_one_kind_receive_distinct_live_names() {
         let fake = FakeHerdr::start();
@@ -2241,6 +2242,7 @@ mod tests {
     /// A herdr that accepts the connection and then never answers used to
     /// hold this task and its file descriptor forever, and every request that
     /// landed on it did the same.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_herdr_that_never_answers_is_given_up_on() {
         let socket_path = crate::short_test_socket("gw-herdr-mute");
@@ -2277,6 +2279,7 @@ mod tests {
     /// supposed to sit idle -- a terminal nobody is typing into produces
     /// nothing for hours -- so a read bound here would tear down a healthy
     /// stream on a quiet session and reconnect it forever.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_quiet_event_stream_is_not_torn_down_for_being_quiet() {
         let socket_path = crate::short_test_socket("gw-herdr-idle");
@@ -2328,6 +2331,7 @@ mod tests {
     /// The setup call inside `activity_stream` is *not* exempt: it goes
     /// through `request_transport`, so a herdr that will not answer cannot
     /// hang the stream constructor either.
+    #[cfg(unix)]
     #[tokio::test]
     async fn opening_a_stream_against_a_mute_herdr_still_gives_up() {
         let socket_path = crate::short_test_socket("gw-herdr-open");

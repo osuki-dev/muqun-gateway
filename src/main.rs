@@ -17727,6 +17727,7 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn explicit_preview_accepts_home_files_without_widening_scan_roots() {
         let base = asset_test_dir("home-preview");
@@ -19522,6 +19523,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn repo_roots_come_from_the_repos_this_session_has_and_never_widen_to_the_machine() {
         // The gathering half of task_repo_roots, which is the part that decides
@@ -20130,6 +20132,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn dispatch_and_stop_are_documented_and_announced() {
         let spec = openapi_spec();

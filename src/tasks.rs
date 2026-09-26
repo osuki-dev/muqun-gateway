@@ -601,6 +601,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_repo_path_has_to_be_one_this_session_already_has() {
         let dir = temp_dir("fence");

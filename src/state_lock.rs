@@ -188,13 +188,34 @@ fn lock_exclusive(
     Ok(StateLock { file })
 }
 
+/// Windows has no `flock`; std's `try_lock` is `LockFileEx` over the whole
+/// file, which gives the same one-gateway-per-directory guarantee. That lock
+/// is mandatory rather than advisory, so another process cannot read the pid
+/// stamped into the file while it is held, and a refused start says so instead
+/// of naming the holder.
 #[cfg(not(unix))]
 fn lock_exclusive(
     file: std::fs::File,
-    _path: PathBuf,
-    _state_dir: &Path,
+    path: PathBuf,
+    state_dir: &Path,
 ) -> anyhow::Result<StateLock> {
-    Ok(StateLock { file })
+    match file.try_lock() {
+        Ok(()) => {
+            record_holder(&file);
+            Ok(StateLock { file })
+        }
+        Err(std::fs::TryLockError::WouldBlock) => {
+            anyhow::bail!(contended_message(state_dir, &path))
+        }
+        Err(std::fs::TryLockError::Error(error)) => {
+            eprintln!(
+                "could not lock {} ({error}); this gateway cannot detect a second one sharing \
+                 its state directory",
+                path.display()
+            );
+            Ok(StateLock { file })
+        }
+    }
 }
 
 /// Stamp the holder's pid into the lock file so a refused start can name it.

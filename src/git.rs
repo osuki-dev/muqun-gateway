@@ -1197,6 +1197,7 @@ mod tests {
         std::fs::remove_dir_all(repo.parent().unwrap()).ok();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_patch_refuses_paths_that_are_arguments_escapes_or_symlinks() {
         let repo = temp_repo("fence");

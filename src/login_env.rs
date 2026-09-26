@@ -428,6 +428,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn lookup_finds_a_program_and_reports_a_missing_one() {
         let dir = std::env::temp_dir().join(format!("muqun-lookup-{}", std::process::id()));
