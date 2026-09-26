@@ -19577,6 +19577,7 @@ mod tests {
         state
     }
 
+    #[cfg(unix)]
     /// A Herdr socket that answers `pane.list` with a fixed set of panes (or
     /// none), for driving the real `HerdrBackend` -> `list_panes` path that
     /// `sessions()` probes end to end, without needing Herdr installed or a
@@ -19585,6 +19586,7 @@ mod tests {
         socket_path: PathBuf,
     }
 
+    #[cfg(unix)]
     impl FakePaneListHerdr {
         fn start(panes: Value) -> Self {
             let socket_path = std::env::temp_dir().join(format!(
@@ -19633,6 +19635,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(unix)]
     /// End to end through the real handler: a herdr session that actually has
     /// a pane outranks a tmux session configured but not running -- the
     /// motivating regression for this card, where the app reads
@@ -19665,6 +19668,7 @@ mod tests {
         assert_eq!(response.0["sessions"][1]["connected"], false);
     }
 
+    #[cfg(unix)]
     /// The dual-backend defect the final review caught: with tmux dead (or
     /// merely empty) and herdr live, the app connects to whichever session
     /// `GET /api/sessions` leads with -- but it validates that connection
@@ -19736,6 +19740,7 @@ mod tests {
         assert_eq!(ids[0], preferred);
     }
 
+    #[cfg(unix)]
     /// The regression `sessions_endpoint_keeps_every_session_when_nothing_is_reachable`
     /// could not have caught on its own: before `probe_reachable`, a tmux
     /// session pointed at a socket nothing is listening on classified as
@@ -19771,6 +19776,7 @@ mod tests {
         assert_eq!(session_ids(&response.0), vec!["herdr-empty", "tmux-dead"]);
     }
 
+    #[cfg(unix)]
     /// A reachable session with no panes open still outranks an unreachable
     /// one, and still trails a session that actually has something in it.
     #[tokio::test]
@@ -20156,6 +20162,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     /// A Herdr socket that answers from a script.
     ///
     /// Every gateway request is its own short-lived connection, so this accepts
@@ -20176,6 +20183,7 @@ mod tests {
     /// zero, so "advanced past the baseline" cannot pass by accident.
     const FAKE_AGENT_SEQ: u64 = 100;
 
+    #[cfg(unix)]
     impl FakeHerdr {
         /// `advance_after` is the number of Enters it takes for the agent's
         /// state sequence to move; `None` makes `agent.list` come back empty,
@@ -20278,12 +20286,14 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl Drop for FakeHerdr {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.socket_path);
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn an_enter_the_agent_took_is_not_repeated() {
         let herdr = FakeHerdr::start(
@@ -20306,6 +20316,7 @@ mod tests {
         assert_eq!(enters[0]["params"]["keys"], json!(["Enter"]));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn enter_waits_for_the_pane_to_stop_redrawing() {
         // The middle screens are Claude Code staging an image: the input line is
@@ -20336,6 +20347,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_screen_that_moved_without_submitting_does_not_pass_for_a_submission() {
         // The exact false positive that broke the first version of this: three
@@ -20358,6 +20370,7 @@ mod tests {
         assert_eq!(herdr.enters().len(), 3);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn enters_stop_at_the_budget_when_the_agent_never_takes_one() {
         let herdr = FakeHerdr::start(vec!["> review this"], Some(usize::MAX));
@@ -20380,6 +20393,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(unix)]
     fn output_state(herdr: &FakeHerdr) -> AppState {
         let mut state = test_state("admin", vec![test_device("d1", "token")]);
         state.config.sessions[0].socket_path = herdr.session().socket_path;
@@ -20404,6 +20418,7 @@ mod tests {
         pane_read_text(&response.0).unwrap_or_default()
     }
 
+    #[cfg(unix)]
     /// The whole point, end to end: Herdr keeps one screen, the gateway watched
     /// four, and the reader can ask for all four.
     #[tokio::test]
@@ -20444,6 +20459,7 @@ mod tests {
         pane_read_text(&response.0).unwrap_or_default()
     }
 
+    #[cfg(unix)]
     /// The bug this pins: a pane the scrollback store is keeping rows for is
     /// exactly the condition the tail-path stitching above exists for, and
     /// `keeps()` is decided from session/pane identity and Herdr's own scroll
@@ -20481,6 +20497,7 @@ mod tests {
         assert_eq!(served, "row 3\nrow 4\nrow 5\nrow 6");
     }
 
+    #[cfg(unix)]
     /// And having kept them, it says so where the reader's affordance looks --
     /// on the pane, not on the output.
     #[tokio::test]
@@ -20504,6 +20521,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     /// The panes that already worked have to keep working exactly as they did.
     #[tokio::test]
     async fn a_pane_with_scrollback_is_answered_as_herdr_answered_it() {
@@ -20523,6 +20541,7 @@ mod tests {
         assert_eq!(served, screens.last().unwrap().as_str());
     }
 
+    #[cfg(unix)]
     /// And so does a pane nobody has reported on: not knowing is a reason to
     /// stay out of the way.
     #[tokio::test]
@@ -20539,6 +20558,7 @@ mod tests {
         assert_eq!(served, screens.last().unwrap().as_str());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_pane_herdr_lists_no_agent_for_falls_back_to_watching_the_screen() {
         let herdr = FakeHerdr::start(
@@ -20555,6 +20575,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_blind_submit_presses_enter_no_more_than_the_small_budget() {
         let herdr = FakeHerdr::start(vec!["$ ls"], None);

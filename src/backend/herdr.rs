@@ -29,19 +29,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
+#[cfg(unix)]
 use anyhow::Context as _;
 use serde_json::{json, Value};
+#[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+#[cfg(unix)]
+use super::BackendActivity;
 #[cfg(unix)]
 use tokio::net::UnixStream;
 
 use super::{
-    Agent, AgentStatus, BackendActivity, BackendActivityStream, BackendError, BackendFuture,
-    BackendKind, BackendMetadata, CreateTab, CreateWorkspace, OutputFormat, OutputSource, Pane,
-    PaneId, PaneOutput, ReadPane, SendTextMode, SplitDirection, SplitPane, StartAgent,
-    StartedAgent, Tab, TabId, TerminalBackend, Workspace, WorkspaceId, Worktree, WorktreePlacement,
-    WorktreeRequest,
+    Agent, AgentStatus, BackendActivityStream, BackendError, BackendFuture, BackendKind,
+    BackendMetadata, CreateTab, CreateWorkspace, OutputFormat, OutputSource, Pane, PaneId,
+    PaneOutput, ReadPane, SendTextMode, SplitDirection, SplitPane, StartAgent, StartedAgent, Tab,
+    TabId, TerminalBackend, Workspace, WorkspaceId, Worktree, WorktreePlacement, WorktreeRequest,
 };
 
 /// How long one herdr request may take, end to end.
@@ -112,9 +115,12 @@ fn startup_ready(
 }
 
 pub struct HerdrBackend {
+    // Only the Unix socket transport reads these; elsewhere every call is refused.
+    #[cfg_attr(not(unix), allow(dead_code))]
     socket_path: PathBuf,
     /// Overridable so a test can prove the timeout fires without waiting out
     /// the real one.
+    #[cfg_attr(not(unix), allow(dead_code))]
     request_timeout: Duration,
     /// Whether this herdr answers `pane.process_info`. Assumed until the
     /// first refusal, then remembered: a herdr below the method's protocol
@@ -1253,6 +1259,7 @@ fn worktree_error(error: BackendError) -> BackendError {
     }
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 fn activity_subscriptions(panes: &[Pane]) -> Vec<Value> {
     let mut subscriptions = vec![
         json!({ "type": "workspace.created" }),
@@ -1345,7 +1352,9 @@ fn required_string<'a>(
         .ok_or(BackendError::InvalidResponse(context))
 }
 
-#[cfg(test)]
+// Every test here drives the Unix socket transport, directly or through a fake
+// Herdr listening on one.
+#[cfg(all(test, unix))]
 mod tests {
     #[test]
     fn agent_identity_is_conversation_scoped_not_pane_scoped() {
