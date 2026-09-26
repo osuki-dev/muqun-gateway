@@ -25,6 +25,23 @@ fn install_case_with_options(
     port: Option<&str>,
     socket_name: Option<&str>,
 ) -> String {
+    match run_installer(herdr, tmux, answer, installed, port, socket_name, "running") {
+        Ok(transcript) => transcript,
+        Err(calls) => panic!("installer failed: {calls}"),
+    }
+}
+
+/// `Err` carries the call log when the installer exits non-zero.
+#[allow(clippy::too_many_arguments)]
+fn run_installer(
+    herdr: bool,
+    tmux: bool,
+    answer: Option<&str>,
+    installed: bool,
+    port: Option<&str>,
+    socket_name: Option<&str>,
+    gateway: &str,
+) -> Result<String, String> {
     let root = std::env::temp_dir().join(format!("muqun-installer-test-{}", uuid::Uuid::new_v4()));
     fs::create_dir(&root).unwrap();
     fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
@@ -48,7 +65,7 @@ fn install_case_with_options(
     }
     // A closed PATH makes backend detection independent of the test host.
     for name in [
-        "awk", "cut", "head", "chmod", "mv", "mkdir", "basename", "id", "uname", "cp",
+        "awk", "cut", "head", "chmod", "mv", "mkdir", "basename", "id", "uname", "cp", "sleep",
     ] {
         let program = [format!("/usr/bin/{name}"), format!("/bin/{name}")]
             .into_iter()
@@ -80,7 +97,7 @@ if [ "${1:-}" = setup ]; then
   printf '%s\000' "$@" > "$MOCK_SETUP_LOG"
 fi
 case "$*" in
-'service status') echo "service: $MOCK_SERVICE";;
+'service status') echo "service: $MOCK_SERVICE"; echo "gateway: $MOCK_GATEWAY";;
 'backend list') printf '%b' "$MOCK_BACKENDS";;
 esac
 "#,
@@ -146,6 +163,7 @@ esac
         .env("MOCK_LOG", &log)
         .env("MOCK_SETUP_LOG", &setup_log)
         .env("MOCK_BACKENDS", backends)
+        .env("MOCK_GATEWAY", gateway)
         .env(
             "MOCK_SERVICE",
             if installed {
@@ -183,7 +201,10 @@ esac
     let mut transcript = String::new();
     let mut backend_answered = false;
     let mut service_answered = false;
-    let deadline = Instant::now() + Duration::from_secs(15);
+    // A gateway that never comes up is waited on for 20 s before the installer
+    // gives up, so that case needs the longer budget.
+    let budget = if gateway == "running" { 15 } else { 40 };
+    let deadline = Instant::now() + Duration::from_secs(budget);
     let status = loop {
         for text in rx.try_iter() {
             transcript.push_str(&text);
@@ -213,7 +234,11 @@ esac
     drop(input);
     reader.join().unwrap();
     let calls = fs::read_to_string(&log).unwrap_or_default();
-    assert!(status.success(), "installer failed: {calls}");
+    if !status.success() {
+        // All contents are generated fixtures under this unique test-owned path.
+        fs::remove_dir_all(root).unwrap();
+        return Err(format!("{calls}\n--- transcript ---\n{transcript}"));
+    }
     let installed_binary = fs::canonicalize(install.join("muqun-gateway")).unwrap();
     assert_eq!(installed_binary.parent(), Some(install.as_path()));
     assert!(installed_binary.starts_with(&root));
@@ -243,7 +268,34 @@ esac
         arguments, expected,
         "installer changed setup argument boundaries"
     );
-    calls
+    Ok(calls)
+}
+
+#[test]
+fn an_update_whose_gateway_never_comes_up_is_reported_as_a_failure() {
+    // v0.12.1 printed "updated and running" after a launchd reload that had
+    // left nothing running. Both the supervised and the unmanaged path must
+    // fail loudly instead, and never claim success.
+    for installed in [true, false] {
+        let failure = run_installer(true, true, None, installed, None, None, "not running")
+            .expect_err("an installer whose gateway never came up must fail");
+        // It waited out the whole start-up budget, asking every second.
+        let polls = failure
+            .lines()
+            .filter(|line| *line == "service status")
+            .count();
+        assert!(polls >= 20, "polled {polls} times:\n{failure}");
+        assert!(!failure.contains("updated and running"), "{failure}");
+        assert!(!failure.contains("configured and running"), "{failure}");
+    }
+}
+
+#[test]
+fn a_host_that_cannot_tell_whether_the_gateway_runs_still_installs() {
+    // `service status` could not answer at all -- no `ss` on a minimal Linux.
+    // That is not evidence of a failed start, so the install completes.
+    run_installer(true, true, None, true, None, None, "unknown")
+        .expect("an unanswerable status check must not fail the install");
 }
 
 #[test]

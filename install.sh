@@ -314,6 +314,32 @@ else
   echo "    $binary service install"
 fi
 
+# Confirm it actually came up. A service manager accepting the job, or a child
+# being spawned, is not a gateway answering on its port: on v0.12.1 a launchd
+# reload could fail halfway and this script still went on to call the result
+# running. Give it a moment to bind, then say plainly if it did not. Only an
+# explicit "not running" is a failure: a host that cannot answer at all (no
+# `ss` on a minimal Linux, say) gets a warning rather than a failed install.
+waited=0
+gateway_state=unknown
+while [ "$waited" -lt 20 ]; do
+  case "$("$binary" service status 2>/dev/null)" in
+    *"gateway: running"*) gateway_state=running; break ;;
+    *"gateway: not running"*) gateway_state=stopped ;;
+    *) gateway_state=unknown ;;
+  esac
+  waited=$((waited + 1))
+  sleep 1
+done
+case "$gateway_state" in
+  running) ;;
+  stopped)
+    die "The gateway did not start. Its log is in the gateway's state directory
+  (gateway.log). Check with: $binary service status
+  Then start it with: $binary service install   (or: $binary start)" ;;
+  *) warn "Could not confirm that the gateway is running. Check with: $binary service status" ;;
+esac
+
 echo
 if [ "$config_existed" = 1 ]; then
   green "Muqun Gateway is updated and running (pairings kept)."

@@ -291,24 +291,105 @@ fn xml_text(value: &str) -> String {
 
 // ------------------------------------------------------------- init plumbing
 
+/// How long a reinstall waits for the old agent to be fully gone. Past launchd's
+/// own `ExitTimeOut` (5 s by default, when SIGTERM becomes SIGKILL), with room.
+#[cfg(target_os = "macos")]
+const BOOTOUT_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Bootstrap attempts, a second apart, before a reinstall gives up.
+#[cfg(target_os = "macos")]
+const BOOTSTRAP_ATTEMPTS: u32 = 10;
+
 #[cfg(target_os = "macos")]
 fn enable(unit: &Path) -> Result<()> {
     let domain = gui_domain();
+    let target = format!("{domain}/{SERVICE_LABEL}");
     // Reinstalling over a live agent: bootstrap refuses a label that is already
     // loaded, so the old one goes first. A failure here is the ordinary "it was
     // not loaded" case, which is why it is not checked.
-    run_quiet(
-        "launchctl",
-        &["bootout", &format!("{domain}/{SERVICE_LABEL}")],
-    );
-    let status = ProcessCommand::new("launchctl")
-        .arg("bootstrap")
-        .arg(&domain)
-        .arg(unit)
-        .status()
-        .context("failed to run launchctl bootstrap")?;
-    anyhow::ensure!(status.success(), "launchctl bootstrap failed ({status})");
-    Ok(())
+    //
+    // `bootout` can return while launchd is still tearing the old job down, and
+    // a bootstrap in that window fails with "5: Input/output error" -- which
+    // is how the installer's update step left the gateway stopped on v0.12.1.
+    // So wait until the label is released and the old process has exited (it
+    // holds the state lock, and a replacement started beside it would lose that
+    // race and exit), then bootstrap, retrying while launchd catches up.
+    let old_pid = loaded_pid(&target);
+    run_quiet("launchctl", &["bootout", &target]);
+    wait_until(BOOTOUT_WAIT, || {
+        !run_quiet("launchctl", &["print", &target]) && !old_pid.is_some_and(process_alive)
+    });
+
+    let mut last_error = String::new();
+    for attempt in 1..=BOOTSTRAP_ATTEMPTS {
+        let output = ProcessCommand::new("launchctl")
+            .arg("bootstrap")
+            .arg(&domain)
+            .arg(unit)
+            .stdin(Stdio::null())
+            .output()
+            .context("failed to run launchctl bootstrap")?;
+        if output.status.success() {
+            return Ok(());
+        }
+        last_error = format!(
+            "{} ({})",
+            String::from_utf8_lossy(&output.stderr).trim(),
+            output.status
+        );
+        if attempt < BOOTSTRAP_ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
+    anyhow::bail!(
+        "launchctl bootstrap failed after {BOOTSTRAP_ATTEMPTS} attempts: {last_error}\n\
+         The gateway is not running. Try `muqun-gateway service install` again in a moment."
+    )
+}
+
+/// The pid launchd reports for a loaded job, if it is running one.
+#[cfg(target_os = "macos")]
+fn loaded_pid(target: &str) -> Option<u32> {
+    let output = ProcessCommand::new("launchctl")
+        .args(["print", target])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_launchd_pid(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// The job's own `pid = N` line. Only the top-level one: nested sections
+/// (endpoints, spawn info) are indented further and are not the job's pid.
+#[cfg(any(target_os = "macos", test))]
+fn parse_launchd_pid(print: &str) -> Option<u32> {
+    print
+        .lines()
+        .find_map(|line| line.strip_prefix("\tpid = "))
+        .and_then(|pid| pid.trim().parse().ok())
+}
+
+#[cfg(target_os = "macos")]
+fn process_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 only checks that the pid exists and may be signalled.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(target_os = "macos")]
+fn wait_until(limit: std::time::Duration, mut done: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + limit;
+    while !done() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -389,6 +470,20 @@ fn run_quiet(program: &str, args: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_job_pid_is_read_from_its_own_line_and_nowhere_else() {
+        let print = "gui/501/dev.osuki.muqun-gateway = {\n\
+                     \tactive count = 1\n\
+                     \tstate = running\n\
+                     \tendpoints = {\n\
+                     \t\tpid = 7\n\
+                     \t}\n\
+                     \tpid = 99542\n\
+                     }\n";
+        assert_eq!(parse_launchd_pid(print), Some(99542));
+        assert_eq!(parse_launchd_pid("\tstate = not running\n"), None);
+    }
 
     fn paths() -> ServicePaths {
         ServicePaths {
