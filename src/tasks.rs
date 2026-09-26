@@ -680,6 +680,7 @@ mod tests {
         assert_eq!(kinds, sorted);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_path_probe_only_ever_looks_on_path() {
         // A name with a separator is not a PATH lookup, and must not be

@@ -2200,6 +2200,7 @@ mod tests {
         assert!(!means_no_tmux_server("can't find pane: %99"));
     }
 
+    #[cfg(unix)]
     /// The exact masking the test above documents, from the other side:
     /// `list_panes` (via `list_output`) reports the same nonexistent socket
     /// as an empty topology, not an error -- correct for every other caller,

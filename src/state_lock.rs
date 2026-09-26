@@ -120,6 +120,7 @@ fn contended_message(state_dir: &Path, lock_path: &Path) -> String {
     };
     let how_to_find = match holder_pid(lock_path) {
         Some(pid) => format!("`ps -p {pid} -o pid,lstart,args`"),
+        None if cfg!(windows) => String::from("`tasklist /FI \"IMAGENAME eq muqun-gateway.exe\"`"),
         None => format!("`fuser {}`", lock_path.display()),
     };
     format!(
@@ -321,6 +322,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(unix)]
     /// A refusal that does not say who is holding the directory leaves the
     /// owner with an unstartable gateway and nothing to act on.
     #[test]

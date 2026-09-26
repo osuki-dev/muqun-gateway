@@ -13766,6 +13766,7 @@ const DOCS_HTML: &str = r#"<!doctype html>
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     #[test]
     fn every_pane_in_one_checkout_resolves_to_its_directory() {
         // Two panes in the same directory. The asset roots keep one entry for
@@ -17855,6 +17856,7 @@ mod tests {
         assert!(first[3..].chars().all(|c| c.is_ascii_hexdigit()));
     }
 
+    #[cfg(unix)]
     #[test]
     fn workspace_roots_come_from_pane_cwds_and_never_widen_to_the_whole_machine() {
         let home = dirs::home_dir().unwrap();
@@ -17957,6 +17959,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn worktree_events_name_a_root_to_scan_and_never_a_file() {
         // The payload Herdr actually sends on protocol 17: the worktree's
@@ -18165,6 +18168,7 @@ mod tests {
         assert!(unknown.as_object().unwrap().get("composer").is_none());
     }
 
+    #[cfg(unix)]
     /// The file search can only ever look in a root the asset API would also
     /// serve, because it takes its root from the same place: the pane cwds
     /// Herdr reports, filtered by the same "this is not the whole machine"
@@ -18869,6 +18873,7 @@ mod tests {
         assert_eq!(serde_json::to_value(tmux).unwrap()["backend"], "tmux");
     }
 
+    #[cfg(unix)]
     /// Config position is what breaks a liveness tie in `session_order_key`,
     /// so position 0 is the session the app opens. Adding a backend must
     /// therefore leave the existing order alone: it appends.
@@ -18882,6 +18887,7 @@ mod tests {
         assert_eq!(config.sessions[1].backend, BackendKind::Tmux);
     }
 
+    #[cfg(unix)]
     /// The bug this closes: `backend default` moves an entry to position 0,
     /// and the next `backend add` used to sort tmux back in front of it --
     /// silently changing which backend the reader's phone opens.
@@ -19383,6 +19389,7 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn plugin_import_keeps_the_paired_identity_and_merges_tmux() {
         let root = std::env::temp_dir().join(format!("gateway-import-{}", uuid::Uuid::new_v4()));

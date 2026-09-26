@@ -448,6 +448,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn lookup_honours_a_path_that_was_written_out_in_full() {
         assert_eq!(
