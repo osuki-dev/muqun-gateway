@@ -337,13 +337,20 @@ fn enable(unit: &Path) -> Result<()> {
             String::from_utf8_lossy(&output.stderr).trim(),
             output.status
         );
+        // Only 5 (EIO) is launchd still holding the old job. Anything else --
+        // a unit it will not parse, no GUI session to load into -- will not
+        // change by waiting, so report it now.
+        if output.status.code() != Some(5) {
+            anyhow::bail!("launchctl bootstrap failed: {last_error}");
+        }
         if attempt < BOOTSTRAP_ATTEMPTS {
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
     }
     anyhow::bail!(
         "launchctl bootstrap failed after {BOOTSTRAP_ATTEMPTS} attempts: {last_error}\n\
-         The gateway is not running. Try `muqun-gateway service install` again in a moment."
+         launchd has not released the previous gateway yet, and the gateway is not running. \
+         Try `muqun-gateway service install` again in a moment."
     )
 }
 
