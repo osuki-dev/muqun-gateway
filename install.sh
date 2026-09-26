@@ -148,7 +148,9 @@ if [ "$have_herdr" = 1 ]; then
   # then) may have real paired devices sitting in that Herdr-plugin config.
   # Adopt it into the standalone install below instead of leaving it behind.
   # A no-op, not an error, when there is nothing to adopt -- a fresh machine,
-  # or one already adopted on an earlier run of this script.
+  # or one already adopted on an earlier run of this script -- and a notice,
+  # not an import, when the standalone install already has devices paired to
+  # its own identity: adopting a leftover plugin pairing would re-point them.
   "$binary" import-herdr-plugin --if-present
 fi
 

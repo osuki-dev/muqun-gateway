@@ -154,7 +154,12 @@ records into it, creates backups before replacing standalone files, and writes
 a marker that makes later plugin actions resolve the standalone config. The
 source plugin state is retained for rollback. Import refuses to proceed while
 the source gateway is listening, preventing two identities from racing on one
-address.
+address. The installer's unattended `--if-present` run is narrower: it skips,
+with a notice, a standalone install that already has devices paired under a
+different server id (adopting the plugin identity would re-point every one of
+them), has an unreadable device file, or is in use by a running gateway, so the
+standalone install is never a reason for it to abort the update. Only an
+explicit `import-herdr-plugin` replaces such an identity.
 
 ## Transport security
 
