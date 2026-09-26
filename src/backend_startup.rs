@@ -253,6 +253,7 @@ mod tests {
         result.unwrap();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     #[ignore = "requires Herdr; creates a unique named QA session and stops only that session"]
     async fn real_herdr_startup_reuses_the_server() {

@@ -29,19 +29,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
+#[cfg(unix)]
 use anyhow::Context as _;
 use serde_json::{json, Value};
+#[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+#[cfg(unix)]
+use super::BackendActivity;
 #[cfg(unix)]
 use tokio::net::UnixStream;
 
 use super::{
-    Agent, AgentStatus, BackendActivity, BackendActivityStream, BackendError, BackendFuture,
-    BackendKind, BackendMetadata, CreateTab, CreateWorkspace, OutputFormat, OutputSource, Pane,
-    PaneId, PaneOutput, ReadPane, SendTextMode, SplitDirection, SplitPane, StartAgent,
-    StartedAgent, Tab, TabId, TerminalBackend, Workspace, WorkspaceId, Worktree, WorktreePlacement,
-    WorktreeRequest,
+    Agent, AgentStatus, BackendActivityStream, BackendError, BackendFuture, BackendKind,
+    BackendMetadata, CreateTab, CreateWorkspace, OutputFormat, OutputSource, Pane, PaneId,
+    PaneOutput, ReadPane, SendTextMode, SplitDirection, SplitPane, StartAgent, StartedAgent, Tab,
+    TabId, TerminalBackend, Workspace, WorkspaceId, Worktree, WorktreePlacement, WorktreeRequest,
 };
 
 /// How long one herdr request may take, end to end.
@@ -112,9 +115,12 @@ fn startup_ready(
 }
 
 pub struct HerdrBackend {
+    // Only the Unix socket transport reads these; elsewhere every call is refused.
+    #[cfg_attr(not(unix), allow(dead_code))]
     socket_path: PathBuf,
     /// Overridable so a test can prove the timeout fires without waiting out
     /// the real one.
+    #[cfg_attr(not(unix), allow(dead_code))]
     request_timeout: Duration,
     /// Whether this herdr answers `pane.process_info`. Assumed until the
     /// first refusal, then remembered: a herdr below the method's protocol
@@ -1253,6 +1259,7 @@ fn worktree_error(error: BackendError) -> BackendError {
     }
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 fn activity_subscriptions(panes: &[Pane]) -> Vec<Value> {
     let mut subscriptions = vec![
         json!({ "type": "workspace.created" }),
@@ -1345,7 +1352,9 @@ fn required_string<'a>(
         .ok_or(BackendError::InvalidResponse(context))
 }
 
-#[cfg(test)]
+// Every test here drives the Unix socket transport, directly or through a fake
+// Herdr listening on one.
+#[cfg(all(test, unix))]
 mod tests {
     #[test]
     fn agent_identity_is_conversation_scoped_not_pane_scoped() {
@@ -1443,6 +1452,7 @@ mod tests {
         task: tokio::task::JoinHandle<()>,
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn two_assistants_of_one_kind_receive_distinct_live_names() {
         let fake = FakeHerdr::start();
@@ -2241,6 +2251,7 @@ mod tests {
     /// A herdr that accepts the connection and then never answers used to
     /// hold this task and its file descriptor forever, and every request that
     /// landed on it did the same.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_herdr_that_never_answers_is_given_up_on() {
         let socket_path = crate::short_test_socket("gw-herdr-mute");
@@ -2277,6 +2288,7 @@ mod tests {
     /// supposed to sit idle -- a terminal nobody is typing into produces
     /// nothing for hours -- so a read bound here would tear down a healthy
     /// stream on a quiet session and reconnect it forever.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_quiet_event_stream_is_not_torn_down_for_being_quiet() {
         let socket_path = crate::short_test_socket("gw-herdr-idle");
@@ -2328,6 +2340,7 @@ mod tests {
     /// The setup call inside `activity_stream` is *not* exempt: it goes
     /// through `request_transport`, so a herdr that will not answer cannot
     /// hang the stream constructor either.
+    #[cfg(unix)]
     #[tokio::test]
     async fn opening_a_stream_against_a_mute_herdr_still_gives_up() {
         let socket_path = crate::short_test_socket("gw-herdr-open");

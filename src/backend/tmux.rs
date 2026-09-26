@@ -1840,6 +1840,7 @@ mod tests {
     /// non-zero -- a wrapper, a hardened host, a container that restricts the
     /// process table -- came back `Ok` with empty stdout and was cached as
     /// "no agent" for every pane, re-probed, and cached again.
+    #[cfg(unix)]
     #[test]
     fn a_ps_that_ran_and_failed_is_not_an_empty_process_table() {
         use std::os::unix::process::ExitStatusExt as _;
@@ -2199,6 +2200,7 @@ mod tests {
         assert!(!means_no_tmux_server("can't find pane: %99"));
     }
 
+    #[cfg(unix)]
     /// The exact masking the test above documents, from the other side:
     /// `list_panes` (via `list_output`) reports the same nonexistent socket
     /// as an empty topology, not an error -- correct for every other caller,

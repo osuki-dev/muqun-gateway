@@ -314,13 +314,13 @@ pub async fn file_patch(
     let Some(relative) = validate_relative_path(path) else {
         return Ok(None);
     };
-    let relative_str = relative.to_string_lossy().into_owned();
+    let relative_str = slash_path(&relative);
     // A rename is only a rename when git can see both sides: with the new
     // path alone as the pathspec, the file is a brand-new one. The old path
     // is validated exactly as the new one and rides after the same `--`.
     let old_relative = match old_path {
         Some(old) => match validate_relative_path(old) {
-            Some(old) => Some(old.to_string_lossy().into_owned()),
+            Some(old) => Some(slash_path(&old)),
             None => return Ok(None),
         },
         None => None,
@@ -721,6 +721,15 @@ fn parse_numstat_z(bytes: &[u8]) -> HashMap<String, Counts> {
     counts
 }
 
+/// A relative path as the App and git spell it on every platform: components
+/// joined by `/`, never the host's `\`.
+pub fn slash_path(path: &Path) -> String {
+    path.components()
+        .map(|part| part.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// The one client-supplied value, checked before it goes anywhere near an
 /// argument list. Relative, made only of normal components, not starting
 /// with `-`, no NUL, and not empty.
@@ -729,6 +738,13 @@ pub fn validate_relative_path(path: &str) -> Option<PathBuf> {
         return None;
     }
     if Path::new(path).is_absolute() {
+        return None;
+    }
+    // Windows reads `\` as a separator too, so `..\secret` would be one
+    // "normal" component here and a parent directory there; and `C:x` is
+    // relative to another drive's working directory. Neither is ever a path
+    // the App sends, which always uses `/`.
+    if cfg!(windows) && (path.contains('\\') || path.contains(':')) {
         return None;
     }
     // Component by component on the string, not through `Path::components`,
@@ -826,6 +842,30 @@ fn page_lines(text: &str, from: usize, lines: usize) -> (usize, usize, usize, bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_paths_are_spelled_with_slashes_everywhere() {
+        let path: PathBuf = ["src", "agent", "mod.rs"].iter().collect();
+        assert_eq!(slash_path(&path), "src/agent/mod.rs");
+        assert_eq!(
+            validate_relative_path("src/a.ts").map(|path| slash_path(&path)),
+            Some(String::from("src/a.ts"))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_separators_and_drives_are_refused() {
+        for bad in [
+            r"..\secret.txt",
+            r"src\..\..\x",
+            "C:x",
+            r"C:\Windows\win.ini",
+            "a/b:c",
+        ] {
+            assert!(validate_relative_path(bad).is_none(), "{bad}");
+        }
+    }
 
     #[test]
     fn porcelain_v2_reads_the_branch_and_every_kind_of_entry() {
@@ -1197,6 +1237,7 @@ mod tests {
         std::fs::remove_dir_all(repo.parent().unwrap()).ok();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_patch_refuses_paths_that_are_arguments_escapes_or_symlinks() {
         let repo = temp_repo("fence");
