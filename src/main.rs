@@ -13796,6 +13796,7 @@ mod tests {
 
     use super::*;
     use axum::http::HeaderValue;
+    #[cfg(unix)]
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     #[test]
@@ -20181,6 +20182,7 @@ mod tests {
 
     /// Seq the fake agent sits on until it accepts an Enter. Arbitrary, but not
     /// zero, so "advanced past the baseline" cannot pass by accident.
+    #[cfg(unix)]
     const FAKE_AGENT_SEQ: u64 = 100;
 
     #[cfg(unix)]
@@ -20382,6 +20384,7 @@ mod tests {
 
     /// A pane that repaints a four-row screen, scrolling one row per read: the
     /// shape of the pane in card #646, small enough to assert on exactly.
+    #[cfg(unix)]
     fn repainting_screens() -> Vec<String> {
         (0..4)
             .map(|top| {
@@ -20400,6 +20403,7 @@ mod tests {
         state
     }
 
+    #[cfg(unix)]
     async fn read_output(state: &AppState, lines: u32) -> String {
         let response = pane_output(
             State(state.clone()),
@@ -20441,6 +20445,7 @@ mod tests {
         assert_eq!(served, "row 0\nrow 1\nrow 2\nrow 3\nrow 4\nrow 5\nrow 6");
     }
 
+    #[cfg(unix)]
     async fn read_output_range(state: &AppState, start: u32, end: u32) -> String {
         let response = pane_output(
             State(state.clone()),
