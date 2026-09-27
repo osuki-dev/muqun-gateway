@@ -428,6 +428,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn lookup_finds_a_program_and_reports_a_missing_one() {
         let dir = std::env::temp_dir().join(format!("muqun-lookup-{}", std::process::id()));
@@ -447,6 +448,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn lookup_honours_a_path_that_was_written_out_in_full() {
         assert_eq!(

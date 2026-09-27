@@ -601,6 +601,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_repo_path_has_to_be_one_this_session_already_has() {
         let dir = temp_dir("fence");
@@ -679,6 +680,7 @@ mod tests {
         assert_eq!(kinds, sorted);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_path_probe_only_ever_looks_on_path() {
         // A name with a separator is not a PATH lookup, and must not be

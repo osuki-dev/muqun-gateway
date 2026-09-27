@@ -859,6 +859,7 @@ mod tests {
     /// install directory is guessed at, so this is the whole order.
     /// `opencode.binary` first, then `opencode` as PATH resolves it. No
     /// install directory is guessed at, so this is the whole order.
+    #[cfg(unix)]
     #[test]
     fn the_binary_is_the_configured_one_or_whatever_path_says() {
         let dir =
@@ -917,6 +918,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn installation_status_distinguishes_local_lookup_from_service_readiness() {
         let dir = std::env::temp_dir().join(format!(

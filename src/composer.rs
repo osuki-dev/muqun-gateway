@@ -824,7 +824,7 @@ pub fn search_files(root: &Path, query: &str, limit: usize) -> Vec<FileHit> {
             let Ok(relative) = path.strip_prefix(root) else {
                 continue;
             };
-            let relative = relative.to_string_lossy().to_string();
+            let relative = crate::git::slash_path(relative);
             let Some(score) = score(&relative, &name, &needle) else {
                 continue;
             };
@@ -1216,6 +1216,7 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn discovery_never_leaves_the_workspace_root() {
         let root = workspace("fence");
@@ -1389,6 +1390,7 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn search_never_leaves_the_workspace_root() {
         let root = workspace("search-fence");
