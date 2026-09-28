@@ -245,3 +245,11 @@ To integrate any future agent (e.g. Claude Code, Pi AI, or custom internal engin
 5. Register the new driver into `AgentEnginePort` and `AgentRuntime` supervisor discovery.
 
 **Result**: Zero changes to Axum HTTP route handlers, zero changes to mobile App schemas, and zero breaking changes for existing paired devices.
+
+---
+
+## 8. Configuration Architecture Reference
+
+For complete configuration schemas, cascading resolution rules (CLI > Env > File > Auto-Discovery > Defaults), terminal multiplexer configs, and headless profiles, refer to the dedicated specification:
+- [`docs/configuration.md`](configuration.md)
+
