@@ -1,214 +1,247 @@
-# Gateway architecture
+# Gateway Architecture & Evolution Specification
 
-The gateway follows a pragmatic Clean/Hexagonal boundary around the terminal
-workspace backend. The mobile HTTP contract is the stable outside contract;
-Herdr and tmux are replaceable infrastructure, and a single gateway instance
-may mount several backend sessions concurrently.
+## 1. Architectural Vision & Core Philosophy
 
-## Layers
+The Muqun Gateway serves as a resilient **Anti-Corruption Layer (ACL)** and **Capability-Negotiation Bridge** connecting developer desktop environments to the mobile client (`../app`).
+
+### 1.1 Inverted Stability Principle
+- **Mobile Client (`../app`)**: Deployments are constrained by mobile app store review cycles (Apple App Store / Google Play), enterprise distribution delays, and unpredictable user update cadence. Changing the mobile App contract requires extensive testing across screen form factors and OS releases.
+- **Desktop Gateway (`muqun-gateway`)**: Deployed locally as a self-contained Rust binary on the developer machine. Iteration, bug fixing, and protocol adaptation have near-zero distribution latency.
+- **Core Directive**: *All upstream protocol volatility, breaking schema migrations, and backend-specific idiosyncrasies must be absorbed entirely within the Gateway.* The external mobile API contract remains backward-compatible and frozen. When an upstream engine (such as OpenCode or DeepSeek Harness) alters its RPC signatures or event formats, only the Gateway binary is upgraded; the mobile client remains untouched.
+
+### 1.2 Zero-Assumption Client (Capability-Driven Rendering)
+The mobile App must never assume that a host machine has specific tools installed (e.g. `tmux`, `herdr`, or a particular AI coding agent). Instead, the Gateway exposes a dynamic, deterministic **Capability Matrix**. The mobile UI functions strictly as an adaptive renderer that enables, disables, or hides views based on active capabilities reported by the Gateway during session handshake.
+
+---
+
+## 2. High-Level System Architecture
+
+The Gateway is organized around Hexagonal / Clean Architecture with two primary domain planes:
 
 ```text
-Muqun / HTTP / SSE
-        |
-        v
-application workflows and route orchestration (main.rs)
-        |
-        v
-TerminalBackend port + backend-neutral model (src/backend/model.rs)
-        |
-        +-------------------+
-        v                   v
-Herdr adapter(s)        tmux adapter(s)
-JSON line protocol      argv-only tmux CLI
+               +---------------------------------------------+
+               |         Mobile Client (../app)              |
+               |  (Adaptive UI: Terminal, Agents, Workspaces)|
+               +---------------------------------------------+
+                                      |
+                     REST APIs / SSE / Encrypted Wire
+                                      v
++-------------------------------------------------------------------------+
+|                              MUQUN GATEWAY                              |
+|                                                                         |
+|  +-------------------------------------------------------------------+  |
+|  |                 Inbound HTTP Routes & Security                     |  |
+|  |       (Auth, Pairing, AES-GCM Transport Encryption, SSE Hub)       |  |
+|  +-------------------------------------------------------------------+  |
+|                                     |                                   |
+|       +-----------------------------+-----------------------------+     |
+|       |                                                           |     |
+|       v                                                           v     |
+|  +---------------------------------+  +----------------------------------+
+|  |      Terminal Control Plane     |  |        Agent Engine Plane        |
+|  |  (TerminalBackend Port Seam)    |  |     (AgentEnginePort Seam)       |
+|  +---------------------------------+  +----------------------------------+
+|       |                     |               |                       |   |
+|       v                     v               v                       v   |
+|  +---------+           +---------+     +----------+           +----------+
+|  |  Herdr  |           |  Tmux   |     | OpenCode |           | DeepSeek |
+|  | Adapter |           | Adapter |     | Adapter  |           | Adapter  |
+|  +---------+           +---------+     +----------+           +----------+
+|                                                                         |
+|  +-------------------------------------------------------------------+  |
+|  |               Capability Discovery & Self-Update Engine           |  |
+|  |        (Matrix Computation, Release Checker, Hot-Restart)          |  |
+|  +-------------------------------------------------------------------+  |
++-------------------------------------------------------------------------+
+        |                     |               |                       |
+        v                     v               v                       v
+ [Herdr Unix Socket]      [tmux CLI]     [OpenCode HTTP]    [DeepSeek RPC/WS]
 ```
 
-- `src/backend/model.rs` is the reusable domain boundary. It owns opaque IDs,
-  workspaces, tabs, panes, agents, worktrees, output requests, commands, and the
-  `TerminalBackend` port.
-- `src/backend/herdr.rs` translates Herdr's JSON socket requests and responses
-  (protocol 17 and newer; the README's "Compatibility and API versions" explains
-  why there is no upper bound).
-- `src/backend/tmux.rs` translates tmux format output and commands. It invokes
-  tmux directly, never through a shell.
-- `src/backend/registry.rs` is the static composition registry for the adapters
-  shipped in this binary. It owns construction, availability probes, setup
-  defaults, and endpoint presentation; it is not a dynamic plugin loader.
-- `src/backend/compat.rs` maps backend-neutral values into the existing
-  Herdr-shaped HTTP envelope. This is why existing app builds can use tmux.
-- `src/authority.rs` owns the pure pairing and credential rules. HTTP supplies
-  bearer tokens and maps failures; disk persistence remains outside it.
-- `src/main.rs` is currently both the inbound HTTP adapter and application
-  workflow layer. Synchronous terminal use cases enter through
-  `TerminalBackend`; activity publication consumes the same port while each
-  adapter owns native subscription versus polling.
-- A configured session is the composition root for one backend adapter. Route
-  handlers select it by `sessionId`; pairing, authentication, devices, SSE, and
-  the HTTP listener belong to the gateway process and are shared.
+---
 
-## Use cases
+## 3. The Dual Domain Planes
 
-The use cases are actions meaningful to the app, independent of the terminal
-implementation:
+### 3.1 Terminal Control Plane (`TerminalBackend`)
+The Terminal plane manages interactive PTY workspaces, window multiplexing, scrollback capture, and command injection.
 
-- inspect topology: snapshot and list/get workspace, tab, pane, and agent. The
-  snapshot is the whole session in one answer, and its `agents` array is the
-  agent list itself -- the same `Agent` values `GET .../agents` serializes,
-  `instance_id` and `target` included -- so a client warming a home screen
-  makes one call rather than four. It is announced as the `session_snapshot`
-  capability;
-- inspect terminal state: read visible/recent output, compose structured parts,
-  detect approvals, and find files relative to pane working directories;
-- control topology: create, focus, rename, close, and split;
-- control a terminal: send text, keys, prompts, and interrupts;
-- run agent workflows: start an agent, create a task/worktree, spawn beside or
-  in a new tab, and observe lifecycle state;
-- publish changes: convert backend activity into the existing SSE and push
-  notification vocabulary.
+- **Port (`src/backend/model.rs`)**:
+  Defines `TerminalBackend` with operations for inspecting topology (workspaces, tabs, panes), capturing output buffers, injecting key strokes, and observing activity streams.
+- **Adapters**:
+  - `HerdrAdapter`: Speaks Herdr JSON-line socket protocol (protocol 17+).
+  - `TmuxAdapter`: Executes direct `tmux` argv commands without shell interpolation.
+  - `WindowsConPtyAdapter` *(Roadmap)*: Windows Console Virtual Terminal / Named Pipe driver.
+- **Graceful Terminal Degradation**:
+  When a host machine lacks both `herdr` and `tmux` (e.g. minimal Windows environments or headless containers), the Gateway does not fail. It disables the `terminal` capability flag, and routes for PTY control respond with HTTP 501 / `BackendError::Unsupported`. The mobile App hides the Terminal navigation tab and transitions smoothly into a dedicated Agent workbench.
 
-Herdr subscriptions and tmux polling are adapter strategies behind
-`TerminalBackend::activity_stream`, not separate use cases. tmux polls topology
-because that gives the same observable app contract without depending on a
-long-lived tmux control client. Selected-pane output polling is a shared
-application policy for both adapters.
+### 3.2 Agent Engine Plane (`AgentEnginePort`)
+The Agent Engine plane manages AI pair-programming sessions, conversation history, model routing, reasoning tiers, file diffs, tool execution approvals, and event streaming.
 
-## Reuse and compatibility rules
+- **Port (`src/agent/ports/engine.rs`)**:
+  `AgentEnginePort` unifies all agent behaviors across providers:
+  ```rust
+  pub trait AgentEnginePort: Send + Sync {
+      fn kind(&self) -> &'static str;
+      fn probe(&self) -> EngineFuture<'_, bool>;
+      fn list_projects(&self) -> EngineFuture<'_, Vec<AgentProject>>;
+      fn list_sessions<'a>(&'a self, query: &'a SessionQuery) -> EngineFuture<'a, Vec<AgentSessionInfo>>;
+      fn create_session<'a>(&'a self, directory: Option<&'a str>, model: Option<&'a ModelRef>, agent: Option<&'a str>) -> EngineFuture<'a, AgentSessionInfo>;
+      fn get_session<'a>(&'a self, session_id: &'a str) -> EngineFuture<'a, AgentSessionInfo>;
+      fn send_prompt<'a>(&'a self, session_id: &'a str, text: &'a str, attachments: &'a [String], delivery: Option<&'a str>) -> EngineFuture<'a, ()>;
+      fn interrupt<'a>(&'a self, session_id: &'a str) -> EngineFuture<'a, ()>;
+      fn switch_model<'a>(&'a self, session_id: &'a str, model: &'a ModelRef) -> EngineFuture<'a, ()>;
+      fn get_catalog<'a>(&'a self, directory: Option<&'a str>) -> EngineFuture<'a, AgentCatalog>;
+      fn get_timeline<'a>(&'a self, session_id: &'a str, limit: usize) -> EngineFuture<'a, Vec<TimelineItem>>;
+      fn get_vcs_diff<'a>(&'a self, session_id: &'a str, mode: &'a str) -> EngineFuture<'a, Vec<FileDiffItem>>;
+      fn reply_permission<'a>(&'a self, session_id: &'a str, request_id: &'a str, decision: PermissionDecision, message: Option<&'a str>) -> EngineFuture<'a, ()>;
+      // ... optional capability extensions with default unsupported fallbacks
+  }
+  ```
+- **Adapters**:
+  - `src/agent/adapters/opencode/`: Drives local OpenCode server instances via REST SSE.
+  - `src/agent/adapters/deepseek/`: Drives DeepSeek Harness (`@deepseek-ai/dsh`) instances via Typert JSON-RPC and WebSocket multiplexer (`/api/remote.mux`) with authority-bound HMAC-SHA256 signed session cookies.
+  - *Future Adapters (Claude Code, Pi, Custom Agents)*: Follow the exact same port pattern without touching routes or domain entities.
 
-Reusable across backends:
+---
 
-- authentication, pairing, device revocation, HTTP routing, OpenAPI, and SSE;
-- approval detection, agent catalog/state inference, composer, structured
-  parts, scrollback cache, shortcuts, tasks, uploads, and asset discovery;
-- all mobile request and response shapes.
+## 4. Dynamic Capability Discovery & Negotiation
 
-Terminal reads have one application policy in `scrollback.rs`. Direct reads,
-structured-parts reads, and sampled event frames identify the same
-session/pane/source/format stream; the store owns observation, deduplication,
-row-bounded serving, and memory limits. Route handlers never inspect its keys
-or decide history depth from UTF-8 byte length.
+To eliminate the need for mobile App store updates when capabilities shift, the Gateway exposes a unified Capability Declaration on `GET /api/health` and `GET /api/meta`.
 
-Backend-specific:
+### 4.1 Capability Schema
+```json
+{
+  "gateway_version": "0.13.0",
+  "api_version": "1.4.0",
+  "platform": "linux",
+  "capabilities": {
+    "terminal": {
+      "supported": true,
+      "backend": "tmux",
+      "features": {
+        "multi_window": true,
+        "split_pane": true,
+        "raw_pty": true
+      }
+    },
+    "agent": {
+      "supported": true,
+      "provider": "deepseek",
+      "version": "1.0.0",
+      "features": {
+        "streaming": true,
+        "reasoning_effort": true,
+        "model_selection": true,
+        "worktree": false,
+        "file_browser": true,
+        "tool_approvals": true
+      }
+    },
+    "workspace_fs": {
+      "supported": true,
+      "diff_preview": true,
+      "file_upload": true
+    },
+    "self_update": {
+      "supported": true,
+      "channel": "stable",
+      "update_available": false,
+      "latest_version": "0.13.0"
+    }
+  }
+}
+```
 
-- transport and availability checks;
-- native ID validation and parsing;
-- topology mutation commands;
-- pane capture and input injection;
-- event acquisition (Herdr subscription versus tmux polling).
+### 4.2 Mobile Client Adaptive Rules
+The mobile client parses the `capabilities` node upon initial pairing and reconnect:
+1. **Terminal Tab Guard**:
+   If `capabilities.terminal.supported == false`, the App removes the Terminal tab from the bottom navigation bar or displays an informational card explaining that the host runs in headless agent-only mode.
+2. **Reasoning Effort Control**:
+   If `capabilities.agent.features.reasoning_effort == true` (e.g. DeepSeek Harness with Flash/Pro models), the input composer dynamically reveals the thinking-depth picker (`Off`, `Low`, `High`, `Max`). If false (e.g. OpenCode standard presets), the UI hides this selector.
+3. **Workspace Isolation & Worktrees**:
+   If `capabilities.agent.features.worktree == false`, the App avoids rendering branch-isolation modals and operates directly within the primary workspace directory.
+4. **Tool Call Visualization**:
+   The Gateway projects engine-specific tool events into normalized metadata cards (e.g. `files` with diff additions/deletions, `exitCode` for shell executions). Even if a brand-new tool type is introduced upstream, the App falls back to generic readable text representation without crashing.
 
-`TerminalBackend` is a real seam: both Herdr and tmux satisfy the same isolated
-read/write contract. A capability one adapter lacks, such as native worktree
-orchestration in tmux, reports `Unsupported`; the use case may then apply a
-backend-neutral fallback without branching on adapter kind.
+---
 
-An old config with no `backend` field must deserialize as Herdr and serialize
-without gaining that field. The API keeps the legacy `herdr` metadata object
-and response envelope for the first configured session; the additive `backend`
-and `backends` metadata plus the `multiple_terminal_backends` capability expose
-the new abstraction to newer clients. Backend order is therefore compatibility
-state, not presentation-only state.
+## 5. Self-Update Architecture & Zero-Friction Upgrades
 
-## Capabilities
+Because updating the mobile client is expensive while updating the Gateway is trivial, the Gateway is designed with built-in **Self-Update** capabilities.
 
-`/health` answers two capability lists, and they are different claims.
+### 5.1 Cross-Platform In-Place Binary Replacement
+Rust binaries can replace themselves on disk during runtime:
 
-`capabilities` at the top level describes this *build*: the endpoint exists and
-its code is compiled in. Every entry is unconditional and stays true for as long
-as the process runs, so a client may read it once. Adding a conditional entry
-here would make the whole list something a client has to re-check.
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as Developer / App User
+    participant App as Mobile App
+    participant GW as muqun-gateway (Running)
+    participant GH as GitHub Releases / Mirror
 
-`backends[].capabilities` describes one *session*, and carries what the build
-can do only where the terminal on the other side can do it too. It is always
-present, empty included: a client that finds the key knows this gateway answers
-per session; a client that does not is talking to a gateway that predates the
-field.
+    App->>GW: GET /api/gateway/update/check
+    GW->>GH: Query latest tag & checksum
+    GH-->>GW: v0.13.1 available (assets + sha256)
+    GW-->>App: { update_available: true, version: "0.13.1", notes: "..." }
+    
+    User->>App: Tap "One-Click Update Gateway"
+    App->>GW: POST /api/gateway/update/apply
+    
+    rect rgb(240, 248, 255)
+        Note over GW: 1. Download release binary to temp file<br/>2. Verify SHA256 integrity<br/>3. Set executable permissions (chmod +x)
+        alt Unix (Linux / macOS)
+            Note over GW: Atomic overwrite via fs::rename(temp, current_exe)
+        else Windows
+            Note over GW: fs::rename(current_exe, current_exe + ".old")<br/>fs::rename(temp, current_exe)
+        end
+        Note over GW: 4. Spawn child restart / execv into new binary
+    end
+    
+    GW-->>App: { status: "restarting", wait_ms: 1500 }
+    
+    loop Poll /api/health
+        App->>GW: GET /api/health (reconnecting)
+    end
+    
+    GW-->>App: 200 OK (v0.13.1, capabilities refreshed)
+    App->>User: Toast: "Gateway upgraded successfully!"
+```
 
-One capability is currently session-scoped. `agent_collaboration` requires the
-session's backend to be a connected Herdr 0.9.0 or newer, because an assignment
-binds to an opaque agent instance id and only Herdr, from that release, has one.
-`TmuxBackend::start_agent` returns no instance id, and a pane id is not a
-substitute -- panes are reused, so a task bound to one can reach whoever took the
-pane over. tmux sessions keep every other capability, including `agent_spawn`,
-which runs on both backends.
+#### Unix (Linux / macOS) Mechanics
+Unix file systems decouple a file's inode from its directory entry (`dentry`). An open and executing binary can be unlinked or overwritten via `fs::rename()`. Once replaced, the Gateway either calls `nix::unistd::execv()` to replace the process image in-place, or gracefully exits so the service supervisor (`systemd`, `launchd`, or container runtime) restarts it within milliseconds.
 
-The top-level list carries `agent_collaboration` when *any* configured session
-qualifies. That is the weaker claim on purpose -- "somewhere on this machine",
-not "on the session you are looking at" -- and it exists for apps too old to read
-the per-session list. A newer app should read `backends[].capabilities` for the
-session it has chosen, and distinguish "this Gateway cannot" from "this Herdr
-cannot" so the upgrade it names is the one that would help.
+#### Windows Mechanics
+Windows prevents overwriting an executing binary (`ERROR_SHARING_VIOLATION`), **but explicitly allows renaming an executing binary**.
+The Gateway renames `muqun-gateway.exe` to `muqun-gateway.exe.old`, writes the new binary into `muqun-gateway.exe`, and schedules the removal of `.old` upon next launch.
 
-The Manager is a gateway UI. It edits the shared backend registry and lifecycle
-configuration; it does not belong to Herdr or tmux and never owns or terminates
-their terminal sessions. Configuration changes require an explicit gateway
-restart.
+---
 
-Observation is side-effect free. In particular, the legacy `pane/zoom` request
-that released app builds send when mounting their viewport is acknowledged at
-the HTTP compatibility edge and is not part of `TerminalBackend`; neither
-adapter may change the user's native layout merely because Muqun connected.
+## 6. Mobile App Upgrade & UX Flow
 
-## Identity migration
+### 6.1 Non-Intrusive Banner (Standard Update)
+When `update_available == true` and current API version is compatible:
+- The App displays a subtle status pill or settings badge:
+  `"Gateway v0.13.1 is available. Tap to upgrade."`
+- The user's active workflow is never interrupted.
 
-An already paired Herdr plugin identity is authoritative during
-`import-herdr-plugin`. Import merges standalone backend sessions and device
-records into it, creates backups before replacing standalone files, and writes
-a marker that makes later plugin actions resolve the standalone config. The
-source plugin state is retained for rollback. Import refuses to proceed while
-the source gateway is listening, preventing two identities from racing on one
-address. The installer's unattended `--if-present` run is narrower: it skips,
-with a notice, a standalone install that already has devices paired under a
-different server id (adopting the plugin identity would re-point every one of
-them), has an unreadable device file, or is in use by a running gateway, so the
-standalone install is never a reason for it to abort the update. Only an
-explicit `import-herdr-plugin` replaces such an identity.
+### 6.2 Capability-Gated Prompt (Feature Requires New Gateway)
+When the user triggers a feature that requires a newer Gateway capability:
+- The App intercepts the action before making an invalid call:
+  - *Title*: "Gateway Update Required"
+  - *Description*: "DeepSeek reasoning configuration requires Gateway v0.13.0 or newer. Your current version is v0.12.2."
+  - *Action*: `[ Update Gateway Now ]` (Triggers `POST /api/gateway/update/apply` with seamless automatic reconnection).
 
-## Transport security
+---
 
-`transport_encryption` is a gateway-level policy for newly paired devices. Its
-default, `required`, protects pairing and API bodies with AES-256-GCM. A QR
-bootstrap secret protects the confirmation-code exchange; only after the code
-is consumed does the gateway mint a distinct transport key for that device.
-HKDF derives direction-separated keys, request method/path are authenticated as
-AAD, timestamps bound acceptance, and successful request nonces enter a replay
-cache. A bearer token alone therefore cannot use an encrypted device record.
+## 7. Extension Protocol: Adding a New Engine
 
-`disabled` is an explicit compatibility mode. Its QR carries no bootstrap key,
-new devices receive no transport key, and their bearer token is sufficient for
-API access. Existing device records retain the mode in which they paired. A
-device that paired while encryption was on keeps its transport key and will
-never present a proof over cleartext, so `disabled` skips the proof check — and
-only the proof check. A valid device token, or the admin token, is still
-required on every device route: the mode is about the envelope around a
-request, never about whether the request is authenticated.
+To integrate any future agent (e.g. Claude Code, Pi AI, or custom internal engines), implement four isolated files under `src/agent/adapters/<engine_name>/`:
 
-`dev_unauthenticated: true` is the one way to turn that off, for a local mock
-or harness that has no pairing to offer. It is a separate, explicitly written
-config key rather than anything `transport_encryption` implies, it defaults to
-false, it is omitted from a written config when false, and a gateway started
-with it on says so on stderr every time.
+1. `endpoint.rs`: Connection metadata, health discovery, and credential loading.
+2. `client.rs`: Transport communication (REST, JSON-RPC, or gRPC).
+3. `stream.rs`: Server-Sent Events or WebSocket stream consumer.
+4. `mapper.rs`: Pure bidirectional mapping between engine payloads and domain entities (`AgentSessionInfo`, `AgentCatalog`, `TimelineItem`, `ToolCall`).
+5. Register the new driver into `AgentEnginePort` and `AgentRuntime` supervisor discovery.
 
-Application encryption hides credentials and payloads, but route names, query
-strings, sizes, timing, device id, and availability remain visible. It has no
-forward secrecy and cannot protect a compromised endpoint. HTTPS remains
-preferred; Tailscale WireGuard and ACLs remain valuable network boundaries.
-
-## Adding another backend
-
-Implement `TerminalBackend`, validate native identifiers before invoking the
-transport, translate failures into `BackendError`, and add contract tests for
-topology, capture, input, and lifecycle commands. Do not add native response
-fields to HTTP handlers; extend the backend-neutral model and compatibility
-mapper only when the app contract genuinely needs new information.
-
-### Explicit file previews
-
-Authenticated paired devices may resolve an exact file path anywhere under the
-Gateway account's canonical home directory, including sibling projects and
-hidden configuration directories. This is a deliberate device trust boundary:
-it includes private files readable by that account. The existing upload,
-workspace, cache and temporary roots remain supported. This does not enable
-recursive scanning of the home directory; ordinary artifact lists keep their
-workspace/tab scope. Canonical path containment rejects symlink escapes to paths
-outside all permitted roots, and directories are not returned as file assets.
-The home is obtained from the Gateway process environment, never from a client
-request. Successful lookups are indexed for the existing authenticated content
-endpoint; no App API change is required.
+**Result**: Zero changes to Axum HTTP route handlers, zero changes to mobile App schemas, and zero breaking changes for existing paired devices.
