@@ -33,8 +33,10 @@ pub struct AgentManager {
     prompt_service: Arc<PromptService>,
     interaction_service: Arc<InteractionService>,
     events_tx: broadcast::Sender<AgentDomainEvent>,
-    driver: Arc<OpencodeDriver>,
-    listener: Arc<OpencodeSseListener>,
+    endpoint_url: String,
+    endpoint_version: Option<String>,
+    stream_connected: Arc<dyn Fn() -> bool + Send + Sync>,
+    shutdown_handle: Arc<dyn Fn() + Send + Sync>,
 }
 
 /// What a `shell.created` told us, kept until the matching `shell.exited`.
@@ -288,15 +290,65 @@ impl AgentManager {
             version = endpoint_version.as_deref().unwrap_or("unknown"),
             "agent manager initialized with OpenCode engine"
         );
+        let stream_listener = listener.clone();
+        let shutdown_listener = listener.clone();
         Self {
-            engine: driver.clone(),
+            engine: driver,
             mirror,
             session_service,
             prompt_service,
             interaction_service,
             events_tx,
-            driver,
-            listener,
+            endpoint_url,
+            endpoint_version,
+            stream_connected: Arc::new(move || stream_listener.is_connected()),
+            shutdown_handle: Arc::new(move || shutdown_listener.stop()),
+        }
+    }
+
+    /// Build a manager for a DeepSeek Harness endpoint.
+    pub fn connect_deepseek(
+        endpoint: crate::agent::adapters::deepseek::DeepseekEndpoint,
+        events_tx: broadcast::Sender<AgentDomainEvent>,
+    ) -> Self {
+        let endpoint_url = endpoint.url.clone();
+        let endpoint_version = endpoint.version.clone();
+        let driver = Arc::new(crate::agent::adapters::deepseek::DeepseekDriver::new(
+            endpoint.clone(),
+        ));
+        let mirror = Arc::new(MemoryMirror::new());
+
+        let session_service = Arc::new(SessionService::with_memory_mirror(
+            driver.clone(),
+            mirror.clone(),
+        ));
+        let prompt_service = Arc::new(PromptService::new(driver.clone(), mirror.clone()));
+        let interaction_service = Arc::new(InteractionService::new(driver.clone(), mirror.clone()));
+
+        let listener =
+            Arc::new(crate::agent::adapters::deepseek::DeepseekStreamListener::new(endpoint));
+        listener.start(events_tx.clone(), None);
+
+        let stream_listener = listener.clone();
+        let shutdown_listener = listener.clone();
+
+        tracing::info!(
+            url = %endpoint_url,
+            version = endpoint_version.as_deref().unwrap_or("unknown"),
+            "agent manager initialized with DeepSeek Harness engine"
+        );
+
+        Self {
+            engine: driver,
+            mirror,
+            session_service,
+            prompt_service,
+            interaction_service,
+            events_tx,
+            endpoint_url,
+            endpoint_version,
+            stream_connected: Arc::new(move || stream_listener.is_running()),
+            shutdown_handle: Arc::new(move || shutdown_listener.stop()),
         }
     }
 
@@ -324,25 +376,25 @@ impl AgentManager {
         &self.engine
     }
 
-    pub fn driver(&self) -> &Arc<OpencodeDriver> {
-        &self.driver
-    }
-
     pub fn mirror(&self) -> &Arc<MemoryMirror> {
         &self.mirror
     }
 
     pub fn endpoint_url(&self) -> &str {
-        &self.driver.client().endpoint.url
+        &self.endpoint_url
     }
 
-    /// True while the SSE reader has an open stream to OpenCode.
+    pub fn version(&self) -> Option<String> {
+        self.endpoint_version.clone()
+    }
+
+    /// True while the event reader has an open stream to the engine.
     pub fn stream_connected(&self) -> bool {
-        self.listener.is_connected()
+        (self.stream_connected)()
     }
 
     pub fn shutdown(&self) {
-        self.listener.stop();
+        (self.shutdown_handle)();
     }
 
     pub(crate) async fn handle_raw_event(raw: OpencodeRawEvent, ctx: &EventContext) {

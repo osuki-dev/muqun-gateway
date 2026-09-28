@@ -75,6 +75,23 @@ impl Default for OpencodeConfig {
     }
 }
 
+/// `deepseek` in `config.json`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeepseekConfig {
+    /// Explicitly enable DeepSeek Harness engine support
+    #[serde(default)]
+    pub enabled: bool,
+    /// Explicit service endpoint URL (default is http://127.0.0.1:19387)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// Optional bearer auth token
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// Optional signing secret for browser-session cookie
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
+}
+
 /// How the engine currently attached was obtained, for the status route and
 /// the log line an operator reads after a restart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +137,7 @@ pub struct AgentRuntime {
     /// subscriber keeps its stream across a reconnect.
     events_tx: broadcast::Sender<AgentDomainEvent>,
     config: OpencodeConfig,
+    deepseek_config: DeepseekConfig,
     origin: RwLock<EngineOrigin>,
     /// Serialize startup commands; OpenCode owns the background service.
     start_lock: Mutex<()>,
@@ -128,11 +146,16 @@ pub struct AgentRuntime {
 
 impl AgentRuntime {
     pub fn new(config: OpencodeConfig) -> Arc<Self> {
+        Self::with_configs(config, DeepseekConfig::default())
+    }
+
+    pub fn with_configs(config: OpencodeConfig, deepseek_config: DeepseekConfig) -> Arc<Self> {
         let (events_tx, _) = broadcast::channel(1024);
         Arc::new(Self {
             manager: RwLock::new(None),
             events_tx,
             config,
+            deepseek_config,
             origin: RwLock::new(EngineOrigin::None),
             start_lock: Mutex::new(()),
             supervising: AtomicBool::new(false),
@@ -142,10 +165,13 @@ impl AgentRuntime {
     /// A runtime that will never attach an engine, for tests and for a build
     /// of `AppState` that has no business starting anything.
     pub fn disabled() -> Arc<Self> {
-        Self::new(OpencodeConfig {
-            autostart: false,
-            binary: None,
-        })
+        Self::with_configs(
+            OpencodeConfig {
+                autostart: false,
+                binary: None,
+            },
+            DeepseekConfig::default(),
+        )
     }
 
     /// The engine as it stands, or `None` while nothing is attached. Every
@@ -169,9 +195,7 @@ impl AgentRuntime {
             },
             origin: *self.origin.read().await,
             url: manager.as_ref().map(|m| m.endpoint_url().to_string()),
-            version: manager
-                .as_ref()
-                .and_then(|m| m.driver().client().endpoint.version.clone()),
+            version: manager.as_ref().and_then(|m| m.version()),
             stream_connected: manager
                 .as_ref()
                 .map(|m| m.stream_connected())
@@ -255,16 +279,43 @@ impl AgentRuntime {
                 .as_ref()
                 .map(|e| e.url == manager.endpoint_url())
                 .unwrap_or(false);
-            if same_endpoint && self.probe(manager.endpoint_url()).await {
+            if (same_endpoint || manager.engine().kind() == "deepseek")
+                && self.probe(manager.endpoint_url()).await
+            {
                 return true;
             }
             tracing::warn!(
                 url = manager.endpoint_url(),
-                "opencode engine unhealthy or moved, re-discovering"
+                kind = manager.engine().kind(),
+                "agent engine unhealthy or moved, re-discovering"
             );
             manager.shutdown();
             *self.manager.write().await = None;
             *self.origin.write().await = EngineOrigin::None;
+        }
+
+        // If DeepSeek Harness is explicitly enabled or configured, try it first
+        if self.deepseek_config.enabled || self.deepseek_config.endpoint.is_some() {
+            let ep = if let Some(ref url) = self.deepseek_config.endpoint {
+                Some(crate::agent::adapters::deepseek::DeepseekEndpoint::new(
+                    url.clone(),
+                    self.deepseek_config.token.clone(),
+                    self.deepseek_config
+                        .secret
+                        .clone()
+                        .or_else(crate::agent::adapters::deepseek::auth::load_local_secret),
+                ))
+            } else {
+                crate::agent::adapters::deepseek::DeepseekEndpoint::discover().await
+            };
+            if let Some(endpoint) = ep {
+                let client = probe_client();
+                if endpoint.probe_healthy(&client).await {
+                    self.attach_deepseek(endpoint, EngineOrigin::Adopted).await;
+                    *start_backoff = Duration::from_secs(2);
+                    return true;
+                }
+            }
         }
 
         // Adopt anything already healthy before starting anything -- but not
@@ -280,6 +331,17 @@ impl AgentRuntime {
                     return false;
                 }
                 self.attach(endpoint, EngineOrigin::Adopted).await;
+                *start_backoff = Duration::from_secs(2);
+                return true;
+            }
+        }
+
+        // If no OpenCode running, check if DeepSeek Harness is discovered on local default port
+        if let Some(endpoint) = crate::agent::adapters::deepseek::DeepseekEndpoint::discover().await
+        {
+            let client = probe_client();
+            if endpoint.probe_healthy(&client).await {
+                self.attach_deepseek(endpoint, EngineOrigin::Adopted).await;
                 *start_backoff = Duration::from_secs(2);
                 return true;
             }
@@ -338,15 +400,34 @@ impl AgentRuntime {
         }
     }
 
+    async fn attach_deepseek(
+        &self,
+        endpoint: crate::agent::adapters::deepseek::DeepseekEndpoint,
+        origin: EngineOrigin,
+    ) {
+        let url = endpoint.url.clone();
+        let version = endpoint.version.clone();
+        let manager = Arc::new(AgentManager::connect_deepseek(
+            endpoint,
+            self.events_tx.clone(),
+        ));
+        *self.manager.write().await = Some(manager);
+        *self.origin.write().await = origin;
+        tracing::info!(
+            url = %url,
+            version = version.as_deref().unwrap_or("unknown"),
+            "adopted the running DeepSeek Harness service"
+        );
+    }
+
     async fn probe(&self, url: &str) -> bool {
         let Some(manager) = self.manager.read().await.clone() else {
             return false;
         };
-        let endpoint = manager.driver().client().endpoint.clone();
-        if endpoint.url != url {
+        if manager.endpoint_url() != url {
             return false;
         }
-        endpoint.probe_healthy(&probe_client()).await
+        manager.engine().probe().await.unwrap_or(false)
     }
 
     /// Let OpenCode load its saved service configuration and start or reuse

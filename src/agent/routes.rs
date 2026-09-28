@@ -1017,12 +1017,10 @@ async fn do_get_agent_vcs_diff(
     // folder has been deleted answered a blank 502, and the useful thing to
     // say is which folder went.
     let directory = manager
-        .driver()
-        .client()
+        .engine()
         .get_session(asid)
         .await
         .ok()
-        .and_then(|raw| super::adapters::opencode::mapper::map_session(&raw))
         .and_then(|info| info.directory);
     require_directory(directory.as_deref())?;
 
@@ -1754,14 +1752,21 @@ fn engine_error(err: super::ports::engine::AgentEngineError) -> (StatusCode, Jso
     // been deleted. It is a 404 that names the folder, and it carries the path
     // as its own field so the app can offer to forget the session rather than
     // parse a sentence.
-    if let super::ports::engine::AgentEngineError::WorkspaceMissing(ref directory) = err {
-        return workspace_missing(directory);
+    match &err {
+        super::ports::engine::AgentEngineError::WorkspaceMissing(directory) => {
+            workspace_missing(directory)
+        }
+        super::ports::engine::AgentEngineError::Unsupported(feature) => api_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "feature_unsupported",
+            &format!("This agent engine does not support: {feature}"),
+        ),
+        _ => api_error(
+            StatusCode::BAD_GATEWAY,
+            "agent_engine_error",
+            &err.to_string(),
+        ),
     }
-    api_error(
-        StatusCode::BAD_GATEWAY,
-        "agent_engine_error",
-        &err.to_string(),
-    )
 }
 
 /// The diff, and whether there was anywhere for one to come from.
@@ -1816,8 +1821,7 @@ async fn delete_agent_session_global(
 ) -> ApiResult<Json<Value>> {
     let manager = manager_or_unavailable!(&state, &headers);
     manager
-        .driver()
-        .client()
+        .engine()
         .delete_session(&asid)
         .await
         .map_err(engine_error)?;
@@ -1839,8 +1843,7 @@ async fn rename_agent_session(
     let manager = manager_or_unavailable!(&state, &headers);
     validate_text(&body.title)?;
     manager
-        .driver()
-        .client()
+        .engine()
         .rename_session(&asid, &body.title)
         .await
         .map_err(engine_error)?;
@@ -1856,8 +1859,7 @@ async fn clear_agent_session_revert(
 ) -> ApiResult<Json<Value>> {
     let manager = manager_or_unavailable!(&state, &headers);
     manager
-        .driver()
-        .client()
+        .engine()
         .clear_revert(&asid)
         .await
         .map_err(engine_error)?;
@@ -1872,22 +1874,17 @@ async fn clear_agent_session_revert(
 /// act on the user's own configuration, and a stale project id would aim it at
 /// the wrong list.
 async fn session_project_id(
-    client: &super::adapters::opencode::OpencodeClient,
+    engine: &dyn super::ports::engine::AgentEnginePort,
     asid: &str,
 ) -> ApiResult<String> {
-    let info = client.get_session(asid).await.map_err(engine_error)?;
-    let item = info.get("data").unwrap_or(&info);
-    item.get("projectID")
-        .and_then(Value::as_str)
-        .filter(|p| !p.is_empty())
-        .map(str::to_string)
-        .ok_or_else(|| {
-            api_error(
-                StatusCode::BAD_GATEWAY,
-                "agent_engine_error",
-                "the session reported no project",
-            )
-        })
+    let session = engine.get_session(asid).await.map_err(engine_error)?;
+    session.project_id.filter(|p| !p.is_empty()).ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_GATEWAY,
+            "agent_engine_error",
+            "the session reported no project",
+        )
+    })
 }
 
 /// The decisions the user has answered "always allow" to, for this session's
@@ -1898,9 +1895,9 @@ async fn list_saved_agent_permissions(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     let manager = manager_or_unavailable!(&state, &headers);
-    let client = manager.driver().client();
-    let project_id = session_project_id(client, &asid).await?;
-    let items = client
+    let engine = manager.engine();
+    let project_id = session_project_id(engine.as_ref(), &asid).await?;
+    let items = engine
         .list_saved_permissions(Some(&project_id))
         .await
         .map_err(engine_error)?;
@@ -1924,9 +1921,9 @@ async fn forget_saved_agent_permission(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     let manager = manager_or_unavailable!(&state, &headers);
-    let client = manager.driver().client();
-    let project_id = session_project_id(client, &asid).await?;
-    let known = client
+    let engine = manager.engine();
+    let project_id = session_project_id(engine.as_ref(), &asid).await?;
+    let known = engine
         .list_saved_permissions(Some(&project_id))
         .await
         .map_err(engine_error)?
@@ -1939,7 +1936,7 @@ async fn forget_saved_agent_permission(
             "no such saved permission in this session's project",
         ));
     }
-    client
+    engine
         .delete_saved_permission(&saved_id)
         .await
         .map_err(engine_error)?;
@@ -1960,8 +1957,7 @@ async fn list_agent_worktrees(
     let manager = manager_or_unavailable!(&state, &headers);
     require_directory(query.directory.as_deref())?;
     let items = manager
-        .driver()
-        .client()
+        .engine()
         .list_worktrees(query.directory.as_deref())
         .await
         .map_err(engine_error)?;
@@ -1989,8 +1985,7 @@ async fn create_agent_worktree(
         }
     }
     let created = manager
-        .driver()
-        .client()
+        .engine()
         .create_worktree(body.directory.as_deref(), &input)
         .await
         .map_err(engine_error)?;
@@ -2013,9 +2008,8 @@ async fn remove_agent_worktree(
         ));
     }
     manager
-        .driver()
-        .client()
-        .remove_worktree(body.directory.as_deref(), worktree, body.force)
+        .engine()
+        .remove_worktree(body.directory.as_deref(), worktree, Some(body.force))
         .await
         .map_err(engine_error)?;
     Ok(Json(content_envelope(json!({ "deleted": true }))))
@@ -2030,8 +2024,7 @@ async fn refresh_agent_worktrees(
     let directory = body.and_then(|Json(b)| b.directory);
     require_directory(directory.as_deref())?;
     manager
-        .driver()
-        .client()
+        .engine()
         .refresh_worktrees(directory.as_deref())
         .await
         .map_err(engine_error)?;
@@ -2067,13 +2060,12 @@ async fn move_agent_session(
     }
     require_directory(Some(directory))?;
     manager
-        .driver()
-        .client()
+        .engine()
         .move_session(&asid, directory)
         .await
         .map_err(engine_error)?;
     let info = manager
-        .driver()
+        .engine()
         .get_session(&asid)
         .await
         .map_err(engine_error)?;
@@ -2103,8 +2095,7 @@ async fn stage_agent_session_revert(
         ));
     }
     let res = manager
-        .driver()
-        .client()
+        .engine()
         .stage_revert(&asid, message_id, body.files)
         .await
         .map_err(engine_error)?;
@@ -2113,7 +2104,8 @@ async fn stage_agent_session_revert(
     // on `info.revert`.
     let revert = res
         .get("data")
-        .and_then(super::adapters::opencode::mapper::map_revert);
+        .and_then(super::adapters::opencode::mapper::map_revert)
+        .or_else(|| super::adapters::opencode::mapper::map_revert(&res));
     Ok(Json(content_envelope(json!({ "revert": revert }))))
 }
 
@@ -2127,8 +2119,7 @@ async fn commit_agent_session_revert(
 ) -> ApiResult<Json<Value>> {
     let manager = manager_or_unavailable!(&state, &headers);
     manager
-        .driver()
-        .client()
+        .engine()
         .commit_revert(&asid)
         .await
         .map_err(engine_error)?;
@@ -2155,8 +2146,7 @@ async fn activate_agent_skill(
     }
     validate_text(skill)?;
     manager
-        .driver()
-        .client()
+        .engine()
         .activate_skill(&asid, skill, body.resume)
         .await
         .map_err(engine_error)?;
@@ -2172,15 +2162,14 @@ async fn compact_agent_session(
     let manager = manager_or_unavailable!(&state, &headers);
     let delivery = body.and_then(|Json(b)| b.delivery);
     let res = manager
-        .driver()
-        .client()
+        .engine()
         .compact_session(&asid, delivery.as_deref())
         .await
         .map_err(engine_error)?;
     // The reply is the inbox item the request was admitted as.
     Ok(Json(content_envelope(json!({
         "requested": true,
-        "item": res.get("data").cloned().unwrap_or(Value::Null),
+        "item": res.get("data").cloned().unwrap_or(res),
     }))))
 }
 
@@ -2191,8 +2180,7 @@ async fn get_agent_session_context(
 ) -> ApiResult<Json<Value>> {
     let manager = manager_or_unavailable!(&state, &headers);
     let messages = manager
-        .driver()
-        .client()
+        .engine()
         .get_context(&asid)
         .await
         .map_err(engine_error)?;
@@ -2218,8 +2206,7 @@ async fn background_agent_session(
 ) -> ApiResult<Json<Value>> {
     let manager = manager_or_unavailable!(&state, &headers);
     manager
-        .driver()
-        .client()
+        .engine()
         .background_session(&asid)
         .await
         .map_err(engine_error)?;
@@ -2238,8 +2225,7 @@ async fn wait_agent_session(
 ) -> ApiResult<Json<Value>> {
     let manager = manager_or_unavailable!(&state, &headers);
     manager
-        .driver()
-        .client()
+        .engine()
         .wait_session(&asid)
         .await
         .map_err(engine_error)?;
@@ -2260,8 +2246,7 @@ async fn view_agent_session(
             .unwrap_or(0)
     });
     manager
-        .driver()
-        .client()
+        .engine()
         .view_session(&asid, idle)
         .await
         .map_err(engine_error)?;
@@ -2278,9 +2263,8 @@ async fn export_agent_session(
     // Sanitized by default: an export leaves the device.
     let sanitize = query.sanitize.unwrap_or(true);
     let res = manager
-        .driver()
-        .client()
-        .export_session(&asid, sanitize)
+        .engine()
+        .export_session(&asid, Some(sanitize))
         .await
         .map_err(engine_error)?;
     Ok(Json(content_envelope(
@@ -2308,8 +2292,7 @@ async fn run_agent_session_command(
         validate_text(&arguments)?;
     }
     manager
-        .driver()
-        .client()
+        .engine()
         .run_command(&asid, name, &arguments, body.delivery.as_deref())
         .await
         .map_err(engine_error)?;
@@ -2323,8 +2306,7 @@ async fn get_agent_inbox(
 ) -> ApiResult<Json<Value>> {
     let manager = manager_or_unavailable!(&state, &headers);
     let items = manager
-        .driver()
-        .client()
+        .engine()
         .get_inbox(&asid)
         .await
         .map_err(engine_error)?;
@@ -2343,8 +2325,7 @@ async fn cancel_agent_inbox_item(
 ) -> ApiResult<Json<Value>> {
     let manager = manager_or_unavailable!(&state, &headers);
     manager
-        .driver()
-        .client()
+        .engine()
         .cancel_inbox_item(&asid, &inbox_id)
         .await
         .map_err(engine_error)?;
@@ -2380,8 +2361,7 @@ async fn set_inbox_delivery(
 ) -> ApiResult<Json<Value>> {
     let manager = manager_or_unavailable!(&state, &headers);
     manager
-        .driver()
-        .client()
+        .engine()
         .set_inbox_delivery(&asid, &inbox_id, delivery)
         .await
         .map_err(engine_error)?;
@@ -2409,8 +2389,7 @@ async fn list_agent_shells(
 ) -> ApiResult<Json<Value>> {
     let manager = manager_or_unavailable!(&state, &headers);
     let shells = manager
-        .driver()
-        .client()
+        .engine()
         .list_shells(query.directory.as_deref())
         .await
         .map_err(engine_error)?;
@@ -2424,8 +2403,7 @@ async fn get_agent_shell(
 ) -> ApiResult<Json<Value>> {
     let manager = manager_or_unavailable!(&state, &headers);
     let shell = manager
-        .driver()
-        .client()
+        .engine()
         .get_shell(&shell_id)
         .await
         .map_err(engine_error)?;
@@ -2440,8 +2418,7 @@ async fn get_agent_shell_output(
 ) -> ApiResult<Json<Value>> {
     let manager = manager_or_unavailable!(&state, &headers);
     let output = manager
-        .driver()
-        .client()
+        .engine()
         .get_shell_output(&shell_id, query.cursor, query.limit)
         .await
         .map_err(engine_error)?;
@@ -2455,8 +2432,7 @@ async fn kill_agent_shell(
 ) -> ApiResult<Json<Value>> {
     let manager = manager_or_unavailable!(&state, &headers);
     manager
-        .driver()
-        .client()
+        .engine()
         .kill_shell(&shell_id)
         .await
         .map_err(engine_error)?;

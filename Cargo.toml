@@ -26,6 +26,7 @@ dirs = "6.0.0"
 # for a dynamic list of futures that doesn't require spawning tasks.
 futures = { version = "0.3.32", default-features = false, features = ["std"] }
 hkdf = "0.12.4"
+hmac = "0.12.1"
 libc = "0.2.178"
 # Default features pull in the `image` crate -- a full image decoder, and the
 # largest attack surface in this dependency tree -- for a renderer this gateway
@@ -44,6 +45,7 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", default-features = false, features = ["ansi", "env-filter", "fmt", "smallvec", "std", "tracing-log"] }
 uuid = { version = "1.24.0", features = ["v4"] }
 argon2 = { version = "0.5.3", default-features = false, features = ["alloc"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake"] }
 
 [dev-dependencies]
 # Only for driving a Router in tests (`ServiceExt::oneshot`).

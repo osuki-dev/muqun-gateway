@@ -763,6 +763,245 @@ impl AgentEnginePort for OpencodeDriver {
             Ok(mapper::map_messages_to_timeline(&messages, &asid))
         })
     }
+
+    fn delete_session<'a>(&'a self, session_id: &'a str) -> EngineFuture<'a, ()> {
+        Box::pin(async move {
+            self.client.delete_session(session_id).await?;
+            Ok(())
+        })
+    }
+
+    fn rename_session<'a>(&'a self, session_id: &'a str, title: &'a str) -> EngineFuture<'a, ()> {
+        Box::pin(async move {
+            self.client.rename_session(session_id, title).await?;
+            Ok(())
+        })
+    }
+
+    fn clear_revert<'a>(&'a self, session_id: &'a str) -> EngineFuture<'a, ()> {
+        Box::pin(async move {
+            self.client.clear_revert(session_id).await?;
+            Ok(())
+        })
+    }
+
+    fn stage_revert<'a>(
+        &'a self,
+        session_id: &'a str,
+        message_id: &'a str,
+        files: Option<bool>,
+    ) -> EngineFuture<'a, serde_json::Value> {
+        Box::pin(async move {
+            self.client
+                .stage_revert(session_id, message_id, files)
+                .await
+        })
+    }
+
+    fn commit_revert<'a>(&'a self, session_id: &'a str) -> EngineFuture<'a, ()> {
+        Box::pin(async move {
+            self.client.commit_revert(session_id).await?;
+            Ok(())
+        })
+    }
+
+    fn move_session<'a>(&'a self, session_id: &'a str, directory: &'a str) -> EngineFuture<'a, ()> {
+        Box::pin(async move {
+            self.client.move_session(session_id, directory).await?;
+            Ok(())
+        })
+    }
+
+    fn compact_session<'a>(
+        &'a self,
+        session_id: &'a str,
+        delivery: Option<&'a str>,
+    ) -> EngineFuture<'a, serde_json::Value> {
+        Box::pin(async move { self.client.compact_session(session_id, delivery).await })
+    }
+
+    fn get_context<'a>(&'a self, session_id: &'a str) -> EngineFuture<'a, Vec<serde_json::Value>> {
+        Box::pin(async move { self.client.get_context(session_id).await })
+    }
+
+    fn background_session<'a>(&'a self, session_id: &'a str) -> EngineFuture<'a, ()> {
+        Box::pin(async move {
+            self.client.background_session(session_id).await?;
+            Ok(())
+        })
+    }
+
+    fn wait_session<'a>(&'a self, session_id: &'a str) -> EngineFuture<'a, ()> {
+        Box::pin(async move {
+            self.client.wait_session(session_id).await?;
+            Ok(())
+        })
+    }
+
+    fn view_session<'a>(&'a self, session_id: &'a str, idle: u64) -> EngineFuture<'a, ()> {
+        Box::pin(async move {
+            self.client.view_session(session_id, idle).await?;
+            Ok(())
+        })
+    }
+
+    fn export_session<'a>(
+        &'a self,
+        session_id: &'a str,
+        sanitize: Option<bool>,
+    ) -> EngineFuture<'a, serde_json::Value> {
+        Box::pin(async move {
+            self.client
+                .export_session(session_id, sanitize.unwrap_or(true))
+                .await
+        })
+    }
+
+    fn run_command<'a>(
+        &'a self,
+        session_id: &'a str,
+        name: &'a str,
+        arguments: &'a str,
+        delivery: Option<&'a str>,
+    ) -> EngineFuture<'a, ()> {
+        Box::pin(async move {
+            self.client
+                .run_command(session_id, name, arguments, delivery)
+                .await?;
+            Ok(())
+        })
+    }
+
+    fn list_worktrees<'a>(
+        &'a self,
+        directory: Option<&'a str>,
+    ) -> EngineFuture<'a, Vec<serde_json::Value>> {
+        Box::pin(async move { self.client.list_worktrees(directory).await })
+    }
+
+    fn create_worktree<'a>(
+        &'a self,
+        directory: Option<&'a str>,
+        input: &'a serde_json::Value,
+    ) -> EngineFuture<'a, serde_json::Value> {
+        Box::pin(async move { self.client.create_worktree(directory, input).await })
+    }
+
+    fn remove_worktree<'a>(
+        &'a self,
+        directory: Option<&'a str>,
+        worktree: &'a str,
+        force: Option<bool>,
+    ) -> EngineFuture<'a, ()> {
+        Box::pin(async move {
+            self.client
+                .remove_worktree(directory, worktree, force.unwrap_or(false))
+                .await?;
+            Ok(())
+        })
+    }
+
+    fn refresh_worktrees<'a>(&'a self, directory: Option<&'a str>) -> EngineFuture<'a, ()> {
+        Box::pin(async move {
+            self.client.refresh_worktrees(directory).await?;
+            Ok(())
+        })
+    }
+
+    fn get_skills<'a>(
+        &'a self,
+        directory: Option<&'a str>,
+    ) -> EngineFuture<'a, Vec<serde_json::Value>> {
+        Box::pin(async move { self.client.get_skills(directory).await })
+    }
+
+    fn activate_skill<'a>(
+        &'a self,
+        session_id: &'a str,
+        name: &'a str,
+        resume: Option<bool>,
+    ) -> EngineFuture<'a, ()> {
+        Box::pin(async move {
+            self.client.activate_skill(session_id, name, resume).await?;
+            Ok(())
+        })
+    }
+
+    fn list_shells<'a>(
+        &'a self,
+        directory: Option<&'a str>,
+    ) -> EngineFuture<'a, Vec<serde_json::Value>> {
+        Box::pin(async move { self.client.list_shells(directory).await })
+    }
+
+    fn get_shell<'a>(&'a self, shell_id: &'a str) -> EngineFuture<'a, serde_json::Value> {
+        Box::pin(async move { self.client.get_shell(shell_id).await })
+    }
+
+    fn get_shell_output<'a>(
+        &'a self,
+        shell_id: &'a str,
+        cursor: Option<u64>,
+        limit: Option<usize>,
+    ) -> EngineFuture<'a, serde_json::Value> {
+        Box::pin(async move { self.client.get_shell_output(shell_id, cursor, limit).await })
+    }
+
+    fn kill_shell<'a>(&'a self, shell_id: &'a str) -> EngineFuture<'a, ()> {
+        Box::pin(async move {
+            self.client.kill_shell(shell_id).await?;
+            Ok(())
+        })
+    }
+
+    fn get_inbox<'a>(&'a self, session_id: &'a str) -> EngineFuture<'a, Vec<serde_json::Value>> {
+        Box::pin(async move { self.client.get_inbox(session_id).await })
+    }
+
+    fn cancel_inbox_item<'a>(
+        &'a self,
+        session_id: &'a str,
+        inbox_id: &'a str,
+    ) -> EngineFuture<'a, ()> {
+        Box::pin(async move {
+            self.client.cancel_inbox_item(session_id, inbox_id).await?;
+            Ok(())
+        })
+    }
+
+    fn set_inbox_delivery<'a>(
+        &'a self,
+        session_id: &'a str,
+        inbox_id: &'a str,
+        delivery: &'a str,
+    ) -> EngineFuture<'a, ()> {
+        Box::pin(async move {
+            self.client
+                .set_inbox_delivery(session_id, inbox_id, delivery)
+                .await?;
+            Ok(())
+        })
+    }
+
+    fn list_saved_permissions<'a>(
+        &'a self,
+        project_id: Option<&'a str>,
+    ) -> EngineFuture<'a, Vec<serde_json::Value>> {
+        Box::pin(async move {
+            let items = self.client.list_saved_permissions(project_id).await?;
+            Ok(items
+                .iter()
+                .filter_map(mapper::map_saved_permission)
+                .collect())
+        })
+    }
+
+    fn delete_saved_permission<'a>(&'a self, id: &'a str) -> EngineFuture<'a, ()> {
+        Box::pin(async move {
+            self.client.delete_saved_permission(id).await?;
+            Ok(())
+        })
+    }
 }
 
 #[cfg(test)]

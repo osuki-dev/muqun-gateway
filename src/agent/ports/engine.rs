@@ -27,6 +27,7 @@ pub enum AgentEngineError {
     RequestFailed(String),
     Network(String),
     Protocol(String),
+    Unsupported(String),
 }
 
 impl fmt::Display for AgentEngineError {
@@ -40,6 +41,7 @@ impl fmt::Display for AgentEngineError {
             Self::RequestFailed(msg) => write!(f, "Agent request failed: {msg}"),
             Self::Network(msg) => write!(f, "Network error communicating with agent engine: {msg}"),
             Self::Protocol(msg) => write!(f, "Protocol error: {msg}"),
+            Self::Unsupported(cap) => write!(f, "Agent engine does not support capability: {cap}"),
         }
     }
 }
@@ -160,4 +162,214 @@ pub trait AgentEnginePort: Send + Sync {
         session_id: &'a str,
         limit: usize,
     ) -> EngineFuture<'a, Vec<TimelineItem>>;
+
+    /// Delete a session
+    fn delete_session<'a>(&'a self, _session_id: &'a str) -> EngineFuture<'a, ()> {
+        Box::pin(async { Err(AgentEngineError::Unsupported("delete_session".into())) })
+    }
+
+    /// Rename a session
+    fn rename_session<'a>(&'a self, _session_id: &'a str, _title: &'a str) -> EngineFuture<'a, ()> {
+        Box::pin(async { Err(AgentEngineError::Unsupported("rename_session".into())) })
+    }
+
+    /// Fork a session
+    fn fork_session<'a>(
+        &'a self,
+        _session_id: &'a str,
+        _message_id: Option<&'a str>,
+    ) -> EngineFuture<'a, AgentSessionInfo> {
+        Box::pin(async { Err(AgentEngineError::Unsupported("fork_session".into())) })
+    }
+
+    /// Clear a staged revert
+    fn clear_revert<'a>(&'a self, _session_id: &'a str) -> EngineFuture<'a, ()> {
+        Box::pin(async { Err(AgentEngineError::Unsupported("clear_revert".into())) })
+    }
+
+    /// Stage revert to message_id
+    fn stage_revert<'a>(
+        &'a self,
+        _session_id: &'a str,
+        _message_id: &'a str,
+        _files: Option<bool>,
+    ) -> EngineFuture<'a, serde_json::Value> {
+        Box::pin(async { Err(AgentEngineError::Unsupported("stage_revert".into())) })
+    }
+
+    /// Commit revert
+    fn commit_revert<'a>(&'a self, _session_id: &'a str) -> EngineFuture<'a, ()> {
+        Box::pin(async { Err(AgentEngineError::Unsupported("commit_revert".into())) })
+    }
+
+    /// Move session to a new directory
+    fn move_session<'a>(
+        &'a self,
+        _session_id: &'a str,
+        _directory: &'a str,
+    ) -> EngineFuture<'a, ()> {
+        Box::pin(async { Err(AgentEngineError::Unsupported("move_session".into())) })
+    }
+
+    /// Compact a session's history
+    fn compact_session<'a>(
+        &'a self,
+        _session_id: &'a str,
+        _delivery: Option<&'a str>,
+    ) -> EngineFuture<'a, serde_json::Value> {
+        Box::pin(async { Err(AgentEngineError::Unsupported("compact_session".into())) })
+    }
+
+    /// Get session context
+    fn get_context<'a>(&'a self, _session_id: &'a str) -> EngineFuture<'a, Vec<serde_json::Value>> {
+        Box::pin(async { Err(AgentEngineError::Unsupported("get_context".into())) })
+    }
+
+    /// Mark session as backgrounded
+    fn background_session<'a>(&'a self, _session_id: &'a str) -> EngineFuture<'a, ()> {
+        Box::pin(async { Err(AgentEngineError::Unsupported("background_session".into())) })
+    }
+
+    /// Wait for session idle
+    fn wait_session<'a>(&'a self, _session_id: &'a str) -> EngineFuture<'a, ()> {
+        Box::pin(async { Err(AgentEngineError::Unsupported("wait_session".into())) })
+    }
+
+    /// Mark session as viewed
+    fn view_session<'a>(&'a self, _session_id: &'a str, _idle: u64) -> EngineFuture<'a, ()> {
+        Box::pin(async { Err(AgentEngineError::Unsupported("view_session".into())) })
+    }
+
+    /// Export session transcript
+    fn export_session<'a>(
+        &'a self,
+        _session_id: &'a str,
+        _sanitize: Option<bool>,
+    ) -> EngineFuture<'a, serde_json::Value> {
+        Box::pin(async { Err(AgentEngineError::Unsupported("export_session".into())) })
+    }
+
+    /// Run a slash command in session
+    fn run_command<'a>(
+        &'a self,
+        _session_id: &'a str,
+        _name: &'a str,
+        _arguments: &'a str,
+        _delivery: Option<&'a str>,
+    ) -> EngineFuture<'a, ()> {
+        Box::pin(async { Err(AgentEngineError::Unsupported("run_command".into())) })
+    }
+
+    /// Worktree operations
+    fn list_worktrees<'a>(
+        &'a self,
+        _directory: Option<&'a str>,
+    ) -> EngineFuture<'a, Vec<serde_json::Value>> {
+        Box::pin(async { Err(AgentEngineError::Unsupported("list_worktrees".into())) })
+    }
+
+    fn create_worktree<'a>(
+        &'a self,
+        _directory: Option<&'a str>,
+        _input: &'a serde_json::Value,
+    ) -> EngineFuture<'a, serde_json::Value> {
+        Box::pin(async { Err(AgentEngineError::Unsupported("create_worktree".into())) })
+    }
+
+    fn remove_worktree<'a>(
+        &'a self,
+        _directory: Option<&'a str>,
+        _worktree: &'a str,
+        _force: Option<bool>,
+    ) -> EngineFuture<'a, ()> {
+        Box::pin(async { Err(AgentEngineError::Unsupported("remove_worktree".into())) })
+    }
+
+    fn refresh_worktrees<'a>(&'a self, _directory: Option<&'a str>) -> EngineFuture<'a, ()> {
+        Box::pin(async { Err(AgentEngineError::Unsupported("refresh_worktrees".into())) })
+    }
+
+    /// Skill operations
+    fn get_skills<'a>(
+        &'a self,
+        _directory: Option<&'a str>,
+    ) -> EngineFuture<'a, Vec<serde_json::Value>> {
+        Box::pin(async { Err(AgentEngineError::Unsupported("get_skills".into())) })
+    }
+
+    fn activate_skill<'a>(
+        &'a self,
+        _session_id: &'a str,
+        _name: &'a str,
+        _resume: Option<bool>,
+    ) -> EngineFuture<'a, ()> {
+        Box::pin(async { Err(AgentEngineError::Unsupported("activate_skill".into())) })
+    }
+
+    /// Shell operations
+    fn list_shells<'a>(
+        &'a self,
+        _directory: Option<&'a str>,
+    ) -> EngineFuture<'a, Vec<serde_json::Value>> {
+        Box::pin(async { Err(AgentEngineError::Unsupported("list_shells".into())) })
+    }
+
+    fn get_shell<'a>(&'a self, _shell_id: &'a str) -> EngineFuture<'a, serde_json::Value> {
+        Box::pin(async { Err(AgentEngineError::Unsupported("get_shell".into())) })
+    }
+
+    fn get_shell_output<'a>(
+        &'a self,
+        _shell_id: &'a str,
+        _cursor: Option<u64>,
+        _limit: Option<usize>,
+    ) -> EngineFuture<'a, serde_json::Value> {
+        Box::pin(async { Err(AgentEngineError::Unsupported("get_shell_output".into())) })
+    }
+
+    fn kill_shell<'a>(&'a self, _shell_id: &'a str) -> EngineFuture<'a, ()> {
+        Box::pin(async { Err(AgentEngineError::Unsupported("kill_shell".into())) })
+    }
+
+    /// Inbox operations
+    fn get_inbox<'a>(&'a self, _session_id: &'a str) -> EngineFuture<'a, Vec<serde_json::Value>> {
+        Box::pin(async { Err(AgentEngineError::Unsupported("get_inbox".into())) })
+    }
+
+    fn cancel_inbox_item<'a>(
+        &'a self,
+        _session_id: &'a str,
+        _inbox_id: &'a str,
+    ) -> EngineFuture<'a, ()> {
+        Box::pin(async { Err(AgentEngineError::Unsupported("cancel_inbox_item".into())) })
+    }
+
+    fn set_inbox_delivery<'a>(
+        &'a self,
+        _session_id: &'a str,
+        _inbox_id: &'a str,
+        _delivery: &'a str,
+    ) -> EngineFuture<'a, ()> {
+        Box::pin(async { Err(AgentEngineError::Unsupported("set_inbox_delivery".into())) })
+    }
+
+    /// Saved permissions operations
+    fn list_saved_permissions<'a>(
+        &'a self,
+        _project_id: Option<&'a str>,
+    ) -> EngineFuture<'a, Vec<serde_json::Value>> {
+        Box::pin(async {
+            Err(AgentEngineError::Unsupported(
+                "list_saved_permissions".into(),
+            ))
+        })
+    }
+
+    fn delete_saved_permission<'a>(&'a self, _id: &'a str) -> EngineFuture<'a, ()> {
+        Box::pin(async {
+            Err(AgentEngineError::Unsupported(
+                "delete_saved_permission".into(),
+            ))
+        })
+    }
 }

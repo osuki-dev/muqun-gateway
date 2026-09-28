@@ -651,12 +651,19 @@ struct Config {
     /// owner asked for; `{"autostart": false}` leaves that to them.
     #[serde(default, skip_serializing_if = "is_default_opencode")]
     opencode: agent::OpencodeConfig,
+    /// Configuration for DeepSeek Harness engine adapter
+    #[serde(default, skip_serializing_if = "is_default_deepseek")]
+    deepseek: agent::DeepseekConfig,
 }
 
 /// `skip_serializing_if` for the OpenCode block, so an existing `config.json`
 /// round-trips untouched until someone changes something.
 fn is_default_opencode(config: &agent::OpencodeConfig) -> bool {
     config.autostart && config.binary.is_none()
+}
+
+fn is_default_deepseek(config: &agent::DeepseekConfig) -> bool {
+    !config.enabled && config.endpoint.is_none() && config.token.is_none()
 }
 
 fn is_required_transport(mode: &TransportEncryptionMode) -> bool {
@@ -1316,6 +1323,7 @@ fn setup(
             agent_commands: BTreeMap::new(),
             rich_agent_pushes: false,
             opencode: agent::OpencodeConfig::default(),
+            deepseek: agent::DeepseekConfig::default(),
         },
     };
     config.listen = listen;
@@ -2228,7 +2236,8 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     // One background attempt per opted-in backend; no restart/logging loop.
     backend_startup::spawn(&config);
 
-    let agent_runtime = agent::AgentRuntime::new(config.opencode.clone());
+    let agent_runtime =
+        agent::AgentRuntime::with_configs(config.opencode.clone(), config.deepseek.clone());
     agent_runtime.spawn_supervisor();
 
     let state = AppState {
@@ -13960,6 +13969,7 @@ mod tests {
             agent_commands: BTreeMap::new(),
             rich_agent_pushes: false,
             opencode: agent::OpencodeConfig::default(),
+            deepseek: agent::DeepseekConfig::default(),
         }
     }
 
