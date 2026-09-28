@@ -8,10 +8,10 @@ use super::client::OpencodeClient;
 use super::client::SessionListFilter;
 use super::discovery::OpencodeEndpoint;
 use super::mapper;
-use crate::agent::domain::{
+use crate::agents::domain::{
     AgentCatalog, AgentProject, AgentSessionInfo, ModelRef, PermissionDecision, SessionQuery,
 };
-use crate::agent::ports::engine::{AgentEngineError, AgentEnginePort, EngineFuture, FileDiffItem};
+use crate::agents::ports::engine::{AgentEngineError, AgentEnginePort, EngineFuture, FileDiffItem};
 
 /// The permission action OpenCode raises when a tool reaches outside the
 /// session's own directory.
@@ -664,7 +664,7 @@ impl AgentEnginePort for OpencodeDriver {
             // all come back empty from a directory OpenCode has not loaded,
             // and any one of them empty would otherwise be served to every
             // caller until the entry expired.
-            if !crate::agent::routes::catalog_is_incomplete(&catalog) {
+            if !crate::agents::routes::catalog_is_incomplete(&catalog) {
                 self.remember_catalog(key, catalog.clone());
             }
             Ok(catalog)
@@ -727,10 +727,10 @@ impl AgentEnginePort for OpencodeDriver {
     fn get_pending_permissions<'a>(
         &'a self,
         session_id: &'a str,
-    ) -> EngineFuture<'a, Vec<crate::agent::domain::PermissionRequest>> {
+    ) -> EngineFuture<'a, Vec<crate::agents::domain::PermissionRequest>> {
         Box::pin(async move {
             let raw = self.client.get_session_permissions(session_id).await?;
-            let asid = crate::agent::domain::AgentSessionId(session_id.to_string());
+            let asid = crate::agents::domain::AgentSessionId(session_id.to_string());
             Ok(raw
                 .iter()
                 .filter_map(|p| mapper::map_permission_request(p, &asid))
@@ -741,10 +741,10 @@ impl AgentEnginePort for OpencodeDriver {
     fn get_pending_forms<'a>(
         &'a self,
         session_id: &'a str,
-    ) -> EngineFuture<'a, Vec<crate::agent::domain::FormRequest>> {
+    ) -> EngineFuture<'a, Vec<crate::agents::domain::FormRequest>> {
         Box::pin(async move {
             let raw = self.client.get_session_forms(session_id).await?;
-            let asid = crate::agent::domain::AgentSessionId(session_id.to_string());
+            let asid = crate::agents::domain::AgentSessionId(session_id.to_string());
             Ok(raw
                 .iter()
                 .filter_map(|f| mapper::map_form_request(f, &asid))
@@ -756,10 +756,10 @@ impl AgentEnginePort for OpencodeDriver {
         &'a self,
         session_id: &'a str,
         limit: usize,
-    ) -> EngineFuture<'a, Vec<crate::agent::domain::TimelineItem>> {
+    ) -> EngineFuture<'a, Vec<crate::agents::domain::TimelineItem>> {
         Box::pin(async move {
             let messages = self.client.get_messages(session_id, limit).await?;
-            let asid = crate::agent::domain::AgentSessionId(session_id.to_string());
+            let asid = crate::agents::domain::AgentSessionId(session_id.to_string());
             Ok(mapper::map_messages_to_timeline(&messages, &asid))
         })
     }
@@ -1102,7 +1102,7 @@ mod tests {
             );
         }
         assert!(
-            !crate::agent::routes::catalog_is_incomplete(&scoped),
+            !crate::agents::routes::catalog_is_incomplete(&scoped),
             "and it is therefore cacheable, which is the whole point"
         );
     }

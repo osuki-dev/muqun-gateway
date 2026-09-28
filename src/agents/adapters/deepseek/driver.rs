@@ -4,11 +4,11 @@ use std::sync::Arc;
 use super::client::DeepseekClient;
 use super::endpoint::DeepseekEndpoint;
 use super::mapper;
-use crate::agent::domain::{
+use crate::agents::domain::{
     AgentCatalog, AgentProject, AgentSessionId, AgentSessionInfo, AgentSessionStatus, FormRequest,
     ModelRef, PermissionDecision, PermissionRequest, SessionQuery, TimelineItem,
 };
-use crate::agent::ports::engine::{AgentEnginePort, EngineFuture, FileDiffItem};
+use crate::agents::ports::engine::{AgentEnginePort, EngineFuture, FileDiffItem};
 
 pub struct DeepseekDriver {
     pub client: Arc<DeepseekClient>,

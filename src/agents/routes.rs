@@ -1114,7 +1114,7 @@ async fn do_get_agent_vcs_diff(
 /// Skills and commands are deliberately not in this list -- a project really
 /// can have none of either, and refusing to cache on that would mean never
 /// caching for such a project.
-pub(crate) fn catalog_is_incomplete(catalog: &crate::agent::domain::AgentCatalog) -> bool {
+pub(crate) fn catalog_is_incomplete(catalog: &crate::agents::domain::AgentCatalog) -> bool {
     catalog.models.is_empty() || catalog.providers.is_empty() || catalog.agents.is_empty()
 }
 
@@ -1130,7 +1130,7 @@ pub(crate) fn catalog_is_incomplete(catalog: &crate::agent::domain::AgentCatalog
 /// their own, and two that resolve to the same catalog share one.
 pub(crate) fn catalog_response(
     headers: &HeaderMap,
-    catalog: crate::agent::domain::AgentCatalog,
+    catalog: crate::agents::domain::AgentCatalog,
 ) -> Response {
     let payload = content_envelope(json!(catalog));
     if catalog_is_incomplete(&catalog) {
@@ -1417,7 +1417,7 @@ pub async fn get_global_agent_catalog(
             for m in cat.models {
                 if !merged_models
                     .iter()
-                    .any(|existing: &crate::agent::domain::ModelInfo| {
+                    .any(|existing: &crate::agents::domain::ModelInfo| {
                         existing.id == m.id && existing.provider_id == m.provider_id
                     })
                 {
@@ -1427,7 +1427,7 @@ pub async fn get_global_agent_catalog(
             for a in cat.agents {
                 if !merged_agents
                     .iter()
-                    .any(|existing: &crate::agent::domain::AgentInfo| existing.id == a.id)
+                    .any(|existing: &crate::agents::domain::AgentInfo| existing.id == a.id)
                 {
                     merged_agents.push(a);
                 }
@@ -1435,7 +1435,7 @@ pub async fn get_global_agent_catalog(
             for p in cat.providers {
                 if !merged_providers
                     .iter()
-                    .any(|existing: &crate::agent::domain::ProviderInfo| existing.id == p.id)
+                    .any(|existing: &crate::agents::domain::ProviderInfo| existing.id == p.id)
                 {
                     merged_providers.push(p);
                 }
@@ -1443,7 +1443,7 @@ pub async fn get_global_agent_catalog(
             for s in cat.skills {
                 if !merged_skills
                     .iter()
-                    .any(|existing: &crate::agent::domain::SkillInfo| existing.id == s.id)
+                    .any(|existing: &crate::agents::domain::SkillInfo| existing.id == s.id)
                 {
                     merged_skills.push(s);
                 }
@@ -1451,7 +1451,7 @@ pub async fn get_global_agent_catalog(
             for c in cat.commands {
                 if !merged_commands
                     .iter()
-                    .any(|existing: &crate::agent::domain::CommandInfo| existing.name == c.name)
+                    .any(|existing: &crate::agents::domain::CommandInfo| existing.name == c.name)
                 {
                     merged_commands.push(c);
                 }
@@ -1460,7 +1460,7 @@ pub async fn get_global_agent_catalog(
         }
     }
 
-    let catalog = crate::agent::domain::AgentCatalog {
+    let catalog = crate::agents::domain::AgentCatalog {
         models: merged_models,
         agents: merged_agents,
         mcp: merged_mcp,
@@ -2620,9 +2620,9 @@ mod tests {
     /// default alone, and `false` is a caller who does not want the diff
     /// computed -- not the same thing.
     fn catalog_with(
-        agents: Vec<crate::agent::domain::AgentInfo>,
-    ) -> crate::agent::domain::AgentCatalog {
-        crate::agent::domain::AgentCatalog {
+        agents: Vec<crate::agents::domain::AgentInfo>,
+    ) -> crate::agents::domain::AgentCatalog {
+        crate::agents::domain::AgentCatalog {
             models: Vec::new(),
             agents,
             mcp: Vec::new(),
@@ -2633,9 +2633,9 @@ mod tests {
         }
     }
 
-    fn complete_catalog() -> crate::agent::domain::AgentCatalog {
+    fn complete_catalog() -> crate::agents::domain::AgentCatalog {
         let mut catalog = catalog_with(vec![agent("build")]);
-        catalog.models = vec![crate::agent::domain::ModelInfo {
+        catalog.models = vec![crate::agents::domain::ModelInfo {
             id: "union-alpha".into(),
             name: "Union Alpha".into(),
             provider_id: "opencode".into(),
@@ -2646,7 +2646,7 @@ mod tests {
             enabled: true,
             status: None,
         }];
-        catalog.providers = vec![crate::agent::domain::ProviderInfo {
+        catalog.providers = vec![crate::agents::domain::ProviderInfo {
             id: "opencode".into(),
             name: "OpenCode".into(),
             activation: None,
@@ -2655,8 +2655,8 @@ mod tests {
         catalog
     }
 
-    fn agent(id: &str) -> crate::agent::domain::AgentInfo {
-        crate::agent::domain::AgentInfo {
+    fn agent(id: &str) -> crate::agents::domain::AgentInfo {
+        crate::agents::domain::AgentInfo {
             id: id.to_string(),
             name: id.to_string(),
             model: None,
@@ -2884,7 +2884,7 @@ mod tests {
     fn a_populated_catalog_is_tagged_per_body() {
         // Complete catalogs: a catalog missing models or providers is refused
         // a tag on purpose, which is a different test.
-        let with_agents = |agents: Vec<crate::agent::domain::AgentInfo>| {
+        let with_agents = |agents: Vec<crate::agents::domain::AgentInfo>| {
             let mut catalog = complete_catalog();
             catalog.agents = agents;
             catalog

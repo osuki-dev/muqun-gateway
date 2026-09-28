@@ -709,7 +709,7 @@ fn capabilities_discovery_responses() -> Value {
                 "protocolVersion": { "type": "string", "description": "Protocol revision date (e.g. 2026-09-28)" },
                 "planes": {
                     "type": "object",
-                    "required": ["terminal", "agent"],
+                    "required": ["terminal", "agents"],
                     "properties": {
                         "terminal": {
                             "type": "object",
@@ -731,6 +731,7 @@ fn capabilities_discovery_responses() -> Value {
                                 }
                             }
                         },
+                        "agents": agent_harness_plane_schema(),
                         "agent": agent_harness_plane_schema(),
                         "harness": agent_harness_plane_schema(),
                         "ssh": {

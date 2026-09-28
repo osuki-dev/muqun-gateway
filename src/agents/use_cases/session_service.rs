@@ -1,17 +1,17 @@
 use std::sync::Arc;
 
-use crate::agent::domain::{
+use crate::agents::domain::{
     AgentCatalog, AgentSessionId, AgentSessionInfo, ModelRef, SessionQuery,
 };
-use crate::agent::ports::engine::{AgentEngineError, AgentEnginePort, FileDiffItem};
-use crate::agent::ports::mirror::{AgentSessionSnapshot, SessionMirrorPort};
+use crate::agents::ports::engine::{AgentEngineError, AgentEnginePort, FileDiffItem};
+use crate::agents::ports::mirror::{AgentSessionSnapshot, SessionMirrorPort};
 
 pub struct SessionService {
     engine: Arc<dyn AgentEnginePort>,
     mirror: Arc<dyn SessionMirrorPort>,
     /// The concrete mirror, for the few operations that are not part of the
     /// port because nothing else implements them.
-    memory: Option<Arc<crate::agent::adapters::memory_mirror::MemoryMirror>>,
+    memory: Option<Arc<crate::agents::adapters::memory_mirror::MemoryMirror>>,
 }
 
 impl SessionService {
@@ -26,7 +26,7 @@ impl SessionService {
     /// Build a service that can also reach the in-memory mirror directly.
     pub fn with_memory_mirror(
         engine: Arc<dyn AgentEnginePort>,
-        mirror: Arc<crate::agent::adapters::memory_mirror::MemoryMirror>,
+        mirror: Arc<crate::agents::adapters::memory_mirror::MemoryMirror>,
     ) -> Self {
         Self {
             engine,
@@ -38,8 +38,8 @@ impl SessionService {
     async fn mirror_pending(
         &self,
         asid: &AgentSessionId,
-        permissions: Vec<crate::agent::domain::PermissionRequest>,
-        forms: Vec<crate::agent::domain::FormRequest>,
+        permissions: Vec<crate::agents::domain::PermissionRequest>,
+        forms: Vec<crate::agents::domain::FormRequest>,
     ) {
         if let Some(ref memory) = self.memory {
             memory.replace_pending(asid, permissions, forms).await;
@@ -136,7 +136,7 @@ impl SessionService {
         &self,
         asid: &AgentSessionId,
         after_seq: u64,
-    ) -> Option<Vec<crate::agent::domain::AgentDomainEvent>> {
+    ) -> Option<Vec<crate::agents::domain::AgentDomainEvent>> {
         self.mirror.get_events_after(asid, after_seq).await
     }
 

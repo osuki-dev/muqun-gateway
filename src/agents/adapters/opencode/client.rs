@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use std::time::Duration;
 
 use super::discovery::OpencodeEndpoint;
-use crate::agent::ports::engine::AgentEngineError;
+use crate::agents::ports::engine::AgentEngineError;
 
 /// The optional filters `GET /api/session` accepts.
 #[derive(Debug, Default, Clone)]
@@ -180,7 +180,7 @@ impl OpencodeClient {
     pub async fn create_session(
         &self,
         directory: Option<&str>,
-        model: Option<&crate::agent::domain::ModelRef>,
+        model: Option<&crate::agents::domain::ModelRef>,
         agent: Option<&str>,
     ) -> Result<Value, AgentEngineError> {
         let mut body = json!({});
@@ -323,7 +323,7 @@ impl OpencodeClient {
     pub async fn switch_model(
         &self,
         session_id: &str,
-        model: &crate::agent::domain::ModelRef,
+        model: &crate::agents::domain::ModelRef,
     ) -> Result<Value, AgentEngineError> {
         let body = json!({
             "model": model_ref_json(model),
@@ -1038,7 +1038,7 @@ pub(crate) fn saved_permission_query(project_id: Option<&str>) -> Vec<(String, S
         .unwrap_or_default()
 }
 
-pub(crate) fn model_ref_json(model: &crate::agent::domain::ModelRef) -> Value {
+pub(crate) fn model_ref_json(model: &crate::agents::domain::ModelRef) -> Value {
     let mut obj = json!({
         "providerID": model.provider_id,
         "id": model.model_id,
@@ -1379,7 +1379,7 @@ mod tests {
 
     #[test]
     fn a_model_ref_omits_the_variant_rather_than_sending_null() {
-        let bare = model_ref_json(&crate::agent::domain::ModelRef {
+        let bare = model_ref_json(&crate::agents::domain::ModelRef {
             provider_id: "opencode".to_string(),
             model_id: "union-alpha".to_string(),
             variant: None,
@@ -1391,7 +1391,7 @@ mod tests {
             "Model.Ref declares additionalProperties:false and variant as a string"
         );
 
-        let with_variant = model_ref_json(&crate::agent::domain::ModelRef {
+        let with_variant = model_ref_json(&crate::agents::domain::ModelRef {
             provider_id: "opencode".to_string(),
             model_id: "union-alpha".to_string(),
             variant: Some("thinking".to_string()),

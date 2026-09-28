@@ -2,12 +2,12 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::agent::domain::{
+use crate::agents::domain::{
     tool_item_id, AgentDomainEvent, AgentErrorInfo, AgentPart, AgentSessionId, AgentSessionInfo,
     AgentSessionStatus, FormRequest, PermissionRequest, RevertState, SessionRevertInfo,
     TimelineItem, TimelineRole, ToolCall, ToolCallStatus, ToolTime,
 };
-use crate::agent::ports::mirror::{AgentSessionSnapshot, MirrorFuture, SessionMirrorPort};
+use crate::agents::ports::mirror::{AgentSessionSnapshot, MirrorFuture, SessionMirrorPort};
 
 /// Ring-buffer bounds. The mirror is a cache in front of OpenCode, not a store:
 /// everything it drops can be refetched, and a client that falls behind is told
@@ -446,7 +446,7 @@ impl MemoryMirror {
     pub async fn record_compaction(
         &self,
         asid: &AgentSessionId,
-        status: crate::agent::domain::CompactionStatus,
+        status: crate::agents::domain::CompactionStatus,
         reason: Option<String>,
         delta: Option<String>,
     ) -> u64 {
@@ -737,7 +737,7 @@ impl MemoryMirror {
         &self,
         asid: &AgentSessionId,
         cost: Option<f64>,
-        tokens: Option<crate::agent::domain::TokensUsage>,
+        tokens: Option<crate::agents::domain::TokensUsage>,
     ) -> Option<(u64, AgentSessionInfo)> {
         let mut sessions = self.sessions.write().await;
         let state = sessions.get_mut(asid)?;
@@ -795,7 +795,7 @@ impl MemoryMirror {
 pub struct SessionPatch {
     pub title: Option<String>,
     pub agent: Option<String>,
-    pub model: Option<crate::agent::domain::ModelRef>,
+    pub model: Option<crate::agents::domain::ModelRef>,
     pub parent_id: Option<String>,
     pub directory: Option<String>,
     pub project_id: Option<String>,
@@ -827,14 +827,14 @@ impl ToolPatch {
             call.name = name.clone();
         }
         if let Some(ref delta) = self.input_delta {
-            crate::agent::domain::push_input_partial(
+            crate::agents::domain::push_input_partial(
                 call.input_partial.get_or_insert_with(String::new),
                 delta,
             );
         }
         if let Some(ref input) = self.input {
             call.input = input.clone();
-            call.title = crate::agent::adapters::opencode::mapper::tool_title(&call.name, input);
+            call.title = crate::agents::adapters::opencode::mapper::tool_title(&call.name, input);
             // The real input is here; the preview it was standing in for has
             // nothing left to say.
             call.input_partial = None;
@@ -876,7 +876,7 @@ impl ToolPatch {
         if let Some(completed) = self.completed_ms {
             call.time.completed = Some(completed);
         }
-        crate::agent::adapters::opencode::mapper::apply_tool_metadata(call);
+        crate::agents::adapters::opencode::mapper::apply_tool_metadata(call);
     }
 }
 
@@ -1073,7 +1073,7 @@ impl SessionMirrorPort for MemoryMirror {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::domain::{AgentPart, AgentSessionInfo, AgentSessionStatus, TimelineRole};
+    use crate::agents::domain::{AgentPart, AgentSessionInfo, AgentSessionStatus, TimelineRole};
 
     fn info(asid: &AgentSessionId, title: &str) -> AgentSessionInfo {
         let mut info = placeholder_session(asid, AgentSessionStatus::Idle);

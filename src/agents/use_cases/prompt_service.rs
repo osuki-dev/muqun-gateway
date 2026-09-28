@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use crate::agent::domain::AgentSessionId;
-use crate::agent::ports::engine::{AgentEngineError, AgentEnginePort};
-use crate::agent::ports::mirror::SessionMirrorPort;
+use crate::agents::domain::AgentSessionId;
+use crate::agents::ports::engine::{AgentEngineError, AgentEnginePort};
+use crate::agents::ports::mirror::SessionMirrorPort;
 
 pub struct PromptService {
     engine: Arc<dyn AgentEnginePort>,

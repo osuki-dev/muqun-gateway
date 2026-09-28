@@ -43,13 +43,13 @@ use tower_http::compression::{
     CompressionLayer,
 };
 
-pub(crate) mod agent;
+pub(crate) mod agents;
 pub(crate) mod connectivity;
 pub(crate) mod platform;
 pub(crate) mod terminal;
 
 // Backward-compatible re-exports at crate root
-pub(crate) use agent::{agent_events, approvals, tasks};
+pub(crate) use agents::{agent_events, approvals, tasks};
 pub(crate) use connectivity::{authority, gateway_listener, transport};
 #[cfg(test)]
 pub(crate) use platform::openapi_spec;
@@ -648,19 +648,19 @@ struct Config {
     /// one when it cannot find a running service, which is the behaviour the
     /// owner asked for; `{"autostart": false}` leaves that to them.
     #[serde(default, skip_serializing_if = "is_default_opencode")]
-    opencode: agent::OpencodeConfig,
+    opencode: agents::OpencodeConfig,
     /// Configuration for DeepSeek Harness engine adapter
     #[serde(default, skip_serializing_if = "is_default_deepseek")]
-    deepseek: agent::DeepseekConfig,
+    deepseek: agents::DeepseekConfig,
 }
 
 /// `skip_serializing_if` for the OpenCode block, so an existing `config.json`
 /// round-trips untouched until someone changes something.
-fn is_default_opencode(config: &agent::OpencodeConfig) -> bool {
+fn is_default_opencode(config: &agents::OpencodeConfig) -> bool {
     config.enabled && config.autostart && config.binary.is_none()
 }
 
-fn is_default_deepseek(config: &agent::DeepseekConfig) -> bool {
+fn is_default_deepseek(config: &agents::DeepseekConfig) -> bool {
     !config.enabled && config.endpoint.is_none() && config.token.is_none()
 }
 
@@ -944,7 +944,7 @@ pub(crate) struct AppState {
     /// The OpenCode engine, which comes and goes: it is discovered, adopted or
     /// started, and re-attached whenever it moves. Routes ask it for the
     /// current manager rather than holding one.
-    pub(crate) agent_runtime: Arc<agent::AgentRuntime>,
+    pub(crate) agent_runtime: Arc<agents::AgentRuntime>,
 }
 
 /// The scrollback store, or nothing if a previous holder panicked while it was
@@ -1320,8 +1320,8 @@ fn setup(
             autostart_backends: Vec::new(),
             agent_commands: BTreeMap::new(),
             rich_agent_pushes: false,
-            opencode: agent::OpencodeConfig::default(),
-            deepseek: agent::DeepseekConfig::default(),
+            opencode: agents::OpencodeConfig::default(),
+            deepseek: agents::DeepseekConfig::default(),
         },
     };
     config.listen = listen;
@@ -2235,7 +2235,7 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     backend_startup::spawn(&config);
 
     let agent_runtime =
-        agent::AgentRuntime::with_configs(config.opencode.clone(), config.deepseek.clone());
+        agents::AgentRuntime::with_configs(config.opencode.clone(), config.deepseek.clone());
     agent_runtime.spawn_supervisor();
 
     let state = AppState {
@@ -2259,7 +2259,7 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
 
     let app = Router::new();
     let app = platform::routes::mount(app);
-    let app = agent::routes::mount(app)
+    let app = agents::routes::mount(app)
         .route("/api/pair/request", post(pair_request))
         .route("/api/pair/claim", post(pair_claim))
         .route("/api/pair/pending", get(pair_pending))
@@ -5335,7 +5335,7 @@ async fn snapshot(
     // running it before the 304 check keeps the store fed even when nothing is
     // sent back.
     let answer = note_and_amend_panes(&state, &session_id, answer);
-    Ok(agent::routes::json_etag_response(&headers, answer))
+    Ok(agents::routes::json_etag_response(&headers, answer))
 }
 
 /// Let the scrollback store read a Herdr answer, and answer back for whatever
@@ -5381,7 +5381,7 @@ async fn panes(
     // Same rule as the snapshot: observe and amend first, hash what that
     // produced.
     let answer = note_and_amend_panes(&state, &session_id, answer);
-    Ok(agent::routes::json_etag_response(&headers, answer))
+    Ok(agents::routes::json_etag_response(&headers, answer))
 }
 
 async fn agents(
@@ -6251,7 +6251,7 @@ fn spawn_agent_engine_watchers(state: AppState) {
 
     tokio::spawn(async move {
         while let Ok(event) = rx.recv().await {
-            if let agent::AgentDomainEvent::PermissionPending {
+            if let agents::AgentDomainEvent::PermissionPending {
                 ref asid,
                 ref request,
                 ..
@@ -9079,7 +9079,7 @@ async fn pane_shortcuts(
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty());
 
-    Ok(agent::routes::json_etag_response(
+    Ok(agents::routes::json_etag_response(
         &headers,
         shortcuts::resolve(agent, title, cwd),
     ))
@@ -12841,8 +12841,8 @@ mod tests {
             }],
             agent_commands: BTreeMap::new(),
             rich_agent_pushes: false,
-            opencode: agent::OpencodeConfig::default(),
-            deepseek: agent::DeepseekConfig::default(),
+            opencode: agents::OpencodeConfig::default(),
+            deepseek: agents::DeepseekConfig::default(),
         }
     }
 
@@ -13191,7 +13191,7 @@ mod tests {
             approval_events: tokio::sync::broadcast::channel(APPROVAL_EVENT_CAPACITY).0,
             activity: Arc::new(Mutex::new(HashMap::new())),
             session_liveness: Arc::new(Mutex::new(SessionLivenessCache::default())),
-            agent_runtime: agent::AgentRuntime::disabled(),
+            agent_runtime: agents::AgentRuntime::disabled(),
         }
     }
 

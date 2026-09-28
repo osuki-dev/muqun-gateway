@@ -1,4 +1,4 @@
-use crate::agent::domain::{
+use crate::agents::domain::{
     part_item_id, push_input_partial, reasoning_item_id, text_item_id, tool_item_id,
     AgentErrorInfo, AgentInfo, AgentPart, AgentProject, AgentSessionId, AgentSessionInfo,
     AgentSessionStatus, CatalogDefaults, CommandInfo, CompactionStatus, FormField, FormOption,
@@ -990,13 +990,13 @@ pub fn map_permission_request(val: &Value, asid: &AgentSessionId) -> Option<Perm
     })
 }
 
-fn map_form_conditions(val: &Value) -> Vec<crate::agent::domain::FormWhen> {
+fn map_form_conditions(val: &Value) -> Vec<crate::agents::domain::FormWhen> {
     val.get("when")
         .and_then(Value::as_array)
         .map(|arr| {
             arr.iter()
                 .filter_map(|w| {
-                    Some(crate::agent::domain::FormWhen {
+                    Some(crate::agents::domain::FormWhen {
                         key: w.get("key").and_then(Value::as_str)?.to_string(),
                         op: w
                             .get("op")

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::agent::domain::{
+use crate::agents::domain::{
     AgentDomainEvent, AgentSessionId, AgentSessionInfo, FormRequest, PermissionRequest,
     TimelineItem,
 };

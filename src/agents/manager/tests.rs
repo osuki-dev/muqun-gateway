@@ -1,9 +1,9 @@
 //! Event-dispatch tests. The frames are real ones, captured from a live
 //! OpenCode 2.0.1 session (`tests/fixtures/opencode-events/`).
 use super::*;
-use crate::agent::adapters::opencode::sse::OpencodeSseListener;
-use crate::agent::domain::AgentPart;
-use crate::agent::ports::mirror::SessionMirrorPort;
+use crate::agents::adapters::opencode::sse::OpencodeSseListener;
+use crate::agents::domain::AgentPart;
+use crate::agents::ports::mirror::SessionMirrorPort;
 
 fn ctx() -> Arc<EventContext> {
     // The driver points at a port nothing is listening on: every test here is

@@ -132,7 +132,7 @@ impl EventContext {
         &self,
         asid: &AgentSessionId,
         status: AgentSessionStatus,
-        error: Option<crate::agent::domain::AgentErrorInfo>,
+        error: Option<crate::agents::domain::AgentErrorInfo>,
     ) {
         if let Some(seq) = self.mirror.update_status(asid, status, error.clone()).await {
             self.emit(AgentDomainEvent::StatusChanged {
@@ -308,12 +308,12 @@ impl AgentManager {
 
     /// Build a manager for a DeepSeek Harness endpoint.
     pub fn connect_deepseek(
-        endpoint: crate::agent::adapters::deepseek::DeepseekEndpoint,
+        endpoint: crate::agents::adapters::deepseek::DeepseekEndpoint,
         events_tx: broadcast::Sender<AgentDomainEvent>,
     ) -> Self {
         let endpoint_url = endpoint.url.clone();
         let endpoint_version = endpoint.version.clone();
-        let driver = Arc::new(crate::agent::adapters::deepseek::DeepseekDriver::new(
+        let driver = Arc::new(crate::agents::adapters::deepseek::DeepseekDriver::new(
             endpoint.clone(),
         ));
         let mirror = Arc::new(MemoryMirror::new());
@@ -326,7 +326,7 @@ impl AgentManager {
         let interaction_service = Arc::new(InteractionService::new(driver.clone(), mirror.clone()));
 
         let listener =
-            Arc::new(crate::agent::adapters::deepseek::DeepseekStreamListener::new(endpoint));
+            Arc::new(crate::agents::adapters::deepseek::DeepseekStreamListener::new(endpoint));
         listener.start(events_tx.clone(), None);
 
         let stream_listener = listener.clone();
@@ -1045,7 +1045,7 @@ impl AgentManager {
         let cost = data.get("cost").and_then(Value::as_f64);
         let tokens = data
             .get("tokens")
-            .map(|t| crate::agent::domain::TokensUsage {
+            .map(|t| crate::agents::domain::TokensUsage {
                 input: t.get("input").and_then(Value::as_u64).unwrap_or(0),
                 output: t.get("output").and_then(Value::as_u64).unwrap_or(0),
                 reasoning: t.get("reasoning").and_then(Value::as_u64),

@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 
-use crate::agent::domain::{
+use crate::agents::domain::{
     AgentCatalog, AgentInfo, AgentPart, AgentSessionId, AgentSessionInfo, AgentSessionStatus,
     CatalogDefaults, CommandInfo, ModelInfo, ModelRef, ModelVariantInfo, ProviderInfo,
     ProviderModelInfo, SkillInfo, TimelineItem, TimelineRole, TokensUsage, ToolCall,

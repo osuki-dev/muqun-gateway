@@ -4,8 +4,8 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use super::endpoint::DeepseekEndpoint;
-use crate::agent::domain::{ModelRef, SessionQuery};
-use crate::agent::ports::engine::AgentEngineError;
+use crate::agents::domain::{ModelRef, SessionQuery};
+use crate::agents::ports::engine::AgentEngineError;
 
 #[derive(Clone)]
 pub struct DeepseekClient {

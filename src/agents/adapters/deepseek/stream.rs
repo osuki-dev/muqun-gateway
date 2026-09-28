@@ -14,7 +14,7 @@ use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
 use super::endpoint::DeepseekEndpoint;
-use crate::agent::domain::AgentDomainEvent;
+use crate::agents::domain::AgentDomainEvent;
 
 /// Messages sent from Gateway client to DeepSeek Harness stream multiplexer.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

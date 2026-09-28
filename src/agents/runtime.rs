@@ -262,6 +262,11 @@ impl AgentRuntime {
         }
     }
 
+    /// Discover status and capabilities of all configured or reachable agents / AI harnesses.
+    pub async fn discover_agents(&self) -> crate::discovery::HarnessPlaneDiscovery {
+        self.discover_harnesses().await
+    }
+
     /// Discover status and capabilities of all configured or reachable AI harnesses.
     pub async fn discover_harnesses(&self) -> crate::discovery::HarnessPlaneDiscovery {
         use crate::discovery::{
@@ -324,26 +329,27 @@ impl AgentRuntime {
             }
         } else {
             let ep = if let Some(ref url) = self.deepseek_config.endpoint {
-                Some(crate::agent::adapters::deepseek::DeepseekEndpoint::new(
+                Some(crate::agents::adapters::deepseek::DeepseekEndpoint::new(
                     url.clone(),
                     self.deepseek_config.token.clone(),
                     self.deepseek_config
                         .secret
                         .clone()
-                        .or_else(crate::agent::adapters::deepseek::auth::load_local_secret),
+                        .or_else(crate::agents::adapters::deepseek::auth::load_local_secret),
                 ))
             } else {
-                crate::agent::adapters::deepseek::DeepseekEndpoint::discover().await
+                crate::agents::adapters::deepseek::DeepseekEndpoint::discover().await
             };
 
             let (status, endpoint_url, version, models, agents) = match ep {
                 Some(endpoint) => {
                     let client = probe_client();
                     if endpoint.probe_healthy(&client).await {
-                        let driver =
-                            crate::agent::adapters::deepseek::DeepseekDriver::new(endpoint.clone());
+                        let driver = crate::agents::adapters::deepseek::DeepseekDriver::new(
+                            endpoint.clone(),
+                        );
                         let (models, agents) =
-                            match crate::agent::ports::AgentEnginePort::get_catalog(&driver, None)
+                            match crate::agents::ports::AgentEnginePort::get_catalog(&driver, None)
                                 .await
                             {
                                 Ok(cat) => (
@@ -451,10 +457,11 @@ impl AgentRuntime {
                 Some(endpoint) => {
                     let client = probe_client();
                     if endpoint.probe_healthy(&client).await {
-                        let driver =
-                            crate::agent::adapters::opencode::OpencodeDriver::new(endpoint.clone());
+                        let driver = crate::agents::adapters::opencode::OpencodeDriver::new(
+                            endpoint.clone(),
+                        );
                         let (models, agents) =
-                            match crate::agent::ports::AgentEnginePort::get_catalog(&driver, None)
+                            match crate::agents::ports::AgentEnginePort::get_catalog(&driver, None)
                                 .await
                             {
                                 Ok(cat) => (
@@ -621,16 +628,16 @@ impl AgentRuntime {
         if !deepseek_ok && (self.deepseek_config.enabled || self.deepseek_config.endpoint.is_some())
         {
             let ep = if let Some(ref url) = self.deepseek_config.endpoint {
-                Some(crate::agent::adapters::deepseek::DeepseekEndpoint::new(
+                Some(crate::agents::adapters::deepseek::DeepseekEndpoint::new(
                     url.clone(),
                     self.deepseek_config.token.clone(),
                     self.deepseek_config
                         .secret
                         .clone()
-                        .or_else(crate::agent::adapters::deepseek::auth::load_local_secret),
+                        .or_else(crate::agents::adapters::deepseek::auth::load_local_secret),
                 ))
             } else {
-                crate::agent::adapters::deepseek::DeepseekEndpoint::discover().await
+                crate::agents::adapters::deepseek::DeepseekEndpoint::discover().await
             };
             if let Some(endpoint) = ep {
                 let client = probe_client();
@@ -693,7 +700,7 @@ impl AgentRuntime {
         // 3. Check fallback DeepSeek discovery if not yet found
         if !deepseek_ok {
             if let Some(endpoint) =
-                crate::agent::adapters::deepseek::DeepseekEndpoint::discover().await
+                crate::agents::adapters::deepseek::DeepseekEndpoint::discover().await
             {
                 let client = probe_client();
                 if endpoint.probe_healthy(&client).await {
@@ -761,7 +768,7 @@ impl AgentRuntime {
 
     async fn attach_deepseek(
         &self,
-        endpoint: crate::agent::adapters::deepseek::DeepseekEndpoint,
+        endpoint: crate::agents::adapters::deepseek::DeepseekEndpoint,
         origin: EngineOrigin,
     ) {
         let url = endpoint.url.clone();

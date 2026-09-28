@@ -2,7 +2,7 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::agent::domain::{
+use crate::agents::domain::{
     AgentCatalog, AgentProject, AgentSessionInfo, FormRequest, ModelRef, PermissionDecision,
     PermissionRequest, SessionQuery, TimelineItem,
 };
