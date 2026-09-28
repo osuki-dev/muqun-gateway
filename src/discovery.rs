@@ -48,6 +48,10 @@ pub struct HarnessModelInfo {
     pub name: String,
     pub provider_id: String,
     pub supports_reasoning: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning_effort_tiers: Vec<String>,
+    #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +61,44 @@ pub struct HarnessAgentInfo {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+/// Convert domain ModelInfo into discovered HarnessModelInfo
+pub fn model_info_to_harness_model(model: &crate::agent::domain::ModelInfo) -> HarnessModelInfo {
+    let mut reasoning_effort_tiers = Vec::new();
+    let mut supports_reasoning = false;
+
+    if let Some(ref variants) = model.variants {
+        for v in variants {
+            if let Some(ref effort) = v.reasoning_effort {
+                supports_reasoning = true;
+                if !reasoning_effort_tiers.contains(effort) {
+                    reasoning_effort_tiers.push(effort.clone());
+                }
+            }
+        }
+    }
+
+    HarnessModelInfo {
+        id: model.id.clone(),
+        name: model.name.clone(),
+        provider_id: model.provider_id.clone(),
+        supports_reasoning,
+        reasoning_effort_tiers,
+        extra: BTreeMap::new(),
+    }
+}
+
+/// Convert domain AgentInfo into discovered HarnessAgentInfo
+pub fn agent_info_to_harness_agent(agent: &crate::agent::domain::AgentInfo) -> HarnessAgentInfo {
+    HarnessAgentInfo {
+        id: agent.id.clone(),
+        name: agent.name.clone(),
+        description: agent.description.clone(),
+        extra: BTreeMap::new(),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +111,8 @@ pub struct HarnessFeatures {
     pub worktrees: bool,
     pub revert: bool,
     pub inbox: bool,
+    #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
 }
 
 /// The Harness Plane discovery model
@@ -256,16 +300,29 @@ mod tests {
             enabled: true,
             endpoint: Some("http://127.0.0.1:3080".to_string()),
             version: Some("0.1.0".to_string()),
-            models: vec![HarnessModelInfo {
-                id: "deepseek-chat".to_string(),
-                name: "DeepSeek Chat (V3)".to_string(),
-                provider_id: "deepseek".to_string(),
-                supports_reasoning: false,
-            }],
+            models: vec![
+                HarnessModelInfo {
+                    id: "deepseek-chat".to_string(),
+                    name: "DeepSeek Chat (V3)".to_string(),
+                    provider_id: "deepseek".to_string(),
+                    supports_reasoning: false,
+                    reasoning_effort_tiers: Vec::new(),
+                    extra: BTreeMap::new(),
+                },
+                HarnessModelInfo {
+                    id: "deepseek-reasoner".to_string(),
+                    name: "DeepSeek Reasoner (R1)".to_string(),
+                    provider_id: "deepseek".to_string(),
+                    supports_reasoning: true,
+                    reasoning_effort_tiers: vec!["low".to_string(), "high".to_string()],
+                    extra: BTreeMap::new(),
+                },
+            ],
             agents: vec![HarnessAgentInfo {
                 id: "deepseek".to_string(),
                 name: "DeepSeek Assistant".to_string(),
                 description: None,
+                extra: BTreeMap::new(),
             }],
             features: HarnessFeatures {
                 streaming: true,
@@ -275,6 +332,7 @@ mod tests {
                 worktrees: false,
                 revert: false,
                 inbox: false,
+                extra: BTreeMap::new(),
             },
         };
 
@@ -283,6 +341,12 @@ mod tests {
         assert_eq!(val["status"], "connected");
         assert_eq!(val["models"][0]["supportsReasoning"], false);
         assert_eq!(val["models"][0]["providerId"], "deepseek");
+        assert!(val["models"][0].get("reasoningEffortTiers").is_none());
+        assert_eq!(val["models"][1]["supportsReasoning"], true);
+        assert_eq!(
+            val["models"][1]["reasoningEffortTiers"],
+            json!(["low", "high"])
+        );
         assert_eq!(val["features"]["reasoningEffort"], true);
     }
 

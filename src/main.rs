@@ -13293,7 +13293,7 @@ fn openapi_spec() -> Value {
                         "properties": {
                             "parts": { "type": "array", "items": { "type": "object" } },
                             "model": { "type": "string" },
-                            "reasoning_effort": { "type": "string", "enum": ["off", "low", "high", "max"] }
+                            "reasoning_effort": { "type": "string", "description": "Reasoning effort tier supported by the model (dynamic string from third-party provider)" }
                         }
                     })),
                     "responses": ok_response()
