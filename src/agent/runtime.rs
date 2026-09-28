@@ -48,6 +48,9 @@ const MIN_OPENCODE_MAJOR: u64 = 2;
 /// `opencode` in `config.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpencodeConfig {
+    /// Explicitly enable or disable the OpenCode harness.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     /// Run `opencode service start` when no healthy service is found.
     #[serde(default = "default_true")]
     pub autostart: bool,
@@ -69,6 +72,7 @@ fn default_true() -> bool {
 impl Default for OpencodeConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             autostart: true,
             binary: None,
         }
@@ -167,6 +171,7 @@ impl AgentRuntime {
     pub fn disabled() -> Arc<Self> {
         Self::with_configs(
             OpencodeConfig {
+                enabled: false,
                 autostart: false,
                 binary: None,
             },
@@ -272,7 +277,11 @@ impl AgentRuntime {
 
         // Whatever the registration file says now wins: OpenCode's port is
         // ephemeral, so a restart moves it and the old URL is dead.
-        let discovered = OpencodeEndpoint::discover().await;
+        let discovered = if self.config.enabled {
+            OpencodeEndpoint::discover().await
+        } else {
+            None
+        };
 
         if let Some(manager) = current {
             let same_endpoint = discovered
@@ -347,8 +356,8 @@ impl AgentRuntime {
             }
         }
 
-        if !self.config.autostart {
-            tracing::debug!("no opencode service and autostart is off");
+        if !self.config.enabled || !self.config.autostart {
+            tracing::debug!("opencode disabled or autostart is off");
             return false;
         }
 
@@ -638,6 +647,9 @@ fn installation_status_in(
 }
 
 fn local_installation_status(config: &OpencodeConfig) -> EngineInstallation {
+    if !config.enabled {
+        return EngineInstallation::NotFound;
+    }
     let Ok(external_endpoint_configured) =
         external_endpoint_configured_with(|name| std::env::var(name))
     else {
@@ -880,6 +892,7 @@ mod tests {
     #[test]
     fn autostart_defaults_to_on_and_the_binary_is_optional() {
         let config: OpencodeConfig = serde_json::from_str("{}").expect("empty config parses");
+        assert!(config.enabled);
         assert!(config.autostart);
         assert!(config.binary.is_none());
     }
@@ -887,8 +900,9 @@ mod tests {
     #[test]
     fn autostart_can_be_turned_off() {
         let config: OpencodeConfig =
-            serde_json::from_str(r#"{"autostart":false,"binary":"/opt/opencode"}"#)
+            serde_json::from_str(r#"{"enabled":false,"autostart":false,"binary":"/opt/opencode"}"#)
                 .expect("config parses");
+        assert!(!config.enabled);
         assert!(!config.autostart);
         assert_eq!(config.binary.as_deref(), Some("/opt/opencode"));
     }

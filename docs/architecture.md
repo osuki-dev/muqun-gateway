@@ -7,10 +7,10 @@ The Muqun Gateway serves as a resilient **Anti-Corruption Layer (ACL)** and **Ca
 ### 1.1 Inverted Stability Principle
 - **Mobile Client (`../app`)**: Deployments are constrained by mobile app store review cycles (Apple App Store / Google Play), enterprise distribution delays, and unpredictable user update cadence. Changing the mobile App contract requires extensive testing across screen form factors and OS releases.
 - **Desktop Gateway (`muqun-gateway`)**: Deployed locally as a self-contained Rust binary on the developer machine. Iteration, bug fixing, and protocol adaptation have near-zero distribution latency.
-- **Core Directive**: *All upstream protocol volatility, breaking schema migrations, and backend-specific idiosyncrasies must be absorbed entirely within the Gateway.* The external mobile API contract remains backward-compatible and frozen. When an upstream engine (such as OpenCode or DeepSeek Harness) alters its RPC signatures or event formats, only the Gateway binary is upgraded; the mobile client remains untouched.
+- **Core Directive**: *All upstream protocol volatility, breaking schema migrations, and backend-specific idiosyncrasies must be absorbed entirely within the Gateway.* The external mobile API contract remains backward-compatible and frozen. When an upstream harness (such as OpenCode or DeepSeek Harness) alters its RPC signatures or event formats, only the Gateway binary is upgraded; the mobile client remains untouched.
 
 ### 1.2 Zero-Assumption Client (Capability-Driven Rendering)
-The mobile App must never assume that a host machine has specific tools installed (e.g. `tmux`, `herdr`, or a particular AI coding agent). Instead, the Gateway exposes a dynamic, deterministic **Capability Matrix**. The mobile UI functions strictly as an adaptive renderer that enables, disables, or hides views based on active capabilities reported by the Gateway during session handshake.
+The mobile App must never assume that a host machine has specific tools installed (e.g. `tmux`, `herdr`, or a particular AI coding harness). Instead, the Gateway exposes a dynamic, deterministic **Capability Matrix**. The mobile UI functions strictly as an adaptive renderer that enables, disables, or hides views based on active capabilities reported by the Gateway during session handshake.
 
 ---
 
@@ -38,8 +38,8 @@ The Gateway is organized around Hexagonal / Clean Architecture with two primary 
 |       |                                                           |     |
 |       v                                                           v     |
 |  +---------------------------------+  +----------------------------------+
-|  |      Terminal Control Plane     |  |        Agent Engine Plane        |
-|  |  (TerminalBackend Port Seam)    |  |     (AgentEnginePort Seam)       |
+|  |      Terminal Control Plane     |  |       Agent Harness Plane        |
+|  |  (TerminalBackend Port Seam)    |  |  (HarnessRegistry / Port Seam)   |
 |  +---------------------------------+  +----------------------------------+
 |       |                     |               |                       |   |
 |       v                     v               v                       v   |
@@ -74,33 +74,50 @@ The Terminal plane manages interactive PTY workspaces, window multiplexing, scro
 - **Graceful Terminal Degradation**:
   When a host machine lacks both `herdr` and `tmux` (e.g. minimal Windows environments or headless containers), the Gateway does not fail. It disables the `terminal` capability flag, and routes for PTY control respond with HTTP 501 / `BackendError::Unsupported`. The mobile App hides the Terminal navigation tab and transitions smoothly into a dedicated Agent workbench.
 
-### 3.2 Agent Engine Plane (`AgentEnginePort`)
-The Agent Engine plane manages AI pair-programming sessions, conversation history, model routing, reasoning tiers, file diffs, tool execution approvals, and event streaming.
+### 3.2 Agent Harness Plane (`AgentEnginePort` / `HarnessRegistry`)
+The Agent Harness plane manages AI pair-programming sessions, conversation history, model routing, reasoning tiers, file diffs, tool execution approvals, and event streaming across one or more concurrent harnesses.
 
-- **Port (`src/agent/ports/engine.rs`)**:
-  `AgentEnginePort` unifies all agent behaviors across providers:
-  ```rust
-  pub trait AgentEnginePort: Send + Sync {
-      fn kind(&self) -> &'static str;
-      fn probe(&self) -> EngineFuture<'_, bool>;
-      fn list_projects(&self) -> EngineFuture<'_, Vec<AgentProject>>;
-      fn list_sessions<'a>(&'a self, query: &'a SessionQuery) -> EngineFuture<'a, Vec<AgentSessionInfo>>;
-      fn create_session<'a>(&'a self, directory: Option<&'a str>, model: Option<&'a ModelRef>, agent: Option<&'a str>) -> EngineFuture<'a, AgentSessionInfo>;
-      fn get_session<'a>(&'a self, session_id: &'a str) -> EngineFuture<'a, AgentSessionInfo>;
-      fn send_prompt<'a>(&'a self, session_id: &'a str, text: &'a str, attachments: &'a [String], delivery: Option<&'a str>) -> EngineFuture<'a, ()>;
-      fn interrupt<'a>(&'a self, session_id: &'a str) -> EngineFuture<'a, ()>;
-      fn switch_model<'a>(&'a self, session_id: &'a str, model: &'a ModelRef) -> EngineFuture<'a, ()>;
-      fn get_catalog<'a>(&'a self, directory: Option<&'a str>) -> EngineFuture<'a, AgentCatalog>;
-      fn get_timeline<'a>(&'a self, session_id: &'a str, limit: usize) -> EngineFuture<'a, Vec<TimelineItem>>;
-      fn get_vcs_diff<'a>(&'a self, session_id: &'a str, mode: &'a str) -> EngineFuture<'a, Vec<FileDiffItem>>;
-      fn reply_permission<'a>(&'a self, session_id: &'a str, request_id: &'a str, decision: PermissionDecision, message: Option<&'a str>) -> EngineFuture<'a, ()>;
-      // ... optional capability extensions with default unsupported fallbacks
-  }
-  ```
-- **Adapters**:
-  - `src/agent/adapters/opencode/`: Drives local OpenCode server instances via REST SSE.
-  - `src/agent/adapters/deepseek/`: Drives DeepSeek Harness (`@deepseek-ai/dsh`) instances via Typert JSON-RPC and WebSocket multiplexer (`/api/remote.mux`) with authority-bound HMAC-SHA256 signed session cookies.
-  - *Future Adapters (Claude Code, Pi, Custom Agents)*: Follow the exact same port pattern without touching routes or domain entities.
+#### 3.2.1 Three-Tier Domain Hierarchy
+To prevent conceptual confusion, the Gateway clearly separates:
+1. **Harness Tier (Runtime Host)**:
+   The execution daemon, tool sandbox, and protocol host.
+   - Examples: DeepSeek Harness (`dsh`), OpenCode Service (`opencode service start`), Claude Code CLI.
+   - Responsibilities: Bash command execution, file system read/write, LSP tool handling, session storage, and transport connection.
+2. **Agent Tier (Persona / Behavioral Role)**:
+   The role or prompt profile running inside a harness.
+   - Examples: `coder`, `reviewer`, `architect`, `build`, `tester`.
+   - Responsibilities: Task decomposition, prompt templates, and tool access permissions.
+3. **Model Tier (Inference LLM)**:
+   The foundation language model invoked for token generation.
+   - Examples: `deepseek-chat`, `deepseek-reasoner`, `claude-3-7-sonnet`, `gpt-4o`.
+
+#### 3.2.2 Port Definition (`src/agent/ports/engine.rs`)
+`AgentEnginePort` unifies all harness behaviors across providers:
+```rust
+pub trait AgentEnginePort: Send + Sync {
+    fn kind(&self) -> &'static str;
+    fn probe(&self) -> EngineFuture<'_, bool>;
+    fn list_projects(&self) -> EngineFuture<'_, Vec<AgentProject>>;
+    fn list_sessions<'a>(&'a self, query: &'a SessionQuery) -> EngineFuture<'a, Vec<AgentSessionInfo>>;
+    fn create_session<'a>(&'a self, directory: Option<&'a str>, model: Option<&'a ModelRef>, agent: Option<&'a str>) -> EngineFuture<'a, AgentSessionInfo>;
+    fn get_session<'a>(&'a self, session_id: &'a str) -> EngineFuture<'a, AgentSessionInfo>;
+    fn send_prompt<'a>(&'a self, session_id: &'a str, text: &'a str, attachments: &'a [String], delivery: Option<&'a str>) -> EngineFuture<'a, ()>;
+    fn interrupt<'a>(&'a self, session_id: &'a str) -> EngineFuture<'a, ()>;
+    fn switch_model<'a>(&'a self, session_id: &'a str, model: &'a ModelRef) -> EngineFuture<'a, ()>;
+    fn get_catalog<'a>(&'a self, directory: Option<&'a str>) -> EngineFuture<'a, AgentCatalog>;
+    fn get_timeline<'a>(&'a self, session_id: &'a str, limit: usize) -> EngineFuture<'a, Vec<TimelineItem>>;
+    fn get_vcs_diff<'a>(&'a self, session_id: &'a str, mode: &'a str) -> EngineFuture<'a, Vec<FileDiffItem>>;
+    fn reply_permission<'a>(&'a self, session_id: &'a str, request_id: &'a str, decision: PermissionDecision, message: Option<&'a str>) -> EngineFuture<'a, ()>;
+    // ... optional capability extensions with default unsupported fallbacks
+}
+```
+
+#### 3.2.3 Concurrent Multi-Harness Coexistence
+A developer may have OpenCode running for one repository while DeepSeek Harness is running on port 3080 for deep reasoning tasks.
+- **Concurrent Supervision**: Gateway supervises all enabled harnesses in parallel (`HarnessRegistry`).
+- **Catalog Aggregation**: `GET /api/agent/catalog` gathers models and agents from all connected harnesses into a unified response.
+- **Session Affinity**: When creating a session, the Gateway tags the session with its owning harness ID (`harness: "deepseek"` or `harness: "opencode"`).
+- **Dynamic Dispatch**: When the mobile App sends prompts, aborts, or inspects diffs for a session, Gateway automatically dispatches to the corresponding harness driver.
 
 ---
 
@@ -135,6 +152,20 @@ To eliminate the need for mobile App store updates when capabilities shift, the 
         "worktree": false,
         "file_browser": true,
         "tool_approvals": true
+      }
+    },
+    "harnesses": {
+      "deepseek": {
+        "connected": true,
+        "endpoint": "http://127.0.0.1:3080",
+        "models": ["deepseek-chat", "deepseek-reasoner"],
+        "agents": ["default"]
+      },
+      "opencode": {
+        "connected": true,
+        "endpoint": "http://127.0.0.1:4096",
+        "models": ["claude-3-7-sonnet"],
+        "agents": ["build", "coder"]
       }
     },
     "workspace_fs": {
@@ -234,14 +265,14 @@ When the user triggers a feature that requires a newer Gateway capability:
 
 ---
 
-## 7. Extension Protocol: Adding a New Engine
+## 7. Extension Protocol: Adding a New Harness Driver
 
-To integrate any future agent (e.g. Claude Code, Pi AI, or custom internal engines), implement four isolated files under `src/agent/adapters/<engine_name>/`:
+To integrate any future harness (e.g. Claude Code, Pi AI, or custom internal engines), implement four isolated files under `src/agent/adapters/<harness_name>/`:
 
 1. `endpoint.rs`: Connection metadata, health discovery, and credential loading.
 2. `client.rs`: Transport communication (REST, JSON-RPC, or gRPC).
 3. `stream.rs`: Server-Sent Events or WebSocket stream consumer.
-4. `mapper.rs`: Pure bidirectional mapping between engine payloads and domain entities (`AgentSessionInfo`, `AgentCatalog`, `TimelineItem`, `ToolCall`).
+4. `mapper.rs`: Pure bidirectional mapping between harness payloads and domain entities (`AgentSessionInfo`, `AgentCatalog`, `TimelineItem`, `ToolCall`).
 5. Register the new driver into `AgentEnginePort` and `AgentRuntime` supervisor discovery.
 
 **Result**: Zero changes to Axum HTTP route handlers, zero changes to mobile App schemas, and zero breaking changes for existing paired devices.
@@ -252,4 +283,3 @@ To integrate any future agent (e.g. Claude Code, Pi AI, or custom internal engin
 
 For complete configuration schemas, cascading resolution rules (CLI > Env > File > Auto-Discovery > Defaults), terminal multiplexer configs, and headless profiles, refer to the dedicated specification:
 - [`docs/configuration.md`](configuration.md)
-

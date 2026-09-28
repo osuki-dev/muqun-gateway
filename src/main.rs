@@ -659,7 +659,7 @@ struct Config {
 /// `skip_serializing_if` for the OpenCode block, so an existing `config.json`
 /// round-trips untouched until someone changes something.
 fn is_default_opencode(config: &agent::OpencodeConfig) -> bool {
-    config.autostart && config.binary.is_none()
+    config.enabled && config.autostart && config.binary.is_none()
 }
 
 fn is_default_deepseek(config: &agent::DeepseekConfig) -> bool {
