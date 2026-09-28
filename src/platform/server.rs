@@ -88,6 +88,7 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     spawn_agent_engine_watchers(state.clone());
     spawn_approval_watchers(state.clone());
     spawn_upload_gc();
+    spawn_memory_watchdog();
 
     let app = Router::new();
     let app = platform::routes::mount(app);
@@ -784,6 +785,70 @@ pub(crate) async fn security_headers(request: Request<Body>, next: Next) -> Resp
     headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
     headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
     response
+}
+
+/// Log the process's own peak resident set and the cgroup's every ten minutes.
+///
+/// The systemd unit reports one `MemoryPeak` for everything the cgroup ever
+/// ran, and that number cannot say whether a spike was this process, a
+/// transient allocation inside it, or something else the unit started. A
+/// timestamped series of `max_rss_mb` (this process's high-water mark) beside
+/// `cgroup_peak_mb` (the unit's) is what tells the two apart the next time the
+/// journal shows a spike.
+fn spawn_memory_watchdog() {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(600));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            if let Some(max_rss_mb) = process_peak_rss_mb() {
+                tracing::info!(
+                    max_rss_mb,
+                    cgroup_peak_mb = cgroup_memory_mb("memory.peak"),
+                    "gateway memory"
+                );
+            }
+        }
+    });
+}
+
+/// This process's high-water resident set, in MiB.
+///
+/// `/proc/self/status` is Linux-only; on other platforms the line is simply
+/// absent and the cgroup figure, where the init system has one, still speaks.
+#[cfg(target_os = "linux")]
+fn process_peak_rss_mb() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    status.lines().find_map(|line| {
+        let value = line.strip_prefix("VmHWM:")?;
+        value
+            .split_whitespace()
+            .next()?
+            .parse::<u64>()
+            .ok()
+            .map(|kb| kb / 1024)
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_peak_rss_mb() -> Option<u64> {
+    None
+}
+
+/// One cgroup v2 memory file for this process's own cgroup, in MiB.
+///
+/// `None` outside a cgroup v2 host -- macOS, or a Linux session started
+/// without an init system -- which is the same "no figure available" the
+/// non-Linux peak answers with.
+fn cgroup_memory_mb(file: &str) -> Option<u64> {
+    let membership = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let relative = membership.trim().strip_prefix("0::")?;
+    let bytes = std::fs::read_to_string(format!("/sys/fs/cgroup{relative}/{file}"))
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    Some(bytes / 1024 / 1024)
 }
 
 #[cfg(test)]
