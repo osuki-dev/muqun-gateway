@@ -50,3 +50,11 @@ tokio-tungstenite = { version = "0.30.0", default-features = false, features = [
 [dev-dependencies]
 # Only for driving a Router in tests (`ServiceExt::oneshot`).
 tower = { version = "0.5", default-features = false, features = ["util"] }
+
+[profile.release]
+# The gateway ships as a single prebuilt binary per platform. Thin LTO and one
+# codegen unit trade a slower release build for a smaller, faster artifact;
+# stripping drops the symbol tables nothing needs at runtime.
+lto = "thin"
+codegen-units = 1
+strip = true
