@@ -4,6 +4,66 @@ use serde_json::{json, Value};
 
 use crate::CONTENT_SCHEMA_VERSION;
 
+fn agent_harness_plane_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["supported", "activeHarness", "harnesses"],
+        "properties": {
+            "supported": { "type": "boolean", "description": "Whether any AI harness is configured and enabled" },
+            "activeHarness": { "type": ["string", "null"], "description": "Preferred active harness id" },
+            "harnesses": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["id", "name", "kind", "status", "features", "models", "agents"],
+                    "properties": {
+                        "id": { "type": "string" },
+                        "name": { "type": "string" },
+                        "kind": { "type": "string" },
+                        "status": { "type": "string", "enum": ["ready", "stopped", "error", "unconfigured"] },
+                        "endpoint": { "type": ["string", "null"] },
+                        "features": {
+                            "type": "object",
+                            "properties": {
+                                "supportsReasoning": { "type": "boolean" },
+                                "reasoningEffort": { "type": "boolean" },
+                                "subagents": { "type": "boolean" },
+                                "streamingDiff": { "type": "boolean" },
+                                "toolApproval": { "type": "boolean" },
+                                "timelineEvents": { "type": "boolean" }
+                            }
+                        },
+                        "models": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "required": ["id", "name"],
+                                "properties": {
+                                    "id": { "type": "string" },
+                                    "name": { "type": "string" },
+                                    "reasoningEffortTiers": { "type": "array", "items": { "type": "string" } }
+                                }
+                            }
+                        },
+                        "agents": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "required": ["id", "name", "description"],
+                                "properties": {
+                                    "id": { "type": "string" },
+                                    "name": { "type": "string" },
+                                    "description": { "type": "string" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
 pub fn openapi_spec() -> Value {
     json!({
         "openapi": "3.1.0",
@@ -649,7 +709,7 @@ fn capabilities_discovery_responses() -> Value {
                 "protocolVersion": { "type": "string", "description": "Protocol revision date (e.g. 2026-09-28)" },
                 "planes": {
                     "type": "object",
-                    "required": ["terminal", "harness"],
+                    "required": ["terminal", "agent"],
                     "properties": {
                         "terminal": {
                             "type": "object",
@@ -671,63 +731,8 @@ fn capabilities_discovery_responses() -> Value {
                                 }
                             }
                         },
-                        "harness": {
-                            "type": "object",
-                            "required": ["supported", "activeHarness", "harnesses"],
-                            "properties": {
-                                "supported": { "type": "boolean", "description": "Whether any AI harness is configured and enabled" },
-                                "activeHarness": { "type": ["string", "null"], "description": "Preferred active harness id" },
-                                "harnesses": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "object",
-                                        "required": ["id", "name", "kind", "status", "features", "models", "agents"],
-                                        "properties": {
-                                            "id": { "type": "string" },
-                                            "name": { "type": "string" },
-                                            "kind": { "type": "string" },
-                                            "status": { "type": "string", "enum": ["ready", "stopped", "error", "unconfigured"] },
-                                            "endpoint": { "type": ["string", "null"] },
-                                            "features": {
-                                                "type": "object",
-                                                "properties": {
-                                                    "supportsReasoning": { "type": "boolean" },
-                                                    "reasoningEffort": { "type": "boolean" },
-                                                    "subagents": { "type": "boolean" },
-                                                    "streamingDiff": { "type": "boolean" },
-                                                    "toolApproval": { "type": "boolean" },
-                                                    "timelineEvents": { "type": "boolean" }
-                                                }
-                                            },
-                                            "models": {
-                                                "type": "array",
-                                                "items": {
-                                                    "type": "object",
-                                                    "required": ["id", "name"],
-                                                    "properties": {
-                                                        "id": { "type": "string" },
-                                                        "name": { "type": "string" },
-                                                        "reasoningEffortTiers": { "type": "array", "items": { "type": "string" } }
-                                                    }
-                                                }
-                                            },
-                                            "agents": {
-                                                "type": "array",
-                                                "items": {
-                                                    "type": "object",
-                                                    "required": ["id", "name", "description"],
-                                                    "properties": {
-                                                        "id": { "type": "string" },
-                                                        "name": { "type": "string" },
-                                                        "description": { "type": "string" }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        },
+                        "agent": agent_harness_plane_schema(),
+                        "harness": agent_harness_plane_schema(),
                         "ssh": {
                             "type": "object",
                             "properties": {

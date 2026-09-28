@@ -185,11 +185,13 @@ pub struct SshPlaneDiscovery {
     pub extra: BTreeMap<String, Value>,
 }
 
-/// Discovered multi-plane structure across Terminal, Harness, and SSH planes
+/// Discovered multi-plane structure across Terminal, Agent, and SSH planes
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscoveryPlanes {
     pub terminal: TerminalPlaneDiscovery,
+    pub agent: HarnessPlaneDiscovery,
+    /// Backward-compatibility alias for `agent`
     pub harness: HarnessPlaneDiscovery,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh: Option<SshPlaneDiscovery>,
@@ -284,6 +286,7 @@ pub async fn build_discovery_planes(state: &AppState) -> DiscoveryPlanes {
     };
     DiscoveryPlanes {
         terminal,
+        agent: harness.clone(),
         harness,
         ssh: Some(ssh),
         extra: BTreeMap::new(),
@@ -456,6 +459,16 @@ mod tests {
                 },
                 degraded_reason: None,
             },
+            agent: HarnessPlaneDiscovery {
+                supported: true,
+                active_harness: Some("deepseek".to_string()),
+                harnesses: Vec::new(),
+                features: HarnessPlaneFeatures {
+                    multi_harness: true,
+                    catalog_aggregation: true,
+                    session_routing: true,
+                },
+            },
             harness: HarnessPlaneDiscovery {
                 supported: true,
                 active_harness: Some("deepseek".to_string()),
@@ -477,8 +490,9 @@ mod tests {
 
         let val = serde_json::to_value(&planes).expect("serializes");
         assert_eq!(val["terminal"]["supported"], true);
+        assert_eq!(val["agent"]["activeHarness"], "deepseek");
         assert_eq!(val["harness"]["activeHarness"], "deepseek");
-        assert_eq!(val["harness"]["features"]["multiHarness"], true);
+        assert_eq!(val["agent"]["features"]["multiHarness"], true);
         assert_eq!(val["harness"]["features"]["sessionRouting"], true);
         assert_eq!(val["ssh"]["supported"], true);
         assert_eq!(val["ssh"]["tunnelSupported"], true);

@@ -19,7 +19,7 @@ use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::response::{Html, IntoResponse as _, Response};
+use axum::response::{IntoResponse as _, Response};
 use axum::routing::{get, patch, post};
 use axum::{Extension, Json, Router};
 use base64::Engine as _;
@@ -51,9 +51,13 @@ pub(crate) mod terminal;
 // Backward-compatible re-exports at crate root
 pub(crate) use agent::{agent_events, approvals, tasks};
 pub(crate) use connectivity::{authority, gateway_listener, transport};
-pub(crate) use platform::{
-    discovery, git, i18n, openapi_spec, parts, service, state_lock, DOCS_HTML,
+#[cfg(test)]
+pub(crate) use platform::openapi_spec;
+#[allow(unused_imports)]
+pub(crate) use platform::routes::{
+    api_capabilities, api_discovery, api_meta, api_set_label, docs, health, openapi_json,
 };
+pub(crate) use platform::{discovery, git, i18n, parts, service, state_lock};
 pub(crate) use terminal::{
     backend, backend_startup, command_catalog, composer, login_env, native, scrollback, shortcuts,
     supervision,
@@ -2253,13 +2257,12 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     spawn_approval_watchers(state.clone());
     spawn_upload_gc();
 
-    let app = agent::routes::mount(Router::new())
-        .route("/docs", get(docs))
-        .route("/openapi.json", get(openapi_json))
+    let app = Router::new();
+    let app = platform::routes::mount(app);
+    let app = agent::routes::mount(app)
         .route("/api/pair/request", post(pair_request))
         .route("/api/pair/claim", post(pair_claim))
         .route("/api/pair/pending", get(pair_pending))
-        .route("/api/meta", get(api_meta).patch(api_set_label))
         .route("/api/pairings", get(list_paired_devices))
         .route(
             "/api/pairings/{device_id}",
@@ -2270,9 +2273,6 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
             post(register_push_token).delete(unregister_push_token),
         )
         .route("/api/notifications/test", post(send_test_notification))
-        .route("/health", get(health))
-        .route("/api/capabilities", get(api_capabilities))
-        .route("/api/discovery", get(api_discovery))
         .route("/api/sessions", get(sessions))
         .route("/api/sessions/{session_id}/events", get(events))
         .route("/api/sessions/{session_id}/snapshot", get(snapshot))
@@ -3087,14 +3087,6 @@ async fn security_headers(request: Request<Body>, next: Next) -> Response {
     headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
     headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
     response
-}
-
-async fn docs() -> Html<&'static str> {
-    Html(DOCS_HTML)
-}
-
-async fn openapi_json() -> Json<Value> {
-    Json(openapi_spec())
 }
 
 async fn pair_request(
@@ -4911,18 +4903,6 @@ fn render_qr(code: &QrCode) -> String {
         .join("\n")
 }
 
-async fn health(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
-    let device_id = require_device(&state, &headers)?;
-    let sealed = device_seals_its_transport(&state, &device_id);
-    Ok(Json(gateway_metadata(&state, sealed).await?))
-}
-
-async fn api_meta(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
-    let device_id = require_device(&state, &headers)?;
-    let sealed = device_seals_its_transport(&state, &device_id);
-    Ok(Json(gateway_metadata(&state, sealed).await?))
-}
-
 /// Whether this device's requests are sealed by the application-layer
 /// transport.
 ///
@@ -4940,62 +4920,7 @@ pub(crate) fn device_seals_its_transport(state: &AppState, device_id: &str) -> b
     })
 }
 
-/// Dynamic dual-plane capability discovery endpoint for mobile client (`/api/capabilities`)
-async fn api_capabilities(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> ApiResult<Json<Value>> {
-    let device_id = headers
-        .get("authorization")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "))
-        .or_else(|| headers.get("x-device-token").and_then(|h| h.to_str().ok()));
-    let sealed = device_id
-        .map(|id| device_seals_its_transport(&state, id))
-        .unwrap_or(false);
-
-    let discovery = discovery::build_discovery(&state, sealed).await;
-    Ok(Json(discovery))
-}
-
-/// Dynamic capability & multi-plane discovery endpoint for client (`/api/discovery`)
-async fn api_discovery(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> ApiResult<Json<Value>> {
-    let device_id = headers
-        .get("authorization")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "))
-        .or_else(|| headers.get("x-device-token").and_then(|h| h.to_str().ok()));
-    let sealed = device_id
-        .map(|id| device_seals_its_transport(&state, id))
-        .unwrap_or(false);
-
-    let discovery = discovery::build_discovery(&state, sealed).await;
-    Ok(Json(discovery))
-}
-
-#[derive(Deserialize)]
-struct SetLabelBody {
-    label: String,
-}
-
-/// Set the server's display label from a paired device -- the app calls this
-/// when the user renames the server, so push notifications carry that name
-/// instead of the hostname default.
-async fn api_set_label(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(body): Json<SetLabelBody>,
-) -> ApiResult<Json<Value>> {
-    require_device(&state, &headers)?;
-    let label = update_server_label(&body.label)
-        .map_err(|err| api_error(StatusCode::BAD_REQUEST, "invalid_label", &err.to_string()))?;
-    Ok(Json(json!({ "label": label })))
-}
-
-async fn gateway_metadata(
+pub(crate) async fn gateway_metadata(
     state: &AppState,
     application_layer_encryption: bool,
 ) -> ApiResult<Value> {
@@ -12678,7 +12603,7 @@ fn hostname_label() -> String {
 /// Persist a new display label into the config (and the pairing payload), so a
 /// name set from the app shows up in push notifications. Mirrors
 /// `update_public_url`.
-fn update_server_label(label: &str) -> anyhow::Result<String> {
+pub(crate) fn update_server_label(label: &str) -> anyhow::Result<String> {
     let label = label.trim();
     anyhow::ensure!(
         !label.is_empty()
