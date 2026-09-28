@@ -123,75 +123,161 @@ A developer may have OpenCode running for one repository while DeepSeek Harness 
 
 ## 4. Dynamic Capability Discovery & Negotiation
 
-To eliminate the need for mobile App store updates when capabilities shift, the Gateway exposes a unified Capability Declaration on `GET /api/health` and `GET /api/meta`.
+To eliminate the need for mobile App store updates when capabilities shift, the Gateway exposes dynamic capability discovery across two independent planes: the **Terminal Plane** and the **Agent Harness Plane**.
 
-### 4.1 Capability Schema
+Discovery is provided through:
+1. **Dedicated Endpoint**: `GET /api/capabilities` (available for unauthenticated probing and authenticated device inspection).
+2. **Initial Handshake & Reconnect**: The `planes` node is embedded additively into `GET /health` and `GET /api/meta`.
+3. **Capability Announcements**: `capabilities_discovery` and `harness_discovery` are broadcast in the legacy `capabilities` array.
+
+### 4.1 Discovery Schema (`GET /api/capabilities`)
 ```json
 {
-  "gateway_version": "0.13.0",
-  "api_version": "1.4.0",
+  "ok": true,
+  "gatewayVersion": "0.12.2",
+  "apiVersion": "1.8.0",
+  "apiMajor": 1,
   "platform": "linux",
-  "capabilities": {
+  "serverId": "srv_dev_box",
+  "label": "Workstation (Linux)",
+  "planes": {
     "terminal": {
       "supported": true,
-      "backend": "tmux",
+      "mode": "auto",
+      "activeBackend": "tmux",
+      "backends": [
+        {
+          "sessionId": "default",
+          "label": "Tmux Workspace",
+          "kind": "tmux",
+          "connected": true,
+          "version": "3.3a",
+          "protocol": null,
+          "capabilities": ["agent_collaboration"]
+        }
+      ],
       "features": {
-        "multi_window": true,
-        "split_pane": true,
-        "raw_pty": true
-      }
-    },
-    "agent": {
-      "supported": true,
-      "provider": "deepseek",
-      "version": "1.0.0",
-      "features": {
-        "streaming": true,
-        "reasoning_effort": true,
-        "model_selection": true,
-        "worktree": false,
-        "file_browser": true,
-        "tool_approvals": true
-      }
-    },
-    "harnesses": {
-      "deepseek": {
-        "connected": true,
-        "endpoint": "http://127.0.0.1:3080",
-        "models": ["deepseek-chat", "deepseek-reasoner"],
-        "agents": ["default"]
+        "multiWindow": true,
+        "splitPane": true,
+        "rawPty": true,
+        "paneShortcuts": true,
+        "paneContext": true,
+        "gitDiff": true
       },
-      "opencode": {
-        "connected": true,
-        "endpoint": "http://127.0.0.1:4096",
-        "models": ["claude-3-7-sonnet"],
-        "agents": ["build", "coder"]
+      "degradedReason": null
+    },
+    "harness": {
+      "supported": true,
+      "activeHarness": "deepseek",
+      "harnesses": [
+        {
+          "id": "deepseek",
+          "name": "DeepSeek Harness",
+          "kind": "deepseek",
+          "status": "connected",
+          "enabled": true,
+          "endpoint": "http://127.0.0.1:3080",
+          "version": null,
+          "models": [
+            {
+              "id": "deepseek-chat",
+              "name": "DeepSeek Chat (V3)",
+              "providerId": "deepseek",
+              "supportsReasoning": false
+            },
+            {
+              "id": "deepseek-reasoner",
+              "name": "DeepSeek Reasoner (R1)",
+              "providerId": "deepseek",
+              "supportsReasoning": true
+            }
+          ],
+          "agents": [
+            {
+              "id": "deepseek",
+              "name": "DeepSeek Assistant",
+              "description": "DeepSeek AI coding agent with tool dispatch and reasoning depth"
+            }
+          ],
+          "features": {
+            "streaming": true,
+            "reasoningEffort": true,
+            "modelSelection": true,
+            "toolApprovals": true,
+            "worktrees": false,
+            "revert": false,
+            "inbox": false
+          }
+        },
+        {
+          "id": "opencode",
+          "name": "OpenCode",
+          "kind": "opencode",
+          "status": "offline",
+          "enabled": true,
+          "endpoint": null,
+          "version": null,
+          "models": [],
+          "agents": [
+            {
+              "id": "build",
+              "name": "Build Agent",
+              "description": "OpenCode autonomous build and development agent"
+            },
+            {
+              "id": "coder",
+              "name": "Coder Agent",
+              "description": "OpenCode pair programming and code generation agent"
+            }
+          ],
+          "features": {
+            "streaming": true,
+            "reasoningEffort": false,
+            "modelSelection": true,
+            "toolApprovals": true,
+            "worktrees": true,
+            "revert": true,
+            "inbox": true
+          }
+        }
+      ],
+      "features": {
+        "multiHarness": true,
+        "catalogAggregation": true,
+        "sessionRouting": true
       }
-    },
-    "workspace_fs": {
-      "supported": true,
-      "diff_preview": true,
-      "file_upload": true
-    },
-    "self_update": {
-      "supported": true,
-      "channel": "stable",
-      "update_available": false,
-      "latest_version": "0.13.0"
     }
-  }
+  },
+  "capabilities": [
+    "agent_catalog",
+    "agent_events",
+    "agent_sessions",
+    "capabilities_discovery",
+    "harness_discovery",
+    "git_diff",
+    "pane_context",
+    "pane_parts"
+  ]
 }
 ```
 
 ### 4.2 Mobile Client Adaptive Rules
-The mobile client parses the `capabilities` node upon initial pairing and reconnect:
-1. **Terminal Tab Guard**:
-   If `capabilities.terminal.supported == false`, the App removes the Terminal tab from the bottom navigation bar or displays an informational card explaining that the host runs in headless agent-only mode.
-2. **Reasoning Effort Control**:
-   If `capabilities.agent.features.reasoning_effort == true` (e.g. DeepSeek Harness with Flash/Pro models), the input composer dynamically reveals the thinking-depth picker (`Off`, `Low`, `High`, `Max`). If false (e.g. OpenCode standard presets), the UI hides this selector.
-3. **Workspace Isolation & Worktrees**:
-   If `capabilities.agent.features.worktree == false`, the App avoids rendering branch-isolation modals and operates directly within the primary workspace directory.
-4. **Tool Call Visualization**:
+The mobile client parses `planes` upon connection:
+1. **Terminal Plane Adaptation**:
+   - If `planes.terminal.supported == false`:
+     The mobile App hides terminal workspaces and tabs. It presents a dedicated AI Agent workbench or an informational banner with `planes.terminal.degradedReason` (`"no_terminal_backend_configured"`).
+   - If `planes.terminal.supported == true`:
+     The App enables terminal multiplexer switching, pane splitting, shortcuts, and git diff preview.
+2. **Harness Plane Adaptation**:
+   - If `planes.harness.supported == false`:
+     The App hides AI session initiation cards and displays harness setup guidance.
+   - If `planes.harness.supported == true`:
+     The App exposes model and agent pickers populated from `planes.harness.harnesses`.
+   - **Reasoning Depth Selector**:
+     If the active harness or selected model declares `supportsReasoning: true` (e.g. `deepseek-reasoner`), the App composer renders the reasoning depth selector (`Off`, `Low`, `High`, `Max`).
+   - **Multi-Harness Session Selector**:
+     When multiple harnesses are in status `connected` (e.g. DeepSeek and OpenCode simultaneously), the App allows the developer to pick which harness powers each new session without reconfiguring the server.
+3. **Resilient Tool Call Visualization**:
    The Gateway projects engine-specific tool events into normalized metadata cards (e.g. `files` with diff additions/deletions, `exitCode` for shell executions). Even if a brand-new tool type is introduced upstream, the App falls back to generic readable text representation without crashing.
 
 ---

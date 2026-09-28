@@ -133,6 +133,8 @@ pub struct EngineStatus {
     pub version: Option<String>,
     pub stream_connected: bool,
     pub autostart: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 pub struct AgentRuntime {
@@ -206,6 +208,183 @@ impl AgentRuntime {
                 .map(|m| m.stream_connected())
                 .unwrap_or(false),
             autostart: self.config.autostart,
+            kind: manager.as_ref().map(|m| m.engine().kind().to_string()),
+        }
+    }
+
+    /// Discover status and capabilities of all configured or reachable AI harnesses.
+    pub async fn discover_harnesses(&self) -> crate::discovery::HarnessPlaneDiscovery {
+        use crate::discovery::{
+            HarnessDiscoveryInfo, HarnessPlaneDiscovery, HarnessPlaneFeatures, HarnessStatus,
+        };
+
+        let current_manager = self.manager.read().await.clone();
+        let active_kind = current_manager
+            .as_ref()
+            .map(|m| m.engine().kind().to_string());
+
+        let mut harnesses = Vec::new();
+
+        // 1. DeepSeek Harness discovery
+        let deepseek_enabled =
+            self.deepseek_config.enabled || self.deepseek_config.endpoint.is_some();
+        let deepseek_info = if !deepseek_enabled {
+            HarnessDiscoveryInfo {
+                id: "deepseek".to_string(),
+                name: "DeepSeek Harness".to_string(),
+                kind: "deepseek".to_string(),
+                status: HarnessStatus::Disabled,
+                enabled: false,
+                endpoint: self.deepseek_config.endpoint.clone(),
+                version: None,
+                models: default_deepseek_models(),
+                agents: default_deepseek_agents(),
+                features: deepseek_features(),
+            }
+        } else if let Some(m) = current_manager
+            .as_ref()
+            .filter(|m| m.engine().kind() == "deepseek")
+        {
+            HarnessDiscoveryInfo {
+                id: "deepseek".to_string(),
+                name: "DeepSeek Harness".to_string(),
+                kind: "deepseek".to_string(),
+                status: HarnessStatus::Connected,
+                enabled: true,
+                endpoint: Some(m.endpoint_url().to_string()),
+                version: m.version(),
+                models: default_deepseek_models(),
+                agents: default_deepseek_agents(),
+                features: deepseek_features(),
+            }
+        } else {
+            let ep = if let Some(ref url) = self.deepseek_config.endpoint {
+                Some(crate::agent::adapters::deepseek::DeepseekEndpoint::new(
+                    url.clone(),
+                    self.deepseek_config.token.clone(),
+                    self.deepseek_config
+                        .secret
+                        .clone()
+                        .or_else(crate::agent::adapters::deepseek::auth::load_local_secret),
+                ))
+            } else {
+                crate::agent::adapters::deepseek::DeepseekEndpoint::discover().await
+            };
+
+            let (status, endpoint_url, version) = match ep {
+                Some(endpoint) => {
+                    let client = probe_client();
+                    if endpoint.probe_healthy(&client).await {
+                        (
+                            HarnessStatus::Reachable,
+                            Some(endpoint.url),
+                            endpoint.version,
+                        )
+                    } else {
+                        (HarnessStatus::Offline, Some(endpoint.url), None)
+                    }
+                }
+                None => (HarnessStatus::Offline, None, None),
+            };
+
+            HarnessDiscoveryInfo {
+                id: "deepseek".to_string(),
+                name: "DeepSeek Harness".to_string(),
+                kind: "deepseek".to_string(),
+                status,
+                enabled: true,
+                endpoint: endpoint_url,
+                version,
+                models: default_deepseek_models(),
+                agents: default_deepseek_agents(),
+                features: deepseek_features(),
+            }
+        };
+        harnesses.push(deepseek_info);
+
+        // 2. OpenCode discovery
+        let opencode_enabled = self.config.enabled;
+        let opencode_info = if !opencode_enabled {
+            HarnessDiscoveryInfo {
+                id: "opencode".to_string(),
+                name: "OpenCode".to_string(),
+                kind: "opencode".to_string(),
+                status: HarnessStatus::Disabled,
+                enabled: false,
+                endpoint: None,
+                version: None,
+                models: Vec::new(),
+                agents: default_opencode_agents(),
+                features: opencode_features(),
+            }
+        } else if let Some(m) = current_manager
+            .as_ref()
+            .filter(|m| m.engine().kind() == "opencode")
+        {
+            HarnessDiscoveryInfo {
+                id: "opencode".to_string(),
+                name: "OpenCode".to_string(),
+                kind: "opencode".to_string(),
+                status: HarnessStatus::Connected,
+                enabled: true,
+                endpoint: Some(m.endpoint_url().to_string()),
+                version: m.version(),
+                models: Vec::new(),
+                agents: default_opencode_agents(),
+                features: opencode_features(),
+            }
+        } else {
+            let (status, endpoint_url, version) = match OpencodeEndpoint::discover().await {
+                Some(endpoint) => {
+                    let client = probe_client();
+                    if endpoint.probe_healthy(&client).await {
+                        (
+                            HarnessStatus::Reachable,
+                            Some(endpoint.url),
+                            endpoint.version,
+                        )
+                    } else {
+                        (HarnessStatus::Offline, Some(endpoint.url), None)
+                    }
+                }
+                None => {
+                    let installed = local_installation_status(&self.config);
+                    if installed == EngineInstallation::Installed {
+                        (HarnessStatus::Offline, None, None)
+                    } else {
+                        (HarnessStatus::NotInstalled, None, None)
+                    }
+                }
+            };
+
+            HarnessDiscoveryInfo {
+                id: "opencode".to_string(),
+                name: "OpenCode".to_string(),
+                kind: "opencode".to_string(),
+                status,
+                enabled: true,
+                endpoint: endpoint_url,
+                version,
+                models: Vec::new(),
+                agents: default_opencode_agents(),
+                features: opencode_features(),
+            }
+        };
+        harnesses.push(opencode_info);
+
+        let supported = harnesses
+            .iter()
+            .any(|h| h.status == HarnessStatus::Connected || h.status == HarnessStatus::Reachable);
+
+        HarnessPlaneDiscovery {
+            supported,
+            active_harness: active_kind,
+            harnesses,
+            features: HarnessPlaneFeatures {
+                multi_harness: true,
+                catalog_aggregation: true,
+                session_routing: true,
+            },
         }
     }
 
@@ -752,6 +931,72 @@ async fn wait_for_service() -> anyhow::Result<OpencodeEndpoint> {
     }
 }
 
+fn default_deepseek_models() -> Vec<crate::discovery::HarnessModelInfo> {
+    vec![
+        crate::discovery::HarnessModelInfo {
+            id: "deepseek-chat".to_string(),
+            name: "DeepSeek Chat (V3)".to_string(),
+            provider_id: "deepseek".to_string(),
+            supports_reasoning: false,
+        },
+        crate::discovery::HarnessModelInfo {
+            id: "deepseek-reasoner".to_string(),
+            name: "DeepSeek Reasoner (R1)".to_string(),
+            provider_id: "deepseek".to_string(),
+            supports_reasoning: true,
+        },
+    ]
+}
+
+fn default_deepseek_agents() -> Vec<crate::discovery::HarnessAgentInfo> {
+    vec![crate::discovery::HarnessAgentInfo {
+        id: "deepseek".to_string(),
+        name: "DeepSeek Assistant".to_string(),
+        description: Some(
+            "DeepSeek AI coding agent with tool dispatch and reasoning depth".to_string(),
+        ),
+    }]
+}
+
+fn deepseek_features() -> crate::discovery::HarnessFeatures {
+    crate::discovery::HarnessFeatures {
+        streaming: true,
+        reasoning_effort: true,
+        model_selection: true,
+        tool_approvals: true,
+        worktrees: false,
+        revert: false,
+        inbox: false,
+    }
+}
+
+fn default_opencode_agents() -> Vec<crate::discovery::HarnessAgentInfo> {
+    vec![
+        crate::discovery::HarnessAgentInfo {
+            id: "build".to_string(),
+            name: "Build Agent".to_string(),
+            description: Some("OpenCode autonomous build and development agent".to_string()),
+        },
+        crate::discovery::HarnessAgentInfo {
+            id: "coder".to_string(),
+            name: "Coder Agent".to_string(),
+            description: Some("OpenCode pair programming and code generation agent".to_string()),
+        },
+    ]
+}
+
+fn opencode_features() -> crate::discovery::HarnessFeatures {
+    crate::discovery::HarnessFeatures {
+        streaming: true,
+        reasoning_effort: false,
+        model_selection: true,
+        tool_approvals: true,
+        worktrees: true,
+        revert: true,
+        inbox: true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1101,6 +1346,7 @@ mod tests {
             version: None,
             stream_connected: false,
             autostart: true,
+            kind: None,
         };
         let value = serde_json::to_value(status).expect("status serializes");
         assert_eq!(value["installation"], "not_found");

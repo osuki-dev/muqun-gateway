@@ -51,6 +51,7 @@ mod backend;
 mod backend_startup;
 mod command_catalog;
 mod composer;
+mod discovery;
 mod gateway_listener;
 mod git;
 mod i18n;
@@ -328,6 +329,8 @@ const API_CAPABILITIES: &[&str] = &[
     "agent_models",
     "agent_permissions",
     "agent_sessions",
+    "capabilities_discovery",
+    "harness_discovery",
     "agent_spawn",
     "agent_timeline",
     "agent_vcs",
@@ -404,7 +407,7 @@ const HERDR_COLLABORATION_MIN: (u64, u64, u64) = (0, 9, 0);
 ///
 /// Pure, so every combination -- including the ones that need a real Herdr or a
 /// real tmux server to reach -- is a unit test rather than a manual check.
-fn session_capabilities(
+pub(crate) fn session_capabilities(
     kind: BackendKind,
     connected: bool,
     version: Option<&str>,
@@ -426,7 +429,7 @@ fn session_capabilities(
 /// conditional without the same justification: a capability that comes and goes
 /// with a socket is a capability a client has to re-check, and every entry in
 /// [`API_CAPABILITIES`] is true for as long as this binary is running.
-fn gateway_capabilities(collaboration_somewhere: bool) -> Vec<&'static str> {
+pub(crate) fn gateway_capabilities(collaboration_somewhere: bool) -> Vec<&'static str> {
     let mut capabilities: Vec<&'static str> = API_CAPABILITIES.to_vec();
     if collaboration_somewhere {
         capabilities.push(AGENT_COLLABORATION_CAPABILITY);
@@ -2277,6 +2280,7 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         )
         .route("/api/notifications/test", post(send_test_notification))
         .route("/health", get(health))
+        .route("/api/capabilities", get(api_capabilities))
         .route("/api/sessions", get(sessions))
         .route("/api/sessions/{session_id}/events", get(events))
         .route("/api/sessions/{session_id}/snapshot", get(snapshot))
@@ -4936,12 +4940,30 @@ async fn api_meta(State(state): State<AppState>, headers: HeaderMap) -> ApiResul
 /// changes -- `require_device` demands the proof header from exactly the
 /// devices that have a key. So the honest answer to "is this connection
 /// encrypted at the application layer" is about the device asking.
-fn device_seals_its_transport(state: &AppState, device_id: &str) -> bool {
+pub(crate) fn device_seals_its_transport(state: &AppState, device_id: &str) -> bool {
     state.devices.lock().is_ok_and(|devices| {
         devices
             .iter()
             .any(|device| device.id == device_id && device.transport_key.is_some())
     })
+}
+
+/// Dynamic dual-plane capability discovery endpoint for mobile client (`/api/capabilities`)
+async fn api_capabilities(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    let device_id = headers
+        .get("authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .or_else(|| headers.get("x-device-token").and_then(|h| h.to_str().ok()));
+    let sealed = device_id
+        .map(|id| device_seals_its_transport(&state, id))
+        .unwrap_or(false);
+
+    let discovery = discovery::build_discovery(&state, sealed).await;
+    Ok(Json(discovery))
 }
 
 #[derive(Deserialize)]
@@ -4974,13 +4996,7 @@ async fn gateway_metadata(
     // session's metadata, not a stored-order tmux entry that always reports
     // `compatible: true`. See `ordered_sessions`.
     let ordered = ordered_sessions(state).await;
-    let primary = ordered.first().copied().ok_or_else(|| {
-        api_error(
-            StatusCode::BAD_GATEWAY,
-            "backend_unavailable",
-            "no terminal backend is configured",
-        )
-    })?;
+    let primary = ordered.first().copied();
     let mut backends = Vec::with_capacity(state.config.sessions.len());
     let mut primary_metadata = None;
     let mut legacy_herdr = None;
@@ -5013,12 +5029,15 @@ async fn gateway_metadata(
             // gateway-wide list.
             "capabilities": capabilities,
         });
-        if session.id == primary.id {
-            primary_metadata = Some(metadata.clone());
-            legacy_herdr = Some(compatibility);
+        if let Some(primary_session) = primary {
+            if session.id == primary_session.id {
+                primary_metadata = Some(metadata.clone());
+                legacy_herdr = Some(compatibility);
+            }
         }
         backends.push(metadata);
     }
+    let planes = discovery::build_discovery_planes(state).await;
     Ok(json!({
         "ok": true,
         "gatewayVersion": env!("CARGO_PKG_VERSION"),
@@ -5027,6 +5046,7 @@ async fn gateway_metadata(
         "minimumCompatibleApiVersion": "1.0.0",
         "legacyUnversionedApi": true,
         "capabilities": gateway_capabilities(collaboration_somewhere),
+        "planes": planes,
         "serverId": state.config.server_id,
         "label": state.config.label,
         "transportSecurity": {
@@ -5090,7 +5110,7 @@ type CachedMetadata = (std::time::Instant, (Value, Value));
 static SESSION_METADATA_CACHE: std::sync::OnceLock<Mutex<HashMap<String, CachedMetadata>>> =
     std::sync::OnceLock::new();
 
-async fn session_metadata(session: &SessionConfig) -> (Value, Value) {
+pub(crate) async fn session_metadata(session: &SessionConfig) -> (Value, Value) {
     let cache = SESSION_METADATA_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(cache) = cache.lock() {
         if let Some((seen, answer)) = cache.get(&session.id) {
@@ -5249,7 +5269,7 @@ const SESSION_LIVENESS_TTL: Duration = Duration::from_millis(1000);
 /// Orders, never filters: every configured session stays in the result, even
 /// when nothing is reachable, so a client that reads only the first entry
 /// never sees `undefined` where it used to see a session.
-async fn ordered_sessions(state: &AppState) -> Vec<&SessionConfig> {
+pub(crate) async fn ordered_sessions(state: &AppState) -> Vec<&SessionConfig> {
     if let Some(order) = state
         .session_liveness
         .lock()
@@ -12800,6 +12820,7 @@ fn openapi_spec() -> Value {
         "security": [{ "bearerAuth": [] }],
         "paths": {
             "/health": { "get": simple_endpoint("Gateway health") },
+            "/api/capabilities": { "get": simple_endpoint("Gateway Terminal and AI Harness dual-plane capability discovery") },
             "/api/meta": { "get": simple_endpoint("Gateway API, backend, and legacy compatibility metadata") },
             "/api/pair/request": {
                 "post": {
@@ -18542,6 +18563,109 @@ mod tests {
         assert!(API_CAPABILITIES.contains(&"agent_catalog"));
         assert!(API_CAPABILITIES.contains(&"terminal_backends"));
         assert!(API_CAPABILITIES.contains(&"multiple_terminal_backends"));
+        assert!(API_CAPABILITIES.contains(&"capabilities_discovery"));
+        assert!(API_CAPABILITIES.contains(&"harness_discovery"));
+    }
+
+    #[tokio::test]
+    async fn capabilities_discovery_endpoint_and_health_expose_dual_planes() {
+        use tower::ServiceExt;
+        let mut state = test_state("admin", vec![test_device("phone-1", "device-token")]);
+        state.config.transport_encryption = TransportEncryptionMode::Disabled;
+        let app = Router::new()
+            .route("/health", axum::routing::get(health))
+            .route("/api/capabilities", axum::routing::get(api_capabilities))
+            .with_state(state);
+
+        // 1. GET /api/capabilities
+        let req = Request::builder()
+            .uri("/api/capabilities")
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert!(json["planes"]["terminal"].is_object());
+        assert!(json["planes"]["harness"].is_object());
+        assert!(json["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("capabilities_discovery")));
+        assert!(json["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("harness_discovery")));
+
+        // 2. GET /health contains planes
+        let req = Request::builder()
+            .uri("/health")
+            .method("GET")
+            .header("authorization", "Bearer device-token")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert!(json["planes"]["terminal"].is_object());
+        assert!(json["planes"]["harness"].is_object());
+    }
+
+    #[tokio::test]
+    async fn headless_gateway_exposes_capabilities_without_crashing() {
+        use tower::ServiceExt;
+        let mut state = test_state("admin", vec![test_device("phone-1", "device-token")]);
+        state.config.transport_encryption = TransportEncryptionMode::Disabled;
+        state.config.sessions.clear();
+
+        let app = Router::new()
+            .route("/health", axum::routing::get(health))
+            .route("/api/capabilities", axum::routing::get(api_capabilities))
+            .with_state(state);
+
+        // 1. GET /api/capabilities
+        let req = Request::builder()
+            .uri("/api/capabilities")
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["planes"]["terminal"]["supported"], false);
+        assert_eq!(
+            json["planes"]["terminal"]["degradedReason"],
+            "no_terminal_backend_configured"
+        );
+
+        // 2. GET /health
+        let req = Request::builder()
+            .uri("/health")
+            .method("GET")
+            .header("authorization", "Bearer device-token")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["planes"]["terminal"]["supported"], false);
+        assert_eq!(json["backend"], Value::Null);
     }
 
     /// The snapshot is one call where the app used to make four, and its
