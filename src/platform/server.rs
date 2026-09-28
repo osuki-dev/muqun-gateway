@@ -787,29 +787,79 @@ pub(crate) async fn security_headers(request: Request<Body>, next: Next) -> Resp
     response
 }
 
-/// Log the process's own peak resident set and the cgroup's every ten minutes.
+/// Log the process's own peak and current resident set, the cgroup's peak, and
+/// hand free heap pages back to the OS, every ten minutes.
 ///
 /// The systemd unit reports one `MemoryPeak` for everything the cgroup ever
 /// ran, and that number cannot say whether a spike was this process, a
 /// transient allocation inside it, or something else the unit started. A
 /// timestamped series of `max_rss_mb` (this process's high-water mark) beside
 /// `cgroup_peak_mb` (the unit's) is what tells the two apart the next time the
-/// journal shows a spike.
+/// journal shows a spike. `rss_before_mb`/`rss_after_mb` straddle the trim, so
+/// the same line also says how much was allocator retention rather than live
+/// data.
 fn spawn_memory_watchdog() {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(600));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
-            if let Some(max_rss_mb) = process_peak_rss_mb() {
+            let max_rss_mb = process_peak_rss_mb();
+            let rss_before_mb = process_rss_mb();
+            trim_allocator();
+            let rss_after_mb = process_rss_mb();
+            if max_rss_mb.is_some() || rss_before_mb.is_some() {
                 tracing::info!(
-                    max_rss_mb,
-                    cgroup_peak_mb = cgroup_memory_mb("memory.peak"),
+                    max_rss_mb = max_rss_mb.unwrap_or(0),
+                    rss_before_mb = rss_before_mb.unwrap_or(0),
+                    rss_after_mb = rss_after_mb.unwrap_or(0),
+                    cgroup_peak_mb = cgroup_memory_mb("memory.peak").unwrap_or(0),
+                    cgroup_current_mb = cgroup_memory_mb("memory.current").unwrap_or(0),
+                    cgroup_anon_mb = cgroup_stat_mb("anon").unwrap_or(0),
+                    cgroup_slab_mb = cgroup_stat_mb("slab").unwrap_or(0),
                     "gateway memory"
                 );
             }
         }
     });
+}
+
+/// Hand free heap pages back to the OS.
+///
+/// glibc keeps freed memory in per-thread arenas: one burst of large
+/// allocations (a 25 MiB upload, a sealed envelope) leaves each arena's
+/// high-water mark in RSS long after the buffers are gone. `malloc_trim`
+/// returns what is free at the top of each arena. Linux/glibc only -- musl
+/// has no arenas, and macOS has its own allocator, so neither needs this.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn trim_allocator() {
+    // Safety: `malloc_trim` only walks the allocator's own free lists.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn trim_allocator() {}
+
+/// This process's current resident set, in MiB.
+#[cfg(target_os = "linux")]
+fn process_rss_mb() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    status.lines().find_map(|line| {
+        let value = line.strip_prefix("VmRSS:")?;
+        value
+            .split_whitespace()
+            .next()?
+            .parse::<u64>()
+            .ok()
+            .map(|kb| kb / 1024)
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_rss_mb() -> Option<u64> {
+    None
 }
 
 /// This process's high-water resident set, in MiB.
@@ -835,20 +885,43 @@ fn process_peak_rss_mb() -> Option<u64> {
     None
 }
 
-/// One cgroup v2 memory file for this process's own cgroup, in MiB.
+/// This process's own cgroup v2 directory, if it is in one.
 ///
 /// `None` outside a cgroup v2 host -- macOS, or a Linux session started
-/// without an init system -- which is the same "no figure available" the
-/// non-Linux peak answers with.
-fn cgroup_memory_mb(file: &str) -> Option<u64> {
+/// without an init system.
+fn cgroup_dir() -> Option<String> {
     let membership = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-    let relative = membership.trim().strip_prefix("0::")?;
-    let bytes = std::fs::read_to_string(format!("/sys/fs/cgroup{relative}/{file}"))
+    Some(format!(
+        "/sys/fs/cgroup{}",
+        membership.trim().strip_prefix("0::")?
+    ))
+}
+
+/// One cgroup v2 memory file for this process's own cgroup, in MiB.
+fn cgroup_memory_mb(file: &str) -> Option<u64> {
+    let bytes = std::fs::read_to_string(format!("{}/{file}", cgroup_dir()?))
         .ok()?
         .trim()
         .parse::<u64>()
         .ok()?;
     Some(bytes / 1024 / 1024)
+}
+
+/// One key from this cgroup's `memory.stat`, in MiB.
+///
+/// `anon` is what the gateway's heap actually holds; `slab` is kernel memory
+/// charged to the cgroup (dentry/inode caches from scanning, mostly
+/// reclaimable). Logging both is what separates a process-heap spike from the
+/// kernel's own accounting the next time `memory.peak` jumps.
+fn cgroup_stat_mb(key: &str) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("{}/memory.stat", cgroup_dir()?)).ok()?;
+    stat.lines().find_map(|line| {
+        let (name, value) = line.split_once(' ')?;
+        if name != key {
+            return None;
+        }
+        value.parse::<u64>().ok().map(|bytes| bytes / 1024 / 1024)
+    })
 }
 
 #[cfg(test)]
