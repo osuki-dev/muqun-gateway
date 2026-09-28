@@ -340,7 +340,7 @@ pub(crate) async fn session_metadata_uncached(session: &SessionConfig) -> (Value
             )
         }
         Err(err) => {
-            eprintln!(
+            tracing::warn!(
                 "terminal metadata request failed for session {} (backend={}, endpoint={}): {err}",
                 session.id,
                 session.backend.as_str(),

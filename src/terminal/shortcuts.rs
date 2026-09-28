@@ -671,7 +671,7 @@ fn load_overlays(config_dir: fn() -> anyhow::Result<PathBuf>) -> HashMap<String,
     match serde_json::from_str::<HashMap<String, AgentOverlay>>(&text) {
         Ok(value) => value,
         Err(err) => {
-            eprintln!("{AGENTS_FILE} is not valid: {err}");
+            tracing::warn!("{AGENTS_FILE} is not valid: {err}");
             HashMap::new()
         }
     }

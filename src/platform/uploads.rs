@@ -123,7 +123,7 @@ pub(crate) async fn upload_file(
     };
 
     let dir = ensure_uploads_dir().map_err(|err| {
-        eprintln!("failed to prepare the upload directory: {err:#}");
+        tracing::warn!("failed to prepare the upload directory: {err:#}");
         api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "upload_failed",
@@ -133,7 +133,7 @@ pub(crate) async fn upload_file(
     let stored_name = stored_upload_name(kind);
     let path = dir.join(&stored_name);
     write_upload_file(&path, &bytes).map_err(|err| {
-        eprintln!("failed to write upload {}: {err:#}", path.display());
+        tracing::warn!("failed to write upload {}: {err:#}", path.display());
         api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "upload_failed",
@@ -179,7 +179,7 @@ pub(crate) async fn upload_content(
         return Err(upload_not_found());
     };
     let dir = uploads_dir().map_err(|err| {
-        eprintln!("failed to resolve the upload directory: {err:#}");
+        tracing::warn!("failed to resolve the upload directory: {err:#}");
         upload_not_found()
     })?;
     let path = dir.join(&name);
@@ -205,7 +205,7 @@ pub(crate) async fn upload_content(
     };
 
     let file = tokio::fs::File::open(&path).await.map_err(|err| {
-        eprintln!("failed to open upload {}: {err}", path.display());
+        tracing::warn!("failed to open upload {}: {err}", path.display());
         upload_not_found()
     })?;
     let stream = async_stream::stream! {
@@ -239,7 +239,7 @@ pub(crate) async fn upload_content(
         .header("cache-control", "private, no-store, max-age=0")
         .body(Body::from_stream(stream))
         .map_err(|err| {
-            eprintln!("failed to build upload response: {err}");
+            tracing::warn!("failed to build upload response: {err}");
             api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "upload_read_failed",
@@ -721,7 +721,7 @@ pub(crate) fn spawn_upload_gc() {
                 continue;
             };
             if let Err(err) = purge_expired_uploads(&dir, SystemTime::now()) {
-                eprintln!("failed to sweep old uploads: {err:#}");
+                tracing::warn!("failed to sweep old uploads: {err:#}");
             }
         }
     });
@@ -750,7 +750,7 @@ pub(crate) fn purge_expired_uploads(dir: &FsPath, now: SystemTime) -> anyhow::Re
         }
         match std::fs::remove_file(entry.path()) {
             Ok(()) => removed += 1,
-            Err(err) => eprintln!("failed to remove {}: {err}", entry.path().display()),
+            Err(err) => tracing::warn!("failed to remove {}: {err}", entry.path().display()),
         }
     }
     Ok(removed)

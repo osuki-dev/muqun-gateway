@@ -270,7 +270,7 @@ pub(crate) async fn pair_claim(
         let mut devices = lock_devices(&state)?;
         authority::enroll_device(&mut devices, record, MAX_DEVICES);
         write_devices(&devices).map_err(|err| {
-            eprintln!("failed to write device tokens: {err:#}");
+            tracing::warn!("failed to write device tokens: {err:#}");
             api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "device_write_failed",
@@ -321,7 +321,7 @@ pub(crate) async fn pair_claim(
             // The device is already enrolled and the response is already sealed
             // with the scanned key. Do not strand it by discarding that response.
             // The manager will generate a fresh key on the next successful write.
-            eprintln!("warning: failed to rotate pairing transport key: {err:#}");
+            tracing::warn!("warning: failed to rotate pairing transport key: {err:#}");
         }
     }
     Ok(response)
@@ -329,7 +329,7 @@ pub(crate) async fn pair_claim(
 
 fn pairing_transport_material() -> ApiResult<Vec<u8>> {
     let pairing = read_pairing_file().map_err(|err| {
-        eprintln!("failed to read pairing transport key: {err:#}");
+        tracing::warn!("failed to read pairing transport key: {err:#}");
         api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "pairing_transport_unavailable",
@@ -650,7 +650,7 @@ pub(crate) async fn register_push_token(
         tokens.drain(..excess);
     }
     write_push_tokens(&tokens).map_err(|err| {
-        eprintln!("failed to write push tokens: {err:#}");
+        tracing::warn!("failed to write push tokens: {err:#}");
         api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "push_token_write_failed",
@@ -678,7 +678,7 @@ pub(crate) async fn unregister_push_token(
     tokens.retain(|record| record.token != body.token);
     if tokens.len() != previous_len {
         write_push_tokens(&tokens).map_err(|err| {
-            eprintln!("failed to remove push token: {err:#}");
+            tracing::warn!("failed to remove push token: {err:#}");
             api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "push_token_write_failed",
@@ -730,7 +730,7 @@ pub(crate) async fn send_test_notification(
     )
     .await
     .map_err(|err| {
-        eprintln!("Expo push request failed: {err:#}");
+        tracing::warn!("Expo push request failed: {err:#}");
         api_error(
             StatusCode::BAD_GATEWAY,
             "expo_push_failed",
@@ -784,7 +784,7 @@ pub(crate) async fn revoke_paired_device(
         ));
     }
     write_devices(&devices).map_err(|err| {
-        eprintln!("failed to write device tokens: {err:#}");
+        tracing::warn!("failed to write device tokens: {err:#}");
         api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "device_write_failed",

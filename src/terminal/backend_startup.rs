@@ -64,7 +64,7 @@ pub(crate) fn spawn(config: &Config) {
         let session = session.clone();
         tokio::spawn(async move {
             if let Err(error) = start(&session).await {
-                eprintln!("backend {} autostart failed: {error}; start it manually or restart the gateway to retry", session.id);
+                tracing::warn!("backend {} autostart failed: {error}; start it manually or restart the gateway to retry", session.id);
             }
         });
     }

@@ -1068,7 +1068,7 @@ async fn prepare_worktree(
             // Reuse is an optimisation, not a contract. If opening the existing
             // checkout fails, fall through and let the create path report a
             // real error rather than masking it with this one.
-            Err(err) => eprintln!("task: worktree open for {branch} failed: {err}"),
+            Err(err) => tracing::warn!("task: worktree open for {branch} failed: {err}"),
         }
     }
 
@@ -1272,7 +1272,7 @@ async fn task_repo_roots(state: &AppState, session: &SessionConfig) -> Vec<PathB
                 }
             }
         }
-        Err(err) => eprintln!("task roots: workspace list failed: {err}"),
+        Err(err) => tracing::warn!("task roots: workspace list failed: {err}"),
     }
 
     for root in session_asset_roots(state, session, None).await {
@@ -1378,7 +1378,7 @@ pub(crate) async fn submit_keypress(session: &SessionConfig, pane_id: &str) {
     // it requires.
     let baseline = agent_state_change_seq(session, pane_id).await;
     if baseline.is_none() {
-        eprintln!(
+        tracing::warn!(
             "agent submit for pane {pane_id}: the terminal backend lists no agent state for it, \
              falling back to watching the screen"
         );
@@ -1392,14 +1392,14 @@ pub(crate) async fn submit_keypress(session: &SessionConfig, pane_id: &str) {
     for attempt in 0..attempts {
         let Some(settled) = settled_pane_text(session, pane_id, &mut previous, deadline).await
         else {
-            eprintln!("agent submit for pane {pane_id} gave up: the pane never settled");
+            tracing::warn!("agent submit for pane {pane_id} gave up: the pane never settled");
             return;
         };
         let sent = terminal_backend(session)
             .send_keys(&BackendPaneId::new(pane_id), &["Enter".to_owned()])
             .await;
         if let Err(err) = sent {
-            eprintln!(
+            tracing::warn!(
                 "agent submit for pane {pane_id} failed to send Enter: {}",
                 err
             );
@@ -1414,7 +1414,7 @@ pub(crate) async fn submit_keypress(session: &SessionConfig, pane_id: &str) {
             None => {
                 tokio::time::sleep(SUBMIT_VERIFY_DELAY).await;
                 let Ok(after) = read_pane_visible_text(session, pane_id).await else {
-                    eprintln!(
+                    tracing::warn!(
                         "agent submit for pane {pane_id} gave up: the pane could not be verified"
                     );
                     return;
@@ -1431,7 +1431,7 @@ pub(crate) async fn submit_keypress(session: &SessionConfig, pane_id: &str) {
             tokio::time::sleep(SUBMIT_RETRY_INTERVAL).await;
         }
     }
-    eprintln!(
+    tracing::warn!(
         "agent submit for pane {pane_id} gave up: the agent did not take the Enter \
          in {attempts} attempts"
     );
@@ -1445,7 +1445,7 @@ async fn agent_state_change_seq(session: &SessionConfig, pane_id: &str) -> Optio
     let value = match backend_agent_list(session).await {
         Ok(value) => value,
         Err(err) => {
-            eprintln!("terminal backend agent list failed: {err}");
+            tracing::warn!("terminal backend agent list failed: {err}");
             return None;
         }
     };
@@ -1571,7 +1571,7 @@ impl HerdrCallError {
         };
         let code = self.code().to_owned();
         let message = self.message();
-        eprintln!("Herdr request {method} failed: {message}");
+        tracing::warn!("Herdr request {method} failed: {message}");
         api_error(status, &code, &message)
     }
 }

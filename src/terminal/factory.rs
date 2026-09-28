@@ -67,7 +67,7 @@ pub(crate) fn warn_about_missing_backend_programs(config: &Config) {
             continue;
         }
         if login_env::lookup(TMUX_PROGRAM, &path).is_none() {
-            eprintln!(
+            tracing::warn!(
                 "session {}: backend=tmux, but no `tmux` on PATH={path}\n  \
                  This gateway cannot drive tmux until it can find it. If tmux works in your\n  \
                  shell but not here, the service is running with a different PATH: reinstall\n  \
@@ -115,6 +115,6 @@ pub(crate) fn backend_api_error(error: BackendError) -> (StatusCode, Json<Value>
     };
     // Adapter diagnostics may name a local socket or tmux target. Keep them in
     // the host log and return only a stable, non-sensitive API error.
-    eprintln!("terminal backend request failed: {error}");
+    tracing::warn!("terminal backend request failed: {error}");
     api_error(status, code, message)
 }

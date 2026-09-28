@@ -126,12 +126,12 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         .with_state(state);
 
     if let Some(warning) = listen_warning {
-        eprintln!("{warning}");
+        tracing::warn!("{warning}");
     }
     if dev_unauthenticated {
         // Said every time, on stderr, unmissably: this is the one setting that
         // hands the API to anything that can reach the port.
-        eprintln!(
+        tracing::warn!(
             "SECURITY WARNING: dev_unauthenticated is on -- every device route \
              answers WITHOUT a token, to anything that can reach {addr}. This is \
              for a local mock only. Remove \"dev_unauthenticated\" from config.json \
@@ -607,7 +607,7 @@ pub(crate) async fn known_host(
         .or_else(|| request.uri().host().map(str::to_owned));
     if let Some(host) = host.as_deref() {
         if !host_is_known(host, &known) {
-            eprintln!(
+            tracing::warn!(
                 "refused a request addressed to {host}: not a name this gateway answers to \
                  (known: {})",
                 known.join(", ")

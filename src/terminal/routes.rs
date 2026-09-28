@@ -498,7 +498,7 @@ pub(crate) fn stream_event(
         Some(sealer) => match sealer.seal(name, data) {
             Ok(event) => Some(event),
             Err(error) => {
-                eprintln!("failed to seal stream event: {error}");
+                tracing::warn!("failed to seal stream event: {error}");
                 None
             }
         },
@@ -1025,7 +1025,7 @@ pub(crate) async fn run_activity_hub(
                                 backend_endpoint(&session),
                             );
                             if notes.is_news(&failure) {
-                                eprintln!("{failure}");
+                                tracing::warn!("{failure}");
                             }
                             let _ = sender.send(SessionActivity::Failed);
                             break;
@@ -1043,7 +1043,7 @@ pub(crate) async fn run_activity_hub(
                     session.backend.as_str(),
                 );
                 if notes.is_news(&failure) {
-                    eprintln!("{failure}");
+                    tracing::warn!("{failure}");
                 }
                 let _ = sender.send(SessionActivity::Failed);
             }
@@ -1312,7 +1312,7 @@ pub(crate) async fn deliver_agent_notification(state: &AppState, notice: AgentPu
     let tokens = match state.push_tokens.lock() {
         Ok(tokens) => tokens.clone(),
         Err(_) => {
-            eprintln!("agent notification skipped: push token lock failed");
+            tracing::warn!("agent notification skipped: push token lock failed");
             return;
         }
     };
@@ -1330,7 +1330,7 @@ pub(crate) async fn deliver_agent_notification(state: &AppState, notice: AgentPu
         )
         .await
         {
-            eprintln!("agent notification failed: {err:#}");
+            tracing::warn!("agent notification failed: {err:#}");
         }
     }
 }
@@ -1521,7 +1521,7 @@ pub(crate) fn absorb_agent_status_event(
             );
         }
         // Losing one line of a digest must not cost the push that goes with it.
-        Err(_) => eprintln!("agent event ring lock failed for session {session_id}"),
+        Err(_) => tracing::warn!("agent event ring lock failed for session {session_id}"),
     }
     notification_for_transition(
         &transition,
@@ -2402,7 +2402,7 @@ pub(crate) async fn checkout_of(cwd: &FsPath) -> Option<PathBuf> {
 pub(crate) fn git_error(err: git::GitError) -> (StatusCode, Json<Value>) {
     // The detail goes to the log; the client gets a bounded, generic sentence,
     // never git's stderr.
-    eprintln!("git: {err}");
+    tracing::warn!("git: {err}");
     match err {
         git::GitError::Timeout => api_error(
             StatusCode::GATEWAY_TIMEOUT,

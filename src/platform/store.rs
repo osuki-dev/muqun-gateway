@@ -142,7 +142,7 @@ pub(crate) fn migrate_renamed_standalone_dir(parent: &std::path::Path) -> anyhow
             new_dir.display()
         )
     })?;
-    eprintln!("migrated {} to {}", old_dir.display(), new_dir.display());
+    tracing::info!("migrated {} to {}", old_dir.display(), new_dir.display());
     Ok(new_dir)
 }
 
@@ -213,7 +213,7 @@ pub(crate) fn load_push_tokens_for_service() -> Vec<PushTokenRecord> {
     match read_push_tokens() {
         Ok(tokens) => tokens,
         Err(error) => {
-            eprintln!(
+            tracing::warn!(
                 "could not read the push token file ({error:#}); starting with none -- devices \
                  will re-register on their next app launch"
             );
@@ -580,7 +580,7 @@ pub(crate) fn write_secret_dir_gitignore(dir: &std::path::Path) {
                 # Never let them reach a repository.\n\
                 *\n";
     if let Err(err) = std::fs::write(&path, body) {
-        eprintln!("could not write {}: {err}", path.display());
+        tracing::warn!("could not write {}: {err}", path.display());
     }
 }
 
@@ -606,7 +606,7 @@ pub(crate) fn lock_down_secret_dir(dir: &std::path::Path) {
         return;
     }
     if let Err(err) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
-        eprintln!("could not restrict {}: {err}", dir.display());
+        tracing::warn!("could not restrict {}: {err}", dir.display());
     }
 }
 

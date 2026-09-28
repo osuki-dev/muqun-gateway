@@ -618,7 +618,7 @@ pub(crate) fn ingest_root(index: &Mutex<AssetIndex>, root: &AssetRoot) -> Vec<As
     };
     let files = scan_workspace_root(&canonical, ASSET_SCAN_MAX_DEPTH, ASSET_SCAN_MAX_FILES);
     let Ok(mut index) = index.lock() else {
-        eprintln!(
+        tracing::warn!(
             "asset index lock failed while scanning {}",
             canonical.display()
         );
@@ -693,7 +693,7 @@ pub(crate) async fn session_asset_roots(
     let mut fresh = match response {
         Ok(value) => pane_list_roots(&session.id, &value),
         Err(err) => {
-            eprintln!("asset roots: pane.list failed: {err}");
+            tracing::warn!("asset roots: pane.list failed: {err}");
             Vec::new()
         }
     };
@@ -1225,7 +1225,7 @@ pub(crate) async fn asset_content(
     }
 
     let file = tokio::fs::File::open(&path).await.map_err(|err| {
-        eprintln!("failed to open asset {}: {err}", path.display());
+        tracing::warn!("failed to open asset {}: {err}", path.display());
         asset_not_found()
     })?;
     let stream = async_stream::stream! {
@@ -1257,7 +1257,7 @@ pub(crate) async fn asset_content(
         .header("x-content-schema-version", CONTENT_SCHEMA_VERSION)
         .body(Body::from_stream(stream))
         .map_err(|err| {
-            eprintln!("failed to build asset response: {err}");
+            tracing::warn!("failed to build asset response: {err}");
             api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "asset_read_failed",

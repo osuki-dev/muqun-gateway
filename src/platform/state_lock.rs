@@ -180,7 +180,7 @@ fn lock_exclusive(
     // A filesystem that cannot take advisory locks must not make the gateway
     // unstartable. The lock guards against a *second* instance; the first one
     // is correct without it. Say what was lost and carry on.
-    eprintln!(
+    tracing::warn!(
         "could not lock {} ({error}); this gateway cannot detect a second one sharing its \
          state directory",
         path.display()

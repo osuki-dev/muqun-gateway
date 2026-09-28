@@ -132,7 +132,7 @@ pub(crate) fn require_device(state: &AppState, headers: &HeaderMap) -> ApiResult
     ) {
         if let Err(err) = write_devices(&devices) {
             // Losing a last-seen timestamp must not fail the request.
-            eprintln!("failed to persist device last-seen: {err:#}");
+            tracing::warn!("failed to persist device last-seen: {err:#}");
         }
     }
     Ok(device_id)
