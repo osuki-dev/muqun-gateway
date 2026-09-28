@@ -22,11 +22,11 @@ use crate::authority::{hash_token, DeviceRecord, PendingPairing};
 use crate::backend::BackendKind;
 use crate::{
     auto_public_url, backend_endpoint, backend_program_state, config_changed_since_start,
-    config_dir, configured_port, ensure_pairing_transport_key, load_config, make_backend_default,
-    now_unix_ms, process_running, read_devices, read_pairing_file, read_pid, revoke_device_by_id,
-    start_background_inner, stop_background_inner, upsert_backend_session, validate_session_id,
-    write_config, write_secret_file, SessionConfig, TransportEncryptionMode, CONFIG_FILE,
-    DEFAULT_PORT, MANAGE_REFRESH_INTERVAL, PAIRING_FILE,
+    config_dir, configured_port, ensure_pairing_transport_key, gateway_listener_pids, load_config,
+    make_backend_default, now_unix_ms, process_running, read_devices, read_pairing_file, read_pid,
+    revoke_device_by_id, start_background_inner, stop_background_inner, upsert_backend_session,
+    validate_session_id, write_config, write_secret_file, SessionConfig, TransportEncryptionMode,
+    CONFIG_FILE, DEFAULT_PORT, MANAGE_REFRESH_INTERVAL, PAIRING_FILE,
 };
 
 pub(crate) fn status() -> anyhow::Result<()> {
@@ -39,6 +39,8 @@ pub(crate) fn status() -> anyhow::Result<()> {
         "transport_encryption: {}",
         config.transport_encryption.as_str()
     );
+    // Read before the sessions loop consumes the config.
+    let port = config.port();
     for session in config.sessions {
         let endpoint = backend_endpoint(&session);
         println!(
@@ -48,10 +50,21 @@ pub(crate) fn status() -> anyhow::Result<()> {
             backend_program_state(&session)
         );
     }
-    match read_pid()? {
-        Some(pid) if process_running(pid) => println!("gateway: running pid {pid}"),
-        Some(pid) => println!("gateway: stale pid {pid}"),
-        None => println!("gateway: stopped"),
+    // A gateway started by the init system runs `run` directly and never writes
+    // the pid file, so the listener is the only evidence `status` has of it --
+    // the same fallback `service status` uses.
+    let pid = read_pid()?;
+    let live_pid = pid.filter(|pid| process_running(*pid));
+    let listener_pid = if live_pid.is_none() {
+        gateway_listener_pids(port)?.first().copied()
+    } else {
+        None
+    };
+    match (pid, live_pid, listener_pid) {
+        (Some(pid), Some(_), _) => println!("gateway: running pid {pid}"),
+        (Some(pid), None, None) => println!("gateway: stale pid {pid}"),
+        (_, None, Some(pid)) => println!("gateway: running pid {pid} (started by the service)"),
+        _ => println!("gateway: stopped"),
     }
     Ok(())
 }
