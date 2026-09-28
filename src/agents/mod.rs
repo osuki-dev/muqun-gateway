@@ -9,6 +9,7 @@ pub mod manager;
 pub mod ports;
 pub mod routes;
 pub mod runtime;
+pub mod session_routes;
 pub mod tasks;
 pub mod use_cases;
 
