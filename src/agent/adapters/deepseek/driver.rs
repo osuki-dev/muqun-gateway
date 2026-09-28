@@ -103,9 +103,7 @@ impl AgentEnginePort for DeepseekDriver {
                 asid: AgentSessionId(session_id.to_string()),
                 backend_session_id: session_id.to_string(),
                 title: "New DeepSeek Session".to_string(),
-                agent: agent
-                    .map(str::to_string)
-                    .or_else(|| Some("deepseek".to_string())),
+                agent: agent.map(str::to_string),
                 model: model.cloned(),
                 status: AgentSessionStatus::Idle,
                 directory: directory.map(str::to_string),
@@ -152,7 +150,7 @@ impl AgentEnginePort for DeepseekDriver {
                 asid: AgentSessionId(session_id.to_string()),
                 backend_session_id: session_id.to_string(),
                 title: "DeepSeek Session".to_string(),
-                agent: Some("deepseek".to_string()),
+                agent: None,
                 model: None,
                 status: AgentSessionStatus::Idle,
                 directory: None,
@@ -344,7 +342,7 @@ impl AgentEnginePort for DeepseekDriver {
                 asid: AgentSessionId(new_id.to_string()),
                 backend_session_id: new_id.to_string(),
                 title: "Forked Session".to_string(),
-                agent: Some("deepseek".to_string()),
+                agent: None,
                 model: None,
                 status: AgentSessionStatus::Idle,
                 directory: None,

@@ -207,72 +207,29 @@ pub fn map_catalog(raw: &Value) -> AgentCatalog {
         }
     }
 
-    // Fallback if empty
-    if models.is_empty() {
-        let v3 = ModelVariantInfo {
-            id: "default".to_string(),
-            reasoning_effort: None,
-        };
-        models.push(ModelInfo {
-            id: "deepseek-chat".to_string(),
-            name: "DeepSeek-V3".to_string(),
-            provider_id: "deepseek".to_string(),
-            family: Some("deepseek".to_string()),
-            limit: None,
-            variants: Some(vec![v3.clone()]),
-            cost: None,
-            enabled: true,
-            status: Some("active".to_string()),
-        });
-        models.push(ModelInfo {
-            id: "deepseek-reasoner".to_string(),
-            name: "DeepSeek-R1".to_string(),
-            provider_id: "deepseek".to_string(),
-            family: Some("deepseek".to_string()),
-            limit: None,
-            variants: Some(vec![v3.clone()]),
-            cost: None,
-            enabled: true,
-            status: Some("active".to_string()),
-        });
-        providers.push(ProviderInfo {
-            id: "deepseek".to_string(),
-            name: "DeepSeek Official".to_string(),
-            activation: Some("enabled".to_string()),
-            models: vec![
-                ProviderModelInfo {
-                    id: "deepseek-chat".to_string(),
-                    name: "DeepSeek-V3".to_string(),
-                    enabled: true,
-                    variants: vec![v3.clone()],
-                    limit: None,
-                    status: Some("active".to_string()),
-                },
-                ProviderModelInfo {
-                    id: "deepseek-reasoner".to_string(),
-                    name: "DeepSeek-R1".to_string(),
-                    enabled: true,
-                    variants: vec![v3],
-                    limit: None,
-                    status: Some("active".to_string()),
-                },
-            ],
-        });
-    }
+    let agents = if models.is_empty() {
+        Vec::new()
+    } else {
+        vec![AgentInfo {
+            id: "general".to_string(),
+            name: "general".to_string(),
+            description: Some("DeepSeek Harness General Agent".to_string()),
+            mode: Some("primary".to_string()),
+            color: None,
+            hidden: false,
+            model: default_model_ref.clone(),
+        }]
+    };
 
-    let default_agent = AgentInfo {
-        id: "general".to_string(),
-        name: "general".to_string(),
-        description: Some("DeepSeek Harness General Agent".to_string()),
-        mode: Some("primary".to_string()),
-        color: None,
-        hidden: false,
-        model: default_model_ref.clone(),
+    let default_agent = if models.is_empty() {
+        None
+    } else {
+        Some("general".to_string())
     };
 
     AgentCatalog {
         models,
-        agents: vec![default_agent],
+        agents,
         mcp: vec![],
         skills: vec![SkillInfo {
             id: "deepseek".to_string(),
@@ -290,7 +247,7 @@ pub fn map_catalog(raw: &Value) -> AgentCatalog {
         }],
         defaults: CatalogDefaults {
             model: default_model_ref,
-            agent: Some("general".to_string()),
+            agent: default_agent,
         },
     }
 }

@@ -519,24 +519,46 @@ async fn do_list_agent_sessions(
 ) -> ApiResult<Response> {
     require_device(state, headers)?;
 
-    let Some(manager) = state.agent_runtime.manager().await else {
+    let all_managers = state.agent_runtime.all_managers().await;
+    if all_managers.is_empty() {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_unavailable",
             "Agent engine is not available",
         ));
-    };
+    }
 
-    let sessions = manager
-        .sessions()
-        .list_sessions(query)
-        .await
-        .map_err(engine_error)?;
+    let mut sessions = Vec::new();
+    let mut any_success = false;
+    let mut last_err = None;
 
-    // The app has been sending `If-None-Match` on this route all along and
-    // getting a fresh 21 kB body every time -- after every turn, because the
-    // list is what the home screen watches. The list is the same bytes far
-    // more often than it is not.
+    for manager in &all_managers {
+        match manager.sessions().list_sessions(query).await {
+            Ok(list) => {
+                any_success = true;
+                for s in &list {
+                    state
+                        .agent_runtime
+                        .record_session_route(&s.asid.0, manager.engine().kind())
+                        .await;
+                }
+                sessions.extend(list);
+            }
+            Err(e) => {
+                last_err = Some(e);
+            }
+        }
+    }
+
+    if !any_success {
+        if let Some(err) = last_err {
+            return Err(engine_error(err));
+        }
+    }
+
+    // Sort newest first
+    sessions.sort_by_key(|b| std::cmp::Reverse(b.updated_ms));
+
     Ok(json_etag_response(
         headers,
         content_envelope(json!(sessions)),
@@ -550,12 +572,42 @@ async fn do_create_agent_session(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let Some(manager) = state.agent_runtime.manager().await else {
-        return Err(api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "agent_unavailable",
-            "Agent engine is not available",
-        ));
+    let target_harness = body.harness.as_deref().or_else(|| {
+        body.model.as_ref().and_then(|m| {
+            if m.provider_id == "deepseek" {
+                Some("deepseek")
+            } else if m.provider_id == "opencode" {
+                Some("opencode")
+            } else {
+                None
+            }
+        })
+    });
+
+    let manager = match target_harness {
+        Some(h) => match state.agent_runtime.manager_for_harness(h).await {
+            Some(m) => m,
+            None => match state.agent_runtime.manager().await {
+                Some(m) => m,
+                None => {
+                    return Err(api_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "agent_unavailable",
+                        &format!("Agent harness '{h}' is not available"),
+                    ));
+                }
+            },
+        },
+        None => match state.agent_runtime.manager().await {
+            Some(m) => m,
+            None => {
+                return Err(api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "agent_unavailable",
+                    "Agent engine is not available",
+                ));
+            }
+        },
     };
 
     let validated_dir = match body.directory.as_deref() {
@@ -603,6 +655,11 @@ async fn do_create_agent_session(
             )
         })?;
 
+    state
+        .agent_runtime
+        .record_session_route(&session.asid.0, manager.engine().kind())
+        .await;
+
     Ok(Json(content_envelope(json!(session))))
 }
 
@@ -613,7 +670,7 @@ async fn do_get_agent_session(
 ) -> ApiResult<Response> {
     require_device(state, headers)?;
 
-    let Some(manager) = state.agent_runtime.manager().await else {
+    let Some(manager) = state.agent_runtime.manager_for_session(asid).await else {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_unavailable",
@@ -643,7 +700,7 @@ async fn do_get_agent_session_events(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let Some(manager) = state.agent_runtime.manager().await else {
+    let Some(manager) = state.agent_runtime.manager_for_session(asid).await else {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_unavailable",
@@ -673,7 +730,7 @@ async fn do_get_agent_session_timeline(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let Some(manager) = state.agent_runtime.manager().await else {
+    let Some(manager) = state.agent_runtime.manager_for_session(asid).await else {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_unavailable",
@@ -704,7 +761,7 @@ async fn do_switch_agent_mode(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let Some(manager) = state.agent_runtime.manager().await else {
+    let Some(manager) = state.agent_runtime.manager_for_session(asid).await else {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_unavailable",
@@ -780,7 +837,7 @@ async fn do_send_agent_prompt(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let Some(manager) = state.agent_runtime.manager().await else {
+    let Some(manager) = state.agent_runtime.manager_for_session(asid).await else {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_unavailable",
@@ -819,7 +876,7 @@ async fn do_revert_agent_session(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let Some(manager) = state.agent_runtime.manager().await else {
+    let Some(manager) = state.agent_runtime.manager_for_session(asid).await else {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_unavailable",
@@ -852,7 +909,7 @@ async fn do_interrupt_agent_session(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let Some(manager) = state.agent_runtime.manager().await else {
+    let Some(manager) = state.agent_runtime.manager_for_session(asid).await else {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_unavailable",
@@ -883,7 +940,7 @@ async fn do_switch_agent_model(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let Some(manager) = state.agent_runtime.manager().await else {
+    let Some(manager) = state.agent_runtime.manager_for_session(asid).await else {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_unavailable",
@@ -915,7 +972,7 @@ async fn do_reply_agent_permission(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let Some(manager) = state.agent_runtime.manager().await else {
+    let Some(manager) = state.agent_runtime.manager_for_session(asid).await else {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_unavailable",
@@ -965,7 +1022,7 @@ async fn do_reply_agent_form(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let Some(manager) = state.agent_runtime.manager().await else {
+    let Some(manager) = state.agent_runtime.manager_for_session(asid).await else {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_unavailable",
@@ -1000,7 +1057,7 @@ async fn do_get_agent_vcs_diff(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let Some(manager) = state.agent_runtime.manager().await else {
+    let Some(manager) = state.agent_runtime.manager_for_session(asid).await else {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_unavailable",
@@ -1271,7 +1328,7 @@ async fn do_stream_agent_session(
         None => None,
     };
 
-    let Some(manager) = state.agent_runtime.manager().await else {
+    let Some(manager) = state.agent_runtime.manager_for_session(asid).await else {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_unavailable",
@@ -1329,20 +1386,89 @@ pub async fn get_global_agent_catalog(
 ) -> ApiResult<Response> {
     require_device(&state, &headers)?;
 
-    let Some(manager) = state.agent_runtime.manager().await else {
+    let all_managers = state.agent_runtime.all_managers().await;
+    if all_managers.is_empty() {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_unavailable",
             "Agent engine is not available",
         ));
-    };
+    }
 
     require_directory(query.directory.as_deref())?;
-    let catalog = manager
-        .sessions()
-        .get_catalog(query.directory.as_deref())
-        .await
-        .map_err(engine_error)?;
+
+    let mut merged_models = Vec::new();
+    let mut merged_agents = Vec::new();
+    let mut merged_mcp = Vec::new();
+    let mut merged_skills = Vec::new();
+    let mut merged_providers = Vec::new();
+    let mut merged_commands = Vec::new();
+    let mut primary_defaults = None;
+
+    for manager in &all_managers {
+        if let Ok(cat) = manager
+            .sessions()
+            .get_catalog(query.directory.as_deref())
+            .await
+        {
+            if primary_defaults.is_none() {
+                primary_defaults = Some(cat.defaults);
+            }
+            for m in cat.models {
+                if !merged_models
+                    .iter()
+                    .any(|existing: &crate::agent::domain::ModelInfo| {
+                        existing.id == m.id && existing.provider_id == m.provider_id
+                    })
+                {
+                    merged_models.push(m);
+                }
+            }
+            for a in cat.agents {
+                if !merged_agents
+                    .iter()
+                    .any(|existing: &crate::agent::domain::AgentInfo| existing.id == a.id)
+                {
+                    merged_agents.push(a);
+                }
+            }
+            for p in cat.providers {
+                if !merged_providers
+                    .iter()
+                    .any(|existing: &crate::agent::domain::ProviderInfo| existing.id == p.id)
+                {
+                    merged_providers.push(p);
+                }
+            }
+            for s in cat.skills {
+                if !merged_skills
+                    .iter()
+                    .any(|existing: &crate::agent::domain::SkillInfo| existing.id == s.id)
+                {
+                    merged_skills.push(s);
+                }
+            }
+            for c in cat.commands {
+                if !merged_commands
+                    .iter()
+                    .any(|existing: &crate::agent::domain::CommandInfo| existing.name == c.name)
+                {
+                    merged_commands.push(c);
+                }
+            }
+            merged_mcp.extend(cat.mcp);
+        }
+    }
+
+    let catalog = crate::agent::domain::AgentCatalog {
+        models: merged_models,
+        agents: merged_agents,
+        mcp: merged_mcp,
+        skills: merged_skills,
+        providers: merged_providers,
+        commands: merged_commands,
+        defaults: primary_defaults.unwrap_or_default(),
+    };
 
     if catalog_is_incomplete(&catalog) {
         tracing::warn!(

@@ -11,6 +11,7 @@
 //! stream or the health probe says the engine has gone, and hands every route
 //! whatever manager is current.
 
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -140,6 +141,8 @@ pub struct EngineStatus {
 
 pub struct AgentRuntime {
     manager: RwLock<Option<Arc<AgentManager>>>,
+    managers: RwLock<BTreeMap<String, Arc<AgentManager>>>,
+    session_routes: RwLock<HashMap<String, String>>,
     /// The event channel belongs to the runtime, not to a manager, so a
     /// subscriber keeps its stream across a reconnect.
     events_tx: broadcast::Sender<AgentDomainEvent>,
@@ -160,6 +163,8 @@ impl AgentRuntime {
         let (events_tx, _) = broadcast::channel(1024);
         Arc::new(Self {
             manager: RwLock::new(None),
+            managers: RwLock::new(BTreeMap::new()),
+            session_routes: RwLock::new(HashMap::new()),
             events_tx,
             config,
             deepseek_config,
@@ -182,10 +187,54 @@ impl AgentRuntime {
         )
     }
 
-    /// The engine as it stands, or `None` while nothing is attached. Every
-    /// agent route asks here rather than holding a manager of its own.
+    /// The default or primary engine manager, or `None` while nothing is attached.
     pub async fn manager(&self) -> Option<Arc<AgentManager>> {
         self.manager.read().await.clone()
+    }
+
+    /// Return all currently active engine managers.
+    pub async fn all_managers(&self) -> Vec<Arc<AgentManager>> {
+        let map = self.managers.read().await;
+        if map.is_empty() {
+            if let Some(m) = self.manager.read().await.clone() {
+                return vec![m];
+            }
+            Vec::new()
+        } else {
+            map.values().cloned().collect()
+        }
+    }
+
+    /// Return manager for a specific harness id (e.g. "opencode", "deepseek").
+    pub async fn manager_for_harness(&self, harness: &str) -> Option<Arc<AgentManager>> {
+        let map = self.managers.read().await;
+        if let Some(m) = map.get(harness) {
+            return Some(m.clone());
+        }
+        if let Some(m) = self.manager.read().await.clone() {
+            if m.engine().kind() == harness {
+                return Some(m);
+            }
+        }
+        None
+    }
+
+    /// Return manager for a specific session id, routing by recorded harness or fallback.
+    pub async fn manager_for_session(&self, asid: &str) -> Option<Arc<AgentManager>> {
+        if let Some(harness) = self.session_routes.read().await.get(asid) {
+            if let Some(m) = self.manager_for_harness(harness).await {
+                return Some(m);
+            }
+        }
+        self.manager().await
+    }
+
+    /// Record routing for a session id to its owning harness.
+    pub async fn record_session_route(&self, asid: &str, harness: &str) {
+        self.session_routes
+            .write()
+            .await
+            .insert(asid.to_string(), harness.to_string());
     }
 
     pub fn subscribe_events(&self) -> broadcast::Receiver<AgentDomainEvent> {
@@ -242,10 +291,7 @@ impl AgentRuntime {
                 agents: Vec::new(),
                 features: deepseek_features(false, false),
             }
-        } else if let Some(m) = current_manager
-            .as_ref()
-            .filter(|m| m.engine().kind() == "deepseek")
-        {
+        } else if let Some(m) = self.manager_for_harness("deepseek").await {
             let (models, agents) = match m.engine().get_catalog(None).await {
                 Ok(cat) => (
                     cat.models
@@ -367,10 +413,7 @@ impl AgentRuntime {
                 agents: Vec::new(),
                 features: opencode_features(false, false),
             }
-        } else if let Some(m) = current_manager
-            .as_ref()
-            .filter(|m| m.engine().kind() == "opencode")
-        {
+        } else if let Some(m) = self.manager_for_harness("opencode").await {
             let (models, agents) = match m.engine().get_catalog(None).await {
                 Ok(cat) => (
                     cat.models
@@ -559,38 +602,24 @@ impl AgentRuntime {
 
     /// One supervision pass. Returns whether an engine is attached and well.
     async fn check_and_repair(&self, start_backoff: &mut Duration) -> bool {
-        let current = self.manager.read().await.clone();
+        let mut deepseek_ok = false;
+        let mut opencode_ok = false;
 
-        // Whatever the registration file says now wins: OpenCode's port is
-        // ephemeral, so a restart moves it and the old URL is dead.
-        let discovered = if self.config.enabled {
-            OpencodeEndpoint::discover().await
-        } else {
-            None
-        };
-
-        if let Some(manager) = current {
-            let same_endpoint = discovered
-                .as_ref()
-                .map(|e| e.url == manager.endpoint_url())
-                .unwrap_or(false);
-            if (same_endpoint || manager.engine().kind() == "deepseek")
-                && self.probe(manager.endpoint_url()).await
-            {
-                return true;
+        // 1. Supervise DeepSeek
+        if let Some(mgr) = self.manager_for_harness("deepseek").await {
+            if mgr.engine().probe().await.unwrap_or(false) {
+                deepseek_ok = true;
+            } else {
+                tracing::warn!(
+                    url = mgr.endpoint_url(),
+                    "DeepSeek engine unhealthy, re-probing"
+                );
+                mgr.shutdown();
+                self.managers.write().await.remove("deepseek");
             }
-            tracing::warn!(
-                url = manager.endpoint_url(),
-                kind = manager.engine().kind(),
-                "agent engine unhealthy or moved, re-discovering"
-            );
-            manager.shutdown();
-            *self.manager.write().await = None;
-            *self.origin.write().await = EngineOrigin::None;
         }
-
-        // If DeepSeek Harness is explicitly enabled or configured, try it first
-        if self.deepseek_config.enabled || self.deepseek_config.endpoint.is_some() {
+        if !deepseek_ok && (self.deepseek_config.enabled || self.deepseek_config.endpoint.is_some())
+        {
             let ep = if let Some(ref url) = self.deepseek_config.endpoint {
                 Some(crate::agent::adapters::deepseek::DeepseekEndpoint::new(
                     url.clone(),
@@ -607,58 +636,87 @@ impl AgentRuntime {
                 let client = probe_client();
                 if endpoint.probe_healthy(&client).await {
                     self.attach_deepseek(endpoint, EngineOrigin::Adopted).await;
-                    *start_backoff = Duration::from_secs(2);
-                    return true;
+                    deepseek_ok = true;
                 }
             }
         }
 
-        // Adopt anything already healthy before starting anything -- but not
-        // a v1 service. Attaching to one used to look like success and then
-        // fail on every route, which is a worse answer than refusing here.
-        if let Some(endpoint) = discovered {
-            if endpoint.probe_healthy(&probe_client()).await {
-                if let Err(refusal) = check_version(endpoint.version.as_deref()) {
-                    tracing::error!(
-                        "refusing to use the OpenCode service at {}: {refusal}",
-                        endpoint.url
-                    );
-                    return false;
+        // 2. Supervise OpenCode
+        let discovered_opencode = if self.config.enabled {
+            OpencodeEndpoint::discover().await
+        } else {
+            None
+        };
+
+        if let Some(mgr) = self.manager_for_harness("opencode").await {
+            let same_endpoint = discovered_opencode
+                .as_ref()
+                .map(|e| e.url == mgr.endpoint_url())
+                .unwrap_or(false);
+            if same_endpoint && mgr.engine().probe().await.unwrap_or(false) {
+                opencode_ok = true;
+            } else {
+                tracing::warn!(
+                    url = mgr.endpoint_url(),
+                    "OpenCode engine unhealthy or moved, re-discovering"
+                );
+                mgr.shutdown();
+                self.managers.write().await.remove("opencode");
+            }
+        }
+
+        if !opencode_ok {
+            if let Some(endpoint) = discovered_opencode {
+                if endpoint.probe_healthy(&probe_client()).await
+                    && check_version(endpoint.version.as_deref()).is_ok()
+                {
+                    self.attach(endpoint, EngineOrigin::Adopted).await;
+                    opencode_ok = true;
                 }
-                self.attach(endpoint, EngineOrigin::Adopted).await;
-                *start_backoff = Duration::from_secs(2);
-                return true;
             }
         }
 
-        // If no OpenCode running, check if DeepSeek Harness is discovered on local default port
-        if let Some(endpoint) = crate::agent::adapters::deepseek::DeepseekEndpoint::discover().await
-        {
-            let client = probe_client();
-            if endpoint.probe_healthy(&client).await {
-                self.attach_deepseek(endpoint, EngineOrigin::Adopted).await;
-                *start_backoff = Duration::from_secs(2);
-                return true;
+        if !opencode_ok && self.config.enabled && self.config.autostart {
+            match self.start_service().await {
+                Ok(endpoint) => {
+                    self.attach(endpoint, EngineOrigin::Spawned).await;
+                    opencode_ok = true;
+                }
+                Err(err) => {
+                    tracing::warn!(%err, backoff_s = start_backoff.as_secs(), "could not start opencode");
+                    tokio::time::sleep(*start_backoff).await;
+                    *start_backoff = (*start_backoff * 2).min(MAX_START_BACKOFF);
+                }
             }
         }
 
-        if !self.config.enabled || !self.config.autostart {
-            tracing::debug!("opencode disabled or autostart is off");
-            return false;
+        // 3. Check fallback DeepSeek discovery if not yet found
+        if !deepseek_ok {
+            if let Some(endpoint) =
+                crate::agent::adapters::deepseek::DeepseekEndpoint::discover().await
+            {
+                let client = probe_client();
+                if endpoint.probe_healthy(&client).await {
+                    self.attach_deepseek(endpoint, EngineOrigin::Adopted).await;
+                    deepseek_ok = true;
+                }
+            }
         }
 
-        match self.start_service().await {
-            Ok(endpoint) => {
-                self.attach(endpoint, EngineOrigin::Spawned).await;
-                *start_backoff = Duration::from_secs(2);
-                true
+        if deepseek_ok || opencode_ok {
+            *start_backoff = Duration::from_secs(2);
+            let managers = self.managers.read().await;
+            if let Some(mgr) = managers
+                .get("deepseek")
+                .or_else(|| managers.get("opencode"))
+            {
+                *self.manager.write().await = Some(mgr.clone());
             }
-            Err(err) => {
-                tracing::warn!(%err, backoff_s = start_backoff.as_secs(), "could not start opencode");
-                tokio::time::sleep(*start_backoff).await;
-                *start_backoff = (*start_backoff * 2).min(MAX_START_BACKOFF);
-                false
-            }
+            true
+        } else {
+            *self.manager.write().await = None;
+            *self.origin.write().await = EngineOrigin::None;
+            false
         }
     }
 
@@ -675,8 +733,14 @@ impl AgentRuntime {
             .and_then(running_binary_path)
             .map(|p| p.display().to_string());
         let manager = Arc::new(AgentManager::connect(endpoint, self.events_tx.clone()));
-        *self.manager.write().await = Some(manager);
-        *self.origin.write().await = origin;
+        self.managers
+            .write()
+            .await
+            .insert("opencode".to_string(), manager.clone());
+        if self.manager.read().await.is_none() || !self.deepseek_config.enabled {
+            *self.manager.write().await = Some(manager);
+            *self.origin.write().await = origin;
+        }
         let path = path.unwrap_or_else(|| "unknown".to_string());
         match origin {
             EngineOrigin::Adopted => tracing::info!(
@@ -706,8 +770,14 @@ impl AgentRuntime {
             endpoint,
             self.events_tx.clone(),
         ));
-        *self.manager.write().await = Some(manager);
-        *self.origin.write().await = origin;
+        self.managers
+            .write()
+            .await
+            .insert("deepseek".to_string(), manager.clone());
+        if self.manager.read().await.is_none() || self.deepseek_config.enabled {
+            *self.manager.write().await = Some(manager);
+            *self.origin.write().await = origin;
+        }
         tracing::info!(
             url = %url,
             version = version.as_deref().unwrap_or("unknown"),
@@ -1465,5 +1535,18 @@ mod tests {
         // A subscriber works with no engine attached, which is what lets a
         // stream outlive a reconnect.
         let _rx = runtime.subscribe_events();
+    }
+
+    #[tokio::test]
+    async fn multi_harness_session_routing_and_all_managers() {
+        let runtime = AgentRuntime::disabled();
+        assert_eq!(runtime.all_managers().await.len(), 0);
+        assert!(runtime.manager_for_harness("deepseek").await.is_none());
+        assert!(runtime.manager_for_harness("opencode").await.is_none());
+        assert!(runtime.manager_for_session("ses_123").await.is_none());
+
+        runtime.record_session_route("ses_123", "deepseek").await;
+        let routes = runtime.session_routes.read().await;
+        assert_eq!(routes.get("ses_123"), Some(&"deepseek".to_string()));
     }
 }

@@ -2281,6 +2281,7 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         .route("/api/notifications/test", post(send_test_notification))
         .route("/health", get(health))
         .route("/api/capabilities", get(api_capabilities))
+        .route("/api/discovery", get(api_discovery))
         .route("/api/sessions", get(sessions))
         .route("/api/sessions/{session_id}/events", get(events))
         .route("/api/sessions/{session_id}/snapshot", get(snapshot))
@@ -4950,6 +4951,24 @@ pub(crate) fn device_seals_its_transport(state: &AppState, device_id: &str) -> b
 
 /// Dynamic dual-plane capability discovery endpoint for mobile client (`/api/capabilities`)
 async fn api_capabilities(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    let device_id = headers
+        .get("authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .or_else(|| headers.get("x-device-token").and_then(|h| h.to_str().ok()));
+    let sealed = device_id
+        .map(|id| device_seals_its_transport(&state, id))
+        .unwrap_or(false);
+
+    let discovery = discovery::build_discovery(&state, sealed).await;
+    Ok(Json(discovery))
+}
+
+/// Dynamic capability & multi-plane discovery endpoint for client (`/api/discovery`)
+async fn api_discovery(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
@@ -12828,6 +12847,14 @@ fn openapi_spec() -> Value {
                     "responses": capabilities_discovery_responses()
                 }
             },
+            "/api/discovery": {
+                "get": {
+                    "summary": "Gateway multi-plane discovery across Terminal, AI Harness, and SSH planes",
+                    "description": "Probes host multiplexers (tmux, herdr), AI harnesses (DeepSeek Harness, OpenCode), and SSH access surfaces. Returns dynamic multi-plane capability matrix so clients can adapt their UI without hardcoded engine assumptions.",
+                    "security": [],
+                    "responses": capabilities_discovery_responses()
+                }
+            },
             "/api/meta": { "get": simple_endpoint("Gateway API, backend, and legacy compatibility metadata") },
             "/api/pair/request": {
                 "post": {
@@ -13515,6 +13542,14 @@ fn capabilities_discovery_responses() -> Value {
                                         }
                                     }
                                 }
+                            }
+                        },
+                        "ssh": {
+                            "type": "object",
+                            "properties": {
+                                "supported": { "type": "boolean", "description": "Whether SSH plane is available" },
+                                "tunnelSupported": { "type": "boolean", "description": "Whether SSH gateway tunnels are supported" },
+                                "pushTokenSupported": { "type": "boolean", "description": "Whether push token registration is supported" }
                             }
                         }
                     }

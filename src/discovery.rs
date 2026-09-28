@@ -174,12 +174,25 @@ pub struct TerminalPlaneDiscovery {
     pub degraded_reason: Option<String>,
 }
 
-/// Discovered dual-plane structure
+/// The SSH Plane discovery model
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshPlaneDiscovery {
+    pub supported: bool,
+    pub tunnel_supported: bool,
+    pub push_token_supported: bool,
+    #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+/// Discovered multi-plane structure across Terminal, Harness, and SSH planes
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscoveryPlanes {
     pub terminal: TerminalPlaneDiscovery,
     pub harness: HarnessPlaneDiscovery,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<SshPlaneDiscovery>,
     #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
@@ -232,18 +245,28 @@ pub async fn build_terminal_plane_discovery(state: &AppState) -> TerminalPlaneDi
         None
     };
 
+    let has_git_diff = backends
+        .iter()
+        .any(|b| b.capabilities.iter().any(|c| c == "git_diff"));
+    let has_pane_context = backends
+        .iter()
+        .any(|b| b.capabilities.iter().any(|c| c == "pane_context"));
+    let has_pty = backends
+        .iter()
+        .any(|b| b.kind == "tmux" || b.kind == "pty" || b.kind == "herdr");
+
     TerminalPlaneDiscovery {
         supported,
         mode: "auto".to_string(),
         active_backend: primary.map(|s| format!("{:?}", s.backend).to_lowercase()),
         backends,
         features: TerminalFeatures {
-            multi_window: true,
-            split_pane: true,
-            raw_pty: true,
-            pane_shortcuts: true,
-            pane_context: true,
-            git_diff: true,
+            multi_window: supported,
+            split_pane: supported,
+            raw_pty: has_pty,
+            pane_shortcuts: supported,
+            pane_context: has_pane_context,
+            git_diff: has_git_diff,
         },
         degraded_reason,
     }
@@ -253,9 +276,16 @@ pub async fn build_terminal_plane_discovery(state: &AppState) -> TerminalPlaneDi
 pub async fn build_discovery_planes(state: &AppState) -> DiscoveryPlanes {
     let terminal = build_terminal_plane_discovery(state).await;
     let harness = state.agent_runtime.discover_harnesses().await;
+    let ssh = SshPlaneDiscovery {
+        supported: true,
+        tunnel_supported: true,
+        push_token_supported: true,
+        extra: BTreeMap::new(),
+    };
     DiscoveryPlanes {
         terminal,
         harness,
+        ssh: Some(ssh),
         extra: BTreeMap::new(),
     }
 }
@@ -406,5 +436,52 @@ mod tests {
         let val = serde_json::to_value(&info).expect("serializes");
         assert_eq!(val["supported"], false);
         assert_eq!(val["degradedReason"], "no_terminal_backend_configured");
+    }
+
+    #[test]
+    fn multi_plane_discovery_serializes_terminal_harness_and_ssh() {
+        let planes = DiscoveryPlanes {
+            terminal: TerminalPlaneDiscovery {
+                supported: true,
+                mode: "auto".to_string(),
+                active_backend: Some("tmux".to_string()),
+                backends: Vec::new(),
+                features: TerminalFeatures {
+                    multi_window: true,
+                    split_pane: true,
+                    raw_pty: true,
+                    pane_shortcuts: true,
+                    pane_context: true,
+                    git_diff: true,
+                },
+                degraded_reason: None,
+            },
+            harness: HarnessPlaneDiscovery {
+                supported: true,
+                active_harness: Some("deepseek".to_string()),
+                harnesses: Vec::new(),
+                features: HarnessPlaneFeatures {
+                    multi_harness: true,
+                    catalog_aggregation: true,
+                    session_routing: true,
+                },
+            },
+            ssh: Some(SshPlaneDiscovery {
+                supported: true,
+                tunnel_supported: true,
+                push_token_supported: true,
+                extra: BTreeMap::new(),
+            }),
+            extra: BTreeMap::new(),
+        };
+
+        let val = serde_json::to_value(&planes).expect("serializes");
+        assert_eq!(val["terminal"]["supported"], true);
+        assert_eq!(val["harness"]["activeHarness"], "deepseek");
+        assert_eq!(val["harness"]["features"]["multiHarness"], true);
+        assert_eq!(val["harness"]["features"]["sessionRouting"], true);
+        assert_eq!(val["ssh"]["supported"], true);
+        assert_eq!(val["ssh"]["tunnelSupported"], true);
+        assert_eq!(val["ssh"]["pushTokenSupported"], true);
     }
 }
