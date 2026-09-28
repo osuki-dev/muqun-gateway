@@ -368,3 +368,67 @@ impl AgentEnginePort for DeepseekDriver {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_live_deepseek_driver_session_lifecycle() {
+        let Some(endpoint) = DeepseekEndpoint::discover().await else {
+            eprintln!("DeepSeek Harness not discovered, skipping live test");
+            return;
+        };
+
+        let driver = DeepseekDriver::new(endpoint);
+        let catalog = driver
+            .get_catalog(None)
+            .await
+            .expect("Catalog fetch failed");
+        assert!(!catalog.models.is_empty());
+        println!(
+            "Live Catalog Models: {:?}",
+            catalog.models.iter().map(|m| &m.name).collect::<Vec<_>>()
+        );
+
+        let temp_dir = "/tmp/gateway_deepseek_live_test";
+        let _ = std::fs::create_dir_all(temp_dir);
+
+        let session = driver
+            .create_session(Some(temp_dir), None, None)
+            .await
+            .expect("Session creation failed");
+        let session_id = session.asid.0.clone();
+        println!("Created Live DeepSeek Session: {session_id}");
+
+        let fetched = driver
+            .get_session(&session_id)
+            .await
+            .expect("Fetch session failed");
+        assert_eq!(fetched.asid.0, session_id);
+        println!("Fetched Session Info: {:?}", fetched);
+
+        let prompt_res = driver
+            .send_prompt(
+                &session_id,
+                "Ping from Rust DeepseekDriver live test!",
+                &[],
+                None,
+            )
+            .await;
+        assert!(prompt_res.is_ok(), "Prompt send failed: {:?}", prompt_res);
+        println!("Successfully sent prompt to live DeepSeek session!");
+
+        tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+        let timeline = driver
+            .get_timeline(&session_id, 10)
+            .await
+            .expect("Get timeline failed");
+        println!("Timeline items count: {}", timeline.len());
+        for item in &timeline {
+            println!("  [Role {:?}] Part: {:?}", item.role, item.part);
+        }
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+}
