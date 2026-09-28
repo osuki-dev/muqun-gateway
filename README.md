@@ -8,6 +8,51 @@ your phone directly — there is no account and no server of ours in between.
 
 macOS and Linux. Windows is not supported yet.
 
+## Architecture
+
+```text
+ Muqun app (phone)
+        │  HTTPS + SSE — device token, optional AES-GCM transport envelope
+        ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ muqun-gateway — one binary, one user                                    │
+│                                                                         │
+│  src/main.rs · src/cli.rs                                               │
+│    composition root: module tree, crate re-exports, AppState, commands  │
+│                                                                         │
+│  src/platform/server.rs                                                 │
+│    startup + middleware: locale · security headers · known hosts ·      │
+│    encrypted transport · compression gate · route composition           │
+│         │                                                               │
+│         ├── platform::routes ────── health, meta, discovery, openapi    │
+│         ├── connectivity::routes ── pairing, push registration          │
+│         ├── terminal::routes ────── sessions, workspaces, panes, SSE    │
+│         └── agents::routes ──────── agent sessions; session_routes for  │
+│            + session_routes         task dispatch, prompts, approvals   │
+│         │                                                               │
+│         ▼                                                               │
+│  ports                                                                  │
+│    TerminalBackend ──► Herdr adapter · tmux adapter                     │
+│    AgentEnginePort ──► OpenCode adapter · DeepSeek adapter              │
+│                                                                         │
+│  shared infrastructure                                                  │
+│    config · store (identity, devices, secrets) · http (envelope, auth,  │
+│    validation) · metadata · uploads · assets · i18n (one catalog per    │
+│    language) · git · parts · discovery · openapi · manage · service ·   │
+│    state_lock                                                           │
+└─────────────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+ Herdr unix socket · tmux argv · OpenCode / DeepSeek HTTP
+```
+
+A request travels: the phone authenticates with its device token (and, when
+paired with transport encryption, the body arrives sealed); `platform::server`
+resolves the locale, checks the host, decrypts and routes; the route's domain
+calls a port; the adapter talks to the terminal or harness; the answer returns
+through the compatibility mapper in the versioned content envelope, with SSE
+events sealed one by one.
+
 ## Install
 
 One command. It checks the machine, installs the gateway, and on a first

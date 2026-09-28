@@ -1727,3 +1727,722 @@ fn decision_named(name: &str) -> ApiResult<approvals::Decision> {
         )),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::*;
+
+    #[test]
+    fn agent_splits_preserve_a_readable_terminal() {
+        for rows in [0, 5, 20, 40, 47] {
+            assert!(!can_split_agent_pane(Some(rows)));
+        }
+        for rows in [48, 80, 120] {
+            assert!(can_split_agent_pane(Some(rows)));
+        }
+        assert!(can_split_agent_pane(None)); // Preserve older backend behavior.
+    }
+
+    #[test]
+    fn startup_refusals_keep_their_actionable_codes() {
+        for code in [
+            "agent_not_ready",
+            "agent_start_failed",
+            "agent_start_timeout",
+        ] {
+            let error = backend_call_error(
+                "agent.start",
+                BackendError::Refused {
+                    code: Some(code.to_owned()),
+                    message: "startup detail".to_owned(),
+                },
+            );
+            assert_eq!(error.code(), code);
+            assert!(!error.can_retry_prompt());
+        }
+    }
+
+    #[test]
+    fn prompt_retry_requires_proof_nothing_was_submitted() {
+        assert!(!HerdrCallError::Unavailable("response lost".into()).can_retry_prompt());
+        assert!(!HerdrCallError::Malformed("agent.prompt".into()).can_retry_prompt());
+        for code in [
+            "agent_blocked",
+            "timeout",
+            "agent_prompt_stalled",
+            "unknown",
+        ] {
+            assert!(!HerdrCallError::Herdr {
+                method: "agent.prompt".into(),
+                error: json!({ "code": code }),
+            }
+            .can_retry_prompt());
+        }
+        assert!(HerdrCallError::Herdr {
+            method: "agent.prompt".into(),
+            error: json!({ "code": "agent_not_found" }),
+        }
+        .can_retry_prompt());
+    }
+
+    #[test]
+    fn blocked_agent_event_creates_one_notification() {
+        let event = json!({
+            "event": "pane.agent_status_changed",
+            "data": {
+                "type": "pane.agent_status_changed",
+                "pane_id": "w1:p2",
+                "workspace_id": "w1",
+                "display_agent": "Codex",
+                "agent_status": "blocked"
+            }
+        });
+        let mut statuses = HashMap::new();
+        let notice = notification_for_agent_status_event(
+            &event,
+            &mut statuses,
+            "server-1",
+            "Studio",
+            "default",
+        )
+        .unwrap();
+        let notification = notice.render(Locale::En);
+        assert_eq!(notification.title, "Agent blocked · Studio");
+        assert_eq!(notification.body, "Codex needs your input.");
+        assert_eq!(notification.data["type"], "agent.blocked");
+        assert_eq!(notification.data["url"], "/servers/server-1");
+        // The same transition, said to a phone that reads Chinese. The name the
+        // agent goes by is not translated -- it is a name.
+        let chinese = notice.render(Locale::ZhTw);
+        assert_eq!(chinese.title, "代理程式等待中 · Studio");
+        assert_eq!(chinese.body, "Codex 需要你的輸入。");
+        assert_eq!(chinese.data["type"], "agent.blocked");
+        assert_eq!(chinese.data["url"], "/servers/server-1");
+        assert!(notification_for_agent_status_event(
+            &event,
+            &mut statuses,
+            "server-1",
+            "Studio",
+            "default",
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn working_to_idle_creates_completion_notification() {
+        let mut statuses = HashMap::from([("w1:p2".into(), "working".into())]);
+        let event = json!({
+            "event": "pane.agent_status_changed",
+            "data": {
+                "pane_id": "w1:p2",
+                "agent": "codex",
+                "agent_status": "idle"
+            }
+        });
+        let notice = notification_for_agent_status_event(
+            &event,
+            &mut statuses,
+            "server-1",
+            "Studio",
+            "default",
+        )
+        .unwrap();
+        let notification = notice.render(Locale::En);
+        assert_eq!(notification.title, "Agent done · Studio");
+        assert_eq!(notification.body, "codex finished running.");
+        assert_eq!(notification.data["type"], "agent.completed");
+        assert_eq!(notification.data["pane_id"], "w1:p2");
+        let chinese = notice.render(Locale::ZhTw);
+        assert_eq!(chinese.title, "代理程式已完成 · Studio");
+        assert_eq!(chinese.body, "codex 已執行完畢。");
+    }
+
+    #[test]
+    fn a_temporary_idle_does_not_send_a_completion_push() {
+        let pane = "w1:p2";
+        let now = Instant::now();
+        let mut gate = CompletionGate::default();
+        let mut statuses = HashMap::from([(pane.to_owned(), "idle".to_owned())]);
+        let present = std::collections::HashSet::from([pane.to_owned()]);
+        let notice = notification_for_transition(
+            &AgentTransition {
+                pane_id: pane.to_owned(),
+                agent: Some("codex".to_owned()),
+                from: Some("working".to_owned()),
+                to: "idle".to_owned(),
+            },
+            "server-1",
+            "Studio",
+            "default",
+        );
+        assert!(gate.observe(pane, "idle", notice, now).is_none());
+        assert!(gate
+            .ready(&statuses, &present, now + COMPLETION_GRACE / 2)
+            .is_empty());
+
+        statuses.insert(pane.to_owned(), "working".to_owned());
+        gate.observe(pane, "working", None, now + COMPLETION_GRACE / 2);
+        assert!(gate
+            .ready(&statuses, &present, now + COMPLETION_GRACE)
+            .is_empty());
+    }
+
+    #[test]
+    fn stable_idle_is_confirmed_once_and_a_quick_second_cycle_is_suppressed() {
+        let pane = "w1:p2";
+        let now = Instant::now();
+        let mut gate = CompletionGate::default();
+        let mut statuses = HashMap::from([(pane.to_owned(), "idle".to_owned())]);
+        let present = std::collections::HashSet::from([pane.to_owned()]);
+        let transition = AgentTransition {
+            pane_id: pane.to_owned(),
+            agent: Some("codex".to_owned()),
+            from: Some("working".to_owned()),
+            to: "idle".to_owned(),
+        };
+        let notice = || notification_for_transition(&transition, "server-1", "Studio", "default");
+        gate.observe(pane, "idle", notice(), now);
+        assert!(gate
+            .ready(
+                &statuses,
+                &present,
+                now + COMPLETION_GRACE - Duration::from_secs(1)
+            )
+            .is_empty());
+        assert_eq!(
+            gate.ready(&statuses, &present, now + COMPLETION_GRACE)
+                .len(),
+            1
+        );
+        assert!(gate
+            .ready(&statuses, &present, now + COMPLETION_GRACE)
+            .is_empty());
+
+        statuses.insert(pane.to_owned(), "working".to_owned());
+        gate.observe(
+            pane,
+            "working",
+            None,
+            now + COMPLETION_GRACE + Duration::from_secs(1),
+        );
+        statuses.insert(pane.to_owned(), "idle".to_owned());
+        gate.observe(
+            pane,
+            "idle",
+            notice(),
+            now + COMPLETION_GRACE + Duration::from_secs(2),
+        );
+        assert!(gate
+            .ready(
+                &statuses,
+                &present,
+                now + COMPLETION_GRACE * 2 + Duration::from_secs(2)
+            )
+            .is_empty());
+    }
+
+    #[test]
+    fn missing_pane_cancels_a_pending_completion() {
+        let pane = "w1:p2";
+        let now = Instant::now();
+        let mut gate = CompletionGate::default();
+        let statuses = HashMap::from([(pane.to_owned(), "idle".to_owned())]);
+        let notice = notification_for_transition(
+            &AgentTransition {
+                pane_id: pane.to_owned(),
+                agent: None,
+                from: Some("working".to_owned()),
+                to: "idle".to_owned(),
+            },
+            "server-1",
+            "Studio",
+            "default",
+        );
+        gate.observe(pane, "idle", notice, now);
+        assert!(gate
+            .ready(
+                &statuses,
+                &std::collections::HashSet::new(),
+                now + COMPLETION_GRACE
+            )
+            .is_empty());
+        assert!(gate.pending.is_empty());
+    }
+
+    /// The agent's name goes where the sentence wants it, not where the English
+    /// happened to put it.
+    ///
+    /// The old body was `format!("{name} {tail}")` over fragments like "needs
+    /// your input.", which fixes the name to the front of the sentence in every
+    /// language there will ever be. A whole format string per locale is what
+    /// makes the slot movable, and an agent that reports no name at all gets the
+    /// reader's own word for one rather than the English "Agent".
+    #[test]
+    fn a_push_names_the_agent_from_a_slot_and_not_from_a_concatenation() {
+        let event = json!({
+            "event": "pane.agent_status_changed",
+            "data": { "pane_id": "w1:p9", "agent": "   ", "agent_status": "blocked" }
+        });
+        let mut statuses = HashMap::new();
+        let notice =
+            notification_for_agent_status_event(&event, &mut statuses, "s", "", "default").unwrap();
+        assert_eq!(notice.agent_name, None);
+        // No server label, so the title is the heading on its own.
+        assert_eq!(notice.render(Locale::En).title, "Agent blocked");
+        assert_eq!(notice.render(Locale::En).body, "Agent needs your input.");
+        assert_eq!(notice.render(Locale::ZhTw).title, "代理程式等待中");
+        assert!(notice.render(Locale::ZhTw).body.ends_with("需要你的輸入。"));
+        assert!(notice.render(Locale::ZhTw).body.starts_with("代理程式"));
+    }
+
+    #[test]
+    fn an_approval_push_says_that_something_needs_answering_and_never_what() {
+        // The whole privacy rule for notifications, asserted end to end on a
+        // real menu: the agent quoted the command in its own option label, and
+        // none of it may reach Expo.
+        let approval = approvals::detect(include_str!(
+            "../../tests/fixtures/approval-claude-bash.txt"
+        ))
+        .expect("the fixture is a pending approval");
+        let notice = approval_notification(
+            "server-1", "Studio", "default", "wM:p1", "claude", &approval,
+        );
+        let notification = notice.render(Locale::En);
+        assert_eq!(notification.title, "Approval needed · Studio");
+        assert_eq!(notification.body, "claude is waiting for your approval.");
+        assert_eq!(notification.data["type"], "approval.pending");
+        assert_eq!(notification.data["pane_id"], "wM:p1");
+        // The category the client registered its approve/deny actions under,
+        // and which of them this menu offers.
+        assert_eq!(notification.data["categoryId"], "approval");
+        assert_eq!(notification.data["options"][0]["decision"], "allow");
+        assert_eq!(notification.data["options"][2]["decision"], "deny");
+        assert_eq!(notification.data["fingerprint"], approval.fingerprint);
+        let rendered = Value::Object(notification.data).to_string();
+        assert!(!rendered.contains("npm"), "the command must not travel");
+        assert!(!rendered.contains("Do you want"), "nor the question");
+
+        // Translating the four labels the gateway wrote for itself cannot
+        // weaken any of that: the words changed, whose words they are did not.
+        let chinese = notice.render(Locale::ZhTw);
+        assert_eq!(chinese.title, "需要核准 · Studio");
+        assert_eq!(chinese.body, "claude 正在等待你的核准。");
+        assert_eq!(chinese.data["options"][0]["label"], "核准");
+        assert_eq!(chinese.data["options"][2]["label"], "拒絕");
+        assert_eq!(
+            chinese.data["options"][0]["decision"], "allow",
+            "the decision is wire vocabulary and has no language"
+        );
+        let rendered = Value::Object(chinese.data).to_string();
+        assert!(!rendered.contains("npm"), "the command must not travel");
+        assert!(!rendered.contains("Do you want"), "nor the question");
+    }
+
+    #[test]
+    fn the_approval_payload_carries_the_pane_and_answers_in_the_content_envelope() {
+        let approval = approvals::detect(include_str!(
+            "../../tests/fixtures/approval-claude-bash.txt"
+        ))
+        .unwrap();
+        let pending = content_envelope(approval_data_menu(
+            "default",
+            "wM:p1",
+            Some("claude"),
+            Some(&approval),
+        ));
+        assert_eq!(pending["schema_version"], CONTENT_SCHEMA_VERSION);
+        assert_eq!(pending["data"]["state"], "pending");
+        assert_eq!(pending["data"]["pane"]["approvals"], "menu");
+        assert_eq!(
+            pending["data"]["approval"]["options"][2]["decision"],
+            "deny"
+        );
+
+        // An idle pane is answered with the same shape and a null approval, so
+        // a client has one code path rather than two.
+        let idle = content_envelope(approval_data_menu("default", "wM:p1", Some("claude"), None));
+        assert_eq!(idle["data"]["state"], "idle");
+        assert!(idle["data"]["approval"].is_null());
+        assert_eq!(idle["data"]["pane"]["approvals"], "menu");
+    }
+
+    #[test]
+    fn first_idle_event_does_not_create_false_completion() {
+        let mut statuses = HashMap::new();
+        let event = json!({
+            "event": "pane.agent_status_changed",
+            "data": { "pane_id": "w1:p2", "agent_status": "idle" }
+        });
+        assert!(notification_for_agent_status_event(
+            &event,
+            &mut statuses,
+            "server-1",
+            "Studio",
+            "default",
+        )
+        .is_none());
+        assert_eq!(statuses.get("w1:p2").map(String::as_str), Some("idle"));
+    }
+
+    #[test]
+    fn a_run_that_got_part_of_the_way_answers_207_with_the_same_body() {
+        let payload = json!({ "workspace_id": "ws-1", "pane_id": "pane-1" });
+
+        let mut steps = tasks::StepLog::new();
+        steps.ok("worktree", json!({ "path": "/tmp/wt" }));
+        steps.ok("workspace", json!({ "workspace_id": "ws-1" }));
+        steps.ok("agent", json!({ "kind": "claude" }));
+        steps.skipped("prompt", "no prompt was given");
+        assert_eq!(
+            task_partial(payload.clone(), &steps).status(),
+            StatusCode::OK,
+            "a skipped step is not a failure"
+        );
+
+        steps.failed("prompt", "herdr_error", "pane vanished");
+        assert_eq!(
+            task_partial(payload, &steps).status(),
+            StatusCode::MULTI_STATUS
+        );
+    }
+
+    #[test]
+    fn nothing_created_is_an_error_whose_status_says_whose_fault_it_was() {
+        let steps = tasks::StepLog::new();
+        // Herdr refusing is the request being wrong.
+        let refused = HerdrCallError::Herdr {
+            method: "worktree.create".into(),
+            error: json!({ "code": "not_a_repo", "message": "not a git repository" }),
+        };
+        assert_eq!(refused.code(), "not_a_repo");
+        assert!(refused.message().contains("worktree.create"));
+        assert_eq!(
+            task_failure(refused, &steps).status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        // The socket being down, or Herdr answering off-schema, is not.
+        assert_eq!(
+            task_failure(
+                HerdrCallError::Unavailable("Herdr is unavailable".into()),
+                &steps
+            )
+            .status(),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            task_failure(HerdrCallError::malformed("workspace.create"), &steps).status(),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            HerdrCallError::malformed("workspace.create").code(),
+            "invalid_herdr_response"
+        );
+    }
+
+    #[test]
+    fn repo_roots_come_from_the_repos_this_session_has_and_never_widen_to_the_machine() {
+        // The gathering half of task_repo_roots, which is the part that decides
+        // what the fence lets through. A workspace names its repo root as well
+        // as its checkout, which is why a pane sitting deep inside a repo still
+        // lets the repo's top level be branched from.
+        let workspaces = json!({
+            "id": "1",
+            "result": { "type": "workspace_list", "workspaces": [
+                { "workspace_id": "ws-1", "worktree": {
+                    "repo_key": "k", "repo_name": "muqun",
+                    "repo_root": "/Users/dev/code/muqun",
+                    "checkout_path": "/Users/dev/code/muqun-task",
+                    "is_linked_worktree": true } },
+                { "workspace_id": "ws-2" },
+                { "workspace_id": "ws-3", "worktree": {
+                    "repo_key": "k2", "repo_name": "home", "repo_root": "/",
+                    "checkout_path": "/", "is_linked_worktree": false } }
+            ] }
+        });
+        let mut found: Vec<String> = Vec::new();
+        for workspace in workspaces["result"]["workspaces"].as_array().unwrap() {
+            for key in ["repo_root", "checkout_path"] {
+                if let Some(path) = workspace
+                    .pointer(&format!("/worktree/{key}"))
+                    .and_then(Value::as_str)
+                {
+                    if is_scannable_root(FsPath::new(path)) {
+                        found.push(path.to_owned());
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            found,
+            vec!["/Users/dev/code/muqun", "/Users/dev/code/muqun-task"]
+        );
+        // A workspace with no worktree contributes nothing, and "/" is refused
+        // by the same guard the asset roots use.
+        assert!(!found.iter().any(|path| path == "/"));
+    }
+
+    #[tokio::test]
+    async fn a_spawn_is_refused_before_anything_is_created() {
+        let state = unreachable_state();
+
+        // An agent this gateway does not offer, answered in the reader's own
+        // language and pointing at the list that would have said so.
+        let refusal = spawn_agent(
+            State(state.clone()),
+            Path("default".into()),
+            locale_headers("token", "zh-TW"),
+            Json(spawn_body("definitely-not-an-agent", None)),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refusal.0, StatusCode::BAD_REQUEST);
+        assert_eq!(error_body(&refusal)["error"]["code"], "unknown_agent");
+        assert!(error_body(&refusal)["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("GET /api/agents/catalog"));
+
+        // A real agent, but a directory this session does not work in. The
+        // socket is unreachable here, so the session has no roots at all --
+        // which is exactly the case that must refuse rather than fall open.
+        let refusal = spawn_agent(
+            State(state.clone()),
+            Path("default".into()),
+            bearer_headers("token"),
+            Json(spawn_body("claude", Some("/etc"))),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refusal.0, StatusCode::FORBIDDEN);
+        assert_eq!(error_body(&refusal)["error"]["code"], "cwd_not_allowed");
+
+        // And none of it is reachable without a paired device.
+        assert_eq!(
+            spawn_agent(
+                State(state),
+                Path("default".into()),
+                bearer_headers("not-a-token"),
+                Json(spawn_body("claude", None)),
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn a_blocked_push_says_nothing_the_agent_wrote_until_the_owner_asks_it_to() {
+        let approval = approvals::detect(concat!(
+            "Bash command\n",
+            "\n",
+            "  rm -rf build/\n",
+            "\n",
+            "Do you want to proceed?\n",
+            "❯ 1. Yes\n",
+            "  2. Yes, and don't ask again for rm commands\n",
+            "  3. No, and tell Claude what to do differently (esc)\n",
+        ))
+        .expect("the fixture draws a menu");
+
+        let mut statuses = HashMap::new();
+        let notice = notification_for_agent_status_event(
+            &status_event("w1:p1", "claude", "blocked"),
+            &mut statuses,
+            "server-1",
+            "Studio",
+            "default",
+        )
+        .unwrap();
+
+        // The default, and what every gateway sends until someone changes it:
+        // that something needs answering, and never what.
+        let plain = notice.render(Locale::En);
+        assert_eq!(plain.title, "Agent blocked · Studio");
+        assert_eq!(plain.body, "claude needs your input.");
+        assert!(plain.data.get("question").is_none());
+        assert!(!plain.body.contains("rm -rf"));
+
+        // Opted in: the agent's own question, verbatim, plus the answers it is
+        // offering. Not translated, because it is a quotation.
+        let mut rich = notice.clone();
+        rich.detail = Some(PushDetail::from_approval(&approval));
+        let opted_in = rich.render(Locale::ZhTw);
+        assert_eq!(opted_in.title, "代理程式等待中 · Studio");
+        assert_eq!(opted_in.body, "Do you want to proceed?");
+        assert_eq!(opted_in.data["question"], "Do you want to proceed?");
+        let labels = opted_in.data["option_labels"].as_array().unwrap();
+        assert_eq!(labels.len(), 3);
+        assert_eq!(labels[0], "Yes");
+
+        // A question longer than a glance is cut, and a menu with more answers
+        // than a notification row shows is cut too.
+        let long = approvals::Approval {
+            prompt: "x".repeat(400),
+            options: (1..=6)
+                .map(|index| approvals::ApprovalOption {
+                    index,
+                    label: "y".repeat(80),
+                    selected: false,
+                    decision: approvals::Decision::Allow,
+                })
+                .collect(),
+            ..approval
+        };
+        let detail = PushDetail::from_approval(&long);
+        // Cut, and visibly cut: the ellipsis is how a reader knows there is
+        // more rather than believing they have read the whole question.
+        assert!(detail
+            .question
+            .starts_with(&"x".repeat(MAX_PUSH_QUESTION_CHARS)));
+        assert!(detail.question.ends_with("..."));
+        assert_eq!(detail.question.chars().count(), MAX_PUSH_QUESTION_CHARS + 3);
+        assert_eq!(detail.option_labels.len(), MAX_PUSH_OPTIONS);
+        assert_eq!(
+            detail.option_labels[0].chars().count(),
+            MAX_PUSH_OPTION_CHARS + 3
+        );
+    }
+
+    #[test]
+    fn rich_pushes_are_off_until_a_config_says_otherwise() {
+        // The one switch that puts terminal text on a lock screen. A config
+        // written before it existed must read as off, and a gateway that has
+        // not been told otherwise must not start saying more than it did.
+        let config = test_config("admin");
+        assert!(!config.rich_agent_pushes);
+
+        let existing = json!({
+            "server_id": "s1",
+            "label": "mac",
+            "listen": "127.0.0.1:23847",
+            "public_url": "https://example.ts.net",
+            "token_hash": "abc",
+            "sessions": [{ "id": "default", "label": "Default", "socket_path": "/tmp/h.sock" }]
+        });
+        let parsed: Config = serde_json::from_value(existing.clone()).unwrap();
+        assert!(!parsed.rich_agent_pushes);
+        // And writing it back does not add the key, so an untouched config file
+        // stays untouched.
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), existing);
+
+        let mut object = existing.as_object().cloned().unwrap();
+        object.insert("rich_agent_pushes".into(), json!(true));
+        let opted_in: Config = serde_json::from_value(Value::Object(object)).unwrap();
+        assert!(opted_in.rich_agent_pushes);
+        assert_eq!(
+            serde_json::to_value(&opted_in).unwrap()["rich_agent_pushes"],
+            json!(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_enter_the_agent_took_is_not_repeated() {
+        let herdr = FakeHerdr::start(
+            // The screen keeps moving after the Enter and then keeps moving
+            // again, which on its own proves nothing either way.
+            vec![
+                "> review this",
+                "> review this",
+                "reviewing...",
+                "reviewing",
+            ],
+            Some(1),
+        );
+
+        submit_keypress(&herdr.session(), "w1:p1").await;
+
+        let enters = herdr.enters();
+        assert_eq!(enters.len(), 1);
+        assert_eq!(enters[0]["params"]["pane_id"], "w1:p1");
+        assert_eq!(enters[0]["params"]["keys"], json!(["Enter"]));
+    }
+
+    #[tokio::test]
+    async fn enter_waits_for_the_pane_to_stop_redrawing() {
+        // The middle screens are Claude Code staging an image: the input line is
+        // rewritten while the file is read, and an Enter in there is swallowed.
+        let herdr = FakeHerdr::start(
+            vec![
+                "> look at /tmp/a.jpg",
+                "> look at /tmp/a.jpg (reading)",
+                "> look at [Image #1]",
+                "> look at [Image #1]",
+                "analyzing image...",
+            ],
+            Some(1),
+        );
+
+        submit_keypress(&herdr.session(), "w1:p1").await;
+
+        assert_eq!(herdr.enters().len(), 1);
+        assert_eq!(
+            herdr.pane_methods(),
+            vec![
+                "pane.read",
+                "pane.read",
+                "pane.read",
+                "pane.read",
+                "pane.send_keys"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_screen_that_moved_without_submitting_does_not_pass_for_a_submission() {
+        // The exact false positive that broke the first version of this: three
+        // large images stage in bursts, so the pane looks still, then different,
+        // then still again, while the prompt never leaves the input box. Only
+        // the agent's state sequence knows, and here it moves on the third
+        // Enter.
+        let herdr = FakeHerdr::start(
+            vec![
+                "> look at [Image #1]",
+                "> look at [Image #1]",
+                "> look at [Image #1] [Image #2]",
+                "> look at [Image #1] [Image #2] [Image #3]",
+            ],
+            Some(3),
+        );
+
+        submit_keypress(&herdr.session(), "w1:p1").await;
+
+        assert_eq!(herdr.enters().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn enters_stop_at_the_budget_when_the_agent_never_takes_one() {
+        let herdr = FakeHerdr::start(vec!["> review this"], Some(usize::MAX));
+
+        submit_keypress(&herdr.session(), "w1:p1").await;
+
+        assert_eq!(herdr.enters().len(), SUBMIT_MAX_ATTEMPTS as usize);
+    }
+
+    #[tokio::test]
+    async fn a_pane_herdr_lists_no_agent_for_falls_back_to_watching_the_screen() {
+        let herdr = FakeHerdr::start(
+            vec!["$ ls", "$ ls", "Cargo.toml  src", "Cargo.toml  src"],
+            None,
+        );
+
+        submit_keypress(&herdr.session(), "w1:p1").await;
+
+        assert_eq!(herdr.enters().len(), 1);
+        assert_eq!(
+            herdr.pane_methods(),
+            vec!["pane.read", "pane.read", "pane.send_keys", "pane.read"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blind_submit_presses_enter_no_more_than_the_small_budget() {
+        let herdr = FakeHerdr::start(vec!["$ ls"], None);
+
+        submit_keypress(&herdr.session(), "w1:p1").await;
+
+        assert_eq!(herdr.enters().len(), SUBMIT_BLIND_MAX_ATTEMPTS as usize);
+    }
+}

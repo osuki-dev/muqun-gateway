@@ -12,8 +12,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use super::domain::{AgentDomainEvent, AgentSessionId, ModelRef, PermissionDecision, SessionQuery};
-use super::ports::engine::AgentEnginePort;
+use super::domain::{AgentSessionId, ModelRef, PermissionDecision, SessionQuery};
 use super::ports::mirror::SessionMirrorPort;
 use crate::{
     api_error, content_envelope, require_device, stream_event, validate_text, ApiResult, AppState,

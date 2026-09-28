@@ -1,5 +1,4 @@
-#![allow(dead_code)]
-#![allow(unused_imports)]
+#![allow(dead_code)] // the port and adapter surface for capabilities not yet routed
 
 pub mod adapters;
 pub mod agent_events;
@@ -14,9 +13,4 @@ pub mod tasks;
 pub mod use_cases;
 
 pub use domain::*;
-pub use manager::AgentManager;
-pub use ports::*;
-pub use runtime::{
-    AgentRuntime, DeepseekConfig, EngineInstallation, EngineOrigin, EngineStatus, OpencodeConfig,
-};
-pub use use_cases::*;
+pub use runtime::{AgentRuntime, DeepseekConfig, OpencodeConfig};

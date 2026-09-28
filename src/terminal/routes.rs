@@ -11,7 +11,8 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse as _, Json, Response};
-use axum::Extension;
+use axum::routing::{get, patch, post};
+use axum::{Extension, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio_stream::{Stream, StreamExt as _};
@@ -41,6 +42,97 @@ use crate::{
 
 type GatewayEventStream =
     Pin<Box<dyn Stream<Item = Result<Event, std::convert::Infallible>> + Send>>;
+
+/// Terminal plane routes: sessions, workspaces, tabs, panes, and their views.
+pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
+    router
+        .route("/api/sessions", get(sessions))
+        .route("/api/sessions/{session_id}/events", get(events))
+        .route("/api/sessions/{session_id}/snapshot", get(snapshot))
+        .route(
+            "/api/sessions/{session_id}/workspaces",
+            get(workspaces).post(create_workspace),
+        )
+        .route(
+            "/api/sessions/{session_id}/workspaces/{workspace_id}/focus",
+            post(focus_workspace),
+        )
+        .route(
+            "/api/sessions/{session_id}/workspaces/{workspace_id}",
+            patch(rename_workspace).delete(close_workspace),
+        )
+        .route(
+            "/api/sessions/{session_id}/tabs",
+            get(tabs).post(create_tab),
+        )
+        .route(
+            "/api/sessions/{session_id}/tabs/{tab_id}/focus",
+            post(focus_tab),
+        )
+        .route(
+            "/api/sessions/{session_id}/tabs/{tab_id}",
+            patch(rename_tab).delete(close_tab),
+        )
+        .route("/api/keymaps", get(keymaps))
+        .route("/api/sessions/{session_id}/recent-cwds", get(recent_cwds))
+        .route(
+            "/api/sessions/{session_id}/panes/{pane_id}/interrupt",
+            post(interrupt_pane),
+        )
+        .route("/api/sessions/{session_id}/panes", get(panes))
+        .route(
+            "/api/sessions/{session_id}/panes/{pane_id}",
+            get(pane).patch(rename_pane).delete(close_pane),
+        )
+        .route(
+            "/api/sessions/{session_id}/panes/{pane_id}/focus",
+            post(focus_pane),
+        )
+        .route(
+            "/api/sessions/{session_id}/panes/{pane_id}/split",
+            post(split_pane),
+        )
+        .route(
+            "/api/sessions/{session_id}/panes/{pane_id}/zoom",
+            post(zoom_pane),
+        )
+        .route(
+            "/api/sessions/{session_id}/panes/{pane_id}/shortcuts",
+            get(pane_shortcuts),
+        )
+        .route(
+            "/api/sessions/{session_id}/panes/{pane_id}/output",
+            get(pane_output),
+        )
+        .route(
+            "/api/sessions/{session_id}/panes/{pane_id}/parts",
+            get(pane_parts),
+        )
+        .route(
+            "/api/sessions/{session_id}/panes/{pane_id}/files",
+            get(pane_files),
+        )
+        .route(
+            "/api/sessions/{session_id}/panes/{pane_id}/context",
+            get(pane_context),
+        )
+        .route(
+            "/api/sessions/{session_id}/panes/{pane_id}/git/status",
+            get(pane_git_status),
+        )
+        .route(
+            "/api/sessions/{session_id}/panes/{pane_id}/git/diff",
+            get(pane_git_diff),
+        )
+        .route(
+            "/api/sessions/{session_id}/panes/{pane_id}/send-text",
+            post(send_text),
+        )
+        .route(
+            "/api/sessions/{session_id}/panes/{pane_id}/send-keys",
+            post(send_keys),
+        )
+}
 
 pub(crate) async fn sessions(
     State(state): State<AppState>,
@@ -838,11 +930,10 @@ pub(crate) const ACTIVITY_REBUILD_DELAY: Duration = Duration::from_secs(2);
 /// This exists because `activity_stream()` used to be called once per
 /// subscriber: once by the notification watcher, and once more by every SSE
 /// connection. For Herdr that is one socket subscription per phone. For tmux --
-/// whose adapter polls, by a deliberate architectural choice recorded in
-/// `docs/architecture.md` -- it was a whole independent poll per phone, and the
-/// cost is processes: three `tmux` invocations every 500ms, times the number of
-/// people looking. Five devices watching one session spawned thirty-six
-/// processes a second, forever.
+/// whose adapter polls by design -- it was a whole independent poll per phone,
+/// and the cost is processes: three `tmux` invocations every 500ms, times the
+/// number of people looking. Five devices watching one session spawned
+/// thirty-six processes a second, forever.
 ///
 /// One stream per session, fanned out, is what "publish changes" was always
 /// meant to be: the conversion happens once and the result is shared. The
@@ -2809,4 +2900,646 @@ pub(crate) struct SplitPaneBody {
 #[derive(Deserialize)]
 pub(crate) struct ZoomPaneBody {
     pub(crate) mode: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::agents::session_routes::native_approval_data;
+    use crate::connectivity::routes::revoke_paired_device;
+    use crate::*;
+
+    /// The defect this hub exists for: `activity_stream()` used to be built
+    /// once per subscriber, so N phones watching one tmux session meant N
+    /// independent polls -- and a tmux poll costs processes, not just sockets.
+    #[tokio::test]
+    async fn many_subscribers_share_one_activity_stream() {
+        let state = test_state("admin", Vec::new());
+        let session = state.config.sessions[0].clone();
+
+        let a = subscribe_activity(&state, &session);
+        let b = subscribe_activity(&state, &session);
+        let c = subscribe_activity(&state, &session);
+
+        let hubs = state.activity.lock().unwrap();
+        assert_eq!(hubs.len(), 1, "three subscribers must not make three hubs");
+        assert_eq!(hubs.get(&session.id).unwrap().receiver_count(), 3);
+        drop(hubs);
+        drop((a, b, c));
+    }
+
+    /// `DELETE /api/pairings/{id}` exists to cut off a device somebody no
+    /// longer controls. Until this, it cut off everything except the one
+    /// channel that actually carries the terminal: the event stream the
+    /// device already had open, which was authorised once at connect and then
+    /// ran for as long as the phone kept it.
+    #[test]
+    fn revoking_a_device_makes_the_stream_recheck_fail() {
+        let state = test_state("admin", vec![test_device("phone-1", "device-token")]);
+        assert!(still_paired(&state, "phone-1"));
+
+        state
+            .devices
+            .lock()
+            .unwrap()
+            .retain(|device| device.id != "phone-1");
+        assert!(
+            !still_paired(&state, "phone-1"),
+            "a revoked device must not keep a stream it already had"
+        );
+    }
+
+    /// End to end: a real event stream, over a live tmux so the stream has a
+    /// working backend and cannot end for any other reason, closed by the
+    /// revoke route itself.
+    ///
+    /// `to_bytes` finishes exactly when the body ends, so it is the assertion:
+    /// before this change it ran until the timeout, because nothing in the
+    /// stream ever asked again whether the device was still allowed to hold
+    /// it.
+    #[tokio::test]
+    #[ignore = "requires a tmux server"]
+    async fn revoking_a_device_closes_the_event_stream_it_already_had() {
+        use tower::ServiceExt as _;
+
+        let socket = std::path::PathBuf::from(format!(
+            "/tmp/gw-revoke-{}.sock",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
+        let tmux = backend::TmuxBackend::new(Some(socket.clone()));
+        let workspace = tmux
+            .create_workspace(&BackendCreateWorkspace {
+                cwd: Some(std::env::temp_dir()),
+                label: Some("gateway-revoke".into()),
+                focus: true,
+            })
+            .await
+            .unwrap();
+
+        let token = "device-token";
+        let mut state = test_state("admin", vec![test_device("phone-1", token)]);
+        state.config.sessions = vec![SessionConfig {
+            id: "default".into(),
+            label: "Default".into(),
+            socket_path: socket.to_string_lossy().into_owned(),
+            backend: BackendKind::Tmux,
+        }];
+
+        let app = Router::new()
+            .route("/api/sessions/{session_id}/events", get(events))
+            .with_state(state.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/default/events")
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let revoking = tokio::spawn({
+            let state = state.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                revoke_paired_device(
+                    State(state),
+                    Path("phone-1".to_owned()),
+                    bearer_headers(token),
+                )
+                .await
+                .expect("the revoke route should accept a paired device")
+            }
+        });
+
+        let ended = tokio::time::timeout(
+            STREAM_DEVICE_RECHECK_INTERVAL * 3,
+            axum::body::to_bytes(response.into_body(), 1 << 20),
+        )
+        .await;
+        drop(revoking.await.unwrap());
+        tmux.close_workspace(&workspace.id).await.ok();
+        assert!(
+            ended.is_ok(),
+            "the stream outlived the revocation of the device holding it"
+        );
+    }
+
+    /// A backend that is down for good rebuilds every `ACTIVITY_REBUILD_DELAY`
+    /// forever. Logging each attempt is about thirty-four thousand identical
+    /// lines a day, which buries every line that matters.
+    #[test]
+    fn a_failure_that_is_still_the_same_failure_is_not_news_again() {
+        let mut notes = FailureNotes::default();
+        let down = "terminal activity failed for session default: no server running";
+
+        assert!(notes.is_news(down), "the first time is always news");
+        for _ in 0..10_000 {
+            assert!(!notes.is_news(down));
+        }
+
+        // A different failure is a different thing to know.
+        let other = "terminal activity failed for session default: connection refused";
+        assert!(notes.is_news(other));
+        assert!(!notes.is_news(other));
+        assert!(notes.is_news(down), "and back again");
+
+        // Recovered: the same failure recurring is news, or the log says
+        // "down" once and never mentions the next three outages.
+        notes.recovered();
+        assert!(notes.is_news(down));
+    }
+
+    /// Two sessions are two streams; the hub is per session, not global.
+    #[tokio::test]
+    async fn each_session_gets_its_own_hub() {
+        let mut state = test_state("admin", Vec::new());
+        let mut second = state.config.sessions[0].clone();
+        second.id = "second".into();
+        state.config.sessions.push(second.clone());
+        let first = state.config.sessions[0].clone();
+
+        let a = subscribe_activity(&state, &first);
+        let b = subscribe_activity(&state, &second);
+        assert_eq!(state.activity.lock().unwrap().len(), 2);
+        drop((a, b));
+    }
+
+    /// And the other half of sharing: when the last subscriber goes, the hub
+    /// is retired, so a gateway nobody is talking to stops polling.
+    #[tokio::test]
+    async fn the_hub_retires_when_the_last_subscriber_leaves() {
+        let state = test_state("admin", Vec::new());
+        let session = state.config.sessions[0].clone();
+
+        let subscriber = subscribe_activity(&state, &session);
+        assert_eq!(state.activity.lock().unwrap().len(), 1);
+        drop(subscriber);
+
+        // `retire_activity_hub` is what the producer calls between streams;
+        // with nothing listening it removes the entry and reports that it
+        // should stop.
+        assert!(retire_activity_hub(&state, &session.id));
+        assert!(state.activity.lock().unwrap().is_empty());
+    }
+
+    /// A subscriber arriving while the producer is deciding to leave must not
+    /// be handed a receiver on a hub that then exits.
+    #[tokio::test]
+    async fn a_hub_with_a_live_subscriber_is_not_retired() {
+        let state = test_state("admin", Vec::new());
+        let session = state.config.sessions[0].clone();
+        let subscriber = subscribe_activity(&state, &session);
+
+        assert!(!retire_activity_hub(&state, &session.id));
+        assert_eq!(state.activity.lock().unwrap().len(), 1);
+        drop(subscriber);
+    }
+
+    #[test]
+    fn an_output_range_needs_both_ends_or_neither() {
+        assert!(validate_output_range(None, None).unwrap().is_none());
+        assert_eq!(
+            validate_output_range(Some(10), Some(20)).unwrap(),
+            Some((10, 20))
+        );
+        assert!(validate_output_range(Some(10), None).is_err());
+        assert!(validate_output_range(None, Some(20)).is_err());
+    }
+
+    #[test]
+    fn an_output_range_must_run_forwards() {
+        assert!(validate_output_range(Some(20), Some(20)).is_err());
+        assert!(validate_output_range(Some(21), Some(20)).is_err());
+    }
+
+    #[test]
+    fn an_oversized_output_range_is_trimmed_from_its_start_rather_than_refused() {
+        // A reader scrolling toward the top always eventually overreaches. That is
+        // an arrival at the top, not a client mistake, so it clamps.
+        let (start, end) = validate_output_range(Some(0), Some(50_000))
+            .unwrap()
+            .unwrap();
+        assert_eq!(start, 0);
+        assert_eq!(end, MAX_OUTPUT_LINES);
+    }
+
+    #[tokio::test]
+    async fn app_mount_zoom_is_side_effect_free_for_both_backends() {
+        for backend in [BackendKind::Herdr, BackendKind::Tmux] {
+            let mut state = test_state("secret", vec![test_device("device-1", "device-token")]);
+            state.config.sessions[0].backend = backend;
+            state.config.sessions[0].socket_path = String::from("/definitely/not/a/socket");
+            let response = zoom_pane(
+                State(state),
+                Path((String::from("default"), String::from("missing-pane"))),
+                bearer_headers("device-token"),
+                Json(ZoomPaneBody {
+                    mode: Some(String::from("on")),
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.0["result"]["type"], "pane_zoomed");
+        }
+    }
+
+    #[test]
+    fn stream_pane_read_becomes_inline_update() {
+        let frame = StreamPaneFrame {
+            revision: 42,
+            output: "hello\n".into(),
+        };
+        let encoded = stream_pane_update_payload(&frame, "w1:p2").unwrap();
+        let payload: Value = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(frame.revision, 42);
+        assert_eq!(payload["event"], "pane_updated");
+        assert_eq!(payload["data"]["pane"]["pane_id"], "w1:p2");
+        assert_eq!(payload["data"]["pane"]["revision"], 42);
+        assert!(payload["data"]["pane"].get("source_revision").is_none());
+        assert_eq!(payload["data"]["output"], "hello\n");
+    }
+
+    /// A native adapter answers `parts: "native"`, and only when it actually
+    /// answered. The distinction matters: an operator who has not pointed the
+    /// gateway at an opencode server still gets the dictionary, and a client
+    /// must be able to tell "could have" from "did".
+    #[test]
+    fn a_pane_says_native_only_when_a_protocol_actually_answered() {
+        let read = native::NativeRead {
+            parts: Vec::new(),
+            session: Some("ses_1".into()),
+            version: Some("1.18.0".into()),
+        };
+        let native_pane = pane_capabilities(
+            "wA:p1",
+            Some("opencode"),
+            parts::dictionary_for(Some("opencode")),
+            Some(&read),
+            None,
+        );
+        assert_eq!(native_pane["parts"], "native");
+        assert_eq!(native_pane["native"]["protocol"], "opencode-server");
+        assert_eq!(native_pane["native"]["version"], "1.18.0");
+        assert_eq!(native_pane["native"]["session"], "ses_1");
+        // The dictionary is still named, because it is still what answers when
+        // the server is not up.
+        assert_eq!(native_pane["dictionary"], "opencode");
+
+        // Same agent, no endpoint reached: the pane falls back and says so.
+        let fallback = pane_capabilities(
+            "wA:p1",
+            Some("opencode"),
+            parts::dictionary_for(Some("opencode")),
+            None,
+            None,
+        );
+        assert_eq!(fallback["parts"], "dictionary");
+        assert_eq!(fallback["native"], Value::Null);
+    }
+
+    /// One shape for both sources: the approval endpoints answer the same keys
+    /// whether the request was read off a menu or reported by a protocol, and
+    /// `pane.approvals` is the only thing that says which.
+    #[test]
+    fn a_reported_approval_answers_in_the_same_shape_a_drawn_one_does() {
+        let pending = native::NativeApproval {
+            adapter: &native::OPENCODE,
+            base: "http://127.0.0.1:1".into(),
+            session: "ses_1".into(),
+            request: parts::ApprovalRequest {
+                id: "per_1".into(),
+                prompt: "Allow bash?".into(),
+                tool: Some("bash".into()),
+                context: vec!["echo hi".into()],
+                options: vec![parts::ApprovalChoice {
+                    index: 1,
+                    label: "Approve".into(),
+                    decision: "allow",
+                }],
+            },
+        };
+        let data = native_approval_data("default", "wM:p1", Some("opencode"), Some(&pending));
+        assert_eq!(data["state"], "pending");
+        assert_eq!(data["approval"]["approval_id"], "per_1");
+        assert_eq!(data["approval"]["options"][0]["decision"], "allow");
+        // The label is the gateway's own, so the command in `context` is the
+        // only agent-authored text on this payload.
+        assert_eq!(data["approval"]["options"][0]["label"], "Approve");
+        assert_eq!(data["pane"]["approvals"], "protocol");
+
+        let idle = native_approval_data("default", "wM:p1", Some("opencode"), None);
+        assert_eq!(idle["state"], "idle");
+        assert_eq!(idle["approval"], Value::Null);
+        assert_eq!(idle["pane"]["approvals"], "protocol");
+    }
+
+    #[test]
+    fn a_pane_carries_a_composer_descriptor_only_for_an_agent_with_a_table() {
+        let known = pane_capabilities(
+            "wA:p1",
+            Some("Claude Code"),
+            parts::dictionary_for(Some("claude")),
+            None,
+            composer::descriptor(Some("Claude Code"), None),
+        );
+        assert_eq!(known["parts"], "dictionary");
+        assert_eq!(known["composer"]["table"], "claude");
+        assert_eq!(known["composer"]["file_mentions"], true);
+        assert!(known["composer"]["slash_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["source"] == "catalog"));
+
+        // An agent with no table carries no key at all -- not a null, which a
+        // client would have to tell apart from "no commands".
+        let unknown = pane_capabilities(
+            "wA:p2",
+            Some("aider"),
+            parts::dictionary_for(Some("aider")),
+            None,
+            composer::descriptor(Some("aider"), None),
+        );
+        assert_eq!(unknown["parts"], "text");
+        assert!(unknown.as_object().unwrap().get("composer").is_none());
+    }
+
+    /// The file search can only ever look in a root the asset API would also
+    /// serve, because it takes its root from the same place: the pane cwds
+    /// Herdr reports, filtered by the same "this is not the whole machine"
+    /// rule. A pane id that is not in that list has no root to search.
+    #[test]
+    fn file_search_takes_its_root_from_the_panes_the_session_actually_has() {
+        let roots = pane_list_roots(
+            "default",
+            &json!({ "result": { "panes": [
+                { "pane_id": "wA:p1", "cwd": "/Users/dev/src/project", "workspace_id": "wA" },
+                { "pane_id": "wA:p2", "cwd": "/" }
+            ] } }),
+        );
+        let root_for = |pane: &str| {
+            roots
+                .iter()
+                .find(|root| root.pane_id.as_deref() == Some(pane))
+                .map(|root| root.path.clone())
+        };
+        assert_eq!(
+            root_for("wA:p1"),
+            Some(PathBuf::from("/Users/dev/src/project"))
+        );
+        // The pane sitting at the filesystem root never became a root, so the
+        // search has nothing to look in rather than the whole machine.
+        assert_eq!(root_for("wA:p2"), None);
+        assert_eq!(root_for("wB:p9"), None);
+    }
+
+    #[test]
+    fn a_file_search_limit_is_clamped_whatever_the_client_asks_for() {
+        let clamp = |limit: Option<usize>| {
+            limit
+                .unwrap_or(composer::FILE_SEARCH_DEFAULT_LIMIT)
+                .clamp(1, composer::FILE_SEARCH_MAX_LIMIT)
+        };
+        assert_eq!(clamp(None), 20);
+        assert_eq!(clamp(Some(0)), 1);
+        assert_eq!(clamp(Some(5)), 5);
+        assert_eq!(clamp(Some(10_000)), 50);
+    }
+
+    /// The compatibility contract this field ships under: the app that sends
+    /// it and the gateway that understands it are released separately, so both
+    /// directions of the mismatch have to be harmless.
+    #[test]
+    fn the_send_text_mode_defaults_to_paste_and_tolerates_what_it_does_not_know() {
+        let parse = |body: &str| serde_json::from_str::<SendTextBody>(body).unwrap();
+
+        // An app built against any earlier gateway sends no mode at all.
+        assert_eq!(parse(r#"{"text":"hi"}"#).mode, SendTextRequestMode::Paste);
+        assert_eq!(
+            BackendSendTextMode::from(parse(r#"{"text":"hi"}"#).mode),
+            BackendSendTextMode::Paste
+        );
+
+        assert_eq!(
+            parse(r#"{"text":"i","mode":"keys"}"#).mode,
+            SendTextRequestMode::Keys
+        );
+        assert_eq!(
+            BackendSendTextMode::from(parse(r#"{"text":"i","mode":"keys"}"#).mode),
+            BackendSendTextMode::Keys
+        );
+        assert_eq!(
+            parse(r#"{"text":"hi","mode":"paste"}"#).mode,
+            SendTextRequestMode::Paste
+        );
+
+        // A newer app naming a mode this gateway has never heard of is a
+        // client running ahead of it, not a bad request. It gets the old
+        // behaviour rather than a 400.
+        for unknown in [
+            r#"{"text":"hi","mode":"literal"}"#,
+            r#"{"text":"hi","mode":"KEYS"}"#,
+            r#"{"text":"hi","mode":""}"#,
+        ] {
+            assert_eq!(
+                BackendSendTextMode::from(parse(unknown).mode),
+                BackendSendTextMode::Paste,
+                "{unknown} should fall back to a paste"
+            );
+        }
+
+        // A mode of the wrong shape is still a malformed body.
+        assert!(serde_json::from_str::<SendTextBody>(r#"{"text":"hi","mode":5}"#).is_err());
+    }
+
+    #[tokio::test]
+    async fn recent_cwds_lists_the_panes_directories_and_is_not_a_directory_browser() {
+        // The picker for spawn. It answers with what the panes are already in
+        // and nothing around it: a phone must not be able to walk the host from
+        // here, and the list it can pick from is exactly the list `cwd` takes.
+        let root = asset_test_dir("recent-cwds");
+        let repo = root.join("repo");
+        let plain = root.join("notes");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&plain).unwrap();
+
+        let state = unreachable_state();
+        state.assets.lock().unwrap().remember_roots(
+            "default",
+            None,
+            vec![
+                AssetRoot {
+                    path: repo.clone(),
+                    session_id: "default".into(),
+                    workspace_id: Some("wA".into()),
+                    tab_id: Some("wA:t1".into()),
+                    pane_id: Some("wA:p1".into()),
+                },
+                AssetRoot {
+                    path: plain.clone(),
+                    session_id: "default".into(),
+                    workspace_id: Some("wB".into()),
+                    tab_id: Some("wB:t1".into()),
+                    pane_id: Some("wB:p1".into()),
+                },
+            ],
+        );
+
+        let answer = recent_cwds(
+            State(state.clone()),
+            Path("default".into()),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap()
+        .0;
+        let cwds = answer["cwds"].as_array().unwrap();
+        assert_eq!(cwds.len(), 2);
+        assert_eq!(cwds[0]["path"], repo.to_string_lossy().as_ref());
+        assert_eq!(cwds[0]["name"], "repo");
+        assert_eq!(cwds[0]["pane_id"], "wA:p1");
+        assert_eq!(cwds[0]["workspace_id"], "wA");
+        // Which of them is a checkout, because "start an agent here" usually
+        // means a repo.
+        assert_eq!(cwds[0]["git"], true);
+        assert_eq!(cwds[1]["git"], false);
+        // Nothing above or below what the panes are in.
+        assert!(!cwds
+            .iter()
+            .any(|entry| entry["path"] == root.to_string_lossy().as_ref()));
+
+        assert_eq!(
+            recent_cwds(
+                State(state),
+                Path("default".into()),
+                bearer_headers("not-a-token"),
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::FORBIDDEN
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The whole point, end to end: Herdr keeps one screen, the gateway watched
+    /// four, and the reader can ask for all four.
+    #[tokio::test]
+    async fn a_zero_backlog_pane_hands_back_more_than_herdr_kept() {
+        let screens = repainting_screens();
+        let herdr = FakeHerdr::start(screens.iter().map(String::as_str).collect(), None);
+        let state = output_state(&herdr);
+        state.scrollback.lock().unwrap().observe(
+            "default",
+            &json!({ "pane_id": "wM:p1", "scroll": { "max_offset_from_bottom": 0, "viewport_rows": 4 } }),
+        );
+
+        for _ in 0..4 {
+            read_output(&state, 240).await;
+        }
+        let served = read_output(&state, 240).await;
+
+        // Herdr's own answer is the last screen alone.
+        assert_eq!(screens.last().unwrap(), "row 3\nrow 4\nrow 5\nrow 6");
+        assert_eq!(served, "row 0\nrow 1\nrow 2\nrow 3\nrow 4\nrow 5\nrow 6");
+    }
+
+    /// The bug this pins: a pane the scrollback store is keeping rows for is
+    /// exactly the condition the tail-path stitching above exists for, and
+    /// `keeps()` is decided from session/pane identity and Herdr's own scroll
+    /// telemetry alone -- nothing about it depends on whether the *current*
+    /// request happens to be range-addressed. Without gating on that, this
+    /// same "kept" pane, read with an explicit `[start, end)`, would come back
+    /// windowed by the plain `lines` default (200) rather than sliced to the
+    /// requested range, while nothing about the response said so.
+    ///
+    /// Reuses the exact setup `a_zero_backlog_pane_hands_back_more_than_herdr_kept`
+    /// uses to prove stitching *does* widen a tail read for this pane, then
+    /// shows a range-addressed read of the same pane is answered with exactly
+    /// what Herdr served -- the last screen alone, not the seven-row window.
+    #[tokio::test]
+    async fn a_range_addressed_read_is_never_widened_by_local_scrollback() {
+        let screens = repainting_screens();
+        let herdr = FakeHerdr::start(screens.iter().map(String::as_str).collect(), None);
+        let state = output_state(&herdr);
+        state.scrollback.lock().unwrap().observe(
+            "default",
+            &json!({ "pane_id": "wM:p1", "scroll": { "max_offset_from_bottom": 0, "viewport_rows": 4 } }),
+        );
+
+        // Feed the store the same four repaints that, in the tail-path test,
+        // make a fifth plain read come back as all seven kept rows.
+        for _ in 0..4 {
+            read_output(&state, 240).await;
+        }
+
+        let served = read_output_range(&state, 0, 240).await;
+
+        // Herdr's own answer for this read is the last screen alone -- the
+        // range-addressed request must get exactly that, not the stitched span.
+        assert_eq!(screens.last().unwrap(), "row 3\nrow 4\nrow 5\nrow 6");
+        assert_eq!(served, "row 3\nrow 4\nrow 5\nrow 6");
+    }
+
+    /// And having kept them, it says so where the reader's affordance looks --
+    /// on the pane, not on the output.
+    #[tokio::test]
+    async fn the_pane_listing_reports_what_was_kept() {
+        let screens = repainting_screens();
+        let herdr = FakeHerdr::start(screens.iter().map(String::as_str).collect(), None);
+        let state = output_state(&herdr);
+        let pane = json!({ "pane_id": "wM:p1", "scroll": { "max_offset_from_bottom": 0, "viewport_rows": 4 } });
+        state.scrollback.lock().unwrap().observe("default", &pane);
+
+        for _ in 0..4 {
+            read_output(&state, 240).await;
+        }
+        let listing =
+            note_and_amend_panes(&state, "default", json!({ "result": { "panes": [pane] } }));
+
+        // Seven rows kept, four of them on screen: three to reach back for.
+        assert_eq!(
+            listing.pointer("/result/panes/0/scroll/max_offset_from_bottom"),
+            Some(&json!(3))
+        );
+    }
+
+    /// The panes that already worked have to keep working exactly as they did.
+    #[tokio::test]
+    async fn a_pane_with_scrollback_is_answered_as_herdr_answered_it() {
+        let screens = repainting_screens();
+        let herdr = FakeHerdr::start(screens.iter().map(String::as_str).collect(), None);
+        let state = output_state(&herdr);
+        state.scrollback.lock().unwrap().observe(
+            "default",
+            &json!({ "pane_id": "wM:p1", "scroll": { "max_offset_from_bottom": 908, "viewport_rows": 4 } }),
+        );
+
+        for _ in 0..4 {
+            read_output(&state, 240).await;
+        }
+        let served = read_output(&state, 240).await;
+
+        assert_eq!(served, screens.last().unwrap().as_str());
+    }
+
+    /// And so does a pane nobody has reported on: not knowing is a reason to
+    /// stay out of the way.
+    #[tokio::test]
+    async fn an_unreported_pane_is_never_buffered() {
+        let screens = repainting_screens();
+        let herdr = FakeHerdr::start(screens.iter().map(String::as_str).collect(), None);
+        let state = output_state(&herdr);
+
+        for _ in 0..4 {
+            read_output(&state, 240).await;
+        }
+        let served = read_output(&state, 240).await;
+
+        assert_eq!(served, screens.last().unwrap().as_str());
+    }
 }

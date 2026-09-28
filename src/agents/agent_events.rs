@@ -162,6 +162,8 @@ impl AgentEventLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::session_routes::{session_agent_events, AgentEventsQuery};
+    use crate::*;
 
     fn log_with(session: &str, count: u64) -> AgentEventLog {
         let mut log = AgentEventLog::default();
@@ -259,6 +261,121 @@ mod tests {
                 "to": "blocked",
                 "unix_ms": 1_700
             })
+        );
+    }
+    #[test]
+    fn the_ring_records_every_transition_and_not_only_the_ones_worth_a_push() {
+        // The digest is the reason: "it worked for twenty minutes and then went
+        // idle" is the sentence a returning user wants, and only the last half
+        // of it ever rang a doorbell.
+        let state = test_state("admin", vec![test_device("d1", "token")]);
+        let mut statuses = HashMap::new();
+
+        let started = absorb_agent_status_event(
+            &state,
+            "default",
+            &status_event("w1:p1", "claude", "working"),
+            &mut statuses,
+        );
+        let finished = absorb_agent_status_event(
+            &state,
+            "default",
+            &status_event("w1:p1", "claude", "idle"),
+            &mut statuses,
+        );
+        // A repeat of the status the pane is already in is not a transition and
+        // must not appear twice in a digest.
+        let repeated = absorb_agent_status_event(
+            &state,
+            "default",
+            &status_event("w1:p1", "claude", "idle"),
+            &mut statuses,
+        );
+
+        assert!(started.is_none(), "starting work wakes nobody");
+        assert!(finished.is_some(), "finishing does");
+        assert!(repeated.is_none());
+
+        let log = state.agent_events.lock().unwrap();
+        let events = log.since("default", None);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].from, None);
+        assert_eq!(events[0].to, "working");
+        assert_eq!(events[1].from.as_deref(), Some("working"));
+        assert_eq!(events[1].to, "idle");
+        assert_eq!(events[1].agent.as_deref(), Some("claude"));
+        assert_eq!(log.latest_seq("default"), 2);
+    }
+
+    #[tokio::test]
+    async fn the_digest_endpoint_answers_what_is_new_and_where_to_resume_from() {
+        let state = test_state("admin", vec![test_device("d1", "token")]);
+        let mut statuses = HashMap::new();
+        for status in ["working", "blocked", "idle"] {
+            absorb_agent_status_event(
+                &state,
+                "default",
+                &status_event("w1:p1", "claude", status),
+                &mut statuses,
+            );
+        }
+
+        let answer = session_agent_events(
+            State(state.clone()),
+            Path("default".into()),
+            Query(AgentEventsQuery { since: None }),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(answer["events"].as_array().unwrap().len(), 3);
+        assert_eq!(answer["events"][0]["to"], "working");
+        assert_eq!(answer["events"][0]["from"], Value::Null);
+        assert_eq!(answer["next_since"], 3);
+        assert_eq!(answer["missed"], false);
+        assert_eq!(answer["capacity"], agent_events::RING_CAPACITY);
+
+        // Polling from where the last answer left off returns nothing and still
+        // says where to resume from, so an idle session does not walk backwards.
+        let resumed = session_agent_events(
+            State(state.clone()),
+            Path("default".into()),
+            Query(AgentEventsQuery { since: Some(3) }),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(resumed["events"].as_array().unwrap().len(), 0);
+        assert_eq!(resumed["next_since"], 3);
+        assert_eq!(resumed["missed"], false);
+
+        // Nothing here is readable without a paired device, and a session this
+        // gateway does not have is a 404 rather than an empty digest.
+        assert_eq!(
+            session_agent_events(
+                State(state.clone()),
+                Path("default".into()),
+                Query(AgentEventsQuery { since: None }),
+                bearer_headers("not-a-token"),
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            session_agent_events(
+                State(state),
+                Path("other".into()),
+                Query(AgentEventsQuery { since: None }),
+                bearer_headers("token"),
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::NOT_FOUND
         );
     }
 }

@@ -22,7 +22,6 @@ use tokio::sync::{broadcast, Mutex, RwLock};
 use super::adapters::opencode::OpencodeEndpoint;
 use super::domain::AgentDomainEvent;
 use super::manager::AgentManager;
-use super::ports::AgentEnginePort;
 
 /// How often the supervisor checks a healthy engine.
 const HEALTHY_POLL: Duration = Duration::from_secs(15);

@@ -251,3 +251,14 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::*;
+
+    #[test]
+    fn event_filter_matches_dot_and_underscore() {
+        assert_eq!(normalize_event_name("pane.updated"), "pane_updated");
+        assert_eq!(normalize_event_name(" pane_updated "), "pane_updated");
+    }
+}

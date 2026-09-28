@@ -1150,3 +1150,132 @@ pub(crate) fn render_qr(code: &QrCode) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::*;
+
+    #[test]
+    fn manager_fields_wrap_without_losing_url_or_message_text() {
+        let value = "http://osk.taila90692.ts.net:23847/a-long-path";
+        let mut lines = Vec::new();
+        push_wrapped_field(&mut lines, "url", value, 24);
+        let reconstructed = lines
+            .iter()
+            .enumerate()
+            .map(|(index, line)| {
+                if index == 0 {
+                    line.strip_prefix("url: ").unwrap()
+                } else {
+                    line.trim_start()
+                }
+            })
+            .collect::<String>();
+        assert_eq!(reconstructed, value);
+        assert!(lines.iter().all(|line| display_width(line) <= 24));
+    }
+
+    #[test]
+    fn manager_qr_uses_the_current_config_fields() {
+        assert_eq!(
+            pairing_qr_offer("http://100.1.2.3:23847", "server-1", Some("key_1")),
+            "muqun://pair?u=http%3A%2F%2F100.1.2.3%3A23847&s=server-1&k=key_1"
+        );
+        assert_eq!(
+            pairing_qr_offer("http://100.1.2.3:23847", "server-1", None),
+            "muqun://pair?u=http%3A%2F%2F100.1.2.3%3A23847&s=server-1"
+        );
+    }
+
+    #[test]
+    fn terminal_qr_has_explicit_standard_colors_and_measurable_width() {
+        let code = QrCode::with_error_correction_level(
+            b"muqun://pair?u=http%3A%2F%2Fhost&s=id",
+            EcLevel::L,
+        )
+        .unwrap();
+        let image = render_qr(&code);
+        let expected_width = code.width() + 8;
+        assert!(image
+            .lines()
+            .all(|line| line.starts_with("\x1b[30;47m") && line.ends_with("\x1b[0m")));
+        assert!(image
+            .lines()
+            .all(|line| display_width(line) == expected_width));
+        assert_eq!(display_width("\x1b[30;47m█▀ \x1b[0m"), 3);
+    }
+
+    #[test]
+    fn public_url_validation_allows_http_without_allowing_url_injection() {
+        assert_eq!(
+            validate_public_url("http://100.100.100.100:23100/").unwrap(),
+            "http://100.100.100.100:23100"
+        );
+        assert!(validate_public_url("ftp://100.100.100.100/file").is_err());
+        assert!(validate_public_url("http://user:secret@100.100.100.100:23100").is_err());
+        assert!(validate_public_url("http://100.100.100.100:23100?token=secret").is_err());
+    }
+
+    #[test]
+    fn management_connection_uses_the_actual_safe_listener() {
+        assert_eq!(
+            local_management_addr("0.0.0.0:23100".parse().unwrap()),
+            "127.0.0.1:23100".parse().unwrap()
+        );
+        assert_eq!(
+            local_management_addr("100.100.100.100:23100".parse().unwrap()),
+            "100.100.100.100:23100".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn an_explicit_loopback_url_never_opens_the_listener_to_the_lan() {
+        assert_eq!(
+            listen_for_explicit_public_url("http://localhost:23847", 23847),
+            "127.0.0.1:23847"
+        );
+        assert_eq!(
+            listen_for_explicit_public_url("http://127.0.0.1:23847", 23847),
+            "127.0.0.1:23847"
+        );
+        assert_eq!(
+            listen_for_explicit_public_url("http://[::1]:23847", 23847),
+            "[::1]:23847"
+        );
+        assert_eq!(
+            listen_for_explicit_public_url("https://host.tailnet.ts.net", 23847),
+            "0.0.0.0:23847"
+        );
+    }
+
+    /// The shape that shipped: a tailnet name in the QR, a socket on loopback.
+    ///
+    /// It is reached without anyone choosing it -- install before Tailscale is
+    /// up, and the next start rewrites the URL and leaves the socket behind --
+    /// so the gateway has to say so rather than come up looking healthy.
+    #[test]
+    fn a_loopback_socket_under_a_tailnet_name_is_warned_about() {
+        let warning = unreachable_listen_warning("127.0.0.1:23847", "http://y.ts.net:23847")
+            .expect("a loopback socket cannot serve a tailnet name");
+        assert!(warning.contains("127.0.0.1:23847"));
+        assert!(warning.contains("http://y.ts.net:23847"));
+    }
+
+    #[test]
+    fn a_reachable_listener_is_not_warned_about() {
+        assert!(unreachable_listen_warning("0.0.0.0:23847", "http://y.ts.net:23847").is_none());
+        assert!(
+            unreachable_listen_warning("100.99.165.54:23847", "http://y.ts.net:23847").is_none()
+        );
+    }
+
+    /// Loopback is correct under a local URL, and correct under Tailscale
+    /// Serve -- which terminates TLS outside and proxies in over 127.0.0.1.
+    /// Warning about either would train people to ignore the warning.
+    #[test]
+    fn loopback_is_left_alone_where_loopback_is_the_answer() {
+        assert!(unreachable_listen_warning("127.0.0.1:23847", "http://127.0.0.1:23847").is_none());
+        assert!(unreachable_listen_warning("127.0.0.1:23847", "http://localhost:23847").is_none());
+        assert!(unreachable_listen_warning("127.0.0.1:23847", "https://y.ts.net").is_none());
+    }
+}

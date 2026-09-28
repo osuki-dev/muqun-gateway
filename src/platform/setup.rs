@@ -990,3 +990,369 @@ pub(crate) fn stop_background_inner(verbose: bool) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::*;
+
+    #[test]
+    fn backend_autostart_is_explicit_and_old_configs_stay_off() {
+        let mut config = test_config("test");
+        let old = serde_json::to_value(&config).unwrap();
+        assert!(old.get("autostart_backends").is_none());
+        assert!(serde_json::from_value::<Config>(old)
+            .unwrap()
+            .autostart_backends
+            .is_empty());
+        config.autostart_backends.push("default".into());
+        let loaded: Config =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert_eq!(loaded.autostart_backends, ["default"]);
+    }
+
+    #[test]
+    fn a_tmux_session_is_explicit_while_old_sessions_stay_herdr() {
+        let old: SessionConfig = serde_json::from_value(json!({
+            "id": "default", "label": "Default", "socket_path": "/tmp/herdr.sock"
+        }))
+        .unwrap();
+        assert_eq!(old.backend, BackendKind::Herdr);
+        assert!(serde_json::to_value(&old).unwrap().get("backend").is_none());
+
+        let tmux = SessionConfig {
+            id: "default".into(),
+            label: "Default".into(),
+            socket_path: String::new(),
+            backend: BackendKind::Tmux,
+        };
+        assert_eq!(serde_json::to_value(tmux).unwrap()["backend"], "tmux");
+    }
+
+    /// Config position is what breaks a liveness tie in `session_order_key`,
+    /// so position 0 is the session the app opens. Adding a backend must
+    /// therefore leave the existing order alone: it appends.
+    #[test]
+    fn adding_a_backend_appends_and_never_reorders_the_existing_ones() {
+        let mut config = test_config("token");
+        config.sessions.clear();
+        upsert_backend_session(&mut config, BackendKind::Herdr, None, None, None).unwrap();
+        upsert_backend_session(&mut config, BackendKind::Tmux, None, None, None).unwrap();
+        assert_eq!(config.sessions[0].backend, BackendKind::Herdr);
+        assert_eq!(config.sessions[1].backend, BackendKind::Tmux);
+    }
+
+    /// The bug this closes: `backend default` moves an entry to position 0,
+    /// and the next `backend add` used to sort tmux back in front of it --
+    /// silently changing which backend the reader's phone opens.
+    #[test]
+    fn a_chosen_default_survives_adding_another_backend() {
+        let mut config = test_config("token");
+        config.sessions.clear();
+        let herdr =
+            upsert_backend_session(&mut config, BackendKind::Herdr, None, None, None).unwrap();
+        upsert_backend_session(&mut config, BackendKind::Tmux, None, None, None).unwrap();
+        make_backend_default(&mut config, &herdr).unwrap();
+        assert_eq!(config.sessions[0].id, herdr);
+
+        upsert_backend_session(
+            &mut config,
+            BackendKind::Tmux,
+            Some("tmux-late".into()),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            config.sessions[0].id, herdr,
+            "adding a backend must not overrule `backend default`"
+        );
+    }
+
+    #[test]
+    fn adding_a_backend_preserves_the_primary_session_and_is_idempotent() {
+        let mut config = test_config("token");
+        config.sessions[0] = SessionConfig {
+            id: "default".into(),
+            label: "tmux".into(),
+            socket_path: String::new(),
+            backend: BackendKind::Tmux,
+        };
+
+        let id = upsert_backend_session(
+            &mut config,
+            BackendKind::Herdr,
+            None,
+            None,
+            Some("/tmp/herdr.sock".into()),
+        )
+        .unwrap();
+        assert_eq!(id, "herdr");
+        assert_eq!(config.sessions[0].id, "default");
+        assert_eq!(config.sessions[1].backend, BackendKind::Herdr);
+
+        let id = upsert_backend_session(
+            &mut config,
+            BackendKind::Herdr,
+            None,
+            Some("Herdr local".into()),
+            Some("/tmp/new.sock".into()),
+        )
+        .unwrap();
+        assert_eq!(id, "herdr");
+        assert_eq!(config.sessions.len(), 2);
+        assert_eq!(config.sessions[1].label, "Herdr local");
+        assert_eq!(config.sessions[1].socket_path, "/tmp/new.sock");
+    }
+
+    #[test]
+    fn choosing_a_default_backend_only_reorders_sessions() {
+        let mut config = test_config("token");
+        config.sessions.push(SessionConfig {
+            id: "tmux".into(),
+            label: "Local tmux".into(),
+            socket_path: String::new(),
+            backend: BackendKind::Tmux,
+        });
+        make_backend_default(&mut config, "tmux").unwrap();
+        assert_eq!(config.sessions[0].id, "tmux");
+        assert_eq!(config.sessions[1].id, "default");
+        assert!(make_backend_default(&mut config, "missing").is_err());
+    }
+
+    #[test]
+    fn a_fresh_install_with_no_backend_named_defaults_to_tmux() {
+        assert_eq!(
+            resolve_setup_backend(None, None),
+            BackendKind::Tmux,
+            "nothing configured yet, and nothing asked for -- tmux is primary"
+        );
+    }
+
+    #[test]
+    fn an_explicit_backend_always_wins_over_whatever_already_exists() {
+        let herdr_only = test_config("token"); // sessions[0] is Herdr, see test_config
+        assert_eq!(
+            resolve_setup_backend(Some(BackendKind::Tmux), Some(&herdr_only)),
+            BackendKind::Tmux
+        );
+    }
+
+    #[test]
+    fn an_existing_herdr_install_stays_herdr_when_backend_is_left_off() {
+        // The exact case the old `default_value_t = SetupBackend::Herdr` was
+        // protecting: a bare `setup` (e.g. the Herdr-plugin action, which has
+        // no way to pass --backend) on a machine already running Herdr must
+        // not start asking for tmux, which might not even be installed.
+        let herdr_only = test_config("token");
+        assert_eq!(
+            resolve_setup_backend(None, Some(&herdr_only)),
+            BackendKind::Herdr
+        );
+    }
+
+    #[test]
+    fn an_existing_tmux_install_stays_tmux_when_backend_is_left_off() {
+        let mut tmux_only = test_config("token");
+        tmux_only.sessions[0] = SessionConfig {
+            id: "default".into(),
+            label: "tmux".into(),
+            socket_path: String::new(),
+            backend: BackendKind::Tmux,
+        };
+        assert_eq!(
+            resolve_setup_backend(None, Some(&tmux_only)),
+            BackendKind::Tmux
+        );
+    }
+
+    #[test]
+    fn backend_ids_and_labels_reject_terminal_control_input() {
+        assert!(validate_session_id("tmux-2").is_ok());
+        assert!(validate_session_id("../tmux").is_err());
+        assert!(validate_session_id("tmux\nforged").is_err());
+        assert!(validate_label("Local tmux").is_ok());
+        assert!(validate_label("tmux\x1b[2J").is_err());
+    }
+
+    #[test]
+    fn an_existing_install_requires_one_consistent_pairing_identity() {
+        let dir =
+            std::env::temp_dir().join(format!("gateway-existing-install-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = test_config("admin-token");
+        let pairing = PairingFile {
+            payload: PairingPayload {
+                kind: "muqun-gateway".into(),
+                server_id: config.server_id.clone(),
+                label: config.label.clone(),
+                url: config.public_url.clone(),
+                token: "admin-token".into(),
+                transport_key: "transport-key".into(),
+            },
+        };
+        std::fs::write(dir.join(CONFIG_FILE), serde_json::to_vec(&config).unwrap()).unwrap();
+        std::fs::write(
+            dir.join(PAIRING_FILE),
+            serde_json::to_vec(&pairing).unwrap(),
+        )
+        .unwrap();
+        assert!(load_existing_install(&dir.join(CONFIG_FILE), &dir.join(PAIRING_FILE)).is_some());
+
+        let mut stale = pairing;
+        stale.payload.token = "different-token".into();
+        std::fs::write(dir.join(PAIRING_FILE), serde_json::to_vec(&stale).unwrap()).unwrap();
+        assert!(load_existing_install(&dir.join(CONFIG_FILE), &dir.join(PAIRING_FILE)).is_none());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn imported_state_is_merged_without_duplicates() {
+        let dir = std::env::temp_dir().join(format!("gateway-state-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.json");
+        let target = dir.join("target.json");
+        std::fs::write(&source, br#"["one","two"]"#).unwrap();
+        std::fs::write(&target, br#"["two","three"]"#).unwrap();
+        merge_plugin_state::<String, _>(&source, &target, |left, right| left == right).unwrap();
+        let merged: Vec<String> = serde_json::from_slice(&std::fs::read(&target).unwrap()).unwrap();
+        assert_eq!(merged, vec!["one", "two", "three"]);
+        assert!(target
+            .with_file_name("target.json.before-herdr-import")
+            .exists());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn plugin_import_keeps_the_paired_identity_and_merges_tmux() {
+        let root = std::env::temp_dir().join(format!("gateway-import-{}", uuid::Uuid::new_v4()));
+        let source_config_dir = root.join("plugin-config");
+        let source_state_dir = root.join("plugin-state");
+        let target_config_dir = root.join("standalone-config");
+        let target_state_dir = root.join("standalone-state");
+        for dir in [
+            &source_config_dir,
+            &source_state_dir,
+            &target_config_dir,
+            &target_state_dir,
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        let mut plugin = test_config("plugin-token");
+        plugin.server_id = "paired-herdr".into();
+        plugin.listen = "127.0.0.1:31987".into();
+        plugin.public_url = "http://127.0.0.1:31987".into();
+        let plugin_pairing = PairingFile {
+            payload: PairingPayload {
+                kind: "muqun-gateway".into(),
+                server_id: plugin.server_id.clone(),
+                label: plugin.label.clone(),
+                url: plugin.public_url.clone(),
+                token: "plugin-token".into(),
+                transport_key: "plugin-transport-key".into(),
+            },
+        };
+        write_config(&source_config_dir.join(CONFIG_FILE), &plugin).unwrap();
+        write_secret_file(
+            &source_config_dir.join(PAIRING_FILE),
+            &serde_json::to_vec(&plugin_pairing).unwrap(),
+        )
+        .unwrap();
+
+        let mut standalone = test_config("tmux-token");
+        standalone.server_id = "discarded-tmux-identity".into();
+        standalone.sessions[0] = SessionConfig {
+            id: "default".into(),
+            label: "tmux".into(),
+            socket_path: String::new(),
+            backend: BackendKind::Tmux,
+        };
+        let standalone_pairing = PairingFile {
+            payload: PairingPayload {
+                kind: "muqun-gateway".into(),
+                server_id: standalone.server_id.clone(),
+                label: standalone.label.clone(),
+                url: standalone.public_url.clone(),
+                token: "tmux-token".into(),
+                transport_key: "tmux-transport-key".into(),
+            },
+        };
+        write_config(&target_config_dir.join(CONFIG_FILE), &standalone).unwrap();
+        write_secret_file(
+            &target_config_dir.join(PAIRING_FILE),
+            &serde_json::to_vec(&standalone_pairing).unwrap(),
+        )
+        .unwrap();
+
+        import_herdr_plugin(
+            Some(source_config_dir),
+            Some(source_state_dir),
+            Some(target_config_dir.clone()),
+            Some(target_state_dir),
+        )
+        .unwrap();
+
+        let merged: Config =
+            serde_json::from_slice(&std::fs::read(target_config_dir.join(CONFIG_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(merged.server_id, "paired-herdr");
+        assert_eq!(merged.sessions.len(), 2);
+        // The install being imported *into* keeps position 0, because that is
+        // the session the reader's phone already opens (`session_order_key`
+        // breaks a liveness tie by config position). Importing a plugin's
+        // backend adds one; it does not re-point the app at it.
+        assert_eq!(merged.sessions[0].backend, BackendKind::Herdr);
+        assert_eq!(merged.sessions[1].backend, BackendKind::Tmux);
+        assert!(target_config_dir.join(HERDR_PLUGIN_IMPORT_MARKER).exists());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn the_installer_never_swaps_the_identity_of_a_standalone_install_with_devices() {
+        let root = std::env::temp_dir().join(format!("gateway-import-{}", uuid::Uuid::new_v4()));
+        let plugin = root.join("plugin-config");
+        let standalone = root.join("standalone-config");
+        let state = root.join("standalone-state");
+        std::fs::create_dir_all(&state).unwrap();
+        write_test_install(&plugin, "stale-plugin", "plugin-token");
+
+        // Nothing standalone yet: adopting the plugin is the migration.
+        assert!(auto_import_skip_reason(&plugin, &standalone, &state).is_none());
+
+        // A standalone identity nothing is paired to loses nothing.
+        write_test_install(&standalone, "standalone", "standalone-token");
+        assert!(auto_import_skip_reason(&plugin, &standalone, &state).is_none());
+
+        // ...unless a gateway is using it: stopping that is not the installer's call.
+        {
+            let _running = state_lock::StateLock::acquire(&state).unwrap();
+            let reason = auto_import_skip_reason(&plugin, &standalone, &state)
+                .expect("a running standalone gateway must be left alone");
+            assert!(reason.contains("running"), "{reason}");
+        }
+
+        // Once a device is paired to it, the installer must leave it alone.
+        write_devices_at(&state, &[test_device("phone", "phone-token")]).unwrap();
+        let reason = auto_import_skip_reason(&plugin, &standalone, &state)
+            .expect("paired standalone identity must be kept");
+        assert!(reason.contains("1 paired device"), "{reason}");
+
+        // An unreadable device file is a reason to skip, never to abort the install.
+        std::fs::write(state.join(DEVICES_FILE), b"not json").unwrap();
+        let reason = auto_import_skip_reason(&plugin, &standalone, &state)
+            .expect("unreadable device file must be kept");
+        assert!(reason.contains("could not be read"), "{reason}");
+
+        // Unless it already is the plugin identity, where import changes nothing.
+        write_test_install(&standalone, "stale-plugin", "plugin-token");
+        assert!(auto_import_skip_reason(&plugin, &standalone, &state).is_none());
+        std::fs::remove_dir_all(root).ok();
+    }
+    #[test]
+    fn tailscale_serve_proxy_matching_uses_the_exact_port() {
+        assert!(proxy_targets_port("http://127.0.0.1:23100", 23100));
+        assert!(proxy_targets_port("http://localhost:23100/path", 23100));
+        assert!(!proxy_targets_port("http://127.0.0.1:123100", 23100));
+        assert!(!proxy_targets_port("http://127.0.0.1:23100.example", 23100));
+    }
+}

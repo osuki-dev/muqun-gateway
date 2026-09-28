@@ -161,6 +161,7 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::*;
 
     fn device(id: &str, token: &str, install_id: Option<&str>) -> DeviceRecord {
         DeviceRecord {
@@ -203,5 +204,125 @@ mod tests {
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].id, "new");
         assert_eq!(identify_device(&devices, "old-token"), None);
+    }
+    #[test]
+    fn token_hash_is_stable_and_not_plaintext() {
+        let hash = hash_token("secret");
+        assert_eq!(hash, hash_token("secret"));
+        assert_ne!(hash, "secret");
+    }
+
+    #[test]
+    fn pairing_code_uses_unambiguous_characters() {
+        let code = generate_pairing_code();
+        assert_eq!(code.len(), PAIRING_CODE_LENGTH);
+        assert_eq!(code.as_bytes()[4], b'-');
+        assert!(valid_pairing_code(&code));
+        assert!(!valid_pairing_code("ABCD2345"));
+        assert!(!valid_pairing_code("abcD-2345"));
+        assert!(!code.contains('0'));
+        assert!(!code.contains('O'));
+        assert!(!code.contains('1'));
+        assert!(!code.contains('I'));
+        assert!(!code.contains('L'));
+    }
+
+    /// What the code is worth is what every position can hold and how evenly it
+    /// holds it. Both halves are asserted, because both were wrong: one
+    /// position could only reach sixteen of the thirty-one glyphs because it
+    /// was reading a UUID's version nibble, and every position leaned on the
+    /// first eight because a byte was folded with `%`.
+    ///
+    /// The bands are wide on purpose. Twenty thousand draws puts about 645 of
+    /// each glyph in each position and about 5161 overall; a tenth of that is
+    /// seven standard deviations, so the old bias (a ninth over, five of them)
+    /// fails and a fair generator does not flake.
+    #[test]
+    fn every_glyph_can_land_in_every_position_and_none_is_favoured() {
+        const DRAWS: usize = 20_000;
+        let mut counts =
+            vec![vec![0_usize; super::PAIRING_CODE_ALPHABET.len()]; PAIRING_CODE_CHARACTER_COUNT];
+        for _ in 0..DRAWS {
+            let code = generate_pairing_code();
+            assert!(valid_pairing_code(&code), "{code} is not a pairing code");
+            let glyphs: Vec<u8> = code.bytes().filter(|byte| *byte != b'-').collect();
+            for (position, glyph) in glyphs.iter().enumerate() {
+                let index = super::PAIRING_CODE_ALPHABET
+                    .iter()
+                    .position(|candidate| candidate == glyph)
+                    .expect("a code is drawn from the alphabet");
+                counts[position][index] += 1;
+            }
+        }
+
+        for (position, row) in counts.iter().enumerate() {
+            for (index, count) in row.iter().enumerate() {
+                assert!(
+                    *count > 0,
+                    "position {position} never produced {}",
+                    super::PAIRING_CODE_ALPHABET[index] as char
+                );
+            }
+        }
+
+        let total = DRAWS * PAIRING_CODE_CHARACTER_COUNT;
+        let expected = total / super::PAIRING_CODE_ALPHABET.len();
+        for index in 0..super::PAIRING_CODE_ALPHABET.len() {
+            let seen: usize = counts.iter().map(|row| row[index]).sum();
+            assert!(
+                seen * 10 > expected * 9 && seen * 10 < expected * 11,
+                "{} came up {seen} times against {expected} expected",
+                super::PAIRING_CODE_ALPHABET[index] as char
+            );
+        }
+    }
+
+    #[test]
+    fn request_id_validation_is_restrictive() {
+        assert!(valid_request_id("iphone-15.req_1"));
+        assert!(!valid_request_id(""));
+        assert!(!valid_request_id("has space"));
+        assert!(!valid_request_id(&"x".repeat(81)));
+    }
+
+    #[test]
+    fn pairing_code_is_consumed_after_one_successful_claim() {
+        let mut pending = test_pending_pairing(1_000);
+        assert_eq!(
+            consume_test_pairing_code(&mut pending, "request-1", "2345-6789", 1_001),
+            Ok(())
+        );
+        assert!(pending.is_none());
+        assert_eq!(
+            consume_test_pairing_code(&mut pending, "request-1", "2345-6789", 1_002),
+            Err(PairingCodeError::Missing)
+        );
+    }
+
+    #[test]
+    fn expired_pairing_code_is_rejected_and_cleared() {
+        let mut pending = test_pending_pairing(1_000);
+        assert_eq!(
+            consume_test_pairing_code(
+                &mut pending,
+                "request-1",
+                "2345-6789",
+                1_000 + PAIRING_CODE_TTL_MS
+            ),
+            Err(PairingCodeError::Expired)
+        );
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn repeated_invalid_pairing_attempts_invalidate_code() {
+        let mut pending = test_pending_pairing(1_000);
+        for _ in 0..MAX_PAIRING_CODE_ATTEMPTS {
+            assert_eq!(
+                consume_test_pairing_code(&mut pending, "request-1", "AAAA-AAAA", 1_001),
+                Err(PairingCodeError::Invalid)
+            );
+        }
+        assert!(pending.is_none());
     }
 }

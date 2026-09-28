@@ -322,3 +322,41 @@ pub(crate) const MAX_REQUEST_BODY_BYTES: usize = 128 * 1024;
 /// `git/status` and `git/diff` -- behind the `pane_context` and `git_diff`
 /// capabilities; no existing payload changes.
 pub(crate) const CONTENT_SCHEMA_VERSION: &str = "1.5.0";
+
+#[cfg(test)]
+mod tests {
+    use crate::*;
+
+    #[test]
+    fn a_config_without_agent_commands_still_loads_and_round_trips_unchanged() {
+        // Every gateway already in the field has a config.json written before
+        // this field existed. Reading one must not fail, and rewriting one must
+        // not add noise to it.
+        let existing = json!({
+            "server_id": "s1",
+            "label": "mac",
+            "listen": "127.0.0.1:23847",
+            "public_url": "https://example.ts.net",
+            "token_hash": "abc",
+            "sessions": [{ "id": "default", "label": "Default", "socket_path": "/tmp/h.sock" }]
+        });
+        let config: Config = serde_json::from_value(existing.clone()).unwrap();
+        assert!(config.agent_commands.is_empty());
+        assert_eq!(serde_json::to_value(&config).unwrap(), existing);
+
+        let with_override = json!({
+            "server_id": "s1",
+            "label": "mac",
+            "listen": "127.0.0.1:23847",
+            "public_url": "https://example.ts.net",
+            "token_hash": "abc",
+            "sessions": [{ "id": "default", "label": "Default", "socket_path": "/tmp/h.sock" }],
+            "agent_commands": { "claude": "claude-canary" }
+        });
+        let config: Config = serde_json::from_value(with_override).unwrap();
+        assert_eq!(
+            config.agent_commands.get("claude").map(String::as_str),
+            Some("claude-canary")
+        );
+    }
+}

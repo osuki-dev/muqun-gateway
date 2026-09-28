@@ -1,6 +1,4 @@
 //! Asset indexing and the file half of the unified content model.
-//! ---------------------------------------------------------------------------
-//! Assets: the file half of the unified content model.
 //!
 //! An asset is a file a session's workspaces produced that the user may want to
 //! look at on the phone. Two feeds keep the index current, in this order:
@@ -36,6 +34,8 @@ use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse as _, Json, Response};
+use axum::routing::get;
+use axum::Router;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -1305,4 +1305,959 @@ pub(crate) fn header_safe_name(name: &str) -> String {
 /// the asset endpoints answer with.
 pub(crate) fn asset_created_payload(entry: &AssetEntry, asset_type: AssetType) -> String {
     content_envelope(json!({ "asset": asset_json(entry, asset_type) })).to_string()
+}
+
+/// The two asset routes: listing one tab's files, and serving their content.
+pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
+    router
+        .route(
+            "/api/sessions/{session_id}/tabs/{tab_id}/assets",
+            get(session_assets),
+        )
+        .route("/api/assets/{asset_id}/content", get(asset_content))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::*;
+
+    #[test]
+    fn every_pane_in_one_checkout_resolves_to_its_directory() {
+        // Two panes in the same directory. The asset roots keep one entry for
+        // it, under the first pane's id; the second pane must still be found.
+        let list = json!({ "result": { "panes": [
+            { "pane_id": "w1:p1", "cwd": "/work/team/app" },
+            { "pane_id": "w1:p2", "cwd": "/work/team/app" },
+            { "pane_id": "w1:p3", "foreground_cwd": "/work/team/api" },
+            { "pane_id": "w1:p4", "cwd": "/" },
+        ] } });
+        assert_eq!(pane_list_roots("s", &list).len(), 2);
+        assert_eq!(
+            pane_cwd_in_list(&list, "w1:p1"),
+            Some(PathBuf::from("/work/team/app"))
+        );
+        assert_eq!(
+            pane_cwd_in_list(&list, "w1:p2"),
+            Some(PathBuf::from("/work/team/app"))
+        );
+        assert_eq!(
+            pane_cwd_in_list(&list, "w1:p3"),
+            Some(PathBuf::from("/work/team/api"))
+        );
+        // Outside the fence, and unknown: no directory, so no git is run.
+        assert_eq!(pane_cwd_in_list(&list, "w1:p4"), None);
+        assert_eq!(pane_cwd_in_list(&list, "w9:p9"), None);
+    }
+
+    #[test]
+    fn asset_reads_are_fenced_inside_the_workspace_roots() {
+        let root = asset_test_dir("fence");
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(workspace.join("docs")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(workspace.join("docs/report.md"), b"# report\n").unwrap();
+        std::fs::write(outside.join("secret.txt"), b"secret\n").unwrap();
+        let roots = vec![workspace.clone()];
+
+        assert!(resolve_asset_path(&workspace.join("docs/report.md"), &roots).is_some());
+
+        // Traversal out of the root, whatever shape it arrives in.
+        assert!(
+            resolve_asset_path(&workspace.join("docs/../../outside/secret.txt"), &roots).is_none()
+        );
+        assert!(resolve_asset_path(&outside.join("secret.txt"), &roots).is_none());
+        assert!(resolve_asset_path(FsPath::new("/etc/hosts"), &roots).is_none());
+
+        // A sibling whose name merely starts with the root's is not inside it.
+        let neighbour = root.join("workspace-notes");
+        std::fs::create_dir_all(&neighbour).unwrap();
+        std::fs::write(neighbour.join("note.txt"), b"note\n").unwrap();
+        assert!(resolve_asset_path(&neighbour.join("note.txt"), &roots).is_none());
+
+        // A directory is not an asset, and neither is the root itself.
+        assert!(resolve_asset_path(&workspace, &roots).is_none());
+        assert!(resolve_asset_path(&workspace.join("docs"), &roots).is_none());
+        assert!(resolve_asset_path(&workspace.join("missing.md"), &roots).is_none());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn an_indexed_asset_outlives_the_workspace_that_made_it() {
+        // The worktree an agent wrote into was removed hours later. The roots
+        // resolve to nothing now, which is the whole of what changed: the file
+        // is still there and still the thing the user tapped.
+        let root = asset_test_dir("provenance");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let report = workspace.join("report.md");
+        std::fs::write(&report, b"# report\n").unwrap();
+
+        // While the workspace is a root, nothing about the read changed.
+        let live = vec![workspace.clone()];
+        assert_eq!(
+            resolve_indexed_asset_path(&report, &live),
+            Some(report.clone())
+        );
+
+        // With no roots at all -- the workspace closed -- the stored path is
+        // replayed and answers the same bytes.
+        assert_eq!(
+            resolve_indexed_asset_path(&report, &[]),
+            Some(report.clone())
+        );
+
+        // A file that is gone is gone, roots or no roots.
+        let deleted = workspace.join("gone.md");
+        std::fs::write(&deleted, b"bye\n").unwrap();
+        std::fs::remove_file(&deleted).unwrap();
+        assert!(resolve_indexed_asset_path(&deleted, &[]).is_none());
+
+        // A directory left where the file was is not a file.
+        std::fs::create_dir_all(workspace.join("was-a-file")).unwrap();
+        assert!(resolve_indexed_asset_path(&workspace.join("was-a-file"), &[]).is_none());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_swapped_into_a_stored_asset_path_is_not_that_asset() {
+        // The attack the equality guard exists for: the workspace closes, the
+        // real file is replaced by a link to somewhere the gateway would never
+        // have indexed, and the old id is presented again.
+        let root = asset_test_dir("provenance-symlink");
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"secret\n").unwrap();
+        let stored = workspace.join("report.md");
+        std::fs::write(&stored, b"# report\n").unwrap();
+        assert!(resolve_indexed_asset_path(&stored, &[]).is_some());
+
+        std::fs::remove_file(&stored).unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.txt"), &stored).unwrap();
+
+        // The path canonicalizes to the link's target, which is not the path
+        // that was stored, so the replay refuses it -- and refuses it the same
+        // way an unknown id is refused.
+        assert!(resolve_indexed_asset_path(&stored, &[]).is_none());
+        assert!(resolve_indexed_asset_path(&stored, std::slice::from_ref(&workspace)).is_none());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_path_that_was_never_indexed_has_no_entry_to_replay() {
+        // The fallback is reached through an index lookup and nowhere else, so
+        // provenance is what it serves. A file the gateway never scanned has no
+        // entry, and the read stops at the lookup with the same 404 as a bad id.
+        let root = asset_test_dir("provenance-unindexed");
+        std::fs::create_dir_all(&root).unwrap();
+        let indexed = root.join("indexed.md");
+        let never = root.join("never-scanned.md");
+        std::fs::write(&indexed, b"# indexed\n").unwrap();
+        std::fs::write(&never, b"# private\n").unwrap();
+
+        let mut index = AssetIndex::default();
+        index.upsert(test_asset_entry(&indexed, &root, 1));
+
+        assert!(index.get(&asset_id(&indexed)).is_some());
+        assert!(index.get(&asset_id(&never)).is_none());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_uploads_directory_ingests_like_any_other_root_and_survives_a_cold_start() {
+        // The bug this guards against: an upload lives in the gateway's own
+        // uploads directory, which is not under any pane's cwd, so a rebuild
+        // that only walks pane roots never finds it again once the in-memory
+        // index is gone (e.g. after a restart). The cold-start path in
+        // `asset_content` now adds the uploads directory as one more root per
+        // session -- this proves that root ingests the same way a pane root
+        // does, and that the resulting entry answers a lookup with none of the
+        // session's live roots present, exactly the state a fresh process is
+        // in right after startup.
+        let uploads = asset_test_dir("uploads-cold-start");
+        let upload = uploads.join("5969c1e3.webp");
+        std::fs::write(&upload, b"fake webp bytes").unwrap();
+
+        let root = AssetRoot {
+            path: uploads.clone(),
+            session_id: "default".into(),
+            workspace_id: None,
+            tab_id: None,
+            pane_id: None,
+        };
+        let index: Mutex<AssetIndex> = Mutex::new(AssetIndex::default());
+        let created = ingest_root(&index, &root);
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].path, upload);
+        assert_eq!(created[0].session_id, "default");
+
+        // Simulate the state right after a restart answering `asset_content`:
+        // the entry is in the index (just rebuilt), but the session's live
+        // roots -- the pane cwds -- do not include the uploads directory and
+        // never will. `resolve_indexed_asset_path`'s own-path fallback is what
+        // actually serves it; this proves the entry it is given exists to
+        // fall back on at all.
+        let id = asset_id(&upload);
+        let entry = index.lock().unwrap().get(&id).unwrap();
+        assert_eq!(entry.path, upload);
+        let no_live_pane_roots: Vec<PathBuf> = Vec::new();
+        assert_eq!(
+            resolve_indexed_asset_path(&entry.path, &no_live_pane_roots),
+            Some(upload.clone())
+        );
+
+        std::fs::remove_dir_all(&uploads).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_out_of_a_workspace_root_cannot_be_read_or_scanned() {
+        let root = asset_test_dir("symlink");
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"secret\n").unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.txt"), workspace.join("escape.txt"))
+            .unwrap();
+        std::os::unix::fs::symlink(&outside, workspace.join("escape-dir")).unwrap();
+        std::fs::write(workspace.join("own.txt"), b"mine\n").unwrap();
+        let roots = vec![workspace.clone()];
+
+        // The link resolves to where it points, which is outside the root.
+        assert!(resolve_asset_path(&workspace.join("escape.txt"), &roots).is_none());
+        assert!(resolve_asset_path(&workspace.join("escape-dir/secret.txt"), &roots).is_none());
+        assert!(resolve_asset_path(&workspace.join("own.txt"), &roots).is_some());
+
+        // The scan never offers such a path in the first place.
+        let names: Vec<String> = scan_workspace_root(&workspace, ASSET_SCAN_MAX_DEPTH, 100)
+            .into_iter()
+            .map(|file| file.name)
+            .collect();
+        assert_eq!(names, vec![String::from("own.txt")]);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn asset_kind_comes_from_the_bytes_and_the_extension_only_splits_the_text_kinds() {
+        assert_eq!(
+            sniff_asset_type(&png_bytes(), "screenshot.png").kind,
+            AssetKind::Image
+        );
+        // A name that lies about the content does not change what it is.
+        assert_eq!(
+            sniff_asset_type(&png_bytes(), "screenshot.md").kind,
+            AssetKind::Image
+        );
+        assert_eq!(
+            sniff_asset_type(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n", "report.pdf").kind,
+            AssetKind::Pdf
+        );
+        assert_eq!(
+            sniff_asset_type(b"# Title\n\nbody\n", "notes.md").kind,
+            AssetKind::Markdown
+        );
+        assert_eq!(
+            sniff_asset_type(b"# Title\n\nbody\n", "notes.MARKDOWN").kind,
+            AssetKind::Markdown
+        );
+        assert_eq!(
+            sniff_asset_type(b"# Title\n\nbody\n", "notes.txt").kind,
+            AssetKind::Text
+        );
+        assert_eq!(
+            sniff_asset_type("日本語とemoji 🎈\n".as_bytes(), "notes").kind,
+            AssetKind::Text
+        );
+        // A markdown extension over bytes that are not text is still binary.
+        assert_eq!(
+            sniff_asset_type(b"\x00\x01\x02binary\x00", "notes.md").kind,
+            AssetKind::Binary
+        );
+        assert_eq!(
+            sniff_asset_type(&[0xff, 0xfe, 0xfd, 0xfc], "blob.bin").kind,
+            AssetKind::Binary
+        );
+        assert_eq!(sniff_asset_type(b"", "empty.txt").kind, AssetKind::Text);
+
+        assert!(AssetKind::Markdown.previewable());
+        assert!(AssetKind::Image.previewable());
+        assert!(AssetKind::Pdf.previewable());
+        assert!(!AssetKind::Binary.previewable());
+
+        // A UTF-8 character cut in half by the sniff window is a truncation,
+        // not a binary file.
+        let mut truncated = "héllo".as_bytes().to_vec();
+        truncated.pop();
+        assert!(looks_textual(&truncated));
+        assert!(!looks_textual(b"text\x00text"));
+    }
+
+    #[test]
+    fn a_scan_stays_shallow_and_skips_heavy_directories() {
+        let root = asset_test_dir("scan");
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        std::fs::create_dir_all(root.join("target/debug")).unwrap();
+        std::fs::create_dir_all(root.join(".git/objects")).unwrap();
+        std::fs::create_dir_all(root.join("a/b/c/d/e")).unwrap();
+        std::fs::write(root.join("report.md"), b"# report\n").unwrap();
+        std::fs::write(root.join(".hidden"), b"hidden\n").unwrap();
+        std::fs::write(root.join("node_modules/pkg/index.js"), b"module\n").unwrap();
+        std::fs::write(root.join("target/debug/binary"), b"binary\n").unwrap();
+        std::fs::write(root.join(".git/objects/blob"), b"blob\n").unwrap();
+        std::fs::write(root.join("a/b/c/deep.txt"), b"deep\n").unwrap();
+        std::fs::write(root.join("a/b/c/d/e/too-deep.txt"), b"too deep\n").unwrap();
+
+        let mut names: Vec<String> = scan_workspace_root(&root, ASSET_SCAN_MAX_DEPTH, 100)
+            .into_iter()
+            .map(|file| file.name)
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![String::from("deep.txt"), String::from("report.md")]
+        );
+
+        // The file budget is a hard stop, not a suggestion.
+        assert_eq!(scan_workspace_root(&root, ASSET_SCAN_MAX_DEPTH, 1).len(), 1);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_index_dedupes_by_path_and_answers_newest_first() {
+        let root = asset_test_dir("index");
+        let nested = root.join("nested");
+        let mut index = AssetIndex::default();
+
+        let old = root.join("old.txt");
+        let new = root.join("new.txt");
+        assert!(index.upsert(test_asset_entry(&old, &root, 1_000)));
+        assert!(index.upsert(test_asset_entry(&new, &root, 2_000)));
+        // The same file seen again by a later scan updates it in place.
+        let mut rescanned = test_asset_entry(&old, &root, 3_000);
+        rescanned.size = 4_096;
+        assert!(!index.upsert(rescanned));
+        assert_eq!(index.entries.len(), 2);
+
+        // `test_asset_entry` puts everything in workspace "wA".
+        let scope_a = AssetScope::Workspace("wA".into());
+        let scope_b = AssetScope::Workspace("wB".into());
+        let listed = index.session_assets("default", &scope_a, None, 10);
+        assert_eq!(
+            listed
+                .iter()
+                .map(|entry| entry.name.clone())
+                .collect::<Vec<_>>(),
+            vec![String::from("old.txt"), String::from("new.txt")]
+        );
+        assert_eq!(listed[0].size, 4_096);
+        assert_eq!(listed[0].modified_unix_ms, 3_000);
+
+        // `since` is exclusive, and `limit` cuts the newest page.
+        assert_eq!(
+            index
+                .session_assets("default", &scope_a, Some(2_000), 10)
+                .len(),
+            1
+        );
+        assert_eq!(
+            index
+                .session_assets("default", &scope_a, Some(3_000), 10)
+                .len(),
+            0
+        );
+        assert_eq!(index.session_assets("default", &scope_a, None, 1).len(), 1);
+        assert_eq!(index.session_assets("other", &scope_a, None, 10).len(), 0);
+        // Same session, a different workspace: none of "wA"'s files leak into
+        // it. This is the defect the workspace scope closes -- everything
+        // above proves the index still works exactly as it did, this proves
+        // it no longer answers wider than the workspace asked for.
+        assert_eq!(index.session_assets("default", &scope_b, None, 10).len(), 0);
+
+        // Nested roots see the same file; the deeper one owns it.
+        let shared = nested.join("shared.txt");
+        assert!(index.upsert(test_asset_entry(&shared, &root, 4_000)));
+        let mut deeper = test_asset_entry(&shared, &nested, 4_000);
+        deeper.workspace_id = Some("wB".into());
+        assert!(!index.upsert(deeper));
+        let owned = index.get(&asset_id(&shared)).unwrap();
+        assert_eq!(owned.root, nested);
+        assert_eq!(owned.workspace_id.as_deref(), Some("wB"));
+        // A shallower root does not take it back.
+        let mut shallower = test_asset_entry(&shared, &root, 5_000);
+        shallower.workspace_id = Some("wA".into());
+        assert!(!index.upsert(shallower));
+        assert_eq!(index.get(&asset_id(&shared)).unwrap().root, nested);
+
+        // A removed worktree takes its files with it.
+        index.forget_under(&nested);
+        assert!(index.get(&asset_id(&shared)).is_none());
+        assert_eq!(index.entries.len(), 2);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_kind_allow_list_is_normalized_and_an_absent_one_filters_nothing() {
+        assert!(asset_kind_filter(None).is_empty());
+        assert!(asset_kind_filter(Some("")).is_empty());
+        // A trailing comma is a client's join, not a kind.
+        assert!(asset_kind_filter(Some(",, ,")).is_empty());
+        assert_eq!(
+            asset_kind_filter(Some("image")),
+            vec![String::from("image")]
+        );
+        assert_eq!(
+            asset_kind_filter(Some(" Markdown , PDF ")),
+            vec![String::from("markdown"), String::from("pdf")]
+        );
+        // A kind outside the taxonomy is carried as asked and simply matches
+        // nothing, the way an unknown name in the events allow-list does.
+        assert_eq!(
+            asset_kind_filter(Some("document")),
+            vec![String::from("document")]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_kind_filter_answers_the_newest_of_that_kind_not_the_kind_among_the_newest() {
+        // The shape that made the filter necessary: an agent editing source code
+        // writes files faster than it writes artifacts, so the image and the
+        // documents sit well behind the newest page.
+        let root = asset_test_dir("kind-listing");
+        std::fs::write(root.join("chart.png"), png_bytes()).unwrap();
+        std::fs::write(root.join("notes.md"), b"# notes\n").unwrap();
+        std::fs::write(root.join("report.pdf"), b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n").unwrap();
+        for index in 0..3 {
+            std::fs::write(root.join(format!("mod{index}.rs")), b"fn main() {}\n").unwrap();
+        }
+        let state = asset_listing_state(
+            &root,
+            vec![
+                test_asset_entry(&root.join("chart.png"), &root, 1_000),
+                test_asset_entry(&root.join("notes.md"), &root, 2_000),
+                test_asset_entry(&root.join("report.pdf"), &root, 3_000),
+                test_asset_entry(&root.join("mod0.rs"), &root, 4_000),
+                test_asset_entry(&root.join("mod1.rs"), &root, 5_000),
+                test_asset_entry(&root.join("mod2.rs"), &root, 6_000),
+            ],
+        );
+
+        // No kind is the old answer exactly: the newest files, whatever they are.
+        assert_eq!(
+            listed_asset_names(&state, None, 3).await,
+            vec![
+                String::from("mod2.rs"),
+                String::from("mod1.rs"),
+                String::from("mod0.rs")
+            ]
+        );
+        assert_eq!(listed_asset_names(&state, Some(""), 3).await.len(), 3);
+
+        // The image is the fourth-oldest file of six, so a page of three would
+        // never have shown it. Filtering during the scan is what finds it.
+        assert_eq!(
+            listed_asset_names(&state, Some("image"), 3).await,
+            vec![String::from("chart.png")]
+        );
+        // One request for a client filter that spans two kinds, still newest
+        // first across both.
+        assert_eq!(
+            listed_asset_names(&state, Some("markdown,pdf"), 3).await,
+            vec![String::from("report.pdf"), String::from("notes.md")]
+        );
+        // The page is still cut to the limit, and cut from the matches.
+        assert_eq!(
+            listed_asset_names(&state, Some("text"), 2).await,
+            vec![String::from("mod2.rs"), String::from("mod1.rs")]
+        );
+        // A kind the gateway does not have matches nothing rather than erroring
+        // or quietly widening back to everything.
+        assert!(listed_asset_names(&state, Some("document"), 3)
+            .await
+            .is_empty());
+
+        // The applied allow-list comes back, so a client can tell this gateway
+        // from one old enough to have ignored the parameter.
+        let response = session_assets(
+            State(state.clone()),
+            Path(("default".into(), "wA".into())),
+            Query(asset_listing_query(Some("Image"), 3)),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.0["data"]["kind"], json!(["image"]));
+        assert_eq!(response.0["data"]["assets"][0]["kind"], "image");
+        let unfiltered = session_assets(
+            State(state.clone()),
+            Path(("default".into(), "wA".into())),
+            Query(asset_listing_query(None, 3)),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(unfiltered.0["data"]["kind"], json!([]));
+
+        // A different workspace in the same session sees none of it: the
+        // scope this fix adds is the workspace, not the session, and this is
+        // the reported defect in miniature -- another workspace's files never
+        // showing up in this one's listing.
+        let other_workspace = session_assets(
+            State(state.clone()),
+            Path(("default".into(), "wB".into())),
+            Query(asset_listing_query(None, 3)),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap();
+        assert!(other_workspace.0["data"]["assets"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_page_is_filled_from_the_matches_and_sniffs_no_further_than_it_has_to() {
+        let root = asset_test_dir("kind-page");
+        std::fs::write(root.join("a.png"), png_bytes()).unwrap();
+        std::fs::write(root.join("b.png"), png_bytes()).unwrap();
+        std::fs::write(root.join("c.txt"), b"plain\n").unwrap();
+        let ordered = vec![
+            test_asset_entry(&root.join("a.png"), &root, 3_000),
+            test_asset_entry(&root.join("b.png"), &root, 2_000),
+            test_asset_entry(&root.join("c.txt"), &root, 1_000),
+        ];
+
+        let names = |page: Vec<Value>| -> Vec<String> {
+            page.iter()
+                .map(|asset| asset["name"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        assert_eq!(
+            names(asset_page(ordered.clone(), &[], 2)),
+            vec![String::from("a.png"), String::from("b.png")]
+        );
+        assert_eq!(
+            names(asset_page(ordered.clone(), &[String::from("image")], 1)),
+            vec![String::from("a.png")]
+        );
+        // A name that lies is not what the filter goes on: the kind is the one
+        // sniffed from the bytes, the same one the asset carries on the wire.
+        std::fs::write(root.join("a.png"), b"not an image at all\n").unwrap();
+        assert_eq!(
+            names(asset_page(ordered, &[String::from("image")], 2)),
+            vec![String::from("b.png")]
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn an_exact_path_lookup_reaches_an_upload_only_through_the_uploads_root() {
+        // The path a client is guaranteed to hold for an upload is the one the
+        // upload response returned -- the gateway's own directory, never under
+        // a pane's cwd. Without the fold-in, that exact path was the one
+        // lookup that could never answer.
+        let base = asset_test_dir("uploads-by-path");
+        let uploads = base.join("uploads");
+        std::fs::create_dir_all(&uploads).unwrap();
+        let stored = uploads.join("9126cf50.webp");
+        std::fs::write(&stored, b"fake webp bytes").unwrap();
+        let pane_roots = vec![AssetRoot {
+            path: base.join("workspace"),
+            session_id: "default".into(),
+            workspace_id: None,
+            tab_id: None,
+            pane_id: None,
+        }];
+
+        // Pane roots alone miss it; the composed lookup roots answer it.
+        assert!(asset_entry_for_path(&stored.to_string_lossy(), &pane_roots).is_none());
+        let composed = with_uploads_root(pane_roots.clone(), "default", Some(uploads.clone()));
+        let found = asset_entry_for_path(&stored.to_string_lossy(), &composed).unwrap();
+        assert_eq!(found.path, stored);
+        assert_eq!(found.session_id, "default");
+
+        // No uploads directory resolved leaves the roots untouched.
+        assert_eq!(
+            with_uploads_root(pane_roots.clone(), "default", None).len(),
+            1
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn explicit_preview_accepts_home_files_without_widening_scan_roots() {
+        let base = asset_test_dir("home-preview");
+        let home = base.join("home");
+        let workspace = home.join("app");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(home.join("docs")).unwrap();
+        std::fs::create_dir_all(home.join(".config")).unwrap();
+        let report = home.join("docs/report.md");
+        let config = home.join(".config/example.txt");
+        let outside = base.join("outside.txt");
+        std::fs::write(&report, b"report").unwrap();
+        std::fs::write(&config, b"configuration").unwrap();
+        std::fs::write(&outside, b"outside").unwrap();
+        let scan_roots = vec![AssetRoot {
+            path: workspace,
+            session_id: "default".into(),
+            workspace_id: Some("wA".into()),
+            tab_id: None,
+            pane_id: None,
+        }];
+        let roots = preview_lookup_roots(
+            scan_roots.clone(),
+            "default",
+            Some(&home),
+            [base.clone(), home.clone(), PathBuf::from("/")],
+        );
+        assert_eq!(scan_roots.len(), 1);
+        assert!(asset_entry_for_path(&report.to_string_lossy(), &scan_roots).is_none());
+        assert_eq!(roots.len(), 2);
+        for path in [&report, &config] {
+            let entry = asset_entry_for_path(&path.to_string_lossy(), &roots).unwrap();
+            assert_eq!(entry.session_id, "default");
+            assert_eq!(
+                resolve_indexed_asset_path(&entry.path, &[]),
+                Some(entry.path)
+            );
+        }
+        assert!(asset_entry_for_path(&outside.to_string_lossy(), &roots).is_none());
+        assert!(asset_entry_for_path(&home.to_string_lossy(), &roots).is_none());
+        #[cfg(unix)]
+        {
+            let link = home.join("escape.txt");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            assert!(asset_entry_for_path(&link.to_string_lossy(), &roots).is_none());
+        }
+        assert!(preview_lookup_roots(vec![], "default", Some(FsPath::new("/")), []).is_empty());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn an_exact_path_lookup_answers_one_asset_or_none_and_never_leaves_the_roots() {
+        let base = asset_test_dir("lookup");
+        let workspace = base.join("workspace");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(workspace.join("a/b/c/d/e/f")).unwrap();
+        std::fs::create_dir_all(workspace.join("node_modules/pkg")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let report = workspace.join("report.md");
+        std::fs::write(&report, b"# report\n").unwrap();
+        // Deeper than the scan goes, and inside a directory the scan skips: the
+        // user pointed at these, so an exact lookup still resolves them.
+        let deep = workspace.join("a/b/c/d/e/f/deep.txt");
+        std::fs::write(&deep, b"deep\n").unwrap();
+        let skipped = workspace.join("node_modules/pkg/index.js");
+        std::fs::write(&skipped, b"module\n").unwrap();
+        let secret = outside.join("secret.txt");
+        std::fs::write(&secret, b"secret\n").unwrap();
+        let roots = vec![AssetRoot {
+            path: workspace.clone(),
+            session_id: "default".into(),
+            workspace_id: Some("wA".into()),
+            tab_id: Some("wA:t1".into()),
+            pane_id: Some("wA:p1".into()),
+        }];
+
+        let found = asset_entry_for_path(&report.to_string_lossy(), &roots).unwrap();
+        assert_eq!(found.path, report);
+        assert_eq!(found.id, asset_id(&report));
+        assert_eq!(found.name, "report.md");
+        assert_eq!(found.workspace_id.as_deref(), Some("wA"));
+        assert!(asset_entry_for_path(&deep.to_string_lossy(), &roots).is_some());
+        assert!(asset_entry_for_path(&skipped.to_string_lossy(), &roots).is_some());
+
+        // The fence still holds, and a fenced-out path is simply a miss.
+        assert!(asset_entry_for_path(&secret.to_string_lossy(), &roots).is_none());
+        assert!(asset_entry_for_path(
+            &workspace.join("../outside/secret.txt").to_string_lossy(),
+            &roots
+        )
+        .is_none());
+        assert!(asset_entry_for_path("/etc/hosts", &roots).is_none());
+        assert!(asset_entry_for_path(&workspace.to_string_lossy(), &roots).is_none());
+        assert!(asset_entry_for_path(&workspace.join("a").to_string_lossy(), &roots).is_none());
+        assert!(
+            asset_entry_for_path(&workspace.join("gone.md").to_string_lossy(), &roots).is_none()
+        );
+        assert!(asset_entry_for_path("report.md", &roots).is_none());
+        assert!(asset_entry_for_path(&report.to_string_lossy(), &[]).is_none());
+
+        // Nested roots: the deepest one owns the file it contains.
+        let nested = AssetRoot {
+            path: workspace.join("a"),
+            session_id: "default".into(),
+            workspace_id: Some("wB".into()),
+            tab_id: Some("wB:t1".into()),
+            pane_id: Some("wB:p1".into()),
+        };
+        let mut both = roots.clone();
+        both.push(nested);
+        let owned = asset_entry_for_path(&deep.to_string_lossy(), &both).unwrap();
+        assert_eq!(owned.workspace_id.as_deref(), Some("wB"));
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn asset_ids_are_stable_per_path_and_carry_no_path() {
+        let first = asset_id(FsPath::new("/tmp/workspace/report.md"));
+        assert_eq!(first, asset_id(FsPath::new("/tmp/workspace/report.md")));
+        assert_ne!(first, asset_id(FsPath::new("/tmp/workspace/report2.md")));
+        assert!(first.starts_with("as_"));
+        assert!(!first.contains("report"));
+        assert!(first[3..].chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn workspace_roots_come_from_pane_cwds_and_never_widen_to_the_whole_machine() {
+        let home = dirs::home_dir().unwrap();
+        let response = json!({
+            "result": { "panes": [
+                { "pane_id": "wA:p1", "workspace_id": "wA", "tab_id": "wA:t1", "cwd": "/Users/okk/.repos/muqun" },
+                // A second pane in the same directory is the same root.
+                { "pane_id": "wA:p2", "workspace_id": "wA", "tab_id": "wA:t1", "cwd": "/Users/okk/.repos/muqun" },
+                { "pane_id": "wB:p1", "workspace_id": "wB", "tab_id": "wB:t1", "foreground_cwd": "/Users/okk/.ws/api" },
+                { "pane_id": "wC:p1", "workspace_id": "wC", "cwd": "/" },
+                { "pane_id": "wD:p1", "workspace_id": "wD", "cwd": home.to_string_lossy() },
+                { "pane_id": "wE:p1", "workspace_id": "wE" }
+            ] }
+        });
+        let roots = pane_list_roots("default", &response);
+        assert_eq!(
+            roots
+                .iter()
+                .map(|root| root.path.to_string_lossy().to_string())
+                .collect::<Vec<_>>(),
+            vec![
+                String::from("/Users/okk/.repos/muqun"),
+                String::from("/Users/okk/.ws/api")
+            ]
+        );
+        assert_eq!(roots[0].pane_id.as_deref(), Some("wA:p1"));
+        assert_eq!(roots[0].tab_id.as_deref(), Some("wA:t1"));
+        assert_eq!(roots[1].workspace_id.as_deref(), Some("wB"));
+        assert_eq!(roots[1].tab_id.as_deref(), Some("wB:t1"));
+        assert!(pane_list_roots("default", &json!({ "result": {} })).is_empty());
+    }
+
+    #[test]
+    fn asset_scope_narrows_to_a_tab_or_to_a_workspace_and_never_to_the_other() {
+        // The invariant card #802's tab-scoping stands on: a `Tab` scope only
+        // ever matches its own tmux window, and a `Workspace` scope (what a
+        // herdr session resolves its tab to) matches every tab inside that
+        // workspace -- so a herdr workspace with more than one tab keeps
+        // seeing all of them, exactly as it did before tabs existed here.
+        let root_in_tab_a = AssetRoot {
+            path: PathBuf::from("/work/a"),
+            session_id: "default".into(),
+            workspace_id: Some("wM".into()),
+            tab_id: Some("wM:t1".into()),
+            pane_id: Some("wM:t1:p1".into()),
+        };
+        let root_in_tab_b = AssetRoot {
+            path: PathBuf::from("/work/b"),
+            session_id: "default".into(),
+            workspace_id: Some("wM".into()),
+            tab_id: Some("wM:t2".into()),
+            pane_id: Some("wM:t2:p1".into()),
+        };
+        let root_elsewhere = AssetRoot {
+            path: PathBuf::from("/work/c"),
+            session_id: "default".into(),
+            workspace_id: Some("wN".into()),
+            tab_id: Some("wN:t1".into()),
+            pane_id: Some("wN:t1:p1".into()),
+        };
+
+        let tab_scope = AssetScope::Tab("wM:t1".into());
+        assert!(tab_scope.matches_root(&root_in_tab_a));
+        assert!(!tab_scope.matches_root(&root_in_tab_b));
+        assert!(!tab_scope.matches_root(&root_elsewhere));
+
+        // A herdr session's tab id resolves to its workspace before scoping,
+        // so both of that workspace's tabs match -- this is the "herdr must
+        // not narrow" guarantee, proven at the layer that actually filters.
+        let workspace_scope = AssetScope::Workspace("wM".into());
+        assert!(workspace_scope.matches_root(&root_in_tab_a));
+        assert!(workspace_scope.matches_root(&root_in_tab_b));
+        assert!(!workspace_scope.matches_root(&root_elsewhere));
+    }
+
+    #[tokio::test]
+    async fn a_tmux_session_scopes_by_tab_directly_and_a_herdr_session_resolves_it_to_a_workspace()
+    {
+        // tmux: the tab id is used verbatim, no lookup involved.
+        let mut session = test_config("token").sessions[0].clone();
+        session.backend = BackendKind::Tmux;
+        assert_eq!(
+            resolve_asset_scope(&session, "@3").await,
+            AssetScope::Tab("@3".into())
+        );
+
+        // herdr: with no live socket to ask (as in every other test in this
+        // file), the tab id can't be translated to its owning workspace, so
+        // it is kept as-is rather than silently widened to "no scope at all".
+        // This is also exactly what makes every pre-existing
+        // `session_assets(Path(("default", "wA")))` test call in this file
+        // keep behaving as a workspace-scoped call after this change: they
+        // never had a live socket either.
+        let mut herdr_session = test_config("token").sessions[0].clone();
+        herdr_session.backend = BackendKind::Herdr;
+        herdr_session.socket_path = "/tmp/herdr-does-not-exist.sock".into();
+        assert_eq!(
+            resolve_asset_scope(&herdr_session, "wA").await,
+            AssetScope::Workspace("wA".into())
+        );
+    }
+
+    #[test]
+    fn worktree_events_name_a_root_to_scan_and_never_a_file() {
+        // The payload Herdr actually sends on protocol 17: the worktree's
+        // checkout path and its workspace, with no file information at all.
+        let created = json!({
+            "event": "worktree_created",
+            "data": {
+                "type": "worktree_created",
+                "workspace": { "workspace_id": "wM", "number": 3, "label": "muqun" },
+                "worktree": {
+                    "path": "/Users/okk/.repos/muqun/.claude/worktrees/agent-a4463",
+                    "branch": "wip/live-activity",
+                    "is_bare": false,
+                    "is_detached": false,
+                    "is_prunable": false,
+                    "is_linked_worktree": true,
+                    "label": "muqun"
+                }
+            }
+        })
+        .to_string();
+        let root = worktree_event_root("default", &created).unwrap();
+        assert_eq!(
+            root.path,
+            PathBuf::from("/Users/okk/.repos/muqun/.claude/worktrees/agent-a4463")
+        );
+        assert_eq!(root.workspace_id.as_deref(), Some("wM"));
+        assert_eq!(root.session_id, "default");
+
+        let opened = json!({
+            "event": "worktree_opened",
+            "data": { "type": "worktree_opened", "already_open": false,
+                "workspace": { "workspace_id": "wZ" },
+                "worktree": { "path": "/Users/okk/.repos/muqun", "label": "muqun" } }
+        })
+        .to_string();
+        assert_eq!(
+            worktree_event_root("default", &opened).unwrap().path,
+            PathBuf::from("/Users/okk/.repos/muqun")
+        );
+
+        let removed = json!({
+            "event": "worktree_removed",
+            "data": { "type": "worktree_removed", "forced": false, "workspace_id": "wZ",
+                "worktree": { "path": "/Users/okk/.repos/muqun/.claude/worktrees/gone" } }
+        })
+        .to_string();
+        assert_eq!(
+            worktree_event_removed_root(&removed).unwrap(),
+            PathBuf::from("/Users/okk/.repos/muqun/.claude/worktrees/gone")
+        );
+        assert!(worktree_event_root("default", &removed).is_none());
+
+        // Everything else on the stream leaves the index alone.
+        assert!(worktree_event_root("default", r#"{"event":"pane_updated","data":{}}"#).is_none());
+        assert!(worktree_event_root("default", "not json").is_none());
+        assert!(worktree_event_removed_root(r#"{"event":"pane_updated","data":{}}"#).is_none());
+    }
+
+    #[test]
+    fn an_asset_envelope_is_versioned_and_declares_capabilities() {
+        let root = PathBuf::from("/tmp/workspace");
+        let entry = test_asset_entry(&root.join("report.md"), &root, 1_785_100_000_000);
+        let envelope: Value = serde_json::from_str(&asset_created_payload(
+            &entry,
+            sniff_asset_type(b"# report\n", "report.md"),
+        ))
+        .unwrap();
+        assert_eq!(envelope["schema_version"], CONTENT_SCHEMA_VERSION);
+        assert_eq!(envelope["capabilities"]["assets"], true);
+        let asset = &envelope["data"]["asset"];
+        assert_eq!(asset["id"], entry.id);
+        assert_eq!(asset["kind"], "markdown");
+        assert_eq!(asset["mime"], "text/markdown; charset=utf-8");
+        assert_eq!(asset["previewable"], true);
+        assert_eq!(asset["origin"]["session_id"], "default");
+        assert_eq!(asset["origin"]["workspace_id"], "wA");
+        assert_eq!(asset["origin"]["pane_id"], "wA:p1");
+        assert_eq!(asset["modified_unix_ms"], 1_785_100_000_000_u64);
+    }
+
+    #[test]
+    fn an_asset_file_name_cannot_break_out_of_a_response_header() {
+        assert_eq!(header_safe_name("report.md"), "report.md");
+        assert_eq!(
+            header_safe_name("re\"port\r\nX-Evil: 1.md"),
+            "reportX-Evil 1.md"
+        );
+        assert_eq!(header_safe_name("../../etc/passwd"), "....etcpasswd");
+        assert_eq!(header_safe_name("图片.png"), ".png");
+        assert_eq!(header_safe_name("\u{202e}"), "asset");
+    }
+
+    /// A tmux tab id is a window id: it counts up for the life of the server
+    /// and is never reused, so browsing assets across tabs used to add one
+    /// permanent entry each, holding that tab's whole `Vec` of root paths.
+    #[test]
+    fn the_remembered_root_scopes_are_bounded_and_evict_the_oldest() {
+        let mut index = AssetIndex::default();
+        let root = |path: &str| AssetRoot {
+            path: PathBuf::from(path),
+            session_id: "default".into(),
+            workspace_id: None,
+            tab_id: None,
+            pane_id: None,
+        };
+        let scope = |tab: usize| AssetScope::Tab(format!("@{tab}"));
+
+        for tab in 0..MAX_REMEMBERED_ROOT_SCOPES * 3 {
+            index.remember_roots("default", Some(&scope(tab)), vec![root("/tmp")]);
+            assert!(index.roots.len() <= MAX_REMEMBERED_ROOT_SCOPES);
+            assert_eq!(index.roots.len(), index.roots_order.len());
+        }
+        assert_eq!(index.roots.len(), MAX_REMEMBERED_ROOT_SCOPES);
+        // The oldest went, the newest stayed.
+        assert!(index.known_roots("default", Some(&scope(0))).is_empty());
+        assert!(!index
+            .known_roots("default", Some(&scope(MAX_REMEMBERED_ROOT_SCOPES * 3 - 1)))
+            .is_empty());
+
+        // Rewriting a scope already held replaces it rather than filling a
+        // second slot, or the cap would evict live scopes on a busy session.
+        let before = index.roots.len();
+        for _ in 0..10 {
+            index.remember_roots(
+                "default",
+                Some(&scope(MAX_REMEMBERED_ROOT_SCOPES * 3 - 1)),
+                vec![root("/tmp/again")],
+            );
+        }
+        assert_eq!(index.roots.len(), before);
+        assert_eq!(index.roots.len(), index.roots_order.len());
+    }
 }

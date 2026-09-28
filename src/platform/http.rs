@@ -338,3 +338,301 @@ pub(crate) fn api_error_in(
         Json(json!({ "error": { "code": code, "message": i18n::t(locale, message) } })),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::*;
+
+    #[test]
+    fn control_routes_accept_a_device_token_and_report_which_device() {
+        let state = test_state("secret", vec![test_device("device-1", "device-token")]);
+        assert_eq!(
+            require_device(&state, &bearer_headers("device-token")).unwrap(),
+            "device-1"
+        );
+    }
+
+    #[test]
+    fn control_routes_reject_the_admin_token() {
+        // The admin token sits in plaintext on disk for the manage UI. Control
+        // routes can run commands on the host, so it must not reach them.
+        let state = test_state("secret", vec![test_device("device-1", "device-token")]);
+        let err = require_device(&state, &bearer_headers("secret")).unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn auth_rejects_invalid_bearer_token() {
+        let state = test_state("secret", vec![test_device("device-1", "device-token")]);
+        let err = require_device(&state, &bearer_headers("wrong")).unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn auth_rejects_overlong_token() {
+        let state = test_state("secret", Vec::new());
+        let err = require_device(&state, &bearer_headers(&"x".repeat(257))).unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        let config = test_config("secret");
+        let err = require_admin(&config, &bearer_headers(&"x".repeat(257))).unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn revoking_a_device_token_stops_it_authenticating() {
+        let devices = vec![
+            test_device("device-1", "token-1"),
+            test_device("device-2", "token-2"),
+        ];
+        assert_eq!(
+            identify_device(&devices, "token-1"),
+            Some("device-1".into())
+        );
+
+        let remaining = devices
+            .into_iter()
+            .filter(|device| device.id != "device-1")
+            .collect::<Vec<_>>();
+        assert_eq!(identify_device(&remaining, "token-1"), None);
+        // Revoking one device must leave the others working.
+        assert_eq!(
+            identify_device(&remaining, "token-2"),
+            Some("device-2".into())
+        );
+    }
+
+    #[test]
+    fn device_names_reject_terminal_escape_injection() {
+        assert!(valid_device_name("Ellen's iPhone"));
+        assert!(valid_device_name("Pixel 9 Pro"));
+        assert!(!valid_device_name(""));
+        // The manage UI draws this into a terminal box.
+        assert!(!valid_device_name("evil\x1b[2J\x1b[Hcode: AAAA-BBBB"));
+        assert!(!valid_device_name("two\nlines"));
+        assert!(!valid_device_name("tab\there"));
+        assert!(!valid_device_name(&"x".repeat(MAX_DEVICE_NAME_CHARS + 1)));
+    }
+
+    #[test]
+    fn validate_text_enforces_size_limit() {
+        assert!(validate_text("ok").is_ok());
+        let too_large = "x".repeat(MAX_SEND_TEXT_BYTES + 1);
+        let err = validate_text(&too_large).unwrap_err();
+        assert_eq!(err.0, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// The only field on this API that becomes argv for a process on the host.
+    /// A device token can already type into the pane, so this is a bound and
+    /// not a fence -- but it is the same bound every other client string is
+    /// under, and an argument list is not the field to leave unbounded.
+    #[test]
+    fn agent_args_are_bounded_like_every_other_client_string() {
+        assert!(validate_agent_args(&[]).is_ok());
+        assert!(validate_agent_args(&["--model".into(), "opus".into()]).is_ok());
+
+        let too_many = vec![String::from("-v"); MAX_AGENT_ARGS + 1];
+        assert_eq!(
+            validate_agent_args(&too_many).unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+
+        let too_long = vec!["x".repeat(MAX_AGENT_ARG_CHARS + 1)];
+        assert_eq!(
+            validate_agent_args(&too_long).unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+
+        // A newline in an argument forges a line of the step log it is echoed
+        // into, which is the same reason a device name cannot carry one.
+        assert_eq!(
+            validate_agent_args(&["--flag\nvalue".into()])
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(validate_agent_args(&["--flag\u{0}".into()]).is_err());
+    }
+
+    /// A device that was never paired is not paired now either -- the recheck
+    /// is an identity test, not a "did anything change" test.
+    #[test]
+    fn a_device_that_was_never_paired_is_not_still_paired() {
+        let state = test_state("admin", vec![test_device("phone-1", "device-token")]);
+        assert!(!still_paired(&state, "phone-2"));
+        assert!(!still_paired(&state, ""));
+    }
+
+    /// The old behaviour survives only as a thing the owner writes down.
+    #[test]
+    fn only_an_explicit_opt_in_answers_without_a_token() {
+        let mut state = test_state("admin-token", vec![test_device("phone-1", "device-token")]);
+        state.config.transport_encryption = TransportEncryptionMode::Disabled;
+        state.config.dev_unauthenticated = true;
+
+        assert_eq!(
+            require_device(&state, &HeaderMap::new()).unwrap(),
+            DEV_UNAUTHENTICATED_DEVICE
+        );
+        // A real device is still identified as itself, not as the stand-in:
+        // the opt-in is a fallback, not a replacement for the token check.
+        assert_eq!(
+            require_device(&state, &bearer_headers("device-token")).unwrap(),
+            "phone-1"
+        );
+
+        // It is off unless written, and writing nothing writes nothing.
+        assert!(!test_config("admin-token").dev_unauthenticated);
+        let round_tripped = serde_json::to_value(test_config("admin-token")).unwrap();
+        assert!(
+            round_tripped.get("dev_unauthenticated").is_none(),
+            "an existing config.json must round-trip untouched"
+        );
+
+        // And it grants nothing in the encrypted mode, where there is no
+        // cleartext story to tell in the first place.
+        state.config.transport_encryption = TransportEncryptionMode::Required;
+        assert_eq!(
+            require_device(&state, &HeaderMap::new()).unwrap_err().0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    /// The refusal a request reads is in the language it asked for, and the
+    /// `code` beside it is not.
+    ///
+    /// This goes through `require_device` rather than through `api_error`
+    /// directly because the interesting part is the *ambient* locale: no handler
+    /// and no helper on this path takes a `Locale` argument, and the answer
+    /// still changes language. That is the whole mechanism, asserted end to end.
+    #[tokio::test]
+    async fn a_refusal_is_written_in_the_language_the_request_asked_for() {
+        let state = test_state("admin-token", vec![test_device("device-1", "token-1")]);
+
+        let english = i18n::scope(Locale::En, async {
+            require_device(&state, &locale_headers("wrong", "en")).unwrap_err()
+        })
+        .await;
+        let chinese = i18n::scope(Locale::ZhTw, async {
+            require_device(&state, &locale_headers("wrong", "zh-TW")).unwrap_err()
+        })
+        .await;
+
+        assert_eq!(english.0, chinese.0, "the status is not prose");
+        let english = error_body(&english);
+        let chinese = error_body(&chinese);
+        assert_eq!(english["error"]["code"], "invalid_token");
+        assert_eq!(
+            english["error"]["code"], chinese["error"]["code"],
+            "a client dispatches on the code, so it has no language"
+        );
+        assert_eq!(english["error"]["message"], "invalid token");
+        assert_eq!(chinese["error"]["message"], "token 無效");
+    }
+
+    /// Outside a request there is no locale to read, and English is the answer
+    /// -- never a panic and never a missing message.
+    #[test]
+    fn a_refusal_built_outside_a_request_is_english() {
+        let state = test_state("admin-token", vec![test_device("device-1", "token-1")]);
+        let refusal = require_device(&state, &bearer_headers("wrong")).unwrap_err();
+        assert_eq!(error_body(&refusal)["error"]["message"], "invalid token");
+    }
+
+    /// The wire vocabulary is the contract; the prose is not.
+    #[test]
+    fn error_codes_are_byte_identical_across_locales() {
+        // One of each shape: a validation refusal, an auth refusal, a
+        // not-found, and one whose message quotes API vocabulary that must
+        // survive translation intact.
+        let cases = [
+            ("session_not_found", "session not found"),
+            ("invalid_platform", "platform must be ios or android"),
+            (
+                "invalid_decision",
+                "decision must be allow, allow_always, or deny",
+            ),
+            (
+                "invalid_source",
+                "source must be visible, recent, recent-unwrapped, or detection",
+            ),
+            (
+                "unknown_agent",
+                "agent is not one this gateway offers; see GET /api/agents/catalog",
+            ),
+        ];
+        for (code, message) in cases {
+            let english = api_error_in(Locale::En, StatusCode::BAD_REQUEST, code, message);
+            let chinese = api_error_in(Locale::ZhTw, StatusCode::BAD_REQUEST, code, message);
+            let english = error_body(&english);
+            let chinese = error_body(&chinese);
+            assert_eq!(english["error"]["code"], code);
+            assert_eq!(chinese["error"]["code"], code);
+            assert_eq!(english["error"]["message"], message);
+            assert_ne!(
+                chinese["error"]["message"], message,
+                "{code} has no translation"
+            );
+        }
+
+        // The literals inside a message are API vocabulary a client sends back,
+        // so only the sentence around them moves.
+        let chinese = error_body(&api_error_in(
+            Locale::ZhTw,
+            StatusCode::BAD_REQUEST,
+            "invalid_decision",
+            "decision must be allow, allow_always, or deny",
+        ));
+        let message = chinese["error"]["message"].as_str().unwrap();
+        for literal in ["decision", "allow", "allow_always", "deny"] {
+            assert!(message.contains(literal), "{literal} was translated away");
+        }
+        let chinese = error_body(&api_error_in(
+            Locale::ZhTw,
+            StatusCode::BAD_REQUEST,
+            "invalid_source",
+            "source must be visible, recent, recent-unwrapped, or detection",
+        ));
+        let message = chinese["error"]["message"].as_str().unwrap();
+        for literal in ["visible", "recent", "recent-unwrapped", "detection"] {
+            assert!(message.contains(literal), "{literal} was translated away");
+        }
+        let chinese = error_body(&api_error_in(
+            Locale::ZhTw,
+            StatusCode::BAD_REQUEST,
+            "unknown_agent",
+            "agent is not one this gateway offers; see GET /api/agents/catalog",
+        ));
+        assert!(chinese["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("GET /api/agents/catalog"));
+    }
+
+    /// A message nobody has translated is still a message.
+    #[test]
+    fn an_untranslated_refusal_falls_back_to_its_english() {
+        let refusal = api_error_in(
+            Locale::ZhTw,
+            StatusCode::BAD_GATEWAY,
+            "herdr_error",
+            "pane.read: Herdr refused the request",
+        );
+        assert_eq!(
+            error_body(&refusal)["error"]["message"],
+            "pane.read: Herdr refused the request"
+        );
+        assert_eq!(error_body(&refusal)["error"]["code"], "herdr_error");
+    }
+
+    #[test]
+    fn the_content_envelope_declares_parts_at_the_version_that_added_them() {
+        // One envelope and one version across the content model: a client reads
+        // the version once and knows both endpoints answer it.
+        let envelope = content_envelope(json!({}));
+        assert_eq!(envelope["schema_version"], "1.5.0");
+        assert_eq!(envelope["capabilities"]["parts"], true);
+        assert_eq!(envelope["capabilities"]["assets"], true);
+        assert_eq!(envelope["capabilities"]["image_upload"], true);
+        assert_eq!(envelope["capabilities"]["composer"], true);
+    }
+}

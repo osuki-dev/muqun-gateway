@@ -826,6 +826,12 @@ fn page_lines(text: &str, from: usize, lines: usize) -> (usize, usize, usize, bo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        bearer_headers, git_test_repo, pane_context, pane_git_diff, pane_git_status,
+        remember_pane_root, unreachable_state, GitDiffQuery, CONTENT_SCHEMA_VERSION,
+    };
+    use axum::extract::{Path as ExtractPath, Query, State};
+    use axum::http::StatusCode;
 
     #[test]
     fn porcelain_v2_reads_the_branch_and_every_kind_of_entry() {
@@ -1328,5 +1334,181 @@ mod tests {
         assert!(!patch.patch.contains("@@"));
 
         std::fs::remove_dir_all(repo.parent().unwrap()).ok();
+    }
+    #[tokio::test]
+    async fn git_status_lists_the_checkout_of_the_panes_fenced_directory() {
+        let (root, repo) = git_test_repo("git-status");
+        let state = unreachable_state();
+        // The pane sits in a subdirectory; the checkout is found above it.
+        remember_pane_root(&state, "wA:p1", repo.join("src"));
+
+        let answer = pane_git_status(
+            State(state.clone()),
+            ExtractPath(("default".into(), "wA:p1".into())),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(answer["schema_version"], CONTENT_SCHEMA_VERSION);
+        let data = &answer["data"];
+        assert_eq!(data["repo"]["branch"], "main");
+        assert_eq!(data["repo"]["changed_files"], 2);
+        assert_eq!(data["truncated"], false);
+        let files = data["files"].as_array().unwrap();
+        let modified = files
+            .iter()
+            .find(|file| file["path"] == "src/a.ts")
+            .unwrap();
+        assert_eq!(modified["status"], "modified");
+        assert_eq!(modified["added"], 1);
+        assert_eq!(modified["removed"], 1);
+        let untracked = files
+            .iter()
+            .find(|file| file["path"] == "notes.md")
+            .unwrap();
+        assert_eq!(untracked["status"], "untracked");
+        assert_eq!(untracked["added"], 1);
+
+        // A wrong token is refused before anything runs.
+        assert_eq!(
+            pane_git_status(
+                State(state.clone()),
+                ExtractPath(("default".into(), "wA:p1".into())),
+                bearer_headers("not-a-token"),
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::FORBIDDEN
+        );
+
+        // A pane the fence knows nothing about is "no repository", not an error.
+        let none = pane_git_status(
+            State(state),
+            ExtractPath(("default".into(), "wB:p9".into())),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(none["data"]["repo"].is_null());
+        assert_eq!(none["data"]["files"].as_array().unwrap().len(), 0);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn git_diff_answers_one_file_and_refuses_what_is_not_a_path() {
+        let (root, repo) = git_test_repo("git-diff");
+        let state = unreachable_state();
+        remember_pane_root(&state, "wA:p1", repo.clone());
+
+        let query = |path: &str| GitDiffQuery {
+            path: Some(path.into()),
+            old_path: None,
+            staged: None,
+            context: Some(3),
+            from: None,
+            lines: None,
+        };
+        let answer = pane_git_diff(
+            State(state.clone()),
+            ExtractPath(("default".into(), "wA:p1".into())),
+            Query(query("src/a.ts")),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap()
+        .0;
+        let data = &answer["data"];
+        assert_eq!(data["path"], "src/a.ts");
+        assert_eq!(data["binary"], false);
+        assert_eq!(data["truncated"], false);
+        assert!(data["patch"]
+            .as_str()
+            .unwrap()
+            .contains("\n-const b = 2;\n+const B = 2;\n"));
+
+        for bad in ["--cached", "../repo/src/a.ts", "/etc/passwd", ""] {
+            let status = pane_git_diff(
+                State(state.clone()),
+                ExtractPath(("default".into(), "wA:p1".into())),
+                Query(query(bad)),
+                bearer_headers("token"),
+            )
+            .await
+            .unwrap_err()
+            .0;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad:?}");
+        }
+
+        let missing = pane_git_diff(
+            State(state.clone()),
+            ExtractPath(("default".into(), "wA:p1".into())),
+            Query(query("nope.txt")),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing.0, StatusCode::NOT_FOUND);
+        assert_eq!(missing.1["error"]["code"], "no_such_path");
+
+        let no_repo = pane_git_diff(
+            State(state),
+            ExtractPath(("default".into(), "wB:p9".into())),
+            Query(query("src/a.ts")),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(no_repo.0, StatusCode::NOT_FOUND);
+        assert_eq!(no_repo.1["error"]["code"], "no_repository");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn pane_context_answers_git_and_cwd_without_a_backend() {
+        let (root, repo) = git_test_repo("pane-context");
+        let state = unreachable_state();
+        remember_pane_root(&state, "wA:p1", repo.clone());
+
+        let answer = pane_context(
+            State(state.clone()),
+            ExtractPath(("default".into(), "wA:p1".into())),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap()
+        .0;
+        let data = &answer["data"];
+        assert_eq!(data["cwd_in_fence"], true);
+        assert_eq!(
+            data["cwd"],
+            std::fs::canonicalize(&repo)
+                .unwrap()
+                .to_string_lossy()
+                .as_ref()
+        );
+        assert_eq!(data["git"]["branch"], "main");
+        assert_eq!(data["git"]["changed_files"], 2);
+        // The backend is unreachable, so nothing is known about an agent --
+        // and nothing is guessed.
+        assert!(data["agent"].is_null());
+
+        let unknown = pane_context(
+            State(state),
+            ExtractPath(("default".into(), "wB:p9".into())),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(unknown["data"]["cwd"].is_null());
+        assert_eq!(unknown["data"]["cwd_in_fence"], false);
+        assert!(unknown["data"]["git"].is_null());
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

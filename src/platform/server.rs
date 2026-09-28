@@ -10,7 +10,6 @@ use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderValue, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse as _, Response};
-use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -19,23 +18,17 @@ use tower_http::compression::{
     CompressionLayer,
 };
 
-use super::assets::{asset_content, session_assets, AssetIndex, MAX_ASSET_CONTENT_BYTES};
+use super::assets::{AssetIndex, MAX_ASSET_CONTENT_BYTES};
 use super::metadata::SessionLivenessCache;
 use super::store::{
     ensure_pairing_transport_key, load_devices_for_service, load_push_tokens_for_service,
 };
-use super::uploads::{
-    spawn_upload_gc, upload_content, upload_file, MAX_UPLOAD_BYTES, UPLOADS_PATH,
-};
+use super::uploads::{spawn_upload_gc, MAX_UPLOAD_BYTES, UPLOADS_PATH};
 use crate::platform;
 use crate::platform::i18n::Locale;
+use crate::terminal;
 use crate::terminal::routes::{
-    close_pane, close_tab, close_workspace, create_tab, create_workspace, events, focus_pane,
-    focus_tab, focus_workspace, interrupt_pane, keymaps, pane, pane_context, pane_files,
-    pane_git_diff, pane_git_status, pane_output, pane_parts, pane_shortcuts, panes, recent_cwds,
-    rename_pane, rename_tab, rename_workspace, send_keys, send_text, sessions, snapshot,
     spawn_agent_engine_watchers, spawn_agent_notification_watchers, spawn_approval_watchers,
-    split_pane, tabs, workspaces, zoom_pane,
 };
 use crate::{
     agent_events, agents, api_error, backend_startup, connectivity, gateway_listener, hash_token,
@@ -100,108 +93,10 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     let app = platform::routes::mount(app);
     let app = connectivity::routes::mount(app);
     let app = agents::session_routes::mount(app);
-    let app = agents::routes::mount(app)
-        .route("/api/sessions", get(sessions))
-        .route("/api/sessions/{session_id}/events", get(events))
-        .route("/api/sessions/{session_id}/snapshot", get(snapshot))
-        .route(
-            "/api/sessions/{session_id}/workspaces",
-            get(workspaces).post(create_workspace),
-        )
-        .route(
-            "/api/sessions/{session_id}/workspaces/{workspace_id}/focus",
-            post(focus_workspace),
-        )
-        .route(
-            "/api/sessions/{session_id}/workspaces/{workspace_id}",
-            patch(rename_workspace).delete(close_workspace),
-        )
-        .route(
-            "/api/sessions/{session_id}/tabs",
-            get(tabs).post(create_tab),
-        )
-        .route(
-            "/api/sessions/{session_id}/tabs/{tab_id}/focus",
-            post(focus_tab),
-        )
-        .route(
-            "/api/sessions/{session_id}/tabs/{tab_id}",
-            patch(rename_tab).delete(close_tab),
-        )
-        .route("/api/keymaps", get(keymaps))
-        .route("/api/sessions/{session_id}/recent-cwds", get(recent_cwds))
-        .route(
-            "/api/sessions/{session_id}/panes/{pane_id}/interrupt",
-            post(interrupt_pane),
-        )
-        .route("/api/sessions/{session_id}/panes", get(panes))
-        .route(
-            "/api/sessions/{session_id}/panes/{pane_id}",
-            get(pane).patch(rename_pane).delete(close_pane),
-        )
-        .route(
-            "/api/sessions/{session_id}/panes/{pane_id}/focus",
-            post(focus_pane),
-        )
-        .route(
-            "/api/sessions/{session_id}/panes/{pane_id}/split",
-            post(split_pane),
-        )
-        .route(
-            "/api/sessions/{session_id}/panes/{pane_id}/zoom",
-            post(zoom_pane),
-        )
-        .route(
-            "/api/sessions/{session_id}/panes/{pane_id}/shortcuts",
-            get(pane_shortcuts),
-        )
-        .route(
-            "/api/sessions/{session_id}/panes/{pane_id}/output",
-            get(pane_output),
-        )
-        .route(
-            "/api/sessions/{session_id}/panes/{pane_id}/parts",
-            get(pane_parts),
-        )
-        .route(
-            "/api/sessions/{session_id}/panes/{pane_id}/files",
-            get(pane_files),
-        )
-        .route(
-            "/api/sessions/{session_id}/panes/{pane_id}/context",
-            get(pane_context),
-        )
-        .route(
-            "/api/sessions/{session_id}/panes/{pane_id}/git/status",
-            get(pane_git_status),
-        )
-        .route(
-            "/api/sessions/{session_id}/panes/{pane_id}/git/diff",
-            get(pane_git_diff),
-        )
-        .route(
-            "/api/sessions/{session_id}/panes/{pane_id}/send-text",
-            post(send_text),
-        )
-        .route(
-            "/api/sessions/{session_id}/panes/{pane_id}/send-keys",
-            post(send_keys),
-        )
-        .route(
-            "/api/sessions/{session_id}/tabs/{tab_id}/assets",
-            get(session_assets),
-        )
-        .route("/api/assets/{asset_id}/content", get(asset_content))
-        // A route-level limit is applied inside the router-wide one, so uploads
-        // get their own ceiling while every JSON route keeps the small one.
-        .route(
-            UPLOADS_PATH,
-            post(upload_file).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
-        )
-        // Reading one back. The app needs this to draw the user's own
-        // attachment in the transcript: the timeline item carries the host
-        // path, which a phone cannot open.
-        .route("/api/uploads/{file_name}", get(upload_content))
+    let app = agents::routes::mount(app);
+    let app = terminal::routes::mount(app);
+    let app = platform::uploads::mount(app);
+    let app = platform::assets::mount(app)
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         // Inside the encrypted transport, so what it compresses is the
         // plaintext body and not the sealed base64 -- ciphertext does not
@@ -889,4 +784,691 @@ pub(crate) async fn security_headers(request: Request<Body>, next: Next) -> Resp
     headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
     headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::*;
+
+    /// The proof header is the encrypted-transport middleware talking to the
+    /// handlers below it, and nothing else may put words in its mouth.
+    ///
+    /// Before this was stripped on the way in, a client could send
+    /// `x-muqun-internal-device-proof` itself over cleartext and be taken for
+    /// the encrypted device whose transport key it named -- having just put
+    /// that key on the wire in the clear to do it, which is precisely what the
+    /// encrypted transport exists to prevent.
+    #[tokio::test]
+    async fn a_client_cannot_forge_the_transport_proof_header() {
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        let state = test_state("admin", Vec::new());
+        let app = Router::new()
+            .route(
+                "/probe",
+                get(|headers: axum::http::HeaderMap| async move {
+                    // What the handlers below the middleware would see.
+                    headers
+                        .get(TRANSPORT_PROOF_HEADER)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("absent")
+                        .to_string()
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                encrypted_transport,
+            ))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/probe")
+                    .header(TRANSPORT_PROOF_HEADER, "a-transport-key-i-do-not-own")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "absent",
+            "a client-supplied device proof must never reach a handler"
+        );
+    }
+
+    /// The gateway advertises a 25 MiB upload limit and answers 413 with "the
+    /// upload must be at most 25 MiB". Over its own encrypted transport --
+    /// which is on by default -- it could not actually accept one: the
+    /// middleware buffered the sealed bytes against a ceiling sized for the
+    /// plaintext, and a 25 MiB file is about 44 MiB sealed.
+    #[test]
+    fn a_maximum_upload_fits_through_the_encrypted_transport() {
+        let transport_key = generate_token();
+        let material = transport::decode_key(&transport_key).unwrap();
+
+        // Measured at a size that is quick to seal rather than at the ceiling
+        // itself. The expansion is affine -- base64, JSON, seal, base64 -- so
+        // one sample fixes the slope, and `MAX_UPLOAD_BYTES` is exactly 25 of
+        // these. The exact version is
+        // `a_literal_maximum_upload_seals_within_the_ceiling`, kept ignored
+        // because sealing 25 MiB in a debug build takes twelve seconds.
+        const SAMPLE: usize = 1024 * 1024;
+        let sampled = sealed_wire_len(&material, "device-token", UPLOADS_PATH, SAMPLE);
+        assert!(sampled <= sealed_body_ceiling(SAMPLE));
+
+        let at_maximum = sampled * (MAX_UPLOAD_BYTES / SAMPLE);
+        let previous = MAX_UPLOAD_BYTES + MAX_REQUEST_BODY_BYTES;
+        assert!(
+            at_maximum > previous,
+            "a {MAX_UPLOAD_BYTES}-byte upload seals to about {at_maximum} bytes, \
+             which the old {previous}-byte ceiling should not have fit"
+        );
+        assert!(
+            at_maximum <= sealed_body_ceiling(MAX_UPLOAD_BYTES),
+            "sealed about {at_maximum} bytes against a ceiling of {}",
+            sealed_body_ceiling(MAX_UPLOAD_BYTES)
+        );
+    }
+
+    #[test]
+    #[ignore = "seals 25 MiB; slow in a debug build"]
+    fn a_literal_maximum_upload_seals_within_the_ceiling() {
+        let transport_key = generate_token();
+        let material = transport::decode_key(&transport_key).unwrap();
+        let wire = sealed_wire_len(&material, "device-token", UPLOADS_PATH, MAX_UPLOAD_BYTES);
+        assert!(
+            wire > MAX_UPLOAD_BYTES + MAX_REQUEST_BODY_BYTES,
+            "sealed to {wire} bytes"
+        );
+        assert!(
+            wire <= sealed_body_ceiling(MAX_UPLOAD_BYTES),
+            "sealed {wire} bytes against a ceiling of {}",
+            sealed_body_ceiling(MAX_UPLOAD_BYTES)
+        );
+    }
+
+    /// And the other half: every route that is not the upload route is held to
+    /// the same 128 KiB the router holds it to in the clear. The middleware
+    /// runs outside those limits, so before this it let any encrypted request
+    /// on any route buffer 25 MiB.
+    #[test]
+    fn every_other_route_is_held_to_the_small_body_limit() {
+        assert_eq!(plaintext_body_limit(UPLOADS_PATH), MAX_UPLOAD_BYTES);
+        for path in [
+            "/api/sessions/default/panes/%1/send-text",
+            "/api/pair/claim",
+            "/api/uploads/",
+            "/api/uploadsx",
+            "/health",
+        ] {
+            assert_eq!(
+                plaintext_body_limit(path),
+                MAX_REQUEST_BODY_BYTES,
+                "{path} should get the small limit"
+            );
+        }
+        assert!(
+            sealed_body_ceiling(MAX_REQUEST_BODY_BYTES) < MAX_UPLOAD_BYTES,
+            "the non-upload ceiling must be far under what it used to be"
+        );
+    }
+
+    /// An over-limit body says so, instead of arriving as a corrupt envelope.
+    #[tokio::test]
+    async fn an_oversized_encrypted_body_is_refused_as_too_large() {
+        let token = "device-token";
+        let transport_key = generate_token();
+        let mut device = test_device("phone-1", token);
+        device.transport_key = Some(transport_key);
+        let state = test_state("admin-token", vec![device]);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/sessions/default/panes/%1/send-text")
+            .header(TRANSPORT_HEADER, "1")
+            .header(TRANSPORT_DEVICE_HEADER, "phone-1")
+            .body(Body::from(vec![
+                b'x';
+                sealed_body_ceiling(MAX_REQUEST_BODY_BYTES)
+                    + 1
+            ]))
+            .unwrap();
+        let (status, body) = decrypt_transport_request(&state, request)
+            .await
+            .expect_err("an over-limit body must be refused");
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(body.0["error"]["code"], "body_too_large");
+    }
+
+    #[tokio::test]
+    async fn a_stolen_bearer_token_is_not_a_device_transport_credential() {
+        let token = "device-token";
+        let transport_key = generate_token();
+        let material = transport::decode_key(&transport_key).unwrap();
+        let mut device = test_device("phone-1", token);
+        device.transport_key = Some(transport_key);
+        let state = test_state("admin-token", vec![device]);
+        assert!(require_device(&state, &bearer_headers(token)).is_err());
+
+        let stolen_token_material = base64::engine::general_purpose::STANDARD
+            .decode(hash_token(token))
+            .unwrap();
+        let rejected = decrypt_transport_request(
+            &state,
+            encrypted_test_request("phone-1", &stolen_token_material, token),
+        )
+        .await;
+        assert!(rejected.is_err());
+
+        let (request, _, _, _) =
+            decrypt_transport_request(&state, encrypted_test_request("phone-1", &material, token))
+                .await
+                .unwrap();
+        assert_eq!(bearer_token(request.headers()).unwrap(), token);
+        assert_eq!(
+            require_device(&state, request.headers()).unwrap(),
+            "phone-1"
+        );
+    }
+
+    /// The decrypted request carries the stream context a sealing handler
+    /// needs, and records sealed under it open exactly the way the app's
+    /// decryptor is specified to: derive from (device key, sid, request
+    /// nonce), AAD of request AAD + sid + seq, nonce = seq.
+    #[tokio::test]
+    async fn an_encrypted_request_leaves_a_stream_context_the_sealer_honours() {
+        let token = "device-token";
+        let transport_key = generate_token();
+        let material = transport::decode_key(&transport_key).unwrap();
+        let mut device = test_device("phone-1", token);
+        device.transport_key = Some(transport_key);
+        let state = test_state("admin-token", vec![device]);
+
+        let (request, _, aad, nonce) =
+            decrypt_transport_request(&state, encrypted_test_request("phone-1", &material, token))
+                .await
+                .unwrap();
+        let context = request
+            .extensions()
+            .get::<EncryptedStreamContext>()
+            .expect("stream context is injected for every encrypted request")
+            .clone();
+        assert_eq!(context.request_aad, aad);
+        assert_eq!(context.request_nonce, nonce);
+        assert_eq!(context.material, material);
+
+        let mut sealer = EventStreamSealer::new(&context).unwrap();
+        let first: Value =
+            serde_json::from_str(&sealer.seal_record("herdr", "{\"n\":1}").unwrap()).unwrap();
+        let second: Value =
+            serde_json::from_str(&sealer.seal_record("approval.pending", "{}").unwrap()).unwrap();
+        assert_eq!(first["v"], 1);
+        assert_eq!(first["seq"], 0);
+        assert_eq!(second["seq"], 1);
+        let sid = first["sid"].as_str().unwrap();
+        assert_eq!(second["sid"].as_str().unwrap(), sid);
+
+        let key = transport::derive_stream_key(&material, sid, &nonce).unwrap();
+        let open = |record: &Value| {
+            let seq = record["seq"].as_u64().unwrap();
+            let aad = format!("{}\n{}\n{}", aad, sid, seq);
+            transport::open_stream_event(
+                &key,
+                seq,
+                aad.as_bytes(),
+                record["ciphertext"].as_str().unwrap(),
+            )
+        };
+        let inner: Value = serde_json::from_slice(&open(&first).unwrap()).unwrap();
+        assert_eq!(inner["event"], "herdr");
+        assert_eq!(inner["data"], "{\"n\":1}");
+        let inner: Value = serde_json::from_slice(&open(&second).unwrap()).unwrap();
+        assert_eq!(inner["event"], "approval.pending");
+
+        // A record moved to another slot in the stream never opens: the seq is
+        // in both the nonce and the AAD, so reorder and replay both fail.
+        let replayed = json!({
+            "v": 1, "sid": sid, "seq": 1,
+            "ciphertext": first["ciphertext"].as_str().unwrap(),
+        });
+        assert!(open(&replayed).is_err());
+    }
+
+    /// What compression will and will not touch.
+    ///
+    /// The two that matter are a stream and an upload. Compressing
+    /// `text/event-stream` would buffer frames that exist to arrive one at a
+    /// time, and an uploaded image is already compressed, so gzip spends CPU
+    /// to make it slightly bigger.
+    #[test]
+    fn compression_leaves_streams_uploads_and_small_bodies_alone() {
+        use tower_http::compression::predicate::Predicate;
+
+        let predicate = DefaultPredicate::new().and(SizeAbove::new(COMPRESSION_MIN_BYTES));
+        // A real body: `SizeAbove` reads the body's own size hint, not the
+        // header, so an empty body with a large content-length is still small.
+        let response = |content_type: &str, len: usize| {
+            Response::builder()
+                .header(axum::http::header::CONTENT_TYPE, content_type)
+                .body(Body::from(vec![b'x'; len]))
+                .unwrap()
+        };
+        let big = COMPRESSION_MIN_BYTES as usize * 40;
+
+        assert!(
+            !predicate.should_compress(&response("text/event-stream", big)),
+            "an SSE stream is never compressed, however long"
+        );
+        for image in ["image/png", "image/jpeg", "image/webp"] {
+            assert!(
+                !predicate.should_compress(&response(image, big)),
+                "{image} is already compressed"
+            );
+        }
+        assert!(
+            !predicate.should_compress(&response("application/json", 64)),
+            "a body under the floor is not worth a gzip header"
+        );
+        assert!(
+            predicate.should_compress(&response("application/json", big)),
+            "a real JSON payload is exactly what this is for"
+        );
+        assert_eq!(COMPRESSION_MIN_BYTES, 512);
+    }
+
+    /// The sealed transport is left exactly as it was.
+    ///
+    /// Compression sits inside the envelope, so without this gate an encrypted
+    /// response would be gzipped and then sealed -- and the client, which sees
+    /// base64 and a `content-encoding: gzip` carried in the envelope's own
+    /// headers, would try to inflate ciphertext. Compressing inside the
+    /// envelope is worth doing, but only once the client says it understands
+    /// the flag; until then an encrypted request is answered as it is today.
+    #[tokio::test]
+    async fn the_gate_keeps_compression_off_a_sealed_response() {
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        // What a handler below the gate sees.
+        let app = Router::new()
+            .route(
+                "/probe",
+                get(|headers: HeaderMap| async move {
+                    headers
+                        .get(axum::http::header::ACCEPT_ENCODING)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("absent")
+                        .to_string()
+                }),
+            )
+            .layer(middleware::from_fn(envelope_compression_gate));
+
+        // A cleartext request keeps its Accept-Encoding: it is compressed the
+        // ordinary way and the client's HTTP stack inflates it.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/probe")
+                    .header(axum::http::header::ACCEPT_ENCODING, "gzip, br")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::VARY)
+                .and_then(|v| v.to_str().ok()),
+            Some("accept-encoding"),
+            "the answer varies by what was asked for, compressed or not"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&body), "gzip, br");
+
+        // A request that arrived sealed has it taken away, so the compression
+        // layer below declines and the envelope seals plaintext.
+        let mut request = Request::builder()
+            .uri("/probe")
+            .header(axum::http::header::ACCEPT_ENCODING, "gzip, br")
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(EncryptedStreamContext {
+            material: vec![0u8; 32],
+            request_aad: "aad".to_string(),
+            request_nonce: "nonce".to_string(),
+        });
+        let response = app.oneshot(request).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "absent",
+            "a sealed request is answered uncompressed"
+        );
+    }
+
+    /// Compression inside the envelope, and only for a client that asked.
+    ///
+    /// The envelope inflates what it seals by about 1.78x, and it seals before
+    /// anything could compress -- so this is the one place that cost can be
+    /// paid back. But the client is reading a base64 body whose real headers
+    /// are sealed with it, so it cannot use `content-encoding` the ordinary
+    /// way: it says what it can inflate with its own request header, and the
+    /// payload answers with its own field.
+    #[tokio::test]
+    async fn the_envelope_compresses_only_for_a_client_that_asked_for_gzip() {
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        let app = Router::new()
+            .route(
+                "/probe",
+                get(|headers: HeaderMap| async move {
+                    headers
+                        .get(axum::http::header::ACCEPT_ENCODING)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("absent")
+                        .to_string()
+                }),
+            )
+            .layer(middleware::from_fn(envelope_compression_gate));
+
+        let sealed_request = |accept: Option<&str>| {
+            let mut request = Request::builder().uri("/probe");
+            request = request.header(axum::http::header::ACCEPT_ENCODING, "gzip, br, zstd");
+            if let Some(accept) = accept {
+                request = request.header(ENVELOPE_ACCEPT_HEADER, accept);
+            }
+            let mut request = request.body(Body::empty()).unwrap();
+            request.extensions_mut().insert(EncryptedStreamContext {
+                material: vec![0u8; 32],
+                request_aad: "aad".to_string(),
+                request_nonce: "nonce".to_string(),
+            });
+            request
+        };
+        let seen = |app: Router, request: Request<Body>| async move {
+            let response = app.oneshot(request).await.unwrap();
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&body).to_string()
+        };
+
+        // A client that says nothing is answered exactly as before.
+        assert_eq!(seen(app.clone(), sealed_request(None)).await, "absent");
+
+        // One that asks for gzip gets gzip -- and only gzip, though it also
+        // sent br and zstd in the ordinary header: the app fails a response
+        // encoded any other way, so the choice is pinned rather than passed on.
+        assert_eq!(
+            seen(app.clone(), sealed_request(Some("gzip"))).await,
+            "gzip"
+        );
+        assert_eq!(
+            seen(app.clone(), sealed_request(Some(" GZIP , br"))).await,
+            "gzip",
+            "the name is matched without case or spacing mattering"
+        );
+
+        // Something else entirely is not an opt-in.
+        assert_eq!(seen(app, sealed_request(Some("br"))).await, "absent");
+    }
+
+    /// Where the flag goes, and what it must not do to the headers map.
+    #[test]
+    fn the_sealed_payload_carries_its_encoding_beside_the_headers() {
+        let payload = EncryptedResponsePayload {
+            status: 200,
+            headers: BTreeMap::from([("content-type".to_string(), "application/json".to_string())]),
+            body: "…".to_string(),
+            content_encoding: Some("gzip".to_string()),
+        };
+        let value = serde_json::to_value(&payload).expect("serializes");
+        assert_eq!(
+            value["content_encoding"], "gzip",
+            "a top-level field, so a client finds it without walking the header map"
+        );
+        assert!(
+            value["headers"].get("content-encoding").is_none(),
+            "and never left in the headers, or the client would inflate twice"
+        );
+
+        // An uncompressed body says nothing at all, so an old client sees the
+        // payload it has always seen.
+        let plain = EncryptedResponsePayload {
+            status: 200,
+            headers: BTreeMap::new(),
+            body: "…".to_string(),
+            content_encoding: None,
+        };
+        let value = serde_json::to_value(&plain).expect("serializes");
+        assert!(value.get("content_encoding").is_none());
+    }
+
+    /// The agent stream is sealed on an encrypted deployment, and plain on a
+    /// cleartext one -- the same rule, and the same record shape, as the
+    /// terminal stream.
+    ///
+    /// It used to be neither: the agent stream went out in the clear whatever
+    /// the deployment, so a gateway configured `transport_encryption:
+    /// required` put the device token and every agent event on the wire
+    /// unprotected. `stream_event` is the single decision point for both
+    /// streams, so this asks it both ways.
+    #[tokio::test]
+    async fn the_agent_stream_is_sealed_exactly_when_the_device_is_encrypted() {
+        let token = "device-token";
+        let transport_key = generate_token();
+        let material = transport::decode_key(&transport_key).unwrap();
+        let mut device = test_device("phone-1", token);
+        device.transport_key = Some(transport_key);
+        let state = test_state("admin-token", vec![device]);
+
+        let (request, _, aad, nonce) =
+            decrypt_transport_request(&state, encrypted_test_request("phone-1", &material, token))
+                .await
+                .unwrap();
+        let context = request
+            .extensions()
+            .get::<EncryptedStreamContext>()
+            .expect("an encrypted request carries a stream context")
+            .clone();
+
+        // What the agent stream emits: a `connected` hello, then a domain
+        // event under its own name.
+        let mut sealed = Some(EventStreamSealer::new(&context).unwrap());
+        let hello = sealed
+            .as_mut()
+            .unwrap()
+            .seal_record("connected", r#"{"asid":"ses_1"}"#)
+            .unwrap();
+        let record: Value = serde_json::from_str(&hello).unwrap();
+        assert_eq!(record["seq"], 0);
+        let sid = record["sid"].as_str().unwrap().to_string();
+
+        let upsert = sealed
+            .as_mut()
+            .unwrap()
+            .seal_record("agent.timeline.upsert", r#"{"items":[]}"#)
+            .unwrap();
+        let record: Value = serde_json::from_str(&upsert).unwrap();
+        assert_eq!(record["seq"], 1, "one stream, one counter");
+        assert_eq!(record["sid"].as_str().unwrap(), sid);
+
+        // And it opens to exactly what the plaintext stream would have sent.
+        let key = transport::derive_stream_key(&material, &sid, &nonce).unwrap();
+        let opened = transport::open_stream_event(
+            &key,
+            1,
+            format!("{}\n{}\n{}", aad, sid, 1).as_bytes(),
+            record["ciphertext"].as_str().unwrap(),
+        )
+        .unwrap();
+        let inner: Value = serde_json::from_slice(&opened).unwrap();
+        assert_eq!(inner["event"], "agent.timeline.upsert");
+        assert_eq!(inner["data"], r#"{"items":[]}"#);
+
+        // A device paired without a transport key keeps the plaintext stream,
+        // byte for byte: no sealer, no envelope, the event under its own name.
+        let mut plain: Option<EventStreamSealer> = None;
+        let event = stream_event(&mut plain, "agent.timeline.upsert", r#"{"items":[]}"#)
+            .expect("a cleartext stream still emits");
+        let wire = format!("{event:?}");
+        assert!(
+            wire.contains("agent.timeline.upsert"),
+            "the event keeps its own name on a cleartext deployment: {wire}"
+        );
+        assert!(
+            !wire.contains(ENCRYPTED_SSE_EVENT),
+            "and is not wrapped in the sealed envelope: {wire}"
+        );
+    }
+
+    #[test]
+    fn the_known_hosts_are_the_public_url_and_the_listen_address() {
+        let mut config = test_config("secret");
+        config.listen = "0.0.0.0:23847".into();
+        config.public_url = "https://desk.example-tailnet.ts.net".into();
+        assert_eq!(
+            known_hosts(&config),
+            vec![
+                String::from("0.0.0.0"),
+                String::from("desk.example-tailnet.ts.net"),
+                String::from("localhost"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_host_header_is_read_down_to_its_name() {
+        assert_eq!(host_name("Example.COM:23847"), "example.com");
+        assert_eq!(host_name("example.com"), "example.com");
+        assert_eq!(host_name("[::1]:23847"), "::1");
+        assert_eq!(host_name("::1"), "::1");
+        assert_eq!(host_name("example.com."), "example.com");
+        // Not a port, so not cut off.
+        assert_eq!(host_name("example.com:notaport"), "example.com:notaport");
+    }
+
+    /// Ellen's gateway answers on a bare Tailscale address, and a great many
+    /// installs will. An address literal has to pass, because rebinding needs a
+    /// name whose resolution can be flipped and an address has none.
+    #[test]
+    fn an_address_is_always_a_host_this_gateway_answers_to() {
+        let known = known_hosts(&test_config("secret"));
+        for address in [
+            "100.99.165.54:23847",
+            "192.168.1.20:23847",
+            "10.0.0.1",
+            "[fd7a:115c:a1e0::1]:23847",
+            "[::1]",
+        ] {
+            assert!(
+                host_is_known(address, &known),
+                "{address} should be answered"
+            );
+        }
+    }
+
+    /// The rebinding case, written as the header it arrives in. A page served
+    /// from a name the attacker owns keeps sending that name in `Host` even
+    /// after the name has been re-pointed at this machine, which is exactly
+    /// what makes the header worth reading.
+    #[test]
+    fn a_name_this_gateway_was_never_told_about_is_refused() {
+        let mut config = test_config("secret");
+        config.listen = "100.99.165.54:23847".into();
+        config.public_url = "http://mac-mini.example-tailnet.ts.net:23847".into();
+        let known = known_hosts(&config);
+
+        for good in [
+            "100.99.165.54:23847",
+            "100.99.165.54",
+            "mac-mini.example-tailnet.ts.net:23847",
+            "MAC-MINI.example-tailnet.TS.NET",
+            "localhost:23847",
+            "127.0.0.1:23847",
+            "[::1]:23847",
+            // A trailing dot is the same name spelled absolutely.
+            "mac-mini.example-tailnet.ts.net.",
+        ] {
+            assert!(host_is_known(good, &known), "{good} should be answered");
+        }
+
+        for bad in [
+            "rebind.attacker.example:23847",
+            "attacker.example",
+            "gateway.attacker.example",
+            // The suffix rules are suffixes of a label, not of a string.
+            "evil-ts.net",
+            "notlocalhost",
+            "ts.net.attacker.example",
+        ] {
+            assert!(!host_is_known(bad, &known), "{bad} should be refused");
+        }
+    }
+
+    /// The blanket `cache-control` is a floor. Every handler that says nothing
+    /// still gets `no-store`; the one that says something says more, not less,
+    /// and must reach the client as it wrote it.
+    #[tokio::test]
+    async fn the_blanket_cache_control_is_a_floor_a_handler_can_only_tighten() {
+        use axum::routing::get;
+        use tower::ServiceExt as _;
+
+        let app = Router::new()
+            .route("/quiet", get(|| async { "body" }))
+            .route(
+                "/specific",
+                get(|| async {
+                    Response::builder()
+                        .header("cache-control", "private, no-store, max-age=0")
+                        .body(Body::from("body"))
+                        .unwrap()
+                }),
+            )
+            .layer(middleware::from_fn(security_headers));
+
+        let quiet = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/quiet")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(quiet.headers()["cache-control"], "no-store, max-age=0");
+
+        let specific = app
+            .oneshot(
+                Request::builder()
+                    .uri("/specific")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            specific.headers()["cache-control"],
+            "private, no-store, max-age=0",
+            "the middleware must not overwrite a handler's own, stricter value"
+        );
+        // The rest of the blanket still applies either way.
+        assert_eq!(specific.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(specific.headers()["pragma"], "no-cache");
+    }
 }

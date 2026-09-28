@@ -6,9 +6,11 @@ use std::time::{Duration, SystemTime};
 use anyhow::Context as _;
 use axum::body::Body;
 use axum::extract::multipart::{MultipartError, MultipartRejection};
-use axum::extract::{Multipart, Path, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Json, Response};
+use axum::routing::{get, post};
+use axum::Router;
 use serde_json::{json, Value};
 
 use crate::{
@@ -760,4 +762,488 @@ pub(crate) fn upload_expired(modified: SystemTime, now: SystemTime) -> bool {
     now.duration_since(modified)
         .map(|age| age >= UPLOAD_RETENTION)
         .unwrap_or(false)
+}
+
+/// The two upload routes: accepting a file, and reading one back.
+pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
+    router
+        // A route-level limit is applied inside the router-wide one, so uploads
+        // get their own ceiling while every JSON route keeps the small one.
+        .route(
+            UPLOADS_PATH,
+            post(upload_file).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
+        )
+        // Reading one back. The app needs this to draw the user's own
+        // attachment in the transcript: the timeline item carries the host
+        // path, which a phone cannot open.
+        .route("/api/uploads/{file_name}", get(upload_content))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::*;
+
+    #[test]
+    fn uploads_are_typed_by_content_not_by_name() {
+        assert_eq!(sniff_upload_kind(&png_bytes()).unwrap().mime, "image/png");
+        assert_eq!(
+            sniff_upload_kind(b"\xff\xd8\xff\xe0\x00\x10JFIF")
+                .unwrap()
+                .mime,
+            "image/jpeg"
+        );
+        assert_eq!(sniff_upload_kind(b"GIF89a....").unwrap().extension, "gif");
+        assert_eq!(sniff_upload_kind(b"GIF87a....").unwrap().extension, "gif");
+        assert_eq!(
+            sniff_upload_kind(b"RIFF\x24\x00\x00\x00WEBPVP8 ")
+                .unwrap()
+                .mime,
+            "image/webp"
+        );
+        assert_eq!(
+            sniff_upload_kind(b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00")
+                .unwrap()
+                .mime,
+            "image/heic"
+        );
+        assert_eq!(
+            sniff_upload_kind(b"\x00\x00\x00\x18ftypmif1\x00\x00\x00\x00")
+                .unwrap()
+                .extension,
+            "heic"
+        );
+    }
+
+    /// Every way of asking for something other than one plain file inside the
+    /// upload directory. The app only ever sends back a name this gateway
+    /// minted, so anything else is an attempt.
+    #[test]
+    fn an_upload_name_that_is_not_one_plain_component_is_refused() {
+        for attempt in [
+            "../config.json",
+            "..",
+            ".",
+            "../../.local/share/muqun-gateway/devices.json",
+            "sub/dir.webp",
+            "sub\\dir.webp",
+            "/etc/passwd",
+            "a/../b.webp",
+            ".hidden.webp",
+            "with space.webp",
+            "semi;colon.webp",
+            "quote\".webp",
+            "nul\0.webp",
+            "unicode\u{2215}.webp",
+            "",
+        ] {
+            assert!(
+                safe_upload_component(attempt).is_none(),
+                "{attempt:?} must not resolve to an upload"
+            );
+        }
+        // A percent-encoded separator is decoded before the handler sees it,
+        // so it arrives as the separator and fails on the same rule.
+        assert!(safe_upload_component("..%2fconfig.json").is_none());
+
+        // What the gateway actually generates passes, unchanged.
+        let minted = stored_upload_name(UploadKind {
+            extension: "webp",
+            mime: "image/webp",
+        });
+        assert_eq!(safe_upload_component(&minted).as_deref(), Some(&*minted));
+        assert_eq!(upload_url(&minted), format!("/api/uploads/{minted}"));
+    }
+
+    /// The round trip the app needs: it posts a file, gets back the host path
+    /// for the agent *and* a URL for itself, and reads the same bytes back
+    /// under the type the content earned rather than the one a name claimed.
+    #[tokio::test]
+    async fn an_upload_answers_with_a_url_the_app_can_read_the_same_bytes_from() {
+        use tower::ServiceExt as _;
+
+        let token = "device-token";
+        let state = test_state("admin", vec![test_device("phone-1", token)]);
+        let app = Router::new()
+            .route(UPLOADS_PATH, post(upload_file))
+            .route("/api/uploads/{file_name}", get(upload_content))
+            .with_state(state);
+
+        // A png announced as a `.txt`: the stored type must come from the
+        // bytes at write time and be re-derived from the bytes at read time.
+        let boundary = "muqun-upload-boundary";
+        let mut body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; \
+             filename=\"screenshot.txt\"\r\n\r\n"
+        )
+        .into_bytes();
+        body.extend_from_slice(&png_bytes());
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(UPLOADS_PATH)
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(
+                        axum::http::header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let stored: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1 << 16)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(stored["mime"], "image/png");
+        // The client name is echoed for the label only; it never became a path.
+        assert_eq!(stored["name"], "screenshot.txt");
+        let host_path = stored["path"].as_str().unwrap().to_string();
+        let url = stored["url"].as_str().unwrap().to_string();
+        let file_name = FsPath::new(&host_path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(file_name.ends_with(".png"), "got {file_name}");
+        assert_eq!(url, format!("/api/uploads/{file_name}"));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&url)
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "image/png");
+        assert_eq!(
+            response.headers()["cache-control"],
+            "private, no-store, max-age=0"
+        );
+        let served = axum::body::to_bytes(response.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        assert_eq!(served.as_ref(), png_bytes().as_slice());
+
+        // A name that was never minted, and a traversal spelled out in full,
+        // are the same miss -- neither says whether the target exists.
+        for miss in [
+            "/api/uploads/deadbeef-0000-0000-0000-000000000000.png",
+            "/api/uploads/..%2f..%2fconfig.json",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(miss)
+                        .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{miss}");
+            let body: Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 1 << 16)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["error"]["code"], "upload_not_found");
+        }
+
+        // And an unpaired caller gets nothing at all.
+        let response = app
+            .oneshot(Request::builder().uri(&url).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Retention is a property of the file's age, not of whether the hourly
+    /// sweep happened to have run: a file the sweeper would take reads as gone.
+    #[test]
+    fn an_upload_past_its_retention_reads_as_gone_before_the_sweep_takes_it() {
+        let dir = asset_test_dir("upload-retention");
+        let path = dir.join("expired.png");
+        std::fs::write(&path, png_bytes()).unwrap();
+        let now = SystemTime::now();
+        assert!(!upload_expired(now, now));
+        assert!(upload_expired(now - UPLOAD_RETENTION, now));
+        // Still typed from its bytes while it lives.
+        assert_eq!(
+            sniff_stored_upload(&path, "expired.png").unwrap().mime,
+            "image/png"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The read path types a stored file the way the write path did: magic
+    /// numbers, then the office container, then text with the earned
+    /// extension deciding the flavour -- never the extension on its own.
+    #[test]
+    fn a_stored_upload_is_typed_by_its_bytes_on_the_way_out_too() {
+        let dir = asset_test_dir("upload-readback-types");
+
+        let png = dir.join("a.png");
+        std::fs::write(&png, png_bytes()).unwrap();
+        assert_eq!(
+            sniff_stored_upload(&png, "a.png").unwrap().mime,
+            "image/png"
+        );
+
+        // The extension lies; the bytes do not.
+        let mislabelled = dir.join("b.md");
+        std::fs::write(&mislabelled, png_bytes()).unwrap();
+        assert_eq!(
+            sniff_stored_upload(&mislabelled, "b.md").unwrap().mime,
+            "image/png"
+        );
+
+        let docx = dir.join("c.docx");
+        std::fs::write(
+            &docx,
+            test_zip(&[
+                ("[Content_Types].xml", b"<Types/>"),
+                ("_rels/.rels", b"<Relationships/>"),
+                ("word/document.xml", b"<document/>"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            sniff_stored_upload(&docx, "c.docx").unwrap().extension,
+            "docx"
+        );
+
+        let markdown = dir.join("d.md");
+        std::fs::write(&markdown, b"# notes\n\nplain\n").unwrap();
+        assert_eq!(
+            sniff_stored_upload(&markdown, "d.md").unwrap().mime,
+            "text/markdown; charset=utf-8"
+        );
+
+        // Nothing the gateway would have refused at upload time is served.
+        let elf = dir.join("e.png");
+        std::fs::write(&elf, b"\x7fELF\x02\x01\x01\x00and the rest").unwrap();
+        assert!(sniff_stored_upload(&elf, "e.png").is_none());
+
+        let empty = dir.join("f.png");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(sniff_stored_upload(&empty, "f.png").is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn safe_documents_are_typed_by_content_before_name() {
+        let pdf = sniff_document_upload_kind(b"%PDF-1.7\n1 0 obj", "notes.txt").unwrap();
+        assert_eq!(pdf.extension, "pdf");
+        assert_eq!(pdf.mime, "application/pdf");
+
+        let markdown = sniff_document_upload_kind(b"# notes\n\nplain\n", "notes.md").unwrap();
+        assert_eq!(markdown.extension, "md");
+        assert_eq!(markdown.mime, "text/markdown; charset=utf-8");
+
+        let source = sniff_document_upload_kind(b"const answer = 42;\n", "answer.ts").unwrap();
+        assert_eq!(source.extension, "ts");
+        assert_eq!(source.mime, "text/plain; charset=utf-8");
+
+        let unknown = sniff_document_upload_kind(b"plain UTF-8\n", "README.weird").unwrap();
+        assert_eq!(unknown.extension, "txt");
+    }
+
+    #[test]
+    fn modern_office_packages_are_recognised_from_their_zip_structure() {
+        let docx = test_zip(&[
+            ("[Content_Types].xml", b"types"),
+            ("_rels/.rels", b"rels"),
+            ("word/document.xml", b"document"),
+        ]);
+        assert_eq!(sniff_office_upload_kind(&docx).unwrap().extension, "docx");
+
+        let xlsx = test_zip(&[
+            ("[Content_Types].xml", b"types"),
+            ("_rels/.rels", b"rels"),
+            ("xl/workbook.xml", b"workbook"),
+        ]);
+        assert_eq!(sniff_office_upload_kind(&xlsx).unwrap().extension, "xlsx");
+
+        let pptx = test_zip(&[
+            ("[Content_Types].xml", b"types"),
+            ("_rels/.rels", b"rels"),
+            ("ppt/presentation.xml", b"presentation"),
+        ]);
+        assert_eq!(sniff_office_upload_kind(&pptx).unwrap().extension, "pptx");
+    }
+
+    #[test]
+    fn open_document_packages_require_the_stored_mimetype_first() {
+        let odt = test_zip(&[
+            ("mimetype", b"application/vnd.oasis.opendocument.text"),
+            ("content.xml", b"content"),
+            ("META-INF/manifest.xml", b"manifest"),
+        ]);
+        assert_eq!(sniff_office_upload_kind(&odt).unwrap().extension, "odt");
+
+        let mimetype_late = test_zip(&[
+            ("content.xml", b"content"),
+            ("mimetype", b"application/vnd.oasis.opendocument.text"),
+            ("META-INF/manifest.xml", b"manifest"),
+        ]);
+        assert!(sniff_office_upload_kind(&mimetype_late).is_none());
+    }
+
+    #[test]
+    fn binary_documents_and_archives_are_refused() {
+        let ordinary_zip = test_zip(&[("hello.txt", b"hello")]);
+        assert!(sniff_office_upload_kind(&ordinary_zip).is_none());
+        assert!(sniff_document_upload_kind(&ordinary_zip, "archive.zip").is_none());
+        let ambiguous = test_zip(&[
+            ("[Content_Types].xml", b"types"),
+            ("_rels/.rels", b"rels"),
+            ("word/document.xml", b"document"),
+            ("xl/workbook.xml", b"workbook"),
+        ]);
+        assert!(sniff_office_upload_kind(&ambiguous).is_none());
+        let traversal = test_zip(&[
+            ("[Content_Types].xml", b"types"),
+            ("_rels/.rels", b"rels"),
+            ("../word/document.xml", b"document"),
+        ]);
+        assert!(sniff_office_upload_kind(&traversal).is_none());
+        assert!(sniff_document_upload_kind(b"hello\0world", "notes.txt").is_none());
+        assert!(sniff_document_upload_kind(b"\xff\xfe\x00x", "notes.txt").is_none());
+        // A filename can preserve a useful extension only after the bytes have
+        // passed the text probe; it cannot disguise an archive as source.
+        assert!(sniff_document_upload_kind(b"PK\x03\x04", "archive.ts").is_none());
+    }
+
+    #[test]
+    fn a_truncated_or_binary_upload_is_not_mistaken_for_a_known_type() {
+        // Half a signature is not a match.
+        assert!(sniff_upload_kind(b"\x89PN").is_none());
+        assert!(sniff_upload_kind(b"\x89PNG\r\n\x1a").is_none());
+        assert!(sniff_upload_kind(b"RIFF\x24\x00\x00\x00WEB").is_none());
+        assert!(sniff_upload_kind(b"\x00\x00\x00\x18ftyp").is_none());
+        // An ISO base media file that is not a HEIC flavour.
+        assert!(sniff_upload_kind(b"\x00\x00\x00\x18ftypqt  \x00\x00\x00\x00").is_none());
+        assert!(sniff_upload_kind(b"\x1f\x8b\x08\x00\x00\x00\x00\x00").is_none());
+        assert!(sniff_upload_kind(b"").is_none());
+    }
+
+    #[test]
+    fn executables_and_scripts_are_refused_whatever_they_are_called() {
+        assert!(looks_executable(b"MZ\x90\x00\x03"));
+        assert!(looks_executable(b"\x7fELF\x02\x01\x01"));
+        assert!(looks_executable(b"\xfe\xed\xfa\xce\x00"));
+        assert!(looks_executable(b"\xfe\xed\xfa\xcf\x00"));
+        assert!(looks_executable(b"\xce\xfa\xed\xfe\x00"));
+        assert!(looks_executable(b"\xcf\xfa\xed\xfe\x00"));
+        assert!(looks_executable(b"\xca\xfe\xba\xbe\x00"));
+        assert!(looks_executable(b"\xbe\xba\xfe\xca\x00"));
+        assert!(looks_executable(b"#!/bin/sh\nrm -rf /\n"));
+        assert!(looks_executable(b"#!"));
+
+        // A script is refused twice over: it is executable, and it carries no
+        // image magic number either.
+        assert!(sniff_upload_kind(b"#!/bin/sh\nrm -rf /\n").is_none());
+
+        assert!(!looks_executable(&png_bytes()));
+        assert!(!looks_executable(b"%PDF-1.7"));
+        assert!(!looks_executable(b"# a markdown file\n"));
+        assert!(!looks_executable(b"M"));
+    }
+
+    #[test]
+    fn a_client_file_name_is_only_ever_echoed_back_after_scrubbing() {
+        assert_eq!(sanitize_upload_name("../../evil.png"), "evil.png");
+        assert_eq!(sanitize_upload_name("..\\..\\evil.png"), "evil.png");
+        assert_eq!(sanitize_upload_name("/etc/passwd"), "passwd");
+        assert_eq!(sanitize_upload_name("shot\r\n.png"), "shot.png");
+        assert_eq!(sanitize_upload_name("bell\x07.txt"), "bell.txt");
+        assert_eq!(sanitize_upload_name("  spaced.png  "), "spaced.png");
+        assert_eq!(sanitize_upload_name(""), "upload");
+        assert_eq!(sanitize_upload_name("   "), "upload");
+        assert_eq!(sanitize_upload_name(".."), "upload");
+        assert_eq!(sanitize_upload_name("../.."), "upload");
+        assert_eq!(sanitize_upload_name("photo.png"), "photo.png");
+
+        let long = format!("{}.png", "n".repeat(400));
+        assert_eq!(
+            sanitize_upload_name(&long).chars().count(),
+            MAX_UPLOAD_NAME_CHARS
+        );
+
+        // A multi-byte name must not be cut mid-character.
+        let wide = "截图".repeat(200);
+        assert!(sanitize_upload_name(&wide).chars().count() <= MAX_UPLOAD_NAME_CHARS);
+    }
+
+    #[test]
+    fn the_stored_name_comes_from_the_sniffed_type_and_nothing_else() {
+        let kind = sniff_upload_kind(&png_bytes()).unwrap();
+        let first = stored_upload_name(kind);
+        let second = stored_upload_name(kind);
+        assert!(first.ends_with(".png"));
+        assert_ne!(first, second, "each upload gets its own name");
+        assert!(!first.contains('/') && !first.contains('\\') && !first.contains(".."));
+        assert_eq!(
+            first.len(),
+            "00000000-0000-0000-0000-000000000000.png".len()
+        );
+    }
+
+    #[test]
+    fn uploads_expire_after_the_retention_window_but_survive_a_clock_jump() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        assert!(!upload_expired(now - Duration::from_secs(47 * 3600), now));
+        assert!(upload_expired(now - UPLOAD_RETENTION, now));
+        assert!(upload_expired(now - Duration::from_secs(49 * 3600), now));
+        // A timestamp in the future means the clock moved, not that the file is
+        // old; deleting it would lose an upload the user just made.
+        assert!(!upload_expired(now + Duration::from_secs(3600), now));
+    }
+
+    #[test]
+    fn the_sweep_removes_only_files_past_the_retention_window() {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-uploads-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = SystemTime::now();
+
+        let fresh = dir.join("fresh.png");
+        std::fs::write(&fresh, b"fresh").unwrap();
+        let stale = dir.join("stale.png");
+        std::fs::write(&stale, b"stale").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(now - UPLOAD_RETENTION - Duration::from_secs(60))
+            .unwrap();
+
+        assert_eq!(purge_expired_uploads(&dir, now).unwrap(), 1);
+        assert!(fresh.exists());
+        assert!(!stale.exists());
+
+        // A missing directory is not an error: nothing has been uploaded yet.
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(purge_expired_uploads(&dir, now).unwrap(), 0);
+    }
 }

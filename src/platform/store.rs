@@ -854,3 +854,376 @@ pub(crate) fn write_config(path: &std::path::Path, config: &Config) -> anyhow::R
     write_secret_file(path, &serde_json::to_vec_pretty(config)?)
         .with_context(|| format!("failed to write config {}", path.display()))
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::*;
+
+    #[test]
+    fn a_secret_directory_is_marked_never_to_be_committed() {
+        let dir = std::env::temp_dir().join(format!("herdr-gitignore-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let secret = dir.join("config.json");
+        write_secret_file(&secret, b"{}").unwrap();
+
+        let ignore = dir.join(".gitignore");
+        assert!(
+            ignore.exists(),
+            "a secret directory must carry a .gitignore"
+        );
+        assert!(std::fs::read_to_string(&ignore).unwrap().contains('*'));
+
+        // An existing file is left alone: the developer may have written it.
+        std::fs::write(&ignore, "mine\n").unwrap();
+        write_secret_file(&secret, b"{}").unwrap();
+        assert_eq!(std::fs::read_to_string(&ignore).unwrap(), "mine\n");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The files have been 0600 for a while. The directory around them was
+    /// left at the umask, and a world-listable directory still says which
+    /// devices' record file is there and that this account runs a gateway.
+    #[cfg(unix)]
+    #[test]
+    fn a_secret_directory_is_the_owners_alone() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!("herdr-secret-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let secret = dir.join("devices.json");
+        write_secret_file(&secret, b"[]").unwrap();
+
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "the directory is still readable");
+        let file = std::fs::metadata(&secret).unwrap().permissions().mode();
+        assert_eq!(file & 0o777, 0o600, "the secret is still readable");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The shape of the loss this file was written for: a device file that a
+    /// process could not read became an empty list, and the next pairing
+    /// wrote that empty list back over the records that were still there.
+    #[test]
+    fn an_unreadable_device_file_is_an_error_not_an_empty_list() {
+        let dir = std::env::temp_dir().join(format!("gateway-devices-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(DEVICES_FILE);
+
+        // A file that was never written is genuinely empty.
+        assert!(read_devices_at(&path).unwrap().is_empty());
+
+        // A write cut short leaves nothing to parse. That is not "no devices".
+        std::fs::write(&path, b"").unwrap();
+        assert!(
+            read_devices_at(&path).is_err(),
+            "a zero-byte device file read as an empty device list"
+        );
+
+        // Nor is a half-written one.
+        std::fs::write(&path, b"[{\"id\":\"phone\",\"na").unwrap();
+        assert!(
+            read_devices_at(&path).is_err(),
+            "a truncated device file read as an empty device list"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Replacing the list must never put the file through a state in which it
+    /// holds less than a whole generation, because every reader of it treats
+    /// what it finds as the complete set of pairings.
+    #[cfg(unix)]
+    #[test]
+    fn replacing_a_secret_file_never_leaves_it_short() {
+        use std::os::unix::fs::MetadataExt as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!("gateway-atomic-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(DEVICES_FILE);
+
+        write_secret_file(&path, b"[\"first\"]").unwrap();
+        let first_inode = std::fs::metadata(&path).unwrap().ino();
+
+        write_secret_file(&path, b"[\"second\"]").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"[\"second\"]");
+        assert_ne!(
+            std::fs::metadata(&path).unwrap().ino(),
+            first_inode,
+            "the file was rewritten in place, so it was empty for part of the write"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the replacement lost the owner-only mode"
+        );
+
+        // The temporary the rename came from must not be left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "left a temporary behind: {leftovers:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Editing the device list on disk while a gateway owns the directory is
+    /// the same loss from the other side: the gateway is holding the whole
+    /// pre-edit list in memory and writes it back at the next pairing, so an
+    /// edit made underneath it is undone without anyone being told. Refusing
+    /// is the only honest answer -- the caller's own fallback is to ask the
+    /// running gateway to do it instead.
+    #[test]
+    fn revoking_on_disk_refuses_while_a_gateway_owns_the_directory() {
+        let dir = std::env::temp_dir().join(format!("gateway-revoke-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_devices_at(&dir, &[device_fixture("phone"), device_fixture("tablet")]).unwrap();
+
+        let owner = state_lock::acquire_within(&dir, state_lock::RELEASE_VISIBLE_WITHIN).unwrap();
+        // Exact, not waited on: while the owner holds it this must be refused
+        // every time.
+        let refused = revoke_device_at(&dir, "phone");
+        assert!(
+            refused.is_err(),
+            "a device was revoked on disk behind a running gateway's back"
+        );
+        assert_eq!(
+            read_devices_at(&dir.join(DEVICES_FILE))
+                .unwrap()
+                .iter()
+                .map(|device| device.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["phone", "tablet"],
+            "the refused revoke still rewrote the device list"
+        );
+
+        // With no gateway running there is no in-memory list to contradict,
+        // and the same call goes through. Waited on rather than asserted on
+        // the next instruction -- see `state_lock::acquire_within`.
+        drop(owner);
+        assert!(
+            state_lock::retry_while_directory_is_busy(|| revoke_device_at(&dir, "phone")).unwrap()
+        );
+        assert_eq!(
+            read_devices_at(&dir.join(DEVICES_FILE))
+                .unwrap()
+                .iter()
+                .map(|device| device.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tablet"]
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The lock has to span the read *and* the write, not just the write.
+    ///
+    /// A change that locked only its write would still lose records, just
+    /// through a smaller window: it reads the whole list, another writer's
+    /// change lands in the gap, and then it stores a list that never
+    /// contained it. This forces exactly that interleaving -- one change is
+    /// held open between its read and its write while a second one tries to
+    /// go -- and the second must be refused rather than allowed to slip in
+    /// and be overwritten a moment later.
+    #[test]
+    fn a_device_list_change_owns_the_directory_from_its_read_to_its_write() {
+        let dir =
+            std::env::temp_dir().join(format!("gateway-devices-rmw-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_devices_at(&dir, &[device_fixture("phone"), device_fixture("tablet")]).unwrap();
+
+        let slow_dir = dir.clone();
+        let slow = std::thread::spawn(move || {
+            state_lock::retry_while_directory_is_busy(|| {
+                update_devices_at(&slow_dir, |devices| {
+                    devices.retain(|device| device.id != "phone");
+                    // Sitting between the read and the write is the entire
+                    // point: this is the window a write-only lock would leave
+                    // open, and it is far longer than the pre-`exec` window
+                    // that makes an unrelated refusal possible.
+                    std::thread::sleep(Duration::from_millis(400));
+                    Some(())
+                })
+            })
+        });
+
+        std::thread::sleep(Duration::from_millis(100));
+        // Exact, not waited on: the slow change is provably mid-flight.
+        let competing = update_devices_at(&dir, |devices| {
+            devices.retain(|device| device.id != "tablet");
+            Some(())
+        });
+        assert!(
+            competing.is_err(),
+            "a second change ran while another was between its read and its write, so the \
+             slower one was about to store a list that never had this change in it"
+        );
+
+        assert!(slow.join().unwrap().unwrap().is_some());
+        assert_eq!(
+            read_devices_at(&dir.join(DEVICES_FILE))
+                .unwrap()
+                .iter()
+                .map(|device| device.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tablet"],
+            "the in-flight change did not land intact"
+        );
+
+        // Once the directory is free again the same change goes through.
+        assert!(
+            state_lock::retry_while_directory_is_busy(|| revoke_device_at(&dir, "tablet")).unwrap()
+        );
+        assert!(read_devices_at(&dir.join(DEVICES_FILE)).unwrap().is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A bad list is survivable as long as the one it replaced is still there.
+    #[test]
+    fn writing_the_device_list_keeps_the_generation_it_replaced() {
+        let dir =
+            std::env::temp_dir().join(format!("gateway-devices-bak-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        write_devices_at(&dir, &[device_fixture("phone"), device_fixture("tablet")]).unwrap();
+        // Nothing was replaced by the first write, so there is nothing to keep.
+        assert!(!dir.join(DEVICES_BACKUP_FILE).exists());
+
+        write_devices_at(&dir, &[]).unwrap();
+        assert!(read_devices_at(&dir.join(DEVICES_FILE)).unwrap().is_empty());
+
+        let kept = read_devices_at(&dir.join(DEVICES_BACKUP_FILE)).unwrap();
+        assert_eq!(
+            kept.iter()
+                .map(|device| device.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["phone", "tablet"],
+            "the replaced pairings were not recoverable"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn configured_port_is_read_from_the_listen_address() {
+        let mut config = test_config("secret");
+        config.listen = "127.0.0.1:23847".into();
+        assert_eq!(config.port(), 23847);
+        config.listen = "0.0.0.0:9000".into();
+        assert_eq!(config.port(), 9000);
+        // A malformed listen address must not silently target another service.
+        config.listen = "not-an-address".into();
+        assert_eq!(config.port(), DEFAULT_PORT);
+    }
+
+    #[test]
+    fn a_renamed_standalone_dir_migrates_once_and_never_again() {
+        let parent = std::env::temp_dir().join(format!("gateway-rename-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&parent).unwrap();
+        let old_dir = parent.join(PRE_RENAME_STANDALONE_DIR_NAME);
+        std::fs::create_dir_all(&old_dir).unwrap();
+        // A real, parseable config so the pre-migration liveness check has a
+        // port to look at -- this is the ordinary case: an install whose old
+        // gateway has already been stopped, so nothing is listening on that
+        // port under the old name and the migration proceeds. (The refusal
+        // path -- a process actually found listening -- is not exercised
+        // here: this file does not spawn real OS processes to unit-test
+        // process introspection anywhere else either, and that path was
+        // verified operationally when this fix was written, against a
+        // gateway genuinely still running under the pre-rename name.)
+        std::fs::write(
+            old_dir.join(CONFIG_FILE),
+            serde_json::to_vec(&test_config("migration-token")).unwrap(),
+        )
+        .unwrap();
+
+        let migrated = migrate_renamed_standalone_dir(&parent).unwrap();
+        assert_eq!(migrated, parent.join("muqun-gateway"));
+        assert!(!old_dir.exists());
+        assert!(migrated.join(CONFIG_FILE).exists());
+
+        // A directory recreated under the old name afterward is left alone:
+        // once the new name exists, migration never looks at the old one again.
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::write(old_dir.join("marker"), b"should not move").unwrap();
+        let migrated_again = migrate_renamed_standalone_dir(&parent).unwrap();
+        assert_eq!(migrated_again, migrated);
+        assert!(old_dir.join("marker").exists());
+        assert!(!migrated.join("marker").exists());
+
+        std::fs::remove_dir_all(&parent).ok();
+    }
+
+    #[test]
+    fn no_old_dir_and_no_new_dir_migrates_nothing() {
+        let parent =
+            std::env::temp_dir().join(format!("gateway-rename-none-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&parent).unwrap();
+        let migrated = migrate_renamed_standalone_dir(&parent).unwrap();
+        assert_eq!(migrated, parent.join("muqun-gateway"));
+        assert!(!migrated.exists());
+        std::fs::remove_dir_all(&parent).ok();
+    }
+
+    #[test]
+    fn an_unparseable_old_config_does_not_block_migration() {
+        // No port can be read from this, so the liveness check has nothing to
+        // ask about and degrades to "proceed" rather than "refuse forever" --
+        // an install should not be permanently stuck migrating because one
+        // file did not parse.
+        let parent = std::env::temp_dir().join(format!(
+            "gateway-rename-unparseable-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&parent).unwrap();
+        let old_dir = parent.join(PRE_RENAME_STANDALONE_DIR_NAME);
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::write(old_dir.join(CONFIG_FILE), b"{}").unwrap();
+
+        let migrated = migrate_renamed_standalone_dir(&parent).unwrap();
+        assert_eq!(migrated, parent.join("muqun-gateway"));
+        assert!(!old_dir.exists());
+
+        std::fs::remove_dir_all(&parent).ok();
+    }
+
+    /// A `push-tokens.json` written before the locale field existed still
+    /// loads, and the device it describes is notified in English.
+    #[test]
+    fn a_push_token_registered_before_locales_existed_still_loads() {
+        let old: Vec<PushTokenRecord> = serde_json::from_str(
+            r#"[{ "token": "ExponentPushToken[abc]", "platform": "ios",
+                  "device_name": "Phone", "updated_unix_ms": 1 }]"#,
+        )
+        .expect("the field is optional, so an older file is still a valid one");
+        assert_eq!(old[0].locale, None);
+        assert_eq!(old[0].locale(), Locale::En);
+
+        let current: Vec<PushTokenRecord> = serde_json::from_str(
+            r#"[{ "token": "ExponentPushToken[abc]", "platform": "ios",
+                  "device_name": "Phone", "locale": "zh-TW", "updated_unix_ms": 1 }]"#,
+        )
+        .unwrap();
+        assert_eq!(current[0].locale(), Locale::ZhTw);
+
+        // And a value that is not a locale this gateway serves is not an error
+        // either -- the device simply gets English.
+        let odd: Vec<PushTokenRecord> = serde_json::from_str(
+            r#"[{ "token": "ExponentPushToken[abc]", "platform": "ios",
+                  "locale": "tlh", "updated_unix_ms": 1 }]"#,
+        )
+        .unwrap();
+        assert_eq!(odd[0].locale(), Locale::En);
+    }
+}

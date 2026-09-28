@@ -19,7 +19,6 @@ pub use session::{
 pub use timeline::{
     part_item_id, push_input_partial, reasoning_item_id, text_item_id, tool_item_id, AgentPart,
     CompactionStatus, TimelineItem, TimelineRole, TodoItem, ToolCall, ToolCallStatus, ToolTime,
-    MAX_TOOL_INPUT_PARTIAL_BYTES,
 };
 
 #[cfg(test)]
@@ -27,6 +26,7 @@ mod contract_tests {
     //! The field names `docs/agent-api.md` promises the app team. A rename
     //! that does not also update the document fails here.
     use super::*;
+    use crate::agents::domain::timeline::MAX_TOOL_INPUT_PARTIAL_BYTES;
     use serde_json::{json, Value};
 
     fn keys(value: &Value) -> Vec<String> {

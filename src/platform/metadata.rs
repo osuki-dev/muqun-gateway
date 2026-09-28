@@ -518,3 +518,547 @@ impl SessionLivenessCache {
         self.taken = Some((now, order));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::*;
+
+    #[test]
+    fn a_liveness_verdict_is_reused_only_inside_its_window() {
+        // Five phones polling on their own schedules asked every backend the
+        // same question about twice a second between them, and on tmux each
+        // ask is two processes.
+        let mut cache = SessionLivenessCache::default();
+        let t0 = Instant::now();
+        assert_eq!(cache.fresh(t0, SESSION_LIVENESS_TTL), None);
+
+        cache.record(vec![1, 0], t0);
+        assert_eq!(
+            cache.fresh(t0 + Duration::from_millis(500), SESSION_LIVENESS_TTL),
+            Some(vec![1, 0])
+        );
+        // Past the window the backends are asked again, so a session that
+        // actually went down is reflected rather than remembered.
+        assert_eq!(
+            cache.fresh(t0 + SESSION_LIVENESS_TTL, SESSION_LIVENESS_TTL),
+            None
+        );
+    }
+
+    #[test]
+    fn liveness_outranks_config_position_in_the_sessions_ordering_key() {
+        use SessionLiveness::{Empty, HasPanes, Unreachable};
+        // Liveness is the significant digit and config position is only the
+        // tiebreaker: index 0 is the reader's preferred entry, and even so,
+        // being down loses to a live session further down the list.
+        assert!(session_order_key(1, HasPanes) < session_order_key(0, Empty));
+        assert!(session_order_key(1, HasPanes) < session_order_key(0, Unreachable));
+        assert!(session_order_key(1, Empty) < session_order_key(0, Unreachable));
+    }
+
+    /// The behaviour `muqun-gateway backend default` promises, and did not
+    /// have: whichever entry the reader put first wins a tie, whatever kind of
+    /// backend it is. Replaces a test that asserted tmux always won, which is
+    /// what made the command a no-op.
+    #[test]
+    fn the_configured_order_breaks_ties_at_every_liveness_level() {
+        for liveness in [
+            SessionLiveness::HasPanes,
+            SessionLiveness::Empty,
+            SessionLiveness::Unreachable,
+        ] {
+            assert!(
+                session_order_key(0, liveness) < session_order_key(1, liveness),
+                "the first configured session should win a tie when both are {liveness:?}"
+            );
+        }
+    }
+
+    /// Sorting a full session list by the key, including every configured
+    /// session staying present when none of them are reachable -- ordering
+    /// must never turn into filtering.
+    #[test]
+    fn sorting_by_the_key_orders_without_dropping_anyone() {
+        let sessions = [
+            liveness_session("herdr-empty", BackendKind::Herdr),
+            liveness_session("tmux-dead", BackendKind::Tmux),
+            liveness_session("herdr-live", BackendKind::Herdr),
+            liveness_session("tmux-empty", BackendKind::Tmux),
+        ];
+        let liveness = [
+            SessionLiveness::Empty,
+            SessionLiveness::Unreachable,
+            SessionLiveness::HasPanes,
+            SessionLiveness::Empty,
+        ];
+        let mut order: Vec<usize> = (0..sessions.len()).collect();
+        order.sort_by_key(|&index| session_order_key(index, liveness[index]));
+        let ids: Vec<&str> = order
+            .iter()
+            .map(|&index| sessions[index].id.as_str())
+            .collect();
+        // Liveness first; among the two equally-empty entries the one
+        // configured earlier wins, which is the reader's stated preference
+        // rather than a rule about backend kinds.
+        assert_eq!(
+            ids,
+            vec!["herdr-live", "herdr-empty", "tmux-empty", "tmux-dead"]
+        );
+        assert_eq!(
+            order.len(),
+            sessions.len(),
+            "every session stays in the list"
+        );
+    }
+
+    /// All-unreachable is the case that matters most: a client reading only
+    /// `sessions[0]` must still get a session back, not `undefined`.
+    #[test]
+    fn every_session_survives_when_all_are_unreachable() {
+        let sessions = [
+            liveness_session("a", BackendKind::Herdr),
+            liveness_session("b", BackendKind::Tmux),
+            liveness_session("c", BackendKind::Herdr),
+        ];
+        let mut order: Vec<usize> = (0..sessions.len()).collect();
+        order.sort_by_key(|&index| session_order_key(index, SessionLiveness::Unreachable));
+        assert_eq!(order.len(), 3);
+        // All equally unreachable, so the configured order stands -- ordering
+        // must never turn into filtering, and it must not reshuffle either.
+        let ids: Vec<&str> = order
+            .iter()
+            .map(|&index| sessions[index].id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn session_liveness_reports_panes_present() {
+        let panes = vec![Pane {
+            id: BackendPaneId::new("p1"),
+            terminal_id: None,
+            workspace_id: BackendWorkspaceId::new("w1"),
+            tab_id: BackendTabId::new("t1"),
+            label: None,
+            terminal_title: None,
+            cwd: None,
+            focused: false,
+            width: None,
+            height: None,
+            revision: None,
+            foreground_command: None,
+            agent: None,
+            agent_status: BackendAgentStatus::Unknown,
+            max_offset_from_bottom: None,
+            viewport_rows: None,
+            alternate_on: None,
+            cursor_x: None,
+            cursor_y: None,
+        }];
+        let outcome = session_liveness(
+            Box::pin(async move { Ok(panes) }),
+            Duration::from_millis(50),
+        )
+        .await;
+        assert_eq!(outcome, SessionLiveness::HasPanes);
+    }
+
+    #[tokio::test]
+    async fn session_liveness_reports_reachable_but_empty() {
+        let outcome = session_liveness(
+            Box::pin(async { Ok(Vec::new()) }),
+            Duration::from_millis(50),
+        )
+        .await;
+        assert_eq!(outcome, SessionLiveness::Empty);
+    }
+
+    #[tokio::test]
+    async fn session_liveness_reports_unreachable_on_a_backend_error() {
+        let outcome = session_liveness(
+            Box::pin(async { Err(BackendError::Unavailable) }),
+            Duration::from_millis(50),
+        )
+        .await;
+        assert_eq!(outcome, SessionLiveness::Unreachable);
+    }
+
+    /// The case a failed connect does not cover: a backend that accepts and
+    /// then never answers must not hang `GET /api/sessions` -- it has to be
+    /// discovered by timeout.
+    #[tokio::test]
+    async fn session_liveness_reports_unreachable_on_timeout_without_waiting_for_the_probe() {
+        let outcome = session_liveness(
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                Ok(Vec::new())
+            }),
+            Duration::from_millis(20),
+        )
+        .await;
+        assert_eq!(outcome, SessionLiveness::Unreachable);
+    }
+
+    /// End to end through the real handler: a herdr session that actually has
+    /// a pane outranks a tmux session configured but not running -- the
+    /// motivating regression for this card, where the app reads
+    /// `sessions[0]` and the old static tmux-first order pointed it at the
+    /// dead backend.
+    #[tokio::test]
+    async fn sessions_endpoint_puts_a_live_backend_ahead_of_a_configured_but_dead_one() {
+        let herdr = FakePaneListHerdr::start(json!([
+            { "pane_id": "p1", "workspace_id": "w1", "tab_id": "t1" }
+        ]));
+        let mut state = test_state("admin", vec![test_device("d1", "token")]);
+        state.config.sessions = vec![
+            SessionConfig {
+                id: "tmux-dead".into(),
+                label: "tmux".into(),
+                socket_path: std::env::temp_dir()
+                    .join(format!("tmux-absent-{}.sock", uuid::Uuid::new_v4()))
+                    .to_string_lossy()
+                    .into_owned(),
+                backend: BackendKind::Tmux,
+            },
+            herdr.session("herdr-live"),
+        ];
+
+        let response = sessions(State(state), bearer_headers("token"))
+            .await
+            .unwrap();
+        assert_eq!(session_ids(&response.0), vec!["herdr-live", "tmux-dead"]);
+        assert_eq!(response.0["sessions"][0]["connected"], true);
+        assert_eq!(response.0["sessions"][1]["connected"], false);
+    }
+
+    /// The dual-backend defect the final review caught: with tmux dead (or
+    /// merely empty) and herdr live, the app connects to whichever session
+    /// `GET /api/sessions` leads with -- but it validates that connection
+    /// against the metadata `/health`/`/api/meta` describe as "primary".
+    /// Before this fix `gateway_metadata` always read
+    /// `config.sessions.first()`, which is stored order (tmux-first) and
+    /// ignores liveness entirely, so it kept describing the dead tmux
+    /// session -- whose `session_metadata` hardcodes `compatible: true` --
+    /// while the app was actually talking to herdr. The version fence
+    /// `assertSupportedHerdr` exists to enforce was defeated for exactly this
+    /// configuration. `gateway_metadata`'s primary must agree with
+    /// `sessions()`'s first entry.
+    #[tokio::test]
+    async fn gateway_metadata_primary_agrees_with_the_sessions_endpoint() {
+        let herdr = FakePaneListHerdr::start(json!([
+            { "pane_id": "p1", "workspace_id": "w1", "tab_id": "t1" }
+        ]));
+        let mut state = test_state("admin", vec![test_device("d1", "token")]);
+        state.config.sessions = vec![
+            SessionConfig {
+                id: "tmux-dead".into(),
+                label: "tmux".into(),
+                socket_path: std::env::temp_dir()
+                    .join(format!("tmux-absent-{}.sock", uuid::Uuid::new_v4()))
+                    .to_string_lossy()
+                    .into_owned(),
+                backend: BackendKind::Tmux,
+            },
+            herdr.session("herdr-live"),
+        ];
+
+        let metadata = gateway_metadata(&state, false).await.unwrap();
+        assert_eq!(metadata["backend"]["sessionId"], "herdr-live");
+        assert_eq!(metadata["backend"]["kind"], json!(BackendKind::Herdr));
+    }
+
+    /// Ordering must never turn into filtering: every configured session is
+    /// still in the response when none of them are reachable, so a client
+    /// reading `sessions[0]` finds a session object instead of `undefined`.
+    #[tokio::test]
+    async fn sessions_endpoint_keeps_every_session_when_nothing_is_reachable() {
+        let mut state = unreachable_state();
+        state.config.sessions.push(SessionConfig {
+            id: "tmux-also-dead".into(),
+            label: "tmux".into(),
+            socket_path: std::env::temp_dir()
+                .join(format!("tmux-absent-{}.sock", uuid::Uuid::new_v4()))
+                .to_string_lossy()
+                .into_owned(),
+            backend: BackendKind::Tmux,
+        });
+        let configured = state.config.sessions.len();
+        let preferred = state.config.sessions[0].id.clone();
+
+        let response = sessions(State(state), bearer_headers("token"))
+            .await
+            .unwrap();
+        let ids = session_ids(&response.0);
+        assert_eq!(ids.len(), configured, "no session drops out of the list");
+        // Both are genuinely SessionLiveness::Unreachable here -- the herdr
+        // entry via a refused connection, the tmux entry via
+        // `probe_reachable` catching the same "no such file or directory"
+        // that `list_output` would otherwise fold into an empty topology
+        // (see `probe_reachable_tells_no_server_apart_from_list_panes_reporting_empty`
+        // in `backend/tmux.rs`). So this genuinely exercises the tiebreak
+        // between two unreachable entries, not an accident of tmux
+        // misreporting as merely empty -- and the tiebreak is now the order
+        // the reader configured, so the first entry stays first.
+        assert_eq!(ids[0], preferred);
+    }
+
+    /// The regression `sessions_endpoint_keeps_every_session_when_nothing_is_reachable`
+    /// could not have caught on its own: before `probe_reachable`, a tmux
+    /// session pointed at a socket nothing is listening on classified as
+    /// `SessionLiveness::Empty` (via `list_output`'s "no server is an empty
+    /// topology" masking), not `Unreachable`. That happened to still sort
+    /// tmux first against an `Unreachable` herdr entry -- Empty outranks
+    /// Unreachable regardless of the tiebreak -- so the bug was invisible
+    /// there. Pairing the dead tmux session with a *reachable-but-empty*
+    /// herdr session instead exposes it directly: a herdr session that is
+    /// genuinely `Empty` must outrank a tmux session that is genuinely
+    /// `Unreachable`, which only holds if tmux's "no server" case is actually
+    /// classified as `Unreachable` and not conflated with `Empty`.
+    #[tokio::test]
+    async fn sessions_endpoint_ranks_a_reachable_empty_backend_ahead_of_a_dead_tmux_one() {
+        let empty_herdr = FakePaneListHerdr::start(json!([]));
+        let mut state = test_state("admin", vec![test_device("d1", "token")]);
+        state.config.sessions = vec![
+            SessionConfig {
+                id: "tmux-dead".into(),
+                label: "tmux".into(),
+                socket_path: std::env::temp_dir()
+                    .join(format!("tmux-absent-{}.sock", uuid::Uuid::new_v4()))
+                    .to_string_lossy()
+                    .into_owned(),
+                backend: BackendKind::Tmux,
+            },
+            empty_herdr.session("herdr-empty"),
+        ];
+
+        let response = sessions(State(state), bearer_headers("token"))
+            .await
+            .unwrap();
+        assert_eq!(session_ids(&response.0), vec!["herdr-empty", "tmux-dead"]);
+    }
+
+    /// A reachable session with no panes open still outranks an unreachable
+    /// one, and still trails a session that actually has something in it.
+    #[tokio::test]
+    async fn sessions_endpoint_ranks_reachable_empty_between_live_and_dead() {
+        let empty_herdr = FakePaneListHerdr::start(json!([]));
+        let busy_herdr = FakePaneListHerdr::start(json!([
+            { "pane_id": "p1", "workspace_id": "w1", "tab_id": "t1" }
+        ]));
+        let mut state = test_state("admin", vec![test_device("d1", "token")]);
+        state.config.sessions = vec![
+            empty_herdr.session("empty"),
+            SessionConfig {
+                id: "dead".into(),
+                label: "dead".into(),
+                socket_path: std::env::temp_dir()
+                    .join(format!("herdr-absent-{}.sock", uuid::Uuid::new_v4()))
+                    .to_string_lossy()
+                    .into_owned(),
+                backend: BackendKind::Herdr,
+            },
+            busy_herdr.session("busy"),
+        ];
+
+        let response = sessions(State(state), bearer_headers("token"))
+            .await
+            .unwrap();
+        assert_eq!(session_ids(&response.0), vec!["busy", "empty", "dead"]);
+    }
+
+    /// Same regression as `sessions_endpoint_puts_a_live_backend_ahead_of_a_configured_but_dead_one`,
+    /// but against a genuinely live tmux server instead of a fake -- on a
+    /// private socket this test creates and owns, never the developer's
+    /// default tmux server. Requires `tmux` on `PATH` and permission to
+    /// create a Unix socket, so it is `--ignored` like the other isolated
+    /// tmux contract tests.
+    #[tokio::test]
+    #[ignore = "requires permission to create a local tmux Unix socket"]
+    async fn sessions_endpoint_puts_a_live_isolated_tmux_session_ahead_of_a_dead_herdr_one() {
+        if tokio::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .await
+            .is_err()
+        {
+            eprintln!("skipping: no tmux on PATH");
+            return;
+        }
+        let socket_path = short_test_socket("gw-live");
+        let tmux = backend::TmuxBackend::new(Some(socket_path.clone()));
+        let workspace = tmux
+            .create_workspace(&BackendCreateWorkspace {
+                cwd: Some(std::env::temp_dir()),
+                label: Some("gateway-sessions-live".into()),
+                focus: true,
+            })
+            .await
+            .unwrap();
+
+        let mut state = test_state("admin", vec![test_device("d1", "token")]);
+        state.config.sessions = vec![
+            SessionConfig {
+                id: "herdr-dead".into(),
+                label: "herdr".into(),
+                socket_path: std::env::temp_dir()
+                    .join(format!("herdr-absent-{}.sock", uuid::Uuid::new_v4()))
+                    .to_string_lossy()
+                    .into_owned(),
+                backend: BackendKind::Herdr,
+            },
+            SessionConfig {
+                id: "tmux-live".into(),
+                label: "tmux".into(),
+                socket_path: socket_path.to_string_lossy().into_owned(),
+                backend: BackendKind::Tmux,
+            },
+        ];
+
+        let response = sessions(State(state), bearer_headers("token"))
+            .await
+            .unwrap();
+        assert_eq!(session_ids(&response.0), vec!["tmux-live", "herdr-dead"]);
+
+        tmux.close_workspace(&workspace.id).await.unwrap();
+    }
+
+    /// `transportSecurity.applicationLayerEncryption` was hardcoded `false`,
+    /// on a gateway whose default is `transport_encryption: required` and
+    /// which had just decrypted the request asking the question. A client
+    /// reading this field to decide whether it needs to seal would have read
+    /// a gateway that does seal as one that does not.
+    ///
+    /// It is a property of the *device*: one paired while encryption was
+    /// disabled holds no transport key, is authorised on its bearer token
+    /// alone, and stays that way after the setting changes.
+    #[tokio::test]
+    async fn the_metadata_says_whether_this_device_actually_seals_its_requests() {
+        let sealed_token = "sealed-device";
+        let plain_token = "plain-device";
+        let mut sealed = test_device("phone-sealed", sealed_token);
+        sealed.transport_key = Some(generate_token());
+        let plain = test_device("phone-plain", plain_token);
+        let state = test_state("admin", vec![sealed, plain]);
+
+        assert!(device_seals_its_transport(&state, "phone-sealed"));
+        assert!(!device_seals_its_transport(&state, "phone-plain"));
+        assert!(!device_seals_its_transport(&state, "phone-gone"));
+
+        for encrypted in [true, false] {
+            let metadata = gateway_metadata(&state, encrypted).await.unwrap();
+            assert_eq!(
+                metadata["transportSecurity"]["applicationLayerEncryption"],
+                json!(encrypted)
+            );
+        }
+    }
+
+    #[test]
+    fn transport_metadata_distinguishes_tls_tailscale_and_plain_http() {
+        let mut config = test_config("token");
+        config.public_url = "https://host.tailnet.ts.net".into();
+        config.listen = "127.0.0.1:23847".into();
+        assert_eq!(transport_protection(&config), "https");
+
+        config.public_url = "http://host.tailnet.ts.net:23847".into();
+        config.listen = "100.118.124.50:23847".into();
+        assert_eq!(transport_protection(&config), "tailscale-wireguard");
+
+        config.listen = "0.0.0.0:23847".into();
+        assert_eq!(transport_protection(&config), "unencrypted-http");
+    }
+
+    /// Collaboration is the one capability that is not a property of this
+    /// build, so it is the one capability that has to be earned per session.
+    #[test]
+    fn collaboration_is_announced_only_for_a_connected_modern_herdr() {
+        assert_eq!(
+            session_capabilities(BackendKind::Herdr, true, Some("0.9.0")),
+            vec![AGENT_COLLABORATION_CAPABILITY]
+        );
+        for version in ["v0.9.1", "0.10.0", "1.0.0", "0.9.0+build"] {
+            assert_eq!(
+                session_capabilities(BackendKind::Herdr, true, Some(version)),
+                vec![AGENT_COLLABORATION_CAPABILITY],
+                "{version} should carry collaboration"
+            );
+        }
+
+        // A Herdr too old to put an instance id on the wire, and a version
+        // string nobody can read, are both refused rather than guessed at.
+        for version in [
+            Some("0.8.9"),
+            Some("0.9.0-rc.1"),
+            Some("0.9"),
+            Some("x"),
+            None,
+        ] {
+            assert!(
+                session_capabilities(BackendKind::Herdr, true, version).is_empty(),
+                "{version:?} should not carry collaboration"
+            );
+        }
+
+        // tmux keeps every other capability and never gains this one: it has no
+        // agent instance identity to bind an assignment to.
+        for version in [Some("3.6"), Some("99.0.0"), None] {
+            assert!(
+                session_capabilities(BackendKind::Tmux, true, version).is_empty(),
+                "tmux {version:?} should not carry collaboration"
+            );
+        }
+
+        // A backend that is not answering cannot deliver anything, whatever
+        // version it reported the last time it did.
+        assert!(session_capabilities(BackendKind::Herdr, false, Some("0.9.0")).is_empty());
+    }
+
+    /// The gateway-wide list is the weaker, older-app-facing claim: it says
+    /// "somewhere on this machine", and it must not disturb anything else.
+    #[test]
+    fn the_gateway_wide_list_adds_collaboration_and_changes_nothing_else() {
+        let without = gateway_capabilities(false);
+        let with = gateway_capabilities(true);
+
+        assert!(!without.contains(&AGENT_COLLABORATION_CAPABILITY));
+        assert!(with.contains(&AGENT_COLLABORATION_CAPABILITY));
+        assert!(
+            !API_CAPABILITIES.contains(&AGENT_COLLABORATION_CAPABILITY),
+            "collaboration must not be static: a tmux-only gateway would announce it"
+        );
+
+        // Every other capability is unconditional, and a tmux-only machine must
+        // lose exactly one thing by being tmux-only.
+        for capability in API_CAPABILITIES {
+            assert!(without.contains(capability), "{capability} went missing");
+            assert!(with.contains(capability), "{capability} went missing");
+        }
+        assert_eq!(without.len(), API_CAPABILITIES.len());
+        assert_eq!(with.len(), API_CAPABILITIES.len() + 1);
+
+        // Spawning is not collaboration. It runs on tmux -- `start_agent` there
+        // types the command and waits for the pane to show the agent -- so it
+        // stays in the static list and a tmux-only gateway still offers it.
+        assert!(without.contains(&"agent_spawn"));
+    }
+
+    #[test]
+    fn herdr_compatibility_has_a_floor_and_no_ceiling() {
+        // The floor is the actual contract: below it the JSON API is a
+        // different shape, so it stays frozen here on purpose.
+        assert_eq!(HERDR_PROTOCOL_MIN, 17);
+        assert!(!herdr_protocol_supported(1));
+        assert!(!herdr_protocol_supported(16));
+
+        // Both Herdr releases in play today.
+        assert!(herdr_protocol_supported(17)); // 0.7.5
+        assert!(herdr_protocol_supported(19)); // 0.8.0
+
+        // And everything above them. A Herdr newer than this build has ever
+        // seen is still served -- the protocol number tracks TUI wire changes
+        // the gateway never speaks, so a bump is not evidence of a break.
+        assert!(herdr_protocol_supported(20));
+        assert!(herdr_protocol_supported(99));
+        assert!(herdr_protocol_supported(u64::MAX));
+    }
+}
