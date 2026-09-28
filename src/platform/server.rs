@@ -686,7 +686,7 @@ pub(crate) fn host_name(host: &str) -> String {
 /// Bodies below this are sent as they are: a gzip header, trailer and the
 /// `content-encoding` line cost more than they save, and every one of them is
 /// a byte on a phone's radio too.
-pub(crate) const COMPRESSION_MIN_BYTES: u16 = 512;
+pub(crate) const COMPRESSION_MIN_BYTES: u64 = 512;
 
 /// Keep compression away from the sealed envelope, and say that the answer
 /// varies by what the client will accept.
