@@ -168,6 +168,8 @@ pub struct CreateAgentSessionBody {
     pub directory: Option<String>,
     pub model: Option<ModelRef>,
     pub agent: Option<String>,
+    #[serde(default)]
+    pub harness: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -175,6 +177,10 @@ pub struct SendAgentPromptBody {
     pub text: String,
     pub attachments: Option<Vec<String>>,
     pub delivery: Option<String>,
+    #[serde(default)]
+    pub model: Option<ModelRef>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

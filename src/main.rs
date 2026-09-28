@@ -12820,7 +12820,14 @@ fn openapi_spec() -> Value {
         "security": [{ "bearerAuth": [] }],
         "paths": {
             "/health": { "get": simple_endpoint("Gateway health") },
-            "/api/capabilities": { "get": simple_endpoint("Gateway Terminal and AI Harness dual-plane capability discovery") },
+            "/api/capabilities": {
+                "get": {
+                    "summary": "Gateway Terminal and AI Harness dual-plane capability discovery",
+                    "description": "Probes host multiplexers (tmux, herdr, conpty) and AI harnesses (DeepSeek Harness, OpenCode). Returns dynamic capability matrix so mobile clients can render or hide tabs, reasoning effort selectors, and model pickers without App Store releases. Supports unauthenticated capability probing and sealed authenticated responses.",
+                    "security": [],
+                    "responses": capabilities_discovery_responses()
+                }
+            },
             "/api/meta": { "get": simple_endpoint("Gateway API, backend, and legacy compatibility metadata") },
             "/api/pair/request": {
                 "post": {
@@ -13235,6 +13242,102 @@ fn openapi_spec() -> Value {
                     })),
                     "responses": ok_response()
                 }
+            },
+            "/api/agent-engine": {
+                "get": {
+                    "summary": "Get status of AI agent engines and active harness",
+                    "description": "Returns status, available models, and active engine configuration for local agent harnesses (DeepSeek Harness, OpenCode).",
+                    "responses": ok_response()
+                }
+            },
+            "/api/agent-catalog": {
+                "get": {
+                    "summary": "Global catalog of AI models and agent roles",
+                    "description": "Lists available LLM models and agent personas aggregated across all active harnesses.",
+                    "responses": ok_response()
+                }
+            },
+            "/api/agent-sessions": {
+                "get": {
+                    "summary": "List all active AI agent sessions",
+                    "description": "Returns list of running agent sessions across all active harnesses.",
+                    "responses": ok_response()
+                },
+                "post": {
+                    "summary": "Create a new AI agent session",
+                    "description": "Spawns an agent conversation session with specified model, harness, and workspace directory.",
+                    "requestBody": json_body(object_schema(&[("title", "string"), ("directory", "string")], &[])),
+                    "responses": ok_response()
+                }
+            },
+            "/api/agent-sessions/{asid}": {
+                "get": {
+                    "summary": "Get details of an AI agent session",
+                    "parameters": [path_param("asid")],
+                    "responses": ok_response()
+                },
+                "delete": {
+                    "summary": "Delete an AI agent session",
+                    "parameters": [path_param("asid")],
+                    "responses": ok_response()
+                }
+            },
+            "/api/agent-sessions/{asid}/prompt": {
+                "post": {
+                    "summary": "Send a prompt to an AI agent session",
+                    "description": "Submits a user prompt to the agent, optionally specifying model override and reasoning effort.",
+                    "parameters": [path_param("asid")],
+                    "requestBody": json_body(json!({
+                        "type": "object",
+                        "required": ["parts"],
+                        "properties": {
+                            "parts": { "type": "array", "items": { "type": "object" } },
+                            "model": { "type": "string" },
+                            "reasoning_effort": { "type": "string", "enum": ["off", "low", "high", "max"] }
+                        }
+                    })),
+                    "responses": ok_response()
+                }
+            },
+            "/api/agent-sessions/{asid}/events": {
+                "get": {
+                    "summary": "Stream agent session events via Server-Sent Events",
+                    "description": "Streams real-time agent execution events, thoughts, tool calls, and text deltas.",
+                    "parameters": [path_param("asid")],
+                    "responses": {
+                        "200": { "description": "SSE stream of agent session events" }
+                    }
+                }
+            },
+            "/api/agent-sessions/{asid}/interrupt": {
+                "post": {
+                    "summary": "Interrupt active agent turn",
+                    "description": "Cancels running model completion or tool execution for the session.",
+                    "parameters": [path_param("asid")],
+                    "responses": ok_response()
+                }
+            },
+            "/api/agent-sessions/{asid}/permissions/{reqId}/reply": {
+                "post": {
+                    "summary": "Reply to a pending agent tool execution permission request",
+                    "parameters": [path_param("asid"), path_param("reqId")],
+                    "requestBody": json_body(json!({
+                        "type": "object",
+                        "required": ["decision"],
+                        "properties": {
+                            "decision": { "type": "string", "enum": ["allow", "allow_always", "deny"] },
+                            "message": { "type": "string" }
+                        }
+                    })),
+                    "responses": ok_response()
+                }
+            },
+            "/api/agent-sessions/{asid}/vcs/diff": {
+                "get": {
+                    "summary": "Get git diff produced by this agent session",
+                    "parameters": [path_param("asid")],
+                    "responses": ok_response()
+                }
             }
         }
     })
@@ -13317,6 +13420,109 @@ fn agents_catalog_responses() -> Value {
                     }
                 }) },
                 "default_startup_timeout_ms": { "type": "integer" }
+            }
+        }) } }
+    });
+    responses
+}
+
+fn capabilities_discovery_responses() -> Value {
+    let mut responses = ok_response();
+    responses["200"] = json!({
+        "description": "Terminal and AI Agent Harness dual-plane capabilities discovery",
+        "content": { "application/json": { "schema": json!({
+            "type": "object",
+            "required": ["serverVersion", "protocolVersion", "planes", "capabilities"],
+            "properties": {
+                "serverVersion": { "type": "string", "description": "Gateway binary semver" },
+                "protocolVersion": { "type": "string", "description": "Protocol revision date (e.g. 2026-09-28)" },
+                "planes": {
+                    "type": "object",
+                    "required": ["terminal", "harness"],
+                    "properties": {
+                        "terminal": {
+                            "type": "object",
+                            "required": ["supported", "activeBackend", "availableBackends", "features"],
+                            "properties": {
+                                "supported": { "type": "boolean", "description": "Whether any terminal multiplexer is available" },
+                                "activeBackend": { "type": ["string", "null"], "description": "Currently active multiplexer backend (tmux, herdr, conpty)" },
+                                "availableBackends": { "type": "array", "items": { "type": "string" } },
+                                "degradedReason": { "type": ["string", "null"], "description": "Reason terminal plane is unavailable if supported is false" },
+                                "features": {
+                                    "type": "object",
+                                    "properties": {
+                                        "sessionList": { "type": "boolean" },
+                                        "splitPanes": { "type": "boolean" },
+                                        "resize": { "type": "boolean" },
+                                        "mouseReporting": { "type": "boolean" },
+                                        "broadcast": { "type": "boolean" }
+                                    }
+                                }
+                            }
+                        },
+                        "harness": {
+                            "type": "object",
+                            "required": ["supported", "activeHarness", "harnesses"],
+                            "properties": {
+                                "supported": { "type": "boolean", "description": "Whether any AI harness is configured and enabled" },
+                                "activeHarness": { "type": ["string", "null"], "description": "Preferred active harness id" },
+                                "harnesses": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "required": ["id", "name", "kind", "status", "features", "models", "agents"],
+                                        "properties": {
+                                            "id": { "type": "string" },
+                                            "name": { "type": "string" },
+                                            "kind": { "type": "string" },
+                                            "status": { "type": "string", "enum": ["ready", "stopped", "error", "unconfigured"] },
+                                            "endpoint": { "type": ["string", "null"] },
+                                            "features": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "supportsReasoning": { "type": "boolean" },
+                                                    "reasoningEffort": { "type": "boolean" },
+                                                    "subagents": { "type": "boolean" },
+                                                    "streamingDiff": { "type": "boolean" },
+                                                    "toolApproval": { "type": "boolean" },
+                                                    "timelineEvents": { "type": "boolean" }
+                                                }
+                                            },
+                                            "models": {
+                                                "type": "array",
+                                                "items": {
+                                                    "type": "object",
+                                                    "required": ["id", "name"],
+                                                    "properties": {
+                                                        "id": { "type": "string" },
+                                                        "name": { "type": "string" },
+                                                        "reasoningEffortTiers": { "type": "array", "items": { "type": "string" } }
+                                                    }
+                                                }
+                                            },
+                                            "agents": {
+                                                "type": "array",
+                                                "items": {
+                                                    "type": "object",
+                                                    "required": ["id", "name", "description"],
+                                                    "properties": {
+                                                        "id": { "type": "string" },
+                                                        "name": { "type": "string" },
+                                                        "description": { "type": "string" }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                "capabilities": {
+                    "type": "array",
+                    "items": { "type": "string" }
+                }
             }
         }) } }
     });
@@ -18550,6 +18756,18 @@ mod tests {
             json!(["repo_path", "agent"])
         );
         assert!(spec["paths"]["/api/agents/catalog"]["get"].is_object());
+        let cap = &spec["paths"]["/api/capabilities"]["get"];
+        assert!(cap.is_object());
+        assert_eq!(
+            cap["responses"]["200"]["content"]["application/json"]["schema"]["required"],
+            json!(["serverVersion", "protocolVersion", "planes", "capabilities"])
+        );
+        assert!(spec["paths"]["/api/agent-engine"]["get"].is_object());
+        assert!(spec["paths"]["/api/agent-catalog"]["get"].is_object());
+        assert!(spec["paths"]["/api/agent-sessions"]["get"].is_object());
+        assert!(spec["paths"]["/api/agent-sessions"]["post"].is_object());
+        assert!(spec["paths"]["/api/agent-sessions/{asid}/prompt"]["post"].is_object());
+        assert!(spec["paths"]["/api/agent-sessions/{asid}/events"]["get"].is_object());
     }
 
     #[test]

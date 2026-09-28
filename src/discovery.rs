@@ -4,6 +4,8 @@
 //! 1. The Terminal Plane: multiplexers, PTY backends, and terminal features.
 //! 2. The Agent Harness Plane: multi-harness status, models, personas, and AI features.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -134,6 +136,8 @@ pub struct TerminalPlaneDiscovery {
 pub struct DiscoveryPlanes {
     pub terminal: TerminalPlaneDiscovery,
     pub harness: HarnessPlaneDiscovery,
+    #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
 }
 
 /// Build terminal plane discovery from current app state
@@ -205,7 +209,11 @@ pub async fn build_terminal_plane_discovery(state: &AppState) -> TerminalPlaneDi
 pub async fn build_discovery_planes(state: &AppState) -> DiscoveryPlanes {
     let terminal = build_terminal_plane_discovery(state).await;
     let harness = state.agent_runtime.discover_harnesses().await;
-    DiscoveryPlanes { terminal, harness }
+    DiscoveryPlanes {
+        terminal,
+        harness,
+        extra: BTreeMap::new(),
+    }
 }
 
 /// Build complete capability discovery response
