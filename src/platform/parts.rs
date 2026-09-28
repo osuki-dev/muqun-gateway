@@ -1219,14 +1219,14 @@ fn paragraphs(text: &str) -> Vec<Part> {
 mod tests {
     use super::*;
 
-    const CLAUDE_FIXTURE: &str = include_str!("../tests/fixtures/claude-transcript.txt");
-    const CLAUDE_SNAPSHOT: &str = include_str!("../tests/fixtures/claude-parts.json");
-    const QODER_FIXTURE: &str = include_str!("../tests/fixtures/qoder-transcript.txt");
-    const QODER_SNAPSHOT: &str = include_str!("../tests/fixtures/qoder-parts.json");
-    const CODEX_FIXTURE: &str = include_str!("../tests/fixtures/codex-transcript.txt");
-    const CODEX_SNAPSHOT: &str = include_str!("../tests/fixtures/codex-parts.json");
-    const OPENCODE_FIXTURE: &str = include_str!("../tests/fixtures/opencode-transcript.txt");
-    const OPENCODE_SNAPSHOT: &str = include_str!("../tests/fixtures/opencode-parts.json");
+    const CLAUDE_FIXTURE: &str = include_str!("../../tests/fixtures/claude-transcript.txt");
+    const CLAUDE_SNAPSHOT: &str = include_str!("../../tests/fixtures/claude-parts.json");
+    const QODER_FIXTURE: &str = include_str!("../../tests/fixtures/qoder-transcript.txt");
+    const QODER_SNAPSHOT: &str = include_str!("../../tests/fixtures/qoder-parts.json");
+    const CODEX_FIXTURE: &str = include_str!("../../tests/fixtures/codex-transcript.txt");
+    const CODEX_SNAPSHOT: &str = include_str!("../../tests/fixtures/codex-parts.json");
+    const OPENCODE_FIXTURE: &str = include_str!("../../tests/fixtures/opencode-transcript.txt");
+    const OPENCODE_SNAPSHOT: &str = include_str!("../../tests/fixtures/opencode-parts.json");
 
     /// Every fixture, with the agent name Herdr reports for the pane it came
     /// from. The two invariants are asserted across all of them, so a new

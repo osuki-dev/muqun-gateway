@@ -956,10 +956,10 @@ mod tests {
 
     // -- the tables ---------------------------------------------------------
 
-    const CLAUDE_SNAPSHOT: &str = include_str!("../tests/fixtures/claude-commands.json");
-    const CODEX_SNAPSHOT: &str = include_str!("../tests/fixtures/codex-commands.json");
-    const OPENCODE_SNAPSHOT: &str = include_str!("../tests/fixtures/opencode-commands.json");
-    const QODER_SNAPSHOT: &str = include_str!("../tests/fixtures/qoder-commands.json");
+    const CLAUDE_SNAPSHOT: &str = include_str!("../../tests/fixtures/claude-commands.json");
+    const CODEX_SNAPSHOT: &str = include_str!("../../tests/fixtures/codex-commands.json");
+    const OPENCODE_SNAPSHOT: &str = include_str!("../../tests/fixtures/opencode-commands.json");
+    const QODER_SNAPSHOT: &str = include_str!("../../tests/fixtures/qoder-commands.json");
 
     /// Tables are pinned per agent version, the same way the part dictionaries
     /// are: an agent that renames or drops a command has to show up as a diff in

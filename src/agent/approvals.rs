@@ -670,15 +670,15 @@ fn fingerprint(prompt: &str, options: &[ApprovalOption]) -> String {
 mod tests {
     use super::*;
 
-    const BASH: &str = include_str!("../tests/fixtures/approval-claude-bash.txt");
-    const READ: &str = include_str!("../tests/fixtures/approval-claude-read.txt");
-    const WRITE: &str = include_str!("../tests/fixtures/approval-claude-write.txt");
-    const FETCH: &str = include_str!("../tests/fixtures/approval-claude-fetch.txt");
-    const TRUST: &str = include_str!("../tests/fixtures/approval-claude-trust.txt");
-    const APIKEY: &str = include_str!("../tests/fixtures/approval-claude-apikey.txt");
-    const RESOLVED: &str = include_str!("../tests/fixtures/approval-claude-resolved.txt");
-    const TRANSCRIPT: &str = include_str!("../tests/fixtures/claude-transcript.txt");
-    const QODER: &str = include_str!("../tests/fixtures/qoder-transcript.txt");
+    const BASH: &str = include_str!("../../tests/fixtures/approval-claude-bash.txt");
+    const READ: &str = include_str!("../../tests/fixtures/approval-claude-read.txt");
+    const WRITE: &str = include_str!("../../tests/fixtures/approval-claude-write.txt");
+    const FETCH: &str = include_str!("../../tests/fixtures/approval-claude-fetch.txt");
+    const TRUST: &str = include_str!("../../tests/fixtures/approval-claude-trust.txt");
+    const APIKEY: &str = include_str!("../../tests/fixtures/approval-claude-apikey.txt");
+    const RESOLVED: &str = include_str!("../../tests/fixtures/approval-claude-resolved.txt");
+    const TRANSCRIPT: &str = include_str!("../../tests/fixtures/claude-transcript.txt");
+    const QODER: &str = include_str!("../../tests/fixtures/qoder-transcript.txt");
 
     fn labels(approval: &Approval) -> Vec<&str> {
         approval

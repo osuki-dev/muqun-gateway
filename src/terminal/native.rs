@@ -634,14 +634,14 @@ mod tests {
     /// A real opencode 1.18.0 session, captured off the server this adapter is
     /// written against: a todo write, a shell command, a file read, a file
     /// edit, and the agent's own prose.
-    const SESSION: &str = include_str!("../tests/fixtures/opencode-native-session.json");
+    const SESSION: &str = include_str!("../../tests/fixtures/opencode-native-session.json");
     /// The same server with a permission pending, captured by giving a session
     /// a `bash -> ask` rule and asking it to run a command.
-    const APPROVAL: &str = include_str!("../tests/fixtures/opencode-native-approval.json");
-    const SNAPSHOT: &str = include_str!("../tests/fixtures/opencode-native-parts.json");
+    const APPROVAL: &str = include_str!("../../tests/fixtures/opencode-native-approval.json");
+    const SNAPSHOT: &str = include_str!("../../tests/fixtures/opencode-native-parts.json");
     /// The terminal capture the marker dictionary reads, for the comparison
     /// that says what a native source buys.
-    const TRANSCRIPT: &str = include_str!("../tests/fixtures/opencode-transcript.txt");
+    const TRANSCRIPT: &str = include_str!("../../tests/fixtures/opencode-transcript.txt");
 
     fn read(fixture: &str) -> (Vec<Part>, String) {
         read_in(fixture, Locale::En)

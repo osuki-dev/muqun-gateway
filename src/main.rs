@@ -43,30 +43,19 @@ use tower_http::compression::{
     CompressionLayer,
 };
 
-mod agent;
-mod agent_events;
-mod approvals;
-mod authority;
-mod backend;
-mod backend_startup;
-mod command_catalog;
-mod composer;
-mod discovery;
-mod gateway_listener;
-mod git;
-mod i18n;
-#[cfg(all(test, unix))]
-mod installer_tests;
-mod login_env;
-mod native;
-mod parts;
-mod scrollback;
-mod service;
-mod shortcuts;
-mod state_lock;
-mod supervision;
-mod tasks;
-mod transport;
+pub(crate) mod agent;
+pub(crate) mod connectivity;
+pub(crate) mod platform;
+pub(crate) mod terminal;
+
+// Backward-compatible re-exports at crate root
+pub(crate) use agent::{agent_events, approvals, tasks};
+pub(crate) use connectivity::{authority, gateway_listener, transport};
+pub(crate) use platform::{discovery, git, i18n, parts, service, state_lock};
+pub(crate) use terminal::{
+    backend, backend_startup, command_catalog, composer, login_env, native, scrollback, shortcuts,
+    supervision,
+};
 
 use authority::{hash_token, identify_device, DeviceRecord, PairingCodeError, PendingPairing};
 
