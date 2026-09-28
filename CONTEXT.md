@@ -155,7 +155,10 @@ pairing mode; changing the gateway setting governs newly paired devices.
 ## Verification
 
 Run `cargo fmt --check`, `cargo test --offline`, `cargo clippy --offline --all-targets
--- -D warnings`, and `cargo build --release --offline`. The ignored Herdr and
+-- -D warnings`, and `cargo build --release --offline`. CI
+(`.github/workflows/ci.yml`) runs the same formatting, clippy, test and audit
+checks on every push and pull request; the audit job is what keeps a RustSec
+advisory from landing unnoticed. The ignored Herdr and
 tmux contracts use isolated sockets and should be run when adapter behavior
 changes. Never mutate a user's active Herdr session in a test. Startup/delivery
 changes additionally require real paired App checks on an explicitly isolated
