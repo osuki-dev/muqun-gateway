@@ -105,6 +105,72 @@ fn tmux_command(socket: &str) -> Command {
     cmd
 }
 
+/// The transient unit an autostarted tmux server is given when the gateway
+/// itself runs under systemd.
+///
+/// The server is a persistent terminal server, not a gateway worker: left in
+/// the gateway's cgroup, systemd reports it as a leftover process on every
+/// restart and folds its memory into the gateway's figure. Its own unit keeps
+/// it just as independent while the gateway's accounting stays its own. The
+/// name is derived from the socket, so two sessions never collide.
+fn tmux_scope_unit(socket: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    let digest = Sha256::digest(socket.as_bytes());
+    format!("muqun-tmux-{}", crate::hex(&digest[..8]))
+}
+
+/// Whether this process is running as a systemd service. `INVOCATION_ID` is
+/// set by systemd for every service it starts and by nothing else, which is
+/// exactly the case the wrapper exists for.
+fn systemd_service_context() -> bool {
+    std::env::var_os("INVOCATION_ID").is_some()
+}
+
+/// Run `direct` inside a transient systemd unit when `under_systemd`; hand it
+/// back untouched everywhere else.
+///
+/// A foreground `muqun-gateway run`, macOS, or a Linux session without
+/// `systemd-run` all keep the old path, and autostart never depends on the
+/// wrapper: the unit is `RemainAfterExit`, so the tmux server outlives the
+/// client exactly as it did before.
+fn systemd_scoped(direct: Command, unit: &str, under_systemd: bool) -> Command {
+    let path = std::env::var("PATH").unwrap_or_default();
+    if !under_systemd || crate::login_env::lookup("systemd-run", &path).is_none() {
+        return direct;
+    }
+    let mut wrapped = Command::new("systemd-run");
+    wrapped.args([
+        "--user",
+        "--quiet",
+        "--collect",
+        &format!("--unit={unit}"),
+        "--property=Type=oneshot",
+        "--property=RemainAfterExit=yes",
+        "--",
+    ]);
+    wrapped.arg(direct.as_std().get_program());
+    wrapped.args(direct.as_std().get_args());
+    for (name, value) in direct.as_std().get_envs() {
+        match value {
+            Some(value) => {
+                wrapped.env(name, value);
+            }
+            None => {
+                wrapped.env_remove(name);
+            }
+        }
+    }
+    if let Some(dir) = direct.as_std().get_current_dir() {
+        wrapped.current_dir(dir);
+    }
+    wrapped
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    wrapped
+}
+
 async fn start(session: &SessionConfig) -> anyhow::Result<()> {
     validate(session)?;
     match session.backend {
@@ -118,11 +184,13 @@ async fn start(session: &SessionConfig) -> anyhow::Result<()> {
                 return Ok(());
             }
             let mut cmd = tmux_command(&session.socket_path);
-            let status = tokio::time::timeout(
-                Duration::from_secs(8),
-                cmd.args(["new-session", "-d", "-s", "muqun"]).status(),
-            )
-            .await??;
+            cmd.args(["new-session", "-d", "-s", "muqun"]);
+            let mut cmd = systemd_scoped(
+                cmd,
+                &tmux_scope_unit(&session.socket_path),
+                systemd_service_context(),
+            );
+            let status = tokio::time::timeout(Duration::from_secs(8), cmd.status()).await??;
             anyhow::ensure!(status.success(), "tmux did not create its initial session");
         }
         BackendKind::Herdr => {
@@ -196,6 +264,64 @@ mod tests {
         ] {
             assert!(herdr_session(Path::new(path), &roots).is_err());
         }
+    }
+
+    #[test]
+    fn the_tmux_scope_unit_name_is_stable_and_systemd_safe() {
+        let name = tmux_scope_unit("/tmp/a.sock");
+        assert_eq!(name, tmux_scope_unit("/tmp/a.sock"));
+        assert_ne!(name, tmux_scope_unit("/tmp/b.sock"));
+        assert!(name.starts_with("muqun-tmux-"));
+        assert!(name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.'));
+    }
+
+    #[test]
+    fn without_a_systemd_session_the_command_is_untouched() {
+        // Tests do not run under a systemd service, so the wrapper must hand
+        // the command back exactly as it was.
+        let direct = tmux_command("/tmp/scope-test.sock");
+        let scoped = systemd_scoped(direct, "muqun-tmux-test", false);
+        assert_eq!(
+            scoped.as_std().get_program(),
+            std::ffi::OsStr::new(crate::backend::TMUX_PROGRAM)
+        );
+        let args: Vec<_> = scoped.as_std().get_args().collect();
+        assert_eq!(args, vec!["-S", "/tmp/scope-test.sock"]);
+    }
+
+    #[test]
+    fn a_systemd_session_wraps_the_command_and_keeps_its_arguments() {
+        let path = std::env::var("PATH").unwrap_or_default();
+        if crate::login_env::lookup("systemd-run", &path).is_none() {
+            return;
+        }
+        let mut direct = tmux_command("/tmp/scope-test.sock");
+        direct.args(["new-session", "-d", "-s", "muqun"]);
+        let scoped = systemd_scoped(direct, "muqun-tmux-test", true);
+        assert_eq!(scoped.as_std().get_program(), "systemd-run");
+        let args: Vec<String> = scoped
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.iter().any(|a| a == "--unit=muqun-tmux-test"));
+        assert!(args.iter().any(|a| a == "--property=RemainAfterExit=yes"));
+        let after_separator: Vec<&String> = args.iter().skip_while(|a| *a != "--").collect();
+        assert_eq!(
+            after_separator,
+            vec![
+                "--",
+                crate::backend::TMUX_PROGRAM,
+                "-S",
+                "/tmp/scope-test.sock",
+                "new-session",
+                "-d",
+                "-s",
+                "muqun"
+            ]
+        );
     }
 
     #[test]
