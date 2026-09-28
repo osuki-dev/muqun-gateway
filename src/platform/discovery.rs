@@ -175,6 +175,10 @@ pub struct TerminalPlaneDiscovery {
 }
 
 /// The SSH Plane discovery model
+///
+/// Advertises the app-side transport, not a gateway subsystem: the phone can
+/// open its own SSH connection to a host and tunnel the gateway's loopback
+/// port. The gateway implements no SSH client or server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SshPlaneDiscovery {
@@ -280,6 +284,10 @@ pub async fn build_terminal_plane_discovery(state: &AppState) -> TerminalPlaneDi
 pub async fn build_discovery_planes(state: &AppState) -> DiscoveryPlanes {
     let terminal = build_terminal_plane_discovery(state).await;
     let harness = state.agent_runtime.discover_agents().await;
+    // The SSH plane is the app's transport, not a gateway subsystem: the phone
+    // opens its own SSH connection and tunnels this gateway's loopback port, so
+    // the same HTTP API answers on the far side. These flags only tell the app
+    // what that transport can carry; nothing here implements SSH.
     let ssh = SshPlaneDiscovery {
         supported: true,
         tunnel_supported: true,

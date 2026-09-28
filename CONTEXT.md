@@ -98,6 +98,13 @@ branch on backend kind. `TerminalBackend::activity_stream` normalizes Herdr
 native events and tmux topology polling into the same internal vocabulary for
 SSE and push.
 
+Two planes are implemented here: the terminal control plane
+(`TerminalBackend`) and the agent harness plane (`AgentEnginePort`).
+`/api/discovery` additionally reports an SSH plane, but that is the app's own
+transport -- the phone can open an SSH connection and tunnel the gateway's
+loopback port, and the same HTTP API answers on the far side -- not a gateway
+subsystem; the gateway implements no SSH client or server.
+
 The gateway owns pairing identity, device tokens, network listener, backend
 registry, Manager, SSE fan-out, and lifecycle. A backend owns only interaction
 with its terminal system. The first session is compatibility-sensitive because

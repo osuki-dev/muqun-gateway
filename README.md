@@ -10,37 +10,55 @@ macOS and Linux. Windows is not supported yet.
 
 ## Architecture
 
+Two planes are implemented in this binary:
+
+- **Terminal control plane** — sessions, workspaces, tabs, panes, output,
+  scrollback and SSE, behind the `TerminalBackend` port; Herdr and tmux
+  adapters implement it.
+- **Agent harness plane** — agent sessions, models, prompts, tasks,
+  permissions, approvals and event history, behind the `AgentEnginePort`
+  port; the OpenCode and DeepSeek adapters implement it.
+
+`/api/discovery` also reports an **SSH plane**, but that one is the app's own
+transport, not a gateway subsystem: the phone can open an SSH connection to a
+host and tunnel the gateway's loopback port, so the same HTTP API answers on
+the far side. The gateway implements no SSH client or server itself.
+
 ```text
  Muqun app (phone)
-        │  HTTPS + SSE — device token, optional AES-GCM transport envelope
+        │
+        ├── SSH host / tunnel (app-side: the phone is the SSH client; the
+        │   gateway answers the same HTTP API on its loopback port)
+        │
+        │   HTTPS + SSE — device token, optional AES-GCM transport envelope
         ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│ muqun-gateway — one binary, one user                                    │
-│                                                                         │
-│  src/main.rs · src/cli.rs                                               │
-│    composition root: module tree, crate re-exports, AppState, commands  │
-│                                                                         │
-│  src/platform/server.rs                                                 │
-│    startup + middleware: locale · security headers · known hosts ·      │
-│    encrypted transport · compression gate · route composition           │
-│         │                                                               │
-│         ├── platform::routes ────── health, meta, discovery, openapi    │
-│         ├── connectivity::routes ── pairing, push registration          │
-│         ├── terminal::routes ────── sessions, workspaces, panes, SSE    │
-│         └── agents::routes ──────── agent sessions; session_routes for  │
-│            + session_routes         task dispatch, prompts, approvals   │
-│         │                                                               │
-│         ▼                                                               │
-│  ports                                                                  │
-│    TerminalBackend ──► Herdr adapter · tmux adapter                     │
-│    AgentEnginePort ──► OpenCode adapter · DeepSeek adapter              │
-│                                                                         │
-│  shared infrastructure                                                  │
-│    config · store (identity, devices, secrets) · http (envelope, auth,  │
-│    validation) · metadata · uploads · assets · i18n (one catalog per    │
-│    language) · git · parts · discovery · openapi · manage · service ·   │
-│    state_lock                                                           │
-└─────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│ muqun-gateway — one binary, one user                                     │
+│                                                                          │
+│  src/main.rs · src/cli.rs — composition root and commands                │
+│  src/platform/server.rs — startup + middleware: locale · security        │
+│    headers · known hosts · encrypted transport · compression · routing   │
+│                                                                          │
+│  the two planes this binary implements                                   │
+│                                                                          │
+│   ┌────────────────────────────┐  ┌────────────────────────────────┐     │
+│   │ Terminal plane             │  │ Agent harness plane            │     │
+│   │ sessions · workspaces ·    │  │ agent sessions · models ·      │     │
+│   │ tabs · panes · output ·    │  │ prompts · tasks · permissions ·│     │
+│   │ SSE · scrollback           │  │ approvals · event history      │     │
+│   │ port: TerminalBackend      │  │ port: AgentEnginePort          │     │
+│   └─────────────┬──────────────┘  └───────────────┬────────────────┘     │
+│                 │                                 │                      │
+│        Herdr adapter · tmux adapter   OpenCode adapter · DeepSeek        │
+│                                       adapter                            │
+│                                                                          │
+│  routes: platform (health, discovery, openapi) · connectivity (pairing,  │
+│    push registration) · terminal · agents                                │
+│  shared: config · store (identity, devices, secrets) · http (envelope,   │
+│    auth, validation) · metadata · uploads · assets · i18n (one catalog   │
+│    per language) · git · parts · discovery · openapi · manage ·          │
+│    service · state_lock                                                  │
+└──────────────────────────────────────────────────────────────────────────┘
         │
         ▼
  Herdr unix socket · tmux argv · OpenCode / DeepSeek HTTP
@@ -48,10 +66,10 @@ macOS and Linux. Windows is not supported yet.
 
 A request travels: the phone authenticates with its device token (and, when
 paired with transport encryption, the body arrives sealed); `platform::server`
-resolves the locale, checks the host, decrypts and routes; the route's domain
-calls a port; the adapter talks to the terminal or harness; the answer returns
-through the compatibility mapper in the versioned content envelope, with SSE
-events sealed one by one.
+resolves the locale, checks the host, decrypts and routes; the route's plane
+calls its port; the adapter talks to the terminal or harness; the answer
+returns through the compatibility mapper in the versioned content envelope,
+with SSE events sealed one by one.
 
 ## Install
 
