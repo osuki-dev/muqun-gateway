@@ -663,7 +663,7 @@ fn fingerprint(prompt: &str, options: &[ApprovalOption]) -> String {
         hasher.update([0x1e]);
         hasher.update(option.label.as_bytes());
     }
-    format!("{:x}", hasher.finalize())[..16].to_string()
+    crate::hex(&hasher.finalize())[..16].to_string()
 }
 
 #[cfg(test)]

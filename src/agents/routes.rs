@@ -1160,7 +1160,7 @@ pub(crate) fn json_etag_response(headers: &HeaderMap, payload: Value) -> Respons
     let mut hasher = Sha256::new();
     hasher.update(&body_bytes);
     let hash = hasher.finalize();
-    let etag = format!("\"{:x}\"", hash);
+    let etag = format!("\"{}\"", crate::hex(&hash));
 
     if let Some(if_none_match) = headers
         .get(header::IF_NONE_MATCH)

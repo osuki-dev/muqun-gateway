@@ -3,7 +3,7 @@
 //! HTTP still exposes routing and traffic-shape metadata. This module protects
 //! credentials and payload bytes with independent request/response keys.
 
-use aes_gcm::aead::{Aead as _, AeadCore as _, OsRng, Payload};
+use aes_gcm::aead::{Aead as _, Generate as _, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit as _, Nonce};
 use anyhow::{anyhow, Context as _};
 use base64::Engine as _;
@@ -99,7 +99,7 @@ pub fn seal_stream_event(
     let nonce = stream_nonce(seq);
     let ciphertext = cipher
         .encrypt(
-            Nonce::from_slice(&nonce),
+            &Nonce::try_from(nonce.as_slice())?,
             Payload {
                 msg: plaintext,
                 aad,
@@ -122,7 +122,10 @@ pub fn open_stream_event(
     let cipher = Aes256Gcm::new_from_slice(key).expect("AES-256 key has fixed length");
     let nonce = stream_nonce(seq);
     cipher
-        .decrypt(Nonce::from_slice(&nonce), Payload { msg: &sealed, aad })
+        .decrypt(
+            &Nonce::try_from(nonce.as_slice())?,
+            Payload { msg: &sealed, aad },
+        )
         .map_err(|_| anyhow!("stream authentication failed"))
 }
 
@@ -135,7 +138,7 @@ pub fn seal(
 ) -> anyhow::Result<Envelope> {
     let key = derive_key(material, direction)?;
     let cipher = Aes256Gcm::new_from_slice(&key).expect("AES-256 key has fixed length");
-    let nonce_bytes = Aes256Gcm::generate_nonce(&mut OsRng);
+    let nonce_bytes = Nonce::generate();
     let ciphertext = cipher
         .encrypt(
             &nonce_bytes,
@@ -175,7 +178,7 @@ pub fn open(
     let cipher = Aes256Gcm::new_from_slice(&key).expect("AES-256 key has fixed length");
     cipher
         .decrypt(
-            Nonce::from_slice(&nonce),
+            &Nonce::try_from(nonce.as_slice())?,
             Payload {
                 msg: &ciphertext,
                 aad,

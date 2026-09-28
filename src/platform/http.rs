@@ -339,6 +339,18 @@ pub(crate) fn api_error_in(
     )
 }
 
+/// Lowercase hex for a digest. `sha2` 0.11's output array no longer formats
+/// with `{:x}`, and both the approval fingerprint and the JSON ETag want the
+/// same spelling.
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use crate::*;
