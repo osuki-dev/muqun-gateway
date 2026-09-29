@@ -271,7 +271,7 @@ pub struct ReplyFormBody {
 }
 
 pub fn mount(router: Router<AppState>) -> Router<AppState> {
-    router
+    super::ws_routes::mount(router)
         // Standalone independent OpenCode agent routes (no tmux / herdr session required)
         .route(
             "/api/agent-sessions",
@@ -1263,6 +1263,19 @@ async fn do_list_agent_directories(
     Ok(Json(content_envelope(json!(dirs_list))))
 }
 
+/// The `event:` name and `data:` string one domain event is published under.
+///
+/// One function for both transports -- this SSE stream and the `GET /api/ws`
+/// socket -- so a client switching between them reads the same bytes.
+pub(crate) fn agent_event_record(
+    event: &super::domain::AgentDomainEvent,
+) -> (&'static str, String) {
+    (
+        event.event_name(),
+        serde_json::to_string(event).unwrap_or_default(),
+    )
+}
+
 /// The agent's event stream, sealed exactly like the terminal's.
 ///
 /// This stream used to go out in the clear on every deployment, including one
@@ -1319,9 +1332,7 @@ async fn do_stream_agent_session(
                     if !ev.asid().0.is_empty() && ev.asid() != &target_asid {
                         continue;
                     }
-                    let ev_name = ev.event_name();
-
-                    let payload = serde_json::to_string(&ev).unwrap_or_default();
+                    let (ev_name, payload) = agent_event_record(&ev);
                     // `None` means the record could not be sealed. It is
                     // dropped rather than ever leaving in the clear.
                     if let Some(event) = stream_event(&mut sealer, ev_name, &payload) {

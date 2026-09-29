@@ -103,7 +103,8 @@ Harness discovery is on `GET /api/discovery` and `GET /api/capabilities`
 byte-identical aliases of it. **This payload is camelCase**, unlike the rest of
 this document, and is *not* wrapped in the envelope: the top level is
 `{"ok", "gatewayVersion", "apiVersion", "apiMajor", "platform", "serverId",
-"label", "planes", "capabilities"}`. An unauthenticated caller gets the same
+"label", "planes", "transports", "capabilities"}`; `transports` is described
+under "WebSocket events" below. An unauthenticated caller gets the same
 body with `endpoint` and `version` removed from every harness.
 
 ```json
@@ -965,6 +966,167 @@ tail it cannot place.
 
 `?after=<seq>` → `{"items": [...], "status": "busy", "resync": false, "latest_seq": 42}`.
 
+### WebSocket events: `GET /api/ws`
+
+One WebSocket per device carrying the agent events of **any number of
+sessions**, so an App can watch every session on a gateway over one socket.
+It carries exactly what the per-session stream above carries; requests stay on
+HTTP, and the SSE stream is unchanged and remains the fallback.
+
+**Feature gate.** `ws_events` in the flat `capabilities` array (`/health`,
+`/api/capabilities`, `/api/discovery`), and in the `/api/discovery` body at
+top level beside `planes`, shown to every caller (it is not sensitive):
+
+```json
+"transports": { "websocket": { "path": "/api/ws", "protocol": 1 } }
+```
+
+A gateway without either has no socket; use the SSE stream. `apiVersion` is
+1.9.0 or later.
+
+#### Handshake
+
+An ordinary HTTP/1.1 WebSocket upgrade (`GET /api/ws`, `Upgrade: websocket`),
+authenticated **exactly like the SSE stream**:
+
+- A device paired without a transport key (`transport_encryption: disabled`):
+  `Authorization: Bearer <device token>`. Every frame is plaintext JSON.
+- A device with a transport key: the encrypted transport's own request —
+  `X-Muqun-Transport: 1`, `X-Muqun-Device: <device id>`, and
+  `X-Muqun-Envelope: <base64url of the envelope JSON>`, no `Authorization`.
+  The envelope is sealed with the request key over AAD `GET /api/ws` (method,
+  one space, then path and query exactly as sent), and its plaintext is
+  `{"token": "<device token>", "content_type": null, "body": ""}`. The `101`
+  carries `x-muqun-transport: 1`, and every frame is sealed (below). Such a
+  device sending a bare `Authorization` header is refused, as on every route.
+
+Refusals are ordinary HTTP answers, never a `101`: `401` (no token), `403`
+(unknown or revoked device, bad envelope, missing device proof), `400
+websocket_upgrade_required` (authenticated, but not an upgrade), `429
+too_many_connections`. On an encrypted device a refusal is sealed like any
+other response.
+
+The first frame is always `hello`. Nothing else is sent until the client
+subscribes.
+
+#### Keys, nonces and AAD (encrypted devices only)
+
+Let `material` be the device's transport key bytes, `nonce` the upgrade
+envelope's `nonce` field **as the base64url string it was sent as**,
+`connection_id` the id from the first frame, and `request_aad` the upgrade's
+AAD (`GET /api/ws`). HKDF-SHA256 with salt `muqun-transport-v1` and a 32-byte
+output:
+
+| Direction | HKDF info |
+|---|---|
+| server → client | `muqun-transport-v1/ws/{connection_id}/{nonce}` |
+| client → server | `muqun-transport-v1/ws-client/{connection_id}/{nonce}` |
+
+Each direction counts its own `seq` from 0, one per frame. A frame is
+AES-256-GCM under its direction's key with
+
+- nonce: 12 bytes, four zero bytes then `seq` as a big-endian u64 (the SSE
+  record's nonce layout);
+- AAD: `{request_aad}\n{connection_id}\n{seq}` (UTF-8; `\n` is a line feed;
+  `seq` in decimal);
+- ciphertext: the frame's plaintext JSON, tag appended, base64url without
+  padding.
+
+On the wire a sealed frame is a text message:
+
+```
+{"seq":0,"cid":"<connection_id>","c":"<base64url ciphertext>"}   first server frame only
+{"seq":1,"c":"<base64url ciphertext>"}                           every other frame, both directions
+```
+
+The first server frame carries `cid` in the clear, because the client needs it
+to derive the key that opens that very frame; it is authenticated all the
+same, through the key and the AAD. The client checks that each server `seq`
+is the next one and that the opened `hello` names the same `connection_id`.
+The gateway requires each client `seq` to be the next one — a gap, repeat or
+reorder is `out_of_order` and a close — and a client frame that fails to open
+is `invalid_frame`. A server frame that cannot be sealed is dropped, never
+sent in the clear.
+
+The client direction has its own per-connection key rather than the device's
+static request key, because frame nonces are counters that restart at 0 on
+every connection: under one shared key, two connections would reuse a
+(key, nonce) pair, which in GCM discloses plaintext and the authentication
+key.
+
+**Worked example.** Both values were produced by the gateway and by an
+independent implementation (Node `crypto`); the gateway test
+`websocket_frame_fixture_matches_the_documented_vector` pins them.
+
+| Input / output | Value |
+|---|---|
+| `material` | the 32 bytes `01 02 03 … 1f 20` |
+| `connection_id` | `conn-fixture` |
+| `nonce` | `req-nonce-fixture` |
+| `request_aad` | `GET /api/ws` |
+| server key (hex) | `b2154a41fe5ff8e4d2d48e2452f5ae1ac7db5dde927a6a836cff95affd0617c4` |
+| server frame `seq` | `3` |
+| its AAD | `GET /api/ws` LF `conn-fixture` LF `3` |
+| its plaintext | `{"t":"pong"}` |
+| its `c` | `OEEP-5TQCD9LdcHsM3giEcyEyokt8XYFIAIRqw` |
+| client key (hex) | `9bce31da785ad2c07b7a1778afc4c1e1ae044ffd3628e917830c069a07065f1d` |
+| client frame `seq` | `0` |
+| its AAD | `GET /api/ws` LF `conn-fixture` LF `0` |
+| its plaintext | `{"t":"ping"}` |
+| its `c` | `V6OgtEmv9QE7CX2BmkcpLomsJYuJgW0aMASrVA` |
+
+#### Frames
+
+Every frame is one JSON text message (the plaintext, when sealed). Binary
+messages are refused with `invalid_frame`.
+
+Server → client:
+
+| Frame | Meaning |
+|---|---|
+| `{"t":"hello","connection_id":"<uuid>","protocol":1}` | First frame, always. |
+| `{"t":"subscribed","asid":"ses_1"}` · `{"t":"subscribed","all":true}` | The subscription is in effect: every event published from here on reaches this socket. Start catch-up after this, not before. |
+| `{"t":"event","asid":"ses_1","seq":12,"event":"agent.timeline.upsert","data":{…}}` | One domain event. `event` is the SSE `event:` name and `data` is the SSE `data:` payload **byte for byte**, embedded as JSON rather than as a string. `asid` and `seq` repeat the event's own (`asid` is `""` and `seq` 0 for `agent.worktree.changed` and `agent.resync`). |
+| `{"t":"resync","asid":"ses_1"}` | This socket fell behind the gateway's event backlog; refetch that session. `asid` `""` means every session. One per subscribed session, or a single `""` under `subscribe_all`. |
+| `{"t":"pong"}` | Answer to `ping`. |
+| `{"t":"error","code":"…"}` | Sent immediately before the gateway closes the socket (close code 1008). |
+
+Client → server:
+
+| Frame | Meaning |
+|---|---|
+| `{"t":"subscribe","asid":"ses_1"}` | Add a session. The id is not looked up, so subscribing to a session that does not exist yet is allowed, and a subscription survives the agent restarting. Idempotent. |
+| `{"t":"unsubscribe","asid":"ses_1"}` | Drop a session. No acknowledgement. |
+| `{"t":"subscribe_all"}` | Every session, for the life of the connection. `unsubscribe` does not narrow it; reconnect to narrow. |
+| `{"t":"ping"}` | Application-level liveness; answered with `pong`. |
+
+Unknown extra fields are ignored. An unknown `t` is `unknown_type` and a
+close. `asid` must be 1–128 bytes with no control characters (else
+`invalid_asid`).
+
+Events with an empty `asid` (`agent.worktree.changed`, a global
+`agent.resync`) reach every socket that has at least one subscription, as they
+reach every SSE stream.
+
+`error` codes: `invalid_frame`, `out_of_order`, `unknown_type`, `invalid_asid`,
+`too_many_subscriptions`, `frame_too_large`, `superseded`.
+
+#### Lifetime and limits
+
+| Bound | Value |
+|---|---|
+| Inbound message size | 16 KiB, else `frame_too_large` and a close |
+| Individually subscribed sessions per socket | 256, else `too_many_subscriptions` and a close |
+| Sockets per device | 4. The newest wins: the device's oldest socket gets `superseded` and is closed. |
+| Sockets per gateway | 64. Past it the upgrade is `429 too_many_connections`. |
+| Server heartbeat | A WebSocket ping every 25 s; two unanswered pings drop the socket. Any client frame counts as an answer. |
+| Revocation | Checked every 5 s; a revoked device's socket is closed without an `error` frame, as its SSE stream is. |
+
+**Catch-up is unchanged.** The socket delivers live events only. After a
+(re)connect, re-subscribe, wait for `subscribed`, then catch up each session
+exactly as with SSE: `GET …/timeline?after=<last seq>`, and on `410
+resync_required` refetch the snapshot. A `resync` frame asks for the same.
+
 ---
 
 ## Domain events
@@ -1402,6 +1564,7 @@ be refetched, and a client that has fallen behind gets `resync_required`.
 | Event log per session | 2000 events or 4 MiB |
 | Sessions in memory | 200, and anything untouched for 6 h |
 | SSE reassembly buffer | 8 MiB per frame |
+| Event WebSocket | see "WebSocket events" |
 
 Sessions are also evicted on `session.deleted`.
 

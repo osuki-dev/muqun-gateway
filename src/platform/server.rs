@@ -83,6 +83,7 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         activity: Arc::new(Mutex::new(HashMap::new())),
         session_liveness: Arc::new(Mutex::new(SessionLivenessCache::default())),
         agent_runtime,
+        ws_connections: Arc::new(agents::ws_routes::WsRegistry::default()),
     };
     spawn_agent_notification_watchers(state.clone());
     spawn_agent_engine_watchers(state.clone());
@@ -276,9 +277,24 @@ pub(crate) async fn encrypted_transport(
         return next.run(request).await;
     }
 
+    let websocket = is_websocket_upgrade(request.headers());
     match decrypt_transport_request(&state, request).await {
         Ok((request, material, aad, request_nonce)) => {
             let response = next.run(request).await;
+            // A WebSocket upgrade has no body to seal: the 101 hands the
+            // connection to the socket handler, which seals every frame under
+            // the stream context injected above (see `agents::ws_routes`).
+            // Sealing it here would buffer an empty body and replace the 101
+            // with a 200 the client cannot upgrade on. A refusal (401, 403,
+            // 429) is an ordinary response and is sealed like any other.
+            if websocket && response.status() == StatusCode::SWITCHING_PROTOCOLS {
+                let mut response = response;
+                response.headers_mut().insert(
+                    axum::http::HeaderName::from_static(TRANSPORT_HEADER),
+                    HeaderValue::from_static("1"),
+                );
+                return response;
+            }
             // An event stream never ends, so it cannot ride the one-envelope
             // response path -- buffering it here would simply hang the
             // connection. The events handler has already sealed every event
@@ -707,7 +723,15 @@ pub(crate) async fn envelope_compression_gate(mut request: Request<Body>, next: 
         .extensions()
         .get::<EncryptedStreamContext>()
         .is_some();
-    if sealed {
+    if is_websocket_upgrade(request.headers()) {
+        // A 101 carries no body, and the connection it hands over is not HTTP
+        // any more: a `content-encoding` on it would be a lie about bytes the
+        // compressor never sees. Taking the client's list away makes the
+        // layer answer identity whatever it would otherwise have decided.
+        request
+            .headers_mut()
+            .remove(axum::http::header::ACCEPT_ENCODING);
+    } else if sealed {
         // Inside the envelope the client cannot use `content-encoding` -- it
         // is reading a base64 body, and the real headers are sealed with it --
         // so it says separately what it can inflate. Only gzip, and only when
@@ -762,6 +786,14 @@ pub(crate) async fn envelope_compression_gate(mut request: Request<Body>, next: 
         }
     }
     response
+}
+
+/// Whether a request asks to become a WebSocket (`Upgrade: websocket`).
+pub(crate) fn is_websocket_upgrade(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::UPGRADE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("websocket"))
 }
 
 pub(crate) async fn security_headers(request: Request<Body>, next: Next) -> Response {

@@ -28,7 +28,7 @@ use crate::{
 /// One session's answer and when it was taken.
 type CachedMetadata = (std::time::Instant, (Value, Value));
 
-pub(crate) const GATEWAY_API_VERSION: &str = "1.8.0";
+pub(crate) const GATEWAY_API_VERSION: &str = "1.9.0";
 pub(crate) const GATEWAY_API_MAJOR: u64 = 1;
 
 /// What this gateway *build* can do, independent of which terminal it is
@@ -81,6 +81,10 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "multiple_terminal_backends",
     "terminal_session_liveness",
     "terminal_input",
+    // `GET /api/ws`: one WebSocket per device carrying the agent events of
+    // any number of sessions. Also announced as `transports.websocket` in
+    // `/api/discovery`. The per-session SSE stream stays the fallback.
+    "ws_events",
 ];
 
 /// Handing a task to an agent the app did not start, and following it home.

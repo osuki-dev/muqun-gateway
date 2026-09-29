@@ -281,7 +281,8 @@ mod tests {
         // A minor bump: the routes are additive, so an older client keeps
         // working, and a newer one can gate on the capability rather than on
         // probing for a 404.
-        assert!(GATEWAY_API_VERSION.starts_with("1.8."));
+        assert!(GATEWAY_API_VERSION.starts_with("1.9."));
+        assert!(API_CAPABILITIES.contains(&"ws_events"));
         assert_eq!(GATEWAY_API_MAJOR, 1);
         assert!(API_CAPABILITIES.contains(&"tasks"));
         assert!(API_CAPABILITIES.contains(&"agent_catalog"));

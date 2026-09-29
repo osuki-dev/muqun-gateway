@@ -74,6 +74,9 @@ pub(crate) struct AppState {
     /// started, and re-attached whenever it moves. Routes ask it for the
     /// current manager rather than holding one.
     pub(crate) agent_runtime: Arc<agents::AgentRuntime>,
+    /// The open `GET /api/ws` event sockets, for the per-device and total
+    /// caps. See `agents::ws_routes`.
+    pub(crate) ws_connections: Arc<agents::ws_routes::WsRegistry>,
 }
 
 fn main() -> anyhow::Result<()> {

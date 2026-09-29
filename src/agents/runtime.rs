@@ -366,6 +366,12 @@ impl AgentRuntime {
         self.events_tx.subscribe()
     }
 
+    /// Put an event on the runtime's channel, as an attached agent would.
+    #[cfg(test)]
+    pub(crate) fn publish_for_test(&self, event: AgentDomainEvent) {
+        let _ = self.events_tx.send(event);
+    }
+
     pub async fn status(&self) -> EngineStatus {
         let manager = self.manager.read().await.clone();
         EngineStatus {

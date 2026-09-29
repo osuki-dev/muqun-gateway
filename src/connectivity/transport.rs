@@ -77,6 +77,53 @@ pub fn derive_stream_key(
     Ok(key)
 }
 
+/// Server-to-client key for one encrypted WebSocket connection (`GET /api/ws`).
+///
+/// A sibling of [`derive_stream_key`] rather than a mode of it: the info
+/// string names the transport, so an SSE record can never be replayed into a
+/// socket (or the reverse) under the same connection id and request nonce.
+/// The connection id is minted by the gateway per upgrade; the request nonce
+/// is the upgrade request envelope's, which binds the socket to the one
+/// authenticated request that opened it.
+pub fn derive_ws_server_key(
+    material: &[u8],
+    connection_id: &str,
+    request_nonce: &str,
+) -> anyhow::Result<[u8; 32]> {
+    derive_info_key(
+        material,
+        &format!("muqun-transport-v1/ws/{connection_id}/{request_nonce}"),
+    )
+}
+
+/// Client-to-server key for one encrypted WebSocket connection.
+///
+/// Per connection, not the device's static `Direction::Request` key: client
+/// frames use their sequence number as the AES-GCM nonce, and every connection
+/// counts from zero, so a key shared across connections would repeat
+/// (key, nonce) pairs -- which in GCM leaks the XOR of the plaintexts and the
+/// authentication key. Binding the connection id and request nonce into the
+/// info makes every connection's client key unique, exactly as the server
+/// direction's is.
+pub fn derive_ws_client_key(
+    material: &[u8],
+    connection_id: &str,
+    request_nonce: &str,
+) -> anyhow::Result<[u8; 32]> {
+    derive_info_key(
+        material,
+        &format!("muqun-transport-v1/ws-client/{connection_id}/{request_nonce}"),
+    )
+}
+
+fn derive_info_key(material: &[u8], info: &str) -> anyhow::Result<[u8; 32]> {
+    let hkdf = Hkdf::<Sha256>::new(Some(b"muqun-transport-v1"), material);
+    let mut key = [0_u8; 32];
+    hkdf.expand(info.as_bytes(), &mut key)
+        .map_err(|_| anyhow!("failed to derive stream key"))?;
+    Ok(key)
+}
+
 /// The nonce for one stream event: the sequence number, big-endian, in the low
 /// bytes. Unique under the per-stream key by construction, which is what lets
 /// the stream skip per-event random nonces and their collision arithmetic.
@@ -109,9 +156,8 @@ pub fn seal_stream_event(
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(ciphertext))
 }
 
-/// The inverse of `seal_stream_event`, used by tests to prove the wire format
-/// a client has to implement.
-#[cfg(test)]
+/// The inverse of `seal_stream_event`: what a client does to every record, and
+/// what the gateway does to every client frame on an encrypted WebSocket.
 pub fn open_stream_event(
     key: &[u8; 32],
     seq: u64,
@@ -251,6 +297,46 @@ mod tests {
             open_stream_event(&key, 7, aad, &sealed).unwrap(),
             b"{\"event\":\"herdr\",\"data\":\"hello\"}"
         );
+    }
+
+    /// The `GET /api/ws` worked example in `docs/agent-api.md`, both
+    /// directions. Checked against an independent Node `crypto` implementation
+    /// when it was written; the App's socket codec should replay it verbatim.
+    #[test]
+    fn websocket_frame_fixture_matches_the_documented_vector() {
+        let material: Vec<u8> = (1..=32).collect();
+        let hex = |key: &[u8; 32]| key.iter().map(|b| format!("{b:02x}")).collect::<String>();
+
+        let server = derive_ws_server_key(&material, "conn-fixture", "req-nonce-fixture").unwrap();
+        assert_eq!(
+            hex(&server),
+            "b2154a41fe5ff8e4d2d48e2452f5ae1ac7db5dde927a6a836cff95affd0617c4"
+        );
+        let aad = b"GET /api/ws\nconn-fixture\n3";
+        let sealed = seal_stream_event(&server, 3, aad, br#"{"t":"pong"}"#).unwrap();
+        assert_eq!(sealed, "OEEP-5TQCD9LdcHsM3giEcyEyokt8XYFIAIRqw");
+        assert_eq!(
+            open_stream_event(&server, 3, aad, &sealed).unwrap(),
+            br#"{"t":"pong"}"#
+        );
+
+        let client = derive_ws_client_key(&material, "conn-fixture", "req-nonce-fixture").unwrap();
+        assert_eq!(
+            hex(&client),
+            "9bce31da785ad2c07b7a1778afc4c1e1ae044ffd3628e917830c069a07065f1d"
+        );
+        let aad = b"GET /api/ws\nconn-fixture\n0";
+        let sealed = seal_stream_event(&client, 0, aad, br#"{"t":"ping"}"#).unwrap();
+        assert_eq!(sealed, "V6OgtEmv9QE7CX2BmkcpLomsJYuJgW0aMASrVA");
+
+        // The two directions, and the SSE stream of the same ids, are three
+        // different keys: nothing sealed for one opens as another.
+        assert_ne!(server, client);
+        assert_ne!(
+            server,
+            derive_stream_key(&material, "conn-fixture", "req-nonce-fixture").unwrap()
+        );
+        assert!(open_stream_event(&server, 0, aad, &sealed).is_err());
     }
 
     #[test]

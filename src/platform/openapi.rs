@@ -580,6 +580,16 @@ pub fn openapi_spec() -> Value {
                     }
                 }
             },
+            "/api/ws": {
+                "get": {
+                    "summary": "Agent events for many sessions over one WebSocket",
+                    "description": "Upgrade to a WebSocket that carries the same agent events as the per-session SSE stream, for the sessions the client subscribes to (or all). Authenticated like the SSE stream; frames are sealed per connection on an encrypted device. See docs/agent-api.md, \"WebSocket events\". Announced as ws_events.",
+                    "responses": {
+                        "101": { "description": "Switched to the WebSocket protocol" },
+                        "429": { "description": "too_many_connections: the gateway-wide socket cap is reached" }
+                    }
+                }
+            },
             "/api/agent-sessions/{asid}/interrupt": {
                 "post": {
                     "summary": "Interrupt active agent turn",

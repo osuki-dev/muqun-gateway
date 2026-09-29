@@ -343,7 +343,21 @@ pub async fn build_discovery(state: &AppState, _sealed: bool, authenticated: boo
         "serverId": state.config.server_id,
         "label": state.config.label,
         "planes": planes,
+        // Not redacted for anyone: a path and a protocol number say nothing
+        // an unauthenticated caller could not learn by trying the upgrade.
+        "transports": transports_discovery(),
         "capabilities": legacy_capabilities,
+    })
+}
+
+/// The App-facing transports beyond plain HTTP, keyed by name. An App that
+/// does not know a key ignores it and keeps using HTTP and SSE.
+pub fn transports_discovery() -> Value {
+    json!({
+        "websocket": {
+            "path": crate::agents::ws_routes::WS_PATH,
+            "protocol": crate::agents::ws_routes::WS_PROTOCOL,
+        }
     })
 }
 
@@ -536,6 +550,23 @@ mod tests {
         assert_eq!(val["ssh"]["supported"], true);
         assert_eq!(val["ssh"]["tunnelSupported"], true);
         assert_eq!(val["ssh"]["pushTokenSupported"], true);
+    }
+
+    #[tokio::test]
+    async fn discovery_announces_the_websocket_transport_to_everyone() {
+        let state = crate::test_state("admin", Vec::new());
+        for authenticated in [true, false] {
+            let body = build_discovery(&state, false, authenticated).await;
+            assert_eq!(
+                body["transports"]["websocket"],
+                json!({ "path": "/api/ws", "protocol": 1 })
+            );
+            assert!(body["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c == "ws_events"));
+        }
     }
 
     #[tokio::test]

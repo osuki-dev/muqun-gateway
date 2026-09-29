@@ -13,7 +13,7 @@ categories = ["command-line-utilities"]
 anyhow = "1.0.103"
 aes-gcm = "0.11.1"
 async-stream = "0.3.6"
-axum = { version = "0.8.9", features = ["multipart", "http2"] }
+axum = { version = "0.8.9", features = ["multipart", "http2", "ws"] }
 # Response compression. Already in the tree through reqwest; named here
 # so the compression features are actually on.
 tower-http = { version = "0.7.1", features = ["compression-gzip", "compression-br"] }

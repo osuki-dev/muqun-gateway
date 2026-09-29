@@ -11,6 +11,7 @@ pub mod runtime;
 pub mod session_routes;
 pub mod tasks;
 pub mod use_cases;
+pub mod ws_routes;
 
 pub use domain::*;
 pub use runtime::{AgentRuntime, DeepseekConfig, OpencodeConfig};
