@@ -1,7 +1,8 @@
 # Agent API
 
 The gateway's agent surface: what the mobile app calls, what comes back, and
-what arrives on the event stream. The engine behind it is OpenCode v2.0.1.
+what arrives on the event stream. The agents behind it are OpenCode v2.0.1 and DeepSeek; where this document
+describes OpenCode's behaviour, it is OpenCode's.
 
 Every field name here is the one the code serializes — snake_case, as the
 domain types spell it — with two deliberate exceptions, both marked below:
@@ -18,8 +19,8 @@ verbatim, so their keys stay camelCase.
   `{"schema_version": "...", "capabilities": {...}, "data": <payload>}`. The
   payload column below describes `data`.
 - **Errors.** `{"error": {"code": "...", "message": "..."}}`. The codes used
-  here are `agent_unavailable` (503, no engine attached),
-  `agent_engine_error` (502, OpenCode refused), `session_not_found` (404),
+  here are `agent_unavailable` (503, no agent attached),
+  `agent_error` (502, OpenCode refused), `session_not_found` (404),
   `saved_permission_not_found` (404), `workspace_missing` (404),
   `resync_required` (410), and the `invalid_*` family (400).
 - **A folder that is gone.** Every route that names a workspace directory —
@@ -35,7 +36,7 @@ verbatim, so their keys stay camelCase.
                "directory": "/tmp/muqun-c10/repo" } }
   ```
 
-  This used to be a `502 agent_engine_error` whose message was empty: OpenCode
+  This used to be a `502 agent_error` whose message was empty: OpenCode
   answers a deleted directory with a bare HTTP 500 and no body, and the gateway
   relayed it verbatim. It told the user their agent had broken when their
   folder had simply been deleted. A 502 is now never blank either — an upstream
@@ -81,37 +82,37 @@ verbatim, so their keys stay camelCase.
 
 ---
 
-## Harnesses
+## Agents
 
-The gateway can have more than one agent engine (a *harness*) attached at once.
-Today the ids are `opencode` and `deepseek`. OpenCode is preferred: the
-**primary** harness is `opencode` when it is attached, otherwise `deepseek`.
-Everything below is additive; an App that knows nothing of it keeps talking to
-the primary harness.
+The gateway can have more than one agent attached at once. Today the ids are
+`opencode` and `deepseek`. OpenCode is preferred: when a request names no
+agent, the **primary** answers — `opencode` when it is attached, otherwise
+`deepseek`. The primary is only that internal preference order; the contract
+names no "active" agent. Inside an agent, a persona such as OpenCode's `build`
+or `plan` is a **mode**.
 
 ### Feature gate
 
-`/health` and `/api/capabilities` list **`agent_harnesses`** in their flat
-`capabilities` array. An App should offer a harness picker only when it is
-present; a gateway without it has one engine and ignores every `harness`
+`/health` and `/api/capabilities` list **`multi_agent`** in their flat
+`capabilities` array. An App should offer an agent picker only when it is
+present; a gateway without it has one agent and ignores every `agent_id`
 parameter below.
 
 ### Discovery payload
 
-Harness discovery is on `GET /api/discovery` and `GET /api/capabilities`
-(identical body), at `planes.harness`; `planes.agents` and `planes.agent` are
-byte-identical aliases of it. **This payload is camelCase**, unlike the rest of
-this document, and is *not* wrapped in the envelope: the top level is
-`{"ok", "gatewayVersion", "apiVersion", "apiMajor", "platform", "serverId",
-"label", "planes", "transports", "capabilities"}`; `transports` is described
-under "WebSocket events" below. An unauthenticated caller gets the same
-body with `endpoint` and `version` removed from every harness.
+Agent discovery is on `GET /api/discovery` and `GET /api/capabilities`
+(identical body), at `planes.agents`, which is the only key for this plane.
+**This payload is camelCase**, unlike the rest of this document, and is *not*
+wrapped in the envelope: the top level is `{"ok", "gatewayVersion",
+"apiVersion", "apiMajor", "platform", "serverId", "label", "planes",
+"transports", "capabilities"}`; `transports` is described under "WebSocket
+events" below. An unauthenticated caller gets the same body with `endpoint`
+and `version` removed from every agent.
 
 ```json
 {
   "supported": true,
-  "activeHarness": "opencode",
-  "harnesses": [
+  "agents": [
     {
       "id": "opencode",
       "name": "OpenCode",
@@ -124,28 +125,27 @@ body with `endpoint` and `version` removed from every harness.
         { "id": "union-alpha", "name": "Union Alpha", "providerId": "opencode",
           "supportsReasoning": true, "reasoningEffortTiers": ["low", "high"] }
       ],
-      "agents": [ { "id": "build", "name": "build", "description": "…" } ],
+      "modes": [ { "id": "build", "name": "build", "description": "…" } ],
       "features": {
         "streaming": true, "reasoningEffort": true, "modelSelection": true,
         "toolApprovals": true, "worktrees": true, "revert": true, "inbox": true
       }
     }
   ],
-  "features": { "multiHarness": true, "catalogAggregation": true, "sessionRouting": true }
+  "features": { "multiAgent": true, "catalogAggregation": true, "sessionRouting": true }
 }
 ```
 
-- `activeHarness` is the primary harness id; omitted when none is attached.
-- `harnesses[]` has one entry per known harness, attached or not. `id` is the
-  value to send as `harness` everywhere below; `kind` is the engine kind and
-  equals the `harness` on that harness's sessions.
+- `agents[]` has one entry per known agent, attached or not. `id` is the value
+  to send as `agent_id` everywhere below; `kind` equals `id` today, and equals
+  the `agent_id` on that agent's sessions.
 - `status` values are snake_case: `connected` (attached and answering),
   `reachable` (an endpoint answers but it is not attached), `offline`,
   `disabled`, `not_installed`, `unconfigured`. Only `connected` can be selected.
 - `endpoint` and `version` are omitted when unknown or redacted. `models[]` and
-  `agents[]` are that harness's own catalog summary; `reasoningEffortTiers` is
-  omitted when empty; `agents[].description` when unset.
-- `features` (per harness) says what the engine can do, so the App can hide
+  `modes[]` are that agent's own catalog summary; `reasoningEffortTiers` is
+  omitted when empty; `modes[].description` when unset.
+- `features` (per agent) says what the agent can do, so the App can hide
   controls rather than call and get `501 feature_unsupported`. The keys are
   camelCase (there is no snake_case spelling of them in this payload; the
   `reasoning_effort` field on prompt bodies and catalog variants is a different
@@ -155,57 +155,56 @@ body with `endpoint` and `version` removed from every harness.
 |---|---|
 | `streaming` | Live text and tool deltas arrive on the session stream. |
 | `reasoningEffort` | At least one model offers reasoning-effort variants (`reasoning_effort` on the prompt body and on catalog `variants[]`). |
-| `modelSelection` | The harness lists models a session can be pointed at. |
-| `toolApprovals` | The harness raises permission requests the App answers. |
-| `worktrees` | The `/api/agent-worktrees` routes work against this harness. |
+| `modelSelection` | The agent lists models a session can be pointed at. |
+| `toolApprovals` | The agent raises permission requests the App answers. |
+| `worktrees` | The `/api/agent-worktrees` routes work against this agent. |
 | `revert` | Stage, commit and clear revert work. |
 | `inbox` | Queued and steered prompts (`/inbox`, `delivery`) work. |
 
-  Flags reflect the harness's last probe (cached for about ten seconds).
+  Flags reflect the agent's last probe (cached for about ten seconds).
   Unknown extra flags may appear; ignore them.
-- `features` (plane level): `multiHarness` (more than one harness may be
+- `features` (plane level): `multiAgent` (more than one agent may be
   attached), `catalogAggregation` (the unfiltered catalog is merged across
-  attached harnesses), `sessionRouting` (per-session routes resolve to the
-  owning harness by themselves).
+  attached agents), `sessionRouting` (per-session routes resolve to the
+  owning agent by themselves).
 
-### `harness` on every session
+### `agent_id` on every session
 
-Every `AgentSessionInfo` carries `harness`: the id of the engine that owns the
+Every `AgentSessionInfo` carries `agent_id`: the id of the agent that owns the
 session. It is on list, get (`data.info`), create, the `move` reply, and on
 every `agent.session.updated` event. Per-session routes
-(`/api/agent-sessions/{asid}/…`) need no `harness`: the gateway remembers which
-harness owns each session it has listed or created, and asks the attached
-harnesses about one it has not seen.
+(`/api/agent-sessions/{asid}/…`) need no `agent_id`: the gateway remembers
+which agent owns each session it has listed or created, and asks the attached
+agents about one it has not seen.
 
-### Selecting a harness
+### Selecting an agent
 
 | Where | How |
 |---|---|
-| `POST /api/agent-sessions` | `harness` in the JSON body. Absent, the primary. A model's `provider_id` never selects the engine. |
-| `GET /api/agent-sessions` (and `/children`) | `?harness=<id>` lists that harness only. Absent, **every attached harness is merged**, newest `updated_ms` first. A harness whose engine errors is left out of the merged list (and logged) rather than failing it; if every harness fails, or the one you named does, the answer is `502 agent_engine_error`. |
-| `GET /api/agent-catalog` | `?harness=<id>` returns that harness's catalog. Absent, the merged catalog of all attached harnesses, as before. |
-| `GET /api/agent-projects` | `?harness=<id>`. Absent, the primary. |
-| `GET /api/agent-engine` | `?harness=<id>`. Absent, the primary. |
+| `POST /api/agent-sessions` | `agent_id` in the JSON body. Absent, the primary. A model's `provider_id` never selects the agent. |
+| `GET /api/agent-sessions` (and `/children`) | `?agent_id=<id>` lists that agent only. Absent, **every attached agent is merged**, newest `updated_ms` first. An agent that errors is left out of the merged list (and logged) rather than failing it; if every agent fails, or the one you named does, the answer is `502 agent_error`. |
+| `GET /api/agent-catalog` | `?agent_id=<id>` returns that agent's catalog. Absent, the merged catalog of all attached agents. |
+| `GET /api/agent-projects` | `?agent_id=<id>`. Absent, the primary. |
+| `GET /api/agent-status` | `?agent_id=<id>`. Absent, the primary. |
 
-`GET /api/agent-directories` reads the local filesystem, not an engine, and
-takes no `harness`.
+`GET /api/agent-directories` reads the local filesystem, not an agent, and
+takes no `agent_id`.
 
-Errors, for every route above that takes `harness`:
+Errors, for every route above that takes `agent_id`:
 
 | Status | `error.code` | When |
 |---|---|---|
-| `400` | `invalid_harness` | The id is not one this gateway knows (`opencode`, `deepseek`). |
-| `503` | `agent_unavailable` | The id is known but not attached; the message names it (`Agent harness 'deepseek' is not available`). |
+| `400` | `invalid_agent` | The id is not one this gateway knows (`opencode`, `deepseek`). |
+| `503` | `agent_unavailable` | The id is known but not attached; the message names it (`Agent 'deepseek' is not available`). |
 
 ### Compatibility
 
-An App that predates `agent_harnesses` never sends `harness`, so it gets the
-primary harness for create, projects and engine status, and sees `harness` as
-one extra string on session objects. Its unfiltered session list and catalog
-already span every attached harness (the `asid`s work on every per-session
-route). To show only the primary, or one harness at a time, an updated App
-sends `?harness=`, and only when `agent_harnesses` is advertised: an older
-gateway ignores the parameter.
+There are no aliases. An App that never sends `agent_id` gets the primary for
+create, projects and status, and sees `agent_id` as one extra string on
+session objects. Its unfiltered session list and catalog already span every
+attached agent (the `asid`s work on every per-session route). To show one agent
+at a time, an App sends `?agent_id=`, and only when `multi_agent` is
+advertised: an older gateway ignores the parameter.
 
 ---
 
@@ -219,7 +218,7 @@ gateway ignores the parameter.
 | `parent_id` | List the children of one session. |
 | `roots` | `true` lists top-level sessions only — no subagent sessions. |
 | `limit`, `order`, `search`, `cursor` | Passed through to OpenCode. `order` is `asc` or `desc`. `limit` defaults to **50**. |
-| `harness` | Only that harness's sessions; absent merges every attached harness. See [Harnesses](#harnesses). |
+| `agent_id` | Only that agent's sessions; absent merges every attached agent. See [Agents](#agents). |
 
 Returns `[AgentSessionInfo]`.
 
@@ -229,10 +228,11 @@ A subagent run creates a real session whose `parent_id` is the caller's. Without
 ### `POST /api/agent-sessions`
 
 ```json
-{ "directory": "/abs/path", "model": {"provider_id": "…", "model_id": "…", "variant": "…"}, "agent": "build", "harness": "opencode" }
+{ "directory": "/abs/path", "model": {"provider_id": "…", "model_id": "…", "variant": "…"}, "mode": "build", "agent_id": "opencode" }
 ```
 
-All four are optional; `harness` picks the engine (see [Harnesses](#harnesses)). **Omitting `model` is the correct way to get the user's
+All four are optional; `agent_id` picks the agent (see [Agents](#agents)) and
+`mode` the session's mode. **Omitting `model` is the correct way to get the user's
 configured default** — the gateway no longer substitutes one. `directory` must
 be absolute and must exist. Returns `AgentSessionInfo`.
 
@@ -296,7 +296,7 @@ Marks the session read. Unread is `info.time_idle > info.time_viewed`.
 `delivery` is `steer` (run at the next step boundary) or `queue` (wait behind
 what is already queued). Returns `{"submitted": true}`.
 
-There is no model or agent field: **model and agent are session state in v2**.
+There is no model or mode field: **model and mode are session state in v2**.
 Switch first, then prompt.
 
 An attachment the app uploaded is an absolute path into the gateway's upload
@@ -317,10 +317,11 @@ Accepts either shape:
 
 Returns `{"switched": true}`. `variant` is optional and omitted, never null.
 
-### `POST /api/agent-sessions/{asid}/agent`
+### `POST /api/agent-sessions/{asid}/mode`
 
-`{"agent": "build"}` (a bare `"build"` also works) → `{"ok": true}`. Agent ids
-are lowercase; a display name such as `"Build"` is rejected by OpenCode.
+`{"mode": "build"}` (a bare `"build"` also works) → `{"ok": true}`. Switches the
+session's mode (persona). Mode ids are lowercase; a display name such as
+`"Build"` is rejected by OpenCode.
 
 ### `POST /api/agent-sessions/{asid}/interrupt` · `/abort`
 
@@ -346,7 +347,7 @@ OpenCode decides whether the agent loop picks up where the skill left it, which
 is what the slash menu wants; `false` appends the skill and leaves the session
 idle. Returns `{"status": "ok"}` — OpenCode answers `204`, and what the user
 sees is the timeline row below, not this reply. An unknown id is `404` from
-OpenCode and comes back as `agent_engine_error`.
+OpenCode and comes back as `agent_error`.
 
 The activation is a `skill` message. It reaches the timeline live, from
 `session.skill.activated`, as an `AgentPart::Skill` row under
@@ -396,7 +397,7 @@ The app stages, shows the user what would go, and commits or clears.
   confirmation draws. Leave it out and OpenCode decides; `files` then comes back
   `null` or empty. Staging again with another `message_id` moves the boundary.
   An unknown message is `404` from OpenCode, and staging while the session is
-  running is `409` — both arrive as `agent_engine_error`.
+  running is `409` — both arrive as `agent_error`.
 
 - `POST …/revert/commit` → `{"committed": true}`. Applies what is staged.
   OpenCode answers `204`. With nothing staged this is a no-op, not an error.
@@ -456,7 +457,7 @@ two that matter:
 - **`name`** is the worktree directory's name.
 - **`branch`** is an **existing ref to branch from**, not a name to create.
   `{"branch": "probe-branch"}` against a repo without that ref is
-  `fatal: invalid reference: probe-branch`, as a `502 agent_engine_error`.
+  `fatal: invalid reference: probe-branch`, as a `502 agent_error`.
 
 `from` and `strategy` are passed through as `Worktree.CreateInput` defines
 them; `from` is a directory rather than a ref (`{"from": "main"}` answers
@@ -501,7 +502,7 @@ requires only `directory`; the live service accepts *any* directory that
 exists, including one belonging to another project, and the session then joins
 that directory's project — `project_id` changes with it. A directory that does
 not exist is `400 Directory does not exist: …`, surfaced as
-`agent_engine_error`, and that is the whole of the rule. The gateway does not
+`agent_error`, and that is the whole of the rule. The gateway does not
 add one of its own: refusing a move OpenCode allows would be the gateway
 inventing policy it was not given. A client that wants to keep a session inside
 one project should offer only that project's
@@ -587,7 +588,7 @@ That `PUT` replaces the ruleset, which is why what is already on the session is
 read first and preserved in order — OpenCode evaluates session rules last and
 lets the last match win, so this is an addition, not a replacement of anything
 the owner set up. The grant names that one directory and nothing wider; every
-other path still asks. It is done once per session per attached engine, logged
+other path still asks. It is done once per session per attached agent, logged
 at `debug`, and a failure is not fatal: without the rule the agent simply asks
 again, which is the behaviour this replaces.
 
@@ -656,7 +657,7 @@ session's project:
 The list is a project's, not a session's — the session names the project, and
 the gateway reads `projectID` off it on every call rather than trusting a cached
 one. A session whose project OpenCode does not report is `502
-agent_engine_error`, not an unscoped list of everything.
+agent_error`, not an unscoped list of everything.
 
 ### `DELETE /api/agent-sessions/{asid}/permissions/saved/{id}`
 
@@ -719,18 +720,18 @@ A directory that no longer exists is not this case: that is
 
 ### `GET /api/agent-catalog`
 
-`?directory=` · `?harness=` (one harness's catalog; absent merges all attached) · ETag + `304`. `data`:
+`?directory=` · `?agent_id=` (one agent's catalog; absent merges all attached) · ETag + `304`. `data`:
 
 ```json
 {
   "models":   [ { "id", "name", "provider_id", "family?", "limit?", "variants?": [{"id", "reasoning_effort?"}], "cost?", "enabled", "status?" } ],
-  "agents":   [ { "id", "name", "description?", "mode?", "color?", "hidden" } ],
+  "modes":    [ { "id", "name", "description?", "mode?", "color?", "hidden" } ],
   "mcp":      [ { "name", "status", "error?" } ],
   "skills":   [ { "id", "name", "description", "slash", "autoinvoke" } ],
   "providers":[ { "id", "name", "activation?": "auto"|"enabled"|"disabled",
                   "models": [ { "id", "name", "enabled", "variants": [...], "limit?", "status?" } ] } ],
-  "commands": [ { "name", "description?", "agent?", "template?" } ],
-  "defaults": { "model?": {"provider_id", "model_id", "variant?"}, "agent?": "build" }
+  "commands": [ { "name", "description?", "mode?", "template?" } ],
+  "defaults": { "model?": {"provider_id", "model_id", "variant?"}, "mode?": "build" }
 }
 ```
 
@@ -740,31 +741,32 @@ skills do. **A slash menu lists only `slash: true`**; the rest exist for the
 agent to reach for, and `autoinvoke: true` says it may do so unasked. Activate
 one with [`POST …/skill`](#post-apiagent-sessionsasidskill).
 
-`?directory=` scopes the catalog **up**, never down: the agents, commands and
+`?directory=` scopes the catalog **up**, never down: the modes, commands and
 skills a project defines are added to the global ones, and a directory never
-returns fewer agents than no directory. The gateway enforces that, because
+returns fewer modes than no directory. The gateway enforces that, because
 OpenCode's `GET /api/agent` is a snapshot that fills in over roughly a second
 for a directory nothing has opened yet — first empty, then the built-ins, then
-the user's own agents. A catalog request waits for the scoped list to hold
-everything the unscoped one holds — `models`, `providers`, `agents`, `skills`
+the user's own modes. A catalog request waits for the scoped list to hold
+everything the unscoped one holds — `models`, `providers`, `modes`, `skills`
 and `commands` alike (bounded, about 1.5s) — rather than handing over whichever
 stage it caught. **A client must never cache an empty catalog.** A catalog whose `models`,
-`providers` or `agents` is empty is answered `cache-control: private, no-store`
+`providers` or `modes` is empty is answered `cache-control: private, no-store`
 and **without an ETag**, so there is nothing to hold on to and the next request
 asks again. Any one of the three empty makes the catalog useless — a model
-picker with no models is as broken as an agent picker with no agents — and all
+picker with no models is as broken as a mode picker with no modes — and all
 three come back empty from a directory OpenCode has not loaded yet.
 
 `skills` and `commands` are deliberately not part of that rule: a project really
 can have none of either, and refusing to cache on that would mean never caching
 for such a project.
 
-User-defined agents come from `~/.config/opencode/agents/<name>.md` (global),
+User-defined modes come from `~/.config/opencode/agents/<name>.md` (global),
 `.opencode/agents/<name>.md` (per project, discovered from the directory up to
 the project root) and an `agent` block in `opencode.json`. They arrive with
 `mode`, `description`, `color` and `hidden: false` like any other.
 
-A picker should hide `agents[].hidden` and `mode == "subagent"` entries.
+A picker should hide `modes[].hidden` and `mode == "subagent"` entries. (OpenCode
+calls these agents; the gateway calls them modes.)
 A provider with `activation: "disabled"` and a model with `enabled: false` are
 carried through rather than filtered — grey them out and say OpenCode on the
 host needs configuring. The gateway proxies no credential, integration or OAuth
@@ -772,7 +774,7 @@ route: sign-in is done on the host.
 
 ### `GET /api/agent-projects`
 
-`?harness=` · ETag + `304`. `[{"id", "canonical", "name", "vcs?", "sandboxes": [], "missing?"}]`.
+`?agent_id=` · ETag + `304`. `[{"id", "canonical", "name", "vcs?", "sandboxes": [], "missing?"}]`.
 
 ```json
 [ { "id": "21eedff2…", "canonical": "/home/ryu/Work/muqun/app", "name": "app",
@@ -816,34 +818,34 @@ good, and `missing` is the whole of what the gateway can say about it.
 
 ---
 
-## Engine status
+## Agent status
 
-### `GET /api/agent-engine`
+### `GET /api/agent-status`
 
 ```json
 { "available": true, "origin": "adopted" | "spawned" | "none",
   "url": "http://127.0.0.1:49374", "version": "2.0.1",
   "stream_connected": true, "autostart": true,
-  "kind": "opencode", "harness": "opencode" }
+  "kind": "opencode", "agent_id": "opencode" }
 ```
 
-`?harness=<id>` describes that harness instead of the primary; `harness` and
-`kind` (both the engine kind, omitted while nothing is attached) say which one
-this is. With `?harness=` this route does **not** answer `available: false`:
-an unknown id is `400 invalid_harness` and a known one that is not attached is
-`503 agent_unavailable` naming it. A non-primary harness is always an adopted
-service (`origin: "adopted"`, `autostart: false`). See [Harnesses](#harnesses).
+`?agent_id=<id>` describes that agent instead of the primary; `agent_id` and
+`kind` (both the agent's id, omitted while nothing is attached) say which one
+this is. With `?agent_id=` this route does **not** answer `available: false`:
+an unknown id is `400 invalid_agent` and a known one that is not attached is
+`503 agent_unavailable` naming it. A non-primary agent is always an adopted
+service (`origin: "adopted"`, `autostart: false`). See [Agents](#agents).
 
-The one agent route that answers `200` when no engine is attached — it exists to
+The one agent route that answers `200` when no agent is attached — it exists to
 explain why the others are returning 503.
 
-`origin` is how the engine currently attached was obtained: `adopted` for a
+`origin` is how the agent currently attached was obtained: `adopted` for a
 service that was already running, `spawned` for one this gateway started,
 `none` when nothing is attached.
 
 ### Which OpenCode, and who starts it
 
-The gateway keeps an engine attached for its own lifetime. It adopts a healthy
+The gateway keeps an OpenCode agent attached for its own lifetime. It adopts a healthy
 service if one is registered, and otherwise starts
 `opencode serve --service` — unless `opencode.autostart` is `false` in
 `config.json`.
@@ -894,12 +896,12 @@ ERROR refusing to start /usr/local/bin/opencode: it reports version opencode 1.1
 A version that cannot be read is allowed through — silence is not evidence of
 being old — so only a legible version below 2.0 is refused.
 
-### Losing the engine
+### Losing the agent
 
 The supervisor re-discovers whenever the health probe fails or the registration
 moves. It also watches the event stream, and **a dropped stream is acted on
 within about a second** rather than at the next health poll: the stream going
-down is the engine telling us it has gone, and waiting out the poll interval
+down is the agent telling us it has gone, and waiting out the poll interval
 left the app silent for as long as it had left to run. A stream that keeps
 dropping backs off — immediately the first time, then 1s doubling to 30s — so
 flapping cannot spin the supervisor, and a full healthy interval resets it.
@@ -1139,7 +1141,7 @@ The SSE `event:` name and the payload's own `type` are the same string.
 { "type": "agent.session.updated", "asid": "ses_1", "seq": 12, "info": { …AgentSessionInfo… } }
 ```
 
-Sent on create, rename (including auto-title), model or agent switch, usage
+Sent on create, rename (including auto-title), model or mode switch, usage
 update, and deletion. Fields the event did not mention keep their previous
 value; a real title is never replaced by an empty one.
 
@@ -1322,10 +1324,10 @@ event backlog overflowed.
 ```json
 {
   "asid": "ses_1",
-  "harness": "opencode",
+  "agent_id": "opencode",
   "backend_session_id": "ses_1",
   "title": "Tool availability and directory file count request",
-  "agent": "build",
+  "mode": "build",
   "model": { "provider_id": "opencode", "model_id": "union-alpha", "variant": "default" },
   "status": "busy",
   "directory": "/home/ryu/Work/muqun/app",
@@ -1345,11 +1347,13 @@ event backlog overflowed.
 }
 ```
 
-Only `asid`, `harness`, `title`, `status` and `updated_ms` are always present (`harness` is the owning engine's id, see [Harnesses](#harnesses)); every other
+Only `asid`, `agent_id`, `title`, `status` and `updated_ms` are always present
+(`agent_id` is the owning agent's id, see [Agents](#agents); `mode` is the
+session's mode); every other
 field is omitted when unset. **`backend_session_id` is omitted when it would
 only repeat `asid`** — which on OpenCode is always, since the gateway mints no
 ids of its own; absent means "the same as `asid`", and it is present only for
-an engine that really does key sessions differently. `deleted` is omitted unless
+an agent that really does key sessions differently. `deleted` is omitted unless
 true. `model` is `null`/absent when OpenCode has not said — the gateway does not
 invent one.
 
@@ -1479,7 +1483,7 @@ Tagged by `type`.
 
 **`model_switched`** — `{ "type": "model_switched", "model": {…}, "previous": {…} }`
 
-**`agent_switched`** — `{ "type": "agent_switched", "agent": "plan", "previous": "build" }`
+**`agent_switched`** — `{ "type": "agent_switched", "mode": "plan", "previous": "build" }`
 
 **`synthetic`** / **`system`** — `{ "type": "synthetic", "text": "…", "description": "…" }`
 
@@ -1573,7 +1577,7 @@ Sessions are also evicted on `session.deleted`.
 ## Things that do not exist in v2, so the gateway does not offer them
 
 - **Session sharing.** Removed upstream. Use `GET …/export`.
-- **A model/agent field on a prompt.** Model and agent are session state.
+- **A model/mode field on a prompt.** Model and mode are session state.
 - **`session.status` / `session.idle` events.** Status comes from
   `session.execution.*`; the gateway accepts the others if a later version
   starts sending them.

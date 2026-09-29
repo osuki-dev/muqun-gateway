@@ -136,13 +136,13 @@ pub struct SessionForkInfo {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentSessionInfo {
     pub asid: AgentSessionId,
-    /// The harness that owns this session: the owning engine's `kind()`
+    /// The agent that owns this session: its `kind()`
     /// (`opencode`, `deepseek`). Stamped by the manager layer -- the session
     /// service and the mirror -- never by an adapter or a route. Empty only on
     /// a value that has not passed through one.
     #[serde(default)]
-    pub harness: String,
-    /// The engine's own id for this session.
+    pub agent_id: String,
+    /// The agent's own id for this session.
     ///
     /// Omitted when it is the same string as `asid`, which on OpenCode it
     /// always is -- the gateway mints no ids of its own. It was 1.6 kB of
@@ -151,8 +151,9 @@ pub struct AgentSessionInfo {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub backend_session_id: String,
     pub title: String,
+    /// The mode (persona) the session runs in, such as OpenCode's `build`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub agent: Option<String>,
+    pub mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelRef>,
     pub status: AgentSessionStatus,

@@ -1,8 +1,8 @@
 use crate::agents::domain::{
     part_item_id, push_input_partial, reasoning_item_id, text_item_id, tool_item_id,
-    AgentErrorInfo, AgentInfo, AgentPart, AgentProject, AgentSessionId, AgentSessionInfo,
-    AgentSessionStatus, CatalogDefaults, CommandInfo, CompactionStatus, FormField, FormOption,
-    FormRequest, McpServerInfo, ModelInfo, ModelRef, ModelVariantInfo, PermissionDecision,
+    AgentErrorInfo, AgentPart, AgentProject, AgentSessionId, AgentSessionInfo, AgentSessionStatus,
+    CatalogDefaults, CommandInfo, CompactionStatus, FormField, FormOption, FormRequest,
+    McpServerInfo, ModeInfo, ModelInfo, ModelRef, ModelVariantInfo, PermissionDecision,
     PermissionOption, PermissionRequest, ProviderInfo, ProviderModelInfo, SessionForkInfo,
     SessionRevertInfo, SkillInfo, TimelineItem, TimelineRole, TodoItem, TokensUsage, ToolCall,
     ToolCallStatus, ToolTime,
@@ -111,7 +111,7 @@ pub fn map_session(val: &Value) -> Option<AgentSessionInfo> {
         .unwrap_or(id)
         .to_string();
 
-    let agent = item
+    let mode = item
         .get("agent")
         .and_then(Value::as_str)
         .map(str::to_string);
@@ -162,13 +162,13 @@ pub fn map_session(val: &Value) -> Option<AgentSessionInfo> {
 
     Some(AgentSessionInfo {
         asid: AgentSessionId(id.to_string()),
-        harness: String::new(),
+        agent_id: String::new(),
         // Left empty, and therefore off the wire, whenever it would only
-        // repeat `asid`. It is set for an engine that really does key
+        // repeat `asid`. It is set for an agent that really does key
         // sessions differently.
         backend_session_id: String::new(),
         title,
-        agent,
+        mode,
         model,
         status,
         directory,
@@ -423,7 +423,7 @@ pub fn map_message(msg: &Value, asid: &AgentSessionId) -> Vec<TimelineItem> {
                     part_item_id(msg_id, 0),
                     0,
                     AgentPart::AgentSwitched {
-                        agent: agent.to_string(),
+                        mode: agent.to_string(),
                         previous: msg
                             .get("previous")
                             .and_then(Value::as_str)
@@ -1225,7 +1225,7 @@ pub fn map_models(data: &[Value]) -> Vec<ModelInfo> {
         .collect()
 }
 
-pub fn map_agents(data: &[Value]) -> Vec<AgentInfo> {
+pub fn map_agents(data: &[Value]) -> Vec<ModeInfo> {
     data.iter()
         .filter_map(|a| {
             let id = a.get("id").and_then(Value::as_str)?.to_string();
@@ -1240,7 +1240,7 @@ pub fn map_agents(data: &[Value]) -> Vec<AgentInfo> {
                 .map(str::to_string);
             let mode = a.get("mode").and_then(Value::as_str).map(str::to_string);
             let color = a.get("color").and_then(Value::as_str).map(str::to_string);
-            Some(AgentInfo {
+            Some(ModeInfo {
                 id,
                 name,
                 model: a.get("model").and_then(config_model_ref),
@@ -1366,7 +1366,7 @@ pub fn map_commands(data: &[Value]) -> Vec<CommandInfo> {
                     .get("description")
                     .and_then(Value::as_str)
                     .map(str::to_string),
-                agent: c.get("agent").and_then(Value::as_str).map(str::to_string),
+                mode: c.get("agent").and_then(Value::as_str).map(str::to_string),
                 template: c
                     .get("template")
                     .and_then(Value::as_str)
@@ -1394,7 +1394,7 @@ pub fn map_catalog_defaults(default_model: Option<&Value>, config: &[Value]) -> 
             .map(str::to_string)
     });
 
-    CatalogDefaults { model, agent }
+    CatalogDefaults { model, mode: agent }
 }
 
 /// `Config.Info.model` is either `"provider/model"` (with an optional
@@ -1461,7 +1461,7 @@ mod tests {
         let s = map_session(&raw).expect("session should map");
         assert_eq!(s.asid.0, "ses-123");
         assert_eq!(s.title, "Fix bug in login");
-        assert_eq!(s.agent.as_deref(), Some("developer"));
+        assert_eq!(s.mode.as_deref(), Some("developer"));
         assert_eq!(s.cost, Some(0.042));
         assert_eq!(s.directory.as_deref(), Some("/home/user/project"));
         let model = s.model.expect("model should exist");
@@ -1929,7 +1929,7 @@ mod catalog_tests {
         });
         let config = vec![json!({ "config": { "default_agent": "plan" } })];
         let defaults = map_catalog_defaults(Some(&default_model), &config);
-        assert_eq!(defaults.agent.as_deref(), Some("plan"));
+        assert_eq!(defaults.mode.as_deref(), Some("plan"));
         let model = defaults.model.expect("a default model");
         assert_eq!(model.provider_id, "opencode");
         assert_eq!(model.model_id, "union-alpha");
@@ -1949,7 +1949,7 @@ mod catalog_tests {
     fn defaults_are_empty_when_opencode_says_nothing() {
         let defaults = map_catalog_defaults(None, &[]);
         assert!(defaults.model.is_none());
-        assert!(defaults.agent.is_none());
+        assert!(defaults.mode.is_none());
     }
 
     #[test]

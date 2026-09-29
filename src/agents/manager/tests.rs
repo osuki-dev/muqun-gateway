@@ -114,7 +114,7 @@ async fn a_subagent_call_exposes_its_child_session() {
     let child_info = ctx.mirror.get_snapshot(&child).await.expect("child known");
     assert_eq!(child_info.info.parent_id.as_deref(), Some("ses_PARENT"));
     assert_eq!(child_info.info.title, "count files");
-    assert_eq!(child_info.info.agent.as_deref(), Some("explore"));
+    assert_eq!(child_info.info.mode.as_deref(), Some("explore"));
 }
 
 #[tokio::test]

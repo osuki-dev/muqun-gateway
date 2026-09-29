@@ -13,7 +13,7 @@ use super::domain::{
     AgentSessionStatus, CompactionStatus, RevertState, TimelineItem, TimelineRole, ToolCallStatus,
     WorktreeState,
 };
-use super::ports::engine::AgentEnginePort;
+use super::ports::agent::AgentPort;
 use super::ports::mirror::SessionMirrorPort;
 use super::use_cases::{InteractionService, PromptService, SessionService};
 
@@ -27,7 +27,7 @@ const END_OF_RUN_REFETCH_LIMIT: usize = 20;
 const MAX_TRACKED_SHELLS: usize = 256;
 
 pub struct AgentManager {
-    engine: Arc<dyn AgentEnginePort>,
+    agent: Arc<dyn AgentPort>,
     mirror: Arc<MemoryMirror>,
     session_service: Arc<SessionService>,
     prompt_service: Arc<PromptService>,
@@ -206,7 +206,7 @@ impl EventContext {
 }
 
 impl AgentManager {
-    /// Attempt to discover and initialize available agent engines (such as OpenCode V2).
+    /// Attempt to discover and initialize available agents (such as OpenCode V2).
     pub async fn discover() -> Option<Self> {
         let endpoint = OpencodeEndpoint::discover().await?;
         let (events_tx, _) = broadcast::channel(1024);
@@ -222,7 +222,7 @@ impl AgentManager {
         let endpoint_url = endpoint.url.clone();
         let endpoint_version = endpoint.version.clone();
         let driver = Arc::new(OpencodeDriver::new(endpoint.clone()));
-        let mirror = Arc::new(MemoryMirror::for_harness(driver.kind()));
+        let mirror = Arc::new(MemoryMirror::for_agent(driver.kind()));
 
         let session_service = Arc::new(SessionService::with_memory_mirror(
             driver.clone(),
@@ -265,7 +265,7 @@ impl AgentManager {
                         // the old pump noticing. That is the hand-over working
                         // -- it used to be logged as a warning, half a second
                         // after the replacement stream had already connected,
-                        // which read like the new engine had failed.
+                        // which read like the new agent had failed.
                         //
                         // A channel that closes while the listener was still
                         // meant to be reading is a different thing and keeps
@@ -289,12 +289,12 @@ impl AgentManager {
         tracing::info!(
             url = %endpoint_url,
             version = endpoint_version.as_deref().unwrap_or("unknown"),
-            "agent manager initialized with OpenCode engine"
+            "agent manager initialized with the OpenCode agent"
         );
         let stream_listener = listener.clone();
         let shutdown_listener = listener.clone();
         Self {
-            engine: driver,
+            agent: driver,
             mirror,
             session_service,
             prompt_service,
@@ -307,7 +307,7 @@ impl AgentManager {
         }
     }
 
-    /// Build a manager for a DeepSeek Harness endpoint.
+    /// Build a manager for a DeepSeek endpoint.
     pub fn connect_deepseek(
         endpoint: crate::agents::adapters::deepseek::DeepseekEndpoint,
         events_tx: broadcast::Sender<AgentDomainEvent>,
@@ -317,7 +317,7 @@ impl AgentManager {
         let driver = Arc::new(crate::agents::adapters::deepseek::DeepseekDriver::new(
             endpoint.clone(),
         ));
-        let mirror = Arc::new(MemoryMirror::for_harness(driver.kind()));
+        let mirror = Arc::new(MemoryMirror::for_agent(driver.kind()));
 
         let session_service = Arc::new(SessionService::with_memory_mirror(
             driver.clone(),
@@ -383,11 +383,11 @@ impl AgentManager {
         tracing::info!(
             url = %endpoint_url,
             version = endpoint_version.as_deref().unwrap_or("unknown"),
-            "agent manager initialized with DeepSeek Harness engine"
+            "agent manager initialized with the DeepSeek agent"
         );
 
         Self {
-            engine: driver,
+            agent: driver,
             mirror,
             session_service,
             prompt_service,
@@ -400,20 +400,20 @@ impl AgentManager {
         }
     }
 
-    /// A manager over a caller-supplied engine with no event stream, for
+    /// A manager over a caller-supplied agent with no event stream, for
     /// route and service tests.
     #[cfg(test)]
-    pub(crate) fn for_test(engine: Arc<dyn AgentEnginePort>) -> Self {
-        let mirror = Arc::new(MemoryMirror::for_harness(engine.kind()));
+    pub(crate) fn for_test(agent: Arc<dyn AgentPort>) -> Self {
+        let mirror = Arc::new(MemoryMirror::for_agent(agent.kind()));
         let (events_tx, _) = broadcast::channel(16);
         Self {
             session_service: Arc::new(SessionService::with_memory_mirror(
-                engine.clone(),
+                agent.clone(),
                 mirror.clone(),
             )),
-            prompt_service: Arc::new(PromptService::new(engine.clone(), mirror.clone())),
-            interaction_service: Arc::new(InteractionService::new(engine.clone(), mirror.clone())),
-            engine,
+            prompt_service: Arc::new(PromptService::new(agent.clone(), mirror.clone())),
+            interaction_service: Arc::new(InteractionService::new(agent.clone(), mirror.clone())),
+            agent,
             mirror,
             events_tx,
             endpoint_url: "http://127.0.0.1:1".to_string(),
@@ -443,8 +443,8 @@ impl AgentManager {
         &self.interaction_service
     }
 
-    pub fn engine(&self) -> &Arc<dyn AgentEnginePort> {
-        &self.engine
+    pub fn agent(&self) -> &Arc<dyn AgentPort> {
+        &self.agent
     }
 
     pub fn mirror(&self) -> &Arc<MemoryMirror> {
@@ -459,7 +459,7 @@ impl AgentManager {
         self.endpoint_version.clone()
     }
 
-    /// True while the event reader has an open stream to the engine.
+    /// True while the event reader has an open stream to the agent.
     pub fn stream_connected(&self) -> bool {
         (self.stream_connected)()
     }

@@ -1,4 +1,4 @@
-//! Keeping an OpenCode engine attached for the life of the gateway.
+//! Keeping an OpenCode agent attached for the life of the gateway.
 //!
 //! Discovery used to run once at startup and the result was final: if OpenCode
 //! was not running at that moment every agent route answered 503 for the life
@@ -8,7 +8,7 @@
 //!
 //! This supervises instead. It adopts a healthy service, starts one when there
 //! is none and the owner has left autostart on, re-discovers whenever the
-//! stream or the health probe says the engine has gone, and hands every route
+//! stream or the health probe says the agent has gone, and hands every route
 //! whatever manager is current.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -23,7 +23,7 @@ use super::adapters::opencode::OpencodeEndpoint;
 use super::domain::AgentDomainEvent;
 use super::manager::AgentManager;
 
-/// How often the supervisor checks a healthy engine.
+/// How often the supervisor checks a healthy agent.
 const HEALTHY_POLL: Duration = Duration::from_secs(15);
 /// How soon it retries after finding none.
 const UNHEALTHY_POLL: Duration = Duration::from_secs(3);
@@ -32,8 +32,8 @@ const STARTUP_WAIT: Duration = Duration::from_secs(20);
 const STARTUP_POLL: Duration = Duration::from_millis(400);
 /// Backoff ceiling between failed start attempts.
 const MAX_START_BACKOFF: Duration = Duration::from_secs(120);
-/// How often the supervisor glances at the event stream while the engine is
-/// otherwise healthy. A lost stream *is* the engine going away, and waiting
+/// How often the supervisor glances at the event stream while the agent is
+/// otherwise healthy. A lost stream *is* the agent going away, and waiting
 /// for the next health poll to notice it cost thirteen seconds of silence in
 /// the app for no reason -- the flag is an atomic read, so this is nearly free.
 const STREAM_WATCH_TICK: Duration = Duration::from_secs(1);
@@ -42,26 +42,26 @@ const STREAM_WATCH_TICK: Duration = Duration::from_secs(1);
 /// supervisor.
 const STREAM_LOSS_FIRST_WAIT: Duration = Duration::ZERO;
 const STREAM_LOSS_MAX_WAIT: Duration = Duration::from_secs(30);
-/// The engine major version this gateway speaks. v1 is a different API, and
+/// The agent major version this gateway speaks. v1 is a different API, and
 /// half-working with it is worse than saying so.
 const MIN_OPENCODE_MAJOR: u64 = 2;
 
-/// Harness ids in primary-preference order. OpenCode is the established
-/// harness and DeepSeek is opt-in, so DeepSeek is primary only when OpenCode is
-/// not attached. Every place that names a harness by position reads this.
-pub const HARNESS_PREFERENCE: [&str; 2] = ["opencode", "deepseek"];
-/// Most session-to-harness routes remembered; the oldest go first.
+/// Agent ids in primary-preference order. OpenCode is the established
+/// agent and DeepSeek is opt-in, so DeepSeek is primary only when OpenCode is
+/// not attached. Every place that names an agent by position reads this.
+pub const AGENT_PREFERENCE: [&str; 2] = ["opencode", "deepseek"];
+/// Most session-to-agent routes remembered; the oldest go first.
 const MAX_SESSION_ROUTES: usize = 4096;
-/// How long a harness discovery result is reused.
+/// How long an agent discovery result is reused.
 const DISCOVERY_TTL: Duration = Duration::from_secs(10);
 /// The longest a request may wait on upstream probing.
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
-/// The longest one engine may take to say whether it owns a session.
+/// The longest one agent may take to say whether it owns a session.
 const SESSION_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// The entry of `map` for the most preferred harness present.
+/// The entry of `map` for the most preferred agent present.
 fn pick_primary<T>(map: &BTreeMap<String, T>) -> Option<&T> {
-    HARNESS_PREFERENCE.iter().find_map(|id| map.get(*id))
+    AGENT_PREFERENCE.iter().find_map(|id| map.get(*id))
 }
 
 /// Remembered session routes, bounded: insertion order is kept so the oldest
@@ -73,10 +73,10 @@ struct SessionRoutes {
 }
 
 impl SessionRoutes {
-    fn insert(&mut self, asid: &str, harness: &str) {
+    fn insert(&mut self, asid: &str, agent_id: &str) {
         if self
             .map
-            .insert(asid.to_string(), harness.to_string())
+            .insert(asid.to_string(), agent_id.to_string())
             .is_none()
         {
             self.order.push_back(asid.to_string());
@@ -101,7 +101,7 @@ impl SessionRoutes {
 /// `opencode` in `config.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpencodeConfig {
-    /// Explicitly enable or disable the OpenCode harness.
+    /// Explicitly enable or disable the OpenCode agent.
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// Run `opencode service start` when no healthy service is found.
@@ -135,7 +135,7 @@ impl Default for OpencodeConfig {
 /// `deepseek` in `config.json`.
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct DeepseekConfig {
-    /// Explicitly enable DeepSeek Harness engine support
+    /// Explicitly enable the DeepSeek agent
     #[serde(default)]
     pub enabled: bool,
     /// Explicit service endpoint URL (default is http://127.0.0.1:19387)
@@ -163,11 +163,11 @@ impl std::fmt::Debug for DeepseekConfig {
     }
 }
 
-/// How the engine currently attached was obtained, for the status route and
+/// How the agent currently attached was obtained, for the status route and
 /// the log line an operator reads after a restart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum EngineOrigin {
+pub enum AgentOrigin {
     /// A service that was already running.
     Adopted,
     /// One this gateway started.
@@ -183,17 +183,17 @@ pub enum EngineOrigin {
 /// its installation cannot be determined from this process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum EngineInstallation {
+pub enum AgentInstallation {
     Installed,
     NotFound,
     Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EngineStatus {
+pub struct AgentStatus {
     pub available: bool,
-    pub installation: EngineInstallation,
-    pub origin: EngineOrigin,
+    pub installation: AgentInstallation,
+    pub origin: AgentOrigin,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -202,23 +202,18 @@ pub struct EngineStatus {
     pub autostart: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
-    /// The harness this status describes; the engine's `kind()`. Absent while
+    /// The agent this status describes; the agent's `kind()`. Absent while
     /// nothing is attached.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub harness: Option<String>,
+    pub agent_id: Option<String>,
 }
 
 pub struct AgentRuntime {
     manager: RwLock<Option<Arc<AgentManager>>>,
     managers: RwLock<BTreeMap<String, Arc<AgentManager>>>,
     session_routes: RwLock<SessionRoutes>,
-    /// The last harness discovery and when it was taken.
-    discovery_cache: RwLock<
-        Option<(
-            tokio::time::Instant,
-            crate::discovery::HarnessPlaneDiscovery,
-        )>,
-    >,
+    /// The last agent discovery and when it was taken.
+    discovery_cache: RwLock<Option<(tokio::time::Instant, crate::discovery::AgentPlaneDiscovery)>>,
     /// One refresh at a time; the rest wait and read its result.
     discovery_refresh: Mutex<()>,
     /// The event channel belongs to the runtime, not to a manager, so a
@@ -226,7 +221,7 @@ pub struct AgentRuntime {
     events_tx: broadcast::Sender<AgentDomainEvent>,
     config: OpencodeConfig,
     deepseek_config: DeepseekConfig,
-    origin: RwLock<EngineOrigin>,
+    origin: RwLock<AgentOrigin>,
     /// Serialize startup commands; OpenCode owns the background service.
     start_lock: Mutex<()>,
     supervising: AtomicBool,
@@ -248,13 +243,13 @@ impl AgentRuntime {
             events_tx,
             config,
             deepseek_config,
-            origin: RwLock::new(EngineOrigin::None),
+            origin: RwLock::new(AgentOrigin::None),
             start_lock: Mutex::new(()),
             supervising: AtomicBool::new(false),
         })
     }
 
-    /// A runtime that will never attach an engine, for tests and for a build
+    /// A runtime that will never attach an agent, for tests and for a build
     /// of `AppState` that has no business starting anything.
     pub fn disabled() -> Arc<Self> {
         Self::with_configs(
@@ -267,23 +262,23 @@ impl AgentRuntime {
         )
     }
 
-    /// The default or primary engine manager, or `None` while nothing is attached.
+    /// The default or primary agent manager, or `None` while nothing is attached.
     pub async fn manager(&self) -> Option<Arc<AgentManager>> {
         self.manager.read().await.clone()
     }
 
-    /// Attach a ready-made manager under its harness id, as `attach` does.
+    /// Attach a ready-made manager under its agent id, as `attach` does.
     #[cfg(test)]
     pub(crate) async fn attach_for_test(&self, manager: Arc<AgentManager>) {
-        let kind = manager.engine().kind();
+        let kind = manager.agent().kind();
         self.managers
             .write()
             .await
             .insert(kind.to_string(), manager);
-        self.promote_primary(kind, EngineOrigin::Adopted).await;
+        self.promote_primary(kind, AgentOrigin::Adopted).await;
     }
 
-    /// Return all currently active engine managers.
+    /// Return all currently active agent managers.
     pub async fn all_managers(&self) -> Vec<Arc<AgentManager>> {
         let map = self.managers.read().await;
         if map.is_empty() {
@@ -296,65 +291,65 @@ impl AgentRuntime {
         }
     }
 
-    /// Return manager for a specific harness id (e.g. "opencode", "deepseek").
-    pub async fn manager_for_harness(&self, harness: &str) -> Option<Arc<AgentManager>> {
+    /// Return manager for a specific agent id (e.g. "opencode", "deepseek").
+    pub async fn manager_for_agent(&self, agent_id: &str) -> Option<Arc<AgentManager>> {
         let map = self.managers.read().await;
-        if let Some(m) = map.get(harness) {
+        if let Some(m) = map.get(agent_id) {
             return Some(m.clone());
         }
         if let Some(m) = self.manager.read().await.clone() {
-            if m.engine().kind() == harness {
+            if m.agent().kind() == agent_id {
                 return Some(m);
             }
         }
         None
     }
 
-    /// Whether `harness` is an id this gateway knows, attached or not.
-    pub fn is_known_harness(&self, harness: &str) -> bool {
-        HARNESS_PREFERENCE.contains(&harness)
+    /// Whether `agent_id` is an id this gateway knows, attached or not.
+    pub fn is_known_agent(&self, agent_id: &str) -> bool {
+        AGENT_PREFERENCE.contains(&agent_id)
     }
 
-    /// Attached managers with their harness ids, most preferred first.
+    /// Attached managers with their agent ids, most preferred first.
     async fn attached_in_order(&self) -> Vec<(String, Arc<AgentManager>)> {
         let map = self.managers.read().await;
-        let mut out: Vec<_> = HARNESS_PREFERENCE
+        let mut out: Vec<_> = AGENT_PREFERENCE
             .iter()
             .filter_map(|id| map.get(*id).map(|m| (id.to_string(), m.clone())))
             .collect();
         if out.is_empty() {
             if let Some(m) = self.manager.read().await.clone() {
-                out.push((m.engine().kind().to_string(), m));
+                out.push((m.agent().kind().to_string(), m));
             }
         }
         out
     }
 
     /// The manager that owns a session: the recorded route, else whichever
-    /// attached engine says it has the session (and that is then recorded).
+    /// attached agent says it has the session (and that is then recorded).
     /// `None` when nothing owns it.
     pub async fn manager_for_session(&self, asid: &str) -> Option<Arc<AgentManager>> {
         let recorded = self.session_routes.read().await.map.get(asid).cloned();
-        if let Some(harness) = recorded {
-            if let Some(m) = self.manager_for_harness(&harness).await {
+        if let Some(agent_id) = recorded {
+            if let Some(m) = self.manager_for_agent(&agent_id).await {
                 return Some(m);
             }
         }
-        for (harness, manager) in self.attached_in_order().await {
+        for (agent_id, manager) in self.attached_in_order().await {
             let owns =
-                tokio::time::timeout(SESSION_LOOKUP_TIMEOUT, manager.engine().get_session(asid))
+                tokio::time::timeout(SESSION_LOOKUP_TIMEOUT, manager.agent().get_session(asid))
                     .await;
             if matches!(owns, Ok(Ok(_))) {
-                self.record_session_route(asid, &harness).await;
+                self.record_session_route(asid, &agent_id).await;
                 return Some(manager);
             }
         }
         None
     }
 
-    /// Record routing for a session id to its owning harness.
-    pub async fn record_session_route(&self, asid: &str, harness: &str) {
-        self.session_routes.write().await.insert(asid, harness);
+    /// Record routing for a session id to its owning agent.
+    pub async fn record_session_route(&self, asid: &str, agent_id: &str) {
+        self.session_routes.write().await.insert(asid, agent_id);
     }
 
     /// Drop the route of a session that no longer exists.
@@ -372,12 +367,12 @@ impl AgentRuntime {
         let _ = self.events_tx.send(event);
     }
 
-    pub async fn status(&self) -> EngineStatus {
+    pub async fn status(&self) -> AgentStatus {
         let manager = self.manager.read().await.clone();
-        EngineStatus {
+        AgentStatus {
             available: manager.is_some(),
             installation: if manager.is_some() {
-                EngineInstallation::Installed
+                AgentInstallation::Installed
             } else {
                 local_installation_status(&self.config)
             },
@@ -389,56 +384,49 @@ impl AgentRuntime {
                 .map(|m| m.stream_connected())
                 .unwrap_or(false),
             autostart: self.config.autostart,
-            kind: manager.as_ref().map(|m| m.engine().kind().to_string()),
-            harness: manager.as_ref().map(|m| m.engine().kind().to_string()),
+            kind: manager.as_ref().map(|m| m.agent().kind().to_string()),
+            agent_id: manager.as_ref().map(|m| m.agent().kind().to_string()),
         }
     }
 
-    /// Status of one attached harness, `None` when it is not attached. The
-    /// primary answers exactly as `status()` does; another attached harness
+    /// Status of one attached agent, `None` when it is not attached. The
+    /// primary answers exactly as `status()` does; another attached agent
     /// (DeepSeek, which OpenCode outranks) is always an adopted service the
     /// gateway does not start.
-    pub async fn status_for(&self, harness: &str) -> Option<EngineStatus> {
-        let manager = self.manager_for_harness(harness).await?;
+    pub async fn status_for(&self, agent_id: &str) -> Option<AgentStatus> {
+        let manager = self.manager_for_agent(agent_id).await?;
         let primary = self.manager.read().await.clone();
         if primary.is_some_and(|p| Arc::ptr_eq(&p, &manager)) {
             return Some(self.status().await);
         }
-        let kind = manager.engine().kind().to_string();
-        Some(EngineStatus {
+        let kind = manager.agent().kind().to_string();
+        Some(AgentStatus {
             available: true,
-            installation: EngineInstallation::Installed,
-            origin: EngineOrigin::Adopted,
+            installation: AgentInstallation::Installed,
+            origin: AgentOrigin::Adopted,
             url: Some(manager.endpoint_url().to_string()),
             version: manager.version(),
             stream_connected: manager.stream_connected(),
             autostart: false,
             kind: Some(kind.clone()),
-            harness: Some(kind),
+            agent_id: Some(kind),
         })
     }
 
-    /// Discover status and capabilities of all configured or reachable agents / AI harnesses.
-    pub async fn discover_agents(&self) -> crate::discovery::HarnessPlaneDiscovery {
-        self.discover_harnesses().await
-    }
-
-    /// Status and capabilities of all configured or reachable AI harnesses.
+    /// Status and capabilities of all configured or reachable AI agents.
     ///
     /// Served from a short-lived cache so unauthenticated discovery requests do
     /// not each probe upstream. A refresh that overruns `DISCOVERY_TIMEOUT`
     /// yields the stale result, or a snapshot of what is attached if there is
     /// none.
-    pub async fn discover_harnesses(&self) -> crate::discovery::HarnessPlaneDiscovery {
-        let fresh = |cache: &Option<(
-            tokio::time::Instant,
-            crate::discovery::HarnessPlaneDiscovery,
-        )>| {
-            cache
-                .as_ref()
-                .filter(|(at, _)| at.elapsed() < DISCOVERY_TTL)
-                .map(|(_, d)| d.clone())
-        };
+    pub async fn discover_agents(&self) -> crate::discovery::AgentPlaneDiscovery {
+        let fresh =
+            |cache: &Option<(tokio::time::Instant, crate::discovery::AgentPlaneDiscovery)>| {
+                cache
+                    .as_ref()
+                    .filter(|(at, _)| at.elapsed() < DISCOVERY_TTL)
+                    .map(|(_, d)| d.clone())
+            };
         if let Some(hit) = fresh(&*self.discovery_cache.read().await) {
             return hit;
         }
@@ -447,7 +435,7 @@ impl AgentRuntime {
             if let Some(hit) = fresh(&*self.discovery_cache.read().await) {
                 return hit;
             }
-            let found = self.probe_harnesses().await;
+            let found = self.probe_agents().await;
             *self.discovery_cache.write().await =
                 Some((tokio::time::Instant::now(), found.clone()));
             found
@@ -455,7 +443,7 @@ impl AgentRuntime {
         match tokio::time::timeout(DISCOVERY_TIMEOUT, refresh).await {
             Ok(found) => found,
             Err(_) => {
-                tracing::warn!("harness discovery timed out");
+                tracing::warn!("agent discovery timed out");
                 let stale = self
                     .discovery_cache
                     .read()
@@ -472,12 +460,12 @@ impl AgentRuntime {
 
     /// Discovery without touching the network: what is attached, and the
     /// configuration, nothing more.
-    async fn attached_snapshot(&self) -> crate::discovery::HarnessPlaneDiscovery {
+    async fn attached_snapshot(&self) -> crate::discovery::AgentPlaneDiscovery {
         use crate::discovery::{
-            HarnessDiscoveryInfo, HarnessPlaneDiscovery, HarnessPlaneFeatures, HarnessStatus,
+            AgentAvailability, AgentDiscoveryInfo, AgentPlaneDiscovery, AgentPlaneFeatures,
         };
         let attached = self.attached_in_order().await;
-        let harnesses = HARNESS_PREFERENCE
+        let agents = AGENT_PREFERENCE
             .iter()
             .map(|id| {
                 let enabled = match *id {
@@ -487,84 +475,73 @@ impl AgentRuntime {
                 let manager = attached.iter().find(|(h, _)| h == id).map(|(_, m)| m);
                 let (name, features) = match *id {
                     "opencode" => ("OpenCode", opencode_features(false, false)),
-                    _ => ("DeepSeek Harness", deepseek_features(false, false)),
+                    _ => ("DeepSeek", deepseek_features(false, false)),
                 };
-                HarnessDiscoveryInfo {
+                AgentDiscoveryInfo {
                     id: id.to_string(),
                     name: name.to_string(),
                     kind: id.to_string(),
                     status: match (enabled, manager) {
-                        (false, _) => HarnessStatus::Disabled,
-                        (true, Some(_)) => HarnessStatus::Connected,
-                        (true, None) => HarnessStatus::Offline,
+                        (false, _) => AgentAvailability::Disabled,
+                        (true, Some(_)) => AgentAvailability::Connected,
+                        (true, None) => AgentAvailability::Offline,
                     },
                     enabled,
                     endpoint: manager.map(|m| m.endpoint_url().to_string()),
                     version: manager.and_then(|m| m.version()),
                     models: Vec::new(),
-                    agents: Vec::new(),
+                    modes: Vec::new(),
                     features,
                 }
             })
             .collect::<Vec<_>>();
-        let supported = harnesses
+        let supported = agents
             .iter()
-            .any(|h| h.status == HarnessStatus::Connected);
-        HarnessPlaneDiscovery {
+            .any(|h| h.status == AgentAvailability::Connected);
+        AgentPlaneDiscovery {
             supported,
-            active_harness: self
-                .manager
-                .read()
-                .await
-                .as_ref()
-                .map(|m| m.engine().kind().to_string()),
-            harnesses,
-            features: HarnessPlaneFeatures {
-                multi_harness: true,
+            agents,
+            features: AgentPlaneFeatures {
+                multi_agent: true,
                 catalog_aggregation: true,
                 session_routing: true,
             },
         }
     }
 
-    async fn probe_harnesses(&self) -> crate::discovery::HarnessPlaneDiscovery {
+    async fn probe_agents(&self) -> crate::discovery::AgentPlaneDiscovery {
         use crate::discovery::{
-            HarnessDiscoveryInfo, HarnessPlaneDiscovery, HarnessPlaneFeatures, HarnessStatus,
+            AgentAvailability, AgentDiscoveryInfo, AgentPlaneDiscovery, AgentPlaneFeatures,
         };
 
-        let current_manager = self.manager.read().await.clone();
-        let active_kind = current_manager
-            .as_ref()
-            .map(|m| m.engine().kind().to_string());
+        let mut agents = Vec::new();
 
-        let mut harnesses = Vec::new();
-
-        // 1. DeepSeek Harness discovery
+        // 1. DeepSeek discovery
         let deepseek_enabled =
             self.deepseek_config.enabled || self.deepseek_config.endpoint.is_some();
         let deepseek_info = if !deepseek_enabled {
-            HarnessDiscoveryInfo {
+            AgentDiscoveryInfo {
                 id: "deepseek".to_string(),
-                name: "DeepSeek Harness".to_string(),
+                name: "DeepSeek".to_string(),
                 kind: "deepseek".to_string(),
-                status: HarnessStatus::Disabled,
+                status: AgentAvailability::Disabled,
                 enabled: false,
                 endpoint: self.deepseek_config.endpoint.clone(),
                 version: None,
                 models: Vec::new(),
-                agents: Vec::new(),
+                modes: Vec::new(),
                 features: deepseek_features(false, false),
             }
-        } else if let Some(m) = self.manager_for_harness("deepseek").await {
-            let (models, agents) = match m.engine().get_catalog(None).await {
+        } else if let Some(m) = self.manager_for_agent("deepseek").await {
+            let (models, modes) = match m.agent().get_catalog(None).await {
                 Ok(cat) => (
                     cat.models
                         .iter()
-                        .map(crate::discovery::model_info_to_harness_model)
+                        .map(crate::discovery::model_info_to_agent_model)
                         .collect::<Vec<_>>(),
-                    cat.agents
+                    cat.modes
                         .iter()
-                        .map(crate::discovery::agent_info_to_harness_agent)
+                        .map(crate::discovery::mode_info_to_agent_mode)
                         .collect::<Vec<_>>(),
                 ),
                 Err(_) => (Vec::new(), Vec::new()),
@@ -574,17 +551,17 @@ impl AgentRuntime {
                 .any(|m| m.supports_reasoning || !m.reasoning_effort_tiers.is_empty());
             let has_models = !models.is_empty();
 
-            HarnessDiscoveryInfo {
+            AgentDiscoveryInfo {
                 id: "deepseek".to_string(),
-                name: "DeepSeek Harness".to_string(),
+                name: "DeepSeek".to_string(),
                 kind: "deepseek".to_string(),
-                status: HarnessStatus::Connected,
+                status: AgentAvailability::Connected,
                 enabled: true,
                 endpoint: Some(m.endpoint_url().to_string()),
                 version: m.version(),
                 features: deepseek_features(supports_reasoning, has_models),
                 models,
-                agents,
+                modes,
             }
         } else {
             let ep = if let Some(ref url) = self.deepseek_config.endpoint {
@@ -600,39 +577,38 @@ impl AgentRuntime {
                 crate::agents::adapters::deepseek::DeepseekEndpoint::discover().await
             };
 
-            let (status, endpoint_url, version, models, agents) = match ep {
+            let (status, endpoint_url, version, models, modes) = match ep {
                 Some(endpoint) => {
                     let client = probe_client();
                     if endpoint.probe_healthy(&client).await {
                         let driver = crate::agents::adapters::deepseek::DeepseekDriver::new(
                             endpoint.clone(),
                         );
-                        let (models, agents) =
-                            match crate::agents::ports::AgentEnginePort::get_catalog(&driver, None)
-                                .await
+                        let (models, modes) =
+                            match crate::agents::ports::AgentPort::get_catalog(&driver, None).await
                             {
                                 Ok(cat) => (
                                     cat.models
                                         .iter()
-                                        .map(crate::discovery::model_info_to_harness_model)
+                                        .map(crate::discovery::model_info_to_agent_model)
                                         .collect::<Vec<_>>(),
-                                    cat.agents
+                                    cat.modes
                                         .iter()
-                                        .map(crate::discovery::agent_info_to_harness_agent)
+                                        .map(crate::discovery::mode_info_to_agent_mode)
                                         .collect::<Vec<_>>(),
                                 ),
                                 Err(_) => (Vec::new(), Vec::new()),
                             };
                         (
-                            HarnessStatus::Reachable,
+                            AgentAvailability::Reachable,
                             Some(endpoint.url),
                             endpoint.version,
                             models,
-                            agents,
+                            modes,
                         )
                     } else {
                         (
-                            HarnessStatus::Offline,
+                            AgentAvailability::Offline,
                             Some(endpoint.url),
                             None,
                             Vec::new(),
@@ -640,7 +616,13 @@ impl AgentRuntime {
                         )
                     }
                 }
-                None => (HarnessStatus::Offline, None, None, Vec::new(), Vec::new()),
+                None => (
+                    AgentAvailability::Offline,
+                    None,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                ),
             };
 
             let supports_reasoning = models
@@ -648,9 +630,9 @@ impl AgentRuntime {
                 .any(|m| m.supports_reasoning || !m.reasoning_effort_tiers.is_empty());
             let has_models = !models.is_empty();
 
-            HarnessDiscoveryInfo {
+            AgentDiscoveryInfo {
                 id: "deepseek".to_string(),
-                name: "DeepSeek Harness".to_string(),
+                name: "DeepSeek".to_string(),
                 kind: "deepseek".to_string(),
                 status,
                 enabled: true,
@@ -658,36 +640,36 @@ impl AgentRuntime {
                 version,
                 features: deepseek_features(supports_reasoning, has_models),
                 models,
-                agents,
+                modes,
             }
         };
-        harnesses.push(deepseek_info);
+        agents.push(deepseek_info);
 
         // 2. OpenCode discovery
         let opencode_enabled = self.config.enabled;
         let opencode_info = if !opencode_enabled {
-            HarnessDiscoveryInfo {
+            AgentDiscoveryInfo {
                 id: "opencode".to_string(),
                 name: "OpenCode".to_string(),
                 kind: "opencode".to_string(),
-                status: HarnessStatus::Disabled,
+                status: AgentAvailability::Disabled,
                 enabled: false,
                 endpoint: None,
                 version: None,
                 models: Vec::new(),
-                agents: Vec::new(),
+                modes: Vec::new(),
                 features: opencode_features(false, false),
             }
-        } else if let Some(m) = self.manager_for_harness("opencode").await {
-            let (models, agents) = match m.engine().get_catalog(None).await {
+        } else if let Some(m) = self.manager_for_agent("opencode").await {
+            let (models, modes) = match m.agent().get_catalog(None).await {
                 Ok(cat) => (
                     cat.models
                         .iter()
-                        .map(crate::discovery::model_info_to_harness_model)
+                        .map(crate::discovery::model_info_to_agent_model)
                         .collect::<Vec<_>>(),
-                    cat.agents
+                    cat.modes
                         .iter()
-                        .map(crate::discovery::agent_info_to_harness_agent)
+                        .map(crate::discovery::mode_info_to_agent_mode)
                         .collect::<Vec<_>>(),
                 ),
                 Err(_) => (Vec::new(), Vec::new()),
@@ -697,20 +679,20 @@ impl AgentRuntime {
                 .any(|m| m.supports_reasoning || !m.reasoning_effort_tiers.is_empty());
             let has_models = !models.is_empty();
 
-            HarnessDiscoveryInfo {
+            AgentDiscoveryInfo {
                 id: "opencode".to_string(),
                 name: "OpenCode".to_string(),
                 kind: "opencode".to_string(),
-                status: HarnessStatus::Connected,
+                status: AgentAvailability::Connected,
                 enabled: true,
                 endpoint: Some(m.endpoint_url().to_string()),
                 version: m.version(),
                 features: opencode_features(supports_reasoning, has_models),
                 models,
-                agents,
+                modes,
             }
         } else {
-            let (status, endpoint_url, version, models, agents) = match OpencodeEndpoint::discover()
+            let (status, endpoint_url, version, models, modes) = match OpencodeEndpoint::discover()
                 .await
             {
                 Some(endpoint) => {
@@ -719,32 +701,31 @@ impl AgentRuntime {
                         let driver = crate::agents::adapters::opencode::OpencodeDriver::new(
                             endpoint.clone(),
                         );
-                        let (models, agents) =
-                            match crate::agents::ports::AgentEnginePort::get_catalog(&driver, None)
-                                .await
+                        let (models, modes) =
+                            match crate::agents::ports::AgentPort::get_catalog(&driver, None).await
                             {
                                 Ok(cat) => (
                                     cat.models
                                         .iter()
-                                        .map(crate::discovery::model_info_to_harness_model)
+                                        .map(crate::discovery::model_info_to_agent_model)
                                         .collect::<Vec<_>>(),
-                                    cat.agents
+                                    cat.modes
                                         .iter()
-                                        .map(crate::discovery::agent_info_to_harness_agent)
+                                        .map(crate::discovery::mode_info_to_agent_mode)
                                         .collect::<Vec<_>>(),
                                 ),
                                 Err(_) => (Vec::new(), Vec::new()),
                             };
                         (
-                            HarnessStatus::Reachable,
+                            AgentAvailability::Reachable,
                             Some(endpoint.url),
                             endpoint.version,
                             models,
-                            agents,
+                            modes,
                         )
                     } else {
                         (
-                            HarnessStatus::Offline,
+                            AgentAvailability::Offline,
                             Some(endpoint.url),
                             None,
                             Vec::new(),
@@ -754,11 +735,17 @@ impl AgentRuntime {
                 }
                 None => {
                     let installed = local_installation_status(&self.config);
-                    if installed == EngineInstallation::Installed {
-                        (HarnessStatus::Offline, None, None, Vec::new(), Vec::new())
+                    if installed == AgentInstallation::Installed {
+                        (
+                            AgentAvailability::Offline,
+                            None,
+                            None,
+                            Vec::new(),
+                            Vec::new(),
+                        )
                     } else {
                         (
-                            HarnessStatus::NotInstalled,
+                            AgentAvailability::NotInstalled,
                             None,
                             None,
                             Vec::new(),
@@ -773,7 +760,7 @@ impl AgentRuntime {
                 .any(|m| m.supports_reasoning || !m.reasoning_effort_tiers.is_empty());
             let has_models = !models.is_empty();
 
-            HarnessDiscoveryInfo {
+            AgentDiscoveryInfo {
                 id: "opencode".to_string(),
                 name: "OpenCode".to_string(),
                 kind: "opencode".to_string(),
@@ -783,28 +770,27 @@ impl AgentRuntime {
                 version,
                 features: opencode_features(supports_reasoning, has_models),
                 models,
-                agents,
+                modes,
             }
         };
-        harnesses.push(opencode_info);
+        agents.push(opencode_info);
 
-        let supported = harnesses
-            .iter()
-            .any(|h| h.status == HarnessStatus::Connected || h.status == HarnessStatus::Reachable);
+        let supported = agents.iter().any(|h| {
+            h.status == AgentAvailability::Connected || h.status == AgentAvailability::Reachable
+        });
 
-        HarnessPlaneDiscovery {
+        AgentPlaneDiscovery {
             supported,
-            active_harness: active_kind,
-            harnesses,
-            features: HarnessPlaneFeatures {
-                multi_harness: true,
+            agents,
+            features: AgentPlaneFeatures {
+                multi_agent: true,
                 catalog_aggregation: true,
                 session_routing: true,
             },
         }
     }
 
-    /// Attach an engine now, and keep one attached. Safe to call once.
+    /// Attach an agent now, and keep one attached. Safe to call once.
     pub fn spawn_supervisor(self: &Arc<Self>) {
         if self.supervising.swap(true, Ordering::SeqCst) {
             return;
@@ -824,10 +810,10 @@ impl AgentRuntime {
         });
     }
 
-    /// Hold until the engine is worth checking again.
+    /// Hold until the agent is worth checking again.
     ///
     /// Normally that is the next health poll. But the event stream dropping is
-    /// the engine telling us it has gone, and that should not wait: this
+    /// the agent telling us it has gone, and that should not wait: this
     /// returns within a tick of the stream going down, so the gap between
     /// OpenCode dying and the gateway re-attaching is about a second rather
     /// than however much of the poll interval was left.
@@ -856,7 +842,7 @@ impl AgentRuntime {
         }
     }
 
-    /// True when an engine is attached but its event stream has dropped.
+    /// True when an agent is attached but its event stream has dropped.
     async fn stream_down(&self) -> bool {
         self.manager
             .read()
@@ -866,19 +852,19 @@ impl AgentRuntime {
             .unwrap_or(false)
     }
 
-    /// One supervision pass. Returns whether an engine is attached and well.
+    /// One supervision pass. Returns whether an agent is attached and well.
     async fn check_and_repair(&self, start_backoff: &mut Duration) -> bool {
         let mut deepseek_ok = false;
         let mut opencode_ok = false;
 
         // 1. Supervise DeepSeek
-        if let Some(mgr) = self.manager_for_harness("deepseek").await {
-            if mgr.engine().probe().await.unwrap_or(false) {
+        if let Some(mgr) = self.manager_for_agent("deepseek").await {
+            if mgr.agent().probe().await.unwrap_or(false) {
                 deepseek_ok = true;
             } else {
                 tracing::warn!(
                     url = mgr.endpoint_url(),
-                    "DeepSeek engine unhealthy, re-probing"
+                    "DeepSeek agent unhealthy, re-probing"
                 );
                 mgr.shutdown();
                 self.managers.write().await.remove("deepseek");
@@ -901,7 +887,7 @@ impl AgentRuntime {
             if let Some(endpoint) = ep {
                 let client = probe_client();
                 if endpoint.probe_healthy(&client).await {
-                    self.attach_deepseek(endpoint, EngineOrigin::Adopted).await;
+                    self.attach_deepseek(endpoint, AgentOrigin::Adopted).await;
                     deepseek_ok = true;
                 }
             }
@@ -914,17 +900,17 @@ impl AgentRuntime {
             None
         };
 
-        if let Some(mgr) = self.manager_for_harness("opencode").await {
+        if let Some(mgr) = self.manager_for_agent("opencode").await {
             let same_endpoint = discovered_opencode
                 .as_ref()
                 .map(|e| e.url == mgr.endpoint_url())
                 .unwrap_or(false);
-            if same_endpoint && mgr.engine().probe().await.unwrap_or(false) {
+            if same_endpoint && mgr.agent().probe().await.unwrap_or(false) {
                 opencode_ok = true;
             } else {
                 tracing::warn!(
                     url = mgr.endpoint_url(),
-                    "OpenCode engine unhealthy or moved, re-discovering"
+                    "OpenCode agent unhealthy or moved, re-discovering"
                 );
                 mgr.shutdown();
                 self.managers.write().await.remove("opencode");
@@ -936,7 +922,7 @@ impl AgentRuntime {
                 if endpoint.probe_healthy(&probe_client()).await
                     && check_version(endpoint.version.as_deref()).is_ok()
                 {
-                    self.attach(endpoint, EngineOrigin::Adopted).await;
+                    self.attach(endpoint, AgentOrigin::Adopted).await;
                     opencode_ok = true;
                 }
             }
@@ -945,7 +931,7 @@ impl AgentRuntime {
         if !opencode_ok && self.config.enabled && self.config.autostart {
             match self.start_service().await {
                 Ok(endpoint) => {
-                    self.attach(endpoint, EngineOrigin::Spawned).await;
+                    self.attach(endpoint, AgentOrigin::Spawned).await;
                     opencode_ok = true;
                 }
                 Err(err) => {
@@ -965,12 +951,12 @@ impl AgentRuntime {
             true
         } else {
             *self.manager.write().await = None;
-            *self.origin.write().await = EngineOrigin::None;
+            *self.origin.write().await = AgentOrigin::None;
             false
         }
     }
 
-    async fn attach(&self, endpoint: OpencodeEndpoint, origin: EngineOrigin) {
+    async fn attach(&self, endpoint: OpencodeEndpoint, origin: AgentOrigin) {
         let url = endpoint.url.clone();
         let version = endpoint.version.clone();
         // Which file is actually serving this. For a service this gateway
@@ -990,28 +976,28 @@ impl AgentRuntime {
         self.promote_primary("opencode", origin).await;
         let path = path.unwrap_or_else(|| "unknown".to_string());
         match origin {
-            EngineOrigin::Adopted => tracing::info!(
+            AgentOrigin::Adopted => tracing::info!(
                 url = %url,
                 version = version.as_deref().unwrap_or("unknown"),
                 binary = %path,
                 "adopted the running OpenCode service"
             ),
-            EngineOrigin::Spawned => tracing::info!(
+            AgentOrigin::Spawned => tracing::info!(
                 url = %url,
                 version = version.as_deref().unwrap_or("unknown"),
                 binary = %path,
                 "started an OpenCode service and attached to it"
             ),
-            EngineOrigin::None => {}
+            AgentOrigin::None => {}
         }
     }
 
     /// Make the most preferred attached manager the primary; `origin` is
     /// recorded when that is the one that was just attached.
-    async fn promote_primary(&self, attached: &str, origin: EngineOrigin) {
+    async fn promote_primary(&self, attached: &str, origin: AgentOrigin) {
         let primary = {
             let map = self.managers.read().await;
-            HARNESS_PREFERENCE
+            AGENT_PREFERENCE
                 .iter()
                 .find(|id| map.contains_key(**id))
                 .map(|id| (*id, map[*id].clone()))
@@ -1027,7 +1013,7 @@ impl AgentRuntime {
     async fn attach_deepseek(
         &self,
         endpoint: crate::agents::adapters::deepseek::DeepseekEndpoint,
-        origin: EngineOrigin,
+        origin: AgentOrigin,
     ) {
         let url = endpoint.url.clone();
         let version = endpoint.version.clone();
@@ -1043,7 +1029,7 @@ impl AgentRuntime {
         tracing::info!(
             url = %url,
             version = version.as_deref().unwrap_or("unknown"),
-            "adopted the running DeepSeek Harness service"
+            "adopted the running DeepSeek service"
         );
     }
 
@@ -1054,7 +1040,7 @@ impl AgentRuntime {
         if manager.endpoint_url() != url {
             return false;
         }
-        manager.engine().probe().await.unwrap_or(false)
+        manager.agent().probe().await.unwrap_or(false)
     }
 
     /// Let OpenCode load its saved service configuration and start or reuse
@@ -1227,30 +1213,30 @@ fn installation_status_in(
     configured: Option<&str>,
     path_var: Option<&std::ffi::OsStr>,
     external_endpoint_configured: bool,
-) -> EngineInstallation {
+) -> AgentInstallation {
     if external_endpoint_configured {
-        return EngineInstallation::Unknown;
+        return AgentInstallation::Unknown;
     }
 
     let name = binary_name(configured);
     if name.contains(std::path::MAIN_SEPARATOR) || name.contains('/') {
         return match std::fs::metadata(name) {
-            Ok(metadata) if metadata_is_executable(&metadata) => EngineInstallation::Installed,
-            Ok(_) => EngineInstallation::NotFound,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => EngineInstallation::NotFound,
-            Err(_) => EngineInstallation::Unknown,
+            Ok(metadata) if metadata_is_executable(&metadata) => AgentInstallation::Installed,
+            Ok(_) => AgentInstallation::NotFound,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => AgentInstallation::NotFound,
+            Err(_) => AgentInstallation::Unknown,
         };
     }
 
     let Some(path_var) = path_var else {
-        return EngineInstallation::Unknown;
+        return AgentInstallation::Unknown;
     };
     let mut ambiguous = false;
     for directory in std::env::split_paths(path_var) {
         let candidate = directory.join(name);
         match std::fs::metadata(&candidate) {
             Ok(metadata) if metadata_is_executable(&metadata) => {
-                return EngineInstallation::Installed;
+                return AgentInstallation::Installed;
             }
             Ok(_) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -1258,20 +1244,20 @@ fn installation_status_in(
         }
     }
     if ambiguous {
-        EngineInstallation::Unknown
+        AgentInstallation::Unknown
     } else {
-        EngineInstallation::NotFound
+        AgentInstallation::NotFound
     }
 }
 
-fn local_installation_status(config: &OpencodeConfig) -> EngineInstallation {
+fn local_installation_status(config: &OpencodeConfig) -> AgentInstallation {
     if !config.enabled {
-        return EngineInstallation::NotFound;
+        return AgentInstallation::NotFound;
     }
     let Ok(external_endpoint_configured) =
         external_endpoint_configured_with(|name| std::env::var(name))
     else {
-        return EngineInstallation::Unknown;
+        return AgentInstallation::Unknown;
     };
     installation_status_in(
         config.binary.as_deref(),
@@ -1373,8 +1359,8 @@ async fn wait_for_service() -> anyhow::Result<OpencodeEndpoint> {
 fn deepseek_features(
     supports_reasoning: bool,
     has_models: bool,
-) -> crate::discovery::HarnessFeatures {
-    crate::discovery::HarnessFeatures {
+) -> crate::discovery::AgentFeatures {
+    crate::discovery::AgentFeatures {
         streaming: true,
         reasoning_effort: supports_reasoning,
         model_selection: has_models,
@@ -1389,8 +1375,8 @@ fn deepseek_features(
 fn opencode_features(
     supports_reasoning: bool,
     has_models: bool,
-) -> crate::discovery::HarnessFeatures {
-    crate::discovery::HarnessFeatures {
+) -> crate::discovery::AgentFeatures {
+    crate::discovery::AgentFeatures {
         streaming: true,
         reasoning_effort: supports_reasoning,
         model_selection: has_models,
@@ -1574,7 +1560,7 @@ mod tests {
     /// v1 is a different API. Attaching to it looked like success and then
     /// failed on every route, which is a worse answer than refusing.
     #[test]
-    fn a_v1_engine_is_refused_and_the_refusal_says_what_to_do() {
+    fn a_v1_agent_is_refused_and_the_refusal_says_what_to_do() {
         let refusal = check_version(Some("opencode 1.18.4")).expect_err("v1 is refused");
         assert!(
             refusal.contains("1.18.4"),
@@ -1685,12 +1671,12 @@ mod tests {
 
         assert_eq!(
             installation_status_in(None, Some(&path_var), false),
-            EngineInstallation::Installed,
+            AgentInstallation::Installed,
             "a local executable is installed even while its service is down"
         );
         assert_eq!(
             installation_status_in(Some(missing.to_str().unwrap()), Some(&path_var), false),
-            EngineInstallation::NotFound,
+            AgentInstallation::NotFound,
             "a broken explicit path does not fall back to PATH"
         );
         #[cfg(unix)]
@@ -1700,21 +1686,21 @@ mod tests {
                 Some(&path_var),
                 false
             ),
-            EngineInstallation::NotFound,
+            AgentInstallation::NotFound,
             "an explicit regular file must also be executable"
         );
         assert_eq!(
             installation_status_in(None, Some(&empty_path), false),
-            EngineInstallation::NotFound
+            AgentInstallation::NotFound
         );
         assert_eq!(
             installation_status_in(None, None, false),
-            EngineInstallation::Unknown,
+            AgentInstallation::Unknown,
             "without PATH the local lookup is inconclusive"
         );
         assert_eq!(
             installation_status_in(None, Some(&path_var), true),
-            EngineInstallation::Unknown,
+            AgentInstallation::Unknown,
             "the local PATH cannot establish installation for an external endpoint"
         );
 
@@ -1742,17 +1728,17 @@ mod tests {
     }
 
     #[test]
-    fn engine_status_serializes_the_additive_installation_field() {
-        let status = EngineStatus {
+    fn agent_status_serializes_the_additive_installation_field() {
+        let status = AgentStatus {
             available: false,
-            installation: EngineInstallation::NotFound,
-            origin: EngineOrigin::None,
+            installation: AgentInstallation::NotFound,
+            origin: AgentOrigin::None,
             url: None,
             version: None,
             stream_connected: false,
             autostart: true,
             kind: None,
-            harness: None,
+            agent_id: None,
         };
         let value = serde_json::to_value(status).expect("status serializes");
         assert_eq!(value["installation"], "not_found");
@@ -1763,7 +1749,7 @@ mod tests {
         assert!(value.get("version").is_none());
     }
 
-    /// A lost stream is the engine going away, so the first one is looked at
+    /// A lost stream is the agent going away, so the first one is looked at
     /// at once; a stream that keeps dropping must not spin the supervisor.
     #[test]
     fn a_flapping_stream_backs_off_but_the_first_loss_does_not_wait() {
@@ -1783,7 +1769,7 @@ mod tests {
         assert_eq!(*seen.last().unwrap(), STREAM_LOSS_MAX_WAIT, "and it stops");
         assert!(
             STREAM_WATCH_TICK < HEALTHY_POLL,
-            "the stream is watched more often than the engine is polled"
+            "the stream is watched more often than the agent is polled"
         );
     }
 
@@ -1794,18 +1780,18 @@ mod tests {
         let status = runtime.status().await;
         assert!(!status.available);
         assert!(!status.autostart);
-        assert_eq!(status.origin, EngineOrigin::None);
-        // A subscriber works with no engine attached, which is what lets a
+        assert_eq!(status.origin, AgentOrigin::None);
+        // A subscriber works with no agent attached, which is what lets a
         // stream outlive a reconnect.
         let _rx = runtime.subscribe_events();
     }
 
     #[tokio::test]
-    async fn multi_harness_session_routing_and_all_managers() {
+    async fn multi_agent_session_routing_and_all_managers() {
         let runtime = AgentRuntime::disabled();
         assert_eq!(runtime.all_managers().await.len(), 0);
-        assert!(runtime.manager_for_harness("deepseek").await.is_none());
-        assert!(runtime.manager_for_harness("opencode").await.is_none());
+        assert!(runtime.manager_for_agent("deepseek").await.is_none());
+        assert!(runtime.manager_for_agent("opencode").await.is_none());
         assert!(runtime.manager_for_session("ses_123").await.is_none());
 
         runtime.record_session_route("ses_123", "deepseek").await;
@@ -1867,11 +1853,11 @@ mod tests {
     }
 
     #[test]
-    fn only_the_preference_list_names_known_harnesses() {
+    fn only_the_preference_list_names_known_agents() {
         let runtime = AgentRuntime::disabled();
-        assert!(runtime.is_known_harness("opencode"));
-        assert!(runtime.is_known_harness("deepseek"));
-        assert!(!runtime.is_known_harness("claude"));
+        assert!(runtime.is_known_agent("opencode"));
+        assert!(runtime.is_known_agent("deepseek"));
+        assert!(!runtime.is_known_agent("claude"));
     }
 
     #[tokio::test]
@@ -1879,17 +1865,17 @@ mod tests {
         let runtime = AgentRuntime::disabled();
         let mut backoff = Duration::from_secs(2);
         assert!(!runtime.check_and_repair(&mut backoff).await);
-        assert!(runtime.manager_for_harness("deepseek").await.is_none());
-        let found = runtime.discover_harnesses().await;
-        let ds = found.harnesses.iter().find(|h| h.id == "deepseek").unwrap();
-        assert_eq!(ds.status, crate::discovery::HarnessStatus::Disabled);
+        assert!(runtime.manager_for_agent("deepseek").await.is_none());
+        let found = runtime.discover_agents().await;
+        let ds = found.agents.iter().find(|a| a.id == "deepseek").unwrap();
+        assert_eq!(ds.status, crate::discovery::AgentAvailability::Disabled);
         assert!(ds.endpoint.is_none());
     }
 
     #[tokio::test]
-    async fn harness_discovery_is_memoized() {
+    async fn agent_discovery_is_memoized() {
         let runtime = AgentRuntime::disabled();
-        let first = runtime.discover_harnesses().await;
+        let first = runtime.discover_agents().await;
         assert!(runtime.discovery_cache.read().await.is_some());
         // Poison the cache; a second call inside the TTL must return it as is.
         runtime
@@ -1899,9 +1885,12 @@ mod tests {
             .as_mut()
             .unwrap()
             .1
-            .active_harness = Some("cached".into());
-        let second = runtime.discover_harnesses().await;
-        assert_eq!(second.active_harness.as_deref(), Some("cached"));
-        assert_ne!(first.active_harness, second.active_harness);
+            .supported = true;
+        let second = runtime.discover_agents().await;
+        assert!(second.supported, "the poisoned cache answered");
+        assert!(
+            !first.supported,
+            "nothing is attached to a disabled runtime"
+        );
     }
 }

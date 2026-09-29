@@ -8,7 +8,7 @@ pub mod timeline;
 pub use events::AgentDomainEvent;
 pub use form::{FormField, FormOption, FormRequest, FormWhen};
 pub use model::{
-    AgentCatalog, AgentInfo, CatalogDefaults, CommandInfo, McpServerInfo, ModelInfo,
+    AgentCatalog, CatalogDefaults, CommandInfo, McpServerInfo, ModeInfo, ModelInfo,
     ModelVariantInfo, ProviderInfo, ProviderModelInfo, SkillInfo,
 };
 pub use permission::{PermissionDecision, PermissionOption, PermissionRequest};
@@ -40,10 +40,10 @@ mod contract_tests {
     fn session_info_keys_match_the_contract() {
         let info = AgentSessionInfo {
             asid: AgentSessionId("ses_1".into()),
-            harness: String::new(),
+            agent_id: String::new(),
             backend_session_id: "ses_1".into(),
             title: "t".into(),
-            agent: Some("build".into()),
+            mode: Some("build".into()),
             model: Some(ModelRef {
                 provider_id: "opencode".into(),
                 model_id: "m".into(),
@@ -73,9 +73,9 @@ mod contract_tests {
         let value = serde_json::to_value(&info).expect("serializes");
         for key in [
             "asid",
-            "harness",
+            "agent_id",
             "title",
-            "agent",
+            "mode",
             "model",
             "status",
             "directory",
@@ -193,15 +193,49 @@ mod contract_tests {
         );
     }
 
-    /// A payload from before `harness` existed still parses: the field is
+    /// A payload from before `agent_id` existed still parses: the field is
     /// defaulted on the way in, and an app that predates it ignores it out.
+    /// A persona is a `mode` everywhere it reaches the app: the catalog's
+    /// default, a command's mode, and the part that records a switch.
     #[test]
-    fn a_session_without_harness_still_deserializes() {
+    fn persona_fields_are_named_mode() {
+        let defaults = serde_json::to_value(CatalogDefaults {
+            model: None,
+            mode: Some("build".into()),
+        })
+        .expect("serializes");
+        assert_eq!(keys(&defaults), ["mode"]);
+        assert_eq!(defaults["mode"], "build");
+
+        let command = serde_json::to_value(CommandInfo {
+            name: "review".into(),
+            description: None,
+            mode: Some("plan".into()),
+            template: None,
+        })
+        .expect("serializes");
+        let mut command_keys = keys(&command);
+        command_keys.sort();
+        assert_eq!(command_keys, ["mode", "name"]);
+
+        let part = serde_json::to_value(AgentPart::AgentSwitched {
+            mode: "plan".into(),
+            previous: Some("build".into()),
+        })
+        .expect("serializes");
+        assert_eq!(
+            part,
+            json!({ "type": "agent_switched", "mode": "plan", "previous": "build" })
+        );
+    }
+
+    #[test]
+    fn a_session_without_agent_id_still_deserializes() {
         let info: AgentSessionInfo = serde_json::from_value(json!({
             "asid": "ses_1", "title": "t", "status": "idle", "updated_ms": 1
         }))
         .expect("parses");
-        assert_eq!(info.harness, "");
+        assert_eq!(info.agent_id, "");
     }
 
     /// `backend_session_id` only earns its place when it says something
@@ -211,10 +245,10 @@ mod contract_tests {
     fn a_backend_session_id_that_only_repeats_the_asid_is_left_off() {
         let mut info = AgentSessionInfo {
             asid: AgentSessionId("ses_1".into()),
-            harness: String::new(),
+            agent_id: String::new(),
             backend_session_id: String::new(),
             title: "t".into(),
-            agent: None,
+            mode: None,
             model: None,
             status: AgentSessionStatus::Idle,
             directory: None,
@@ -239,10 +273,10 @@ mod contract_tests {
         );
         assert_eq!(value["asid"], "ses_1");
 
-        // An engine that really does key sessions differently still says so.
-        info.backend_session_id = "engine-42".into();
+        // An agent that really does key sessions differently still says so.
+        info.backend_session_id = "agent-42".into();
         let value = serde_json::to_value(&info).expect("serializes");
-        assert_eq!(value["backend_session_id"], "engine-42");
+        assert_eq!(value["backend_session_id"], "agent-42");
     }
 
     /// The streaming preview is a string on the tool part, and it is bounded:

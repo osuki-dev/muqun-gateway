@@ -268,7 +268,7 @@ mod tests {
             cap["responses"]["200"]["content"]["application/json"]["schema"]["required"],
             json!(["serverVersion", "protocolVersion", "planes", "capabilities"])
         );
-        assert!(spec["paths"]["/api/agent-engine"]["get"].is_object());
+        assert!(spec["paths"]["/api/agent-status"]["get"].is_object());
         assert!(spec["paths"]["/api/agent-catalog"]["get"].is_object());
         assert!(spec["paths"]["/api/agent-sessions"]["get"].is_object());
         assert!(spec["paths"]["/api/agent-sessions"]["post"].is_object());
@@ -289,8 +289,8 @@ mod tests {
         assert!(API_CAPABILITIES.contains(&"terminal_backends"));
         assert!(API_CAPABILITIES.contains(&"multiple_terminal_backends"));
         assert!(API_CAPABILITIES.contains(&"capabilities_discovery"));
-        assert!(API_CAPABILITIES.contains(&"harness_discovery"));
-        assert!(API_CAPABILITIES.contains(&"agent_harnesses"));
+        assert!(API_CAPABILITIES.contains(&"agent_discovery"));
+        assert!(API_CAPABILITIES.contains(&"multi_agent"));
     }
 
     #[tokio::test]
@@ -317,7 +317,7 @@ mod tests {
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["ok"], true);
         assert!(json["planes"]["terminal"].is_object());
-        assert!(json["planes"]["harness"].is_object());
+        assert!(json["planes"]["agents"].is_object());
         assert!(json["capabilities"]
             .as_array()
             .unwrap()
@@ -325,11 +325,11 @@ mod tests {
         assert!(json["capabilities"]
             .as_array()
             .unwrap()
-            .contains(&json!("harness_discovery")));
+            .contains(&json!("agent_discovery")));
         assert!(json["capabilities"]
             .as_array()
             .unwrap()
-            .contains(&json!("agent_harnesses")));
+            .contains(&json!("multi_agent")));
 
         // 2. GET /health contains planes
         let req = Request::builder()
@@ -346,11 +346,11 @@ mod tests {
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["ok"], true);
         assert!(json["planes"]["terminal"].is_object());
-        assert!(json["planes"]["harness"].is_object());
+        assert!(json["planes"]["agents"].is_object());
         assert!(json["capabilities"]
             .as_array()
             .unwrap()
-            .contains(&json!("agent_harnesses")));
+            .contains(&json!("multi_agent")));
     }
 
     #[tokio::test]

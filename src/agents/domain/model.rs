@@ -29,10 +29,10 @@ pub struct ModelInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AgentInfo {
+pub struct ModeInfo {
     pub id: String,
     pub name: String,
-    /// The agent's configured model, distinct from the session's selected model.
+    /// The mode's configured model, distinct from the session's selected model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<super::ModelRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -114,7 +114,7 @@ pub struct CommandInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub agent: Option<String>,
+    pub mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub template: Option<String>,
 }
@@ -125,13 +125,13 @@ pub struct CatalogDefaults {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<super::session::ModelRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub agent: Option<String>,
+    pub mode: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct AgentCatalog {
     pub models: Vec<ModelInfo>,
-    pub agents: Vec<AgentInfo>,
+    pub modes: Vec<ModeInfo>,
     pub mcp: Vec<McpServerInfo>,
     #[serde(default)]
     pub skills: Vec<SkillInfo>,

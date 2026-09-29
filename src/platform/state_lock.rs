@@ -37,7 +37,7 @@
 //! holding the directory. The consequence is bounded and fail-safe: an
 //! acquirer in that window is *refused*, never wrongly let in, and the next
 //! attempt succeeds. It cannot corrupt anything, which is why this is
-//! documented rather than engineered around -- the alternative primitives
+//! documented rather than designed around -- the alternative primitives
 //! trade this window for worse properties (POSIX record locks are not
 //! inherited across `fork`, but they are dropped when the process closes *any*
 //! descriptor to the file, and they do not contend between threads of one
@@ -362,7 +362,7 @@ mod tests {
         if child == 0 {
             unsafe {
                 libc::dup2(write_end, 1);
-                // Everything else inherited from the test harness goes,
+                // Everything else inherited from the test runner goes,
                 // including its captured output pipes: an orphan holding one
                 // of those open hangs the whole test run rather than failing
                 // it. This is also what keeps the child from holding a lock

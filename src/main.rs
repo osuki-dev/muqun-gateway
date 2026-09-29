@@ -70,7 +70,7 @@ pub(crate) struct AppState {
     /// The last backend liveness ordering, reused briefly so a burst of
     /// clients asking at once is answered once. See [`SESSION_LIVENESS_TTL`].
     pub(crate) session_liveness: Arc<Mutex<SessionLivenessCache>>,
-    /// The OpenCode engine, which comes and goes: it is discovered, adopted or
+    /// The OpenCode agent, which comes and goes: it is discovered, adopted or
     /// started, and re-attached whenever it moves. Routes ask it for the
     /// current manager rather than holding one.
     pub(crate) agent_runtime: Arc<agents::AgentRuntime>,

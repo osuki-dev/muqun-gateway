@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use std::time::Duration;
 
 use super::discovery::OpencodeEndpoint;
-use crate::agents::ports::engine::AgentEngineError;
+use crate::agents::ports::agent::AgentError;
 
 /// The optional filters `GET /api/session` accepts.
 #[derive(Debug, Default, Clone)]
@@ -45,7 +45,7 @@ impl OpencodeClient {
         resp: Response,
         method: &str,
         path: &str,
-    ) -> Result<Value, AgentEngineError> {
+    ) -> Result<Value, AgentError> {
         let status = resp.status();
         if !status.is_success() {
             let err_text = resp.text().await.unwrap_or_default();
@@ -57,13 +57,13 @@ impl OpencodeClient {
             // blank: if OpenCode will not say what went wrong, the gateway at
             // least says what it asked and what came back.
             if err_text.is_empty() {
-                return Err(AgentEngineError::RequestFailed(empty_body_failure(
+                return Err(AgentError::RequestFailed(empty_body_failure(
                     status.as_u16(),
                     method,
                     path,
                 )));
             }
-            return Err(AgentEngineError::RequestFailed(format!(
+            return Err(AgentError::RequestFailed(format!(
                 "HTTP {status}: {err_text}"
             )));
         }
@@ -73,15 +73,14 @@ impl OpencodeClient {
         let bytes = resp
             .bytes()
             .await
-            .map_err(|e| AgentEngineError::Network(e.to_string()))?;
+            .map_err(|e| AgentError::Network(e.to_string()))?;
         if bytes.is_empty() {
             return Ok(json!({ "success": true }));
         }
-        serde_json::from_slice::<Value>(&bytes)
-            .map_err(|e| AgentEngineError::Protocol(e.to_string()))
+        serde_json::from_slice::<Value>(&bytes).map_err(|e| AgentError::Protocol(e.to_string()))
     }
 
-    pub async fn get<K, V>(&self, path: &str, query: &[(K, V)]) -> Result<Value, AgentEngineError>
+    pub async fn get<K, V>(&self, path: &str, query: &[(K, V)]) -> Result<Value, AgentError>
     where
         K: AsRef<str> + serde::Serialize,
         V: AsRef<str> + serde::Serialize,
@@ -91,46 +90,46 @@ impl OpencodeClient {
         let resp = req
             .send()
             .await
-            .map_err(|e| AgentEngineError::Network(e.to_string()))?;
+            .map_err(|e| AgentError::Network(e.to_string()))?;
         self.handle_resp(resp, "GET", path).await
     }
 
-    pub async fn delete(&self, path: &str) -> Result<Value, AgentEngineError> {
+    pub async fn delete(&self, path: &str) -> Result<Value, AgentError> {
         let url = format!("{}{path}", self.endpoint.url);
         let req = self.authed_req(self.http.delete(&url));
         let resp = req
             .send()
             .await
-            .map_err(|e| AgentEngineError::Network(e.to_string()))?;
+            .map_err(|e| AgentError::Network(e.to_string()))?;
         self.handle_resp(resp, "DELETE", path).await
     }
 
     /// `get` with no query parameters.
-    pub async fn get_plain(&self, path: &str) -> Result<Value, AgentEngineError> {
+    pub async fn get_plain(&self, path: &str) -> Result<Value, AgentError> {
         self.get(path, &[] as &[(&str, &str)]).await
     }
 
-    pub async fn post(&self, path: &str, body: &Value) -> Result<Value, AgentEngineError> {
+    pub async fn post(&self, path: &str, body: &Value) -> Result<Value, AgentError> {
         let url = format!("{}{path}", self.endpoint.url);
         let req = self.authed_req(self.http.post(&url).json(body));
         let resp = req
             .send()
             .await
-            .map_err(|e| AgentEngineError::Network(e.to_string()))?;
+            .map_err(|e| AgentError::Network(e.to_string()))?;
         self.handle_resp(resp, "POST", path).await
     }
 
-    pub async fn patch(&self, path: &str, body: &Value) -> Result<Value, AgentEngineError> {
+    pub async fn patch(&self, path: &str, body: &Value) -> Result<Value, AgentError> {
         let url = format!("{}{path}", self.endpoint.url);
         let req = self.authed_req(self.http.patch(&url).json(body));
         let resp = req
             .send()
             .await
-            .map_err(|e| AgentEngineError::Network(e.to_string()))?;
+            .map_err(|e| AgentError::Network(e.to_string()))?;
         self.handle_resp(resp, "PATCH", path).await
     }
 
-    pub async fn list_projects(&self) -> Result<Vec<Value>, AgentEngineError> {
+    pub async fn list_projects(&self) -> Result<Vec<Value>, AgentError> {
         let res = self.get_plain("/api/project").await?;
         if let Some(arr) = res.as_array() {
             return Ok(arr.clone());
@@ -149,7 +148,7 @@ impl OpencodeClient {
         &self,
         directory: Option<&str>,
         filter: &SessionListFilter<'_>,
-    ) -> Result<Vec<Value>, AgentEngineError> {
+    ) -> Result<Vec<Value>, AgentError> {
         let mut query: Vec<(String, String)> = Vec::new();
         if let Some(d) = directory {
             query.push(("directory".to_string(), d.to_string()));
@@ -182,7 +181,7 @@ impl OpencodeClient {
         directory: Option<&str>,
         model: Option<&crate::agents::domain::ModelRef>,
         agent: Option<&str>,
-    ) -> Result<Value, AgentEngineError> {
+    ) -> Result<Value, AgentError> {
         let mut body = json!({});
         if let Some(d) = directory {
             body["location"] = json!({ "directory": d });
@@ -200,7 +199,7 @@ impl OpencodeClient {
         self.post("/api/session", &body).await
     }
 
-    pub async fn get_session(&self, id: &str) -> Result<Value, AgentEngineError> {
+    pub async fn get_session(&self, id: &str) -> Result<Value, AgentError> {
         self.get_plain(&format!("/api/session/{id}")).await
     }
 
@@ -208,7 +207,7 @@ impl OpencodeClient {
         &self,
         session_id: &str,
         limit: usize,
-    ) -> Result<Vec<Value>, AgentEngineError> {
+    ) -> Result<Vec<Value>, AgentError> {
         let limit_str = limit.to_string();
         // `order` is sent explicitly rather than inferred from two timestamps.
         // It has to be `desc`: verified against 2.0.1, `limit` is applied from
@@ -240,7 +239,7 @@ impl OpencodeClient {
         text: &str,
         attachments: &[String],
         delivery: Option<&str>,
-    ) -> Result<Value, AgentEngineError> {
+    ) -> Result<Value, AgentError> {
         let mut body = json!({ "text": text });
         if !attachments.is_empty() {
             let files: Vec<Value> = attachments
@@ -282,7 +281,7 @@ impl OpencodeClient {
         &self,
         session_id: &str,
         message_id: &str,
-    ) -> Result<Value, AgentEngineError> {
+    ) -> Result<Value, AgentError> {
         self.stage_revert(session_id, message_id, Some(true))
             .await?;
         self.commit_revert(session_id).await
@@ -297,7 +296,7 @@ impl OpencodeClient {
         session_id: &str,
         message_id: &str,
         files: Option<bool>,
-    ) -> Result<Value, AgentEngineError> {
+    ) -> Result<Value, AgentError> {
         let mut body = json!({ "messageID": message_id });
         if let Some(files) = files {
             body["files"] = json!(files);
@@ -307,7 +306,7 @@ impl OpencodeClient {
     }
 
     /// `POST /api/session/{id}/revert/commit`: apply the staged rollback.
-    pub async fn commit_revert(&self, session_id: &str) -> Result<Value, AgentEngineError> {
+    pub async fn commit_revert(&self, session_id: &str) -> Result<Value, AgentError> {
         self.post(
             &format!("/api/session/{session_id}/revert/commit"),
             &json!({}),
@@ -315,7 +314,7 @@ impl OpencodeClient {
         .await
     }
 
-    pub async fn interrupt(&self, session_id: &str) -> Result<Value, AgentEngineError> {
+    pub async fn interrupt(&self, session_id: &str) -> Result<Value, AgentError> {
         self.post(&format!("/api/session/{session_id}/interrupt"), &json!({}))
             .await
     }
@@ -324,7 +323,7 @@ impl OpencodeClient {
         &self,
         session_id: &str,
         model: &crate::agents::domain::ModelRef,
-    ) -> Result<Value, AgentEngineError> {
+    ) -> Result<Value, AgentError> {
         let body = json!({
             "model": model_ref_json(model),
         });
@@ -332,11 +331,7 @@ impl OpencodeClient {
             .await
     }
 
-    pub async fn switch_agent(
-        &self,
-        session_id: &str,
-        agent: &str,
-    ) -> Result<Value, AgentEngineError> {
+    pub async fn switch_mode(&self, session_id: &str, agent: &str) -> Result<Value, AgentError> {
         let body = json!({
             "agent": agent,
         });
@@ -350,7 +345,7 @@ impl OpencodeClient {
         request_id: &str,
         reply: &str,
         message: Option<&str>,
-    ) -> Result<Value, AgentEngineError> {
+    ) -> Result<Value, AgentError> {
         let mut body = json!({
             "reply": reply,
         });
@@ -415,10 +410,7 @@ impl OpencodeClient {
     /// `[{"directory": "/repo"}, {"directory": "…/probe", "strategy": "git"}]`.
     /// The project's own root is in the list and is the one without a
     /// `strategy`: it is not a worktree OpenCode made and cannot be removed.
-    pub async fn list_worktrees(
-        &self,
-        directory: Option<&str>,
-    ) -> Result<Vec<Value>, AgentEngineError> {
+    pub async fn list_worktrees(&self, directory: Option<&str>) -> Result<Vec<Value>, AgentError> {
         let res = self
             .get("/api/worktree", &location_query(directory))
             .await?;
@@ -444,7 +436,7 @@ impl OpencodeClient {
         &self,
         directory: Option<&str>,
         input: &Value,
-    ) -> Result<Value, AgentEngineError> {
+    ) -> Result<Value, AgentError> {
         let url = format!("{}/api/worktree", self.endpoint.url);
         let req = self.authed_req(
             self.http
@@ -455,7 +447,7 @@ impl OpencodeClient {
         let resp = req
             .send()
             .await
-            .map_err(|e| AgentEngineError::Network(e.to_string()))?;
+            .map_err(|e| AgentError::Network(e.to_string()))?;
         self.handle_resp(resp, "POST", "/api/worktree").await
     }
 
@@ -468,7 +460,7 @@ impl OpencodeClient {
         directory: Option<&str>,
         worktree_directory: &str,
         force: bool,
-    ) -> Result<Value, AgentEngineError> {
+    ) -> Result<Value, AgentError> {
         let url = format!("{}/api/worktree", self.endpoint.url);
         let req = self.authed_req(
             self.http
@@ -479,15 +471,12 @@ impl OpencodeClient {
         let resp = req
             .send()
             .await
-            .map_err(|e| AgentEngineError::Network(e.to_string()))?;
+            .map_err(|e| AgentError::Network(e.to_string()))?;
         self.handle_resp(resp, "DELETE", "/api/worktree").await
     }
 
     /// `POST /api/worktree/refresh`: rediscover and reconcile the inventory.
-    pub async fn refresh_worktrees(
-        &self,
-        directory: Option<&str>,
-    ) -> Result<Value, AgentEngineError> {
+    pub async fn refresh_worktrees(&self, directory: Option<&str>) -> Result<Value, AgentError> {
         let url = format!("{}/api/worktree/refresh", self.endpoint.url);
         let req = self.authed_req(
             self.http
@@ -498,7 +487,7 @@ impl OpencodeClient {
         let resp = req
             .send()
             .await
-            .map_err(|e| AgentEngineError::Network(e.to_string()))?;
+            .map_err(|e| AgentError::Network(e.to_string()))?;
         self.handle_resp(resp, "POST", "/api/worktree/refresh")
             .await
     }
@@ -514,7 +503,7 @@ impl OpencodeClient {
         &self,
         session_id: &str,
         directory: &str,
-    ) -> Result<Value, AgentEngineError> {
+    ) -> Result<Value, AgentError> {
         self.post(
             &format!("/api/session/{session_id}/move"),
             &json!({ "directory": directory }),
@@ -528,7 +517,7 @@ impl OpencodeClient {
     pub async fn list_saved_permissions(
         &self,
         project_id: Option<&str>,
-    ) -> Result<Vec<Value>, AgentEngineError> {
+    ) -> Result<Vec<Value>, AgentError> {
         let res = self
             .get("/api/permission/saved", &saved_permission_query(project_id))
             .await?;
@@ -541,7 +530,7 @@ impl OpencodeClient {
 
     /// `DELETE /api/permission/saved/{id}`: forget one remembered decision.
     /// Answers `204`.
-    pub async fn delete_saved_permission(&self, id: &str) -> Result<Value, AgentEngineError> {
+    pub async fn delete_saved_permission(&self, id: &str) -> Result<Value, AgentError> {
         self.delete(&format!("/api/permission/saved/{id}")).await
     }
 
@@ -550,7 +539,7 @@ impl OpencodeClient {
         session_id: &str,
         form_id: &str,
         answers: &Value,
-    ) -> Result<Value, AgentEngineError> {
+    ) -> Result<Value, AgentError> {
         let body = json!({
             "answer": answers,
         });
@@ -561,10 +550,7 @@ impl OpencodeClient {
         .await
     }
 
-    pub async fn get_models(
-        &self,
-        directory: Option<&str>,
-    ) -> Result<Vec<Value>, AgentEngineError> {
+    pub async fn get_models(&self, directory: Option<&str>) -> Result<Vec<Value>, AgentError> {
         let res = self.get("/api/model", &location_query(directory)).await?;
         Ok(res
             .get("data")
@@ -573,10 +559,7 @@ impl OpencodeClient {
             .unwrap_or_default())
     }
 
-    pub async fn get_agents(
-        &self,
-        directory: Option<&str>,
-    ) -> Result<Vec<Value>, AgentEngineError> {
+    pub async fn get_agents(&self, directory: Option<&str>) -> Result<Vec<Value>, AgentError> {
         let res = self.get("/api/agent", &location_query(directory)).await?;
         Ok(res
             .get("data")
@@ -585,7 +568,7 @@ impl OpencodeClient {
             .unwrap_or_default())
     }
 
-    pub async fn get_mcp(&self, directory: Option<&str>) -> Result<Vec<Value>, AgentEngineError> {
+    pub async fn get_mcp(&self, directory: Option<&str>) -> Result<Vec<Value>, AgentError> {
         let res = self.get("/api/mcp", &location_query(directory)).await?;
         Ok(res
             .get("data")
@@ -601,7 +584,7 @@ impl OpencodeClient {
         directory: Option<&str>,
         mode: &str,
         base: Option<&str>,
-    ) -> Result<Vec<Value>, AgentEngineError> {
+    ) -> Result<Vec<Value>, AgentError> {
         let mut query = location_query(directory);
         query.push(("mode".to_string(), mode.to_string()));
         if let Some(b) = base {
@@ -615,10 +598,7 @@ impl OpencodeClient {
             .unwrap_or_default())
     }
 
-    pub async fn get_skills(
-        &self,
-        directory: Option<&str>,
-    ) -> Result<Vec<Value>, AgentEngineError> {
+    pub async fn get_skills(&self, directory: Option<&str>) -> Result<Vec<Value>, AgentError> {
         let res = self.get("/api/skill", &location_query(directory)).await?;
         Ok(res
             .get("data")
@@ -635,7 +615,7 @@ impl OpencodeClient {
         session_id: &str,
         skill: &str,
         resume: Option<bool>,
-    ) -> Result<Value, AgentEngineError> {
+    ) -> Result<Value, AgentError> {
         let mut body = json!({ "id": skill });
         if let Some(resume) = resume {
             body["resume"] = json!(resume);
@@ -657,7 +637,7 @@ impl OpencodeClient {
         &self,
         session_id: &str,
         delivery: Option<&str>,
-    ) -> Result<Value, AgentEngineError> {
+    ) -> Result<Value, AgentError> {
         let mut body = json!({});
         if let Some(d) = delivery.filter(|d| *d == "steer" || *d == "queue") {
             body["delivery"] = json!(d);
@@ -668,7 +648,7 @@ impl OpencodeClient {
 
     /// `GET /api/session/{id}/context`: the messages still in the model's
     /// context, i.e. everything after the last compaction.
-    pub async fn get_context(&self, session_id: &str) -> Result<Vec<Value>, AgentEngineError> {
+    pub async fn get_context(&self, session_id: &str) -> Result<Vec<Value>, AgentError> {
         let res = self
             .get_plain(&format!("/api/session/{session_id}/context"))
             .await?;
@@ -681,13 +661,13 @@ impl OpencodeClient {
 
     /// `POST /api/session/{id}/background`: detach the foreground tools that
     /// are blocking the agent loop. They keep running.
-    pub async fn background_session(&self, session_id: &str) -> Result<Value, AgentEngineError> {
+    pub async fn background_session(&self, session_id: &str) -> Result<Value, AgentError> {
         self.post(&format!("/api/session/{session_id}/background"), &json!({}))
             .await
     }
 
     /// `POST /api/experimental/session/{id}/wait`: resolves when the agent loop is idle.
-    pub async fn wait_session(&self, session_id: &str) -> Result<Value, AgentEngineError> {
+    pub async fn wait_session(&self, session_id: &str) -> Result<Value, AgentError> {
         self.post(
             &format!("/api/experimental/session/{session_id}/wait"),
             &json!({}),
@@ -695,11 +675,7 @@ impl OpencodeClient {
         .await
     }
 
-    pub async fn rename_session(
-        &self,
-        session_id: &str,
-        title: &str,
-    ) -> Result<Value, AgentEngineError> {
+    pub async fn rename_session(&self, session_id: &str, title: &str) -> Result<Value, AgentError> {
         self.patch(
             &format!("/api/session/{session_id}"),
             &json!({ "title": title }),
@@ -707,23 +683,19 @@ impl OpencodeClient {
         .await
     }
 
-    pub async fn delete_session(&self, session_id: &str) -> Result<Value, AgentEngineError> {
+    pub async fn delete_session(&self, session_id: &str) -> Result<Value, AgentError> {
         self.delete(&format!("/api/session/{session_id}")).await
     }
 
     /// `DELETE /api/session/{id}/revert`: cancel a staged rollback.
-    pub async fn clear_revert(&self, session_id: &str) -> Result<Value, AgentEngineError> {
+    pub async fn clear_revert(&self, session_id: &str) -> Result<Value, AgentError> {
         self.delete(&format!("/api/session/{session_id}/revert"))
             .await
     }
 
     /// `POST /api/session/{id}/view {idle}`: mark the session read up to a
     /// point. `idle` greater than `viewed` is the unread rule.
-    pub async fn view_session(
-        &self,
-        session_id: &str,
-        idle: u64,
-    ) -> Result<Value, AgentEngineError> {
+    pub async fn view_session(&self, session_id: &str, idle: u64) -> Result<Value, AgentError> {
         self.post(
             &format!("/api/session/{session_id}/view"),
             &json!({ "idle": idle }),
@@ -736,7 +708,7 @@ impl OpencodeClient {
         &self,
         session_id: &str,
         sanitize: bool,
-    ) -> Result<Value, AgentEngineError> {
+    ) -> Result<Value, AgentError> {
         self.get(
             &format!("/api/experimental/session/{session_id}/export"),
             &[("sanitize", if sanitize { "true" } else { "false" })],
@@ -752,7 +724,7 @@ impl OpencodeClient {
         command: &str,
         text: &str,
         delivery: Option<&str>,
-    ) -> Result<Value, AgentEngineError> {
+    ) -> Result<Value, AgentError> {
         let mut body = json!({ "command": command, "text": text });
         if let Some(d) = delivery.filter(|d| *d == "steer" || *d == "queue") {
             body["delivery"] = json!(d);
@@ -765,7 +737,7 @@ impl OpencodeClient {
     // Inbox
     // -----------------------------------------------------------------
 
-    pub async fn get_inbox(&self, session_id: &str) -> Result<Vec<Value>, AgentEngineError> {
+    pub async fn get_inbox(&self, session_id: &str) -> Result<Vec<Value>, AgentError> {
         let res = self
             .get_plain(&format!("/api/session/{session_id}/inbox"))
             .await?;
@@ -780,7 +752,7 @@ impl OpencodeClient {
         &self,
         session_id: &str,
         inbox_id: &str,
-    ) -> Result<Value, AgentEngineError> {
+    ) -> Result<Value, AgentError> {
         self.delete(&format!("/api/session/{session_id}/inbox/{inbox_id}"))
             .await
     }
@@ -791,7 +763,7 @@ impl OpencodeClient {
         session_id: &str,
         inbox_id: &str,
         delivery: &str,
-    ) -> Result<Value, AgentEngineError> {
+    ) -> Result<Value, AgentError> {
         self.patch(
             &format!("/api/session/{session_id}/inbox/{inbox_id}"),
             &json!({ "delivery": delivery }),
@@ -806,7 +778,7 @@ impl OpencodeClient {
     pub async fn get_session_permissions(
         &self,
         session_id: &str,
-    ) -> Result<Vec<Value>, AgentEngineError> {
+    ) -> Result<Vec<Value>, AgentError> {
         let res = self
             .get_plain(&format!("/api/session/{session_id}/permission"))
             .await?;
@@ -828,7 +800,7 @@ impl OpencodeClient {
     pub async fn get_session_permission_rules(
         &self,
         session_id: &str,
-    ) -> Result<Vec<Value>, AgentEngineError> {
+    ) -> Result<Vec<Value>, AgentError> {
         let raw = self.get_session(session_id).await?;
         let info = raw.get("data").unwrap_or(&raw);
         Ok(info
@@ -845,7 +817,7 @@ impl OpencodeClient {
         &self,
         session_id: &str,
         rules: &[Value],
-    ) -> Result<(), AgentEngineError> {
+    ) -> Result<(), AgentError> {
         self.patch(
             &format!("/api/session/{session_id}"),
             &json!({ "permissions": rules }),
@@ -854,10 +826,7 @@ impl OpencodeClient {
         Ok(())
     }
 
-    pub async fn get_session_forms(
-        &self,
-        session_id: &str,
-    ) -> Result<Vec<Value>, AgentEngineError> {
+    pub async fn get_session_forms(&self, session_id: &str) -> Result<Vec<Value>, AgentError> {
         let res = self
             .get_plain(&format!("/api/session/{session_id}/form"))
             .await?;
@@ -874,10 +843,7 @@ impl OpencodeClient {
 
     /// `GET /api/config` returns the merged configuration as the list of
     /// documents it was assembled from.
-    pub async fn get_config(
-        &self,
-        directory: Option<&str>,
-    ) -> Result<Vec<Value>, AgentEngineError> {
+    pub async fn get_config(&self, directory: Option<&str>) -> Result<Vec<Value>, AgentError> {
         let res = self.get("/api/config", &location_query(directory)).await?;
         match res {
             Value::Array(arr) => Ok(arr),
@@ -893,17 +859,14 @@ impl OpencodeClient {
     pub async fn get_default_model(
         &self,
         directory: Option<&str>,
-    ) -> Result<Option<Value>, AgentEngineError> {
+    ) -> Result<Option<Value>, AgentError> {
         let res = self
             .get("/api/model/default", &location_query(directory))
             .await?;
         Ok(res.get("data").cloned().filter(|d| !d.is_null()))
     }
 
-    pub async fn get_providers(
-        &self,
-        directory: Option<&str>,
-    ) -> Result<Vec<Value>, AgentEngineError> {
+    pub async fn get_providers(&self, directory: Option<&str>) -> Result<Vec<Value>, AgentError> {
         let res = self
             .get("/api/provider", &location_query(directory))
             .await?;
@@ -914,10 +877,7 @@ impl OpencodeClient {
             .unwrap_or_default())
     }
 
-    pub async fn get_commands(
-        &self,
-        directory: Option<&str>,
-    ) -> Result<Vec<Value>, AgentEngineError> {
+    pub async fn get_commands(&self, directory: Option<&str>) -> Result<Vec<Value>, AgentError> {
         let res = self.get("/api/command", &location_query(directory)).await?;
         Ok(res
             .get("data")
@@ -930,10 +890,7 @@ impl OpencodeClient {
     // Background shells
     // -----------------------------------------------------------------
 
-    pub async fn list_shells(
-        &self,
-        directory: Option<&str>,
-    ) -> Result<Vec<Value>, AgentEngineError> {
+    pub async fn list_shells(&self, directory: Option<&str>) -> Result<Vec<Value>, AgentError> {
         let res = self.get("/api/shell", &location_query(directory)).await?;
         Ok(res
             .get("data")
@@ -942,7 +899,7 @@ impl OpencodeClient {
             .unwrap_or_default())
     }
 
-    pub async fn get_shell(&self, shell_id: &str) -> Result<Value, AgentEngineError> {
+    pub async fn get_shell(&self, shell_id: &str) -> Result<Value, AgentError> {
         let res = self.get_plain(&format!("/api/shell/{shell_id}")).await?;
         Ok(res.get("data").cloned().unwrap_or(res))
     }
@@ -952,7 +909,7 @@ impl OpencodeClient {
         shell_id: &str,
         cursor: Option<u64>,
         limit: Option<usize>,
-    ) -> Result<Value, AgentEngineError> {
+    ) -> Result<Value, AgentError> {
         let mut query: Vec<(String, String)> = Vec::new();
         if let Some(c) = cursor {
             query.push(("cursor".to_string(), c.to_string()));
@@ -966,7 +923,7 @@ impl OpencodeClient {
         Ok(res.get("data").cloned().unwrap_or(res))
     }
 
-    pub async fn kill_shell(&self, shell_id: &str) -> Result<Value, AgentEngineError> {
+    pub async fn kill_shell(&self, shell_id: &str) -> Result<Value, AgentError> {
         self.delete(&format!("/api/shell/{shell_id}")).await
     }
 
@@ -978,7 +935,7 @@ impl OpencodeClient {
         query: &str,
         limit: usize,
         directory: Option<&str>,
-    ) -> Result<Vec<Value>, AgentEngineError> {
+    ) -> Result<Vec<Value>, AgentError> {
         if query.trim().is_empty() {
             let res = self.get("/api/fs/list", &location_query(directory)).await?;
             let mut items = res
@@ -1055,7 +1012,7 @@ mod tests {
 
     async fn rename_against_upstream(
         patch_status: StatusCode,
-    ) -> (Result<Value, AgentEngineError>, Vec<(String, Value)>) {
+    ) -> (Result<Value, AgentError>, Vec<(String, Value)>) {
         use axum::{
             routing::{patch, post},
             Json, Router,

@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use super::endpoint::DeepseekEndpoint;
 use crate::agents::domain::{ModelRef, SessionQuery};
-use crate::agents::ports::engine::AgentEngineError;
+use crate::agents::ports::agent::AgentError;
 
 /// Largest upstream response body we will buffer.
 pub(super) const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -119,7 +119,7 @@ impl DeepseekClient {
         namespace: &str,
         method: &str,
         args: Value,
-    ) -> Result<Value, AgentEngineError> {
+    ) -> Result<Value, AgentError> {
         let url = format!("{}/api/{namespace}/{method}", self.endpoint.url);
         let rpc_id = format!("req_{}", Uuid::new_v4().simple());
         let full_method = format!("{namespace}/{method}");
@@ -145,7 +145,7 @@ impl DeepseekClient {
 
         let resp = req.json(&wire_payload).send().await.map_err(|e| {
             tracing::warn!(target: "deepseek", "{full_method}: request failed: {e}");
-            AgentEngineError::Network(if e.is_timeout() {
+            AgentError::Network(if e.is_timeout() {
                 "upstream request timed out".to_string()
             } else {
                 "connection to upstream failed".to_string()
@@ -164,11 +164,9 @@ impl DeepseekClient {
                 truncate_for_log(&snippet, ERROR_SNIPPET_BYTES)
             );
             if status == reqwest::StatusCode::NOT_FOUND && namespace == "session" {
-                return Err(AgentEngineError::SessionNotFound(session_id_of(
-                    &args_for_id,
-                )));
+                return Err(AgentError::SessionNotFound(session_id_of(&args_for_id)));
             }
-            return Err(AgentEngineError::RequestFailed(format!(
+            return Err(AgentError::RequestFailed(format!(
                 "upstream returned HTTP {}",
                 status.as_u16()
             )));
@@ -178,10 +176,10 @@ impl DeepseekClient {
             tracing::warn!(target: "deepseek", "{full_method}: reading response failed: {e}");
             match e {
                 ReadError::TooLarge => {
-                    AgentEngineError::Protocol("upstream response too large".to_string())
+                    AgentError::Protocol("upstream response too large".to_string())
                 }
                 ReadError::Network => {
-                    AgentEngineError::Network("reading upstream response failed".to_string())
+                    AgentError::Network("reading upstream response failed".to_string())
                 }
             }
         })?;
@@ -192,7 +190,7 @@ impl DeepseekClient {
 
         let envelope: Value = serde_json::from_slice(&bytes).map_err(|e| {
             tracing::warn!(target: "deepseek", "{full_method}: invalid JSON response: {e}");
-            AgentEngineError::Protocol("invalid JSON RPC response".to_string())
+            AgentError::Protocol("invalid JSON RPC response".to_string())
         })?;
 
         // Typert Connection RPC Envelope check:
@@ -214,11 +212,9 @@ impl DeepseekClient {
 
                 tracing::warn!(target: "deepseek", "{full_method}: RPC error {code}: {}", truncate_for_log(msg, ERROR_SNIPPET_BYTES));
                 if code.contains("not-found") {
-                    Err(AgentEngineError::SessionNotFound(session_id_of(
-                        &args_for_id,
-                    )))
+                    Err(AgentError::SessionNotFound(session_id_of(&args_for_id)))
                 } else {
-                    Err(AgentEngineError::RequestFailed(format!(
+                    Err(AgentError::RequestFailed(format!(
                         "upstream RPC error: {}",
                         sanitize_code(code)
                     )))
@@ -230,10 +226,7 @@ impl DeepseekClient {
     }
 
     /// List sessions from session-controller: `session/list`
-    pub async fn list_sessions(
-        &self,
-        _query: &SessionQuery,
-    ) -> Result<Vec<Value>, AgentEngineError> {
+    pub async fn list_sessions(&self, _query: &SessionQuery) -> Result<Vec<Value>, AgentError> {
         let args = json!({
             "_request": {}
         });
@@ -255,7 +248,7 @@ impl DeepseekClient {
         directory: Option<&str>,
         _model: Option<&ModelRef>,
         agent_preset: Option<&str>,
-    ) -> Result<String, AgentEngineError> {
+    ) -> Result<String, AgentError> {
         let session_id = format!("session-{}", Uuid::new_v4());
         let cwd = directory.unwrap_or(".");
         let mut req_body = json!({
@@ -282,13 +275,13 @@ impl DeepseekClient {
         text: &str,
         attachments: &[String],
         delivery: Option<&str>,
-    ) -> Result<Value, AgentEngineError> {
+    ) -> Result<Value, AgentError> {
         if !attachments.is_empty() {
-            return Err(AgentEngineError::Unsupported("attachments".to_string()));
+            return Err(AgentError::Unsupported("attachments".to_string()));
         }
         let mode = delivery.unwrap_or("steer");
         if !DELIVERY_MODES.contains(&mode) {
-            return Err(AgentEngineError::RequestFailed(
+            return Err(AgentError::RequestFailed(
                 "unsupported delivery mode".to_string(),
             ));
         }
@@ -311,7 +304,7 @@ impl DeepseekClient {
     }
 
     /// Cancel active turn: `session/cancel`
-    pub async fn cancel(&self, session_id: &str) -> Result<Value, AgentEngineError> {
+    pub async fn cancel(&self, session_id: &str) -> Result<Value, AgentError> {
         let args = json!({
             "request": {
                 "sessionId": session_id
@@ -321,7 +314,7 @@ impl DeepseekClient {
     }
 
     /// Rename session: `session/rename`
-    pub async fn rename(&self, session_id: &str, title: &str) -> Result<Value, AgentEngineError> {
+    pub async fn rename(&self, session_id: &str, title: &str) -> Result<Value, AgentError> {
         let args = json!({
             "request": {
                 "sessionId": session_id,
@@ -332,7 +325,7 @@ impl DeepseekClient {
     }
 
     /// Fork session: `session/fork`
-    pub async fn fork(&self, session_id: &str) -> Result<Value, AgentEngineError> {
+    pub async fn fork(&self, session_id: &str) -> Result<Value, AgentError> {
         let args = json!({
             "request": {
                 "sessionId": session_id
@@ -342,11 +335,7 @@ impl DeepseekClient {
     }
 
     /// Read historical messages page: `session/page`
-    pub async fn get_page(
-        &self,
-        session_id: &str,
-        limit: usize,
-    ) -> Result<Value, AgentEngineError> {
+    pub async fn get_page(&self, session_id: &str, limit: usize) -> Result<Value, AgentError> {
         let args = json!({
             "request": {
                 "address": {
@@ -361,7 +350,7 @@ impl DeepseekClient {
     }
 
     /// Read session projections: `session/projections`
-    pub async fn get_projections(&self, session_id: &str) -> Result<Value, AgentEngineError> {
+    pub async fn get_projections(&self, session_id: &str) -> Result<Value, AgentError> {
         let args = json!({
             "request": {
                 "sessionId": session_id
@@ -371,7 +360,7 @@ impl DeepseekClient {
     }
 
     /// Fetch available model catalog: `session/modelCatalog`
-    pub async fn model_catalog(&self) -> Result<Value, AgentEngineError> {
+    pub async fn model_catalog(&self) -> Result<Value, AgentError> {
         self.call_remote("session", "modelCatalog", json!({})).await
     }
 
@@ -382,7 +371,7 @@ impl DeepseekClient {
         provider: &str,
         model: &str,
         reasoning_effort: Option<&str>,
-    ) -> Result<Value, AgentEngineError> {
+    ) -> Result<Value, AgentError> {
         let mut selection = json!({
             "sessionId": session_id,
             "provider": provider,
@@ -400,11 +389,7 @@ impl DeepseekClient {
     }
 
     /// List files in workspace: `workspaceFiles/list`
-    pub async fn workspace_files_list(
-        &self,
-        cwd: &str,
-        path: &str,
-    ) -> Result<Value, AgentEngineError> {
+    pub async fn workspace_files_list(&self, cwd: &str, path: &str) -> Result<Value, AgentError> {
         let args = json!({
             "workspaceFileScope": {
                 "cwd": cwd,
@@ -415,11 +400,7 @@ impl DeepseekClient {
     }
 
     /// Read file metadata: `workspaceFiles/stat`
-    pub async fn workspace_files_stat(
-        &self,
-        cwd: &str,
-        path: &str,
-    ) -> Result<Value, AgentEngineError> {
+    pub async fn workspace_files_stat(&self, cwd: &str, path: &str) -> Result<Value, AgentError> {
         let args = json!({
             "workspaceFileScope": {
                 "cwd": cwd,
@@ -543,7 +524,7 @@ mod tests {
             .await
             .unwrap_err();
         let msg = err.to_string();
-        assert!(matches!(err, AgentEngineError::RequestFailed(_)));
+        assert!(matches!(err, AgentError::RequestFailed(_)));
         assert!(msg.contains("HTTP 500"));
         assert!(!msg.contains("secret-internal-detail"));
         assert!(!msg.contains("127.0.0.1"));
@@ -553,7 +534,7 @@ mod tests {
     async fn http_404_on_session_method_is_session_not_found() {
         let c = client_for(test_server::serve(404, b"nope".to_vec()).await);
         let err = c.cancel("ses_x").await.unwrap_err();
-        assert!(matches!(err, AgentEngineError::SessionNotFound(ref id) if id == "ses_x"));
+        assert!(matches!(err, AgentError::SessionNotFound(ref id) if id == "ses_x"));
     }
 
     #[tokio::test]
@@ -564,7 +545,7 @@ mod tests {
         drop(l);
         let c = client_for(format!("http://127.0.0.1:{port}"));
         let err = c.model_catalog().await.unwrap_err();
-        assert!(matches!(err, AgentEngineError::Network(_)));
+        assert!(matches!(err, AgentError::Network(_)));
         assert!(!err.to_string().contains("127.0.0.1"));
     }
 
@@ -572,7 +553,7 @@ mod tests {
     async fn oversized_response_is_rejected() {
         let c = client_for(test_server::serve(200, vec![b' '; MAX_RESPONSE_BYTES + 1]).await);
         let err = c.model_catalog().await.unwrap_err();
-        assert!(matches!(err, AgentEngineError::Protocol(_)));
+        assert!(matches!(err, AgentError::Protocol(_)));
     }
 
     #[tokio::test]
@@ -599,12 +580,12 @@ mod tests {
             .send_prompt("s", "hi", &["a.png".to_string()], None)
             .await
             .unwrap_err();
-        assert!(matches!(e, AgentEngineError::Unsupported(_)));
+        assert!(matches!(e, AgentError::Unsupported(_)));
         let e = c
             .send_prompt("s", "hi", &[], Some("bogus"))
             .await
             .unwrap_err();
-        assert!(matches!(e, AgentEngineError::RequestFailed(_)));
+        assert!(matches!(e, AgentError::RequestFailed(_)));
     }
 
     #[test]

@@ -1086,7 +1086,7 @@ pub(crate) fn spawn_agent_notification_watchers(state: AppState) {
     }
 }
 
-pub(crate) fn spawn_agent_engine_watchers(state: AppState) {
+pub(crate) fn spawn_agent_permission_watchers(state: AppState) {
     let mut rx = state.agent_runtime.subscribe_events();
     let state = state.clone();
 

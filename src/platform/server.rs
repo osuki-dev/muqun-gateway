@@ -28,7 +28,7 @@ use crate::platform;
 use crate::platform::i18n::Locale;
 use crate::terminal;
 use crate::terminal::routes::{
-    spawn_agent_engine_watchers, spawn_agent_notification_watchers, spawn_approval_watchers,
+    spawn_agent_notification_watchers, spawn_agent_permission_watchers, spawn_approval_watchers,
 };
 use crate::{
     agent_events, agents, api_error, backend_startup, connectivity, gateway_listener, hash_token,
@@ -86,7 +86,7 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         ws_connections: Arc::new(agents::ws_routes::WsRegistry::default()),
     };
     spawn_agent_notification_watchers(state.clone());
-    spawn_agent_engine_watchers(state.clone());
+    spawn_agent_permission_watchers(state.clone());
     spawn_approval_watchers(state.clone());
     spawn_upload_gc();
     spawn_memory_watchdog();

@@ -58,7 +58,7 @@ pub(crate) struct Config {
     pub(crate) transport_encryption: TransportEncryptionMode,
     /// Answer every device route without asking for a token at all.
     ///
-    /// For a mock or harness that has no pairing to offer and talks to a
+    /// For a mock or test double that has no pairing to offer and talks to a
     /// gateway bound to loopback. It is not a transport setting and is not
     /// implied by `transport_encryption: disabled`: cleartext means no
     /// envelope, never no authentication. Off unless the owner writes it, and
@@ -93,12 +93,12 @@ pub(crate) struct Config {
     /// round-trips untouched.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) rich_agent_pushes: bool,
-    /// How this gateway gets an OpenCode engine to talk to. Absent, it starts
+    /// How this gateway gets an OpenCode agent to talk to. Absent, it starts
     /// one when it cannot find a running service, which is the behaviour the
     /// owner asked for; `{"autostart": false}` leaves that to them.
     #[serde(default, skip_serializing_if = "is_default_opencode")]
     pub(crate) opencode: agents::OpencodeConfig,
-    /// Configuration for DeepSeek Harness engine adapter
+    /// Configuration for the DeepSeek agent adapter
     #[serde(default, skip_serializing_if = "is_default_deepseek")]
     pub(crate) deepseek: agents::DeepseekConfig,
 }

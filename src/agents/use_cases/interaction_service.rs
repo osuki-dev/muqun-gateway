@@ -1,17 +1,17 @@
 use std::sync::Arc;
 
 use crate::agents::domain::{AgentSessionId, PermissionDecision};
-use crate::agents::ports::engine::{AgentEngineError, AgentEnginePort};
+use crate::agents::ports::agent::{AgentError, AgentPort};
 use crate::agents::ports::mirror::SessionMirrorPort;
 
 pub struct InteractionService {
-    engine: Arc<dyn AgentEnginePort>,
+    agent: Arc<dyn AgentPort>,
     mirror: Arc<dyn SessionMirrorPort>,
 }
 
 impl InteractionService {
-    pub fn new(engine: Arc<dyn AgentEnginePort>, mirror: Arc<dyn SessionMirrorPort>) -> Self {
-        Self { engine, mirror }
+    pub fn new(agent: Arc<dyn AgentPort>, mirror: Arc<dyn SessionMirrorPort>) -> Self {
+        Self { agent, mirror }
     }
 
     pub async fn reply_permission(
@@ -20,8 +20,8 @@ impl InteractionService {
         request_id: &str,
         decision: PermissionDecision,
         message: Option<&str>,
-    ) -> Result<(), AgentEngineError> {
-        self.engine
+    ) -> Result<(), AgentError> {
+        self.agent
             .reply_permission(&asid.0, request_id, decision, message)
             .await?;
         self.mirror.resolve_permission(asid, request_id).await;
@@ -33,8 +33,8 @@ impl InteractionService {
         asid: &AgentSessionId,
         form_id: &str,
         answers: serde_json::Value,
-    ) -> Result<(), AgentEngineError> {
-        self.engine.reply_form(&asid.0, form_id, answers).await?;
+    ) -> Result<(), AgentError> {
+        self.agent.reply_form(&asid.0, form_id, answers).await?;
         self.mirror.resolve_form(asid, form_id).await;
         Ok(())
     }

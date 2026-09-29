@@ -695,16 +695,16 @@ impl Drop for FakeHerdr {
     }
 }
 
-/// An agent engine that answers from canned data, for route and service
+/// An agent that answers from canned data, for route and service
 /// tests. `failing` makes every read error.
-pub(crate) struct FakeEngine {
+pub(crate) struct FakeAgent {
     pub kind: &'static str,
     pub sessions: Vec<agents::domain::AgentSessionInfo>,
     pub failing: bool,
     pub catalog: agents::domain::AgentCatalog,
 }
 
-impl FakeEngine {
+impl FakeAgent {
     pub fn new(kind: &'static str) -> Self {
         Self {
             kind,
@@ -731,14 +731,14 @@ impl FakeEngine {
         Arc::new(agents::manager::AgentManager::for_test(Arc::new(self)))
     }
 
-    fn fail<T>(&self) -> Result<T, agents::ports::engine::AgentEngineError> {
-        Err(agents::ports::engine::AgentEngineError::Network(
-            "fake engine is down".into(),
+    fn fail<T>(&self) -> Result<T, agents::ports::agent::AgentError> {
+        Err(agents::ports::agent::AgentError::Network(
+            "fake agent is down".into(),
         ))
     }
 }
 
-/// A session as an adapter returns it: no `harness`, which the manager adds.
+/// A session as an adapter returns it: no `agent_id`, which the manager adds.
 pub(crate) fn fake_session(asid: &str, updated_ms: u64) -> agents::domain::AgentSessionInfo {
     serde_json::from_value(json!({
         "asid": asid,
@@ -749,16 +749,16 @@ pub(crate) fn fake_session(asid: &str, updated_ms: u64) -> agents::domain::Agent
     .expect("a minimal session parses")
 }
 
-impl agents::ports::engine::AgentEnginePort for FakeEngine {
+impl agents::ports::agent::AgentPort for FakeAgent {
     fn kind(&self) -> &'static str {
         self.kind
     }
-    fn probe(&self) -> agents::ports::engine::EngineFuture<'_, bool> {
+    fn probe(&self) -> agents::ports::agent::AgentFuture<'_, bool> {
         Box::pin(async move { Ok(!self.failing) })
     }
     fn list_projects(
         &self,
-    ) -> agents::ports::engine::EngineFuture<'_, Vec<agents::domain::AgentProject>> {
+    ) -> agents::ports::agent::AgentFuture<'_, Vec<agents::domain::AgentProject>> {
         Box::pin(async move {
             if self.failing {
                 return self.fail();
@@ -776,7 +776,7 @@ impl agents::ports::engine::AgentEnginePort for FakeEngine {
     fn list_sessions<'a>(
         &'a self,
         _query: &'a agents::domain::SessionQuery,
-    ) -> agents::ports::engine::EngineFuture<'a, Vec<agents::domain::AgentSessionInfo>> {
+    ) -> agents::ports::agent::AgentFuture<'a, Vec<agents::domain::AgentSessionInfo>> {
         Box::pin(async move {
             if self.failing {
                 return self.fail();
@@ -788,8 +788,8 @@ impl agents::ports::engine::AgentEnginePort for FakeEngine {
         &'a self,
         _directory: Option<&'a str>,
         _model: Option<&'a agents::domain::ModelRef>,
-        _agent: Option<&'a str>,
-    ) -> agents::ports::engine::EngineFuture<'a, agents::domain::AgentSessionInfo> {
+        _mode: Option<&'a str>,
+    ) -> agents::ports::agent::AgentFuture<'a, agents::domain::AgentSessionInfo> {
         Box::pin(async move {
             if self.failing {
                 return self.fail();
@@ -800,15 +800,13 @@ impl agents::ports::engine::AgentEnginePort for FakeEngine {
     fn get_session<'a>(
         &'a self,
         session_id: &'a str,
-    ) -> agents::ports::engine::EngineFuture<'a, agents::domain::AgentSessionInfo> {
+    ) -> agents::ports::agent::AgentFuture<'a, agents::domain::AgentSessionInfo> {
         Box::pin(async move {
             self.sessions
                 .iter()
                 .find(|s| s.asid.0 == session_id)
                 .cloned()
-                .ok_or_else(|| {
-                    agents::ports::engine::AgentEngineError::SessionNotFound(session_id.into())
-                })
+                .ok_or_else(|| agents::ports::agent::AgentError::SessionNotFound(session_id.into()))
         })
     }
     fn send_prompt<'a>(
@@ -817,34 +815,31 @@ impl agents::ports::engine::AgentEnginePort for FakeEngine {
         _text: &'a str,
         _attachments: &'a [String],
         _delivery: Option<&'a str>,
-    ) -> agents::ports::engine::EngineFuture<'a, ()> {
+    ) -> agents::ports::agent::AgentFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }
     fn revert_session<'a>(
         &'a self,
         _session_id: &'a str,
         _message_id: &'a str,
-    ) -> agents::ports::engine::EngineFuture<'a, ()> {
+    ) -> agents::ports::agent::AgentFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }
-    fn interrupt<'a>(
-        &'a self,
-        _session_id: &'a str,
-    ) -> agents::ports::engine::EngineFuture<'a, ()> {
+    fn interrupt<'a>(&'a self, _session_id: &'a str) -> agents::ports::agent::AgentFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }
     fn switch_model<'a>(
         &'a self,
         _session_id: &'a str,
         _model: &'a agents::domain::ModelRef,
-    ) -> agents::ports::engine::EngineFuture<'a, ()> {
+    ) -> agents::ports::agent::AgentFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }
-    fn switch_agent<'a>(
+    fn switch_mode<'a>(
         &'a self,
         _session_id: &'a str,
-        _agent: &'a str,
-    ) -> agents::ports::engine::EngineFuture<'a, ()> {
+        _mode: &'a str,
+    ) -> agents::ports::agent::AgentFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }
     fn find_files<'a>(
@@ -852,7 +847,7 @@ impl agents::ports::engine::AgentEnginePort for FakeEngine {
         _query: &'a str,
         _limit: usize,
         _directory: Option<&'a str>,
-    ) -> agents::ports::engine::EngineFuture<'a, Vec<serde_json::Value>> {
+    ) -> agents::ports::agent::AgentFuture<'a, Vec<serde_json::Value>> {
         Box::pin(async { Ok(Vec::new()) })
     }
     fn reply_permission<'a>(
@@ -861,7 +856,7 @@ impl agents::ports::engine::AgentEnginePort for FakeEngine {
         _request_id: &'a str,
         _decision: agents::domain::PermissionDecision,
         _message: Option<&'a str>,
-    ) -> agents::ports::engine::EngineFuture<'a, ()> {
+    ) -> agents::ports::agent::AgentFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }
     fn reply_form<'a>(
@@ -869,13 +864,13 @@ impl agents::ports::engine::AgentEnginePort for FakeEngine {
         _session_id: &'a str,
         _form_id: &'a str,
         _answers: serde_json::Value,
-    ) -> agents::ports::engine::EngineFuture<'a, ()> {
+    ) -> agents::ports::agent::AgentFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }
     fn get_catalog<'a>(
         &'a self,
         _directory: Option<&'a str>,
-    ) -> agents::ports::engine::EngineFuture<'a, agents::domain::AgentCatalog> {
+    ) -> agents::ports::agent::AgentFuture<'a, agents::domain::AgentCatalog> {
         Box::pin(async move {
             if self.failing {
                 return self.fail();
@@ -887,26 +882,26 @@ impl agents::ports::engine::AgentEnginePort for FakeEngine {
         &'a self,
         _session_id: &'a str,
         _mode: &'a str,
-    ) -> agents::ports::engine::EngineFuture<'a, Vec<agents::ports::engine::FileDiffItem>> {
+    ) -> agents::ports::agent::AgentFuture<'a, Vec<agents::ports::agent::FileDiffItem>> {
         Box::pin(async { Ok(Vec::new()) })
     }
     fn get_pending_permissions<'a>(
         &'a self,
         _session_id: &'a str,
-    ) -> agents::ports::engine::EngineFuture<'a, Vec<agents::domain::PermissionRequest>> {
+    ) -> agents::ports::agent::AgentFuture<'a, Vec<agents::domain::PermissionRequest>> {
         Box::pin(async { Ok(Vec::new()) })
     }
     fn get_pending_forms<'a>(
         &'a self,
         _session_id: &'a str,
-    ) -> agents::ports::engine::EngineFuture<'a, Vec<agents::domain::FormRequest>> {
+    ) -> agents::ports::agent::AgentFuture<'a, Vec<agents::domain::FormRequest>> {
         Box::pin(async { Ok(Vec::new()) })
     }
     fn get_timeline<'a>(
         &'a self,
         _session_id: &'a str,
         _limit: usize,
-    ) -> agents::ports::engine::EngineFuture<'a, Vec<agents::domain::TimelineItem>> {
+    ) -> agents::ports::agent::AgentFuture<'a, Vec<agents::domain::TimelineItem>> {
         Box::pin(async { Ok(Vec::new()) })
     }
 }

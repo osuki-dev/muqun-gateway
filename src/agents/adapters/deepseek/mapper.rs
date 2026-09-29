@@ -1,11 +1,12 @@
 use serde_json::{json, Value};
 
 use crate::agents::domain::{
-    reasoning_item_id, text_item_id, tool_item_id, AgentCatalog, AgentErrorInfo, AgentInfo,
-    AgentPart, AgentSessionId, AgentSessionInfo, AgentSessionStatus, CatalogDefaults, CommandInfo,
-    CompactionStatus, FormField, FormOption, FormRequest, ModelInfo, ModelRef, ModelVariantInfo,
-    PermissionDecision, PermissionOption, PermissionRequest, ProviderInfo, ProviderModelInfo,
-    SkillInfo, TimelineItem, TimelineRole, TokensUsage, ToolCall, ToolCallStatus, ToolTime,
+    reasoning_item_id, text_item_id, tool_item_id, AgentCatalog, AgentErrorInfo, AgentPart,
+    AgentSessionId, AgentSessionInfo, AgentSessionStatus, CatalogDefaults, CommandInfo,
+    CompactionStatus, FormField, FormOption, FormRequest, ModeInfo, ModelInfo, ModelRef,
+    ModelVariantInfo, PermissionDecision, PermissionOption, PermissionRequest, ProviderInfo,
+    ProviderModelInfo, SkillInfo, TimelineItem, TimelineRole, TokensUsage, ToolCall,
+    ToolCallStatus, ToolTime,
 };
 
 /// Map a DeepSeek Harness `SessionSummary` JSON object into Gateway `AgentSessionInfo`.
@@ -92,10 +93,10 @@ pub fn map_session(raw: &Value) -> Option<AgentSessionInfo> {
 
     Some(AgentSessionInfo {
         asid: AgentSessionId(session_id.to_string()),
-        harness: String::new(),
+        agent_id: String::new(),
         backend_session_id: session_id.to_string(),
         title,
-        agent: Some("deepseek".to_string()),
+        mode: Some("deepseek".to_string()),
         model,
         status,
         directory: cwd,
@@ -209,13 +210,13 @@ pub fn map_catalog(raw: &Value) -> AgentCatalog {
         }
     }
 
-    let agents = if models.is_empty() {
+    let modes = if models.is_empty() {
         Vec::new()
     } else {
-        vec![AgentInfo {
+        vec![ModeInfo {
             id: "general".to_string(),
             name: "general".to_string(),
-            description: Some("DeepSeek Harness General Agent".to_string()),
+            description: Some("DeepSeek general agent".to_string()),
             mode: Some("primary".to_string()),
             color: None,
             hidden: false,
@@ -231,12 +232,12 @@ pub fn map_catalog(raw: &Value) -> AgentCatalog {
 
     AgentCatalog {
         models,
-        agents,
+        modes,
         mcp: vec![],
         skills: vec![SkillInfo {
             id: "deepseek".to_string(),
             name: "deepseek".to_string(),
-            description: "DeepSeek Harness Tools".to_string(),
+            description: "DeepSeek tools".to_string(),
             slash: true,
             autoinvoke: true,
         }],
@@ -244,12 +245,12 @@ pub fn map_catalog(raw: &Value) -> AgentCatalog {
         commands: vec![CommandInfo {
             name: "help".to_string(),
             description: Some("Show available help".to_string()),
-            agent: None,
+            mode: None,
             template: None,
         }],
         defaults: CatalogDefaults {
             model: default_model_ref,
-            agent: default_agent,
+            mode: default_agent,
         },
     }
 }
@@ -257,7 +258,7 @@ pub fn map_catalog(raw: &Value) -> AgentCatalog {
 // ---------------------------------------------------------------------------
 // Timeline rows
 //
-// The harness's message ids are random UUIDs (`freezeMessage` in
+// DeepSeek Harness's message ids are random UUIDs (`freezeMessage` in
 // dsh-llm/lib/index.js), and the mirror orders rows by message id, so a row's
 // message id is the zero-padded log seq of the event that produced it. That
 // is chronological by construction and the same whether the row came from a
@@ -700,7 +701,7 @@ pub fn map_snapshot_session(
     }
     let mut info = map_session(&summary)?;
     if let Some(preset) = header.get("agentPreset").and_then(Value::as_str) {
-        info.agent = Some(preset.to_string());
+        info.mode = Some(preset.to_string());
     }
     Some(info)
 }
@@ -761,7 +762,7 @@ pub fn map_approval_request(event_id: &str, agent_id: &str, request: &Value) -> 
     }
 }
 
-/// The `ApprovalOutcome` a decision becomes. The harness grants one shot or
+/// The `ApprovalOutcome` a decision becomes. DeepSeek Harness grants one shot or
 /// rejects; an "always" from the app is honoured as the one-shot grant it
 /// can express.
 pub fn approval_outcome(decision: PermissionDecision) -> &'static str {
@@ -1135,7 +1136,7 @@ mod tests {
         assert_eq!(info.title, "Fix the build");
         assert_eq!(info.directory.as_deref(), Some("/w"));
         assert_eq!(info.parent_id.as_deref(), Some("ses_0"));
-        assert_eq!(info.agent.as_deref(), Some("coder"));
+        assert_eq!(info.mode.as_deref(), Some("coder"));
     }
 
     /// The waterfall request is `ApprovalRequestEvent` less its `agent` and

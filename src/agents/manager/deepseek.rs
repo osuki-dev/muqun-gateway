@@ -1,4 +1,4 @@
-//! DeepSeek Harness event processing: the counterpart of
+//! DeepSeek event processing: the counterpart of
 //! `AgentManager::handle_raw_event` for the frames
 //! `DeepseekStreamListener` publishes. Each frame updates the mirror and
 //! emits the same `AgentDomainEvent`s the OpenCode path does, so the app
@@ -882,7 +882,7 @@ async fn apply_stream_chunk(asid: &AgentSessionId, chunk: &Value, ctx: &Deepseek
 
 #[cfg(test)]
 mod tests {
-    //! Frame shapes here follow the harness source: `SessionFollowFrame`
+    //! Frame shapes here follow the DeepSeek source: `SessionFollowFrame`
     //! and `SessionControlFrame` in dsh-api-session-controller's
     //! `types.d.ts`, the `$events` frames in dsh-api-gateway's
     //! `openRemoteEvents`/`startRemoteEvent`, and `StreamChunk` in dsh-llm.
@@ -1283,7 +1283,7 @@ mod tests {
     /// host never forwarded is refused before any call is made.
     #[tokio::test]
     async fn the_driver_refuses_replies_it_cannot_deliver() {
-        use crate::agents::ports::engine::{AgentEngineError, AgentEnginePort};
+        use crate::agents::ports::agent::{AgentError, AgentPort};
         let endpoint = DeepseekEndpoint::new("http://127.0.0.1:1", None, None);
         let driver = DeepseekDriver::new(endpoint.clone());
         let registry = DeepseekInteractions::for_endpoint(&endpoint.url);
@@ -1296,7 +1296,7 @@ mod tests {
         let unknown = driver
             .reply_permission("ses_1", "evt-none", PermissionDecision::Allow, None)
             .await;
-        assert!(matches!(unknown, Err(AgentEngineError::SessionNotFound(_))));
+        assert!(matches!(unknown, Err(AgentError::SessionNotFound(_))));
 
         let request =
             mapper::map_approval_request("evt-1", "ses_1", &json!({ "toolName": "bash" }));
@@ -1320,15 +1320,12 @@ mod tests {
         let wrong_session = driver
             .reply_permission("ses_other", "evt-1", PermissionDecision::Allow, None)
             .await;
-        assert!(matches!(
-            wrong_session,
-            Err(AgentEngineError::SessionNotFound(_))
-        ));
+        assert!(matches!(wrong_session, Err(AgentError::SessionNotFound(_))));
 
         let offline = driver
             .reply_permission("ses_1", "evt-1", PermissionDecision::Allow, None)
             .await;
-        assert!(matches!(offline, Err(AgentEngineError::NotAvailable(_))));
+        assert!(matches!(offline, Err(AgentError::NotAvailable(_))));
         assert!(
             registry.approval("evt-1").is_some(),
             "a reply that was not delivered leaves the request pending"
@@ -1341,7 +1338,7 @@ mod tests {
             .reply_permission("ses_1", "evt-1", PermissionDecision::Deny, None)
             .await;
         assert!(
-            matches!(refused, Err(AgentEngineError::Network(_))),
+            matches!(refused, Err(AgentError::Network(_))),
             "{refused:?}"
         );
         assert!(registry.approval("evt-1").is_some());

@@ -16,11 +16,11 @@ the gateway itself (see the last line of this file).
 - `src/cli.rs`: CLI arguments, subcommands, and dispatch.
 - `src/test_support.rs`: shared test fixtures and fakes, compiled only for
   test builds.
-- `src/agents/`: agent harness plane.
+- `src/agents/`: agents plane.
   - `domain/`: neutral agent entities: sessions, timeline, permissions, forms.
-  - `ports/`: `AgentEnginePort` and `SessionMirrorPort`.
+  - `ports/`: `AgentPort` (`ports/agent.rs`) and `SessionMirrorPort`.
   - `adapters/`: OpenCode, DeepSeek, and the in-memory mirror adapter.
-  - `manager.rs`, `runtime.rs`, `use_cases/`: engine supervision and the
+  - `manager.rs`, `runtime.rs`, `use_cases/`: agent supervision and the
     session/prompt/interaction services.
   - `routes.rs`: the OpenCode-style agent-session API (global and legacy paths).
   - `session_routes.rs`: terminal-multiplexer agent orchestration -- task
@@ -99,7 +99,7 @@ native events and tmux topology polling into the same internal vocabulary for
 SSE and push.
 
 Two planes are implemented here: the terminal control plane
-(`TerminalBackend`) and the agent harness plane (`AgentEnginePort`).
+(`TerminalBackend`) and the agents plane (`AgentPort`).
 `/api/discovery` additionally reports an SSH plane, but that is the app's own
 transport -- the phone can open an SSH connection and tunnel the gateway's
 loopback port, and the same HTTP API answers on the far side -- not a gateway

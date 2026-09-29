@@ -9,7 +9,7 @@ use crate::agents::domain::{
     AgentCatalog, AgentProject, AgentSessionId, AgentSessionInfo, AgentSessionStatus, FormRequest,
     ModelRef, PermissionDecision, PermissionRequest, SessionQuery, TimelineItem,
 };
-use crate::agents::ports::engine::{AgentEngineError, AgentEnginePort, EngineFuture, FileDiffItem};
+use crate::agents::ports::agent::{AgentError, AgentFuture, AgentPort, FileDiffItem};
 
 pub struct DeepseekDriver {
     pub client: Arc<DeepseekClient>,
@@ -27,19 +27,19 @@ impl DeepseekDriver {
     }
 }
 
-impl AgentEnginePort for DeepseekDriver {
+impl AgentPort for DeepseekDriver {
     fn kind(&self) -> &'static str {
         "deepseek"
     }
 
-    fn probe(&self) -> EngineFuture<'_, bool> {
+    fn probe(&self) -> AgentFuture<'_, bool> {
         Box::pin(async move {
             let req_client = reqwest::Client::new();
             Ok(self.client.endpoint.probe_healthy(&req_client).await)
         })
     }
 
-    fn list_projects(&self) -> EngineFuture<'_, Vec<AgentProject>> {
+    fn list_projects(&self) -> AgentFuture<'_, Vec<AgentProject>> {
         Box::pin(async move {
             let cwd = std::env::current_dir()
                 .map(|p| p.to_string_lossy().to_string())
@@ -64,7 +64,7 @@ impl AgentEnginePort for DeepseekDriver {
     fn list_sessions<'a>(
         &'a self,
         query: &'a SessionQuery,
-    ) -> EngineFuture<'a, Vec<AgentSessionInfo>> {
+    ) -> AgentFuture<'a, Vec<AgentSessionInfo>> {
         Box::pin(async move {
             let raw_sessions = self.client.list_sessions(query).await?;
             let sessions: Vec<AgentSessionInfo> = raw_sessions
@@ -79,10 +79,10 @@ impl AgentEnginePort for DeepseekDriver {
         &'a self,
         directory: Option<&'a str>,
         model: Option<&'a ModelRef>,
-        agent: Option<&'a str>,
-    ) -> EngineFuture<'a, AgentSessionInfo> {
+        mode: Option<&'a str>,
+    ) -> AgentFuture<'a, AgentSessionInfo> {
         Box::pin(async move {
-            let session_id = self.client.create_session(directory, model, agent).await?;
+            let session_id = self.client.create_session(directory, model, mode).await?;
             let session_id = session_id.as_str();
 
             if let Some(m) = model {
@@ -102,10 +102,10 @@ impl AgentEnginePort for DeepseekDriver {
 
             Ok(AgentSessionInfo {
                 asid: AgentSessionId(session_id.to_string()),
-                harness: String::new(),
+                agent_id: String::new(),
                 backend_session_id: session_id.to_string(),
                 title: "New DeepSeek Session".to_string(),
-                agent: agent.map(str::to_string),
+                mode: mode.map(str::to_string),
                 model: model.cloned(),
                 status: AgentSessionStatus::Idle,
                 directory: directory.map(str::to_string),
@@ -129,7 +129,7 @@ impl AgentEnginePort for DeepseekDriver {
         })
     }
 
-    fn get_session<'a>(&'a self, session_id: &'a str) -> EngineFuture<'a, AgentSessionInfo> {
+    fn get_session<'a>(&'a self, session_id: &'a str) -> AgentFuture<'a, AgentSessionInfo> {
         Box::pin(async move {
             // First try get_projections which gives complete session projection
             match self.client.get_projections(session_id).await {
@@ -143,7 +143,7 @@ impl AgentEnginePort for DeepseekDriver {
                         return Ok(info);
                     }
                 }
-                Err(e @ AgentEngineError::SessionNotFound(_)) => return Err(e),
+                Err(e @ AgentError::SessionNotFound(_)) => return Err(e),
                 Err(e) => {
                     tracing::debug!(target: "deepseek", "projections failed, trying page: {e}");
                 }
@@ -154,7 +154,7 @@ impl AgentEnginePort for DeepseekDriver {
             // one here would let ownership resolution adopt any id.
             let mut info = mapper::map_session(&page).ok_or_else(|| {
                 tracing::warn!(target: "deepseek", "session page carried no sessionId");
-                AgentEngineError::Protocol("session page is unreadable".to_string())
+                AgentError::Protocol("session page is unreadable".to_string())
             })?;
             info.asid = AgentSessionId(session_id.to_string());
             Ok(info)
@@ -167,7 +167,7 @@ impl AgentEnginePort for DeepseekDriver {
         text: &'a str,
         attachments: &'a [String],
         delivery: Option<&'a str>,
-    ) -> EngineFuture<'a, ()> {
+    ) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             self.client
                 .send_prompt(session_id, text, attachments, delivery)
@@ -180,23 +180,19 @@ impl AgentEnginePort for DeepseekDriver {
         &'a self,
         _session_id: &'a str,
         _message_id: &'a str,
-    ) -> EngineFuture<'a, ()> {
-        // The harness has no revert RPC (it forks instead).
-        Box::pin(async { Err(AgentEngineError::Unsupported("revert_session".into())) })
+    ) -> AgentFuture<'a, ()> {
+        // DeepSeek Harness has no revert RPC (it forks instead).
+        Box::pin(async { Err(AgentError::Unsupported("revert_session".into())) })
     }
 
-    fn interrupt<'a>(&'a self, session_id: &'a str) -> EngineFuture<'a, ()> {
+    fn interrupt<'a>(&'a self, session_id: &'a str) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             self.client.cancel(session_id).await?;
             Ok(())
         })
     }
 
-    fn switch_model<'a>(
-        &'a self,
-        session_id: &'a str,
-        model: &'a ModelRef,
-    ) -> EngineFuture<'a, ()> {
+    fn switch_model<'a>(&'a self, session_id: &'a str, model: &'a ModelRef) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             self.client
                 .select_model(
@@ -210,9 +206,9 @@ impl AgentEnginePort for DeepseekDriver {
         })
     }
 
-    fn switch_agent<'a>(&'a self, _session_id: &'a str, _agent: &'a str) -> EngineFuture<'a, ()> {
+    fn switch_mode<'a>(&'a self, _session_id: &'a str, _mode: &'a str) -> AgentFuture<'a, ()> {
         // Agent presets are fixed at session creation; no switch RPC exists.
-        Box::pin(async { Err(AgentEngineError::Unsupported("switch_agent".into())) })
+        Box::pin(async { Err(AgentError::Unsupported("switch_mode".into())) })
     }
 
     fn find_files<'a>(
@@ -220,7 +216,7 @@ impl AgentEnginePort for DeepseekDriver {
         _query: &'a str,
         _limit: usize,
         directory: Option<&'a str>,
-    ) -> EngineFuture<'a, Vec<Value>> {
+    ) -> AgentFuture<'a, Vec<Value>> {
         Box::pin(async move {
             let cwd = directory.unwrap_or(".");
             let res = self.client.workspace_files_list(cwd, "").await?;
@@ -242,21 +238,21 @@ impl AgentEnginePort for DeepseekDriver {
         request_id: &'a str,
         decision: PermissionDecision,
         _message: Option<&'a str>,
-    ) -> EngineFuture<'a, ()> {
+    ) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             let interactions = DeepseekInteractions::for_endpoint(&self.client.endpoint.url);
             let Some(pending) = interactions.approval(request_id) else {
-                return Err(AgentEngineError::SessionNotFound(
+                return Err(AgentError::SessionNotFound(
                     "the approval is no longer pending".to_string(),
                 ));
             };
             if pending.asid.0 != session_id {
-                return Err(AgentEngineError::SessionNotFound(
+                return Err(AgentError::SessionNotFound(
                     "the approval belongs to another session".to_string(),
                 ));
             }
             let Some(client_id) = interactions.client_id() else {
-                return Err(AgentEngineError::NotAvailable(
+                return Err(AgentError::NotAvailable(
                     "the DeepSeek event stream is not connected".to_string(),
                 ));
             };
@@ -272,27 +268,27 @@ impl AgentEnginePort for DeepseekDriver {
     }
 
     /// A form is a forwarded `user-questions/request`; the answer goes back
-    /// the same way, rebuilt in the harness's `{answers: [...]}` shape.
+    /// the same way, rebuilt in DeepSeek Harness's `{answers: [...]}` shape.
     fn reply_form<'a>(
         &'a self,
         session_id: &'a str,
         form_id: &'a str,
         answers: Value,
-    ) -> EngineFuture<'a, ()> {
+    ) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             let interactions = DeepseekInteractions::for_endpoint(&self.client.endpoint.url);
             let Some(pending) = interactions.question(form_id) else {
-                return Err(AgentEngineError::SessionNotFound(
+                return Err(AgentError::SessionNotFound(
                     "the question is no longer pending".to_string(),
                 ));
             };
             if pending.asid.0 != session_id {
-                return Err(AgentEngineError::SessionNotFound(
+                return Err(AgentError::SessionNotFound(
                     "the question belongs to another session".to_string(),
                 ));
             }
             let Some(client_id) = interactions.client_id() else {
-                return Err(AgentEngineError::NotAvailable(
+                return Err(AgentError::NotAvailable(
                     "the DeepSeek event stream is not connected".to_string(),
                 ));
             };
@@ -308,7 +304,7 @@ impl AgentEnginePort for DeepseekDriver {
         })
     }
 
-    fn get_catalog<'a>(&'a self, _directory: Option<&'a str>) -> EngineFuture<'a, AgentCatalog> {
+    fn get_catalog<'a>(&'a self, _directory: Option<&'a str>) -> AgentFuture<'a, AgentCatalog> {
         Box::pin(async move {
             let raw = self.client.model_catalog().await?;
             Ok(mapper::map_catalog(&raw))
@@ -319,17 +315,17 @@ impl AgentEnginePort for DeepseekDriver {
         &'a self,
         _session_id: &'a str,
         _mode: &'a str,
-    ) -> EngineFuture<'a, Vec<FileDiffItem>> {
+    ) -> AgentFuture<'a, Vec<FileDiffItem>> {
         Box::pin(async move { Ok(vec![]) })
     }
 
-    /// The harness has no query for pending approvals: they exist only as
+    /// DeepSeek Harness has no query for pending approvals: they exist only as
     /// unsettled waterfalls, which the `$events` stream re-delivers on every
     /// open. What is pending is therefore what the stream has told us.
     fn get_pending_permissions<'a>(
         &'a self,
         session_id: &'a str,
-    ) -> EngineFuture<'a, Vec<PermissionRequest>> {
+    ) -> AgentFuture<'a, Vec<PermissionRequest>> {
         Box::pin(async move {
             Ok(
                 DeepseekInteractions::for_endpoint(&self.client.endpoint.url)
@@ -338,7 +334,7 @@ impl AgentEnginePort for DeepseekDriver {
         })
     }
 
-    fn get_pending_forms<'a>(&'a self, session_id: &'a str) -> EngineFuture<'a, Vec<FormRequest>> {
+    fn get_pending_forms<'a>(&'a self, session_id: &'a str) -> AgentFuture<'a, Vec<FormRequest>> {
         Box::pin(async move {
             Ok(
                 DeepseekInteractions::for_endpoint(&self.client.endpoint.url)
@@ -351,14 +347,14 @@ impl AgentEnginePort for DeepseekDriver {
         &'a self,
         session_id: &'a str,
         limit: usize,
-    ) -> EngineFuture<'a, Vec<TimelineItem>> {
+    ) -> AgentFuture<'a, Vec<TimelineItem>> {
         Box::pin(async move {
             let res = self.client.get_page(session_id, limit).await?;
             Ok(mapper::map_timeline_records(&res))
         })
     }
 
-    fn rename_session<'a>(&'a self, session_id: &'a str, title: &'a str) -> EngineFuture<'a, ()> {
+    fn rename_session<'a>(&'a self, session_id: &'a str, title: &'a str) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             self.client.rename(session_id, title).await?;
             Ok(())
@@ -369,23 +365,21 @@ impl AgentEnginePort for DeepseekDriver {
         &'a self,
         session_id: &'a str,
         _message_id: Option<&'a str>,
-    ) -> EngineFuture<'a, AgentSessionInfo> {
+    ) -> AgentFuture<'a, AgentSessionInfo> {
         Box::pin(async move {
             let res = self.client.fork(session_id).await?;
             let new_id = res
                 .get("sessionId")
                 .and_then(Value::as_str)
                 .filter(|id| !id.is_empty())
-                .ok_or_else(|| {
-                    AgentEngineError::Protocol("fork response lacks sessionId".to_string())
-                })?;
+                .ok_or_else(|| AgentError::Protocol("fork response lacks sessionId".to_string()))?;
 
             Ok(AgentSessionInfo {
                 asid: AgentSessionId(new_id.to_string()),
-                harness: String::new(),
+                agent_id: String::new(),
                 backend_session_id: new_id.to_string(),
                 title: "Forked Session".to_string(),
-                agent: None,
+                mode: None,
                 model: None,
                 status: AgentSessionStatus::Idle,
                 directory: None,
@@ -473,7 +467,7 @@ mod tests {
             println!("  [Role {:?}] Part: {:?}", item.role, item.part);
         }
 
-        // The harness exposes no session/delete RPC, so the best available
+        // DeepSeek Harness exposes no session/delete RPC, so the best available
         // cleanup is to stop any running turn and remove our workspace.
         let _ = driver.interrupt(&session_id).await;
         let _ = std::fs::remove_dir_all(&temp_path);

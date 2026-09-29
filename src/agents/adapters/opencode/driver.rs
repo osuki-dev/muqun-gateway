@@ -11,7 +11,7 @@ use super::mapper;
 use crate::agents::domain::{
     AgentCatalog, AgentProject, AgentSessionInfo, ModelRef, PermissionDecision, SessionQuery,
 };
-use crate::agents::ports::engine::{AgentEngineError, AgentEnginePort, EngineFuture, FileDiffItem};
+use crate::agents::ports::agent::{AgentError, AgentFuture, AgentPort, FileDiffItem};
 
 /// The permission action OpenCode raises when a tool reaches outside the
 /// session's own directory.
@@ -30,14 +30,14 @@ static MISSING_REPORTED: std::sync::OnceLock<Mutex<HashMap<String, std::time::In
 ///
 /// Every directory-scoped read OpenCode offers answers a bare HTTP 500 with an
 /// empty body when the directory has been deleted, which the gateway relayed
-/// as `502 agent_engine_error` with nothing after the colon -- the user was
+/// as `502 agent_error` with nothing after the colon -- the user was
 /// told the agent had failed when their folder had simply gone. One `stat`
 /// ahead of the call turns that into a 404 that says which folder.
 ///
 /// A path that exists but cannot be read is treated as present: the guard is
 /// for "it is not there", not for permissions, and OpenCode's own answer is
 /// the better one for anything else.
-pub(crate) fn check_directory(directory: Option<&str>) -> Result<(), AgentEngineError> {
+pub(crate) fn check_directory(directory: Option<&str>) -> Result<(), AgentError> {
     let Some(directory) = directory.map(str::trim).filter(|d| !d.is_empty()) else {
         return Ok(());
     };
@@ -45,7 +45,7 @@ pub(crate) fn check_directory(directory: Option<&str>) -> Result<(), AgentEngine
         return Ok(());
     }
     report_missing_directory(directory);
-    Err(AgentEngineError::WorkspaceMissing(directory.to_string()))
+    Err(AgentError::WorkspaceMissing(directory.to_string()))
 }
 
 /// Say it once, at INFO. A folder that is gone is news the first time and
@@ -139,7 +139,7 @@ fn missing_ids(scoped: &[Value], floor: &[Value]) -> Vec<String> {
 /// Rebuilding it is eight calls into OpenCode, and the app asks for it on
 /// every foreground -- the measured cost was the same 16 ms whether the answer
 /// was a 200 or a 304, because the work happened before the tag was compared.
-/// Short, because the honest invalidation is the engine's own events and this
+/// Short, because the honest invalidation is the agent's own events and this
 /// is only the floor under them.
 const CATALOG_CACHE_TTL: Duration = Duration::from_secs(30);
 
@@ -149,7 +149,7 @@ type CachedCatalog = (std::time::Instant, AgentCatalog);
 pub struct OpencodeDriver {
     client: Arc<OpencodeClient>,
     /// Sessions whose ruleset already carries the uploads allowance. The work
-    /// is two HTTP calls, so it is done once per session per attached engine
+    /// is two HTTP calls, so it is done once per session per attached agent
     /// rather than on every prompt; a reconnect builds a new driver and primes
     /// again, which is the cheap side to be wrong on.
     primed: Mutex<HashSet<String>>,
@@ -276,14 +276,14 @@ impl OpencodeDriver {
     }
 
     /// Seed and inspect the cache, for the tests that check invalidation
-    /// without standing up an engine to build a real catalog from.
+    /// without standing up an agent to build a real catalog from.
     #[cfg(test)]
     pub fn remember_test_catalog(&self, key: &str) {
         self.remember_catalog(
             key.to_string(),
             AgentCatalog {
                 models: Vec::new(),
-                agents: Vec::new(),
+                modes: Vec::new(),
                 mcp: Vec::new(),
                 skills: Vec::new(),
                 providers: Vec::new(),
@@ -405,19 +405,19 @@ fn merge_uploads_rule(
     Some(rules)
 }
 
-impl AgentEnginePort for OpencodeDriver {
+impl AgentPort for OpencodeDriver {
     fn kind(&self) -> &'static str {
         "opencode"
     }
 
-    fn probe(&self) -> EngineFuture<'_, bool> {
+    fn probe(&self) -> AgentFuture<'_, bool> {
         Box::pin(async move {
             let req_client = reqwest::Client::new();
             Ok(self.client.endpoint.probe_healthy(&req_client).await)
         })
     }
 
-    fn list_projects(&self) -> EngineFuture<'_, Vec<AgentProject>> {
+    fn list_projects(&self) -> AgentFuture<'_, Vec<AgentProject>> {
         Box::pin(async move {
             let raw_projects = self.client.list_projects().await?;
             let mut projects: Vec<AgentProject> = raw_projects
@@ -442,7 +442,7 @@ impl AgentEnginePort for OpencodeDriver {
     fn list_sessions<'a>(
         &'a self,
         query: &'a SessionQuery,
-    ) -> EngineFuture<'a, Vec<AgentSessionInfo>> {
+    ) -> AgentFuture<'a, Vec<AgentSessionInfo>> {
         Box::pin(async move {
             let filter = SessionListFilter {
                 parent_id: query.parent_id.as_deref(),
@@ -467,12 +467,12 @@ impl AgentEnginePort for OpencodeDriver {
         &'a self,
         directory: Option<&'a str>,
         model: Option<&'a ModelRef>,
-        agent: Option<&'a str>,
-    ) -> EngineFuture<'a, AgentSessionInfo> {
+        mode: Option<&'a str>,
+    ) -> AgentFuture<'a, AgentSessionInfo> {
         Box::pin(async move {
-            let raw = self.client.create_session(directory, model, agent).await?;
+            let raw = self.client.create_session(directory, model, mode).await?;
             let info = mapper::map_session(&raw).ok_or_else(|| {
-                AgentEngineError::Protocol("Failed to parse created session".to_string())
+                AgentError::Protocol("Failed to parse created session".to_string())
             })?;
             // Done at birth so the first prompt with an attachment is not also
             // the first one to pay for two extra round trips.
@@ -481,11 +481,11 @@ impl AgentEnginePort for OpencodeDriver {
         })
     }
 
-    fn get_session<'a>(&'a self, session_id: &'a str) -> EngineFuture<'a, AgentSessionInfo> {
+    fn get_session<'a>(&'a self, session_id: &'a str) -> AgentFuture<'a, AgentSessionInfo> {
         Box::pin(async move {
             let raw = self.client.get_session(session_id).await?;
             mapper::map_session(&raw)
-                .ok_or_else(|| AgentEngineError::SessionNotFound(session_id.to_string()))
+                .ok_or_else(|| AgentError::SessionNotFound(session_id.to_string()))
         })
     }
 
@@ -495,7 +495,7 @@ impl AgentEnginePort for OpencodeDriver {
         text: &'a str,
         attachments: &'a [String],
         delivery: Option<&'a str>,
-    ) -> EngineFuture<'a, ()> {
+    ) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             // An attachment is a path into the gateway's upload directory,
             // which sits outside the session's own -- so the allowance goes on
@@ -514,34 +514,30 @@ impl AgentEnginePort for OpencodeDriver {
         &'a self,
         session_id: &'a str,
         message_id: &'a str,
-    ) -> EngineFuture<'a, ()> {
+    ) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             self.client.revert_session(session_id, message_id).await?;
             Ok(())
         })
     }
 
-    fn interrupt<'a>(&'a self, session_id: &'a str) -> EngineFuture<'a, ()> {
+    fn interrupt<'a>(&'a self, session_id: &'a str) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             self.client.interrupt(session_id).await?;
             Ok(())
         })
     }
 
-    fn switch_model<'a>(
-        &'a self,
-        session_id: &'a str,
-        model: &'a ModelRef,
-    ) -> EngineFuture<'a, ()> {
+    fn switch_model<'a>(&'a self, session_id: &'a str, model: &'a ModelRef) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             self.client.switch_model(session_id, model).await?;
             Ok(())
         })
     }
 
-    fn switch_agent<'a>(&'a self, session_id: &'a str, agent: &'a str) -> EngineFuture<'a, ()> {
+    fn switch_mode<'a>(&'a self, session_id: &'a str, mode: &'a str) -> AgentFuture<'a, ()> {
         Box::pin(async move {
-            self.client.switch_agent(session_id, agent).await?;
+            self.client.switch_mode(session_id, mode).await?;
             Ok(())
         })
     }
@@ -551,7 +547,7 @@ impl AgentEnginePort for OpencodeDriver {
         query: &'a str,
         limit: usize,
         directory: Option<&'a str>,
-    ) -> EngineFuture<'a, Vec<serde_json::Value>> {
+    ) -> AgentFuture<'a, Vec<serde_json::Value>> {
         Box::pin(async move {
             // A failed search is an error, not an empty result set: the two
             // are indistinguishable to the caller otherwise.
@@ -565,7 +561,7 @@ impl AgentEnginePort for OpencodeDriver {
         request_id: &'a str,
         decision: PermissionDecision,
         message: Option<&'a str>,
-    ) -> EngineFuture<'a, ()> {
+    ) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             let reply_str = match decision {
                 PermissionDecision::Allow => "once",
@@ -584,7 +580,7 @@ impl AgentEnginePort for OpencodeDriver {
         session_id: &'a str,
         form_id: &'a str,
         answers: serde_json::Value,
-    ) -> EngineFuture<'a, ()> {
+    ) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             self.client
                 .reply_form(session_id, form_id, &answers)
@@ -593,7 +589,7 @@ impl AgentEnginePort for OpencodeDriver {
         })
     }
 
-    fn get_catalog<'a>(&'a self, directory: Option<&'a str>) -> EngineFuture<'a, AgentCatalog> {
+    fn get_catalog<'a>(&'a self, directory: Option<&'a str>) -> AgentFuture<'a, AgentCatalog> {
         Box::pin(async move {
             let key = directory.unwrap_or_default().to_string();
             if let Some(cached) = self.cached_catalog(&key) {
@@ -601,13 +597,13 @@ impl AgentEnginePort for OpencodeDriver {
             }
             // One failing fan-out arm must not empty the whole catalog, but it
             // is worth saying which one failed.
-            let log = |what: &str, err: &AgentEngineError| {
+            let log = |what: &str, err: &AgentError| {
                 tracing::warn!(surface = what, %err, "catalog fan-out arm failed");
             };
             // One check for the whole fan-out: without it each of the seven
             // arms called a dead directory, failed, and logged its own WARN.
             check_directory(directory)?;
-            // Eight reads of the same engine that do not depend on each
+            // Eight reads of the same agent that do not depend on each
             // other. In sequence they were eight round trips the app waited
             // through before it could open a picker; together they cost the
             // slowest of them. Three of them settle (see `settled_list`), and
@@ -652,7 +648,7 @@ impl AgentEnginePort for OpencodeDriver {
 
             let models = mapper::map_models(&raw_models);
             let catalog = AgentCatalog {
-                agents: mapper::map_agents(&raw_agents),
+                modes: mapper::map_agents(&raw_agents),
                 mcp: mapper::map_mcp(&raw_mcp),
                 skills: mapper::map_skills(&raw_skills),
                 providers: mapper::map_providers(&raw_providers, &models),
@@ -675,7 +671,7 @@ impl AgentEnginePort for OpencodeDriver {
         &'a self,
         session_id: &'a str,
         mode: &'a str,
-    ) -> EngineFuture<'a, Vec<FileDiffItem>> {
+    ) -> AgentFuture<'a, Vec<FileDiffItem>> {
         Box::pin(async move {
             // The diff is scoped to the session's own directory; a global diff
             // is not what the caller asked for.
@@ -727,7 +723,7 @@ impl AgentEnginePort for OpencodeDriver {
     fn get_pending_permissions<'a>(
         &'a self,
         session_id: &'a str,
-    ) -> EngineFuture<'a, Vec<crate::agents::domain::PermissionRequest>> {
+    ) -> AgentFuture<'a, Vec<crate::agents::domain::PermissionRequest>> {
         Box::pin(async move {
             let raw = self.client.get_session_permissions(session_id).await?;
             let asid = crate::agents::domain::AgentSessionId(session_id.to_string());
@@ -741,7 +737,7 @@ impl AgentEnginePort for OpencodeDriver {
     fn get_pending_forms<'a>(
         &'a self,
         session_id: &'a str,
-    ) -> EngineFuture<'a, Vec<crate::agents::domain::FormRequest>> {
+    ) -> AgentFuture<'a, Vec<crate::agents::domain::FormRequest>> {
         Box::pin(async move {
             let raw = self.client.get_session_forms(session_id).await?;
             let asid = crate::agents::domain::AgentSessionId(session_id.to_string());
@@ -756,7 +752,7 @@ impl AgentEnginePort for OpencodeDriver {
         &'a self,
         session_id: &'a str,
         limit: usize,
-    ) -> EngineFuture<'a, Vec<crate::agents::domain::TimelineItem>> {
+    ) -> AgentFuture<'a, Vec<crate::agents::domain::TimelineItem>> {
         Box::pin(async move {
             let messages = self.client.get_messages(session_id, limit).await?;
             let asid = crate::agents::domain::AgentSessionId(session_id.to_string());
@@ -764,21 +760,21 @@ impl AgentEnginePort for OpencodeDriver {
         })
     }
 
-    fn delete_session<'a>(&'a self, session_id: &'a str) -> EngineFuture<'a, ()> {
+    fn delete_session<'a>(&'a self, session_id: &'a str) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             self.client.delete_session(session_id).await?;
             Ok(())
         })
     }
 
-    fn rename_session<'a>(&'a self, session_id: &'a str, title: &'a str) -> EngineFuture<'a, ()> {
+    fn rename_session<'a>(&'a self, session_id: &'a str, title: &'a str) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             self.client.rename_session(session_id, title).await?;
             Ok(())
         })
     }
 
-    fn clear_revert<'a>(&'a self, session_id: &'a str) -> EngineFuture<'a, ()> {
+    fn clear_revert<'a>(&'a self, session_id: &'a str) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             self.client.clear_revert(session_id).await?;
             Ok(())
@@ -790,7 +786,7 @@ impl AgentEnginePort for OpencodeDriver {
         session_id: &'a str,
         message_id: &'a str,
         files: Option<bool>,
-    ) -> EngineFuture<'a, serde_json::Value> {
+    ) -> AgentFuture<'a, serde_json::Value> {
         Box::pin(async move {
             self.client
                 .stage_revert(session_id, message_id, files)
@@ -798,14 +794,14 @@ impl AgentEnginePort for OpencodeDriver {
         })
     }
 
-    fn commit_revert<'a>(&'a self, session_id: &'a str) -> EngineFuture<'a, ()> {
+    fn commit_revert<'a>(&'a self, session_id: &'a str) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             self.client.commit_revert(session_id).await?;
             Ok(())
         })
     }
 
-    fn move_session<'a>(&'a self, session_id: &'a str, directory: &'a str) -> EngineFuture<'a, ()> {
+    fn move_session<'a>(&'a self, session_id: &'a str, directory: &'a str) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             self.client.move_session(session_id, directory).await?;
             Ok(())
@@ -816,29 +812,29 @@ impl AgentEnginePort for OpencodeDriver {
         &'a self,
         session_id: &'a str,
         delivery: Option<&'a str>,
-    ) -> EngineFuture<'a, serde_json::Value> {
+    ) -> AgentFuture<'a, serde_json::Value> {
         Box::pin(async move { self.client.compact_session(session_id, delivery).await })
     }
 
-    fn get_context<'a>(&'a self, session_id: &'a str) -> EngineFuture<'a, Vec<serde_json::Value>> {
+    fn get_context<'a>(&'a self, session_id: &'a str) -> AgentFuture<'a, Vec<serde_json::Value>> {
         Box::pin(async move { self.client.get_context(session_id).await })
     }
 
-    fn background_session<'a>(&'a self, session_id: &'a str) -> EngineFuture<'a, ()> {
+    fn background_session<'a>(&'a self, session_id: &'a str) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             self.client.background_session(session_id).await?;
             Ok(())
         })
     }
 
-    fn wait_session<'a>(&'a self, session_id: &'a str) -> EngineFuture<'a, ()> {
+    fn wait_session<'a>(&'a self, session_id: &'a str) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             self.client.wait_session(session_id).await?;
             Ok(())
         })
     }
 
-    fn view_session<'a>(&'a self, session_id: &'a str, idle: u64) -> EngineFuture<'a, ()> {
+    fn view_session<'a>(&'a self, session_id: &'a str, idle: u64) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             self.client.view_session(session_id, idle).await?;
             Ok(())
@@ -849,7 +845,7 @@ impl AgentEnginePort for OpencodeDriver {
         &'a self,
         session_id: &'a str,
         sanitize: Option<bool>,
-    ) -> EngineFuture<'a, serde_json::Value> {
+    ) -> AgentFuture<'a, serde_json::Value> {
         Box::pin(async move {
             self.client
                 .export_session(session_id, sanitize.unwrap_or(true))
@@ -863,7 +859,7 @@ impl AgentEnginePort for OpencodeDriver {
         name: &'a str,
         arguments: &'a str,
         delivery: Option<&'a str>,
-    ) -> EngineFuture<'a, ()> {
+    ) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             self.client
                 .run_command(session_id, name, arguments, delivery)
@@ -875,7 +871,7 @@ impl AgentEnginePort for OpencodeDriver {
     fn list_worktrees<'a>(
         &'a self,
         directory: Option<&'a str>,
-    ) -> EngineFuture<'a, Vec<serde_json::Value>> {
+    ) -> AgentFuture<'a, Vec<serde_json::Value>> {
         Box::pin(async move { self.client.list_worktrees(directory).await })
     }
 
@@ -883,7 +879,7 @@ impl AgentEnginePort for OpencodeDriver {
         &'a self,
         directory: Option<&'a str>,
         input: &'a serde_json::Value,
-    ) -> EngineFuture<'a, serde_json::Value> {
+    ) -> AgentFuture<'a, serde_json::Value> {
         Box::pin(async move { self.client.create_worktree(directory, input).await })
     }
 
@@ -892,7 +888,7 @@ impl AgentEnginePort for OpencodeDriver {
         directory: Option<&'a str>,
         worktree: &'a str,
         force: Option<bool>,
-    ) -> EngineFuture<'a, ()> {
+    ) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             self.client
                 .remove_worktree(directory, worktree, force.unwrap_or(false))
@@ -901,7 +897,7 @@ impl AgentEnginePort for OpencodeDriver {
         })
     }
 
-    fn refresh_worktrees<'a>(&'a self, directory: Option<&'a str>) -> EngineFuture<'a, ()> {
+    fn refresh_worktrees<'a>(&'a self, directory: Option<&'a str>) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             self.client.refresh_worktrees(directory).await?;
             Ok(())
@@ -911,7 +907,7 @@ impl AgentEnginePort for OpencodeDriver {
     fn get_skills<'a>(
         &'a self,
         directory: Option<&'a str>,
-    ) -> EngineFuture<'a, Vec<serde_json::Value>> {
+    ) -> AgentFuture<'a, Vec<serde_json::Value>> {
         Box::pin(async move { self.client.get_skills(directory).await })
     }
 
@@ -920,7 +916,7 @@ impl AgentEnginePort for OpencodeDriver {
         session_id: &'a str,
         name: &'a str,
         resume: Option<bool>,
-    ) -> EngineFuture<'a, ()> {
+    ) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             self.client.activate_skill(session_id, name, resume).await?;
             Ok(())
@@ -930,11 +926,11 @@ impl AgentEnginePort for OpencodeDriver {
     fn list_shells<'a>(
         &'a self,
         directory: Option<&'a str>,
-    ) -> EngineFuture<'a, Vec<serde_json::Value>> {
+    ) -> AgentFuture<'a, Vec<serde_json::Value>> {
         Box::pin(async move { self.client.list_shells(directory).await })
     }
 
-    fn get_shell<'a>(&'a self, shell_id: &'a str) -> EngineFuture<'a, serde_json::Value> {
+    fn get_shell<'a>(&'a self, shell_id: &'a str) -> AgentFuture<'a, serde_json::Value> {
         Box::pin(async move { self.client.get_shell(shell_id).await })
     }
 
@@ -943,18 +939,18 @@ impl AgentEnginePort for OpencodeDriver {
         shell_id: &'a str,
         cursor: Option<u64>,
         limit: Option<usize>,
-    ) -> EngineFuture<'a, serde_json::Value> {
+    ) -> AgentFuture<'a, serde_json::Value> {
         Box::pin(async move { self.client.get_shell_output(shell_id, cursor, limit).await })
     }
 
-    fn kill_shell<'a>(&'a self, shell_id: &'a str) -> EngineFuture<'a, ()> {
+    fn kill_shell<'a>(&'a self, shell_id: &'a str) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             self.client.kill_shell(shell_id).await?;
             Ok(())
         })
     }
 
-    fn get_inbox<'a>(&'a self, session_id: &'a str) -> EngineFuture<'a, Vec<serde_json::Value>> {
+    fn get_inbox<'a>(&'a self, session_id: &'a str) -> AgentFuture<'a, Vec<serde_json::Value>> {
         Box::pin(async move { self.client.get_inbox(session_id).await })
     }
 
@@ -962,7 +958,7 @@ impl AgentEnginePort for OpencodeDriver {
         &'a self,
         session_id: &'a str,
         inbox_id: &'a str,
-    ) -> EngineFuture<'a, ()> {
+    ) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             self.client.cancel_inbox_item(session_id, inbox_id).await?;
             Ok(())
@@ -974,7 +970,7 @@ impl AgentEnginePort for OpencodeDriver {
         session_id: &'a str,
         inbox_id: &'a str,
         delivery: &'a str,
-    ) -> EngineFuture<'a, ()> {
+    ) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             self.client
                 .set_inbox_delivery(session_id, inbox_id, delivery)
@@ -986,7 +982,7 @@ impl AgentEnginePort for OpencodeDriver {
     fn list_saved_permissions<'a>(
         &'a self,
         project_id: Option<&'a str>,
-    ) -> EngineFuture<'a, Vec<serde_json::Value>> {
+    ) -> AgentFuture<'a, Vec<serde_json::Value>> {
         Box::pin(async move {
             let items = self.client.list_saved_permissions(project_id).await?;
             Ok(items
@@ -996,7 +992,7 @@ impl AgentEnginePort for OpencodeDriver {
         })
     }
 
-    fn delete_saved_permission<'a>(&'a self, id: &'a str) -> EngineFuture<'a, ()> {
+    fn delete_saved_permission<'a>(&'a self, id: &'a str) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             self.client.delete_saved_permission(id).await?;
             Ok(())
@@ -1093,7 +1089,7 @@ mod tests {
             scoped.providers.len(),
             floor.providers.len()
         );
-        assert!(scoped.agents.len() >= floor.agents.len());
+        assert!(scoped.modes.len() >= floor.modes.len());
         for expected in &floor.providers {
             assert!(
                 scoped.providers.iter().any(|p| p.id == expected.id),
@@ -1124,7 +1120,7 @@ mod tests {
 
         let global = driver.get_catalog(None).await.expect("a global catalog");
         assert!(
-            !global.agents.is_empty(),
+            !global.modes.is_empty(),
             "OpenCode always has its built-in agents"
         );
 
@@ -1140,14 +1136,14 @@ mod tests {
         let _ = std::fs::remove_dir(&directory);
 
         assert!(
-            scoped.agents.len() >= global.agents.len(),
+            scoped.modes.len() >= global.modes.len(),
             "a directory adds agents, it never takes them away: {} scoped vs {} global",
-            scoped.agents.len(),
-            global.agents.len()
+            scoped.modes.len(),
+            global.modes.len()
         );
-        for expected in &global.agents {
+        for expected in &global.modes {
             assert!(
-                scoped.agents.iter().any(|a| a.id == expected.id),
+                scoped.modes.iter().any(|a| a.id == expected.id),
                 "{} is missing from the scoped catalog",
                 expected.id
             );
@@ -1163,7 +1159,7 @@ mod tests {
         let path = dir.to_str().unwrap().to_string();
 
         match check_directory(Some(&path)) {
-            Err(AgentEngineError::WorkspaceMissing(reported)) => assert_eq!(reported, path),
+            Err(AgentError::WorkspaceMissing(reported)) => assert_eq!(reported, path),
             other => panic!("expected a missing workspace, got {other:?}"),
         }
 
@@ -1192,7 +1188,7 @@ mod tests {
     /// folder rather than which status code.
     #[test]
     fn a_missing_workspace_says_which_folder() {
-        let err = AgentEngineError::WorkspaceMissing("/tmp/muqun-c10/repo".to_string());
+        let err = AgentError::WorkspaceMissing("/tmp/muqun-c10/repo".to_string());
         assert_eq!(
             err.to_string(),
             "The workspace folder is gone: /tmp/muqun-c10/repo"

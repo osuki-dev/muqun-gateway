@@ -1,7 +1,7 @@
 //! The live side of the DeepSeek Harness adapter: one WebSocket to
 //! `/api/remote.mux`, the Typert Remote stream multiplexer.
 //!
-//! # What the harness offers
+//! # What DeepSeek Harness offers
 //!
 //! Checked against the installed `@deepseek-ai/dsh` packages rather than
 //! guessed:
@@ -254,7 +254,7 @@ pub struct PendingApproval {
     pub request: PermissionRequest,
 }
 
-/// A question batch the host is waiting on. `questions` is the harness's own
+/// A question batch the host is waiting on. `questions` is DeepSeek Harness's own
 /// request, kept so the answer can be rebuilt in its vocabulary.
 #[derive(Debug, Clone)]
 pub struct PendingQuestion {
@@ -277,7 +277,7 @@ struct InteractionState {
 /// The interactive requests the host has forwarded and not yet settled, and
 /// the `clientId` that settles them.
 ///
-/// The harness has no query for pending approvals -- they live in the
+/// DeepSeek Harness has no query for pending approvals -- they live in the
 /// gateway's memory until answered -- so this is the record. It is shared by
 /// the listener, which fills it, and the driver, which answers from it; the
 /// two only meet through [`DeepseekInteractions::for_endpoint`], keyed by the
@@ -290,7 +290,7 @@ pub struct DeepseekInteractions {
 static INTERACTIONS: OnceLock<Mutex<HashMap<String, Arc<DeepseekInteractions>>>> = OnceLock::new();
 
 impl DeepseekInteractions {
-    /// The registry for one harness endpoint, created on first use.
+    /// The registry for one DeepSeek Harness endpoint, created on first use.
     pub fn for_endpoint(endpoint_url: &str) -> Arc<Self> {
         let map = INTERACTIONS.get_or_init(|| Mutex::new(HashMap::new()));
         let mut map = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1185,7 +1185,7 @@ mod tests {
         );
     }
 
-    /// A refused upgrade (the harness answers 401 without a cookie) is a
+    /// A refused upgrade (DeepSeek Harness answers 401 without a cookie) is a
     /// failed connect, not a connected stream.
     #[tokio::test]
     async fn a_refused_upgrade_is_not_connected() {

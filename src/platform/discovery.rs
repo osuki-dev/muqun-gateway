@@ -1,8 +1,8 @@
-//! Discovery and capability negotiation for Terminal and Harness planes.
+//! Discovery and capability negotiation for the Terminal and Agents planes.
 //!
 //! Provides structured runtime capability inspection across:
 //! 1. The Terminal Plane: multiplexers, PTY backends, and terminal features.
-//! 2. The Agent Harness Plane: multi-harness status, models, personas, and AI features.
+//! 2. The Agents Plane: status of each agent, its models, modes, and features.
 
 use std::collections::BTreeMap;
 
@@ -11,10 +11,10 @@ use serde_json::{json, Value};
 
 use crate::{ordered_sessions, session_capabilities, session_metadata, AppState};
 
-/// Status of a harness instance
+/// Whether one agent can be used right now
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum HarnessStatus {
+pub enum AgentAvailability {
     Connected,
     Reachable,
     Offline,
@@ -23,27 +23,27 @@ pub enum HarnessStatus {
     Unconfigured,
 }
 
-/// Metadata describing one discovered or configured AI harness
+/// Metadata describing one discovered or configured agent
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct HarnessDiscoveryInfo {
+pub struct AgentDiscoveryInfo {
     pub id: String,
     pub name: String,
     pub kind: String,
-    pub status: HarnessStatus,
+    pub status: AgentAvailability,
     pub enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    pub models: Vec<HarnessModelInfo>,
-    pub agents: Vec<HarnessAgentInfo>,
-    pub features: HarnessFeatures,
+    pub models: Vec<AgentModelInfo>,
+    pub modes: Vec<AgentModeInfo>,
+    pub features: AgentFeatures,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct HarnessModelInfo {
+pub struct AgentModelInfo {
     pub id: String,
     pub name: String,
     pub provider_id: String,
@@ -56,7 +56,7 @@ pub struct HarnessModelInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct HarnessAgentInfo {
+pub struct AgentModeInfo {
     pub id: String,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -65,8 +65,8 @@ pub struct HarnessAgentInfo {
     pub extra: BTreeMap<String, Value>,
 }
 
-/// Convert domain ModelInfo into discovered HarnessModelInfo
-pub fn model_info_to_harness_model(model: &crate::agents::domain::ModelInfo) -> HarnessModelInfo {
+/// Convert domain ModelInfo into discovered AgentModelInfo
+pub fn model_info_to_agent_model(model: &crate::agents::domain::ModelInfo) -> AgentModelInfo {
     let mut reasoning_effort_tiers = Vec::new();
     let mut supports_reasoning = false;
 
@@ -81,7 +81,7 @@ pub fn model_info_to_harness_model(model: &crate::agents::domain::ModelInfo) -> 
         }
     }
 
-    HarnessModelInfo {
+    AgentModelInfo {
         id: model.id.clone(),
         name: model.name.clone(),
         provider_id: model.provider_id.clone(),
@@ -91,19 +91,19 @@ pub fn model_info_to_harness_model(model: &crate::agents::domain::ModelInfo) -> 
     }
 }
 
-/// Convert domain AgentInfo into discovered HarnessAgentInfo
-pub fn agent_info_to_harness_agent(agent: &crate::agents::domain::AgentInfo) -> HarnessAgentInfo {
-    HarnessAgentInfo {
-        id: agent.id.clone(),
-        name: agent.name.clone(),
-        description: agent.description.clone(),
+/// Convert domain ModeInfo into discovered AgentModeInfo
+pub fn mode_info_to_agent_mode(mode: &crate::agents::domain::ModeInfo) -> AgentModeInfo {
+    AgentModeInfo {
+        id: mode.id.clone(),
+        name: mode.name.clone(),
+        description: mode.description.clone(),
         extra: BTreeMap::new(),
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct HarnessFeatures {
+pub struct AgentFeatures {
     pub streaming: bool,
     pub reasoning_effort: bool,
     pub model_selection: bool,
@@ -115,21 +115,19 @@ pub struct HarnessFeatures {
     pub extra: BTreeMap<String, Value>,
 }
 
-/// The Harness Plane discovery model
+/// The Agents Plane discovery model
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct HarnessPlaneDiscovery {
+pub struct AgentPlaneDiscovery {
     pub supported: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub active_harness: Option<String>,
-    pub harnesses: Vec<HarnessDiscoveryInfo>,
-    pub features: HarnessPlaneFeatures,
+    pub agents: Vec<AgentDiscoveryInfo>,
+    pub features: AgentPlaneFeatures,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct HarnessPlaneFeatures {
-    pub multi_harness: bool,
+pub struct AgentPlaneFeatures {
+    pub multi_agent: bool,
     pub catalog_aggregation: bool,
     pub session_routing: bool,
 }
@@ -194,11 +192,7 @@ pub struct SshPlaneDiscovery {
 #[serde(rename_all = "camelCase")]
 pub struct DiscoveryPlanes {
     pub terminal: TerminalPlaneDiscovery,
-    pub agents: HarnessPlaneDiscovery,
-    /// Backward-compatibility alias for `agents`
-    pub agent: HarnessPlaneDiscovery,
-    /// Backward-compatibility alias for `agents`
-    pub harness: HarnessPlaneDiscovery,
+    pub agents: AgentPlaneDiscovery,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh: Option<SshPlaneDiscovery>,
     #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
@@ -283,7 +277,7 @@ pub async fn build_terminal_plane_discovery(state: &AppState) -> TerminalPlaneDi
 /// Build combined discovery planes
 pub async fn build_discovery_planes(state: &AppState) -> DiscoveryPlanes {
     let terminal = build_terminal_plane_discovery(state).await;
-    let harness = state.agent_runtime.discover_agents().await;
+    let agents = state.agent_runtime.discover_agents().await;
     // The SSH plane is the app's transport, not a gateway subsystem: the phone
     // opens its own SSH connection and tunnels this gateway's loopback port, so
     // the same HTTP API answers on the far side. These flags only tell the app
@@ -296,33 +290,29 @@ pub async fn build_discovery_planes(state: &AppState) -> DiscoveryPlanes {
     };
     DiscoveryPlanes {
         terminal,
-        agents: harness.clone(),
-        agent: harness.clone(),
-        harness,
+        agents,
         ssh: Some(ssh),
         extra: BTreeMap::new(),
     }
 }
 
-impl HarnessPlaneDiscovery {
-    /// Drop what only a paired device should learn: where each harness
+impl AgentPlaneDiscovery {
+    /// Drop what only a paired device should learn: where each agent
     /// listens and which version it runs.
     pub fn redact_endpoints(&mut self) {
-        for h in &mut self.harnesses {
-            h.endpoint = None;
-            h.version = None;
+        for agent in &mut self.agents {
+            agent.endpoint = None;
+            agent.version = None;
         }
     }
 }
 
 /// Build complete capability discovery response. An unauthenticated caller
-/// gets harness id, kind, status and features, without endpoints or versions.
+/// gets each agent's id, kind, status and features, without endpoints or versions.
 pub async fn build_discovery(state: &AppState, _sealed: bool, authenticated: bool) -> Value {
     let mut planes = build_discovery_planes(state).await;
     if !authenticated {
         planes.agents.redact_endpoints();
-        planes.agent.redact_endpoints();
-        planes.harness.redact_endpoints();
     }
     let collaboration_somewhere = planes.terminal.backends.iter().any(|b| {
         b.capabilities
@@ -366,17 +356,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn harness_discovery_info_serializes_with_camel_case() {
-        let info = HarnessDiscoveryInfo {
+    fn agent_discovery_info_serializes_with_camel_case() {
+        let info = AgentDiscoveryInfo {
             id: "deepseek".to_string(),
-            name: "DeepSeek Harness".to_string(),
+            name: "DeepSeek".to_string(),
             kind: "deepseek".to_string(),
-            status: HarnessStatus::Connected,
+            status: AgentAvailability::Connected,
             enabled: true,
             endpoint: Some("http://127.0.0.1:3080".to_string()),
             version: Some("0.1.0".to_string()),
             models: vec![
-                HarnessModelInfo {
+                AgentModelInfo {
                     id: "deepseek-chat".to_string(),
                     name: "DeepSeek Chat (V3)".to_string(),
                     provider_id: "deepseek".to_string(),
@@ -384,7 +374,7 @@ mod tests {
                     reasoning_effort_tiers: Vec::new(),
                     extra: BTreeMap::new(),
                 },
-                HarnessModelInfo {
+                AgentModelInfo {
                     id: "deepseek-reasoner".to_string(),
                     name: "DeepSeek Reasoner (R1)".to_string(),
                     provider_id: "deepseek".to_string(),
@@ -393,13 +383,13 @@ mod tests {
                     extra: BTreeMap::new(),
                 },
             ],
-            agents: vec![HarnessAgentInfo {
+            modes: vec![AgentModeInfo {
                 id: "deepseek".to_string(),
                 name: "DeepSeek Assistant".to_string(),
                 description: None,
                 extra: BTreeMap::new(),
             }],
-            features: HarnessFeatures {
+            features: AgentFeatures {
                 streaming: true,
                 reasoning_effort: true,
                 model_selection: true,
@@ -484,7 +474,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_plane_discovery_serializes_terminal_harness_and_ssh() {
+    fn multi_plane_discovery_serializes_terminal_agents_and_ssh() {
         let planes = DiscoveryPlanes {
             terminal: TerminalPlaneDiscovery {
                 supported: true,
@@ -501,32 +491,11 @@ mod tests {
                 },
                 degraded_reason: None,
             },
-            agents: HarnessPlaneDiscovery {
+            agents: AgentPlaneDiscovery {
                 supported: true,
-                active_harness: Some("deepseek".to_string()),
-                harnesses: Vec::new(),
-                features: HarnessPlaneFeatures {
-                    multi_harness: true,
-                    catalog_aggregation: true,
-                    session_routing: true,
-                },
-            },
-            agent: HarnessPlaneDiscovery {
-                supported: true,
-                active_harness: Some("deepseek".to_string()),
-                harnesses: Vec::new(),
-                features: HarnessPlaneFeatures {
-                    multi_harness: true,
-                    catalog_aggregation: true,
-                    session_routing: true,
-                },
-            },
-            harness: HarnessPlaneDiscovery {
-                supported: true,
-                active_harness: Some("deepseek".to_string()),
-                harnesses: Vec::new(),
-                features: HarnessPlaneFeatures {
-                    multi_harness: true,
+                agents: Vec::new(),
+                features: AgentPlaneFeatures {
+                    multi_agent: true,
                     catalog_aggregation: true,
                     session_routing: true,
                 },
@@ -542,11 +511,17 @@ mod tests {
 
         let val = serde_json::to_value(&planes).expect("serializes");
         assert_eq!(val["terminal"]["supported"], true);
-        assert_eq!(val["agents"]["activeHarness"], "deepseek");
-        assert_eq!(val["agent"]["activeHarness"], "deepseek");
-        assert_eq!(val["harness"]["activeHarness"], "deepseek");
-        assert_eq!(val["agents"]["features"]["multiHarness"], true);
-        assert_eq!(val["harness"]["features"]["sessionRouting"], true);
+        // `agents` is the only agent plane key, and it names no active agent.
+        let keys = |v: &Value| {
+            let mut keys: Vec<_> = v.as_object().unwrap().keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+        assert_eq!(keys(&val), ["agents", "ssh", "terminal"]);
+        assert_eq!(keys(&val["agents"]), ["agents", "features", "supported"]);
+        assert_eq!(val["agents"]["agents"], json!([]));
+        assert_eq!(val["agents"]["features"]["multiAgent"], true);
+        assert_eq!(val["agents"]["features"]["sessionRouting"], true);
         assert_eq!(val["ssh"]["supported"], true);
         assert_eq!(val["ssh"]["tunnelSupported"], true);
         assert_eq!(val["ssh"]["pushTokenSupported"], true);
@@ -572,16 +547,16 @@ mod tests {
     #[tokio::test]
     async fn redaction_drops_endpoints_and_versions_but_keeps_status() {
         let mut plane = crate::agents::AgentRuntime::disabled()
-            .discover_harnesses()
+            .discover_agents()
             .await;
-        let id = plane.harnesses[0].id.clone();
-        plane.harnesses[0].endpoint = Some("http://127.0.0.1:4096".into());
-        plane.harnesses[0].version = Some("2.0.1".into());
+        let id = plane.agents[0].id.clone();
+        plane.agents[0].endpoint = Some("http://127.0.0.1:4096".into());
+        plane.agents[0].version = Some("2.0.1".into());
         plane.redact_endpoints();
         let val = serde_json::to_value(&plane).unwrap();
-        assert!(val["harnesses"][0].get("endpoint").is_none());
-        assert!(val["harnesses"][0].get("version").is_none());
-        assert_eq!(val["harnesses"][0]["status"], "disabled");
-        assert_eq!(val["harnesses"][0]["id"], id.as_str());
+        assert!(val["agents"][0].get("endpoint").is_none());
+        assert!(val["agents"][0].get("version").is_none());
+        assert_eq!(val["agents"][0]["status"], "disabled");
+        assert_eq!(val["agents"][0]["id"], id.as_str());
     }
 }

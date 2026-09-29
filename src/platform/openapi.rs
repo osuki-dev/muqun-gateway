@@ -4,52 +4,58 @@ use serde_json::{json, Value};
 
 use crate::CONTENT_SCHEMA_VERSION;
 
-fn agent_harness_plane_schema() -> Value {
+fn agents_plane_schema() -> Value {
     json!({
         "type": "object",
-        "required": ["supported", "activeHarness", "harnesses"],
+        "required": ["supported", "agents", "features"],
         "properties": {
-            "supported": { "type": "boolean", "description": "Whether any AI harness is configured and enabled" },
-            "activeHarness": { "type": ["string", "null"], "description": "Preferred active harness id" },
-            "harnesses": {
+            "supported": { "type": "boolean", "description": "Whether any agent is connected or reachable" },
+            "agents": {
                 "type": "array",
+                "description": "One entry per known agent, attached or not. `id` is the value to send as `agent_id`.",
                 "items": {
                     "type": "object",
-                    "required": ["id", "name", "kind", "status", "features", "models", "agents"],
+                    "required": ["id", "name", "kind", "status", "enabled", "features", "models", "modes"],
                     "properties": {
-                        "id": { "type": "string" },
+                        "id": { "type": "string", "enum": ["opencode", "deepseek"] },
                         "name": { "type": "string" },
                         "kind": { "type": "string" },
-                        "status": { "type": "string", "enum": ["ready", "stopped", "error", "unconfigured"] },
-                        "endpoint": { "type": ["string", "null"] },
+                        "status": { "type": "string", "enum": ["connected", "reachable", "offline", "disabled", "not_installed", "unconfigured"] },
+                        "enabled": { "type": "boolean" },
+                        "endpoint": { "type": "string", "description": "Omitted when unknown or for an unauthenticated caller" },
+                        "version": { "type": "string", "description": "Omitted when unknown or for an unauthenticated caller" },
                         "features": {
                             "type": "object",
                             "properties": {
-                                "supportsReasoning": { "type": "boolean" },
+                                "streaming": { "type": "boolean" },
                                 "reasoningEffort": { "type": "boolean" },
-                                "subagents": { "type": "boolean" },
-                                "streamingDiff": { "type": "boolean" },
-                                "toolApproval": { "type": "boolean" },
-                                "timelineEvents": { "type": "boolean" }
+                                "modelSelection": { "type": "boolean" },
+                                "toolApprovals": { "type": "boolean" },
+                                "worktrees": { "type": "boolean" },
+                                "revert": { "type": "boolean" },
+                                "inbox": { "type": "boolean" }
                             }
                         },
                         "models": {
                             "type": "array",
                             "items": {
                                 "type": "object",
-                                "required": ["id", "name"],
+                                "required": ["id", "name", "providerId", "supportsReasoning"],
                                 "properties": {
                                     "id": { "type": "string" },
                                     "name": { "type": "string" },
+                                    "providerId": { "type": "string" },
+                                    "supportsReasoning": { "type": "boolean" },
                                     "reasoningEffortTiers": { "type": "array", "items": { "type": "string" } }
                                 }
                             }
                         },
-                        "agents": {
+                        "modes": {
                             "type": "array",
+                            "description": "The agent's modes (personas), such as OpenCode's build and plan.",
                             "items": {
                                 "type": "object",
-                                "required": ["id", "name", "description"],
+                                "required": ["id", "name"],
                                 "properties": {
                                     "id": { "type": "string" },
                                     "name": { "type": "string" },
@@ -58,6 +64,14 @@ fn agent_harness_plane_schema() -> Value {
                             }
                         }
                     }
+                }
+            },
+            "features": {
+                "type": "object",
+                "properties": {
+                    "multiAgent": { "type": "boolean" },
+                    "catalogAggregation": { "type": "boolean" },
+                    "sessionRouting": { "type": "boolean" }
                 }
             }
         }
@@ -85,16 +99,16 @@ pub fn openapi_spec() -> Value {
             "/health": { "get": simple_endpoint("Gateway health") },
             "/api/capabilities": {
                 "get": {
-                    "summary": "Gateway Terminal and AI Harness dual-plane capability discovery",
-                    "description": "Probes host multiplexers (tmux, herdr, conpty) and AI harnesses (DeepSeek Harness, OpenCode). Returns dynamic capability matrix so mobile clients can render or hide tabs, reasoning effort selectors, and model pickers without App Store releases. Supports unauthenticated capability probing and sealed authenticated responses.",
+                    "summary": "Gateway Terminal and Agents dual-plane capability discovery",
+                    "description": "Probes host multiplexers (tmux, herdr, conpty) and agents (OpenCode, DeepSeek). Returns dynamic capability matrix so mobile clients can render or hide tabs, reasoning effort selectors, and model pickers without App Store releases. Supports unauthenticated capability probing and sealed authenticated responses.",
                     "security": [],
                     "responses": capabilities_discovery_responses()
                 }
             },
             "/api/discovery": {
                 "get": {
-                    "summary": "Gateway multi-plane discovery across Terminal, AI Harness, and SSH planes",
-                    "description": "Probes host multiplexers (tmux, herdr), AI harnesses (DeepSeek Harness, OpenCode), and SSH access surfaces. Returns dynamic multi-plane capability matrix so clients can adapt their UI without hardcoded engine assumptions.",
+                    "summary": "Gateway multi-plane discovery across the Terminal, Agents, and SSH planes",
+                    "description": "Probes host multiplexers (tmux, herdr), agents (OpenCode, DeepSeek), and SSH access surfaces. Returns dynamic multi-plane capability matrix so clients can adapt their UI without hardcoded agent assumptions.",
                     "security": [],
                     "responses": capabilities_discovery_responses()
                 }
@@ -514,30 +528,31 @@ pub fn openapi_spec() -> Value {
                     "responses": ok_response()
                 }
             },
-            "/api/agent-engine": {
+            "/api/agent-status": {
                 "get": {
-                    "summary": "Get status of AI agent engines and active harness",
-                    "description": "Returns status, available models, and active engine configuration for local agent harnesses (DeepSeek Harness, OpenCode).",
+                    "summary": "Get the status of one agent",
+                    "description": "Returns availability, origin, endpoint, version and stream state of the agent named by agent_id, or of the primary agent when agent_id is absent. The response carries agent_id and kind. An unknown agent_id is 400 invalid_agent; a known one that is not attached is 503 agent_unavailable.",
+                    "parameters": [query_param("agent_id", "The agent to describe: opencode or deepseek. Absent, the primary agent")],
                     "responses": ok_response()
                 }
             },
             "/api/agent-catalog": {
                 "get": {
                     "summary": "Global catalog of AI models and agent roles",
-                    "description": "Lists available LLM models and agent personas aggregated across all active harnesses.",
+                    "description": "Lists available LLM models and agent modes, merged across every attached agent, or for one agent with agent_id.",
                     "responses": ok_response()
                 }
             },
             "/api/agent-sessions": {
                 "get": {
                     "summary": "List all active AI agent sessions",
-                    "description": "Returns list of running agent sessions across all active harnesses.",
+                    "description": "Returns agent sessions merged across every attached agent, or for one agent with agent_id. Each session carries agent_id.",
                     "responses": ok_response()
                 },
                 "post": {
                     "summary": "Create a new AI agent session",
-                    "description": "Spawns an agent conversation session with specified model, harness, and workspace directory.",
-                    "requestBody": json_body(object_schema(&[("title", "string"), ("directory", "string")], &[])),
+                    "description": "Spawns an agent conversation session with the given model, mode, agent_id and workspace directory. Absent agent_id means the primary agent.",
+                    "requestBody": json_body(object_schema(&[("directory", "string"), ("mode", "string"), ("agent_id", "string")], &[])),
                     "responses": ok_response()
                 }
             },
@@ -595,6 +610,15 @@ pub fn openapi_spec() -> Value {
                     "summary": "Interrupt active agent turn",
                     "description": "Cancels running model completion or tool execution for the session.",
                     "parameters": [path_param("asid")],
+                    "responses": ok_response()
+                }
+            },
+            "/api/agent-sessions/{asid}/mode": {
+                "post": {
+                    "summary": "Switch the session's mode",
+                    "description": "Switches the mode (persona) the session runs in, such as build or plan. The body is {\"mode\": \"build\"} or a bare \"build\".",
+                    "parameters": [path_param("asid")],
+                    "requestBody": json_body(object_schema(&[("mode", "string")], &["mode"])),
                     "responses": ok_response()
                 }
             },
@@ -710,7 +734,7 @@ fn agents_catalog_responses() -> Value {
 fn capabilities_discovery_responses() -> Value {
     let mut responses = ok_response();
     responses["200"] = json!({
-        "description": "Terminal and AI Agent Harness dual-plane capabilities discovery",
+        "description": "Terminal and Agents dual-plane capabilities discovery",
         "content": { "application/json": { "schema": json!({
             "type": "object",
             "required": ["serverVersion", "protocolVersion", "planes", "capabilities"],
@@ -741,9 +765,7 @@ fn capabilities_discovery_responses() -> Value {
                                 }
                             }
                         },
-                        "agents": agent_harness_plane_schema(),
-                        "agent": agent_harness_plane_schema(),
-                        "harness": agent_harness_plane_schema(),
+                        "agents": agents_plane_schema(),
                         "ssh": {
                             "type": "object",
                             "properties": {

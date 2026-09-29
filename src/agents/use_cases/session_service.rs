@@ -3,11 +3,11 @@ use std::sync::Arc;
 use crate::agents::domain::{
     AgentCatalog, AgentSessionId, AgentSessionInfo, ModelRef, SessionQuery,
 };
-use crate::agents::ports::engine::{AgentEngineError, AgentEnginePort, FileDiffItem};
+use crate::agents::ports::agent::{AgentError, AgentPort, FileDiffItem};
 use crate::agents::ports::mirror::{AgentSessionSnapshot, SessionMirrorPort};
 
 pub struct SessionService {
-    engine: Arc<dyn AgentEnginePort>,
+    agent: Arc<dyn AgentPort>,
     mirror: Arc<dyn SessionMirrorPort>,
     /// The concrete mirror, for the few operations that are not part of the
     /// port because nothing else implements them.
@@ -15,9 +15,9 @@ pub struct SessionService {
 }
 
 impl SessionService {
-    pub fn new(engine: Arc<dyn AgentEnginePort>, mirror: Arc<dyn SessionMirrorPort>) -> Self {
+    pub fn new(agent: Arc<dyn AgentPort>, mirror: Arc<dyn SessionMirrorPort>) -> Self {
         Self {
-            engine,
+            agent,
             mirror,
             memory: None,
         }
@@ -25,11 +25,11 @@ impl SessionService {
 
     /// Build a service that can also reach the in-memory mirror directly.
     pub fn with_memory_mirror(
-        engine: Arc<dyn AgentEnginePort>,
+        agent: Arc<dyn AgentPort>,
         mirror: Arc<crate::agents::adapters::memory_mirror::MemoryMirror>,
     ) -> Self {
         Self {
-            engine,
+            agent,
             mirror: mirror.clone(),
             memory: Some(mirror),
         }
@@ -49,23 +49,23 @@ impl SessionService {
     pub async fn list_sessions(
         &self,
         query: &SessionQuery,
-    ) -> Result<Vec<AgentSessionInfo>, AgentEngineError> {
-        let mut sessions = self.engine.list_sessions(query).await?;
+    ) -> Result<Vec<AgentSessionInfo>, AgentError> {
+        let mut sessions = self.agent.list_sessions(query).await?;
         for session in &mut sessions {
             self.stamp(session);
         }
         Ok(sessions)
     }
 
-    /// Tag a session with the harness that owns it. The one place engine
-    /// results gain `harness`; adapters and routes never set it.
+    /// Tag a session with the agent that owns it. The one place agent
+    /// results gain `agent_id`; adapters and routes never set it.
     fn stamp(&self, info: &mut AgentSessionInfo) {
-        info.harness = self.engine.kind().to_string();
+        info.agent_id = self.agent.kind().to_string();
     }
 
-    /// One session as the engine reports it, tagged with its harness.
-    pub async fn get_session(&self, asid: &str) -> Result<AgentSessionInfo, AgentEngineError> {
-        let mut info = self.engine.get_session(asid).await?;
+    /// One session as the agent reports it, tagged with its agent.
+    pub async fn get_session(&self, asid: &str) -> Result<AgentSessionInfo, AgentError> {
+        let mut info = self.agent.get_session(asid).await?;
         self.stamp(&mut info);
         Ok(info)
     }
@@ -74,9 +74,9 @@ impl SessionService {
         &self,
         directory: Option<&str>,
         model: Option<&ModelRef>,
-        agent: Option<&str>,
-    ) -> Result<AgentSessionInfo, AgentEngineError> {
-        let mut info = self.engine.create_session(directory, model, agent).await?;
+        mode: Option<&str>,
+    ) -> Result<AgentSessionInfo, AgentError> {
+        let mut info = self.agent.create_session(directory, model, mode).await?;
         self.stamp(&mut info);
         self.mirror.update_session(info.clone()).await;
         Ok(info)
@@ -85,7 +85,7 @@ impl SessionService {
     pub async fn get_snapshot(
         &self,
         asid: &AgentSessionId,
-    ) -> Result<AgentSessionSnapshot, AgentEngineError> {
+    ) -> Result<AgentSessionSnapshot, AgentError> {
         // A session the mirror holds is served from the mirror, even when its
         // timeline is legitimately empty: treating "no rows" as a cache miss
         // re-hit OpenCode twice on every poll of a new session.
@@ -93,12 +93,12 @@ impl SessionService {
             return Ok(snapshot);
         }
 
-        let mut info = self.engine.get_session(&asid.0).await?;
+        let mut info = self.agent.get_session(&asid.0).await?;
         self.stamp(&mut info);
         self.mirror.update_session(info.clone()).await;
 
         let timeline = self
-            .engine
+            .agent
             .get_timeline(&asid.0, 100)
             .await
             .unwrap_or_default();
@@ -130,7 +130,7 @@ impl SessionService {
     /// Re-read the permissions and forms OpenCode still considers pending.
     pub async fn catch_up_pending(&self, asid: &AgentSessionId) {
         let permissions = self
-            .engine
+            .agent
             .get_pending_permissions(&asid.0)
             .await
             .unwrap_or_else(|err| {
@@ -138,7 +138,7 @@ impl SessionService {
                 Vec::new()
             });
         let forms = self
-            .engine
+            .agent
             .get_pending_forms(&asid.0)
             .await
             .unwrap_or_else(|err| {
@@ -163,33 +163,30 @@ impl SessionService {
         &self,
         asid: &AgentSessionId,
         model: &ModelRef,
-    ) -> Result<(), AgentEngineError> {
-        self.engine.switch_model(&asid.0, model).await
+    ) -> Result<(), AgentError> {
+        self.agent.switch_model(&asid.0, model).await
     }
 
-    pub async fn get_catalog(
-        &self,
-        directory: Option<&str>,
-    ) -> Result<AgentCatalog, AgentEngineError> {
-        self.engine.get_catalog(directory).await
+    pub async fn get_catalog(&self, directory: Option<&str>) -> Result<AgentCatalog, AgentError> {
+        self.agent.get_catalog(directory).await
     }
 
     pub async fn get_vcs_diff(
         &self,
         asid: &AgentSessionId,
         mode: &str,
-    ) -> Result<Vec<FileDiffItem>, AgentEngineError> {
-        self.engine.get_vcs_diff(&asid.0, mode).await
+    ) -> Result<Vec<FileDiffItem>, AgentError> {
+        self.agent.get_vcs_diff(&asid.0, mode).await
     }
 
     pub async fn revert_session(
         &self,
         asid: &AgentSessionId,
         message_id: &str,
-    ) -> Result<(), AgentEngineError> {
-        self.engine.revert_session(&asid.0, message_id).await?;
+    ) -> Result<(), AgentError> {
+        self.agent.revert_session(&asid.0, message_id).await?;
         let timeline = self
-            .engine
+            .agent
             .get_timeline(&asid.0, 100)
             .await
             .unwrap_or_default();

@@ -15,8 +15,8 @@ use sha2::{Digest, Sha256};
 use super::domain::{AgentSessionId, ModelRef, PermissionDecision, SessionQuery};
 use super::ports::mirror::SessionMirrorPort;
 use crate::{
-    api_error, content_envelope, require_device, stream_event, validate_text, ApiResult, AppState,
-    EncryptedStreamContext, EventStreamSealer,
+    api_error, content_envelope, require_device, still_paired, stream_event, validate_text,
+    ApiResult, AppState, EncryptedStreamContext, EventStreamSealer, STREAM_DEVICE_RECHECK_INTERVAL,
 };
 
 #[derive(Debug, Deserialize)]
@@ -38,21 +38,21 @@ pub struct AgentSessionsQuery {
     pub order: Option<String>,
     pub search: Option<String>,
     pub cursor: Option<String>,
-    /// Restrict the list (or the catalog) to one harness. Absent, the list
-    /// merges every attached harness.
-    pub harness: Option<String>,
+    /// Restrict the list (or the catalog) to one agent. Absent, the list
+    /// merges every attached agent.
+    pub agent_id: Option<String>,
 }
 
-/// `?harness=` alone, on the routes that read one engine.
+/// `?agent_id=` alone, on the routes that read one agent.
 #[derive(Debug, Deserialize)]
-pub struct HarnessQuery {
-    pub harness: Option<String>,
+pub struct AgentQuery {
+    pub agent_id: Option<String>,
 }
 
 /// What a session list answers when the caller does not say.
 ///
 /// The app already asks for fifty; a caller that asks for nothing used to get
-/// every session the engine had ever seen. A page is the right default for a
+/// every session the agent had ever seen. A page is the right default for a
 /// list a phone scrolls.
 const DEFAULT_SESSION_LIMIT: usize = 50;
 
@@ -138,16 +138,16 @@ pub struct AgentFilesQuery {
 /// a convenience, a bare `"build"` string.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
-pub enum SwitchAgentBody {
-    Wrapped { agent: String },
+pub enum SwitchModeBody {
+    Wrapped { mode: String },
     Bare(String),
 }
 
-impl SwitchAgentBody {
-    pub fn into_agent(self) -> String {
+impl SwitchModeBody {
+    pub fn into_mode(self) -> String {
         match self {
-            Self::Wrapped { agent } => agent,
-            Self::Bare(agent) => agent,
+            Self::Wrapped { mode } => mode,
+            Self::Bare(mode) => mode,
         }
     }
 }
@@ -175,9 +175,9 @@ impl SwitchModelBody {
 pub struct CreateAgentSessionBody {
     pub directory: Option<String>,
     pub model: Option<ModelRef>,
-    pub agent: Option<String>,
+    pub mode: Option<String>,
     #[serde(default)]
-    pub harness: Option<String>,
+    pub agent_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -359,7 +359,7 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
             "/api/agent-sessions/{asid}/inbox/{inbox_id}/queue",
             post(queue_agent_inbox_item),
         )
-        .route("/api/agent-engine", get(get_agent_engine_status))
+        .route("/api/agent-status", get(get_agent_status))
         .route("/api/agent-shells", get(list_agent_shells))
         .route(
             "/api/agent-shells/{shell_id}",
@@ -377,10 +377,7 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
             "/api/agent-sessions/{asid}/timeline",
             get(get_agent_session_timeline_global),
         )
-        .route(
-            "/api/agent-sessions/{asid}/agent",
-            post(switch_agent_mode_global),
-        )
+        .route("/api/agent-sessions/{asid}/mode", post(switch_mode_global))
         .route("/api/agent-files", get(find_agent_files_root_global))
         .route(
             "/api/agent-sessions/{asid}/files",
@@ -447,8 +444,8 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
             get(get_agent_session_timeline_legacy),
         )
         .route(
-            "/api/sessions/{session_id}/agent-sessions/{asid}/agent",
-            post(switch_agent_mode_legacy),
+            "/api/sessions/{session_id}/agent-sessions/{asid}/mode",
+            post(switch_mode_legacy),
         )
         .route(
             "/api/sessions/{session_id}/agent-files",
@@ -520,47 +517,47 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
 // Core implementation functions (pure OpenCode, zero herdr/tmux dependency)
 // ---------------------------------------------------------------------------
 
-/// The manager of one named harness. An id this gateway has never heard of is
-/// `400 invalid_harness`; a known one that is not attached is
+/// The manager of one named agent. An id this gateway has never heard of is
+/// `400 invalid_agent`; a known one that is not attached is
 /// `503 agent_unavailable`, naming it.
-async fn harness_manager_or_err(
+async fn agent_manager_or_err(
     state: &AppState,
-    harness: &str,
+    agent_id: &str,
 ) -> ApiResult<std::sync::Arc<super::manager::AgentManager>> {
-    if !state.agent_runtime.is_known_harness(harness) {
+    if !state.agent_runtime.is_known_agent(agent_id) {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
-            "invalid_harness",
-            &format!("Unknown agent harness '{harness}'"),
+            "invalid_agent",
+            &format!("Unknown agent '{agent_id}'"),
         ));
     }
     state
         .agent_runtime
-        .manager_for_harness(harness)
+        .manager_for_agent(agent_id)
         .await
         .ok_or_else(|| {
             api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "agent_unavailable",
-                &format!("Agent harness '{harness}' is not available"),
+                &format!("Agent '{agent_id}' is not available"),
             )
         })
 }
 
-/// The managers a read covers: the named harness alone, or every attached one.
+/// The managers a read covers: the named agent alone, or every attached one.
 async fn managers_for_read(
     state: &AppState,
-    harness: Option<&str>,
+    agent_id: Option<&str>,
 ) -> ApiResult<Vec<std::sync::Arc<super::manager::AgentManager>>> {
-    if let Some(harness) = harness {
-        return Ok(vec![harness_manager_or_err(state, harness).await?]);
+    if let Some(agent_id) = agent_id {
+        return Ok(vec![agent_manager_or_err(state, agent_id).await?]);
     }
     let all_managers = state.agent_runtime.all_managers().await;
     if all_managers.is_empty() {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_unavailable",
-            "Agent engine is not available",
+            "No agent is available",
         ));
     }
     Ok(all_managers)
@@ -569,12 +566,12 @@ async fn managers_for_read(
 async fn do_list_agent_sessions(
     state: &AppState,
     query: &SessionQuery,
-    harness: Option<&str>,
+    agent_id: Option<&str>,
     headers: &HeaderMap,
 ) -> ApiResult<Response> {
     require_device(state, headers)?;
 
-    let all_managers = managers_for_read(state, harness).await?;
+    let all_managers = managers_for_read(state, agent_id).await?;
 
     let mut sessions = Vec::new();
     let mut any_success = false;
@@ -587,27 +584,27 @@ async fn do_list_agent_sessions(
                 for s in &list {
                     state
                         .agent_runtime
-                        .record_session_route(&s.asid.0, manager.engine().kind())
+                        .record_session_route(&s.asid.0, manager.agent().kind())
                         .await;
                 }
                 sessions.extend(list);
             }
             Err(e) => {
                 tracing::warn!(
-                    harness = manager.engine().kind(),
+                    agent_id = manager.agent().kind(),
                     error = %e,
-                    "agent session list failed; skipping this harness"
+                    "agent session list failed; skipping this agent"
                 );
                 last_err = Some(e);
             }
         }
     }
 
-    // A harness that errors is skipped while another answers. When every one
+    // An agent that errors is skipped while another answers. When every one
     // asked failed, or the caller named the one that failed, say so.
-    if !any_success || (harness.is_some() && last_err.is_some()) {
+    if !any_success || (agent_id.is_some() && last_err.is_some()) {
         if let Some(err) = last_err {
-            return Err(engine_error(err));
+            return Err(agent_error(err));
         }
     }
 
@@ -627,15 +624,15 @@ async fn do_create_agent_session(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    // An explicit `harness` is the only selector. The model's provider says
-    // nothing about the engine: an OpenCode provider may be named `deepseek`.
-    let manager = match body.harness.as_deref() {
-        Some(h) => harness_manager_or_err(state, h).await?,
+    // An explicit `agent_id` is the only selector. The model's provider says
+    // nothing about the agent: an OpenCode provider may be named `deepseek`.
+    let manager = match body.agent_id.as_deref() {
+        Some(h) => agent_manager_or_err(state, h).await?,
         None => state.agent_runtime.manager().await.ok_or_else(|| {
             api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "agent_unavailable",
-                "Agent engine is not available",
+                "No agent is available",
             )
         })?,
     };
@@ -674,20 +671,14 @@ async fn do_create_agent_session(
         .create_session(
             validated_dir.as_deref(),
             body.model.as_ref(),
-            body.agent.as_deref(),
+            body.mode.as_deref(),
         )
         .await
-        .map_err(|e| {
-            api_error(
-                StatusCode::BAD_GATEWAY,
-                "agent_engine_error",
-                &e.to_string(),
-            )
-        })?;
+        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "agent_error", &e.to_string()))?;
 
     state
         .agent_runtime
-        .record_session_route(&session.asid.0, manager.engine().kind())
+        .record_session_route(&session.asid.0, manager.agent().kind())
         .await;
 
     Ok(Json(content_envelope(json!(session))))
@@ -765,10 +756,10 @@ async fn do_get_agent_session_timeline(
     Ok(Json(content_envelope(payload)))
 }
 
-async fn do_switch_agent_mode(
+async fn do_switch_mode(
     state: &AppState,
     asid: &str,
-    agent: &str,
+    mode: &str,
     headers: &HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
@@ -776,16 +767,10 @@ async fn do_switch_agent_mode(
     let manager = session_manager_or_err(state, asid).await?;
 
     manager
-        .engine()
-        .switch_agent(asid, agent)
+        .agent()
+        .switch_mode(asid, mode)
         .await
-        .map_err(|e| {
-            api_error(
-                StatusCode::BAD_GATEWAY,
-                "agent_engine_error",
-                &e.to_string(),
-            )
-        })?;
+        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "agent_error", &e.to_string()))?;
 
     Ok(Json(content_envelope(json!({ "ok": true }))))
 }
@@ -803,14 +788,14 @@ async fn do_find_agent_files(
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_unavailable",
-            "Agent engine is not available",
+            "No agent is available",
         ));
     };
 
     require_directory(directory)?;
 
     let files = manager
-        .engine()
+        .agent()
         .find_files(query, limit, directory)
         .await
         .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "fs_error", &e.to_string()))?;
@@ -857,13 +842,7 @@ async fn do_send_agent_prompt(
             body.delivery.as_deref(),
         )
         .await
-        .map_err(|e| {
-            api_error(
-                StatusCode::BAD_GATEWAY,
-                "agent_engine_error",
-                &e.to_string(),
-            )
-        })?;
+        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "agent_error", &e.to_string()))?;
 
     Ok(Json(content_envelope(json!({ "submitted": true }))))
 }
@@ -882,13 +861,7 @@ async fn do_revert_agent_session(
         .sessions()
         .revert_session(&AgentSessionId(asid.to_string()), &body.message_id)
         .await
-        .map_err(|e| {
-            api_error(
-                StatusCode::BAD_GATEWAY,
-                "agent_engine_error",
-                &e.to_string(),
-            )
-        })?;
+        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "agent_error", &e.to_string()))?;
 
     Ok(Json(content_envelope(json!({
         "status": "ok",
@@ -909,13 +882,7 @@ async fn do_interrupt_agent_session(
         .prompts()
         .interrupt(&AgentSessionId(asid.to_string()))
         .await
-        .map_err(|e| {
-            api_error(
-                StatusCode::BAD_GATEWAY,
-                "agent_engine_error",
-                &e.to_string(),
-            )
-        })?;
+        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "agent_error", &e.to_string()))?;
 
     Ok(Json(content_envelope(json!({ "interrupted": true }))))
 }
@@ -934,13 +901,7 @@ async fn do_switch_agent_model(
         .sessions()
         .switch_model(&AgentSessionId(asid.to_string()), &model)
         .await
-        .map_err(|e| {
-            api_error(
-                StatusCode::BAD_GATEWAY,
-                "agent_engine_error",
-                &e.to_string(),
-            )
-        })?;
+        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "agent_error", &e.to_string()))?;
 
     Ok(Json(content_envelope(json!({ "switched": true }))))
 }
@@ -978,13 +939,7 @@ async fn do_reply_agent_permission(
             body.message.as_deref(),
         )
         .await
-        .map_err(|e| {
-            api_error(
-                StatusCode::BAD_GATEWAY,
-                "agent_engine_error",
-                &e.to_string(),
-            )
-        })?;
+        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "agent_error", &e.to_string()))?;
 
     Ok(Json(content_envelope(json!({ "replied": true }))))
 }
@@ -1008,13 +963,7 @@ async fn do_reply_agent_form(
             serde_json::Value::Object(body.answers),
         )
         .await
-        .map_err(|e| {
-            api_error(
-                StatusCode::BAD_GATEWAY,
-                "agent_engine_error",
-                &e.to_string(),
-            )
-        })?;
+        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "agent_error", &e.to_string()))?;
 
     Ok(Json(content_envelope(json!({ "replied": true }))))
 }
@@ -1044,7 +993,7 @@ async fn do_get_agent_vcs_diff(
     // folder has been deleted answered a blank 502, and the useful thing to
     // say is which folder went.
     let directory = manager
-        .engine()
+        .agent()
         .get_session(asid)
         .await
         .ok()
@@ -1055,7 +1004,7 @@ async fn do_get_agent_vcs_diff(
         .sessions()
         .get_vcs_diff(&AgentSessionId(asid.to_string()), mode)
         .await
-        .map_err(engine_error)?;
+        .map_err(agent_error)?;
 
     // OpenCode answers `200` with an empty list both for a clean repository
     // and for a directory that is not a repository at all, so on its own the
@@ -1070,16 +1019,16 @@ async fn do_get_agent_vcs_diff(
 
 /// Whether a catalog is one a client should be allowed to keep.
 ///
-/// Models, providers and agents all come back empty from a directory OpenCode
+/// Models, providers and modes all come back empty from a directory OpenCode
 /// has not loaded yet, and any one of them empty makes the catalog useless: a
-/// model picker with no models is as broken as an agent picker with no agents.
+/// model picker with no models is as broken as a mode picker with no modes.
 /// The driver waits for all three, and this is the last guard behind it.
 ///
 /// Skills and commands are deliberately not in this list -- a project really
 /// can have none of either, and refusing to cache on that would mean never
 /// caching for such a project.
 pub(crate) fn catalog_is_incomplete(catalog: &crate::agents::domain::AgentCatalog) -> bool {
-    catalog.models.is_empty() || catalog.providers.is_empty() || catalog.agents.is_empty()
+    catalog.models.is_empty() || catalog.providers.is_empty() || catalog.modes.is_empty()
 }
 
 /// The catalog's answer, and whether the app may cache it.
@@ -1166,29 +1115,27 @@ pub(crate) fn json_etag_response(headers: &HeaderMap, payload: Value) -> Respons
 
 async fn do_list_agent_projects(
     state: &AppState,
-    harness: Option<&str>,
+    agent_id: Option<&str>,
     headers: &HeaderMap,
 ) -> ApiResult<Response> {
     require_device(state, headers)?;
 
-    let manager = match harness {
-        Some(h) => harness_manager_or_err(state, h).await?,
+    let manager = match agent_id {
+        Some(h) => agent_manager_or_err(state, h).await?,
         None => state.agent_runtime.manager().await.ok_or_else(|| {
             api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "agent_unavailable",
-                "Agent engine is not available",
+                "No agent is available",
             )
         })?,
     };
 
-    let projects = manager.engine().list_projects().await.map_err(|e| {
-        api_error(
-            StatusCode::BAD_GATEWAY,
-            "agent_engine_error",
-            &e.to_string(),
-        )
-    })?;
+    let projects = manager
+        .agent()
+        .list_projects()
+        .await
+        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "agent_error", &e.to_string()))?;
 
     Ok(json_etag_response(
         headers,
@@ -1299,7 +1246,7 @@ async fn do_stream_agent_session(
     Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>> + Send>,
     (StatusCode, Json<Value>),
 > {
-    require_device(state, headers)?;
+    let device_id = require_device(state, headers)?;
 
     let mut sealer = match stream_crypto {
         Some(Extension(context)) => Some(EventStreamSealer::new(&context).map_err(|_| {
@@ -1317,6 +1264,7 @@ async fn do_stream_agent_session(
     let target_asid = AgentSessionId(asid.to_string());
     let mut rx = state.agent_runtime.subscribe_events();
     drop(manager);
+    let devices = state.clone();
 
     let stream = async_stream::stream! {
         let hello = serde_json::to_string(&json!({ "asid": target_asid.0 })).unwrap_or_default();
@@ -1324,8 +1272,28 @@ async fn do_stream_agent_session(
             yield Ok(event);
         }
 
+        // The authorisation this stream was opened on is rechecked for as
+        // long as it is open, as the terminal event stream and `/api/ws` do.
+        // See `STREAM_DEVICE_RECHECK_INTERVAL`.
+        let mut device_recheck = tokio::time::interval(STREAM_DEVICE_RECHECK_INTERVAL);
+        device_recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The first tick is immediate, and `require_device` just ran.
+        device_recheck.tick().await;
+
         loop {
-            match rx.recv().await {
+            let next = tokio::select! {
+                _ = device_recheck.tick() => {
+                    if !still_paired(&devices, &device_id) {
+                        // Closed without an event, like the terminal stream: a
+                        // revoked device is not owed an explanation, and a
+                        // legitimate client learns it from its reconnect's 403.
+                        break;
+                    }
+                    continue;
+                }
+                next = rx.recv() => next,
+            };
+            match next {
                 Ok(ev) => {
                     // An event with no session -- a global resync, or a
                     // worktree change -- reaches every stream.
@@ -1362,12 +1330,12 @@ pub async fn get_global_agent_catalog(
 ) -> ApiResult<Response> {
     require_device(&state, &headers)?;
 
-    let all_managers = managers_for_read(&state, query.harness.as_deref()).await?;
+    let all_managers = managers_for_read(&state, query.agent_id.as_deref()).await?;
 
     require_directory(query.directory.as_deref())?;
 
     let mut merged_models = Vec::new();
-    let mut merged_agents = Vec::new();
+    let mut merged_modes = Vec::new();
     let mut merged_mcp = Vec::new();
     let mut merged_skills = Vec::new();
     let mut merged_providers = Vec::new();
@@ -1393,12 +1361,12 @@ pub async fn get_global_agent_catalog(
                     merged_models.push(m);
                 }
             }
-            for a in cat.agents {
-                if !merged_agents
+            for a in cat.modes {
+                if !merged_modes
                     .iter()
-                    .any(|existing: &crate::agents::domain::AgentInfo| existing.id == a.id)
+                    .any(|existing: &crate::agents::domain::ModeInfo| existing.id == a.id)
                 {
-                    merged_agents.push(a);
+                    merged_modes.push(a);
                 }
             }
             for p in cat.providers {
@@ -1431,7 +1399,7 @@ pub async fn get_global_agent_catalog(
 
     let catalog = crate::agents::domain::AgentCatalog {
         models: merged_models,
-        agents: merged_agents,
+        modes: merged_modes,
         mcp: merged_mcp,
         skills: merged_skills,
         providers: merged_providers,
@@ -1444,7 +1412,7 @@ pub async fn get_global_agent_catalog(
             directory = query.directory.as_deref().unwrap_or("<none>"),
             models = catalog.models.len(),
             providers = catalog.providers.len(),
-            agents = catalog.agents.len(),
+            modes = catalog.modes.len(),
             "agent catalog is incomplete; answering without an ETag"
         );
     }
@@ -1463,7 +1431,7 @@ async fn list_agent_sessions_global(
     do_list_agent_sessions(
         &state,
         &query.to_session_query(),
-        query.harness.as_deref(),
+        query.agent_id.as_deref(),
         &headers,
     )
     .await
@@ -1503,13 +1471,13 @@ async fn get_agent_session_timeline_global(
     do_get_agent_session_timeline(&state, &asid, query.after.unwrap_or(0), &headers).await
 }
 
-async fn switch_agent_mode_global(
+async fn switch_mode_global(
     State(state): State<AppState>,
     Path(asid): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<SwitchAgentBody>,
+    Json(body): Json<SwitchModeBody>,
 ) -> ApiResult<Json<Value>> {
-    do_switch_agent_mode(&state, &asid, &body.into_agent(), &headers).await
+    do_switch_mode(&state, &asid, &body.into_mode(), &headers).await
 }
 
 async fn find_agent_files_root_global(
@@ -1618,7 +1586,7 @@ async fn list_agent_sessions_legacy(
     do_list_agent_sessions(
         &state,
         &query.to_session_query(),
-        query.harness.as_deref(),
+        query.agent_id.as_deref(),
         &headers,
     )
     .await
@@ -1659,13 +1627,13 @@ async fn get_agent_session_timeline_legacy(
     do_get_agent_session_timeline(&state, &asid, query.after.unwrap_or(0), &headers).await
 }
 
-async fn switch_agent_mode_legacy(
+async fn switch_mode_legacy(
     State(state): State<AppState>,
     Path((_session_id, asid)): Path<(String, String)>,
     headers: HeaderMap,
-    Json(body): Json<SwitchAgentBody>,
+    Json(body): Json<SwitchModeBody>,
 ) -> ApiResult<Json<Value>> {
-    do_switch_agent_mode(&state, &asid, &body.into_agent(), &headers).await
+    do_switch_mode(&state, &asid, &body.into_mode(), &headers).await
 }
 
 async fn find_agent_files_root_legacy(
@@ -1782,19 +1750,19 @@ async fn get_session_agent_catalog(
 
 async fn list_agent_projects_global(
     State(state): State<AppState>,
-    Query(query): Query<HarnessQuery>,
+    Query(query): Query<AgentQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    do_list_agent_projects(&state, query.harness.as_deref(), &headers).await
+    do_list_agent_projects(&state, query.agent_id.as_deref(), &headers).await
 }
 
 async fn list_agent_projects_legacy(
     State(state): State<AppState>,
     Path(_session_id): Path<String>,
-    Query(query): Query<HarnessQuery>,
+    Query(query): Query<AgentQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    do_list_agent_projects(&state, query.harness.as_deref(), &headers).await
+    do_list_agent_projects(&state, query.agent_id.as_deref(), &headers).await
 }
 
 async fn list_agent_directories_global(
@@ -1854,7 +1822,7 @@ macro_rules! manager_or_unavailable {
                 return Err(api_error(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "agent_unavailable",
-                    "Agent engine is not available",
+                    "No agent is available",
                 ));
             }
         }
@@ -1868,9 +1836,9 @@ macro_rules! session_manager_or_err {
     }};
 }
 
-/// The manager that owns a session. Nothing attached is 503; an engine is
+/// The manager that owns a session. Nothing attached is 503; an agent is
 /// attached but none of them knows the id is 404, so a session id from before
-/// a restart is never handed to an engine that will not recognise it.
+/// a restart is never handed to an agent that will not recognise it.
 async fn session_manager_or_err(
     state: &AppState,
     asid: &str,
@@ -1882,36 +1850,32 @@ async fn session_manager_or_err(
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_unavailable",
-            "Agent engine is not available",
+            "No agent is available",
         ));
     }
     Err(api_error(
         StatusCode::NOT_FOUND,
         "session_not_found",
-        "No attached agent engine owns this session",
+        "No attached agent owns this session",
     ))
 }
 
-fn engine_error(err: super::ports::engine::AgentEngineError) -> (StatusCode, Json<Value>) {
-    // A folder that is gone is not an engine fault, and answering 502 for it
+fn agent_error(err: super::ports::agent::AgentError) -> (StatusCode, Json<Value>) {
+    // A folder that is gone is not an agent fault, and answering 502 for it
     // told the user their agent had broken when their directory had simply
     // been deleted. It is a 404 that names the folder, and it carries the path
     // as its own field so the app can offer to forget the session rather than
     // parse a sentence.
     match &err {
-        super::ports::engine::AgentEngineError::WorkspaceMissing(directory) => {
+        super::ports::agent::AgentError::WorkspaceMissing(directory) => {
             workspace_missing(directory)
         }
-        super::ports::engine::AgentEngineError::Unsupported(feature) => api_error(
+        super::ports::agent::AgentError::Unsupported(feature) => api_error(
             StatusCode::NOT_IMPLEMENTED,
             "feature_unsupported",
-            &format!("This agent engine does not support: {feature}"),
+            &format!("This agent does not support: {feature}"),
         ),
-        _ => api_error(
-            StatusCode::BAD_GATEWAY,
-            "agent_engine_error",
-            &err.to_string(),
-        ),
+        _ => api_error(StatusCode::BAD_GATEWAY, "agent_error", &err.to_string()),
     }
 }
 
@@ -1946,7 +1910,7 @@ pub(crate) fn workspace_missing(directory: &str) -> (StatusCode, Json<Value>) {
 
 /// The guard every directory-scoped route runs before proxying.
 fn require_directory(directory: Option<&str>) -> Result<(), (StatusCode, Json<Value>)> {
-    super::adapters::opencode::driver::check_directory(directory).map_err(engine_error)
+    super::adapters::opencode::driver::check_directory(directory).map_err(agent_error)
 }
 
 async fn list_agent_session_children(
@@ -1957,7 +1921,7 @@ async fn list_agent_session_children(
 ) -> ApiResult<Response> {
     let mut session_query = query.to_session_query();
     session_query.parent_id = Some(asid);
-    do_list_agent_sessions(&state, &session_query, query.harness.as_deref(), &headers).await
+    do_list_agent_sessions(&state, &session_query, query.agent_id.as_deref(), &headers).await
 }
 
 async fn delete_agent_session_global(
@@ -1967,10 +1931,10 @@ async fn delete_agent_session_global(
 ) -> ApiResult<Json<Value>> {
     let manager = session_manager_or_err!(&state, &headers, &asid);
     manager
-        .engine()
+        .agent()
         .delete_session(&asid)
         .await
-        .map_err(engine_error)?;
+        .map_err(agent_error)?;
     // OpenCode deletes the children too, but it also announces each one on the
     // stream, so the mirror only has to forget this session here.
     manager
@@ -1990,10 +1954,10 @@ async fn rename_agent_session(
     let manager = session_manager_or_err!(&state, &headers, &asid);
     validate_text(&body.title)?;
     manager
-        .engine()
+        .agent()
         .rename_session(&asid, &body.title)
         .await
-        .map_err(engine_error)?;
+        .map_err(agent_error)?;
     Ok(Json(content_envelope(
         json!({ "renamed": true, "title": body.title }),
     )))
@@ -2006,10 +1970,10 @@ async fn clear_agent_session_revert(
 ) -> ApiResult<Json<Value>> {
     let manager = session_manager_or_err!(&state, &headers, &asid);
     manager
-        .engine()
+        .agent()
         .clear_revert(&asid)
         .await
-        .map_err(engine_error)?;
+        .map_err(agent_error)?;
     Ok(Json(content_envelope(json!({ "cleared": true }))))
 }
 
@@ -2021,14 +1985,14 @@ async fn clear_agent_session_revert(
 /// act on the user's own configuration, and a stale project id would aim it at
 /// the wrong list.
 async fn session_project_id(
-    engine: &dyn super::ports::engine::AgentEnginePort,
+    agent: &dyn super::ports::agent::AgentPort,
     asid: &str,
 ) -> ApiResult<String> {
-    let session = engine.get_session(asid).await.map_err(engine_error)?;
+    let session = agent.get_session(asid).await.map_err(agent_error)?;
     session.project_id.filter(|p| !p.is_empty()).ok_or_else(|| {
         api_error(
             StatusCode::BAD_GATEWAY,
-            "agent_engine_error",
+            "agent_error",
             "the session reported no project",
         )
     })
@@ -2042,12 +2006,12 @@ async fn list_saved_agent_permissions(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     let manager = session_manager_or_err!(&state, &headers, &asid);
-    let engine = manager.engine();
-    let project_id = session_project_id(engine.as_ref(), &asid).await?;
-    let items = engine
+    let agent = manager.agent();
+    let project_id = session_project_id(agent.as_ref(), &asid).await?;
+    let items = agent
         .list_saved_permissions(Some(&project_id))
         .await
-        .map_err(engine_error)?;
+        .map_err(agent_error)?;
     let items: Vec<Value> = items
         .iter()
         .filter_map(super::adapters::opencode::mapper::map_saved_permission)
@@ -2068,12 +2032,12 @@ async fn forget_saved_agent_permission(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     let manager = session_manager_or_err!(&state, &headers, &asid);
-    let engine = manager.engine();
-    let project_id = session_project_id(engine.as_ref(), &asid).await?;
-    let known = engine
+    let agent = manager.agent();
+    let project_id = session_project_id(agent.as_ref(), &asid).await?;
+    let known = agent
         .list_saved_permissions(Some(&project_id))
         .await
-        .map_err(engine_error)?
+        .map_err(agent_error)?
         .iter()
         .any(|item| item.get("id").and_then(Value::as_str) == Some(saved_id.as_str()));
     if !known {
@@ -2083,10 +2047,10 @@ async fn forget_saved_agent_permission(
             "no such saved permission in this session's project",
         ));
     }
-    engine
+    agent
         .delete_saved_permission(&saved_id)
         .await
-        .map_err(engine_error)?;
+        .map_err(agent_error)?;
     Ok(Json(content_envelope(json!({ "deleted": true }))))
 }
 
@@ -2104,10 +2068,10 @@ async fn list_agent_worktrees(
     let manager = manager_or_unavailable!(&state, &headers);
     require_directory(query.directory.as_deref())?;
     let items = manager
-        .engine()
+        .agent()
         .list_worktrees(query.directory.as_deref())
         .await
-        .map_err(engine_error)?;
+        .map_err(agent_error)?;
     Ok(Json(content_envelope(json!({ "items": items }))))
 }
 
@@ -2132,10 +2096,10 @@ async fn create_agent_worktree(
         }
     }
     let created = manager
-        .engine()
+        .agent()
         .create_worktree(body.directory.as_deref(), &input)
         .await
-        .map_err(engine_error)?;
+        .map_err(agent_error)?;
     Ok(Json(content_envelope(json!({ "worktree": created }))))
 }
 
@@ -2155,10 +2119,10 @@ async fn remove_agent_worktree(
         ));
     }
     manager
-        .engine()
+        .agent()
         .remove_worktree(body.directory.as_deref(), worktree, Some(body.force))
         .await
-        .map_err(engine_error)?;
+        .map_err(agent_error)?;
     Ok(Json(content_envelope(json!({ "deleted": true }))))
 }
 
@@ -2171,10 +2135,10 @@ async fn refresh_agent_worktrees(
     let directory = body.and_then(|Json(b)| b.directory);
     require_directory(directory.as_deref())?;
     manager
-        .engine()
+        .agent()
         .refresh_worktrees(directory.as_deref())
         .await
-        .map_err(engine_error)?;
+        .map_err(agent_error)?;
     Ok(Json(content_envelope(json!({ "refreshed": true }))))
 }
 
@@ -2207,15 +2171,15 @@ async fn move_agent_session(
     }
     require_directory(Some(directory))?;
     manager
-        .engine()
+        .agent()
         .move_session(&asid, directory)
         .await
-        .map_err(engine_error)?;
+        .map_err(agent_error)?;
     let info = manager
         .sessions()
         .get_session(&asid)
         .await
-        .map_err(engine_error)?;
+        .map_err(agent_error)?;
     manager.mirror().update_session(info.clone()).await;
     Ok(Json(content_envelope(
         serde_json::to_value(&info).unwrap_or(Value::Null),
@@ -2242,10 +2206,10 @@ async fn stage_agent_session_revert(
         ));
     }
     let res = manager
-        .engine()
+        .agent()
         .stage_revert(&asid, message_id, body.files)
         .await
-        .map_err(engine_error)?;
+        .map_err(agent_error)?;
     // `Session.Revert` comes back under `data`; it is mapped rather than
     // forwarded so the app reads the same snake_case shape it already reads
     // on `info.revert`.
@@ -2266,10 +2230,10 @@ async fn commit_agent_session_revert(
 ) -> ApiResult<Json<Value>> {
     let manager = session_manager_or_err!(&state, &headers, &asid);
     manager
-        .engine()
+        .agent()
         .commit_revert(&asid)
         .await
-        .map_err(engine_error)?;
+        .map_err(agent_error)?;
     Ok(Json(content_envelope(json!({ "committed": true }))))
 }
 
@@ -2293,10 +2257,10 @@ async fn activate_agent_skill(
     }
     validate_text(skill)?;
     manager
-        .engine()
+        .agent()
         .activate_skill(&asid, skill, body.resume)
         .await
-        .map_err(engine_error)?;
+        .map_err(agent_error)?;
     Ok(Json(content_envelope(json!({ "status": "ok" }))))
 }
 
@@ -2309,10 +2273,10 @@ async fn compact_agent_session(
     let manager = session_manager_or_err!(&state, &headers, &asid);
     let delivery = body.and_then(|Json(b)| b.delivery);
     let res = manager
-        .engine()
+        .agent()
         .compact_session(&asid, delivery.as_deref())
         .await
-        .map_err(engine_error)?;
+        .map_err(agent_error)?;
     // The reply is the inbox item the request was admitted as.
     Ok(Json(content_envelope(json!({
         "requested": true,
@@ -2327,10 +2291,10 @@ async fn get_agent_session_context(
 ) -> ApiResult<Json<Value>> {
     let manager = session_manager_or_err!(&state, &headers, &asid);
     let messages = manager
-        .engine()
+        .agent()
         .get_context(&asid)
         .await
-        .map_err(engine_error)?;
+        .map_err(agent_error)?;
 
     // The context window's token totals are the last assistant message's, which
     // is what "context used" is measured against.
@@ -2353,10 +2317,10 @@ async fn background_agent_session(
 ) -> ApiResult<Json<Value>> {
     let manager = session_manager_or_err!(&state, &headers, &asid);
     manager
-        .engine()
+        .agent()
         .background_session(&asid)
         .await
-        .map_err(engine_error)?;
+        .map_err(agent_error)?;
     // OpenCode has no event for this, so the tool cards are marked here.
     manager
         .mirror()
@@ -2372,10 +2336,10 @@ async fn wait_agent_session(
 ) -> ApiResult<Json<Value>> {
     let manager = session_manager_or_err!(&state, &headers, &asid);
     manager
-        .engine()
+        .agent()
         .wait_session(&asid)
         .await
-        .map_err(engine_error)?;
+        .map_err(agent_error)?;
     Ok(Json(content_envelope(json!({ "idle": true }))))
 }
 
@@ -2393,10 +2357,10 @@ async fn view_agent_session(
             .unwrap_or(0)
     });
     manager
-        .engine()
+        .agent()
         .view_session(&asid, idle)
         .await
-        .map_err(engine_error)?;
+        .map_err(agent_error)?;
     Ok(Json(content_envelope(json!({ "viewed": idle }))))
 }
 
@@ -2410,10 +2374,10 @@ async fn export_agent_session(
     // Sanitized by default: an export leaves the device.
     let sanitize = query.sanitize.unwrap_or(true);
     let res = manager
-        .engine()
+        .agent()
         .export_session(&asid, Some(sanitize))
         .await
-        .map_err(engine_error)?;
+        .map_err(agent_error)?;
     Ok(Json(content_envelope(
         res.get("data").cloned().unwrap_or(res),
     )))
@@ -2439,10 +2403,10 @@ async fn run_agent_session_command(
         validate_text(&arguments)?;
     }
     manager
-        .engine()
+        .agent()
         .run_command(&asid, name, &arguments, body.delivery.as_deref())
         .await
-        .map_err(engine_error)?;
+        .map_err(agent_error)?;
     Ok(Json(content_envelope(json!({ "submitted": true }))))
 }
 
@@ -2453,10 +2417,10 @@ async fn get_agent_inbox(
 ) -> ApiResult<Json<Value>> {
     let manager = session_manager_or_err!(&state, &headers, &asid);
     let items = manager
-        .engine()
+        .agent()
         .get_inbox(&asid)
         .await
-        .map_err(engine_error)?;
+        .map_err(agent_error)?;
     // Refresh the mirror so a later snapshot and the stream agree.
     manager
         .mirror()
@@ -2472,10 +2436,10 @@ async fn cancel_agent_inbox_item(
 ) -> ApiResult<Json<Value>> {
     let manager = session_manager_or_err!(&state, &headers, &asid);
     manager
-        .engine()
+        .agent()
         .cancel_inbox_item(&asid, &inbox_id)
         .await
-        .map_err(engine_error)?;
+        .map_err(agent_error)?;
     manager
         .mirror()
         .upsert_inbox_item(&AgentSessionId(asid), &inbox_id, None)
@@ -2508,33 +2472,33 @@ async fn set_inbox_delivery(
 ) -> ApiResult<Json<Value>> {
     let manager = session_manager_or_err!(&state, &headers, &asid);
     manager
-        .engine()
+        .agent()
         .set_inbox_delivery(&asid, &inbox_id, delivery)
         .await
-        .map_err(engine_error)?;
+        .map_err(agent_error)?;
     Ok(Json(content_envelope(
         json!({ "delivery": delivery, "inbox_id": inbox_id }),
     )))
 }
 
-/// What engine, if any, the gateway currently has. Unlike every other agent
+/// What agent, if any, the gateway currently has. Unlike every other agent
 /// route this one answers 200 with `available: false` rather than 503 -- the
 /// app asks it precisely to find out why the others are refusing.
-async fn get_agent_engine_status(
+async fn get_agent_status(
     State(state): State<AppState>,
-    Query(query): Query<HarnessQuery>,
+    Query(query): Query<AgentQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
-    let status = match query.harness.as_deref() {
+    let status = match query.agent_id.as_deref() {
         Some(h) => {
             // Validates the id (400) and that it is attached (503).
-            harness_manager_or_err(&state, h).await?;
+            agent_manager_or_err(&state, h).await?;
             state.agent_runtime.status_for(h).await.ok_or_else(|| {
                 api_error(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "agent_unavailable",
-                    &format!("Agent harness '{h}' is not available"),
+                    &format!("Agent '{h}' is not available"),
                 )
             })?
         }
@@ -2550,10 +2514,10 @@ async fn list_agent_shells(
 ) -> ApiResult<Json<Value>> {
     let manager = manager_or_unavailable!(&state, &headers);
     let shells = manager
-        .engine()
+        .agent()
         .list_shells(query.directory.as_deref())
         .await
-        .map_err(engine_error)?;
+        .map_err(agent_error)?;
     Ok(Json(content_envelope(json!(shells))))
 }
 
@@ -2564,10 +2528,10 @@ async fn get_agent_shell(
 ) -> ApiResult<Json<Value>> {
     let manager = manager_or_unavailable!(&state, &headers);
     let shell = manager
-        .engine()
+        .agent()
         .get_shell(&shell_id)
         .await
-        .map_err(engine_error)?;
+        .map_err(agent_error)?;
     Ok(Json(content_envelope(shell)))
 }
 
@@ -2579,10 +2543,10 @@ async fn get_agent_shell_output(
 ) -> ApiResult<Json<Value>> {
     let manager = manager_or_unavailable!(&state, &headers);
     let output = manager
-        .engine()
+        .agent()
         .get_shell_output(&shell_id, query.cursor, query.limit)
         .await
-        .map_err(engine_error)?;
+        .map_err(agent_error)?;
     Ok(Json(content_envelope(output)))
 }
 
@@ -2593,10 +2557,10 @@ async fn kill_agent_shell(
 ) -> ApiResult<Json<Value>> {
     let manager = manager_or_unavailable!(&state, &headers);
     manager
-        .engine()
+        .agent()
         .kill_shell(&shell_id)
         .await
-        .map_err(engine_error)?;
+        .map_err(agent_error)?;
     Ok(Json(content_envelope(json!({ "killed": true }))))
 }
 
@@ -2649,11 +2613,11 @@ mod tests {
     /// default alone, and `false` is a caller who does not want the diff
     /// computed -- not the same thing.
     fn catalog_with(
-        agents: Vec<crate::agents::domain::AgentInfo>,
+        modes: Vec<crate::agents::domain::ModeInfo>,
     ) -> crate::agents::domain::AgentCatalog {
         crate::agents::domain::AgentCatalog {
             models: Vec::new(),
-            agents,
+            modes,
             mcp: Vec::new(),
             skills: Vec::new(),
             providers: Vec::new(),
@@ -2663,7 +2627,7 @@ mod tests {
     }
 
     fn complete_catalog() -> crate::agents::domain::AgentCatalog {
-        let mut catalog = catalog_with(vec![agent("build")]);
+        let mut catalog = catalog_with(vec![mode("build")]);
         catalog.models = vec![crate::agents::domain::ModelInfo {
             id: "union-alpha".into(),
             name: "Union Alpha".into(),
@@ -2684,8 +2648,8 @@ mod tests {
         catalog
     }
 
-    fn agent(id: &str) -> crate::agents::domain::AgentInfo {
-        crate::agents::domain::AgentInfo {
+    fn mode(id: &str) -> crate::agents::domain::ModeInfo {
+        crate::agents::domain::ModeInfo {
             id: id.to_string(),
             name: id.to_string(),
             model: None,
@@ -2780,23 +2744,23 @@ mod tests {
         assert_eq!(body["error"]["directory"], "/tmp/muqun-c10/repo");
     }
 
-    /// And the engine error that stands for it maps to exactly that, rather
-    /// than falling into the 502 every other engine failure takes.
+    /// And the agent error that stands for it maps to exactly that, rather
+    /// than falling into the 502 every other agent failure takes.
     #[test]
     fn a_missing_workspace_never_becomes_a_bad_gateway() {
-        let (status, Json(body)) = engine_error(
-            super::super::ports::engine::AgentEngineError::WorkspaceMissing("/gone".into()),
+        let (status, Json(body)) = agent_error(
+            super::super::ports::agent::AgentError::WorkspaceMissing("/gone".into()),
         );
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"]["code"], "workspace_missing");
         assert_eq!(body["error"]["directory"], "/gone");
 
         // Everything else still is one.
-        let (status, Json(body)) = engine_error(
-            super::super::ports::engine::AgentEngineError::RequestFailed("nope".into()),
+        let (status, Json(body)) = agent_error(
+            super::super::ports::agent::AgentError::RequestFailed("nope".into()),
         );
         assert_eq!(status, StatusCode::BAD_GATEWAY);
-        assert_eq!(body["error"]["code"], "agent_engine_error");
+        assert_eq!(body["error"]["code"], "agent_error");
     }
 
     /// An empty diff from a repository and an empty diff from a directory that
@@ -2839,12 +2803,12 @@ mod tests {
     }
 
     /// Every arm that can come back empty from an unloaded directory, not just
-    /// agents.
+    /// modes.
     ///
-    /// This is the bug the app found: a catalog with seven agents and **zero
+    /// This is the bug the app found: a catalog with seven modes and **zero
     /// models** was answered 200 with an ETag, so a model picker that happened
     /// to open first was pinned empty. A catalog is only cacheable when all
-    /// three of models, providers and agents have something in them.
+    /// three of models, providers and modes have something in them.
     #[test]
     fn a_catalog_missing_models_or_providers_is_not_cacheable_either() {
         let full = complete_catalog();
@@ -2871,9 +2835,9 @@ mod tests {
                 c.providers.clear();
                 c
             }),
-            ("agents", {
+            ("modes", {
                 let mut c = complete_catalog();
-                c.agents.clear();
+                c.modes.clear();
                 c
             }),
         ] {
@@ -2913,15 +2877,15 @@ mod tests {
     fn a_populated_catalog_is_tagged_per_body() {
         // Complete catalogs: a catalog missing models or providers is refused
         // a tag on purpose, which is a different test.
-        let with_agents = |agents: Vec<crate::agents::domain::AgentInfo>| {
+        let with_modes = |modes: Vec<crate::agents::domain::ModeInfo>| {
             let mut catalog = complete_catalog();
-            catalog.agents = agents;
+            catalog.modes = modes;
             catalog
         };
-        let one = catalog_response(&HeaderMap::new(), with_agents(vec![agent("build")]));
+        let one = catalog_response(&HeaderMap::new(), with_modes(vec![mode("build")]));
         let two = catalog_response(
             &HeaderMap::new(),
-            with_agents(vec![agent("build"), agent("osuki-coder")]),
+            with_modes(vec![mode("build"), mode("osuki-coder")]),
         );
         let tag = |r: &Response| {
             r.headers()
@@ -2933,7 +2897,7 @@ mod tests {
         assert_ne!(one, two, "a different catalog is a different tag");
 
         // And the same catalog is the same tag, which is what makes 304 work.
-        let again = catalog_response(&HeaderMap::new(), with_agents(vec![agent("build")]));
+        let again = catalog_response(&HeaderMap::new(), with_modes(vec![mode("build")]));
         assert_eq!(tag(&again).expect("tagged"), one);
     }
 
@@ -3031,14 +2995,14 @@ mod tests {
     }
 
     #[test]
-    fn switch_agent_body_accepts_object_and_bare_string() {
-        let wrapped: SwitchAgentBody =
-            serde_json::from_value(json!({ "agent": "build" })).expect("object should parse");
-        assert_eq!(wrapped.into_agent(), "build");
+    fn switch_mode_body_accepts_object_and_bare_string() {
+        let wrapped: SwitchModeBody =
+            serde_json::from_value(json!({ "mode": "build" })).expect("object should parse");
+        assert_eq!(wrapped.into_mode(), "build");
 
-        let bare: SwitchAgentBody =
+        let bare: SwitchModeBody =
             serde_json::from_value(json!("plan")).expect("bare string should parse");
-        assert_eq!(bare.into_agent(), "plan");
+        assert_eq!(bare.into_mode(), "plan");
     }
 
     async fn create_refusal(body: Value) -> (StatusCode, Value) {
@@ -3056,32 +3020,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_session_rejects_an_unknown_harness() {
-        let (status, body) = create_refusal(json!({ "harness": "claude" })).await;
+    async fn create_session_rejects_an_unknown_agent() {
+        let (status, body) = create_refusal(json!({ "agent_id": "claude" })).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body["error"]["code"], "invalid_harness");
+        assert_eq!(body["error"]["code"], "invalid_agent");
     }
 
     #[tokio::test]
-    async fn create_session_names_a_known_harness_that_is_not_attached() {
-        let (status, body) = create_refusal(json!({ "harness": "deepseek" })).await;
+    async fn create_session_names_a_known_agent_that_is_not_attached() {
+        let (status, body) = create_refusal(json!({ "agent_id": "deepseek" })).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["error"]["code"], "agent_unavailable");
     }
 
     #[tokio::test]
-    async fn a_provider_name_does_not_select_the_engine() {
-        // Without `harness` the primary is used; a `deepseek` provider is just
+    async fn a_provider_name_does_not_select_the_agent() {
+        // Without `agent_id` the primary is used; a `deepseek` provider is just
         // a provider, so with nothing attached this is the generic 503.
         let (status, body) =
             create_refusal(json!({ "model": { "provider_id": "deepseek", "model_id": "m" } }))
                 .await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body["error"]["message"], "Agent engine is not available");
+        assert_eq!(body["error"]["message"], "No agent is available");
     }
 
     #[tokio::test]
-    async fn a_session_with_no_engine_attached_is_unavailable_not_missing() {
+    async fn a_session_with_no_agent_attached_is_unavailable_not_missing() {
         let state = crate::test_support::test_state("admin", Vec::new());
         let refusal = session_manager_or_err(&state, "ses_1")
             .await
@@ -3090,21 +3054,21 @@ mod tests {
         assert_eq!(refusal.0, StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    // -- multi-harness contract --------------------------------------------
+    // -- multi-agent contract --------------------------------------------
 
-    use crate::test_support::FakeEngine;
+    use crate::test_support::FakeAgent;
 
     fn device_headers() -> HeaderMap {
         crate::test_support::bearer_headers("device-token")
     }
 
-    async fn state_with(engines: Vec<FakeEngine>) -> AppState {
+    async fn state_with(agents: Vec<FakeAgent>) -> AppState {
         let state = crate::test_support::test_state(
             "admin",
             vec![crate::test_support::test_device("phone-1", "device-token")],
         );
-        for engine in engines {
-            state.agent_runtime.attach_for_test(engine.manager()).await;
+        for agent in agents {
+            state.agent_runtime.attach_for_test(agent.manager()).await;
         }
         state
     }
@@ -3123,42 +3087,42 @@ mod tests {
             .map(|s| {
                 (
                     s["asid"].as_str().unwrap().to_string(),
-                    s["harness"].as_str().unwrap().to_string(),
+                    s["agent_id"].as_str().unwrap().to_string(),
                 )
             })
             .collect()
     }
 
     #[tokio::test]
-    async fn every_session_object_carries_its_harness() {
+    async fn every_session_object_carries_its_agent() {
         let state = state_with(vec![
-            FakeEngine::new("opencode").with_sessions(&[("ses_oc", 10)]),
-            FakeEngine::new("deepseek").with_sessions(&[("ses_ds", 20)]),
+            FakeAgent::new("opencode").with_sessions(&[("ses_oc", 10)]),
+            FakeAgent::new("deepseek").with_sessions(&[("ses_ds", 20)]),
         ])
         .await;
         let headers = device_headers();
 
-        // create, on each harness
-        for (harness, expected) in [(None, "opencode"), (Some("deepseek"), "deepseek")] {
+        // create, on each agent
+        for (agent_id, expected) in [(None, "opencode"), (Some("deepseek"), "deepseek")] {
             let body = CreateAgentSessionBody {
                 directory: None,
                 model: None,
-                agent: None,
-                harness: harness.map(str::to_string),
+                mode: None,
+                agent_id: agent_id.map(str::to_string),
             };
             let Json(created) = do_create_agent_session(&state, body, &headers)
                 .await
                 .expect("creates");
-            assert_eq!(created["data"]["harness"], expected);
+            assert_eq!(created["data"]["agent_id"], expected);
         }
 
-        // get, from the engine and then again from the mirror
+        // get, from the agent and then again from the mirror
         for _ in 0..2 {
             let response = do_get_agent_session(&state, "ses_ds", &headers)
                 .await
                 .expect("gets");
             assert_eq!(
-                body_json(response).await["data"]["info"]["harness"],
+                body_json(response).await["data"]["info"]["agent_id"],
                 "deepseek"
             );
         }
@@ -3166,7 +3130,7 @@ mod tests {
         // the events the stream replays
         let manager = state
             .agent_runtime
-            .manager_for_harness("deepseek")
+            .manager_for_agent("deepseek")
             .await
             .unwrap();
         let events = manager
@@ -3175,14 +3139,14 @@ mod tests {
             .await
             .expect("events are held");
         let events = serde_json::to_string(&events).unwrap();
-        assert!(events.contains("\"harness\":\"deepseek\""), "{events}");
+        assert!(events.contains("\"agent_id\":\"deepseek\""), "{events}");
     }
 
     #[tokio::test]
-    async fn the_session_list_merges_every_harness_and_routes_each_session() {
+    async fn the_session_list_merges_every_agent_and_routes_each_session() {
         let state = state_with(vec![
-            FakeEngine::new("opencode").with_sessions(&[("ses_oc1", 10), ("ses_oc2", 30)]),
-            FakeEngine::new("deepseek").with_sessions(&[("ses_ds", 20)]),
+            FakeAgent::new("opencode").with_sessions(&[("ses_oc1", 10), ("ses_oc2", 30)]),
+            FakeAgent::new("deepseek").with_sessions(&[("ses_ds", 20)]),
         ])
         .await;
         let response =
@@ -3200,13 +3164,13 @@ mod tests {
         );
 
         // Routes were recorded, so a per-session lookup needs no probing.
-        for (asid, harness) in ids(&data) {
+        for (asid, agent_id) in ids(&data) {
             let owner = state
                 .agent_runtime
                 .manager_for_session(&asid)
                 .await
                 .unwrap();
-            assert_eq!(owner.engine().kind(), harness);
+            assert_eq!(owner.agent().kind(), agent_id);
         }
 
         let response = do_list_agent_sessions(
@@ -3224,17 +3188,77 @@ mod tests {
         );
     }
 
+    /// The agent-session twin of the terminal stream's
+    /// `revoking_a_device_closes_the_event_stream_it_already_had`: a real
+    /// stream, over an attached agent that owns the session so it cannot end
+    /// for any other reason, closed by the revoke route itself.
+    ///
+    /// `to_bytes` finishes exactly when the body ends, so it is the assertion:
+    /// before the recheck this ran until the timeout. It takes one recheck
+    /// interval, about five seconds.
     #[tokio::test]
-    async fn a_failing_harness_is_skipped_not_a_502() {
+    async fn revoking_a_device_closes_the_agent_session_stream_it_already_had() {
+        use tower::ServiceExt as _;
+
+        let token = "device-token";
         let state = state_with(vec![
-            FakeEngine::new("opencode").failing(),
-            FakeEngine::new("deepseek").with_sessions(&[("ses_ds", 20)]),
+            FakeAgent::new("opencode").with_sessions(&[("ses_1", 10)])
+        ])
+        .await;
+        let app = Router::new()
+            .route(
+                "/api/agent-sessions/{asid}/stream",
+                get(stream_agent_session_global),
+            )
+            .with_state(state.clone());
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/agent-sessions/ses_1/stream")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let revoking = tokio::spawn({
+            let state = state.clone();
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                crate::connectivity::routes::revoke_paired_device(
+                    State(state),
+                    Path("phone-1".to_owned()),
+                    crate::test_support::bearer_headers(token),
+                )
+                .await
+                .expect("the revoke route should accept a paired device")
+            }
+        });
+
+        let ended = tokio::time::timeout(
+            STREAM_DEVICE_RECHECK_INTERVAL * 3,
+            axum::body::to_bytes(response.into_body(), 1 << 20),
+        )
+        .await;
+        drop(revoking.await.unwrap());
+        let body = ended.expect("the stream outlived the revocation of the device holding it");
+        let body = String::from_utf8(body.unwrap().to_vec()).unwrap();
+        assert!(body.contains("event: connected"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_failing_agent_is_skipped_not_a_502() {
+        let state = state_with(vec![
+            FakeAgent::new("opencode").failing(),
+            FakeAgent::new("deepseek").with_sessions(&[("ses_ds", 20)]),
         ])
         .await;
         let response =
             do_list_agent_sessions(&state, &SessionQuery::default(), None, &device_headers())
                 .await
-                .expect("the healthy harness still answers");
+                .expect("the healthy agent still answers");
         let data = body_json(response).await["data"].clone();
         assert_eq!(
             ids(&data),
@@ -3249,19 +3273,19 @@ mod tests {
             &device_headers(),
         )
         .await
-        .expect_err("the named harness is down");
+        .expect_err("the named agent is down");
         assert_eq!(refusal.0, StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]
-    async fn the_harness_query_selects_one_catalog_and_project_list() {
-        let mut opencode = FakeEngine::new("opencode");
+    async fn the_agent_query_selects_one_catalog_and_project_list() {
+        let mut opencode = FakeAgent::new("opencode");
         opencode.catalog = complete_catalog();
-        let mut deepseek = FakeEngine::new("deepseek");
-        deepseek.catalog = catalog_with(vec![agent("deepseek-agent")]);
+        let mut deepseek = FakeAgent::new("deepseek");
+        deepseek.catalog = catalog_with(vec![mode("deepseek-agent")]);
         let state = state_with(vec![opencode, deepseek]).await;
 
-        let query = |harness: Option<&str>| AgentSessionsQuery {
+        let query = |agent_id: Option<&str>| AgentSessionsQuery {
             directory: None,
             parent_id: None,
             roots: None,
@@ -3269,10 +3293,10 @@ mod tests {
             order: None,
             search: None,
             cursor: None,
-            harness: harness.map(str::to_string),
+            agent_id: agent_id.map(str::to_string),
         };
-        let agents_of = |body: &Value| -> Vec<String> {
-            body["data"]["agents"]
+        let modes_of = |body: &Value| -> Vec<String> {
+            body["data"]["modes"]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -3287,10 +3311,7 @@ mod tests {
         )
         .await
         .expect("deepseek catalog");
-        assert_eq!(
-            agents_of(&body_json(response).await),
-            vec!["deepseek-agent"]
-        );
+        assert_eq!(modes_of(&body_json(response).await), vec!["deepseek-agent"]);
 
         let response = get_global_agent_catalog(
             State(state.clone()),
@@ -3299,7 +3320,7 @@ mod tests {
         )
         .await
         .expect("opencode catalog");
-        assert_eq!(agents_of(&body_json(response).await), vec!["build"]);
+        assert_eq!(modes_of(&body_json(response).await), vec!["build"]);
 
         let response = do_list_agent_projects(&state, Some("deepseek"), &device_headers())
             .await
@@ -3326,34 +3347,30 @@ mod tests {
         assert_eq!(refusal.0, StatusCode::BAD_REQUEST);
         assert_eq!(
             crate::test_support::error_body(&refusal)["error"]["code"],
-            "invalid_harness"
+            "invalid_agent"
         );
     }
 
     #[tokio::test]
-    async fn engine_status_is_per_harness_with_the_two_refusals() {
-        let state = state_with(vec![
-            FakeEngine::new("opencode"),
-            FakeEngine::new("deepseek"),
-        ])
-        .await;
-        let status = |harness: Option<&str>| {
-            get_agent_engine_status(
+    async fn agent_status_is_per_agent_with_the_two_refusals() {
+        let state = state_with(vec![FakeAgent::new("opencode"), FakeAgent::new("deepseek")]).await;
+        let status = |agent_id: Option<&str>| {
+            get_agent_status(
                 State(state.clone()),
-                Query(HarnessQuery {
-                    harness: harness.map(str::to_string),
+                Query(AgentQuery {
+                    agent_id: agent_id.map(str::to_string),
                 }),
                 device_headers(),
             )
         };
 
         let Json(primary) = status(None).await.expect("primary");
-        assert_eq!(primary["data"]["harness"], "opencode");
+        assert_eq!(primary["data"]["agent_id"], "opencode");
         assert_eq!(primary["data"]["kind"], "opencode");
         assert_eq!(primary["data"]["available"], true);
 
         let Json(other) = status(Some("deepseek")).await.expect("deepseek");
-        assert_eq!(other["data"]["harness"], "deepseek");
+        assert_eq!(other["data"]["agent_id"], "deepseek");
         assert_eq!(other["data"]["kind"], "deepseek");
         assert_eq!(other["data"]["available"], true);
 
@@ -3361,14 +3378,14 @@ mod tests {
         assert_eq!(refusal.0, StatusCode::BAD_REQUEST);
         assert_eq!(
             crate::test_support::error_body(&refusal)["error"]["code"],
-            "invalid_harness"
+            "invalid_agent"
         );
 
-        let only_opencode = state_with(vec![FakeEngine::new("opencode")]).await;
-        let refusal = get_agent_engine_status(
+        let only_opencode = state_with(vec![FakeAgent::new("opencode")]).await;
+        let refusal = get_agent_status(
             State(only_opencode),
-            Query(HarnessQuery {
-                harness: Some("deepseek".into()),
+            Query(AgentQuery {
+                agent_id: Some("deepseek".into()),
             }),
             device_headers(),
         )

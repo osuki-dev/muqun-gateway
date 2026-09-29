@@ -228,7 +228,7 @@ pub enum AgentPart {
     },
     /// `Session.Message.AgentSelected`.
     AgentSwitched {
-        agent: String,
+        mode: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         previous: Option<String>,
     },

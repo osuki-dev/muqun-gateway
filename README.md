@@ -15,8 +15,8 @@ Two planes are implemented in this binary:
 - **Terminal control plane** — sessions, workspaces, tabs, panes, output,
   scrollback and SSE, behind the `TerminalBackend` port; Herdr and tmux
   adapters implement it.
-- **Agent harness plane** — agent sessions, models, prompts, tasks,
-  permissions, approvals and event history, behind the `AgentEnginePort`
+- **Agents plane** — agent sessions, models, prompts, tasks,
+  permissions, approvals and event history, behind the `AgentPort`
   port; the OpenCode and DeepSeek adapters implement it.
 
 `/api/discovery` also reports an **SSH plane**, but that one is the app's own
@@ -42,11 +42,11 @@ the far side. The gateway implements no SSH client or server itself.
 │  the two planes this binary implements                                   │
 │                                                                          │
 │   ┌────────────────────────────┐  ┌────────────────────────────────┐     │
-│   │ Terminal plane             │  │ Agent harness plane            │     │
+│   │ Terminal plane             │  │ Agents plane                   │     │
 │   │ sessions · workspaces ·    │  │ agent sessions · models ·      │     │
 │   │ tabs · panes · output ·    │  │ prompts · tasks · permissions ·│     │
 │   │ SSE · scrollback           │  │ approvals · event history      │     │
-│   │ port: TerminalBackend      │  │ port: AgentEnginePort          │     │
+│   │ port: TerminalBackend      │  │ port: AgentPort                │     │
 │   └─────────────┬──────────────┘  └───────────────┬────────────────┘     │
 │                 │                                 │                      │
 │        Herdr adapter · tmux adapter   OpenCode adapter · DeepSeek        │
@@ -67,7 +67,7 @@ the far side. The gateway implements no SSH client or server itself.
 A request travels: the phone authenticates with its device token (and, when
 paired with transport encryption, the body arrives sealed); `platform::server`
 resolves the locale, checks the host, decrypts and routes; the route's plane
-calls its port; the adapter talks to the terminal or harness; the answer
+calls its port; the adapter talks to the terminal or agent; the answer
 returns through the compatibility mapper in the versioned content envelope,
 with SSE events sealed one by one.
 
@@ -167,7 +167,7 @@ With a service installed, `muqun-gateway stop` stops the process but the service
 starts it again — that is what it is for. `service uninstall` is how you stop it
 for good.
 
-### The agent engine
+### The OpenCode agent
 
 The gateway's agent features require OpenCode 2 with `GET /api/info`. While the
 gateway runs, it adopts a registered service or runs `opencode service start`.
@@ -201,8 +201,8 @@ INFO adopted the running OpenCode service url=http://127.0.0.1:49374 version="2.
 If what it finds is older than 2.0 it refuses it — started or adopted — with
 one line saying which file, which version, and that `opencode.binary` is how to
 point it elsewhere. OpenCode 1 is a different API, and half-working with it is
-worse than saying so. `GET /api/agent-engine` reports the same facts to the
-app, including whether the engine was `adopted` or `spawned`.
+worse than saying so. `GET /api/agent-status` reports the same facts to the
+app, including whether the agent was `adopted` or `spawned`.
 
 If the configured listen IP changes or is unavailable, startup reports the
 address and asks you to update `listen` in the gateway's `config.json`, then
