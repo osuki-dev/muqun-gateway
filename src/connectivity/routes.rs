@@ -811,6 +811,16 @@ mod tests {
     }
 
     #[test]
+    fn cleartext_transport_still_requires_the_admin_token() {
+        let mut config = test_config("secret");
+        config.transport_encryption = TransportEncryptionMode::Disabled;
+        assert!(require_admin(&config, &bearer_headers("secret")).is_ok());
+        assert!(require_admin(&config, &HeaderMap::new()).is_err());
+        let err = require_admin(&config, &bearer_headers("guess")).unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
     fn pairing_revocation_accepts_manager_or_device_but_control_stays_device_only() {
         let state = test_state("admin-token", vec![test_device("device-1", "device-token")]);
         assert!(require_pairing_manager(&state, &bearer_headers("admin-token")).is_ok());

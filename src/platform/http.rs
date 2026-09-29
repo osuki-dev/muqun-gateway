@@ -155,11 +155,11 @@ pub(crate) fn still_paired(state: &AppState, device_id: &str) -> bool {
 }
 
 /// The local manage UI's credential, which authorises nothing but reading the
-/// pending pairing code.
+/// pending pairing code and the device list. It is required in every
+/// transport mode: `disabled` drops the envelope, never authentication, and
+/// the pending code plus its request id is exactly what an attacker on the
+/// same network needs to claim a pairing before the user does.
 pub(crate) fn require_admin(config: &Config, headers: &HeaderMap) -> ApiResult<()> {
-    if config.transport_encryption == TransportEncryptionMode::Disabled {
-        return Ok(());
-    }
     let token = bearer_token(headers)?;
     if !authority::authenticates_admin(&config.token_hash, token) {
         return Err(api_error(
