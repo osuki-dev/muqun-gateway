@@ -385,6 +385,34 @@ fn message_role(role: &str) -> TimelineRole {
     }
 }
 
+/// The producer kind of a `user/message` the harness injected rather than the
+/// user typed. dsh stamps every message with `source.kind`
+/// (`MessageSourceMap`, dsh-llm `types/message.d.ts`): a typed prompt is
+/// `"user"` (`user-rpc` in dsh-api-session-controller), while producers use
+/// their own kind, e.g. `runtime-context` (dsh-agent-loop), `time-context`,
+/// `skill-catalog` (dsh-tool-skill), `skill-invocation` (dsh-skill). A record
+/// with no `source` is kept as a user message.
+fn injected_source_kind(data: &Value) -> Option<&str> {
+    data.pointer("/source/kind")
+        .and_then(Value::as_str)
+        .filter(|kind| *kind != "user")
+}
+
+/// Re-express injected text as a `system` row carrying a `Synthetic` part,
+/// the way the OpenCode mapper treats `Session.Message.Synthetic`, so the App
+/// does not render it as a user bubble.
+fn mark_injected(items: &mut [TimelineItem], kind: &str) {
+    for item in items {
+        if let AgentPart::Text { text } = &mut item.part {
+            item.part = AgentPart::Synthetic {
+                text: std::mem::take(text),
+                description: Some(kind.to_string()),
+            };
+            item.role = TimelineRole::System;
+        }
+    }
+}
+
 /// Rows for one message's `ContentBlock[]`, under `message_id`.
 fn map_content_blocks(
     message_id: &str,
@@ -477,7 +505,11 @@ pub fn map_record(event: &Value) -> Vec<TimelineItem> {
         "user/message" => {
             let role = message_role(data.get("role").and_then(Value::as_str).unwrap_or("user"));
             let blocks = data.get("content").cloned().unwrap_or(Value::Null);
-            map_content_blocks(&message_id, role, &blocks, seq, time)
+            let mut items = map_content_blocks(&message_id, role, &blocks, seq, time);
+            if let Some(kind) = injected_source_kind(data) {
+                mark_injected(&mut items, kind);
+            }
+            items
         }
         "assistant/message" => {
             let message = data.get("message").unwrap_or(data);
@@ -1062,6 +1094,47 @@ mod tests {
             sorted.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
             items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn harness_injected_user_messages_are_synthetic_system_rows_not_user_rows() {
+        let injected = |seq: u64, kind: &str, text: &str| {
+            json!({ "type": "user/message", "seq": seq, "time": 5, "surfaceOp": "append",
+                "data": { "id": "m", "role": "user", "content": [ { "type": "text", "text": text } ],
+                          "source": { "kind": kind, "form": "snapshot" } } })
+        };
+        let typed = json!({ "type": "user/message", "seq": 1, "time": 5, "surfaceOp": "append",
+            "data": { "id": "u", "role": "user", "content": [ { "type": "text", "text": "hi" } ],
+                      "source": { "kind": "user", "rpcId": "req_1", "clientTimeZone": "UTC" } } });
+        let page = json!({ "records": [
+            { "event": typed },
+            { "event": injected(2, "runtime-context", "Current runtime context. This snapshot supersedes earlier runtime-context ...") },
+            { "event": injected(3, "skill-catalog", "<system-reminder>\nA skill is a reusable set of task-specific instructions ...") },
+            { "event": injected(4, "time-context", "The current time is ...") },
+        ] });
+        let items = map_timeline_records(&page);
+        assert_eq!(items.len(), 4);
+        assert_eq!(items[0].role, TimelineRole::User);
+        assert!(matches!(items[0].part, AgentPart::Text { ref text } if text == "hi"));
+        for (item, kind) in
+            items[1..]
+                .iter()
+                .zip(["runtime-context", "skill-catalog", "time-context"])
+        {
+            assert_eq!(item.role, TimelineRole::System);
+            assert!(
+                matches!(&item.part, AgentPart::Synthetic { description: Some(d), .. } if d == kind),
+                "{:?}",
+                item.part
+            );
+        }
+        // Same result for a single live record.
+        let live = map_record(&injected(9, "skill-invocation", "<skill_content>"));
+        assert_eq!(live[0].role, TimelineRole::System);
+        // A record without a source stays a user message.
+        let bare = json!({ "type": "user/message", "seq": 1, "time": 5,
+            "data": { "role": "user", "content": [ { "type": "text", "text": "x" } ] } });
+        assert_eq!(map_record(&bare)[0].role, TimelineRole::User);
     }
 
     #[test]
