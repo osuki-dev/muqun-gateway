@@ -46,6 +46,10 @@ tracing-subscriber = { version = "0.3.20", default-features = false, features = 
 uuid = { version = "1.24.0", features = ["v4"] }
 argon2 = { version = "0.6.0", default-features = false, features = ["alloc"] }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake"] }
+# `CancellationToken` for the T3 Code RPC connection actor: one token stops
+# the socket task, its ping timer and every subscription together. Already in
+# the tree through reqwest, so this adds no compiled crate.
+tokio-util = "0.7.19"
 
 [dev-dependencies]
 # Only for driving a Router in tests (`ServiceExt::oneshot`).

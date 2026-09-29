@@ -1,0 +1,39 @@
+{
+  "environmentId": "9cf7bafb-c136-4850-9a09-d6099368ca29",
+  "label": "osk",
+  "platform": {
+    "os": "linux",
+    "arch": "x64",
+    "machine": "desktop"
+  },
+  "serverVersion": "0.0.42",
+  "capabilities": {
+    "repositoryIdentity": true,
+    "connectionProbe": true,
+    "attachmentUploads": true,
+    "questionAttachments": true,
+    "fileAttachments": {
+      "maxUploadBytes": 52428800
+    },
+    "pullRequests": true,
+    "inlineMessageContext": true,
+    "threadSettlement": true,
+    "threadAutoSettlement": true,
+    "threadRestartContinuation": true,
+    "projectSettingsOverrides": true,
+    "threadSnooze": true,
+    "environmentThemes": true,
+    "usageLimitSources": true,
+    "usagePriceOverrides": true,
+    "threadPinning": true,
+    "threadPinReorder": true,
+    "threadActiveReorder": true,
+    "threadTitleRegeneration": true,
+    "threadPullRequestLinking": true,
+    "threadPullRequests": true,
+    "pullRequestStackActions": true,
+    "agentActivityPublishing": false,
+    "projectCloneTracking": true,
+    "environmentIcon": true
+  }
+}
