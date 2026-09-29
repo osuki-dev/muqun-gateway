@@ -2,13 +2,26 @@ use reqwest::Client;
 use std::time::Duration;
 
 /// The connection details for a DeepSeek Harness service instance.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct DeepseekEndpoint {
     pub url: String,
     pub ws_url: String,
     pub token: Option<String>,
     pub secret: Option<String>,
     pub version: Option<String>,
+}
+
+impl std::fmt::Debug for DeepseekEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redact = |o: &Option<String>| o.as_ref().map(|_| "<redacted>");
+        f.debug_struct("DeepseekEndpoint")
+            .field("url", &self.url)
+            .field("ws_url", &self.ws_url)
+            .field("token", &redact(&self.token))
+            .field("secret", &redact(&self.secret))
+            .field("version", &self.version)
+            .finish()
+    }
 }
 
 impl DeepseekEndpoint {
@@ -52,7 +65,9 @@ impl DeepseekEndpoint {
         }
     }
 
-    /// Check if the DeepSeek Harness HTTP/RPC endpoint is reachable.
+    /// Check that a DeepSeek Harness answers RPC with our credentials: a 2xx
+    /// whose body is a Typert `server-response` envelope. Anything else
+    /// (401/403 included) means we cannot use the service.
     pub async fn probe_healthy(&self, client: &Client) -> bool {
         let probe_url = format!("{}/api/session/modelCatalog", self.url);
         let mut req = client.post(&probe_url).timeout(Duration::from_millis(1500));
@@ -69,14 +84,23 @@ impl DeepseekEndpoint {
             "method": "session/modelCatalog",
             "payload": { "args": {} }
         });
-        match req.json(&body).send().await {
-            Ok(resp) => {
-                resp.status().is_success()
-                    || resp.status().as_u16() == 401
-                    || resp.status().as_u16() == 403
-            }
-            Err(_) => false,
+        let Ok(resp) = req.json(&body).send().await else {
+            return false;
+        };
+        if !resp.status().is_success() {
+            return false;
         }
+        let Ok(bytes) = super::client::read_capped(resp, 64 * 1024).await else {
+            return false;
+        };
+        serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|v| {
+                v.get("type")
+                    .and_then(|t| t.as_str())
+                    .map(|t| t == "server-response")
+            })
+            .unwrap_or(false)
     }
 
     /// Discover a running DeepSeek Harness instance from environment or default ports.
@@ -143,5 +167,36 @@ mod tests {
         assert!(cookie.is_some());
         let c = cookie.unwrap();
         assert!(c.starts_with("dsh-auth-VPhEEcLKeqRDBoBalzN2Nm7CnfxKhLE00pKIDWxt1sw=v1."));
+    }
+
+    #[test]
+    fn debug_redacts_token_and_secret() {
+        let ep = DeepseekEndpoint::new("http://h", Some("tok-123".into()), Some("sec-456".into()));
+        let dbg = format!("{ep:?}");
+        assert!(!dbg.contains("tok-123") && !dbg.contains("sec-456"));
+        assert!(dbg.contains("<redacted>"));
+        let none = format!("{:?}", DeepseekEndpoint::new("http://h", None, None));
+        assert!(none.contains("token: None"));
+    }
+
+    async fn probe(status: u16, body: &str) -> bool {
+        let url = crate::agents::adapters::deepseek::client::test_server::serve(
+            status,
+            body.as_bytes().to_vec(),
+        )
+        .await;
+        DeepseekEndpoint::new(url, None, None)
+            .probe_healthy(&Client::new())
+            .await
+    }
+
+    #[tokio::test]
+    async fn probe_accepts_only_2xx_server_response() {
+        assert!(probe(200, r#"{"type":"server-response","rpcId":"probe"}"#).await);
+        assert!(!probe(200, "<html>hello</html>").await);
+        assert!(!probe(200, r#"{"type":"other"}"#).await);
+        assert!(!probe(401, r#"{"type":"server-response"}"#).await);
+        assert!(!probe(403, "").await);
+        assert!(!probe(500, "").await);
     }
 }

@@ -39,6 +39,7 @@ fn now_ms() -> u64 {
 fn placeholder_session(asid: &AgentSessionId, status: AgentSessionStatus) -> AgentSessionInfo {
     AgentSessionInfo {
         asid: asid.clone(),
+        harness: String::new(),
         backend_session_id: asid.0.clone(),
         title: String::new(),
         agent: None,
@@ -441,6 +442,33 @@ impl MemoryMirror {
         };
         state.push_event(event);
         Some((seq, doomed))
+    }
+
+    /// Drop exactly the rows named. What a streamed assistant attempt leaves
+    /// behind once its committed message has been read under its real id.
+    pub async fn remove_timeline_items(
+        &self,
+        asid: &AgentSessionId,
+        ids: &[String],
+    ) -> Option<(u64, Vec<String>)> {
+        let mut sessions = self.sessions.write().await;
+        let state = sessions.get_mut(asid)?;
+        let removed: Vec<String> = ids
+            .iter()
+            .filter(|id| state.timeline.remove(id.as_str()).is_some())
+            .cloned()
+            .collect();
+        if removed.is_empty() {
+            return None;
+        }
+        let seq = state.next_seq();
+        let event = AgentDomainEvent::TimelineRemoved {
+            asid: asid.clone(),
+            ids: removed.clone(),
+            seq,
+        };
+        state.push_event(event);
+        Some((seq, removed))
     }
 
     pub async fn record_compaction(

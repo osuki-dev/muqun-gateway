@@ -325,9 +325,56 @@ impl AgentManager {
         let prompt_service = Arc::new(PromptService::new(driver.clone(), mirror.clone()));
         let interaction_service = Arc::new(InteractionService::new(driver.clone(), mirror.clone()));
 
-        let listener =
-            Arc::new(crate::agents::adapters::deepseek::DeepseekStreamListener::new(endpoint));
-        listener.start(events_tx.clone(), None);
+        // The pending approvals and the `$events` client id are shared with
+        // the driver through the per-endpoint registry, because the driver
+        // is what answers them and it is built before the listener.
+        let interactions =
+            crate::agents::adapters::deepseek::stream::DeepseekInteractions::for_endpoint(
+                &endpoint_url,
+            );
+        let (listener, mut stream_rx) =
+            crate::agents::adapters::deepseek::DeepseekStreamListener::new(endpoint);
+        let listener = Arc::new(listener);
+        listener.start();
+
+        let ctx = Arc::new(deepseek::DeepseekEventContext::new(
+            driver.clone(),
+            mirror.clone(),
+            events_tx.clone(),
+            listener.clone(),
+            interactions,
+        ));
+
+        let pump_listener = listener.clone();
+        tokio::spawn(async move {
+            loop {
+                match stream_rx.recv().await {
+                    Ok(event) => {
+                        deepseek::handle_deepseek_event(event, &ctx).await;
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "deepseek event backlog overflowed, resyncing");
+                        ctx.emit(AgentDomainEvent::Resync {
+                            asid: AgentSessionId(String::new()),
+                            reason: "event_backlog_overflow".to_string(),
+                        });
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        if pump_listener.is_running() {
+                            tracing::warn!(
+                                "deepseek event channel closed while still listening, \
+                                 stopping event pump"
+                            );
+                        } else {
+                            tracing::debug!(
+                                "previous deepseek event pump wound down after hand-over"
+                            );
+                        }
+                        break;
+                    }
+                }
+            }
+        });
 
         let stream_listener = listener.clone();
         let shutdown_listener = listener.clone();
@@ -347,7 +394,7 @@ impl AgentManager {
             events_tx,
             endpoint_url,
             endpoint_version,
-            stream_connected: Arc::new(move || stream_listener.is_running()),
+            stream_connected: Arc::new(move || stream_listener.is_connected()),
             shutdown_handle: Arc::new(move || shutdown_listener.stop()),
         }
     }
@@ -1242,6 +1289,8 @@ impl AgentManager {
         ctx.upsert_tool(&asid, msg_id, call_id, patch).await;
     }
 }
+
+mod deepseek;
 
 #[cfg(test)]
 mod tests;
