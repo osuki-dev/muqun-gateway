@@ -28,7 +28,7 @@ use crate::agents::domain::{
     ProviderModelInfo, SkillInfo, TimelineItem, TimelineRole, TodoItem, ToolCall, ToolCallStatus,
     ToolTime,
 };
-use crate::agents::ports::engine::FileDiffItem;
+use crate::agents::ports::agent::FileDiffItem;
 
 fn s<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(Value::as_str).filter(|x| !x.is_empty())
@@ -159,8 +159,9 @@ pub fn map_session(thread: &Value, projects: &HashMap<String, String>) -> Option
     Some(AgentSessionInfo {
         asid: AgentSessionId(id.to_string()),
         backend_session_id: String::new(),
+        agent_id: String::new(),
         title,
-        agent: None,
+        mode: None,
         model: thread.get("modelSelection").and_then(map_model_ref),
         status,
         directory,
@@ -236,6 +237,9 @@ pub fn map_message(message: &Value, seq: u64) -> Option<TimelineItem> {
     let updated_ms = ms(message, "updatedAt")
         .or_else(|| ms(message, "createdAt"))
         .unwrap_or(0);
+    let created_ms = ms(message, "createdAt").unwrap_or(updated_ms);
+    let message_id = row_group(created_ms, id);
+    let id = message_id.as_str();
     let attachments: Vec<String> = message
         .get("attachments")
         .and_then(Value::as_array)
@@ -272,7 +276,7 @@ pub fn map_message(message: &Value, seq: u64) -> Option<TimelineItem> {
     };
     Some(TimelineItem {
         id: item_id,
-        message_id: id.to_string(),
+        message_id: message_id.clone(),
         role: timeline_role,
         part,
         seq,
@@ -284,6 +288,53 @@ pub fn map_message(message: &Value, seq: u64) -> Option<TimelineItem> {
             Some(attachments)
         },
     })
+}
+
+/// The timeline `message_id` of a row group: the group's creation time
+/// (milliseconds, zero-padded) ahead of the T3 id.
+///
+/// The contract orders a timeline by `(message_id, ordinal)` and promises
+/// that message ids sort by creation. T3's ids do not: user messages are
+/// UUIDs, assistant messages `assistant:<uuid>`, and activities have only a
+/// turn id. The prefix makes them sort by creation; [`t3_message_id`]
+/// takes it off again.
+pub fn row_group(created_ms: u64, raw: &str) -> String {
+    format!("{created_ms:013}:{raw}")
+}
+
+/// The T3 id inside a timeline `message_id` made by [`row_group`]; any other
+/// string is returned as it is.
+pub fn t3_message_id(message_id: &str) -> &str {
+    let bytes = message_id.as_bytes();
+    if bytes.len() > 14 && bytes[13] == b':' && bytes[..13].iter().all(u8::is_ascii_digit) {
+        &message_id[14..]
+    } else {
+        message_id
+    }
+}
+
+/// What ties successive activities to one timeline row: the tool call id
+/// for tool cards, the turn for the plan. The row keeps the time its first
+/// activity was created, so it stays where it started as it updates.
+/// `None` for activities that are rows of their own.
+pub fn activity_anchor_key(activity: &Value) -> Option<String> {
+    let kind = s(activity, "kind")?;
+    match kind {
+        "tool.started" | "tool.updated" | "tool.completed" | "tool.denied" => {
+            let payload = activity.get("payload")?;
+            let id = s(payload, "toolCallId")
+                .or_else(|| s(payload, "toolUseId"))
+                .or_else(|| s(activity, "id"))?;
+            Some(format!("tool:{id}"))
+        }
+        "turn.plan.updated" => Some(format!("plan:{}", activity_message_id(activity))),
+        _ => None,
+    }
+}
+
+/// The creation time of an activity, in milliseconds.
+pub fn activity_created_ms(activity: &Value) -> u64 {
+    ms(activity, "createdAt").unwrap_or(0)
 }
 
 /// The message id a turn's activities attach to: activities carry only a
@@ -609,6 +660,7 @@ pub fn activity_has_row(kind: &str) -> bool {
             | "turn.plan.updated"
             | "runtime.error"
             | "runtime.warning"
+            | "checkpoint.revert.failed"
             | "runtime.note"
             | "context-compaction"
     )
@@ -617,23 +669,33 @@ pub fn activity_has_row(kind: &str) -> bool {
 /// One `OrchestrationThreadActivity` as a timeline row. `pending` says
 /// whether an approval/user-input request is still open; resolved ones
 /// produce no row.
+///
+/// `anchor_ms` is when the row's first activity was created (see
+/// [`activity_anchor_key`]); `None` uses this activity's own time.
 pub fn map_activity(
     thread_id: &str,
     activity: &Value,
     seq: u64,
     pending: bool,
+    anchor_ms: Option<u64>,
 ) -> Option<TimelineItem> {
     let kind = s(activity, "kind")?;
     if !activity_has_row(kind) {
         return None;
     }
     let activity_id = s(activity, "id")?;
-    let message_id = activity_message_id(activity);
     let updated_ms = ms(activity, "createdAt").unwrap_or(0);
+    let message_id = row_group(
+        anchor_ms.unwrap_or(updated_ms),
+        &activity_message_id(activity),
+    );
     let payload = activity.get("payload").cloned().unwrap_or(Value::Null);
     let (id, part) = match kind {
         "tool.started" | "tool.updated" | "tool.completed" | "tool.denied" => {
-            let tool = map_tool(activity)?;
+            let mut tool = map_tool(activity)?;
+            if anchor_ms.is_some() {
+                tool.time.created = anchor_ms;
+            }
             (
                 crate::agents::domain::tool_item_id(&message_id, &tool.id),
                 AgentPart::Tool(tool),
@@ -740,13 +802,19 @@ pub fn map_thread_timeline(thread_id: &str, thread: &Value) -> Vec<TimelineItem>
         .unwrap_or_default();
     let resolved = resolved_request_ids(&activities);
     let mut tools_seen: HashMap<String, usize> = HashMap::new();
+    let mut anchors: HashMap<String, u64> = HashMap::new();
     for activity in &activities {
         let pending = activity
             .get("payload")
             .and_then(|p| s(p, "requestId"))
             .map(|id| !resolved.contains(id))
             .unwrap_or(true);
-        if let Some(item) = map_activity(thread_id, activity, seq, pending) {
+        let anchor = activity_anchor_key(activity).map(|key| {
+            *anchors
+                .entry(key)
+                .or_insert_with(|| activity_created_ms(activity))
+        });
+        if let Some(item) = map_activity(thread_id, activity, seq, pending, anchor) {
             // Later tool activities replace the earlier card in place.
             if let Some(index) = tools_seen.get(&item.id) {
                 items[*index] = item;
@@ -757,7 +825,7 @@ pub fn map_thread_timeline(thread_id: &str, thread: &Value) -> Vec<TimelineItem>
         }
         seq += 1;
     }
-    items.sort_by(|a, b| a.updated_ms.cmp(&b.updated_ms).then(a.seq.cmp(&b.seq)));
+    items.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
     items
 }
 
@@ -802,6 +870,46 @@ pub fn latest_checkpoint_turn(thread: &Value) -> Option<u64> {
         .iter()
         .filter_map(|c| c.get("checkpointTurnCount").and_then(Value::as_u64))
         .max()
+}
+
+/// The checkpoint turn count to revert to so that `target` and everything
+/// after it are gone. `target` is a T3 message id or `turn:<turnId>`.
+///
+/// A turn starts with the user message that asked for it, so the turn count
+/// to go back to is the number of user messages before that one. A
+/// `turn:<id>` without a matching message falls back to the checkpoint taken
+/// before that turn.
+pub fn revert_turn_count(thread: &Value, target: &str) -> Option<u64> {
+    let messages = thread
+        .get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let turn = target.strip_prefix("turn:");
+    let position = messages.iter().position(|m| match turn {
+        Some(turn) => s(m, "turnId") == Some(turn),
+        None => s(m, "id") == Some(target),
+    });
+    if let Some(position) = position {
+        // The user message that opened the turn `target` belongs to.
+        let opener = messages[..=position]
+            .iter()
+            .rposition(|m| s(m, "role") == Some("user"))
+            .unwrap_or(0);
+        let before = messages[..opener]
+            .iter()
+            .filter(|m| s(m, "role") == Some("user"))
+            .count() as u64;
+        return Some(before);
+    }
+    let turn = turn?;
+    thread
+        .get("checkpoints")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|c| s(c, "turnId") == Some(turn))
+        .and_then(|c| c.get("checkpointTurnCount").and_then(Value::as_u64))
+        .map(|n| n.saturating_sub(1))
 }
 
 // ---- diffs ----------------------------------------------------------------
@@ -919,7 +1027,7 @@ pub fn map_catalog(config: &Value) -> AgentCatalog {
                                 commands.push(CommandInfo {
                                     name: cmd_name.to_string(),
                                     description: s(c, "description").map(str::to_string),
-                                    agent: Some(instance_id.to_string()),
+                                    mode: None,
                                     template: None,
                                 });
                             }
@@ -960,14 +1068,14 @@ pub fn map_catalog(config: &Value) -> AgentCatalog {
 
     AgentCatalog {
         models,
-        agents: vec![],
+        modes: vec![],
         mcp: vec![],
         skills,
         providers,
         commands,
         defaults: CatalogDefaults {
             model: default_model,
-            agent: None,
+            mode: None,
         },
     }
 }
@@ -1017,7 +1125,7 @@ mod tests {
         assert!(!sessions.is_empty());
         let first = &sessions[0];
         assert_eq!(first.model.as_ref().unwrap().provider_id, "claudeAgent");
-        assert!(first.agent.is_none(), "T3 has no mode inside an agent");
+        assert!(first.mode.is_none(), "T3 has no mode inside an agent");
         assert!(
             first.directory.as_deref().unwrap().ends_with("/t3proj"),
             "directory comes from the project"
@@ -1088,7 +1196,25 @@ mod tests {
             "the provider's tool call id: {}",
             tool.id
         );
-        assert!(tools[0].id.starts_with("turn:"));
+        assert_eq!(
+            t3_message_id(&tools[0].message_id),
+            format!("turn:{}", thread["latestTurn"]["turnId"].as_str().unwrap())
+        );
+        // Rows sort by creation: the prompt, then the tool card, then the
+        // reply, which T3's own ids would not give.
+        let order: Vec<&str> = items
+            .iter()
+            .map(|i| match &i.part {
+                AgentPart::Text { .. } if i.role == TimelineRole::User => "user",
+                AgentPart::Tool(_) => "tool",
+                AgentPart::Text { .. } => "assistant",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(order, ["user", "tool", "assistant"]);
+        let mut sorted = items.clone();
+        sorted.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+        assert_eq!(sorted, items, "the mirror's order is the timeline's order");
         assert!(
             !items
                 .iter()
@@ -1127,9 +1253,9 @@ mod tests {
             "T3 offered no options, so the defaults are listed"
         );
         assert_eq!(request.options[1].decision, PermissionDecision::AllowAlways);
-        let row = map_activity("t1", &activity, 5, true).unwrap();
+        let row = map_activity("t1", &activity, 5, true, None).unwrap();
         assert!(matches!(row.part, AgentPart::Approval { .. }));
-        assert!(map_activity("t1", &activity, 5, false).is_none());
+        assert!(map_activity("t1", &activity, 5, false, None).is_none());
     }
 
     #[test]
@@ -1185,8 +1311,9 @@ mod tests {
         assert!(
             matches!(&form.fields[1], FormField::String { key, custom: true, .. } if key == "q2")
         );
-        let row = map_activity("t1", &activity, 1, true).unwrap();
-        assert_eq!(row.message_id, "turn:turn-1");
+        let row = map_activity("t1", &activity, 1, true, None).unwrap();
+        assert_eq!(row.message_id, "1790670904754:turn:turn-1");
+        assert_eq!(t3_message_id(&row.message_id), "turn:turn-1");
         assert!(matches!(row.part, AgentPart::Form { .. }));
     }
 
@@ -1221,16 +1348,54 @@ mod tests {
     fn plan_and_runtime_activities_have_rows_and_noise_does_not() {
         let plan = json!({"id": "p", "kind": "turn.plan.updated", "summary": "Plan updated", "payload": {"plan": [
             {"step": "Read", "status": "completed"}, {"step": "Write", "status": "in_progress"}]}, "turnId": "t", "createdAt": "2026-09-29T08:35:04.754Z"});
-        let row = map_activity("t1", &plan, 0, true).unwrap();
+        let row = map_activity("t1", &plan, 0, true, None).unwrap();
         assert!(
             matches!(&row.part, AgentPart::Todo { items } if items.len() == 2 && items[0].done && !items[1].done)
         );
+        // Observed live: a revert in a folder that is not a git repository
+        // is accepted as a command and then fails as an activity; the row
+        // is the only place the user learns why nothing was undone.
+        let revert = json!({"id": "r", "tone": "error", "kind": "checkpoint.revert.failed", "summary": "Checkpoint revert failed",
+            "payload": {"turnCount": 0, "detail": "Checkpoint workspace is unavailable or is not a git repository."},
+            "turnId": null, "createdAt": "2026-09-29T08:35:04.754Z"});
+        let row = map_activity("t1", &revert, 0, true, None).unwrap();
+        assert!(
+            matches!(&row.part, AgentPart::Status { text } if text.contains("not a git repository"))
+        );
         let err = json!({"id": "e", "kind": "runtime.error", "summary": "Runtime error", "payload": {"message": "boom"}, "turnId": null, "createdAt": "2026-09-29T08:35:04.754Z"});
-        let row = map_activity("t1", &err, 0, true).unwrap();
+        let row = map_activity("t1", &err, 0, true, None).unwrap();
         assert!(matches!(&row.part, AgentPart::Status { text } if text == "boom"));
-        assert_eq!(row.message_id, "turn:none");
+        assert_eq!(t3_message_id(&row.message_id), "turn:none");
+        assert_eq!(
+            t3_message_id("msg_1"),
+            "msg_1",
+            "a foreign id is left alone"
+        );
         let ctx = json!({"id": "c", "kind": "context-window.updated", "summary": "x", "payload": {}, "turnId": "t", "createdAt": "2026-09-29T08:35:04.754Z"});
-        assert!(map_activity("t1", &ctx, 0, true).is_none());
+        assert!(map_activity("t1", &ctx, 0, true, None).is_none());
+    }
+
+    #[test]
+    fn a_revert_target_resolves_to_the_turn_before_it() {
+        let detail = fixture("thread");
+        let thread = &detail["thread"];
+        let items = map_thread_timeline("t", thread);
+        // Every row of the only turn reverts to before it.
+        for item in &items {
+            assert_eq!(
+                revert_turn_count(thread, t3_message_id(&item.message_id)),
+                Some(0),
+                "{}",
+                item.message_id
+            );
+        }
+        let two_turns = json!({"messages": [
+            {"id": "u1", "role": "user"}, {"id": "a1", "role": "assistant", "turnId": "x"},
+            {"id": "u2", "role": "user"}, {"id": "a2", "role": "assistant", "turnId": "y"}]});
+        assert_eq!(revert_turn_count(&two_turns, "u2"), Some(1));
+        assert_eq!(revert_turn_count(&two_turns, "a2"), Some(1));
+        assert_eq!(revert_turn_count(&two_turns, "turn:x"), Some(0));
+        assert_eq!(revert_turn_count(&two_turns, "nope"), None);
     }
 
     #[test]
@@ -1279,8 +1444,8 @@ mod tests {
             default.provider_id, "codex",
             "the first ready provider's default model"
         );
-        assert!(catalog.defaults.agent.is_none());
-        assert!(catalog.agents.is_empty(), "T3 has no modes");
+        assert!(catalog.defaults.mode.is_none());
+        assert!(catalog.modes.is_empty(), "T3 has no modes");
         assert!(
             !catalog.commands.is_empty(),
             "slash commands come from the providers"

@@ -15,10 +15,10 @@
 //! gap; a replay the server cannot serve comes back as a fresh snapshot,
 //! which the consumer treats as a resync.
 //!
-//! Phase 2 maps [`T3StreamEvent`]s to `AgentDomainEvent`s in the manager;
-//! `mapper` has every function that needs.
+//! The manager (`agents/manager/t3.rs`) folds [`T3StreamEvent`]s into
+//! `AgentDomainEvent`s with the functions in `mapper`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -70,6 +70,9 @@ pub enum ThreadEvent {
         text: String,
         streaming: bool,
         turn_id: Option<String>,
+        /// When the message was created; every delta of one message carries
+        /// the same value, so it is what orders the message's row.
+        created_at: String,
         updated_at: String,
     },
     /// `thread.activity-appended`: the raw `OrchestrationThreadActivity`.
@@ -186,6 +189,9 @@ pub fn parse_thread_event(event: &Value) -> Option<ThreadEvent> {
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             turn_id: str_of("turnId"),
+            created_at: str_of("createdAt")
+                .or_else(|| str_of("updatedAt"))
+                .unwrap_or_default(),
             updated_at: str_of("updatedAt")
                 .or_else(|| str_of("createdAt"))
                 .unwrap_or_default(),
@@ -234,9 +240,42 @@ fn sequence_of(item: &Value) -> Option<u64> {
         })
 }
 
+/// Most threads followed at once. Each is one open subscription on the
+/// socket; the least recently watched goes first.
+pub const MAX_WATCHED_THREADS: usize = 32;
+
 enum Control {
     Watch(String),
     Unwatch(String),
+}
+
+/// A handle that starts and stops thread subscriptions, cheap to clone into
+/// whatever learns that a session is being looked at.
+#[derive(Clone)]
+pub struct ThreadWatcher {
+    control_tx: mpsc::Sender<Control>,
+}
+
+impl ThreadWatcher {
+    /// Start following `thread_id`. Idempotent; a thread already followed
+    /// becomes the most recently watched.
+    pub fn watch(&self, thread_id: &str) {
+        let _ = self
+            .control_tx
+            .try_send(Control::Watch(thread_id.to_string()));
+    }
+
+    pub fn unwatch(&self, thread_id: &str) {
+        let _ = self
+            .control_tx
+            .try_send(Control::Unwatch(thread_id.to_string()));
+    }
+
+    /// A watcher whose commands go nowhere, for a driver without a listener.
+    pub fn detached() -> Self {
+        let (control_tx, _) = mpsc::channel(1);
+        Self { control_tx }
+    }
 }
 
 /// Runs the subscriptions and forwards typed events.
@@ -266,17 +305,20 @@ impl T3StreamListener {
         self.cancel.cancel();
     }
 
+    /// A handle for starting and stopping thread subscriptions.
+    pub fn watcher(&self) -> ThreadWatcher {
+        ThreadWatcher {
+            control_tx: self.control_tx.clone(),
+        }
+    }
+
     /// Start following `thread_id`. Idempotent.
     pub fn watch_thread(&self, thread_id: &str) {
-        let _ = self
-            .control_tx
-            .try_send(Control::Watch(thread_id.to_string()));
+        self.watcher().watch(thread_id);
     }
 
     pub fn unwatch_thread(&self, thread_id: &str) {
-        let _ = self
-            .control_tx
-            .try_send(Control::Unwatch(thread_id.to_string()));
+        self.watcher().unwatch(thread_id);
     }
 
     /// Spawn the listener. Events arrive on the returned receiver; the
@@ -294,6 +336,7 @@ impl T3StreamListener {
             events: tx,
             shell_seq: None,
             threads: HashMap::new(),
+            order: VecDeque::new(),
         };
         tokio::spawn(task.run());
         rx
@@ -312,9 +355,34 @@ struct ListenerTask {
     events: mpsc::Sender<T3StreamEvent>,
     shell_seq: Option<u64>,
     threads: HashMap<String, WatchedThread>,
+    /// Watched thread ids, least recently watched first.
+    order: VecDeque<String>,
 }
 
 impl ListenerTask {
+    /// Add `id` to the watched set, or make it the most recent. Returns the
+    /// thread that had to make room, if any; its subscription is dropped,
+    /// which interrupts it on the server.
+    fn remember(&mut self, id: &str) -> Option<String> {
+        self.order.retain(|x| x != id);
+        self.order.push_back(id.to_string());
+        self.threads.entry(id.to_string()).or_insert(WatchedThread {
+            last_seq: None,
+            sub: None,
+        });
+        if self.threads.len() > MAX_WATCHED_THREADS {
+            let oldest = self.order.pop_front()?;
+            self.threads.remove(&oldest);
+            return Some(oldest);
+        }
+        None
+    }
+
+    fn forget(&mut self, id: &str) {
+        self.threads.remove(id);
+        self.order.retain(|x| x != id);
+    }
+
     async fn run(mut self) {
         let mut backoff = Duration::from_millis(500);
         loop {
@@ -398,14 +466,14 @@ impl ListenerTask {
                 _ = self.cancel.cancelled() => return None,
                 control = self.control_rx.recv() => match control {
                     Some(Control::Watch(id)) => {
-                        if !self.threads.contains_key(&id) {
-                            self.threads.insert(id.clone(), WatchedThread { last_seq: None, sub: None });
+                        if let Some(evicted) = self.remember(&id) {
+                            tracing::debug!(thread_id = %evicted, "t3 thread subscription evicted");
                         }
                         if self.threads.get(&id).map(|w| w.sub.is_none()).unwrap_or(false) {
                             self.open_thread(&id).await;
                         }
                     }
-                    Some(Control::Unwatch(id)) => { self.threads.remove(&id); }
+                    Some(Control::Unwatch(id)) => self.forget(&id),
                     None => return None,
                 },
                 item = shell.next() => match item {
@@ -441,7 +509,7 @@ impl ListenerTask {
                                     return None;
                                 }
                                 if deleted {
-                                    self.threads.remove(&thread_id);
+                                    self.forget(&thread_id);
                                 }
                             }
                         }
@@ -455,14 +523,12 @@ impl ListenerTask {
                                 }
                                 Err(e) => e.to_string(),
                             };
-                            self.threads.remove(&thread_id);
+                            self.forget(&thread_id);
                             if self.events.send(T3StreamEvent::ThreadClosed { thread_id, reason }).await.is_err() {
                                 return None;
                             }
                         }
-                        None => {
-                            self.threads.remove(&thread_id);
-                        }
+                        None => self.forget(&thread_id),
                     }
                 }
             }
@@ -486,7 +552,7 @@ impl ListenerTask {
                         reason: e.to_string(),
                     })
                     .await;
-                self.threads.remove(id);
+                self.forget(id);
             }
         }
     }
@@ -611,6 +677,36 @@ mod tests {
             .expect("an assistant message");
         assert!(!assistant.0.is_empty());
         assert!(!assistant.1, "closed");
+    }
+
+    #[tokio::test]
+    async fn the_watched_set_is_bounded_least_recent_first() {
+        let client = Arc::new(T3Client::new(super::super::T3Endpoint::new(
+            "http://127.0.0.1:9",
+            super::super::T3Credential::None,
+        )));
+        let (tx, _rx) = mpsc::channel(1);
+        let (_ctl, control_rx) = mpsc::channel(1);
+        let mut task = ListenerTask {
+            client: client.clone(),
+            cancel: CancellationToken::new(),
+            control_rx,
+            events: tx,
+            shell_seq: None,
+            threads: HashMap::new(),
+            order: VecDeque::new(),
+        };
+        for i in 0..MAX_WATCHED_THREADS {
+            assert_eq!(task.remember(&format!("t{i}")), None);
+        }
+        // Watching t0 again makes it the most recent, so t1 goes first.
+        assert_eq!(task.remember("t0"), None);
+        assert_eq!(task.remember("new"), Some("t1".to_string()));
+        assert_eq!(task.threads.len(), MAX_WATCHED_THREADS);
+        task.forget("t0");
+        assert!(!task.order.contains(&"t0".to_string()));
+        assert_eq!(task.order.len(), task.threads.len());
+        client.shutdown();
     }
 
     #[test]

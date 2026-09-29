@@ -15,14 +15,12 @@
 //!   reconnect with backoff and cancellation.
 //! - `client.rs`: typed wrappers for the orchestration commands and queries.
 //! - `mapper.rs`: T3 read-model and event payloads into the neutral domain.
-//! - `driver.rs`: `AgentEnginePort` implementation.
+//! - `driver.rs`: `AgentPort` implementation.
 //! - `stream.rs`: shell and thread subscriptions parsed into typed events for
-//!   the manager to fold into `AgentDomainEvent`s.
-
-// Phase 1 ships the adapter without registering it in the runtime, so from
-// the binary's point of view nothing here is reachable yet. Remove this once
-// `runtime.rs` constructs `T3Driver`.
-#![allow(dead_code, unused_imports)]
+//!   the manager (`agents/manager/t3.rs`) to fold into `AgentDomainEvent`s.
+//!
+//! The runtime (`agents/runtime/t3.rs`) attaches it when `t3.enabled` or
+//! `t3.url` is set in `config.json`, and keeps the bearer it pairs for.
 
 pub mod client;
 pub mod driver;
@@ -33,10 +31,10 @@ pub mod stream;
 
 pub use client::T3Client;
 pub use driver::T3Driver;
-pub use endpoint::{EnvironmentDescriptor, T3Credential, T3Endpoint};
+pub use endpoint::{T3Credential, T3Endpoint};
 pub use stream::{T3StreamEvent, T3StreamListener};
 
-/// The agent id the runtime will register this adapter under.
+/// The agent id the runtime registers this adapter under.
 pub const KIND: &str = "t3";
 
 /// The orchestration wire version this adapter was written against. A

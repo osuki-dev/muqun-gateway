@@ -17,7 +17,7 @@ Two planes are implemented in this binary:
   adapters implement it.
 - **Agents plane** — agent sessions, models, prompts, tasks,
   permissions, approvals and event history, behind the `AgentPort`
-  port; the OpenCode and DeepSeek adapters implement it.
+  port; the OpenCode, DeepSeek and T3 Code adapters implement it.
 
 `/api/discovery` also reports an **SSH plane**, but that one is the app's own
 transport, not a gateway subsystem: the phone can open an SSH connection to a
@@ -49,8 +49,8 @@ the far side. The gateway implements no SSH client or server itself.
 │   │ port: TerminalBackend      │  │ port: AgentPort                │     │
 │   └─────────────┬──────────────┘  └───────────────┬────────────────┘     │
 │                 │                                 │                      │
-│        Herdr adapter · tmux adapter   OpenCode adapter · DeepSeek        │
-│                                       adapter                            │
+│        Herdr adapter · tmux adapter   OpenCode · DeepSeek · T3 Code      │
+│                                       adapters                           │
 │                                                                          │
 │  routes: platform (health, discovery, openapi) · connectivity (pairing,  │
 │    push registration) · terminal · agents                                │
@@ -61,7 +61,7 @@ the far side. The gateway implements no SSH client or server itself.
 └──────────────────────────────────────────────────────────────────────────┘
         │
         ▼
- Herdr unix socket · tmux argv · OpenCode / DeepSeek HTTP
+ Herdr unix socket · tmux argv · OpenCode / DeepSeek HTTP · T3 WebSocket
 ```
 
 A request travels: the phone authenticates with its device token (and, when
@@ -203,6 +203,26 @@ one line saying which file, which version, and that `opencode.binary` is how to
 point it elsewhere. OpenCode 1 is a different API, and half-working with it is
 worse than saying so. `GET /api/agent-status` reports the same facts to the
 app, including whether the agent was `adopted` or `spawned`.
+
+### T3 Code
+
+The gateway can also drive a [T3 Code](https://t3.codes) server (`t3 serve`),
+which runs Claude Code, Codex and other agents behind one API. It is off
+until you turn it on in `config.json`, and the gateway only ever tries the URL
+you give it (T3's default `http://127.0.0.1:3773` if you give none):
+
+```json
+{ "t3": { "enabled": true, "url": "http://127.0.0.1:3773", "pairing_token": "…" } }
+```
+
+Get the pairing token by running `t3 pair` on the T3 host; it prints a pairing
+link ending in `#token=…` and the token itself. The gateway exchanges the token
+once for a long-lived credential, keeps that in `t3-credential.json` in its
+state directory (readable by you only), and never needs the token again.
+`t3.runtime_mode` sets what new threads may do without asking
+(`full-access` by default, or `approval-required`, `auto-accept-edits`,
+`auto`). The full reference is in `docs/agent-api.md` under "Configuring T3
+Code".
 
 If the configured listen IP changes or is unavailable, startup reports the
 address and asks you to update `listen` in the gateway's `config.json`, then

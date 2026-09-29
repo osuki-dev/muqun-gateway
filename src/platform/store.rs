@@ -682,6 +682,62 @@ pub(crate) fn write_secret_file(path: &std::path::Path, bytes: &[u8]) -> anyhow:
     }
 }
 
+/// The file under the state directory that holds the T3 Code bearer.
+pub(crate) const T3_CREDENTIAL_FILE: &str = "t3-credential.json";
+
+/// The bearer a T3 Code server issued this gateway for a one-time pairing
+/// credential, and the server it belongs to. The pairing credential itself
+/// is consumed by the exchange and never written anywhere.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct T3StoredCredential {
+    /// The server URL the bearer was issued by; a bearer is only offered
+    /// back to the same one.
+    pub url: String,
+    pub token: String,
+    #[serde(default)]
+    pub saved_at_ms: u64,
+}
+
+impl std::fmt::Debug for T3StoredCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("T3StoredCredential")
+            .field("url", &self.url)
+            .field("token", &"<redacted>")
+            .field("saved_at_ms", &self.saved_at_ms)
+            .finish()
+    }
+}
+
+/// The stored T3 bearer in `dir`, `None` when there is none. A file that
+/// cannot be read or parsed is an error the caller reports; it is not
+/// silently treated as absent, and it is not deleted.
+pub(crate) fn read_t3_credential_at(
+    dir: &std::path::Path,
+) -> anyhow::Result<Option<T3StoredCredential>> {
+    let path = dir.join(T3_CREDENTIAL_FILE);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes =
+        std::fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .with_context(|| format!("failed to parse {}", path.display()))
+}
+
+/// Persist the T3 bearer in `dir`, `0600` under a `0700` directory.
+pub(crate) fn write_t3_credential_at(
+    dir: &std::path::Path,
+    credential: &T3StoredCredential,
+) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("failed to create state dir {}", dir.display()))?;
+    write_secret_file(
+        &dir.join(T3_CREDENTIAL_FILE),
+        &serde_json::to_vec_pretty(credential)?,
+    )
+}
+
 pub(crate) fn default_socket_path() -> String {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -858,6 +914,41 @@ pub(crate) fn write_config(path: &std::path::Path, config: &Config) -> anyhow::R
 #[cfg(test)]
 mod tests {
     use crate::*;
+
+    #[test]
+    fn a_t3_bearer_round_trips_as_an_owner_only_file() {
+        let dir = std::env::temp_dir().join(format!("t3-cred-{}", uuid::Uuid::new_v4()));
+        assert!(
+            read_t3_credential_at(&dir).unwrap().is_none(),
+            "no file is no credential"
+        );
+        let credential = T3StoredCredential {
+            url: "http://127.0.0.1:3773".into(),
+            token: "secret-bearer".into(),
+            saved_at_ms: 1,
+        };
+        write_t3_credential_at(&dir, &credential).unwrap();
+        assert_eq!(
+            read_t3_credential_at(&dir).unwrap(),
+            Some(credential.clone())
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let file = std::fs::metadata(dir.join(T3_CREDENTIAL_FILE)).unwrap();
+            assert_eq!(file.permissions().mode() & 0o777, 0o600);
+            let parent = std::fs::metadata(&dir).unwrap();
+            assert_eq!(parent.permissions().mode() & 0o777, 0o700);
+        }
+        assert!(!format!("{credential:?}").contains("secret-bearer"));
+
+        std::fs::write(dir.join(T3_CREDENTIAL_FILE), b"not json").unwrap();
+        assert!(
+            read_t3_credential_at(&dir).is_err(),
+            "a damaged file is reported, not taken for none"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn a_secret_directory_is_marked_never_to_be_committed() {

@@ -22,7 +22,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::MAX_PAYLOAD_BYTES;
-use crate::agents::ports::engine::AgentEngineError;
+use crate::agents::ports::agent::AgentError;
 
 pub const WELL_KNOWN_PATH: &str = "/.well-known/t3/environment";
 pub const TOKEN_PATH: &str = "/oauth/token";
@@ -38,7 +38,7 @@ const REQUESTED_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_toke
 /// The credential the gateway holds for a server.
 ///
 /// A pairing credential is single-use: the first successful exchange turns it
-/// into a bearer, which is what phase 2 persists. `None` is accepted so a
+/// into a bearer, which the runtime persists. `None` is accepted so a
 /// server in `unsafe-no-auth` mode can still be probed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum T3Credential {
@@ -165,23 +165,22 @@ impl T3Endpoint {
 
     /// Fetch the environment descriptor. This is the health probe: a server
     /// that answers it with a decodable descriptor is a T3 server.
-    pub async fn describe(&self, http: &Client) -> Result<EnvironmentDescriptor, AgentEngineError> {
+    pub async fn describe(&self, http: &Client) -> Result<EnvironmentDescriptor, AgentError> {
         let resp = http
             .get(format!("{}{WELL_KNOWN_PATH}", self.url))
             .timeout(Duration::from_millis(2500))
             .send()
             .await
-            .map_err(|e| AgentEngineError::Network(short(&e.to_string())))?;
+            .map_err(|e| AgentError::Network(short(&e.to_string())))?;
         let status = resp.status();
         if !status.is_success() {
-            return Err(AgentEngineError::NotAvailable(format!(
+            return Err(AgentError::NotAvailable(format!(
                 "descriptor returned HTTP {status}"
             )));
         }
         let body = read_bounded(resp, 64 * 1024).await?;
-        serde_json::from_slice(&body).map_err(|e| {
-            AgentEngineError::Protocol(format!("descriptor: {}", short(&e.to_string())))
-        })
+        serde_json::from_slice(&body)
+            .map_err(|e| AgentError::Protocol(format!("descriptor: {}", short(&e.to_string()))))
     }
 
     pub async fn probe_healthy(&self, http: &Client) -> bool {
@@ -217,7 +216,7 @@ impl T3Endpoint {
         http: &Client,
         pairing: &str,
         client_label: &str,
-    ) -> Result<BearerGrant, AgentEngineError> {
+    ) -> Result<BearerGrant, AgentError> {
         let form = [
             ("grant_type", GRANT_TYPE),
             ("subject_token", pairing),
@@ -232,12 +231,12 @@ impl T3Endpoint {
             .form(&form)
             .send()
             .await
-            .map_err(|e| AgentEngineError::Network(short(&e.to_string())))?;
+            .map_err(|e| AgentError::Network(short(&e.to_string())))?;
         let status = resp.status();
         let body = read_bounded(resp, 64 * 1024).await?;
         if !status.is_success() {
             tracing::warn!(%status, body = %String::from_utf8_lossy(&body[..body.len().min(300)]), "t3 pairing exchange rejected");
-            return Err(AgentEngineError::NotAvailable(format!(
+            return Err(AgentError::NotAvailable(format!(
                 "pairing exchange returned HTTP {status}"
             )));
         }
@@ -250,7 +249,7 @@ impl T3Endpoint {
             scope: String,
         }
         let parsed: TokenResponse = serde_json::from_slice(&body)
-            .map_err(|e| AgentEngineError::Protocol(format!("token: {}", short(&e.to_string()))))?;
+            .map_err(|e| AgentError::Protocol(format!("token: {}", short(&e.to_string()))))?;
         Ok(BearerGrant {
             token: parsed.access_token,
             expires_in_secs: parsed.expires_in.max(0.0) as u64,
@@ -263,23 +262,23 @@ impl T3Endpoint {
         &self,
         http: &Client,
         bearer: &str,
-    ) -> Result<String, AgentEngineError> {
+    ) -> Result<String, AgentError> {
         let resp = http
             .post(format!("{}{TICKET_PATH}", self.url))
             .timeout(Duration::from_secs(10))
             .bearer_auth(bearer)
             .send()
             .await
-            .map_err(|e| AgentEngineError::Network(short(&e.to_string())))?;
+            .map_err(|e| AgentError::Network(short(&e.to_string())))?;
         let status = resp.status();
         let body = read_bounded(resp, 16 * 1024).await?;
         if status.as_u16() == 401 || status.as_u16() == 403 {
-            return Err(AgentEngineError::NotAvailable(
+            return Err(AgentError::NotAvailable(
                 "the stored T3 credential was rejected; pair again".into(),
             ));
         }
         if !status.is_success() {
-            return Err(AgentEngineError::RequestFailed(format!(
+            return Err(AgentError::RequestFailed(format!(
                 "websocket ticket returned HTTP {status}"
             )));
         }
@@ -287,50 +286,42 @@ impl T3Endpoint {
         struct Ticket {
             ticket: String,
         }
-        let parsed: Ticket = serde_json::from_slice(&body).map_err(|e| {
-            AgentEngineError::Protocol(format!("ticket: {}", short(&e.to_string())))
-        })?;
+        let parsed: Ticket = serde_json::from_slice(&body)
+            .map_err(|e| AgentError::Protocol(format!("ticket: {}", short(&e.to_string()))))?;
         Ok(parsed.ticket)
     }
 
     /// `GET /api/auth/session`: whether the bearer is still accepted, and its
     /// scopes.
-    pub async fn session_state(
-        &self,
-        http: &Client,
-        bearer: &str,
-    ) -> Result<Value, AgentEngineError> {
+    pub async fn session_state(&self, http: &Client, bearer: &str) -> Result<Value, AgentError> {
         let resp = http
             .get(format!("{}{SESSION_PATH}", self.url))
             .timeout(Duration::from_secs(10))
             .bearer_auth(bearer)
             .send()
             .await
-            .map_err(|e| AgentEngineError::Network(short(&e.to_string())))?;
+            .map_err(|e| AgentError::Network(short(&e.to_string())))?;
         let body = read_bounded(resp, 16 * 1024).await?;
         serde_json::from_slice(&body)
-            .map_err(|e| AgentEngineError::Protocol(format!("session: {}", short(&e.to_string()))))
+            .map_err(|e| AgentError::Protocol(format!("session: {}", short(&e.to_string()))))
     }
 }
 
 /// Read a response body, refusing one larger than `max` bytes. The body is
 /// streamed so an oversized answer is abandoned, not buffered.
-pub async fn read_bounded(
-    resp: reqwest::Response,
-    max: usize,
-) -> Result<Vec<u8>, AgentEngineError> {
+pub async fn read_bounded(resp: reqwest::Response, max: usize) -> Result<Vec<u8>, AgentError> {
     use futures::StreamExt;
     if let Some(len) = resp.content_length() {
         if len as usize > max {
-            return Err(AgentEngineError::Protocol("response too large".into()));
+            return Err(AgentError::Protocol("response too large".into()));
         }
     }
     let mut out = Vec::new();
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| AgentEngineError::Network(short(&e.to_string())))?;
+        let chunk = chunk.map_err(|e| AgentError::Network(short(&e.to_string())))?;
         if out.len() + chunk.len() > max {
-            return Err(AgentEngineError::Protocol("response too large".into()));
+            return Err(AgentError::Protocol("response too large".into()));
         }
         out.extend_from_slice(&chunk);
     }

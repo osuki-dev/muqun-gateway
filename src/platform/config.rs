@@ -101,6 +101,9 @@ pub(crate) struct Config {
     /// Configuration for the DeepSeek agent adapter
     #[serde(default, skip_serializing_if = "is_default_deepseek")]
     pub(crate) deepseek: agents::DeepseekConfig,
+    /// The T3 Code agent adapter: off unless `enabled` or `url` is set.
+    #[serde(default, skip_serializing_if = "is_default_t3")]
+    pub(crate) t3: agents::T3Config,
 }
 
 /// `skip_serializing_if` for the OpenCode block, so an existing `config.json`
@@ -111,6 +114,10 @@ pub(crate) fn is_default_opencode(config: &agents::OpencodeConfig) -> bool {
 
 pub(crate) fn is_default_deepseek(config: &agents::DeepseekConfig) -> bool {
     !config.enabled && config.endpoint.is_none() && config.token.is_none()
+}
+
+pub(crate) fn is_default_t3(config: &agents::T3Config) -> bool {
+    *config == agents::T3Config::default()
 }
 
 pub(crate) fn is_required_transport(mode: &TransportEncryptionMode) -> bool {
@@ -326,6 +333,43 @@ pub(crate) const CONTENT_SCHEMA_VERSION: &str = "1.5.0";
 #[cfg(test)]
 mod tests {
     use crate::*;
+
+    #[test]
+    fn the_t3_block_is_read_from_config_json_and_left_out_when_default() {
+        let base = json!({
+            "server_id": "s1",
+            "label": "mac",
+            "listen": "127.0.0.1:23847",
+            "public_url": "https://example.ts.net",
+            "token_hash": "abc",
+            "sessions": []
+        });
+        let config: Config = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(config.t3, agents::T3Config::default());
+        assert!(!config.t3.wanted());
+        assert_eq!(
+            serde_json::to_value(&config).unwrap(),
+            base,
+            "an absent t3 block stays absent"
+        );
+
+        let mut with_t3 = base.clone();
+        with_t3["t3"] = json!({
+            "enabled": true,
+            "url": "http://127.0.0.1:3773",
+            "pairing_token": "from-t3-pair",
+            "runtime_mode": "approval-required"
+        });
+        let config: Config = serde_json::from_value(with_t3.clone()).unwrap();
+        assert!(config.t3.wanted());
+        assert_eq!(config.t3.url.as_deref(), Some("http://127.0.0.1:3773"));
+        assert_eq!(config.t3.pairing_token.as_deref(), Some("from-t3-pair"));
+        assert_eq!(serde_json::to_value(&config).unwrap(), with_t3);
+        assert!(
+            !format!("{config:?}").contains("from-t3-pair"),
+            "the logged config never shows the token"
+        );
+    }
 
     #[test]
     fn a_config_without_agent_commands_still_loads_and_round_trips_unchanged() {

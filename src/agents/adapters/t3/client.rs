@@ -4,8 +4,10 @@
 //! snapshots come from the HTTP endpoints the T3 clients themselves use for
 //! initial loads (`GET /api/orchestration/shell`, `/threads/:id`). The
 //! bearer token is obtained lazily: a pairing credential is exchanged once
-//! and the resulting bearer kept in memory, where phase 2 can read it back
-//! for persistence.
+//! and the resulting bearer kept in memory. The runtime normally does that
+//! exchange itself before building a client (`agents/runtime/t3.rs`), so it
+//! can persist the bearer; this lazy path serves a client built straight
+//! from a pairing credential, such as the live test.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -17,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::endpoint::{read_bounded, short, BearerGrant, T3Credential, T3Endpoint, MAX_HTTP_BODY};
 use super::rpc::{RpcConfig, RpcConnection, RpcError, Subscription};
-use crate::agents::ports::engine::AgentEngineError;
+use crate::agents::ports::agent::AgentError;
 
 pub const RPC_DISPATCH: &str = "orchestration.dispatchCommand";
 pub const RPC_GET_TURN_DIFF: &str = "orchestration.getTurnDiff";
@@ -49,16 +51,16 @@ const MAX_PROMPT_CHARS: usize = 120_000;
 /// A validated opaque id: T3 ids are UUIDs the client mints, but the server
 /// only requires a trimmed non-empty string, so this accepts the characters a
 /// URL path segment and a JSON string can carry safely and nothing else.
-pub fn validate_id(id: &str, what: &str) -> Result<String, AgentEngineError> {
+pub fn validate_id(id: &str, what: &str) -> Result<String, AgentError> {
     let trimmed = id.trim();
     if trimmed.is_empty() || trimmed.len() > MAX_ID_LEN {
-        return Err(AgentEngineError::RequestFailed(format!("invalid {what}")));
+        return Err(AgentError::RequestFailed(format!("invalid {what}")));
     }
     if !trimmed
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
     {
-        return Err(AgentEngineError::RequestFailed(format!("invalid {what}")));
+        return Err(AgentError::RequestFailed(format!("invalid {what}")));
     }
     Ok(trimmed.to_string())
 }
@@ -443,8 +445,8 @@ impl T3Client {
     }
 
     /// The bearer currently held, exchanging the pairing credential on first
-    /// use. Phase 2 persists what this returns after a successful exchange.
-    pub async fn bearer(&self) -> Result<String, AgentEngineError> {
+    /// use.
+    pub async fn bearer(&self) -> Result<String, AgentError> {
         bearer_for(&self.endpoint, &self.http, &self.auth).await
     }
 
@@ -455,7 +457,7 @@ impl T3Client {
 
     // ---- RPC -------------------------------------------------------------
 
-    pub async fn probe(&self) -> Result<(), AgentEngineError> {
+    pub async fn probe(&self) -> Result<(), AgentError> {
         self.rpc
             .request(RPC_SERVER_PROBE, json!({}))
             .await
@@ -464,7 +466,7 @@ impl T3Client {
     }
 
     /// `server.getConfig`: environment, providers with their models, settings.
-    pub async fn get_config(&self) -> Result<Value, AgentEngineError> {
+    pub async fn get_config(&self) -> Result<Value, AgentError> {
         self.rpc
             .request(RPC_SERVER_GET_CONFIG, json!({}))
             .await
@@ -474,7 +476,7 @@ impl T3Client {
     /// Dispatch one orchestration command; returns the event sequence the
     /// command committed at. Acceptance means the intent was recorded, not
     /// that the provider finished acting on it.
-    pub async fn dispatch(&self, command: Value) -> Result<u64, AgentEngineError> {
+    pub async fn dispatch(&self, command: Value) -> Result<u64, AgentError> {
         let kind = command
             .get("type")
             .and_then(Value::as_str)
@@ -492,7 +494,7 @@ impl T3Client {
         thread_id: &str,
         from: u64,
         to: u64,
-    ) -> Result<Value, AgentEngineError> {
+    ) -> Result<Value, AgentError> {
         self.rpc
             .request(
                 RPC_GET_TURN_DIFF,
@@ -506,7 +508,7 @@ impl T3Client {
         &self,
         thread_id: &str,
         to: u64,
-    ) -> Result<Value, AgentEngineError> {
+    ) -> Result<Value, AgentError> {
         self.rpc
             .request(
                 RPC_GET_FULL_THREAD_DIFF,
@@ -516,11 +518,7 @@ impl T3Client {
             .map_err(map_rpc_error)
     }
 
-    pub async fn search_threads(
-        &self,
-        query: &str,
-        limit: usize,
-    ) -> Result<Value, AgentEngineError> {
+    pub async fn search_threads(&self, query: &str, limit: usize) -> Result<Value, AgentError> {
         let q: String = query.trim().chars().take(200).collect();
         if q.chars().count() < 2 {
             return Ok(json!({ "matches": [] }));
@@ -540,7 +538,7 @@ impl T3Client {
     pub async fn subscribe_shell(
         &self,
         after_sequence: Option<u64>,
-    ) -> Result<Subscription, AgentEngineError> {
+    ) -> Result<Subscription, AgentError> {
         let mut payload = json!({ "requestCompletionMarker": true });
         if let Some(seq) = after_sequence {
             payload["afterSequence"] = json!(seq);
@@ -557,7 +555,7 @@ impl T3Client {
         &self,
         thread_id: &str,
         after_sequence: Option<u64>,
-    ) -> Result<Subscription, AgentEngineError> {
+    ) -> Result<Subscription, AgentError> {
         let mut payload = json!({
             "threadId": thread_id,
             "reasoningMessages": true,
@@ -575,7 +573,7 @@ impl T3Client {
     // ---- HTTP read model -------------------------------------------------
 
     /// `GET /api/orchestration/shell`: every project and thread summary.
-    pub async fn shell_snapshot(&self) -> Result<Value, AgentEngineError> {
+    pub async fn shell_snapshot(&self) -> Result<Value, AgentError> {
         self.get_json(HTTP_SHELL_SNAPSHOT.to_string()).await
     }
 
@@ -586,21 +584,21 @@ impl T3Client {
         &self,
         thread_id: &str,
         turn_limit: Option<usize>,
-    ) -> Result<Value, AgentEngineError> {
+    ) -> Result<Value, AgentError> {
         let id = validate_id(thread_id, "session id")?;
         let mut path = format!("{HTTP_THREAD_SNAPSHOT}/{id}?reasoningMessages=true");
         if let Some(limit) = turn_limit {
             path.push_str(&format!("&turnLimit={}", limit.max(1)));
         }
         match self.get_json(path).await {
-            Err(AgentEngineError::RequestFailed(msg)) if msg.starts_with("HTTP 404") => {
-                Err(AgentEngineError::SessionNotFound(thread_id.to_string()))
+            Err(AgentError::RequestFailed(msg)) if msg.starts_with("HTTP 404") => {
+                Err(AgentError::SessionNotFound(thread_id.to_string()))
             }
             other => other,
         }
     }
 
-    async fn get_json(&self, path: String) -> Result<Value, AgentEngineError> {
+    async fn get_json(&self, path: String) -> Result<Value, AgentError> {
         let bearer = self.bearer().await?;
         let resp = self
             .http
@@ -608,19 +606,19 @@ impl T3Client {
             .bearer_auth(&bearer)
             .send()
             .await
-            .map_err(|e| AgentEngineError::Network(short(&e.to_string())))?;
+            .map_err(|e| AgentError::Network(short(&e.to_string())))?;
         let status = resp.status();
         let body = read_bounded(resp, MAX_HTTP_BODY).await?;
         if status.as_u16() == 401 {
-            return Err(AgentEngineError::NotAvailable(
+            return Err(AgentError::NotAvailable(
                 "the stored T3 credential was rejected; pair again".into(),
             ));
         }
         if !status.is_success() {
             tracing::debug!(%status, path = %path.split('?').next().unwrap_or(""), "t3 http read failed");
-            return Err(AgentEngineError::RequestFailed(format!("HTTP {status}")));
+            return Err(AgentError::RequestFailed(format!("HTTP {status}")));
         }
-        serde_json::from_slice(&body).map_err(|e| AgentEngineError::Protocol(short(&e.to_string())))
+        serde_json::from_slice(&body).map_err(|e| AgentError::Protocol(short(&e.to_string())))
     }
 }
 
@@ -628,7 +626,7 @@ async fn bearer_for(
     endpoint: &T3Endpoint,
     http: &Client,
     auth: &RwLock<Auth>,
-) -> Result<String, AgentEngineError> {
+) -> Result<String, AgentError> {
     if let Some(b) = auth.read().await.bearer.clone() {
         return Ok(b);
     }
@@ -637,7 +635,7 @@ async fn bearer_for(
         return Ok(b);
     }
     let Some(pairing) = guard.pairing.take() else {
-        return Err(AgentEngineError::NotAvailable(
+        return Err(AgentError::NotAvailable(
             "no T3 credential configured; pair with the server first".into(),
         ));
     };
@@ -657,7 +655,7 @@ async fn bearer_for(
         Err(e) => {
             // The credential may still be valid (network blip); keep it for
             // the next attempt. A rejection consumed it either way.
-            if matches!(e, AgentEngineError::Network(_)) {
+            if matches!(e, AgentError::Network(_)) {
                 guard.pairing = Some(pairing);
             }
             Err(e)
@@ -666,33 +664,33 @@ async fn bearer_for(
 }
 
 /// Reduce an RPC error to the port's vocabulary with a bounded message.
-pub fn map_rpc_error(e: RpcError) -> AgentEngineError {
+pub fn map_rpc_error(e: RpcError) -> AgentError {
     match e {
         RpcError::Failed(f) => {
             let msg = short(&f.message);
             let lower = msg.to_ascii_lowercase();
             if f.tag == "EnvironmentAuthorizationError" {
-                AgentEngineError::NotAvailable("the T3 credential lacks the required scope".into())
+                AgentError::NotAvailable("the T3 credential lacks the required scope".into())
             } else if lower.contains("not found") || lower.contains("unknown thread") {
-                AgentEngineError::SessionNotFound(msg)
+                AgentError::SessionNotFound(msg)
             } else {
-                AgentEngineError::RequestFailed(msg)
+                AgentError::RequestFailed(msg)
             }
         }
-        RpcError::Interrupted => AgentEngineError::RequestFailed("request interrupted".into()),
-        RpcError::Defect(d) => AgentEngineError::Protocol(short(&d)),
+        RpcError::Interrupted => AgentError::RequestFailed("request interrupted".into()),
+        RpcError::Defect(d) => AgentError::Protocol(short(&d)),
         RpcError::Disconnected | RpcError::Closed => {
-            AgentEngineError::Network("T3 Code server not connected".into())
+            AgentError::Network("T3 Code server not connected".into())
         }
-        RpcError::Timeout => AgentEngineError::Network("T3 Code request timed out".into()),
-        RpcError::Protocol(p) => AgentEngineError::Protocol(short(&p)),
+        RpcError::Timeout => AgentError::Network("T3 Code request timed out".into()),
+        RpcError::Protocol(p) => AgentError::Protocol(short(&p)),
     }
 }
 
 /// Bound a prompt to what T3 accepts (`PROVIDER_SEND_TURN_MAX_INPUT_CHARS`).
-pub fn bounded_prompt(text: &str) -> Result<&str, AgentEngineError> {
+pub fn bounded_prompt(text: &str) -> Result<&str, AgentError> {
     if text.chars().count() > MAX_PROMPT_CHARS {
-        return Err(AgentEngineError::RequestFailed("prompt too long".into()));
+        return Err(AgentError::RequestFailed("prompt too long".into()));
     }
     Ok(text)
 }
@@ -798,22 +796,16 @@ mod tests {
             message: "Thread not found".into(),
             raw: Value::Null,
         });
-        assert!(matches!(
-            map_rpc_error(nf),
-            AgentEngineError::SessionNotFound(_)
-        ));
+        assert!(matches!(map_rpc_error(nf), AgentError::SessionNotFound(_)));
         let scope = RpcError::Failed(super::super::rpc::RpcFailure {
             tag: "EnvironmentAuthorizationError".into(),
             message: "needs orchestration:operate".into(),
             raw: Value::Null,
         });
-        assert!(matches!(
-            map_rpc_error(scope),
-            AgentEngineError::NotAvailable(_)
-        ));
+        assert!(matches!(map_rpc_error(scope), AgentError::NotAvailable(_)));
         assert!(matches!(
             map_rpc_error(RpcError::Disconnected),
-            AgentEngineError::Network(_)
+            AgentError::Network(_)
         ));
     }
 }

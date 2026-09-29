@@ -69,7 +69,8 @@ grant_type=urn:ietf:params:oauth:grant-type:token-exchange
 ```
 
 The pairing credential is consumed. The bearer is what the gateway must
-persist (phase 2, `store.rs`); it carries the standard client scopes
+persist (`t3-credential.json` in the state directory, written by
+`platform/store.rs`); it carries the standard client scopes
 (`orchestration:read`, `orchestration:operate`, `terminal:operate`,
 `review:write`, `relay:read`). `GET /api/auth/session` with the bearer returns
 `{authenticated, auth:{policy,…}, scopes, sessionMethod, expiresAt}` and is a
@@ -351,6 +352,7 @@ observed:
 | `approval.resolved` | `{requestId, requestKind, requestType, decision:"accept"}` |
 | `context-window.updated` | token accounting (ignored) |
 | `checkpoint.captured` | `{turnCount, status}` |
+| `checkpoint.revert.failed` | `{turnCount, detail}`, `tone:"error"`; seen when the workspace is not a git repository (no checkpoints): the `thread.checkpoint.revert` command was still accepted with a sequence |
 
 From the contracts, not observed (**unverified**): `tool.denied
 {toolName, toolUseId?, detail?}`, `user-input.requested {requestId,
@@ -380,5 +382,15 @@ Fixtures: `fixtures/activity_approval_requested.json`,
 - `get_catalog` -> providers and models from `server.getConfig`; modes are
   empty (T3 has no persona; `runtimeMode` is a gateway setting).
 - Reads (`list_projects`, `list_sessions`, `get_session`, `get_timeline`,
-  pending approvals/forms) come from the HTTP snapshots; the streams are for
-  phase 2's event mapping.
+  pending approvals/forms) come from the HTTP snapshots. The shell stream and
+  one thread stream per watched thread feed the manager
+  (`agents/manager/t3.rs`), which folds them into the domain events. A
+  thread is watched when a client opens, creates or reads it, when a list or
+  the shell stream shows it running, and unwatched when it is deleted; at
+  most 32 threads are watched, least recently used first out.
+- Timeline `message_id`s are `<13-digit creation ms>:<T3 id>` (activities
+  file under `turn:<turnId>`): the contract orders a timeline by
+  `(message_id, ordinal)`, and T3's own ids (UUIDs, `assistant:<uuid>`) do
+  not sort by creation. A multi-activity row (a tool card, the plan) keeps
+  the time of its first activity. `revert_session` strips the prefix and
+  reverts to the turn count before the turn the message belongs to.

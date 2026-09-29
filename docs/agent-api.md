@@ -85,11 +85,12 @@ verbatim, so their keys stay camelCase.
 ## Agents
 
 The gateway can have more than one agent attached at once. Today the ids are
-`opencode` and `deepseek`. OpenCode is preferred: when a request names no
-agent, the **primary** answers — `opencode` when it is attached, otherwise
-`deepseek`. The primary is only that internal preference order; the contract
-names no "active" agent. Inside an agent, a persona such as OpenCode's `build`
-or `plan` is a **mode**.
+`opencode`, `deepseek` and `t3` (T3 Code). OpenCode is preferred: when a
+request names no agent, the **primary** answers — the first attached of
+`opencode`, `deepseek`, `t3`, in that order. The primary is only that internal
+preference order; the contract names no "active" agent. Inside an agent, a
+persona such as OpenCode's `build` or `plan` is a **mode**; T3 Code has none,
+so its `modes[]` is empty.
 
 ### Feature gate
 
@@ -163,6 +164,26 @@ and `version` removed from every agent.
 
   Flags reflect the agent's last probe (cached for about ten seconds).
   Unknown extra flags may appear; ignore them.
+
+  What each agent reports today:
+
+  | Flag | `opencode` | `deepseek` | `t3` |
+  |---|---|---|---|
+  | `streaming` | yes | yes | yes |
+  | `reasoningEffort` | when a model has effort variants | when a model has effort variants | no |
+  | `modelSelection` | when it lists models | when it lists models | yes |
+  | `toolApprovals` | yes | yes | yes |
+  | `worktrees` | yes | no | no |
+  | `revert` | yes | no | yes |
+  | `inbox` | yes | no | no |
+
+  `t3` is `name: "T3 Code"`; its `version` is the T3 server version, its
+  `models[]` are every model of the providers T3 has ready (Claude Code,
+  Codex, …), and it is `reachable` rather than `connected` while the server
+  answers but the gateway holds no credential for it. A T3 revert rolls back
+  whole turns: reverting to any row of a turn removes that turn and
+  everything after it (`agent.revert.changed` `committed`, then the timeline
+  is re-read); there is no staged state.
 - `features` (plane level): `multiAgent` (more than one agent may be
   attached), `catalogAggregation` (the unfiltered catalog is merged across
   attached agents), `sessionRouting` (per-session routes resolve to the
@@ -194,7 +215,7 @@ Errors, for every route above that takes `agent_id`:
 
 | Status | `error.code` | When |
 |---|---|---|
-| `400` | `invalid_agent` | The id is not one this gateway knows (`opencode`, `deepseek`). |
+| `400` | `invalid_agent` | The id is not one this gateway knows (`opencode`, `deepseek`, `t3`). |
 | `503` | `agent_unavailable` | The id is known but not attached; the message names it (`Agent 'deepseek' is not available`). |
 
 ### Compatibility
@@ -895,6 +916,39 @@ ERROR refusing to start /usr/local/bin/opencode: it reports version opencode 1.1
 
 A version that cannot be read is allowed through — silence is not evidence of
 being old — so only a legible version below 2.0 is refused.
+
+### Configuring T3 Code
+
+T3 Code (`t3 serve`) is off until `config.json` asks for it. The gateway never
+scans for it: it tries only the URL it is given, or T3's default
+`http://127.0.0.1:3773` when `enabled` is set without one.
+
+```json
+{ "t3": { "enabled": true, "url": "http://127.0.0.1:3773",
+          "pairing_token": "<token printed by t3 pair>",
+          "runtime_mode": "full-access" } }
+```
+
+| Key | Meaning |
+|---|---|
+| `enabled` | Attach to T3. Setting `url` also enables it. |
+| `url` | The T3 server, `http(s)://host:port`. |
+| `pairing_token` | A one-time pairing token. |
+| `token` | A bearer you already hold; used instead of pairing. |
+| `runtime_mode` | What new threads may do unasked: `full-access` (T3's default), `approval-required`, `auto-accept-edits` or `auto`. |
+
+`T3_URL`, `T3_TOKEN` and `T3_PAIRING_TOKEN` in the gateway's environment fill
+the matching keys when `config.json` leaves them unset; they never enable T3
+by themselves.
+
+To pair, run `t3 pair` on the T3 host (with the same `--base-dir` as the
+server, if it has one). It prints a pairing URL ending in `#token=…` and the
+token on its own line; put that token in `t3.pairing_token` and restart the
+gateway. The gateway exchanges it once for a bearer, keeps the bearer in
+`t3-credential.json` (mode `0600`) in its state directory, and forgets the
+pairing token, which T3 has now consumed; the stale value left in
+`config.json` is ignored while the stored bearer is accepted. If T3 revokes
+the bearer, pair again with a new token.
 
 ### Losing the agent
 

@@ -1,4 +1,4 @@
-//! `AgentEnginePort` over a T3 Code server.
+//! `AgentPort` over a T3 Code server.
 //!
 //! A T3 thread is a session and its id is the session id. Reads come from
 //! the HTTP read-model snapshots, writes are orchestration commands over the
@@ -16,11 +16,12 @@ use super::client::{
 };
 use super::endpoint::T3Endpoint;
 use super::mapper;
+use super::stream::ThreadWatcher;
 use crate::agents::domain::{
     AgentCatalog, AgentProject, AgentSessionInfo, FormRequest, ModelRef, PermissionDecision,
     PermissionRequest, SessionQuery, TimelineItem,
 };
-use crate::agents::ports::engine::{AgentEngineError, AgentEnginePort, EngineFuture, FileDiffItem};
+use crate::agents::ports::agent::{AgentError, AgentFuture, AgentPort, FileDiffItem};
 
 pub struct T3Driver {
     client: Arc<T3Client>,
@@ -29,6 +30,9 @@ pub struct T3Driver {
     /// A gateway setting, not a mode the app picks: T3 has no persona
     /// inside an agent, so the catalog's modes are empty.
     runtime_mode: String,
+    /// Follows the threads a client looks at, so their turns stream. A
+    /// driver built without a listener gets a detached one.
+    watcher: ThreadWatcher,
 }
 
 impl T3Driver {
@@ -40,17 +44,23 @@ impl T3Driver {
         Self {
             client,
             runtime_mode: DEFAULT_RUNTIME_MODE.to_string(),
+            watcher: ThreadWatcher::detached(),
         }
+    }
+
+    /// Follow the threads this driver opens, creates or lists as live with
+    /// `watcher`, and stop following the ones it deletes.
+    pub fn with_watcher(mut self, watcher: ThreadWatcher) -> Self {
+        self.watcher = watcher;
+        self
     }
 
     /// Use another T3 runtime mode for new threads. Rejects names T3 does
     /// not know rather than letting the server reject every thread later.
-    pub fn with_runtime_mode(mut self, runtime_mode: &str) -> Result<Self, AgentEngineError> {
+    pub fn with_runtime_mode(mut self, runtime_mode: &str) -> Result<Self, AgentError> {
         let name = runtime_mode.trim();
         if !RUNTIME_MODES.contains(&name) {
-            return Err(AgentEngineError::RequestFailed(
-                "unknown T3 runtime mode".into(),
-            ));
+            return Err(AgentError::RequestFailed("unknown T3 runtime mode".into()));
         }
         self.runtime_mode = name.to_string();
         Ok(self)
@@ -65,12 +75,12 @@ impl T3Driver {
     async fn session_from_snapshot(
         &self,
         thread_id: &str,
-    ) -> Result<(AgentSessionInfo, Value), AgentEngineError> {
+    ) -> Result<(AgentSessionInfo, Value), AgentError> {
         let detail = self.client.thread_snapshot(thread_id, None).await?;
         let thread = detail
             .get("thread")
             .cloned()
-            .ok_or_else(|| AgentEngineError::Protocol("thread snapshot without thread".into()))?;
+            .ok_or_else(|| AgentError::Protocol("thread snapshot without thread".into()))?;
         let roots = match self.client.shell_snapshot().await {
             Ok(shell) => mapper::project_roots(&shell),
             Err(e) => {
@@ -79,20 +89,18 @@ impl T3Driver {
             }
         };
         let info = mapper::map_session(&thread, &roots)
-            .ok_or_else(|| AgentEngineError::Protocol("thread snapshot missing id".into()))?;
+            .ok_or_else(|| AgentError::Protocol("thread snapshot missing id".into()))?;
         Ok((info, thread))
     }
 
     /// Find the project whose workspace root is `directory`, or create one.
-    async fn project_for(&self, directory: &str) -> Result<String, AgentEngineError> {
+    async fn project_for(&self, directory: &str) -> Result<String, AgentError> {
         let dir = directory.trim().trim_end_matches('/');
         if dir.is_empty() {
-            return Err(AgentEngineError::RequestFailed(
-                "a directory is required".into(),
-            ));
+            return Err(AgentError::RequestFailed("a directory is required".into()));
         }
         if !std::path::Path::new(dir).is_dir() {
-            return Err(AgentEngineError::WorkspaceMissing(dir.to_string()));
+            return Err(AgentError::WorkspaceMissing(dir.to_string()));
         }
         let shell = self.client.shell_snapshot().await?;
         if let Some(existing) = shell
@@ -122,7 +130,7 @@ impl T3Driver {
         Ok(project_id)
     }
 
-    async fn default_model(&self) -> Result<ModelSelection, AgentEngineError> {
+    async fn default_model(&self) -> Result<ModelSelection, AgentError> {
         let config = self.client.get_config().await?;
         let catalog = mapper::map_catalog(&config);
         catalog
@@ -131,21 +139,21 @@ impl T3Driver {
             .as_ref()
             .map(mapper::model_selection_from_ref)
             .ok_or_else(|| {
-                AgentEngineError::NotAvailable("no provider is ready on the T3 Code host".into())
+                AgentError::NotAvailable("no provider is ready on the T3 Code host".into())
             })
     }
 }
 
-impl AgentEnginePort for T3Driver {
+impl AgentPort for T3Driver {
     fn kind(&self) -> &'static str {
         super::KIND
     }
 
-    fn probe(&self) -> EngineFuture<'_, bool> {
+    fn probe(&self) -> AgentFuture<'_, bool> {
         Box::pin(async move { Ok(self.client.endpoint.probe_healthy(self.client.http()).await) })
     }
 
-    fn list_projects(&self) -> EngineFuture<'_, Vec<AgentProject>> {
+    fn list_projects(&self) -> AgentFuture<'_, Vec<AgentProject>> {
         Box::pin(async move {
             let shell = self.client.shell_snapshot().await?;
             Ok(shell
@@ -159,7 +167,7 @@ impl AgentEnginePort for T3Driver {
     fn list_sessions<'a>(
         &'a self,
         query: &'a SessionQuery,
-    ) -> EngineFuture<'a, Vec<AgentSessionInfo>> {
+    ) -> AgentFuture<'a, Vec<AgentSessionInfo>> {
         Box::pin(async move {
             let shell = self.client.shell_snapshot().await?;
             let mut sessions = mapper::map_shell_sessions(&shell);
@@ -205,6 +213,14 @@ impl AgentEnginePort for T3Driver {
             if let Some(limit) = query.limit {
                 sessions.truncate(limit);
             }
+            // A thread with a turn in flight is worth following before it is
+            // opened: its approvals should reach the phone.
+            for session in sessions
+                .iter()
+                .filter(|s| s.status == crate::agents::domain::AgentSessionStatus::Busy)
+            {
+                self.watcher.watch(&session.asid.0);
+            }
             Ok(sessions)
         })
     }
@@ -213,16 +229,14 @@ impl AgentEnginePort for T3Driver {
         &'a self,
         directory: Option<&'a str>,
         model: Option<&'a ModelRef>,
-        agent: Option<&'a str>,
-    ) -> EngineFuture<'a, AgentSessionInfo> {
+        mode: Option<&'a str>,
+    ) -> AgentFuture<'a, AgentSessionInfo> {
         Box::pin(async move {
             let directory = directory.ok_or_else(|| {
-                AgentEngineError::RequestFailed(
-                    "a directory is required to open a T3 thread".into(),
-                )
+                AgentError::RequestFailed("a directory is required to open a T3 thread".into())
             })?;
-            if agent.map(str::trim).filter(|a| !a.is_empty()).is_some() {
-                return Err(AgentEngineError::Unsupported("mode".into()));
+            if mode.map(str::trim).filter(|a| !a.is_empty()).is_some() {
+                return Err(AgentError::Unsupported("mode".into()));
             }
             let runtime_mode = self.runtime_mode.as_str();
             let interaction_mode = DEFAULT_INTERACTION_MODE;
@@ -243,6 +257,7 @@ impl AgentEnginePort for T3Driver {
                     interaction_mode,
                 ))
                 .await?;
+            self.watcher.watch(&thread_id);
             match self.session_from_snapshot(&thread_id).await {
                 Ok((info, _)) => Ok(info),
                 Err(e) => {
@@ -251,8 +266,9 @@ impl AgentEnginePort for T3Driver {
                     Ok(AgentSessionInfo {
                         asid: thread_id.clone().into(),
                         backend_session_id: String::new(),
+                        agent_id: String::new(),
                         title: title.into(),
-                        agent: None,
+                        mode: None,
                         model: mapper::map_model_ref(&selection.to_value()),
                         status: crate::agents::domain::AgentSessionStatus::Idle,
                         directory: Some(directory.trim_end_matches('/').to_string()),
@@ -278,10 +294,12 @@ impl AgentEnginePort for T3Driver {
         })
     }
 
-    fn get_session<'a>(&'a self, session_id: &'a str) -> EngineFuture<'a, AgentSessionInfo> {
+    fn get_session<'a>(&'a self, session_id: &'a str) -> AgentFuture<'a, AgentSessionInfo> {
         Box::pin(async move {
             let id = validate_id(session_id, "session id")?;
-            Ok(self.session_from_snapshot(&id).await?.0)
+            let info = self.session_from_snapshot(&id).await?.0;
+            self.watcher.watch(&id);
+            Ok(info)
         })
     }
 
@@ -291,11 +309,11 @@ impl AgentEnginePort for T3Driver {
         text: &'a str,
         attachments: &'a [String],
         _delivery: Option<&'a str>,
-    ) -> EngineFuture<'a, ()> {
+    ) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             let id = validate_id(session_id, "session id")?;
             if !attachments.is_empty() {
-                return Err(AgentEngineError::Unsupported("attachments".into()));
+                return Err(AgentError::Unsupported("attachments".into()));
             }
             let text = bounded_prompt(text)?;
             let (info, thread) = self.session_from_snapshot(&id).await?;
@@ -325,35 +343,24 @@ impl AgentEnginePort for T3Driver {
     }
 
     /// `message_id` is a T3 checkpoint turn count (`0` = before the first
-    /// turn) or the synthetic `turn:<turnId>` message id the timeline uses
-    /// for a turn, which is resolved to the checkpoint taken after it.
+    /// turn), a timeline message id, or the synthetic `turn:<turnId>` message
+    /// id activities are filed under. T3 rolls back whole turns, so a message
+    /// resolves to the turn count before the turn it belongs to.
     fn revert_session<'a>(
         &'a self,
         session_id: &'a str,
         message_id: &'a str,
-    ) -> EngineFuture<'a, ()> {
+    ) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             let id = validate_id(session_id, "session id")?;
-            let turn_count = if let Ok(n) = message_id.trim().parse::<u64>() {
+            let target = mapper::t3_message_id(message_id.trim());
+            let turn_count = if let Ok(n) = target.parse::<u64>() {
                 n
             } else {
                 let (_, thread) = self.session_from_snapshot(&id).await?;
-                let turn = message_id
-                    .trim()
-                    .strip_prefix("turn:")
-                    .unwrap_or(message_id.trim());
-                thread
-                    .get("checkpoints")
-                    .and_then(Value::as_array)
-                    .and_then(|items| {
-                        items
-                            .iter()
-                            .find(|c| c.get("turnId").and_then(Value::as_str) == Some(turn))
-                    })
-                    .and_then(|c| c.get("checkpointTurnCount").and_then(Value::as_u64))
-                    .ok_or_else(|| {
-                        AgentEngineError::RequestFailed("no checkpoint for that message".into())
-                    })?
+                mapper::revert_turn_count(&thread, target).ok_or_else(|| {
+                    AgentError::RequestFailed("no checkpoint for that message".into())
+                })?
             };
             self.client
                 .dispatch(commands::checkpoint_revert(&id, turn_count))
@@ -362,7 +369,7 @@ impl AgentEnginePort for T3Driver {
         })
     }
 
-    fn interrupt<'a>(&'a self, session_id: &'a str) -> EngineFuture<'a, ()> {
+    fn interrupt<'a>(&'a self, session_id: &'a str) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             let id = validate_id(session_id, "session id")?;
             self.client.dispatch(commands::turn_interrupt(&id)).await?;
@@ -370,11 +377,7 @@ impl AgentEnginePort for T3Driver {
         })
     }
 
-    fn switch_model<'a>(
-        &'a self,
-        session_id: &'a str,
-        model: &'a ModelRef,
-    ) -> EngineFuture<'a, ()> {
+    fn switch_model<'a>(&'a self, session_id: &'a str, model: &'a ModelRef) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             let id = validate_id(session_id, "session id")?;
             let selection = mapper::model_selection_from_ref(model);
@@ -388,8 +391,8 @@ impl AgentEnginePort for T3Driver {
     /// T3 has no persona to switch between. Its runtime and interaction
     /// modes are permission policies (`commands::runtime_mode_set`,
     /// `commands::interaction_mode_set`), which are not the app's modes.
-    fn switch_agent<'a>(&'a self, _session_id: &'a str, _agent: &'a str) -> EngineFuture<'a, ()> {
-        Box::pin(async { Err(AgentEngineError::Unsupported("switch_mode".into())) })
+    fn switch_mode<'a>(&'a self, _session_id: &'a str, _mode: &'a str) -> AgentFuture<'a, ()> {
+        Box::pin(async { Err(AgentError::Unsupported("switch_mode".into())) })
     }
 
     fn find_files<'a>(
@@ -397,8 +400,8 @@ impl AgentEnginePort for T3Driver {
         _query: &'a str,
         _limit: usize,
         _directory: Option<&'a str>,
-    ) -> EngineFuture<'a, Vec<Value>> {
-        Box::pin(async { Err(AgentEngineError::Unsupported("find_files".into())) })
+    ) -> AgentFuture<'a, Vec<Value>> {
+        Box::pin(async { Err(AgentError::Unsupported("find_files".into())) })
     }
 
     fn reply_permission<'a>(
@@ -407,7 +410,7 @@ impl AgentEnginePort for T3Driver {
         request_id: &'a str,
         decision: PermissionDecision,
         _message: Option<&'a str>,
-    ) -> EngineFuture<'a, ()> {
+    ) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             let id = validate_id(session_id, "session id")?;
             let request = validate_id(request_id, "request id")?;
@@ -451,12 +454,12 @@ impl AgentEnginePort for T3Driver {
         session_id: &'a str,
         form_id: &'a str,
         answers: Value,
-    ) -> EngineFuture<'a, ()> {
+    ) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             let id = validate_id(session_id, "session id")?;
             let request = validate_id(form_id, "form id")?;
             if !answers.is_object() {
-                return Err(AgentEngineError::RequestFailed(
+                return Err(AgentError::RequestFailed(
                     "answers must be an object".into(),
                 ));
             }
@@ -467,7 +470,7 @@ impl AgentEnginePort for T3Driver {
         })
     }
 
-    fn get_catalog<'a>(&'a self, _directory: Option<&'a str>) -> EngineFuture<'a, AgentCatalog> {
+    fn get_catalog<'a>(&'a self, _directory: Option<&'a str>) -> AgentFuture<'a, AgentCatalog> {
         Box::pin(async move {
             let config = self.client.get_config().await?;
             Ok(mapper::map_catalog(&config))
@@ -481,13 +484,11 @@ impl AgentEnginePort for T3Driver {
         &'a self,
         session_id: &'a str,
         mode: &'a str,
-    ) -> EngineFuture<'a, Vec<FileDiffItem>> {
+    ) -> AgentFuture<'a, Vec<FileDiffItem>> {
         Box::pin(async move {
             let id = validate_id(session_id, "session id")?;
             if !matches!(mode, "working" | "branch") {
-                return Err(AgentEngineError::Unsupported(format!(
-                    "vcs diff mode {mode}"
-                )));
+                return Err(AgentError::Unsupported(format!("vcs diff mode {mode}")));
             }
             let (_, thread) = self.session_from_snapshot(&id).await?;
             let Some(turn) = mapper::latest_checkpoint_turn(&thread) else {
@@ -502,7 +503,7 @@ impl AgentEnginePort for T3Driver {
     fn get_pending_permissions<'a>(
         &'a self,
         session_id: &'a str,
-    ) -> EngineFuture<'a, Vec<PermissionRequest>> {
+    ) -> AgentFuture<'a, Vec<PermissionRequest>> {
         Box::pin(async move {
             let id = validate_id(session_id, "session id")?;
             let (_, thread) = self.session_from_snapshot(&id).await?;
@@ -510,7 +511,7 @@ impl AgentEnginePort for T3Driver {
         })
     }
 
-    fn get_pending_forms<'a>(&'a self, session_id: &'a str) -> EngineFuture<'a, Vec<FormRequest>> {
+    fn get_pending_forms<'a>(&'a self, session_id: &'a str) -> AgentFuture<'a, Vec<FormRequest>> {
         Box::pin(async move {
             let id = validate_id(session_id, "session id")?;
             let (_, thread) = self.session_from_snapshot(&id).await?;
@@ -522,13 +523,14 @@ impl AgentEnginePort for T3Driver {
         &'a self,
         session_id: &'a str,
         limit: usize,
-    ) -> EngineFuture<'a, Vec<TimelineItem>> {
+    ) -> AgentFuture<'a, Vec<TimelineItem>> {
         Box::pin(async move {
             let id = validate_id(session_id, "session id")?;
             let detail = self.client.thread_snapshot(&id, None).await?;
-            let thread = detail.get("thread").ok_or_else(|| {
-                AgentEngineError::Protocol("thread snapshot without thread".into())
-            })?;
+            let thread = detail
+                .get("thread")
+                .ok_or_else(|| AgentError::Protocol("thread snapshot without thread".into()))?;
+            self.watcher.watch(&id);
             let mut items = mapper::map_thread_timeline(&id, thread);
             if limit > 0 && items.len() > limit {
                 items.drain(..items.len() - limit);
@@ -537,20 +539,21 @@ impl AgentEnginePort for T3Driver {
         })
     }
 
-    fn delete_session<'a>(&'a self, session_id: &'a str) -> EngineFuture<'a, ()> {
+    fn delete_session<'a>(&'a self, session_id: &'a str) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             let id = validate_id(session_id, "session id")?;
             self.client.dispatch(commands::thread_delete(&id)).await?;
+            self.watcher.unwatch(&id);
             Ok(())
         })
     }
 
-    fn rename_session<'a>(&'a self, session_id: &'a str, title: &'a str) -> EngineFuture<'a, ()> {
+    fn rename_session<'a>(&'a self, session_id: &'a str, title: &'a str) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             let id = validate_id(session_id, "session id")?;
             let title = title.trim();
             if title.is_empty() || title.chars().count() > 200 {
-                return Err(AgentEngineError::RequestFailed("invalid title".into()));
+                return Err(AgentError::RequestFailed("invalid title".into()));
             }
             self.client
                 .dispatch(commands::thread_rename(&id, title))
@@ -597,11 +600,11 @@ mod tests {
         ));
         assert!(matches!(
             driver.create_session(Some("/"), None, Some("build")).await,
-            Err(AgentEngineError::Unsupported(_))
+            Err(AgentError::Unsupported(_))
         ));
         assert!(matches!(
-            driver.switch_agent("t1", "plan").await,
-            Err(AgentEngineError::Unsupported(_))
+            driver.switch_mode("t1", "plan").await,
+            Err(AgentError::Unsupported(_))
         ));
         driver.client().shutdown();
     }
@@ -693,7 +696,7 @@ mod tests {
         driver.delete_session(&id).await.expect("delete");
         assert!(matches!(
             driver.get_session(&id).await,
-            Err(AgentEngineError::SessionNotFound(_))
+            Err(AgentError::SessionNotFound(_))
         ));
         driver.client().shutdown();
         let _ = std::fs::remove_dir_all(&dir);
