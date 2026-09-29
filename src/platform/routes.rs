@@ -45,16 +45,13 @@ pub async fn api_capabilities(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    let device_id = headers
-        .get("authorization")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "))
-        .or_else(|| headers.get("x-device-token").and_then(|h| h.to_str().ok()));
+    let device_id = require_device(&state, &headers).ok();
     let sealed = device_id
+        .as_deref()
         .map(|id| device_seals_its_transport(&state, id))
         .unwrap_or(false);
 
-    let discovery = super::discovery::build_discovery(&state, sealed).await;
+    let discovery = super::discovery::build_discovery(&state, sealed, device_id.is_some()).await;
     Ok(Json(discovery))
 }
 
@@ -62,16 +59,13 @@ pub async fn api_discovery(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    let device_id = headers
-        .get("authorization")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "))
-        .or_else(|| headers.get("x-device-token").and_then(|h| h.to_str().ok()));
+    let device_id = require_device(&state, &headers).ok();
     let sealed = device_id
+        .as_deref()
         .map(|id| device_seals_its_transport(&state, id))
         .unwrap_or(false);
 
-    let discovery = super::discovery::build_discovery(&state, sealed).await;
+    let discovery = super::discovery::build_discovery(&state, sealed, device_id.is_some()).await;
     Ok(Json(discovery))
 }
 

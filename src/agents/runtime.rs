@@ -11,7 +11,7 @@
 //! stream or the health probe says the engine has gone, and hands every route
 //! whatever manager is current.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,6 +45,58 @@ const STREAM_LOSS_MAX_WAIT: Duration = Duration::from_secs(30);
 /// The engine major version this gateway speaks. v1 is a different API, and
 /// half-working with it is worse than saying so.
 const MIN_OPENCODE_MAJOR: u64 = 2;
+
+/// Harness ids in primary-preference order. OpenCode is the established
+/// harness and DeepSeek is opt-in, so DeepSeek is primary only when OpenCode is
+/// not attached. Every place that names a harness by position reads this.
+pub const HARNESS_PREFERENCE: [&str; 2] = ["opencode", "deepseek"];
+/// Most session-to-harness routes remembered; the oldest go first.
+const MAX_SESSION_ROUTES: usize = 4096;
+/// How long a harness discovery result is reused.
+const DISCOVERY_TTL: Duration = Duration::from_secs(10);
+/// The longest a request may wait on upstream probing.
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
+/// The longest one engine may take to say whether it owns a session.
+const SESSION_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The entry of `map` for the most preferred harness present.
+fn pick_primary<T>(map: &BTreeMap<String, T>) -> Option<&T> {
+    HARNESS_PREFERENCE.iter().find_map(|id| map.get(*id))
+}
+
+/// Remembered session routes, bounded: insertion order is kept so the oldest
+/// can be dropped.
+#[derive(Default)]
+struct SessionRoutes {
+    map: HashMap<String, String>,
+    order: VecDeque<String>,
+}
+
+impl SessionRoutes {
+    fn insert(&mut self, asid: &str, harness: &str) {
+        if self
+            .map
+            .insert(asid.to_string(), harness.to_string())
+            .is_none()
+        {
+            self.order.push_back(asid.to_string());
+        }
+        while self.map.len() > MAX_SESSION_ROUTES {
+            match self.order.pop_front() {
+                Some(oldest) => {
+                    self.map.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+    }
+
+    fn remove(&mut self, asid: &str) {
+        if self.map.remove(asid).is_some() {
+            self.order.retain(|a| a != asid);
+        }
+    }
+}
 
 /// `opencode` in `config.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,7 +133,7 @@ impl Default for OpencodeConfig {
 }
 
 /// `deepseek` in `config.json`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct DeepseekConfig {
     /// Explicitly enable DeepSeek Harness engine support
     #[serde(default)]
@@ -95,6 +147,20 @@ pub struct DeepseekConfig {
     /// Optional signing secret for browser-session cookie
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,
+}
+
+/// `Debug` never prints the token or the cookie secret: `Config` derives
+/// `Debug` and is logged at startup, and a bearer in the journal is a leak.
+impl std::fmt::Debug for DeepseekConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redact = |value: &Option<String>| value.as_ref().map(|_| "<redacted>");
+        f.debug_struct("DeepseekConfig")
+            .field("enabled", &self.enabled)
+            .field("endpoint", &self.endpoint)
+            .field("token", &redact(&self.token))
+            .field("secret", &redact(&self.secret))
+            .finish()
+    }
 }
 
 /// How the engine currently attached was obtained, for the status route and
@@ -141,7 +207,16 @@ pub struct EngineStatus {
 pub struct AgentRuntime {
     manager: RwLock<Option<Arc<AgentManager>>>,
     managers: RwLock<BTreeMap<String, Arc<AgentManager>>>,
-    session_routes: RwLock<HashMap<String, String>>,
+    session_routes: RwLock<SessionRoutes>,
+    /// The last harness discovery and when it was taken.
+    discovery_cache: RwLock<
+        Option<(
+            tokio::time::Instant,
+            crate::discovery::HarnessPlaneDiscovery,
+        )>,
+    >,
+    /// One refresh at a time; the rest wait and read its result.
+    discovery_refresh: Mutex<()>,
     /// The event channel belongs to the runtime, not to a manager, so a
     /// subscriber keeps its stream across a reconnect.
     events_tx: broadcast::Sender<AgentDomainEvent>,
@@ -163,7 +238,9 @@ impl AgentRuntime {
         Arc::new(Self {
             manager: RwLock::new(None),
             managers: RwLock::new(BTreeMap::new()),
-            session_routes: RwLock::new(HashMap::new()),
+            session_routes: RwLock::new(SessionRoutes::default()),
+            discovery_cache: RwLock::new(None),
+            discovery_refresh: Mutex::new(()),
             events_tx,
             config,
             deepseek_config,
@@ -218,22 +295,56 @@ impl AgentRuntime {
         None
     }
 
-    /// Return manager for a specific session id, routing by recorded harness or fallback.
+    /// Whether `harness` is an id this gateway knows, attached or not.
+    pub fn is_known_harness(&self, harness: &str) -> bool {
+        HARNESS_PREFERENCE.contains(&harness)
+    }
+
+    /// Attached managers with their harness ids, most preferred first.
+    async fn attached_in_order(&self) -> Vec<(String, Arc<AgentManager>)> {
+        let map = self.managers.read().await;
+        let mut out: Vec<_> = HARNESS_PREFERENCE
+            .iter()
+            .filter_map(|id| map.get(*id).map(|m| (id.to_string(), m.clone())))
+            .collect();
+        if out.is_empty() {
+            if let Some(m) = self.manager.read().await.clone() {
+                out.push((m.engine().kind().to_string(), m));
+            }
+        }
+        out
+    }
+
+    /// The manager that owns a session: the recorded route, else whichever
+    /// attached engine says it has the session (and that is then recorded).
+    /// `None` when nothing owns it.
     pub async fn manager_for_session(&self, asid: &str) -> Option<Arc<AgentManager>> {
-        if let Some(harness) = self.session_routes.read().await.get(asid) {
-            if let Some(m) = self.manager_for_harness(harness).await {
+        let recorded = self.session_routes.read().await.map.get(asid).cloned();
+        if let Some(harness) = recorded {
+            if let Some(m) = self.manager_for_harness(&harness).await {
                 return Some(m);
             }
         }
-        self.manager().await
+        for (harness, manager) in self.attached_in_order().await {
+            let owns =
+                tokio::time::timeout(SESSION_LOOKUP_TIMEOUT, manager.engine().get_session(asid))
+                    .await;
+            if matches!(owns, Ok(Ok(_))) {
+                self.record_session_route(asid, &harness).await;
+                return Some(manager);
+            }
+        }
+        None
     }
 
     /// Record routing for a session id to its owning harness.
     pub async fn record_session_route(&self, asid: &str, harness: &str) {
-        self.session_routes
-            .write()
-            .await
-            .insert(asid.to_string(), harness.to_string());
+        self.session_routes.write().await.insert(asid, harness);
+    }
+
+    /// Drop the route of a session that no longer exists.
+    pub async fn forget_session_route(&self, asid: &str) {
+        self.session_routes.write().await.remove(asid);
     }
 
     pub fn subscribe_events(&self) -> broadcast::Receiver<AgentDomainEvent> {
@@ -266,8 +377,111 @@ impl AgentRuntime {
         self.discover_harnesses().await
     }
 
-    /// Discover status and capabilities of all configured or reachable AI harnesses.
+    /// Status and capabilities of all configured or reachable AI harnesses.
+    ///
+    /// Served from a short-lived cache so unauthenticated discovery requests do
+    /// not each probe upstream. A refresh that overruns `DISCOVERY_TIMEOUT`
+    /// yields the stale result, or a snapshot of what is attached if there is
+    /// none.
     pub async fn discover_harnesses(&self) -> crate::discovery::HarnessPlaneDiscovery {
+        let fresh = |cache: &Option<(
+            tokio::time::Instant,
+            crate::discovery::HarnessPlaneDiscovery,
+        )>| {
+            cache
+                .as_ref()
+                .filter(|(at, _)| at.elapsed() < DISCOVERY_TTL)
+                .map(|(_, d)| d.clone())
+        };
+        if let Some(hit) = fresh(&*self.discovery_cache.read().await) {
+            return hit;
+        }
+        let refresh = async {
+            let _one = self.discovery_refresh.lock().await;
+            if let Some(hit) = fresh(&*self.discovery_cache.read().await) {
+                return hit;
+            }
+            let found = self.probe_harnesses().await;
+            *self.discovery_cache.write().await =
+                Some((tokio::time::Instant::now(), found.clone()));
+            found
+        };
+        match tokio::time::timeout(DISCOVERY_TIMEOUT, refresh).await {
+            Ok(found) => found,
+            Err(_) => {
+                tracing::warn!("harness discovery timed out");
+                let stale = self
+                    .discovery_cache
+                    .read()
+                    .await
+                    .as_ref()
+                    .map(|(_, d)| d.clone());
+                match stale {
+                    Some(d) => d,
+                    None => self.attached_snapshot().await,
+                }
+            }
+        }
+    }
+
+    /// Discovery without touching the network: what is attached, and the
+    /// configuration, nothing more.
+    async fn attached_snapshot(&self) -> crate::discovery::HarnessPlaneDiscovery {
+        use crate::discovery::{
+            HarnessDiscoveryInfo, HarnessPlaneDiscovery, HarnessPlaneFeatures, HarnessStatus,
+        };
+        let attached = self.attached_in_order().await;
+        let harnesses = HARNESS_PREFERENCE
+            .iter()
+            .map(|id| {
+                let enabled = match *id {
+                    "opencode" => self.config.enabled,
+                    _ => self.deepseek_config.enabled || self.deepseek_config.endpoint.is_some(),
+                };
+                let manager = attached.iter().find(|(h, _)| h == id).map(|(_, m)| m);
+                let (name, features) = match *id {
+                    "opencode" => ("OpenCode", opencode_features(false, false)),
+                    _ => ("DeepSeek Harness", deepseek_features(false, false)),
+                };
+                HarnessDiscoveryInfo {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    kind: id.to_string(),
+                    status: match (enabled, manager) {
+                        (false, _) => HarnessStatus::Disabled,
+                        (true, Some(_)) => HarnessStatus::Connected,
+                        (true, None) => HarnessStatus::Offline,
+                    },
+                    enabled,
+                    endpoint: manager.map(|m| m.endpoint_url().to_string()),
+                    version: manager.and_then(|m| m.version()),
+                    models: Vec::new(),
+                    agents: Vec::new(),
+                    features,
+                }
+            })
+            .collect::<Vec<_>>();
+        let supported = harnesses
+            .iter()
+            .any(|h| h.status == HarnessStatus::Connected);
+        HarnessPlaneDiscovery {
+            supported,
+            active_harness: self
+                .manager
+                .read()
+                .await
+                .as_ref()
+                .map(|m| m.engine().kind().to_string()),
+            harnesses,
+            features: HarnessPlaneFeatures {
+                multi_harness: true,
+                catalog_aggregation: true,
+                session_routing: true,
+            },
+        }
+    }
+
+    async fn probe_harnesses(&self) -> crate::discovery::HarnessPlaneDiscovery {
         use crate::discovery::{
             HarnessDiscoveryInfo, HarnessPlaneDiscovery, HarnessPlaneFeatures, HarnessStatus,
         };
@@ -696,27 +910,11 @@ impl AgentRuntime {
             }
         }
 
-        // 3. Check fallback DeepSeek discovery if not yet found
-        if !deepseek_ok {
-            if let Some(endpoint) =
-                crate::agents::adapters::deepseek::DeepseekEndpoint::discover().await
-            {
-                let client = probe_client();
-                if endpoint.probe_healthy(&client).await {
-                    self.attach_deepseek(endpoint, EngineOrigin::Adopted).await;
-                    deepseek_ok = true;
-                }
-            }
-        }
-
         if deepseek_ok || opencode_ok {
             *start_backoff = Duration::from_secs(2);
-            let managers = self.managers.read().await;
-            if let Some(mgr) = managers
-                .get("deepseek")
-                .or_else(|| managers.get("opencode"))
-            {
-                *self.manager.write().await = Some(mgr.clone());
+            let primary = pick_primary(&*self.managers.read().await).cloned();
+            if let Some(mgr) = primary {
+                *self.manager.write().await = Some(mgr);
             }
             true
         } else {
@@ -742,11 +940,8 @@ impl AgentRuntime {
         self.managers
             .write()
             .await
-            .insert("opencode".to_string(), manager.clone());
-        if self.manager.read().await.is_none() || !self.deepseek_config.enabled {
-            *self.manager.write().await = Some(manager);
-            *self.origin.write().await = origin;
-        }
+            .insert("opencode".to_string(), manager);
+        self.promote_primary("opencode", origin).await;
         let path = path.unwrap_or_else(|| "unknown".to_string());
         match origin {
             EngineOrigin::Adopted => tracing::info!(
@@ -765,6 +960,24 @@ impl AgentRuntime {
         }
     }
 
+    /// Make the most preferred attached manager the primary; `origin` is
+    /// recorded when that is the one that was just attached.
+    async fn promote_primary(&self, attached: &str, origin: EngineOrigin) {
+        let primary = {
+            let map = self.managers.read().await;
+            HARNESS_PREFERENCE
+                .iter()
+                .find(|id| map.contains_key(**id))
+                .map(|id| (*id, map[*id].clone()))
+        };
+        if let Some((id, manager)) = primary {
+            *self.manager.write().await = Some(manager);
+            if id == attached {
+                *self.origin.write().await = origin;
+            }
+        }
+    }
+
     async fn attach_deepseek(
         &self,
         endpoint: crate::agents::adapters::deepseek::DeepseekEndpoint,
@@ -779,11 +992,8 @@ impl AgentRuntime {
         self.managers
             .write()
             .await
-            .insert("deepseek".to_string(), manager.clone());
-        if self.manager.read().await.is_none() || self.deepseek_config.enabled {
-            *self.manager.write().await = Some(manager);
-            *self.origin.write().await = origin;
-        }
+            .insert("deepseek".to_string(), manager);
+        self.promote_primary("deepseek", origin).await;
         tracing::info!(
             url = %url,
             version = version.as_deref().unwrap_or("unknown"),
@@ -1553,6 +1763,98 @@ mod tests {
 
         runtime.record_session_route("ses_123", "deepseek").await;
         let routes = runtime.session_routes.read().await;
-        assert_eq!(routes.get("ses_123"), Some(&"deepseek".to_string()));
+        assert_eq!(routes.map.get("ses_123"), Some(&"deepseek".to_string()));
+    }
+
+    #[test]
+    fn primary_follows_the_preference_order_not_the_map_order() {
+        let mut map = BTreeMap::new();
+        assert_eq!(pick_primary(&map), None);
+        map.insert("deepseek".to_string(), 2);
+        assert_eq!(pick_primary(&map), Some(&2));
+        map.insert("opencode".to_string(), 1);
+        assert_eq!(
+            pick_primary(&map),
+            Some(&1),
+            "OpenCode wins when both are attached"
+        );
+        map.insert("other".to_string(), 3);
+        map.remove("opencode");
+        assert_eq!(pick_primary(&map), Some(&2));
+    }
+
+    #[test]
+    fn session_routes_are_bounded_and_evictable() {
+        let mut routes = SessionRoutes::default();
+        for i in 0..MAX_SESSION_ROUTES + 10 {
+            routes.insert(&format!("s{i}"), "opencode");
+        }
+        assert_eq!(routes.map.len(), MAX_SESSION_ROUTES);
+        assert!(!routes.map.contains_key("s0"), "the oldest went first");
+        assert!(routes
+            .map
+            .contains_key(&format!("s{}", MAX_SESSION_ROUTES + 9)));
+        routes.insert("s20", "deepseek");
+        assert_eq!(
+            routes.order.len(),
+            MAX_SESSION_ROUTES,
+            "re-recording adds no entry"
+        );
+        routes.remove("s20");
+        assert!(!routes.map.contains_key("s20"));
+        assert_eq!(routes.order.len(), MAX_SESSION_ROUTES - 1);
+    }
+
+    #[tokio::test]
+    async fn an_unrecorded_session_with_nothing_attached_is_owned_by_nobody() {
+        let runtime = AgentRuntime::disabled();
+        assert!(runtime.manager_for_session("ses_unknown").await.is_none());
+        runtime.record_session_route("ses_x", "opencode").await;
+        runtime.forget_session_route("ses_x").await;
+        assert!(!runtime
+            .session_routes
+            .read()
+            .await
+            .map
+            .contains_key("ses_x"));
+    }
+
+    #[test]
+    fn only_the_preference_list_names_known_harnesses() {
+        let runtime = AgentRuntime::disabled();
+        assert!(runtime.is_known_harness("opencode"));
+        assert!(runtime.is_known_harness("deepseek"));
+        assert!(!runtime.is_known_harness("claude"));
+    }
+
+    #[tokio::test]
+    async fn a_disabled_deepseek_is_not_probed_or_attached() {
+        let runtime = AgentRuntime::disabled();
+        let mut backoff = Duration::from_secs(2);
+        assert!(!runtime.check_and_repair(&mut backoff).await);
+        assert!(runtime.manager_for_harness("deepseek").await.is_none());
+        let found = runtime.discover_harnesses().await;
+        let ds = found.harnesses.iter().find(|h| h.id == "deepseek").unwrap();
+        assert_eq!(ds.status, crate::discovery::HarnessStatus::Disabled);
+        assert!(ds.endpoint.is_none());
+    }
+
+    #[tokio::test]
+    async fn harness_discovery_is_memoized() {
+        let runtime = AgentRuntime::disabled();
+        let first = runtime.discover_harnesses().await;
+        assert!(runtime.discovery_cache.read().await.is_some());
+        // Poison the cache; a second call inside the TTL must return it as is.
+        runtime
+            .discovery_cache
+            .write()
+            .await
+            .as_mut()
+            .unwrap()
+            .1
+            .active_harness = Some("cached".into());
+        let second = runtime.discover_harnesses().await;
+        assert_eq!(second.active_harness.as_deref(), Some("cached"));
+        assert_ne!(first.active_harness, second.active_harness);
     }
 }

@@ -304,9 +304,26 @@ pub async fn build_discovery_planes(state: &AppState) -> DiscoveryPlanes {
     }
 }
 
-/// Build complete capability discovery response
-pub async fn build_discovery(state: &AppState, _sealed: bool) -> Value {
-    let planes = build_discovery_planes(state).await;
+impl HarnessPlaneDiscovery {
+    /// Drop what only a paired device should learn: where each harness
+    /// listens and which version it runs.
+    pub fn redact_endpoints(&mut self) {
+        for h in &mut self.harnesses {
+            h.endpoint = None;
+            h.version = None;
+        }
+    }
+}
+
+/// Build complete capability discovery response. An unauthenticated caller
+/// gets harness id, kind, status and features, without endpoints or versions.
+pub async fn build_discovery(state: &AppState, _sealed: bool, authenticated: bool) -> Value {
+    let mut planes = build_discovery_planes(state).await;
+    if !authenticated {
+        planes.agents.redact_endpoints();
+        planes.agent.redact_endpoints();
+        planes.harness.redact_endpoints();
+    }
     let collaboration_somewhere = planes.terminal.backends.iter().any(|b| {
         b.capabilities
             .iter()
@@ -519,5 +536,21 @@ mod tests {
         assert_eq!(val["ssh"]["supported"], true);
         assert_eq!(val["ssh"]["tunnelSupported"], true);
         assert_eq!(val["ssh"]["pushTokenSupported"], true);
+    }
+
+    #[tokio::test]
+    async fn redaction_drops_endpoints_and_versions_but_keeps_status() {
+        let mut plane = crate::agents::AgentRuntime::disabled()
+            .discover_harnesses()
+            .await;
+        let id = plane.harnesses[0].id.clone();
+        plane.harnesses[0].endpoint = Some("http://127.0.0.1:4096".into());
+        plane.harnesses[0].version = Some("2.0.1".into());
+        plane.redact_endpoints();
+        let val = serde_json::to_value(&plane).unwrap();
+        assert!(val["harnesses"][0].get("endpoint").is_none());
+        assert!(val["harnesses"][0].get("version").is_none());
+        assert_eq!(val["harnesses"][0]["status"], "disabled");
+        assert_eq!(val["harnesses"][0]["id"], id.as_str());
     }
 }

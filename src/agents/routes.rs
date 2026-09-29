@@ -571,42 +571,36 @@ async fn do_create_agent_session(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let target_harness = body.harness.as_deref().or_else(|| {
-        body.model.as_ref().and_then(|m| {
-            if m.provider_id == "deepseek" {
-                Some("deepseek")
-            } else if m.provider_id == "opencode" {
-                Some("opencode")
-            } else {
-                None
+    // An explicit `harness` is the only selector. The model's provider says
+    // nothing about the engine: an OpenCode provider may be named `deepseek`.
+    let manager = match body.harness.as_deref() {
+        Some(h) => {
+            if !state.agent_runtime.is_known_harness(h) {
+                return Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_harness",
+                    &format!("Unknown agent harness '{h}'"),
+                ));
             }
-        })
-    });
-
-    let manager = match target_harness {
-        Some(h) => match state.agent_runtime.manager_for_harness(h).await {
-            Some(m) => m,
-            None => match state.agent_runtime.manager().await {
-                Some(m) => m,
-                None => {
-                    return Err(api_error(
+            state
+                .agent_runtime
+                .manager_for_harness(h)
+                .await
+                .ok_or_else(|| {
+                    api_error(
                         StatusCode::SERVICE_UNAVAILABLE,
                         "agent_unavailable",
                         &format!("Agent harness '{h}' is not available"),
-                    ));
-                }
-            },
-        },
-        None => match state.agent_runtime.manager().await {
-            Some(m) => m,
-            None => {
-                return Err(api_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "agent_unavailable",
-                    "Agent engine is not available",
-                ));
-            }
-        },
+                    )
+                })?
+        }
+        None => state.agent_runtime.manager().await.ok_or_else(|| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "agent_unavailable",
+                "Agent engine is not available",
+            )
+        })?,
     };
 
     let validated_dir = match body.directory.as_deref() {
@@ -669,13 +663,7 @@ async fn do_get_agent_session(
 ) -> ApiResult<Response> {
     require_device(state, headers)?;
 
-    let Some(manager) = state.agent_runtime.manager_for_session(asid).await else {
-        return Err(api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "agent_unavailable",
-            "Agent engine is not available",
-        ));
-    };
+    let manager = session_manager_or_err(state, asid).await?;
 
     let snapshot = manager
         .sessions()
@@ -699,13 +687,7 @@ async fn do_get_agent_session_events(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let Some(manager) = state.agent_runtime.manager_for_session(asid).await else {
-        return Err(api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "agent_unavailable",
-            "Agent engine is not available",
-        ));
-    };
+    let manager = session_manager_or_err(state, asid).await?;
 
     match manager
         .sessions()
@@ -729,13 +711,7 @@ async fn do_get_agent_session_timeline(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let Some(manager) = state.agent_runtime.manager_for_session(asid).await else {
-        return Err(api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "agent_unavailable",
-            "Agent engine is not available",
-        ));
-    };
+    let manager = session_manager_or_err(state, asid).await?;
 
     let (items, status, resync, latest_seq) = manager
         .mirror()
@@ -760,13 +736,7 @@ async fn do_switch_agent_mode(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let Some(manager) = state.agent_runtime.manager_for_session(asid).await else {
-        return Err(api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "agent_unavailable",
-            "Agent engine is not available",
-        ));
-    };
+    let manager = session_manager_or_err(state, asid).await?;
 
     manager
         .engine()
@@ -836,13 +806,7 @@ async fn do_send_agent_prompt(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let Some(manager) = state.agent_runtime.manager_for_session(asid).await else {
-        return Err(api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "agent_unavailable",
-            "Agent engine is not available",
-        ));
-    };
+    let manager = session_manager_or_err(state, asid).await?;
 
     validate_text(&body.text)?;
 
@@ -875,13 +839,7 @@ async fn do_revert_agent_session(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let Some(manager) = state.agent_runtime.manager_for_session(asid).await else {
-        return Err(api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "agent_unavailable",
-            "Agent engine is not available",
-        ));
-    };
+    let manager = session_manager_or_err(state, asid).await?;
 
     manager
         .sessions()
@@ -908,13 +866,7 @@ async fn do_interrupt_agent_session(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let Some(manager) = state.agent_runtime.manager_for_session(asid).await else {
-        return Err(api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "agent_unavailable",
-            "Agent engine is not available",
-        ));
-    };
+    let manager = session_manager_or_err(state, asid).await?;
 
     manager
         .prompts()
@@ -939,13 +891,7 @@ async fn do_switch_agent_model(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let Some(manager) = state.agent_runtime.manager_for_session(asid).await else {
-        return Err(api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "agent_unavailable",
-            "Agent engine is not available",
-        ));
-    };
+    let manager = session_manager_or_err(state, asid).await?;
 
     manager
         .sessions()
@@ -971,13 +917,7 @@ async fn do_reply_agent_permission(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let Some(manager) = state.agent_runtime.manager_for_session(asid).await else {
-        return Err(api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "agent_unavailable",
-            "Agent engine is not available",
-        ));
-    };
+    let manager = session_manager_or_err(state, asid).await?;
 
     let decision = match body.decision.as_str() {
         "allow" | "once" => PermissionDecision::Allow,
@@ -1021,13 +961,7 @@ async fn do_reply_agent_form(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let Some(manager) = state.agent_runtime.manager_for_session(asid).await else {
-        return Err(api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "agent_unavailable",
-            "Agent engine is not available",
-        ));
-    };
+    let manager = session_manager_or_err(state, asid).await?;
 
     manager
         .interactions()
@@ -1056,13 +990,7 @@ async fn do_get_agent_vcs_diff(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let Some(manager) = state.agent_runtime.manager_for_session(asid).await else {
-        return Err(api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "agent_unavailable",
-            "Agent engine is not available",
-        ));
-    };
+    let manager = session_manager_or_err(state, asid).await?;
 
     let mode = match mode.unwrap_or("working") {
         m @ ("working" | "branch" | "committed") => m,
@@ -1327,13 +1255,7 @@ async fn do_stream_agent_session(
         None => None,
     };
 
-    let Some(manager) = state.agent_runtime.manager_for_session(asid).await else {
-        return Err(api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "agent_unavailable",
-            "Agent engine is not available",
-        ));
-    };
+    let manager = session_manager_or_err(state, asid).await?;
 
     let target_asid = AgentSessionId(asid.to_string());
     let mut rx = state.agent_runtime.subscribe_events();
@@ -1877,6 +1799,37 @@ macro_rules! manager_or_unavailable {
     }};
 }
 
+macro_rules! session_manager_or_err {
+    ($state:expr, $headers:expr, $asid:expr) => {{
+        require_device($state, $headers)?;
+        session_manager_or_err($state, $asid).await?
+    }};
+}
+
+/// The manager that owns a session. Nothing attached is 503; an engine is
+/// attached but none of them knows the id is 404, so a session id from before
+/// a restart is never handed to an engine that will not recognise it.
+async fn session_manager_or_err(
+    state: &AppState,
+    asid: &str,
+) -> ApiResult<std::sync::Arc<super::manager::AgentManager>> {
+    if let Some(manager) = state.agent_runtime.manager_for_session(asid).await {
+        return Ok(manager);
+    }
+    if state.agent_runtime.all_managers().await.is_empty() {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "agent_unavailable",
+            "Agent engine is not available",
+        ));
+    }
+    Err(api_error(
+        StatusCode::NOT_FOUND,
+        "session_not_found",
+        "No attached agent engine owns this session",
+    ))
+}
+
 fn engine_error(err: super::ports::engine::AgentEngineError) -> (StatusCode, Json<Value>) {
     // A folder that is gone is not an engine fault, and answering 502 for it
     // told the user their agent had broken when their directory had simply
@@ -1950,7 +1903,7 @@ async fn delete_agent_session_global(
     Path(asid): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    let manager = manager_or_unavailable!(&state, &headers);
+    let manager = session_manager_or_err!(&state, &headers, &asid);
     manager
         .engine()
         .delete_session(&asid)
@@ -1962,6 +1915,7 @@ async fn delete_agent_session_global(
         .mirror()
         .remove_session(&AgentSessionId(asid.clone()))
         .await;
+    state.agent_runtime.forget_session_route(&asid).await;
     Ok(Json(content_envelope(json!({ "deleted": true }))))
 }
 
@@ -1971,7 +1925,7 @@ async fn rename_agent_session(
     headers: HeaderMap,
     Json(body): Json<RenameSessionBody>,
 ) -> ApiResult<Json<Value>> {
-    let manager = manager_or_unavailable!(&state, &headers);
+    let manager = session_manager_or_err!(&state, &headers, &asid);
     validate_text(&body.title)?;
     manager
         .engine()
@@ -1988,7 +1942,7 @@ async fn clear_agent_session_revert(
     Path(asid): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    let manager = manager_or_unavailable!(&state, &headers);
+    let manager = session_manager_or_err!(&state, &headers, &asid);
     manager
         .engine()
         .clear_revert(&asid)
@@ -2025,7 +1979,7 @@ async fn list_saved_agent_permissions(
     Path(asid): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    let manager = manager_or_unavailable!(&state, &headers);
+    let manager = session_manager_or_err!(&state, &headers, &asid);
     let engine = manager.engine();
     let project_id = session_project_id(engine.as_ref(), &asid).await?;
     let items = engine
@@ -2051,7 +2005,7 @@ async fn forget_saved_agent_permission(
     Path((asid, saved_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    let manager = manager_or_unavailable!(&state, &headers);
+    let manager = session_manager_or_err!(&state, &headers, &asid);
     let engine = manager.engine();
     let project_id = session_project_id(engine.as_ref(), &asid).await?;
     let known = engine
@@ -2180,7 +2134,7 @@ async fn move_agent_session(
     headers: HeaderMap,
     Json(body): Json<MoveSessionBody>,
 ) -> ApiResult<Json<Value>> {
-    let manager = manager_or_unavailable!(&state, &headers);
+    let manager = session_manager_or_err!(&state, &headers, &asid);
     let directory = body.directory.trim();
     if directory.is_empty() {
         return Err(api_error(
@@ -2216,7 +2170,7 @@ async fn stage_agent_session_revert(
     headers: HeaderMap,
     Json(body): Json<StageRevertBody>,
 ) -> ApiResult<Json<Value>> {
-    let manager = manager_or_unavailable!(&state, &headers);
+    let manager = session_manager_or_err!(&state, &headers, &asid);
     let message_id = body.message_id.trim();
     if message_id.is_empty() {
         return Err(api_error(
@@ -2248,7 +2202,7 @@ async fn commit_agent_session_revert(
     Path(asid): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    let manager = manager_or_unavailable!(&state, &headers);
+    let manager = session_manager_or_err!(&state, &headers, &asid);
     manager
         .engine()
         .commit_revert(&asid)
@@ -2266,7 +2220,7 @@ async fn activate_agent_skill(
     headers: HeaderMap,
     Json(body): Json<ActivateSkillBody>,
 ) -> ApiResult<Json<Value>> {
-    let manager = manager_or_unavailable!(&state, &headers);
+    let manager = session_manager_or_err!(&state, &headers, &asid);
     let skill = body.skill.trim();
     if skill.is_empty() {
         return Err(api_error(
@@ -2290,7 +2244,7 @@ async fn compact_agent_session(
     headers: HeaderMap,
     body: Option<Json<CompactBody>>,
 ) -> ApiResult<Json<Value>> {
-    let manager = manager_or_unavailable!(&state, &headers);
+    let manager = session_manager_or_err!(&state, &headers, &asid);
     let delivery = body.and_then(|Json(b)| b.delivery);
     let res = manager
         .engine()
@@ -2309,7 +2263,7 @@ async fn get_agent_session_context(
     Path(asid): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    let manager = manager_or_unavailable!(&state, &headers);
+    let manager = session_manager_or_err!(&state, &headers, &asid);
     let messages = manager
         .engine()
         .get_context(&asid)
@@ -2335,7 +2289,7 @@ async fn background_agent_session(
     Path(asid): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    let manager = manager_or_unavailable!(&state, &headers);
+    let manager = session_manager_or_err!(&state, &headers, &asid);
     manager
         .engine()
         .background_session(&asid)
@@ -2354,7 +2308,7 @@ async fn wait_agent_session(
     Path(asid): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    let manager = manager_or_unavailable!(&state, &headers);
+    let manager = session_manager_or_err!(&state, &headers, &asid);
     manager
         .engine()
         .wait_session(&asid)
@@ -2369,7 +2323,7 @@ async fn view_agent_session(
     headers: HeaderMap,
     body: Option<Json<ViewSessionBody>>,
 ) -> ApiResult<Json<Value>> {
-    let manager = manager_or_unavailable!(&state, &headers);
+    let manager = session_manager_or_err!(&state, &headers, &asid);
     let idle = body.and_then(|Json(b)| b.idle).unwrap_or_else(|| {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2390,7 +2344,7 @@ async fn export_agent_session(
     Query(query): Query<ExportQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    let manager = manager_or_unavailable!(&state, &headers);
+    let manager = session_manager_or_err!(&state, &headers, &asid);
     // Sanitized by default: an export leaves the device.
     let sanitize = query.sanitize.unwrap_or(true);
     let res = manager
@@ -2409,7 +2363,7 @@ async fn run_agent_session_command(
     headers: HeaderMap,
     Json(body): Json<RunCommandBody>,
 ) -> ApiResult<Json<Value>> {
-    let manager = manager_or_unavailable!(&state, &headers);
+    let manager = session_manager_or_err!(&state, &headers, &asid);
     let name = body.name.trim().trim_start_matches('/');
     if name.is_empty() {
         return Err(api_error(
@@ -2435,7 +2389,7 @@ async fn get_agent_inbox(
     Path(asid): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    let manager = manager_or_unavailable!(&state, &headers);
+    let manager = session_manager_or_err!(&state, &headers, &asid);
     let items = manager
         .engine()
         .get_inbox(&asid)
@@ -2454,7 +2408,7 @@ async fn cancel_agent_inbox_item(
     Path((asid, inbox_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    let manager = manager_or_unavailable!(&state, &headers);
+    let manager = session_manager_or_err!(&state, &headers, &asid);
     manager
         .engine()
         .cancel_inbox_item(&asid, &inbox_id)
@@ -2490,7 +2444,7 @@ async fn set_inbox_delivery(
     delivery: &str,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    let manager = manager_or_unavailable!(&state, &headers);
+    let manager = session_manager_or_err!(&state, &headers, &asid);
     manager
         .engine()
         .set_inbox_delivery(&asid, &inbox_id, delivery)
@@ -3009,5 +2963,54 @@ mod tests {
         let bare: SwitchAgentBody =
             serde_json::from_value(json!("plan")).expect("bare string should parse");
         assert_eq!(bare.into_agent(), "plan");
+    }
+
+    async fn create_refusal(body: Value) -> (StatusCode, Value) {
+        let state = crate::test_support::test_state(
+            "admin",
+            vec![crate::test_support::test_device("phone-1", "device-token")],
+        );
+        let headers = crate::test_support::bearer_headers("device-token");
+        let body: CreateAgentSessionBody = serde_json::from_value(body).unwrap();
+        let refusal = do_create_agent_session(&state, body, &headers)
+            .await
+            .expect_err("nothing is attached");
+        let status = refusal.0;
+        (status, crate::test_support::error_body(&refusal))
+    }
+
+    #[tokio::test]
+    async fn create_session_rejects_an_unknown_harness() {
+        let (status, body) = create_refusal(json!({ "harness": "claude" })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_harness");
+    }
+
+    #[tokio::test]
+    async fn create_session_names_a_known_harness_that_is_not_attached() {
+        let (status, body) = create_refusal(json!({ "harness": "deepseek" })).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"]["code"], "agent_unavailable");
+    }
+
+    #[tokio::test]
+    async fn a_provider_name_does_not_select_the_engine() {
+        // Without `harness` the primary is used; a `deepseek` provider is just
+        // a provider, so with nothing attached this is the generic 503.
+        let (status, body) =
+            create_refusal(json!({ "model": { "provider_id": "deepseek", "model_id": "m" } }))
+                .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"]["message"], "Agent engine is not available");
+    }
+
+    #[tokio::test]
+    async fn a_session_with_no_engine_attached_is_unavailable_not_missing() {
+        let state = crate::test_support::test_state("admin", Vec::new());
+        let refusal = session_manager_or_err(&state, "ses_1")
+            .await
+            .err()
+            .expect("nothing attached");
+        assert_eq!(refusal.0, StatusCode::SERVICE_UNAVAILABLE);
     }
 }
