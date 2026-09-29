@@ -211,11 +211,13 @@ impl DeepseekClient {
                     .unwrap_or("RPC call failed");
 
                 tracing::warn!(target: "deepseek", "{full_method}: RPC error {code}: {}", truncate_for_log(msg, ERROR_SNIPPET_BYTES));
-                if code.contains("not-found") {
+                // Only a missing session is `SessionNotFound`; a missing preset,
+                // workspace or job is a rejected request, not a lost session.
+                if code == "session/not-found" {
                     Err(AgentError::SessionNotFound(session_id_of(&args_for_id)))
                 } else {
                     Err(AgentError::RequestFailed(format!(
-                        "upstream RPC error: {}",
+                        "upstream rejected: {}",
                         sanitize_code(code)
                     )))
                 }
@@ -255,7 +257,8 @@ impl DeepseekClient {
             "sessionId": session_id,
             "cwd": cwd,
         });
-        if let Some(preset) = agent_preset {
+        // No preset unless the caller named one; DSH resolves its own default.
+        if let Some(preset) = agent_preset.filter(|p| !p.is_empty()) {
             req_body["agentPreset"] = json!(preset);
         }
 
@@ -357,6 +360,11 @@ impl DeepseekClient {
             }
         });
         self.call_remote("session", "projections", args).await
+    }
+
+    /// List the Agent presets `session/create` accepts: `agentPresets/list`.
+    pub async fn agent_presets(&self) -> Result<Value, AgentError> {
+        self.call_remote("agentPresets", "list", json!({})).await
     }
 
     /// Fetch available model catalog: `session/modelCatalog`
@@ -533,6 +541,32 @@ mod tests {
     #[tokio::test]
     async fn http_404_on_session_method_is_session_not_found() {
         let c = client_for(test_server::serve(404, b"nope".to_vec()).await);
+        let err = c.cancel("ses_x").await.unwrap_err();
+        assert!(matches!(err, AgentError::SessionNotFound(ref id) if id == "ses_x"));
+    }
+
+    fn rpc_error_body(code: &str) -> Vec<u8> {
+        serde_json::to_vec(&json!({"type":"server-response","result":{"ok":false,
+            "error":{"code":code,"message":"Unknown agent preset: general"}}}))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn rejected_preset_is_request_failed_not_session_not_found() {
+        let c = client_for(test_server::serve(200, rpc_error_body("agent-preset/not-found")).await);
+        let err = c
+            .create_session(Some("/tmp"), None, Some("general"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, AgentError::RequestFailed(m) if m == "upstream rejected: agent-preset/not-found"),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_not_found_rpc_code_maps_to_session_not_found() {
+        let c = client_for(test_server::serve(200, rpc_error_body("session/not-found")).await);
         let err = c.cancel("ses_x").await.unwrap_err();
         assert!(matches!(err, AgentError::SessionNotFound(ref id) if id == "ses_x"));
     }

@@ -96,7 +96,11 @@ pub fn map_session(raw: &Value) -> Option<AgentSessionInfo> {
         agent_id: String::new(),
         backend_session_id: session_id.to_string(),
         title,
-        mode: Some("deepseek".to_string()),
+        mode: projections_values
+            .and_then(|v| v.get("agentPreset"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
         model,
         status,
         directory: cwd,
@@ -117,7 +121,12 @@ pub fn map_session(raw: &Value) -> Option<AgentSessionInfo> {
 }
 
 /// Map a DeepSeek Harness `ModelCatalog` JSON response into Gateway `AgentCatalog`.
-pub fn map_catalog(raw: &Value) -> AgentCatalog {
+///
+/// `presets` is the `agentPresets/list` roster (`{ "presets": [{ id, isDefault,
+/// name?, description?, broken? }] }`), the only source of modes: DSH's
+/// `session/create` accepts exactly those ids as `agentPreset`. Without a
+/// roster the catalog advertises no modes rather than inventing one.
+pub fn map_catalog(raw: &Value, presets: Option<&Value>) -> AgentCatalog {
     let mut models = Vec::new();
     let mut providers = Vec::new();
 
@@ -210,25 +219,44 @@ pub fn map_catalog(raw: &Value) -> AgentCatalog {
         }
     }
 
-    let modes = if models.is_empty() {
-        Vec::new()
-    } else {
-        vec![ModeInfo {
-            id: "general".to_string(),
-            name: "general".to_string(),
-            description: Some("DeepSeek general agent".to_string()),
+    let mut modes = Vec::new();
+    let mut default_mode = None;
+    let rows = presets
+        .and_then(|p| p.get("presets"))
+        .and_then(Value::as_array);
+    for row in rows.into_iter().flatten() {
+        let Some(id) = row
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        // A preset that failed to activate cannot start a session.
+        if row.get("broken").is_some() {
+            continue;
+        }
+        if default_mode.is_none() && row.get("isDefault").and_then(Value::as_bool) == Some(true) {
+            default_mode = Some(id.to_string());
+        }
+        modes.push(ModeInfo {
+            id: id.to_string(),
+            name: row
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(id)
+                .to_string(),
+            description: row
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             mode: Some("primary".to_string()),
             color: None,
             hidden: false,
-            model: default_model_ref.clone(),
-        }]
-    };
-
-    let default_agent = if models.is_empty() {
-        None
-    } else {
-        Some("general".to_string())
-    };
+            model: None,
+        });
+    }
 
     AgentCatalog {
         models,
@@ -250,7 +278,7 @@ pub fn map_catalog(raw: &Value) -> AgentCatalog {
         }],
         defaults: CatalogDefaults {
             model: default_model_ref,
-            mode: default_agent,
+            mode: default_mode,
         },
     }
 }
@@ -951,6 +979,41 @@ pub fn question_answers(questions: &Value, answers: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn raw_catalog() -> Value {
+        json!({ "default": { "provider": "deepseek", "model": "deepseek-chat" },
+                "groups": [{ "provider": "deepseek", "models": [{ "id": "deepseek-chat" }] }] })
+    }
+
+    #[test]
+    fn catalog_without_preset_roster_has_no_modes() {
+        let c = map_catalog(&raw_catalog(), None);
+        assert!(c.modes.is_empty());
+        assert_eq!(c.defaults.mode, None);
+        let c = map_catalog(&raw_catalog(), Some(&json!({})));
+        assert!(c.modes.is_empty() && c.defaults.mode.is_none());
+    }
+
+    #[test]
+    fn catalog_modes_come_from_the_preset_roster() {
+        let roster = json!({ "presets": [
+            { "id": "coder", "isDefault": true, "name": "Coder", "description": "Codes" },
+            { "id": "plain", "isDefault": false },
+            { "id": "bad", "isDefault": false, "broken": "row failed" },
+        ]});
+        let c = map_catalog(&raw_catalog(), Some(&roster));
+        let ids: Vec<_> = c.modes.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["coder", "plain"]);
+        assert_eq!(c.modes[0].name, "Coder");
+        assert_eq!(c.modes[1].name, "plain");
+        assert_eq!(c.defaults.mode.as_deref(), Some("coder"));
+        let none_default = json!({ "presets": [{ "id": "a", "isDefault": false }] });
+        assert_eq!(
+            map_catalog(&raw_catalog(), Some(&none_default))
+                .defaults
+                .mode,
+            None
+        );
+    }
 
     #[test]
     fn maps_deepseek_session_summary() {

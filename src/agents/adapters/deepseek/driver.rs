@@ -307,7 +307,15 @@ impl AgentPort for DeepseekDriver {
     fn get_catalog<'a>(&'a self, _directory: Option<&'a str>) -> AgentFuture<'a, AgentCatalog> {
         Box::pin(async move {
             let raw = self.client.model_catalog().await?;
-            Ok(mapper::map_catalog(&raw))
+            // Modes are optional: without a roster the catalog has none.
+            let presets = match self.client.agent_presets().await {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!(target: "deepseek", "agentPresets/list failed: {e}");
+                    None
+                }
+            };
+            Ok(mapper::map_catalog(&raw, presets.as_ref()))
         })
     }
 
