@@ -952,6 +952,21 @@ pub fn map_unified_diff(diff: &str) -> Vec<FileDiffItem> {
 
 // ---- catalog --------------------------------------------------------------
 
+/// A human name for a T3 provider driver, for a config payload that carries no
+/// `displayName`. An unknown driver is shown as its own id.
+fn provider_display_name(driver: &str) -> String {
+    match driver {
+        "claudeAgent" => "Claude Code",
+        "codex" => "Codex",
+        "opencode" => "OpenCode",
+        "cursor" => "Cursor",
+        "grok" => "Grok",
+        "antigravity" => "Antigravity",
+        other => other,
+    }
+    .to_string()
+}
+
 /// `server.getConfig()` -> `AgentCatalog`.
 ///
 /// Providers that are not installed or enabled are still listed (with
@@ -971,7 +986,11 @@ pub fn map_catalog(config: &Value) -> AgentCatalog {
                 continue;
             };
             let driver = s(p, "driver").unwrap_or(instance_id);
-            let name = s(p, "displayName").unwrap_or(driver).to_string();
+            // T3's own display name wins; the fallback only covers a payload
+            // that omits it.
+            let name = s(p, "displayName")
+                .map(str::to_string)
+                .unwrap_or_else(|| provider_display_name(driver));
             let enabled = p.get("enabled").and_then(Value::as_bool).unwrap_or(false);
             let installed = p.get("installed").and_then(Value::as_bool).unwrap_or(false);
             let ready = enabled && installed && s(p, "status") != Some("disabled");
@@ -1052,6 +1071,7 @@ pub fn map_catalog(config: &Value) -> AgentCatalog {
                 id: instance_id.to_string(),
                 name,
                 activation: Some(if ready { "enabled" } else { "disabled" }.to_string()),
+                available: ready && !provider_models.is_empty(),
                 models: provider_models,
             });
         }
@@ -1409,6 +1429,44 @@ mod tests {
         assert_eq!(items[1].path, "src/x.rs");
         assert_eq!((items[1].additions, items[1].deletions), (1, 1));
         assert!(map_unified_diff("").is_empty());
+    }
+
+    #[test]
+    fn provider_availability_and_names_follow_the_config() {
+        let catalog = map_catalog(&fixture("config"));
+        let by_id = |id: &str| catalog.providers.iter().find(|p| p.id == id).unwrap();
+        for id in ["codex", "claudeAgent"] {
+            assert!(by_id(id).available, "{id} is ready with models");
+        }
+        for id in ["cursor", "grok", "opencode", "antigravity"] {
+            assert!(!by_id(id).available, "{id} is disabled in T3");
+        }
+        assert_eq!(by_id("codex").name, "Codex");
+        assert_eq!(by_id("claudeAgent").name, "Claude", "T3's own name wins");
+        assert_eq!(by_id("antigravity").name, "Antigravity");
+        let json = serde_json::to_value(by_id("grok")).unwrap();
+        assert_eq!(json["available"], false);
+        assert_eq!(json["name"], "Grok");
+    }
+
+    #[test]
+    fn a_ready_provider_without_models_is_unavailable_and_names_fall_back() {
+        let config = json!({"providers": [
+            {"instanceId": "claudeAgent", "driver": "claudeAgent",
+             "enabled": true, "installed": true, "status": "ready", "models": []},
+            {"instanceId": "codex", "driver": "codex",
+             "enabled": true, "installed": true, "status": "ready",
+             "models": [{"slug": "m"}]},
+            {"instanceId": "x", "driver": "mystery", "enabled": true,
+             "installed": true, "models": [{"slug": "m"}]},
+        ]});
+        let catalog = map_catalog(&config);
+        let p = |id: &str| catalog.providers.iter().find(|p| p.id == id).unwrap();
+        assert!(!p("claudeAgent").available);
+        assert_eq!(p("claudeAgent").name, "Claude Code");
+        assert!(p("codex").available);
+        assert_eq!(p("codex").name, "Codex");
+        assert_eq!(p("x").name, "mystery");
     }
 
     #[test]

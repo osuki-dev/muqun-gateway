@@ -33,7 +33,13 @@ fn agents_plane_schema() -> Value {
                                 "toolApprovals": { "type": "boolean" },
                                 "worktrees": { "type": "boolean" },
                                 "revert": { "type": "boolean" },
-                                "inbox": { "type": "boolean" }
+                                "inbox": { "type": "boolean" },
+                                "modes": { "type": "boolean" },
+                                "skills": { "type": "boolean" },
+                                "slashCommands": { "type": "boolean" },
+                                "compaction": { "type": "boolean" },
+                                "backgroundShells": { "type": "boolean" },
+                                "attachments": { "type": "boolean" }
                             }
                         },
                         "models": {

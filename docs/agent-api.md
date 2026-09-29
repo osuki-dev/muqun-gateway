@@ -129,7 +129,9 @@ and `version` removed from every agent.
       "modes": [ { "id": "build", "name": "build", "description": "…" } ],
       "features": {
         "streaming": true, "reasoningEffort": true, "modelSelection": true,
-        "toolApprovals": true, "worktrees": true, "revert": true, "inbox": true
+        "toolApprovals": true, "worktrees": true, "revert": true, "inbox": true,
+        "modes": true, "skills": true, "slashCommands": true, "compaction": true,
+        "backgroundShells": true, "attachments": true
       }
     }
   ],
@@ -161,6 +163,15 @@ and `version` removed from every agent.
 | `worktrees` | The `/api/agent-worktrees` routes work against this agent. |
 | `revert` | Stage, commit and clear revert work. |
 | `inbox` | Queued and steered prompts (`/inbox`, `delivery`) work. |
+| `modes` | The agent has modes (personas or presets) to pick; `mode` on create and `POST …/mode` apply. `modes[]` and the catalog's `modes` are meaningful only when true. |
+| `skills` | The catalog `skills[]` list is the agent's and skill activation works. |
+| `slashCommands` | The catalog `commands[]` list is runnable (`POST /api/agent-sessions/{asid}/command`). |
+| `compaction` | `POST /api/agent-sessions/{asid}/compact` works. |
+| `backgroundShells` | The `/api/agent-shells` routes list, read and kill the agent's background shells. |
+| `attachments` | A prompt may carry `attachments`; when false the agent answers `501 feature_unsupported`. |
+
+  The App renders agent-specific UI from these flags alone, never from the
+  agent's `kind`. All six are always present (booleans, never omitted).
 
   Flags reflect the agent's last probe (cached for about ten seconds).
   Unknown extra flags may appear; ignore them.
@@ -176,6 +187,12 @@ and `version` removed from every agent.
   | `worktrees` | yes | no | no |
   | `revert` | yes | no | yes |
   | `inbox` | yes | no | no |
+  | `modes` | yes | yes (presets) | no |
+  | `skills` | yes | no | no |
+  | `slashCommands` | yes | no | no |
+  | `compaction` | yes | no | no |
+  | `backgroundShells` | yes | no | no |
+  | `attachments` | yes | no | no |
 
   `t3` is `name: "T3 Code"`; its `version` is the T3 server version, its
   `models[]` are every model of the providers T3 has ready (Claude Code,
@@ -749,12 +766,20 @@ A directory that no longer exists is not this case: that is
   "modes":    [ { "id", "name", "description?", "mode?", "color?", "hidden" } ],
   "mcp":      [ { "name", "status", "error?" } ],
   "skills":   [ { "id", "name", "description", "slash", "autoinvoke" } ],
-  "providers":[ { "id", "name", "activation?": "auto"|"enabled"|"disabled",
+  "providers":[ { "id", "name", "available", "activation?": "auto"|"enabled"|"disabled",
                   "models": [ { "id", "name", "enabled", "variants": [...], "limit?", "status?" } ] } ],
   "commands": [ { "name", "description?", "mode?", "template?" } ],
   "defaults": { "model?": {"provider_id", "model_id", "variant?"}, "mode?": "build" }
 }
 ```
+
+`providers[].name` is the display name (T3's own `displayName`, else a
+built-in one such as "Claude Code" for `claudeAgent`; OpenCode's name, else the
+id). `providers[].available` is `true` when the provider can start a session
+now (OpenCode and DeepSeek: always; T3: enabled, installed, not `disabled`, and
+offering at least one model). An unavailable provider is still listed so the
+App can grey it out; `activation` keeps the finer state. Providers are not part
+of `/api/discovery`, only of the catalog.
 
 `skills[].slash` and `skills[].autoinvoke` are `Skill.Info`'s own optional
 flags, and both default to `false` when the payload leaves them out — which most

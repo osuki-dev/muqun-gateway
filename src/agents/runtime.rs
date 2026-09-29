@@ -1374,6 +1374,14 @@ fn deepseek_features(
         worktrees: false,
         revert: false,
         inbox: false,
+        // Presets are the modes; the client refuses attachments and the driver
+        // leaves skills, commands, compaction and shells at `Unsupported`.
+        modes: true,
+        skills: false,
+        slash_commands: false,
+        compaction: false,
+        background_shells: false,
+        attachments: false,
         extra: std::collections::BTreeMap::new(),
     }
 }
@@ -1390,6 +1398,12 @@ fn opencode_features(
         worktrees: true,
         revert: true,
         inbox: true,
+        modes: true,
+        skills: true,
+        slash_commands: true,
+        compaction: true,
+        background_shells: true,
+        attachments: true,
         extra: std::collections::BTreeMap::new(),
     }
 }
@@ -1397,6 +1411,27 @@ fn opencode_features(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_agent_serializes_the_capability_flags() {
+        let keys = [
+            "modes",
+            "skills",
+            "slashCommands",
+            "compaction",
+            "backgroundShells",
+            "attachments",
+        ];
+        let flags = |f: crate::discovery::AgentFeatures| {
+            let v = serde_json::to_value(f).unwrap();
+            keys.map(|k| v[k].as_bool().unwrap_or_else(|| panic!("{k} missing")))
+        };
+        assert_eq!(flags(opencode_features(true, true)), [true; 6]);
+        assert_eq!(
+            flags(deepseek_features(true, true)),
+            [true, false, false, false, false, false]
+        );
+    }
 
     #[cfg(unix)]
     #[tokio::test]

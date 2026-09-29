@@ -254,6 +254,14 @@ pub(super) fn t3_features() -> crate::discovery::AgentFeatures {
         worktrees: false,
         revert: true,
         inbox: false,
+        // The driver answers `Unsupported` for a mode, attachments, skills,
+        // commands, compaction and shells.
+        modes: false,
+        skills: false,
+        slash_commands: false,
+        compaction: false,
+        background_shells: false,
+        attachments: false,
         extra: std::collections::BTreeMap::new(),
     }
 }
@@ -374,6 +382,21 @@ pub(super) async fn catalog_entry(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn t3_features_declare_no_agent_specific_extras() {
+        let v = serde_json::to_value(super::t3_features()).unwrap();
+        for key in [
+            "modes",
+            "skills",
+            "slashCommands",
+            "compaction",
+            "backgroundShells",
+            "attachments",
+        ] {
+            assert_eq!(v[key], false, "{key}");
+        }
+    }
+
     use super::*;
 
     fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {

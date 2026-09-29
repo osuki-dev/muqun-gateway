@@ -2643,6 +2643,7 @@ mod tests {
             id: "opencode".into(),
             name: "OpenCode".into(),
             activation: None,
+            available: true,
             models: Vec::new(),
         }];
         catalog
