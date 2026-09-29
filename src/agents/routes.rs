@@ -663,7 +663,10 @@ async fn do_create_agent_session(
             }
             Some(canonical.to_string_lossy().to_string())
         }
-        _ => None,
+        // The App shows `~/` for a session it opens without naming a folder,
+        // so that is the folder it gets. Left as `None`, OpenCode used its own
+        // cwd and DeepSeek Harness refused the relative "." outright.
+        _ => dirs::home_dir().map(|home| home.to_string_lossy().to_string()),
     };
 
     let session = manager
