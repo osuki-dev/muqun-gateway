@@ -91,7 +91,8 @@ impl EventContext {
         }
     }
 
-    fn emit(&self, event: AgentDomainEvent) {
+    fn emit(&self, mut event: AgentDomainEvent) {
+        self.mirror.stamp_event(&mut event);
         // A send with no subscribers is not a failure: nobody is watching.
         let _ = self.tx.send(event);
     }
@@ -221,7 +222,7 @@ impl AgentManager {
         let endpoint_url = endpoint.url.clone();
         let endpoint_version = endpoint.version.clone();
         let driver = Arc::new(OpencodeDriver::new(endpoint.clone()));
-        let mirror = Arc::new(MemoryMirror::new());
+        let mirror = Arc::new(MemoryMirror::for_harness(driver.kind()));
 
         let session_service = Arc::new(SessionService::with_memory_mirror(
             driver.clone(),
@@ -316,7 +317,7 @@ impl AgentManager {
         let driver = Arc::new(crate::agents::adapters::deepseek::DeepseekDriver::new(
             endpoint.clone(),
         ));
-        let mirror = Arc::new(MemoryMirror::new());
+        let mirror = Arc::new(MemoryMirror::for_harness(driver.kind()));
 
         let session_service = Arc::new(SessionService::with_memory_mirror(
             driver.clone(),
@@ -396,6 +397,29 @@ impl AgentManager {
             endpoint_version,
             stream_connected: Arc::new(move || stream_listener.is_connected()),
             shutdown_handle: Arc::new(move || shutdown_listener.stop()),
+        }
+    }
+
+    /// A manager over a caller-supplied engine with no event stream, for
+    /// route and service tests.
+    #[cfg(test)]
+    pub(crate) fn for_test(engine: Arc<dyn AgentEnginePort>) -> Self {
+        let mirror = Arc::new(MemoryMirror::for_harness(engine.kind()));
+        let (events_tx, _) = broadcast::channel(16);
+        Self {
+            session_service: Arc::new(SessionService::with_memory_mirror(
+                engine.clone(),
+                mirror.clone(),
+            )),
+            prompt_service: Arc::new(PromptService::new(engine.clone(), mirror.clone())),
+            interaction_service: Arc::new(InteractionService::new(engine.clone(), mirror.clone())),
+            engine,
+            mirror,
+            events_tx,
+            endpoint_url: "http://127.0.0.1:1".to_string(),
+            endpoint_version: Some("test".to_string()),
+            stream_connected: Arc::new(|| false),
+            shutdown_handle: Arc::new(|| {}),
         }
     }
 

@@ -693,3 +693,219 @@ impl Drop for FakeHerdr {
         let _ = std::fs::remove_file(&self.socket_path);
     }
 }
+
+/// An agent engine that answers from canned data, for route and service
+/// tests. `failing` makes every read error.
+pub(crate) struct FakeEngine {
+    pub kind: &'static str,
+    pub sessions: Vec<agents::domain::AgentSessionInfo>,
+    pub failing: bool,
+    pub catalog: agents::domain::AgentCatalog,
+}
+
+impl FakeEngine {
+    pub fn new(kind: &'static str) -> Self {
+        Self {
+            kind,
+            sessions: Vec::new(),
+            failing: false,
+            catalog: Default::default(),
+        }
+    }
+
+    pub fn with_sessions(mut self, sessions: &[(&str, u64)]) -> Self {
+        self.sessions = sessions
+            .iter()
+            .map(|(asid, updated_ms)| fake_session(asid, *updated_ms))
+            .collect();
+        self
+    }
+
+    pub fn failing(mut self) -> Self {
+        self.failing = true;
+        self
+    }
+
+    pub fn manager(self) -> Arc<agents::manager::AgentManager> {
+        Arc::new(agents::manager::AgentManager::for_test(Arc::new(self)))
+    }
+
+    fn fail<T>(&self) -> Result<T, agents::ports::engine::AgentEngineError> {
+        Err(agents::ports::engine::AgentEngineError::Network(
+            "fake engine is down".into(),
+        ))
+    }
+}
+
+/// A session as an adapter returns it: no `harness`, which the manager adds.
+pub(crate) fn fake_session(asid: &str, updated_ms: u64) -> agents::domain::AgentSessionInfo {
+    serde_json::from_value(json!({
+        "asid": asid,
+        "title": asid,
+        "status": "idle",
+        "updated_ms": updated_ms,
+    }))
+    .expect("a minimal session parses")
+}
+
+impl agents::ports::engine::AgentEnginePort for FakeEngine {
+    fn kind(&self) -> &'static str {
+        self.kind
+    }
+    fn probe(&self) -> agents::ports::engine::EngineFuture<'_, bool> {
+        Box::pin(async move { Ok(!self.failing) })
+    }
+    fn list_projects(
+        &self,
+    ) -> agents::ports::engine::EngineFuture<'_, Vec<agents::domain::AgentProject>> {
+        Box::pin(async move {
+            if self.failing {
+                return self.fail();
+            }
+            Ok(vec![agents::domain::AgentProject {
+                id: format!("{}-project", self.kind),
+                canonical: "/work".into(),
+                name: self.kind.into(),
+                vcs: None,
+                sandboxes: Vec::new(),
+                missing: false,
+            }])
+        })
+    }
+    fn list_sessions<'a>(
+        &'a self,
+        _query: &'a agents::domain::SessionQuery,
+    ) -> agents::ports::engine::EngineFuture<'a, Vec<agents::domain::AgentSessionInfo>> {
+        Box::pin(async move {
+            if self.failing {
+                return self.fail();
+            }
+            Ok(self.sessions.clone())
+        })
+    }
+    fn create_session<'a>(
+        &'a self,
+        _directory: Option<&'a str>,
+        _model: Option<&'a agents::domain::ModelRef>,
+        _agent: Option<&'a str>,
+    ) -> agents::ports::engine::EngineFuture<'a, agents::domain::AgentSessionInfo> {
+        Box::pin(async move {
+            if self.failing {
+                return self.fail();
+            }
+            Ok(fake_session(&format!("{}_new", self.kind), 1))
+        })
+    }
+    fn get_session<'a>(
+        &'a self,
+        session_id: &'a str,
+    ) -> agents::ports::engine::EngineFuture<'a, agents::domain::AgentSessionInfo> {
+        Box::pin(async move {
+            self.sessions
+                .iter()
+                .find(|s| s.asid.0 == session_id)
+                .cloned()
+                .ok_or_else(|| {
+                    agents::ports::engine::AgentEngineError::SessionNotFound(session_id.into())
+                })
+        })
+    }
+    fn send_prompt<'a>(
+        &'a self,
+        _session_id: &'a str,
+        _text: &'a str,
+        _attachments: &'a [String],
+        _delivery: Option<&'a str>,
+    ) -> agents::ports::engine::EngineFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+    fn revert_session<'a>(
+        &'a self,
+        _session_id: &'a str,
+        _message_id: &'a str,
+    ) -> agents::ports::engine::EngineFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+    fn interrupt<'a>(
+        &'a self,
+        _session_id: &'a str,
+    ) -> agents::ports::engine::EngineFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+    fn switch_model<'a>(
+        &'a self,
+        _session_id: &'a str,
+        _model: &'a agents::domain::ModelRef,
+    ) -> agents::ports::engine::EngineFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+    fn switch_agent<'a>(
+        &'a self,
+        _session_id: &'a str,
+        _agent: &'a str,
+    ) -> agents::ports::engine::EngineFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+    fn find_files<'a>(
+        &'a self,
+        _query: &'a str,
+        _limit: usize,
+        _directory: Option<&'a str>,
+    ) -> agents::ports::engine::EngineFuture<'a, Vec<serde_json::Value>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+    fn reply_permission<'a>(
+        &'a self,
+        _session_id: &'a str,
+        _request_id: &'a str,
+        _decision: agents::domain::PermissionDecision,
+        _message: Option<&'a str>,
+    ) -> agents::ports::engine::EngineFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+    fn reply_form<'a>(
+        &'a self,
+        _session_id: &'a str,
+        _form_id: &'a str,
+        _answers: serde_json::Value,
+    ) -> agents::ports::engine::EngineFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+    fn get_catalog<'a>(
+        &'a self,
+        _directory: Option<&'a str>,
+    ) -> agents::ports::engine::EngineFuture<'a, agents::domain::AgentCatalog> {
+        Box::pin(async move {
+            if self.failing {
+                return self.fail();
+            }
+            Ok(self.catalog.clone())
+        })
+    }
+    fn get_vcs_diff<'a>(
+        &'a self,
+        _session_id: &'a str,
+        _mode: &'a str,
+    ) -> agents::ports::engine::EngineFuture<'a, Vec<agents::ports::engine::FileDiffItem>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+    fn get_pending_permissions<'a>(
+        &'a self,
+        _session_id: &'a str,
+    ) -> agents::ports::engine::EngineFuture<'a, Vec<agents::domain::PermissionRequest>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+    fn get_pending_forms<'a>(
+        &'a self,
+        _session_id: &'a str,
+    ) -> agents::ports::engine::EngineFuture<'a, Vec<agents::domain::FormRequest>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+    fn get_timeline<'a>(
+        &'a self,
+        _session_id: &'a str,
+        _limit: usize,
+    ) -> agents::ports::engine::EngineFuture<'a, Vec<agents::domain::TimelineItem>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}

@@ -136,6 +136,12 @@ pub struct SessionForkInfo {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentSessionInfo {
     pub asid: AgentSessionId,
+    /// The harness that owns this session: the owning engine's `kind()`
+    /// (`opencode`, `deepseek`). Stamped by the manager layer -- the session
+    /// service and the mirror -- never by an adapter or a route. Empty only on
+    /// a value that has not passed through one.
+    #[serde(default)]
+    pub harness: String,
     /// The engine's own id for this session.
     ///
     /// Omitted when it is the same string as `asid`, which on OpenCode it

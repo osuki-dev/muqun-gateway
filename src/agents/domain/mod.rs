@@ -40,6 +40,7 @@ mod contract_tests {
     fn session_info_keys_match_the_contract() {
         let info = AgentSessionInfo {
             asid: AgentSessionId("ses_1".into()),
+            harness: String::new(),
             backend_session_id: "ses_1".into(),
             title: "t".into(),
             agent: Some("build".into()),
@@ -72,6 +73,7 @@ mod contract_tests {
         let value = serde_json::to_value(&info).expect("serializes");
         for key in [
             "asid",
+            "harness",
             "title",
             "agent",
             "model",
@@ -191,6 +193,17 @@ mod contract_tests {
         );
     }
 
+    /// A payload from before `harness` existed still parses: the field is
+    /// defaulted on the way in, and an app that predates it ignores it out.
+    #[test]
+    fn a_session_without_harness_still_deserializes() {
+        let info: AgentSessionInfo = serde_json::from_value(json!({
+            "asid": "ses_1", "title": "t", "status": "idle", "updated_ms": 1
+        }))
+        .expect("parses");
+        assert_eq!(info.harness, "");
+    }
+
     /// `backend_session_id` only earns its place when it says something
     /// `asid` does not. On OpenCode it never does -- it was the same string
     /// repeated once per row, 1.6 kB of every 21.5 kB list.
@@ -198,6 +211,7 @@ mod contract_tests {
     fn a_backend_session_id_that_only_repeats_the_asid_is_left_off() {
         let mut info = AgentSessionInfo {
             asid: AgentSessionId("ses_1".into()),
+            harness: String::new(),
             backend_session_id: String::new(),
             title: "t".into(),
             agent: None,

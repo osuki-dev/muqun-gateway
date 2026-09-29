@@ -162,6 +162,7 @@ pub fn map_session(val: &Value) -> Option<AgentSessionInfo> {
 
     Some(AgentSessionInfo {
         asid: AgentSessionId(id.to_string()),
+        harness: String::new(),
         // Left empty, and therefore off the wire, whenever it would only
         // repeat `asid`. It is set for an engine that really does key
         // sessions differently.

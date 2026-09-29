@@ -289,6 +289,7 @@ mod tests {
         assert!(API_CAPABILITIES.contains(&"multiple_terminal_backends"));
         assert!(API_CAPABILITIES.contains(&"capabilities_discovery"));
         assert!(API_CAPABILITIES.contains(&"harness_discovery"));
+        assert!(API_CAPABILITIES.contains(&"agent_harnesses"));
     }
 
     #[tokio::test]
@@ -324,6 +325,10 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&json!("harness_discovery")));
+        assert!(json["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("agent_harnesses")));
 
         // 2. GET /health contains planes
         let req = Request::builder()
@@ -341,6 +346,10 @@ mod tests {
         assert_eq!(json["ok"], true);
         assert!(json["planes"]["terminal"].is_object());
         assert!(json["planes"]["harness"].is_object());
+        assert!(json["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("agent_harnesses")));
     }
 
     #[tokio::test]

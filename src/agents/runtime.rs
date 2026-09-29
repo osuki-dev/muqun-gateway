@@ -202,6 +202,10 @@ pub struct EngineStatus {
     pub autostart: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    /// The harness this status describes; the engine's `kind()`. Absent while
+    /// nothing is attached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
 }
 
 pub struct AgentRuntime {
@@ -266,6 +270,17 @@ impl AgentRuntime {
     /// The default or primary engine manager, or `None` while nothing is attached.
     pub async fn manager(&self) -> Option<Arc<AgentManager>> {
         self.manager.read().await.clone()
+    }
+
+    /// Attach a ready-made manager under its harness id, as `attach` does.
+    #[cfg(test)]
+    pub(crate) async fn attach_for_test(&self, manager: Arc<AgentManager>) {
+        let kind = manager.engine().kind();
+        self.managers
+            .write()
+            .await
+            .insert(kind.to_string(), manager);
+        self.promote_primary(kind, EngineOrigin::Adopted).await;
     }
 
     /// Return all currently active engine managers.
@@ -369,7 +384,32 @@ impl AgentRuntime {
                 .unwrap_or(false),
             autostart: self.config.autostart,
             kind: manager.as_ref().map(|m| m.engine().kind().to_string()),
+            harness: manager.as_ref().map(|m| m.engine().kind().to_string()),
         }
+    }
+
+    /// Status of one attached harness, `None` when it is not attached. The
+    /// primary answers exactly as `status()` does; another attached harness
+    /// (DeepSeek, which OpenCode outranks) is always an adopted service the
+    /// gateway does not start.
+    pub async fn status_for(&self, harness: &str) -> Option<EngineStatus> {
+        let manager = self.manager_for_harness(harness).await?;
+        let primary = self.manager.read().await.clone();
+        if primary.is_some_and(|p| Arc::ptr_eq(&p, &manager)) {
+            return Some(self.status().await);
+        }
+        let kind = manager.engine().kind().to_string();
+        Some(EngineStatus {
+            available: true,
+            installation: EngineInstallation::Installed,
+            origin: EngineOrigin::Adopted,
+            url: Some(manager.endpoint_url().to_string()),
+            version: manager.version(),
+            stream_connected: manager.stream_connected(),
+            autostart: false,
+            kind: Some(kind.clone()),
+            harness: Some(kind),
+        })
     }
 
     /// Discover status and capabilities of all configured or reachable agents / AI harnesses.
@@ -1706,6 +1746,7 @@ mod tests {
             stream_connected: false,
             autostart: true,
             kind: None,
+            harness: None,
         };
         let value = serde_json::to_value(status).expect("status serializes");
         assert_eq!(value["installation"], "not_found");

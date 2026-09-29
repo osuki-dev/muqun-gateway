@@ -38,6 +38,15 @@ pub struct AgentSessionsQuery {
     pub order: Option<String>,
     pub search: Option<String>,
     pub cursor: Option<String>,
+    /// Restrict the list (or the catalog) to one harness. Absent, the list
+    /// merges every attached harness.
+    pub harness: Option<String>,
+}
+
+/// `?harness=` alone, on the routes that read one engine.
+#[derive(Debug, Deserialize)]
+pub struct HarnessQuery {
+    pub harness: Option<String>,
 }
 
 /// What a session list answers when the caller does not say.
@@ -511,13 +520,41 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
 // Core implementation functions (pure OpenCode, zero herdr/tmux dependency)
 // ---------------------------------------------------------------------------
 
-async fn do_list_agent_sessions(
+/// The manager of one named harness. An id this gateway has never heard of is
+/// `400 invalid_harness`; a known one that is not attached is
+/// `503 agent_unavailable`, naming it.
+async fn harness_manager_or_err(
     state: &AppState,
-    query: &SessionQuery,
-    headers: &HeaderMap,
-) -> ApiResult<Response> {
-    require_device(state, headers)?;
+    harness: &str,
+) -> ApiResult<std::sync::Arc<super::manager::AgentManager>> {
+    if !state.agent_runtime.is_known_harness(harness) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_harness",
+            &format!("Unknown agent harness '{harness}'"),
+        ));
+    }
+    state
+        .agent_runtime
+        .manager_for_harness(harness)
+        .await
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "agent_unavailable",
+                &format!("Agent harness '{harness}' is not available"),
+            )
+        })
+}
 
+/// The managers a read covers: the named harness alone, or every attached one.
+async fn managers_for_read(
+    state: &AppState,
+    harness: Option<&str>,
+) -> ApiResult<Vec<std::sync::Arc<super::manager::AgentManager>>> {
+    if let Some(harness) = harness {
+        return Ok(vec![harness_manager_or_err(state, harness).await?]);
+    }
     let all_managers = state.agent_runtime.all_managers().await;
     if all_managers.is_empty() {
         return Err(api_error(
@@ -526,6 +563,18 @@ async fn do_list_agent_sessions(
             "Agent engine is not available",
         ));
     }
+    Ok(all_managers)
+}
+
+async fn do_list_agent_sessions(
+    state: &AppState,
+    query: &SessionQuery,
+    harness: Option<&str>,
+    headers: &HeaderMap,
+) -> ApiResult<Response> {
+    require_device(state, headers)?;
+
+    let all_managers = managers_for_read(state, harness).await?;
 
     let mut sessions = Vec::new();
     let mut any_success = false;
@@ -544,12 +593,19 @@ async fn do_list_agent_sessions(
                 sessions.extend(list);
             }
             Err(e) => {
+                tracing::warn!(
+                    harness = manager.engine().kind(),
+                    error = %e,
+                    "agent session list failed; skipping this harness"
+                );
                 last_err = Some(e);
             }
         }
     }
 
-    if !any_success {
+    // A harness that errors is skipped while another answers. When every one
+    // asked failed, or the caller named the one that failed, say so.
+    if !any_success || (harness.is_some() && last_err.is_some()) {
         if let Some(err) = last_err {
             return Err(engine_error(err));
         }
@@ -574,26 +630,7 @@ async fn do_create_agent_session(
     // An explicit `harness` is the only selector. The model's provider says
     // nothing about the engine: an OpenCode provider may be named `deepseek`.
     let manager = match body.harness.as_deref() {
-        Some(h) => {
-            if !state.agent_runtime.is_known_harness(h) {
-                return Err(api_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_harness",
-                    &format!("Unknown agent harness '{h}'"),
-                ));
-            }
-            state
-                .agent_runtime
-                .manager_for_harness(h)
-                .await
-                .ok_or_else(|| {
-                    api_error(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "agent_unavailable",
-                        &format!("Agent harness '{h}' is not available"),
-                    )
-                })?
-        }
+        Some(h) => harness_manager_or_err(state, h).await?,
         None => state.agent_runtime.manager().await.ok_or_else(|| {
             api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1127,15 +1164,22 @@ pub(crate) fn json_etag_response(headers: &HeaderMap, payload: Value) -> Respons
         .into_response()
 }
 
-async fn do_list_agent_projects(state: &AppState, headers: &HeaderMap) -> ApiResult<Response> {
+async fn do_list_agent_projects(
+    state: &AppState,
+    harness: Option<&str>,
+    headers: &HeaderMap,
+) -> ApiResult<Response> {
     require_device(state, headers)?;
 
-    let Some(manager) = state.agent_runtime.manager().await else {
-        return Err(api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "agent_unavailable",
-            "Agent engine is not available",
-        ));
+    let manager = match harness {
+        Some(h) => harness_manager_or_err(state, h).await?,
+        None => state.agent_runtime.manager().await.ok_or_else(|| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "agent_unavailable",
+                "Agent engine is not available",
+            )
+        })?,
     };
 
     let projects = manager.engine().list_projects().await.map_err(|e| {
@@ -1307,14 +1351,7 @@ pub async fn get_global_agent_catalog(
 ) -> ApiResult<Response> {
     require_device(&state, &headers)?;
 
-    let all_managers = state.agent_runtime.all_managers().await;
-    if all_managers.is_empty() {
-        return Err(api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "agent_unavailable",
-            "Agent engine is not available",
-        ));
-    }
+    let all_managers = managers_for_read(&state, query.harness.as_deref()).await?;
 
     require_directory(query.directory.as_deref())?;
 
@@ -1412,7 +1449,13 @@ async fn list_agent_sessions_global(
     Query(query): Query<AgentSessionsQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    do_list_agent_sessions(&state, &query.to_session_query(), &headers).await
+    do_list_agent_sessions(
+        &state,
+        &query.to_session_query(),
+        query.harness.as_deref(),
+        &headers,
+    )
+    .await
 }
 
 async fn create_agent_session_global(
@@ -1561,7 +1604,13 @@ async fn list_agent_sessions_legacy(
     Query(query): Query<AgentSessionsQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    do_list_agent_sessions(&state, &query.to_session_query(), &headers).await
+    do_list_agent_sessions(
+        &state,
+        &query.to_session_query(),
+        query.harness.as_deref(),
+        &headers,
+    )
+    .await
 }
 
 async fn create_agent_session_legacy(
@@ -1722,17 +1771,19 @@ async fn get_session_agent_catalog(
 
 async fn list_agent_projects_global(
     State(state): State<AppState>,
+    Query(query): Query<HarnessQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    do_list_agent_projects(&state, &headers).await
+    do_list_agent_projects(&state, query.harness.as_deref(), &headers).await
 }
 
 async fn list_agent_projects_legacy(
     State(state): State<AppState>,
     Path(_session_id): Path<String>,
+    Query(query): Query<HarnessQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    do_list_agent_projects(&state, &headers).await
+    do_list_agent_projects(&state, query.harness.as_deref(), &headers).await
 }
 
 async fn list_agent_directories_global(
@@ -1895,7 +1946,7 @@ async fn list_agent_session_children(
 ) -> ApiResult<Response> {
     let mut session_query = query.to_session_query();
     session_query.parent_id = Some(asid);
-    do_list_agent_sessions(&state, &session_query, &headers).await
+    do_list_agent_sessions(&state, &session_query, query.harness.as_deref(), &headers).await
 }
 
 async fn delete_agent_session_global(
@@ -2150,7 +2201,7 @@ async fn move_agent_session(
         .await
         .map_err(engine_error)?;
     let info = manager
-        .engine()
+        .sessions()
         .get_session(&asid)
         .await
         .map_err(engine_error)?;
@@ -2460,10 +2511,24 @@ async fn set_inbox_delivery(
 /// app asks it precisely to find out why the others are refusing.
 async fn get_agent_engine_status(
     State(state): State<AppState>,
+    Query(query): Query<HarnessQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
-    let status = state.agent_runtime.status().await;
+    let status = match query.harness.as_deref() {
+        Some(h) => {
+            // Validates the id (400) and that it is attached (503).
+            harness_manager_or_err(&state, h).await?;
+            state.agent_runtime.status_for(h).await.ok_or_else(|| {
+                api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "agent_unavailable",
+                    &format!("Agent harness '{h}' is not available"),
+                )
+            })?
+        }
+        None => state.agent_runtime.status().await,
+    };
     Ok(Json(content_envelope(json!(status))))
 }
 
@@ -3012,5 +3077,298 @@ mod tests {
             .err()
             .expect("nothing attached");
         assert_eq!(refusal.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // -- multi-harness contract --------------------------------------------
+
+    use crate::test_support::FakeEngine;
+
+    fn device_headers() -> HeaderMap {
+        crate::test_support::bearer_headers("device-token")
+    }
+
+    async fn state_with(engines: Vec<FakeEngine>) -> AppState {
+        let state = crate::test_support::test_state(
+            "admin",
+            vec![crate::test_support::test_device("phone-1", "device-token")],
+        );
+        for engine in engines {
+            state.agent_runtime.attach_for_test(engine.manager()).await;
+        }
+        state
+    }
+
+    async fn body_json(response: Response) -> Value {
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body reads");
+        serde_json::from_slice(&bytes).expect("body is json")
+    }
+
+    fn ids(data: &Value) -> Vec<(String, String)> {
+        data.as_array()
+            .expect("a list")
+            .iter()
+            .map(|s| {
+                (
+                    s["asid"].as_str().unwrap().to_string(),
+                    s["harness"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn every_session_object_carries_its_harness() {
+        let state = state_with(vec![
+            FakeEngine::new("opencode").with_sessions(&[("ses_oc", 10)]),
+            FakeEngine::new("deepseek").with_sessions(&[("ses_ds", 20)]),
+        ])
+        .await;
+        let headers = device_headers();
+
+        // create, on each harness
+        for (harness, expected) in [(None, "opencode"), (Some("deepseek"), "deepseek")] {
+            let body = CreateAgentSessionBody {
+                directory: None,
+                model: None,
+                agent: None,
+                harness: harness.map(str::to_string),
+            };
+            let Json(created) = do_create_agent_session(&state, body, &headers)
+                .await
+                .expect("creates");
+            assert_eq!(created["data"]["harness"], expected);
+        }
+
+        // get, from the engine and then again from the mirror
+        for _ in 0..2 {
+            let response = do_get_agent_session(&state, "ses_ds", &headers)
+                .await
+                .expect("gets");
+            assert_eq!(
+                body_json(response).await["data"]["info"]["harness"],
+                "deepseek"
+            );
+        }
+
+        // the events the stream replays
+        let manager = state
+            .agent_runtime
+            .manager_for_harness("deepseek")
+            .await
+            .unwrap();
+        let events = manager
+            .sessions()
+            .get_events_after(&AgentSessionId("ses_ds".into()), 0)
+            .await
+            .expect("events are held");
+        let events = serde_json::to_string(&events).unwrap();
+        assert!(events.contains("\"harness\":\"deepseek\""), "{events}");
+    }
+
+    #[tokio::test]
+    async fn the_session_list_merges_every_harness_and_routes_each_session() {
+        let state = state_with(vec![
+            FakeEngine::new("opencode").with_sessions(&[("ses_oc1", 10), ("ses_oc2", 30)]),
+            FakeEngine::new("deepseek").with_sessions(&[("ses_ds", 20)]),
+        ])
+        .await;
+        let response =
+            do_list_agent_sessions(&state, &SessionQuery::default(), None, &device_headers())
+                .await
+                .expect("lists");
+        let data = body_json(response).await["data"].clone();
+        assert_eq!(
+            ids(&data),
+            vec![
+                ("ses_oc2".to_string(), "opencode".to_string()),
+                ("ses_ds".to_string(), "deepseek".to_string()),
+                ("ses_oc1".to_string(), "opencode".to_string()),
+            ]
+        );
+
+        // Routes were recorded, so a per-session lookup needs no probing.
+        for (asid, harness) in ids(&data) {
+            let owner = state
+                .agent_runtime
+                .manager_for_session(&asid)
+                .await
+                .unwrap();
+            assert_eq!(owner.engine().kind(), harness);
+        }
+
+        let response = do_list_agent_sessions(
+            &state,
+            &SessionQuery::default(),
+            Some("deepseek"),
+            &device_headers(),
+        )
+        .await
+        .expect("filtered list");
+        let data = body_json(response).await["data"].clone();
+        assert_eq!(
+            ids(&data),
+            vec![("ses_ds".to_string(), "deepseek".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_harness_is_skipped_not_a_502() {
+        let state = state_with(vec![
+            FakeEngine::new("opencode").failing(),
+            FakeEngine::new("deepseek").with_sessions(&[("ses_ds", 20)]),
+        ])
+        .await;
+        let response =
+            do_list_agent_sessions(&state, &SessionQuery::default(), None, &device_headers())
+                .await
+                .expect("the healthy harness still answers");
+        let data = body_json(response).await["data"].clone();
+        assert_eq!(
+            ids(&data),
+            vec![("ses_ds".to_string(), "deepseek".to_string())]
+        );
+
+        // Naming the broken one is an explicit ask, and says it failed.
+        let refusal = do_list_agent_sessions(
+            &state,
+            &SessionQuery::default(),
+            Some("opencode"),
+            &device_headers(),
+        )
+        .await
+        .expect_err("the named harness is down");
+        assert_eq!(refusal.0, StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn the_harness_query_selects_one_catalog_and_project_list() {
+        let mut opencode = FakeEngine::new("opencode");
+        opencode.catalog = complete_catalog();
+        let mut deepseek = FakeEngine::new("deepseek");
+        deepseek.catalog = catalog_with(vec![agent("deepseek-agent")]);
+        let state = state_with(vec![opencode, deepseek]).await;
+
+        let query = |harness: Option<&str>| AgentSessionsQuery {
+            directory: None,
+            parent_id: None,
+            roots: None,
+            limit: None,
+            order: None,
+            search: None,
+            cursor: None,
+            harness: harness.map(str::to_string),
+        };
+        let agents_of = |body: &Value| -> Vec<String> {
+            body["data"]["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|a| a["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let response = get_global_agent_catalog(
+            State(state.clone()),
+            Query(query(Some("deepseek"))),
+            device_headers(),
+        )
+        .await
+        .expect("deepseek catalog");
+        assert_eq!(
+            agents_of(&body_json(response).await),
+            vec!["deepseek-agent"]
+        );
+
+        let response = get_global_agent_catalog(
+            State(state.clone()),
+            Query(query(Some("opencode"))),
+            device_headers(),
+        )
+        .await
+        .expect("opencode catalog");
+        assert_eq!(agents_of(&body_json(response).await), vec!["build"]);
+
+        let response = do_list_agent_projects(&state, Some("deepseek"), &device_headers())
+            .await
+            .expect("deepseek projects");
+        assert_eq!(
+            body_json(response).await["data"][0]["id"],
+            "deepseek-project"
+        );
+        let response = do_list_agent_projects(&state, None, &device_headers())
+            .await
+            .expect("primary projects");
+        assert_eq!(
+            body_json(response).await["data"][0]["id"],
+            "opencode-project"
+        );
+
+        let refusal = get_global_agent_catalog(
+            State(state.clone()),
+            Query(query(Some("claude"))),
+            device_headers(),
+        )
+        .await
+        .expect_err("unknown");
+        assert_eq!(refusal.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            crate::test_support::error_body(&refusal)["error"]["code"],
+            "invalid_harness"
+        );
+    }
+
+    #[tokio::test]
+    async fn engine_status_is_per_harness_with_the_two_refusals() {
+        let state = state_with(vec![
+            FakeEngine::new("opencode"),
+            FakeEngine::new("deepseek"),
+        ])
+        .await;
+        let status = |harness: Option<&str>| {
+            get_agent_engine_status(
+                State(state.clone()),
+                Query(HarnessQuery {
+                    harness: harness.map(str::to_string),
+                }),
+                device_headers(),
+            )
+        };
+
+        let Json(primary) = status(None).await.expect("primary");
+        assert_eq!(primary["data"]["harness"], "opencode");
+        assert_eq!(primary["data"]["kind"], "opencode");
+        assert_eq!(primary["data"]["available"], true);
+
+        let Json(other) = status(Some("deepseek")).await.expect("deepseek");
+        assert_eq!(other["data"]["harness"], "deepseek");
+        assert_eq!(other["data"]["kind"], "deepseek");
+        assert_eq!(other["data"]["available"], true);
+
+        let refusal = status(Some("claude")).await.expect_err("unknown");
+        assert_eq!(refusal.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            crate::test_support::error_body(&refusal)["error"]["code"],
+            "invalid_harness"
+        );
+
+        let only_opencode = state_with(vec![FakeEngine::new("opencode")]).await;
+        let refusal = get_agent_engine_status(
+            State(only_opencode),
+            Query(HarnessQuery {
+                harness: Some("deepseek".into()),
+            }),
+            device_headers(),
+        )
+        .await
+        .expect_err("not attached");
+        assert_eq!(refusal.0, StatusCode::SERVICE_UNAVAILABLE);
+        let body = crate::test_support::error_body(&refusal);
+        assert_eq!(body["error"]["code"], "agent_unavailable");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("deepseek"));
     }
 }

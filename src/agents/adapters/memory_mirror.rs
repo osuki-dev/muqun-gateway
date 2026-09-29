@@ -186,12 +186,31 @@ impl SessionState {
 #[derive(Clone, Default)]
 pub struct MemoryMirror {
     sessions: Arc<RwLock<HashMap<AgentSessionId, SessionState>>>,
+    /// The owning engine's `kind()`, stamped on every session this mirror
+    /// holds so snapshots and `agent.session.updated` events carry `harness`.
+    harness: Arc<str>,
 }
 
 impl MemoryMirror {
     pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Tag a session-carrying event with this mirror's harness, for events
+    /// built from an engine read rather than from the mirror's own state.
+    pub fn stamp_event(&self, event: &mut AgentDomainEvent) {
+        if let AgentDomainEvent::SessionUpdated { info, .. } = event {
+            if !self.harness.is_empty() {
+                info.harness = self.harness.to_string();
+            }
+        }
+    }
+
+    /// A mirror for the sessions of one harness (the engine's `kind()`).
+    pub fn for_harness(harness: &str) -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            harness: Arc::from(harness),
         }
     }
 
@@ -213,12 +232,15 @@ impl MemoryMirror {
     }
 
     fn entry<'a>(
+        harness: &str,
         sessions: &'a mut HashMap<AgentSessionId, SessionState>,
         asid: &AgentSessionId,
         status: AgentSessionStatus,
     ) -> &'a mut SessionState {
         if !sessions.contains_key(asid) {
-            let mut fresh = SessionState::new(placeholder_session(asid, status));
+            let mut placeholder = placeholder_session(asid, status);
+            placeholder.harness = harness.to_string();
+            let mut fresh = SessionState::new(placeholder);
             fresh.placeholder = true;
             sessions.insert(asid.clone(), fresh);
             Self::evict(sessions);
@@ -240,7 +262,7 @@ impl MemoryMirror {
         error: Option<AgentErrorInfo>,
     ) -> Option<u64> {
         let mut sessions = self.sessions.write().await;
-        let state = Self::entry(&mut sessions, asid, AgentSessionStatus::Idle);
+        let state = Self::entry(&self.harness, &mut sessions, asid, AgentSessionStatus::Idle);
         state.info.status = status;
         if error.is_some() {
             state.info.error = error.clone();
@@ -273,7 +295,7 @@ impl MemoryMirror {
         patch: SessionPatch,
     ) -> Option<(u64, AgentSessionInfo)> {
         let mut sessions = self.sessions.write().await;
-        let state = Self::entry(&mut sessions, asid, AgentSessionStatus::Idle);
+        let state = Self::entry(&self.harness, &mut sessions, asid, AgentSessionStatus::Idle);
 
         if let Some(title) = patch.title {
             if !title.trim().is_empty() {
@@ -327,7 +349,7 @@ impl MemoryMirror {
         items: Vec<serde_json::Value>,
     ) -> (u64, Vec<serde_json::Value>) {
         let mut sessions = self.sessions.write().await;
-        let state = Self::entry(&mut sessions, asid, AgentSessionStatus::Idle);
+        let state = Self::entry(&self.harness, &mut sessions, asid, AgentSessionStatus::Idle);
         state.inbox = items;
         let seq = state.next_seq();
         let items = state.inbox.clone();
@@ -356,7 +378,7 @@ impl MemoryMirror {
         item: Option<serde_json::Value>,
     ) -> (u64, Vec<serde_json::Value>) {
         let mut sessions = self.sessions.write().await;
-        let state = Self::entry(&mut sessions, asid, AgentSessionStatus::Idle);
+        let state = Self::entry(&self.harness, &mut sessions, asid, AgentSessionStatus::Idle);
         state
             .inbox
             .retain(|it| it.get("id").and_then(serde_json::Value::as_str) != Some(inbox_id));
@@ -391,7 +413,7 @@ impl MemoryMirror {
         revert: Option<SessionRevertInfo>,
     ) -> (u64, AgentSessionInfo) {
         let mut sessions = self.sessions.write().await;
-        let state = Self::entry(&mut sessions, asid, AgentSessionStatus::Idle);
+        let state = Self::entry(&self.harness, &mut sessions, asid, AgentSessionStatus::Idle);
         state.info.revert = revert.clone();
         state.info.updated_ms = now_ms();
         let seq = state.next_seq();
@@ -479,7 +501,7 @@ impl MemoryMirror {
         delta: Option<String>,
     ) -> u64 {
         let mut sessions = self.sessions.write().await;
-        let state = Self::entry(&mut sessions, asid, AgentSessionStatus::Busy);
+        let state = Self::entry(&self.harness, &mut sessions, asid, AgentSessionStatus::Busy);
         let seq = state.next_seq();
         let event = AgentDomainEvent::CompactionChanged {
             asid: asid.clone(),
@@ -547,7 +569,7 @@ impl MemoryMirror {
         append: bool,
     ) -> Option<u64> {
         let mut sessions = self.sessions.write().await;
-        let state = Self::entry(&mut sessions, asid, AgentSessionStatus::Busy);
+        let state = Self::entry(&self.harness, &mut sessions, asid, AgentSessionStatus::Busy);
 
         let now = now_ms();
         let seq = state.next_seq();
@@ -619,7 +641,7 @@ impl MemoryMirror {
         patch: ToolPatch,
     ) -> Option<(u64, TimelineItem)> {
         let mut sessions = self.sessions.write().await;
-        let state = Self::entry(&mut sessions, asid, AgentSessionStatus::Busy);
+        let state = Self::entry(&self.harness, &mut sessions, asid, AgentSessionStatus::Busy);
 
         let item_id = tool_item_id(message_id, tool_call_id);
         let now = now_ms();
@@ -794,7 +816,7 @@ impl MemoryMirror {
         forms: Vec<FormRequest>,
     ) {
         let mut sessions = self.sessions.write().await;
-        let state = Self::entry(&mut sessions, asid, AgentSessionStatus::Idle);
+        let state = Self::entry(&self.harness, &mut sessions, asid, AgentSessionStatus::Idle);
         state.permissions = permissions.into_iter().map(|p| (p.id.clone(), p)).collect();
         state.forms = forms.into_iter().map(|f| (f.id.clone(), f)).collect();
     }
@@ -959,6 +981,10 @@ impl SessionMirrorPort for MemoryMirror {
     fn update_session<'a>(&'a self, info: AgentSessionInfo) -> MirrorFuture<'a, u64> {
         Box::pin(async move {
             let mut sessions = self.sessions.write().await;
+            let mut info = info;
+            if !self.harness.is_empty() {
+                info.harness = self.harness.to_string();
+            }
             let asid = info.asid.clone();
             if !sessions.contains_key(&asid) {
                 sessions.insert(asid.clone(), SessionState::new(info.clone()));
@@ -1000,7 +1026,7 @@ impl SessionMirrorPort for MemoryMirror {
     ) -> MirrorFuture<'a, u64> {
         Box::pin(async move {
             let mut sessions = self.sessions.write().await;
-            let state = Self::entry(&mut sessions, asid, AgentSessionStatus::Idle);
+            let state = Self::entry(&self.harness, &mut sessions, asid, AgentSessionStatus::Idle);
             let seq = state.next_seq();
             let mut updated_items = Vec::new();
 
@@ -1029,7 +1055,12 @@ impl SessionMirrorPort for MemoryMirror {
             let asid = request.asid.clone();
             // A permission raised on a session the mirror has not otherwise
             // seen used to be dropped on the floor and answered with `seq: 0`.
-            let state = Self::entry(&mut sessions, &asid, AgentSessionStatus::Busy);
+            let state = Self::entry(
+                &self.harness,
+                &mut sessions,
+                &asid,
+                AgentSessionStatus::Busy,
+            );
             let seq = state.next_seq();
             state
                 .permissions
@@ -1048,7 +1079,7 @@ impl SessionMirrorPort for MemoryMirror {
     ) -> MirrorFuture<'a, u64> {
         Box::pin(async move {
             let mut sessions = self.sessions.write().await;
-            let state = Self::entry(&mut sessions, asid, AgentSessionStatus::Idle);
+            let state = Self::entry(&self.harness, &mut sessions, asid, AgentSessionStatus::Idle);
             state.permissions.remove(request_id);
             let seq = state.next_seq();
 
@@ -1066,7 +1097,12 @@ impl SessionMirrorPort for MemoryMirror {
         Box::pin(async move {
             let mut sessions = self.sessions.write().await;
             let asid = request.asid.clone();
-            let state = Self::entry(&mut sessions, &asid, AgentSessionStatus::Busy);
+            let state = Self::entry(
+                &self.harness,
+                &mut sessions,
+                &asid,
+                AgentSessionStatus::Busy,
+            );
             let seq = state.next_seq();
             state.forms.insert(request.id.clone(), request.clone());
 
@@ -1083,7 +1119,7 @@ impl SessionMirrorPort for MemoryMirror {
     ) -> MirrorFuture<'a, u64> {
         Box::pin(async move {
             let mut sessions = self.sessions.write().await;
-            let state = Self::entry(&mut sessions, asid, AgentSessionStatus::Idle);
+            let state = Self::entry(&self.harness, &mut sessions, asid, AgentSessionStatus::Idle);
             state.forms.remove(form_id);
             let seq = state.next_seq();
 

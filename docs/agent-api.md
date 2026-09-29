@@ -81,6 +81,133 @@ verbatim, so their keys stay camelCase.
 
 ---
 
+## Harnesses
+
+The gateway can have more than one agent engine (a *harness*) attached at once.
+Today the ids are `opencode` and `deepseek`. OpenCode is preferred: the
+**primary** harness is `opencode` when it is attached, otherwise `deepseek`.
+Everything below is additive; an App that knows nothing of it keeps talking to
+the primary harness.
+
+### Feature gate
+
+`/health` and `/api/capabilities` list **`agent_harnesses`** in their flat
+`capabilities` array. An App should offer a harness picker only when it is
+present; a gateway without it has one engine and ignores every `harness`
+parameter below.
+
+### Discovery payload
+
+Harness discovery is on `GET /api/discovery` and `GET /api/capabilities`
+(identical body), at `planes.harness`; `planes.agents` and `planes.agent` are
+byte-identical aliases of it. **This payload is camelCase**, unlike the rest of
+this document, and is *not* wrapped in the envelope: the top level is
+`{"ok", "gatewayVersion", "apiVersion", "apiMajor", "platform", "serverId",
+"label", "planes", "capabilities"}`. An unauthenticated caller gets the same
+body with `endpoint` and `version` removed from every harness.
+
+```json
+{
+  "supported": true,
+  "activeHarness": "opencode",
+  "harnesses": [
+    {
+      "id": "opencode",
+      "name": "OpenCode",
+      "kind": "opencode",
+      "status": "connected",
+      "enabled": true,
+      "endpoint": "http://127.0.0.1:49374",
+      "version": "2.0.1",
+      "models": [
+        { "id": "union-alpha", "name": "Union Alpha", "providerId": "opencode",
+          "supportsReasoning": true, "reasoningEffortTiers": ["low", "high"] }
+      ],
+      "agents": [ { "id": "build", "name": "build", "description": "…" } ],
+      "features": {
+        "streaming": true, "reasoningEffort": true, "modelSelection": true,
+        "toolApprovals": true, "worktrees": true, "revert": true, "inbox": true
+      }
+    }
+  ],
+  "features": { "multiHarness": true, "catalogAggregation": true, "sessionRouting": true }
+}
+```
+
+- `activeHarness` is the primary harness id; omitted when none is attached.
+- `harnesses[]` has one entry per known harness, attached or not. `id` is the
+  value to send as `harness` everywhere below; `kind` is the engine kind and
+  equals the `harness` on that harness's sessions.
+- `status` values are snake_case: `connected` (attached and answering),
+  `reachable` (an endpoint answers but it is not attached), `offline`,
+  `disabled`, `not_installed`, `unconfigured`. Only `connected` can be selected.
+- `endpoint` and `version` are omitted when unknown or redacted. `models[]` and
+  `agents[]` are that harness's own catalog summary; `reasoningEffortTiers` is
+  omitted when empty; `agents[].description` when unset.
+- `features` (per harness) says what the engine can do, so the App can hide
+  controls rather than call and get `501 feature_unsupported`. The keys are
+  camelCase (there is no snake_case spelling of them in this payload; the
+  `reasoning_effort` field on prompt bodies and catalog variants is a different
+  thing):
+
+| Flag | Meaning |
+|---|---|
+| `streaming` | Live text and tool deltas arrive on the session stream. |
+| `reasoningEffort` | At least one model offers reasoning-effort variants (`reasoning_effort` on the prompt body and on catalog `variants[]`). |
+| `modelSelection` | The harness lists models a session can be pointed at. |
+| `toolApprovals` | The harness raises permission requests the App answers. |
+| `worktrees` | The `/api/agent-worktrees` routes work against this harness. |
+| `revert` | Stage, commit and clear revert work. |
+| `inbox` | Queued and steered prompts (`/inbox`, `delivery`) work. |
+
+  Flags reflect the harness's last probe (cached for about ten seconds).
+  Unknown extra flags may appear; ignore them.
+- `features` (plane level): `multiHarness` (more than one harness may be
+  attached), `catalogAggregation` (the unfiltered catalog is merged across
+  attached harnesses), `sessionRouting` (per-session routes resolve to the
+  owning harness by themselves).
+
+### `harness` on every session
+
+Every `AgentSessionInfo` carries `harness`: the id of the engine that owns the
+session. It is on list, get (`data.info`), create, the `move` reply, and on
+every `agent.session.updated` event. Per-session routes
+(`/api/agent-sessions/{asid}/…`) need no `harness`: the gateway remembers which
+harness owns each session it has listed or created, and asks the attached
+harnesses about one it has not seen.
+
+### Selecting a harness
+
+| Where | How |
+|---|---|
+| `POST /api/agent-sessions` | `harness` in the JSON body. Absent, the primary. A model's `provider_id` never selects the engine. |
+| `GET /api/agent-sessions` (and `/children`) | `?harness=<id>` lists that harness only. Absent, **every attached harness is merged**, newest `updated_ms` first. A harness whose engine errors is left out of the merged list (and logged) rather than failing it; if every harness fails, or the one you named does, the answer is `502 agent_engine_error`. |
+| `GET /api/agent-catalog` | `?harness=<id>` returns that harness's catalog. Absent, the merged catalog of all attached harnesses, as before. |
+| `GET /api/agent-projects` | `?harness=<id>`. Absent, the primary. |
+| `GET /api/agent-engine` | `?harness=<id>`. Absent, the primary. |
+
+`GET /api/agent-directories` reads the local filesystem, not an engine, and
+takes no `harness`.
+
+Errors, for every route above that takes `harness`:
+
+| Status | `error.code` | When |
+|---|---|---|
+| `400` | `invalid_harness` | The id is not one this gateway knows (`opencode`, `deepseek`). |
+| `503` | `agent_unavailable` | The id is known but not attached; the message names it (`Agent harness 'deepseek' is not available`). |
+
+### Compatibility
+
+An App that predates `agent_harnesses` never sends `harness`, so it gets the
+primary harness for create, projects and engine status, and sees `harness` as
+one extra string on session objects. Its unfiltered session list and catalog
+already span every attached harness (the `asid`s work on every per-session
+route). To show only the primary, or one harness at a time, an updated App
+sends `?harness=`, and only when `agent_harnesses` is advertised: an older
+gateway ignores the parameter.
+
+---
+
 ## Session lifecycle
 
 ### `GET /api/agent-sessions`
@@ -91,6 +218,7 @@ verbatim, so their keys stay camelCase.
 | `parent_id` | List the children of one session. |
 | `roots` | `true` lists top-level sessions only — no subagent sessions. |
 | `limit`, `order`, `search`, `cursor` | Passed through to OpenCode. `order` is `asc` or `desc`. `limit` defaults to **50**. |
+| `harness` | Only that harness's sessions; absent merges every attached harness. See [Harnesses](#harnesses). |
 
 Returns `[AgentSessionInfo]`.
 
@@ -100,10 +228,10 @@ A subagent run creates a real session whose `parent_id` is the caller's. Without
 ### `POST /api/agent-sessions`
 
 ```json
-{ "directory": "/abs/path", "model": {"provider_id": "…", "model_id": "…", "variant": "…"}, "agent": "build" }
+{ "directory": "/abs/path", "model": {"provider_id": "…", "model_id": "…", "variant": "…"}, "agent": "build", "harness": "opencode" }
 ```
 
-All three are optional. **Omitting `model` is the correct way to get the user's
+All four are optional; `harness` picks the engine (see [Harnesses](#harnesses)). **Omitting `model` is the correct way to get the user's
 configured default** — the gateway no longer substitutes one. `directory` must
 be absolute and must exist. Returns `AgentSessionInfo`.
 
@@ -590,7 +718,7 @@ A directory that no longer exists is not this case: that is
 
 ### `GET /api/agent-catalog`
 
-`?directory=` · ETag + `304`. `data`:
+`?directory=` · `?harness=` (one harness's catalog; absent merges all attached) · ETag + `304`. `data`:
 
 ```json
 {
@@ -643,7 +771,7 @@ route: sign-in is done on the host.
 
 ### `GET /api/agent-projects`
 
-ETag + `304`. `[{"id", "canonical", "name", "vcs?", "sandboxes": [], "missing?"}]`.
+`?harness=` · ETag + `304`. `[{"id", "canonical", "name", "vcs?", "sandboxes": [], "missing?"}]`.
 
 ```json
 [ { "id": "21eedff2…", "canonical": "/home/ryu/Work/muqun/app", "name": "app",
@@ -694,8 +822,16 @@ good, and `missing` is the whole of what the gateway can say about it.
 ```json
 { "available": true, "origin": "adopted" | "spawned" | "none",
   "url": "http://127.0.0.1:49374", "version": "2.0.1",
-  "stream_connected": true, "autostart": true }
+  "stream_connected": true, "autostart": true,
+  "kind": "opencode", "harness": "opencode" }
 ```
+
+`?harness=<id>` describes that harness instead of the primary; `harness` and
+`kind` (both the engine kind, omitted while nothing is attached) say which one
+this is. With `?harness=` this route does **not** answer `available: false`:
+an unknown id is `400 invalid_harness` and a known one that is not attached is
+`503 agent_unavailable` naming it. A non-primary harness is always an adopted
+service (`origin: "adopted"`, `autostart: false`). See [Harnesses](#harnesses).
 
 The one agent route that answers `200` when no engine is attached — it exists to
 explain why the others are returning 503.
@@ -1024,6 +1160,7 @@ event backlog overflowed.
 ```json
 {
   "asid": "ses_1",
+  "harness": "opencode",
   "backend_session_id": "ses_1",
   "title": "Tool availability and directory file count request",
   "agent": "build",
@@ -1046,7 +1183,7 @@ event backlog overflowed.
 }
 ```
 
-Only `asid`, `title`, `status` and `updated_ms` are always present; every other
+Only `asid`, `harness`, `title`, `status` and `updated_ms` are always present (`harness` is the owning engine's id, see [Harnesses](#harnesses)); every other
 field is omitted when unset. **`backend_session_id` is omitted when it would
 only repeat `asid`** — which on OpenCode is always, since the gateway mints no
 ids of its own; absent means "the same as `asid`", and it is present only for

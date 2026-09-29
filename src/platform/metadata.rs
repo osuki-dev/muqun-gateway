@@ -40,6 +40,7 @@ pub(crate) const GATEWAY_API_MAJOR: u64 = 1;
 pub(crate) const API_CAPABILITIES: &[&str] = &[
     "agent_catalog",
     "agent_events",
+    "agent_harnesses",
     "agent_forms",
     "agent_lifecycle_notifications",
     "agent_mcp",

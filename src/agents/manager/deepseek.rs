@@ -75,7 +75,8 @@ impl DeepseekEventContext {
         }
     }
 
-    pub(crate) fn emit(&self, event: AgentDomainEvent) {
+    pub(crate) fn emit(&self, mut event: AgentDomainEvent) {
+        self.mirror.stamp_event(&mut event);
         // A send with no subscribers is not a failure: nobody is watching.
         let _ = self.tx.send(event);
     }

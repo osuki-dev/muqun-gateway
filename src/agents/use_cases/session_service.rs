@@ -50,7 +50,24 @@ impl SessionService {
         &self,
         query: &SessionQuery,
     ) -> Result<Vec<AgentSessionInfo>, AgentEngineError> {
-        self.engine.list_sessions(query).await
+        let mut sessions = self.engine.list_sessions(query).await?;
+        for session in &mut sessions {
+            self.stamp(session);
+        }
+        Ok(sessions)
+    }
+
+    /// Tag a session with the harness that owns it. The one place engine
+    /// results gain `harness`; adapters and routes never set it.
+    fn stamp(&self, info: &mut AgentSessionInfo) {
+        info.harness = self.engine.kind().to_string();
+    }
+
+    /// One session as the engine reports it, tagged with its harness.
+    pub async fn get_session(&self, asid: &str) -> Result<AgentSessionInfo, AgentEngineError> {
+        let mut info = self.engine.get_session(asid).await?;
+        self.stamp(&mut info);
+        Ok(info)
     }
 
     pub async fn create_session(
@@ -59,7 +76,8 @@ impl SessionService {
         model: Option<&ModelRef>,
         agent: Option<&str>,
     ) -> Result<AgentSessionInfo, AgentEngineError> {
-        let info = self.engine.create_session(directory, model, agent).await?;
+        let mut info = self.engine.create_session(directory, model, agent).await?;
+        self.stamp(&mut info);
         self.mirror.update_session(info.clone()).await;
         Ok(info)
     }
@@ -75,7 +93,8 @@ impl SessionService {
             return Ok(snapshot);
         }
 
-        let info = self.engine.get_session(&asid.0).await?;
+        let mut info = self.engine.get_session(&asid.0).await?;
+        self.stamp(&mut info);
         self.mirror.update_session(info.clone()).await;
 
         let timeline = self
