@@ -774,6 +774,15 @@ impl AgentRuntime {
             }
         };
         agents.push(opencode_info);
+        // The App draws its launch row in this order and fills the first tile
+        // as the primary one, so the list follows the same preference the
+        // runtime uses to pick a default agent.
+        agents.sort_by_key(|agent| {
+            AGENT_PREFERENCE
+                .iter()
+                .position(|id| *id == agent.id)
+                .unwrap_or(AGENT_PREFERENCE.len())
+        });
 
         let supported = agents.iter().any(|h| {
             h.status == AgentAvailability::Connected || h.status == AgentAvailability::Reachable
@@ -1870,6 +1879,14 @@ mod tests {
         let ds = found.agents.iter().find(|a| a.id == "deepseek").unwrap();
         assert_eq!(ds.status, crate::discovery::AgentAvailability::Disabled);
         assert!(ds.endpoint.is_none());
+    }
+
+    #[tokio::test]
+    async fn discovery_lists_agents_in_preference_order() {
+        let runtime = AgentRuntime::disabled();
+        let found = runtime.discover_agents().await;
+        let ids: Vec<&str> = found.agents.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, AGENT_PREFERENCE.to_vec());
     }
 
     #[tokio::test]
