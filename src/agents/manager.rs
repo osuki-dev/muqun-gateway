@@ -443,6 +443,33 @@ impl AgentManager {
         &self.interaction_service
     }
 
+    pub async fn view_session(
+        &self,
+        asid: &str,
+        viewed: u64,
+    ) -> Result<(), super::ports::agent::AgentError> {
+        use super::ports::agent::AgentError;
+        match self.agent.view_session(asid, viewed).await {
+            Ok(()) | Err(AgentError::Unsupported(_)) => {}
+            Err(err) => return Err(err),
+        }
+        let id = AgentSessionId(asid.to_string());
+        if self.mirror.is_placeholder(&id).await {
+            let info = self.agent.get_session(asid).await?;
+            self.mirror.update_session(info).await;
+        }
+        if let Some((seq, info)) = self.mirror.mark_viewed(&id, viewed).await {
+            let mut event = AgentDomainEvent::SessionUpdated {
+                asid: id,
+                info: Box::new(info),
+                seq,
+            };
+            self.mirror.stamp_event(&mut event);
+            let _ = self.events_tx.send(event);
+        }
+        Ok(())
+    }
+
     pub fn agent(&self) -> &Arc<dyn AgentPort> {
         &self.agent
     }

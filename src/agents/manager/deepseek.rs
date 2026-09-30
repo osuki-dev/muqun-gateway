@@ -267,9 +267,10 @@ async fn seed_followed_sessions(ctx: &DeepseekEventContext) {
         }
     };
     for summary in summaries.iter().filter(|s| summary_is_live(s)) {
-        if let Some(info) = mapper::map_session(summary) {
+        if let Some(mut info) = mapper::map_session(summary) {
             let asid = info.asid.clone();
             let seq = ctx.mirror.update_session(info.clone()).await;
+            ctx.mirror.overlay_read_markers(&mut info).await;
             ctx.emit(AgentDomainEvent::SessionUpdated {
                 asid: asid.clone(),
                 info: Box::new(info),
@@ -386,11 +387,12 @@ async fn handle_emit(event: &str, args: &[Value], ctx: &DeepseekEventContext) {
             let Some(summary) = args.first() else {
                 return;
             };
-            let Some(info) = mapper::map_session(summary) else {
+            let Some(mut info) = mapper::map_session(summary) else {
                 return;
             };
             let asid = info.asid.clone();
             let seq = ctx.mirror.update_session(info.clone()).await;
+            ctx.mirror.overlay_read_markers(&mut info).await;
             ctx.emit(AgentDomainEvent::SessionUpdated {
                 asid: asid.clone(),
                 info: Box::new(info),
@@ -481,8 +483,9 @@ async fn handle_follow_frame(asid: &AgentSessionId, frame: &Value, ctx: &Deepsee
 async fn handle_snapshot(asid: &AgentSessionId, frame: &Value, ctx: &DeepseekEventContext) {
     let header = frame.get("header").cloned().unwrap_or(Value::Null);
     let projections = frame.get("projections").cloned().unwrap_or(Value::Null);
-    if let Some(info) = mapper::map_snapshot_session(&asid.0, &header, &projections) {
+    if let Some(mut info) = mapper::map_snapshot_session(&asid.0, &header, &projections) {
         let seq = ctx.mirror.update_session(info.clone()).await;
+        ctx.mirror.overlay_read_markers(&mut info).await;
         ctx.emit(AgentDomainEvent::SessionUpdated {
             asid: asid.clone(),
             info: Box::new(info),
@@ -964,6 +967,27 @@ mod tests {
         assert_eq!(
             drain(&mut rx),
             vec!["agent.session.updated", "agent.timeline.upsert"]
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_broadcast_preserves_gateway_read_marker() {
+        let (ctx, mut rx) = ctx();
+        let snapshot = json!({
+            "type": "snapshot",
+            "header": { "version": 4, "id": "ses_1", "createdAt": 1, "cwd": "/w" },
+            "records": [],
+            "projections": { "asOfSeq": 5, "values": { "title": "Greeting" } }
+        });
+        follow(&ctx, "ses_1", snapshot.clone()).await;
+        drain(&mut rx);
+        let asid = AgentSessionId("ses_1".into());
+        ctx.mirror.mark_viewed(&asid, u64::MAX).await.unwrap();
+        follow(&ctx, "ses_1", snapshot).await;
+        let event = rx.try_recv().unwrap();
+        assert!(
+            matches!(event, AgentDomainEvent::SessionUpdated { info, .. }
+            if info.time_viewed == Some(u64::MAX))
         );
     }
 

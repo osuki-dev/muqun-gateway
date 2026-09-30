@@ -1377,7 +1377,17 @@ fn deepseek_features(
         worktrees: false,
         revert: false,
         inbox: false,
-        extra: std::collections::BTreeMap::new(),
+        // Session presets are available at creation. The remaining driver
+        // operations are unsupported; omitted flags would enable them in clients.
+        extra: std::collections::BTreeMap::from([
+            ("modeSwitching".into(), serde_json::Value::Bool(false)),
+            ("modes".into(), serde_json::Value::Bool(true)),
+            ("skills".into(), serde_json::Value::Bool(false)),
+            ("slashCommands".into(), serde_json::Value::Bool(false)),
+            ("compaction".into(), serde_json::Value::Bool(false)),
+            ("backgroundShells".into(), serde_json::Value::Bool(false)),
+            ("attachments".into(), serde_json::Value::Bool(false)),
+        ]),
     }
 }
 

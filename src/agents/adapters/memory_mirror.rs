@@ -255,6 +255,34 @@ impl MemoryMirror {
         sessions.get(asid).map(|s| s.placeholder).unwrap_or(true)
     }
 
+    /// Upstream metadata cannot erase read markers the Gateway owns.
+    pub async fn overlay_read_markers(&self, info: &mut AgentSessionInfo) {
+        let sessions = self.sessions.read().await;
+        if let Some(state) = sessions.get(&info.asid) {
+            info.time_idle = info.time_idle.max(state.info.time_idle);
+            info.time_viewed = info.time_viewed.max(state.info.time_viewed);
+        }
+    }
+
+    /// Reading a session is Gateway-owned when the upstream has no read marker.
+    pub async fn mark_viewed(
+        &self,
+        asid: &AgentSessionId,
+        viewed: u64,
+    ) -> Option<(u64, AgentSessionInfo)> {
+        let mut sessions = self.sessions.write().await;
+        let state = sessions.get_mut(asid)?;
+        state.info.time_viewed = Some(viewed.max(state.info.time_viewed.unwrap_or(0)));
+        let seq = state.next_seq();
+        let info = state.info.clone();
+        state.push_event(AgentDomainEvent::SessionUpdated {
+            asid: asid.clone(),
+            info: Box::new(info.clone()),
+            seq,
+        });
+        Some((seq, info))
+    }
+
     pub async fn update_status(
         &self,
         asid: &AgentSessionId,
@@ -268,13 +296,14 @@ impl MemoryMirror {
             asid,
             AgentSessionStatus::Idle,
         );
+        let previous_status = state.info.status;
         state.info.status = status;
         if error.is_some() {
             state.info.error = error.clone();
         } else if status != AgentSessionStatus::Failed {
             state.info.error = None;
         }
-        if status == AgentSessionStatus::Idle {
+        if status == AgentSessionStatus::Idle && previous_status != AgentSessionStatus::Idle {
             state.info.time_idle = Some(now_ms());
         }
         let seq = state.next_seq();
@@ -1050,6 +1079,8 @@ impl SessionMirrorPort for MemoryMirror {
             {
                 merged.status = live_status;
             }
+            merged.time_idle = merged.time_idle.max(state.info.time_idle);
+            merged.time_viewed = merged.time_viewed.max(state.info.time_viewed);
             state.info = merged.clone();
             state.placeholder = false;
             let seq = state.next_seq();
@@ -1220,6 +1251,43 @@ mod tests {
             ordinal: 0,
             attachments: None,
         }
+    }
+
+    #[tokio::test]
+    async fn read_markers_survive_refetch_and_duplicate_idle_events() {
+        let mirror = MemoryMirror::new();
+        let asid = AgentSessionId("ses-read".into());
+        mirror.update_session(info(&asid, "Read test")).await;
+        mirror
+            .update_status(&asid, AgentSessionStatus::Busy, None)
+            .await;
+        mirror
+            .update_status(&asid, AgentSessionStatus::Idle, None)
+            .await;
+        let idle = mirror
+            .get_snapshot(&asid)
+            .await
+            .unwrap()
+            .info
+            .time_idle
+            .unwrap();
+        mirror.mark_viewed(&asid, idle + 1).await.unwrap();
+        mirror.mark_viewed(&asid, idle).await.unwrap();
+        mirror
+            .update_status(&asid, AgentSessionStatus::Idle, None)
+            .await;
+        mirror.update_session(info(&asid, "Read test")).await;
+        let snap = mirror.get_snapshot(&asid).await.unwrap();
+        assert_eq!(snap.info.time_idle, Some(idle));
+        assert_eq!(snap.info.time_viewed, Some(idle + 1));
+        let mut upstream = info(&asid, "Read test");
+        mirror.overlay_read_markers(&mut upstream).await;
+        assert_eq!(upstream.time_idle, Some(idle));
+        assert_eq!(upstream.time_viewed, Some(idle + 1));
+        assert!(mirror
+            .mark_viewed(&AgentSessionId("missing".into()), idle)
+            .await
+            .is_none());
     }
 
     #[tokio::test]
