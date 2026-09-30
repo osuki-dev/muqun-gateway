@@ -131,33 +131,24 @@ impl AgentPort for DeepseekDriver {
 
     fn get_session<'a>(&'a self, session_id: &'a str) -> AgentFuture<'a, AgentSessionInfo> {
         Box::pin(async move {
-            // First try get_projections which gives complete session projection
+            // Projections are default-valued even for an unknown id. Only the
+            // authoritative inventory can establish ownership across agents.
+            let summaries = self.client.list_sessions(&SessionQuery::default()).await?;
+            let mut summary = summaries
+                .into_iter()
+                .find(|item| {
+                    item.get("sessionId").and_then(serde_json::Value::as_str) == Some(session_id)
+                })
+                .ok_or_else(|| AgentError::SessionNotFound(session_id.to_string()))?;
             match self.client.get_projections(session_id).await {
-                Ok(proj) => {
-                    let wrapped = serde_json::json!({
-                        "sessionId": session_id,
-                        "projections": proj,
-                    });
-                    if let Some(mut info) = mapper::map_session(&wrapped) {
-                        info.asid = AgentSessionId(session_id.to_string());
-                        return Ok(info);
-                    }
-                }
+                Ok(projections) => summary["projections"] = projections,
                 Err(e @ AgentError::SessionNotFound(_)) => return Err(e),
                 Err(e) => {
-                    tracing::debug!(target: "deepseek", "projections failed, trying page: {e}");
+                    tracing::debug!(target: "deepseek", "projections failed; using session summary: {e}");
                 }
             }
-
-            let page = self.client.get_page(session_id, 1).await?;
-            // A page that names no session is not a session we own; claiming
-            // one here would let ownership resolution adopt any id.
-            let mut info = mapper::map_session(&page).ok_or_else(|| {
-                tracing::warn!(target: "deepseek", "session page carried no sessionId");
-                AgentError::Protocol("session page is unreadable".to_string())
-            })?;
-            info.asid = AgentSessionId(session_id.to_string());
-            Ok(info)
+            mapper::map_session(&summary)
+                .ok_or_else(|| AgentError::Protocol("session summary is unreadable".to_string()))
         })
     }
 
@@ -415,6 +406,40 @@ impl AgentPort for DeepseekDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn default_projections_cannot_claim_another_agents_session() {
+        use axum::{routing::post, Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let projection_calls = Arc::new(AtomicUsize::new(0));
+        let count = projection_calls.clone();
+        let app = Router::new()
+            .route("/api/session/list", post(|| async {
+                Json(serde_json::json!({ "result": { "ok": true, "value": [
+                    { "sessionId": "session-owned", "cwd": "/qa", "title": "Known session" }
+                ] } }))
+            }))
+            .route("/api/session/projections", post(move || {
+                let count = count.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({ "result": { "ok": true, "value": { "values": {} } } }))
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let driver = DeepseekDriver::new(DeepseekEndpoint::new(url, None, None));
+        assert!(
+            matches!(driver.get_session("t3-thread").await, Err(AgentError::SessionNotFound(id)) if id == "t3-thread")
+        );
+        assert_eq!(projection_calls.load(Ordering::SeqCst), 0);
+        let known = driver.get_session("session-owned").await.unwrap();
+        assert_eq!(known.directory.as_deref(), Some("/qa"));
+        assert_eq!(known.title, "Known session");
+        assert_eq!(projection_calls.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
 
     #[tokio::test]
     #[ignore = "requires a running DeepSeek Harness; creates a real session"]

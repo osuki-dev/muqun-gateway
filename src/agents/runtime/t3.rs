@@ -346,7 +346,7 @@ impl AgentRuntime {
         // version can be told without a credential; the models cannot.
         match self.t3.endpoint().describe(&probe_client()).await {
             Ok(descriptor) => {
-                info.status = AgentAvailability::Reachable;
+                info.status = AgentAvailability::Unconfigured;
                 info.version = Some(descriptor.server_version);
             }
             Err(_) => info.status = AgentAvailability::Offline,

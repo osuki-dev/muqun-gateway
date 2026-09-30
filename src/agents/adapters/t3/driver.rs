@@ -380,6 +380,9 @@ impl AgentPort for T3Driver {
     fn switch_model<'a>(&'a self, session_id: &'a str, model: &'a ModelRef) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             let id = validate_id(session_id, "session id")?;
+            let (_, thread) = self.session_from_snapshot(&id).await?;
+            let config = self.client.get_config().await?;
+            validate_model_driver(&thread, model, &config)?;
             let selection = mapper::model_selection_from_ref(model);
             self.client
                 .dispatch(commands::thread_set_model(&id, &selection))
@@ -563,9 +566,67 @@ impl AgentPort for T3Driver {
     }
 }
 
+/// T3 binds a started thread to its driver; changing metadata across drivers
+/// succeeds upstream but makes the next turn fail. Reject before writing it.
+fn validate_model_driver(
+    thread: &Value,
+    model: &ModelRef,
+    config: &Value,
+) -> Result<(), AgentError> {
+    let Some(bound) = thread
+        .pointer("/session/providerName")
+        .and_then(Value::as_str)
+    else {
+        return Ok(());
+    };
+    let driver = config
+        .get("providers")
+        .and_then(Value::as_array)
+        .and_then(|providers| {
+            providers
+                .iter()
+                .find(|p| p.get("instanceId").and_then(Value::as_str) == Some(&model.provider_id))
+        })
+        .and_then(|p| p.get("driver").and_then(Value::as_str))
+        .ok_or_else(|| {
+            AgentError::RequestFailed("the selected provider is not in the T3 catalog".into())
+        })?;
+    if bound != driver {
+        return Err(AgentError::RequestFailed(format!(
+            "This T3 session uses {bound}. Start a new session to use {driver}."
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_started_thread_cannot_change_drivers_but_can_change_model_or_instance() {
+        let config = serde_json::json!({"providers": [
+            {"instanceId":"codex", "driver":"codex"},
+            {"instanceId":"codex-alt", "driver":"codex"},
+            {"instanceId":"claudeAgent", "driver":"claudeAgent"}
+        ]});
+        let thread = serde_json::json!({"session":{"providerName":"codex"}});
+        let model = |provider: &str| ModelRef {
+            provider_id: provider.into(),
+            model_id: "cheap-model".into(),
+            variant: None,
+        };
+        assert!(validate_model_driver(&thread, &model("codex"), &config).is_ok());
+        assert!(validate_model_driver(&thread, &model("codex-alt"), &config).is_ok());
+        assert!(validate_model_driver(&thread, &model("claudeAgent"), &config).is_err());
+        assert!(validate_model_driver(&thread, &model("unknown"), &config).is_err());
+        assert!(validate_model_driver(
+            &serde_json::json!({"session":null}),
+            &model("claudeAgent"),
+            &config
+        )
+        .is_ok());
+    }
 
     /// A `tokio::test`: constructing a driver spawns the RPC actor.
     #[tokio::test]

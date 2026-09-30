@@ -53,6 +53,9 @@ impl SessionService {
         let mut sessions = self.agent.list_sessions(query).await?;
         for session in &mut sessions {
             self.stamp(session);
+            if let Some(memory) = &self.memory {
+                memory.overlay_read_markers(session).await;
+            }
         }
         Ok(sessions)
     }
@@ -67,6 +70,9 @@ impl SessionService {
     pub async fn get_session(&self, asid: &str) -> Result<AgentSessionInfo, AgentError> {
         let mut info = self.agent.get_session(asid).await?;
         self.stamp(&mut info);
+        if let Some(memory) = &self.memory {
+            memory.overlay_read_markers(&mut info).await;
+        }
         Ok(info)
     }
 

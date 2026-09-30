@@ -548,23 +548,31 @@ pub fn map_tool(activity: &Value) -> Option<ToolCall> {
         .or_else(|| s(activity, "id"))?
         .to_string();
     let data = payload.get("data").filter(|d| d.is_object());
+    let command = data.and_then(|d| d.get("item")).filter(|item| {
+        s(item, "type") == Some("commandExecution")
+            || (s(payload, "itemType") == Some("command_execution") && s(item, "command").is_some())
+    });
     let name = data
         .and_then(|d| s(d, "toolName"))
         .or_else(|| s(payload, "toolName"))
+        .or_else(|| command.map(|_| "bash"))
         .or_else(|| s(payload, "itemType"))
         .unwrap_or("tool")
         .to_string();
     let title = s(payload, "title")
         .or_else(|| s(activity, "summary"))
         .map(str::to_string);
-    let mut input = data
-        .map(|d| {
-            let mut m = d.clone();
-            if let Some(o) = m.as_object_mut() {
-                o.remove("rawOutput");
-                o.remove("toolName");
-            }
-            m
+    let mut input = command
+        .map(|item| json!({ "command": item.get("command"), "cwd": item.get("cwd") }))
+        .or_else(|| {
+            data.map(|d| {
+                let mut m = d.clone();
+                if let Some(o) = m.as_object_mut() {
+                    o.remove("rawOutput");
+                    o.remove("toolName");
+                }
+                m
+            })
         })
         .unwrap_or(Value::Null);
     if input.as_object().map(|o| o.is_empty()).unwrap_or(true) {
@@ -572,11 +580,16 @@ pub fn map_tool(activity: &Value) -> Option<ToolCall> {
             input = json!({ "detail": detail });
         }
     }
-    let output = data
-        .and_then(|d| d.get("rawOutput"))
-        .map(|raw| match raw.get("content") {
-            Some(c) => c.clone(),
-            None => raw.clone(),
+    let output = command
+        .and_then(|item| item.get("aggregatedOutput"))
+        .filter(|output| !output.is_null())
+        .cloned()
+        .or_else(|| {
+            data.and_then(|d| d.get("rawOutput"))
+                .map(|raw| match raw.get("content") {
+                    Some(c) => c.clone(),
+                    None => raw.clone(),
+                })
         });
     let state = match kind {
         "tool.denied" => ToolCallStatus::Failed,
@@ -617,6 +630,7 @@ pub fn map_tool(activity: &Value) -> Option<ToolCall> {
             "itemType": payload.get("itemType").cloned().unwrap_or(Value::Null),
             "toolSurface": payload.get("toolSurface").cloned().unwrap_or(Value::Null),
             "agentId": payload.get("agentId").cloned().unwrap_or(Value::Null),
+            "exit": command.and_then(|item| item.get("exitCode")),
         })),
         state,
         status: state,
@@ -1335,6 +1349,46 @@ mod tests {
         assert_eq!(row.message_id, "1790670904754:turn:turn-1");
         assert_eq!(t3_message_id(&row.message_id), "turn:turn-1");
         assert!(matches!(row.part, AgentPart::Form { .. }));
+    }
+
+    #[test]
+    fn codex_command_items_use_shell_cards_and_plain_stdout() {
+        let mut activity = json!({
+            "id": "activity-1", "kind": "tool.completed", "summary": "Ran command",
+            "payload": { "itemType": "command_execution", "toolCallId": "exec-1", "status": "completed",
+                "data": { "completedAtMs": 10, "item": {
+                    "type": "commandExecution", "command": "printf 'OK\\n'", "cwd": "/w",
+                    "aggregatedOutput": "OK\n", "exitCode": 0
+                } }
+            }, "createdAt": "2026-09-29T08:35:04.754Z"
+        });
+        let tool = map_tool(&activity).unwrap();
+        assert_eq!(tool.name, "bash");
+        assert_eq!(
+            tool.input,
+            json!({ "command": "printf 'OK\\n'", "cwd": "/w" })
+        );
+        assert_eq!(tool.output, Some(json!("OK\n")));
+        assert_eq!(tool.content.unwrap()[0]["text"], "OK\n");
+        assert_eq!(tool.metadata.unwrap()["exit"], 0);
+        activity["kind"] = json!("tool.started");
+        activity["payload"]["data"]["item"]["aggregatedOutput"] = Value::Null;
+        activity["payload"]["data"]["item"]["exitCode"] = Value::Null;
+        let tool = map_tool(&activity).unwrap();
+        assert_eq!(tool.state, ToolCallStatus::Running);
+        assert!(tool.output.is_none());
+
+        // The enclosing itemType also identifies a command execution when
+        // the nested item's type and cwd are absent.
+        activity["kind"] = json!("tool.completed");
+        activity["payload"]["data"]["item"] = json!({
+            "command": "printf 'OK\\n'", "aggregatedOutput": "OK"
+        });
+        let tool = map_tool(&activity).unwrap();
+        assert_eq!(tool.name, "bash");
+        assert_eq!(tool.input["command"], "printf 'OK\\n'");
+        assert_eq!(tool.output, Some(json!("OK")));
+        assert_eq!(tool.content.unwrap()[0]["text"], "OK");
     }
 
     #[test]

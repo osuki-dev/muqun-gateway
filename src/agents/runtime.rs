@@ -1382,7 +1382,10 @@ fn deepseek_features(
         compaction: false,
         background_shells: false,
         attachments: false,
-        extra: std::collections::BTreeMap::new(),
+        extra: std::collections::BTreeMap::from([(
+            "modeSwitching".into(),
+            serde_json::Value::Bool(false),
+        )]),
     }
 }
 

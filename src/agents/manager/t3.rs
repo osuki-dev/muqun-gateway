@@ -115,13 +115,14 @@ impl T3EventContext {
 
     async fn update_session(&self, thread: &Value) -> Option<AgentSessionId> {
         let roots = self.roots.lock().await.clone();
-        let info = mapper::map_session(thread, &roots)?;
+        let mut info = mapper::map_session(thread, &roots)?;
         let asid = info.asid.clone();
         if info.deleted {
             self.forget_session(&asid).await;
             return Some(asid);
         }
         let seq = self.mirror.update_session(info.clone()).await;
+        self.mirror.overlay_read_markers(&mut info).await;
         self.emit(AgentDomainEvent::SessionUpdated {
             asid: asid.clone(),
             info: Box::new(info),
@@ -723,6 +724,24 @@ mod tests {
         let snapshot = ctx.mirror.get_snapshot(&asid).await.unwrap();
         assert_eq!(snapshot.timeline.len(), 1, "one row throughout");
         assert!(matches!(&snapshot.timeline[0].part, AgentPart::Text { text } if text == "pong!"));
+    }
+
+    #[tokio::test]
+    async fn shell_metadata_broadcast_preserves_gateway_read_marker() {
+        let (ctx, mut rx) = ctx();
+        let detail: Value =
+            serde_json::from_str(include_str!("../adapters/t3/fixtures/thread_detail.json"))
+                .unwrap();
+        let thread = &detail["thread"];
+        let asid = ctx.update_session(thread).await.unwrap();
+        drain(&mut rx);
+        ctx.mirror.mark_viewed(&asid, u64::MAX).await.unwrap();
+        ctx.update_session(thread).await.unwrap();
+        let events = drain(&mut rx);
+        assert!(
+            matches!(&events[..], [AgentDomainEvent::SessionUpdated { info, .. }]
+            if info.time_viewed == Some(u64::MAX))
+        );
     }
 
     #[tokio::test]

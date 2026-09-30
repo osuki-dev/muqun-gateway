@@ -2360,7 +2360,6 @@ async fn view_agent_session(
             .unwrap_or(0)
     });
     manager
-        .agent()
         .view_session(&asid, idle)
         .await
         .map_err(agent_error)?;
