@@ -1,0 +1,1930 @@
+//! Keeping an OpenCode agent attached for the life of the gateway.
+//!
+//! Discovery used to run once at startup and the result was final: if OpenCode
+//! was not running at that moment every agent route answered 503 for the life
+//! of the process, and if OpenCode restarted on a new port -- its port is
+//! ephemeral -- the gateway kept the dead URL forever. Restarting OpenCode
+//! meant restarting the gateway.
+//!
+//! This supervises instead. It adopts a healthy service, starts one when there
+//! is none and the owner has left autostart on, re-discovers whenever the
+//! stream or the health probe says the agent has gone, and hands every route
+//! whatever manager is current.
+
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+use tokio::sync::{broadcast, Mutex, RwLock};
+
+use super::adapters::opencode::OpencodeEndpoint;
+use super::domain::AgentDomainEvent;
+use super::manager::AgentManager;
+
+/// How often the supervisor checks a healthy agent.
+const HEALTHY_POLL: Duration = Duration::from_secs(15);
+/// How soon it retries after finding none.
+const UNHEALTHY_POLL: Duration = Duration::from_secs(3);
+/// How long service startup and registration may each take.
+const STARTUP_WAIT: Duration = Duration::from_secs(20);
+const STARTUP_POLL: Duration = Duration::from_millis(400);
+/// Backoff ceiling between failed start attempts.
+const MAX_START_BACKOFF: Duration = Duration::from_secs(120);
+/// How often the supervisor glances at the event stream while the agent is
+/// otherwise healthy. A lost stream *is* the agent going away, and waiting
+/// for the next health poll to notice it cost thirteen seconds of silence in
+/// the app for no reason -- the flag is an atomic read, so this is nearly free.
+const STREAM_WATCH_TICK: Duration = Duration::from_secs(1);
+/// The wait before re-discovering after the stream dropped. Nothing the first
+/// time: look at once. Then doubling, so a stream that flaps cannot spin the
+/// supervisor.
+const STREAM_LOSS_FIRST_WAIT: Duration = Duration::ZERO;
+const STREAM_LOSS_MAX_WAIT: Duration = Duration::from_secs(30);
+/// The agent major version this gateway speaks. v1 is a different API, and
+/// half-working with it is worse than saying so.
+const MIN_OPENCODE_MAJOR: u64 = 2;
+
+/// Agent ids in primary-preference order. OpenCode is the established
+/// agent and DeepSeek is opt-in, so DeepSeek is primary only when OpenCode is
+/// not attached. Every place that names an agent by position reads this.
+pub const AGENT_PREFERENCE: [&str; 2] = ["opencode", "deepseek"];
+/// Most session-to-agent routes remembered; the oldest go first.
+const MAX_SESSION_ROUTES: usize = 4096;
+/// How long an agent discovery result is reused.
+const DISCOVERY_TTL: Duration = Duration::from_secs(10);
+/// The longest a request may wait on upstream probing.
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
+/// The longest one agent may take to say whether it owns a session.
+const SESSION_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The entry of `map` for the most preferred agent present.
+fn pick_primary<T>(map: &BTreeMap<String, T>) -> Option<&T> {
+    AGENT_PREFERENCE.iter().find_map(|id| map.get(*id))
+}
+
+/// Remembered session routes, bounded: insertion order is kept so the oldest
+/// can be dropped.
+#[derive(Default)]
+struct SessionRoutes {
+    map: HashMap<String, String>,
+    order: VecDeque<String>,
+}
+
+impl SessionRoutes {
+    fn insert(&mut self, asid: &str, agent_id: &str) {
+        if self
+            .map
+            .insert(asid.to_string(), agent_id.to_string())
+            .is_none()
+        {
+            self.order.push_back(asid.to_string());
+        }
+        while self.map.len() > MAX_SESSION_ROUTES {
+            match self.order.pop_front() {
+                Some(oldest) => {
+                    self.map.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+    }
+
+    fn remove(&mut self, asid: &str) {
+        if self.map.remove(asid).is_some() {
+            self.order.retain(|a| a != asid);
+        }
+    }
+}
+
+/// `opencode` in `config.json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpencodeConfig {
+    /// Explicitly enable or disable the OpenCode agent.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Run `opencode service start` when no healthy service is found.
+    #[serde(default = "default_true")]
+    pub autostart: bool,
+    /// The binary to start, when `PATH` is not the right answer.
+    ///
+    /// Absent, the gateway runs whatever `opencode` `PATH` resolves to, and
+    /// says which file that turned out to be. It does not go looking in an
+    /// install directory of its own: where OpenCode lives differs per OS and
+    /// per install, and a gateway guessing at it would quietly run a different
+    /// binary than the one the owner's shell does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for OpencodeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            autostart: true,
+            binary: None,
+        }
+    }
+}
+
+/// `deepseek` in `config.json`.
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct DeepseekConfig {
+    /// Explicitly enable the DeepSeek agent
+    #[serde(default)]
+    pub enabled: bool,
+    /// Explicit service endpoint URL (default is http://127.0.0.1:19387)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// Optional bearer auth token
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// Optional signing secret for browser-session cookie
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
+}
+
+/// `Debug` never prints the token or the cookie secret: `Config` derives
+/// `Debug` and is logged at startup, and a bearer in the journal is a leak.
+impl std::fmt::Debug for DeepseekConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redact = |value: &Option<String>| value.as_ref().map(|_| "<redacted>");
+        f.debug_struct("DeepseekConfig")
+            .field("enabled", &self.enabled)
+            .field("endpoint", &self.endpoint)
+            .field("token", &redact(&self.token))
+            .field("secret", &redact(&self.secret))
+            .finish()
+    }
+}
+
+/// How the agent currently attached was obtained, for the status route and
+/// the log line an operator reads after a restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentOrigin {
+    /// A service that was already running.
+    Adopted,
+    /// One this gateway started.
+    Spawned,
+    /// Nothing attached.
+    None,
+}
+
+/// Whether this gateway can establish that OpenCode is installed locally.
+///
+/// This deliberately says nothing about whether a service is currently
+/// reachable. An externally configured endpoint is not necessarily local, so
+/// its installation cannot be determined from this process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentInstallation {
+    Installed,
+    NotFound,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentStatus {
+    pub available: bool,
+    pub installation: AgentInstallation,
+    pub origin: AgentOrigin,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    pub stream_connected: bool,
+    pub autostart: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// The agent this status describes; the agent's `kind()`. Absent while
+    /// nothing is attached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+}
+
+pub struct AgentRuntime {
+    manager: RwLock<Option<Arc<AgentManager>>>,
+    managers: RwLock<BTreeMap<String, Arc<AgentManager>>>,
+    session_routes: RwLock<SessionRoutes>,
+    /// The last agent discovery and when it was taken.
+    discovery_cache: RwLock<Option<(tokio::time::Instant, crate::discovery::AgentPlaneDiscovery)>>,
+    /// One refresh at a time; the rest wait and read its result.
+    discovery_refresh: Mutex<()>,
+    /// The event channel belongs to the runtime, not to a manager, so a
+    /// subscriber keeps its stream across a reconnect.
+    events_tx: broadcast::Sender<AgentDomainEvent>,
+    config: OpencodeConfig,
+    deepseek_config: DeepseekConfig,
+    origin: RwLock<AgentOrigin>,
+    /// Serialize startup commands; OpenCode owns the background service.
+    start_lock: Mutex<()>,
+    supervising: AtomicBool,
+}
+
+impl AgentRuntime {
+    pub fn new(config: OpencodeConfig) -> Arc<Self> {
+        Self::with_configs(config, DeepseekConfig::default())
+    }
+
+    pub fn with_configs(config: OpencodeConfig, deepseek_config: DeepseekConfig) -> Arc<Self> {
+        let (events_tx, _) = broadcast::channel(1024);
+        Arc::new(Self {
+            manager: RwLock::new(None),
+            managers: RwLock::new(BTreeMap::new()),
+            session_routes: RwLock::new(SessionRoutes::default()),
+            discovery_cache: RwLock::new(None),
+            discovery_refresh: Mutex::new(()),
+            events_tx,
+            config,
+            deepseek_config,
+            origin: RwLock::new(AgentOrigin::None),
+            start_lock: Mutex::new(()),
+            supervising: AtomicBool::new(false),
+        })
+    }
+
+    /// A runtime that will never attach an agent, for tests and for a build
+    /// of `AppState` that has no business starting anything.
+    pub fn disabled() -> Arc<Self> {
+        Self::with_configs(
+            OpencodeConfig {
+                enabled: false,
+                autostart: false,
+                binary: None,
+            },
+            DeepseekConfig::default(),
+        )
+    }
+
+    /// The default or primary agent manager, or `None` while nothing is attached.
+    pub async fn manager(&self) -> Option<Arc<AgentManager>> {
+        self.manager.read().await.clone()
+    }
+
+    /// Attach a ready-made manager under its agent id, as `attach` does.
+    #[cfg(test)]
+    pub(crate) async fn attach_for_test(&self, manager: Arc<AgentManager>) {
+        let kind = manager.agent().kind();
+        self.managers
+            .write()
+            .await
+            .insert(kind.to_string(), manager);
+        self.promote_primary(kind, AgentOrigin::Adopted).await;
+    }
+
+    /// Return all currently active agent managers.
+    pub async fn all_managers(&self) -> Vec<Arc<AgentManager>> {
+        let map = self.managers.read().await;
+        if map.is_empty() {
+            if let Some(m) = self.manager.read().await.clone() {
+                return vec![m];
+            }
+            Vec::new()
+        } else {
+            map.values().cloned().collect()
+        }
+    }
+
+    /// Return manager for a specific agent id (e.g. "opencode", "deepseek").
+    pub async fn manager_for_agent(&self, agent_id: &str) -> Option<Arc<AgentManager>> {
+        let map = self.managers.read().await;
+        if let Some(m) = map.get(agent_id) {
+            return Some(m.clone());
+        }
+        if let Some(m) = self.manager.read().await.clone() {
+            if m.agent().kind() == agent_id {
+                return Some(m);
+            }
+        }
+        None
+    }
+
+    /// Whether `agent_id` is an id this gateway knows, attached or not.
+    pub fn is_known_agent(&self, agent_id: &str) -> bool {
+        AGENT_PREFERENCE.contains(&agent_id)
+    }
+
+    /// Attached managers with their agent ids, most preferred first.
+    async fn attached_in_order(&self) -> Vec<(String, Arc<AgentManager>)> {
+        let map = self.managers.read().await;
+        let mut out: Vec<_> = AGENT_PREFERENCE
+            .iter()
+            .filter_map(|id| map.get(*id).map(|m| (id.to_string(), m.clone())))
+            .collect();
+        if out.is_empty() {
+            if let Some(m) = self.manager.read().await.clone() {
+                out.push((m.agent().kind().to_string(), m));
+            }
+        }
+        out
+    }
+
+    /// The manager that owns a session: the recorded route, else whichever
+    /// attached agent says it has the session (and that is then recorded).
+    /// `None` when nothing owns it.
+    pub async fn manager_for_session(&self, asid: &str) -> Option<Arc<AgentManager>> {
+        let recorded = self.session_routes.read().await.map.get(asid).cloned();
+        if let Some(agent_id) = recorded {
+            if let Some(m) = self.manager_for_agent(&agent_id).await {
+                return Some(m);
+            }
+        }
+        for (agent_id, manager) in self.attached_in_order().await {
+            let owns =
+                tokio::time::timeout(SESSION_LOOKUP_TIMEOUT, manager.agent().get_session(asid))
+                    .await;
+            if matches!(owns, Ok(Ok(_))) {
+                self.record_session_route(asid, &agent_id).await;
+                return Some(manager);
+            }
+        }
+        None
+    }
+
+    /// Record routing for a session id to its owning agent.
+    pub async fn record_session_route(&self, asid: &str, agent_id: &str) {
+        self.session_routes.write().await.insert(asid, agent_id);
+    }
+
+    /// Drop the route of a session that no longer exists.
+    pub async fn forget_session_route(&self, asid: &str) {
+        self.session_routes.write().await.remove(asid);
+    }
+
+    pub fn subscribe_events(&self) -> broadcast::Receiver<AgentDomainEvent> {
+        self.events_tx.subscribe()
+    }
+
+    /// Put an event on the runtime's channel, as an attached agent would.
+    #[cfg(test)]
+    pub(crate) fn publish_for_test(&self, event: AgentDomainEvent) {
+        let _ = self.events_tx.send(event);
+    }
+
+    pub async fn status(&self) -> AgentStatus {
+        let manager = self.manager.read().await.clone();
+        AgentStatus {
+            available: manager.is_some(),
+            installation: if manager.is_some() {
+                AgentInstallation::Installed
+            } else {
+                local_installation_status(&self.config)
+            },
+            origin: *self.origin.read().await,
+            url: manager.as_ref().map(|m| m.endpoint_url().to_string()),
+            version: manager.as_ref().and_then(|m| m.version()),
+            stream_connected: manager
+                .as_ref()
+                .map(|m| m.stream_connected())
+                .unwrap_or(false),
+            autostart: self.config.autostart,
+            kind: manager.as_ref().map(|m| m.agent().kind().to_string()),
+            agent_id: manager.as_ref().map(|m| m.agent().kind().to_string()),
+        }
+    }
+
+    /// Status of one attached agent, `None` when it is not attached. The
+    /// primary answers exactly as `status()` does; another attached agent
+    /// (DeepSeek, which OpenCode outranks) is always an adopted service the
+    /// gateway does not start.
+    pub async fn status_for(&self, agent_id: &str) -> Option<AgentStatus> {
+        let manager = self.manager_for_agent(agent_id).await?;
+        let primary = self.manager.read().await.clone();
+        if primary.is_some_and(|p| Arc::ptr_eq(&p, &manager)) {
+            return Some(self.status().await);
+        }
+        let kind = manager.agent().kind().to_string();
+        Some(AgentStatus {
+            available: true,
+            installation: AgentInstallation::Installed,
+            origin: AgentOrigin::Adopted,
+            url: Some(manager.endpoint_url().to_string()),
+            version: manager.version(),
+            stream_connected: manager.stream_connected(),
+            autostart: false,
+            kind: Some(kind.clone()),
+            agent_id: Some(kind),
+        })
+    }
+
+    /// Status and capabilities of all configured or reachable AI agents.
+    ///
+    /// Served from a short-lived cache so unauthenticated discovery requests do
+    /// not each probe upstream. A refresh that overruns `DISCOVERY_TIMEOUT`
+    /// yields the stale result, or a snapshot of what is attached if there is
+    /// none.
+    pub async fn discover_agents(&self) -> crate::discovery::AgentPlaneDiscovery {
+        let fresh =
+            |cache: &Option<(tokio::time::Instant, crate::discovery::AgentPlaneDiscovery)>| {
+                cache
+                    .as_ref()
+                    .filter(|(at, _)| at.elapsed() < DISCOVERY_TTL)
+                    .map(|(_, d)| d.clone())
+            };
+        if let Some(hit) = fresh(&*self.discovery_cache.read().await) {
+            return hit;
+        }
+        let refresh = async {
+            let _one = self.discovery_refresh.lock().await;
+            if let Some(hit) = fresh(&*self.discovery_cache.read().await) {
+                return hit;
+            }
+            let found = self.probe_agents().await;
+            *self.discovery_cache.write().await =
+                Some((tokio::time::Instant::now(), found.clone()));
+            found
+        };
+        match tokio::time::timeout(DISCOVERY_TIMEOUT, refresh).await {
+            Ok(found) => found,
+            Err(_) => {
+                tracing::warn!("agent discovery timed out");
+                let stale = self
+                    .discovery_cache
+                    .read()
+                    .await
+                    .as_ref()
+                    .map(|(_, d)| d.clone());
+                match stale {
+                    Some(d) => d,
+                    None => self.attached_snapshot().await,
+                }
+            }
+        }
+    }
+
+    /// Discovery without touching the network: what is attached, and the
+    /// configuration, nothing more.
+    async fn attached_snapshot(&self) -> crate::discovery::AgentPlaneDiscovery {
+        use crate::discovery::{
+            AgentAvailability, AgentDiscoveryInfo, AgentPlaneDiscovery, AgentPlaneFeatures,
+        };
+        let attached = self.attached_in_order().await;
+        let agents = AGENT_PREFERENCE
+            .iter()
+            .map(|id| {
+                let enabled = match *id {
+                    "opencode" => self.config.enabled,
+                    _ => self.deepseek_config.enabled || self.deepseek_config.endpoint.is_some(),
+                };
+                let manager = attached.iter().find(|(h, _)| h == id).map(|(_, m)| m);
+                let (name, features) = match *id {
+                    "opencode" => ("OpenCode", opencode_features(false, false)),
+                    _ => ("DeepSeek", deepseek_features(false, false)),
+                };
+                AgentDiscoveryInfo {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    kind: id.to_string(),
+                    status: match (enabled, manager) {
+                        (false, _) => AgentAvailability::Disabled,
+                        (true, Some(_)) => AgentAvailability::Connected,
+                        (true, None) => AgentAvailability::Offline,
+                    },
+                    enabled,
+                    endpoint: manager.map(|m| m.endpoint_url().to_string()),
+                    version: manager.and_then(|m| m.version()),
+                    models: Vec::new(),
+                    modes: Vec::new(),
+                    features,
+                }
+            })
+            .collect::<Vec<_>>();
+        let supported = agents
+            .iter()
+            .any(|h| h.status == AgentAvailability::Connected);
+        AgentPlaneDiscovery {
+            supported,
+            agents,
+            features: AgentPlaneFeatures {
+                multi_agent: true,
+                catalog_aggregation: true,
+                session_routing: true,
+            },
+        }
+    }
+
+    async fn probe_agents(&self) -> crate::discovery::AgentPlaneDiscovery {
+        use crate::discovery::{
+            AgentAvailability, AgentDiscoveryInfo, AgentPlaneDiscovery, AgentPlaneFeatures,
+        };
+
+        let mut agents = Vec::new();
+
+        // 1. DeepSeek discovery
+        let deepseek_enabled =
+            self.deepseek_config.enabled || self.deepseek_config.endpoint.is_some();
+        let deepseek_info = if !deepseek_enabled {
+            AgentDiscoveryInfo {
+                id: "deepseek".to_string(),
+                name: "DeepSeek".to_string(),
+                kind: "deepseek".to_string(),
+                status: AgentAvailability::Disabled,
+                enabled: false,
+                endpoint: self.deepseek_config.endpoint.clone(),
+                version: None,
+                models: Vec::new(),
+                modes: Vec::new(),
+                features: deepseek_features(false, false),
+            }
+        } else if let Some(m) = self.manager_for_agent("deepseek").await {
+            let (models, modes) = match m.agent().get_catalog(None).await {
+                Ok(cat) => (
+                    cat.models
+                        .iter()
+                        .map(crate::discovery::model_info_to_agent_model)
+                        .collect::<Vec<_>>(),
+                    cat.modes
+                        .iter()
+                        .map(crate::discovery::mode_info_to_agent_mode)
+                        .collect::<Vec<_>>(),
+                ),
+                Err(_) => (Vec::new(), Vec::new()),
+            };
+            let supports_reasoning = models
+                .iter()
+                .any(|m| m.supports_reasoning || !m.reasoning_effort_tiers.is_empty());
+            let has_models = !models.is_empty();
+
+            AgentDiscoveryInfo {
+                id: "deepseek".to_string(),
+                name: "DeepSeek".to_string(),
+                kind: "deepseek".to_string(),
+                status: AgentAvailability::Connected,
+                enabled: true,
+                endpoint: Some(m.endpoint_url().to_string()),
+                version: m.version(),
+                features: deepseek_features(supports_reasoning, has_models),
+                models,
+                modes,
+            }
+        } else {
+            let ep = if let Some(ref url) = self.deepseek_config.endpoint {
+                Some(crate::agents::adapters::deepseek::DeepseekEndpoint::new(
+                    url.clone(),
+                    self.deepseek_config.token.clone(),
+                    self.deepseek_config
+                        .secret
+                        .clone()
+                        .or_else(crate::agents::adapters::deepseek::auth::load_local_secret),
+                ))
+            } else {
+                crate::agents::adapters::deepseek::DeepseekEndpoint::discover().await
+            };
+
+            let (status, endpoint_url, version, models, modes) = match ep {
+                Some(endpoint) => {
+                    let client = probe_client();
+                    if endpoint.probe_healthy(&client).await {
+                        let driver = crate::agents::adapters::deepseek::DeepseekDriver::new(
+                            endpoint.clone(),
+                        );
+                        let (models, modes) =
+                            match crate::agents::ports::AgentPort::get_catalog(&driver, None).await
+                            {
+                                Ok(cat) => (
+                                    cat.models
+                                        .iter()
+                                        .map(crate::discovery::model_info_to_agent_model)
+                                        .collect::<Vec<_>>(),
+                                    cat.modes
+                                        .iter()
+                                        .map(crate::discovery::mode_info_to_agent_mode)
+                                        .collect::<Vec<_>>(),
+                                ),
+                                Err(_) => (Vec::new(), Vec::new()),
+                            };
+                        (
+                            AgentAvailability::Reachable,
+                            Some(endpoint.url),
+                            endpoint.version,
+                            models,
+                            modes,
+                        )
+                    } else {
+                        (
+                            AgentAvailability::Offline,
+                            Some(endpoint.url),
+                            None,
+                            Vec::new(),
+                            Vec::new(),
+                        )
+                    }
+                }
+                None => (
+                    AgentAvailability::Offline,
+                    None,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            };
+
+            let supports_reasoning = models
+                .iter()
+                .any(|m| m.supports_reasoning || !m.reasoning_effort_tiers.is_empty());
+            let has_models = !models.is_empty();
+
+            AgentDiscoveryInfo {
+                id: "deepseek".to_string(),
+                name: "DeepSeek".to_string(),
+                kind: "deepseek".to_string(),
+                status,
+                enabled: true,
+                endpoint: endpoint_url,
+                version,
+                features: deepseek_features(supports_reasoning, has_models),
+                models,
+                modes,
+            }
+        };
+        agents.push(deepseek_info);
+
+        // 2. OpenCode discovery
+        let opencode_enabled = self.config.enabled;
+        let opencode_info = if !opencode_enabled {
+            AgentDiscoveryInfo {
+                id: "opencode".to_string(),
+                name: "OpenCode".to_string(),
+                kind: "opencode".to_string(),
+                status: AgentAvailability::Disabled,
+                enabled: false,
+                endpoint: None,
+                version: None,
+                models: Vec::new(),
+                modes: Vec::new(),
+                features: opencode_features(false, false),
+            }
+        } else if let Some(m) = self.manager_for_agent("opencode").await {
+            let (models, modes) = match m.agent().get_catalog(None).await {
+                Ok(cat) => (
+                    cat.models
+                        .iter()
+                        .map(crate::discovery::model_info_to_agent_model)
+                        .collect::<Vec<_>>(),
+                    cat.modes
+                        .iter()
+                        .map(crate::discovery::mode_info_to_agent_mode)
+                        .collect::<Vec<_>>(),
+                ),
+                Err(_) => (Vec::new(), Vec::new()),
+            };
+            let supports_reasoning = models
+                .iter()
+                .any(|m| m.supports_reasoning || !m.reasoning_effort_tiers.is_empty());
+            let has_models = !models.is_empty();
+
+            AgentDiscoveryInfo {
+                id: "opencode".to_string(),
+                name: "OpenCode".to_string(),
+                kind: "opencode".to_string(),
+                status: AgentAvailability::Connected,
+                enabled: true,
+                endpoint: Some(m.endpoint_url().to_string()),
+                version: m.version(),
+                features: opencode_features(supports_reasoning, has_models),
+                models,
+                modes,
+            }
+        } else {
+            let (status, endpoint_url, version, models, modes) = match OpencodeEndpoint::discover()
+                .await
+            {
+                Some(endpoint) => {
+                    let client = probe_client();
+                    if endpoint.probe_healthy(&client).await {
+                        let driver = crate::agents::adapters::opencode::OpencodeDriver::new(
+                            endpoint.clone(),
+                        );
+                        let (models, modes) =
+                            match crate::agents::ports::AgentPort::get_catalog(&driver, None).await
+                            {
+                                Ok(cat) => (
+                                    cat.models
+                                        .iter()
+                                        .map(crate::discovery::model_info_to_agent_model)
+                                        .collect::<Vec<_>>(),
+                                    cat.modes
+                                        .iter()
+                                        .map(crate::discovery::mode_info_to_agent_mode)
+                                        .collect::<Vec<_>>(),
+                                ),
+                                Err(_) => (Vec::new(), Vec::new()),
+                            };
+                        (
+                            AgentAvailability::Reachable,
+                            Some(endpoint.url),
+                            endpoint.version,
+                            models,
+                            modes,
+                        )
+                    } else {
+                        (
+                            AgentAvailability::Offline,
+                            Some(endpoint.url),
+                            None,
+                            Vec::new(),
+                            Vec::new(),
+                        )
+                    }
+                }
+                None => {
+                    let installed = local_installation_status(&self.config);
+                    if installed == AgentInstallation::Installed {
+                        (
+                            AgentAvailability::Offline,
+                            None,
+                            None,
+                            Vec::new(),
+                            Vec::new(),
+                        )
+                    } else {
+                        (
+                            AgentAvailability::NotInstalled,
+                            None,
+                            None,
+                            Vec::new(),
+                            Vec::new(),
+                        )
+                    }
+                }
+            };
+
+            let supports_reasoning = models
+                .iter()
+                .any(|m| m.supports_reasoning || !m.reasoning_effort_tiers.is_empty());
+            let has_models = !models.is_empty();
+
+            AgentDiscoveryInfo {
+                id: "opencode".to_string(),
+                name: "OpenCode".to_string(),
+                kind: "opencode".to_string(),
+                status,
+                enabled: true,
+                endpoint: endpoint_url,
+                version,
+                features: opencode_features(supports_reasoning, has_models),
+                models,
+                modes,
+            }
+        };
+        agents.push(opencode_info);
+        // The App draws its launch row in this order and fills the first tile
+        // as the primary one, so the list follows the same preference the
+        // runtime uses to pick a default agent.
+        agents.sort_by_key(|agent| {
+            AGENT_PREFERENCE
+                .iter()
+                .position(|id| *id == agent.id)
+                .unwrap_or(AGENT_PREFERENCE.len())
+        });
+
+        let supported = agents.iter().any(|h| {
+            h.status == AgentAvailability::Connected || h.status == AgentAvailability::Reachable
+        });
+
+        AgentPlaneDiscovery {
+            supported,
+            agents,
+            features: AgentPlaneFeatures {
+                multi_agent: true,
+                catalog_aggregation: true,
+                session_routing: true,
+            },
+        }
+    }
+
+    /// Attach an agent now, and keep one attached. Safe to call once.
+    pub fn spawn_supervisor(self: &Arc<Self>) {
+        if self.supervising.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            let mut start_backoff = Duration::from_secs(2);
+            let mut stream_loss_wait = STREAM_LOSS_FIRST_WAIT;
+            loop {
+                let healthy = runtime.check_and_repair(&mut start_backoff).await;
+                if healthy {
+                    runtime.watch_while_healthy(&mut stream_loss_wait).await;
+                } else {
+                    tokio::time::sleep(UNHEALTHY_POLL).await;
+                }
+            }
+        });
+    }
+
+    /// Hold until the agent is worth checking again.
+    ///
+    /// Normally that is the next health poll. But the event stream dropping is
+    /// the agent telling us it has gone, and that should not wait: this
+    /// returns within a tick of the stream going down, so the gap between
+    /// OpenCode dying and the gateway re-attaching is about a second rather
+    /// than however much of the poll interval was left.
+    async fn watch_while_healthy(&self, stream_loss_wait: &mut Duration) {
+        let deadline = tokio::time::Instant::now() + HEALTHY_POLL;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                // A full interval with the stream up: whatever flapping there
+                // was has settled, so the next loss is looked at immediately.
+                *stream_loss_wait = STREAM_LOSS_FIRST_WAIT;
+                return;
+            }
+            tokio::time::sleep(STREAM_WATCH_TICK.min(remaining)).await;
+            if self.stream_down().await {
+                tracing::warn!(
+                    wait_s = stream_loss_wait.as_secs(),
+                    "opencode event stream is down, re-discovering"
+                );
+                if !stream_loss_wait.is_zero() {
+                    tokio::time::sleep(*stream_loss_wait).await;
+                }
+                *stream_loss_wait = next_stream_loss_wait(*stream_loss_wait);
+                return;
+            }
+        }
+    }
+
+    /// True when an agent is attached but its event stream has dropped.
+    async fn stream_down(&self) -> bool {
+        self.manager
+            .read()
+            .await
+            .as_ref()
+            .map(|m| !m.stream_connected())
+            .unwrap_or(false)
+    }
+
+    /// One supervision pass. Returns whether an agent is attached and well.
+    async fn check_and_repair(&self, start_backoff: &mut Duration) -> bool {
+        let mut deepseek_ok = false;
+        let mut opencode_ok = false;
+
+        // 1. Supervise DeepSeek
+        if let Some(mgr) = self.manager_for_agent("deepseek").await {
+            if mgr.agent().probe().await.unwrap_or(false) {
+                deepseek_ok = true;
+            } else {
+                tracing::warn!(
+                    url = mgr.endpoint_url(),
+                    "DeepSeek agent unhealthy, re-probing"
+                );
+                mgr.shutdown();
+                self.managers.write().await.remove("deepseek");
+            }
+        }
+        if !deepseek_ok && (self.deepseek_config.enabled || self.deepseek_config.endpoint.is_some())
+        {
+            let ep = if let Some(ref url) = self.deepseek_config.endpoint {
+                Some(crate::agents::adapters::deepseek::DeepseekEndpoint::new(
+                    url.clone(),
+                    self.deepseek_config.token.clone(),
+                    self.deepseek_config
+                        .secret
+                        .clone()
+                        .or_else(crate::agents::adapters::deepseek::auth::load_local_secret),
+                ))
+            } else {
+                crate::agents::adapters::deepseek::DeepseekEndpoint::discover().await
+            };
+            if let Some(endpoint) = ep {
+                let client = probe_client();
+                if endpoint.probe_healthy(&client).await {
+                    self.attach_deepseek(endpoint, AgentOrigin::Adopted).await;
+                    deepseek_ok = true;
+                }
+            }
+        }
+
+        // 2. Supervise OpenCode
+        let discovered_opencode = if self.config.enabled {
+            OpencodeEndpoint::discover().await
+        } else {
+            None
+        };
+
+        if let Some(mgr) = self.manager_for_agent("opencode").await {
+            let same_endpoint = discovered_opencode
+                .as_ref()
+                .map(|e| e.url == mgr.endpoint_url())
+                .unwrap_or(false);
+            if same_endpoint && mgr.agent().probe().await.unwrap_or(false) {
+                opencode_ok = true;
+            } else {
+                tracing::warn!(
+                    url = mgr.endpoint_url(),
+                    "OpenCode agent unhealthy or moved, re-discovering"
+                );
+                mgr.shutdown();
+                self.managers.write().await.remove("opencode");
+            }
+        }
+
+        if !opencode_ok {
+            if let Some(endpoint) = discovered_opencode {
+                if endpoint.probe_healthy(&probe_client()).await
+                    && check_version(endpoint.version.as_deref()).is_ok()
+                {
+                    self.attach(endpoint, AgentOrigin::Adopted).await;
+                    opencode_ok = true;
+                }
+            }
+        }
+
+        if !opencode_ok && self.config.enabled && self.config.autostart {
+            match self.start_service().await {
+                Ok(endpoint) => {
+                    self.attach(endpoint, AgentOrigin::Spawned).await;
+                    opencode_ok = true;
+                }
+                Err(err) => {
+                    tracing::warn!(%err, backoff_s = start_backoff.as_secs(), "could not start opencode");
+                    tokio::time::sleep(*start_backoff).await;
+                    *start_backoff = (*start_backoff * 2).min(MAX_START_BACKOFF);
+                }
+            }
+        }
+
+        if deepseek_ok || opencode_ok {
+            *start_backoff = Duration::from_secs(2);
+            let primary = pick_primary(&*self.managers.read().await).cloned();
+            if let Some(mgr) = primary {
+                *self.manager.write().await = Some(mgr);
+            }
+            true
+        } else {
+            *self.manager.write().await = None;
+            *self.origin.write().await = AgentOrigin::None;
+            false
+        }
+    }
+
+    async fn attach(&self, endpoint: OpencodeEndpoint, origin: AgentOrigin) {
+        let url = endpoint.url.clone();
+        let version = endpoint.version.clone();
+        // Which file is actually serving this. For a service this gateway
+        // started that is the path it resolved; for one it adopted it is read
+        // off the running process, because "which opencode am I talking to" is
+        // the question an operator has after a restart and a bare `opencode`
+        // does not answer it.
+        let path = endpoint
+            .pid
+            .and_then(running_binary_path)
+            .map(|p| p.display().to_string());
+        let manager = Arc::new(AgentManager::connect(endpoint, self.events_tx.clone()));
+        self.managers
+            .write()
+            .await
+            .insert("opencode".to_string(), manager);
+        self.promote_primary("opencode", origin).await;
+        let path = path.unwrap_or_else(|| "unknown".to_string());
+        match origin {
+            AgentOrigin::Adopted => tracing::info!(
+                url = %url,
+                version = version.as_deref().unwrap_or("unknown"),
+                binary = %path,
+                "adopted the running OpenCode service"
+            ),
+            AgentOrigin::Spawned => tracing::info!(
+                url = %url,
+                version = version.as_deref().unwrap_or("unknown"),
+                binary = %path,
+                "started an OpenCode service and attached to it"
+            ),
+            AgentOrigin::None => {}
+        }
+    }
+
+    /// Make the most preferred attached manager the primary; `origin` is
+    /// recorded when that is the one that was just attached.
+    async fn promote_primary(&self, attached: &str, origin: AgentOrigin) {
+        let primary = {
+            let map = self.managers.read().await;
+            AGENT_PREFERENCE
+                .iter()
+                .find(|id| map.contains_key(**id))
+                .map(|id| (*id, map[*id].clone()))
+        };
+        if let Some((id, manager)) = primary {
+            *self.manager.write().await = Some(manager);
+            if id == attached {
+                *self.origin.write().await = origin;
+            }
+        }
+    }
+
+    async fn attach_deepseek(
+        &self,
+        endpoint: crate::agents::adapters::deepseek::DeepseekEndpoint,
+        origin: AgentOrigin,
+    ) {
+        let url = endpoint.url.clone();
+        let version = endpoint.version.clone();
+        let manager = Arc::new(AgentManager::connect_deepseek(
+            endpoint,
+            self.events_tx.clone(),
+        ));
+        self.managers
+            .write()
+            .await
+            .insert("deepseek".to_string(), manager);
+        self.promote_primary("deepseek", origin).await;
+        tracing::info!(
+            url = %url,
+            version = version.as_deref().unwrap_or("unknown"),
+            "adopted the running DeepSeek service"
+        );
+    }
+
+    async fn probe(&self, url: &str) -> bool {
+        let Some(manager) = self.manager.read().await.clone() else {
+            return false;
+        };
+        if manager.endpoint_url() != url {
+            return false;
+        }
+        manager.agent().probe().await.unwrap_or(false)
+    }
+
+    /// Let OpenCode load its saved service configuration and start or reuse
+    /// its background server, then verify the registered endpoint.
+    async fn start_service(&self) -> anyhow::Result<OpencodeEndpoint> {
+        let _start = self.start_lock.lock().await;
+
+        // `opencode.binary` if the owner set one, otherwise whatever `opencode`
+        // means on PATH -- and then the file that resolved to, so the log names
+        // a path rather than a word.
+        let binary = match resolve_binary(self.config.binary.as_deref()) {
+            Ok(path) => path,
+            Err(err) => {
+                anyhow::bail!("{err}");
+            }
+        };
+        let version = binary_version(&binary);
+        if let Err(refusal) = check_version(version.as_deref()) {
+            // One line, naming the file and what it said, because the reader
+            // has to go and fix an install.
+            tracing::error!("refusing to start {}: {refusal}", binary.display());
+            anyhow::bail!("{} is not OpenCode 2.x", binary.display());
+        }
+        tracing::info!(
+            binary = %binary.display(),
+            version = version.as_deref().unwrap_or("unknown"),
+            "no OpenCode service found, starting one"
+        );
+
+        launch_service(tokio::process::Command::new(&binary)).await?;
+        wait_for_service().await
+    }
+}
+
+async fn launch_service(mut command: tokio::process::Command) -> anyhow::Result<()> {
+    // `serve --service` bypasses saved service env; the CLI owns that setup.
+    command
+        .args(["service", "start"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let status = tokio::time::timeout(STARTUP_WAIT, command.status())
+        .await
+        .map_err(|_| anyhow::anyhow!("`opencode service start` timed out"))?
+        .map_err(|err| anyhow::anyhow!("could not run `opencode service start`: {err}"))?;
+    anyhow::ensure!(
+        status.success(),
+        "`opencode service start` exited with {status}"
+    );
+    Ok(())
+}
+
+/// The wait after a stream loss, given the last one.
+///
+/// The first loss is looked at immediately, because that is the common case
+/// and the whole point. Repeated losses without a settled interval in between
+/// mean something is flapping, and the supervisor backs off rather than
+/// re-discovering once a second forever.
+fn next_stream_loss_wait(current: Duration) -> Duration {
+    if current.is_zero() {
+        Duration::from_secs(1)
+    } else {
+        (current * 2).min(STREAM_LOSS_MAX_WAIT)
+    }
+}
+
+/// The major version out of whatever `--version` or a registration said:
+/// `opencode v2.0.1`, `2.0.1`, `v2.0.1-beta.3`.
+fn parse_major(version: &str) -> Option<u64> {
+    version
+        .split_whitespace()
+        .filter_map(|word| {
+            let word = word.trim_start_matches(['v', 'V']);
+            let head = word.split(['.', '-', '+']).next()?;
+            head.parse::<u64>().ok().map(|major| (major, word))
+        })
+        // A bare `2` is not a version string; take the first word that looks
+        // like one, so `opencode v2.0.1` is not read as the `opencode` in it.
+        .find(|(_, word)| word.contains('.'))
+        .map(|(major, _)| major)
+        .or_else(|| {
+            version
+                .trim()
+                .trim_start_matches(['v', 'V'])
+                .parse::<u64>()
+                .ok()
+        })
+}
+
+/// Whether a version is one this gateway will talk to.
+///
+/// An unreadable or absent version is allowed through: it cannot be shown to
+/// be too old, and refusing on silence would break an install that simply does
+/// not report one. Only a version that is legible *and* below 2.0 is refused.
+fn check_version(version: Option<&str>) -> Result<(), String> {
+    let Some(version) = version.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(());
+    };
+    let Some(major) = parse_major(version) else {
+        return Ok(());
+    };
+    if major >= MIN_OPENCODE_MAJOR {
+        return Ok(());
+    }
+    Err(format!(
+        "it reports version {version}, and this gateway speaks OpenCode \
+         {MIN_OPENCODE_MAJOR}.x only. Install OpenCode 2, or point the gateway \
+         at the right one by setting `opencode.binary` to its absolute path in \
+         config.json"
+    ))
+}
+
+/// `opencode.binary` if the owner set one, else `opencode` as `PATH` resolves
+/// it -- and in both cases the file it actually is.
+///
+/// No install directory is guessed at. Where OpenCode lives differs per OS and
+/// per install, and a gateway reaching into one of its own would quietly run a
+/// different binary than the owner's shell does, which is the confusion this
+/// is here to end.
+fn resolve_binary(configured: Option<&str>) -> anyhow::Result<std::path::PathBuf> {
+    resolve_binary_in(configured, std::env::var_os("PATH").as_deref())
+}
+
+/// The lookup itself, with `PATH` passed in rather than read, so a test can
+/// exercise the order without reaching into the process environment that every
+/// other thread is also using.
+fn resolve_binary_in(
+    configured: Option<&str>,
+    path_var: Option<&std::ffi::OsStr>,
+) -> anyhow::Result<std::path::PathBuf> {
+    let name = binary_name(configured);
+
+    // Anything with a separator is a path the owner meant literally, and a
+    // missing one is an error naming it rather than a quiet fall back to PATH:
+    // they asked for that file.
+    if name.contains(std::path::MAIN_SEPARATOR) || name.contains('/') {
+        let path = std::path::PathBuf::from(name);
+        if !path.is_file() {
+            anyhow::bail!("`opencode.binary` is set to {name}, and there is no file there");
+        }
+        return Ok(absolute(path));
+    }
+
+    let path_var = path_var
+        .ok_or_else(|| anyhow::anyhow!("PATH is not set, so `{name}` cannot be resolved"))?;
+    for dir in std::env::split_paths(path_var) {
+        let candidate = dir.join(name);
+        if is_executable(&candidate) {
+            return Ok(absolute(candidate));
+        }
+    }
+    anyhow::bail!(
+        "`{name}` is not on PATH. Install OpenCode 2, or set `opencode.binary` \
+         to its absolute path in config.json"
+    )
+}
+
+fn binary_name(configured: Option<&str>) -> &str {
+    configured
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("opencode")
+}
+
+/// Classify installation without starting OpenCode or contacting an endpoint.
+/// The inputs are injected to keep lookup tests independent of global process
+/// environment.
+fn installation_status_in(
+    configured: Option<&str>,
+    path_var: Option<&std::ffi::OsStr>,
+    external_endpoint_configured: bool,
+) -> AgentInstallation {
+    if external_endpoint_configured {
+        return AgentInstallation::Unknown;
+    }
+
+    let name = binary_name(configured);
+    if name.contains(std::path::MAIN_SEPARATOR) || name.contains('/') {
+        return match std::fs::metadata(name) {
+            Ok(metadata) if metadata_is_executable(&metadata) => AgentInstallation::Installed,
+            Ok(_) => AgentInstallation::NotFound,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => AgentInstallation::NotFound,
+            Err(_) => AgentInstallation::Unknown,
+        };
+    }
+
+    let Some(path_var) = path_var else {
+        return AgentInstallation::Unknown;
+    };
+    let mut ambiguous = false;
+    for directory in std::env::split_paths(path_var) {
+        let candidate = directory.join(name);
+        match std::fs::metadata(&candidate) {
+            Ok(metadata) if metadata_is_executable(&metadata) => {
+                return AgentInstallation::Installed;
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => ambiguous = true,
+        }
+    }
+    if ambiguous {
+        AgentInstallation::Unknown
+    } else {
+        AgentInstallation::NotFound
+    }
+}
+
+fn local_installation_status(config: &OpencodeConfig) -> AgentInstallation {
+    if !config.enabled {
+        return AgentInstallation::NotFound;
+    }
+    let Ok(external_endpoint_configured) =
+        external_endpoint_configured_with(|name| std::env::var(name))
+    else {
+        return AgentInstallation::Unknown;
+    };
+    installation_status_in(
+        config.binary.as_deref(),
+        std::env::var_os("PATH").as_deref(),
+        external_endpoint_configured,
+    )
+}
+
+fn external_endpoint_configured_with(
+    mut read: impl FnMut(&str) -> Result<String, std::env::VarError>,
+) -> Result<bool, ()> {
+    for name in ["OPENCODE_URL", "HERDR_GATEWAY_OPENCODE_URL"] {
+        match read(name) {
+            Ok(url) => return Ok(!url.trim().is_empty()),
+            Err(std::env::VarError::NotPresent) => {}
+            Err(std::env::VarError::NotUnicode(_)) => return Err(()),
+        }
+    }
+    Ok(false)
+}
+
+fn absolute(path: std::path::PathBuf) -> std::path::PathBuf {
+    std::fs::canonicalize(&path).unwrap_or(path)
+}
+
+#[cfg(unix)]
+fn metadata_is_executable(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn metadata_is_executable(metadata: &std::fs::Metadata) -> bool {
+    metadata.is_file()
+}
+
+fn is_executable(path: &std::path::Path) -> bool {
+    std::fs::metadata(path)
+        .map(|metadata| metadata_is_executable(&metadata))
+        .unwrap_or(false)
+}
+
+/// What `<binary> --version` says, or `None` if it cannot be asked.
+fn binary_version(path: &std::path::Path) -> Option<String> {
+    let output = std::process::Command::new(path)
+        .arg("--version")
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let text = if text.trim().is_empty() {
+        String::from_utf8_lossy(&output.stderr).to_string()
+    } else {
+        text.to_string()
+    };
+    let line = text.lines().next()?.trim().to_string();
+    (!line.is_empty()).then_some(line)
+}
+
+/// The executable behind a running pid, where the platform will say.
+#[cfg(target_os = "linux")]
+fn running_binary_path(pid: u32) -> Option<std::path::PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn running_binary_path(_pid: u32) -> Option<std::path::PathBuf> {
+    None
+}
+
+fn probe_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap_or_default()
+}
+
+/// Poll the registration file until the service answers its health probe, or
+/// give up after `STARTUP_WAIT`. Bounded on purpose: the caller backs off and
+/// tries again rather than blocking the supervisor forever.
+async fn wait_for_service() -> anyhow::Result<OpencodeEndpoint> {
+    let client = probe_client();
+    let deadline = std::time::Instant::now() + STARTUP_WAIT;
+    loop {
+        if let Some(endpoint) = OpencodeEndpoint::discover().await {
+            if endpoint.probe_healthy(&client).await {
+                return Ok(endpoint);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "the OpenCode service did not become healthy within {}s",
+                STARTUP_WAIT.as_secs()
+            );
+        }
+        tokio::time::sleep(STARTUP_POLL).await;
+    }
+}
+
+fn deepseek_features(
+    supports_reasoning: bool,
+    has_models: bool,
+) -> crate::discovery::AgentFeatures {
+    crate::discovery::AgentFeatures {
+        streaming: true,
+        reasoning_effort: supports_reasoning,
+        model_selection: has_models,
+        tool_approvals: true,
+        worktrees: false,
+        revert: false,
+        inbox: false,
+        // Presets are the modes; the client refuses attachments and the driver
+        // leaves skills, commands, compaction and shells at `Unsupported`.
+        modes: true,
+        skills: false,
+        slash_commands: false,
+        compaction: false,
+        background_shells: false,
+        attachments: false,
+        extra: std::collections::BTreeMap::from([(
+            "modeSwitching".into(),
+            serde_json::Value::Bool(false),
+        )]),
+    }
+}
+
+fn opencode_features(
+    supports_reasoning: bool,
+    has_models: bool,
+) -> crate::discovery::AgentFeatures {
+    crate::discovery::AgentFeatures {
+        streaming: true,
+        reasoning_effort: supports_reasoning,
+        model_selection: has_models,
+        tool_approvals: true,
+        worktrees: true,
+        revert: true,
+        inbox: true,
+        modes: true,
+        skills: true,
+        slash_commands: true,
+        compaction: true,
+        background_shells: true,
+        attachments: true,
+        extra: std::collections::BTreeMap::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_uses_the_service_cli_and_waits_for_its_exit() {
+        let mut command = tokio::process::Command::new("sh");
+        command.args([
+            "-c",
+            "test \"$#\" -eq 2 && test \"$1\" = service && test \"$2\" = start",
+            "opencode",
+        ]);
+        launch_service(command)
+            .await
+            .expect("service start arguments");
+
+        let mut failing = tokio::process::Command::new("sh");
+        failing.args(["-c", "exit 7", "opencode"]);
+        let err = launch_service(failing).await.expect_err("failed startup");
+        assert!(err.to_string().contains("exited with"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn startup_reports_a_missing_executable() {
+        let missing =
+            std::env::temp_dir().join(format!("missing-opencode-{}", uuid::Uuid::new_v4()));
+        let err = launch_service(tokio::process::Command::new(missing))
+            .await
+            .expect_err("missing binary");
+        assert!(
+            err.to_string()
+                .contains("could not run `opencode service start`"),
+            "{err}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "Requires installed OpenCode 2; starts and stops a private service"]
+    async fn installed_service_loads_saved_env_and_reuses_the_background_process() {
+        struct PrivateService {
+            root: std::path::PathBuf,
+            binary: std::path::PathBuf,
+        }
+        impl PrivateService {
+            fn command(&self) -> std::process::Command {
+                let mut command = std::process::Command::new(&self.binary);
+                for (key, path) in [
+                    ("XDG_CONFIG_HOME", "config"),
+                    ("XDG_STATE_HOME", "state"),
+                    ("XDG_DATA_HOME", "data"),
+                    ("XDG_CACHE_HOME", "cache"),
+                    ("OPENCODE_DB", "opencode.db"),
+                ] {
+                    command.env(key, self.root.join(path));
+                }
+                for key in [
+                    "OPENCODE_CONFIG",
+                    "OPENCODE_CONFIG_CONTENT",
+                    "OPENCODE_SERVER_PASSWORD",
+                    "MUQUN_STARTUP_TEST",
+                ] {
+                    command.env_remove(key);
+                }
+                command.current_dir(&self.root);
+                command
+            }
+        }
+        impl Drop for PrivateService {
+            fn drop(&mut self) {
+                // Stop only the service registered under this fixture's XDG paths.
+                let mut command = self.command();
+                command
+                    .args(["service", "stop"])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+                if command.status().is_ok_and(|status| status.success())
+                    && !std::thread::panicking()
+                {
+                    let _ = std::fs::remove_dir_all(&self.root);
+                } else {
+                    eprintln!(
+                        "Private OpenCode test files retained at {}",
+                        self.root.display()
+                    );
+                }
+            }
+        }
+        let service = PrivateService {
+            root: std::env::temp_dir()
+                .join(format!("muqun-opencode-start-{}", uuid::Uuid::new_v4())),
+            binary: resolve_binary(None).expect("installed OpenCode"),
+        };
+        let config = service.root.join("config/opencode");
+        std::fs::create_dir_all(&config).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        std::fs::write(
+            config.join("service.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "hostname": "127.0.0.1", "port": port,
+                "env": { "MUQUN_STARTUP_TEST": "saved-service-env" }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        launch_service(service.command().into())
+            .await
+            .expect("start private service");
+        let registration_path = service.root.join("state/opencode/service.json");
+        let first: super::super::adapters::opencode::OpencodeServiceRegistration =
+            serde_json::from_slice(&std::fs::read(&registration_path).unwrap()).unwrap();
+        let pid = first.pid.expect("background daemon PID");
+        let environment = std::fs::read(format!("/proc/{pid}/environ")).unwrap();
+        assert!(environment
+            .split(|byte| *byte == 0)
+            .any(|entry| entry == b"MUQUN_STARTUP_TEST=saved-service-env"));
+        let endpoint = OpencodeEndpoint {
+            url: first.url.clone(),
+            password: first.password,
+            version: first.version,
+            pid: Some(pid),
+        };
+        assert!(endpoint.probe_healthy(&probe_client()).await);
+
+        launch_service(service.command().into())
+            .await
+            .expect("reuse private service");
+        let second: super::super::adapters::opencode::OpencodeServiceRegistration =
+            serde_json::from_slice(&std::fs::read(registration_path).unwrap()).unwrap();
+        assert_eq!(second.pid, Some(pid));
+        assert_eq!(second.url, first.url);
+    }
+
+    #[test]
+    fn autostart_defaults_to_on_and_the_binary_is_optional() {
+        let config: OpencodeConfig = serde_json::from_str("{}").expect("empty config parses");
+        assert!(config.enabled);
+        assert!(config.autostart);
+        assert!(config.binary.is_none());
+    }
+
+    #[test]
+    fn autostart_can_be_turned_off() {
+        let config: OpencodeConfig =
+            serde_json::from_str(r#"{"enabled":false,"autostart":false,"binary":"/opt/opencode"}"#)
+                .expect("config parses");
+        assert!(!config.enabled);
+        assert!(!config.autostart);
+        assert_eq!(config.binary.as_deref(), Some("/opt/opencode"));
+    }
+
+    /// The version gate is about the major number, and the string it reads
+    /// comes from three different places in three different shapes.
+    #[test]
+    fn a_version_is_read_out_of_whatever_shape_it_arrives_in() {
+        assert_eq!(parse_major("opencode v2.0.1"), Some(2));
+        assert_eq!(parse_major("2.0.1"), Some(2));
+        assert_eq!(parse_major("v2.0.1-beta.3"), Some(2));
+        assert_eq!(parse_major("opencode 1.18.4"), Some(1));
+        assert_eq!(parse_major("v10.2.0"), Some(10));
+        assert_eq!(parse_major("2"), Some(2));
+        assert_eq!(parse_major("not a version"), None);
+        assert_eq!(parse_major(""), None);
+    }
+
+    /// v1 is a different API. Attaching to it looked like success and then
+    /// failed on every route, which is a worse answer than refusing.
+    #[test]
+    fn a_v1_agent_is_refused_and_the_refusal_says_what_to_do() {
+        let refusal = check_version(Some("opencode 1.18.4")).expect_err("v1 is refused");
+        assert!(
+            refusal.contains("1.18.4"),
+            "it names what it found: {refusal}"
+        );
+        assert!(
+            refusal.contains("opencode.binary"),
+            "and how to point it elsewhere: {refusal}"
+        );
+
+        assert!(check_version(Some("opencode v2.0.1")).is_ok());
+        assert!(check_version(Some("v3.0.0")).is_ok());
+    }
+
+    /// Silence is not evidence of being old. An install that reports no
+    /// version, or one this cannot parse, is allowed through rather than
+    /// refused on a guess.
+    #[test]
+    fn an_unreadable_version_is_not_treated_as_too_old() {
+        assert!(check_version(None).is_ok());
+        assert!(check_version(Some("")).is_ok());
+        assert!(check_version(Some("   ")).is_ok());
+        assert!(check_version(Some("unknown build")).is_ok());
+    }
+
+    /// `opencode.binary` first, then `opencode` as PATH resolves it. No
+    /// install directory is guessed at, so this is the whole order.
+    /// `opencode.binary` first, then `opencode` as PATH resolves it. No
+    /// install directory is guessed at, so this is the whole order.
+    #[test]
+    fn the_binary_is_the_configured_one_or_whatever_path_says() {
+        let dir =
+            std::env::temp_dir().join(format!("muqun-resolve-{}", uuid::Uuid::new_v4().simple()));
+        let other = dir.join("elsewhere");
+        std::fs::create_dir_all(&other).expect("temp dir");
+
+        let on_path = dir.join("opencode");
+        let configured = other.join("opencode-2");
+        for file in [&on_path, &configured] {
+            std::fs::write(file, "#!/bin/sh\nexit 0\n").expect("write");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod");
+            }
+        }
+        let path_var = std::ffi::OsString::from(&dir);
+        let empty_path = std::ffi::OsString::from(&other);
+
+        // An absolute `opencode.binary` is taken literally, whatever PATH says.
+        assert_eq!(
+            resolve_binary_in(Some(configured.to_str().unwrap()), Some(&path_var))
+                .expect("configured"),
+            std::fs::canonicalize(&configured).unwrap()
+        );
+
+        // A configured path that is not there names itself rather than
+        // silently falling back to PATH.
+        let missing = other.join("not-here");
+        let err = resolve_binary_in(Some(missing.to_str().unwrap()), Some(&path_var))
+            .expect_err("missing");
+        assert!(err.to_string().contains("not-here"), "got {err}");
+
+        // Absent, it is `opencode` on PATH -- and the answer is the file.
+        assert_eq!(
+            resolve_binary_in(None, Some(&path_var)).expect("found on PATH"),
+            std::fs::canonicalize(&on_path).unwrap()
+        );
+        // A bare name is looked up the same way.
+        assert_eq!(
+            resolve_binary_in(Some("opencode"), Some(&path_var)).expect("bare name"),
+            std::fs::canonicalize(&on_path).unwrap()
+        );
+
+        // Nothing named `opencode` anywhere on PATH: an error that says how to
+        // fix it, not a guess at an install directory.
+        let err = resolve_binary_in(None, Some(&empty_path)).expect_err("not there");
+        assert!(err.to_string().contains("not on PATH"), "got {err}");
+        assert!(err.to_string().contains("opencode.binary"), "got {err}");
+
+        let err = resolve_binary_in(None, None).expect_err("no PATH at all");
+        assert!(err.to_string().contains("PATH is not set"), "got {err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn installation_status_distinguishes_local_lookup_from_service_readiness() {
+        let dir = std::env::temp_dir().join(format!(
+            "muqun-installation-status-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let binary = dir.join("opencode");
+        std::fs::write(&binary, "#!/bin/sh\nexit 0\n").expect("write binary");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        let path_var = std::ffi::OsString::from(&dir);
+        let empty_path = std::ffi::OsString::from(dir.join("empty"));
+        let missing = dir.join("missing-opencode");
+        let non_executable = dir.join("not-executable");
+        std::fs::write(&non_executable, "not a program\n").expect("write non-executable");
+
+        assert_eq!(
+            installation_status_in(None, Some(&path_var), false),
+            AgentInstallation::Installed,
+            "a local executable is installed even while its service is down"
+        );
+        assert_eq!(
+            installation_status_in(Some(missing.to_str().unwrap()), Some(&path_var), false),
+            AgentInstallation::NotFound,
+            "a broken explicit path does not fall back to PATH"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            installation_status_in(
+                Some(non_executable.to_str().unwrap()),
+                Some(&path_var),
+                false
+            ),
+            AgentInstallation::NotFound,
+            "an explicit regular file must also be executable"
+        );
+        assert_eq!(
+            installation_status_in(None, Some(&empty_path), false),
+            AgentInstallation::NotFound
+        );
+        assert_eq!(
+            installation_status_in(None, None, false),
+            AgentInstallation::Unknown,
+            "without PATH the local lookup is inconclusive"
+        );
+        assert_eq!(
+            installation_status_in(None, Some(&path_var), true),
+            AgentInstallation::Unknown,
+            "the local PATH cannot establish installation for an external endpoint"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn endpoint_environment_errors_make_installation_inconclusive() {
+        let unreadable = std::ffi::OsString::from("unreadable");
+        assert_eq!(
+            external_endpoint_configured_with(|name| match name {
+                "OPENCODE_URL" => Err(std::env::VarError::NotUnicode(unreadable.clone())),
+                _ => Err(std::env::VarError::NotPresent),
+            }),
+            Err(())
+        );
+        assert_eq!(
+            external_endpoint_configured_with(|name| match name {
+                "OPENCODE_URL" => Err(std::env::VarError::NotPresent),
+                "HERDR_GATEWAY_OPENCODE_URL" => Ok(" http://127.0.0.1:4096 ".to_string()),
+                _ => unreachable!(),
+            }),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn agent_status_serializes_the_additive_installation_field() {
+        let status = AgentStatus {
+            available: false,
+            installation: AgentInstallation::NotFound,
+            origin: AgentOrigin::None,
+            url: None,
+            version: None,
+            stream_connected: false,
+            autostart: true,
+            kind: None,
+            agent_id: None,
+        };
+        let value = serde_json::to_value(status).expect("status serializes");
+        assert_eq!(value["installation"], "not_found");
+        assert_eq!(value["available"], false);
+        assert_eq!(value["origin"], "none");
+        assert_eq!(value["autostart"], true);
+        assert!(value.get("url").is_none());
+        assert!(value.get("version").is_none());
+    }
+
+    /// A lost stream is the agent going away, so the first one is looked at
+    /// at once; a stream that keeps dropping must not spin the supervisor.
+    #[test]
+    fn a_flapping_stream_backs_off_but_the_first_loss_does_not_wait() {
+        assert_eq!(STREAM_LOSS_FIRST_WAIT, Duration::ZERO);
+        let mut wait = STREAM_LOSS_FIRST_WAIT;
+        wait = next_stream_loss_wait(wait);
+        assert_eq!(wait, Duration::from_secs(1));
+        let mut seen = vec![wait];
+        for _ in 0..8 {
+            wait = next_stream_loss_wait(wait);
+            seen.push(wait);
+        }
+        assert!(
+            seen.windows(2).all(|w| w[1] >= w[0]),
+            "it only grows: {seen:?}"
+        );
+        assert_eq!(*seen.last().unwrap(), STREAM_LOSS_MAX_WAIT, "and it stops");
+        assert!(
+            STREAM_WATCH_TICK < HEALTHY_POLL,
+            "the stream is watched more often than the agent is polled"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_disabled_runtime_attaches_nothing_and_never_spawns() {
+        let runtime = AgentRuntime::disabled();
+        assert!(runtime.manager().await.is_none());
+        let status = runtime.status().await;
+        assert!(!status.available);
+        assert!(!status.autostart);
+        assert_eq!(status.origin, AgentOrigin::None);
+        // A subscriber works with no agent attached, which is what lets a
+        // stream outlive a reconnect.
+        let _rx = runtime.subscribe_events();
+    }
+
+    #[tokio::test]
+    async fn multi_agent_session_routing_and_all_managers() {
+        let runtime = AgentRuntime::disabled();
+        assert_eq!(runtime.all_managers().await.len(), 0);
+        assert!(runtime.manager_for_agent("deepseek").await.is_none());
+        assert!(runtime.manager_for_agent("opencode").await.is_none());
+        assert!(runtime.manager_for_session("ses_123").await.is_none());
+
+        runtime.record_session_route("ses_123", "deepseek").await;
+        let routes = runtime.session_routes.read().await;
+        assert_eq!(routes.map.get("ses_123"), Some(&"deepseek".to_string()));
+    }
+
+    #[test]
+    fn primary_follows_the_preference_order_not_the_map_order() {
+        let mut map = BTreeMap::new();
+        assert_eq!(pick_primary(&map), None);
+        map.insert("deepseek".to_string(), 2);
+        assert_eq!(pick_primary(&map), Some(&2));
+        map.insert("opencode".to_string(), 1);
+        assert_eq!(
+            pick_primary(&map),
+            Some(&1),
+            "OpenCode wins when both are attached"
+        );
+        map.insert("other".to_string(), 3);
+        map.remove("opencode");
+        assert_eq!(pick_primary(&map), Some(&2));
+    }
+
+    #[test]
+    fn session_routes_are_bounded_and_evictable() {
+        let mut routes = SessionRoutes::default();
+        for i in 0..MAX_SESSION_ROUTES + 10 {
+            routes.insert(&format!("s{i}"), "opencode");
+        }
+        assert_eq!(routes.map.len(), MAX_SESSION_ROUTES);
+        assert!(!routes.map.contains_key("s0"), "the oldest went first");
+        assert!(routes
+            .map
+            .contains_key(&format!("s{}", MAX_SESSION_ROUTES + 9)));
+        routes.insert("s20", "deepseek");
+        assert_eq!(
+            routes.order.len(),
+            MAX_SESSION_ROUTES,
+            "re-recording adds no entry"
+        );
+        routes.remove("s20");
+        assert!(!routes.map.contains_key("s20"));
+        assert_eq!(routes.order.len(), MAX_SESSION_ROUTES - 1);
+    }
+
+    #[tokio::test]
+    async fn an_unrecorded_session_with_nothing_attached_is_owned_by_nobody() {
+        let runtime = AgentRuntime::disabled();
+        assert!(runtime.manager_for_session("ses_unknown").await.is_none());
+        runtime.record_session_route("ses_x", "opencode").await;
+        runtime.forget_session_route("ses_x").await;
+        assert!(!runtime
+            .session_routes
+            .read()
+            .await
+            .map
+            .contains_key("ses_x"));
+    }
+
+    #[test]
+    fn only_the_preference_list_names_known_agents() {
+        let runtime = AgentRuntime::disabled();
+        assert!(runtime.is_known_agent("opencode"));
+        assert!(runtime.is_known_agent("deepseek"));
+        assert!(!runtime.is_known_agent("claude"));
+    }
+
+    #[tokio::test]
+    async fn a_disabled_deepseek_is_not_probed_or_attached() {
+        let runtime = AgentRuntime::disabled();
+        let mut backoff = Duration::from_secs(2);
+        assert!(!runtime.check_and_repair(&mut backoff).await);
+        assert!(runtime.manager_for_agent("deepseek").await.is_none());
+        let found = runtime.discover_agents().await;
+        let ds = found.agents.iter().find(|a| a.id == "deepseek").unwrap();
+        assert_eq!(ds.status, crate::discovery::AgentAvailability::Disabled);
+        assert!(ds.endpoint.is_none());
+    }
+
+    #[tokio::test]
+    async fn discovery_lists_agents_in_preference_order() {
+        let runtime = AgentRuntime::disabled();
+        let found = runtime.discover_agents().await;
+        let ids: Vec<&str> = found.agents.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, AGENT_PREFERENCE.to_vec());
+    }
+
+    #[tokio::test]
+    async fn agent_discovery_is_memoized() {
+        let runtime = AgentRuntime::disabled();
+        let first = runtime.discover_agents().await;
+        assert!(runtime.discovery_cache.read().await.is_some());
+        // Poison the cache; a second call inside the TTL must return it as is.
+        runtime
+            .discovery_cache
+            .write()
+            .await
+            .as_mut()
+            .unwrap()
+            .1
+            .supported = true;
+        let second = runtime.discover_agents().await;
+        assert!(second.supported, "the poisoned cache answered");
+        assert!(
+            !first.supported,
+            "nothing is attached to a disabled runtime"
+        );
+    }
+}
