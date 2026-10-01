@@ -45,7 +45,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      issues: write
+      # audit-check publishes a check when it finds an advisory or warning.
+      checks: write
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2.0.0
