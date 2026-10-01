@@ -24,8 +24,8 @@ use super::domain::AgentDomainEvent;
 use super::manager::AgentManager;
 
 mod t3;
-pub use t3::T3Config;
 use t3::{catalog_entry, t3_features, T3State};
+pub use t3::{T3Config, DEFAULT_T3_URL};
 
 /// How often the supervisor checks a healthy agent.
 const HEALTHY_POLL: Duration = Duration::from_secs(15);
