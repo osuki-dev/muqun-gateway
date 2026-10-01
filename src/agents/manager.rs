@@ -224,13 +224,6 @@ impl AgentManager {
         let driver = Arc::new(OpencodeDriver::new(endpoint.clone()));
         let mirror = Arc::new(MemoryMirror::for_agent(driver.kind()));
 
-        let session_service = Arc::new(SessionService::with_memory_mirror(
-            driver.clone(),
-            mirror.clone(),
-        ));
-        let prompt_service = Arc::new(PromptService::new(driver.clone(), mirror.clone()));
-        let interaction_service = Arc::new(InteractionService::new(driver.clone(), mirror.clone()));
-
         let (listener, mut sse_rx) = OpencodeSseListener::new(endpoint);
         let listener = Arc::new(listener);
         listener.start();
@@ -293,17 +286,42 @@ impl AgentManager {
         );
         let stream_listener = listener.clone();
         let shutdown_listener = listener.clone();
-        Self {
-            agent: driver,
+        Self::assemble(
+            driver,
             mirror,
-            session_service,
-            prompt_service,
-            interaction_service,
             events_tx,
             endpoint_url,
             endpoint_version,
-            stream_connected: Arc::new(move || stream_listener.is_connected()),
-            shutdown_handle: Arc::new(move || shutdown_listener.stop()),
+            Arc::new(move || stream_listener.is_connected()),
+            Arc::new(move || shutdown_listener.stop()),
+        )
+    }
+
+    /// The part every agent's manager has in common: the use-case services
+    /// over its driver and mirror, and the handles to its event stream.
+    fn assemble(
+        agent: Arc<dyn AgentPort>,
+        mirror: Arc<MemoryMirror>,
+        events_tx: broadcast::Sender<AgentDomainEvent>,
+        endpoint_url: String,
+        endpoint_version: Option<String>,
+        stream_connected: Arc<dyn Fn() -> bool + Send + Sync>,
+        shutdown_handle: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        Self {
+            session_service: Arc::new(SessionService::with_memory_mirror(
+                agent.clone(),
+                mirror.clone(),
+            )),
+            prompt_service: Arc::new(PromptService::new(agent.clone(), mirror.clone())),
+            interaction_service: Arc::new(InteractionService::new(agent.clone(), mirror.clone())),
+            agent,
+            mirror,
+            events_tx,
+            endpoint_url,
+            endpoint_version,
+            stream_connected,
+            shutdown_handle,
         }
     }
 
@@ -318,13 +336,6 @@ impl AgentManager {
             endpoint.clone(),
         ));
         let mirror = Arc::new(MemoryMirror::for_agent(driver.kind()));
-
-        let session_service = Arc::new(SessionService::with_memory_mirror(
-            driver.clone(),
-            mirror.clone(),
-        ));
-        let prompt_service = Arc::new(PromptService::new(driver.clone(), mirror.clone()));
-        let interaction_service = Arc::new(InteractionService::new(driver.clone(), mirror.clone()));
 
         // The pending approvals and the `$events` client id are shared with
         // the driver through the per-endpoint registry, because the driver
@@ -386,18 +397,82 @@ impl AgentManager {
             "agent manager initialized with the DeepSeek agent"
         );
 
-        Self {
-            agent: driver,
+        Self::assemble(
+            driver,
             mirror,
-            session_service,
-            prompt_service,
-            interaction_service,
             events_tx,
             endpoint_url,
             endpoint_version,
-            stream_connected: Arc::new(move || stream_listener.is_connected()),
-            shutdown_handle: Arc::new(move || shutdown_listener.stop()),
+            Arc::new(move || stream_listener.is_connected()),
+            Arc::new(move || shutdown_listener.stop()),
+        )
+    }
+
+    /// Build a manager for a T3 Code server. `endpoint` carries the
+    /// credential; `version` is the server version its descriptor reported.
+    pub fn connect_t3(
+        endpoint: crate::agents::adapters::t3::T3Endpoint,
+        runtime_mode: Option<&str>,
+        version: Option<String>,
+        events_tx: broadcast::Sender<AgentDomainEvent>,
+    ) -> Self {
+        use crate::agents::adapters::t3::client::RUNTIME_MODES;
+        use crate::agents::adapters::t3::{T3Client, T3Driver, T3StreamListener};
+        let endpoint_url = endpoint.url.clone();
+        let client = Arc::new(T3Client::new(endpoint));
+        let mut listener = T3StreamListener::new(client.clone());
+        let watcher = listener.watcher();
+        let mut stream_rx = listener.start();
+
+        let mut driver = T3Driver::from_client(client.clone()).with_watcher(watcher.clone());
+        if let Some(mode) = runtime_mode.map(str::trim) {
+            if RUNTIME_MODES.contains(&mode) {
+                driver = driver
+                    .with_runtime_mode(mode)
+                    .unwrap_or_else(|_| unreachable!());
+            } else {
+                tracing::warn!(
+                    runtime_mode = mode,
+                    "t3.runtime_mode is not a T3 runtime mode; using full-access"
+                );
+            }
         }
+        let driver = Arc::new(driver);
+        let mirror = Arc::new(MemoryMirror::for_agent(driver.kind()));
+        let ctx = Arc::new(t3::T3EventContext::new(
+            driver.clone(),
+            mirror.clone(),
+            events_tx.clone(),
+            watcher,
+        ));
+        tokio::spawn(async move {
+            // The listener owns the sending side; it ends when the manager
+            // is shut down, and so does this pump.
+            while let Some(event) = stream_rx.recv().await {
+                t3::handle_t3_event(event, &ctx).await;
+            }
+            tracing::debug!("t3 event pump wound down");
+        });
+
+        tracing::info!(
+            url = %endpoint_url,
+            version = version.as_deref().unwrap_or("unknown"),
+            "agent manager initialized with the T3 Code agent"
+        );
+        let socket = client.clone();
+        let cancel = listener.cancel_token();
+        Self::assemble(
+            driver,
+            mirror,
+            events_tx,
+            endpoint_url,
+            version,
+            Arc::new(move || socket.rpc().is_connected()),
+            Arc::new(move || {
+                cancel.cancel();
+                client.shutdown();
+            }),
+        )
     }
 
     /// A manager over a caller-supplied agent with no event stream, for
@@ -406,21 +481,15 @@ impl AgentManager {
     pub(crate) fn for_test(agent: Arc<dyn AgentPort>) -> Self {
         let mirror = Arc::new(MemoryMirror::for_agent(agent.kind()));
         let (events_tx, _) = broadcast::channel(16);
-        Self {
-            session_service: Arc::new(SessionService::with_memory_mirror(
-                agent.clone(),
-                mirror.clone(),
-            )),
-            prompt_service: Arc::new(PromptService::new(agent.clone(), mirror.clone())),
-            interaction_service: Arc::new(InteractionService::new(agent.clone(), mirror.clone())),
+        Self::assemble(
             agent,
             mirror,
             events_tx,
-            endpoint_url: "http://127.0.0.1:1".to_string(),
-            endpoint_version: Some("test".to_string()),
-            stream_connected: Arc::new(|| false),
-            shutdown_handle: Arc::new(|| {}),
-        }
+            "http://127.0.0.1:1".to_string(),
+            Some("test".to_string()),
+            Arc::new(|| false),
+            Arc::new(|| {}),
+        )
     }
 
     pub fn is_available(&self) -> bool {
@@ -1342,6 +1411,7 @@ impl AgentManager {
 }
 
 mod deepseek;
+mod t3;
 
 #[cfg(test)]
 mod tests;

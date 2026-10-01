@@ -214,6 +214,7 @@ pub fn map_catalog(raw: &Value, presets: Option<&Value>) -> AgentCatalog {
                 id: provider_id.to_string(),
                 name: provider_name.to_string(),
                 activation: Some("enabled".to_string()),
+                available: true,
                 models: group_models,
             });
         }

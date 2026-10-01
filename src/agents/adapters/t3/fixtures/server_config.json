@@ -1,0 +1,1189 @@
+{
+  "environment": {
+    "environmentId": "9cf7bafb-c136-4850-9a09-d6099368ca29",
+    "label": "osk",
+    "platform": {
+      "os": "linux",
+      "arch": "x64",
+      "machine": "desktop"
+    },
+    "serverVersion": "0.0.42",
+    "capabilities": {
+      "repositoryIdentity": true,
+      "connectionProbe": true,
+      "attachmentUploads": true,
+      "questionAttachments": true,
+      "fileAttachments": {
+        "maxUploadBytes": 52428800
+      },
+      "pullRequests": true,
+      "inlineMessageContext": true,
+      "threadSettlement": true,
+      "threadAutoSettlement": true,
+      "threadRestartContinuation": true,
+      "projectSettingsOverrides": true,
+      "threadSnooze": true,
+      "environmentThemes": true,
+      "usageLimitSources": true,
+      "usagePriceOverrides": true,
+      "threadPinning": true,
+      "threadPinReorder": true,
+      "threadActiveReorder": true,
+      "threadTitleRegeneration": true,
+      "threadPullRequestLinking": true,
+      "threadPullRequests": true,
+      "pullRequestStackActions": true,
+      "agentActivityPublishing": false,
+      "projectCloneTracking": true,
+      "environmentIcon": true
+    }
+  },
+  "auth": {
+    "policy": "loopback-browser",
+    "bootstrapMethods": [
+      "one-time-token"
+    ],
+    "sessionMethods": [
+      "browser-session-cookie",
+      "bearer-access-token",
+      "dpop-access-token"
+    ],
+    "sessionCookieName": "t3_session_37731_395f4cf4d60f"
+  },
+  "cwd": "/home/user/work/t3proj",
+  "providers": [
+    {
+      "instanceId": "codex",
+      "driver": "codex",
+      "displayName": "Codex",
+      "continuation": {
+        "groupKey": "codex:home:/home/user/.codex"
+      },
+      "showInteractionModeToggle": true,
+      "reportsContextWindow": true,
+      "enabled": true,
+      "installed": true,
+      "version": "0.158.0",
+      "status": "ready",
+      "auth": {
+        "status": "authenticated",
+        "type": "chatgpt",
+        "label": "ChatGPT Pro 20x Subscription",
+        "email": "<redacted>"
+      },
+      "checkedAt": "2026-09-29T08:26:14.081Z",
+      "models": [
+        {
+          "slug": "gpt-6-astra",
+          "name": "GPT-6-Astra",
+          "isCustom": false,
+          "isDefault": true,
+          "capabilities": {
+            "optionDescriptors": [
+              {
+                "id": "reasoningEffort",
+                "label": "Reasoning",
+                "type": "select",
+                "options": [
+                  {
+                    "id": "low",
+                    "label": "Low"
+                  },
+                  {
+                    "id": "medium",
+                    "label": "Medium",
+                    "isDefault": true
+                  },
+                  {
+                    "id": "high",
+                    "label": "High"
+                  },
+                  {
+                    "id": "xhigh",
+                    "label": "Extra High"
+                  },
+                  {
+                    "id": "max",
+                    "label": "Max"
+                  },
+                  {
+                    "id": "ultra",
+                    "label": "Ultra"
+                  }
+                ],
+                "currentValue": "medium"
+              },
+              {
+                "id": "serviceTier",
+                "label": "Service Tier",
+                "type": "select",
+                "options": [
+                  {
+                    "id": "default",
+                    "label": "Standard",
+                    "isDefault": true
+                  },
+                  {
+                    "id": "priority",
+                    "label": "Fast",
+                    "description": "2x speed, increased usage"
+                  }
+                ],
+                "currentValue": "default"
+              }
+            ]
+          }
+        },
+        {
+          "slug": "gpt-6-sol",
+          "name": "GPT-6-Sol",
+          "isCustom": false,
+          "isLegacy": true,
+          "capabilities": {
+            "optionDescriptors": [
+              {
+                "id": "reasoningEffort",
+                "label": "Reasoning",
+                "type": "select",
+                "options": [
+                  {
+                    "id": "low",
+                    "label": "Low"
+                  },
+                  {
+                    "id": "medium",
+                    "label": "Medium",
+                    "isDefault": true
+                  },
+                  {
+                    "id": "high",
+                    "label": "High"
+                  },
+                  {
+                    "id": "xhigh",
+                    "label": "Extra High"
+                  },
+                  {
+                    "id": "max",
+                    "label": "Max"
+                  },
+                  {
+                    "id": "ultra",
+                    "label": "Ultra"
+                  }
+                ],
+                "currentValue": "medium"
+              },
+              {
+                "id": "serviceTier",
+                "label": "Service Tier",
+                "type": "select",
+                "options": [
+                  {
+                    "id": "default",
+                    "label": "Standard",
+                    "isDefault": true
+                  },
+                  {
+                    "id": "priority",
+                    "label": "Fast",
+                    "description": "1.5x speed"
+                  }
+                ],
+                "currentValue": "default"
+              }
+            ]
+          }
+        },
+        {
+          "slug": "gpt-6-luna",
+          "name": "GPT-6-Luna",
+          "isCustom": false,
+          "isLegacy": true,
+          "capabilities": {
+            "optionDescriptors": [
+              {
+                "id": "reasoningEffort",
+                "label": "Reasoning",
+                "type": "select",
+                "options": [
+                  {
+                    "id": "low",
+                    "label": "Low"
+                  },
+                  {
+                    "id": "medium",
+                    "label": "Medium",
+                    "isDefault": true
+                  },
+                  {
+                    "id": "high",
+                    "label": "High"
+                  },
+                  {
+                    "id": "xhigh",
+                    "label": "Extra High"
+                  },
+                  {
+                    "id": "max",
+                    "label": "Max"
+                  }
+                ],
+                "currentValue": "medium"
+              },
+              {
+                "id": "serviceTier",
+                "label": "Service Tier",
+                "type": "select",
+                "options": [
+                  {
+                    "id": "default",
+                    "label": "Standard",
+                    "isDefault": true
+                  },
+                  {
+                    "id": "priority",
+                    "label": "Fast",
+                    "description": "1.5x speed"
+                  }
+                ],
+                "currentValue": "default"
+              }
+            ]
+          }
+        },
+        {
+          "slug": "gpt-5.6-sol",
+          "name": "GPT-5.6-Sol",
+          "isCustom": false,
+          "capabilities": {
+            "optionDescriptors": [
+              {
+                "id": "reasoningEffort",
+                "label": "Reasoning",
+                "type": "select",
+                "options": [
+                  {
+                    "id": "low",
+                    "label": "Low",
+                    "isDefault": true
+                  },
+                  {
+                    "id": "medium",
+                    "label": "Medium"
+                  },
+                  {
+                    "id": "high",
+                    "label": "High"
+                  },
+                  {
+                    "id": "xhigh",
+                    "label": "Extra High"
+                  },
+                  {
+                    "id": "max",
+                    "label": "Max"
+                  },
+                  {
+                    "id": "ultra",
+                    "label": "Ultra"
+                  }
+                ],
+                "currentValue": "low"
+              },
+              {
+                "id": "serviceTier",
+                "label": "Service Tier",
+                "type": "select",
+                "options": [
+                  {
+                    "id": "default",
+                    "label": "Standard",
+                    "isDefault": true
+                  },
+                  {
+                    "id": "priority",
+                    "label": "Fast",
+                    "description": "1.5x speed, increased usage"
+                  }
+                ],
+                "currentValue": "default"
+              }
+            ]
+          }
+        },
+        {
+          "slug": "gpt-5.6-terra",
+          "name": "GPT-5.6-Terra",
+          "isCustom": false,
+          "capabilities": {
+            "optionDescriptors": [
+              {
+                "id": "reasoningEffort",
+                "label": "Reasoning",
+                "type": "select",
+                "options": [
+                  {
+                    "id": "low",
+                    "label": "Low"
+                  },
+                  {
+                    "id": "medium",
+                    "label": "Medium",
+                    "isDefault": true
+                  },
+                  {
+                    "id": "high",
+                    "label": "High"
+                  },
+                  {
+                    "id": "xhigh",
+                    "label": "Extra High"
+                  },
+                  {
+                    "id": "max",
+                    "label": "Max"
+                  },
+                  {
+                    "id": "ultra",
+                    "label": "Ultra"
+                  }
+                ],
+                "currentValue": "medium"
+              },
+              {
+                "id": "serviceTier",
+                "label": "Service Tier",
+                "type": "select",
+                "options": [
+                  {
+                    "id": "default",
+                    "label": "Standard",
+                    "isDefault": true
+                  },
+                  {
+                    "id": "priority",
+                    "label": "Fast",
+                    "description": "1.5x speed, increased usage"
+                  }
+                ],
+                "currentValue": "default"
+              }
+            ]
+          }
+        },
+        {
+          "slug": "gpt-5.6-luna",
+          "name": "GPT-5.6-Luna",
+          "isCustom": false,
+          "capabilities": {
+            "optionDescriptors": [
+              {
+                "id": "reasoningEffort",
+                "label": "Reasoning",
+                "type": "select",
+                "options": [
+                  {
+                    "id": "low",
+                    "label": "Low"
+                  },
+                  {
+                    "id": "medium",
+                    "label": "Medium",
+                    "isDefault": true
+                  },
+                  {
+                    "id": "high",
+                    "label": "High"
+                  },
+                  {
+                    "id": "xhigh",
+                    "label": "Extra High"
+                  },
+                  {
+                    "id": "max",
+                    "label": "Max"
+                  }
+                ],
+                "currentValue": "medium"
+              },
+              {
+                "id": "serviceTier",
+                "label": "Service Tier",
+                "type": "select",
+                "options": [
+                  {
+                    "id": "default",
+                    "label": "Standard",
+                    "isDefault": true
+                  },
+                  {
+                    "id": "priority",
+                    "label": "Fast",
+                    "description": "1.5x speed, increased usage"
+                  }
+                ],
+                "currentValue": "default"
+              }
+            ]
+          }
+        },
+        {
+          "slug": "gpt-5.5",
+          "name": "GPT-5.5",
+          "isCustom": false,
+          "isLegacy": true,
+          "capabilities": {
+            "optionDescriptors": [
+              {
+                "id": "reasoningEffort",
+                "label": "Reasoning",
+                "type": "select",
+                "options": [
+                  {
+                    "id": "low",
+                    "label": "Low"
+                  },
+                  {
+                    "id": "medium",
+                    "label": "Medium",
+                    "isDefault": true
+                  },
+                  {
+                    "id": "high",
+                    "label": "High"
+                  },
+                  {
+                    "id": "xhigh",
+                    "label": "Extra High"
+                  }
+                ],
+                "currentValue": "medium"
+              },
+              {
+                "id": "serviceTier",
+                "label": "Service Tier",
+                "type": "select",
+                "options": [
+                  {
+                    "id": "default",
+                    "label": "Standard",
+                    "isDefault": true
+                  },
+                  {
+                    "id": "priority",
+                    "label": "Fast",
+                    "description": "1.5x speed, increased usage"
+                  }
+                ],
+                "currentValue": "default"
+              }
+            ]
+          }
+        }
+      ],
+      "slashCommands": [
+        {
+          "name": "compact",
+          "description": "Summarize the conversation and reduce context usage"
+        },
+        {
+          "name": "feedback",
+          "description": "Send this thread and Codex logs to OpenAI",
+          "input": {
+            "hint": "Describe the issue (optional)"
+          }
+        }
+      ],
+      "skills": [
+        {
+          "name": "add-mouse-driven-orbit",
+          "description": "Add restrained mouse-driven orbit and parallax depth to a Three.js hero by damping one pointer target and splitting it across camera translation, look-at, and small object rotations. Use for passive cinematic 3D heroes, pointer-responsive scenes, organic model parallax, and interactive depth where OrbitControls would feel like a product viewer.",
+          "path": "/home/user/.agents/skills/add-mouse-driven-orbit/SKILL.md",
+          "scope": "user",
+          "enabled": true,
+          "displayName": "Mouse-driven Orbit",
+          "shortDescription": "Add damped cinematic pointer orbit depth"
+        },
+        {
+          "name": "add-shader-cursor-trail",
+          "description": "Add the Shaders WebGPU mouse effect used for the Tidal Commons hero: a white twinkling halftone cursor trail driven by ChromaFlow, masked through a DotGrid, finished with chromatic ripples and film grain, and protected by static, touch, accessibility, SSR, and performance fallbacks. Use when a user asks for this shader mouse effect, a halftone cursor trail, an interactive WebGPU hero/contact background, or a reusable cursor-following shader layer in React, Next.js, Vue, Svelte, Solid, or plain web projects.",
+          "path": "/home/user/.agents/skills/add-shader-cursor-trail/SKILL.md",
+          "scope": "user",
+          "enabled": true,
+          "displayName": "Add Shader Cursor Trail",
+          "shortDescription": "Build an accessible WebGPU halftone mouse trail"
+        }
+      ]
+    },
+    {
+      "instanceId": "claudeAgent",
+      "driver": "claudeAgent",
+      "displayName": "Claude",
+      "continuation": {
+        "groupKey": "claude:home:/home/user"
+      },
+      "showInteractionModeToggle": true,
+      "reportsContextWindow": true,
+      "enabled": true,
+      "installed": true,
+      "version": "2.1.284",
+      "status": "ready",
+      "auth": {
+        "status": "authenticated",
+        "type": "Claude Max",
+        "label": "Claude Max Subscription",
+        "email": "<redacted>"
+      },
+      "checkedAt": "2026-09-29T08:26:14.082Z",
+      "models": [
+        {
+          "slug": "claude-fable-5-1",
+          "name": "Claude Fable 5.1",
+          "aliases": [
+            "fable",
+            "fable-5.1",
+            "claude-fable-5.1"
+          ],
+          "badge": "new",
+          "isCustom": false,
+          "isDefault": true,
+          "capabilities": {
+            "optionDescriptors": [
+              {
+                "id": "effort",
+                "label": "Reasoning",
+                "type": "select",
+                "options": [
+                  {
+                    "id": "low",
+                    "label": "Low"
+                  },
+                  {
+                    "id": "medium",
+                    "label": "Medium",
+                    "isDefault": true
+                  },
+                  {
+                    "id": "high",
+                    "label": "High"
+                  },
+                  {
+                    "id": "xhigh",
+                    "label": "Extra High"
+                  },
+                  {
+                    "id": "max",
+                    "label": "Max"
+                  },
+                  {
+                    "id": "ultracode",
+                    "label": "Ultracode",
+                    "description": "xhigh effort plus multi-agent workflow orchestration"
+                  },
+                  {
+                    "id": "ultrathink",
+                    "label": "Ultrathink"
+                  }
+                ],
+                "promptInjectedValues": [
+                  "ultrathink"
+                ]
+              },
+              {
+                "id": "contextWindow",
+                "label": "Context Window",
+                "type": "select",
+                "options": [
+                  {
+                    "id": "200k",
+                    "label": "200k"
+                  },
+                  {
+                    "id": "1m",
+                    "label": "1M",
+                    "isDefault": true
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "slug": "claude-fable-5",
+          "name": "Claude Fable 5",
+          "isCustom": false,
+          "isLegacy": true,
+          "capabilities": {
+            "optionDescriptors": [
+              {
+                "id": "effort",
+                "label": "Reasoning",
+                "type": "select",
+                "options": [
+                  {
+                    "id": "low",
+                    "label": "Low"
+                  },
+                  {
+                    "id": "medium",
+                    "label": "Medium",
+                    "isDefault": true
+                  },
+                  {
+                    "id": "high",
+                    "label": "High"
+                  },
+                  {
+                    "id": "xhigh",
+                    "label": "Extra High"
+                  },
+                  {
+                    "id": "max",
+                    "label": "Max"
+                  },
+                  {
+                    "id": "ultracode",
+                    "label": "Ultracode",
+                    "description": "xhigh effort plus multi-agent workflow orchestration"
+                  },
+                  {
+                    "id": "ultrathink",
+                    "label": "Ultrathink"
+                  }
+                ],
+                "promptInjectedValues": [
+                  "ultrathink"
+                ]
+              },
+              {
+                "id": "contextWindow",
+                "label": "Context Window",
+                "type": "select",
+                "options": [
+                  {
+                    "id": "200k",
+                    "label": "200k"
+                  },
+                  {
+                    "id": "1m",
+                    "label": "1M",
+                    "isDefault": true
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "slug": "claude-opus-5",
+          "name": "Claude Opus 5",
+          "aliases": [
+            "opus",
+            "opus-5",
+            "claude-opus-5.0",
+            "claude-opus-5-0"
+          ],
+          "isCustom": false,
+          "capabilities": {
+            "optionDescriptors": [
+              {
+                "id": "effort",
+                "label": "Reasoning",
+                "type": "select",
+                "options": [
+                  {
+                    "id": "low",
+                    "label": "Low"
+                  },
+                  {
+                    "id": "medium",
+                    "label": "Medium"
+                  },
+                  {
+                    "id": "high",
+                    "label": "High",
+                    "isDefault": true
+                  },
+                  {
+                    "id": "xhigh",
+                    "label": "Extra High"
+                  },
+                  {
+                    "id": "max",
+                    "label": "Max"
+                  },
+                  {
+                    "id": "ultracode",
+                    "label": "Ultracode",
+                    "description": "xhigh effort plus multi-agent workflow orchestration"
+                  },
+                  {
+                    "id": "ultrathink",
+                    "label": "Ultrathink"
+                  }
+                ],
+                "promptInjectedValues": [
+                  "ultrathink"
+                ]
+              },
+              {
+                "id": "fastMode",
+                "label": "Fast Mode",
+                "type": "boolean"
+              },
+              {
+                "id": "contextWindow",
+                "label": "Context Window",
+                "type": "select",
+                "options": [
+                  {
+                    "id": "200k",
+                    "label": "200k"
+                  },
+                  {
+                    "id": "1m",
+                    "label": "1M",
+                    "isDefault": true
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "slug": "claude-opus-4-8",
+          "name": "Claude Opus 4.8",
+          "aliases": [
+            "opus-4.8",
+            "claude-opus-4.8"
+          ],
+          "isCustom": false,
+          "isLegacy": true,
+          "capabilities": {
+            "optionDescriptors": [
+              {
+                "id": "effort",
+                "label": "Reasoning",
+                "type": "select",
+                "options": [
+                  {
+                    "id": "low",
+                    "label": "Low"
+                  },
+                  {
+                    "id": "medium",
+                    "label": "Medium"
+                  },
+                  {
+                    "id": "high",
+                    "label": "High",
+                    "isDefault": true
+                  },
+                  {
+                    "id": "xhigh",
+                    "label": "Extra High"
+                  },
+                  {
+                    "id": "max",
+                    "label": "Max"
+                  },
+                  {
+                    "id": "ultracode",
+                    "label": "Ultracode",
+                    "description": "xhigh effort plus multi-agent workflow orchestration"
+                  },
+                  {
+                    "id": "ultrathink",
+                    "label": "Ultrathink"
+                  }
+                ],
+                "promptInjectedValues": [
+                  "ultrathink"
+                ]
+              },
+              {
+                "id": "fastMode",
+                "label": "Fast Mode",
+                "type": "boolean"
+              }
+            ]
+          }
+        },
+        {
+          "slug": "claude-opus-4-7",
+          "name": "Claude Opus 4.7",
+          "aliases": [
+            "opus-4.7",
+            "claude-opus-4.7"
+          ],
+          "isCustom": false,
+          "isLegacy": true,
+          "capabilities": {
+            "optionDescriptors": [
+              {
+                "id": "effort",
+                "label": "Reasoning",
+                "type": "select",
+                "options": [
+                  {
+                    "id": "low",
+                    "label": "Low"
+                  },
+                  {
+                    "id": "medium",
+                    "label": "Medium"
+                  },
+                  {
+                    "id": "high",
+                    "label": "High"
+                  },
+                  {
+                    "id": "xhigh",
+                    "label": "Extra High",
+                    "isDefault": true
+                  },
+                  {
+                    "id": "max",
+                    "label": "Max"
+                  },
+                  {
+                    "id": "ultrathink",
+                    "label": "Ultrathink"
+                  }
+                ],
+                "promptInjectedValues": [
+                  "ultrathink"
+                ]
+              },
+              {
+                "id": "fastMode",
+                "label": "Fast Mode",
+                "type": "boolean"
+              }
+            ]
+          }
+        },
+        {
+          "slug": "claude-opus-4-6",
+          "name": "Claude Opus 4.6",
+          "aliases": [
+            "opus-4.6",
+            "claude-opus-4.6",
+            "claude-opus-4-6-20251117"
+          ],
+          "isCustom": false,
+          "isLegacy": true,
+          "capabilities": {
+            "optionDescriptors": [
+              {
+                "id": "effort",
+                "label": "Reasoning",
+                "type": "select",
+                "options": [
+                  {
+                    "id": "low",
+                    "label": "Low"
+                  },
+                  {
+                    "id": "medium",
+                    "label": "Medium"
+                  },
+                  {
+                    "id": "high",
+                    "label": "High",
+                    "isDefault": true
+                  },
+                  {
+                    "id": "max",
+                    "label": "Max"
+                  },
+                  {
+                    "id": "ultrathink",
+                    "label": "Ultrathink"
+                  }
+                ],
+                "promptInjectedValues": [
+                  "ultrathink"
+                ]
+              },
+              {
+                "id": "fastMode",
+                "label": "Fast Mode",
+                "type": "boolean"
+              },
+              {
+                "id": "contextWindow",
+                "label": "Context Window",
+                "type": "select",
+                "options": [
+                  {
+                    "id": "200k",
+                    "label": "200k"
+                  },
+                  {
+                    "id": "1m",
+                    "label": "1M",
+                    "isDefault": true
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "slug": "claude-opus-4-5",
+          "name": "Claude Opus 4.5",
+          "isCustom": false,
+          "isLegacy": true,
+          "capabilities": {
+            "optionDescriptors": [
+              {
+                "id": "effort",
+                "label": "Reasoning",
+                "type": "select",
+                "options": [
+                  {
+                    "id": "low",
+                    "label": "Low"
+                  },
+                  {
+                    "id": "medium",
+                    "label": "Medium"
+                  },
+                  {
+                    "id": "high",
+                    "label": "High",
+                    "isDefault": true
+                  },
+                  {
+                    "id": "max",
+                    "label": "Max"
+                  }
+                ]
+              },
+              {
+                "id": "fastMode",
+                "label": "Fast Mode",
+                "type": "boolean"
+              }
+            ]
+          }
+        },
+        {
+          "slug": "claude-sonnet-5",
+          "name": "Claude Sonnet 5",
+          "aliases": [
+            "sonnet",
+            "sonnet-5",
+            "claude-sonnet-5.0",
+            "claude-sonnet-5-0"
+          ],
+          "isCustom": false,
+          "capabilities": {
+            "optionDescriptors": [
+              {
+                "id": "effort",
+                "label": "Reasoning",
+                "type": "select",
+                "options": [
+                  {
+                    "id": "low",
+                    "label": "Low"
+                  },
+                  {
+                    "id": "medium",
+                    "label": "Medium"
+                  },
+                  {
+                    "id": "high",
+                    "label": "High",
+                    "isDefault": true
+                  },
+                  {
+                    "id": "xhigh",
+                    "label": "Extra High"
+                  },
+                  {
+                    "id": "max",
+                    "label": "Max"
+                  },
+                  {
+                    "id": "ultrathink",
+                    "label": "Ultrathink"
+                  }
+                ],
+                "promptInjectedValues": [
+                  "ultrathink"
+                ]
+              },
+              {
+                "id": "contextWindow",
+                "label": "Context Window",
+                "type": "select",
+                "options": [
+                  {
+                    "id": "200k",
+                    "label": "200k",
+                    "isDefault": true
+                  },
+                  {
+                    "id": "1m",
+                    "label": "1M"
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "slashCommands": [
+        {
+          "name": "compact",
+          "description": "Summarize the conversation and reduce context usage",
+          "input": {
+            "hint": "<optional custom summarization instructions>"
+          }
+        },
+        {
+          "name": "build-mobile-threejs-games",
+          "description": "Build, tune, or test a Three.js game for mobile web. Use for touch movement, action controls, target selection, touch inventory, safe areas, portrait/landscape layouts, responsive HUD, battery/performance budgets, and real mobile browser QA. (user)"
+        },
+        {
+          "name": "build-threejs-enemy-systems",
+          "description": "Build or refactor reusable, data-driven enemy archetype and moveset systems for Three.js action games. Use for enemy content schemas, model and rig conventions, combat move timing and contact contracts, runtime state boundaries, placeholder fallbacks, deterministic fixtures, or production playthrough validation. (user)"
+        },
+        {
+          "name": "build-threejs-scroll-worlds",
+          "description": "Build rich, scroll-controlled real-time Three.js experiences as one persistent 3D world whose camera, lighting, atmosphere, materials, objects, DOM story, and interactions evolve across authored chapters. Use for 3D scrollytelling, scroll-driven WebGL worlds, camera journeys, interactive portfolios, product stories, exhibitions, explainers, game or film microsites, spatial narratives, and multi-scene websites where native scroll should travel through one continuous place. Not limited to landing pages. (user)"
+        }
+      ],
+      "skills": [
+        {
+          "name": "build-mobile-threejs-games",
+          "description": "Build, tune, or test a Three.js game for mobile web. Use for touch movement, action controls, target selection, touch inventory, safe areas, portrait/landscape layouts, responsive HUD, battery/performance budgets, and real mobile browser QA.",
+          "path": "/home/user/.claude/skills/build-mobile-threejs-games/SKILL.md",
+          "scope": "user",
+          "enabled": true
+        },
+        {
+          "name": "build-threejs-enemy-systems",
+          "description": "Build or refactor reusable, data-driven enemy archetype and moveset systems for Three.js action games. Use for enemy content schemas, model and rig conventions, combat move timing and contact contracts, runtime state boundaries, placeholder fallbacks, deterministic fixtures, or production playthrough validation.",
+          "path": "/home/user/.claude/skills/build-threejs-enemy-systems/SKILL.md",
+          "scope": "user",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "instanceId": "cursor",
+      "driver": "cursor",
+      "displayName": "Cursor",
+      "badgeLabel": "Early Access",
+      "continuation": {
+        "groupKey": "cursor:instance:cursor"
+      },
+      "showInteractionModeToggle": true,
+      "supportsConversationRollback": false,
+      "enabled": false,
+      "installed": false,
+      "version": null,
+      "status": "disabled",
+      "auth": {
+        "status": "unknown"
+      },
+      "checkedAt": "2026-09-29T08:26:14.086Z",
+      "message": "Cursor is disabled in T3 Code settings.",
+      "models": [],
+      "slashCommands": [],
+      "skills": []
+    },
+    {
+      "instanceId": "grok",
+      "driver": "grok",
+      "displayName": "Grok",
+      "badgeLabel": "Early Access",
+      "continuation": {
+        "groupKey": "grok:instance:grok"
+      },
+      "showInteractionModeToggle": false,
+      "supportsConversationRollback": false,
+      "enabled": false,
+      "installed": false,
+      "version": null,
+      "status": "disabled",
+      "auth": {
+        "status": "unknown"
+      },
+      "checkedAt": "2026-09-29T08:26:14.086Z",
+      "message": "Grok is disabled in T3 Code settings.",
+      "models": [
+        {
+          "slug": "grok-build",
+          "name": "Grok Build",
+          "isCustom": false,
+          "capabilities": {
+            "optionDescriptors": []
+          }
+        }
+      ],
+      "slashCommands": [],
+      "skills": []
+    },
+    {
+      "instanceId": "opencode",
+      "driver": "opencode",
+      "displayName": "OpenCode",
+      "continuation": {
+        "groupKey": "opencode:instance:opencode"
+      },
+      "showInteractionModeToggle": false,
+      "enabled": false,
+      "installed": false,
+      "version": null,
+      "status": "disabled",
+      "auth": {
+        "status": "unknown"
+      },
+      "checkedAt": "2026-09-29T08:26:14.086Z",
+      "message": "OpenCode is disabled in T3 Code settings.",
+      "models": [],
+      "slashCommands": [],
+      "skills": []
+    },
+    {
+      "instanceId": "antigravity",
+      "driver": "antigravity",
+      "displayName": "Antigravity",
+      "continuation": {
+        "groupKey": "antigravity:instance:antigravity"
+      },
+      "showInteractionModeToggle": false,
+      "supportsConversationRollback": false,
+      "supportsTextGeneration": false,
+      "setup": {
+        "canAuthenticate": true,
+        "canInstall": true
+      },
+      "enabled": false,
+      "installed": false,
+      "version": null,
+      "status": "disabled",
+      "auth": {
+        "status": "unknown",
+        "type": "oauth-personal"
+      },
+      "checkedAt": "2026-09-29T08:26:14.080Z",
+      "message": "Antigravity is disabled in T3 Code settings.",
+      "models": [],
+      "slashCommands": [],
+      "skills": []
+    }
+  ],
+  "availableEditors": [
+    "cursor",
+    "vscode",
+    "antigravity",
+    "file-manager"
+  ]
+}

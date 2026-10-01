@@ -103,6 +103,18 @@ impl DeepseekEndpoint {
             .unwrap_or(false)
     }
 
+    /// An endpoint for `url` with the configured `token`/`secret`, each
+    /// falling back to the environment and the secret then to the local
+    /// credentials file, the same as discovery.
+    pub fn with_fallbacks(
+        url: impl Into<String>,
+        token: Option<String>,
+        secret: Option<String>,
+    ) -> Self {
+        let (token, secret) = credentials_with_env(token, secret, |key| std::env::var(key).ok());
+        Self::new(url, token, secret.or_else(super::auth::load_local_secret))
+    }
+
     /// Discover a running DeepSeek Harness instance from environment or default ports.
     pub async fn discover() -> Option<Self> {
         let candidate_urls = if let Ok(env_url) = std::env::var("DEEPSEEK_HARNESS_URL") {
@@ -118,14 +130,8 @@ impl DeepseekEndpoint {
             ]
         };
 
-        let token = std::env::var("DEEPSEEK_HARNESS_TOKEN")
-            .or_else(|_| std::env::var("DSH_TOKEN"))
-            .ok();
-
-        let secret = std::env::var("DEEPSEEK_HARNESS_SECRET")
-            .or_else(|_| std::env::var("DSH_SECRET"))
-            .ok()
-            .or_else(super::auth::load_local_secret);
+        let (token, secret) = credentials_with_env(None, None, |key| std::env::var(key).ok());
+        let secret = secret.or_else(super::auth::load_local_secret);
 
         let client = Client::builder()
             .timeout(Duration::from_millis(800))
@@ -142,9 +148,44 @@ impl DeepseekEndpoint {
     }
 }
 
+/// `token` and `secret` as given, else from `DEEPSEEK_HARNESS_*`, else from
+/// `DSH_*`.
+pub fn credentials_with_env(
+    token: Option<String>,
+    secret: Option<String>,
+    env: impl Fn(&str) -> Option<String>,
+) -> (Option<String>, Option<String>) {
+    let token = token
+        .or_else(|| env("DEEPSEEK_HARNESS_TOKEN"))
+        .or_else(|| env("DSH_TOKEN"));
+    let secret = secret
+        .or_else(|| env("DEEPSEEK_HARNESS_SECRET"))
+        .or_else(|| env("DSH_SECRET"));
+    (token, secret)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_credentials_win_then_harness_then_dsh_env() {
+        let env = |key: &str| match key {
+            "DEEPSEEK_HARNESS_TOKEN" => Some("harness-token".to_string()),
+            "DSH_TOKEN" => Some("dsh-token".to_string()),
+            "DSH_SECRET" => Some("dsh-secret".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            credentials_with_env(None, None, env),
+            (Some("harness-token".into()), Some("dsh-secret".into()))
+        );
+        assert_eq!(
+            credentials_with_env(Some("t".into()), Some("s".into()), env),
+            (Some("t".into()), Some("s".into()))
+        );
+        assert_eq!(credentials_with_env(None, None, |_| None), (None, None));
+    }
 
     #[test]
     fn derives_ws_url_and_authority_correctly() {

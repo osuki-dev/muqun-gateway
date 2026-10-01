@@ -45,6 +45,7 @@ pub(crate) fn test_config(token: &str) -> Config {
         rich_agent_pushes: false,
         opencode: agents::OpencodeConfig::default(),
         deepseek: agents::DeepseekConfig::default(),
+        t3: agents::T3Config::default(),
     }
 }
 

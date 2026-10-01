@@ -19,9 +19,15 @@ the gateway itself (see the last line of this file).
 - `src/agents/`: agents plane.
   - `domain/`: neutral agent entities: sessions, timeline, permissions, forms.
   - `ports/`: `AgentPort` (`ports/agent.rs`) and `SessionMirrorPort`.
-  - `adapters/`: OpenCode, DeepSeek, and the in-memory mirror adapter.
+  - `adapters/`: OpenCode, DeepSeek, T3 Code (`adapters/t3/`, Effect RPC over
+    a WebSocket; wire reference in `docs/t3-protocol.md`), and the in-memory
+    mirror adapter. Each adapter's event stream is folded into domain events
+    by a module under `manager/` (`deepseek.rs`, `t3.rs`).
   - `manager.rs`, `runtime.rs`, `use_cases/`: agent supervision and the
-    session/prompt/interaction services.
+    session/prompt/interaction services. `runtime/t3.rs` holds T3's config
+    block, its pairing-token-to-bearer credential (persisted by
+    `platform/store.rs` as `t3-credential.json`, 0600), and its attach and
+    discovery.
   - `routes.rs`: the OpenCode-style agent-session API (global and legacy paths).
   - `session_routes.rs`: terminal-multiplexer agent orchestration -- task
     dispatch, agent spawn, prompt delivery, approvals, and agent event history.

@@ -1103,25 +1103,30 @@ pub(crate) fn spawn_agent_permission_watchers(state: AppState) {
                     Err(_) => Vec::new(),
                 };
                 if !tokens.is_empty() {
-                    let mut data = serde_json::Map::new();
-                    data.insert("type".to_string(), json!("approval"));
-                    data.insert("category".to_string(), json!("approval"));
-                    data.insert("session_id".to_string(), json!("default"));
-                    data.insert("asid".to_string(), json!(asid.0));
-                    data.insert("approval_id".to_string(), json!(request.id));
-                    data.insert("fingerprint".to_string(), json!(request.id));
-
                     let _ = send_expo_push_notifications(
                         &tokens,
                         "Approval Required".to_string(),
                         request.prompt.clone(),
-                        data,
+                        agent_permission_push_data(&asid.0, &request.id),
                     )
                     .await;
                 }
             }
         }
     });
+}
+
+/// The data of a structured agent's approval push; `session_id` is the agent
+/// session the request belongs to.
+fn agent_permission_push_data(asid: &str, request_id: &str) -> serde_json::Map<String, Value> {
+    let mut data = serde_json::Map::new();
+    data.insert("type".to_string(), json!("approval"));
+    data.insert("category".to_string(), json!("approval"));
+    data.insert("session_id".to_string(), json!(asid));
+    data.insert("asid".to_string(), json!(asid));
+    data.insert("approval_id".to_string(), json!(request_id));
+    data.insert("fingerprint".to_string(), json!(request_id));
+    data
 }
 
 pub(crate) async fn watch_agent_notifications(state: AppState, session: SessionConfig) {
@@ -2907,6 +2912,18 @@ mod tests {
     use crate::agents::session_routes::native_approval_data;
     use crate::connectivity::routes::revoke_paired_device;
     use crate::*;
+
+    /// A structured agent's approval push names the agent session it is for,
+    /// not a placeholder.
+    #[test]
+    fn an_agent_permission_push_carries_its_agent_session_id() {
+        let data = super::agent_permission_push_data("ses_42", "perm_1");
+        assert_eq!(data["session_id"], "ses_42");
+        assert_eq!(data["asid"], "ses_42");
+        assert_eq!(data["approval_id"], "perm_1");
+        assert_eq!(data["fingerprint"], "perm_1");
+        assert_eq!(data["type"], "approval");
+    }
 
     /// The defect this hub exists for: `activity_stream()` used to be built
     /// once per subscriber, so N phones watching one tmux session meant N

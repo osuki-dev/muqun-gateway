@@ -103,6 +103,11 @@ pub struct ProviderInfo {
     /// `auto`, `enabled` or `disabled`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub activation: Option<String>,
+    /// Whether the provider can start a session now: installed, enabled and
+    /// offering at least one model. An unavailable provider is still listed so
+    /// the app can say what the host needs.
+    #[serde(default = "default_true")]
+    pub available: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<ProviderModelInfo>,
 }

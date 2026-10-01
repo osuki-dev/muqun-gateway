@@ -135,6 +135,7 @@ pub(crate) fn setup(
             rich_agent_pushes: false,
             opencode: agents::OpencodeConfig::default(),
             deepseek: agents::DeepseekConfig::default(),
+            t3: agents::T3Config::default(),
         },
     };
     config.listen = listen;

@@ -17,7 +17,7 @@ Two planes are implemented in this binary:
   adapters implement it.
 - **Agents plane** — agent sessions, models, prompts, tasks,
   permissions, approvals and event history, behind the `AgentPort`
-  port; the OpenCode and DeepSeek adapters implement it.
+  port; the OpenCode, DeepSeek and T3 Code adapters implement it.
 
 `/api/discovery` also reports an **SSH plane**, but that one is the app's own
 transport, not a gateway subsystem: the phone can open an SSH connection to a
@@ -49,8 +49,8 @@ the far side. The gateway implements no SSH client or server itself.
 │   │ port: TerminalBackend      │  │ port: AgentPort                │     │
 │   └─────────────┬──────────────┘  └───────────────┬────────────────┘     │
 │                 │                                 │                      │
-│        Herdr adapter · tmux adapter   OpenCode adapter · DeepSeek        │
-│                                       adapter                            │
+│        Herdr adapter · tmux adapter   OpenCode · DeepSeek · T3 Code      │
+│                                       adapters                           │
 │                                                                          │
 │  routes: platform (health, discovery, openapi) · connectivity (pairing,  │
 │    push registration) · terminal · agents                                │
@@ -61,7 +61,7 @@ the far side. The gateway implements no SSH client or server itself.
 └──────────────────────────────────────────────────────────────────────────┘
         │
         ▼
- Herdr unix socket · tmux argv · OpenCode / DeepSeek HTTP
+ Herdr unix socket · tmux argv · OpenCode / DeepSeek HTTP · T3 WebSocket
 ```
 
 A request travels: the phone authenticates with its device token (and, when
@@ -167,6 +167,38 @@ With a service installed, `muqun-gateway stop` stops the process but the service
 starts it again — that is what it is for. `service uninstall` is how you stop it
 for good.
 
+### Agents at a glance
+
+```sh
+muqun-gateway agent                  # each agent's status and the next step (--json for the raw list)
+muqun-gateway agent setup t3         # store a T3 Code credential and enable T3
+muqun-gateway agent setup deepseek   # point the gateway at a running DeepSeek Harness
+```
+
+`agent` probes the agents from your shell the way the running gateway does,
+prints one line per agent (`id  status  version  endpoint  → next step`) and
+whether the gateway is running, and exits non-zero while an enabled agent is not
+usable. It reports reachability only: it never attaches, so it shows `reachable`
+where the gateway may be `connected`. A T3 bearer the server refuses (expired or
+revoked) shows as `unconfigured`. `setup t3` checks that a T3 server answers
+(`--url`, else `t3.url`, else `http://127.0.0.1:3773`), mints a bearer with
+`t3 auth session issue` when `t3` is on `PATH` (`--base-dir` is passed through) or
+exchanges a `--token <code>` from `t3 pair` (`--token` wins over the local `t3`,
+and `--base-dir` is ignored with it; a non-loopback `--url` always needs
+`--token`), stores it in `t3-credential.json`,
+and sets `t3.enabled`/`t3.url` in `config.json`. It prints how long the bearer
+lasts: what T3 granted for a pairing code, or 30 days (unless T3 caps it) for
+an issued one. The gateway cannot renew it; re-run `agent setup t3` when it
+expires (`agent` then shows T3 as `unconfigured`). `setup deepseek` probes
+`--endpoint`, `deepseek.endpoint`, `DEEPSEEK_HARNESS_URL`/`DSH_URL`, then ports
+3080 and 19387 (with `deepseek.token`/`secret`, else the `DEEPSEEK_HARNESS_*` /
+`DSH_*` token and secret from the environment), and sets
+`deepseek.enabled`/`deepseek.endpoint`. An explicit endpoint still takes the
+token and secret from the environment when config.json has none. Both offer to restart the gateway's
+user service when the change needs one (`--yes` skips the question). `agent setup
+opencode` only shows the OpenCode binary the gateway would use: OpenCode needs
+no setup.
+
 ### The OpenCode agent
 
 The gateway's agent features require OpenCode 2 with `GET /api/info`. While the
@@ -203,6 +235,27 @@ one line saying which file, which version, and that `opencode.binary` is how to
 point it elsewhere. OpenCode 1 is a different API, and half-working with it is
 worse than saying so. `GET /api/agent-status` reports the same facts to the
 app, including whether the agent was `adopted` or `spawned`.
+
+### T3 Code
+
+The gateway can also drive a [T3 Code](https://t3.codes) server (`t3 serve`),
+which runs Claude Code, Codex and other agents behind one API. It is off
+until you turn it on in `config.json`, and the gateway only ever tries the URL
+you give it (T3's default `http://127.0.0.1:3773` if you give none):
+
+```json
+{ "t3": { "enabled": true, "url": "http://127.0.0.1:3773", "pairing_token": "…" } }
+```
+
+`muqun-gateway agent setup t3` does all of this for you. By hand: get the
+pairing token by running `t3 pair` on the T3 host; it prints a pairing
+link ending in `#token=…` and the token itself. The gateway exchanges the token
+once for a long-lived credential, keeps that in `t3-credential.json` in its
+state directory (readable by you only), and never needs the token again.
+`t3.runtime_mode` sets what new threads may do without asking
+(`full-access` by default, or `approval-required`, `auto-accept-edits`,
+`auto`). The full reference is in `docs/agent-api.md` under "Configuring T3
+Code".
 
 If the configured listen IP changes or is unavailable, startup reports the
 address and asks you to update `listen` in the gateway's `config.json`, then
