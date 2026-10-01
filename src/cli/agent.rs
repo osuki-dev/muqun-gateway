@@ -9,9 +9,10 @@ use std::process::{Command as ProcessCommand, Stdio};
 use anyhow::{anyhow, Context as _};
 use clap::Subcommand;
 
+use crate::agents::adapters::deepseek::{auth::load_local_secret, DeepseekEndpoint};
 use crate::agents::adapters::t3::{T3Credential, T3Endpoint};
-use crate::agents::runtime::{resolve_binary, DEFAULT_T3_URL};
-use crate::agents::{AgentRuntime, T3Config};
+use crate::agents::runtime::{binary_version, resolve_binary, DEFAULT_T3_URL};
+use crate::agents::{AgentRuntime, DeepseekConfig, T3Config};
 use crate::discovery::{AgentAvailability, AgentDiscoveryInfo};
 use crate::platform::service::SERVICE_LABEL;
 use crate::{
@@ -51,6 +52,18 @@ pub(crate) enum SetupAgent {
         #[arg(long, short)]
         yes: bool,
     },
+    /// Point the gateway at a running DeepSeek Harness and enable it.
+    Deepseek {
+        /// Harness URL; defaults to `deepseek.endpoint`, `DSH_URL`, then the
+        /// local ports 3080 and 19387.
+        #[arg(long)]
+        endpoint: Option<String>,
+        /// Restart the gateway service without asking.
+        #[arg(long, short)]
+        yes: bool,
+    },
+    /// Show the OpenCode the gateway would use; it needs no setup.
+    Opencode,
 }
 
 pub(crate) async fn run_agent_command(
@@ -94,6 +107,17 @@ pub(crate) async fn run_agent_command(
                      credential on its next round, no restart needed",
                 )?;
             }
+            SetupAgent::Deepseek { endpoint, yes } => {
+                let config_path = config_dir()?.join(CONFIG_FILE);
+                let env_url = std::env::var("DSH_URL").ok();
+                let restart = setup_deepseek_at(&config_path, endpoint, env_url).await?;
+                restart_if_running(
+                    restart,
+                    yes,
+                    "DeepSeek was already on for this endpoint; nothing to restart",
+                )?;
+            }
+            SetupAgent::Opencode => setup_opencode()?,
         },
     }
     Ok(())
@@ -306,6 +330,101 @@ pub(crate) fn parse_issued_token(stdout: &str) -> Option<String> {
         .map(str::trim)
         .rfind(|line| !line.is_empty() && !line.contains(char::is_whitespace))
         .map(str::to_owned)
+}
+
+/// Find a healthy DeepSeek Harness and enable it in `config_path`; returns
+/// whether the running gateway needs a restart to see the change.
+pub(crate) async fn setup_deepseek_at(
+    config_path: &Path,
+    endpoint: Option<String>,
+    env_url: Option<String>,
+) -> anyhow::Result<bool> {
+    let config = load_config(Some(config_path.to_string_lossy().into_owned()))?;
+    match dsh_credentials_path() {
+        Some(path) if path.exists() => {}
+        path => println!(
+            "    warning: no {}; the Harness will refuse the gateway until it has created it",
+            path.map_or("~/.dsh/.credentials.yaml".into(), |p| p
+                .display()
+                .to_string())
+        ),
+    }
+    let candidates = deepseek_candidates(endpoint, config.deepseek.endpoint.clone(), env_url);
+    let secret = config.deepseek.secret.clone().or_else(load_local_secret);
+    let http = reqwest::Client::new();
+    let mut found = None;
+    for url in &candidates {
+        let probe = DeepseekEndpoint::new(url, config.deepseek.token.clone(), secret.clone());
+        if probe.probe_healthy(&http).await {
+            found = Some(probe.url);
+            break;
+        }
+    }
+    let Some(url) = found else {
+        anyhow::bail!(
+            "No DeepSeek Harness answers at {}. Start DeepSeek Harness first: `{DSH_START}`",
+            candidates.join(", ")
+        );
+    };
+    println!("==> DeepSeek Harness answers at {url}");
+    let before = apply_config_edit(config_path, |config| {
+        enable_deepseek(&mut config.deepseek, &url)
+    })?;
+    println!("==> Enabled DeepSeek at {url} in {}", config_path.display());
+    Ok(deepseek_needs_restart(&before.deepseek, &url))
+}
+
+/// Where to look for the Harness: the flag, else the configured endpoint,
+/// else `DSH_URL`, else its two default local ports.
+pub(crate) fn deepseek_candidates(
+    endpoint: Option<String>,
+    configured: Option<String>,
+    env_url: Option<String>,
+) -> Vec<String> {
+    match endpoint.or(configured).or(env_url) {
+        Some(url) => vec![url],
+        None => vec![
+            "http://127.0.0.1:3080".to_string(),
+            "http://127.0.0.1:19387".to_string(),
+        ],
+    }
+}
+
+pub(crate) fn enable_deepseek(deepseek: &mut DeepseekConfig, url: &str) {
+    deepseek.enabled = true;
+    deepseek.endpoint = Some(url.to_string());
+}
+
+/// The DeepSeek settings are read once at start, and a configured endpoint
+/// already turns the agent on, so only a new endpoint needs a restart.
+pub(crate) fn deepseek_needs_restart(before: &DeepseekConfig, url: &str) -> bool {
+    before.endpoint.as_deref() != Some(url)
+}
+
+/// The Harness credentials file the gateway signs its cookie with, as
+/// `load_local_secret` finds it.
+fn dsh_credentials_path() -> Option<PathBuf> {
+    let home = std::env::var_os("DSH_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".dsh")))?;
+    Some(home.join(".credentials.yaml"))
+}
+
+fn setup_opencode() -> anyhow::Result<()> {
+    let config = load_config(None)?;
+    println!(
+        "OpenCode is managed by the gateway: it adopts a running `opencode service`, or \
+         starts one when `opencode.autostart` is on. Nothing to set up."
+    );
+    match resolve_binary(config.opencode.binary.as_deref()) {
+        Ok(path) => {
+            println!("binary:  {}", path.display());
+            let version = binary_version(&path);
+            println!("version: {}", version.as_deref().unwrap_or("unknown"));
+        }
+        Err(err) => println!("{err:#}"),
+    }
+    Ok(())
 }
 
 /// Enable T3 at `url`, dropping any pairing code: the bearer replaces it.
@@ -619,6 +738,71 @@ mod tests {
                 .contains("No T3 server at http://127.0.0.1:9"),
             "{err}"
         );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn deepseek_candidates_follow_flag_config_env_then_ports() {
+        let some = |v: &str| Some(v.to_string());
+        assert_eq!(
+            deepseek_candidates(some("http://a"), some("http://b"), some("http://c")),
+            ["http://a"]
+        );
+        assert_eq!(
+            deepseek_candidates(None, some("http://b"), some("http://c")),
+            ["http://b"]
+        );
+        assert_eq!(
+            deepseek_candidates(None, None, some("http://c")),
+            ["http://c"]
+        );
+        assert_eq!(
+            deepseek_candidates(None, None, None),
+            ["http://127.0.0.1:3080", "http://127.0.0.1:19387"]
+        );
+    }
+
+    #[test]
+    fn enabling_deepseek_keeps_its_credentials_and_the_rest() {
+        let (dir, path) = temp_config(T3Config::default());
+        apply_config_edit(&path, |config| {
+            config.deepseek.token = Some("tok".into());
+        })
+        .unwrap();
+        let before = apply_config_edit(&path, |config| {
+            enable_deepseek(&mut config.deepseek, "http://127.0.0.1:3080")
+        })
+        .unwrap();
+        assert!(deepseek_needs_restart(
+            &before.deepseek,
+            "http://127.0.0.1:3080"
+        ));
+        let after = reload(&path);
+        assert!(after.deepseek.enabled);
+        assert_eq!(
+            after.deepseek.endpoint.as_deref(),
+            Some("http://127.0.0.1:3080")
+        );
+        assert_eq!(after.deepseek.token.as_deref(), Some("tok"));
+        assert_eq!(after.label, "keep me");
+        assert!(!deepseek_needs_restart(
+            &after.deepseek,
+            "http://127.0.0.1:3080"
+        ));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn setup_deepseek_fails_clearly_when_no_harness_answers() {
+        let (dir, path) = temp_config(T3Config::default());
+        let err = setup_deepseek_at(&path, Some("http://127.0.0.1:9".into()), None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Start DeepSeek Harness first"),
+            "{err}"
+        );
+        assert!(!reload(&path).deepseek.enabled, "config untouched");
         std::fs::remove_dir_all(dir).ok();
     }
 }
