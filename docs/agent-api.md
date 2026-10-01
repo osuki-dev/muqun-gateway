@@ -146,7 +146,16 @@ and `version` removed from every agent.
   `reachable` (an endpoint answers but it is not attached), `offline`,
   `disabled`, `not_installed`, `unconfigured`. `connected` and `reachable` can
   be selected: `reachable` means the gateway will attach on first use. The
-  rest cannot.
+  rest cannot. `muqun-gateway agent` prints the same list on the gateway host
+  with the next step for each:
+
+  | `status` | Next step `muqun-gateway agent` prints |
+  |---|---|
+  | `connected`, `reachable` | none |
+  | `unconfigured` (t3) | `muqun-gateway agent setup t3` |
+  | `disabled` | `muqun-gateway agent setup t3` / `muqun-gateway agent setup deepseek`; for OpenCode, set `opencode.enabled` |
+  | `offline` | the agent's own start command: `opencode service start`, `bunx @deepseek-ai/dsh web --no-open`, or "open T3 Code, or run `t3 service install`" |
+  | `not_installed` | install OpenCode 2 / T3 Code; for DeepSeek, `bunx @deepseek-ai/dsh web --no-open` |
 - `endpoint` and `version` are omitted when unknown or redacted. `models[]` and
   `modes[]` are that agent's own catalog summary; `reasoningEffortTiers` is
   omitted when empty; `modes[].description` when unset.
@@ -972,7 +981,13 @@ scans for it: it tries only the URL it is given, or T3's default
 the matching keys when `config.json` leaves them unset; they never enable T3
 by themselves.
 
-To pair, run `t3 pair` on the T3 host (with the same `--base-dir` as the
+`muqun-gateway agent setup t3` does the pairing on the gateway host: it
+mints a bearer with `t3 auth session issue` (or exchanges `--token <code>`),
+checks it against the server, stores it, and sets `enabled` and `url`. When T3
+was already on for that URL the running gateway picks the new credential up on
+its next round without a restart.
+
+To pair by hand, run `t3 pair` on the T3 host (with the same `--base-dir` as the
 server, if it has one). It prints a pairing URL ending in `#token=…` and the
 token on its own line; put that token in `t3.pairing_token` and restart the
 gateway. The gateway exchanges it once for a bearer, keeps the bearer in

@@ -167,6 +167,27 @@ With a service installed, `muqun-gateway stop` stops the process but the service
 starts it again — that is what it is for. `service uninstall` is how you stop it
 for good.
 
+### Agents at a glance
+
+```sh
+muqun-gateway agent                  # each agent's status and the next step (--json for the raw list)
+muqun-gateway agent setup t3         # store a T3 Code credential and enable T3
+muqun-gateway agent setup deepseek   # point the gateway at a running DeepSeek Harness
+```
+
+`agent` probes the agents the way the running gateway does, prints one line per
+agent (`id  status  version  endpoint  → next step`), and exits non-zero while an
+enabled agent is not usable. `setup t3` checks that a T3 server answers
+(`--url`, else `t3.url`, else `http://127.0.0.1:3773`), mints a bearer with
+`t3 auth session issue` when `t3` is on `PATH` (`--base-dir` is passed through) or
+exchanges a `--token <code>` from `t3 pair`, stores it in `t3-credential.json`,
+and sets `t3.enabled`/`t3.url` in `config.json`. `setup deepseek` probes
+`--endpoint`, `deepseek.endpoint`, `DSH_URL`, then ports 3080 and 19387, and
+sets `deepseek.enabled`/`deepseek.endpoint`. Both offer to restart the gateway's
+user service when the change needs one (`--yes` skips the question). `agent setup
+opencode` only shows the OpenCode binary the gateway would use: OpenCode needs
+no setup.
+
 ### The OpenCode agent
 
 The gateway's agent features require OpenCode 2 with `GET /api/info`. While the
@@ -215,7 +236,8 @@ you give it (T3's default `http://127.0.0.1:3773` if you give none):
 { "t3": { "enabled": true, "url": "http://127.0.0.1:3773", "pairing_token": "…" } }
 ```
 
-Get the pairing token by running `t3 pair` on the T3 host; it prints a pairing
+`muqun-gateway agent setup t3` does all of this for you. By hand: get the
+pairing token by running `t3 pair` on the T3 host; it prints a pairing
 link ending in `#token=…` and the token itself. The gateway exchanges the token
 once for a long-lived credential, keeps that in `t3-credential.json` in its
 state directory (readable by you only), and never needs the token again.
