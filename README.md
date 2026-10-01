@@ -175,9 +175,12 @@ muqun-gateway agent setup t3         # store a T3 Code credential and enable T3
 muqun-gateway agent setup deepseek   # point the gateway at a running DeepSeek Harness
 ```
 
-`agent` probes the agents the way the running gateway does, prints one line per
-agent (`id  status  version  endpoint  → next step`), and exits non-zero while an
-enabled agent is not usable. `setup t3` checks that a T3 server answers
+`agent` probes the agents from your shell the way the running gateway does,
+prints one line per agent (`id  status  version  endpoint  → next step`) and
+whether the gateway is running, and exits non-zero while an enabled agent is not
+usable. It reports reachability only: it never attaches, so it shows `reachable`
+where the gateway may be `connected`. A T3 bearer the server refuses (expired or
+revoked) shows as `unconfigured`. `setup t3` checks that a T3 server answers
 (`--url`, else `t3.url`, else `http://127.0.0.1:3773`), mints a bearer with
 `t3 auth session issue` when `t3` is on `PATH` (`--base-dir` is passed through) or
 exchanges a `--token <code>` from `t3 pair`, stores it in `t3-credential.json`,

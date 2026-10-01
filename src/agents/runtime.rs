@@ -538,6 +538,8 @@ impl AgentRuntime {
         }
     }
 
+    /// One discovery pass, uncached and with no TTL or timeout. The routes go
+    /// through `discover_agents`; this is for the `agent` CLI only.
     pub(crate) async fn probe_agents(&self) -> crate::discovery::AgentPlaneDiscovery {
         use crate::discovery::{
             AgentAvailability, AgentDiscoveryInfo, AgentPlaneDiscovery, AgentPlaneFeatures,

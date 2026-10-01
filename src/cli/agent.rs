@@ -16,7 +16,8 @@ use crate::agents::{AgentRuntime, DeepseekConfig, T3Config};
 use crate::discovery::{AgentAvailability, AgentDiscoveryInfo};
 use crate::platform::service::SERVICE_LABEL;
 use crate::{
-    config_dir, load_config, now_unix_ms, state_dir, write_config, write_t3_credential_at, Config,
+    config_dir, gateway_listener_pids, load_config, now_unix_ms, process_running, read_pid,
+    read_t3_credential_at, state_dir, write_config, write_t3_credential_at, Config,
     T3StoredCredential, CONFIG_FILE,
 };
 
@@ -138,11 +139,29 @@ async fn list(json: bool) -> anyhow::Result<bool> {
     );
     // The uncached probe: `discover_agents` gives up after a few seconds
     // and would report everything offline while a catalog is still loading.
-    let agents = runtime.probe_agents().await.agents;
+    let mut agents = runtime.probe_agents().await.agents;
+    // Discovery counts any held T3 bearer as usable; check it, read-only, so
+    // an expired or revoked one says what to do about it.
+    let t3 = config
+        .t3
+        .clone()
+        .with_env_fallback(|key| std::env::var(key).ok());
+    for agent in agents.iter_mut() {
+        if agent.id == "t3"
+            && agent.status == AgentAvailability::Reachable
+            && t3_bearer_rejected(&t3, &state_dir()?).await
+        {
+            agent.status = AgentAvailability::Unconfigured;
+        }
+    }
     let text = if json {
         serde_json::to_string_pretty(&agents)?
     } else {
-        let rows: Vec<String> = agents.iter().map(|a| format_row(a, &config)).collect();
+        let mut rows: Vec<String> = agents.iter().map(|a| format_row(a, &config)).collect();
+        rows.push(format!(
+            "(probed from this shell: `connected` is only known to the running gateway; {})",
+            gateway_state(config.port())
+        ));
         rows.join("\n")
     };
     // `agent --json | head` closes the pipe early; that is not an error.
@@ -153,6 +172,46 @@ async fn list(json: bool) -> anyhow::Result<bool> {
     Ok(all_ready(
         agents.iter().map(|agent| (agent.enabled, &agent.status)),
     ))
+}
+
+/// Whether the T3 server answers but refuses the bearer the gateway would
+/// use: `t3.token`, else the stored one for this URL. `false` when there is
+/// no bearer to check (only a pairing code) or the server cannot be asked.
+pub(crate) async fn t3_bearer_rejected(t3: &T3Config, state_dir: &Path) -> bool {
+    let endpoint = T3Endpoint::new(
+        t3.url.as_deref().unwrap_or(DEFAULT_T3_URL),
+        T3Credential::None,
+    );
+    let stored = || {
+        read_t3_credential_at(state_dir)
+            .ok()
+            .flatten()
+            .filter(|stored| stored.url == endpoint.url)
+            .map(|stored| stored.token)
+    };
+    let Some(bearer) = t3.token.clone().or_else(stored) else {
+        return false;
+    };
+    match endpoint
+        .session_state(&reqwest::Client::new(), &bearer)
+        .await
+    {
+        Ok(state) => state.get("authenticated").and_then(|v| v.as_bool()) != Some(true),
+        Err(_) => false,
+    }
+}
+
+/// Whether a gateway process is up, as `muqun-gateway status` tells it.
+fn gateway_state(port: u16) -> String {
+    let pid = read_pid()
+        .ok()
+        .flatten()
+        .filter(|pid| process_running(*pid))
+        .or_else(|| gateway_listener_pids(port).ok()?.first().copied());
+    match pid {
+        Some(pid) => format!("gateway running, pid {pid}"),
+        None => "gateway not running".to_string(),
+    }
 }
 
 fn format_row(agent: &AgentDiscoveryInfo, config: &Config) -> String {
@@ -811,6 +870,43 @@ mod tests {
             "{err}"
         );
         assert!(!reload(&path).deepseek.enabled, "config untouched");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_refused_t3_bearer_reads_as_rejected() {
+        let url = fake_t3().await;
+        let dir = std::env::temp_dir().join(format!("agent-cli-{}", uuid::Uuid::new_v4()));
+        let t3 = T3Config {
+            enabled: true,
+            url: Some(url.clone()),
+            ..Default::default()
+        };
+        assert!(!t3_bearer_rejected(&t3, &dir).await, "nothing to check");
+        let store = |token: &str| {
+            write_t3_credential_at(
+                &dir,
+                &T3StoredCredential {
+                    url: url.clone(),
+                    token: token.into(),
+                    saved_at_ms: 0,
+                },
+            )
+            .unwrap()
+        };
+        store("expired");
+        assert!(t3_bearer_rejected(&t3, &dir).await);
+        store("minted");
+        assert!(!t3_bearer_rejected(&t3, &dir).await);
+        let unreachable = T3Config {
+            url: Some("http://127.0.0.1:9".into()),
+            token: Some("x".into()),
+            ..Default::default()
+        };
+        assert!(
+            !t3_bearer_rejected(&unreachable, &dir).await,
+            "unknown is not rejected"
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 }

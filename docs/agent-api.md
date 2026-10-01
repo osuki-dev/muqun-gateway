@@ -146,13 +146,17 @@ and `version` removed from every agent.
   `reachable` (an endpoint answers but it is not attached), `offline`,
   `disabled`, `not_installed`, `unconfigured`. `connected` and `reachable` can
   be selected: `reachable` means the gateway will attach on first use. The
-  rest cannot. `muqun-gateway agent` prints the same list on the gateway host
-  with the next step for each:
+  rest cannot. `muqun-gateway agent` probes the same list from a shell on the
+  gateway host and prints the next step for each. It never attaches, so it
+  reports reachability only: never `connected`, and `reachable` where the
+  running gateway may say `connected`. It also checks a held T3 bearer and
+  reports `unconfigured` when the server refuses it.
 
   | `status` | Next step `muqun-gateway agent` prints |
   |---|---|
-  | `connected`, `reachable` | none |
-  | `unconfigured` (t3) | `muqun-gateway agent setup t3` |
+  | `reachable` | none |
+  | `connected` | not shown by the CLI (only the running gateway knows) |
+  | `unconfigured` (t3: no bearer, or a refused one) | `muqun-gateway agent setup t3` |
   | `disabled` | `muqun-gateway agent setup t3` / `muqun-gateway agent setup deepseek`; for OpenCode, set `opencode.enabled` |
   | `offline` | the agent's own start command: `opencode service start`, `bunx @deepseek-ai/dsh web --no-open`, or "open T3 Code, or run `t3 service install`" |
   | `not_installed` | install OpenCode 2 / T3 Code; for DeepSeek, `bunx @deepseek-ai/dsh web --no-open` |
