@@ -180,6 +180,16 @@ impl T3State {
         }
     }
 
+    /// Whether the gateway has anything to attach with, without spending or
+    /// checking it: a configured, exchanged or stored bearer, or a pairing
+    /// token not yet exchanged.
+    async fn holds_credential(&self) -> bool {
+        self.config.token.is_some()
+            || self.exchanged.lock().await.is_some()
+            || self.pairing.lock().await.is_some()
+            || self.stored_bearer(&self.url()).is_some()
+    }
+
     /// The credential to attach with: the configured bearer, else a stored
     /// one the server still accepts, else the pairing token exchanged now
     /// (and the bearer stored), else nothing.
@@ -253,6 +263,8 @@ pub(super) fn t3_features() -> crate::discovery::AgentFeatures {
         tool_approvals: true,
         worktrees: false,
         revert: true,
+        // T3 rolls whole turns back in one step; there is no staged state.
+        staged_revert: false,
         inbox: false,
         // The driver answers `Unsupported` for a mode, attachments, skills,
         // commands, compaction and shells.
@@ -343,10 +355,16 @@ impl AgentRuntime {
             return info;
         }
         // Not attached: the descriptor is public, so reachability and the
-        // version can be told without a credential; the models cannot.
+        // version can be told without a credential; the models cannot. Only
+        // a server the gateway can authenticate to is `reachable` (attached
+        // on first use); without a credential it is `unconfigured`.
         match self.t3.endpoint().describe(&probe_client()).await {
             Ok(descriptor) => {
-                info.status = AgentAvailability::Unconfigured;
+                info.status = if self.t3.holds_credential().await {
+                    AgentAvailability::Reachable
+                } else {
+                    AgentAvailability::Unconfigured
+                };
                 info.version = Some(descriptor.server_version);
             }
             Err(_) => info.status = AgentAvailability::Offline,
@@ -392,6 +410,7 @@ mod tests {
             "compaction",
             "backgroundShells",
             "attachments",
+            "stagedRevert",
         ] {
             assert_eq!(v[key], false, "{key}");
         }

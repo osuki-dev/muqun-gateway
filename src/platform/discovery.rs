@@ -110,6 +110,9 @@ pub struct AgentFeatures {
     pub tool_approvals: bool,
     pub worktrees: bool,
     pub revert: bool,
+    /// Revert goes through `POST …/revert/stage` and commit; when false the
+    /// agent only reverts in one step and staging answers `501`.
+    pub staged_revert: bool,
     pub inbox: bool,
     /// The agent has modes (personas or presets) to pick from.
     pub modes: bool,
@@ -403,6 +406,7 @@ mod tests {
                 tool_approvals: true,
                 worktrees: false,
                 revert: false,
+                staged_revert: false,
                 inbox: false,
                 modes: true,
                 skills: false,

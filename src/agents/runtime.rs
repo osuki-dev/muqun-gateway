@@ -1373,6 +1373,7 @@ fn deepseek_features(
         tool_approvals: true,
         worktrees: false,
         revert: false,
+        staged_revert: false,
         inbox: false,
         // Presets are the modes; the client refuses attachments and the driver
         // leaves skills, commands, compaction and shells at `Unsupported`.
@@ -1400,6 +1401,7 @@ fn opencode_features(
         tool_approvals: true,
         worktrees: true,
         revert: true,
+        staged_revert: true,
         inbox: true,
         modes: true,
         skills: true,
@@ -1424,15 +1426,16 @@ mod tests {
             "compaction",
             "backgroundShells",
             "attachments",
+            "stagedRevert",
         ];
         let flags = |f: crate::discovery::AgentFeatures| {
             let v = serde_json::to_value(f).unwrap();
             keys.map(|k| v[k].as_bool().unwrap_or_else(|| panic!("{k} missing")))
         };
-        assert_eq!(flags(opencode_features(true, true)), [true; 6]);
+        assert_eq!(flags(opencode_features(true, true)), [true; 7]);
         assert_eq!(
             flags(deepseek_features(true, true)),
-            [true, false, false, false, false, false]
+            [true, false, false, false, false, false, false]
         );
     }
 
@@ -1975,6 +1978,41 @@ mod tests {
         let t3 = found.agents.iter().find(|a| a.id == "t3").unwrap();
         assert_eq!(t3.status, crate::discovery::AgentAvailability::Offline);
         assert_eq!(enabled.t3.url(), t3::DEFAULT_T3_URL);
+    }
+
+    /// A T3 server that answers only its public descriptor.
+    async fn fake_t3_descriptor() -> String {
+        let app = axum::Router::new().route(
+            crate::agents::adapters::t3::endpoint::WELL_KNOWN_PATH,
+            axum::routing::get(|| async {
+                r#"{"environmentId":"env","label":"t3","serverVersion":"0.9.1"}"#
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        url
+    }
+
+    #[tokio::test]
+    async fn a_t3_server_without_a_credential_is_unconfigured_not_reachable() {
+        let url = fake_t3_descriptor().await;
+        let runtime = t3_runtime(T3Config {
+            url: Some(url.clone()),
+            ..Default::default()
+        });
+        let t3 = runtime.t3_discovery().await;
+        assert_eq!(t3.status, crate::discovery::AgentAvailability::Unconfigured);
+        assert_eq!(t3.version.as_deref(), Some("0.9.1"));
+
+        // Holding a credential, the gateway will attach on first use.
+        let runtime = t3_runtime(T3Config {
+            url: Some(url),
+            token: Some("bearer".into()),
+            ..Default::default()
+        });
+        let t3 = runtime.t3_discovery().await;
+        assert_eq!(t3.status, crate::discovery::AgentAvailability::Reachable);
     }
 
     #[tokio::test]

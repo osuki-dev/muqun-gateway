@@ -129,8 +129,8 @@ and `version` removed from every agent.
       "modes": [ { "id": "build", "name": "build", "description": "…" } ],
       "features": {
         "streaming": true, "reasoningEffort": true, "modelSelection": true,
-        "toolApprovals": true, "worktrees": true, "revert": true, "inbox": true,
-        "modes": true, "skills": true, "slashCommands": true, "compaction": true,
+        "toolApprovals": true, "worktrees": true, "revert": true, "stagedRevert": true,
+        "inbox": true, "modes": true, "skills": true, "slashCommands": true, "compaction": true,
         "backgroundShells": true, "attachments": true
       }
     }
@@ -144,7 +144,9 @@ and `version` removed from every agent.
   the `agent_id` on that agent's sessions.
 - `status` values are snake_case: `connected` (attached and answering),
   `reachable` (an endpoint answers but it is not attached), `offline`,
-  `disabled`, `not_installed`, `unconfigured`. Only `connected` can be selected.
+  `disabled`, `not_installed`, `unconfigured`. `connected` and `reachable` can
+  be selected: `reachable` means the gateway will attach on first use. The
+  rest cannot.
 - `endpoint` and `version` are omitted when unknown or redacted. `models[]` and
   `modes[]` are that agent's own catalog summary; `reasoningEffortTiers` is
   omitted when empty; `modes[].description` when unset.
@@ -162,6 +164,7 @@ and `version` removed from every agent.
 | `toolApprovals` | The agent raises permission requests the App answers. |
 | `worktrees` | The `/api/agent-worktrees` routes work against this agent. |
 | `revert` | Stage, commit and clear revert work. |
+| `stagedRevert` | Revert is two-step (`POST …/revert/stage`, then commit). When false, staging answers `501 feature_unsupported` and the agent reverts in one step. |
 | `inbox` | Queued and steered prompts (`/inbox`, `delivery`) work. |
 | `modes` | The agent has modes (personas or presets) to pick; `mode` on create and `POST …/mode` apply. `modes[]` and the catalog's `modes` are meaningful only when true. |
 | `skills` | The catalog `skills[]` list is the agent's and skill activation works. |
@@ -171,7 +174,7 @@ and `version` removed from every agent.
 | `attachments` | A prompt may carry `attachments`; when false the agent answers `501 feature_unsupported`. |
 
   The App renders agent-specific UI from these flags alone, never from the
-  agent's `kind`. All six are always present (booleans, never omitted).
+  agent's `kind`. Every flag is always present (booleans, never omitted).
 
   Flags reflect the agent's last probe (cached for about ten seconds).
   Unknown extra flags may appear; ignore them.
@@ -186,6 +189,7 @@ and `version` removed from every agent.
   | `toolApprovals` | yes | yes | yes |
   | `worktrees` | yes | no | no |
   | `revert` | yes | no | yes |
+  | `stagedRevert` | yes | no | no |
   | `inbox` | yes | no | no |
   | `modes` | yes | yes (presets) | no |
   | `skills` | yes | no | no |
@@ -196,8 +200,10 @@ and `version` removed from every agent.
 
   `t3` is `name: "T3 Code"`; its `version` is the T3 server version, its
   `models[]` are every model of the providers T3 has ready (Claude Code,
-  Codex, …), and it is `reachable` rather than `connected` while the server
-  answers but the gateway holds no credential for it. A T3 revert rolls back
+  Codex, …). While not attached it is `reachable` when the server answers and
+  the gateway holds a credential (a bearer or an unspent pairing token) it
+  will attach with, and `unconfigured` when the server answers but the
+  gateway holds no credential for it. A T3 revert rolls back
   whole turns: reverting to any row of a turn removes that turn and
   everything after it (`agent.revert.changed` `committed`, then the timeline
   is re-read); there is no staged state.

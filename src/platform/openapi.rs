@@ -33,6 +33,7 @@ fn agents_plane_schema() -> Value {
                                 "toolApprovals": { "type": "boolean" },
                                 "worktrees": { "type": "boolean" },
                                 "revert": { "type": "boolean" },
+                                "stagedRevert": { "type": "boolean", "description": "Revert is staged (`POST …/revert/stage`) then committed; false means staging answers 501" },
                                 "inbox": { "type": "boolean" },
                                 "modes": { "type": "boolean" },
                                 "skills": { "type": "boolean" },
