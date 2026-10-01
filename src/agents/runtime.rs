@@ -1377,17 +1377,18 @@ fn deepseek_features(
         worktrees: false,
         revert: false,
         inbox: false,
-        // Session presets are available at creation. The remaining driver
-        // operations are unsupported; omitted flags would enable them in clients.
-        extra: std::collections::BTreeMap::from([
-            ("modeSwitching".into(), serde_json::Value::Bool(false)),
-            ("modes".into(), serde_json::Value::Bool(true)),
-            ("skills".into(), serde_json::Value::Bool(false)),
-            ("slashCommands".into(), serde_json::Value::Bool(false)),
-            ("compaction".into(), serde_json::Value::Bool(false)),
-            ("backgroundShells".into(), serde_json::Value::Bool(false)),
-            ("attachments".into(), serde_json::Value::Bool(false)),
-        ]),
+        // Presets are the modes; the client refuses attachments and the driver
+        // leaves skills, commands, compaction and shells at `Unsupported`.
+        modes: true,
+        skills: false,
+        slash_commands: false,
+        compaction: false,
+        background_shells: false,
+        attachments: false,
+        extra: std::collections::BTreeMap::from([(
+            "modeSwitching".into(),
+            serde_json::Value::Bool(false),
+        )]),
     }
 }
 
@@ -1403,6 +1404,12 @@ fn opencode_features(
         worktrees: true,
         revert: true,
         inbox: true,
+        modes: true,
+        skills: true,
+        slash_commands: true,
+        compaction: true,
+        background_shells: true,
+        attachments: true,
         extra: std::collections::BTreeMap::new(),
     }
 }

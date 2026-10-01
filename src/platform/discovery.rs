@@ -111,6 +111,13 @@ pub struct AgentFeatures {
     pub worktrees: bool,
     pub revert: bool,
     pub inbox: bool,
+    /// The agent has modes (personas or presets) to pick from.
+    pub modes: bool,
+    pub skills: bool,
+    pub slash_commands: bool,
+    pub compaction: bool,
+    pub background_shells: bool,
+    pub attachments: bool,
     #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
@@ -397,6 +404,12 @@ mod tests {
                 worktrees: false,
                 revert: false,
                 inbox: false,
+                modes: true,
+                skills: false,
+                slash_commands: false,
+                compaction: false,
+                background_shells: false,
+                attachments: false,
                 extra: BTreeMap::new(),
             },
         };
