@@ -538,7 +538,7 @@ impl AgentRuntime {
         }
     }
 
-    async fn probe_agents(&self) -> crate::discovery::AgentPlaneDiscovery {
+    pub(crate) async fn probe_agents(&self) -> crate::discovery::AgentPlaneDiscovery {
         use crate::discovery::{
             AgentAvailability, AgentDiscoveryInfo, AgentPlaneDiscovery, AgentPlaneFeatures,
         };
@@ -1167,7 +1167,7 @@ fn check_version(version: Option<&str>) -> Result<(), String> {
 /// per install, and a gateway reaching into one of its own would quietly run a
 /// different binary than the owner's shell does, which is the confusion this
 /// is here to end.
-fn resolve_binary(configured: Option<&str>) -> anyhow::Result<std::path::PathBuf> {
+pub(crate) fn resolve_binary(configured: Option<&str>) -> anyhow::Result<std::path::PathBuf> {
     resolve_binary_in(configured, std::env::var_os("PATH").as_deref())
 }
 
@@ -1307,7 +1307,7 @@ fn is_executable(path: &std::path::Path) -> bool {
 }
 
 /// What `<binary> --version` says, or `None` if it cannot be asked.
-fn binary_version(path: &std::path::Path) -> Option<String> {
+pub(crate) fn binary_version(path: &std::path::Path) -> Option<String> {
     let output = std::process::Command::new(path)
         .arg("--version")
         .output()
