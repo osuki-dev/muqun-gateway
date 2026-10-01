@@ -9,7 +9,7 @@ use std::process::{Command as ProcessCommand, Stdio};
 use anyhow::{anyhow, Context as _};
 use clap::Subcommand;
 
-use crate::agents::adapters::deepseek::{auth::load_local_secret, DeepseekEndpoint};
+use crate::agents::adapters::deepseek::DeepseekEndpoint;
 use crate::agents::adapters::t3::{T3Credential, T3Endpoint};
 use crate::agents::runtime::{binary_version, resolve_binary, DEFAULT_T3_URL};
 use crate::agents::{AgentRuntime, DeepseekConfig, T3Config};
@@ -118,7 +118,9 @@ pub(crate) async fn run_agent_command(
             }
             SetupAgent::Deepseek { endpoint, yes } => {
                 let config_path = config_dir()?.join(CONFIG_FILE);
-                let env_url = std::env::var("DSH_URL").ok();
+                let env_url = std::env::var("DEEPSEEK_HARNESS_URL")
+                    .or_else(|_| std::env::var("DSH_URL"))
+                    .ok();
                 let restart = setup_deepseek_at(&config_path, endpoint, env_url).await?;
                 restart_if_running(
                     restart,
@@ -442,11 +444,15 @@ pub(crate) async fn setup_deepseek_at(
         ),
     }
     let candidates = deepseek_candidates(endpoint, config.deepseek.endpoint.clone(), env_url);
-    let secret = config.deepseek.secret.clone().or_else(load_local_secret);
     let http = reqwest::Client::new();
     let mut found = None;
     for url in &candidates {
-        let probe = DeepseekEndpoint::new(url, config.deepseek.token.clone(), secret.clone());
+        // The same credentials the gateway will use: config, then env.
+        let probe = DeepseekEndpoint::with_fallbacks(
+            url,
+            config.deepseek.token.clone(),
+            config.deepseek.secret.clone(),
+        );
         if probe.probe_healthy(&http).await {
             found = Some(probe.url);
             break;
@@ -467,7 +473,7 @@ pub(crate) async fn setup_deepseek_at(
 }
 
 /// Where to look for the Harness: the flag, else the configured endpoint,
-/// else `DSH_URL`, else its two default local ports.
+/// else `DEEPSEEK_HARNESS_URL` or `DSH_URL`, else its two default local ports.
 pub(crate) fn deepseek_candidates(
     endpoint: Option<String>,
     configured: Option<String>,

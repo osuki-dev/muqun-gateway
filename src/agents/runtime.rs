@@ -584,14 +584,13 @@ impl AgentRuntime {
             }
         } else {
             let ep = if let Some(ref url) = self.deepseek_config.endpoint {
-                Some(crate::agents::adapters::deepseek::DeepseekEndpoint::new(
-                    url.clone(),
-                    self.deepseek_config.token.clone(),
-                    self.deepseek_config
-                        .secret
-                        .clone()
-                        .or_else(crate::agents::adapters::deepseek::auth::load_local_secret),
-                ))
+                Some(
+                    crate::agents::adapters::deepseek::DeepseekEndpoint::with_fallbacks(
+                        url.clone(),
+                        self.deepseek_config.token.clone(),
+                        self.deepseek_config.secret.clone(),
+                    ),
+                )
             } else {
                 crate::agents::adapters::deepseek::DeepseekEndpoint::discover().await
             };
@@ -854,14 +853,13 @@ impl AgentRuntime {
         if !deepseek_ok && (self.deepseek_config.enabled || self.deepseek_config.endpoint.is_some())
         {
             let ep = if let Some(ref url) = self.deepseek_config.endpoint {
-                Some(crate::agents::adapters::deepseek::DeepseekEndpoint::new(
-                    url.clone(),
-                    self.deepseek_config.token.clone(),
-                    self.deepseek_config
-                        .secret
-                        .clone()
-                        .or_else(crate::agents::adapters::deepseek::auth::load_local_secret),
-                ))
+                Some(
+                    crate::agents::adapters::deepseek::DeepseekEndpoint::with_fallbacks(
+                        url.clone(),
+                        self.deepseek_config.token.clone(),
+                        self.deepseek_config.secret.clone(),
+                    ),
+                )
             } else {
                 crate::agents::adapters::deepseek::DeepseekEndpoint::discover().await
             };

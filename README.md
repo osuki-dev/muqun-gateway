@@ -188,8 +188,11 @@ and sets `t3.enabled`/`t3.url` in `config.json`. It prints how long the bearer
 lasts: what T3 granted for a pairing code, or 30 days (unless T3 caps it) for
 an issued one. The gateway cannot renew it; re-run `agent setup t3` when it
 expires (`agent` then shows T3 as `unconfigured`). `setup deepseek` probes
-`--endpoint`, `deepseek.endpoint`, `DSH_URL`, then ports 3080 and 19387, and
-sets `deepseek.enabled`/`deepseek.endpoint`. Both offer to restart the gateway's
+`--endpoint`, `deepseek.endpoint`, `DEEPSEEK_HARNESS_URL`/`DSH_URL`, then ports
+3080 and 19387 (with `deepseek.token`/`secret`, else the `DEEPSEEK_HARNESS_*` /
+`DSH_*` token and secret from the environment), and sets
+`deepseek.enabled`/`deepseek.endpoint`. An explicit endpoint still takes the
+token and secret from the environment when config.json has none. Both offer to restart the gateway's
 user service when the change needs one (`--yes` skips the question). `agent setup
 opencode` only shows the OpenCode binary the gateway would use: OpenCode needs
 no setup.
