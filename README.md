@@ -184,7 +184,10 @@ revoked) shows as `unconfigured`. `setup t3` checks that a T3 server answers
 (`--url`, else `t3.url`, else `http://127.0.0.1:3773`), mints a bearer with
 `t3 auth session issue` when `t3` is on `PATH` (`--base-dir` is passed through) or
 exchanges a `--token <code>` from `t3 pair`, stores it in `t3-credential.json`,
-and sets `t3.enabled`/`t3.url` in `config.json`. `setup deepseek` probes
+and sets `t3.enabled`/`t3.url` in `config.json`. It prints how long the bearer
+lasts: what T3 granted for a pairing code, or 30 days (unless T3 caps it) for
+an issued one. The gateway cannot renew it; re-run `agent setup t3` when it
+expires (`agent` then shows T3 as `unconfigured`). `setup deepseek` probes
 `--endpoint`, `deepseek.endpoint`, `DSH_URL`, then ports 3080 and 19387, and
 sets `deepseek.enabled`/`deepseek.endpoint`. Both offer to restart the gateway's
 user service when the change needs one (`--yes` skips the question). `agent setup

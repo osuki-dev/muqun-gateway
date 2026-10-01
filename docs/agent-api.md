@@ -987,7 +987,11 @@ by themselves.
 
 `muqun-gateway agent setup t3` does the pairing on the gateway host: it
 mints a bearer with `t3 auth session issue` (or exchanges `--token <code>`),
-checks it against the server, stores it, and sets `enabled` and `url`. When T3
+checks it against the server, stores it, and sets `enabled` and `url`. An
+issued bearer asks for a 30-day TTL (T3 may cap it); a paired one lasts what
+T3 grants, which setup prints. The gateway cannot renew either: when T3 stops
+accepting it, `muqun-gateway agent` shows T3 `unconfigured`, and re-running
+`agent setup t3` replaces it. When T3
 was already on for that URL the running gateway picks the new credential up on
 its next round without a restart.
 

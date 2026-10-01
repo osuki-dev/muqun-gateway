@@ -24,6 +24,10 @@ use crate::{
 const DSH_START: &str = "bunx @deepseek-ai/dsh web --no-open";
 /// How the gateway names itself to an agent it pairs with.
 const CLIENT_LABEL: &str = "muqun-gateway";
+/// What a locally issued T3 bearer asks for: long, since the gateway keeps it
+/// and cannot renew it.
+const ISSUED_TTL: &str = "30d";
+const ISSUED_TTL_TEXT: &str = "30 days";
 
 #[derive(Subcommand)]
 pub(crate) enum AgentCommand {
@@ -304,19 +308,22 @@ pub(crate) async fn setup_t3_at(
         descriptor.server_version, endpoint.url
     );
 
-    let bearer = match (token, t3_bin) {
+    let (bearer, lifetime) = match (token, t3_bin) {
         (Some(code), _) => {
             let grant = endpoint
                 .exchange_pairing(&http, code.trim(), CLIENT_LABEL)
                 .await
                 .map_err(|err| anyhow!("T3 did not accept the pairing code: {err}"))?;
             println!("==> Exchanged the pairing code for a bearer");
-            grant.token
+            (grant.token, lifetime_text(grant.expires_in_secs))
         }
         (None, Some(bin)) => {
             let bearer = issue_t3_bearer(&bin, base_dir)?;
             println!("==> Issued a bearer with `t3 auth session issue`");
-            bearer
+            (
+                bearer,
+                format!("valid for {ISSUED_TTL_TEXT} unless T3 caps it"),
+            )
         }
         (None, None) => return Ok(None),
     };
@@ -351,19 +358,37 @@ pub(crate) async fn setup_t3_at(
         endpoint.url,
         config_path.display()
     );
+    println!("==> The bearer is {lifetime}; re-run `muqun-gateway agent setup t3` when it expires");
     Ok(Some(t3_needs_restart(&before.t3, &endpoint.url)))
+}
+
+/// How long a bearer T3 granted for `secs` lasts, in words.
+pub(crate) fn lifetime_text(secs: u64) -> String {
+    let (unit_secs, unit) = match secs {
+        0 => return "of unstated lifetime".to_string(),
+        86_400.. => (86_400, "day"),
+        3_600.. => (3_600, "hour"),
+        _ => (60, "minute"),
+    };
+    let count = (secs / unit_secs).max(1);
+    let about = if secs.is_multiple_of(unit_secs) {
+        ""
+    } else {
+        "about "
+    };
+    let plural = if count == 1 { "" } else { "s" };
+    format!("valid for {about}{count} {unit}{plural}")
 }
 
 /// A bearer minted locally by the T3 CLI, without a pairing round trip.
 fn issue_t3_bearer(t3: &Path, base_dir: Option<&Path>) -> anyhow::Result<String> {
     let mut command = ProcessCommand::new(t3);
     command.args(["auth", "session", "issue", "--token-only"]);
-    // A long TTL: the gateway keeps this bearer and cannot renew it.
     command.args([
         "--label",
         CLIENT_LABEL,
         "--ttl",
-        "30d",
+        ISSUED_TTL,
         "--log-level",
         "none",
     ]);
@@ -908,5 +933,15 @@ mod tests {
             "unknown is not rejected"
         );
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn bearer_lifetimes_read_in_words() {
+        assert_eq!(lifetime_text(3600), "valid for 1 hour");
+        assert_eq!(lifetime_text(30 * 86_400), "valid for 30 days");
+        assert_eq!(lifetime_text(90_000), "valid for about 1 day");
+        assert_eq!(lifetime_text(7_200 + 60), "valid for about 2 hours");
+        assert_eq!(lifetime_text(90), "valid for about 1 minute");
+        assert_eq!(lifetime_text(0), "of unstated lifetime");
     }
 }
