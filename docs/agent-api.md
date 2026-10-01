@@ -159,7 +159,7 @@ and `version` removed from every agent.
   | `unconfigured` (t3: no bearer, or a refused one) | `muqun-gateway agent setup t3` |
   | `disabled` | `muqun-gateway agent setup t3` / `muqun-gateway agent setup deepseek`; for OpenCode, set `opencode.enabled` |
   | `offline` | the agent's own start command: `opencode service start`, `bunx @deepseek-ai/dsh web --no-open`, or "open T3 Code, or run `t3 service install`" |
-  | `not_installed` | install OpenCode 2 / T3 Code; for DeepSeek, `bunx @deepseek-ai/dsh web --no-open` |
+  | `not_installed` | install OpenCode 2 (or set `opencode.enabled` to false) / T3 Code; for DeepSeek, `bunx @deepseek-ai/dsh web --no-open` |
 - `endpoint` and `version` are omitted when unknown or redacted. `models[]` and
   `modes[]` are that agent's own catalog summary; `reasoningEffortTiers` is
   omitted when empty; `modes[].description` when unset.

@@ -183,7 +183,9 @@ where the gateway may be `connected`. A T3 bearer the server refuses (expired or
 revoked) shows as `unconfigured`. `setup t3` checks that a T3 server answers
 (`--url`, else `t3.url`, else `http://127.0.0.1:3773`), mints a bearer with
 `t3 auth session issue` when `t3` is on `PATH` (`--base-dir` is passed through) or
-exchanges a `--token <code>` from `t3 pair`, stores it in `t3-credential.json`,
+exchanges a `--token <code>` from `t3 pair` (`--token` wins over the local `t3`,
+and `--base-dir` is ignored with it; a non-loopback `--url` always needs
+`--token`), stores it in `t3-credential.json`,
 and sets `t3.enabled`/`t3.url` in `config.json`. It prints how long the bearer
 lasts: what T3 granted for a pairing code, or 30 days (unless T3 caps it) for
 an issued one. The gateway cannot renew it; re-run `agent setup t3` when it

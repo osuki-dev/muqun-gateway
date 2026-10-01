@@ -105,10 +105,7 @@ pub(crate) async fn run_agent_command(
                 )
                 .await?;
                 let Some(restart) = outcome else {
-                    eprintln!(
-                        "No `t3` on PATH: run `t3 pair` on the T3 host and re-run with \
-                         `--token <code>`."
-                    );
+                    eprintln!("Run `t3 pair` on the T3 host and re-run with `--token <code>`.");
                     std::process::exit(2);
                 };
                 restart_if_running(
@@ -261,7 +258,9 @@ pub(crate) fn next_step(id: &str, status: &AgentAvailability) -> Option<&'static
         (Offline, "opencode") => "opencode service start",
         (Offline | NotInstalled, "deepseek") => DSH_START,
         (Offline, "t3") => "open T3 Code, or run `t3 service install`",
-        (NotInstalled, "opencode") => "install OpenCode 2 (https://opencode.ai)",
+        (NotInstalled, "opencode") => {
+            "install OpenCode 2 (https://opencode.ai), or set `opencode.enabled` to false"
+        }
         (NotInstalled, "t3") => "install T3 Code (https://t3.codes)",
         _ => return None,
     })
@@ -312,8 +311,12 @@ pub(crate) async fn setup_t3_at(
         descriptor.server_version, endpoint.url
     );
 
-    let (bearer, lifetime) = match (token, t3_bin) {
-        (Some(code), _) => {
+    if token.is_some() && base_dir.is_some() {
+        println!("    note: --base-dir is ignored with --token");
+    }
+    let source = bearer_source(token, t3_bin, is_loopback_url(&endpoint.url));
+    let (bearer, lifetime) = match source {
+        BearerSource::Pairing(code) => {
             let grant = endpoint
                 .exchange_pairing(&http, code.trim(), CLIENT_LABEL)
                 .await
@@ -321,7 +324,7 @@ pub(crate) async fn setup_t3_at(
             println!("==> Exchanged the pairing code for a bearer");
             (grant.token, lifetime_text(grant.expires_in_secs))
         }
-        (None, Some(bin)) => {
+        BearerSource::Issue(bin) => {
             let bearer = issue_t3_bearer(&bin, base_dir).await?;
             println!("==> Issued a bearer with `t3 auth session issue`");
             (
@@ -329,7 +332,10 @@ pub(crate) async fn setup_t3_at(
                 format!("valid for {ISSUED_TTL_TEXT} unless T3 caps it"),
             )
         }
-        (None, None) => return Ok(None),
+        BearerSource::Missing(why) => {
+            println!("    {why}");
+            return Ok(None);
+        }
     };
     let session = endpoint
         .session_state(&http, &bearer)
@@ -382,6 +388,33 @@ pub(crate) fn lifetime_text(secs: u64) -> String {
     };
     let plural = if count == 1 { "" } else { "s" };
     format!("valid for {about}{count} {unit}{plural}")
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum BearerSource {
+    /// A pairing code to exchange.
+    Pairing(String),
+    /// The local `t3` CLI, to issue a bearer.
+    Issue(PathBuf),
+    /// Neither, and why.
+    Missing(&'static str),
+}
+
+/// Where the T3 bearer comes from: `--token` first; the local `t3` only for
+/// a server on this machine, since it issues from its own data directory.
+pub(crate) fn bearer_source(
+    token: Option<String>,
+    t3_bin: Option<PathBuf>,
+    loopback: bool,
+) -> BearerSource {
+    match (token, t3_bin) {
+        (Some(code), _) => BearerSource::Pairing(code),
+        (None, Some(bin)) if loopback => BearerSource::Issue(bin),
+        (None, Some(_)) => BearerSource::Missing(
+            "the T3 server is not on this machine, so the local `t3` cannot issue for it",
+        ),
+        (None, None) => BearerSource::Missing("no `t3` on PATH to issue a bearer with"),
+    }
 }
 
 /// A bearer minted locally by the T3 CLI, without a pairing round trip.
@@ -504,7 +537,8 @@ pub(crate) fn enable_deepseek(deepseek: &mut DeepseekConfig, url: &str) {
 /// The DeepSeek settings are read once at start, and a configured endpoint
 /// already turns the agent on, so only a new endpoint needs a restart.
 pub(crate) fn deepseek_needs_restart(before: &DeepseekConfig, url: &str) -> bool {
-    before.endpoint.as_deref() != Some(url)
+    let normal = |url: &str| DeepseekEndpoint::new(url, None, None).url;
+    before.endpoint.as_deref().map(normal) != Some(normal(url))
 }
 
 /// The Harness credentials file the gateway signs its cookie with, as
@@ -533,6 +567,23 @@ fn setup_opencode() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether `url` names this machine (`localhost` or a loopback address),
+/// where the local `t3` CLI can issue a bearer for the server.
+pub(crate) fn is_loopback_url(url: &str) -> bool {
+    let Some(host) = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+    else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 /// Enable T3 at `url`, dropping any pairing code: the bearer replaces it.
 pub(crate) fn enable_t3(t3: &mut T3Config, url: &str) {
     t3.enabled = true;
@@ -543,7 +594,11 @@ pub(crate) fn enable_t3(t3: &mut T3Config, url: &str) {
 /// A running gateway re-reads the stored bearer each round, but only for
 /// the URL it started with, and only if T3 was on at all.
 pub(crate) fn t3_needs_restart(before: &T3Config, url: &str) -> bool {
-    !before.wanted() || before.url.as_deref().unwrap_or(DEFAULT_T3_URL) != url
+    let running = T3Endpoint::new(
+        before.url.as_deref().unwrap_or(DEFAULT_T3_URL),
+        T3Credential::None,
+    );
+    !before.wanted() || running.url != T3Endpoint::new(url, T3Credential::None).url
 }
 
 /// Load `path`, apply `edit`, save it atomically; returns the config as it
@@ -627,7 +682,9 @@ mod tests {
             (
                 "opencode",
                 NotInstalled,
-                Some("install OpenCode 2 (https://opencode.ai)"),
+                Some(
+                    "install OpenCode 2 (https://opencode.ai), or set `opencode.enabled` to false",
+                ),
             ),
             (
                 "t3",
@@ -1075,6 +1132,57 @@ mod tests {
                 }),
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn only_loopback_urls_are_this_machine() {
+        for url in [
+            "http://127.0.0.1:3773",
+            "http://localhost:3773",
+            "http://[::1]:3773",
+            "https://127.1.2.3",
+        ] {
+            assert!(is_loopback_url(url), "{url}");
+        }
+        for url in ["http://10.0.0.5:3773", "http://t3.example", "not a url"] {
+            assert!(!is_loopback_url(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn restart_decisions_compare_normalised_urls() {
+        let t3 = T3Config {
+            url: Some("127.0.0.1:3773/".into()),
+            ..Default::default()
+        };
+        assert!(!t3_needs_restart(&t3, "http://127.0.0.1:3773"));
+        let deepseek = DeepseekConfig {
+            endpoint: Some("http://127.0.0.1:3080/".into()),
+            ..Default::default()
+        };
+        assert!(!deepseek_needs_restart(&deepseek, "http://127.0.0.1:3080"));
+        assert!(deepseek_needs_restart(&deepseek, "http://127.0.0.1:19387"));
+    }
+
+    #[test]
+    fn a_remote_t3_is_never_issued_a_local_bearer() {
+        let bin = || Some(PathBuf::from("/usr/bin/t3"));
+        assert_eq!(
+            bearer_source(Some("c".into()), bin(), false),
+            BearerSource::Pairing("c".into())
+        );
+        assert_eq!(
+            bearer_source(None, bin(), true),
+            BearerSource::Issue("/usr/bin/t3".into())
+        );
+        assert!(matches!(
+            bearer_source(None, bin(), false),
+            BearerSource::Missing(_)
+        ));
+        assert!(matches!(
+            bearer_source(None, None, true),
+            BearerSource::Missing(_)
         ));
     }
 }
