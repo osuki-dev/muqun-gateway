@@ -28,6 +28,8 @@ const CLIENT_LABEL: &str = "muqun-gateway";
 /// and cannot renew it.
 const ISSUED_TTL: &str = "30d";
 const ISSUED_TTL_TEXT: &str = "30 days";
+/// How long the `t3` CLI may take to issue a bearer.
+const T3_CLI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Subcommand)]
 pub(crate) enum AgentCommand {
@@ -320,7 +322,7 @@ pub(crate) async fn setup_t3_at(
             (grant.token, lifetime_text(grant.expires_in_secs))
         }
         (None, Some(bin)) => {
-            let bearer = issue_t3_bearer(&bin, base_dir)?;
+            let bearer = issue_t3_bearer(&bin, base_dir).await?;
             println!("==> Issued a bearer with `t3 auth session issue`");
             (
                 bearer,
@@ -383,8 +385,8 @@ pub(crate) fn lifetime_text(secs: u64) -> String {
 }
 
 /// A bearer minted locally by the T3 CLI, without a pairing round trip.
-fn issue_t3_bearer(t3: &Path, base_dir: Option<&Path>) -> anyhow::Result<String> {
-    let mut command = ProcessCommand::new(t3);
+async fn issue_t3_bearer(t3: &Path, base_dir: Option<&Path>) -> anyhow::Result<String> {
+    let mut command = tokio::process::Command::new(t3);
     command.args(["auth", "session", "issue", "--token-only"]);
     command.args([
         "--label",
@@ -397,9 +399,15 @@ fn issue_t3_bearer(t3: &Path, base_dir: Option<&Path>) -> anyhow::Result<String>
     if let Some(dir) = base_dir {
         command.arg("--base-dir").arg(dir);
     }
-    let output = command
-        .stdin(Stdio::null())
-        .output()
+    command.stdin(Stdio::null()).kill_on_drop(true);
+    let output = tokio::time::timeout(T3_CLI_TIMEOUT, command.output())
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "`t3 auth session issue` did not finish in {}s",
+                T3_CLI_TIMEOUT.as_secs()
+            )
+        })?
         .with_context(|| format!("failed to run {}", t3.display()))?;
     anyhow::ensure!(
         output.status.success(),
@@ -949,5 +957,124 @@ mod tests {
         assert_eq!(lifetime_text(7_200 + 60), "valid for about 2 hours");
         assert_eq!(lifetime_text(90), "valid for about 1 minute");
         assert_eq!(lifetime_text(0), "of unstated lifetime");
+    }
+
+    /// A stand-in `t3` that records its arguments, one per line, and prints
+    /// `token`.
+    #[cfg(unix)]
+    fn fake_t3_cli(dir: &Path, token: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let argv = dir.join("argv");
+        let bin = dir.join("t3");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\necho '{token}'\n",
+                argv.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (bin, argv)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn setup_t3_issues_a_bearer_with_the_local_t3_cli() {
+        let url = fake_t3().await;
+        let (dir, path) = temp_config(T3Config::default());
+        let state = dir.join("state");
+        let (bin, argv) = fake_t3_cli(&dir, "minted");
+        let base = dir.join("t3 home");
+        let restart = setup_t3_at(
+            &path,
+            &state,
+            Some(url.clone()),
+            None,
+            Some(bin),
+            Some(&base),
+        )
+        .await
+        .unwrap();
+        assert_eq!(restart, Some(true));
+        let args: Vec<String> = std::fs::read_to_string(&argv)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let has = |run: &[&str]| args.windows(run.len()).any(|w| w == run);
+        assert!(
+            has(&["auth", "session", "issue", "--token-only"]),
+            "{args:?}"
+        );
+        assert!(has(&["--log-level", "none"]), "{args:?}");
+        assert!(has(&["--base-dir", &base.to_string_lossy()]), "{args:?}");
+        let stored = crate::read_t3_credential_at(&state).unwrap().unwrap();
+        assert_eq!(stored.token, "minted");
+        assert!(reload(&path).t3.enabled);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn setup_t3_refuses_a_bearer_the_server_does_not_accept() {
+        let url = fake_t3().await;
+        let (dir, path) = temp_config(T3Config::default());
+        let state = dir.join("state");
+        let (bin, _) = fake_t3_cli(&dir, "not-accepted");
+        let err = setup_t3_at(&path, &state, Some(url), None, Some(bin), None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("does not accept the bearer"),
+            "{err}"
+        );
+        assert!(crate::read_t3_credential_at(&state).unwrap().is_none());
+        assert!(!reload(&path).t3.enabled, "config untouched");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn agent_json_parses_with_and_without_list() {
+        use clap::Parser as _;
+        let parse = |args: &[&str]| crate::Cli::try_parse_from(args).unwrap().command;
+        assert!(matches!(
+            parse(&["muqun-gateway", "agent", "--json"]),
+            crate::Command::Agent {
+                command: None,
+                json: true
+            }
+        ));
+        assert!(matches!(
+            parse(&["muqun-gateway", "agent", "list", "--json"]),
+            crate::Command::Agent {
+                command: Some(AgentCommand::List { json: true }),
+                json: false
+            }
+        ));
+        assert!(matches!(
+            parse(&["muqun-gateway", "agent"]),
+            crate::Command::Agent {
+                command: None,
+                json: false
+            }
+        ));
+        assert!(matches!(
+            parse(&[
+                "muqun-gateway",
+                "agent",
+                "setup",
+                "t3",
+                "--token",
+                "c",
+                "-y"
+            ]),
+            crate::Command::Agent {
+                command: Some(AgentCommand::Setup {
+                    agent: SetupAgent::T3 { yes: true, .. }
+                }),
+                ..
+            }
+        ));
     }
 }
