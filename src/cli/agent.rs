@@ -27,7 +27,11 @@ const CLIENT_LABEL: &str = "muqun-gateway";
 #[derive(Subcommand)]
 pub(crate) enum AgentCommand {
     /// Each agent's status and the next step (the default).
-    List,
+    List {
+        /// Print the discovery agents array as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Configure one agent in config.json and apply it.
     Setup {
         #[command(subcommand)]
@@ -70,9 +74,9 @@ pub(crate) async fn run_agent_command(
     command: Option<AgentCommand>,
     json: bool,
 ) -> anyhow::Result<()> {
-    match command.unwrap_or(AgentCommand::List) {
-        AgentCommand::List => {
-            if !list(json).await? {
+    match command.unwrap_or(AgentCommand::List { json }) {
+        AgentCommand::List { json: list_json } => {
+            if !list(json || list_json).await? {
                 std::process::exit(1);
             }
         }
@@ -135,12 +139,16 @@ async fn list(json: bool) -> anyhow::Result<bool> {
     // The uncached probe: `discover_agents` gives up after a few seconds
     // and would report everything offline while a catalog is still loading.
     let agents = runtime.probe_agents().await.agents;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&agents)?);
+    let text = if json {
+        serde_json::to_string_pretty(&agents)?
     } else {
-        for agent in &agents {
-            println!("{}", format_row(agent, &config));
-        }
+        let rows: Vec<String> = agents.iter().map(|a| format_row(a, &config)).collect();
+        rows.join("\n")
+    };
+    // `agent --json | head` closes the pipe early; that is not an error.
+    match writeln!(std::io::stdout(), "{text}") {
+        Err(err) if err.kind() != std::io::ErrorKind::BrokenPipe => return Err(err.into()),
+        _ => {}
     }
     Ok(all_ready(
         agents.iter().map(|agent| (agent.enabled, &agent.status)),

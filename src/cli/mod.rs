@@ -94,7 +94,7 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: Option<AgentCommand>,
         /// Print the discovery agents array as JSON.
-        #[arg(long, global = true)]
+        #[arg(long)]
         json: bool,
     },
 }
