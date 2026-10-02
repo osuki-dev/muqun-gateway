@@ -40,7 +40,8 @@ fn agents_plane_schema() -> Value {
                                 "slashCommands": { "type": "boolean" },
                                 "compaction": { "type": "boolean" },
                                 "backgroundShells": { "type": "boolean" },
-                                "attachments": { "type": "boolean" }
+                                "attachments": { "type": "boolean" },
+                                "attachmentsByPath": { "type": "boolean", "description": "Attachments reach the agent as host paths appended to the prompt text (the agent reads them with its own tools) rather than as native file parts" }
                             }
                         },
                         "models": {

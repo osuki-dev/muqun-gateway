@@ -131,7 +131,7 @@ and `version` removed from every agent.
         "streaming": true, "reasoningEffort": true, "modelSelection": true,
         "toolApprovals": true, "worktrees": true, "revert": true, "stagedRevert": true,
         "inbox": true, "modes": true, "skills": true, "slashCommands": true, "compaction": true,
-        "backgroundShells": true, "attachments": true
+        "backgroundShells": true, "attachments": true, "attachmentsByPath": false
       }
     }
   ],
@@ -185,6 +185,7 @@ and `version` removed from every agent.
 | `compaction` | `POST /api/agent-sessions/{asid}/compact` works. |
 | `backgroundShells` | The `/api/agent-shells` routes list, read and kill the agent's background shells. |
 | `attachments` | A prompt may carry `attachments`; when false the agent answers `501 feature_unsupported`. |
+| `attachmentsByPath` | The agent has no native attachment API: the gateway lists the attachments as host paths at the end of the prompt text and the agent opens them with its own tools. Only uploads are accepted (see [`POST …/prompt`](#post-apiagent-sessionsasidprompt)). |
 
   The App renders agent-specific UI from these flags alone, never from the
   agent's `kind`. Every flag is always present (booleans, never omitted).
@@ -209,7 +210,8 @@ and `version` removed from every agent.
   | `slashCommands` | yes | no | no |
   | `compaction` | yes | no | no |
   | `backgroundShells` | yes | no | no |
-  | `attachments` | yes | no | no |
+  | `attachments` | yes | yes | yes |
+  | `attachmentsByPath` | no | yes | yes |
 
   `t3` is `name: "T3 Code"`; its `version` is the T3 server version, its
   `models[]` are every model of the providers T3 has ready (Claude Code,
@@ -361,6 +363,29 @@ An attachment the app uploaded is an absolute path into the gateway's upload
 directory — see [Attachments](#attachments) for how one gets there, and for the
 permission rule the gateway puts on the session so the agent can open it without
 an approval prompt.
+
+How attachments reach the agent depends on the agent:
+
+- **`opencode`** (`attachmentsByPath: false`) takes them natively as file
+  parts; absolute paths, `file://`, `https://` and `data:` URLs all work.
+- **`deepseek`** and **`t3`** (`attachmentsByPath: true`) have no file parts.
+  The gateway sends the agent an empty attachment list and appends the paths
+  to the prompt text instead:
+
+  ```text
+  <your text>
+
+  Attached files (on this host):
+  - /home/ryu/.local/share/muqun-gateway/uploads/6f1c….webp
+  ```
+
+  The agent reads them with its own file and image tools. Each attachment must
+  be an absolute path that resolves (after symlinks and `..`) to a regular file
+  inside the gateway's upload directory -- that is, a `path` returned by
+  `POST /api/uploads` within its 48-hour retention. Anything else (a relative
+  path, a URL, a file elsewhere on the host, an expired upload) is refused with
+  `400 invalid_request` before the agent sees the prompt, so a client cannot
+  point the agent at a file it did not upload.
 
 ### `POST /api/agent-sessions/{asid}/model`
 

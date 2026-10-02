@@ -121,6 +121,9 @@ pub struct AgentFeatures {
     pub compaction: bool,
     pub background_shells: bool,
     pub attachments: bool,
+    /// Attachments reach the agent as host paths listed in the prompt text,
+    /// not as native file parts; the agent reads them with its own tools.
+    pub attachments_by_path: bool,
     #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
@@ -413,7 +416,8 @@ mod tests {
                 slash_commands: false,
                 compaction: false,
                 background_shells: false,
-                attachments: false,
+                attachments: true,
+                attachments_by_path: true,
                 extra: BTreeMap::new(),
             },
         };
@@ -430,6 +434,8 @@ mod tests {
             json!(["low", "high"])
         );
         assert_eq!(val["features"]["reasoningEffort"], true);
+        assert_eq!(val["features"]["attachments"], true);
+        assert_eq!(val["features"]["attachmentsByPath"], true);
     }
 
     #[test]

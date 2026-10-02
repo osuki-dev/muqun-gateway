@@ -790,6 +790,20 @@ mod tests {
     }
 
     #[test]
+    fn attached_paths_ride_in_the_turn_text_not_its_attachments() {
+        let text = crate::agents::ports::agent::append_attachment_paths(
+            "look",
+            &["/up/a.png".to_string(), "/up/b.pdf".to_string()],
+        );
+        let t = commands::turn_start("t1", "m1", &text, None, "full-access", "default");
+        assert_eq!(t["message"]["attachments"], json!([]));
+        assert_eq!(
+            t["message"]["text"],
+            "look\n\nAttached files (on this host):\n- /up/a.png\n- /up/b.pdf"
+        );
+    }
+
+    #[test]
     fn rpc_errors_reduce_to_the_port_vocabulary() {
         let nf = RpcError::Failed(super::super::rpc::RpcFailure {
             tag: "OrchestrationDispatchCommandError".into(),
