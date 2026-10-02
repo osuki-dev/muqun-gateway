@@ -325,7 +325,7 @@ pub trait AgentPort: Send + Sync {
         Box::pin(async { Err(AgentError::Unsupported("get_shell_output".into())) })
     }
 
-    fn kill_shell<'a>(&'a self, _shell_id: &'a str) -> AgentFuture<'a, ()> {
+    fn kill_shell<'a>(&'a self, _shell_id: &'a str) -> AgentFuture<'a, serde_json::Value> {
         Box::pin(async { Err(AgentError::Unsupported("kill_shell".into())) })
     }
 

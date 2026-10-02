@@ -2558,12 +2558,14 @@ async fn kill_agent_shell(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     let manager = manager_or_unavailable!(&state, &headers);
-    manager
+    let shell = manager
         .agent()
         .kill_shell(&shell_id)
         .await
         .map_err(agent_error)?;
-    Ok(Json(content_envelope(json!({ "killed": true }))))
+    Ok(Json(content_envelope(
+        json!({ "killed": true, "shell": shell }),
+    )))
 }
 
 #[cfg(test)]

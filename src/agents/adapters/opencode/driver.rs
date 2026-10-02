@@ -943,11 +943,8 @@ impl AgentPort for OpencodeDriver {
         Box::pin(async move { self.client.get_shell_output(shell_id, cursor, limit).await })
     }
 
-    fn kill_shell<'a>(&'a self, shell_id: &'a str) -> AgentFuture<'a, ()> {
-        Box::pin(async move {
-            self.client.kill_shell(shell_id).await?;
-            Ok(())
-        })
+    fn kill_shell<'a>(&'a self, shell_id: &'a str) -> AgentFuture<'a, serde_json::Value> {
+        Box::pin(async move { self.client.kill_shell(shell_id).await })
     }
 
     fn get_inbox<'a>(&'a self, session_id: &'a str) -> AgentFuture<'a, Vec<serde_json::Value>> {

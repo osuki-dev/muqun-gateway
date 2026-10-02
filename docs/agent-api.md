@@ -897,7 +897,9 @@ good, and `missing` is the whole of what the gateway can say about it.
 | `GET /api/agent-shells` | `directory` | `[Shell.Info]` (verbatim) |
 | `GET /api/agent-shells/{shell_id}` | — | `Shell.Info` |
 | `GET /api/agent-shells/{shell_id}/output` | `cursor`, `limit` | `{output, cursor, size, truncated}` |
-| `DELETE /api/agent-shells/{shell_id}` | — | `{"killed": true}` |
+| `DELETE /api/agent-shells/{shell_id}` | — | `{"killed": true, "shell": Shell.Info}` |
+
+`DELETE` on OpenCode finishes the job itself: if the shell is still `running` after OpenCode's own kill (a reparented child), the Gateway verifies the pid belongs to OpenCode, sends SIGTERM, then SIGKILL after 2 s (Linux only). A shell that cannot be stopped answers an error naming the pid; one OpenCode already dropped has `shell.status: "gone"`.
 
 `Shell.Info` is OpenCode's own, camelCase:
 `{id, status: "running"|"exited"|"timeout"|"killed", command, cwd, shell, file, pid?, exit?, metadata, time}`.
