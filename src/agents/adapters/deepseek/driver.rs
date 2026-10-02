@@ -9,7 +9,9 @@ use crate::agents::domain::{
     AgentCatalog, AgentProject, AgentSessionId, AgentSessionInfo, AgentSessionStatus, FormRequest,
     ModelRef, PermissionDecision, PermissionRequest, SessionQuery, TimelineItem,
 };
-use crate::agents::ports::agent::{AgentError, AgentFuture, AgentPort, FileDiffItem};
+use crate::agents::ports::agent::{
+    AgentError, AgentFuture, AgentPort, AttachmentMode, FileDiffItem,
+};
 
 pub struct DeepseekDriver {
     pub client: Arc<DeepseekClient>,
@@ -151,6 +153,11 @@ impl AgentPort for DeepseekDriver {
             mapper::map_session(&summary)
                 .ok_or_else(|| AgentError::Protocol("session summary is unreadable".to_string()))
         })
+    }
+
+    /// DeepSeek's prompt has text parts only, but its tools read files.
+    fn attachment_mode(&self) -> AttachmentMode {
+        AttachmentMode::ByPath
     }
 
     fn send_prompt<'a>(
@@ -407,6 +414,45 @@ impl AgentPort for DeepseekDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_prompt_with_attachments_carries_the_paths_in_its_text() {
+        use axum::{routing::post, Json, Router};
+        let seen = Arc::new(std::sync::Mutex::new(Value::Null));
+        let sink = seen.clone();
+        let app = Router::new().route(
+            "/api/session/prompt",
+            post(move |Json(body): Json<Value>| {
+                let sink = sink.clone();
+                async move {
+                    *sink.lock().unwrap() = body;
+                    Json(serde_json::json!({ "result": { "ok": true, "value": {} } }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let driver = DeepseekDriver::new(DeepseekEndpoint::new(url, None, None));
+        assert_eq!(driver.attachment_mode(), AttachmentMode::ByPath);
+        driver
+            .send_prompt("s", "look", &["/up/a.png".to_string()], None)
+            .await
+            .unwrap();
+        let body = seen.lock().unwrap().clone();
+        let parts = body
+            .pointer("/payload/args/request/content")
+            .cloned()
+            .unwrap_or_else(|| panic!("no content in {body}"));
+        assert_eq!(
+            parts,
+            serde_json::json!([{
+                "type": "text",
+                "text": "look\n\nAttached files (on this host):\n- /up/a.png"
+            }])
+        );
+        server.abort();
+    }
 
     #[tokio::test]
     async fn default_projections_cannot_claim_another_agents_session() {

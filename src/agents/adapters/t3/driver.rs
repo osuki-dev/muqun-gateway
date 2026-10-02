@@ -21,7 +21,9 @@ use crate::agents::domain::{
     AgentCatalog, AgentProject, AgentSessionInfo, FormRequest, ModelRef, PermissionDecision,
     PermissionRequest, SessionQuery, TimelineItem,
 };
-use crate::agents::ports::agent::{AgentError, AgentFuture, AgentPort, FileDiffItem};
+use crate::agents::ports::agent::{
+    append_attachment_paths, AgentError, AgentFuture, AgentPort, AttachmentMode, FileDiffItem,
+};
 
 pub struct T3Driver {
     client: Arc<T3Client>,
@@ -147,6 +149,10 @@ impl T3Driver {
 impl AgentPort for T3Driver {
     fn kind(&self) -> &'static str {
         super::KIND
+    }
+
+    fn attachment_mode(&self) -> AttachmentMode {
+        AttachmentMode::ByPath
     }
 
     fn probe(&self) -> AgentFuture<'_, bool> {
@@ -313,10 +319,10 @@ impl AgentPort for T3Driver {
     ) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             let id = validate_id(session_id, "session id")?;
-            if !attachments.is_empty() {
-                return Err(AgentError::Unsupported("attachments".into()));
-            }
-            let text = bounded_prompt(text)?;
+            // T3's own attachment upload is unverified; its agents read
+            // files with their tools, so paths travel in the text.
+            let text = append_attachment_paths(text, attachments);
+            let text = bounded_prompt(&text)?;
             let (info, thread) = self.session_from_snapshot(&id).await?;
             let runtime_mode = thread
                 .get("runtimeMode")

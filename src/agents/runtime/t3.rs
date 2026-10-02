@@ -266,14 +266,16 @@ pub(super) fn t3_features() -> crate::discovery::AgentFeatures {
         // T3 rolls whole turns back in one step; there is no staged state.
         staged_revert: false,
         inbox: false,
-        // The driver answers `Unsupported` for a mode, attachments, skills,
-        // commands, compaction and shells.
+        // Attachments arrive as host paths in the prompt text; the driver
+        // answers `Unsupported` for a mode, skills, commands, compaction and
+        // shells.
         modes: false,
         skills: false,
         slash_commands: false,
         compaction: false,
         background_shells: false,
-        attachments: false,
+        attachments: true,
+        attachments_by_path: true,
         extra: std::collections::BTreeMap::new(),
     }
 }
@@ -409,11 +411,12 @@ mod tests {
             "slashCommands",
             "compaction",
             "backgroundShells",
-            "attachments",
             "stagedRevert",
         ] {
             assert_eq!(v[key], false, "{key}");
         }
+        assert_eq!(v["attachments"], true);
+        assert_eq!(v["attachmentsByPath"], true);
     }
 
     use super::*;

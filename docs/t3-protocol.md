@@ -231,8 +231,8 @@ means the intent was recorded, not that the provider finished.
   confirms with a `thread.reverted{turnCount}` event about a second later.
 - Attachments: the `thread.turn.start` message accepts `attachments` (image
   and file references, uploads via `attachments.createUploadUrl`);
-  **unverified**, the adapter sends `[]` and reports attachments as
-  unsupported.
+  **unverified**, so the adapter always sends `[]` and instead lists the
+  gateway upload paths at the end of `text` (`attachmentsByPath`).
 
 Other commands exist (`thread.archive`, `thread.settle`, `thread.snooze`,
 `thread.pin`, pull-request linking, `thread.session.stop`,

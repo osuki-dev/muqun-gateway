@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use super::endpoint::DeepseekEndpoint;
 use crate::agents::domain::{ModelRef, SessionQuery};
-use crate::agents::ports::agent::AgentError;
+use crate::agents::ports::agent::{append_attachment_paths, AgentError};
 
 /// Largest upstream response body we will buffer.
 pub(super) const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -279,9 +279,9 @@ impl DeepseekClient {
         attachments: &[String],
         delivery: Option<&str>,
     ) -> Result<Value, AgentError> {
-        if !attachments.is_empty() {
-            return Err(AgentError::Unsupported("attachments".to_string()));
-        }
+        // DeepSeek has no file parts; it reads files with its own tools, so
+        // any path that reached this far travels in the text.
+        let text = &append_attachment_paths(text, attachments);
         let mode = delivery.unwrap_or("steer");
         if !DELIVERY_MODES.contains(&mode) {
             return Err(AgentError::RequestFailed(
@@ -608,13 +608,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prompt_rejects_attachments_and_unknown_delivery() {
+    async fn prompt_rejects_unknown_delivery_but_not_attachments() {
         let c = client_for("http://127.0.0.1:1".to_string());
+        // Attachments travel in the text, so this gets as far as the network.
         let e = c
-            .send_prompt("s", "hi", &["a.png".to_string()], None)
+            .send_prompt("s", "hi", &["/up/a.png".to_string()], None)
             .await
             .unwrap_err();
-        assert!(matches!(e, AgentError::Unsupported(_)));
+        assert!(matches!(e, AgentError::Network(_)));
         let e = c
             .send_prompt("s", "hi", &[], Some("bogus"))
             .await

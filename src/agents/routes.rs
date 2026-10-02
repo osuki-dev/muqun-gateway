@@ -845,7 +845,10 @@ async fn do_send_agent_prompt(
             body.delivery.as_deref(),
         )
         .await
-        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "agent_error", &e.to_string()))?;
+        .map_err(|e| match e {
+            super::ports::agent::AgentError::InvalidRequest(_) => agent_error(e),
+            _ => api_error(StatusCode::BAD_GATEWAY, "agent_error", &e.to_string()),
+        })?;
 
     Ok(Json(content_envelope(json!({ "submitted": true }))))
 }
@@ -1878,6 +1881,9 @@ fn agent_error(err: super::ports::agent::AgentError) -> (StatusCode, Json<Value>
             "feature_unsupported",
             &format!("This agent does not support: {feature}"),
         ),
+        super::ports::agent::AgentError::InvalidRequest(message) => {
+            api_error(StatusCode::BAD_REQUEST, "invalid_request", message)
+        }
         _ => api_error(StatusCode::BAD_GATEWAY, "agent_error", &err.to_string()),
     }
 }
@@ -2766,6 +2772,16 @@ mod tests {
         );
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert_eq!(body["error"]["code"], "agent_error");
+    }
+
+    /// Pointing the agent at a file nobody uploaded is the client's mistake.
+    #[test]
+    fn an_invalid_request_is_a_400() {
+        let (status, Json(body)) = agent_error(
+            super::super::ports::agent::AgentError::InvalidRequest("not an upload".into()),
+        );
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_request");
     }
 
     /// An empty diff from a repository and an empty diff from a directory that
