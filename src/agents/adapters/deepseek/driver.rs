@@ -70,6 +70,7 @@ impl AgentPort for DeepseekDriver {
             let sessions: Vec<AgentSessionInfo> = raw_sessions
                 .iter()
                 .filter_map(mapper::map_session)
+                .filter(|s| query.keeps_parent(s.parent_id.as_deref()))
                 .collect();
             Ok(sessions)
         })
@@ -438,6 +439,44 @@ mod tests {
         assert_eq!(known.directory.as_deref(), Some("/qa"));
         assert_eq!(known.title, "Known session");
         assert_eq!(projection_calls.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn list_sessions_honours_the_parent_filter() {
+        use axum::{routing::post, Json, Router};
+        let app = Router::new().route(
+            "/api/session/list",
+            post(|| async {
+                Json(serde_json::json!({ "result": { "ok": true, "value": [
+                    { "sessionId": "session-a", "cwd": "/qa", "title": "A" },
+                    { "sessionId": "session-b", "cwd": "/qa", "title": "B" }
+                ] } }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let driver = DeepseekDriver::new(DeepseekEndpoint::new(url, None, None));
+        let query = |parent: Option<&str>| SessionQuery {
+            parent_id: parent.map(str::to_string),
+            ..Default::default()
+        };
+        assert_eq!(driver.list_sessions(&query(None)).await.unwrap().len(), 2);
+        assert_eq!(
+            driver
+                .list_sessions(&query(Some("null")))
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "roots only keeps top-level sessions"
+        );
+        assert!(driver
+            .list_sessions(&query(Some("session-x")))
+            .await
+            .unwrap()
+            .is_empty());
         server.abort();
     }
 

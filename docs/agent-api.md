@@ -315,7 +315,8 @@ by `(message_id, ordinal)`.
 ### `GET /api/agent-sessions/{asid}/children`
 
 Same response as the list route, filtered to this session's children. Accepts
-the same `limit` / `order` / `search` / `cursor`.
+the same `limit` / `order` / `search` / `cursor`. Every adapter honours the
+parent filter; DeepSeek and T3 have no sub-agent sessions, so they list none.
 
 ### `DELETE /api/agent-sessions/{asid}`
 

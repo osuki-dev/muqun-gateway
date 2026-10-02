@@ -77,6 +77,18 @@ pub struct SessionQuery {
     pub cursor: Option<String>,
 }
 
+impl SessionQuery {
+    /// Whether a session whose own parent is `parent` passes the `parent_id`
+    /// filter. For adapters that list everything they hold and filter locally.
+    pub fn keeps_parent(&self, parent: Option<&str>) -> bool {
+        match self.parent_id.as_deref() {
+            None => true,
+            Some("null") => parent.is_none(),
+            Some(wanted) => parent == Some(wanted),
+        }
+    }
+}
+
 /// `Session.Info.revert`: a staged rollback the user can still cancel.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionRevertInfo {

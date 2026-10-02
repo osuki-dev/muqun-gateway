@@ -171,6 +171,7 @@ impl AgentPort for T3Driver {
         Box::pin(async move {
             let shell = self.client.shell_snapshot().await?;
             let mut sessions = mapper::map_shell_sessions(&shell);
+            sessions.retain(|s| query.keeps_parent(s.parent_id.as_deref()));
             if let Some(dir) = query.directory.as_deref().map(|d| d.trim_end_matches('/')) {
                 sessions.retain(|s| {
                     s.directory
@@ -651,6 +652,49 @@ mod tests {
             assert!(attempt.with_runtime_mode(bad).is_err(), "{bad}");
             client.shutdown();
         }
+    }
+
+    #[tokio::test]
+    async fn list_sessions_honours_the_parent_filter() {
+        use axum::{routing::get, Json, Router};
+        let shell: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/shell_snapshot.json")).unwrap();
+        let app = Router::new().route(
+            "/api/orchestration/shell",
+            get(move || {
+                let shell = shell.clone();
+                async move { Json(shell) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let driver = T3Driver::new(T3Endpoint::new(
+            url,
+            super::super::endpoint::T3Credential::Bearer("test-token".into()),
+        ));
+        let query = |parent: Option<&str>| SessionQuery {
+            parent_id: parent.map(str::to_string),
+            ..Default::default()
+        };
+        let all = driver.list_sessions(&query(None)).await.unwrap();
+        assert!(!all.is_empty());
+        assert_eq!(
+            driver
+                .list_sessions(&query(Some("null")))
+                .await
+                .unwrap()
+                .len(),
+            all.len(),
+            "roots only keeps top-level threads"
+        );
+        assert!(driver
+            .list_sessions(&query(Some("thread-x")))
+            .await
+            .unwrap()
+            .is_empty());
+        driver.client().shutdown();
+        server.abort();
     }
 
     #[tokio::test]
