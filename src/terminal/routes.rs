@@ -1091,42 +1091,216 @@ pub(crate) fn spawn_agent_permission_watchers(state: AppState) {
     let state = state.clone();
 
     tokio::spawn(async move {
-        while let Ok(event) = rx.recv().await {
-            if let agents::AgentDomainEvent::PermissionPending {
-                ref asid,
-                ref request,
-                ..
-            } = event
-            {
-                let tokens = match state.push_tokens.lock() {
-                    Ok(guard) => guard.clone(),
-                    Err(_) => Vec::new(),
-                };
-                if !tokens.is_empty() {
-                    let _ = send_expo_push_notifications(
-                        &tokens,
-                        "Approval Required".to_string(),
-                        request.prompt.clone(),
-                        agent_permission_push_data(&asid.0, &request.id),
-                    )
-                    .await;
+        let mut gates = AgentPushGates::default();
+        loop {
+            let event = match rx.recv().await {
+                Ok(event) => event,
+                // Falling behind loses the skipped events, not the watcher.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+            match gates.admit(&event) {
+                Some(AgentPendingPush::Approval { asid, request }) => {
+                    let tokens = match state.push_tokens.lock() {
+                        Ok(guard) => guard.clone(),
+                        Err(_) => Vec::new(),
+                    };
+                    if !tokens.is_empty() {
+                        let _ = send_expo_push_notifications(
+                            &tokens,
+                            "Approval Required".to_string(),
+                            request.prompt.clone(),
+                            agent_permission_push_data(&state.config.server_id, asid, &request.id),
+                        )
+                        .await;
+                    }
                 }
+                Some(AgentPendingPush::Form { asid, request }) => {
+                    // Naming the agent and the session can take a round trip
+                    // to the agent; the event loop does not wait for it.
+                    let state = state.clone();
+                    let asid = asid.to_owned();
+                    let request = request.clone();
+                    tokio::spawn(async move {
+                        deliver_agent_form_notice(&state, &asid, &request).await;
+                    });
+                }
+                None => {}
             }
         }
     });
 }
 
+/// A pending approval or question that has earned a push.
+#[derive(Debug, PartialEq)]
+pub(crate) enum AgentPendingPush<'a> {
+    Approval {
+        asid: &'a str,
+        request: &'a agents::PermissionRequest,
+    },
+    Form {
+        asid: &'a str,
+        request: &'a agents::FormRequest,
+    },
+}
+
+/// One push per pending request. T3 re-announces every open approval and
+/// question on each thread snapshot, so the same request id arrives as a
+/// fresh `*Pending` event many times; only the first is news. A resolve
+/// forgets the id. Events are per session, a child session's included --
+/// nothing here looks at `parent_id`.
+#[derive(Debug, Default)]
+pub(crate) struct AgentPushGates {
+    approvals: std::collections::HashSet<(String, String)>,
+    forms: std::collections::HashSet<(String, String)>,
+}
+
+/// Requests that are never resolved (an agent that went away) must not grow
+/// the gates forever; forgetting them all costs at most a repeat push.
+const AGENT_PUSH_GATE_CAPACITY: usize = 1024;
+
+impl AgentPushGates {
+    pub(crate) fn admit<'a>(
+        &mut self,
+        event: &'a agents::AgentDomainEvent,
+    ) -> Option<AgentPendingPush<'a>> {
+        use agents::AgentDomainEvent as E;
+        match event {
+            E::PermissionPending { asid, request, .. } => {
+                first_sighting(&mut self.approvals, &asid.0, &request.id).then_some(
+                    AgentPendingPush::Approval {
+                        asid: &asid.0,
+                        request,
+                    },
+                )
+            }
+            E::FormPending { asid, request, .. } => {
+                first_sighting(&mut self.forms, &asid.0, &request.id).then_some(
+                    AgentPendingPush::Form {
+                        asid: &asid.0,
+                        request,
+                    },
+                )
+            }
+            E::PermissionResolved {
+                asid, request_id, ..
+            } => {
+                self.approvals.remove(&(asid.0.clone(), request_id.clone()));
+                None
+            }
+            E::FormResolved { asid, form_id, .. } => {
+                self.forms.remove(&(asid.0.clone(), form_id.clone()));
+                None
+            }
+            _ => None,
+        }
+    }
+}
+
+fn first_sighting(
+    open: &mut std::collections::HashSet<(String, String)>,
+    asid: &str,
+    id: &str,
+) -> bool {
+    if open.len() >= AGENT_PUSH_GATE_CAPACITY {
+        open.clear();
+    }
+    open.insert((asid.to_owned(), id.to_owned()))
+}
+
 /// The data of a structured agent's approval push; `session_id` is the agent
 /// session the request belongs to.
-fn agent_permission_push_data(asid: &str, request_id: &str) -> serde_json::Map<String, Value> {
+fn agent_permission_push_data(
+    server_id: &str,
+    asid: &str,
+    request_id: &str,
+) -> serde_json::Map<String, Value> {
     let mut data = serde_json::Map::new();
     data.insert("type".to_string(), json!("approval"));
     data.insert("category".to_string(), json!("approval"));
+    data.insert("server_id".to_string(), json!(server_id));
     data.insert("session_id".to_string(), json!(asid));
     data.insert("asid".to_string(), json!(asid));
     data.insert("approval_id".to_string(), json!(request_id));
     data.insert("fingerprint".to_string(), json!(request_id));
     data
+}
+
+/// The data of a structured agent's question push: an agent session -- a
+/// child's as much as a top-level one's -- asking the user to fill a form.
+fn agent_form_push_data(
+    server_id: &str,
+    agent_id: &str,
+    asid: &str,
+    form_id: &str,
+) -> serde_json::Map<String, Value> {
+    let mut data = serde_json::Map::new();
+    data.insert("type".to_string(), json!("question"));
+    data.insert("category".to_string(), json!("question"));
+    data.insert("server_id".to_string(), json!(server_id));
+    data.insert("agent_id".to_string(), json!(agent_id));
+    data.insert("session_id".to_string(), json!(asid));
+    data.insert("asid".to_string(), json!(asid));
+    data.insert("form_id".to_string(), json!(form_id));
+    data.insert("fingerprint".to_string(), json!(form_id));
+    data
+}
+
+/// An agent's own name, for a push about one of its sessions.
+fn agent_display_name(agent_id: &str) -> Option<&'static str> {
+    match agent_id {
+        "opencode" => Some("OpenCode"),
+        "deepseek" => Some("DeepSeek"),
+        "t3" => Some("T3 Code"),
+        _ => None,
+    }
+}
+
+/// The push a pending question sends, before it is put into words: "{name}
+/// needs your input", where the name is the session's title when there is one
+/// and the agent's otherwise. The form's own title is the body only when the
+/// owner turned `rich_agent_pushes` on.
+fn form_notification(
+    state: &AppState,
+    agent_id: &str,
+    session_title: Option<&str>,
+    asid: &str,
+    request: &agents::FormRequest,
+) -> AgentPushNotice {
+    let agent_name = session_title
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .or_else(|| agent_display_name(agent_id))
+        .map(str::to_owned);
+    AgentPushNotice {
+        notice: AgentNotice::AgentBlocked,
+        server_label: current_server_label(&state.config.label).trim().to_owned(),
+        agent_name,
+        data: agent_form_push_data(&state.config.server_id, agent_id, asid, &request.id),
+        choices: Vec::new(),
+        detail: state
+            .config
+            .rich_agent_pushes
+            .then(|| PushDetail::from_question(&request.title))
+            .flatten(),
+    }
+}
+
+async fn deliver_agent_form_notice(state: &AppState, asid: &str, request: &agents::FormRequest) {
+    let (agent_id, title) = match state.agent_runtime.manager_for_session(asid).await {
+        Some(manager) => {
+            let title =
+                tokio::time::timeout(Duration::from_secs(3), manager.sessions().get_session(asid))
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .map(|info| info.title);
+            (manager.agent().kind().to_owned(), title)
+        }
+        None => (String::new(), None),
+    };
+    let notice = form_notification(state, &agent_id, title.as_deref(), asid, request);
+    deliver_agent_notification(state, notice).await;
 }
 
 pub(crate) async fn watch_agent_notifications(state: AppState, session: SessionConfig) {
@@ -2917,12 +3091,87 @@ mod tests {
     /// not a placeholder.
     #[test]
     fn an_agent_permission_push_carries_its_agent_session_id() {
-        let data = super::agent_permission_push_data("ses_42", "perm_1");
+        let data = super::agent_permission_push_data("server-1", "ses_42", "perm_1");
+        assert_eq!(data["server_id"], "server-1");
         assert_eq!(data["session_id"], "ses_42");
         assert_eq!(data["asid"], "ses_42");
         assert_eq!(data["approval_id"], "perm_1");
         assert_eq!(data["fingerprint"], "perm_1");
         assert_eq!(data["type"], "approval");
+    }
+
+    /// A structured agent's question push names the server, the agent and the
+    /// agent session it is for, and the form to answer.
+    #[test]
+    fn an_agent_form_push_carries_its_agent_session_and_form_id() {
+        let data = super::agent_form_push_data("server-1", "t3", "ses_child", "form_1");
+        assert_eq!(data["type"], "question");
+        assert_eq!(data["category"], "question");
+        assert_eq!(data["server_id"], "server-1");
+        assert_eq!(data["agent_id"], "t3");
+        assert_eq!(data["session_id"], "ses_child");
+        assert_eq!(data["asid"], "ses_child");
+        assert_eq!(data["form_id"], "form_1");
+        assert_eq!(data["fingerprint"], "form_1");
+    }
+
+    /// One question is one push: T3 re-announces open forms on every thread
+    /// snapshot, so a repeat of the same id is not news until it is resolved.
+    /// A child session's form is admitted like any other.
+    #[test]
+    fn a_pending_form_pushes_once_until_it_is_resolved() {
+        use crate::agents::{AgentDomainEvent, AgentSessionId, FormRequest};
+        let pending = |asid: &str, id: &str| AgentDomainEvent::FormPending {
+            asid: AgentSessionId(asid.into()),
+            request: FormRequest {
+                id: id.into(),
+                asid: AgentSessionId(asid.into()),
+                title: "Which branch?".into(),
+                fields: Vec::new(),
+            },
+            seq: 1,
+        };
+        let mut gates = super::AgentPushGates::default();
+        let first = pending("ses_child", "form_1");
+        assert!(matches!(
+            gates.admit(&first),
+            Some(super::AgentPendingPush::Form { asid: "ses_child", request }) if request.id == "form_1"
+        ));
+        assert_eq!(gates.admit(&pending("ses_child", "form_1")), None);
+        assert!(gates.admit(&pending("ses_child", "form_2")).is_some());
+        assert!(gates.admit(&pending("ses_other", "form_1")).is_some());
+
+        let resolved = AgentDomainEvent::FormResolved {
+            asid: AgentSessionId("ses_child".into()),
+            form_id: "form_1".into(),
+            seq: 2,
+        };
+        assert_eq!(gates.admit(&resolved), None);
+        assert!(gates.admit(&pending("ses_child", "form_1")).is_some());
+    }
+
+    /// The question push says "{name} needs your input", naming the session
+    /// when it has a title and the agent when it does not.
+    #[test]
+    fn a_form_push_names_the_session_else_the_agent() {
+        use crate::agents::{AgentSessionId, FormRequest};
+        let state = test_state("admin", Vec::new());
+        let request = FormRequest {
+            id: "form_1".into(),
+            asid: AgentSessionId("ses_1".into()),
+            title: "Which branch?".into(),
+            fields: Vec::new(),
+        };
+        let titled = super::form_notification(&state, "t3", Some("Fix login"), "ses_1", &request);
+        assert_eq!(titled.notice, AgentNotice::AgentBlocked);
+        assert_eq!(titled.agent_name.as_deref(), Some("Fix login"));
+        assert_eq!(titled.detail, None);
+        let rendered = titled.render(Locale::default());
+        assert_eq!(rendered.body, "Fix login needs your input.");
+        assert_eq!(rendered.data["form_id"], "form_1");
+
+        let untitled = super::form_notification(&state, "deepseek", Some("  "), "ses_1", &request);
+        assert_eq!(untitled.agent_name.as_deref(), Some("DeepSeek"));
     }
 
     /// The defect this hub exists for: `activity_stream()` used to be built

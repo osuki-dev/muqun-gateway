@@ -738,6 +738,26 @@ with `404`.
 
 Forms are v2's question mechanism; there is no separate question event.
 
+### Push notifications
+
+Every registered device is pushed once per pending approval and once per
+pending form, for any agent session -- a child session's included. A repeat of
+the same request id (T3 re-announces open requests on every thread snapshot)
+pushes nothing until that request is resolved.
+
+| | approval | question (form) |
+|---|---|---|
+| `type`, `category` | `approval` | `question` |
+| `server_id` | the gateway's server id | the gateway's server id |
+| `session_id`, `asid` | the agent session | the agent session |
+| request id | `approval_id` | `form_id` |
+| `fingerprint` | the request id | the form id |
+| `agent_id` | — | the owning agent (`opencode`, `deepseek`, `t3`) |
+
+A question push reads "*name* needs your input", where *name* is the session's
+title, or the agent's name when the session has none. With `rich_agent_pushes`
+on, the body is the form's title instead and the data carries it as `question`.
+
 ---
 
 ## Files, diff, catalog, projects
