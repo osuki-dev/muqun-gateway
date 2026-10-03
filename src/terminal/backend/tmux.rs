@@ -116,19 +116,32 @@ impl TmuxBackend {
     /// every program in every pane receives; a refusal that names the fix is
     /// the most this adapter does about it. Any failure to read it -- no
     /// server, a tmux too old to have the option -- answers `false`. `version`
-    /// is what `metadata()` already reported, when the caller has it. Nothing
-    /// is cached: the option is one cheap process and can change at any time.
+    /// is what `metadata()` already reported. Nothing is cached beyond the
+    /// discovery cache this is called under: the option can change at any
+    /// time, and `send_keys` reads it afresh through [`Self::pane_keys`].
     async fn extended_keys(&self, version: Option<&str>) -> bool {
-        let version = match version {
-            Some(version) => Some(version.to_owned()),
-            None => self.metadata().await.ok().and_then(|meta| meta.version),
-        };
-        if version.as_deref().and_then(tmux_version) < Some((3, 2)) {
+        if version.and_then(tmux_version) < Some((3, 2)) {
             return false;
         }
         self.output(["show-options", "-gs", "extended-keys"])
             .await
-            .is_ok_and(|output| extended_keys_enabled(&output))
+            .is_ok_and(|output| matches!(output.split_whitespace().last(), Some("on" | "always")))
+    }
+
+    /// What tmux will do with a chord sent to this pane, in one process: the
+    /// version, the server's `extended-keys`, and the key mode the program in
+    /// the pane asked for.
+    async fn pane_keys(&self, pane: &str) -> PaneKeys {
+        self.output([
+            "display-message",
+            "-p",
+            "-t",
+            pane,
+            "#{version}|#{extended-keys}|#{pane_key_mode}",
+        ])
+        .await
+        .map(|output| PaneKeys::parse(&output))
+        .unwrap_or_default()
     }
 
     async fn output<I, S>(&self, args: I) -> Result<String, BackendError>
@@ -1035,14 +1048,14 @@ impl TerminalBackend for TmuxBackend {
                 .collect::<Result<Vec<_>, _>>()?;
             // Asked only when a chord needs it, so the keys every client sends
             // all day -- Enter, Esc, ctrl+c -- cost no extra tmux process.
-            let extended = if chords.iter().all(KeyChord::is_classic) {
-                false
+            let pane = if chords.iter().all(KeyChord::is_classic) {
+                PaneKeys::default()
             } else {
-                self.extended_keys(None).await
+                self.pane_keys(id.as_str()).await
             };
             let mapped = chords
                 .iter()
-                .map(|chord| tmux_chord(chord, extended))
+                .map(|chord| tmux_chord(chord, pane))
                 .collect::<Result<Vec<_>, _>>()?;
             let mut args = vec![
                 "send-keys".to_owned(),
@@ -1313,17 +1326,70 @@ fn tmux_version(version: &str) -> Option<(u32, u32)> {
     Some((major.parse().ok()?, minor.parse().ok()?))
 }
 
-/// `show-options -gs extended-keys` answers `extended-keys on`.
-fn extended_keys_enabled(output: &str) -> bool {
-    matches!(output.split_whitespace().last(), Some("on" | "always"))
+/// What tmux will do with a chord sent to one pane.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PaneKeys {
+    /// tmux 3.2+ with `extended-keys` `on` or `always`.
+    extended: bool,
+    /// The program in the pane has not asked for extended keys (tmux reports
+    /// its key mode as `VT10x`) and the server is not set to `always`, so
+    /// tmux will send it the legacy encoding of every chord.
+    legacy_pane: bool,
+}
+
+impl PaneKeys {
+    /// `display-message -p '#{version}|#{extended-keys}|#{pane_key_mode}'`,
+    /// e.g. `3.7c|on|VT10x`. A tmux too old to know a field prints it empty,
+    /// which reads as "no extended keys" and "mode unknown" respectively.
+    fn parse(output: &str) -> Self {
+        let mut fields = output.trim().split('|');
+        let version = fields.next().and_then(tmux_version);
+        let option = fields.next().unwrap_or("");
+        let mode = fields.next().unwrap_or("");
+        Self {
+            extended: version >= Some((3, 2)) && matches!(option, "on" | "always"),
+            legacy_pane: option != "always" && mode == "VT10x",
+        }
+    }
+}
+
+/// Whether tmux's legacy encoding of a chord still says what was pressed.
+///
+/// Measured against tmux 3.7c with the pane in `VT10x` mode: modified arrows,
+/// Home/End/PageUp/PageDown/Insert/Delete and F-keys keep their modifiers
+/// (`C-Up` is `CSI 1;5A`), and `alt` in front of a classic key is an Esc
+/// prefix (`M-Enter` is `ESC CR`). Everything else loses its modifier:
+/// `C-Enter`, `S-Enter` and `C-S-Enter` all arrive as a bare `CR`, `C-1` as
+/// `1`, `C-Tab` as Tab, `M-S-Tab` as `ESC Tab`.
+fn survives_legacy_encoding(chord: &KeyChord) -> bool {
+    use NamedKey::*;
+    match chord.base {
+        KeyBase::Named(
+            Up | Down | Left | Right | Home | End | PageUp | PageDown | Insert | Delete | F(_),
+        ) => true,
+        _ => {
+            let without_alt = KeyChord {
+                alt: false,
+                ..*chord
+            };
+            without_alt.is_classic()
+                && !(without_alt.shift && without_alt.base == KeyBase::Named(Tab))
+        }
+    }
 }
 
 /// A key name from a shortcut table, in tmux's spelling, given whether the
-/// server has extended keys.
+/// server has extended keys and the pane has asked for them.
 #[cfg(test)]
 fn tmux_key(value: &str, extended: bool) -> Result<String, BackendError> {
     let chord = KeyChord::parse(value).ok_or_else(|| unknown_key(value))?;
-    tmux_chord(&chord, extended)
+    tmux_chord(
+        &chord,
+        PaneKeys {
+            extended,
+            legacy_pane: false,
+        },
+    )
 }
 
 /// One parsed key in tmux's spelling.
@@ -1334,16 +1400,29 @@ fn tmux_key(value: &str, extended: bool) -> Result<String, BackendError> {
 /// failing. Refusing turns a wrong key into an error the caller can see rather
 /// than into text in somebody's prompt.
 ///
-/// A chord outside the classic set is refused when `extended` is false rather
-/// than sent anyway: without extended keys tmux has no encoding for `C-Enter`
-/// and delivers a plain Enter -- which submits the message the person meant
-/// to break onto a new line.
-fn tmux_chord(chord: &KeyChord, extended: bool) -> Result<String, BackendError> {
-    if !extended && !chord.is_classic() {
-        return Err(BackendError::KeyUnsupported(format!(
-            "{:?} needs tmux extended keys: tmux set -s extended-keys on",
-            chord.name()
-        )));
+/// A chord outside the classic set is refused when tmux has no extended keys,
+/// as the contract says. It is also refused, with extended keys on, when the
+/// program in the pane never asked for them and the chord's legacy encoding
+/// would lose its modifier: tmux then delivers `C-Enter` as a plain Enter,
+/// which submits the message the person meant to break onto a new line.
+/// Measured: Codex under tmux 3.7c stays in `VT10x` (it asks only for kitty's
+/// protocol, which tmux does not implement), where Claude Code and opencode
+/// ask for modifyOtherKeys.
+fn tmux_chord(chord: &KeyChord, pane: PaneKeys) -> Result<String, BackendError> {
+    if !chord.is_classic() {
+        if !pane.extended {
+            return Err(BackendError::KeyUnsupported(format!(
+                "{:?} needs tmux extended keys: tmux set -s extended-keys on",
+                chord.name()
+            )));
+        }
+        if pane.legacy_pane && !survives_legacy_encoding(chord) {
+            return Err(BackendError::KeyUnsupported(format!(
+                "{:?} would reach this pane without its modifiers: the program in it has not \
+                 turned on extended keys",
+                chord.name()
+            )));
+        }
     }
     let base = match chord.base {
         // Back-tab, which is what Shift+Tab is on the wire (`CSI Z`). tmux
@@ -1365,8 +1444,10 @@ fn tmux_chord(chord: &KeyChord, extended: bool) -> Result<String, BackendError> 
         // the character: `send-keys -t %0 '\;'` puts a semicolon in the pane.
         // `;` is the only character this applies to -- every other ASCII
         // punctuation mark, `{` and `}` and `\` included, arrives literally.
-        // Behind a modifier it is no longer a bare `;` and needs nothing.
-        KeyBase::Char(';') if !chord.has_modifiers() => "\\;".to_owned(),
+        // Behind a modifier it still needs it: tmux reads any argument that
+        // ends in `;` as a separator, so `M-;` typed `M-` and ran nothing.
+        // `M-\;` arrives as `ESC ;` (tmux 3.7c, measured).
+        KeyBase::Char(';') => "\\;".to_owned(),
         KeyBase::Char(c) => c.to_string(),
     };
     let mut key = String::new();
@@ -1919,7 +2000,7 @@ mod tests {
             ("alt+x", "M-x"),
             ("alt+X", "M-X"),
             ("ctrl+1", "C-1"),
-            ("alt+;", "M-;"),
+            ("alt+;", "M-\\;"),
             ("ctrl+tab", "C-Tab"),
         ];
         for (name, tmux) in cases {
@@ -1973,10 +2054,60 @@ mod tests {
         assert_eq!(tmux_version("next-3.6"), Some((3, 6)));
         assert_eq!(tmux_version("master"), None);
         assert!(tmux_version("3.1c") < Some((3, 2)));
-        assert!(extended_keys_enabled("extended-keys on\n"));
-        assert!(extended_keys_enabled("extended-keys always"));
-        assert!(!extended_keys_enabled("extended-keys off"));
-        assert!(!extended_keys_enabled(""));
+        let parse = PaneKeys::parse;
+        let keys = |extended, legacy_pane| PaneKeys {
+            extended,
+            legacy_pane,
+        };
+        assert_eq!(parse("3.7c|on|VT10x\n"), keys(true, true));
+        assert_eq!(parse("3.7c|on|Ext 2"), keys(true, false));
+        assert_eq!(parse("3.7c|always|VT10x"), keys(true, false));
+        assert_eq!(parse("3.7c|off|VT10x"), keys(false, true));
+        assert_eq!(parse("3.1c|on|"), keys(false, false));
+        assert_eq!(parse("3.2a||"), keys(false, false));
+        assert_eq!(parse(""), keys(false, false));
+    }
+
+    /// The pane's own key mode decides whether a chord can be sent at all:
+    /// in `VT10x` tmux falls back to the legacy encoding, and for most
+    /// chords that is a different key -- `ctrl+enter` would submit.
+    #[test]
+    fn a_chord_the_pane_would_receive_as_another_key_is_refused() {
+        let legacy = PaneKeys {
+            extended: true,
+            legacy_pane: true,
+        };
+        let send = |name: &str| tmux_chord(&KeyChord::parse(name).unwrap(), legacy);
+        for name in [
+            "ctrl+enter",
+            "shift+enter",
+            "ctrl+shift+enter",
+            "ctrl+1",
+            "ctrl+tab",
+            "alt+shift+tab",
+            "shift+a",
+            "ctrl+alt+shift+x",
+        ] {
+            match send(name) {
+                Err(BackendError::KeyUnsupported(message)) => {
+                    assert!(message.contains("extended keys"), "{message}")
+                }
+                other => panic!("{name}: {other:?}"),
+            }
+        }
+        for (name, tmux) in [
+            ("alt+enter", "M-Enter"),
+            ("alt+x", "M-x"),
+            ("ctrl+alt+a", "C-M-a"),
+            ("ctrl+up", "C-Up"),
+            ("alt+left", "M-Left"),
+            ("ctrl+shift+home", "C-S-Home"),
+            ("shift+f5", "S-F5"),
+            ("shift+tab", "BTab"),
+            ("ctrl+c", "C-c"),
+        ] {
+            assert_eq!(send(name).unwrap(), tmux, "{name}");
+        }
     }
 
     #[test]
@@ -2807,6 +2938,77 @@ mod tests {
         assert_eq!(
             received,
             b"a;b".to_vec(),
+            "the pane received {:?}",
+            String::from_utf8_lossy(&received)
+        );
+    }
+
+    /// Chords reach the pane in its extended-key encoding, end to end through
+    /// `send_keys`, on a private tmux server whose `extended-keys` this test
+    /// sets itself. The recorder asks for modifyOtherKeys 2, which is what
+    /// Claude Code asks for; tmux does not act on kitty's `CSI > 1 u`.
+    #[tokio::test]
+    #[ignore = "requires a tmux server"]
+    async fn modifier_chords_reach_a_pane_that_asked_for_extended_keys() {
+        let (backend, workspace) = contract_workspace().await;
+        let pane = backend
+            .list_panes()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.workspace_id == workspace.id)
+            .unwrap();
+        let ctrl_enter = || vec!["ctrl+enter".to_owned()];
+
+        // Off, the default: refused with the fix in the message.
+        backend
+            .output(["set-option", "-s", "extended-keys", "off"])
+            .await
+            .unwrap();
+        let refused = backend.send_keys(&pane.id, &ctrl_enter()).await;
+        assert!(
+            matches!(&refused, Err(BackendError::KeyUnsupported(m)) if m.contains("extended-keys on")),
+            "{refused:?}"
+        );
+
+        // On, but the shell has not asked for extended keys: still refused,
+        // because tmux would send a plain Enter.
+        backend
+            .output(["set-option", "-s", "extended-keys", "on"])
+            .await
+            .unwrap();
+        let refused = backend.send_keys(&pane.id, &ctrl_enter()).await;
+        assert!(
+            matches!(&refused, Err(BackendError::KeyUnsupported(_))),
+            "{refused:?}"
+        );
+
+        let recording =
+            std::env::temp_dir().join(format!("gateway-chords-{}", uuid::Uuid::new_v4()));
+        let recorder = format!(
+            "printf '\\033[>4;2m'; stty raw -echo; head -c 27 > {}; stty sane",
+            shell_word(&recording.to_string_lossy())
+        );
+        backend
+            .send_text(&pane.id, &recorder, SendTextMode::Keys)
+            .await
+            .unwrap();
+        backend
+            .send_keys(&pane.id, &["enter".to_owned()])
+            .await
+            .unwrap();
+        wait_for_pane_flag(&backend, &pane.id, "#{pane_key_mode}", "Ext 2").await;
+
+        let keys = ["ctrl+enter", "shift+enter", "alt+;", "ctrl+up"].map(str::to_owned);
+        backend.send_keys(&pane.id, &keys).await.unwrap();
+
+        let expected = b"\x1b[13;5u\x1b[13;2u\x1b[59;3u\x1b[1;5A";
+        let received = read_when_complete(&recording, b"\x1b[1;5A").await;
+        let _ = std::fs::remove_file(&recording);
+        backend.close_workspace(&workspace.id).await.unwrap();
+        assert_eq!(
+            received,
+            expected.to_vec(),
             "the pane received {:?}",
             String::from_utf8_lossy(&received)
         );
