@@ -651,6 +651,42 @@ pub fn openapi_spec() -> Value {
                     "parameters": [path_param("asid")],
                     "responses": ok_response()
                 }
+            },
+            "/api/agent-sessions/{asid}/vcs/files": {
+                "get": {
+                    "summary": "List the files changed in this agent session's git checkout, with line totals and no patches. data: { vcs: \"git\"|null, reason?: \"not_a_repository\", mode, base?, truncated, files: [{ path, old_path?, status: added|modified|deleted|renamed|untracked|copied|typechange, additions, deletions, binary }] }. At most 2000 files. 400 invalid_mode",
+                    "parameters": [
+                        path_param("asid"),
+                        query_param("mode", "working (default): index and working tree against HEAD, plus untracked files. branch: everything since the merge-base with the default branch (origin/HEAD, else main, master, origin/main, origin/master), plus untracked files; base names the ref")
+                    ],
+                    "responses": ok_response()
+                }
+            },
+            "/api/agent-sessions/{asid}/vcs/file": {
+                "get": {
+                    "summary": "One changed file's whole unified patch. data: { path, old_path?, status, additions, deletions, binary, patch, truncated }. An untracked file is an all-additions patch; a binary file has an empty patch; truncated when the patch reached 8 MB. 404 unknown_path, 404 not_a_repository, 400 invalid_mode",
+                    "parameters": [
+                        path_param("asid"),
+                        query_param("mode", "working (default) or branch, as for vcs/files"),
+                        query_param("path", "Repo-relative path of a file in the change list, or of a tracked file"),
+                        query_param("context", "Context lines per hunk, 0 to 25, default 3")
+                    ],
+                    "responses": ok_response()
+                }
+            },
+            "/api/agent-sessions/{asid}/vcs/discard": {
+                "post": {
+                    "summary": "Discard one file's uncommitted changes. A tracked file is restored from HEAD in the index and working tree (action restored; a staged new file is removed, action deleted); an untracked file is deleted (action deleted), never a directory. data: { path, action }. 404 unknown_path, 403 path_outside_repository, 404 not_a_repository",
+                    "parameters": [path_param("asid")],
+                    "requestBody": json_body(json!({
+                        "type": "object",
+                        "required": ["path"],
+                        "properties": {
+                            "path": { "type": "string", "description": "Repo-relative" }
+                        }
+                    })),
+                    "responses": ok_response()
+                }
             }
         }
     })
