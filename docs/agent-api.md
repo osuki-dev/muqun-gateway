@@ -821,6 +821,109 @@ showed the same empty screen for both. So:
 A directory that no longer exists is not this case: that is
 [`404 workspace_missing`](#conventions).
 
+### Changes (git)
+
+Capability `agent_vcs_files`. Three routes that ask **git** in the session's
+directory rather than the agent, so they mean the same thing for OpenCode,
+DeepSeek Harness and T3 Code. `vcs/diff` above is unchanged. Paths are
+relative to the checkout's top level, which may be above the session's
+directory. Every git process is bounded by 5 s and 8 MB of output.
+
+A `path` is a file **name**, never a pattern: it must be repo-relative with no
+`..`, and it is matched by exact string equality against git's own list
+before anything uses it. `*`, `:(exclude)x`, `a[b].txt` and a directory name
+select nothing beyond the one file of exactly that name (and a directory
+selects nothing at all).
+
+**`GET /api/agent-sessions/{asid}/vcs/files?mode=working|branch`** (default
+`working`) — the list, with line totals and no patches:
+
+```json
+{ "vcs": "git", "reason": null, "mode": "branch", "base": "origin/main", "truncated": false,
+  "files": [
+    { "path": "src/a.rs", "status": "modified", "additions": 3, "deletions": 1, "binary": false },
+    { "path": "docs/new.md", "old_path": "docs/old.md", "status": "renamed", "additions": 0, "deletions": 0, "binary": false },
+    { "path": "notes.txt", "status": "untracked", "additions": 12, "deletions": 0, "binary": false }
+  ] }
+```
+
+- `working`: index and working tree against `HEAD`, plus every untracked file
+  (each file, not its directory).
+- `branch`: everything since the merge-base with the default branch, committed
+  or not, plus untracked files. The default branch is `origin/HEAD` when the
+  clone recorded it, then `main`, `master`, `origin/main`, `origin/master`:
+  the first that exists **and** shares history with `HEAD`; `base` names it.
+  With none, `base` is absent, `reason` is `"no_default_branch"` and the list
+  is the working one.
+- `status` is one of `added`, `modified`, `deleted`, `renamed`, `untracked`,
+  `copied`, `typechange`, `conflicted` (an unmerged path). Treat an unknown
+  value as `modified`. A file missing from the working tree is `deleted`
+  whatever the index holds; a file removed from the index but still on disk
+  (`git rm --cached`) is one `modified` row. `old_path` is present for
+  `renamed` and `copied`.
+- `additions` is `null` for an untracked file whose lines were not counted
+  (over 1 MB, past the list's 16 MB read budget, or not a regular file). A
+  binary file has `binary: true` and zero totals.
+- At most 2000 files, cut before any file is read; `truncated` says the list
+  stopped there or git's output reached 8 MB.
+- `reason` is `null` inside a repository. Not a repository:
+  `200 { "vcs": null, "reason": "not_a_repository", "mode", "truncated": false, "files": [] }`.
+- Any other `mode` is `400 invalid_mode`.
+
+**`GET /api/agent-sessions/{asid}/vcs/file?mode=&path=&context=3`** — one
+file's whole patch:
+
+```json
+{ "path": "src/a.rs", "status": "modified", "additions": 3, "deletions": 1,
+  "binary": false, "patch": "diff --git a/src/a.rs b/src/a.rs\n…", "truncated": false }
+```
+
+`context` is 0–25 (default 3). The file is looked up by name alone, so a file
+past the list's 2000-file cut still answers. An untracked file is an
+all-additions patch against `/dev/null`; a binary file has `patch: ""`;
+`truncated` is true when the patch reached 8 MB. A tracked file with no
+change is `200` with `status: "unchanged"` and an empty patch. Any other path
+is `404 unknown_path`; outside a repository, `404 not_a_repository`.
+
+**`POST /api/agent-sessions/{asid}/vcs/discard`** `{ "path": "src/a.rs" }` →
+`{ "path": "src/a.rs", "action": "restored" | "deleted" }`. Device token
+required, like every session write; logged at info.
+
+- The path must be exactly one row of the **working** list (whatever `mode`
+  the app is showing); a file with no working change is `404 unknown_path`,
+  not a `200` that did nothing.
+- A tracked file is restored from `HEAD` in both the index and the working
+  tree (`git restore --staged --worktree`; `git checkout HEAD --` only on a
+  git that has no `restore`): `restored`. A staged rename restores its old
+  path too. A staged new file is removed: `deleted`. Any other git failure,
+  such as a held `index.lock`, is returned, not retried another way.
+- An untracked file is deleted: `deleted`. Never a directory. The unlink walks
+  the directories with `O_NOFOLLOW`, so a directory swapped for a symlink
+  after the checks fails rather than deleting outside the checkout.
+- A path that leads out of the checkout through a symlink, the file itself
+  or a directory on the way, is `403 path_outside_repository`.
+- A checkout whose top level is the user's home directory (a session opened in
+  `~` with a dotfiles repository) is `403 repository_is_home`: discard is
+  never offered there.
+- When git's answer for the path was cut at 8 MB the row cannot be trusted:
+  `409 listing_truncated`.
+
+Errors shared by the three routes:
+
+| Status | Code | When |
+|---|---|---|
+| 400 | `invalid_mode` | `mode` is not `working` or `branch` |
+| 403 | `path_outside_repository` | discard: the path leaves the checkout through a symlink |
+| 403 | `repository_is_home` | discard: the checkout is the home directory |
+| 404 | `unknown_path` | not a row of the list (or, for `vcs/file`, a tracked file) |
+| 404 | `not_a_repository` | `vcs/file`, `vcs/discard` outside a repository |
+| 404 | `workspace_missing` | the session's directory is gone |
+| 409 | `listing_truncated` | discard: git's answer was cut at 8 MB |
+| 500 | `discard_failed` | discard: the file could not be removed |
+| 501 | `git_missing` | git is not installed on the host |
+| 502 | `git_failed` | git exited with an error |
+| 504 | `git_timeout` | git took longer than 5 s |
+
 ### `GET /api/agent-catalog`
 
 `?directory=` · `?agent_id=` (one agent's catalog; absent merges all attached) · ETag + `304`. `data`:

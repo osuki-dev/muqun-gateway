@@ -52,6 +52,9 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "agent_spawn",
     "agent_timeline",
     "agent_vcs",
+    // `vcs/files`, `vcs/file` and `vcs/discard` on an agent session: git in
+    // the session's directory, for every agent.
+    "agent_vcs_files",
     "assets",
     "device_revocation",
     "file_uploads",
