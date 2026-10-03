@@ -1583,6 +1583,10 @@ pub(crate) fn backend_call_error(method: &str, error: BackendError) -> HerdrCall
             error: json!({ "code": code, "message": message }),
         },
         BackendError::InvalidResponse(_) => HerdrCallError::malformed(method),
+        BackendError::KeyUnsupported(message) => HerdrCallError::Herdr {
+            method: method.to_owned(),
+            error: json!({ "code": "key_unsupported", "message": message }),
+        },
         other @ (BackendError::Unavailable | BackendError::Unsupported(_)) => {
             HerdrCallError::Unavailable(other.to_string())
         }
@@ -2357,7 +2361,7 @@ mod tests {
         let enters = herdr.enters();
         assert_eq!(enters.len(), 1);
         assert_eq!(enters[0]["params"]["pane_id"], "w1:p1");
-        assert_eq!(enters[0]["params"]["keys"], json!(["Enter"]));
+        assert_eq!(enters[0]["params"]["keys"], json!(["enter"]));
     }
 
     #[tokio::test]

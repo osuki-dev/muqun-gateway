@@ -14,8 +14,10 @@ use serde_json::{json, Value};
 
 /// Bumped when the key row or command source changes. Version 7 makes the
 /// downloaded catalog the only slash-command source and adds key sequences,
-/// editor text actions, and the two bracket control chords.
-pub const KEYMAP_VERSION: u32 = 7;
+/// editor text actions, and the two bracket control chords. Version 8 adds the
+/// newline chords (`shift+enter`, and `ctrl+enter` where the agent takes it)
+/// to the agent profiles that document them.
+pub const KEYMAP_VERSION: u32 = 8;
 
 /// Overlay file, read from the gateway's config directory on every request.
 /// Re-read rather than cached so an edit takes effect on the next pane switch
@@ -131,13 +133,12 @@ const fn sequence_key(
 
 /// Answering a prompt and getting out of one. Every pane needs these.
 ///
-/// `shift+enter` used to sit between them, for writing a multi-line message.
-/// It is gone because it never worked on tmux and did not need to: tmux has no
-/// portable name for Shift+Enter -- whether the terminal even distinguishes it
-/// from Enter depends on extended-keys mode -- and multi-line text from the
-/// composer already reaches the pane as a bracketed paste rather than as a
-/// stream of Enters. A key row that advertises a key one backend cannot press
-/// is worse than a shorter row.
+/// `shift+enter` is not here: it means something only to a program that
+/// tells it apart from Enter, so it sits in the profiles of the agents that
+/// document it as a newline. Whether a backend can deliver it at all is
+/// `keyboard.extended` in discovery -- tmux only with `extended-keys` on --
+/// and the app hides the key where it cannot, so the table lists it
+/// unconditionally.
 const PRIMARY: &[Shortcut] = &[key("↵", "enter", "Enter"), key("ESC", "esc", "Escape")];
 
 /// Still needed everywhere, but reached for less often than what the agent
@@ -243,11 +244,18 @@ const NAVIGATION: &[Shortcut] = &[
     key("⌥↓", "alt+down", "Alt down"),
 ];
 
+/// A line break in the agent's composer without submitting it.
+const NEWLINE_SHIFT: Shortcut = key("⇧↵", "shift+enter", "Newline without sending");
+
 /// From Claude Code's own footer: "esc to interrupt · ctrl+t to hide tasks ·
 /// ctrl+b to run in background", and collapsed blocks marked "(ctrl+o to
 /// expand)".
+///
+/// Shift+Enter is its documented newline (`/terminal-setup`: "iTerm2,
+/// WezTerm, Ghostty, Kitty ... support Shift+Enter natively").
 const CLAUDE_KEYS: &[Shortcut] = &[
     key("⇧TAB", "shift+tab", "Cycle permission mode"),
+    NEWLINE_SHIFT,
     key("⌃O", "ctrl+o", "Expand output"),
     key("⌃T", "ctrl+t", "Toggle tasks"),
     key("⌃B", "ctrl+b", "Run in background"),
@@ -256,8 +264,11 @@ const CLAUDE_KEYS: &[Shortcut] = &[
 ];
 
 /// From Codex's footer: "Esc to cancel · Tab to amend · ctrl+e to explain".
+/// Its composer inserts a newline on Shift+Enter (`insert_newline` in its
+/// keymap, whose own example binding is `shift-enter`).
 const CODEX_KEYS: &[Shortcut] = &[
     key("⇧TAB", "shift+tab", "Cycle approval mode"),
+    NEWLINE_SHIFT,
     key("⌃E", "ctrl+e", "Explain"),
     key("⌃R", "ctrl+r", "Transcript"),
     key("⌃L", "ctrl+l", "Clear screen"),
@@ -275,9 +286,12 @@ const QODER_KEYS: &[Shortcut] = &[
 /// `command_list`, `variant_cycle`, `session_rename`, `session_background`) and
 /// its leader key, which is `ctrl+x`. The leader-prefixed bindings need two
 /// keystrokes and are not what a phone row is for; these are the ones that are
-/// one key on their own.
+/// one key on their own. Its `input_newline` default is
+/// `shift+return,ctrl+return,alt+return,ctrl+j`, so both chords are listed.
 const OPENCODE_KEYS: &[Shortcut] = &[
     key("⇧TAB", "shift+tab", "Cycle agent"),
+    NEWLINE_SHIFT,
+    key("⌃↵", "ctrl+enter", "Newline without sending"),
     key("⌃P", "ctrl+p", "List commands"),
     key("⌃T", "ctrl+t", "Cycle model variant"),
     key("⌃R", "ctrl+r", "Rename session"),
@@ -965,6 +979,26 @@ mod tests {
     }
 
     #[test]
+    fn agents_that_document_a_newline_chord_offer_it() {
+        let value = resolve(Some("claude"), None, None);
+        assert_eq!(value["version"], 8);
+        let row = |agent: &str| key_names(&resolve(Some(agent), None, None));
+        for agent in ["claude", "codex", "opencode"] {
+            assert_eq!(row(agent)[3], "shift+enter", "{agent}");
+        }
+        assert!(row("opencode").contains(&"ctrl+enter".to_string()));
+        assert!(!row("claude").contains(&"ctrl+enter".to_string()));
+        let newline = value["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|key| key["key"] == "shift+enter")
+            .unwrap();
+        assert_eq!(newline["label"], "⇧↵");
+        assert_eq!(newline["description"], "Newline without sending");
+    }
+
+    #[test]
     fn discovery_reads_a_command_file_and_its_front_matter() {
         let (description, hint) =
             front_matter("---\ndescription: Ship a release\nargument-hint: [version]\n---\nbody\n");
@@ -1044,10 +1078,13 @@ mod tests {
             let keys = key_names(&resolve(agent, None, None));
             assert_eq!(keys[0], "enter");
             assert_eq!(keys[1], "esc");
-            // shift+enter is deliberately absent: tmux has no portable name
-            // for it, so advertising it put a key on the row that one backend
-            // could never press.
-            assert!(!keys.contains(&"shift+enter".to_string()));
+            // The newline chord is the agent's, never the shell's: at a
+            // prompt it is just Enter.
+            assert_eq!(
+                keys.contains(&"shift+enter".to_string()),
+                agent.is_some_and(|agent| agent != "qodercli"),
+                "{agent:?}"
+            );
             assert_eq!(keys.last().unwrap(), "alt+down");
         }
     }

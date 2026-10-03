@@ -158,6 +158,11 @@ pub struct TerminalBackendDiscoveryInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub protocol: Option<String>,
     pub capabilities: Vec<String>,
+    /// The key names `send-keys` delivers on this backend. Absent while the
+    /// backend is unreachable, and from gateways that predate it; the app then
+    /// falls back to its own check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyboard: Option<crate::backend::KeyboardVocabulary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -248,6 +253,10 @@ pub async fn build_terminal_plane_discovery(state: &AppState) -> TerminalPlaneDi
                 .and_then(Value::as_str)
                 .map(String::from),
             capabilities: capabilities.into_iter().map(String::from).collect(),
+            keyboard: metadata
+                .get("keyboard")
+                .cloned()
+                .and_then(|keyboard| serde_json::from_value(keyboard).ok()),
         });
     }
 
@@ -452,6 +461,10 @@ mod tests {
                 version: Some("3.3a".to_string()),
                 protocol: None,
                 capabilities: vec!["agent_collaboration".to_string()],
+                keyboard: Some(crate::backend::KeyboardVocabulary::new(
+                    &crate::backend::NamedKey::ALL,
+                    true,
+                )),
             }],
             features: TerminalFeatures {
                 multi_window: true,
@@ -468,6 +481,13 @@ mod tests {
         assert_eq!(val["supported"], true);
         assert_eq!(val["activeBackend"], "tmux");
         assert_eq!(val["backends"][0]["sessionId"], "s1");
+        assert_eq!(val["backends"][0]["keyboard"]["version"], 1);
+        assert_eq!(val["backends"][0]["keyboard"]["extended"], true);
+        assert_eq!(
+            val["backends"][0]["keyboard"]["modifiers"],
+            json!(["ctrl", "alt", "shift"])
+        );
+        assert_eq!(val["backends"][0]["keyboard"]["bases"][0], "enter");
         assert_eq!(val["features"]["multiWindow"], true);
         assert_eq!(val["features"]["gitDiff"], true);
         assert!(val.get("degradedReason").is_none());

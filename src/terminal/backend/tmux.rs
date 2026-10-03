@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
+use super::keys::{unknown_key, KeyBase, KeyChord, KeyboardVocabulary, NamedKey};
 use super::{
     Agent, AgentStatus, BackendActivity, BackendActivityStream, BackendError, BackendFuture,
     BackendKind, BackendMetadata, CreateTab, CreateWorkspace, OutputFormat, OutputSource, Pane,
@@ -106,6 +107,28 @@ impl TmuxBackend {
             binary: binary.into(),
             socket_path,
         }
+    }
+
+    /// Whether a modifier + special-key chord reaches the pane: tmux 3.2 or
+    /// newer with the server option `extended-keys` at `on` or `always`.
+    ///
+    /// Read, never set. The option is the user's, and changing it changes what
+    /// every program in every pane receives; a refusal that names the fix is
+    /// the most this adapter does about it. Any failure to read it -- no
+    /// server, a tmux too old to have the option -- answers `false`. `version`
+    /// is what `metadata()` already reported, when the caller has it. Nothing
+    /// is cached: the option is one cheap process and can change at any time.
+    async fn extended_keys(&self, version: Option<&str>) -> bool {
+        let version = match version {
+            Some(version) => Some(version.to_owned()),
+            None => self.metadata().await.ok().and_then(|meta| meta.version),
+        };
+        if version.as_deref().and_then(tmux_version) < Some((3, 2)) {
+            return false;
+        }
+        self.output(["show-options", "-gs", "extended-keys"])
+            .await
+            .is_ok_and(|output| extended_keys_enabled(&output))
     }
 
     async fn output<I, S>(&self, args: I) -> Result<String, BackendError>
@@ -1006,9 +1029,20 @@ impl TerminalBackend for TmuxBackend {
     fn send_keys<'a>(&'a self, id: &'a PaneId, keys: &'a [String]) -> BackendFuture<'a, ()> {
         Box::pin(async move {
             validate_tmux_id(id.as_str(), '%', "pane")?;
-            let mapped = keys
+            let chords = keys
                 .iter()
-                .map(|key| tmux_key(key))
+                .map(|key| KeyChord::parse(key).ok_or_else(|| unknown_key(key)))
+                .collect::<Result<Vec<_>, _>>()?;
+            // Asked only when a chord needs it, so the keys every client sends
+            // all day -- Enter, Esc, ctrl+c -- cost no extra tmux process.
+            let extended = if chords.iter().all(KeyChord::is_classic) {
+                false
+            } else {
+                self.extended_keys(None).await
+            };
+            let mapped = chords
+                .iter()
+                .map(|chord| tmux_chord(chord, extended))
                 .collect::<Result<Vec<_>, _>>()?;
             let mut args = vec![
                 "send-keys".to_owned(),
@@ -1018,6 +1052,16 @@ impl TerminalBackend for TmuxBackend {
             args.extend(mapped);
             self.output(&args).await?;
             Ok(())
+        })
+    }
+
+    fn keyboard<'a>(
+        &'a self,
+        metadata: &'a BackendMetadata,
+    ) -> BackendFuture<'a, Option<KeyboardVocabulary>> {
+        Box::pin(async move {
+            let extended = self.extended_keys(metadata.version.as_deref()).await;
+            Ok(Some(KeyboardVocabulary::new(&NamedKey::ALL, extended)))
         })
     }
 
@@ -1259,24 +1303,56 @@ fn means_no_tmux_server(message: &str) -> bool {
         || message.contains("no such file or directory")
 }
 
-/// A key name from a shortcut table, in tmux's spelling.
+/// `major.minor` from what `tmux -V` reports: `3.7c` and `next-3.6` are both
+/// readable; `master` is not, and an unreadable version is not taken as new
+/// enough.
+fn tmux_version(version: &str) -> Option<(u32, u32)> {
+    let version = version.trim().trim_start_matches("next-");
+    let (major, rest) = version.split_once('.')?;
+    let minor: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
+
+/// `show-options -gs extended-keys` answers `extended-keys on`.
+fn extended_keys_enabled(output: &str) -> bool {
+    matches!(output.split_whitespace().last(), Some("on" | "always"))
+}
+
+/// A key name from a shortcut table, in tmux's spelling, given whether the
+/// server has extended keys.
+#[cfg(test)]
+fn tmux_key(value: &str, extended: bool) -> Result<String, BackendError> {
+    let chord = KeyChord::parse(value).ok_or_else(|| unknown_key(value))?;
+    tmux_chord(&chord, extended)
+}
+
+/// One parsed key in tmux's spelling.
 ///
-/// Unknown names are refused rather than passed through, and that is
-/// load-bearing: `tmux send-keys` treats a name it does not recognise as
-/// literal text, so handing it `shift+tab` types those nine characters into the
-/// pane instead of failing. Refusing turns a wrong key into an error the caller
-/// can see rather than into text in somebody's prompt.
-fn tmux_key(value: &str) -> Result<String, BackendError> {
-    let lower = value.to_ascii_lowercase();
-    let mapped = match lower.as_str() {
-        "enter" => "Enter".to_owned(),
-        "escape" | "esc" => "Escape".to_owned(),
-        "tab" => "Tab".to_owned(),
+/// Unknown names never get this far, and that is load-bearing: `tmux
+/// send-keys` treats a name it does not recognise as literal text, so handing
+/// it `shift+tab` types those nine characters into the pane instead of
+/// failing. Refusing turns a wrong key into an error the caller can see rather
+/// than into text in somebody's prompt.
+///
+/// A chord outside the classic set is refused when `extended` is false rather
+/// than sent anyway: without extended keys tmux has no encoding for `C-Enter`
+/// and delivers a plain Enter -- which submits the message the person meant
+/// to break onto a new line.
+fn tmux_chord(chord: &KeyChord, extended: bool) -> Result<String, BackendError> {
+    if !extended && !chord.is_classic() {
+        return Err(BackendError::KeyUnsupported(format!(
+            "{:?} needs tmux extended keys: tmux set -s extended-keys on",
+            chord.name()
+        )));
+    }
+    let base = match chord.base {
         // Back-tab, which is what Shift+Tab is on the wire (`CSI Z`). tmux
         // spells it `BTab` and accepts neither `shift+tab` nor `S-Tab` for it:
         // the first becomes literal text and the second lands as a plain Tab.
-        "shift+tab" => "BTab".to_owned(),
-        "backspace" => "BSpace".to_owned(),
+        KeyBase::Named(NamedKey::Tab) if chord.shift && !chord.ctrl && !chord.alt => {
+            return Ok("BTab".to_owned());
+        }
+        KeyBase::Named(key) => tmux_named(key).into_owned(),
         // tmux separates the commands in one invocation at a bare `;`
         // argument, and that split happens before `send-keys` ever sees its
         // own arguments. So a `;` passed through as a key is not typed at
@@ -1289,22 +1365,39 @@ fn tmux_key(value: &str) -> Result<String, BackendError> {
         // the character: `send-keys -t %0 '\;'` puts a semicolon in the pane.
         // `;` is the only character this applies to -- every other ASCII
         // punctuation mark, `{` and `}` and `\` included, arrives literally.
-        ";" => "\\;".to_owned(),
-        "up" | "arrowup" => "Up".to_owned(),
-        "down" | "arrowdown" => "Down".to_owned(),
-        "left" | "arrowleft" => "Left".to_owned(),
-        "right" | "arrowright" => "Right".to_owned(),
-        _ if lower.starts_with("ctrl+") && lower.len() == 6 => {
-            let key = lower.as_bytes()[5] as char;
-            if !key.is_ascii_alphabetic() && key != '[' && key != ']' {
-                return Err(BackendError::InvalidResponse("key name"));
-            }
-            format!("C-{key}")
-        }
-        _ if value.chars().count() == 1 && !value.chars().any(char::is_control) => value.to_owned(),
-        _ => return Err(BackendError::InvalidResponse("key name")),
+        // Behind a modifier it is no longer a bare `;` and needs nothing.
+        KeyBase::Char(';') if !chord.has_modifiers() => "\\;".to_owned(),
+        KeyBase::Char(c) => c.to_string(),
     };
-    Ok(mapped)
+    let mut key = String::new();
+    for (on, prefix) in [(chord.ctrl, "C-"), (chord.alt, "M-"), (chord.shift, "S-")] {
+        if on {
+            key.push_str(prefix);
+        }
+    }
+    key.push_str(&base);
+    Ok(key)
+}
+
+fn tmux_named(key: NamedKey) -> std::borrow::Cow<'static, str> {
+    std::borrow::Cow::Borrowed(match key {
+        NamedKey::Enter => "Enter",
+        NamedKey::Esc => "Escape",
+        NamedKey::Tab => "Tab",
+        NamedKey::Backspace => "BSpace",
+        NamedKey::Space => "Space",
+        NamedKey::Up => "Up",
+        NamedKey::Down => "Down",
+        NamedKey::Left => "Left",
+        NamedKey::Right => "Right",
+        NamedKey::Home => "Home",
+        NamedKey::End => "End",
+        NamedKey::PageUp => "PPage",
+        NamedKey::PageDown => "NPage",
+        NamedKey::Insert => "IC",
+        NamedKey::Delete => "DC",
+        NamedKey::F(number) => return std::borrow::Cow::Owned(format!("F{number}")),
+    })
 }
 
 fn parse_rows(
@@ -1757,12 +1850,133 @@ mod tests {
         // unrecognised name is not an error to tmux at all -- `send-keys`
         // types it, so passing `shift+tab` through would put those nine
         // characters in the pane.
-        assert_eq!(tmux_key("shift+tab").unwrap(), "BTab");
-        assert_eq!(tmux_key("Shift+Tab").unwrap(), "BTab");
-        assert_eq!(tmux_key("tab").unwrap(), "Tab");
-        // Still refused, rather than guessed at from the `shift+` prefix.
-        assert!(tmux_key("shift+enter").is_err());
-        assert!(tmux_key("shift+f5").is_err());
+        assert_eq!(tmux_key("shift+tab", false).unwrap(), "BTab");
+        assert_eq!(tmux_key("Shift+Tab", false).unwrap(), "BTab");
+        assert_eq!(tmux_key("tab", false).unwrap(), "Tab");
+        // With extended keys too: `S-Tab` would still be the wrong key.
+        assert_eq!(tmux_key("shift+tab", true).unwrap(), "BTab");
+        // Other shift chords need extended keys, and say so.
+        assert!(matches!(
+            tmux_key("shift+enter", false),
+            Err(BackendError::KeyUnsupported(_))
+        ));
+        assert!(tmux_key("shift+f5", false).is_err());
+    }
+
+    #[test]
+    fn every_base_reaches_tmux_under_its_own_name() {
+        let expected = [
+            ("enter", "Enter"),
+            ("esc", "Escape"),
+            ("tab", "Tab"),
+            ("backspace", "BSpace"),
+            ("space", "Space"),
+            ("up", "Up"),
+            ("down", "Down"),
+            ("left", "Left"),
+            ("right", "Right"),
+            ("home", "Home"),
+            ("end", "End"),
+            ("pageup", "PPage"),
+            ("pagedown", "NPage"),
+            ("insert", "IC"),
+            ("delete", "DC"),
+        ];
+        for (name, tmux) in expected {
+            for extended in [false, true] {
+                assert_eq!(tmux_key(name, extended).unwrap(), tmux, "{name}");
+            }
+        }
+        for number in 1..=12 {
+            assert_eq!(
+                tmux_key(&format!("f{number}"), false).unwrap(),
+                format!("F{number}")
+            );
+        }
+        // The vocabulary tmux advertises is every one of them.
+        let vocabulary = KeyboardVocabulary::new(&NamedKey::ALL, true);
+        for base in &vocabulary.bases {
+            assert!(tmux_key(base, false).is_ok(), "{base}");
+        }
+    }
+
+    #[test]
+    fn modifier_chords_become_tmux_prefixes_in_a_fixed_order() {
+        let cases = [
+            ("ctrl+enter", "C-Enter"),
+            ("shift+enter", "S-Enter"),
+            ("alt+enter", "M-Enter"),
+            ("ctrl+shift+enter", "C-S-Enter"),
+            ("shift+ctrl+enter", "C-S-Enter"),
+            ("ctrl+alt+shift+x", "C-M-S-x"),
+            ("alt+left", "M-Left"),
+            ("ctrl+up", "C-Up"),
+            ("ctrl+shift+home", "C-S-Home"),
+            ("shift+pageup", "S-PPage"),
+            ("ctrl+delete", "C-DC"),
+            ("shift+f5", "S-F5"),
+            ("ctrl+f12", "C-F12"),
+            ("alt+x", "M-x"),
+            ("alt+X", "M-X"),
+            ("ctrl+1", "C-1"),
+            ("alt+;", "M-;"),
+            ("ctrl+tab", "C-Tab"),
+        ];
+        for (name, tmux) in cases {
+            assert_eq!(tmux_key(name, true).unwrap(), tmux, "{name}");
+            // And every one of them is refused without extended keys, with the
+            // fix in the message.
+            match tmux_key(name, false) {
+                Err(BackendError::KeyUnsupported(message)) => {
+                    assert!(
+                        message.contains("tmux set -s extended-keys on"),
+                        "{message}"
+                    );
+                }
+                other => panic!("{name}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_classic_chords_need_no_extended_keys() {
+        let cases = [
+            ("ctrl+a", "C-a"),
+            ("ctrl+C", "C-c"),
+            ("ctrl+[", "C-["),
+            ("ctrl+]", "C-]"),
+            ("ctrl+\\", "C-\\"),
+            ("ctrl+space", "C-Space"),
+            ("shift+tab", "BTab"),
+        ];
+        for (name, tmux) in cases {
+            for extended in [false, true] {
+                assert_eq!(tmux_key(name, extended).unwrap(), tmux, "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_unknown_key_is_a_key_unsupported_error() {
+        for name in ["hyper+a", "f13", "ctrl+", "pgup", "C-Enter"] {
+            assert!(
+                matches!(tmux_key(name, true), Err(BackendError::KeyUnsupported(_))),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn extended_keys_are_read_from_the_version_and_the_option() {
+        assert_eq!(tmux_version("3.7c"), Some((3, 7)));
+        assert_eq!(tmux_version("3.2"), Some((3, 2)));
+        assert_eq!(tmux_version("next-3.6"), Some((3, 6)));
+        assert_eq!(tmux_version("master"), None);
+        assert!(tmux_version("3.1c") < Some((3, 2)));
+        assert!(extended_keys_enabled("extended-keys on\n"));
+        assert!(extended_keys_enabled("extended-keys always"));
+        assert!(!extended_keys_enabled("extended-keys off"));
+        assert!(!extended_keys_enabled(""));
     }
 
     #[test]
@@ -2044,13 +2258,13 @@ mod tests {
 
     #[test]
     fn mobile_key_names_are_mapped_without_becoming_tmux_options() {
-        assert_eq!(tmux_key("Enter").unwrap(), "Enter");
-        assert_eq!(tmux_key("ctrl+c").unwrap(), "C-c");
-        assert_eq!(tmux_key("ctrl+[").unwrap(), "C-[");
-        assert_eq!(tmux_key("ctrl+]").unwrap(), "C-]");
-        assert_eq!(tmux_key("ArrowUp").unwrap(), "Up");
-        assert!(tmux_key("-t").is_err());
-        assert!(tmux_key("C-x;kill-server").is_err());
+        assert_eq!(tmux_key("Enter", false).unwrap(), "Enter");
+        assert_eq!(tmux_key("ctrl+c", false).unwrap(), "C-c");
+        assert_eq!(tmux_key("ctrl+[", false).unwrap(), "C-[");
+        assert_eq!(tmux_key("ctrl+]", false).unwrap(), "C-]");
+        assert_eq!(tmux_key("ArrowUp", false).unwrap(), "Up");
+        assert!(tmux_key("-t", false).is_err());
+        assert!(tmux_key("C-x;kill-server", false).is_err());
     }
 
     /// A bare `;` argument ends the command tmux is currently reading, so a
@@ -2065,7 +2279,7 @@ mod tests {
     /// is the part a person actually meets.
     #[test]
     fn a_semicolon_is_escaped_so_tmux_types_it_instead_of_reading_a_command() {
-        assert_eq!(tmux_key(";").unwrap(), "\\;");
+        assert_eq!(tmux_key(";", false).unwrap(), "\\;");
     }
 
     /// Every other printable ASCII character is passed through untouched.
@@ -2079,7 +2293,7 @@ mod tests {
                 continue;
             }
             assert_eq!(
-                tmux_key(&key).unwrap(),
+                tmux_key(&key, false).unwrap(),
                 key,
                 "{key:?} should reach tmux as itself"
             );

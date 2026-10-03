@@ -3808,4 +3808,33 @@ mod tests {
 
         assert_eq!(served, screens.last().unwrap().as_str());
     }
+
+    /// A key the backend cannot deliver is the caller's mistake, said plainly:
+    /// a 400 naming the key, never the 502 that reads as a broken backend, and
+    /// nothing reaches the pane.
+    #[tokio::test]
+    async fn a_key_the_backend_cannot_send_is_a_clean_400() {
+        let herdr = FakeHerdr::start(vec![""], None);
+        let session = herdr.session();
+        for keys in [vec!["home"], vec!["enter", "hyper+x"]] {
+            let keys: Vec<String> = keys.into_iter().map(str::to_owned).collect();
+            let (status, Json(body)) = send_pane_keys(&session, "w1:p1", &keys)
+                .await
+                .expect_err("refused");
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body["error"]["code"], "key_unsupported");
+        }
+        assert!(herdr.enters().is_empty(), "nothing may be typed");
+
+        // The vocabulary itself goes through, in herdr's spelling.
+        let keys: Vec<String> = ["ctrl+enter", "Shift+Enter", "escape", " "]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        send_pane_keys(&session, "w1:p1", &keys).await.unwrap();
+        assert_eq!(
+            herdr.enters()[0]["params"]["keys"],
+            json!(["ctrl+enter", "shift+enter", "esc", "space"])
+        );
+    }
 }

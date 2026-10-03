@@ -6,6 +6,8 @@ use std::pin::Pin;
 use serde::{Deserialize, Serialize};
 use tokio_stream::Stream;
 
+use super::keys::KeyboardVocabulary;
+
 macro_rules! opaque_id {
     ($name:ident) => {
         #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -350,6 +352,9 @@ pub enum BackendError {
         code: Option<String>,
         message: String,
     },
+    /// A `send-keys` entry this backend cannot deliver. The message names the
+    /// key and, where there is one, the fix; it is safe to show the caller.
+    KeyUnsupported(String),
 }
 
 impl fmt::Display for BackendError {
@@ -367,6 +372,7 @@ impl fmt::Display for BackendError {
                 Some(code) => write!(formatter, "terminal backend refused ({code}): {message}"),
                 None => write!(formatter, "terminal backend refused: {message}"),
             },
+            Self::KeyUnsupported(message) => formatter.write_str(message),
         }
     }
 }
@@ -439,6 +445,18 @@ pub trait TerminalBackend: Send + Sync {
         mode: SendTextMode,
     ) -> BackendFuture<'a, ()>;
     fn send_keys<'a>(&'a self, id: &'a PaneId, keys: &'a [String]) -> BackendFuture<'a, ()>;
+    /// The key names `send_keys` can deliver on this backend, as discovery
+    /// advertises them. `metadata` is the answer `metadata()` just gave, so a
+    /// backend need not ask its server for its version twice.
+    ///
+    /// `None` for a backend that has not described its keyboard: discovery
+    /// then omits the field and the app keeps its own legacy check.
+    fn keyboard<'a>(
+        &'a self,
+        _metadata: &'a BackendMetadata,
+    ) -> BackendFuture<'a, Option<KeyboardVocabulary>> {
+        Box::pin(async { Ok(None) })
+    }
     fn focus_agent<'a>(&'a self, target: &'a str) -> BackendFuture<'a, ()>;
     fn prompt_agent<'a>(&'a self, target: &'a str, text: &'a str) -> BackendFuture<'a, ()>;
     /// A backend decides whether its prompt operation needs the legacy Enter
