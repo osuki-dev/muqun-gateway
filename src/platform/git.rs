@@ -27,6 +27,7 @@
 //! whatever repository the gateway happened to be started from.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -1359,17 +1360,25 @@ fn command(cwd: &Path) -> Command {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_PAGER", "cat")
-        .env("LC_ALL", "C")
         .kill_on_drop(true);
+    // Nothing of the gateway's own git environment reaches the child: an
+    // inherited `GIT_DIR` or `GIT_COMMON_DIR` would point it at another
+    // repository, `GIT_GLOB_PATHSPECS` would undo `--literal-pathspecs`, and
+    // `GIT_CONFIG_*` would smuggle settings past the `-c` flags above. The
+    // terminal multiplexer variables are dropped so a hook cannot tell it is
+    // running under one.
+    scrub_env(&mut cmd, std::env::vars_os().map(|(name, _)| name));
+    cmd
+}
+
+/// Remove every inherited `GIT_*` variable, then set the few git settings
+/// the gateway relies on. `inherited` is the parent's environment, passed in
+/// so a test can hand over a synthetic one.
+fn scrub_env(cmd: &mut Command, inherited: impl Iterator<Item = OsString>) {
+    for name in inherited.filter(|name| name.as_encoded_bytes().starts_with(b"GIT_")) {
+        cmd.env_remove(name);
+    }
     for name in [
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_INDEX_FILE",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
         "TMUX",
         "HERDR_SESSION",
         "HERDR_SOCKET_PATH",
@@ -1381,7 +1390,10 @@ fn command(cwd: &Path) -> Command {
     ] {
         cmd.env_remove(name);
     }
-    cmd
+    cmd.env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_PAGER", "cat")
+        .env("LC_ALL", "C");
 }
 
 /// Run one git command with the fixed prefix, a timeout and a stdout cap.
@@ -1781,6 +1793,55 @@ fn page_lines(text: &str, from: usize, lines: usize) -> (usize, usize, usize, bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scrub_env_drops_every_inherited_git_variable_and_keeps_the_gateway_ones() {
+        use std::ffi::OsStr;
+        let mut cmd = Command::new("git");
+        scrub_env(
+            &mut cmd,
+            [
+                "GIT_DIR",
+                "GIT_COMMON_DIR",
+                "GIT_GLOB_PATHSPECS",
+                "GIT_CONFIG_COUNT",
+                "GIT_CONFIG_KEY_0",
+                "PATH",
+                "HOME",
+            ]
+            .into_iter()
+            .map(OsString::from),
+        );
+        let envs: std::collections::HashMap<_, _> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| (k.to_os_string(), v.map(|v| v.to_os_string())))
+            .collect();
+        for removed in [
+            "GIT_DIR",
+            "GIT_COMMON_DIR",
+            "GIT_GLOB_PATHSPECS",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_0",
+        ] {
+            assert_eq!(
+                envs.get(OsStr::new(removed)),
+                Some(&None),
+                "{removed} must be removed"
+            );
+        }
+        assert!(!envs.contains_key(OsStr::new("PATH")));
+        assert!(!envs.contains_key(OsStr::new("HOME")));
+        assert_eq!(
+            envs.get(OsStr::new("GIT_OPTIONAL_LOCKS")),
+            Some(&Some(OsString::from("0")))
+        );
+        assert_eq!(
+            envs.get(OsStr::new("GIT_TERMINAL_PROMPT")),
+            Some(&Some(OsString::from("0")))
+        );
+    }
+
     use crate::{
         bearer_headers, git_test_repo, pane_context, pane_git_diff, pane_git_status,
         remember_pane_root, unreachable_state, GitDiffQuery, CONTENT_SCHEMA_VERSION,
