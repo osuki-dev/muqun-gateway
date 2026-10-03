@@ -848,7 +848,9 @@ selects nothing at all).
 ```
 
 - `working`: index and working tree against `HEAD`, plus every untracked file
-  (each file, not its directory).
+  (each file, not its directory). `base` still names the default branch a
+  `branch` list would compare with, when there is one, so a client can offer
+  that scope without asking for it first.
 - `branch`: everything since the merge-base with the default branch, committed
   or not, plus untracked files. The default branch is `origin/HEAD` when the
   clone recorded it, then `main`, `master`, `origin/main`, `origin/master`:

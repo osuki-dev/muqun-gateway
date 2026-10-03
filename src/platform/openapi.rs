@@ -657,7 +657,7 @@ pub fn openapi_spec() -> Value {
                     "summary": "List the files changed in this agent session's git checkout, with line totals and no patches. data: { vcs: \"git\"|null, reason: null|\"not_a_repository\"|\"no_default_branch\", mode, base?, truncated, files: [{ path, old_path?, status: added|modified|deleted|renamed|untracked|copied|typechange|conflicted, additions (null when an untracked file was not counted), deletions, binary }] }. At most 2000 files. 400 invalid_mode, 501 git_missing, 502 git_failed, 504 git_timeout",
                     "parameters": [
                         path_param("asid"),
-                        query_param("mode", "working (default): index and working tree against HEAD, plus untracked files. branch: everything since the merge-base with the default branch (origin/HEAD, else main, master, origin/main, origin/master: the first sharing history with HEAD), plus untracked files; base names the ref, and reason is no_default_branch when none was found")
+                        query_param("mode", "working (default): index and working tree against HEAD, plus untracked files. branch: everything since the merge-base with the default branch (origin/HEAD, else main, master, origin/main, origin/master: the first sharing history with HEAD), plus untracked files; base names the ref, and reason is no_default_branch when none was found. A working list also carries base when a default branch exists, so a client can offer the branch comparison up front")
                     ],
                     "responses": ok_response()
                 }

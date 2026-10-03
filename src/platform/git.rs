@@ -518,7 +518,8 @@ impl VcsFile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangedFiles {
     pub mode: VcsMode,
-    /// The default-branch ref a `branch` list is measured from.
+    /// The default-branch ref a `branch` list is measured from; a `working`
+    /// list names the one a `branch` list would use, when there is one.
     pub base: Option<String>,
     /// `no_default_branch` for a `branch` list that found no base and is
     /// therefore the working list.
@@ -595,6 +596,17 @@ pub async fn repository_root(cwd: &Path) -> Result<Option<PathBuf>, GitError> {
 /// small; at most [`MAX_STATUS_FILES`] entries, cut before any file is read.
 pub async fn changed_files(toplevel: &Path, mode: VcsMode) -> Result<ChangedFiles, GitError> {
     let listing = list_rows(toplevel, mode, None).await?;
+    // A working list still names the default branch, so the phone knows a
+    // `branch` comparison exists before asking for one. Best effort: a slow
+    // or failing lookup leaves `base` out rather than failing the list.
+    let default_base = match (mode, &listing.base) {
+        (VcsMode::Working, None) => branch_base(toplevel)
+            .await
+            .ok()
+            .flatten()
+            .map(|base| base.name),
+        _ => None,
+    };
     let revision = listing
         .base
         .as_ref()
@@ -608,7 +620,7 @@ pub async fn changed_files(toplevel: &Path, mode: VcsMode) -> Result<ChangedFile
     count_untracked(toplevel, &mut files).await;
     Ok(ChangedFiles {
         mode,
-        base: listing.base.map(|base| base.name),
+        base: listing.base.map(|base| base.name).or(default_base),
         reason: listing.no_default_branch.then_some("no_default_branch"),
         files,
         truncated: listing.truncated || capped,
@@ -2473,7 +2485,7 @@ mod tests {
         let repo = changes_repo("vcs-files");
         let changes = changed_files(&repo, VcsMode::Working).await.unwrap();
         assert_eq!(changes.mode, VcsMode::Working);
-        assert_eq!(changes.base, None);
+        assert_eq!(changes.base.as_deref(), Some("main"));
         assert_eq!(changes.reason, None);
         assert!(!changes.truncated);
         let files = by_path(&changes);
@@ -2502,7 +2514,7 @@ mod tests {
         assert_eq!(json["vcs"], "git");
         assert!(json["reason"].is_null());
         assert_eq!(json["mode"], "working");
-        assert!(json.get("base").is_none());
+        assert_eq!(json["base"], "main");
         let rows = json["files"].as_array().unwrap();
         let renamed = rows.iter().find(|file| file["path"] == "docs.md").unwrap();
         assert_eq!(renamed["old_path"], "README.md");
@@ -2748,11 +2760,14 @@ mod tests {
         assert!(patch.patch.contains("+a\n+b\n+c\n"), "{}", patch.patch);
         assert_eq!(patch.file.additions, Some(3));
 
-        // The working list does not see the commit.
+        // The working list does not see the commit, but it still names the
+        // default branch so the phone can offer the comparison.
         let working = changed_files(&repo, VcsMode::Working).await.unwrap();
         let files = by_path(&working);
         assert_eq!(files["feature.ts"].status, VcsStatus::Modified);
         assert_eq!(files["feature.ts"].additions, Some(1));
+        assert_eq!(working.base.as_deref(), Some("main"));
+        assert_eq!(working.reason, None);
 
         // A recorded `origin/HEAD` wins over the local fallbacks.
         let main = rev_parse(&repo, "main");
