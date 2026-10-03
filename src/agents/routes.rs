@@ -1073,7 +1073,9 @@ fn vcs_mode(mode: Option<&str>) -> ApiResult<git::VcsMode> {
 
 /// The checkout an agent session works in: `None` when the session has no
 /// directory or its directory is in no checkout. A directory that has been
-/// deleted is `404 workspace_missing`, as on every directory-scoped route.
+/// deleted is `404 workspace_missing`, as on every directory-scoped route; an
+/// agent that cannot say where the session is, or a git that cannot answer,
+/// is an error rather than "not a repository".
 async fn agent_session_checkout(
     state: &AppState,
     asid: &str,
@@ -1083,14 +1085,16 @@ async fn agent_session_checkout(
         .agent()
         .get_session(asid)
         .await
-        .ok()
-        .and_then(|info| info.directory)
+        .map_err(agent_error)?
+        .directory
         .filter(|directory| !directory.trim().is_empty());
     require_directory(directory.as_deref())?;
     let Some(directory) = directory else {
         return Ok(None);
     };
-    Ok(git::toplevel(std::path::Path::new(&directory)).await)
+    git::repository_root(std::path::Path::new(&directory))
+        .await
+        .map_err(git_error)
 }
 
 fn unknown_path() -> (StatusCode, Json<Value>) {
@@ -1098,6 +1102,14 @@ fn unknown_path() -> (StatusCode, Json<Value>) {
         StatusCode::NOT_FOUND,
         "unknown_path",
         "No changed or tracked file has this path",
+    )
+}
+
+fn outside_repository() -> (StatusCode, Json<Value>) {
+    api_error(
+        StatusCode::FORBIDDEN,
+        "path_outside_repository",
+        "The path leads outside the repository",
     )
 }
 
@@ -1169,17 +1181,29 @@ async fn discard_agent_vcs_file(
         .await
         .map_err(|err| match err {
             git::DiscardError::UnknownPath => unknown_path(),
-            git::DiscardError::OutsideRepository => api_error(
+            git::DiscardError::OutsideRepository => outside_repository(),
+            git::DiscardError::RepositoryIsHome => api_error(
                 StatusCode::FORBIDDEN,
-                "path_outside_repository",
-                "The path leads outside the repository",
+                "repository_is_home",
+                "This repository is the home directory; discard is refused there",
+            ),
+            git::DiscardError::ListingTruncated => api_error(
+                StatusCode::CONFLICT,
+                "listing_truncated",
+                "git's answer was cut short, so this file cannot be discarded safely",
             ),
             git::DiscardError::Git(err) => git_error(err),
             git::DiscardError::Io(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 unknown_path()
             }
+            // A directory on the way became a symlink after it was checked.
+            git::DiscardError::Io(err)
+                if matches!(err.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) =>
+            {
+                outside_repository()
+            }
             git::DiscardError::Io(err) => {
-                tracing::warn!(asid, path = %body.path, "discard failed: {err}");
+                tracing::warn!(asid, path = ?body.path, "discard failed: {err}");
                 api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "discard_failed",
@@ -1189,7 +1213,7 @@ async fn discard_agent_vcs_file(
         })?;
     tracing::info!(
         asid,
-        path = %body.path,
+        path = ?body.path,
         action = action.as_str(),
         "discarded an agent session change"
     );
@@ -3638,6 +3662,7 @@ mod tests {
         let Json(answer) = files("ses_git", None).await.expect("lists");
         let data = &answer["data"];
         assert_eq!(data["vcs"], "git");
+        assert!(data["reason"].is_null());
         assert_eq!(data["mode"], "working");
         assert_eq!(data["truncated"], false);
         let list = data["files"].as_array().unwrap();
@@ -3685,7 +3710,7 @@ mod tests {
             .unwrap()
             .contains("\n-const b = 2;\n+const B = 2;\n"));
 
-        for unknown in ["nope.txt", "../x", "/etc/passwd"] {
+        for unknown in ["nope.txt", "../x", "/etc/passwd", "*", "src"] {
             let refusal = file(file_query(None, unknown))
                 .await
                 .expect_err("not a change");
@@ -3743,7 +3768,8 @@ mod tests {
         assert_eq!(deleted["data"]["action"], "deleted");
         assert!(!repo.join("notes.md").exists());
 
-        for unknown in ["nope.txt", "../x"] {
+        // Already restored, a glob, a directory: none is a row of the list.
+        for unknown in ["nope.txt", "../x", "src/a.ts", "*", "src"] {
             let refusal = discard(unknown, device_headers())
                 .await
                 .expect_err("unknown");
