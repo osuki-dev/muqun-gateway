@@ -1078,6 +1078,13 @@ impl TerminalBackend for TmuxBackend {
         })
     }
 
+    fn pane_extended_keys<'a>(&'a self, id: &'a PaneId) -> BackendFuture<'a, Option<bool>> {
+        Box::pin(async move {
+            validate_tmux_id(id.as_str(), '%', "pane")?;
+            Ok(Some(self.pane_keys(id.as_str()).await.delivers_chords()))
+        })
+    }
+
     fn focus_agent<'a>(&'a self, target: &'a str) -> BackendFuture<'a, ()> {
         Box::pin(async move { self.focus_pane(&PaneId::new(target)).await })
     }
@@ -1350,6 +1357,13 @@ impl PaneKeys {
             extended: version >= Some((3, 2)) && matches!(option, "on" | "always"),
             legacy_pane: option != "always" && mode == "VT10x",
         }
+    }
+
+    /// Whether every chord reaches the pane with its modifiers: the server
+    /// has extended keys, and either it is set to `always` or the program in
+    /// the pane has asked for them (its key mode is not `VT10x`).
+    fn delivers_chords(self) -> bool {
+        self.extended && !self.legacy_pane
     }
 }
 
@@ -2066,6 +2080,19 @@ mod tests {
         assert_eq!(parse("3.1c|on|"), keys(false, false));
         assert_eq!(parse("3.2a||"), keys(false, false));
         assert_eq!(parse(""), keys(false, false));
+
+        // What the shortcuts response reports per pane.
+        for (probe, delivers) in [
+            ("3.7c|always|VT10x", true),
+            ("3.7c|on|Ext 2", true),
+            ("3.7c|on|Ext 1", true),
+            ("3.7c|on|VT10x", false),
+            ("3.7c|off|Ext 2", false),
+            ("3.1c|on|", false),
+            ("", false),
+        ] {
+            assert_eq!(parse(probe).delivers_chords(), delivers, "{probe}");
+        }
     }
 
     /// The pane's own key mode decides whether a chord can be sent at all:

@@ -457,6 +457,16 @@ pub trait TerminalBackend: Send + Sync {
     ) -> BackendFuture<'a, Option<KeyboardVocabulary>> {
         Box::pin(async { Ok(None) })
     }
+    /// Whether a modifier chord outside the classic set reaches this pane
+    /// with its modifiers, given what the program in it has asked for right
+    /// now. The pane-level half of [`KeyboardVocabulary::extended`]: a client
+    /// combines the two before drawing a chord.
+    ///
+    /// `None` for a backend that cannot tell; the shortcuts response then
+    /// omits the field.
+    fn pane_extended_keys<'a>(&'a self, _id: &'a PaneId) -> BackendFuture<'a, Option<bool>> {
+        Box::pin(async { Ok(None) })
+    }
     fn focus_agent<'a>(&'a self, target: &'a str) -> BackendFuture<'a, ()>;
     fn prompt_agent<'a>(&'a self, target: &'a str, text: &'a str) -> BackendFuture<'a, ()>;
     /// A backend decides whether its prompt operation needs the legacy Enter

@@ -394,7 +394,12 @@ pub fn openapi_spec() -> Value {
                 }
             },
             "/api/sessions/{sessionId}/panes/{paneId}/shortcuts": {
-                "get": resource_endpoint("Key row and slash commands for a pane", "paneId")
+                "get": {
+                    "summary": "Key row and slash commands for a pane",
+                    "description": "`version` is the keymap table version (8). `keys` is the key row, one physical key per entry; `keyActions` holds multi-key sequences and text actions (e.g. Claude Code's newline, `sequence:newline` = [\"\\\\\", \"enter\"]), which older apps ignore. `keyboard.extended` is pane state, not table state, so it does not move `version` but is part of the body and therefore of the ETag: whether a modifier chord outside the classic set reaches this pane right now. On tmux it is true when the server's extended-keys is always, or on and the program in the pane has asked for extended keys (its key mode is not VT10x); on herdr it is always true. A client combines it with the backend's discovery `keyboard.extended` before drawing a chord. Absent when the backend cannot tell.",
+                    "parameters": [path_param("sessionId"), path_param("paneId")],
+                    "responses": ok_response()
+                }
             },
             "/api/sessions/{sessionId}/agents": { "get": session_endpoint("List agents") },
             "/api/sessions/{sessionId}/agents/{target}": { "get": resource_endpoint("Get an agent", "target") },
@@ -791,7 +796,7 @@ fn keyboard_schema() -> Value {
         "required": ["version", "bases", "modifiers", "extended"],
         "properties": {
             "version": { "type": "integer", "const": 1 },
-            "bases": { "type": "array", "items": { "type": "string" }, "description": "Named keys deliverable on their own: enter, esc, tab, backspace, space, up, down, left, right, home, end, pageup, pagedown, insert, delete, f1..f12 (herdr has no home/end/pageup/pagedown/insert/delete)" },
+            "bases": { "type": "array", "items": { "type": "string" }, "description": "Named keys deliverable on their own: enter, esc, tab, backspace, space, up, down, left, right, home, end, pageup, pagedown, insert, delete, f1..f12. herdr delivers home/end/pageup/pagedown/insert/delete as typed vt220/xterm bytes, since its own key names lack them" },
             "modifiers": { "type": "array", "items": { "type": "string", "enum": ["ctrl", "alt", "shift"] } },
             "extended": { "type": "boolean", "description": "Whether modifier + special-key chords beyond the classic set reach the pane" }
         }

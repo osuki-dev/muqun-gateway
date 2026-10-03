@@ -255,6 +255,36 @@ impl KeyChord {
         }
         name
     }
+
+    /// The bytes a vt220/xterm keyboard sends for a key of the editing block
+    /// (`home`, `end`, `pageup`, `pagedown`, `insert`, `delete`), modifiers
+    /// included; `None` for any other key. For a backend whose own key names
+    /// stop short of this block (herdr), which then types the bytes instead.
+    ///
+    /// Plain keys use the vt220 `CSI n ~` spellings, which readline, nvim,
+    /// less and the agent TUIs read whatever the cursor-key mode. A modifier
+    /// becomes xterm's parameter `m` = 1 + shift 1 + alt 2 + ctrl 4: `CSI 1;m H`
+    /// and `CSI 1;m F` for home and end, `CSI n;m ~` for the rest.
+    pub fn editing_sequence(&self) -> Option<String> {
+        let KeyBase::Named(key) = self.base else {
+            return None;
+        };
+        let (code, final_letter) = match key {
+            NamedKey::Home => (1, Some('H')),
+            NamedKey::End => (4, Some('F')),
+            NamedKey::Insert => (2, None),
+            NamedKey::Delete => (3, None),
+            NamedKey::PageUp => (5, None),
+            NamedKey::PageDown => (6, None),
+            _ => return None,
+        };
+        let modifier = 1 + u8::from(self.shift) + 2 * u8::from(self.alt) + 4 * u8::from(self.ctrl);
+        Some(match (modifier, final_letter) {
+            (1, _) => format!("\x1b[{code}~"),
+            (modifier, Some(letter)) => format!("\x1b[1;{modifier}{letter}"),
+            (modifier, None) => format!("\x1b[{code};{modifier}~"),
+        })
+    }
 }
 
 fn single_printable(value: &str) -> Option<char> {
@@ -347,6 +377,36 @@ mod tests {
             "ctrl+tab",
         ] {
             assert!(!chord(value).is_classic(), "{value}");
+        }
+    }
+
+    #[test]
+    fn the_editing_block_has_its_vt220_and_xterm_bytes() {
+        for (value, bytes) in [
+            ("home", "\x1b[1~"),
+            ("end", "\x1b[4~"),
+            ("pageup", "\x1b[5~"),
+            ("pagedown", "\x1b[6~"),
+            ("insert", "\x1b[2~"),
+            ("delete", "\x1b[3~"),
+            ("shift+home", "\x1b[1;2H"),
+            ("alt+end", "\x1b[1;3F"),
+            ("ctrl+home", "\x1b[1;5H"),
+            ("ctrl+shift+end", "\x1b[1;6F"),
+            ("ctrl+alt+shift+home", "\x1b[1;8H"),
+            ("shift+pageup", "\x1b[5;2~"),
+            ("ctrl+pagedown", "\x1b[6;5~"),
+            ("alt+insert", "\x1b[2;3~"),
+            ("ctrl+delete", "\x1b[3;5~"),
+        ] {
+            assert_eq!(
+                chord(value).editing_sequence().as_deref(),
+                Some(bytes),
+                "{value}"
+            );
+        }
+        for value in ["enter", "up", "f5", "a", "ctrl+a", "ctrl+up", "space"] {
+            assert_eq!(chord(value).editing_sequence(), None, "{value}");
         }
     }
 

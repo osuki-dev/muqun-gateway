@@ -396,6 +396,13 @@ impl TerminalBackend for TmuxWireIds {
         self.inner.keyboard(metadata)
     }
 
+    fn pane_extended_keys<'a>(&'a self, id: &'a PaneId) -> BackendFuture<'a, Option<bool>> {
+        Box::pin(async move {
+            let native = decode_wire(id.as_str(), "pane")?;
+            self.inner.pane_extended_keys(&PaneId::new(native)).await
+        })
+    }
+
     fn probe_reachable(&self) -> BackendFuture<'_, bool> {
         // No id on either side of this call -- nothing to translate, just
         // forward to the wrapped tmux backend's own answer.

@@ -1,36 +1,29 @@
-/// The named keys herdr's `pane.send_keys` accepts.
+/// How a `send-keys` request reaches herdr: its own key names through
+/// `pane.send_keys`, and the editing block as typed bytes through
+/// `pane.send_text`.
 ///
-/// Established against herdr 0.9.1 by sending each name to a scratch pane in
-/// a session of its own, followed by a name herdr cannot know: herdr validates
-/// every key before writing any, so the error names the first unknown key and
-/// nothing is typed. `home`, `end`, `pageup`, `pagedown`, `insert` and
-/// `delete` come back `invalid_key` under every spelling tried (`Home`,
-/// `PageUp`, `pgup`, `page_up`, `del`, `ins`, `ic`, `dc`, ...); everything
-/// else in the vocabulary is accepted under the app's own spelling, with
-/// `ctrl`, `alt` and `shift` in any combination.
-const HERDR_BASES: [NamedKey; 21] = [
-    NamedKey::Enter,
-    NamedKey::Esc,
-    NamedKey::Tab,
-    NamedKey::Backspace,
-    NamedKey::Space,
-    NamedKey::Up,
-    NamedKey::Down,
-    NamedKey::Left,
-    NamedKey::Right,
-    NamedKey::F(1),
-    NamedKey::F(2),
-    NamedKey::F(3),
-    NamedKey::F(4),
-    NamedKey::F(5),
-    NamedKey::F(6),
-    NamedKey::F(7),
-    NamedKey::F(8),
-    NamedKey::F(9),
-    NamedKey::F(10),
-    NamedKey::F(11),
-    NamedKey::F(12),
-];
+/// herdr 0.9.1's `pane.send_keys` takes every key of the vocabulary under the
+/// app's own spelling, with `ctrl`, `alt` and `shift` in any combination --
+/// except `home`, `end`, `pageup`, `pagedown`, `insert` and `delete`, which
+/// come back `invalid_key` under every spelling tried (`Home`, `PageUp`,
+/// `pgup`, `page_up`, `del`, `ins`, `ic`, `dc`, ...). Established by sending
+/// each name to a scratch pane in a session of its own, followed by a name
+/// herdr cannot know: herdr validates every key before writing any, so the
+/// error names the first unknown key and nothing is typed.
+///
+/// Those six go as the bytes a keyboard would have sent
+/// ([`KeyChord::editing_sequence`]) through `pane.send_text`, which types
+/// rather than pastes (see `send_text` below). Measured against 0.9.1 with
+/// `cat -v` in a scratch pane, through this adapter:
+/// `^[[1~^[[4~^[[5~^[[6~^[[2~^[[3~^[[1;5H` for home, end, pageup, pagedown,
+/// insert, delete, ctrl+home. So herdr advertises the whole vocabulary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HerdrInput {
+    /// One `pane.send_keys` call.
+    Keys(Vec<String>),
+    /// One `pane.send_text` call.
+    Text(String),
+}
 
 /// The first herdr whose chords were seen arriving in the pane's own
 /// extended-key protocol: with kitty's disambiguate flag requested, 0.9.1
@@ -39,27 +32,36 @@ const HERDR_BASES: [NamedKey; 21] = [
 /// checked, so they are not claimed.
 const HERDR_EXTENDED_KEYS_MIN: (u64, u64, u64) = (0, 9, 1);
 
-/// One `send-keys` entry in herdr's spelling, which is the app's own.
+/// A `send-keys` request as the herdr calls that deliver it, in order:
+/// consecutive key names share one `pane.send_keys`, consecutive editing-block
+/// keys one `pane.send_text`.
 ///
-/// Parsed here rather than passed through so a name is refused the same way
-/// on both backends, and so the aliases the API has always taken (`escape`,
-/// `ArrowUp`, `Enter`) reach herdr under the one name it knows. A literal
-/// space becomes `space`: herdr trims whitespace before parsing a key name, so
-/// `" "` would be refused.
-fn herdr_key(value: &str) -> Result<String, BackendError> {
-    let chord = KeyChord::parse(value).ok_or_else(|| unknown_key(value))?;
-    if let KeyBase::Named(key) = chord.base {
-        if !HERDR_BASES.contains(&key) {
-            return Err(BackendError::KeyUnsupported(format!(
-                "herdr cannot send {:?}",
-                key.name()
-            )));
+/// Every entry is parsed before anything is sent, so a name is refused the
+/// same way on both backends and nothing reaches the pane. The aliases the API
+/// has always taken (`escape`, `ArrowUp`, `Enter`) reach herdr under the one
+/// name it knows. A literal space becomes `space`: herdr trims whitespace
+/// before parsing a key name, so `" "` would be refused.
+fn herdr_inputs(keys: &[String]) -> Result<Vec<HerdrInput>, BackendError> {
+    let mut inputs: Vec<HerdrInput> = Vec::new();
+    for value in keys {
+        let chord = KeyChord::parse(value).ok_or_else(|| unknown_key(value))?;
+        if let Some(bytes) = chord.editing_sequence() {
+            match inputs.last_mut() {
+                Some(HerdrInput::Text(text)) => text.push_str(&bytes),
+                _ => inputs.push(HerdrInput::Text(bytes)),
+            }
+            continue;
+        }
+        let name = match chord.base {
+            KeyBase::Char(' ') if !chord.has_modifiers() => "space".to_owned(),
+            _ => chord.name(),
+        };
+        match inputs.last_mut() {
+            Some(HerdrInput::Keys(names)) => names.push(name),
+            _ => inputs.push(HerdrInput::Keys(vec![name])),
         }
     }
-    Ok(match chord.base {
-        KeyBase::Char(' ') if !chord.has_modifiers() => "space".to_owned(),
-        _ => chord.name(),
-    })
+    Ok(inputs)
 }
 
 fn herdr_owns_prompt_submission(version: Option<&str>) -> bool {
@@ -646,25 +648,37 @@ impl TerminalBackend for HerdrBackend {
 
     fn send_keys<'a>(&'a self, id: &'a PaneId, keys: &'a [String]) -> BackendFuture<'a, ()> {
         Box::pin(async move {
-            let keys = keys
-                .iter()
-                .map(|key| herdr_key(key))
-                .collect::<Result<Vec<_>, _>>()?;
-            self.command(
-                "pane.send_keys",
-                json!({ "pane_id": id.as_str(), "keys": keys }),
-            )
-            .await
-            .map_err(|error| match error {
-                // Herdr validates every key before writing any, so this is
-                // a clean refusal with nothing typed -- a key it does not
-                // know, which is the caller's to fix, not a backend fault.
-                BackendError::Refused {
-                    code: Some(code),
-                    message,
-                } if code == "invalid_key" => BackendError::KeyUnsupported(message),
-                other => other,
-            })
+            // One call per run, awaited in turn, so the pane sees the keys in
+            // the order they were asked for.
+            for input in herdr_inputs(keys)? {
+                match input {
+                    HerdrInput::Keys(keys) => self
+                        .command(
+                            "pane.send_keys",
+                            json!({ "pane_id": id.as_str(), "keys": keys }),
+                        )
+                        .await
+                        .map_err(|error| match error {
+                            // Herdr validates every key of a call before
+                            // writing any, so this is a clean refusal of that
+                            // call -- a key it does not know, which is the
+                            // caller's to fix, not a backend fault.
+                            BackendError::Refused {
+                                code: Some(code),
+                                message,
+                            } if code == "invalid_key" => BackendError::KeyUnsupported(message),
+                            other => other,
+                        })?,
+                    HerdrInput::Text(text) => {
+                        self.command(
+                            "pane.send_text",
+                            json!({ "pane_id": id.as_str(), "text": text }),
+                        )
+                        .await?
+                    }
+                }
+            }
+            Ok(())
         })
     }
 
@@ -674,7 +688,14 @@ impl TerminalBackend for HerdrBackend {
     ) -> BackendFuture<'a, Option<KeyboardVocabulary>> {
         let extended =
             super::model::version_at_least(metadata.version.as_deref(), HERDR_EXTENDED_KEYS_MIN);
-        Box::pin(async move { Ok(Some(KeyboardVocabulary::new(&HERDR_BASES, extended))) })
+        Box::pin(async move { Ok(Some(KeyboardVocabulary::new(&NamedKey::ALL, extended))) })
+    }
+
+    fn pane_extended_keys<'a>(&'a self, _id: &'a PaneId) -> BackendFuture<'a, Option<bool>> {
+        // herdr encodes a chord itself, in whatever protocol the program in
+        // the pane asked for; there is no per-pane state that drops a
+        // modifier the way tmux's `VT10x` does.
+        Box::pin(async { Ok(Some(true)) })
     }
 
     fn focus_agent<'a>(&'a self, target: &'a str) -> BackendFuture<'a, ()> {
@@ -2119,7 +2140,10 @@ mod tests {
     }
 
     #[test]
-    fn herdr_takes_the_vocabulary_except_the_editing_block() {
+    fn herdr_takes_the_whole_vocabulary() {
+        let inputs = |names: &[&str]| {
+            herdr_inputs(&names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>())
+        };
         for (name, herdr) in [
             ("ctrl+enter", "ctrl+enter"),
             ("shift+ctrl+enter", "ctrl+shift+enter"),
@@ -2130,22 +2154,44 @@ mod tests {
             ("ctrl+\\", "ctrl+\\"),
             (" ", "space"),
         ] {
-            assert_eq!(herdr_key(name).unwrap(), herdr, "{name}");
-        }
-        for name in [
-            "home",
-            "end",
-            "pageup",
-            "pagedown",
-            "insert",
-            "delete",
-            "ctrl+home",
-        ] {
-            assert!(
-                matches!(herdr_key(name), Err(BackendError::KeyUnsupported(_))),
+            assert_eq!(
+                inputs(&[name]).unwrap(),
+                [HerdrInput::Keys(vec![herdr.to_owned()])],
                 "{name}"
             );
         }
+        // The editing block is typed, as one run per stretch of such keys,
+        // between the named keys around it.
+        assert_eq!(
+            inputs(&[
+                "home",
+                "end",
+                "pageup",
+                "pagedown",
+                "insert",
+                "delete",
+                "ctrl+home"
+            ])
+            .unwrap(),
+            [HerdrInput::Text(
+                "\x1b[1~\x1b[4~\x1b[5~\x1b[6~\x1b[2~\x1b[3~\x1b[1;5H".to_owned()
+            )]
+        );
+        assert_eq!(
+            inputs(&["a", "b", "shift+end", "Delete", "enter", "alt+pageup"]).unwrap(),
+            [
+                HerdrInput::Keys(vec!["a".to_owned(), "b".to_owned()]),
+                HerdrInput::Text("\x1b[1;2F\x1b[3~".to_owned()),
+                HerdrInput::Keys(vec!["enter".to_owned()]),
+                HerdrInput::Text("\x1b[5;3~".to_owned()),
+            ]
+        );
+        assert_eq!(inputs(&[]).unwrap(), []);
+        // One unknown name refuses the whole request.
+        assert!(matches!(
+            inputs(&["home", "hyper+x"]),
+            Err(BackendError::KeyUnsupported(_))
+        ));
         let metadata = |version: &str| BackendMetadata {
             kind: BackendKind::Herdr,
             version: Some(version.to_owned()),
@@ -2164,9 +2210,87 @@ mod tests {
         };
         let current = keyboard("0.9.1");
         assert!(current.extended);
-        assert!(!current.bases.contains(&"home".to_owned()));
-        assert_eq!(current.bases.len(), 21);
+        assert!(current.bases.contains(&"home".to_owned()));
+        assert_eq!(current.bases.len(), 27);
+        assert_eq!(
+            runtime
+                .block_on(backend.pane_extended_keys(&PaneId::new("w1:p1")))
+                .unwrap(),
+            Some(true)
+        );
         assert!(!keyboard("0.9.0").extended);
+    }
+
+    /// The editing block arrives as the bytes a keyboard sends, in order with
+    /// the named keys around it, through a real herdr. Point
+    /// `MUQUN_HERDR_PROBE_SOCKET` at a scratch session's socket (never the
+    /// one you work in): the test makes its own workspace there, runs
+    /// `cat -v` in it, and closes it afterwards.
+    #[tokio::test]
+    #[ignore = "requires a scratch herdr session"]
+    async fn the_editing_block_reaches_a_real_herdr_pane_as_vt_bytes() {
+        let socket = std::env::var("MUQUN_HERDR_PROBE_SOCKET")
+            .expect("MUQUN_HERDR_PROBE_SOCKET names a scratch herdr session's socket");
+        let backend = HerdrBackend::new(&socket);
+        let workspace = backend
+            .create_workspace(&CreateWorkspace {
+                cwd: Some(std::env::temp_dir()),
+                label: Some("muqun-keys-probe".into()),
+                focus: false,
+            })
+            .await
+            .unwrap();
+        let pane = backend
+            .list_panes()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|pane| pane.workspace_id == workspace.id)
+            .unwrap()
+            .id;
+        backend
+            .send_text(&pane, "cat -v", SendTextMode::Keys)
+            .await
+            .unwrap();
+        backend.send_keys(&pane, &["enter".into()]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let keys = [
+            "home",
+            "end",
+            "pageup",
+            "pagedown",
+            "insert",
+            "delete",
+            "ctrl+home",
+            "x",
+            "shift+end",
+            "ctrl+delete",
+            "enter",
+        ]
+        .map(str::to_owned);
+        backend.send_keys(&pane, &keys).await.unwrap();
+        let expected = "^[[1~^[[4~^[[5~^[[6~^[[2~^[[3~^[[1;5Hx^[[1;2F^[[3;5~";
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let screen = loop {
+            let screen = backend
+                .read_pane(&ReadPane {
+                    pane_id: pane.clone(),
+                    source: OutputSource::Visible,
+                    format: OutputFormat::Text,
+                    lines: 50,
+                    start: None,
+                    end: None,
+                })
+                .await
+                .unwrap()
+                .text;
+            if screen.contains(expected) || tokio::time::Instant::now() > deadline {
+                break screen;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        backend.close_workspace(&workspace.id).await.unwrap();
+        assert!(screen.contains(expected), "{screen}");
     }
 
     #[tokio::test]

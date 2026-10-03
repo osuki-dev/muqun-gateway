@@ -305,9 +305,15 @@ Even then, tmux encodes a chord only for a program that asked for it
 program has not, and the chord would arrive as a different key -- `ctrl+enter`
 as a plain Enter, which submits -- `send-keys` answers `400 key_unsupported`
 instead of sending it. Discovery reports what each backend can deliver as
-`planes.terminal.backends[].keyboard`; the app hides keys it cannot press.
-Herdr delivers the chords natively, but has no Home/End/PageUp/PageDown/
-Insert/Delete.
+`planes.terminal.backends[].keyboard`, and a pane's shortcuts response
+carries `keyboard.extended` -- whether chords reach that pane right now -- so
+the app can dim a chord before it is pressed rather than after. The agents'
+newline keys avoid the problem altogether: Claude Code gets backslash-Enter,
+Codex `ctrl+j`, and opencode, which asks for extended keys, `shift+enter`.
+
+Herdr delivers the chords natively. Its key names stop short of Home, End,
+PageUp, PageDown, Insert and Delete, so the gateway types those as the bytes a
+keyboard sends (`ESC [1~`, `ESC [1;5H` for `ctrl+home`, ...).
 
 ## Reaching it from outside your network
 
