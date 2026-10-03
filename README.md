@@ -290,6 +290,25 @@ Reinstall the service after upgrading to apply the child-process lifetime rules:
 gateway restarts must not kill persistent terminal servers. On macOS this is
 login startup; on Linux boot startup requires the user service and lingering.
 
+### Modifier chords on tmux
+
+Keys such as `shift+enter` (newline without sending), `ctrl+enter`, `ctrl+up`
+or `alt+x` reach a tmux pane only when tmux 3.2+ has extended keys on. The
+gateway reads this setting and never changes it; add it to `~/.tmux.conf`:
+
+```sh
+set -s extended-keys on
+```
+
+Even then, tmux encodes a chord only for a program that asked for it
+(modifyOtherKeys; tmux does not act on the kitty keyboard request). Where the
+program has not, and the chord would arrive as a different key -- `ctrl+enter`
+as a plain Enter, which submits -- `send-keys` answers `400 key_unsupported`
+instead of sending it. Discovery reports what each backend can deliver as
+`planes.terminal.backends[].keyboard`; the app hides keys it cannot press.
+Herdr delivers the chords natively, but has no Home/End/PageUp/PageDown/
+Insert/Delete.
+
 ## Reaching it from outside your network
 
 Put both devices on [Tailscale](https://tailscale.com) and point the gateway at

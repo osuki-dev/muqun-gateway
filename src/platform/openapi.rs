@@ -527,13 +527,14 @@ pub fn openapi_spec() -> Value {
             "/api/sessions/{sessionId}/panes/{paneId}/send-keys": {
                 "post": {
                     "summary": "Send key names to a pane",
+                    "description": "Each entry is one printable character or a key from the backend's keyboard vocabulary (planes.terminal.backends[].keyboard in /api/discovery): a base such as enter, esc, tab, backspace, space, up, home, pageup, delete or f1..f12, optionally prefixed by ctrl+, alt+ and shift+ in that order (ctrl+shift+enter, alt+left). The classic chords -- ctrl+<a-z>, ctrl+[, ctrl+], ctrl+\\, ctrl+space, shift+tab -- always work; every other modifier chord needs keyboard.extended. On tmux that is extended-keys on or always, and a chord is also refused when the program in the pane has not turned on extended keys and would receive it as a different key. Anything a backend cannot deliver is 400 key_unsupported and nothing is sent.",
                     "parameters": [path_param("sessionId"), path_param("paneId")],
                     "requestBody": json_body(json!({
                         "type": "object",
                         "required": ["keys"],
-                        "properties": { "keys": { "type": "array", "items": { "type": "string" } } }
+                        "properties": { "keys": { "type": "array", "minItems": 1, "maxItems": 32, "items": { "type": "string" } } }
                     })),
-                    "responses": ok_response()
+                    "responses": send_keys_responses()
                 }
             },
             "/api/agent-status": {
@@ -775,6 +776,28 @@ fn agents_catalog_responses() -> Value {
     responses
 }
 
+fn send_keys_responses() -> Value {
+    let mut responses = ok_response();
+    responses["400"] = json!({
+        "description": "invalid_keys when the list is empty or longer than 32; key_unsupported, naming the key, when this backend cannot deliver it -- on tmux the message names the fix (tmux set -s extended-keys on)"
+    });
+    responses
+}
+
+fn keyboard_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Key names send-keys delivers on this backend. Absent while the backend is unreachable and from older gateways.",
+        "required": ["version", "bases", "modifiers", "extended"],
+        "properties": {
+            "version": { "type": "integer", "const": 1 },
+            "bases": { "type": "array", "items": { "type": "string" }, "description": "Named keys deliverable on their own: enter, esc, tab, backspace, space, up, down, left, right, home, end, pageup, pagedown, insert, delete, f1..f12 (herdr has no home/end/pageup/pagedown/insert/delete)" },
+            "modifiers": { "type": "array", "items": { "type": "string", "enum": ["ctrl", "alt", "shift"] } },
+            "extended": { "type": "boolean", "description": "Whether modifier + special-key chords beyond the classic set reach the pane" }
+        }
+    })
+}
+
 fn capabilities_discovery_responses() -> Value {
     let mut responses = ok_response();
     responses["200"] = json!({
@@ -796,6 +819,18 @@ fn capabilities_discovery_responses() -> Value {
                                 "supported": { "type": "boolean", "description": "Whether any terminal multiplexer is available" },
                                 "activeBackend": { "type": ["string", "null"], "description": "Currently active multiplexer backend (tmux, herdr, conpty)" },
                                 "availableBackends": { "type": "array", "items": { "type": "string" } },
+                                "backends": { "type": "array", "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "sessionId": { "type": "string" },
+                                        "label": { "type": "string" },
+                                        "kind": { "type": "string" },
+                                        "connected": { "type": "boolean" },
+                                        "version": { "type": "string" },
+                                        "capabilities": { "type": "array", "items": { "type": "string" } },
+                                        "keyboard": keyboard_schema()
+                                    }
+                                } },
                                 "degradedReason": { "type": ["string", "null"], "description": "Reason terminal plane is unavailable if supported is false" },
                                 "features": {
                                     "type": "object",
