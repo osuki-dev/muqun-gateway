@@ -2845,10 +2845,18 @@ pub(crate) async fn pane_shortcuts(
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty());
 
-    Ok(agents::routes::json_etag_response(
-        &headers,
-        shortcuts::resolve(agent, title, cwd),
-    ))
+    let mut body = shortcuts::resolve(agent, title, cwd);
+    // Pane state rather than table state, so `KEYMAP_VERSION` does not move
+    // with it; it is part of the body, so the ETag does. Best effort: a probe
+    // that fails leaves the field out and the client keeps the backend's
+    // answer alone.
+    if let Ok(Some(extended)) = terminal_backend(&session)
+        .pane_extended_keys(&BackendPaneId::new(&pane_id))
+        .await
+    {
+        body["keyboard"] = json!({ "extended": extended });
+    }
+    Ok(agents::routes::json_etag_response(&headers, body))
 }
 
 pub(crate) async fn send_pane_keys(
@@ -3816,7 +3824,7 @@ mod tests {
     async fn a_key_the_backend_cannot_send_is_a_clean_400() {
         let herdr = FakeHerdr::start(vec![""], None);
         let session = herdr.session();
-        for keys in [vec!["home"], vec!["enter", "hyper+x"]] {
+        for keys in [vec!["hyper+x"], vec!["enter", "home", "hyper+x"]] {
             let keys: Vec<String> = keys.into_iter().map(str::to_owned).collect();
             let (status, Json(body)) = send_pane_keys(&session, "w1:p1", &keys)
                 .await
@@ -3836,5 +3844,158 @@ mod tests {
             herdr.enters()[0]["params"]["keys"],
             json!(["ctrl+enter", "shift+enter", "esc", "space"])
         );
+    }
+
+    /// herdr has no names for the editing block, so those keys are typed as
+    /// the bytes a keyboard sends -- and a request that mixes them with named
+    /// keys still reaches the pane in the order it was written.
+    #[tokio::test]
+    async fn herdr_types_the_editing_block_in_order_with_named_keys() {
+        let herdr = FakeHerdr::start(vec![""], None);
+        let session = herdr.session();
+        let keys: Vec<String> = ["esc", "home", "ctrl+home", "x", "pagedown", "enter"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        send_pane_keys(&session, "w1:p1", &keys).await.unwrap();
+        let calls: Vec<Value> = herdr
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|call| json!([call["method"], call["params"]]))
+            .collect();
+        assert_eq!(
+            calls,
+            [
+                json!(["pane.send_keys", { "pane_id": "w1:p1", "keys": ["esc"] }]),
+                json!(["pane.send_text", { "pane_id": "w1:p1", "text": "\x1b[1~\x1b[1;5H" }]),
+                json!(["pane.send_keys", { "pane_id": "w1:p1", "keys": ["x"] }]),
+                json!(["pane.send_text", { "pane_id": "w1:p1", "text": "\x1b[6~" }]),
+                json!(["pane.send_keys", { "pane_id": "w1:p1", "keys": ["enter"] }]),
+            ]
+        );
+    }
+
+    /// The shortcuts response says whether chords reach this pane, and the
+    /// ETag follows it. On herdr the answer is always yes.
+    #[tokio::test]
+    async fn herdr_pane_shortcuts_report_extended_keys() {
+        let herdr = FakeHerdr::start(vec![""], None);
+        let mut state = test_state("admin", vec![test_device("phone-1", "device-token")]);
+        state.config.sessions = vec![herdr.session()];
+        let response = pane_shortcuts(
+            State(state),
+            Path(("default".to_owned(), "w1:p1".to_owned())),
+            bearer_headers("device-token"),
+        )
+        .await
+        .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["keyboard"], json!({ "extended": true }));
+        assert_eq!(body["version"], shortcuts::KEYMAP_VERSION);
+    }
+
+    /// On tmux the answer is live pane state: off until the program in the
+    /// pane asks for extended keys (or the server is set to `always`), and the
+    /// ETag changes with it so a client's conditional re-read sees the flip.
+    #[tokio::test]
+    #[ignore = "requires a tmux server"]
+    async fn tmux_pane_shortcuts_report_whether_chords_reach_the_pane() {
+        let socket = std::path::PathBuf::from(format!(
+            "/tmp/gw-keys-{}.sock",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
+        let tmux = backend::TmuxBackend::new(Some(socket.clone()));
+        let workspace = tmux
+            .create_workspace(&BackendCreateWorkspace {
+                cwd: Some(std::env::temp_dir()),
+                label: Some("gateway-keys".into()),
+                focus: true,
+            })
+            .await
+            .unwrap();
+        let set_option = |value: &str| {
+            let status = std::process::Command::new("tmux")
+                .arg("-S")
+                .arg(&socket)
+                .args(["set-option", "-s", "extended-keys", value])
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+        let mut state = test_state("admin", vec![test_device("phone-1", "device-token")]);
+        state.config.sessions = vec![SessionConfig {
+            id: "default".into(),
+            label: "Default".into(),
+            socket_path: socket.to_string_lossy().into_owned(),
+            backend: BackendKind::Tmux,
+        }];
+        let session = state.config.sessions[0].clone();
+        let pane = terminal_backend(&session)
+            .list_panes()
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .id;
+        let read = || {
+            let state = state.clone();
+            let pane = pane.as_str().to_owned();
+            async move {
+                let response = pane_shortcuts(
+                    State(state),
+                    Path(("default".to_owned(), pane)),
+                    bearer_headers("device-token"),
+                )
+                .await
+                .unwrap();
+                let etag = response.headers()[axum::http::header::ETAG].clone();
+                let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                (body["keyboard"]["extended"].clone(), etag)
+            }
+        };
+
+        set_option("off");
+        let (extended, off_etag) = read().await;
+        assert_eq!(extended, json!(false), "server without extended keys");
+
+        set_option("on");
+        let (extended, _) = read().await;
+        assert_eq!(extended, json!(false), "a shell that never asked");
+
+        set_option("always");
+        let (extended, always_etag) = read().await;
+        assert_eq!(extended, json!(true), "server set to always");
+        assert_ne!(off_etag, always_etag);
+
+        set_option("on");
+        terminal_backend(&session)
+            .send_text(&pane, "printf '\\033[>4;2m'", BackendSendTextMode::Keys)
+            .await
+            .unwrap();
+        terminal_backend(&session)
+            .send_keys(&pane, &["enter".to_owned()])
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if read().await.0 == json!(true) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the pane never reported extended keys after asking"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tmux.close_workspace(&workspace.id).await.ok();
     }
 }

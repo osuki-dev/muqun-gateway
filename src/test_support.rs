@@ -529,6 +529,13 @@ impl FakeHerdr {
                         enters += 1;
                         json!({ "ok": true })
                     }
+                    "pane.get" => json!({
+                        "pane": {
+                            "pane_id": request["params"]["pane_id"],
+                            "workspace_id": "w1",
+                            "tab_id": "w1:t1",
+                        }
+                    }),
                     _ => json!({ "ok": true }),
                 };
                 recorded.lock().unwrap().push(request.clone());
