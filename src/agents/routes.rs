@@ -14,6 +14,8 @@ use sha2::{Digest, Sha256};
 
 use super::domain::{AgentSessionId, ModelRef, PermissionDecision, SessionQuery};
 use super::ports::mirror::SessionMirrorPort;
+use crate::platform::git;
+use crate::terminal::routes::git_error;
 use crate::{
     api_error, content_envelope, require_device, still_paired, stream_event, validate_text,
     ApiResult, AppState, EncryptedStreamContext, EventStreamSealer, STREAM_DEVICE_RECHECK_INTERVAL,
@@ -125,6 +127,22 @@ pub struct AgentEventsQuery {
 pub struct AgentVcsDiffQuery {
     /// `working` (default), `branch` or `committed`.
     pub mode: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AgentVcsFileQuery {
+    /// `working` (default) or `branch`.
+    pub mode: Option<String>,
+    /// Repo-relative.
+    pub path: Option<String>,
+    /// Unified context lines, clamped to 0..=25; 3 when absent.
+    pub context: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AgentVcsDiscardBody {
+    /// Repo-relative.
+    pub path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -410,6 +428,18 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
         .route(
             "/api/agent-sessions/{asid}/vcs-diff",
             get(get_agent_vcs_diff_global),
+        )
+        .route(
+            "/api/agent-sessions/{asid}/vcs/files",
+            get(get_agent_vcs_files),
+        )
+        .route(
+            "/api/agent-sessions/{asid}/vcs/file",
+            get(get_agent_vcs_file),
+        )
+        .route(
+            "/api/agent-sessions/{asid}/vcs/discard",
+            post(discard_agent_vcs_file),
         )
         .route(
             "/api/agent-sessions/{asid}/abort",
@@ -1021,6 +1051,152 @@ async fn do_get_agent_vcs_diff(
         .map(super::adapters::opencode::driver::is_git_worktree)
         .unwrap_or(true);
     Ok(Json(content_envelope(vcs_diff_body(json!(diffs), is_repo))))
+}
+
+// ---------------------------------------------------------------------------
+// Changes (git): the agent-independent list, one file, and discard
+// ---------------------------------------------------------------------------
+//
+// `vcs/diff` asks the agent and answers every patch at once; these ask git,
+// in the session's directory, so they mean the same thing for every agent.
+
+/// `mode` for the git routes: `working` when absent.
+fn vcs_mode(mode: Option<&str>) -> ApiResult<git::VcsMode> {
+    git::VcsMode::parse(mode.unwrap_or("working")).ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_mode",
+            "mode must be 'working' or 'branch'",
+        )
+    })
+}
+
+/// The checkout an agent session works in: `None` when the session has no
+/// directory or its directory is in no checkout. A directory that has been
+/// deleted is `404 workspace_missing`, as on every directory-scoped route.
+async fn agent_session_checkout(
+    state: &AppState,
+    asid: &str,
+) -> ApiResult<Option<std::path::PathBuf>> {
+    let manager = session_manager_or_err(state, asid).await?;
+    let directory = manager
+        .agent()
+        .get_session(asid)
+        .await
+        .ok()
+        .and_then(|info| info.directory)
+        .filter(|directory| !directory.trim().is_empty());
+    require_directory(directory.as_deref())?;
+    let Some(directory) = directory else {
+        return Ok(None);
+    };
+    Ok(git::toplevel(std::path::Path::new(&directory)).await)
+}
+
+fn unknown_path() -> (StatusCode, Json<Value>) {
+    api_error(
+        StatusCode::NOT_FOUND,
+        "unknown_path",
+        "No changed or tracked file has this path",
+    )
+}
+
+fn not_a_repository() -> (StatusCode, Json<Value>) {
+    api_error(
+        StatusCode::NOT_FOUND,
+        "not_a_repository",
+        "This session's directory is not in a git repository",
+    )
+}
+
+async fn get_agent_vcs_files(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    Query(query): Query<AgentVcsDiffQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let mode = vcs_mode(query.mode.as_deref())?;
+    let Some(toplevel) = agent_session_checkout(&state, &asid).await? else {
+        return Ok(Json(content_envelope(json!({
+            "vcs": null,
+            "reason": "not_a_repository",
+            "mode": mode.as_str(),
+            "truncated": false,
+            "files": [],
+        }))));
+    };
+    let changes = git::changed_files(&toplevel, mode)
+        .await
+        .map_err(git_error)?;
+    Ok(Json(content_envelope(changes.to_json())))
+}
+
+async fn get_agent_vcs_file(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    Query(query): Query<AgentVcsFileQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let mode = vcs_mode(query.mode.as_deref())?;
+    let Some(toplevel) = agent_session_checkout(&state, &asid).await? else {
+        return Err(not_a_repository());
+    };
+    let path = query.path.as_deref().unwrap_or("");
+    let context = query
+        .context
+        .unwrap_or(git::DEFAULT_CONTEXT_LINES)
+        .min(git::MAX_CONTEXT_LINES);
+    let patch = git::changed_file_patch(&toplevel, mode, path, context)
+        .await
+        .map_err(git_error)?
+        .ok_or_else(unknown_path)?;
+    Ok(Json(content_envelope(patch.to_json())))
+}
+
+async fn discard_agent_vcs_file(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<AgentVcsDiscardBody>,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let Some(toplevel) = agent_session_checkout(&state, &asid).await? else {
+        return Err(not_a_repository());
+    };
+    let action = git::discard(&toplevel, &body.path)
+        .await
+        .map_err(|err| match err {
+            git::DiscardError::UnknownPath => unknown_path(),
+            git::DiscardError::OutsideRepository => api_error(
+                StatusCode::FORBIDDEN,
+                "path_outside_repository",
+                "The path leads outside the repository",
+            ),
+            git::DiscardError::Git(err) => git_error(err),
+            git::DiscardError::Io(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                unknown_path()
+            }
+            git::DiscardError::Io(err) => {
+                tracing::warn!(asid, path = %body.path, "discard failed: {err}");
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "discard_failed",
+                    "The file could not be discarded",
+                )
+            }
+        })?;
+    tracing::info!(
+        asid,
+        path = %body.path,
+        action = action.as_str(),
+        "discarded an agent session change"
+    );
+    Ok(Json(content_envelope(json!({
+        "path": body.path,
+        "action": action.as_str(),
+    }))))
 }
 
 /// Whether a catalog is one a client should be allowed to keep.
@@ -3419,5 +3595,165 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("deepseek"));
+    }
+
+    // -- changes (git) ----------------------------------------------------
+
+    /// A DeepSeek session -- an agent whose own `vcs/diff` answers nothing --
+    /// whose directory is a subdirectory of a real checkout, and one with no
+    /// checkout at all.
+    async fn vcs_state(name: &str) -> (AppState, std::path::PathBuf, std::path::PathBuf) {
+        let (root, repo) = crate::test_support::git_test_repo(name);
+        let plain = root.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let mut agent =
+            FakeAgent::new("deepseek").with_sessions(&[("ses_git", 10), ("ses_plain", 20)]);
+        agent.sessions[0].directory = Some(repo.join("src").to_string_lossy().into_owned());
+        agent.sessions[1].directory = Some(plain.to_string_lossy().into_owned());
+        (state_with(vec![agent]).await, root, repo)
+    }
+
+    fn file_query(mode: Option<&str>, path: &str) -> AgentVcsFileQuery {
+        AgentVcsFileQuery {
+            mode: mode.map(str::to_string),
+            path: Some(path.to_string()),
+            context: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn vcs_files_and_file_answer_from_git_for_any_agent() {
+        let (state, root, _repo) = vcs_state("agent-vcs-files").await;
+        let files = |asid: &str, mode: Option<&str>| {
+            get_agent_vcs_files(
+                State(state.clone()),
+                Path(asid.to_string()),
+                Query(AgentVcsDiffQuery {
+                    mode: mode.map(str::to_string),
+                }),
+                device_headers(),
+            )
+        };
+
+        let Json(answer) = files("ses_git", None).await.expect("lists");
+        let data = &answer["data"];
+        assert_eq!(data["vcs"], "git");
+        assert_eq!(data["mode"], "working");
+        assert_eq!(data["truncated"], false);
+        let list = data["files"].as_array().unwrap();
+        assert_eq!(list.len(), 2, "{list:?}");
+        let modified = list.iter().find(|f| f["path"] == "src/a.ts").unwrap();
+        assert_eq!(modified["status"], "modified");
+        assert_eq!(modified["additions"], 1);
+        assert_eq!(modified["deletions"], 1);
+        assert_eq!(modified["binary"], false);
+        let untracked = list.iter().find(|f| f["path"] == "notes.md").unwrap();
+        assert_eq!(untracked["status"], "untracked");
+
+        let Json(branch) = files("ses_git", Some("branch")).await.expect("lists");
+        assert_eq!(branch["data"]["mode"], "branch");
+        assert_eq!(branch["data"]["base"], "main");
+
+        let refusal = files("ses_git", Some("committed"))
+            .await
+            .expect_err("committed is not a mode here");
+        assert_eq!(refusal.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            crate::test_support::error_body(&refusal)["error"]["code"],
+            "invalid_mode"
+        );
+
+        let Json(plain) = files("ses_plain", None).await.expect("answers");
+        assert!(plain["data"]["vcs"].is_null());
+        assert_eq!(plain["data"]["reason"], "not_a_repository");
+        assert_eq!(plain["data"]["files"], json!([]));
+
+        let file = |query: AgentVcsFileQuery| {
+            get_agent_vcs_file(
+                State(state.clone()),
+                Path("ses_git".to_string()),
+                Query(query),
+                device_headers(),
+            )
+        };
+        let Json(one) = file(file_query(None, "src/a.ts")).await.expect("patch");
+        assert_eq!(one["data"]["path"], "src/a.ts");
+        assert_eq!(one["data"]["status"], "modified");
+        assert_eq!(one["data"]["truncated"], false);
+        assert!(one["data"]["patch"]
+            .as_str()
+            .unwrap()
+            .contains("\n-const b = 2;\n+const B = 2;\n"));
+
+        for unknown in ["nope.txt", "../x", "/etc/passwd"] {
+            let refusal = file(file_query(None, unknown))
+                .await
+                .expect_err("not a change");
+            assert_eq!(refusal.0, StatusCode::NOT_FOUND, "{unknown:?}");
+            assert_eq!(
+                crate::test_support::error_body(&refusal)["error"]["code"],
+                "unknown_path"
+            );
+        }
+        let refusal = file(file_query(Some("staged"), "src/a.ts"))
+            .await
+            .expect_err("bad mode");
+        assert_eq!(
+            crate::test_support::error_body(&refusal)["error"]["code"],
+            "invalid_mode"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn vcs_discard_restores_and_deletes_and_refuses_unknown_paths() {
+        let (state, root, repo) = vcs_state("agent-vcs-discard").await;
+        let discard = |path: &str, headers: HeaderMap| {
+            discard_agent_vcs_file(
+                State(state.clone()),
+                Path("ses_git".to_string()),
+                headers,
+                Json(AgentVcsDiscardBody {
+                    path: path.to_string(),
+                }),
+            )
+        };
+
+        let refusal = discard("src/a.ts", crate::test_support::bearer_headers("wrong"))
+            .await
+            .expect_err("needs a device");
+        assert_eq!(refusal.0, StatusCode::FORBIDDEN);
+        assert!(std::fs::read_to_string(repo.join("src/a.ts"))
+            .unwrap()
+            .contains("const B"));
+
+        let Json(restored) = discard("src/a.ts", device_headers())
+            .await
+            .expect("restores");
+        assert_eq!(restored["data"]["path"], "src/a.ts");
+        assert_eq!(restored["data"]["action"], "restored");
+        assert!(std::fs::read_to_string(repo.join("src/a.ts"))
+            .unwrap()
+            .contains("const b"));
+
+        let Json(deleted) = discard("notes.md", device_headers())
+            .await
+            .expect("deletes");
+        assert_eq!(deleted["data"]["action"], "deleted");
+        assert!(!repo.join("notes.md").exists());
+
+        for unknown in ["nope.txt", "../x"] {
+            let refusal = discard(unknown, device_headers())
+                .await
+                .expect_err("unknown");
+            assert_eq!(refusal.0, StatusCode::NOT_FOUND);
+            assert_eq!(
+                crate::test_support::error_body(&refusal)["error"]["code"],
+                "unknown_path"
+            );
+        }
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }
