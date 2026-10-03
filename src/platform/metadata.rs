@@ -84,6 +84,11 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "multiple_terminal_backends",
     "terminal_session_liveness",
     "terminal_input",
+    // `planes.terminal.backends[].keyboard` in `/api/discovery`: the key
+    // names and chords `send-keys` delivers per backend, and `400
+    // key_unsupported` for the rest. Lets the app feature-detect without
+    // parsing the planes.
+    "terminal_keyboard",
     // `GET /api/ws`: one WebSocket per device carrying the agent events of
     // any number of sessions. Also announced as `transports.websocket` in
     // `/api/discovery`. The per-session SSE stream stays the fallback.
@@ -314,8 +319,12 @@ pub(crate) async fn session_metadata(session: &SessionConfig) -> (Value, Value) 
 }
 
 pub(crate) async fn session_metadata_uncached(session: &SessionConfig) -> (Value, Value) {
-    match terminal_backend(session).metadata().await {
+    let backend = terminal_backend(session);
+    match backend.metadata().await {
         Ok(metadata) => {
+            // Asked here so it rides the same short-lived cache as the
+            // version: discovery is polled, and on tmux this is a process.
+            let keyboard = backend.keyboard(&metadata).await.ok().flatten();
             // A backend that does not report a protocol at all is taken at the
             // floor rather than refused: absent is not the same as too old.
             let compatibility_protocol = metadata.protocol.unwrap_or(HERDR_PROTOCOL_MIN);
@@ -343,6 +352,7 @@ pub(crate) async fn session_metadata_uncached(session: &SessionConfig) -> (Value
                     "connected": true,
                     "version": metadata.version,
                     "protocol": metadata.protocol,
+                    "keyboard": keyboard,
                 }),
                 compatibility,
             )

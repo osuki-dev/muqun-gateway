@@ -1,3 +1,67 @@
+/// The named keys herdr's `pane.send_keys` accepts.
+///
+/// Established against herdr 0.9.1 by sending each name to a scratch pane in
+/// a session of its own, followed by a name herdr cannot know: herdr validates
+/// every key before writing any, so the error names the first unknown key and
+/// nothing is typed. `home`, `end`, `pageup`, `pagedown`, `insert` and
+/// `delete` come back `invalid_key` under every spelling tried (`Home`,
+/// `PageUp`, `pgup`, `page_up`, `del`, `ins`, `ic`, `dc`, ...); everything
+/// else in the vocabulary is accepted under the app's own spelling, with
+/// `ctrl`, `alt` and `shift` in any combination.
+const HERDR_BASES: [NamedKey; 21] = [
+    NamedKey::Enter,
+    NamedKey::Esc,
+    NamedKey::Tab,
+    NamedKey::Backspace,
+    NamedKey::Space,
+    NamedKey::Up,
+    NamedKey::Down,
+    NamedKey::Left,
+    NamedKey::Right,
+    NamedKey::F(1),
+    NamedKey::F(2),
+    NamedKey::F(3),
+    NamedKey::F(4),
+    NamedKey::F(5),
+    NamedKey::F(6),
+    NamedKey::F(7),
+    NamedKey::F(8),
+    NamedKey::F(9),
+    NamedKey::F(10),
+    NamedKey::F(11),
+    NamedKey::F(12),
+];
+
+/// The first herdr whose chords were seen arriving in the pane's own
+/// extended-key protocol: with kitty's disambiguate flag requested, 0.9.1
+/// writes `ctrl+enter` as `CSI 13;5u`, `shift+enter` as `CSI 13;2u`, `alt+x`
+/// as `CSI 120;3u` and `ctrl+up` as `CSI 1;5A`. Older releases were not
+/// checked, so they are not claimed.
+const HERDR_EXTENDED_KEYS_MIN: (u64, u64, u64) = (0, 9, 1);
+
+/// One `send-keys` entry in herdr's spelling, which is the app's own.
+///
+/// Parsed here rather than passed through so a name is refused the same way
+/// on both backends, and so the aliases the API has always taken (`escape`,
+/// `ArrowUp`, `Enter`) reach herdr under the one name it knows. A literal
+/// space becomes `space`: herdr trims whitespace before parsing a key name, so
+/// `" "` would be refused.
+fn herdr_key(value: &str) -> Result<String, BackendError> {
+    let chord = KeyChord::parse(value).ok_or_else(|| unknown_key(value))?;
+    if let KeyBase::Named(key) = chord.base {
+        if !HERDR_BASES.contains(&key) {
+            return Err(BackendError::KeyUnsupported(format!(
+                "herdr cannot send {:?}",
+                key.name()
+            )));
+        }
+    }
+    Ok(match chord.base {
+        KeyBase::Char(' ') if !chord.has_modifiers() => "space".to_owned(),
+        _ => chord.name(),
+    })
+}
+
 fn herdr_owns_prompt_submission(version: Option<&str>) -> bool {
     super::model::version_at_least(version, (0, 9, 0))
 }
@@ -36,6 +100,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 #[cfg(unix)]
 use tokio::net::UnixStream;
 
+use super::keys::{unknown_key, KeyBase, KeyChord, KeyboardVocabulary, NamedKey};
 use super::{
     Agent, AgentStatus, BackendActivity, BackendActivityStream, BackendError, BackendFuture,
     BackendKind, BackendMetadata, CreateTab, CreateWorkspace, OutputFormat, OutputSource, Pane,
@@ -580,17 +645,36 @@ impl TerminalBackend for HerdrBackend {
     }
 
     fn send_keys<'a>(&'a self, id: &'a PaneId, keys: &'a [String]) -> BackendFuture<'a, ()> {
-        // Herdr parses key names after trimming whitespace, so a literal
-        // space is rejected. Keep the neutral API literal and translate only
-        // at this boundary, preserving order and repeated spaces in one call.
-        let keys: Vec<&str> = keys
-            .iter()
-            .map(|key| if key == " " { "space" } else { key.as_str() })
-            .collect();
-        self.command(
-            "pane.send_keys",
-            json!({ "pane_id": id.as_str(), "keys": keys }),
-        )
+        Box::pin(async move {
+            let keys = keys
+                .iter()
+                .map(|key| herdr_key(key))
+                .collect::<Result<Vec<_>, _>>()?;
+            self.command(
+                "pane.send_keys",
+                json!({ "pane_id": id.as_str(), "keys": keys }),
+            )
+            .await
+            .map_err(|error| match error {
+                // Herdr validates every key before writing any, so this is
+                // a clean refusal with nothing typed -- a key it does not
+                // know, which is the caller's to fix, not a backend fault.
+                BackendError::Refused {
+                    code: Some(code),
+                    message,
+                } if code == "invalid_key" => BackendError::KeyUnsupported(message),
+                other => other,
+            })
+        })
+    }
+
+    fn keyboard<'a>(
+        &'a self,
+        metadata: &'a BackendMetadata,
+    ) -> BackendFuture<'a, Option<KeyboardVocabulary>> {
+        let extended =
+            super::model::version_at_least(metadata.version.as_deref(), HERDR_EXTENDED_KEYS_MIN);
+        Box::pin(async move { Ok(Some(KeyboardVocabulary::new(&HERDR_BASES, extended))) })
     }
 
     fn focus_agent<'a>(&'a self, target: &'a str) -> BackendFuture<'a, ()> {
@@ -2030,7 +2114,59 @@ mod tests {
             .filter(|call| call["method"] == "pane.send_keys")
             .map(|call| call["params"]["keys"][0].as_str().unwrap().to_owned())
             .collect();
-        assert_eq!(sent, ["i", "h", ":", ";", "Escape", "Enter"]);
+        // Named keys arrive under the vocabulary's one spelling.
+        assert_eq!(sent, ["i", "h", ":", ";", "esc", "enter"]);
+    }
+
+    #[test]
+    fn herdr_takes_the_vocabulary_except_the_editing_block() {
+        for (name, herdr) in [
+            ("ctrl+enter", "ctrl+enter"),
+            ("shift+ctrl+enter", "ctrl+shift+enter"),
+            ("alt+X", "alt+X"),
+            ("ctrl+C", "ctrl+c"),
+            ("ArrowUp", "up"),
+            ("shift+f5", "shift+f5"),
+            ("ctrl+\\", "ctrl+\\"),
+            (" ", "space"),
+        ] {
+            assert_eq!(herdr_key(name).unwrap(), herdr, "{name}");
+        }
+        for name in [
+            "home",
+            "end",
+            "pageup",
+            "pagedown",
+            "insert",
+            "delete",
+            "ctrl+home",
+        ] {
+            assert!(
+                matches!(herdr_key(name), Err(BackendError::KeyUnsupported(_))),
+                "{name}"
+            );
+        }
+        let metadata = |version: &str| BackendMetadata {
+            kind: BackendKind::Herdr,
+            version: Some(version.to_owned()),
+            protocol: None,
+            compatibility_response: None,
+        };
+        let backend = HerdrBackend::new("/nonexistent.sock");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let keyboard = |version: &str| {
+            runtime
+                .block_on(backend.keyboard(&metadata(version)))
+                .unwrap()
+                .unwrap()
+        };
+        let current = keyboard("0.9.1");
+        assert!(current.extended);
+        assert!(!current.bases.contains(&"home".to_owned()));
+        assert_eq!(current.bases.len(), 21);
+        assert!(!keyboard("0.9.0").extended);
     }
 
     #[tokio::test]
