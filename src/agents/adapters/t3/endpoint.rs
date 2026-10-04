@@ -1,6 +1,12 @@
 //! Where a T3 Code server is and how the gateway proves itself to it.
 //!
-//! The auth flow, as observed against `t3 serve` 0.0.42:
+//! The auth flow, as observed against `t3 serve` 0.0.42 and still current in
+//! 0.0.45 (which reports `orchestrationProtocolVersion: 1`). Orchestrator V2
+//! servers (0.0.46 nightlies on) accept only V2 clients: a descriptor
+//! announcing a protocol above [`super::ORCHESTRATION_PROTOCOL_VERSION`] is
+//! never attached to (see [`EnvironmentDescriptor::unsupported_reason`]).
+//!
+//! The flow:
 //!
 //! 1. `GET /.well-known/t3/environment` (unauthenticated) returns the
 //!    [`EnvironmentDescriptor`]: environment id, label, server version and
@@ -74,6 +80,18 @@ impl EnvironmentDescriptor {
     pub fn protocol_version(&self) -> u64 {
         self.orchestration_protocol_version
             .unwrap_or(super::ORCHESTRATION_PROTOCOL_VERSION)
+    }
+
+    /// Why this gateway cannot drive the server, or `None` when it can: a
+    /// server speaking a newer orchestration protocol rejects this client.
+    pub fn unsupported_reason(&self) -> Option<String> {
+        let version = self.protocol_version();
+        let supported = super::ORCHESTRATION_PROTOCOL_VERSION;
+        (version > supported).then(|| {
+            format!(
+                "T3 server speaks orchestration protocol {version}; this gateway supports {supported}"
+            )
+        })
     }
 
     pub fn capability(&self, name: &str) -> bool {
@@ -183,8 +201,11 @@ impl T3Endpoint {
             .map_err(|e| AgentError::Protocol(format!("descriptor: {}", short(&e.to_string()))))
     }
 
+    /// The server answers and speaks a protocol this gateway supports.
     pub async fn probe_healthy(&self, http: &Client) -> bool {
-        self.describe(http).await.is_ok()
+        self.describe(http)
+            .await
+            .is_ok_and(|d| d.unsupported_reason().is_none())
     }
 
     /// Find a server from the environment or on the default loopback port.
@@ -401,6 +422,23 @@ mod tests {
         );
         assert!(!d.capability("agentActivityPublishing"));
         assert!(!d.capability("no-such-flag"));
+        assert_eq!(d.unsupported_reason(), None);
+    }
+
+    fn descriptor_with_protocol(version: u64) -> EnvironmentDescriptor {
+        let mut raw: Value =
+            serde_json::from_str(include_str!("fixtures/environment.json")).unwrap();
+        raw["orchestrationProtocolVersion"] = version.into();
+        serde_json::from_value(raw).unwrap()
+    }
+
+    #[test]
+    fn protocol_1_is_supported_and_protocol_2_is_not() {
+        assert_eq!(descriptor_with_protocol(1).unsupported_reason(), None);
+        assert_eq!(
+            descriptor_with_protocol(2).unsupported_reason().as_deref(),
+            Some("T3 server speaks orchestration protocol 2; this gateway supports 1")
+        );
     }
 
     #[test]

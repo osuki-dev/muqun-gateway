@@ -105,6 +105,8 @@ pub(super) struct T3State {
     exchanged: Mutex<Option<String>>,
     /// "Nothing to authenticate with" is said once, not every poll.
     warned_no_credential: AtomicBool,
+    /// So is "the server speaks a protocol this gateway cannot".
+    warned_unsupported: AtomicBool,
 }
 
 impl T3State {
@@ -126,6 +128,7 @@ impl T3State {
             state_dir,
             exchanged: Mutex::new(None),
             warned_no_credential: AtomicBool::new(false),
+            warned_unsupported: AtomicBool::new(false),
         }
     }
 
@@ -298,12 +301,19 @@ impl AgentRuntime {
                 return false;
             }
         };
-        if descriptor.protocol_version() > t3::ORCHESTRATION_PROTOCOL_VERSION {
-            tracing::warn!(
-                version = descriptor.protocol_version(),
-                "the T3 server speaks a newer orchestration protocol than this gateway"
-            );
+        // A newer protocol (Orchestrator V2 servers accept only V2 clients)
+        // is not attached to: discovery reports it `unsupported` instead.
+        if let Some(reason) = descriptor.unsupported_reason() {
+            if !self.t3.warned_unsupported.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    version = descriptor.protocol_version(),
+                    "the T3 server speaks a newer orchestration protocol than this gateway; \
+                     not attaching: {reason}"
+                );
+            }
+            return false;
         }
+        self.t3.warned_unsupported.store(false, Ordering::Relaxed);
         let Some(credential) = self.t3.credential(&endpoint, &http).await else {
             if !self.t3.warned_no_credential.swap(true, Ordering::Relaxed) {
                 tracing::warn!(
@@ -341,6 +351,7 @@ impl AgentRuntime {
             enabled: self.t3.wanted(),
             endpoint: self.t3.config.url.clone(),
             version: None,
+            reason: None,
             models: Vec::new(),
             modes: Vec::new(),
             features: t3_features(),
@@ -359,10 +370,14 @@ impl AgentRuntime {
         // Not attached: the descriptor is public, so reachability and the
         // version can be told without a credential; the models cannot. Only
         // a server the gateway can authenticate to is `reachable` (attached
-        // on first use); without a credential it is `unconfigured`.
+        // on first use); without a credential it is `unconfigured`; a server
+        // speaking a newer orchestration protocol is `unsupported`.
         match self.t3.endpoint().describe(&probe_client()).await {
             Ok(descriptor) => {
-                info.status = if self.t3.holds_credential().await {
+                info.status = if let Some(reason) = descriptor.unsupported_reason() {
+                    info.reason = Some(reason);
+                    AgentAvailability::Unsupported
+                } else if self.t3.holds_credential().await {
                     AgentAvailability::Reachable
                 } else {
                     AgentAvailability::Unconfigured

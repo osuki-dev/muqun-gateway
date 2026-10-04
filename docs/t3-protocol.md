@@ -12,7 +12,11 @@ Everything below was seen on the wire unless a line is marked
 
 `orchestrationProtocolVersion`: the descriptor of 0.0.42 **omits** the field,
 which the contract defines as protocol **1** (`ORCHESTRATION_PROTOCOL_VERSION`
-in `environment.ts`). The adapter treats absent as 1 and logs a newer value.
+in `environment.ts`). 0.0.45 (2026-10-02) sends it explicitly as `1`, and a
+read-only probe (descriptor, session and project lists) passes against it. The
+adapter treats absent as 1. A newer value is not attached to: Orchestrator V2
+servers (0.0.46 nightlies on) accept only V2 clients, so the gateway logs a
+warning and discovery reports `t3` as `unsupported` with a `reason`.
 
 ## 1. Transport summary
 

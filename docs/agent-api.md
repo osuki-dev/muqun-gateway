@@ -144,7 +144,10 @@ and `version` removed from every agent.
   the `agent_id` on that agent's sessions.
 - `status` values are snake_case: `connected` (attached and answering),
   `reachable` (an endpoint answers but it is not attached), `offline`,
-  `disabled`, `not_installed`, `unconfigured`. `connected` and `reachable` can
+  `disabled`, `not_installed`, `unconfigured`, `unsupported` (the agent
+  answers but speaks a protocol this gateway cannot drive; today only `t3`
+  when its server announces an `orchestrationProtocolVersion` above 1).
+  `connected` and `reachable` can
   be selected: `reachable` means the gateway will attach on first use. The
   rest cannot. `muqun-gateway agent` probes the same list from a shell on the
   gateway host and prints the next step for each. It never attaches, so it
@@ -160,6 +163,11 @@ and `version` removed from every agent.
   | `disabled` | `muqun-gateway agent setup t3` / `muqun-gateway agent setup deepseek`; for OpenCode, set `opencode.enabled` |
   | `offline` | the agent's own start command: `opencode service start`, `bunx @deepseek-ai/dsh web --no-open`, or "open T3 Code, or run `t3 service install`" |
   | `not_installed` | install OpenCode 2 (or set `opencode.enabled` to false) / T3 Code; for DeepSeek, `bunx @deepseek-ai/dsh web --no-open` |
+  | `unsupported` (t3: newer orchestration protocol) | update muqun-gateway |
+- `reason` is a one-line, human-readable explanation, present only when the
+  status alone does not say why (today: with `unsupported`, e.g. "T3 server
+  speaks orchestration protocol 2; this gateway supports 1"). Show it, don't
+  parse it.
 - `endpoint` and `version` are omitted when unknown or redacted. `models[]` and
   `modes[]` are that agent's own catalog summary; `reasoningEffortTiers` is
   omitted when empty; `modes[].description` when unset.
@@ -218,7 +226,11 @@ and `version` removed from every agent.
   Codex, …). While not attached it is `reachable` when the server answers and
   the gateway holds a credential (a bearer or an unspent pairing token) it
   will attach with, and `unconfigured` when the server answers but the
-  gateway holds no credential for it. A T3 revert rolls back
+  gateway holds no credential for it. A server announcing an
+  `orchestrationProtocolVersion` above 1 (Orchestrator V2, which accepts only
+  V2 clients) is `unsupported`: it is not attached, so no sessions or
+  streams, and an attached one is dropped if its server starts announcing
+  one. A T3 revert rolls back
   whole turns: reverting to any row of a turn removes that turn and
   everything after it (`agent.revert.changed` `committed`, then the timeline
   is re-read); there is no staged state.

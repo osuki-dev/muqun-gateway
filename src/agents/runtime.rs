@@ -518,6 +518,7 @@ impl AgentRuntime {
                     enabled,
                     endpoint: manager.map(|m| m.endpoint_url().to_string()),
                     version: manager.and_then(|m| m.version()),
+                    reason: None,
                     models: Vec::new(),
                     modes: Vec::new(),
                     features,
@@ -559,6 +560,7 @@ impl AgentRuntime {
                 enabled: false,
                 endpoint: self.deepseek_config.endpoint.clone(),
                 version: None,
+                reason: None,
                 models: Vec::new(),
                 modes: Vec::new(),
                 features: deepseek_features(false, false),
@@ -578,6 +580,7 @@ impl AgentRuntime {
                 enabled: true,
                 endpoint: Some(m.endpoint_url().to_string()),
                 version: m.version(),
+                reason: None,
                 features: deepseek_features(supports_reasoning, has_models),
                 models,
                 modes,
@@ -642,6 +645,7 @@ impl AgentRuntime {
                 enabled: true,
                 endpoint: endpoint_url,
                 version,
+                reason: None,
                 features: deepseek_features(supports_reasoning, has_models),
                 models,
                 modes,
@@ -660,6 +664,7 @@ impl AgentRuntime {
                 enabled: false,
                 endpoint: None,
                 version: None,
+                reason: None,
                 models: Vec::new(),
                 modes: Vec::new(),
                 features: opencode_features(false, false),
@@ -679,6 +684,7 @@ impl AgentRuntime {
                 enabled: true,
                 endpoint: Some(m.endpoint_url().to_string()),
                 version: m.version(),
+                reason: None,
                 features: opencode_features(supports_reasoning, has_models),
                 models,
                 modes,
@@ -745,6 +751,7 @@ impl AgentRuntime {
                 enabled: true,
                 endpoint: endpoint_url,
                 version,
+                reason: None,
                 features: opencode_features(supports_reasoning, has_models),
                 models,
                 modes,
@@ -1989,11 +1996,14 @@ mod tests {
 
     /// A T3 server that answers only its public descriptor.
     async fn fake_t3_descriptor() -> String {
+        fake_t3_serving(r#"{"environmentId":"env","label":"t3","serverVersion":"0.9.1"}"#).await
+    }
+
+    /// A T3 server that answers `descriptor` at its well-known path.
+    async fn fake_t3_serving(descriptor: &'static str) -> String {
         let app = axum::Router::new().route(
             crate::agents::adapters::t3::endpoint::WELL_KNOWN_PATH,
-            axum::routing::get(|| async {
-                r#"{"environmentId":"env","label":"t3","serverVersion":"0.9.1"}"#
-            }),
+            axum::routing::get(move || async move { descriptor }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -2020,6 +2030,54 @@ mod tests {
         });
         let t3 = runtime.t3_discovery().await;
         assert_eq!(t3.status, crate::discovery::AgentAvailability::Reachable);
+    }
+
+    /// The live 0.0.45 descriptor, with the protocol version swapped in.
+    fn t3_descriptor_speaking(version: u64) -> &'static str {
+        let mut raw: serde_json::Value =
+            serde_json::from_str(include_str!("adapters/t3/fixtures/environment.json")).unwrap();
+        raw["serverVersion"] = "0.0.45".into();
+        raw["orchestrationProtocolVersion"] = version.into();
+        Box::leak(raw.to_string().into_boxed_str())
+    }
+
+    #[tokio::test]
+    async fn a_t3_server_on_a_newer_protocol_is_unsupported_and_never_attached() {
+        let url = fake_t3_serving(t3_descriptor_speaking(2)).await;
+        let runtime = t3_runtime(T3Config {
+            url: Some(url),
+            token: Some("bearer".into()),
+            ..Default::default()
+        });
+        assert!(!runtime.supervise_t3().await);
+        assert!(runtime.manager_for_agent("t3").await.is_none());
+        let t3 = runtime.t3_discovery().await;
+        assert_eq!(t3.status, crate::discovery::AgentAvailability::Unsupported);
+        assert_eq!(
+            t3.reason.as_deref(),
+            Some("T3 server speaks orchestration protocol 2; this gateway supports 1")
+        );
+        assert_eq!(t3.version.as_deref(), Some("0.0.45"));
+        assert!(t3.models.is_empty());
+        let wire = serde_json::to_value(&t3).unwrap();
+        assert_eq!(wire["status"], "unsupported");
+    }
+
+    #[tokio::test]
+    async fn a_t3_server_on_protocol_1_is_attached() {
+        let url = fake_t3_serving(t3_descriptor_speaking(1)).await;
+        let runtime = t3_runtime(T3Config {
+            url: Some(url),
+            token: Some("bearer".into()),
+            ..Default::default()
+        });
+        assert!(runtime.supervise_t3().await);
+        let manager = runtime.manager_for_agent("t3").await.expect("attached");
+        assert_eq!(manager.version().as_deref(), Some("0.0.45"));
+        let t3 = runtime.t3_discovery().await;
+        assert_eq!(t3.status, crate::discovery::AgentAvailability::Connected);
+        assert!(t3.reason.is_none());
+        manager.shutdown();
     }
 
     #[tokio::test]
