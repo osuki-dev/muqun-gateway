@@ -357,6 +357,9 @@ pub(crate) async fn backend_metadata(
             )
         }
         Ok(metadata) => {
+            if backend_came_back(&session.id) {
+                tracing::info!("terminal backend for session {} answers again", session.id);
+            }
             // Asked here so it rides the same short-lived cache as the
             // version: discovery is polled, and on tmux this is a process.
             let keyboard = backend.keyboard(&metadata).await.ok().flatten();
@@ -393,18 +396,55 @@ pub(crate) async fn backend_metadata(
             )
         }
         Err(err) => {
-            tracing::warn!(
-                "terminal metadata request failed for session {} (backend={}, endpoint={}): {err}",
-                session.id,
-                session.backend.as_str(),
-                backend_endpoint(session),
-            );
+            // Discovery polls this about once a second per client, so a backend
+            // that stays down would write the same warning every second for as
+            // long as it is down. Warned once when it goes down; debug after.
+            if backend_went_down(&session.id) {
+                tracing::warn!(
+                    "terminal metadata request failed for session {} (backend={}, endpoint={}): {err}; \
+                     further failures are logged at debug until it answers again",
+                    session.id,
+                    session.backend.as_str(),
+                    backend_endpoint(session),
+                );
+            } else {
+                tracing::debug!(
+                    "terminal metadata request failed for session {}: {err}",
+                    session.id
+                );
+            }
             (
                 json!({ "kind": session.backend, "connected": false }),
                 json!({ "connected": false, "error": "Terminal backend is unavailable" }),
             )
         }
     }
+}
+
+/// Sessions whose backend failed its last metadata request, so a backend that
+/// stays down is warned about once rather than on every discovery poll.
+static DOWN_SESSIONS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Whether this failure is the first since the session's backend last answered.
+fn backend_went_down(session_id: &str) -> bool {
+    let Ok(mut down) = DOWN_SESSIONS.lock() else {
+        return true;
+    };
+    if down.iter().any(|seen| seen == session_id) {
+        return false;
+    }
+    down.push(session_id.to_owned());
+    true
+}
+
+/// Whether this answer ends a run of failures for the session's backend.
+fn backend_came_back(session_id: &str) -> bool {
+    let Ok(mut down) = DOWN_SESSIONS.lock() else {
+        return false;
+    };
+    let before = down.len();
+    down.retain(|seen| seen != session_id);
+    down.len() != before
 }
 
 /// How much of "there's something to actually look at" a configured session
@@ -1239,5 +1279,20 @@ mod tests {
         let (metadata, _) = session_metadata_uncached(&session).await;
         assert_eq!(metadata["connected"], false);
         assert!(!socket.exists(), "discovery started a tmux server");
+    }
+
+    #[test]
+    fn a_backend_that_stays_down_is_warned_about_once() {
+        let session = "metadata-test-down-once";
+        assert!(super::backend_went_down(session));
+        assert!(!super::backend_went_down(session));
+        assert!(!super::backend_went_down(session));
+        assert!(super::backend_came_back(session));
+        assert!(!super::backend_came_back(session));
+        assert!(
+            super::backend_went_down(session),
+            "a second outage is warned about again"
+        );
+        assert!(super::backend_came_back(session));
     }
 }
