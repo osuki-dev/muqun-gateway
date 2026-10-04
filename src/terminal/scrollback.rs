@@ -532,6 +532,66 @@ fn history_bottom(held: &[u64], body: &[u64], carries: &[bool], least: usize) ->
     })
 }
 
+/// A row's shape: its text with every run of digits made one `#`, so a clock
+/// or a counter repainted in place keeps its shape while its text changes --
+/// `(9s)` and `(10s)` included.
+fn shape_hash(line: &str) -> u64 {
+    let mut shape = String::with_capacity(line.len());
+    for c in line.chars() {
+        if !c.is_ascii_digit() {
+            shape.push(c);
+        } else if !shape.ends_with('#') {
+            shape.push('#');
+        }
+    }
+    line_hash(&shape)
+}
+
+/// The furniture, grown upward by the status rows just above it that were
+/// repainted in place: a spinner and its clock (`✻ Swirling… (1m 22s · ↓ 3.5k
+/// tokens)`), which no two frames share, so `common_suffix` stops below it.
+///
+/// A row counts when it sits at the same distance from the bottom in both
+/// frames, changed, kept its shape (`shape_hash`), and no other row of the
+/// read has that shape -- a transcript row rarely has a twin on the same
+/// screen once its digits are ignored, but a numbered list does, and is left
+/// alone. At most [`REDRAW_SLACK_ROWS`] of them, and only above furniture that
+/// was found, because a status region is what furniture sits under.
+///
+/// Without this the spinner of the frame before was kept whenever a read could
+/// not be placed -- the first read after a gap, or after the gateway started --
+/// and stayed in the middle of history with the transcript resuming below it.
+fn status_rows_above(
+    previous: &[u64],
+    previous_shapes: &[u64],
+    current: &[u64],
+    shapes: &[u64],
+    carries: &[bool],
+    furniture: usize,
+) -> usize {
+    if furniture == 0 || previous_shapes.len() != previous.len() {
+        return furniture;
+    }
+    let mut rows = furniture;
+    while rows - furniture < REDRAW_SLACK_ROWS && rows < previous.len() && rows < current.len() {
+        let here = current.len() - rows - 1;
+        let there = previous.len() - rows - 1;
+        let repainted = carries[here]
+            && current[here] != previous[there]
+            && shapes[here] == previous_shapes[there]
+            && shapes
+                .iter()
+                .filter(|shape| **shape == shapes[here])
+                .count()
+                == 1;
+        if !repainted {
+            break;
+        }
+        rows += 1;
+    }
+    rows
+}
+
 /// How many rows two frames end with in common, allowing for the ones a repaint
 /// changed without anything scrolling.
 ///
@@ -581,6 +641,9 @@ struct PaneBuffer {
     /// belongs at the bottom of the buffer once, not scattered through it
     /// every time the screen jumped further than a read could follow.
     last_frame: Vec<u64>,
+    /// The same frame by row *shape* -- see `shape_hash` -- for recognising a
+    /// status row repainted in place, whose text changes on every frame.
+    last_shapes: Vec<u64>,
     /// Rows a backward placement took off the bottom -- the screen moved up
     /// and the read replaced them -- kept until the next read says whether the
     /// screen carried on from there (they were rewritten, and are dropped for
@@ -859,6 +922,7 @@ impl ScrollbackStore {
             }
             buffer.trim();
             buffer.last_frame = buffer.hashes.iter().copied().collect();
+            buffer.last_shapes = buffer.lines.iter().map(|line| shape_hash(line)).collect();
             self.total_bytes = self.total_bytes + buffer.bytes - before;
             self.evict();
             return;
@@ -878,8 +942,16 @@ impl ScrollbackStore {
             .iter()
             .map(|line| !line.trim().is_empty())
             .collect();
-        let furniture =
-            common_suffix(&buffer.last_frame, &frame, &carries).min(frame.len() / FURNITURE_SHARE);
+        let shapes: Vec<u64> = incoming.iter().map(|line| shape_hash(line)).collect();
+        let furniture = status_rows_above(
+            &buffer.last_frame,
+            &buffer.last_shapes,
+            &frame,
+            &shapes,
+            &carries,
+            common_suffix(&buffer.last_frame, &frame, &carries),
+        )
+        .min(frame.len() / FURNITURE_SHARE);
         let mut strip = 0;
         if furniture > 0 {
             let held = furniture.min(buffer.lines.len());
@@ -1010,6 +1082,7 @@ impl ScrollbackStore {
         }
         buffer.trim();
         buffer.last_frame = frame;
+        buffer.last_shapes = shapes;
         self.total_bytes = self.total_bytes + buffer.bytes - before;
         self.evict();
     }
@@ -2701,6 +2774,260 @@ mod tests {
             // repainted, which is the trade it makes.
             let lost: Vec<_> = shown.iter().filter(|n| !messages.contains(n)).collect();
             assert!(lost.len() <= 1, "seed {seed}: lost {lost:?}");
+        }
+    }
+
+    /// Claude Code as it looks on the owner's pane: a transcript above a
+    /// ten-row status region -- the spinner with its clock, a blank, the
+    /// prompt between two rules, the mode line, a blank, and the agent roster
+    /// -- of which the spinner, the clock and the roster repaint in place.
+    /// `painted` is how many status rows have been drawn so far, for a read
+    /// taken in the middle of a redraw.
+    fn claude_screen(top: usize, tick: usize, painted: usize) -> String {
+        const TRANSCRIPT: usize = 30;
+        let mut rows: Vec<String> = (0..TRANSCRIPT)
+            .map(|row| {
+                let n = top + row;
+                if n % 3 == 2 {
+                    String::new()
+                } else {
+                    format!("● transcript line {n}: something the agent said")
+                }
+            })
+            .collect();
+        let status = [
+            format!(
+                "✻ Swirling… ({}m {}s · ↓ {}.{}k tokens)",
+                tick / 60,
+                tick % 60,
+                tick / 10,
+                tick % 10
+            ),
+            String::new(),
+            "─".repeat(100),
+            "❯ 做好了没".to_owned(),
+            "─".repeat(100),
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents".to_owned(),
+            String::new(),
+            "  ● main".to_owned(),
+            format!("  ◯ general-purpose  Reading file {}", tick % 4),
+            format!("  ◯ general-purpose  Running {} tools", tick % 3),
+        ];
+        rows.extend(status.iter().enumerate().map(|(row, line)| {
+            if row < painted {
+                line.clone()
+            } else {
+                String::new()
+            }
+        }));
+        rows.join("\n")
+    }
+
+    fn assert_claude_history(held: &str, last_line: usize) {
+        let rows = split_lines(held);
+        let lines: Vec<usize> = rows
+            .iter()
+            .filter_map(|row| {
+                row.strip_prefix("● transcript line ")?
+                    .split(':')
+                    .next()?
+                    .parse()
+                    .ok()
+            })
+            .collect();
+        let expected: Vec<usize> = (0..=last_line).filter(|n| n % 3 != 2).collect();
+        assert_eq!(
+            lines, expected,
+            "transcript held twice, out of order or lost"
+        );
+        // The status region is at the bottom, once: no frozen copy of it in
+        // the middle of the transcript.
+        for marker in ["✻ Swirling", "❯ 做好了没", "⏵⏵ bypass", "● main"] {
+            let at: Vec<usize> = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.contains(marker))
+                .map(|(index, _)| index)
+                .collect();
+            assert_eq!(at.len(), 1, "{marker:?} held {} times", at.len());
+            assert!(
+                at[0] + 12 > rows.len(),
+                "{marker:?} left in the middle of history at {} of {}",
+                at[0],
+                rows.len()
+            );
+        }
+    }
+
+    #[test]
+    fn the_first_read_after_startup_does_not_freeze_its_status_region_into_history() {
+        // The gateway starts with an empty buffer and its first read is the
+        // live screen, status region and all. Every read after it has to
+        // replace that status region, not keep it while the transcript lands
+        // above and below it.
+        for (scroll, first_painted) in [
+            (1_usize, 10_usize),
+            (3, 10),
+            (7, 10),
+            (3, 4),
+            (3, 1),
+            (12, 6),
+        ] {
+            let mut store = ScrollbackStore::default();
+            let mut top = 0;
+            store.record("k", &claude_screen(top, 82, first_painted), false);
+            for tick in 83..140 {
+                // Quiet polls, where only the clock and the roster move.
+                if tick % 4 != 0 {
+                    top += scroll;
+                }
+                store.record("k", &claude_screen(top, tick, 10), false);
+            }
+            let held = store.window("k", MAX_PANE_LINES).unwrap();
+            let last = top + 29;
+            let last = if last % 3 == 2 { last - 1 } else { last };
+            assert_claude_history(&held, last);
+        }
+    }
+
+    #[test]
+    fn a_status_region_that_changes_height_never_freezes_into_history() {
+        // The same pane after startup, with a status region that grows and
+        // shrinks between reads -- the spinner comes and goes, the roster
+        // gains and loses agents, a feedback box opens above the prompt -- on
+        // a fixed seed. The prompt is held once, at the bottom, and the
+        // transcript once, in order.
+        for seed in 1_u64..=60 {
+            let mut state = seed;
+            let mut next = |bound: u64| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 33) % bound
+            };
+            let mut store = ScrollbackStore::default();
+            let mut top = 0;
+            let mut last = 0;
+            for tick in 80..200 {
+                if tick > 80 && next(4) != 0 {
+                    top += next(6) as usize;
+                }
+                let spinner = next(3) != 0;
+                let roster = next(4) as usize;
+                let boxed = next(5) == 0;
+                let body = 40 - 6 - usize::from(spinner) * 2 - roster - usize::from(boxed) * 5;
+                let mut rows: Vec<String> = (0..body)
+                    .map(|row| {
+                        let n = top + row;
+                        if n % 3 == 2 {
+                            String::new()
+                        } else {
+                            format!("● transcript line {n}: something the agent said")
+                        }
+                    })
+                    .collect();
+                last = (0..body)
+                    .map(|row| top + row)
+                    .filter(|n| n % 3 != 2)
+                    .max()
+                    .unwrap();
+                if spinner {
+                    rows.push(format!(
+                        "✻ Swirling… (1m {}s · ↓ 3.{}k tokens)",
+                        tick % 60,
+                        tick % 10
+                    ));
+                    rows.push(String::new());
+                }
+                if boxed {
+                    rows.push(format!("╭{}", "─".repeat(90)));
+                    rows.push("│ ✻ Bug report drafted".to_owned());
+                    rows.push("│ 1 to review · 2 to send".to_owned());
+                    rows.push(format!("╰{}", "─".repeat(90)));
+                    rows.push(String::new());
+                }
+                rows.push("─".repeat(100));
+                rows.push("❯ 做好了没".to_owned());
+                rows.push("─".repeat(100));
+                rows.push("  ⏵⏵ bypass permissions on (shift+tab to cycle)".to_owned());
+                rows.push(String::new());
+                rows.push("  ● main".to_owned());
+                for agent in 0..roster {
+                    rows.push(format!("  ◯ general-purpose  task {agent} at {}", tick % 7));
+                }
+                store.record("k", &rows.join("\n"), false);
+            }
+            let held = store.window("k", MAX_PANE_LINES).unwrap();
+            let rows = split_lines(&held);
+            let lines: Vec<usize> = rows
+                .iter()
+                .filter_map(|row| {
+                    row.strip_prefix("● transcript line ")?
+                        .split(':')
+                        .next()?
+                        .parse()
+                        .ok()
+                })
+                .collect();
+            let mut seen = HashSet::new();
+            let twice: Vec<_> = lines.iter().filter(|n| !seen.insert(**n)).collect();
+            let disorder = lines.windows(2).filter(|p| p[0] >= p[1]).count();
+            let prompts = rows.iter().filter(|row| row.starts_with("❯")).count();
+            let lost = (0..=last)
+                .filter(|n| n % 3 != 2 && !lines.contains(n))
+                .count();
+            assert!(
+                twice.is_empty() && disorder == 0 && prompts == 1 && lost == 0,
+                "seed {seed}: held twice {twice:?}, {disorder} out of order, \
+                 {prompts} prompts, {lost} lost"
+            );
+        }
+    }
+
+    #[test]
+    fn a_spinner_is_not_left_in_history_when_the_next_read_does_not_overlap() {
+        // Measured live against a scripted pane: a read that could not be
+        // placed -- the first one after the gateway started, or one after
+        // output outran the poll -- went on top of the screen before it, and
+        // that screen's spinner, which no two frames share and so was never
+        // furniture, stayed in the middle of history.
+        for steady in [0_usize, 1, 5] {
+            let mut agent = ScriptedAgent::new(true);
+            let mut store = ScrollbackStore::default();
+            let mut tick = 0;
+            for _ in 0..20 {
+                agent.print();
+            }
+            for _ in 0..=steady {
+                agent.print();
+                store.record("k", &agent.screen(None, tick), false);
+                tick += 1;
+            }
+            for _ in 0..3 {
+                // A burst of more than a screen, then a quiet poll or two.
+                for _ in 0..15 {
+                    agent.print();
+                }
+                store.record("k", &agent.screen(None, tick), false);
+                tick += 1;
+                store.record("k", &agent.screen(None, tick), false);
+                tick += 1;
+            }
+            let held = store.window("k", MAX_PANE_LINES).unwrap();
+            let rows = split_lines(&held);
+            let spinners: Vec<usize> = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.starts_with("✢ Compacting"))
+                .map(|(index, _)| index)
+                .collect();
+            assert_eq!(
+                spinners,
+                vec![rows.len() - 6],
+                "after {steady} steady reads a spinner was kept mid-history"
+            );
+            let messages = held_messages(&held);
+            assert!(messages.windows(2).all(|pair| pair[0] < pair[1]));
         }
     }
 }
