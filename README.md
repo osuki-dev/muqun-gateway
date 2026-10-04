@@ -315,6 +315,17 @@ Herdr delivers the chords natively. Its key names stop short of Home, End,
 PageUp, PageDown, Insert and Delete, so the gateway types those as the bytes a
 keyboard sends (`ESC [1~`, `ESC [1;5H` for `ctrl+home`, ...).
 
+### Recording pane reads
+
+Set `MUQUN_SCROLLBACK_TRACE_DIR` to a directory and the gateway appends every
+pane read it serves or samples -- buffered or passed through -- to
+`<dir>/<session>_<pane>.jsonl`, one JSON line per read: time, source, format,
+whether the gateway was keeping its own history for the pane, whether the pane
+owns its screen, and the rows. It is off by default and is for replaying a real
+pane through the scrollback model in a test; it writes terminal contents to
+disk, so switch it on for a session (a systemd drop-in with
+`Environment=MUQUN_SCROLLBACK_TRACE_DIR=…`) and off again.
+
 ## Reaching it from outside your network
 
 Put both devices on [Tailscale](https://tailscale.com) and point the gateway at

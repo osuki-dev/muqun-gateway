@@ -787,15 +787,17 @@ impl ScrollbackStore {
     /// is the question this store actually needs answered and the one
     /// `alternate_on` answers directly.
     pub fn observe(&mut self, session_id: &str, value: &Value) {
+        let mut passed_through = Vec::new();
         visit_panes(value, &mut |pane_id, pane| {
             if let Some(scroll) = pane.get("scroll").and_then(Value::as_object) {
                 if let Some(maximum) = scroll.get("max_offset_from_bottom").and_then(Value::as_f64)
                 {
                     let alternate = scroll.get("alternate_on").and_then(Value::as_bool);
-                    self.kept.insert(
-                        pane_key(session_id, pane_id),
-                        alternate == Some(true) || maximum <= 0.0,
-                    );
+                    let kept = alternate == Some(true) || maximum <= 0.0;
+                    self.kept.insert(pane_key(session_id, pane_id), kept);
+                    if !kept {
+                        passed_through.push(pane_id.to_owned());
+                    }
                 }
             }
             if let Some(command) = pane.get("foreground_command").and_then(Value::as_str) {
@@ -805,6 +807,9 @@ impl ScrollbackStore {
                 );
             }
         });
+        for pane_id in passed_through {
+            self.forget_pane(session_id, &pane_id);
+        }
     }
 
     /// The same, for a listing that is known to be every pane in the session
@@ -1119,12 +1124,23 @@ impl ScrollbackStore {
         backend_text: &str,
         rows: usize,
     ) -> String {
-        if !self.keeps(session_id, pane_id) {
+        let kept = self.keeps(session_id, pane_id);
+        let owns_screen = self.owns_screen(session_id, pane_id);
+        trace_read(
+            session_id,
+            pane_id,
+            source,
+            format,
+            kept,
+            owns_screen,
+            backend_text,
+        );
+        if !kept {
+            self.forget_pane(session_id, pane_id);
             return backend_text.to_owned();
         }
 
         let key = read_key(session_id, pane_id, source, format);
-        let owns_screen = self.owns_screen(session_id, pane_id);
         self.record(&key, backend_text, owns_screen);
         let backend_rows = split_lines(backend_text).len();
         self.window(&key, rows)
@@ -1143,12 +1159,51 @@ impl ScrollbackStore {
         format: &str,
         output: &str,
     ) {
-        if output.is_empty() || !self.keeps(session_id, pane_id) {
+        if output.is_empty() {
+            return;
+        }
+        let kept = self.keeps(session_id, pane_id);
+        let owns_screen = self.owns_screen(session_id, pane_id);
+        trace_read(
+            session_id,
+            pane_id,
+            source,
+            format,
+            kept,
+            owns_screen,
+            output,
+        );
+        if !kept {
+            self.forget_pane(session_id, pane_id);
             return;
         }
         let key = read_key(session_id, pane_id, source, format);
-        let owns_screen = self.owns_screen(session_id, pane_id);
         self.record(&key, output, owns_screen);
+    }
+
+    /// Drop every buffer held for this pane.
+    ///
+    /// Called whenever the pane is not kept -- Herdr reports scrollback of its
+    /// own for it and its reads are passed through. A Claude Code pane flips:
+    /// working, it draws on the normal screen and Herdr keeps real scrollback
+    /// (`max_offset_from_bottom` ~1000); idle, it is back on the alternate
+    /// screen at 0. Whatever was held from before such a gap ends with a
+    /// screen the next buffered read cannot be lined up with, so that read
+    /// went on the end whole and the old screen -- composer, spinner, roster
+    /// -- stayed frozen in the middle of history, one per flip. Starting again
+    /// from the current screen loses nothing the reader needs: while the pane
+    /// was passed through, Herdr's own history was what got served.
+    fn forget_pane(&mut self, session_id: &str, pane_id: &str) {
+        let prefix = format!("{}/", pane_key(session_id, pane_id));
+        let mut freed = 0;
+        self.buffers.retain(|key, buffer| {
+            let keep = !key.starts_with(&prefix);
+            if !keep {
+                freed += buffer.bytes;
+            }
+            keep
+        });
+        self.total_bytes = self.total_bytes.saturating_sub(freed);
     }
 
     /// How many rows are held for this pane, across every read shape.
@@ -1237,6 +1292,76 @@ impl ScrollbackStore {
                 self.total_bytes = self.total_bytes.saturating_sub(buffer.bytes);
             }
         }
+    }
+}
+
+/// Where `MUQUN_SCROLLBACK_TRACE_DIR` says every pane read goes, if it is set.
+///
+/// The raw-read recorder. Off unless the variable names a directory; then every
+/// read this store is handed -- kept or passed through, from a direct read or a
+/// stream frame -- is appended as one JSON line to `<dir>/<session>_<pane>.jsonl`
+/// with its time, source and format, whether the pane was kept and owns its
+/// screen, and the rows themselves. That is enough to replay a real pane
+/// through `record` in a test, which is how the next placement bug gets a
+/// fixture instead of a guess. It writes terminal contents to disk, which is
+/// exactly what this module otherwise refuses to do, so it is for a developer's
+/// own machine, switched on for a session and off again.
+fn trace_dir() -> Option<&'static std::path::Path> {
+    static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        std::env::var_os("MUQUN_SCROLLBACK_TRACE_DIR")
+            .filter(|dir| !dir.is_empty())
+            .map(std::path::PathBuf::from)
+    })
+    .as_deref()
+}
+
+fn trace_read(
+    session_id: &str,
+    pane_id: &str,
+    source: &str,
+    format: &str,
+    kept: bool,
+    owns_screen: bool,
+    text: &str,
+) {
+    let Some(dir) = trace_dir() else {
+        return;
+    };
+    let safe = |part: &str| -> String {
+        part.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    };
+    let line = serde_json::json!({
+        "ts_ms": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis() as u64),
+        "session": session_id,
+        "pane": pane_id,
+        "source": source,
+        "format": format,
+        "kept": kept,
+        "owns_screen": owns_screen,
+        "rows": split_lines(text),
+    });
+    let path = dir.join(format!("{}_{}.jsonl", safe(session_id), safe(pane_id)));
+    let written = std::fs::create_dir_all(dir).and_then(|()| {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        writeln!(file, "{line}")
+    });
+    if let Err(err) = written {
+        tracing::debug!("scrollback trace to {} failed: {err}", path.display());
     }
 }
 
@@ -3029,5 +3154,110 @@ mod tests {
             let messages = held_messages(&held);
             assert!(messages.windows(2).all(|pair| pair[0] < pair[1]));
         }
+    }
+
+    #[test]
+    fn a_pane_that_flips_to_real_scrollback_and_back_starts_again_from_its_screen() {
+        // Claude Code on Herdr: idle on the alternate screen (offset 0, kept),
+        // working on the normal screen (Herdr's own scrollback, passed
+        // through), idle again with a different screen. The buffer held from
+        // before the gap must not end up with the old screen frozen in it.
+        fn observe(store: &mut ScrollbackStore, offset: u64) {
+            store.observe(
+                "s",
+                &json!({
+                    "pane_id": "p",
+                    "foreground_command": "claude",
+                    "scroll": { "max_offset_from_bottom": offset, "viewport_rows": 30 },
+                }),
+            );
+        }
+        let mut agent = ScriptedAgent::new(true);
+        let mut store = ScrollbackStore::default();
+        let mut tick = 0;
+        let mut read = |store: &mut ScrollbackStore, agent: &ScriptedAgent| {
+            tick += 1;
+            store.serve_read(
+                "s",
+                "p",
+                "recent_unwrapped",
+                "text",
+                &agent.screen(None, tick),
+                MAX_PANE_LINES,
+            )
+        };
+        observe(&mut store, 0);
+        for _ in 0..20 {
+            agent.print();
+            read(&mut store, &agent);
+        }
+        assert!(store.depth("s", "p") > 30);
+
+        // Working: Herdr has scrollback of its own, and its text is served.
+        observe(&mut store, 1069);
+        for _ in 0..40 {
+            agent.print();
+        }
+        let passed = agent.screen(None, 99);
+        assert_eq!(
+            store.serve_read(
+                "s",
+                "p",
+                "recent_unwrapped",
+                "text",
+                &passed,
+                MAX_PANE_LINES
+            ),
+            passed
+        );
+        assert_eq!(
+            store.depth("s", "p"),
+            0,
+            "a passed-through pane kept a buffer"
+        );
+
+        // Idle again, on a screen that shares nothing with the one held before.
+        observe(&mut store, 0);
+        for _ in 0..3 {
+            agent.print();
+            read(&mut store, &agent);
+        }
+        let held = agent_window_for(&store, "s", "p");
+        let rows = split_lines(&held);
+        assert_eq!(rows.iter().filter(|row| row.starts_with('❯')).count(), 1);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.starts_with("✢ Compacting"))
+                .count(),
+            1
+        );
+        let messages = held_messages(&held);
+        assert!(messages.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(
+            messages[0] > 20,
+            "the screen from before the gap is still held"
+        );
+    }
+
+    fn agent_window_for(store: &ScrollbackStore, session: &str, pane: &str) -> String {
+        store
+            .window(
+                &read_key(session, pane, "recent_unwrapped", "text"),
+                MAX_PANE_LINES,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn a_pane_listed_with_real_scrollback_drops_what_was_held() {
+        let mut store = ScrollbackStore::default();
+        let pane = |offset: u64| json!({ "pane_id": "p", "scroll": { "max_offset_from_bottom": offset, "viewport_rows": 3 } });
+        store.observe("s", &pane(0));
+        store.serve_read("s", "p", "recent_unwrapped", "text", "a\nb\nc", 100);
+        store.serve_read("s", "p", "recent_unwrapped", "text", "b\nc\nd", 100);
+        assert_eq!(store.depth("s", "p"), 4);
+        store.observe("s", &pane(500));
+        assert_eq!(store.depth("s", "p"), 0);
+        assert_eq!(store.total_bytes, 0);
     }
 }
