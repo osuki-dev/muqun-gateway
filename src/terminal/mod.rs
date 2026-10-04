@@ -9,5 +9,7 @@ pub mod login_env;
 pub mod native;
 pub mod routes;
 pub mod scrollback;
+#[cfg(test)]
+mod scrollback_replay;
 pub mod shortcuts;
 pub mod supervision;
