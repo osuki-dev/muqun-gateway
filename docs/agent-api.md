@@ -42,6 +42,17 @@ verbatim, so their keys stay camelCase.
   folder had simply been deleted. A 502 is now never blank either — an upstream
   failure with no body reads `OpenCode answered 500 to GET /api/vcs/diff`, so
   there is always a status and a route to go on.
+- **Directories may start with `~`.** Every agent route that takes a
+  directory — `POST /api/agent-sessions`, `?directory=` on the session list,
+  `agent-catalog`, the file search, `agent-shells` and the worktree routes, a
+  session move's target, and a task's `repo_path` / spawn's `cwd` — accepts
+  `~` and `~/…` for the gateway user's home as well as an absolute path. The
+  gateway expands it before any check and, when the folder exists, sends and
+  answers the canonical absolute path, so `~/Work/x` and `/home/u/Work/x` are
+  one project. `~user` is not expanded and fails as any non-absolute path does
+  (`400 invalid_directory` on create); a `~/…` that does not exist is the
+  route's usual not-found answer (`400 directory_not_found` on create,
+  `404 workspace_missing` with the expanded path elsewhere).
 - **Compression.** Responses are gzipped (or brotli'd) when the client asks
   with `Accept-Encoding` and the body is over 512 bytes. `text/event-stream`
   and already-compressed content such as an uploaded image are never touched.
@@ -305,7 +316,7 @@ A subagent run creates a real session whose `parent_id` is the caller's. Without
 All four are optional; `agent_id` picks the agent (see [Agents](#agents)) and
 `mode` the session's mode. **Omitting `model` is the correct way to get the user's
 configured default** — the gateway no longer substitutes one. `directory` must
-be absolute and must exist. Returns `AgentSessionInfo`.
+be absolute or `~`-rooted and must exist; the session records it canonical. Returns `AgentSessionInfo`.
 
 ### `GET /api/agent-sessions/{asid}`
 

@@ -282,7 +282,8 @@ pub fn validate_branch_name(name: &str) -> Result<(), BranchNameError> {
 /// path is *allowed to be* a root -- the repo the user is looking at is the
 /// obvious thing to branch from -- so the test is equal-or-inside.
 pub fn resolve_repo_path(raw: &str, roots: &[PathBuf]) -> Option<PathBuf> {
-    let canonical = std::fs::canonicalize(raw).ok()?;
+    let expanded = super::directories::expand_home(raw.trim())?;
+    let canonical = std::fs::canonicalize(expanded).ok()?;
     if !canonical.is_dir() {
         return None;
     }
@@ -599,6 +600,17 @@ mod tests {
             BranchNameError::Empty.message(Locale::ZhTw),
             "branch_name 不得為空"
         );
+    }
+
+    #[test]
+    fn a_repo_path_may_be_spelled_from_home() {
+        let home = std::fs::canonicalize(dirs::home_dir().unwrap()).unwrap();
+        let roots = vec![home.clone()];
+        assert_eq!(resolve_repo_path("~", &roots), Some(home.clone()));
+        assert_eq!(resolve_repo_path(" ~/ ", &roots), Some(home));
+        assert!(resolve_repo_path("~/muqun-no-such-dir-for-tests", &roots).is_none());
+        // `~user` is not expanded, so it is a miss like any other bad path.
+        assert!(resolve_repo_path("~nobody", &roots).is_none());
     }
 
     #[test]
