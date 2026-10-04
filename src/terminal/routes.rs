@@ -318,7 +318,15 @@ pub(crate) fn pane_read_text(value: &Value) -> Option<String> {
 /// Convert one sampled frame into the enriched `pane_updated` payload consumed
 /// by Muqun. Output content, rather than revision, is used to decide whether to
 /// emit because Herdr can expose new text before its coalesced revision advances.
-pub(crate) fn stream_pane_update_payload(frame: &StreamPaneFrame, pane_id: &str) -> Option<String> {
+///
+/// `data.generation` is the gateway's instance generation, carried on every
+/// frame that carries output so a client can tell rows streamed by this
+/// process from rows it kept from a previous one.
+pub(crate) fn stream_pane_update_payload(
+    frame: &StreamPaneFrame,
+    pane_id: &str,
+    generation: &str,
+) -> Option<String> {
     let payload = json!({
         "event": "pane_updated",
         "data": {
@@ -326,7 +334,8 @@ pub(crate) fn stream_pane_update_payload(frame: &StreamPaneFrame, pane_id: &str)
                 "pane_id": pane_id,
                 "revision": frame.revision
             },
-            "output": frame.output
+            "output": frame.output,
+            "generation": generation
         }
     });
     serde_json::to_string(&payload).ok()
@@ -351,13 +360,15 @@ pub(crate) async fn poll_stream_pane_update(
 }
 
 /// If `line` is a `pane.updated` for the streamed pane, read that pane's output
-/// and fold it into the event as `data.output`. Returns `None` to forward the
+/// and fold it into the event as `data.output`, with the instance generation
+/// beside it as `data.generation`. Returns `None` to forward the
 /// line untouched (wrong pane, wrong event, or a read failure -- the client
 /// still has its revision and can fall back to a read).
 pub(crate) async fn enrich_pane_update(
     line: &str,
     backend: &dyn TerminalBackend,
     opts: &StreamOutputOpts,
+    generation: &str,
 ) -> Option<String> {
     let pane = opts.pane.as_deref()?;
     let mut value: Value = serde_json::from_str(line).ok()?;
@@ -382,10 +393,9 @@ pub(crate) async fn enrich_pane_update(
     .await
     .ok()?
     .ok()?;
-    value
-        .get_mut("data")
-        .and_then(Value::as_object_mut)?
-        .insert("output".into(), Value::String(read.text));
+    let data = value.get_mut("data").and_then(Value::as_object_mut)?;
+    data.insert("output".into(), Value::String(read.text));
+    data.insert("generation".into(), json!(generation));
     serde_json::to_string(&value).ok()
 }
 
@@ -580,6 +590,7 @@ pub(crate) async fn events(
     let devices = state.clone();
     let assets = state.assets.clone();
     let scrollback_store = state.scrollback.clone();
+    let generation = state.generation.clone();
     let backend = terminal_backend(&session);
     let mut activity = subscribe_activity(&state, &session);
     // The runtime's channel, not a manager's: a client's stream has to survive
@@ -614,7 +625,7 @@ pub(crate) async fn events(
                         });
                         if keep {
                             let payload = if stream_opts.pane.is_some() {
-                                enrich_pane_update(&data, backend.as_ref(), &stream_opts)
+                                enrich_pane_update(&data, backend.as_ref(), &stream_opts, &generation)
                                     .await
                                     .unwrap_or_else(|| data.clone())
                             } else {
@@ -672,7 +683,7 @@ pub(crate) async fn events(
                             last_stream_output = Some(frame.output.clone());
                             if let Some(pane_id) = stream_opts.pane.as_deref() {
                                 keep_stream_frame(&scrollback_store, &session_id, pane_id, &stream_opts, &frame.output);
-                                if let Some(payload) = stream_pane_update_payload(&frame, pane_id) {
+                                if let Some(payload) = stream_pane_update_payload(&frame, pane_id, &generation) {
                                     if let Some(event) = stream_event(&mut sealer, "herdr", &payload) {
                                         yield Ok(event);
                                     }
@@ -2267,7 +2278,22 @@ pub(crate) async fn pane_output(
             }
         }
     }
+    stamp_read_generation(&mut answer, &state.generation);
     Ok(Json(answer))
+}
+
+/// Put the instance generation beside `revision` in a `pane_read` answer, at
+/// `result.read.generation`. A read is only comparable with rows read in the
+/// same generation: the scrollback this gateway stitches in lives in memory,
+/// so after a restart it starts over and older rows must not be merged under
+/// the new ones.
+pub(crate) fn stamp_read_generation(answer: &mut Value, generation: &str) {
+    if let Some(read) = answer
+        .pointer_mut("/result/read")
+        .and_then(Value::as_object_mut)
+    {
+        read.insert("generation".into(), json!(generation));
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -2390,6 +2416,8 @@ pub(crate) async fn pane_parts(
         },
         "lines": lines,
         "revision": revision,
+        // Instance generation; see `stamp_read_generation`.
+        "generation": &*state.generation,
         "pane": pane_capabilities(
             &pane_id,
             agent.as_deref(),
@@ -3525,7 +3553,7 @@ mod tests {
             revision: 42,
             output: "hello\n".into(),
         };
-        let encoded = stream_pane_update_payload(&frame, "w1:p2").unwrap();
+        let encoded = stream_pane_update_payload(&frame, "w1:p2", "gen-1").unwrap();
         let payload: Value = serde_json::from_str(&encoded).unwrap();
 
         assert_eq!(frame.revision, 42);
@@ -3534,6 +3562,7 @@ mod tests {
         assert_eq!(payload["data"]["pane"]["revision"], 42);
         assert!(payload["data"]["pane"].get("source_revision").is_none());
         assert_eq!(payload["data"]["output"], "hello\n");
+        assert_eq!(payload["data"]["generation"], "gen-1");
     }
 
     /// A native adapter answers `parts: "native"`, and only when it actually
@@ -3857,6 +3886,95 @@ mod tests {
         // range-addressed request must get exactly that, not the stitched span.
         assert_eq!(screens.last().unwrap(), "row 3\nrow 4\nrow 5\nrow 6");
         assert_eq!(served, "row 3\nrow 4\nrow 5\nrow 6");
+    }
+
+    /// The instance generation is one value for the life of a process, on
+    /// every route and frame a client merges rows from -- and a different one
+    /// for a different process, which is how a client knows the rows it kept
+    /// from before a restart no longer line up with what it reads now.
+    #[tokio::test]
+    async fn every_read_carries_one_generation_and_another_instance_has_another() {
+        let screens = repainting_screens();
+        let herdr = FakeHerdr::start(screens.iter().map(String::as_str).collect(), None);
+        let state = output_state(&herdr);
+        let generation = state.generation.to_string();
+        assert!(!generation.is_empty());
+
+        let output = |start: Option<u32>, end: Option<u32>| {
+            let state = state.clone();
+            async move {
+                pane_output(
+                    State(state),
+                    Path(("default".into(), "wM:p1".into())),
+                    Query(OutputQuery {
+                        source: Some("recent-unwrapped".into()),
+                        lines: Some(240),
+                        format: Some("text".into()),
+                        start,
+                        end,
+                    }),
+                    bearer_headers("token"),
+                )
+                .await
+                .unwrap()
+                .0
+            }
+        };
+        for answer in [
+            output(None, None).await,
+            output(None, None).await,
+            output(Some(0), Some(240)).await,
+        ] {
+            assert_eq!(answer["result"]["read"]["generation"], generation.as_str());
+        }
+
+        let parts = pane_parts(
+            State(state.clone()),
+            Path(("default".into(), "wM:p1".into())),
+            Query(PartsQuery { lines: Some(40) }),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(parts["data"]["generation"], generation.as_str());
+
+        let health = crate::platform::routes::health(State(state.clone()), bearer_headers("token"))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(health["generation"], generation.as_str());
+        let discovery =
+            crate::platform::routes::api_discovery(State(state.clone()), HeaderMap::new())
+                .await
+                .unwrap()
+                .0;
+        assert_eq!(discovery["generation"], generation.as_str());
+
+        // A streamed `pane.updated` for the watched pane gets the generation
+        // folded in beside the output.
+        let opts = StreamOutputOpts {
+            pane: Some("wM:p1".into()),
+            lines: 240,
+            source: "recent_unwrapped".into(),
+            format: "text".into(),
+        };
+        let line = json!({ "event": "pane.updated", "data": { "pane": { "pane_id": "wM:p1", "revision": 1 } } }).to_string();
+        let backend = terminal_backend(&state.config.sessions[0]);
+        let enriched = enrich_pane_update(&line, backend.as_ref(), &opts, &state.generation)
+            .await
+            .unwrap();
+        let enriched: Value = serde_json::from_str(&enriched).unwrap();
+        assert!(enriched["data"]["output"].is_string());
+        assert_eq!(enriched["data"]["generation"], generation.as_str());
+
+        let other = output_state(&herdr);
+        assert_ne!(*other.generation, *state.generation);
+        let other_health = crate::platform::routes::health(State(other), bearer_headers("token"))
+            .await
+            .unwrap()
+            .0;
+        assert_ne!(other_health["generation"], health["generation"]);
     }
 
     /// And having kept them, it says so where the reader's affordance looks --

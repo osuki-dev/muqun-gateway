@@ -104,7 +104,13 @@ pub fn openapi_spec() -> Value {
         },
         "security": [{ "bearerAuth": [] }],
         "paths": {
-            "/health": { "get": simple_endpoint("Gateway health") },
+            "/health": {
+                "get": {
+                    "summary": "Gateway health",
+                    "description": "Also carries the top-level instance generation (generation), the same value /api/discovery, every pane read and every streamed output frame carry.",
+                    "responses": ok_response()
+                }
+            },
             "/api/capabilities": {
                 "get": {
                     "summary": "Gateway Terminal and Agents dual-plane capability discovery",
@@ -208,7 +214,7 @@ pub fn openapi_spec() -> Value {
             "/api/sessions/{sessionId}/events": {
                 "get": {
                     "summary": "Stream Herdr lifecycle events as Server-Sent Events",
-                    "description": "Herdr events arrive as SSE `herdr` events. The gateway adds its own `asset.created` event, carrying one asset in the content-model envelope, when a Herdr worktree event reveals newly produced files. It obeys the same `types=` allow-list, under the name `asset.created`.",
+                    "description": "Herdr events arrive as SSE `herdr` events. With stream_pane set, every pane_updated frame for that pane that carries data.output also carries data.generation, the gateway instance generation (see /health). The gateway adds its own `asset.created` event, carrying one asset in the content-model envelope, when a Herdr worktree event reveals newly produced files. It obeys the same `types=` allow-list, under the name `asset.created`.",
                     "parameters": [path_param("sessionId")],
                     "responses": {
                         "200": { "description": "SSE stream of Herdr event JSON lines, plus gateway asset.created events" },
@@ -424,7 +430,7 @@ pub fn openapi_spec() -> Value {
                         query_param("end", "One past the last absolute line to read. Requires start. A range wins over lines, and is clamped to 5000 lines and to what the pane holds rather than refused."),
                         query_param("format", "Output format: text or ansi")
                     ],
-                    "responses": ok_response()
+                    "responses": pane_read_responses()
                 }
             },
             "/api/sessions/{sessionId}/panes/{paneId}/parts": {
@@ -650,7 +656,7 @@ pub fn openapi_spec() -> Value {
             "/api/ws": {
                 "get": {
                     "summary": "Agent events for many sessions over one WebSocket",
-                    "description": "Upgrade to a WebSocket that carries the same agent events as the per-session SSE stream, for the sessions the client subscribes to (or all). Authenticated like the SSE stream; frames are sealed per connection on an encrypted device. See docs/agent-api.md, \"WebSocket events\". Announced as ws_events.",
+                    "description": "Upgrade to a WebSocket that carries the same agent events as the per-session SSE stream, for the sessions the client subscribes to (or all). Authenticated like the SSE stream; frames are sealed per connection on an encrypted device. The first frame is hello, carrying connection_id, protocol and generation (the gateway instance generation, see /health). See docs/agent-api.md, \"WebSocket events\". Announced as ws_events.",
                     "responses": {
                         "101": { "description": "Switched to the WebSocket protocol" },
                         "429": { "description": "too_many_connections: the gateway-wide socket cap is reached" }
@@ -851,6 +857,7 @@ fn capabilities_discovery_responses() -> Value {
             "properties": {
                 "serverVersion": { "type": "string", "description": "Gateway binary semver" },
                 "protocolVersion": { "type": "string", "description": "Protocol revision date (e.g. 2026-09-28)" },
+                "generation": { "type": "string", "description": GENERATION_DOC },
                 "planes": {
                     "type": "object",
                     "required": ["terminal", "agents"],
@@ -904,6 +911,41 @@ fn capabilities_discovery_responses() -> Value {
                 }
             }
         }) } }
+    });
+    responses
+}
+
+/// What `generation` means, wherever it appears.
+const GENERATION_DOC: &str = "The gateway instance generation: an opaque string minted once at process start and unchanged until the process exits. Compare it for equality only. Rows read under a different generation came from a gateway whose in-memory scrollback has since started over, so a client drops them instead of merging new reads under them.";
+
+/// `GET .../output`: Herdr's `pane_read` result shape, plus the generation.
+fn pane_read_responses() -> Value {
+    let mut responses = ok_response();
+    responses["200"] = json!({
+        "description": "The pane's text",
+        "content": { "application/json": { "schema": {
+            "type": "object",
+            "required": ["result"],
+            "properties": {
+                "result": {
+                    "type": "object",
+                    "required": ["type", "read"],
+                    "properties": {
+                        "type": { "type": "string", "const": "pane_read" },
+                        "read": {
+                            "type": "object",
+                            "required": ["output", "generation"],
+                            "properties": {
+                                "output": { "type": "string" },
+                                "revision": { "type": ["integer", "null"] },
+                                "range": object_schema(&[("start", "integer"), ("end", "integer"), ("total", "integer")], &["start", "end", "total"]),
+                                "generation": { "type": "string", "description": GENERATION_DOC }
+                            }
+                        }
+                    }
+                }
+            }
+        } } }
     });
     responses
 }
@@ -1321,6 +1363,7 @@ fn parts_responses() -> Value {
                 "source": { "type": "string", "enum": ["recent-unwrapped", "native"], "description": "recent-unwrapped: the pane's own text, which is what the dictionaries key off. native: the agent's own protocol answered, and range spans the adapter's rendering -- which is the parts' fallback_text joined by newlines -- rather than terminal rows" },
                 "lines": { "type": "integer", "description": "How many lines were read, echoed back" },
                 "revision": { "type": ["integer", "null"], "description": "Herdr's pane revision for this read, when it reported one" },
+                "generation": { "type": "string", "description": GENERATION_DOC },
                 "pane": {
                     "type": "object",
                     "required": ["pane_id", "parts", "image_input"],

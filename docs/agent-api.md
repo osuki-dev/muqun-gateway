@@ -18,6 +18,17 @@ verbatim, so their keys stay camelCase.
 - **Envelope.** A successful JSON body is wrapped:
   `{"schema_version": "...", "capabilities": {...}, "data": <payload>}`. The
   payload column below describes `data`.
+- **Instance generation.** The gateway mints one opaque string, `generation`,
+  when the process starts and never changes it while the process lives.
+  Everything it keeps only in memory — above all the per-pane scrollback it
+  stitches into terminal reads — is valid within one generation. It appears as
+  top-level `generation` on `GET /health`, `GET /api/meta`, `GET /api/discovery`
+  and `GET /api/capabilities`; as `generation` in the `hello` frame of
+  `GET /api/ws`; and on every pane read and streamed output frame (see
+  `docs/content-model.md`, "Instance generation"). Compare it for equality
+  only. When it changes, drop the terminal rows held from before and read
+  again instead of merging the new reads under them. A gateway that predates
+  the field sends none; treat absence as "unknown" and keep the old behaviour.
 - **Errors.** `{"error": {"code": "...", "message": "..."}}`. The codes used
   here are `agent_unavailable` (503, no agent attached),
   `agent_error` (502, OpenCode refused), `session_not_found` (404),
@@ -1412,7 +1423,7 @@ Server → client:
 
 | Frame | Meaning |
 |---|---|
-| `{"t":"hello","connection_id":"<uuid>","protocol":1}` | First frame, always. |
+| `{"t":"hello","connection_id":"<uuid>","protocol":1,"generation":"<id>"}` | First frame, always. `generation` is the gateway instance generation (see Conventions); a client that finds it changed since its last socket is talking to a restarted gateway. Older gateways omit it. |
 | `{"t":"subscribed","asid":"ses_1"}` · `{"t":"subscribed","all":true}` | The subscription is in effect: every event published from here on reaches this socket. Start catch-up after this, not before. |
 | `{"t":"event","asid":"ses_1","seq":12,"event":"agent.timeline.upsert","data":{…}}` | One domain event. `event` is the SSE `event:` name and `data` is the SSE `data:` payload **byte for byte**, embedded as JSON rather than as a string. `asid` and `seq` repeat the event's own (`asid` is `""` and `seq` 0 for `agent.worktree.changed` and `agent.resync`). |
 | `{"t":"resync","asid":"ses_1"}` | This socket fell behind the gateway's event backlog; refetch that session. `asid` `""` means every session. One per subscribed session, or a single `""` under `subscribe_all`. |

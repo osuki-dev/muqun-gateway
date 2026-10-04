@@ -361,6 +361,10 @@ pub async fn build_discovery(state: &AppState, _sealed: bool, authenticated: boo
         "apiVersion": crate::GATEWAY_API_VERSION,
         "apiMajor": crate::GATEWAY_API_MAJOR,
         "platform": std::env::consts::OS,
+        // Instance generation: changes on every gateway restart, when every
+        // pane's scrollback buffer starts over. Not redacted -- it is a
+        // random id that says nothing but "this is a different process".
+        "generation": &*state.generation,
         "serverId": state.config.server_id,
         "label": state.config.label,
         "planes": planes,

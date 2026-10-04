@@ -108,6 +108,11 @@ mod tests {
         assert!(output.is_object());
         assert_eq!(output["parameters"][4]["name"], "start");
         assert_eq!(output["parameters"][5]["name"], "end");
+        assert_eq!(
+            output["responses"]["200"]["content"]["application/json"]["schema"]["properties"]
+                ["result"]["properties"]["read"]["properties"]["generation"]["type"],
+            "string"
+        );
         assert!(spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/zoom"].is_object());
         assert!(spec["paths"]["/api/sessions/{sessionId}/events"].is_object());
         assert!(spec["paths"]["/api/pair/request"].is_object());

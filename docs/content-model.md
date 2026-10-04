@@ -64,6 +64,29 @@ through `fallback_text` exactly as rule 1 promises. The gateway's own
   } }
 ```
 
+### Instance generation
+
+Every answer a client merges terminal rows from carries the gateway's instance
+generation: an opaque string minted once when the gateway process starts and
+unchanged until it exits. The scrollback the gateway stitches into a pane read
+lives in memory, so a restarted gateway starts every pane's buffer over; rows
+held from a previous generation do not line up with rows read now and must be
+dropped, not merged under the new read.
+
+| Where | JSON path |
+|---|---|
+| `GET /api/sessions/{s}/panes/{p}/output` | `result.read.generation`, beside `revision` |
+| `GET /api/sessions/{s}/panes/{p}/parts` | `data.generation`, beside `revision` |
+| `GET /api/sessions/{s}/events?stream_pane=…` | `data.generation` on every `pane_updated` frame that carries `data.output` |
+| `GET /health`, `/api/meta`, `/api/discovery`, `/api/capabilities` | top-level `generation` |
+| `GET /api/ws` | `generation` in the `hello` frame |
+
+It is the same value everywhere within one process. Compare it for equality
+only; its format is not part of the contract. The field is additive: an older
+client ignores it, and a newer client talking to an older gateway sees none
+and keeps its old behaviour. Not a schema change, so `schema_version` is
+unchanged.
+
 ## Part
 
 A pane transcript normalizes to an ordered list of parts.
