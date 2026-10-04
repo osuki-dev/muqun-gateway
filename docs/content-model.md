@@ -337,6 +337,36 @@ cap and `kill_on_drop`; `--no-optional-locks` keeps a status from taking
 `index.lock` from the agent working in the same checkout; git's stderr goes to
 the log and never to a client.
 
+### Changes (git)
+
+Capability `pane_vcs_files`, and `features.vcsFiles` in `planes.terminal` of
+`/api/discovery`. The agent sessions' three Changes routes, on a pane:
+
+- `GET /api/sessions/{sessionId}/panes/{paneId}/vcs/files?mode=working|branch`
+- `GET /api/sessions/{sessionId}/panes/{paneId}/vcs/file?mode=&path=&context=`
+- `POST /api/sessions/{sessionId}/panes/{paneId}/vcs/discard` `{ "path" }` —
+  device token required, like every pane write; logged at info.
+
+Payloads, limits, path rules, statuses and error codes are those of
+`docs/agent-api.md`, "Changes (git)": the handler bodies are shared
+(`src/platform/vcs_routes.rs`), so the two cannot drift. Only where the
+checkout comes from, and what "gone" means, differ:
+
+- The checkout is `git rev-parse --show-toplevel` from the cwd the terminal
+  backend reports for the pane (`pane.get`, the cwd `shortcuts` scopes by).
+  Like the agent routes and unlike `git/status`, there is no fence: a pane in a
+  home directory that is a dotfiles repository lists it, and discard there is
+  refused with `403 repository_is_home`.
+- A pane the backend does not know is `404 unknown_pane`, where an agent
+  session answers `404 workspace_missing`.
+- A pane that reports no cwd, whose cwd has been deleted, or whose cwd is in no
+  checkout is "not a repository": `vcs/files` answers `200` with
+  `vcs: null, reason: "not_a_repository"`, and `vcs/file` and `vcs/discard`
+  answer `404 not_a_repository`, exactly as an agent session outside a
+  checkout does.
+
+`git/status` and `git/diff` above are unchanged and stay for older apps.
+
 ## Asset
 
 Anything the agent produced that exists as a file and the user may want to see.

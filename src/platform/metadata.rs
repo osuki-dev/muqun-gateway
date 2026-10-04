@@ -69,6 +69,8 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "pane_parts",
     "pane_parts_native",
     "pane_shortcuts",
+    // The same three Changes routes on a terminal pane, in its cwd.
+    "pane_vcs_files",
     "configurable_agent_profiles",
     "per_device_tokens",
     "push_notifications",

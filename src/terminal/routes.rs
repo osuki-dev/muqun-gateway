@@ -26,6 +26,7 @@ use crate::platform::assets::{
     MAX_ASSET_EVENTS_PER_WORKTREE,
 };
 use crate::platform::i18n::Locale;
+use crate::platform::vcs_routes::{self, VcsDiscardBody, VcsFileQuery, VcsFilesQuery};
 use crate::{
     agents, api_error, approvals, backend, backend_api_error, backend_endpoint, composer,
     content_envelope, current_server_label, find_session, generate_token, git, i18n, native,
@@ -123,6 +124,18 @@ pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
         .route(
             "/api/sessions/{session_id}/panes/{pane_id}/git/diff",
             get(pane_git_diff),
+        )
+        .route(
+            "/api/sessions/{session_id}/panes/{pane_id}/vcs/files",
+            get(pane_vcs_files),
+        )
+        .route(
+            "/api/sessions/{session_id}/panes/{pane_id}/vcs/file",
+            get(pane_vcs_file),
+        )
+        .route(
+            "/api/sessions/{session_id}/panes/{pane_id}/vcs/discard",
+            post(discard_pane_vcs_file),
         )
         .route(
             "/api/sessions/{session_id}/panes/{pane_id}/send-text",
@@ -2786,6 +2799,90 @@ pub(crate) async fn pane_git_diff(
     data["session_id"] = json!(session_id);
     data["pane_id"] = json!(pane_id);
     Ok(Json(content_envelope(data)))
+}
+
+// ---------------------------------------------------------------------------
+// Changes (git): the same list, file and discard the agent sessions answer
+// ---------------------------------------------------------------------------
+//
+// The bodies are shared (`platform::vcs_routes`); a pane only differs in how
+// the checkout is found -- from the cwd the backend reports for it -- and in
+// answering `unknown_pane` where an agent session answers
+// `workspace_missing`.
+
+/// The checkout a pane's cwd belongs to: `None` when the pane reports no cwd,
+/// its cwd no longer exists, or the cwd is in no checkout. A pane the backend
+/// does not know is `404 unknown_pane`.
+async fn pane_checkout(
+    state: &AppState,
+    session_id: &str,
+    pane_id: &str,
+) -> ApiResult<Option<PathBuf>> {
+    let session = find_session(&state.config, session_id)?.clone();
+    let pane = terminal_backend(&session)
+        .get_pane(&BackendPaneId::new(pane_id))
+        .await
+        .map_err(|err| match err {
+            BackendError::InvalidTarget(_) => unknown_pane(),
+            BackendError::Refused {
+                code: Some(ref code),
+                ..
+            } if code == "pane_not_found" => unknown_pane(),
+            err => backend_api_error(err),
+        })?;
+    // A deleted directory would reach git as a spawn failure, which reads as
+    // "git is not installed"; it is "not in a repository".
+    let Some(cwd) = pane.cwd.filter(|cwd| cwd.is_dir()) else {
+        return Ok(None);
+    };
+    git::repository_root(&cwd).await.map_err(git_error)
+}
+
+fn unknown_pane() -> (StatusCode, Json<Value>) {
+    api_error(StatusCode::NOT_FOUND, "unknown_pane", "No pane has this id")
+}
+
+pub(crate) async fn pane_vcs_files(
+    State(state): State<AppState>,
+    Path((session_id, pane_id)): Path<(String, String)>,
+    Query(query): Query<VcsFilesQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let mode = vcs_routes::vcs_mode(query.mode.as_deref())?;
+    let toplevel = pane_checkout(&state, &session_id, &pane_id).await?;
+    vcs_routes::files(toplevel.as_deref(), mode).await
+}
+
+pub(crate) async fn pane_vcs_file(
+    State(state): State<AppState>,
+    Path((session_id, pane_id)): Path<(String, String)>,
+    Query(query): Query<VcsFileQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let mode = vcs_routes::vcs_mode(query.mode.as_deref())?;
+    let toplevel = pane_checkout(&state, &session_id, &pane_id).await?;
+    vcs_routes::file(toplevel.as_deref(), mode, &query).await
+}
+
+pub(crate) async fn discard_pane_vcs_file(
+    State(state): State<AppState>,
+    Path((session_id, pane_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<VcsDiscardBody>,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let toplevel = pane_checkout(&state, &session_id, &pane_id).await?;
+    let (action, answer) = vcs_routes::discard(toplevel.as_deref(), &body.path).await?;
+    tracing::info!(
+        session_id,
+        pane_id,
+        path = ?body.path,
+        action = action.as_str(),
+        "discarded a pane change"
+    );
+    Ok(answer)
 }
 
 /// Which agents have a key row and command list, and where to add one. Lets a
