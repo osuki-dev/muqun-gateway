@@ -102,7 +102,7 @@ impl TmuxBackend {
     }
 
     #[cfg(test)]
-    fn with_binary(binary: impl Into<PathBuf>, socket_path: Option<PathBuf>) -> Self {
+    pub(crate) fn with_binary(binary: impl Into<PathBuf>, socket_path: Option<PathBuf>) -> Self {
         Self {
             binary: binary.into(),
             socket_path,
