@@ -115,6 +115,34 @@
 //! which is the point: the two ends of the same pane must not disagree about
 //! where a row belongs.
 //!
+//! ## A screen redrawn from further back
+//!
+//! An agent does not only scroll forward. Claude Code redraws its whole screen
+//! and can land it on an older stretch of the transcript -- sixty rows up, a
+//! hundred -- for a few seconds before coming back down. Every placement above
+//! looks at the end of the buffer, so that older screen placed nowhere and went
+//! on the end whole; when the agent came back down the newest screen no longer
+//! overlapped it and went on the end after it. The reader got an older screen
+//! below newer messages and the newest one twice, for as long as the gateway
+//! ran, and the app's parts showed both.
+//!
+//! So before a read is placed it is also looked for *anywhere* in what is held
+//! (`history_view` from its head, `history_bottom` from its bottom), and a read
+//! held more than half a screen above the end of the buffer is a redraw: it
+//! changes nothing. The newer rows below it are still the truth, and whatever
+//! it shows that the buffer lacks could only go in the middle, which this never
+//! splices into. Half the read agreeing is believed over any placement; a
+//! quarter where nothing placed at all, because the alternative is appending
+//! an older screen below newer output.
+//!
+//! Two smaller seams go with it. A read that places just above the end of the
+//! buffer -- past a spinner row left behind by the frame before, which the
+//! furniture rule cannot strip because no two frames share it -- takes those
+//! [`REDRAW_SLACK_ROWS`] with the overlap instead of failing to place. And a
+//! backward placement (the re-wrap below) no longer forgets what it retracted:
+//! the rows are set aside, dropped if the next read carries on from the
+//! retracted screen, and put back if it comes down past them.
+//!
 //! # The pane read/hold contract (card #721)
 //!
 //! This module is one half of a contract whose other half is
@@ -261,6 +289,15 @@ const ANCHOR_SKEW: usize = 1;
 /// much history one read can retract, which is why it is a small number: a read
 /// may correct the screen it followed, not rewrite the session.
 const ANCHOR_REACH: usize = 2;
+
+/// Rows at the bottom of a read's transcript that may sit over held rows they
+/// do not agree with and still be taken for status rather than history.
+///
+/// An agent's status region is not all furniture: the spinner row above the
+/// composer (`* Compacting conversation… (1m 4s)`) and a roster row can change
+/// on every frame without two consecutive frames sharing them, so the
+/// furniture rule never strips them. Two is that region and nothing more.
+const REDRAW_SLACK_ROWS: usize = 2;
 
 /// The most of a read that may be called furniture rather than history, as a
 /// divisor: a third. An agent's composer is eight rows of sixty-five, and a pane
@@ -427,6 +464,74 @@ fn already_held(held: &[u64], incoming: &[u64]) -> usize {
         .unwrap_or(0)
 }
 
+/// How many rows from the head of `body` agree with `held` laid from the same
+/// row: a run of agreeing rows starting at the head or [`ANCHOR_SKEW`] rows
+/// below it, counted from the head, and zero unless the run carries at least
+/// [`ANCHOR_ROWS`] rows of text.
+fn held_prefix(held: &[u64], body: &[u64], carries: &[bool]) -> usize {
+    let reach = body.len().min(held.len());
+    (0..=ANCHOR_SKEW.min(reach.saturating_sub(1)))
+        .filter_map(|skew| {
+            let run = held[skew..reach]
+                .iter()
+                .zip(&body[skew..reach])
+                .take_while(|(left, right)| left == right)
+                .count();
+            let carried = carries[skew..skew + run].iter().filter(|c| **c).count();
+            (carried >= ANCHOR_ROWS).then_some(skew + run)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Where a read's transcript (`body`: the read without its furniture) sits
+/// *anywhere* in what is held, rather than only against its end -- the search
+/// for a screen the agent redrew from history.
+///
+/// Each alignment is scored by how many rows from the read's own head agree
+/// (see [`held_prefix`]), so a pinned composer or a column of blank rows lining
+/// up with itself is never a match. The most recent alignment agreeing on at
+/// least `least` rows wins, so a screen that really is repeated is matched
+/// where it was last seen. Returns where that alignment ends -- its start plus
+/// the read's length, which may run past the end of what is held -- and how
+/// many rows it covers.
+fn history_view(
+    held: &[u64],
+    body: &[u64],
+    carries: &[bool],
+    least: usize,
+) -> Option<(usize, usize)> {
+    (0..held.len()).rev().find_map(|position| {
+        let covered = held_prefix(&held[position..], body, carries);
+        (covered > 0 && covered >= least).then_some((position + body.len(), covered))
+    })
+}
+
+/// The same search from the other end: where the bottom of the read -- the
+/// newest rows on it, less up to [`REDRAW_SLACK_ROWS`] of status -- was last
+/// held, as the end of the alignment, if at least `least` rows agree there,
+/// [`ANCHOR_ROWS`] of them carrying text.
+///
+/// This is what recognises an older screen whose top shows rows a burst carried
+/// past before any read saw them: its head is held nowhere, but its bottom is
+/// held far above the end of the buffer.
+fn history_bottom(held: &[u64], body: &[u64], carries: &[bool], least: usize) -> Option<usize> {
+    let slack = REDRAW_SLACK_ROWS.min(body.len() / FURNITURE_SHARE);
+    (1..=held.len()).rev().find_map(|end| {
+        (0..=slack).find_map(|skip| {
+            let rows = body.len() - skip;
+            let run = held[..end]
+                .iter()
+                .rev()
+                .zip(body[..rows].iter().rev())
+                .take_while(|(left, right)| left == right)
+                .count();
+            let carried = carries[rows - run..rows].iter().filter(|c| **c).count();
+            (run >= least.max(1) && carried >= ANCHOR_ROWS).then_some(end + skip)
+        })
+    })
+}
+
 /// How many rows two frames end with in common, allowing for the ones a repaint
 /// changed without anything scrolling.
 ///
@@ -476,6 +581,19 @@ struct PaneBuffer {
     /// belongs at the bottom of the buffer once, not scattered through it
     /// every time the screen jumped further than a read could follow.
     last_frame: Vec<u64>,
+    /// Rows a backward placement took off the bottom -- the screen moved up
+    /// and the read replaced them -- kept until the next read says whether the
+    /// screen carried on from there (they were rewritten, and are dropped for
+    /// good) or came back down past them (they were only out of view, and go
+    /// back where they were). Without this a redraw a few rows up, followed by
+    /// output that outran the poll, lost the rows it had covered.
+    retracted: Vec<String>,
+    /// How many rows at the end of the buffer go when `retracted` comes back:
+    /// the read that retracted them, from the first row of it that did not
+    /// agree with what it sat over -- a spinner repainted where a transcript
+    /// row was -- down through its composer. The rows `retracted` goes back
+    /// under, so the row a stale status line covered is not lost behind it.
+    retracted_over: usize,
 }
 
 impl PaneBuffer {
@@ -734,6 +852,7 @@ impl ScrollbackStore {
         buffer.touched = clock;
 
         if owns_screen {
+            buffer.retracted.clear();
             buffer.drop_back(buffer.lines.len());
             for line in incoming {
                 buffer.push(line);
@@ -761,6 +880,7 @@ impl ScrollbackStore {
             .collect();
         let furniture =
             common_suffix(&buffer.last_frame, &frame, &carries).min(frame.len() / FURNITURE_SHARE);
+        let mut strip = 0;
         if furniture > 0 {
             let held = furniture.min(buffer.lines.len());
             let ends_with_it = buffer
@@ -771,7 +891,7 @@ impl ScrollbackStore {
                 .zip(buffer.last_frame.iter().rev())
                 .all(|(seen, before)| seen == before);
             if ends_with_it {
-                buffer.drop_back(held);
+                strip = held;
             }
         }
 
@@ -780,16 +900,109 @@ impl ScrollbackStore {
         // appended stays contiguous and in arrival order.
         let mut skip = 0;
         if !buffer.lines.is_empty() {
-            let held = buffer.tail(MAX_OVERLAP);
-            match placement(&held, &frame, &carries) {
+            // What is held, as this read is placed against it: without the
+            // furniture this read will repaint, and with whatever the last
+            // backward placement set aside put back where it came from.
+            let cut = if buffer.retracted.is_empty() {
+                strip
+            } else {
+                buffer.retracted_over
+            };
+            let mut held = buffer.tail(MAX_OVERLAP + cut);
+            held.truncate(held.len().saturating_sub(cut));
+            held.extend(buffer.retracted.iter().map(|line| line_hash(line)));
+            let held = &held[held.len().saturating_sub(MAX_OVERLAP)..];
+            let body = &frame[..frame.len() - furniture];
+
+            // Where the read does not place against the end of what is held,
+            // it may place against the rows just above it: the bottom of the
+            // held screen was a status row repainted in place -- a spinner
+            // above the composer that no two frames share, so the furniture
+            // rule left it behind -- and the read has scrolled past where it
+            // stood. Those rows go with the rest of the overlap. Only the
+            // anchored placement is asked there: a scored overlap of one blank
+            // row is evidence of nothing once rows are being skipped.
+            let placed = placement(held, &frame, &carries).or_else(|| {
+                (1..=REDRAW_SLACK_ROWS.min(held.len().saturating_sub(1))).find_map(|stale| {
+                    let above = &held[..held.len() - stale];
+                    let reach = above
+                        .len()
+                        .min(frame.len().saturating_mul(ANCHOR_REACH))
+                        .min(MAX_OVERLAP);
+                    anchored_placement(above, &frame, &carries, reach)
+                        .map(|discard| discard + stale)
+                })
+            });
+
+            // The agent redrew a screen from further back than a re-wrap moves
+            // one: its head is held more than half a screen above the end of
+            // the buffer. The rows held below it are newer and still the truth
+            // -- the screen will come back down to them -- and whatever else it
+            // shows can only belong in the middle of history, which this never
+            // splices into. So nothing changes, not even the frame the
+            // furniture rule compares against: the buffer still ends with that
+            // frame's composer.
+            //
+            // Half the read agreeing from its head is believed over any
+            // placement, which would otherwise take a redraw within its reach
+            // for a re-wrap and retract everything below it. A quarter is
+            // enough where nothing placed at all: the alternative is appending
+            // an older screen below newer output.
+            let far = |end: usize| end + body.len() / 2 < held.len();
+            let half = body.len().div_ceil(2);
+            let quarter = body.len() / 4;
+            let redrawn = history_view(held, body, &carries, half).is_some_and(|(end, _)| far(end))
+                || history_bottom(held, body, &carries, half).is_some_and(far)
+                || (placed.is_none()
+                    && (history_view(held, body, &carries, quarter)
+                        .is_some_and(|(end, _)| far(end))
+                        || history_bottom(held, body, &carries, quarter)
+                            .is_some_and(|end| end + REDRAW_SLACK_ROWS < held.len())));
+            if redrawn {
+                return;
+            }
+
+            buffer.drop_back(cut);
+            for line in std::mem::take(&mut buffer.retracted) {
+                buffer.push(line);
+            }
+            buffer.retracted_over = 0;
+            match placed {
                 // The read re-sends this many held rows; they are dropped so the
-                // newest rendering of each of them is the one kept.
-                Some(discard) => buffer.drop_back(discard.min(buffer.lines.len())),
+                // newest rendering of each of them is the one kept. Held rows
+                // below the read's own transcript are set aside rather than
+                // forgotten: see `retracted`.
+                Some(discard) => {
+                    let discard = discard.min(buffer.lines.len());
+                    if discard > body.len() {
+                        let start = buffer.lines.len() - discard;
+                        let agreed = held_prefix(&held[held.len() - discard..], body, &carries);
+                        buffer.retracted = buffer.lines.range(start + agreed..).cloned().collect();
+                        buffer.retracted_over = frame.len() - agreed;
+                    }
+                    buffer.drop_back(discard);
+                }
                 // Neither placement believed anything: the screen moved further
                 // than one read can be followed, so nothing held is dropped --
-                // but whatever the buffer verbatim ends with is not appended
-                // again.
-                None => skip = already_held(&held, &frame),
+                // but neither the rows the buffer verbatim ends with nor the
+                // half or more of the read already held near its end are
+                // appended again.
+                //
+                // The same stale status rows may sit between the buffer's last
+                // transcript row and the read's first: a verbatim seam carrying
+                // text just above them takes them with it.
+                None => {
+                    let (stale, verbatim) = (0..=REDRAW_SLACK_ROWS.min(held.len()))
+                        .map(|stale| (stale, already_held(&held[..held.len() - stale], &frame)))
+                        .find(|(stale, seam)| {
+                            *seam > 0 && (*stale == 0 || carries[..*seam].contains(&true))
+                        })
+                        .unwrap_or((0, 0));
+                    buffer.drop_back(stale);
+                    let covered = history_view(held, body, &carries, body.len().div_ceil(2))
+                        .map_or(0, |(_, covered)| covered);
+                    skip = verbatim.max(covered);
+                }
             }
         }
         for line in incoming.into_iter().skip(skip) {
@@ -2256,5 +2469,238 @@ mod tests {
                 .unwrap(),
             "new 1\nnew 2\nnew 3"
         );
+    }
+
+    /// A Claude-like full-screen agent, as the App's scripted reproduction drove
+    /// it: a transcript of numbered messages (with a `✻ Waiting for` banner every
+    /// fifth one) scrolling under a pinned five-row composer whose mode line
+    /// carries a timer. `top` is `None` for the newest screen, or the transcript
+    /// row the view starts at when the agent has redrawn an older screen.
+    struct ScriptedAgent {
+        log: Vec<String>,
+        messages: usize,
+        /// Whether a spinner row redrawn on every frame sits between the
+        /// transcript and the composer -- the row above Claude Code's composer
+        /// that the furniture rule cannot strip, because no two frames share it.
+        spinner: bool,
+    }
+
+    const SCRIPTED_BODY_ROWS: usize = 25;
+
+    impl ScriptedAgent {
+        fn new(spinner: bool) -> Self {
+            Self {
+                log: Vec::new(),
+                messages: 0,
+                spinner,
+            }
+        }
+
+        fn print(&mut self) {
+            self.messages += 1;
+            let n = self.messages;
+            self.log.push(String::new());
+            self.log.push(format!(
+                "● Message number {n}: the agent says something distinctive {}",
+                n * 7919 % 10007
+            ));
+            if n.is_multiple_of(5) {
+                self.log.push(String::new());
+                self.log.push(format!(
+                    "✻ Waiting for {} background agents to finish",
+                    n % 3 + 1
+                ));
+            }
+        }
+
+        fn screen(&self, top: Option<usize>, tick: usize) -> String {
+            let transcript = SCRIPTED_BODY_ROWS - usize::from(self.spinner);
+            let start = top.unwrap_or(self.log.len().saturating_sub(transcript));
+            let mut rows: Vec<String> = (0..transcript)
+                .map(|row| self.log.get(start + row).cloned().unwrap_or_default())
+                .collect();
+            if self.spinner {
+                rows.push(format!("✢ Compacting conversation… ({tick}s)"));
+            }
+            rows.extend([
+                String::new(),
+                "─".repeat(80),
+                "❯ ".to_owned(),
+                "─".repeat(80),
+                format!("  ⏵⏵ bypass permissions on · {tick}s"),
+            ]);
+            rows.join("\n")
+        }
+    }
+
+    /// The message numbers the buffer holds, top to bottom.
+    fn held_messages(held: &str) -> Vec<usize> {
+        split_lines(held)
+            .iter()
+            .filter_map(|line| {
+                line.strip_prefix("● Message number ")?
+                    .split(':')
+                    .next()?
+                    .parse()
+                    .ok()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_screen_redrawn_far_back_in_history_is_not_appended_again() {
+        // The owner's screenshot and the App's scripted reproduction: the agent
+        // redraws an older screen (the transcript sixty rows up), the placement
+        // cannot anchor it within reach of the buffer's tail, and the whole
+        // older screen went on the end -- then the newest screen went on the end
+        // after it once the agent came back down. Both copies stayed for as long
+        // as the gateway ran.
+        for (back, spinner) in [30_usize, 60, 100, 200]
+            .into_iter()
+            .flat_map(|back| [(back, false), (back, true)])
+        {
+            let mut agent = ScriptedAgent::new(spinner);
+            let mut store = ScrollbackStore::default();
+            let mut shown = std::collections::BTreeSet::new();
+            for tick in 0..120 {
+                agent.print();
+                // Long enough that the newest screen has moved on by more than
+                // a screen when the agent comes back down to it.
+                let top = (40..56)
+                    .contains(&tick)
+                    .then(|| agent.log.len().saturating_sub(SCRIPTED_BODY_ROWS + back));
+                let screen = agent.screen(top, tick);
+                shown.extend(held_messages(&screen));
+                store.record("k", &screen, false);
+            }
+            let held = store.window("k", MAX_PANE_LINES).unwrap();
+            // Every message the pane ever showed, once, in order. (The ones
+            // printed while the older screen was up and scrolled away before
+            // the agent came back down were never on screen to be kept.)
+            assert_eq!(
+                held_messages(&held),
+                shown.into_iter().collect::<Vec<_>>(),
+                "a redraw {back} rows back (spinner: {spinner}) left the transcript duplicated or out of order"
+            );
+            assert!(substantial_duplicates(&held)
+                .iter()
+                .all(|(row, _)| row.starts_with("✻ Waiting for")));
+            // The composer is kept once, at the bottom.
+            let rows = split_lines(&held);
+            assert_eq!(rows.iter().filter(|row| row.starts_with("❯")).count(), 1);
+            assert!(rows
+                .last()
+                .unwrap()
+                .contains("bypass permissions on · 119s"));
+        }
+    }
+
+    #[test]
+    fn a_strict_rerender_shifted_back_keeps_every_line_once() {
+        // The narrowest form of the same thing: steady output, then one read
+        // that is an exact re-render of an earlier screen shifted up by `shift`
+        // rows, then a burst that outruns the poll, then steady output again.
+        for (shift, spinner) in [4_usize, 10, 25, 40, 61, 90, 150]
+            .into_iter()
+            .flat_map(|shift| [(shift, false), (shift, true)])
+        {
+            let mut agent = ScriptedAgent::new(spinner);
+            let mut store = ScrollbackStore::default();
+            let mut shown = std::collections::BTreeSet::new();
+            let mut tick = 0;
+            let mut read =
+                |agent: &ScriptedAgent, top: Option<usize>, store: &mut ScrollbackStore| {
+                    let screen = agent.screen(top, tick);
+                    shown.extend(held_messages(&screen));
+                    store.record("k", &screen, false);
+                    tick += 1;
+                };
+            for _ in 0..80 {
+                agent.print();
+                read(&agent, None, &mut store);
+            }
+            let top = agent.log.len().saturating_sub(SCRIPTED_BODY_ROWS + shift);
+            read(&agent, Some(top), &mut store);
+            for _ in 0..15 {
+                agent.print();
+            }
+            for _ in 0..10 {
+                agent.print();
+                read(&agent, None, &mut store);
+            }
+            let held = store.window("k", MAX_PANE_LINES).unwrap();
+            assert_eq!(
+                held_messages(&held),
+                shown.into_iter().collect::<Vec<_>>(),
+                "a re-render shifted {shift} rows back (spinner: {spinner}) duplicated or reordered the transcript"
+            );
+        }
+    }
+
+    #[test]
+    fn an_agent_that_jumps_about_never_duplicates_or_reorders() {
+        // Bursts, quiet polls, and redraws of an older screen at random depths
+        // for random lengths, on a fixed seed: whatever the sequence, every
+        // message the pane showed is held once, in the order it was printed.
+        //
+        // The one thing the sequence may not do is show rows no read could
+        // have kept: output printed while the older screen is up must not
+        // scroll it into rows nobody saw at the bottom, nor carry the newest
+        // screen clean past the one it left. A screen of rows the buffer has
+        // never seen is new output as far as anything can tell.
+        for seed in 1_u64..=60 {
+            let mut state = seed;
+            let mut next = |bound: u64| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 33) % bound
+            };
+            let mut agent = ScriptedAgent::new(seed % 2 == 0);
+            let mut store = ScrollbackStore::default();
+            let mut shown = std::collections::BTreeSet::new();
+            // How far up the older screen is, and how long the log was when
+            // the agent went up there.
+            let mut jump: Option<(usize, usize)> = None;
+            for tick in 0..300 {
+                for _ in 0..next(4) {
+                    agent.print();
+                }
+                // The agent comes back down at the end, so nothing is left set
+                // aside under an older screen when the buffer is checked.
+                let roll = if tick >= 297 { 0 } else { next(20) };
+                jump = match jump {
+                    _ if tick >= 297 => None,
+                    None if roll == 0 => Some((next(150) as usize + 1, agent.log.len())),
+                    Some(_) if roll <= 3 => None,
+                    Some((back, left))
+                        if agent.log.len() - left >= back.min(SCRIPTED_BODY_ROWS - 6) =>
+                    {
+                        None
+                    }
+                    jump => jump,
+                };
+                let top =
+                    jump.map(|(back, _)| agent.log.len().saturating_sub(SCRIPTED_BODY_ROWS + back));
+                let screen = agent.screen(top, tick);
+                if top.is_none() {
+                    shown.extend(held_messages(&screen));
+                }
+                store.record("k", &screen, false);
+            }
+            let held = store.window("k", MAX_PANE_LINES).unwrap();
+            let messages = held_messages(&held);
+            assert!(
+                messages.windows(2).all(|pair| pair[0] < pair[1]),
+                "seed {seed}: duplicated or reordered: {messages:?}"
+            );
+            // A row a burst carried past before any newest screen showed it can
+            // turn up from an older screen: in order, and harmless. The other
+            // way round is allowed one row: the seam skew (`ANCHOR_SKEW`) may
+            // take a lone row repainted across the seam for the same row
+            // repainted, which is the trade it makes.
+            let lost: Vec<_> = shown.iter().filter(|n| !messages.contains(n)).collect();
+            assert!(lost.len() <= 1, "seed {seed}: lost {lost:?}");
+        }
     }
 }
