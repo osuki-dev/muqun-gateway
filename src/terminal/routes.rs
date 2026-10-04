@@ -2363,7 +2363,10 @@ pub(crate) async fn pane_parts(
     };
     let normalized = match &native {
         Some(read) => read.parts.clone(),
-        None => parts::normalize_json(&text, dictionary),
+        // The chat view hides the frozen bottom areas a Claude pane leaves in
+        // its real history; the raw output routes still serve them. See
+        // `parts::blank_frozen_status`.
+        None => parts::normalize_json(&parts::blank_frozen_status(&text), dictionary),
     };
 
     // Reading a workspace's own skills and commands is blocking filesystem
