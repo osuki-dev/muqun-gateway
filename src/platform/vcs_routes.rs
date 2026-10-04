@@ -280,6 +280,10 @@ mod tests {
         assert!(data["reason"].is_null());
         assert_eq!(data["mode"], "working");
         assert_eq!(data["truncated"], false);
+        assert_eq!(data["repo"]["branch"], "main");
+        assert_eq!(data["repo"]["detached"], false);
+        assert!(data["repo"]["upstream"].is_null());
+        assert_eq!(data["repo"]["ahead"], 0);
         let list = data["files"].as_array().unwrap();
         assert_eq!(list.len(), 2, "{list:?}");
         let modified = list.iter().find(|f| f["path"] == "src/a.ts").unwrap();
@@ -306,6 +310,7 @@ mod tests {
         let Json(branch) = files("w1:p1", Some("branch")).await.expect("lists");
         assert_eq!(branch["data"]["mode"], "branch");
         assert_eq!(branch["data"]["base"], "main");
+        assert_eq!(branch["data"]["repo"]["branch"], "feat");
         assert!(branch["data"]["files"]
             .as_array()
             .unwrap()
@@ -323,6 +328,7 @@ mod tests {
             assert!(none["data"]["vcs"].is_null(), "{id}");
             assert_eq!(none["data"]["reason"], "not_a_repository", "{id}");
             assert_eq!(none["data"]["files"], json!([]), "{id}");
+            assert!(none["data"].get("repo").is_none(), "{id}");
         }
 
         let refusal = files("w1:p9", None).await.expect_err("no such pane");

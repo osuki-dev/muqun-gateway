@@ -1039,7 +1039,15 @@ async fn do_get_agent_vcs_diff(
         .as_deref()
         .map(super::adapters::opencode::driver::is_git_worktree)
         .unwrap_or(true);
-    Ok(Json(content_envelope(vcs_diff_body(json!(diffs), is_repo))))
+    let mut body = vcs_diff_body(json!(diffs), is_repo);
+    // The same `repo` the Changes list carries. Best effort: a git that
+    // cannot answer leaves it out rather than failing the diff.
+    if let Some(directory) = directory.as_deref().filter(|_| is_repo) {
+        if let Ok(line) = Box::pin(git::branch_line(std::path::Path::new(directory))).await {
+            body["repo"] = line.branch_json();
+        }
+    }
+    Ok(Json(content_envelope(body)))
 }
 
 // ---------------------------------------------------------------------------
@@ -3615,6 +3623,8 @@ mod tests {
         assert!(data["reason"].is_null());
         assert_eq!(data["mode"], "working");
         assert_eq!(data["truncated"], false);
+        assert_eq!(data["repo"]["branch"], "main");
+        assert_eq!(data["repo"]["head"].as_str().map(str::len), Some(7));
         let list = data["files"].as_array().unwrap();
         assert_eq!(list.len(), 2, "{list:?}");
         let modified = list.iter().find(|f| f["path"] == "src/a.ts").unwrap();
@@ -3628,6 +3638,7 @@ mod tests {
         let Json(branch) = files("ses_git", Some("branch")).await.expect("lists");
         assert_eq!(branch["data"]["mode"], "branch");
         assert_eq!(branch["data"]["base"], "main");
+        assert_eq!(branch["data"]["repo"]["branch"], "main");
 
         let refusal = files("ses_git", Some("committed"))
             .await
@@ -3642,6 +3653,19 @@ mod tests {
         assert!(plain["data"]["vcs"].is_null());
         assert_eq!(plain["data"]["reason"], "not_a_repository");
         assert_eq!(plain["data"]["files"], json!([]));
+        assert!(plain["data"].get("repo").is_none());
+
+        // The agent's own diff carries the same branch line.
+        let Json(diff) = do_get_agent_vcs_diff(&state, "ses_git", None, &device_headers())
+            .await
+            .expect("diff");
+        assert_eq!(diff["data"]["vcs"], "git");
+        assert_eq!(diff["data"]["repo"]["branch"], "main");
+        assert_eq!(diff["data"]["repo"]["detached"], false);
+        let Json(diff) = do_get_agent_vcs_diff(&state, "ses_plain", None, &device_headers())
+            .await
+            .expect("diff");
+        assert!(diff["data"].get("repo").is_none());
 
         let file = |query: VcsFileQuery| {
             get_agent_vcs_file(
