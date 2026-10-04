@@ -485,6 +485,44 @@ pub fn openapi_spec() -> Value {
                     "responses": git_diff_responses()
                 }
             },
+            "/api/sessions/{sessionId}/panes/{paneId}/vcs/files": {
+                "get": {
+                    "summary": "List the files changed in the pane's git checkout: the same answer as GET /api/agent-sessions/{asid}/vcs/files, run in the checkout of the cwd the terminal backend reports for this pane. A pane with no cwd, a deleted cwd or a cwd in no checkout answers vcs: null, reason: not_a_repository. 404 unknown_pane, 400 invalid_mode, 501 git_missing, 502 git_failed, 504 git_timeout. Announced as pane_vcs_files",
+                    "parameters": [
+                        path_param("sessionId"),
+                        path_param("paneId"),
+                        query_param("mode", "working (default) or branch, as for the agent session route")
+                    ],
+                    "responses": ok_response()
+                }
+            },
+            "/api/sessions/{sessionId}/panes/{paneId}/vcs/file": {
+                "get": {
+                    "summary": "One changed file's whole unified patch in the pane's checkout: the same answer as GET /api/agent-sessions/{asid}/vcs/file. 404 unknown_pane, 404 not_a_repository, 404 unknown_path, 400 invalid_mode",
+                    "parameters": [
+                        path_param("sessionId"),
+                        path_param("paneId"),
+                        query_param("mode", "working (default) or branch, as for vcs/files"),
+                        query_param("path", "Repo-relative file name, matched exactly: a file in the change list, or a tracked file"),
+                        query_param("context", "Context lines per hunk, 0 to 25, default 3")
+                    ],
+                    "responses": ok_response()
+                }
+            },
+            "/api/sessions/{sessionId}/panes/{paneId}/vcs/discard": {
+                "post": {
+                    "summary": "Discard one file's uncommitted changes in the pane's checkout: the same rules and answer as POST /api/agent-sessions/{asid}/vcs/discard. data: { path, action }. 404 unknown_pane, 404 not_a_repository, 404 unknown_path, 403 path_outside_repository, 403 repository_is_home, 409 listing_truncated, 500 discard_failed, 501 git_missing, 502 git_failed, 504 git_timeout",
+                    "parameters": [path_param("sessionId"), path_param("paneId")],
+                    "requestBody": json_body(json!({
+                        "type": "object",
+                        "required": ["path"],
+                        "properties": {
+                            "path": { "type": "string", "description": "Repo-relative" }
+                        }
+                    })),
+                    "responses": ok_response()
+                }
+            },
             "/api/sessions/{sessionId}/panes/{paneId}/approval": {
                 "get": {
                     "summary": "Read whether the pane is blocked on an approval, and what it asks",

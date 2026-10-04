@@ -424,6 +424,8 @@ mod tests {
             "/api/sessions/{sessionId}/panes/{paneId}/context",
             "/api/sessions/{sessionId}/panes/{paneId}/git/status",
             "/api/sessions/{sessionId}/panes/{paneId}/git/diff",
+            "/api/sessions/{sessionId}/panes/{paneId}/vcs/files",
+            "/api/sessions/{sessionId}/panes/{paneId}/vcs/file",
         ] {
             assert!(
                 spec["paths"][path]["get"].is_object(),
@@ -450,7 +452,11 @@ mod tests {
                 "lines"
             ]
         );
-        for capability in ["pane_context", "git_diff"] {
+        assert!(
+            spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/vcs/discard"]["post"]
+                .is_object()
+        );
+        for capability in ["pane_context", "git_diff", "pane_vcs_files"] {
             assert!(
                 API_CAPABILITIES.contains(&capability),
                 "{capability} is not announced"
