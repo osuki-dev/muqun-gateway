@@ -12,6 +12,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use super::directories::expand_directory_param;
 use super::domain::{AgentSessionId, ModelRef, PermissionDecision, SessionQuery};
 use super::ports::mirror::SessionMirrorPort;
 use crate::platform::git;
@@ -24,8 +25,8 @@ use crate::{
 
 #[derive(Debug, Deserialize)]
 pub struct AgentDirectoriesQuery {
+    /// What the user has typed: `~/Work/mu`, `/ho`, `~/.co`.
     pub prefix: Option<String>,
-    pub query: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -62,7 +63,7 @@ const DEFAULT_SESSION_LIMIT: usize = 50;
 impl AgentSessionsQuery {
     fn to_session_query(&self) -> SessionQuery {
         SessionQuery {
-            directory: self.directory.clone(),
+            directory: expand_directory_param(self.directory.as_deref()),
             // OpenCode takes the literal string `null` for "roots only".
             parent_id: match (self.parent_id.as_deref(), self.roots) {
                 (Some(parent), _) if !parent.trim().is_empty() => Some(parent.to_string()),
@@ -652,7 +653,8 @@ async fn do_create_agent_session(
         })?,
     };
 
-    let validated_dir = match body.directory.as_deref() {
+    let directory = expand_directory_param(body.directory.as_deref());
+    let validated_dir = match directory.as_deref() {
         Some(dir) if !dir.trim().is_empty() => {
             let p = std::path::Path::new(dir.trim());
             if !p.is_absolute() {
@@ -810,6 +812,8 @@ async fn do_find_agent_files(
         ));
     };
 
+    let directory = expand_directory_param(directory);
+    let directory = directory.as_deref();
     require_directory(directory)?;
 
     let files = manager
@@ -1239,6 +1243,9 @@ async fn do_list_agent_projects(
     ))
 }
 
+/// `GET /api/agent-directories`: a completer for the folder a session opens
+/// in. `data` stays the bare `[{name, path}]` list older Apps read; `home` and
+/// `truncated` sit beside it in the envelope.
 async fn do_list_agent_directories(
     state: &AppState,
     query: AgentDirectoriesQuery,
@@ -1246,64 +1253,13 @@ async fn do_list_agent_directories(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let search_dir = query.prefix.as_deref().unwrap_or("~");
-    let expanded = if search_dir.starts_with("~/") || search_dir == "~" {
-        if let Some(home) = dirs::home_dir() {
-            if search_dir == "~" {
-                home
-            } else {
-                home.join(&search_dir[2..])
-            }
-        } else {
-            std::path::PathBuf::from(search_dir)
-        }
-    } else {
-        std::path::PathBuf::from(search_dir)
-    };
-
-    let mut dirs_list = Vec::new();
-    let target = if expanded.is_dir() {
-        expanded
-    } else {
-        expanded
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| std::path::PathBuf::from("/"))
-    };
-
-    if let Ok(mut entries) = tokio::fs::read_dir(&target).await {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            if let Ok(file_type) = entry.file_type().await {
-                if file_type.is_dir() {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if !name.starts_with('.')
-                        || query
-                            .query
-                            .as_deref()
-                            .map(|q| q.starts_with('.'))
-                            .unwrap_or(false)
-                    {
-                        let full_path = entry.path().to_string_lossy().to_string();
-                        dirs_list.push(json!({
-                            "name": name,
-                            "path": full_path,
-                        }));
-                    }
-                }
-            }
-        }
-    }
-    dirs_list.sort_by(|a, b| {
-        a["name"]
-            .as_str()
-            .unwrap_or("")
-            .cmp(b["name"].as_str().unwrap_or(""))
-    });
-    if dirs_list.len() > 50 {
-        dirs_list.truncate(50);
-    }
-
-    Ok(Json(content_envelope(json!(dirs_list))))
+    let home = dirs::home_dir();
+    let completion =
+        super::directories::complete(query.prefix.as_deref().unwrap_or(""), home.as_deref()).await;
+    let mut body = content_envelope(json!(completion.directories));
+    body["home"] = json!(home.map(|h| h.to_string_lossy().into_owned()));
+    body["truncated"] = json!(completion.truncated);
+    Ok(Json(body))
 }
 
 /// The `event:` name and `data:` string one domain event is published under.
@@ -1421,10 +1377,11 @@ async fn do_stream_agent_session(
 
 pub async fn get_global_agent_catalog(
     State(state): State<AppState>,
-    Query(query): Query<AgentSessionsQuery>,
+    Query(mut query): Query<AgentSessionsQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     require_device(&state, &headers)?;
+    query.directory = expand_directory_param(query.directory.as_deref());
 
     let all_managers = managers_for_read(&state, query.agent_id.as_deref()).await?;
 
@@ -2161,10 +2118,11 @@ async fn forget_saved_agent_permission(
 /// made, and `DELETE` refuses it.
 async fn list_agent_worktrees(
     State(state): State<AppState>,
-    Query(query): Query<AgentWorktreesQuery>,
+    Query(mut query): Query<AgentWorktreesQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     let manager = manager_or_unavailable!(&state, &headers);
+    query.directory = expand_directory_param(query.directory.as_deref());
     require_directory(query.directory.as_deref())?;
     let items = manager
         .agent()
@@ -2177,9 +2135,10 @@ async fn list_agent_worktrees(
 async fn create_agent_worktree(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<CreateWorktreeBody>,
+    Json(mut body): Json<CreateWorktreeBody>,
 ) -> ApiResult<Json<Value>> {
     let manager = manager_or_unavailable!(&state, &headers);
+    body.directory = expand_directory_param(body.directory.as_deref());
     require_directory(body.directory.as_deref())?;
     // `Worktree.CreateInput` declares additionalProperties:false, so only the
     // fields the caller actually set are sent -- an explicit null is refused.
@@ -2205,11 +2164,13 @@ async fn create_agent_worktree(
 async fn remove_agent_worktree(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<RemoveWorktreeBody>,
+    Json(mut body): Json<RemoveWorktreeBody>,
 ) -> ApiResult<Json<Value>> {
     let manager = manager_or_unavailable!(&state, &headers);
+    body.directory = expand_directory_param(body.directory.as_deref());
     require_directory(body.directory.as_deref())?;
-    let worktree = body.worktree.trim();
+    let worktree = expand_directory_param(Some(&body.worktree)).unwrap_or_default();
+    let worktree = worktree.trim();
     if worktree.is_empty() {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
@@ -2232,6 +2193,7 @@ async fn refresh_agent_worktrees(
 ) -> ApiResult<Json<Value>> {
     let manager = manager_or_unavailable!(&state, &headers);
     let directory = body.and_then(|Json(b)| b.directory);
+    let directory = expand_directory_param(directory.as_deref());
     require_directory(directory.as_deref())?;
     manager
         .agent()
@@ -2260,7 +2222,8 @@ async fn move_agent_session(
     Json(body): Json<MoveSessionBody>,
 ) -> ApiResult<Json<Value>> {
     let manager = session_manager_or_err!(&state, &headers, &asid);
-    let directory = body.directory.trim();
+    let directory = expand_directory_param(Some(&body.directory)).unwrap_or_default();
+    let directory = directory.trim();
     if directory.is_empty() {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
@@ -2613,7 +2576,7 @@ async fn list_agent_shells(
     let manager = manager_or_unavailable!(&state, &headers);
     let shells = manager
         .agent()
-        .list_shells(query.directory.as_deref())
+        .list_shells(expand_directory_param(query.directory.as_deref()).as_deref())
         .await
         .map_err(agent_error)?;
     Ok(Json(content_envelope(json!(shells))))
@@ -3251,6 +3214,103 @@ mod tests {
             .expect("events are held");
         let events = serde_json::to_string(&events).unwrap();
         assert!(events.contains("\"agent_id\":\"deepseek\""), "{events}");
+    }
+
+    /// `~` and `~/…` are the home directory, and the session records the
+    /// canonical absolute path so the App groups it with the same folder typed
+    /// in full. `~user`, a relative path and a missing folder are refused as
+    /// they always were.
+    #[tokio::test]
+    async fn create_session_expands_home_and_answers_the_canonical_path() {
+        let state = state_with(vec![FakeAgent::new("opencode")]).await;
+        let headers = device_headers();
+        let home = std::fs::canonicalize(dirs::home_dir().unwrap()).unwrap();
+        let create = |directory: &str| CreateAgentSessionBody {
+            directory: Some(directory.to_string()),
+            model: None,
+            mode: None,
+            agent_id: None,
+        };
+
+        // A real subdirectory of home, whatever this machine has.
+        let sub = std::fs::read_dir(&home)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|e| {
+                e.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                    && !e.file_name().to_string_lossy().starts_with('.')
+            })
+            .map(|e| e.file_name().to_string_lossy().into_owned());
+
+        let mut cases = vec![
+            ("~".to_string(), home.clone()),
+            ("~/".to_string(), home.clone()),
+        ];
+        if let Some(sub) = sub {
+            cases.push((
+                format!("~/{sub}"),
+                std::fs::canonicalize(home.join(&sub)).unwrap(),
+            ));
+        }
+        for (typed, expected) in cases {
+            let Json(created) = do_create_agent_session(&state, create(&typed), &headers)
+                .await
+                .unwrap_or_else(|e| panic!("{typed} creates: {:?}", e.1));
+            assert_eq!(
+                created["data"]["directory"],
+                expected.to_string_lossy().as_ref(),
+                "{typed}"
+            );
+        }
+
+        for (typed, code) in [
+            ("~nobody", "invalid_directory"),
+            ("~nobody/x", "invalid_directory"),
+            ("relative/dir", "invalid_directory"),
+            ("~/muqun-no-such-dir-for-tests", "directory_not_found"),
+        ] {
+            let refusal = do_create_agent_session(&state, create(typed), &headers)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{typed} is refused"));
+            assert_eq!(refusal.0, StatusCode::BAD_REQUEST, "{typed}");
+            assert_eq!(
+                crate::test_support::error_body(&refusal)["error"]["code"],
+                code,
+                "{typed}"
+            );
+        }
+    }
+
+    /// The directory-scoped routes expand `~` before the missing-folder check,
+    /// so a `~/…` that is gone is the usual 404 naming the absolute path.
+    #[tokio::test]
+    async fn a_missing_home_relative_workspace_is_a_404_with_the_expanded_path() {
+        let state = state_with(vec![FakeAgent::new("opencode")]).await;
+        let refusal = do_find_agent_files(
+            &state,
+            "x",
+            10,
+            Some("~/muqun-no-such-dir-for-tests"),
+            &device_headers(),
+        )
+        .await
+        .expect_err("a missing folder is refused");
+        assert_eq!(refusal.0, StatusCode::NOT_FOUND);
+        let body = crate::test_support::error_body(&refusal);
+        assert_eq!(body["error"]["code"], "workspace_missing");
+        let expected = dirs::home_dir()
+            .unwrap()
+            .join("muqun-no-such-dir-for-tests");
+        assert_eq!(
+            body["error"]["directory"],
+            expected.to_string_lossy().as_ref()
+        );
+
+        // And one that exists is let through.
+        let Json(_) = do_find_agent_files(&state, "x", 10, Some("~"), &device_headers())
+            .await
+            .expect("home is a workspace the agent can search");
     }
 
     #[tokio::test]

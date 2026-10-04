@@ -3,6 +3,7 @@
 pub mod adapters;
 pub mod agent_events;
 pub mod approvals;
+pub mod directories;
 pub mod domain;
 pub mod manager;
 pub mod ports;

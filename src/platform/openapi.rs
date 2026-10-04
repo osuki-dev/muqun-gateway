@@ -347,7 +347,7 @@ pub fn openapi_spec() -> Value {
                         "type": "object",
                         "required": ["repo_path", "agent"],
                         "properties": {
-                            "repo_path": { "type": "string", "description": "Absolute path, inside a workspace this session has open" },
+                            "repo_path": { "type": "string", "description": "Absolute path, or one starting ~ or ~/ for the gateway user's home (~user is not expanded), inside a workspace this session has open" },
                             "branch_name": { "type": "string", "description": "Branch for a dedicated worktree; omit to work in the repo as it stands" },
                             "agent": { "type": "string", "description": "Agent kind from GET /api/agents/catalog" },
                             "prompt": { "type": "string", "description": "Sent once the agent is interactive" },
@@ -369,7 +369,7 @@ pub fn openapi_spec() -> Value {
                         "required": ["agent"],
                         "properties": {
                             "agent": { "type": "string", "description": "Agent kind from GET /api/agents/catalog, or a profile named in agents.json" },
-                            "cwd": { "type": "string", "description": "Absolute path, inside a workspace this session has open; omit to take the backend's default" },
+                            "cwd": { "type": "string", "description": "Absolute path, or one starting ~ or ~/ for the gateway user's home (~user is not expanded), inside a workspace this session has open; omit to take the backend's default" },
                             "tab_id": { "type": "string", "description": "Split this tab's focused pane instead of opening a new tab" },
                             "prompt": { "type": "string", "description": "Sent once the agent is interactive" }
                         }
@@ -603,7 +603,7 @@ pub fn openapi_spec() -> Value {
                 },
                 "post": {
                     "summary": "Create a new AI agent session",
-                    "description": "Spawns an agent conversation session with the given model, mode, agent_id and workspace directory. Absent agent_id means the primary agent.",
+                    "description": "Spawns an agent conversation session with the given model, mode, agent_id and workspace directory. Absent agent_id means the primary agent. directory is absolute or starts ~ or ~/ for the gateway user's home (~user is not expanded); it must exist, and the session records it canonicalized, so ~/x and its absolute spelling are the same project. A relative path or ~user is 400 invalid_directory, a missing one 400 directory_not_found. Every other agent route that takes a directory expands ~ the same way.",
                     "requestBody": json_body(object_schema(&[("directory", "string"), ("mode", "string"), ("agent_id", "string")], &[])),
                     "responses": ok_response()
                 }

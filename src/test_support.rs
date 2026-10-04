@@ -794,7 +794,7 @@ impl agents::ports::agent::AgentPort for FakeAgent {
     }
     fn create_session<'a>(
         &'a self,
-        _directory: Option<&'a str>,
+        directory: Option<&'a str>,
         _model: Option<&'a agents::domain::ModelRef>,
         _mode: Option<&'a str>,
     ) -> agents::ports::agent::AgentFuture<'a, agents::domain::AgentSessionInfo> {
@@ -802,7 +802,9 @@ impl agents::ports::agent::AgentPort for FakeAgent {
             if self.failing {
                 return self.fail();
             }
-            Ok(fake_session(&format!("{}_new", self.kind), 1))
+            let mut session = fake_session(&format!("{}_new", self.kind), 1);
+            session.directory = directory.map(str::to_string);
+            Ok(session)
         })
     }
     fn get_session<'a>(
