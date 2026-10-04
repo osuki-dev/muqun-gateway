@@ -25,8 +25,8 @@ use crate::{
 
 #[derive(Debug, Deserialize)]
 pub struct AgentDirectoriesQuery {
+    /// What the user has typed: `~/Work/mu`, `/ho`, `~/.co`.
     pub prefix: Option<String>,
-    pub query: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1243,6 +1243,9 @@ async fn do_list_agent_projects(
     ))
 }
 
+/// `GET /api/agent-directories`: a completer for the folder a session opens
+/// in. `data` stays the bare `[{name, path}]` list older Apps read; `home` and
+/// `truncated` sit beside it in the envelope.
 async fn do_list_agent_directories(
     state: &AppState,
     query: AgentDirectoriesQuery,
@@ -1250,53 +1253,13 @@ async fn do_list_agent_directories(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let search_dir = query.prefix.as_deref().unwrap_or("~");
-    let expanded = super::directories::expand_home(search_dir)
-        .unwrap_or_else(|| std::path::PathBuf::from(search_dir));
-
-    let mut dirs_list = Vec::new();
-    let target = if expanded.is_dir() {
-        expanded
-    } else {
-        expanded
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| std::path::PathBuf::from("/"))
-    };
-
-    if let Ok(mut entries) = tokio::fs::read_dir(&target).await {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            if let Ok(file_type) = entry.file_type().await {
-                if file_type.is_dir() {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if !name.starts_with('.')
-                        || query
-                            .query
-                            .as_deref()
-                            .map(|q| q.starts_with('.'))
-                            .unwrap_or(false)
-                    {
-                        let full_path = entry.path().to_string_lossy().to_string();
-                        dirs_list.push(json!({
-                            "name": name,
-                            "path": full_path,
-                        }));
-                    }
-                }
-            }
-        }
-    }
-    dirs_list.sort_by(|a, b| {
-        a["name"]
-            .as_str()
-            .unwrap_or("")
-            .cmp(b["name"].as_str().unwrap_or(""))
-    });
-    if dirs_list.len() > 50 {
-        dirs_list.truncate(50);
-    }
-
-    Ok(Json(content_envelope(json!(dirs_list))))
+    let home = dirs::home_dir();
+    let completion =
+        super::directories::complete(query.prefix.as_deref().unwrap_or(""), home.as_deref()).await;
+    let mut body = content_envelope(json!(completion.directories));
+    body["home"] = json!(home.map(|h| h.to_string_lossy().into_owned()));
+    body["truncated"] = json!(completion.truncated);
+    Ok(Json(body))
 }
 
 /// The `event:` name and `data:` string one domain event is published under.

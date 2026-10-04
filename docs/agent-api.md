@@ -1039,7 +1039,34 @@ good, and `missing` is the whole of what the gateway can say about it.
 
 ### `GET /api/agent-directories`
 
-`?prefix=&query=` → `[{"name", "path"}]`, at most 50. Local filesystem only.
+`?prefix=` is what the user has typed, completed one level at a time. Local
+filesystem only, nothing cached.
+
+- The prefix splits at its last `/`: `~/Work/mu` lists `~/Work` for names
+  starting `mu`, case-insensitively; a trailing `/` (`~/Work/`) lists
+  everything there; `~` or an empty prefix lists the home directory. `/ho`
+  completes against the filesystem root, which is allowed: this lists names one
+  level down and never recurses, unlike the asset scan, whose fence keeps `/`
+  and a bare home out as *workspaces*.
+- A prefix that is neither `~`-rooted nor absolute, `~user`, or a directory that
+  does not exist answers an empty list.
+- Dot directories only when the partial starts with `.` (`~/.co`).
+  `node_modules`, `.git`, `target`, `build`, `dist`, `.cache` and
+  `__pycache__` are never offered.
+- A symlink is listed when it points at a directory; it is never read into.
+- At most 30 answers, sorted by name, from at most 2000 entries read in at most
+  50 ms. Hitting any bound sets `truncated`.
+
+`data` is still the bare list, so older Apps keep working; `home` (the absolute
+home directory, for display) and `truncated` sit beside it in the envelope:
+
+```json
+{ "schema_version": "…", "capabilities": {…},
+  "data": [{ "name": "muqun", "path": "/home/u/Work/muqun" }],
+  "home": "/home/u", "truncated": false }
+```
+
+`path` is under the canonical form of the directory being listed.
 
 ---
 
