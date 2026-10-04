@@ -17,6 +17,7 @@ pub mod setup;
 pub mod state_lock;
 pub mod store;
 pub mod uploads;
+pub mod vcs_routes;
 
 #[allow(unused_imports)]
 pub use openapi::{openapi_spec, DOCS_HTML};

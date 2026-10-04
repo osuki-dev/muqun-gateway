@@ -174,6 +174,10 @@ pub struct TerminalFeatures {
     pub pane_shortcuts: bool,
     pub pane_context: bool,
     pub git_diff: bool,
+    /// `vcs/files`, `vcs/file` and `vcs/discard` on a pane: the agent
+    /// sessions' Changes routes, in the pane's cwd. Build-wide, like
+    /// `pane_shortcuts`.
+    pub vcs_files: bool,
 }
 
 /// The Terminal Plane discovery model
@@ -291,6 +295,7 @@ pub async fn build_terminal_plane_discovery(state: &AppState) -> TerminalPlaneDi
             pane_shortcuts: supported,
             pane_context: has_pane_context,
             git_diff: has_git_diff,
+            vcs_files: supported,
         },
         degraded_reason,
     }
@@ -473,6 +478,7 @@ mod tests {
                 pane_shortcuts: true,
                 pane_context: true,
                 git_diff: true,
+                vcs_files: true,
             },
             degraded_reason: None,
         };
@@ -490,6 +496,7 @@ mod tests {
         assert_eq!(val["backends"][0]["keyboard"]["bases"][0], "enter");
         assert_eq!(val["features"]["multiWindow"], true);
         assert_eq!(val["features"]["gitDiff"], true);
+        assert_eq!(val["features"]["vcsFiles"], true);
         assert!(val.get("degradedReason").is_none());
     }
 
@@ -507,6 +514,7 @@ mod tests {
                 pane_shortcuts: false,
                 pane_context: false,
                 git_diff: false,
+                vcs_files: false,
             },
             degraded_reason: Some("no_terminal_backend_configured".to_string()),
         };
@@ -531,6 +539,7 @@ mod tests {
                     pane_shortcuts: true,
                     pane_context: true,
                     git_diff: true,
+                    vcs_files: true,
                 },
                 degraded_reason: None,
             },
