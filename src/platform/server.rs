@@ -88,6 +88,7 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         session_liveness: Arc::new(Mutex::new(SessionLivenessCache::default())),
         agent_runtime,
         ws_connections: Arc::new(agents::ws_routes::WsRegistry::default()),
+        generation: crate::new_generation(),
     };
     spawn_agent_notification_watchers(state.clone());
     spawn_agent_permission_watchers(state.clone());

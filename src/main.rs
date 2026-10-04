@@ -77,6 +77,18 @@ pub(crate) struct AppState {
     /// The open `GET /api/ws` event sockets, for the per-device and total
     /// caps. See `agents::ws_routes`.
     pub(crate) ws_connections: Arc<agents::ws_routes::WsRegistry>,
+    /// This process's instance generation: an opaque id minted once at start
+    /// and never changed while the process lives. Everything the gateway
+    /// keeps in memory -- the scrollback above all -- is only valid within
+    /// one generation, so a client that sees it change drops what it holds
+    /// and reads again. See [`new_generation`].
+    pub(crate) generation: Arc<str>,
+}
+
+/// A fresh instance generation. Opaque to clients: they compare it for
+/// equality and nothing else.
+pub(crate) fn new_generation() -> Arc<str> {
+    uuid::Uuid::new_v4().to_string().into()
 }
 
 fn main() -> anyhow::Result<()> {

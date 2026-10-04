@@ -244,6 +244,7 @@ pub(crate) async fn gateway_metadata(
         "gatewayVersion": env!("CARGO_PKG_VERSION"),
         "apiVersion": GATEWAY_API_VERSION,
         "apiMajor": GATEWAY_API_MAJOR,
+        "generation": &*state.generation,
         "minimumCompatibleApiVersion": "1.0.0",
         "legacyUnversionedApi": true,
         "capabilities": gateway_capabilities(collaboration_somewhere),
