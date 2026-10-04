@@ -823,8 +823,14 @@ empty list.
 ```json
 { "files": [ { "path": "src/a.rs", "patch": "@@ …", "additions": 3, "deletions": 1 } ],
   "vcs": "git",
-  "reason": null }
+  "reason": null,
+  "repo": { "branch": "feat/x", "head": "abc1234", "detached": false,
+            "upstream": "origin/feat/x", "ahead": 2, "behind": 0 } }
 ```
+
+`repo` is the same branch line as on [`vcs/files`](#changes-git), read by
+git in the session's directory; it is absent outside a repository and, best
+effort, when git cannot answer.
 
 > **Shape change.** This used to be a bare array. It is now an object, and the
 > array is under `files`. The two new fields are why — see below.
@@ -863,6 +869,8 @@ selects nothing at all).
 
 ```json
 { "vcs": "git", "reason": null, "mode": "branch", "base": "origin/main", "truncated": false,
+  "repo": { "branch": "feat/x", "head": "abc1234", "detached": false,
+            "upstream": "origin/feat/x", "ahead": 2, "behind": 0 },
   "files": [
     { "path": "src/a.rs", "status": "modified", "additions": 3, "deletions": 1, "binary": false },
     { "path": "docs/new.md", "old_path": "docs/old.md", "status": "renamed", "additions": 0, "deletions": 0, "binary": false },
@@ -891,6 +899,13 @@ selects nothing at all).
   binary file has `binary: true` and zero totals.
 - At most 2000 files, cut before any file is read; `truncated` says the list
   stopped there or git's output reached 8 MB.
+- `repo` is the checkout's branch line, read by the same `git status` that
+  lists the files, for both modes. `branch` is the checked-out branch, `null`
+  on a detached `HEAD` (`detached: true`) and on an unborn branch (no commit
+  yet). `head` is the abbreviated commit, `null` only on an unborn branch.
+  `upstream` is the tracking branch or `null`; `ahead`/`behind` count commits
+  against it and are `0` when there is none. `repo` is absent only outside a
+  repository.
 - `reason` is `null` inside a repository. Not a repository:
   `200 { "vcs": null, "reason": "not_a_repository", "mode", "truncated": false, "files": [] }`.
 - Any other `mode` is `400 invalid_mode`.

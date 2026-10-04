@@ -101,6 +101,20 @@ impl RepoSummary {
             "changed_files": self.changed_files,
         })
     }
+
+    /// The branch line alone, as the Changes list carries it under `repo`.
+    /// An unborn branch has neither a `branch` nor a `head` yet; `ahead` and
+    /// `behind` are `0` when there is no upstream to count against.
+    pub fn branch_json(&self) -> Value {
+        json!({
+            "branch": self.head.as_ref().and(self.branch.as_ref()),
+            "head": self.head,
+            "detached": self.detached,
+            "upstream": self.upstream,
+            "ahead": self.ahead.unwrap_or(0),
+            "behind": self.behind.unwrap_or(0),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -265,6 +279,12 @@ pub async fn status(toplevel: &Path) -> Result<Status, GitError> {
 /// the pane context and the badge need, at the cost of one process.
 pub async fn summary(toplevel: &Path) -> Result<RepoSummary, GitError> {
     Ok(porcelain(toplevel, "normal").await?.0)
+}
+
+/// The branch line alone, from any directory inside a checkout: one
+/// `status` that does not look for untracked files.
+pub async fn branch_line(cwd: &Path) -> Result<RepoSummary, GitError> {
+    Ok(porcelain(cwd, "no").await?.0)
 }
 
 async fn porcelain(
@@ -524,6 +544,9 @@ pub struct ChangedFiles {
     /// `no_default_branch` for a `branch` list that found no base and is
     /// therefore the working list.
     pub reason: Option<&'static str>,
+    /// The checkout's branch line, read by the same `status` that lists the
+    /// files; `None` only where there is no checkout to describe.
+    pub repo: Option<RepoSummary>,
     pub files: Vec<VcsFile>,
     /// The list stopped at [`MAX_STATUS_FILES`], or git's output at
     /// [`MAX_OUTPUT_BYTES`].
@@ -546,6 +569,9 @@ impl ChangedFiles {
         });
         if let Some(base) = &self.base {
             body["base"] = json!(base);
+        }
+        if let Some(repo) = &self.repo {
+            body["repo"] = repo.branch_json();
         }
         body
     }
@@ -622,6 +648,7 @@ pub async fn changed_files(toplevel: &Path, mode: VcsMode) -> Result<ChangedFile
         mode,
         base: listing.base.map(|base| base.name).or(default_base),
         reason: listing.no_default_branch.then_some("no_default_branch"),
+        repo: Some(listing.summary),
         files,
         truncated: listing.truncated || capped,
     })
@@ -641,6 +668,8 @@ struct Row {
 
 struct Listing {
     base: Option<Base>,
+    /// The branch line of the `status` the rows came from.
+    summary: RepoSummary,
     rows: Vec<Row>,
     truncated: bool,
     no_default_branch: bool,
@@ -664,7 +693,7 @@ async fn list_rows(
     let no_default_branch = mode == VcsMode::Branch && base.is_none();
 
     let untracked_files = if only.is_some() { "no" } else { "all" };
-    let (_, entries, mut truncated) = porcelain(toplevel, untracked_files).await?;
+    let (summary, entries, mut truncated) = porcelain(toplevel, untracked_files).await?;
     let mut untracked: Vec<String> = Vec::new();
     let mut rows = Vec::new();
     for entry in entries {
@@ -754,6 +783,7 @@ async fn list_rows(
     }
     Ok(Listing {
         base,
+        summary,
         rows,
         truncated,
         no_default_branch,
@@ -1930,6 +1960,68 @@ mod tests {
     }
 
     #[test]
+    fn changed_files_json_carries_the_branch_line_under_repo() {
+        let list = |repo: Option<RepoSummary>| {
+            ChangedFiles {
+                mode: VcsMode::Working,
+                base: Some("main".into()),
+                reason: None,
+                repo,
+                files: Vec::new(),
+                truncated: false,
+            }
+            .to_json()
+        };
+
+        let tracking = RepoSummary {
+            toplevel: PathBuf::from("/r"),
+            branch: Some("feat/x".into()),
+            upstream: Some("origin/feat/x".into()),
+            ahead: Some(2),
+            behind: Some(0),
+            detached: false,
+            head: Some("abc1234".into()),
+            changed_files: 3,
+        };
+        assert_eq!(
+            list(Some(tracking))["repo"],
+            json!({
+                "branch": "feat/x",
+                "head": "abc1234",
+                "detached": false,
+                "upstream": "origin/feat/x",
+                "ahead": 2,
+                "behind": 0,
+            })
+        );
+
+        let (detached, _) =
+            parse_porcelain_v2("# branch.oid abcdef0123\0# branch.head (detached)\0".as_bytes());
+        assert_eq!(
+            list(Some(detached))["repo"],
+            json!({
+                "branch": null,
+                "head": "abcdef0",
+                "detached": true,
+                "upstream": null,
+                "ahead": 0,
+                "behind": 0,
+            })
+        );
+
+        let (unborn, _) =
+            parse_porcelain_v2("# branch.oid (initial)\0# branch.head main\0".as_bytes());
+        let body = list(Some(unborn));
+        assert!(body["repo"]["branch"].is_null(), "{body}");
+        assert!(body["repo"]["head"].is_null(), "{body}");
+        assert_eq!(body["repo"]["detached"], false);
+
+        let body = list(None);
+        assert!(body.get("repo").is_none(), "{body}");
+        assert_eq!(body["base"], "main");
+    }
+
+    #[test]
     fn numstat_z_reads_totals_renames_and_binaries() {
         let bytes =
             "41\t6\tsrc/a.ts\0-\t-\tassets/icon.png\x003\t0\t\0src/old.ts\0src/new.ts\0".as_bytes();
@@ -2486,6 +2578,9 @@ mod tests {
         let changes = changed_files(&repo, VcsMode::Working).await.unwrap();
         assert_eq!(changes.mode, VcsMode::Working);
         assert_eq!(changes.base.as_deref(), Some("main"));
+        let repo_line = changes.to_json()["repo"].clone();
+        assert_eq!(repo_line["branch"], "main", "{repo_line}");
+        assert_eq!(repo_line["head"].as_str().map(str::len), Some(7));
         assert_eq!(changes.reason, None);
         assert!(!changes.truncated);
         let files = by_path(&changes);
