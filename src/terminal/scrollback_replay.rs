@@ -585,6 +585,8 @@ fn recorded_panes_fold_without_copies_or_frozen_footers() {
         ("codex-pinned-prompt", fixture!("codex-pinned-prompt")),
         // OpenCode read again after 55 minutes: a new screen, a new footer.
         ("opencode-after-gap", fixture!("opencode-after-gap")),
+        // OpenCode scrolling its transcript beside a sidebar that stays put.
+        ("opencode-sidebar", fixture!("opencode-sidebar")),
     ] {
         let held = fold_reads(&reads);
         let copies: Vec<String> = copied_blocks(&held)
@@ -610,4 +612,13 @@ fn a_pinned_codex_prompt_is_held_once_and_real_repeats_stay() {
     let rows: Vec<String> = held.split('\n').map(normalised).collect();
     assert_eq!(rows.iter().filter(|row| **row == pinned).count(), 1);
     assert_eq!(rows.iter().filter(|row| *row == "/zahabz").count(), 2);
+}
+
+/// OpenCode: a transcript row that scrolled beside the sidebar, and so carries
+/// a different piece of it on each read, is still held once.
+#[test]
+fn a_row_scrolled_beside_a_sidebar_is_held_once() {
+    let held = fold_reads(&fixture!("opencode-sidebar"));
+    // "Clarifying token use", through the fixture's substitution.
+    assert_eq!(held.matches("Jshypmfpun avrlu bzl").count(), 1);
 }
