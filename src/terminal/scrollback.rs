@@ -293,9 +293,18 @@ pub fn split_lines(text: &str) -> Vec<String> {
 /// believed it, and the whole read went on the end: the live gateway held the
 /// same 77-row screen six times over in twelve minutes of one Claude pane
 /// (`scrollback_replay`, `w17:p1`, 21:10-21:24).
+///
+/// Nor on a sidebar. OpenCode draws one down the right-hand side of the same
+/// rows its transcript scrolls in -- the session title, a token count, MCP
+/// status -- and it stays put while the transcript moves under it, so every
+/// row that scrolled carries a different piece of sidebar after it. Compared
+/// whole, no row of a read matched the row it had been one read before, and
+/// the transcript went on again and again (`wZ:p2`, 23:49-23:52: one run held
+/// four times). Whatever follows a gap of [`SIDEBAR_GAP`] blanks from column
+/// [`SIDEBAR_COLUMN`] on is left out (`without_sidebar`).
 fn row_text(line: &str) -> std::borrow::Cow<'_, str> {
     if !line.contains('\u{1b}') {
-        return std::borrow::Cow::Borrowed(line.trim_end());
+        return std::borrow::Cow::Borrowed(without_sidebar(line.trim_end()));
     }
     let mut text = String::with_capacity(line.len());
     let mut chars = line.chars().peekable();
@@ -328,9 +337,49 @@ fn row_text(line: &str) -> std::borrow::Cow<'_, str> {
             _ => {}
         }
     }
-    let kept = text.trim_end().len();
+    let kept = without_sidebar(text.trim_end()).len();
     text.truncate(kept);
     std::borrow::Cow::Owned(text)
+}
+
+/// From this display column on, text after a gap is taken for a sidebar.
+const SIDEBAR_COLUMN: usize = 60;
+
+/// How many blank columns separate a transcript row from a sidebar beside it.
+const SIDEBAR_GAP: usize = 3;
+
+/// `text` up to a sidebar drawn beside it -- see `row_text`. A row that is
+/// only sidebar comes back blank.
+fn without_sidebar(text: &str) -> &str {
+    let (mut column, mut blanks, mut end) = (0, 0, 0);
+    for (at, c) in text.char_indices() {
+        if c == ' ' {
+            blanks += 1;
+        } else {
+            if blanks >= SIDEBAR_GAP && column >= SIDEBAR_COLUMN {
+                return text[..end].trim_end();
+            }
+            blanks = 0;
+            end = at + c.len_utf8();
+        }
+        column += if is_wide(c) { 2 } else { 1 };
+    }
+    text
+}
+
+/// Whether a terminal draws `c` two columns wide: the East Asian wide and
+/// fullwidth blocks and the emoji planes, which is what a transcript holds.
+fn is_wide(c: char) -> bool {
+    matches!(u32::from(c),
+        0x1100..=0x115F
+            | 0x2E80..=0xA4CF
+            | 0xAC00..=0xD7A3
+            | 0xF900..=0xFAFF
+            | 0xFE30..=0xFE4F
+            | 0xFF00..=0xFF60
+            | 0xFFE0..=0xFFE6
+            | 0x1F300..=0x1FAFF
+            | 0x20000..=0x3FFFD)
 }
 
 /// Whether a row shows anything once its escapes and blanks are gone.
