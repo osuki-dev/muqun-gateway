@@ -279,12 +279,6 @@ pub async fn build_terminal_plane_discovery(state: &AppState) -> TerminalPlaneDi
         None
     };
 
-    let has_git_diff = backends
-        .iter()
-        .any(|b| b.capabilities.iter().any(|c| c == "git_diff"));
-    let has_pane_context = backends
-        .iter()
-        .any(|b| b.capabilities.iter().any(|c| c == "pane_context"));
     let has_pty = backends
         .iter()
         .any(|b| b.kind == "tmux" || b.kind == "pty" || b.kind == "herdr");
@@ -299,8 +293,12 @@ pub async fn build_terminal_plane_discovery(state: &AppState) -> TerminalPlaneDi
             split_pane: supported,
             raw_pty: has_pty,
             pane_shortcuts: supported,
-            pane_context: has_pane_context,
-            git_diff: has_git_diff,
+            // Build-wide, like `vcs_files`: both are in `API_CAPABILITIES` and
+            // read the pane's cwd, not the backend. They used to be looked up in
+            // the per-session capability lists, which never carry them, so
+            // discovery said `false` on every gateway that served them.
+            pane_context: supported,
+            git_diff: supported,
             vcs_files: supported,
         },
         degraded_reason,
