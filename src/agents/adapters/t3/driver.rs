@@ -720,6 +720,66 @@ mod tests {
         driver.client().shutdown();
     }
 
+    /// Read-only, against the owner's own server: with `MUQUN_T3_PROBE=1`,
+    /// reads the descriptor and lists sessions with the bearer the gateway
+    /// stored (`MUQUN_T3_STATE_DIR`, default `~/.local/share/muqun-gateway`),
+    /// or `T3_TOKEN`, at `T3_URL` (default loopback). Never creates a
+    /// session or sends a prompt.
+    #[tokio::test]
+    #[ignore = "requires a running T3 Code server and MUQUN_T3_PROBE=1; read-only"]
+    async fn live_read_only_probe() {
+        if std::env::var("MUQUN_T3_PROBE").as_deref() != Ok("1") {
+            eprintln!("MUQUN_T3_PROBE is not 1; skipping");
+            return;
+        }
+        let url = std::env::var("T3_URL").unwrap_or_else(|_| "http://127.0.0.1:3773".into());
+        let token = std::env::var("T3_TOKEN").ok().or_else(|| {
+            // `state_dir()` is a scratch directory under `cfg(test)`.
+            let dir = std::env::var_os("MUQUN_T3_STATE_DIR")
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| {
+                        std::path::PathBuf::from(home).join(".local/share/muqun-gateway")
+                    })
+                })?;
+            crate::platform::store::read_t3_credential_at(&dir)
+                .ok()
+                .flatten()
+                .filter(|stored| stored.url == url)
+                .map(|stored| stored.token)
+        });
+        let token = token.expect("T3_TOKEN or a stored gateway credential for T3_URL");
+        let endpoint = T3Endpoint::new(url, super::super::endpoint::T3Credential::Bearer(token));
+
+        let descriptor = endpoint
+            .describe(&reqwest::Client::new())
+            .await
+            .expect("descriptor");
+        eprintln!(
+            "server {} protocol {}",
+            descriptor.server_version,
+            descriptor.protocol_version()
+        );
+        assert_eq!(
+            descriptor.unsupported_reason(),
+            None,
+            "a protocol this gateway speaks"
+        );
+
+        let driver = T3Driver::new(endpoint);
+        assert!(driver.probe().await.unwrap(), "healthy");
+        let sessions = driver
+            .list_sessions(&SessionQuery::default())
+            .await
+            .expect("list sessions");
+        let projects = driver.list_projects().await.expect("list projects");
+        eprintln!("{} sessions in {} projects", sessions.len(), projects.len());
+        for session in sessions.iter().take(3) {
+            assert!(!session.asid.0.is_empty());
+        }
+        driver.client().shutdown();
+    }
+
     /// Against a real server: `T3_URL` plus `T3_TOKEN` (bearer) or
     /// `T3_PAIRING_TOKEN` (from `t3 pair`), and optionally `T3_MODEL` as
     /// `instance/model` (default `claudeAgent/claude-haiku-4-5`). Creates its

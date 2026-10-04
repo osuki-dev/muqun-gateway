@@ -262,6 +262,9 @@ pub(crate) fn next_step(id: &str, status: &AgentAvailability) -> Option<&'static
             "install OpenCode 2 (https://opencode.ai), or set `opencode.enabled` to false"
         }
         (NotInstalled, "t3") => "install T3 Code (https://t3.codes)",
+        (Unsupported, "t3") => {
+            "update muqun-gateway: this T3 server speaks a newer orchestration protocol"
+        }
         _ => return None,
     })
 }
@@ -692,6 +695,11 @@ mod tests {
                 Some("install T3 Code (https://t3.codes)"),
             ),
             ("opencode", Connected, None),
+            (
+                "t3",
+                Unsupported,
+                Some("update muqun-gateway: this T3 server speaks a newer orchestration protocol"),
+            ),
             ("t3", Reachable, None),
             ("other", Offline, None),
         ];

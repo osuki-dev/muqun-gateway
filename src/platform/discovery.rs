@@ -21,6 +21,8 @@ pub enum AgentAvailability {
     Disabled,
     NotInstalled,
     Unconfigured,
+    /// The agent answers but speaks a protocol this gateway cannot drive.
+    Unsupported,
 }
 
 /// Metadata describing one discovered or configured agent
@@ -36,6 +38,10 @@ pub struct AgentDiscoveryInfo {
     pub endpoint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// Why the agent is not usable, when the status alone does not say
+    /// (today only with `unsupported`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     pub models: Vec<AgentModelInfo>,
     pub modes: Vec<AgentModeInfo>,
     pub features: AgentFeatures,
@@ -392,6 +398,7 @@ mod tests {
             enabled: true,
             endpoint: Some("http://127.0.0.1:3080".to_string()),
             version: Some("0.1.0".to_string()),
+            reason: None,
             models: vec![
                 AgentModelInfo {
                     id: "deepseek-chat".to_string(),
