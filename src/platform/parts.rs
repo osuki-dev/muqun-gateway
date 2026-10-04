@@ -547,6 +547,139 @@ pub fn normalize(text: &str, dictionary: Option<&Dictionary>) -> Vec<Part> {
     parts
 }
 
+/// Blank every frozen copy of Claude Code's bottom area but the last.
+///
+/// A chat-view derivation rule, applied to the text `/parts` normalizes and to
+/// nothing else: the raw output routes keep serving the pane's text exactly.
+///
+/// Claude Code redraws its bottom area -- spinner, an optional feedback box,
+/// the prompt between two rules, the mode line, the agent roster -- in place.
+/// On the normal screen, when that area grows past what it can erase, the old
+/// copy has already scrolled into the terminal's real history and stays there:
+/// Herdr's own scrollback for a working Claude pane holds one frozen bottom
+/// area per redraw like that, with the transcript carrying on below it. No
+/// placement can remove rows from a pane's real history, so the chat view is
+/// the one place they can be hidden.
+///
+/// A box is a rule, a line opening with `❯`, up to [`PROMPT_BOX_ROWS`] more
+/// lines, and a closing rule. Every box but the last is frozen; the last is the
+/// live one. A frozen box is blanked together with what is drawn around it:
+/// above, blank rows, a right-aligned notice, a `╭ … ╰` box and a spinner row
+/// (`✻ Channeling… (7m 6s)` -- a status glyph, a word ending in `…`, an open
+/// parenthesis); below, the
+/// mode line and the indented `●`/`◯` roster. Rows are blanked rather than
+/// removed, so every part's `range` still points at the rows of the raw text.
+/// A sent prompt in the transcript (`❯ text` without rules), a `✻ Waiting for N
+/// background agents` line and anything else away from a frozen box is kept.
+pub fn blank_frozen_status(text: &str) -> String {
+    let mut lines: Vec<&str> = text.split('\n').collect();
+    let boxes = prompt_boxes(&lines);
+    let Some((_, frozen)) = boxes.split_last() else {
+        return text.to_owned();
+    };
+    for &(open, close) in frozen {
+        let mut start = open;
+        let mut above = open;
+        let mut spinner_seen = false;
+        let mut notice_seen = false;
+        while above > 0 {
+            let line = lines[above - 1].trim_end();
+            if line.trim().is_empty() {
+                above -= 1;
+                continue;
+            }
+            if line.starts_with('╰') {
+                let mut top = above - 1;
+                while top > 0 && lines[top].starts_with(['│', '╰']) {
+                    top -= 1;
+                }
+                if !lines[top].starts_with('╭') {
+                    break;
+                }
+                above = top;
+                start = above;
+                continue;
+            }
+            // The notice Claude right-aligns above the prompt (`Update
+            // available! Run: …`), drawn in the same area.
+            if !notice_seen && lines[above - 1].starts_with(NOTICE_INDENT) {
+                notice_seen = true;
+                above -= 1;
+                start = above;
+                continue;
+            }
+            if !spinner_seen && is_spinner(line) {
+                spinner_seen = true;
+                above -= 1;
+                start = above;
+                continue;
+            }
+            break;
+        }
+        let mut end = close + 1;
+        while end < lines.len() {
+            let line = lines[end];
+            let trimmed = line.trim();
+            let roster =
+                line.starts_with("  ") && (trimmed.starts_with("● ") || trimmed.starts_with("◯ "));
+            if trimmed.is_empty() || roster || is_mode_line(line) {
+                end += 1;
+            } else {
+                break;
+            }
+        }
+        for line in &mut lines[start..end] {
+            *line = "";
+        }
+    }
+    lines.join("\n")
+}
+
+/// How far a notice is pushed right before it reads as one drawn above the
+/// prompt rather than as indented transcript.
+const NOTICE_INDENT: &str = "                    ";
+
+/// The most rows a prompt box may hold between its rules besides the `❯` line.
+const PROMPT_BOX_ROWS: usize = 6;
+
+fn is_rule(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.chars().count() >= 10 && trimmed.chars().all(|c| c == '─')
+}
+
+/// Every `(open rule, close rule)` pair framing a `❯` line, top to bottom.
+fn prompt_boxes(lines: &[&str]) -> Vec<(usize, usize)> {
+    let mut boxes = Vec::new();
+    let mut row = 0;
+    while row + 2 < lines.len() {
+        if is_rule(lines[row]) && lines[row + 1].trim_start().starts_with('❯') {
+            let close = (row + 2..lines.len().min(row + 3 + PROMPT_BOX_ROWS))
+                .find(|close| is_rule(lines[*close]));
+            if let Some(close) = close {
+                boxes.push((row, close));
+                row = close + 1;
+                continue;
+            }
+        }
+        row += 1;
+    }
+    boxes
+}
+
+fn is_spinner(line: &str) -> bool {
+    let mut chars = line.chars();
+    let glyph = chars.next();
+    glyph.is_some_and(|glyph| "✻✽✳✢∗·*✶".contains(glyph))
+        && chars.next() == Some(' ')
+        && line.contains("… (")
+}
+
+fn is_mode_line(line: &str) -> bool {
+    ["⏵⏵", "shift+tab", "? for shortcuts", "esc to interrupt"]
+        .iter()
+        .any(|marker| line.contains(marker))
+}
+
 /// Parts as they go on the wire.
 pub fn normalize_json(text: &str, dictionary: Option<&Dictionary>) -> Vec<Value> {
     normalize(text, dictionary)
@@ -2015,5 +2148,83 @@ mod tests {
                 parts.len()
             );
         }
+    }
+
+    #[test]
+    fn frozen_bottom_areas_are_blanked_and_the_live_one_kept() {
+        let rule = "─".repeat(60);
+        let text = [
+            "● Agent \"Website\" finished · 24m 35s",
+            "",
+            "✻ Waiting for 2 background agents to finish",
+            "",
+            "❯ 做好了没",
+            "",
+            "✻ Channeling… (7m 6s · ↓ 3.5k tokens)",
+            "",
+            "╭────────────────",
+            "│ ✻ Bug report drafted",
+            "╰────────────────",
+            "",
+            "                                        Update available! Run: mise upgrade claude",
+            &rule,
+            "❯ /usage",
+            &rule,
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+            "",
+            "  ● main",
+            "  ◯ general-purpose  Reading file",
+            "● Agent \"App\" finished · 11m 13s",
+            "",
+            "✻ Waiting for 3 background agents to finish",
+            "",
+            "✻ Inferring… (32s)",
+            "",
+            &rule,
+            "❯ ",
+            &rule,
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+            "",
+            "  ● main",
+        ]
+        .join("\n");
+        let blanked = blank_frozen_status(&text);
+        let rows: Vec<&str> = blanked.split('\n').collect();
+        assert_eq!(
+            rows.len(),
+            text.split('\n').count(),
+            "rows must keep their numbers"
+        );
+        // The frozen area is gone, from its spinner down through its roster.
+        for gone in [
+            "Channeling",
+            "Bug report",
+            "Update available",
+            "❯ /usage",
+            "Reading file",
+        ] {
+            assert!(!blanked.contains(gone), "{gone:?} survived");
+        }
+        assert_eq!(rows.iter().filter(|row| row.contains("⏵⏵")).count(), 1);
+        // The live area, the sent prompt and both banners are kept.
+        for kept in [
+            "✻ Inferring… (32s)",
+            "❯ 做好了没",
+            "✻ Waiting for 2 background agents to finish",
+            "✻ Waiting for 3 background agents to finish",
+            "● Agent \"App\" finished · 11m 13s",
+        ] {
+            assert!(blanked.contains(kept), "{kept:?} was blanked");
+        }
+        assert_eq!(rows.last(), Some(&"  ● main"));
+        assert_eq!(rows.iter().filter(|row| row.starts_with('❯')).count(), 2);
+    }
+
+    #[test]
+    fn a_text_with_one_prompt_box_is_left_alone() {
+        let rule = "─".repeat(60);
+        let text = ["● done", "", &rule, "❯ ", &rule, "  ⏵⏵ auto mode on"].join("\n");
+        assert_eq!(blank_frozen_status(&text), text);
+        assert_eq!(blank_frozen_status("plain\ntext"), "plain\ntext");
     }
 }

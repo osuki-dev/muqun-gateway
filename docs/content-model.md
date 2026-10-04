@@ -146,6 +146,17 @@ agent upgrades therefore loses structure and cannot lose content. The fixture
 snapshots in `tests/fixtures/` pin each dictionary's output so that drift shows
 up as a reviewable diff; re-pin with `UPDATE_PART_SNAPSHOTS=1 cargo test`.
 
+**Chat-view rule: frozen bottom areas are blanked.** Before `/parts` normalizes
+a pane, every Claude Code prompt box but the last -- a rule, a `❯` line, a rule
+-- is blanked together with what is drawn around it: a spinner row, a feedback
+box and a right-aligned notice above it, the mode line and the agent roster
+below. Working on the normal screen, Claude Code leaves one such frozen copy in
+the terminal's real history each time it redraws a bottom area taller than it
+can erase; the last box is the live one. Rows are blanked rather than removed,
+so `range` still indexes the raw text, and the raw output routes are unchanged:
+they serve the pane's text exactly. A sent prompt in the transcript (`❯` without
+rules) and `✻ Waiting for N background agents` banners are never touched.
+
 ## Native protocol adapters (v1.4)
 
 Some agents leave more behind than a screen. opencode runs an HTTP server beside
