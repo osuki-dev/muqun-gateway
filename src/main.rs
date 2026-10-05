@@ -58,6 +58,9 @@ pub(crate) struct AppState {
     /// What panes with no scrollback of their own showed while the gateway was
     /// watching. Memory only, and only for those panes; see `scrollback`.
     pub(crate) scrollback: Arc<Mutex<scrollback::ScrollbackStore>>,
+    /// Selected captured-history storage adapter. Current composition is memory
+    /// only; future persistence belongs here, not in HTTP or live frame folding.
+    pub(crate) history: Arc<dyn terminal::history::HistoryRepository>,
     /// The agent status transitions this gateway saw, so a phone coming back
     /// after a while can be told what happened. Memory only; see
     /// `agent_events`.

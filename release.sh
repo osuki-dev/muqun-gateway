@@ -92,8 +92,8 @@ cargo fetch --locked >/dev/null
 
 info "Bumping $current -> $next on $branch"
 git checkout -q -b "$branch"
-sed -i.bak "s/^version = \"$current\"/version = \"$next\"/" Cargo.toml herdr-plugin.toml
-rm -f Cargo.toml.bak herdr-plugin.toml.bak
+sed -i.bak "s/^version = \"$current\"/version = \"$next\"/" Cargo.toml
+rm -f Cargo.toml.bak
 
 info "Rebuilding so Cargo.lock and tests reflect the new version"
 # Not `--locked`. Cargo.lock records this package's own version, so the bump two
@@ -105,7 +105,7 @@ info "Rebuilding so Cargo.lock and tests reflect the new version"
 cargo build --release --offline >/dev/null
 cargo test --offline >/dev/null
 
-git add Cargo.toml herdr-plugin.toml Cargo.lock
+git add Cargo.toml Cargo.lock
 git commit -q -m "release: $tag"
 git push -q -u origin "$branch"
 

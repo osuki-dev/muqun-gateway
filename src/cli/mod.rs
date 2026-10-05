@@ -17,7 +17,11 @@ use crate::{
 };
 
 #[derive(Parser)]
-#[command(name = "gateway", about = "Mobile gateway for terminal workspaces")]
+#[command(
+    name = "muqun-gateway",
+    version,
+    about = "Mobile gateway for terminal workspaces"
+)]
 pub(crate) struct Cli {
     #[command(subcommand)]
     pub(crate) command: Command,
@@ -48,8 +52,16 @@ pub(crate) enum Command {
     },
     Start,
     Stop,
+    /// Restart using the existing background or user-service owner.
+    Restart,
     Status,
     Manage,
+    /// Check or manually install a newer stable official release (never downgrades).
+    Update {
+        /// Only check; do not download binaries or change running state.
+        #[arg(long)]
+        check: bool,
+    },
     /// Keep the gateway running across a logout or a reboot.
     Service {
         #[command(subcommand)]
@@ -194,8 +206,17 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Run { config } => run(config).await?,
         Command::Start => start_background()?,
         Command::Stop => stop_background()?,
+        Command::Restart => crate::restart_gateway(true)?,
         Command::Status => status()?,
         Command::Manage => manage()?,
+        Command::Update { check } => {
+            let plan = crate::platform::update::check().await?;
+            println!("{}", plan.summary());
+            if !check && plan.available() {
+                println!("Verifying download before downtime. Running Gateway will restart; terminal tasks and pairings stay unchanged.");
+                println!("{}", crate::platform::update::apply(plan).await?);
+            }
+        }
         Command::Service { command } => run_service_command(command)?,
         Command::Backend { command } => configure_backend(command)?,
         Command::Commands { command } => match command {

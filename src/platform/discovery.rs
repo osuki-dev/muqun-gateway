@@ -208,6 +208,9 @@ impl TerminalBackendFeatures {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalFeatures {
+    /// Frozen pagination of bounded Gateway captures, not native ranged reads.
+    #[serde(default)]
+    pub captured_history: bool,
     pub multi_window: bool,
     pub split_pane: bool,
     pub raw_pty: bool,
@@ -324,6 +327,7 @@ pub async fn build_terminal_plane_discovery(state: &AppState) -> TerminalPlaneDi
         active_backend: primary.map(|s| format!("{:?}", s.backend).to_lowercase()),
         backends,
         features: TerminalFeatures {
+            captured_history: true,
             multi_window: supported,
             split_pane: supported,
             raw_pty: has_pty,
@@ -540,6 +544,7 @@ mod tests {
                 features: TerminalBackendFeatures::for_backend(BackendKind::Tmux, true),
             }],
             features: TerminalFeatures {
+                captured_history: true,
                 multi_window: true,
                 split_pane: true,
                 raw_pty: true,
@@ -565,6 +570,7 @@ mod tests {
         );
         assert_eq!(val["backends"][0]["keyboard"]["bases"][0], "enter");
         assert_eq!(val["features"]["multiWindow"], true);
+        assert_eq!(val["features"]["capturedHistory"], true);
         assert_eq!(val["features"]["gitDiff"], true);
         assert_eq!(val["features"]["vcsFiles"], true);
         assert!(val.get("degradedReason").is_none());
@@ -578,6 +584,7 @@ mod tests {
             active_backend: None,
             backends: Vec::new(),
             features: TerminalFeatures {
+                captured_history: true,
                 multi_window: false,
                 split_pane: false,
                 raw_pty: false,
@@ -603,6 +610,7 @@ mod tests {
                 active_backend: Some("tmux".to_string()),
                 backends: Vec::new(),
                 features: TerminalFeatures {
+                    captured_history: true,
                     multi_window: true,
                     split_pane: true,
                     raw_pty: true,

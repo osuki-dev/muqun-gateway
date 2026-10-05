@@ -36,13 +36,34 @@ use anyhow::{Context, Result};
 pub const SERVICE_LABEL: &str = "dev.osuki.muqun-gateway";
 
 /// What `service status` found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceState {
     /// Registered with the init system, and it reports the gateway as loaded.
     Installed,
-    /// A unit file is on disk but the init system does not have it loaded,
-    /// which is what a half-finished install or a manual `bootout` leaves.
+    /// Registered for login autostart and not loaded right now. On macOS this
+    /// is what `stop` leaves: stopping a LaunchAgent unloads it (KeepAlive
+    /// would restart it otherwise), and the plist loads it again at the next
+    /// login or `start`. Never reported on Linux, where a stopped unit stays
+    /// enabled and reads `Installed`.
+    Stopped,
+    /// A unit file is on disk but would not autostart: not enabled (Linux) or
+    /// not a LaunchAgent for this label that runs at load (macOS).
     FileOnly,
     NotInstalled,
+}
+
+impl ServiceState {
+    /// From what the reader found: whether the unit file exists, whether the
+    /// init system has it loaded/enabled, and whether the file on its own
+    /// registers the gateway for login.
+    fn classify(file: bool, loaded: bool, registered: bool) -> Self {
+        match (file, loaded, registered) {
+            (false, _, _) => Self::NotInstalled,
+            (true, true, _) => Self::Installed,
+            (true, false, true) => Self::Stopped,
+            (true, false, false) => Self::FileOnly,
+        }
+    }
 }
 
 /// Everything the unit file needs to name. Passed in rather than resolved here
@@ -50,6 +71,7 @@ pub enum ServiceState {
 pub struct ServicePaths {
     pub exe: PathBuf,
     pub config: PathBuf,
+    pub state: PathBuf,
     pub log: PathBuf,
     /// The account the unit is pinned to. See `launch_agent_plist`.
     pub home: PathBuf,
@@ -69,14 +91,14 @@ pub fn install(paths: &ServicePaths) -> Result<()> {
     }
     std::fs::write(&unit, contents)
         .with_context(|| format!("failed to write {}", unit.display()))?;
-    enable(&unit)?;
+    enable(&unit, paths)?;
     println!("service installed: {}", unit.display());
     Ok(())
 }
 
 pub fn uninstall() -> Result<()> {
     let unit = unit_path()?;
-    disable(&unit);
+    disable(&unit)?;
     if unit.exists() {
         std::fs::remove_file(&unit)
             .with_context(|| format!("failed to remove {}", unit.display()))?;
@@ -94,19 +116,481 @@ pub fn state() -> Result<ServiceState> {
     if !unit.exists() {
         return Ok(ServiceState::NotInstalled);
     }
-    Ok(if loaded() {
-        ServiceState::Installed
-    } else {
-        ServiceState::FileOnly
-    })
+    let loaded = loaded();
+    let registered = cfg!(target_os = "macos")
+        && !loaded
+        && std::fs::read_to_string(&unit).is_ok_and(|plist| registers_at_login(&plist));
+    Ok(ServiceState::classify(true, loaded, registered))
 }
 
-/// Whether an init system is currently managing the gateway.
-///
-/// The caller uses this to explain why killing the pid did not stick: with a
-/// service installed, `KeepAlive`/`Restart=always` puts it straight back.
-pub fn is_installed() -> bool {
-    matches!(state(), Ok(ServiceState::Installed))
+/// A plist for this label that launchd loads -- and so starts -- at login.
+fn registers_at_login(plist: &str) -> bool {
+    plist.contains(&format!(
+        "<key>Label</key>\n  <string>{SERVICE_LABEL}</string>"
+    )) && plist.contains("<key>RunAtLoad</key>\n  <true/>")
+}
+
+/// Refuse to control a same-label service belonging to another installation.
+/// Linux checks the reloaded effective unit, not just its base file. Older units
+/// without directory pins also require inspecting the inherited manager environment.
+pub fn ensure_current_install(paths: &ServicePaths) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let contents = std::fs::read_to_string(unit_path()?)?;
+        validate_install_unit(&contents, paths)?;
+        // The file is what loads at the next login; what launchd runs now is
+        // whatever it loaded, which an edited plist does not change.
+        if let Some(print) = super::launchd::Launchctl::system()?.print() {
+            validate_loaded_program(&print, &paths.exe)?;
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    ensure_effective_unit(&format!("{SERVICE_LABEL}.service"), paths)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn validate_install_unit(contents: &str, paths: &ServicePaths) -> Result<()> {
+    if cfg!(target_os = "macos") {
+        validate_launch_agent_program(contents, &paths.exe)?;
+    }
+    let config_matches = if cfg!(target_os = "macos") {
+        contents.contains(&format!("<string>{}</string>", xml(&paths.config)))
+    } else {
+        contents.contains(&format!(
+            "--config {}",
+            systemd_word(&paths.config.display().to_string())?
+        ))
+    };
+    let state_matches = if contents.contains("MUQUN_GATEWAY_STATE_DIR") {
+        if cfg!(target_os = "macos") {
+            contents.contains(&format!("<string>{}</string>", xml(&paths.state)))
+        } else {
+            contents.contains(&systemd_word(&format!(
+                "MUQUN_GATEWAY_STATE_DIR={}",
+                paths.state.display()
+            ))?)
+        }
+    } else {
+        let default = if cfg!(target_os = "macos") {
+            paths.home.join("Library/Application Support/muqun-gateway")
+        } else {
+            paths.home.join(".local/share/muqun-gateway")
+        };
+        paths.state == default
+    };
+    anyhow::ensure!(config_matches && state_matches,
+        "the installed service uses different config/state paths; refusing to control another installation");
+    anyhow::ensure!(if cfg!(target_os = "macos") {
+        contents.contains("<key>AbandonProcessGroup</key>\n  <true/>")
+    } else { contents.contains("KillMode=process") || contents.contains("KillMode=none") },
+        "the service may terminate terminal tasks; update its child-process lifetime rules before controlling it");
+    Ok(())
+}
+
+/// The plist runs this binary: one `ProgramArguments`, no `Program`, and
+/// `[<exe>, "run", ...]` where `<exe>` is the same file as `exe` however
+/// either is spelled.
+#[cfg(any(target_os = "macos", test))]
+fn validate_launch_agent_program(contents: &str, exe: &Path) -> Result<()> {
+    anyhow::ensure!(
+        !contents.contains("<key>Program</key>")
+            && contents.matches("<key>ProgramArguments</key>").count() == 1,
+        "ambiguous LaunchAgent executable; reinstall the service from the standalone binary"
+    );
+    let arguments = plist_program_arguments(contents).unwrap_or_default();
+    anyhow::ensure!(
+        arguments.get(1).is_some_and(|run| run == "run")
+            && arguments
+                .first()
+                .is_some_and(|program| same_executable(Path::new(program), exe)),
+        "the installed LaunchAgent runs {}, not this binary ({}); refusing to control another installation",
+        arguments.first().map_or("an unreadable program", String::as_str),
+        exe.display()
+    );
+    Ok(())
+}
+
+/// What launchd has loaded must be this binary too. `launchctl print` names
+/// the job's executable on its own top-level `program = ` line.
+#[cfg(any(target_os = "macos", test))]
+fn validate_loaded_program(print: &str, exe: &Path) -> Result<()> {
+    let program = print
+        .lines()
+        .find_map(|line| line.strip_prefix("\tprogram = "))
+        .map(str::trim);
+    anyhow::ensure!(
+        program.is_some_and(|program| same_executable(Path::new(program), exe)),
+        "launchd has the gateway loaded from {}, not this binary ({}); refusing to control another installation",
+        program.unwrap_or("an unknown program"),
+        exe.display()
+    );
+    Ok(())
+}
+
+/// Two spellings of one file: a symlink, `./muqun-gateway`, `bin/../bin/x`.
+/// A path that does not resolve matches only itself.
+#[cfg(any(target_os = "macos", test))]
+fn same_executable(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(a), Ok(b)) if a == b
+        )
+}
+
+/// `ProgramArguments`' strings, unescaped. `None` when the key is not followed
+/// by an array.
+#[cfg(any(target_os = "macos", test))]
+fn plist_program_arguments(contents: &str) -> Option<Vec<String>> {
+    let (_, after) = contents.split_once("<key>ProgramArguments</key>")?;
+    let (array, _) = after
+        .trim_start()
+        .strip_prefix("<array>")?
+        .split_once("</array>")?;
+    let mut arguments = Vec::new();
+    let mut rest = array;
+    while let Some((_, tail)) = rest.split_once("<string>") {
+        let (value, tail) = tail.split_once("</string>")?;
+        arguments.push(xml_unescape(value));
+        rest = tail;
+    }
+    Some(arguments)
+}
+
+fn xml_unescape(value: &str) -> String {
+    value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// The `PATH` the installed unit pins for the gateway, if a unit is installed.
+/// What the supervised gateway finds programs on -- not this shell's `PATH`.
+pub fn installed_path_env() -> Option<String> {
+    unit_path_env(&std::fs::read_to_string(unit_path().ok()?).ok()?)
+}
+
+/// `PATH` from either unit format: the plist's `EnvironmentVariables`, or the
+/// systemd unit's quoted `Environment="PATH=..."` (see `systemd_word`).
+fn unit_path_env(contents: &str) -> Option<String> {
+    if let Some((_, after)) = contents.split_once("<key>PATH</key>") {
+        let (value, _) = after
+            .trim_start()
+            .strip_prefix("<string>")?
+            .split_once("</string>")?;
+        return Some(xml_unescape(value));
+    }
+    let quoted = contents
+        .lines()
+        .find_map(|line| line.strip_prefix("Environment=\"PATH="))?
+        .strip_suffix('"')?;
+    let mut value = String::new();
+    let mut chars = quoted.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => value.extend(chars.next()),
+            '%' => {
+                chars.next();
+                value.push('%');
+            }
+            _ => value.push(ch),
+        }
+    }
+    Some(value)
+}
+
+/// Reload before inspecting: a later reload between validation and stop would
+/// activate unchecked drop-ins. D-Bus provides the exact argv/environment;
+/// systemctl's human-readable ExecStart joins argv with spaces and is lossy.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn ensure_effective_unit(unit: &str, paths: &ServicePaths) -> Result<()> {
+    checked_command("systemctl", &["--user", "daemon-reload"])?;
+    let policy = command_output(
+        "systemctl",
+        &["--user", "show", unit, "--property=KillMode", "--value"],
+    )?;
+    let object = command_json(
+        "busctl",
+        &[
+            "--user",
+            "--json=short",
+            "--timeout=5s",
+            "call",
+            "org.freedesktop.systemd1",
+            "/org/freedesktop/systemd1",
+            "org.freedesktop.systemd1.Manager",
+            "GetUnit",
+            "s",
+            unit,
+        ],
+    )?;
+    let object = object
+        .get("data")
+        .and_then(|data| data.get(0))
+        .and_then(serde_json::Value::as_str)
+        .filter(|path| path.starts_with("/org/freedesktop/systemd1/unit/"))
+        .context("invalid systemd unit object")?;
+    let properties = command_json(
+        "busctl",
+        &[
+            "--user",
+            "--json=short",
+            "--timeout=5s",
+            "call",
+            "org.freedesktop.systemd1",
+            object,
+            "org.freedesktop.DBus.Properties",
+            "GetAll",
+            "s",
+            "org.freedesktop.systemd1.Service",
+        ],
+    )?;
+    let assignments: Vec<String> =
+        serde_json::from_value(properties["data"][0]["Environment"]["data"].clone())
+            .map_err(|_| anyhow::anyhow!("missing or invalid effective service environment"))?;
+    let pinned = [
+        "HOME=",
+        "MUQUN_GATEWAY_CONFIG_DIR=",
+        "MUQUN_GATEWAY_STATE_DIR=",
+    ]
+    .iter()
+    .all(|name| assignments.iter().any(|value| value.starts_with(name)));
+    let manager_environment = if pinned {
+        Vec::new()
+    } else {
+        let manager = command_json(
+            "busctl",
+            &[
+                "--user",
+                "--json=short",
+                "--timeout=5s",
+                "call",
+                "org.freedesktop.systemd1",
+                "/org/freedesktop/systemd1",
+                "org.freedesktop.DBus.Properties",
+                "GetAll",
+                "s",
+                "org.freedesktop.systemd1.Manager",
+            ],
+        )?;
+        serde_json::from_value(manager["data"][0]["Environment"]["data"].clone())
+            .map_err(|_| anyhow::anyhow!("missing or invalid inherited manager environment"))?
+    };
+    validate_effective_unit(&properties, policy.trim(), paths, &manager_environment)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn command_output(program: &str, args: &[&str]) -> Result<String> {
+    let output = ProcessCommand::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("failed to inspect effective service with {program}"))?;
+    // Never include Environment/JSON output in diagnostics: it may contain secrets.
+    anyhow::ensure!(
+        output.status.success(),
+        "{program} could not inspect effective service configuration ({})",
+        output.status
+    );
+    String::from_utf8(output.stdout).context("invalid UTF-8 service configuration")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn command_json(program: &str, args: &[&str]) -> Result<serde_json::Value> {
+    serde_json::from_str(&command_output(program, args)?)
+        .context("invalid structured service configuration")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn validate_effective_unit(
+    reply: &serde_json::Value,
+    policy: &str,
+    paths: &ServicePaths,
+    manager_environment: &[String],
+) -> Result<()> {
+    let properties = reply
+        .get("data")
+        .and_then(|data| data.get(0))
+        .and_then(serde_json::Value::as_object)
+        .context("missing effective systemd properties")?;
+    let property = |name: &str| -> Result<&serde_json::Value> {
+        properties
+            .get(name)
+            .and_then(|value| value.get("data"))
+            .with_context(|| format!("missing effective systemd {name}"))
+    };
+    anyhow::ensure!(
+        matches!(policy, "process" | "none") && property("KillMode")?.as_str() == Some(policy),
+        "the effective service may terminate terminal tasks; require KillMode=process or none"
+    );
+    for name in [
+        "EnvironmentFiles",
+        "UnsetEnvironment",
+        "ExecStop",
+        "ExecStopPost",
+    ] {
+        anyhow::ensure!(property(name)?.as_array().is_some_and(Vec::is_empty),
+            "effective {name} prevents verifying service ownership/shutdown; refusing lifecycle action");
+    }
+    let starts = property("ExecStart")?
+        .as_array()
+        .context("invalid effective ExecStart")?;
+    anyhow::ensure!(
+        starts.len() == 1,
+        "require exactly one effective gateway ExecStart"
+    );
+    let executable = starts[0]
+        .get(0)
+        .and_then(serde_json::Value::as_str)
+        .context("missing effective executable")?;
+    let argv: Vec<String> =
+        serde_json::from_value(starts[0].get(1).context("missing effective argv")?.clone())?;
+    let config_arg = match argv.as_slice() {
+        [_, run, flag, config] if run == "run" && flag == "--config" => Some(config.as_str()),
+        [_, run, flag] if run == "run" => flag.strip_prefix("--config="),
+        _ => None,
+    };
+    anyhow::ensure!(
+        Path::new(executable) == paths.exe
+            && argv.first().is_some_and(|arg| Path::new(arg) == paths.exe)
+            && config_arg.is_some_and(|arg| Path::new(arg) == paths.config),
+        "effective ExecStart belongs to another installation; refusing lifecycle action"
+    );
+    // ExecStart's argv is before environment expansion. Literal '$' in paths
+    // is safe only with the ':' (no-env-expand) flag, exposed by ExecStartEx.
+    if argv.iter().any(|arg| arg.contains('$')) {
+        let flags = property("ExecStartEx")?
+            .get(0)
+            .and_then(|start| start.get(2))
+            .and_then(serde_json::Value::as_array)
+            .context("missing effective ExecStart flags")?;
+        anyhow::ensure!(flags.iter().any(|flag| flag.as_str() == Some("no-env-expand")),
+            "effective ExecStart expands environment variables; refusing ambiguous installation identity");
+    }
+    let assignments: Vec<String> = serde_json::from_value(property("Environment")?.clone())
+        .map_err(|_| anyhow::anyhow!("invalid effective service environment"))?;
+    let mut environment = std::collections::HashMap::new();
+    for assignment in manager_environment {
+        let (name, value) = assignment
+            .split_once('=')
+            .context("invalid manager environment assignment")?;
+        environment.insert(name, value);
+    }
+    let mut unit_names = std::collections::HashSet::new();
+    for assignment in &assignments {
+        let (name, value) = assignment
+            .split_once('=')
+            .context("invalid effective environment assignment")?;
+        anyhow::ensure!(
+            unit_names.insert(name),
+            "ambiguous effective service environment"
+        );
+        environment.insert(name, value);
+    }
+    anyhow::ensure!(
+        environment
+            .get("HOME")
+            .is_some_and(|value| Path::new(value) == paths.home),
+        "effective HOME belongs to another installation; refusing lifecycle action"
+    );
+    // Mirror only the directory precedence in store: explicit pins, then the
+    // legacy plugin environment before import, then HOME/XDG defaults. Read the
+    // marker without calling the migrating store helpers or mutating this CLI's environment.
+    let config_parent = environment
+        .get("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| paths.home.join(".config"));
+    let standalone_config = config_parent.join("muqun-gateway");
+    let imported = standalone_config
+        .join(crate::HERDR_PLUGIN_IMPORT_MARKER)
+        .exists();
+    let resolve = |pin: &str, legacy: &str, default: PathBuf| {
+        environment
+            .get(pin)
+            .or_else(|| {
+                if imported {
+                    None
+                } else {
+                    environment.get(legacy)
+                }
+            })
+            .map(PathBuf::from)
+            .unwrap_or(default)
+    };
+    let config = resolve(
+        "MUQUN_GATEWAY_CONFIG_DIR",
+        "HERDR_PLUGIN_CONFIG_DIR",
+        standalone_config,
+    );
+    let data_parent = environment
+        .get("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| paths.home.join(".local/share"));
+    let state = resolve(
+        "MUQUN_GATEWAY_STATE_DIR",
+        "HERDR_PLUGIN_STATE_DIR",
+        data_parent.join("muqun-gateway"),
+    );
+    anyhow::ensure!(
+        config.is_absolute()
+            && state.is_absolute()
+            && config == paths.config.parent().context("config has no parent")?
+            && state == paths.state,
+        "effective config/state paths belong to another installation; refusing lifecycle action"
+    );
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceAction {
+    Start,
+    Stop,
+    Restart,
+}
+
+impl ServiceAction {
+    pub fn verb(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Stop => "stop",
+            Self::Restart => "restart",
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn control(action: ServiceAction) -> Result<()> {
+    checked_command(
+        "systemctl",
+        &["--user", action.verb(), &format!("{SERVICE_LABEL}.service")],
+    )
+}
+
+/// Every macOS transition shares `launchd`'s retrying bootstrap; see there.
+#[cfg(target_os = "macos")]
+pub fn control(action: ServiceAction) -> Result<()> {
+    super::launchd::Launchctl::system()?.control(action)
+}
+
+pub fn checked_command(program: &str, args: &[&str]) -> Result<()> {
+    let output = ProcessCommand::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("failed to run {program}"))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "{program} {} failed ({}): {}",
+        args.join(" "),
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+            .chars()
+            .take(512)
+            .collect::<String>()
+            .trim()
+    );
+    Ok(())
 }
 
 pub fn unit_path() -> Result<PathBuf> {
@@ -169,6 +653,8 @@ fn launch_agent_plist(paths: &ServicePaths) -> String {
     let home = xml(&paths.home);
     let path = xml_text(&paths.path);
     let lc_ctype = xml_text(&paths.lc_ctype);
+    let config_dir = xml(paths.config.parent().unwrap_or(Path::new(".")));
+    let state = xml(&paths.state);
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -199,6 +685,10 @@ fn launch_agent_plist(paths: &ServicePaths) -> String {
     <string>{path}</string>
     <key>LC_CTYPE</key>
     <string>{lc_ctype}</string>
+    <key>MUQUN_GATEWAY_CONFIG_DIR</key>
+    <string>{config_dir}</string>
+    <key>MUQUN_GATEWAY_STATE_DIR</key>
+    <string>{state}</string>
   </dict>
   <key>StandardOutPath</key>
   <string>{log}</string>
@@ -229,6 +719,14 @@ fn systemd_unit(paths: &ServicePaths) -> Result<String> {
     let home = systemd_word(&format!("HOME={}", path_text(&paths.home)?))?;
     let path = systemd_word(&format!("PATH={}", paths.path))?;
     let lc_ctype = systemd_word(&format!("LC_CTYPE={}", paths.lc_ctype))?;
+    let config_dir = systemd_word(&format!(
+        "MUQUN_GATEWAY_CONFIG_DIR={}",
+        path_text(paths.config.parent().context("config has no parent")?)?
+    ))?;
+    let state = systemd_word(&format!(
+        "MUQUN_GATEWAY_STATE_DIR={}",
+        path_text(&paths.state)?
+    ))?;
     Ok(format!(
         "[Unit]\n\
          Description=Muqun Gateway\n\
@@ -240,6 +738,8 @@ fn systemd_unit(paths: &ServicePaths) -> Result<String> {
          Environment={home}\n\
          Environment={path}\n\
          Environment={lc_ctype}\n\
+         Environment={config_dir}\n\
+         Environment={state}\n\
          ExecStart={exe} run --config {config}\n\
          Restart=always\n\
          RestartSec=3\n\
@@ -291,150 +791,46 @@ fn xml_text(value: &str) -> String {
 
 // ------------------------------------------------------------- init plumbing
 
-/// How long a reinstall waits for the old agent to be fully gone. Past launchd's
-/// own `ExitTimeOut` (5 s by default, when SIGTERM becomes SIGKILL), with room.
 #[cfg(target_os = "macos")]
-const BOOTOUT_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
-
-/// Bootstrap attempts, a second apart, before a reinstall gives up.
-#[cfg(target_os = "macos")]
-const BOOTSTRAP_ATTEMPTS: u32 = 10;
-
-#[cfg(target_os = "macos")]
-fn enable(unit: &Path) -> Result<()> {
-    let domain = gui_domain();
-    let target = format!("{domain}/{SERVICE_LABEL}");
+fn enable(_unit: &Path, _paths: &ServicePaths) -> Result<()> {
     // Reinstalling over a live agent: bootstrap refuses a label that is already
-    // loaded, so the old one goes first. A failure here is the ordinary "it was
-    // not loaded" case, which is why it is not checked.
-    //
-    // `bootout` can return while launchd is still tearing the old job down, and
-    // a bootstrap in that window fails with "5: Input/output error" -- which
-    // is how the installer's update step left the gateway stopped on v0.12.1.
-    // So wait until the label is released and the old process has exited (it
-    // holds the state lock, and a replacement started beside it would lose that
-    // race and exit), then bootstrap, retrying while launchd catches up.
-    let old_pid = loaded_pid(&target);
-    run_quiet("launchctl", &["bootout", &target]);
-    wait_until(BOOTOUT_WAIT, || {
-        !run_quiet("launchctl", &["print", &target]) && !old_pid.is_some_and(process_alive)
-    });
-
-    let mut last_error = String::new();
-    for attempt in 1..=BOOTSTRAP_ATTEMPTS {
-        let output = ProcessCommand::new("launchctl")
-            .arg("bootstrap")
-            .arg(&domain)
-            .arg(unit)
-            .stdin(Stdio::null())
-            .output()
-            .context("failed to run launchctl bootstrap")?;
-        if output.status.success() {
-            return Ok(());
-        }
-        last_error = format!(
-            "{} ({})",
-            String::from_utf8_lossy(&output.stderr).trim(),
-            output.status
-        );
-        // Only 5 (EIO) is launchd still holding the old job. Anything else --
-        // a unit it will not parse, no GUI session to load into -- will not
-        // change by waiting, so report it now.
-        if output.status.code() != Some(5) {
-            anyhow::bail!("launchctl bootstrap failed: {last_error}");
-        }
-        if attempt < BOOTSTRAP_ATTEMPTS {
-            std::thread::sleep(std::time::Duration::from_secs(1));
-        }
-    }
-    anyhow::bail!(
-        "launchctl bootstrap failed after {BOOTSTRAP_ATTEMPTS} attempts: {last_error}\n\
-         launchd has not released the previous gateway yet, and the gateway is not running. \
-         Try `muqun-gateway service install` again in a moment."
+    // loaded, so the old one goes first, and the bootstrap retries while
+    // launchd releases it (see `launchd`).
+    super::launchd::Launchctl::system()?.reload().context(
+        "the gateway is not running. Try `muqun-gateway service install` again in a moment",
     )
 }
 
-/// The pid launchd reports for a loaded job, if it is running one.
 #[cfg(target_os = "macos")]
-fn loaded_pid(target: &str) -> Option<u32> {
-    let output = ProcessCommand::new("launchctl")
-        .args(["print", target])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    parse_launchd_pid(&String::from_utf8_lossy(&output.stdout))
-}
-
-/// The job's own `pid = N` line. Only the top-level one: nested sections
-/// (endpoints, spawn info) are indented further and are not the job's pid.
-#[cfg(any(target_os = "macos", test))]
-fn parse_launchd_pid(print: &str) -> Option<u32> {
-    print
-        .lines()
-        .find_map(|line| line.strip_prefix("\tpid = "))
-        .and_then(|pid| pid.trim().parse().ok())
+pub fn owns_pid(pid: u32) -> bool {
+    super::launchd::Launchctl::system().is_ok_and(|launchd| launchd.loaded_pid() == Some(pid))
 }
 
 #[cfg(target_os = "macos")]
-fn process_alive(pid: u32) -> bool {
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
-        return false;
-    };
-    // SAFETY: signal 0 only checks that the pid exists and may be signalled.
-    if unsafe { libc::kill(pid, 0) } == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-#[cfg(target_os = "macos")]
-fn wait_until(limit: std::time::Duration, mut done: impl FnMut() -> bool) {
-    let deadline = std::time::Instant::now() + limit;
-    while !done() && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn disable(_unit: &Path) {
-    run_quiet(
-        "launchctl",
-        &["bootout", &format!("{}/{SERVICE_LABEL}", gui_domain())],
-    );
+fn disable(_unit: &Path) -> Result<()> {
+    control(ServiceAction::Stop)
 }
 
 #[cfg(target_os = "macos")]
 fn loaded() -> bool {
-    run_quiet(
-        "launchctl",
-        &["print", &format!("{}/{SERVICE_LABEL}", gui_domain())],
-    )
-}
-
-#[cfg(target_os = "macos")]
-fn gui_domain() -> String {
-    // The per-user GUI domain, which is where an agent that has to reach the
-    // user's own tmux server belongs. `unsafe` only because getuid is FFI; it
-    // cannot fail and touches nothing.
-    format!("gui/{}", unsafe { libc::getuid() })
+    super::launchd::Launchctl::system().is_ok_and(|launchd| launchd.loaded())
 }
 
 #[cfg(not(target_os = "macos"))]
-fn enable(_unit: &Path) -> Result<()> {
-    run_quiet("systemctl", &["--user", "daemon-reload"]);
+fn enable(_unit: &Path, paths: &ServicePaths) -> Result<()> {
     let unit_name = format!("{SERVICE_LABEL}.service");
+    ensure_effective_unit(&unit_name, paths)?;
     let status = ProcessCommand::new("systemctl")
-        .args(["--user", "enable", "--now", &unit_name])
+        .args(["--user", "enable", &unit_name])
+        .stdin(Stdio::null())
         .status()
         .context("failed to run systemctl --user enable")?;
     anyhow::ensure!(
         status.success(),
         "systemctl --user enable failed ({status})"
     );
+
+    checked_command("systemctl", &["--user", "restart", &unit_name])?;
 
     // Without lingering, the user manager -- and the gateway with it -- is torn
     // down when the last session ends, so a phone can reach the machine only
@@ -451,9 +847,9 @@ fn enable(_unit: &Path) -> Result<()> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn disable(_unit: &Path) {
+fn disable(_unit: &Path) -> Result<()> {
     let unit_name = format!("{SERVICE_LABEL}.service");
-    run_quiet("systemctl", &["--user", "disable", "--now", &unit_name]);
+    checked_command("systemctl", &["--user", "disable", "--now", &unit_name])
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -465,9 +861,11 @@ fn loaded() -> bool {
     )
 }
 
+#[cfg(not(target_os = "macos"))]
 fn run_quiet(program: &str, args: &[&str]) -> bool {
     ProcessCommand::new(program)
         .args(args)
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -478,29 +876,50 @@ fn run_quiet(program: &str, args: &[&str]) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn the_job_pid_is_read_from_its_own_line_and_nowhere_else() {
-        let print = "gui/501/dev.osuki.muqun-gateway = {\n\
-                     \tactive count = 1\n\
-                     \tstate = running\n\
-                     \tendpoints = {\n\
-                     \t\tpid = 7\n\
-                     \t}\n\
-                     \tpid = 99542\n\
-                     }\n";
-        assert_eq!(parse_launchd_pid(print), Some(99542));
-        assert_eq!(parse_launchd_pid("\tstate = not running\n"), None);
-    }
-
     fn paths() -> ServicePaths {
         ServicePaths {
             exe: PathBuf::from("/home/a b/.local/bin/muqun-gateway"),
             config: PathBuf::from("/home/a b/.config/muqun-gateway/config.json"),
+            state: PathBuf::from("/home/a b/.local/share/muqun-gateway"),
             log: PathBuf::from("/home/a b/.local/share/muqun-gateway/gateway.log"),
             home: PathBuf::from("/home/a b"),
             path: String::from("/opt/homebrew/bin:/usr/bin:/bin"),
             lc_ctype: String::from("zh_CN.UTF-8"),
         }
+    }
+
+    #[test]
+    fn a_stopped_launch_agent_reads_as_installed_and_stopped_not_incomplete() {
+        use ServiceState::*;
+        assert_eq!(ServiceState::classify(false, false, false), NotInstalled);
+        assert_eq!(ServiceState::classify(true, true, true), Installed);
+        // `stop` unloads a LaunchAgent; its plist still starts it at login.
+        assert_eq!(ServiceState::classify(true, false, true), Stopped);
+        assert_eq!(ServiceState::classify(true, false, false), FileOnly);
+        assert!(registers_at_login(&launch_agent_plist(&paths())));
+        let manual = launch_agent_plist(&paths()).replace(
+            "<key>RunAtLoad</key>\n  <true/>",
+            "<key>RunAtLoad</key>\n  <false/>",
+        );
+        assert!(!registers_at_login(&manual));
+        assert!(!registers_at_login(
+            &launch_agent_plist(&paths()).replace(SERVICE_LABEL, "dev.example.other")
+        ));
+    }
+
+    #[test]
+    fn the_path_a_unit_pins_is_read_back_exactly_from_either_format() {
+        let mut fixture = paths();
+        fixture.path = String::from("/opt/a&b/bin:/home/x \"y\"/50%/bin:/usr/bin");
+        assert_eq!(
+            unit_path_env(&launch_agent_plist(&fixture)).as_deref(),
+            Some(fixture.path.as_str())
+        );
+        assert_eq!(
+            unit_path_env(&systemd_unit(&fixture).unwrap()).as_deref(),
+            Some(fixture.path.as_str())
+        );
+        assert_eq!(unit_path_env("[Service]\nExecStart=/bin/true\n"), None);
     }
 
     #[test]
@@ -528,6 +947,7 @@ mod tests {
         let plist = launch_agent_plist(&ServicePaths {
             exe: PathBuf::from("/Users/a&b/bin/muqun-gateway"),
             config: PathBuf::from("/Users/a&b/config.json"),
+            state: PathBuf::from("/Users/a&b/state"),
             log: PathBuf::from("/Users/a<b>/gateway.log"),
             home: PathBuf::from("/Users/a&b"),
             path: String::from("/Users/a&b/bin:/usr/bin"),
@@ -588,6 +1008,172 @@ mod tests {
     }
 
     #[test]
+    fn units_pin_resolved_config_and_state_overrides_and_refuse_other_installs() {
+        let fixture = paths();
+        let unit = unit_contents(&fixture).unwrap();
+        assert!(unit.contains("MUQUN_GATEWAY_CONFIG_DIR"));
+        assert!(unit.contains("MUQUN_GATEWAY_STATE_DIR"));
+        assert!(validate_install_unit(&unit, &fixture).is_ok());
+        let mut other = paths();
+        other.state = "/another/state".into();
+        assert!(validate_install_unit(&unit, &other).is_err());
+        other = paths();
+        other.config = "/another/config.json".into();
+        assert!(validate_install_unit(&unit, &other).is_err());
+        let unsafe_unit = unit
+            .replace("KillMode=process", "KillMode=control-group")
+            .replace(
+                "<key>AbandonProcessGroup</key>\n  <true/>",
+                "<key>AbandonProcessGroup</key>\n  <false/>",
+            );
+        assert!(validate_install_unit(&unsafe_unit, &fixture).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_agent_ownership_accepts_any_spelling_of_this_binary_and_refuses_others() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/ownership-fixtures")
+            .join(uuid::Uuid::new_v4().to_string());
+        let bin = root.join("a&b/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let installed = bin.join("muqun-gateway");
+        std::fs::write(&installed, b"binary").unwrap();
+        let link = root.join("muqun-gateway");
+        std::os::unix::fs::symlink(&installed, &link).unwrap();
+        let other = root.join("other/muqun-gateway");
+        std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+        std::fs::write(&other, b"another install").unwrap();
+
+        let mut fixture = paths();
+        fixture.exe = installed.clone();
+        let plist = launch_agent_plist(&fixture);
+        // The CLI run through a symlink, or relatively, is still this install.
+        for exe in [
+            installed.clone(),
+            link.clone(),
+            bin.join("../bin/muqun-gateway"),
+        ] {
+            validate_launch_agent_program(&plist, &exe).unwrap();
+        }
+        // A plist written through the symlink names the same binary too.
+        fixture.exe = link.clone();
+        validate_launch_agent_program(&launch_agent_plist(&fixture), &installed).unwrap();
+        // A plist pointing at another installation is refused, naming it.
+        fixture.exe = other.clone();
+        let error = validate_launch_agent_program(&launch_agent_plist(&fixture), &installed)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&other.display().to_string()), "{error}");
+        // What launchd has loaded is checked the same way.
+        let print = |program: &Path| {
+            format!(
+                "gui/501/{SERVICE_LABEL} = {{\n\tstate = running\n\tprogram = {}\n\tpid = 7\n}}\n",
+                program.display()
+            )
+        };
+        validate_loaded_program(&print(&link), &installed).unwrap();
+        assert!(validate_loaded_program(&print(&other), &installed).is_err());
+        assert!(validate_loaded_program("\tstate = running\n", &installed).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn effective_systemd_identity_uses_exact_arguments_and_environment() {
+        let fixture = paths();
+        let exe = fixture.exe.to_str().unwrap();
+        let valid = serde_json::json!({"type": "a{sv}", "data": [{
+            "KillMode": {"type": "s", "data": "process"},
+            "ExecStart": {"type": "a(sasbttttuii)", "data": [[exe, [exe, "run", "--config", fixture.config], false, 0, 0, 0, 0, 0, 0, 0]]},
+            "Environment": {"type": "as", "data": [
+                format!("HOME={}", fixture.home.display()),
+                format!("MUQUN_GATEWAY_CONFIG_DIR={}", fixture.config.parent().unwrap().display()),
+                format!("MUQUN_GATEWAY_STATE_DIR={}", fixture.state.display())
+            ]},
+            "EnvironmentFiles": {"type": "a(sb)", "data": []},
+            "UnsetEnvironment": {"type": "as", "data": []},
+            "ExecStop": {"type": "a(sasbttttuii)", "data": []},
+            "ExecStopPost": {"type": "a(sasbttttuii)", "data": []}
+        }]});
+        assert!(validate_effective_unit(&valid, "process", &fixture, &[]).is_ok());
+        for (name, replacement) in [
+            ("KillMode", serde_json::json!("control-group")),
+            (
+                "EnvironmentFiles",
+                serde_json::json!([["/foreign/environment", false]]),
+            ),
+            (
+                "UnsetEnvironment",
+                serde_json::json!(["MUQUN_GATEWAY_STATE_DIR"]),
+            ),
+            (
+                "ExecStop",
+                serde_json::json!([["/bin/kill", ["kill", "-1"], false]]),
+            ),
+            (
+                "ExecStopPost",
+                serde_json::json!([["/foreign/cleanup", [], false]]),
+            ),
+            (
+                "ExecStart",
+                serde_json::json!([[
+                    exe,
+                    [
+                        exe,
+                        "run",
+                        "--config",
+                        format!("{} extra", fixture.config.display())
+                    ],
+                    false
+                ]]),
+            ),
+            // Same flattened command, different argv boundaries must not pass.
+            (
+                "ExecStart",
+                serde_json::json!([[exe, [exe, "run --config", fixture.config], false]]),
+            ),
+            ("Environment", serde_json::json!(["HOME=/foreign"])),
+        ] {
+            let mut invalid = valid.clone();
+            invalid["data"][0][name]["data"] = replacement;
+            assert!(
+                validate_effective_unit(&invalid, "process", &fixture, &[]).is_err(),
+                "{name}"
+            );
+        }
+        assert!(validate_effective_unit(&valid, "none", &fixture, &[]).is_err());
+        assert!(validate_effective_unit(&serde_json::json!({}), "process", &fixture, &[]).is_err());
+
+        let mut legacy_paths = paths();
+        legacy_paths.config = fixture.home.join(".config/muqun-gateway/config.json");
+        legacy_paths.state = fixture.home.join(".local/share/muqun-gateway");
+        let mut legacy = valid.clone();
+        legacy["data"][0]["Environment"]["data"] =
+            serde_json::json!([format!("HOME={}", fixture.home.display())]);
+        legacy["data"][0]["ExecStart"]["data"][0][1][3] = serde_json::json!(legacy_paths.config);
+        assert!(validate_effective_unit(&legacy, "process", &legacy_paths, &[]).is_ok());
+        for inherited in [
+            "XDG_DATA_HOME=/foreign",
+            "HERDR_PLUGIN_STATE_DIR=/foreign",
+            "MUQUN_GATEWAY_CONFIG_DIR=/foreign",
+        ] {
+            assert!(validate_effective_unit(
+                &legacy,
+                "process",
+                &legacy_paths,
+                &[inherited.to_owned()]
+            )
+            .is_err());
+            // Explicit service pins take precedence over inherited environment.
+            assert!(
+                validate_effective_unit(&valid, "process", &fixture, &[inherited.to_owned()])
+                    .is_ok()
+            );
+        }
+    }
+
+    #[test]
     fn systemd_escapes_commands_and_environment_with_distinct_dollar_rules() {
         let value = "/home/a b/\"quoted\"/back\\slash/$HOME/${USER}/%h/单引号'";
         let escaped = "/home/a b/\\\"quoted\\\"/back\\\\slash/$HOME/${USER}/%%h/单引号'";
@@ -611,7 +1197,7 @@ mod tests {
     #[test]
     fn systemd_rejects_controls_in_every_interpolated_field() {
         for control in ['\n', '\r', '\0', '\t', '\u{7f}'] {
-            for field in 0..5 {
+            for field in 0..6 {
                 let mut paths = paths();
                 let invalid = format!("/safe{control}ExecStart=/unwanted");
                 match field {
@@ -619,7 +1205,8 @@ mod tests {
                     1 => paths.config = invalid.into(),
                     2 => paths.home = invalid.into(),
                     3 => paths.path = invalid,
-                    _ => paths.lc_ctype = invalid,
+                    4 => paths.lc_ctype = invalid,
+                    _ => paths.state = invalid.into(),
                 }
                 assert!(systemd_unit(&paths).is_err(), "field {field}");
             }

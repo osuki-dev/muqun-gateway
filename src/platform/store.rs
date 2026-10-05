@@ -29,6 +29,9 @@ pub(crate) fn load_config(config_path: Option<String>) -> anyhow::Result<Config>
 }
 
 pub(crate) fn config_dir() -> anyhow::Result<std::path::PathBuf> {
+    if let Some(path) = std::env::var_os("MUQUN_GATEWAY_CONFIG_DIR") {
+        return Ok(path.into());
+    }
     let standalone = standalone_config_dir()?;
     if !standalone.join(HERDR_PLUGIN_IMPORT_MARKER).exists() {
         if let Ok(path) = std::env::var("HERDR_PLUGIN_CONFIG_DIR") {
@@ -84,6 +87,9 @@ pub(crate) fn short_test_socket(prefix: &str) -> std::path::PathBuf {
 
 #[cfg(not(test))]
 pub(crate) fn state_dir() -> anyhow::Result<std::path::PathBuf> {
+    if let Some(path) = std::env::var_os("MUQUN_GATEWAY_STATE_DIR") {
+        return Ok(path.into());
+    }
     let standalone_config = standalone_config_dir()?;
     if !standalone_config.join(HERDR_PLUGIN_IMPORT_MARKER).exists() {
         if let Ok(path) = std::env::var("HERDR_PLUGIN_STATE_DIR") {
@@ -546,6 +552,17 @@ pub(crate) fn listener_pids_named(port: u16, process_name: &str) -> anyhow::Resu
     Ok(pids)
 }
 
+/// A process's short name as `ps` reports it, for naming it in a message.
+pub(crate) fn process_name(pid: u32) -> Option<String> {
+    let output = ProcessCommand::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+        .ok()?;
+    let name = String::from_utf8_lossy(&output.stdout);
+    let name = name.trim().rsplit('/').next()?.trim();
+    (output.status.success() && !name.is_empty()).then(|| name.to_owned())
+}
+
 /// Confirm a pid really belongs to a process named `process_name` before
 /// trusting it (e.g. before signalling it, or before refusing a directory
 /// migration on its account).
@@ -562,6 +579,17 @@ pub(crate) fn process_matches_name(pid: u32, process_name: &str) -> bool {
                     .next()
                     .is_some_and(|name| name.starts_with(process_name))
         })
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn process_matches_name(pid: u32, process_name: &str) -> bool {
+    std::fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .is_some_and(|name| name == process_name || name == format!("{process_name} (deleted)"))
 }
 
 /// Marks a directory as never-to-be-committed.

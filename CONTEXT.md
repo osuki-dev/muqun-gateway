@@ -4,16 +4,16 @@
 
 This repository implements Muqun's local terminal gateway. It exposes one
 authenticated HTTP/SSE contract over one or more terminal backends. The
-repository, package, and binary are `muqun-gateway`; the Herdr plugin
-identifier stays `herdr.gateway` because it names the Herdr integration, not
-the gateway itself (see the last line of this file).
+repository, package, and binary are `muqun-gateway`. Distribution and lifecycle
+are standalone; Herdr remains a backend, not the host of a Gateway plugin.
+The retired `herdr.gateway` identifier remains only for migration compatibility.
 
 ## Shape of the codebase
 
 - `src/main.rs`: composition root only -- module declarations, the legacy
   crate-root re-exports, `AppState`, and `fn main`. Domain code lives in the
   module tree below.
-- `src/cli.rs`: CLI arguments, subcommands, and dispatch.
+- `src/cli/`: CLI arguments, subcommands, and dispatch.
 - `src/test_support.rs`: shared test fixtures and fakes, compiled only for
   test builds.
 - `src/agents/`: agents plane.
@@ -49,6 +49,12 @@ the gateway itself (see the last line of this file).
   - `scrollback.rs`: bounded scrollback retention and the application policy
     for observing frames and serving row-bounded reads. Callers do not assemble
     cache keys or compare output byte lengths.
+  - `history.rs`, `history_memory.rs`, `history_routes.rs`: captured-history
+    pagination use case and async repository port, the current memory adapter,
+    and authenticated HTTP boundary. Captured historical prefix only, separately
+    from native ranges and the mutable viewport; bounded ephemeral snapshots.
+    Storage is selected at server composition (memory only now); contract and
+    future persistence-switch constraints in `docs/captured-history.md`.
   - `login_env.rs`: the `PATH` and `LC_CTYPE` a backend actually needs,
     recovered from a login shell. An init system starts the gateway with neither,
     and the tmux adapter cannot spawn tmux without the first or parse its output
@@ -72,7 +78,16 @@ the gateway itself (see the last line of this file).
     domain's `mount()`.
   - `setup.rs`: setup, backend configuration, Herdr plugin import, and the
     service/background lifecycle.
-  - `manage.rs`: the interactive terminal management UI.
+  - `manage.rs`: crossterm management views (overview, terminals, devices,
+    settings), structured styled rows, Enter primary actions, default-cancel
+    scope confirmations, selected-row scrolling and cell-safe resize handling.
+  - `lifecycle.rs`: shared CLI/TUI start/stop/restart/status ownership and
+    transition checks; serializes commands separately from the runtime state lock.
+  - `update.rs`: explicit stable-only official GitHub release checks and self-update;
+    requires the complete four-platform binary/checksum matrix, verifies bounded
+    HTTPS downloads, SHA256/native platform/version, then atomically replaces with
+    exact-image rollback. Retains one lifecycle controller across downtime; no
+    automatic update polling, downgrades or history database.
   - `metadata.rs`: capabilities, health metadata, and session liveness ordering.
   - `uploads.rs`, `assets.rs`: phone uploads and the workspace asset index.
   - `git.rs`: read-only, bounded `git` for one pane's checkout -- the
@@ -89,7 +104,9 @@ the gateway itself (see the last line of this file).
   with the app team -- the versioned content envelope and part set, and the
   agent-session field names. Contract tests in `platform/parts.rs` and
   `agents/domain/` enforce them.
-- `herdr-plugin.toml`, `install.sh`, `scripts/`: plugin packaging and releases.
+- `install.sh`, `release.sh`, `.github/workflows/release.yml`: standalone
+  installation and releases. The plugin manifest/fetch step are retired;
+  import compatibility and historical fixtures remain.
 
 There are no nested `CONTEXT.md` files at present.
 
@@ -149,7 +166,27 @@ present, it is renamed in place (an atomic same-filesystem `rename`, so there
 is no partially-migrated state) and never looked at again. The Herdr plugin
 supplies its own directories through environment variables until
 `import-herdr-plugin` writes the migration marker. After that, direct CLI and
-plugin actions share standalone ownership.
+legacy environments share standalone ownership. Explicit
+`MUQUN_GATEWAY_CONFIG_DIR`/`MUQUN_GATEWAY_STATE_DIR` overrides take precedence;
+service units pin the resolved paths so service and ordinary runs share identity.
+
+Lifecycle uses a live state-lock owner, verified as a gateway process, not a
+PID-file value or a port scan, for running status and direct signals. A separate
+`state/lifecycle/gateway.lock` serializes lifecycle commands. Detached startup
+waits for the child's authenticated local manager endpoint and reports/reaps
+failed starts. Supervised actions go through the installed user unit/LaunchAgent;
+custom user systemd units must use process-only shutdown, and system units are
+left to their operator. A failed stop never starts a replacement. Gateway
+autostart registers the service; backend autostart independently opts terminal
+servers into one startup attempt. Neither removal nor gateway shutdown terminates
+terminal sessions. Disabling gateway autostart preserves whether it was running.
+On Linux, safety and identity checks follow daemon-reload and inspect effective
+systemd properties, including drop-ins. `busctl` supplies structured argv and
+environment values that `systemctl show` renders lossily. Unpinned older units
+also require the inherited manager environment; unsupported environment files,
+custom stop hooks, missing inspection tools, or ambiguous ownership fail closed.
+TUI clipping/wrapping measures display cells using POSIX `wcwidth` under a private
+thread-local UTF-8 locale, without changing the multithreaded process's global locale.
 
 The public listener is normally localhost behind Tailscale Serve HTTPS or a
 Tailscale IPv4 address. HTTPS is preferred. Application transport encryption is
@@ -178,6 +215,5 @@ Important quirks:
 - Removing a backend never terminates the corresponding terminal sessions.
 - The current Muqun data layer is multi-session capable, but its ordinary UI
   automatically selects the first session and does not yet expose a picker.
-- The Herdr plugin ID (`herdr.gateway`) and the legacy `herdr` response
-  metadata are the Herdr-integration surface, not the gateway's own name --
-  they do not follow the gateway when it is renamed.
+- The historical plugin ID (`herdr.gateway`) still identifies migration paths;
+  legacy `herdr` response metadata remains unchanged for older Apps.

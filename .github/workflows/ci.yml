@@ -41,6 +41,34 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+  # The LaunchAgent, launchctl and proc_pidpath paths are
+  # `#[cfg(target_os = "macos")]` and compile nowhere else; release.yml builds
+  # them only when a tag is pushed. A separate job, so a macOS-only failure is
+  # reported on its own and does not hide the Linux checks. Linux-only tests
+  # stay behind their own `#[cfg(target_os = "linux")]`.
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install tmux
+        run: brew install tmux
+
+      - name: Build
+        run: cargo build --locked
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
   audit:
     runs-on: ubuntu-latest
     permissions:

@@ -57,6 +57,19 @@ use anyhow::Context as _;
 /// removed -- see the module docs on why unlinking it would defeat the lock.
 pub const LOCK_FILE: &str = "gateway.lock";
 
+/// The owner has taken the lock but has not finished publishing its PID.
+/// Transition waits may retry this exact state; it never authorizes a signal.
+#[derive(Debug)]
+pub(crate) struct UnpublishedOwner;
+
+impl std::fmt::Display for UnpublishedOwner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("state directory lock is held but its owner PID is not published yet")
+    }
+}
+
+impl std::error::Error for UnpublishedOwner {}
+
 /// Ownership of one state directory, for as long as this value is alive.
 ///
 /// There is no explicit release, and deliberately so. `flock` is held against
@@ -76,13 +89,39 @@ pub struct StateLock {
 }
 
 impl StateLock {
+    /// Transactions must fail closed on filesystems without working locks.
+    #[cfg(unix)]
+    pub(crate) fn acquire_strict(state_dir: &Path) -> anyhow::Result<Self> {
+        use std::os::fd::AsRawFd as _;
+        std::fs::create_dir_all(state_dir)?;
+        let file = open_lock_file(&state_dir.join(LOCK_FILE))?;
+        // SAFETY: file owns the descriptor until this guard is dropped.
+        anyhow::ensure!(
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
+            "another lifecycle command is in progress, or this filesystem cannot lock safely"
+        );
+        record_holder(&file);
+        Ok(Self { file })
+    }
+
     /// Take exclusive ownership of `state_dir`, or fail naming the holder.
     pub fn acquire(state_dir: &Path) -> anyhow::Result<Self> {
+        Self::acquire_with(state_dir, 1)
+    }
+
+    /// The gateway's own claim on its state directory at startup: retried
+    /// `ACQUIRE_ATTEMPTS` times, so a probe or a fork window holding the lock
+    /// for an instant does not make a freshly started gateway exit.
+    pub fn acquire_owner(state_dir: &Path) -> anyhow::Result<Self> {
+        Self::acquire_with(state_dir, ACQUIRE_ATTEMPTS)
+    }
+
+    fn acquire_with(state_dir: &Path, attempts: u32) -> anyhow::Result<Self> {
         std::fs::create_dir_all(state_dir)
             .with_context(|| format!("failed to create state dir {}", state_dir.display()))?;
         let path = state_dir.join(LOCK_FILE);
         let file = open_lock_file(&path)?;
-        lock_exclusive(file, path, state_dir)
+        lock_exclusive(file, path, state_dir, attempts)
     }
 }
 
@@ -92,6 +131,52 @@ impl StateLock {
 /// pid stays in the file, and the lock does not.
 pub fn holder_pid(path: &Path) -> Option<u32> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// Inspect an existing lock without stamping our PID or creating state. The
+/// recorded PID is meaningful only while another open description holds it.
+///
+/// The probe takes a *shared* lock, read-only, for the instant it needs: it
+/// never holds what a gateway starting at that moment wants exclusively, only
+/// shares it with other probes. `manage` redraws and the lifecycle readiness
+/// wait (every 50 ms) both probe; with an exclusive probe a restart's own
+/// readiness check could win the lock from the gateway it had just started,
+/// which then exited and waited out launchd's 10 s respawn throttle. A probe
+/// that lands in the gateway's attempt still delays it by microseconds, which
+/// `ACQUIRE_ATTEMPTS` absorbs.
+#[cfg(unix)]
+pub fn running_owner(state_dir: &Path) -> anyhow::Result<Option<u32>> {
+    use std::os::unix::io::AsRawFd as _;
+    let path = state_dir.join(LOCK_FILE);
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    // SAFETY: the file owns the descriptor; dropping it releases a probe lock.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0 {
+        return Ok(None);
+    }
+    let error = std::io::Error::last_os_error();
+    anyhow::ensure!(
+        error.kind() == std::io::ErrorKind::WouldBlock,
+        "cannot inspect state lock: {error}"
+    );
+    let contents = std::fs::read_to_string(&path)
+        .context("state directory is owned but its PID is unreadable")?;
+    if contents.is_empty() {
+        return Err(UnpublishedOwner.into());
+    }
+    contents
+        .trim()
+        .parse()
+        .map(Some)
+        .context("state directory is owned but its PID is unreadable")
+}
+
+#[cfg(not(unix))]
+pub fn running_owner(_state_dir: &Path) -> anyhow::Result<Option<u32>> {
+    anyhow::bail!("gateway lifecycle is supported on macOS and Linux only")
 }
 
 fn contended_message(state_dir: &Path, lock_path: &Path) -> String {
@@ -158,22 +243,37 @@ fn open_lock_file(path: &Path) -> anyhow::Result<std::fs::File> {
         .with_context(|| format!("failed to open the state lock {}", path.display()))
 }
 
+/// How many times a gateway tries for its state directory at startup,
+/// `ACQUIRE_RETRY` apart, before it refuses to start. A probe (`running_owner`) or a
+/// fork-to-exec window (module docs) holds the lock for microseconds; a second
+/// gateway holds it for as long as it runs. One second tells them apart, and
+/// costs a refused second start that second.
+pub(crate) const ACQUIRE_ATTEMPTS: u32 = 5;
+pub(crate) const ACQUIRE_RETRY: std::time::Duration = std::time::Duration::from_millis(200);
+
 #[cfg(unix)]
 fn lock_exclusive(
     file: std::fs::File,
     path: PathBuf,
     state_dir: &Path,
+    attempts: u32,
 ) -> anyhow::Result<StateLock> {
     use std::os::unix::io::AsRawFd as _;
 
-    // SAFETY: `file` owns this descriptor for the whole call and outlives it.
-    let outcome = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if outcome == 0 {
-        record_holder(&file);
-        return Ok(StateLock { file });
-    }
-
-    let error = std::io::Error::last_os_error();
+    let mut attempt = 1;
+    let error = loop {
+        // SAFETY: `file` owns this descriptor for the whole call and outlives it.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            record_holder(&file);
+            return Ok(StateLock { file });
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::WouldBlock || attempt >= attempts {
+            break error;
+        }
+        attempt += 1;
+        std::thread::sleep(ACQUIRE_RETRY);
+    };
     if error.kind() == std::io::ErrorKind::WouldBlock {
         anyhow::bail!(contended_message(state_dir, &path));
     }
@@ -193,6 +293,7 @@ fn lock_exclusive(
     file: std::fs::File,
     _path: PathBuf,
     _state_dir: &Path,
+    _attempts: u32,
 ) -> anyhow::Result<StateLock> {
     Ok(StateLock { file })
 }
@@ -204,8 +305,8 @@ fn lock_exclusive(
 fn record_holder(file: &std::fs::File) {
     use std::io::{Seek as _, Write as _};
     let mut file = file;
-    // Best effort throughout: a pid that could not be recorded costs the next
-    // gateway a helpful line in an error message, and nothing else.
+    // Best effort: an unpublished PID prevents proving lifecycle ownership.
+    // Readiness waits retry the empty publication window; signals fail closed.
     let _ = file.set_len(0);
     let _ = file.rewind();
     let _ = file.write_all(format!("{}\n", std::process::id()).as_bytes());
@@ -273,8 +374,73 @@ mod tests {
         dir
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn owner_inspection_does_not_create_or_trust_stale_lock_files() {
+        let dir = scratch_dir("inspect");
+        assert_eq!(running_owner(&dir).unwrap(), None);
+        assert!(!dir.join(LOCK_FILE).exists());
+        std::fs::write(dir.join(LOCK_FILE), "12345\n").unwrap();
+        assert_eq!(running_owner(&dir).unwrap(), None);
+        assert_eq!(
+            std::fs::read_to_string(dir.join(LOCK_FILE)).unwrap(),
+            "12345\n"
+        );
+        let held = StateLock::acquire(&dir).unwrap();
+        assert_eq!(running_owner(&dir).unwrap(), Some(std::process::id()));
+        drop(held);
+        retry_while_directory_is_busy(|| {
+            anyhow::ensure!(running_owner(&dir)?.is_none(), "probe still held");
+            Ok(())
+        })
+        .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// The loss this file exists to prevent: two gateways against one state
     /// directory, each rewriting the whole device list over the other's.
+    #[cfg(unix)]
+    #[test]
+    fn probing_a_held_directory_never_disturbs_its_holder() {
+        let dir = scratch_dir("probe-held");
+        let holder = StateLock::acquire(&dir).unwrap();
+        for _ in 0..100 {
+            assert_eq!(running_owner(&dir).unwrap(), Some(std::process::id()));
+        }
+        // Still exclusively held: neither another owner nor a lifecycle
+        // command can take it after all those probes.
+        assert!(StateLock::acquire_strict(&dir).is_err());
+        assert!(StateLock::acquire_owner(&dir).is_err());
+        assert_eq!(holder_pid(&dir.join(LOCK_FILE)), Some(std::process::id()));
+        drop(holder);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_gateway_starting_under_a_probe_waits_it_out_instead_of_exiting() {
+        use std::os::unix::io::AsRawFd as _;
+        let dir = scratch_dir("probe-start");
+        std::fs::create_dir_all(&dir).unwrap();
+        let probe = std::fs::File::create(dir.join(LOCK_FILE)).unwrap();
+        // SAFETY: an owned descriptor for an isolated fixture file.
+        assert_eq!(
+            unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) },
+            0
+        );
+        // A probe of the empty directory sees no owner and does not block.
+        assert_eq!(running_owner(&dir).unwrap(), None);
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(ACQUIRE_RETRY / 2);
+            drop(probe);
+        });
+        let lock = StateLock::acquire_owner(&dir).expect("the gateway retried past the probe");
+        release.join().unwrap();
+        assert_eq!(running_owner(&dir).unwrap(), Some(std::process::id()));
+        drop(lock);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn a_second_gateway_cannot_take_a_held_state_directory() {
         let dir = scratch_dir("second");

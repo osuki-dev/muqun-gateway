@@ -63,6 +63,7 @@ pub(crate) fn test_device(id: &str, token: &str) -> DeviceRecord {
 }
 
 pub(crate) fn test_state(admin_token: &str, devices: Vec<DeviceRecord>) -> AppState {
+    let scrollback = Arc::new(Mutex::new(scrollback::ScrollbackStore::default()));
     AppState {
         config: test_config(admin_token),
         pending_pairing: Arc::new(Mutex::new(None)),
@@ -70,7 +71,10 @@ pub(crate) fn test_state(admin_token: &str, devices: Vec<DeviceRecord>) -> AppSt
         push_tokens: Arc::new(Mutex::new(Vec::new())),
         devices: Arc::new(Mutex::new(devices)),
         assets: Arc::new(Mutex::new(AssetIndex::default())),
-        scrollback: Arc::new(Mutex::new(scrollback::ScrollbackStore::default())),
+        history: Arc::new(terminal::history_memory::MemoryHistoryRepository::new(
+            scrollback.clone(),
+        )),
+        scrollback,
         agent_events: Arc::new(Mutex::new(agent_events::AgentEventLog::default())),
         approval_events: tokio::sync::broadcast::channel(APPROVAL_EVENT_CAPACITY).0,
         activity: Arc::new(Mutex::new(HashMap::new())),

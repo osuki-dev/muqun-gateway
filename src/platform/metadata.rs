@@ -66,6 +66,7 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "pane_file_search",
     "pane_interrupt",
     "pane_output_ansi",
+    "pane_captured_history",
     "pane_parts",
     "pane_parts_native",
     "pane_shortcuts",

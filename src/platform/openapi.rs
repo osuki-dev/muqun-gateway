@@ -87,7 +87,7 @@ fn agents_plane_schema() -> Value {
 }
 
 pub fn openapi_spec() -> Value {
-    json!({
+    let mut spec = json!({
         "openapi": "3.1.0",
         "info": {
             "title": "Terminal Gateway API",
@@ -739,7 +739,9 @@ pub fn openapi_spec() -> Value {
                 }
             }
         }
-    })
+    });
+    spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/history"] = captured_history_path();
+    spec
 }
 
 fn task_steps_schema() -> Value {
@@ -882,7 +884,7 @@ fn capabilities_discovery_responses() -> Value {
                                         "features": {
                                             "type": "object",
                                             "properties": {
-                                                "pagedHistory": { "type": "boolean", "description": "Whether older terminal history can be pulled (pull-to-load-more): by range where rangeReads is true, otherwise by re-reading a longer tail (lines=N). true on a connected tmux or herdr backend; false on a disconnected backend. Absent from gateways that predate it." },
+                                                "pagedHistory": { "type": "boolean", "description": "Whether older terminal history can be pulled (pull-to-load-more): by range where rangeReads is true, otherwise by re-reading a longer tail (lines=N). true on a connected tmux or herdr backend; false on a disconnected backend. Absent from gateways that predate it. Separate from Gateway capturedHistory." },
                                                 "rangeReads": { "type": "boolean", "description": "Whether ranged recent-unwrapped reads (start/end on the pane output route) are served. true on a connected tmux backend; false on herdr, whose pane.read takes no range, and on a disconnected backend. Absent from gateways that predate it." }
                                             }
                                         }
@@ -892,6 +894,7 @@ fn capabilities_discovery_responses() -> Value {
                                 "features": {
                                     "type": "object",
                                     "properties": {
+                                        "capturedHistory": { "type": "boolean", "description": "Build-wide Gateway-captured frozen history API, independent of native pagedHistory. Does not promise captured rows for every pane." },
                                         "sessionList": { "type": "boolean" },
                                         "splitPanes": { "type": "boolean" },
                                         "resize": { "type": "boolean" },
@@ -924,6 +927,61 @@ fn capabilities_discovery_responses() -> Value {
 
 /// What `generation` means, wherever it appears.
 const GENERATION_DOC: &str = "The gateway instance generation: an opaque string minted once at process start and unchanged until the process exits. Compare it for equality only. Rows read under a different generation came from a gateway whose in-memory scrollback has since started over, so a client drops them instead of merging new reads under them.";
+
+fn captured_history_path() -> Value {
+    json!({ "get": {
+        "summary": "Page bounded Gateway-captured historical rows",
+        "description": "Requires pane_captured_history. Frozen, memory-only historical prefix of already-observed recent-unwrapped rows; excludes the last mutable screen and does not seed from or paginate native backlog. ANSI/text captures are independent. First page is newest; prepend older pages, each internally oldest-to-newest. First pages reuse the same device/request snapshot for 60 seconds from creation. Append/repaint cannot alter its pages. Capture reset, truncation, eviction, detected resize or observed pane identity/disappearance invalidates it. This is not a complete archive and has no native range coordinates. See docs/captured-history.md for retention and reset semantics. Existing output routes are unchanged.",
+        "parameters": [
+            path_param("sessionId"), path_param("paneId"),
+            { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 500, "default": 200 }, "description": "Maximum rows per page; keep fixed throughout traversal. Raw row bytes plus newline allowances are capped at 256 KiB." },
+            query_param("before", "Opaque server-held cursor. Bound to authenticated device, session, pane, format, source, limit and generation. Not a credential."),
+            { "name": "format", "in": "query", "schema": { "type": "string", "enum": ["text", "ansi"], "default": "text" } },
+            { "name": "source", "in": "query", "schema": { "type": "string", "enum": ["recent-unwrapped"], "default": "recent-unwrapped" } }
+        ],
+        "responses": captured_history_responses()
+    } })
+}
+
+fn captured_history_responses() -> Value {
+    let mut responses = ok_response();
+    responses["200"] = json!({
+        "description": "Versioned captured-history page; empty not_captured is a successful answer, not a backend error",
+        "content": { "application/json": { "schema": {
+            "type": "object", "required": ["schema_version", "capabilities", "data"],
+            "properties": {
+                "schema_version": { "type": "string", "const": CONTENT_SCHEMA_VERSION },
+                "capabilities": { "type": "object" },
+                "data": {
+                    "type": "object",
+                    "required": ["session_id", "pane_id", "generation", "source", "read_source", "format", "availability", "snapshot_id", "capture_epoch", "rows", "row_count", "has_more", "next_before", "order", "includes_live_viewport", "complete_archive"],
+                    "properties": {
+                        "session_id": { "type": "string" }, "pane_id": { "type": "string" },
+                        "generation": { "type": "string", "description": GENERATION_DOC },
+                        "source": { "const": "gateway-captured" }, "read_source": { "const": "recent-unwrapped" },
+                        "format": { "enum": ["text", "ansi"] }, "availability": { "enum": ["captured", "not_captured"] },
+                        "snapshot_id": { "type": ["string", "null"] }, "capture_epoch": { "type": ["string", "null"] },
+                        "rows": { "type": "array", "maxItems": 500, "items": { "type": "string" } },
+                        "row_count": { "type": "integer", "minimum": 0, "maximum": 500 },
+                        "has_more": { "type": "boolean" }, "next_before": { "type": ["string", "null"], "maxLength": 65 },
+                        "order": { "const": "oldest-to-newest" }, "includes_live_viewport": { "const": false }, "complete_archive": { "const": false }
+                    }
+                }
+            }
+        } } }
+    });
+    for (status, description) in [
+        ("400", "Invalid query, identity, limit, source, format or cursor syntax"),
+        ("404", "Session or first-page pane not found"),
+        ("409", "history_cursor_mismatch: request shape/device/generation mismatch; restart without before"),
+        ("410", "history_cursor_gone: expired/evicted/reset/unknown cursor or vanished pane; restart without before"),
+        ("413", "history_snapshot_too_large: snapshot/row byte cap exceeded; no partial rows served"),
+        ("503", "history_storage_unavailable: storage failed; no empty success is substituted"),
+    ] {
+        responses[status] = json!({ "description": description });
+    }
+    responses
+}
 
 /// `GET .../output`: Herdr's `pane_read` result shape, plus the generation.
 fn pane_read_responses() -> Value {
@@ -1518,3 +1576,38 @@ pub const DOCS_HTML: &str = r#"<!doctype html>
   </body>
 </html>
 "#;
+
+#[cfg(test)]
+mod history_contract_tests {
+    use super::*;
+
+    #[test]
+    fn captured_history_openapi_capability_and_bounded_contract_are_explicit() {
+        let spec = openapi_spec();
+        assert_eq!(spec["security"], json!([{ "bearerAuth": [] }]));
+        let get = &spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/history"]["get"];
+        assert!(get["description"]
+            .as_str()
+            .unwrap()
+            .contains("pane_captured_history"));
+        let limit = get["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|parameter| parameter["name"] == "limit")
+            .unwrap();
+        assert_eq!(limit["schema"]["minimum"], 1);
+        assert_eq!(limit["schema"]["maximum"], 500);
+        for status in [
+            "200", "400", "401", "403", "404", "409", "410", "413", "503",
+        ] {
+            assert!(get["responses"].get(status).is_some(), "{status}");
+        }
+        let schema = &get["responses"]["200"]["content"]["application/json"]["schema"]
+            ["properties"]["data"]["properties"];
+        assert_eq!(schema["source"]["const"], "gateway-captured");
+        assert_eq!(schema["includes_live_viewport"]["const"], false);
+        assert_eq!(schema["complete_archive"]["const"], false);
+        assert!(crate::API_CAPABILITIES.contains(&"pane_captured_history"));
+    }
+}

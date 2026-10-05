@@ -8,8 +8,10 @@ use anyhow::Context as _;
 use crossterm::cursor::MoveTo;
 use crossterm::event::{
     poll as poll_event, read as read_event, Event as TerminalEvent, KeyCode, KeyEventKind,
+    KeyModifiers,
 };
 use crossterm::execute;
+use crossterm::style::{Attribute, Color, ContentStyle};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, size as terminal_size, Clear, ClearType,
     EnterAlternateScreen, LeaveAlternateScreen,
@@ -18,18 +20,28 @@ use qrcode::render::unicode;
 use qrcode::{EcLevel, QrCode};
 use serde_json::Value;
 
+use super::{lifecycle, service, update};
 use crate::authority::{hash_token, DeviceRecord, PendingPairing};
 use crate::backend::BackendKind;
 use crate::{
-    auto_public_url, backend_endpoint, backend_program_state, config_changed_since_start,
-    config_dir, configured_port, ensure_pairing_transport_key, gateway_listener_pids, load_config,
-    make_backend_default, now_unix_ms, process_running, read_devices, read_pairing_file, read_pid,
-    revoke_device_by_id, start_background_inner, stop_background_inner, upsert_backend_session,
-    validate_session_id, write_config, write_secret_file, SessionConfig, TransportEncryptionMode,
-    CONFIG_FILE, DEFAULT_PORT, MANAGE_REFRESH_INTERVAL, PAIRING_FILE,
+    auto_public_url, backend_endpoint, config_changed_since_start, config_dir, configured_port,
+    ensure_pairing_transport_key, load_config, make_backend_default, now_unix_ms, read_devices,
+    read_pairing_file, revoke_device_by_id, start_background_inner, stop_background_inner,
+    upsert_backend_session, validate_session_id, write_config, write_secret_file, SessionConfig,
+    TransportEncryptionMode, CONFIG_FILE, DEFAULT_PORT, MANAGE_REFRESH_INTERVAL, PAIRING_FILE,
 };
 
+/// What `status` prints after a session's endpoint: tmux's availability,
+/// judged and labelled the way manage's Overview does.
+fn backend_program_state(session: &SessionConfig, service_path: Option<&str>) -> String {
+    if session.backend != BackendKind::Tmux {
+        return String::new();
+    }
+    tmux_availability(&std::env::var("PATH").unwrap_or_default(), service_path)
+}
+
 pub(crate) fn status() -> anyhow::Result<()> {
+    let service_path = service::installed_path_env();
     let config = load_config(None)?;
     println!("server_id: {}", config.server_id);
     println!("label: {}", config.label);
@@ -39,33 +51,17 @@ pub(crate) fn status() -> anyhow::Result<()> {
         "transport_encryption: {}",
         config.transport_encryption.as_str()
     );
-    // Read before the sessions loop consumes the config.
-    let port = config.port();
     for session in config.sessions {
         let endpoint = backend_endpoint(&session);
         println!(
             "session {}: backend={} endpoint={endpoint} {}",
             session.id,
             session.backend.as_str(),
-            backend_program_state(&session)
+            backend_program_state(&session, service_path.as_deref())
         );
     }
-    // A gateway started by the init system runs `run` directly and never writes
-    // the pid file, so the listener is the only evidence `status` has of it --
-    // the same fallback `service status` uses.
-    let pid = read_pid()?;
-    let live_pid = pid.filter(|pid| process_running(*pid));
-    let listener_pid = if live_pid.is_none() {
-        gateway_listener_pids(port)?.first().copied()
-    } else {
-        None
-    };
-    match (pid, live_pid, listener_pid) {
-        (Some(pid), Some(_), _) => println!("gateway: running pid {pid}"),
-        (Some(pid), None, None) => println!("gateway: stale pid {pid}"),
-        (_, None, Some(pid)) => println!("gateway: running pid {pid} (started by the service)"),
-        _ => println!("gateway: stopped"),
-    }
+    println!("gateway: {}", lifecycle::summary()?);
+    println!("gateway autostart: {:?}", service::state()?);
     Ok(())
 }
 
@@ -87,7 +83,14 @@ pub(crate) fn manage() -> anyhow::Result<()> {
     // False by default so a finished pairing lands on the device list; `p` flips
     // it on to add another device.
     let mut show_qr = false;
-    print_manage_screen(&message, pending_pairing.as_ref(), &devices, show_qr)?;
+    let mut ui = ManageView::default();
+    print_manage_screen(
+        &message,
+        pending_pairing.as_ref(),
+        &devices,
+        show_qr,
+        &mut ui,
+    )?;
 
     loop {
         if !poll_event(MANAGE_REFRESH_INTERVAL)? {
@@ -106,115 +109,277 @@ pub(crate) fn manage() -> anyhow::Result<()> {
                 }
                 pending_pairing = next_pending_pairing;
                 devices = next_devices;
-                print_manage_screen(&message, pending_pairing.as_ref(), &devices, show_qr)?;
             }
+            print_manage_screen(
+                &message,
+                pending_pairing.as_ref(),
+                &devices,
+                show_qr,
+                &mut ui,
+            )?;
             continue;
         }
 
         let event = read_event()?;
         let TerminalEvent::Key(event) = event else {
             if matches!(event, TerminalEvent::Resize(_, _)) {
-                print_manage_screen(&message, pending_pairing.as_ref(), &devices, show_qr)?;
+                print_manage_screen(
+                    &message,
+                    pending_pairing.as_ref(),
+                    &devices,
+                    show_qr,
+                    &mut ui,
+                )?;
             }
             continue;
         };
         if event.kind != KeyEventKind::Press {
             continue;
         }
+        if event.code == KeyCode::Char('c') && event.modifiers.contains(KeyModifiers::CONTROL) {
+            break;
+        }
+        let item_count = match ui.section {
+            Section::Terminals => load_config(None)?.sessions.len(),
+            Section::Devices if !show_qr && pending_pairing.is_none() => devices.len(),
+            Section::Settings => 4,
+            _ => 0,
+        };
+        if event.code == KeyCode::Esc {
+            if ui.section == Section::Devices && show_qr {
+                show_qr = false;
+                message = String::from("Pairing view closed; existing devices are unchanged.");
+            } else if ui.section != Section::Overview {
+                ui = ManageView::default();
+            } else {
+                break;
+            }
+            print_manage_screen(
+                &message,
+                pending_pairing.as_ref(),
+                &devices,
+                show_qr,
+                &mut ui,
+            )?;
+            continue;
+        }
+        if ui.navigate(event.code, item_count) {
+            print_manage_screen(
+                &message,
+                pending_pairing.as_ref(),
+                &devices,
+                show_qr,
+                &mut ui,
+            )?;
+            continue;
+        }
         let input = match event.code {
             KeyCode::Char(ch) => ch.to_string(),
-            KeyCode::Enter => String::new(),
-            KeyCode::Esc => String::from("q"),
+            KeyCode::Enter => primary_action(
+                ui.section,
+                ui.selected,
+                item_count == 0,
+                show_qr,
+                pending_pairing.is_some(),
+                lifecycle::running_pid().is_ok_and(|pid| pid.is_some()),
+            )
+            .map(|ch| ch.to_string())
+            .unwrap_or_default(),
             _ => String::new(),
         };
-        match input.as_str() {
-            "s" | "start" => {
-                // A refusal -- another gateway already owns this state
-                // directory -- belongs on the status line. Propagating it
-                // would drop the operator out of the UI on a keypress.
-                message = match start_background_inner(false) {
-                    Ok(()) => String::from("start requested"),
-                    Err(error) => first_line(&error.to_string()),
-                };
-            }
-            "t" | "stop" => {
-                stop_background_inner(false)?;
-                message = String::from("stop requested");
-            }
-            "p" | "pair" => {
-                show_qr = true;
-                message = String::from("scan to pair another device");
-            }
-            "x" | "revoke" => {
-                if devices.is_empty() {
-                    message = String::from("no paired devices to revoke");
-                } else if let Some(device) = prompt_revoke_device(&devices)? {
-                    // A revocation that could not be carried out is a status
-                    // line, not an exit: dropping the operator out of the UI
-                    // mid-revoke tells them nothing about what happened.
-                    match revoke_managed_device(&device.id) {
-                        Ok(true) => {
-                            message = format!(
-                                "revoked {}; scan to pair again",
-                                truncate(&device.name, 32)
-                            );
-                            // Revocation usually means the user is replacing
-                            // this app's credential. Return straight to the
-                            // pairing QR instead of leaving them on the
-                            // remaining device list.
-                            show_qr = true;
-                        }
-                        Ok(false) => message = String::from("device was already revoked"),
-                        Err(error) => message = first_line(&format!("{error:#}")),
+        if input == "q" {
+            break;
+        }
+        // Only the active view's keys may change state. Every failed action is
+        // shown in the status line, never an unexpected exit from raw mode.
+        let outcome = (|| -> anyhow::Result<()> {
+            match (ui.section, input.as_str()) {
+                (Section::Overview, "s") => {
+                    // A refusal -- another gateway already owns this state
+                    // directory -- belongs on the status line. Propagating it
+                    // would drop the operator out of the UI on a keypress.
+                    start_background_inner(false)?;
+                    message = String::from("Gateway started. Terminal tasks are unchanged.");
+                }
+                (Section::Overview, "t") => {
+                    if !confirm_action(
+                        "Stop gateway?",
+                        &[
+                            String::from(
+                                "Phones will lose Gateway access until you start it again.",
+                            ),
+                            String::from(
+                                "Terminal servers, sessions, and running tasks stay running.",
+                            ),
+                            String::from("Login autostart stays registered; pairing is unchanged."),
+                        ],
+                        "stop gateway",
+                    )? {
+                        message = String::from("Gateway stop cancelled.");
+                        return Ok(());
                     }
-                } else {
-                    message = String::from("revoke cancelled");
+                    stop_background_inner(false)?;
+                    message = String::from("Gateway stopped. Terminal tasks are still running.");
                 }
-            }
-            "r" | "refresh" | "" => {
-                show_qr = false;
-                message = String::from("refreshed");
-            }
-            "u" | "url" => match prompt_public_url()? {
-                Some(url) => {
-                    let listen = listen_for_explicit_public_url(&url, configured_port());
-                    update_public_url(&url, &listen)?;
-                    message = format!("url updated: {}", truncate(&url, 36));
+                (Section::Overview, "r") => {
+                    crate::restart_gateway(false)?;
+                    message = String::from("gateway restarted");
                 }
-                None => {
-                    message = String::from("url unchanged");
+                (Section::Devices, "p") => {
+                    show_qr = true;
+                    ui.scroll = 0;
+                    message = String::from("scan to pair another device");
                 }
-            },
-            "a" | "auto" => {
-                let port = configured_port();
-                let selection = auto_public_url(port);
-                update_public_url(&selection.url, &format!("{}:{port}", selection.listen_host))?;
-                message = format!("auto url: {}", truncate(&selection.url, 36));
+                (Section::Devices, "x") if !show_qr && pending_pairing.is_none() => {
+                    if devices.is_empty() {
+                        message = String::from("no paired devices to revoke");
+                    } else if let Some(device) = devices.iter().rev().nth(ui.selected).cloned() {
+                        if !confirm_revoke_device(&device)? {
+                            message = String::from("revoke cancelled");
+                            return Ok(());
+                        }
+                        // A revocation that could not be carried out is a status
+                        // line, not an exit: dropping the operator out of the UI
+                        // mid-revoke tells them nothing about what happened.
+                        match revoke_managed_device(&device.id) {
+                            Ok(true) => {
+                                message = format!(
+                                    "revoked {}; scan to pair again",
+                                    truncate(&device.name, 32)
+                                );
+                                // Revocation usually means the user is replacing
+                                // this app's credential. Return straight to the
+                                // pairing QR instead of leaving them on the
+                                // remaining device list.
+                                show_qr = true;
+                            }
+                            Ok(false) => message = String::from("device was already revoked"),
+                            Err(error) => message = first_line(&format!("{error:#}")),
+                        }
+                    } else {
+                        message = String::from("revoke cancelled");
+                    }
+                }
+                (Section::Devices, "r") => {
+                    show_qr = false;
+                    ui.scroll = 0;
+                    if pending_pairing.is_some() {
+                        ui.section = Section::Overview;
+                    }
+                    message = String::from("Pairing view closed; paired devices are unchanged.");
+                }
+                (Section::Settings, "u") => match prompt_public_url()? {
+                    Some(url) => {
+                        let listen = listen_for_explicit_public_url(&url, configured_port());
+                        update_public_url(&url, &listen)?;
+                        message = format!("url updated: {}", truncate(&url, 36));
+                    }
+                    None => {
+                        message = String::from("url unchanged");
+                    }
+                },
+                (Section::Settings, "a") => {
+                    let port = configured_port();
+                    let selection = auto_public_url(port);
+                    update_public_url(
+                        &selection.url,
+                        &format!("{}:{port}", selection.listen_host),
+                    )?;
+                    message = format!("auto url: {}", truncate(&selection.url, 36));
+                }
+                (Section::Settings, "e") => {
+                    message = toggle_transport_encryption()?;
+                }
+                (Section::Terminals, "h") => {
+                    message = enable_managed_backend(BackendKind::Herdr)?;
+                }
+                (Section::Terminals, "m") => {
+                    message = enable_managed_backend(BackendKind::Tmux)?;
+                }
+                (Section::Terminals, "d") => {
+                    if let Some(session) = load_config(None)?.sessions.get(ui.selected) {
+                        if confirm_remove_backend(session)? {
+                            message = remove_managed_backend(&session.id)?;
+                        } else {
+                            message = String::from("backend unchanged");
+                        }
+                    }
+                }
+                (Section::Terminals, "f") => {
+                    if let Some(session) = load_config(None)?.sessions.get(ui.selected) {
+                        message = set_managed_default_backend(&session.id)?;
+                        ui.selected = 0;
+                        ui.scroll = 0;
+                    }
+                }
+                (Section::Terminals, "b") => {
+                    if let Some(session) = load_config(None)?.sessions.get(ui.selected) {
+                        message = toggle_backend_autostart(&session.id)?;
+                    }
+                }
+                (Section::Settings, "g") => match autostart_toggle(service::state()) {
+                    AutostartToggle::Refuse(reason) => message = reason,
+                    toggle => {
+                        let enable = toggle == AutostartToggle::Install;
+                        if confirm_gateway_autostart(enable)? {
+                            crate::run_service_command(if enable {
+                                crate::ServiceCommand::Install
+                            } else {
+                                crate::ServiceCommand::Uninstall
+                            })?;
+                            message =
+                                format!("gateway autostart {}", if enable { "on" } else { "off" });
+                        } else {
+                            message = String::from("gateway autostart unchanged");
+                        }
+                    }
+                },
+                (Section::Settings, "c") => {
+                    message =
+                        String::from("Checking official stable release (no background polling)...");
+                    print_manage_screen(
+                        &message,
+                        pending_pairing.as_ref(),
+                        &devices,
+                        show_qr,
+                        &mut ui,
+                    )?;
+                    let plan = update::in_thread(update::check)?;
+                    message = plan.summary();
+                }
+                (Section::Settings, "i") => {
+                    message =
+                        String::from("Checking official stable release before confirmation...");
+                    print_manage_screen(
+                        &message,
+                        pending_pairing.as_ref(),
+                        &devices,
+                        show_qr,
+                        &mut ui,
+                    )?;
+                    let plan = update::in_thread(update::check)?;
+                    if !plan.available() {
+                        message = plan.summary();
+                    } else if confirm_action("Install stable Gateway update?", &[
+                        plan.summary(),
+                        String::from("Download, SHA256, platform and version are checked before downtime."),
+                        String::from("Running Gateway restarts through its owner; stopped Gateway stays stopped."),
+                        String::from("Phone access pauses briefly. Pairings, config and terminal tasks stay unchanged."),
+                        String::from("This manager stays open on its old image; reopen it to load the new UI."),
+                    ], "update Gateway")? {
+                        message = String::from("Downloading/verifying, then updating. Please wait; do not close this manager.");
+                        print_manage_screen(&message, pending_pairing.as_ref(), &devices, show_qr, &mut ui)?;
+                        message = update::in_thread(move || update::apply(plan))?;
+                    } else {
+                        message = String::from("Gateway update cancelled; no binary downloaded or restart.");
+                    }
+                }
+                _ => {}
             }
-            "e" | "encryption" => {
-                message = toggle_transport_encryption()?;
-                show_qr = true;
-            }
-            "h" | "herdr" => {
-                message = enable_managed_backend(BackendKind::Herdr)?;
-            }
-            "m" | "tmux" => {
-                message = enable_managed_backend(BackendKind::Tmux)?;
-            }
-            "d" | "backend" => {
-                message = match prompt_remove_backend()? {
-                    Some(id) => remove_managed_backend(&id)?,
-                    None => String::from("backend unchanged"),
-                };
-            }
-            "f" | "default" => {
-                message = match prompt_default_backend()? {
-                    Some(id) => set_managed_default_backend(&id)?,
-                    None => String::from("default backend unchanged"),
-                };
-            }
-            "q" | "quit" => break,
-            other => message = format!("unknown command: {other}"),
+            Ok(())
+        })();
+        if let Err(error) = outcome {
+            message = format!("Action failed: {}", first_line(&error.to_string()));
         }
 
         pending_pairing = fetch_pending_pairing().ok().flatten();
@@ -222,7 +387,13 @@ pub(crate) fn manage() -> anyhow::Result<()> {
             Ok(next_devices) => devices = next_devices,
             Err(error) => message = format!("could not read paired devices: {error}"),
         }
-        print_manage_screen(&message, pending_pairing.as_ref(), &devices, show_qr)?;
+        print_manage_screen(
+            &message,
+            pending_pairing.as_ref(),
+            &devices,
+            show_qr,
+            &mut ui,
+        )?;
     }
     Ok(())
 }
@@ -273,6 +444,7 @@ pub(crate) fn remove_managed_backend(id: &str) -> anyhow::Result<String> {
     anyhow::ensure!(config.sessions.len() > 1, "cannot remove the only backend");
     let previous_len = config.sessions.len();
     config.sessions.retain(|session| session.id != id);
+    config.autostart_backends.retain(|item| item != id);
     anyhow::ensure!(
         config.sessions.len() != previous_len,
         "backend {id} not found"
@@ -289,101 +461,17 @@ pub(crate) fn set_managed_default_backend(id: &str) -> anyhow::Result<String> {
     Ok(format!("default is now {id}; restart gateway to apply"))
 }
 
-pub(crate) fn prompt_default_backend() -> anyhow::Result<Option<String>> {
-    let config = load_config(None)?;
-    prompt_backend_picker(&config.sessions, "Choose the default terminal backend")
-}
-
-pub(crate) fn prompt_remove_backend() -> anyhow::Result<Option<String>> {
-    let config = load_config(None)?;
-    if config.sessions.len() <= 1 {
-        return Ok(None);
-    }
-    let Some(id) = prompt_backend_picker(&config.sessions, "Remove a terminal backend")? else {
-        return Ok(None);
-    };
-    let session = config
-        .sessions
-        .iter()
-        .find(|session| session.id == id)
-        .context("selected backend disappeared")?;
-    Ok(confirm_remove_backend(session)?.then_some(id))
-}
-
-pub(crate) fn prompt_backend_picker(
-    sessions: &[SessionConfig],
-    title: &str,
-) -> anyhow::Result<Option<String>> {
-    if sessions.is_empty() {
-        return Ok(None);
-    }
-    let mut selected = 0_usize;
-    loop {
-        render_backend_picker(title, sessions, selected)?;
-        let TerminalEvent::Key(event) = read_event()? else {
-            continue;
-        };
-        if event.kind != KeyEventKind::Press {
-            continue;
-        }
-        match event.code {
-            KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(sessions.len() - 1),
-            KeyCode::Enter => return Ok(Some(sessions[selected].id.clone())),
-            KeyCode::Esc | KeyCode::Char('q') => return Ok(None),
-            _ => {}
-        }
-    }
-}
-
-pub(crate) fn render_backend_picker(
-    title: &str,
-    sessions: &[SessionConfig],
-    selected: usize,
-) -> anyhow::Result<()> {
-    execute!(stdout(), Clear(ClearType::All), MoveTo(0, 0))?;
-    let mut lines = vec![
-        title.to_owned(),
-        String::new(),
-        String::from("Up/Down or j/k selects | Enter continues | Esc cancels"),
-        String::new(),
-    ];
-    for (index, session) in sessions.iter().enumerate() {
-        lines.push(format!(
-            "{} {}   {}   {}",
-            if index == selected { ">" } else { " " },
-            session.id,
-            session.backend.as_str(),
-            truncate(&session.label, 30)
-        ));
-    }
-    write_centered_panel(&lines)
-}
-
 pub(crate) fn confirm_remove_backend(session: &SessionConfig) -> anyhow::Result<bool> {
-    loop {
-        execute!(stdout(), Clear(ClearType::All), MoveTo(0, 0))?;
-        write_centered_panel(&[
-            String::from("Remove terminal backend?"),
-            String::new(),
-            format!("{} ({})", session.label, session.backend.as_str()),
-            String::from("Existing terminal sessions are not deleted."),
-            String::from("The gateway must be restarted after this change."),
-            String::new(),
-            String::from("y remove | n or Esc cancel"),
-        ])?;
-        let TerminalEvent::Key(event) = read_event()? else {
-            continue;
-        };
-        if event.kind != KeyEventKind::Press {
-            continue;
-        }
-        match event.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => return Ok(true),
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => return Ok(false),
-            _ => {}
-        }
-    }
+    confirm_action(
+        "Remove terminal backend?",
+        &[
+            format!("Selected: {} ({})", session.label, session.backend.as_str()),
+            String::from("Only this Gateway's backend configuration is removed."),
+            String::from("Terminal servers, sessions, and running tasks stay running."),
+            String::from("Restart Gateway after this change."),
+        ],
+        "remove backend",
+    )
 }
 
 pub(crate) fn prompt_public_url() -> anyhow::Result<Option<String>> {
@@ -391,8 +479,9 @@ pub(crate) fn prompt_public_url() -> anyhow::Result<Option<String>> {
         .map(|config| config.public_url)
         .unwrap_or_else(|_| auto_public_url(configured_port()).url);
     let mut value = current;
+    let mut invalid = false;
     loop {
-        render_public_url_prompt(&value)?;
+        render_public_url_prompt(&value, invalid)?;
         if let TerminalEvent::Key(event) = read_event()? {
             if event.kind != KeyEventKind::Press {
                 continue;
@@ -402,7 +491,7 @@ pub(crate) fn prompt_public_url() -> anyhow::Result<Option<String>> {
                     if let Ok(url) = validate_public_url(&value) {
                         return Ok(Some(url));
                     }
-                    value = String::from("http://");
+                    invalid = true;
                 }
                 KeyCode::Esc => return Ok(None),
                 KeyCode::Backspace => {
@@ -415,104 +504,37 @@ pub(crate) fn prompt_public_url() -> anyhow::Result<Option<String>> {
     }
 }
 
-pub(crate) fn render_public_url_prompt(value: &str) -> anyhow::Result<()> {
-    execute!(stdout(), Clear(ClearType::All), MoveTo(0, 0))?;
-    let lines = vec![
-        String::from("Gateway URL"),
-        String::from(""),
-        String::from("Edit the URL encoded into the pairing QR."),
-        String::from("Use a Tailscale HTTPS name if Tailscale Serve is configured."),
-        format!("Otherwise use http://<tailscale-ip>:{DEFAULT_PORT}."),
-        String::from(""),
-        format!("url: {value}"),
-        String::from(""),
-        String::from("Enter saves | Esc cancels | Backspace deletes"),
-    ];
-    write_centered_panel(&lines)
-}
-
-pub(crate) fn prompt_revoke_device(
-    devices: &[DeviceRecord],
-) -> anyhow::Result<Option<DeviceRecord>> {
-    let choices = devices.iter().rev().cloned().collect::<Vec<_>>();
-    if choices.is_empty() {
-        return Ok(None);
-    }
-    let mut selected = 0_usize;
-
-    loop {
-        render_revoke_device_picker(&choices, selected)?;
-        let TerminalEvent::Key(event) = read_event()? else {
-            continue;
-        };
-        if event.kind != KeyEventKind::Press {
-            continue;
-        }
-        match event.code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                selected = selected.saturating_sub(1);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                selected = (selected + 1).min(choices.len() - 1);
-            }
-            KeyCode::Enter => {
-                let device = &choices[selected];
-                if confirm_revoke_device(device)? {
-                    return Ok(Some(device.clone()));
-                }
-            }
-            KeyCode::Esc | KeyCode::Char('q') => return Ok(None),
-            _ => {}
-        }
-    }
-}
-
-pub(crate) fn render_revoke_device_picker(
-    devices: &[DeviceRecord],
-    selected: usize,
-) -> anyhow::Result<()> {
-    execute!(stdout(), Clear(ClearType::All), MoveTo(0, 0))?;
+fn render_public_url_prompt(value: &str, invalid: bool) -> anyhow::Result<()> {
     let mut lines = vec![
-        String::from("Revoke a paired device"),
-        String::from(""),
-        String::from("Up/Down or j/k selects | Enter continues | Esc cancels"),
-        String::from(""),
+        String::from("This address is shared with your phone for pairing."),
+        format!("Use HTTPS with Tailscale Serve, or http://<tailscale-ip>:{DEFAULT_PORT}."),
+        format!("Address: {value}"),
     ];
-    for (index, device) in devices.iter().enumerate() {
-        lines.push(format!(
-            "{} {}   paired {}",
-            if index == selected { ">" } else { " " },
-            truncate(&device.name, 42),
-            relative_since(device.paired_unix_ms)
+    if invalid {
+        lines.push(String::from(
+            "Invalid address: use http:// or https:// without credentials or a query.",
         ));
     }
-    write_centered_panel(&lines)
+    write_dialog(
+        "Edit Gateway address",
+        &lines,
+        ScreenLine::text(
+            "Enter Save address | Esc Cancel | Backspace Delete",
+            Tone::Accent,
+        ),
+    )
 }
 
 pub(crate) fn confirm_revoke_device(device: &DeviceRecord) -> anyhow::Result<bool> {
-    loop {
-        execute!(stdout(), Clear(ClearType::All), MoveTo(0, 0))?;
-        let lines = vec![
-            String::from("Revoke device?"),
-            String::from(""),
-            truncate(&device.name, 52),
-            String::from("Its access token will stop working immediately."),
-            String::from(""),
-            String::from("y revoke | n or Esc cancel"),
-        ];
-        write_centered_panel(&lines)?;
-        let TerminalEvent::Key(event) = read_event()? else {
-            continue;
-        };
-        if event.kind != KeyEventKind::Press {
-            continue;
-        }
-        match event.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => return Ok(true),
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => return Ok(false),
-            _ => {}
-        }
-    }
+    confirm_action(
+        "Revoke selected device?",
+        &[
+            format!("Selected: {}", device.name),
+            String::from("This device loses Gateway access immediately; it must pair again."),
+            String::from("Other devices and terminal tasks are unchanged."),
+        ],
+        "revoke device",
+    )
 }
 
 /// Point the gateway at a new address -- and move its listener with it.
@@ -588,7 +610,7 @@ pub(crate) fn unreachable_listen_warning(listen: &str, public_url: &str) -> Opti
         "warning: this gateway answers only on {listen}, but tells devices to reach it at \
          {public_url}. Nothing outside this machine can connect, and a phone will report the \
          pairing code as refused. Fix it with: muqun-gateway manage, then press [a] to detect \
-         the address again."
+          the address again in [4] Settings."
     ))
 }
 
@@ -606,7 +628,10 @@ impl TerminalModeGuard {
             EnterAlternateScreen,
             Clear(ClearType::All),
             MoveTo(0, 0)
-        )?;
+        )
+        .inspect_err(|_| {
+            let _ = disable_raw_mode();
+        })?;
         Ok(Self)
     }
 }
@@ -618,197 +643,986 @@ impl Drop for TerminalModeGuard {
     }
 }
 
-pub(crate) fn print_manage_screen(
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Section {
+    #[default]
+    Overview,
+    Terminals,
+    Devices,
+    Settings,
+}
+
+impl Section {
+    const ALL: [Self; 4] = [
+        Self::Overview,
+        Self::Terminals,
+        Self::Devices,
+        Self::Settings,
+    ];
+    fn hints(self) -> &'static str {
+        match self {
+            Self::Overview => "s Start gateway | t Stop gateway | r Restart gateway",
+            Self::Terminals => "Enter Make selected default | b Toggle terminal-server startup | d Remove selected backend | h Add Herdr | m Add tmux",
+            Self::Devices => "Enter Revoke selected device | p Pair new device",
+            Self::Settings => "Enter Change selected setting | c Check updates | i Install update | g Gateway login autostart | u Edit address | a Detect address | e Toggle encryption",
+        }
+    }
+}
+
+fn primary_action(
+    section: Section,
+    selected: usize,
+    empty_items: bool,
+    show_qr: bool,
+    pending: bool,
+    running: bool,
+) -> Option<char> {
+    match section {
+        Section::Overview => Some(if running { 't' } else { 's' }),
+        Section::Terminals => Some(if empty_items { 'm' } else { 'f' }),
+        Section::Devices if show_qr || pending => Some('r'),
+        Section::Devices => Some(if empty_items { 'p' } else { 'x' }),
+        Section::Settings => ['g', 'u', 'e', 'c'].get(selected).copied(),
+    }
+}
+
+#[derive(Default)]
+struct ManageView {
+    section: Section,
+    selected: usize,
+    scroll: usize,
+}
+
+impl ManageView {
+    fn navigate(&mut self, key: KeyCode, item_count: usize) -> bool {
+        let index = Section::ALL
+            .iter()
+            .position(|section| *section == self.section)
+            .unwrap();
+        let section = match key {
+            KeyCode::Tab | KeyCode::Right => Some((index + 1) % 4),
+            KeyCode::BackTab | KeyCode::Left => Some((index + 3) % 4),
+            KeyCode::Char(ch @ '1'..='4') => Some(ch as usize - '1' as usize),
+            _ => None,
+        };
+        if let Some(index) = section {
+            self.section = Section::ALL[index];
+            self.selected = 0;
+            self.scroll = 0;
+            return true;
+        }
+        match key {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.selected = self.selected.saturating_sub(1);
+                self.scroll = self.scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if item_count > 0 {
+                    self.selected = (self.selected + 1).min(item_count - 1);
+                } else {
+                    self.scroll = self.scroll.saturating_add(1);
+                }
+            }
+            KeyCode::PageUp if item_count > 0 => self.selected = self.selected.saturating_sub(10),
+            KeyCode::PageDown if item_count > 0 => {
+                self.selected = self.selected.saturating_add(10).min(item_count - 1)
+            }
+            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(10),
+            KeyCode::PageDown => self.scroll = self.scroll.saturating_add(10),
+            KeyCode::Home => {
+                self.selected = 0;
+                self.scroll = 0;
+            }
+            KeyCode::End if item_count > 0 => self.selected = item_count - 1,
+            _ => return false,
+        }
+        true
+    }
+}
+
+/// Keep the selected item visible after navigation, deletion, and resizing.
+fn viewport_start(scroll: usize, selected: Option<usize>, rows: usize, height: usize) -> usize {
+    let height = height.max(1);
+    let mut start = scroll.min(rows.saturating_sub(height));
+    if let Some(selected) = selected {
+        let selected = selected.min(rows.saturating_sub(1));
+        if selected < start {
+            start = selected;
+        }
+        if selected >= start + height {
+            start = selected + 1 - height;
+        }
+    }
+    start
+}
+
+fn print_manage_screen(
     message: &str,
     pending_pairing: Option<&PendingPairing>,
     devices: &[DeviceRecord],
     show_qr: bool,
+    ui: &mut ManageView,
 ) -> anyhow::Result<()> {
-    execute!(stdout(), Clear(ClearType::All), MoveTo(0, 0))?;
-    let config = load_config(None).ok();
-    let server = config
-        .as_ref()
-        .map(|config| truncate(&config.label, 24))
-        .unwrap_or_else(|| "not configured".into());
-    let url = config
-        .as_ref()
-        .map(|config| config.public_url.clone())
-        .unwrap_or_else(|| "run setup first".into());
-    let pid_on_disk = read_pid()?;
-    let running_pid = pid_on_disk.filter(|&pid| process_running(pid));
-    let status = match (running_pid, pid_on_disk) {
-        (Some(pid), _) => format!("running ({pid})"),
-        (None, Some(_)) => String::from("stale pid"),
-        (None, None) => String::from("stopped"),
+    let config = load_config(None)?;
+    let (width, height) = terminal_size().unwrap_or((100, 30));
+    let owner = lifecycle::running_pid();
+    let running = matches!(owner, Ok(Some(_)));
+    let runtime = match owner {
+        Ok(Some(pid)) => format!("Running - process {pid}"),
+        Ok(None) => String::from("Stopped - press Enter to start"),
+        Err(error) => format!("Unavailable: {}", first_line(&error.to_string())),
     };
-    // `run` loads config.json once at startup into a plain value and never
-    // re-reads it (see `AppState`); every setting below this line -- and the
-    // encryption line, backend list, default marker, and URL further down --
-    // comes straight from disk, not from what the running process actually
-    // enforces. If the file was rewritten after the process started, those
-    // fields are pending, not live, and the panel needs to say so instead of
-    // presenting them as current.
-    let restart_pending = running_pid.is_some() && config_changed_since_start();
-    let pending_note = if restart_pending {
-        " (pending restart -- [t] stop, [s] start to apply)"
-    } else {
-        ""
-    };
-    // Same signal, shorter: the QR panel is a narrow two-column layout where
-    // the long-form hint would blow the column width, and [s]/[t] are already
-    // listed as controls right there.
-    let pending_note_short = if restart_pending {
-        " (pending restart)"
-    } else {
-        ""
-    };
-
-    let mut lines = vec![
-        String::from("Muqun Terminal Gateway"),
-        String::from(""),
-        String::from("keys   : [s] start  [t] stop  [p] pair  [x] revoke"),
-        String::from("         [m] tmux  [h] Herdr  [f] default backend"),
-        String::from("         [d] remove [u] url   [a] auto  [e] encryption"),
-        String::from("         [r] refresh [q] close"),
-        format!("server : {server}"),
-        format!("status : {status}"),
-    ];
-    push_wrapped_field(&mut lines, "url    ", &format!("{url}{pending_note}"), 64);
-    push_wrapped_field(&mut lines, "message", message, 64);
-    lines.push(String::new());
-    if let Some(config) = &config {
-        lines.push(format!(
-            "encryption: {}{}{}",
-            config.transport_encryption.as_str(),
-            if config.transport_encryption == TransportEncryptionMode::Disabled {
-                " (token-only; unsafe on public HTTP)"
-            } else {
-                ""
-            },
-            pending_note
-        ));
-        lines.push(String::new());
-        lines.push(format!(
-            "Terminal backends ({}){pending_note}",
-            config.sessions.len()
-        ));
-        for (index, session) in config.sessions.iter().enumerate() {
-            let endpoint = backend_endpoint(session);
-            lines.push(format!(
-                "{} {}  {}  {}",
-                if index == 0 { "*" } else { " " },
-                session.id,
-                session.backend.as_str(),
-                truncate(&endpoint, 38)
-            ));
-        }
-        lines.push(String::new());
-    }
-
-    // A device mid-pairing takes priority: show its name + the code to enter.
-    // `url` is already on screen above this block, so the message can point
-    // at it rather than repeat it -- there is no QR involved in this path.
-    if let Some(pending) = pending_pairing {
-        lines.extend([
-            String::from("Pairing request"),
-            format!("device : {}", truncate(&pending.device_name, 48)),
-            format!("code   : {}", pending.code),
-            String::from(""),
-            String::from("In Muqun, enter the address above and this code."),
-        ]);
-        write_centered_panel(&lines)?;
-        return Ok(());
-    }
-
-    // Once at least one device is paired, the QR is not the default view -- a
-    // finished pairing should land on the device list, not another QR. `p` (or a
-    // fresh install with nothing paired yet) brings the QR back to add another.
-    let show_qr = show_qr || devices.is_empty();
-
-    if !show_qr {
-        lines.push(format!("Paired devices ({})", devices.len()));
-        lines.push(String::from(""));
-        for device in devices.iter().rev() {
-            lines.push(format!(
-                "  {}   paired {}",
-                truncate(&device.name, 40),
-                relative_since(device.paired_unix_ms)
-            ));
-        }
-        lines.push(String::from(""));
-        lines.push(String::from(
-            "Press p to pair another device, or x to revoke one.",
-        ));
-        write_centered_panel(&lines)?;
-        return Ok(());
-    }
-
-    if let (Some(config), Ok(pairing)) = (config.as_ref(), read_pairing_file()) {
-        if hash_token(&pairing.payload.token) != config.token_hash {
-            lines.push(String::from("Pairing identity is stale. Run setup again."));
-            write_centered_panel(&lines)?;
-            return Ok(());
-        }
-        let mut qr_controls = vec![
-            String::from("Muqun Gateway"),
-            String::from(""),
-            String::from("[s] start  [t] stop  [p] pair"),
-            String::from("[x] revoke [r] refresh [q] close"),
-            String::from("[m] tmux  [h] Herdr  [f] default"),
-            String::from("[d] remove [u] URL   [a] auto"),
-            format!(
-                "[e] encryption: {}{}",
-                config.transport_encryption.as_str(),
-                pending_note_short
+    let autostart = autostart_label(&service::state());
+    let service_path = service::installed_path_env();
+    let backend_states = config
+        .sessions
+        .iter()
+        .map(|session| match session.backend {
+            BackendKind::Tmux => tmux_availability(
+                &std::env::var("PATH").unwrap_or_default(),
+                service_path.as_deref(),
             ),
-            String::from(""),
-            format!("server: {}", truncate(&server, 26)),
-            format!("status: {}", truncate(&status, 25)),
-        ];
-        push_wrapped_field(
-            &mut qr_controls,
-            "url",
-            &format!("{url}{pending_note_short}"),
-            34,
-        );
-        qr_controls.push(format!("backends (* default):{pending_note_short}"));
-        for (index, session) in config.sessions.iter().enumerate() {
-            qr_controls.push(format!(
-                " {} {} ({})",
-                if index == 0 { "*" } else { " " },
-                truncate(&session.label, 17),
-                session.backend.as_str()
+            BackendKind::Herdr => String::from("Herdr socket configured"),
+        })
+        .collect::<Vec<_>>();
+    let qr_result =
+        if ui.section == Section::Devices && show_qr && pending_pairing.is_none() {
+            Some((|| -> anyhow::Result<String> {
+                let pairing = read_pairing_file()?;
+                anyhow::ensure!(hash_token(&pairing.payload.token) == config.token_hash,
+            "Pairing identity is inconsistent; check configuration with `muqun-gateway setup`.");
+                let encoded = pairing_qr_offer(
+                    &config.public_url,
+                    &config.server_id,
+                    (config.transport_encryption == TransportEncryptionMode::Required)
+                        .then_some(pairing.payload.transport_key.as_str()),
+                );
+                Ok(render_qr(&QrCode::with_error_correction_level(
+                    encoded.as_bytes(),
+                    EcLevel::L,
+                )?))
+            })())
+        } else {
+            None
+        };
+    let qr_error = qr_result
+        .as_ref()
+        .and_then(|result| result.as_ref().err())
+        .map(|error| format!("Action failed: {}", first_line(&error.to_string())));
+    let qr = qr_result.as_ref().and_then(|result| result.as_ref().ok());
+    let data = ManageData {
+        config: &config,
+        message: qr_error.as_deref().unwrap_or(message),
+        pending: pending_pairing,
+        devices,
+        runtime: &runtime,
+        running,
+        autostart,
+        backend_states: &backend_states,
+        qr: qr.map(String::as_str),
+        changed: running && config_changed_since_start(),
+    };
+    let lines = manage_lines(&data, show_qr, ui, width, height);
+    write_viewport(&lines, width, height)
+}
+
+/// Whether tmux can be found by the gateway that will run it, and on which
+/// PATH that was judged. With a service installed that is the unit's pinned
+/// `PATH`, not this shell's: a Homebrew tmux on the CLI's `PATH` but not the
+/// unit's is what leaves the service's tmux backend unavailable while
+/// `tmux -V` works here. `status` and manage's Overview both print this.
+fn tmux_availability(cli_path: &str, service_path: Option<&str>) -> String {
+    let lookup =
+        |path: &str| crate::terminal::login_env::lookup(crate::backend::TMUX_PROGRAM, path);
+    let cli = lookup(cli_path);
+    let Some(service_path) = service_path else {
+        return match cli {
+            Some(found) => format!("tmux: found on CLI PATH ({})", found.display()),
+            None => format!("tmux: NOT FOUND on CLI PATH ({cli_path})"),
+        };
+    };
+    match (lookup(service_path), cli) {
+        (Some(found), _) => format!("tmux: found on service PATH ({})", found.display()),
+        (None, Some(found)) => format!(
+            "tmux: NOT on service PATH ({service_path}); found on CLI PATH ({}) -- reinstall the service from this shell",
+            found.display()
+        ),
+        (None, None) => format!(
+            "tmux: NOT FOUND on service PATH ({service_path}) or CLI PATH ({cli_path})"
+        ),
+    }
+}
+
+fn safe_text(value: &str) -> String {
+    value.chars().filter(|ch| !ch.is_control()).collect()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tone {
+    Normal,
+    Quiet,
+    Accent,
+    Good,
+    Warning,
+    Error,
+    Selected,
+    Title,
+}
+
+impl Tone {
+    fn style(self) -> ContentStyle {
+        let mut style = ContentStyle::new();
+        style.foreground_color = match self {
+            Self::Quiet => Some(Color::DarkGrey),
+            Self::Accent => Some(Color::DarkCyan),
+            Self::Good => Some(Color::DarkGreen),
+            Self::Warning => Some(Color::DarkYellow),
+            Self::Error => Some(Color::DarkRed),
+            _ => None,
+        };
+        if matches!(self, Self::Title | Self::Selected) {
+            style.attributes.set(Attribute::Bold);
+        }
+        if self == Self::Selected {
+            style.attributes.set(Attribute::Reverse);
+        }
+        style
+    }
+}
+
+#[derive(Clone)]
+struct ScreenLine {
+    spans: Vec<(String, Tone)>,
+    qr: Option<String>,
+}
+
+impl ScreenLine {
+    fn text(text: impl AsRef<str>, tone: Tone) -> Self {
+        Self {
+            spans: vec![(safe_text(text.as_ref()), tone)],
+            qr: None,
+        }
+    }
+    fn plain(text: impl AsRef<str>) -> Self {
+        Self::text(text, Tone::Normal)
+    }
+    fn width(&self) -> usize {
+        self.qr
+            .as_deref()
+            .map(display_width)
+            .unwrap_or_else(|| self.spans.iter().map(|(text, _)| display_width(text)).sum())
+    }
+    fn selected(&self) -> bool {
+        self.spans.iter().any(|(_, tone)| *tone == Tone::Selected)
+    }
+    fn render(&self, budget: usize) -> String {
+        if let Some(qr) = &self.qr {
+            // QR rows are internally generated, never clipped or sanitized.
+            return if self.width() <= budget {
+                qr.clone()
+            } else {
+                String::new()
+            };
+        }
+        let mut output = String::new();
+        let mut remaining = budget;
+        for (text, tone) in &self.spans {
+            let clipped = clip_cells(text, remaining);
+            output.push_str(&tone.style().apply(clipped).to_string());
+            remaining = remaining.saturating_sub(display_width(clipped));
+            if clipped.len() != text.len() {
+                break;
+            }
+        }
+        output
+    }
+}
+
+struct ManageData<'a> {
+    config: &'a crate::Config,
+    message: &'a str,
+    pending: Option<&'a PendingPairing>,
+    devices: &'a [DeviceRecord],
+    runtime: &'a str,
+    running: bool,
+    autostart: &'a str,
+    backend_states: &'a [String],
+    qr: Option<&'a str>,
+    changed: bool,
+}
+
+fn panel(
+    body: &mut Vec<ScreenLine>,
+    title: &str,
+    rows: Vec<ScreenLine>,
+    width: usize,
+    framed: bool,
+) {
+    if framed {
+        let heading = format!("─ {} ", safe_text(title));
+        let heading = clip_cells(&heading, width.saturating_sub(2));
+        body.push(ScreenLine::text(
+            format!(
+                "┌{}{}┐",
+                heading,
+                "─".repeat(width.saturating_sub(2 + display_width(heading)))
+            ),
+            Tone::Accent,
+        ));
+        for mut row in rows {
+            row.spans.insert(0, ("│ ".into(), Tone::Accent));
+            // Clip only the content before appending the right border.
+            let mut budget = width.saturating_sub(4);
+            for (text, _) in row.spans.iter_mut().skip(1) {
+                *text = clip_cells(text, budget).to_owned();
+                budget = budget.saturating_sub(display_width(text));
+            }
+            let padding = width.saturating_sub(2 + row.width());
+            row.spans
+                .push((format!("{} │", " ".repeat(padding)), Tone::Accent));
+            body.push(row);
+        }
+        body.push(ScreenLine::text(
+            format!("└{}┘", "─".repeat(width.saturating_sub(2))),
+            Tone::Accent,
+        ));
+        body.push(ScreenLine::plain(""));
+    } else {
+        body.push(ScreenLine::text(title, Tone::Title));
+        body.extend(rows);
+        body.push(ScreenLine::plain(""));
+    }
+}
+
+fn wrapped_rows(label: &str, value: &str, width: usize) -> Vec<ScreenLine> {
+    let mut lines = Vec::new();
+    push_wrapped_field(&mut lines, label, value, width);
+    lines.into_iter().map(ScreenLine::plain).collect()
+}
+
+fn shortcut_rows(hints: &str, width: usize) -> Vec<ScreenLine> {
+    let mut rows = Vec::new();
+    let mut line = String::new();
+    for hint in hints.split(" | ") {
+        if !line.is_empty() && display_width(&line) + 3 + display_width(hint) > width {
+            rows.push(ScreenLine::text(&line, Tone::Accent));
+            line.clear();
+        }
+        if !line.is_empty() {
+            line.push_str(" | ");
+        }
+        line.push_str(hint);
+    }
+    if !line.is_empty() {
+        rows.push(ScreenLine::text(line, Tone::Accent));
+    }
+    rows
+}
+
+fn manage_lines(
+    data: &ManageData<'_>,
+    show_qr: bool,
+    ui: &mut ManageView,
+    width: u16,
+    height: u16,
+) -> Vec<ScreenLine> {
+    let width = width.saturating_sub(1) as usize;
+    let height = height as usize;
+    let margin = if width >= 50 { 2 } else { 0 };
+    let content = width.saturating_sub(margin * 2).min(96);
+    let framed = content >= 48 && height >= 18;
+    let inner = if framed {
+        content.saturating_sub(4)
+    } else {
+        content
+    };
+    let config = data.config;
+    ui.selected = ui.selected.min(match ui.section {
+        Section::Terminals => config.sessions.len().saturating_sub(1),
+        Section::Devices => data.devices.len().saturating_sub(1),
+        Section::Settings => 3,
+        Section::Overview => 0,
+    });
+    let mut header = vec![ScreenLine {
+        spans: vec![
+            ("Muqun Gateway".into(), Tone::Title),
+            (format!("  v{}", env!("CARGO_PKG_VERSION")), Tone::Quiet),
+        ],
+        qr: None,
+    }];
+    let mut tabs = ScreenLine {
+        spans: Vec::new(),
+        qr: None,
+    };
+    for (index, section) in Section::ALL.iter().enumerate() {
+        if content < 60 && *section != ui.section {
+            continue;
+        }
+        tabs.spans.push((
+            format!(" {} {:?} ", index + 1, section),
+            if *section == ui.section {
+                Tone::Selected
+            } else {
+                Tone::Quiet
+            },
+        ));
+        tabs.spans.push((" ".into(), Tone::Normal));
+    }
+    header.push(tabs);
+    if framed {
+        header.push(ScreenLine::plain(""));
+    }
+    let hints = match ui.section {
+        Section::Terminals if config.sessions.is_empty() => {
+            "Enter Add tmux backend | h Add Herdr backend"
+        }
+        Section::Overview => {
+            if data.running {
+                "Enter Stop gateway | s Start gateway | r Restart gateway"
+            } else {
+                "Enter Start gateway | t Stop gateway | r Restart gateway"
+            }
+        }
+        Section::Devices if data.pending.is_some() => {
+            "Enter Back to Overview | Esc Back to Overview"
+        }
+        Section::Devices if show_qr => "Enter Back to device list | Esc Cancel pairing view",
+        Section::Devices if data.devices.is_empty() => {
+            "Enter Pair first device | p Pair new device"
+        }
+        _ => ui.section.hints(),
+    };
+    let mut footer = shortcut_rows(hints, content);
+    footer.push(ScreenLine::text(
+        if ui.section == Section::Overview {
+            "Tab Views | Arrows Select | PageUp/Down Scroll | Esc/q Close"
+        } else {
+            "Tab Views | Arrows Select | Esc Back | q Close"
+        },
+        Tone::Quiet,
+    ));
+    footer.push(ScreenLine::text(
+        format!(
+            "{}{}",
+            if data.message.starts_with("Action failed:") {
+                ""
+            } else {
+                "Status: "
+            },
+            data.message
+        ),
+        if data.message.starts_with("Action failed:") {
+            Tone::Error
+        } else {
+            Tone::Normal
+        },
+    ));
+    // Small windows keep one primary action and one status row, not a wall of shortcuts.
+    if height < 14 {
+        footer.truncate(1);
+        footer[0] = ScreenLine::text(hints.split(" | ").next().unwrap_or(hints), Tone::Accent);
+        footer.push(ScreenLine::text(
+            "Tab Views | Esc Back | q Close",
+            Tone::Quiet,
+        ));
+        footer.push(ScreenLine::plain(format!("Status: {}", data.message)));
+    }
+    let pinned_backend =
+        ui.section == Section::Terminals && height >= 14 && config.sessions.len() + 12 >= height;
+    if pinned_backend {
+        if let Some(session) = config.sessions.get(ui.selected) {
+            let mut context = vec![
+                ScreenLine::text(
+                    format!("Selected: {} ({})", session.label, session.backend.as_str()),
+                    Tone::Title,
+                ),
+                ScreenLine::plain(format!(
+                    "Terminal-server startup: {} (on Gateway start)",
+                    if config.autostart_backends.contains(&session.id) {
+                        "On"
+                    } else {
+                        "Off"
+                    }
+                )),
+                ScreenLine::text(
+                    format!("Endpoint: {}", backend_endpoint(session)),
+                    Tone::Quiet,
+                ),
+            ];
+            context.extend(footer);
+            footer = context;
+        }
+    }
+    let body_height = height.saturating_sub(header.len() + footer.len());
+    let mut body = Vec::new();
+    match ui.section {
+        Section::Overview => {
+            let mut rows = vec![
+                ScreenLine::text(
+                    format!("Gateway: {}", data.runtime),
+                    if data.running {
+                        Tone::Good
+                    } else {
+                        Tone::Warning
+                    },
+                ),
+                ScreenLine::plain(format!("Login autostart: {}", data.autostart)),
+            ];
+            if framed {
+                rows.insert(0, ScreenLine::text(&config.label, Tone::Title));
+            }
+            if data.changed {
+                rows.push(ScreenLine::text(
+                    "Settings changed: restart Gateway to apply.",
+                    Tone::Warning,
+                ));
+            }
+            panel(&mut body, "Runtime", rows, content, framed);
+            let mut rows = wrapped_rows("Address", &config.public_url, inner);
+            rows.push(ScreenLine::plain(format!("Listener: {}", config.listen)));
+            rows.push(ScreenLine::plain(format!(
+                "Devices: {} paired",
+                data.devices.len()
+            )));
+            if data.pending.is_some() {
+                rows.push(ScreenLine::text(
+                    "Pairing request waiting: open 3 Devices for the code.",
+                    Tone::Warning,
+                ));
+            }
+            panel(&mut body, "Connectivity", rows, content, framed);
+            let mut rows = config
+                .sessions
+                .iter()
+                .enumerate()
+                .map(|(index, session)| {
+                    ScreenLine::plain(format!(
+                        "{}{}: {}",
+                        session.id,
+                        if index == 0 { " [default]" } else { "" },
+                        data.backend_states
+                            .get(index)
+                            .map(String::as_str)
+                            .unwrap_or("unavailable")
+                    ))
+                })
+                .collect::<Vec<_>>();
+            if rows.is_empty() {
+                rows.push(ScreenLine::plain(
+                    "No backends. Open 2 Terminals to add Herdr or tmux.",
+                ));
+            }
+            panel(&mut body, "Terminal servers", rows, content, framed);
+            body.push(ScreenLine::text(
+                "Server connections are checked when the App opens a backend.",
+                Tone::Quiet,
+            ));
+            body.push(ScreenLine::text(
+                "Stopping Gateway leaves terminal sessions and tasks running.",
+                Tone::Quiet,
             ));
         }
-        push_wrapped_field(&mut qr_controls, "message", message, 34);
-        let mut qr_lines = vec![
-            String::from("Scan with Muqun"),
-            String::from("Code appears after scan"),
-            String::from(""),
-        ];
-        // Config is authoritative for the advertised URL and server id. Older
-        // pairing files can retain a stale URL even though their admin token is
-        // still valid; rendering from that file made `p` show the wrong server.
-        let encoded = pairing_qr_offer(
-            &config.public_url,
-            &config.server_id,
-            (config.transport_encryption == TransportEncryptionMode::Required)
-                .then_some(pairing.payload.transport_key.as_str()),
-        );
-        let code = QrCode::with_error_correction_level(encoded.as_bytes(), EcLevel::L)?;
-        let image = render_qr(&code);
-        for line in image.lines() {
-            qr_lines.push(line.to_string());
+        Section::Terminals => {
+            ui.selected = ui.selected.min(config.sessions.len().saturating_sub(1));
+            let mut rows = config
+                .sessions
+                .iter()
+                .enumerate()
+                .map(|(index, session)| {
+                    ScreenLine::text(
+                        format!(
+                            "{} {}{}  {}",
+                            if index == ui.selected { ">" } else { " " },
+                            session.id,
+                            if index == 0 { " [default]" } else { "" },
+                            session.label
+                        ),
+                        if index == ui.selected {
+                            Tone::Selected
+                        } else {
+                            Tone::Normal
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            if rows.is_empty() {
+                rows.push(ScreenLine::plain(
+                    "No terminal backends. Enter Add tmux or h Add Herdr.",
+                ));
+            }
+            panel(
+                &mut body,
+                "Terminal backends - select with arrows",
+                rows,
+                content,
+                framed,
+            );
+            if let Some(session) = config.sessions.get(ui.selected).filter(|_| !pinned_backend) {
+                let mut details = vec![
+                    ScreenLine::plain(format!(
+                        "Selected: {} ({})",
+                        session.label,
+                        session.backend.as_str()
+                    )),
+                    ScreenLine::plain(format!(
+                        "Terminal-server startup: {} (on Gateway start)",
+                        if config.autostart_backends.contains(&session.id) {
+                            "On"
+                        } else {
+                            "Off"
+                        }
+                    )),
+                ];
+                details.extend(wrapped_rows("Endpoint", &backend_endpoint(session), inner));
+                panel(&mut body, "Selected backend", details, content, framed);
+            }
+            body.push(ScreenLine::plain(
+                "Enter makes the selected backend the default for the App.",
+            ));
+            body.push(ScreenLine::text(
+                "Removal never closes terminals. Restart Gateway after changes.",
+                Tone::Quiet,
+            ));
         }
-        write_two_column_panel(&qr_controls, &qr_lines)?;
-        return Ok(());
-    } else {
-        lines.push(String::from(
-            "Gateway pairing is not configured. Run setup first.",
-        ));
+        Section::Devices => {
+            if let Some(pending) = data.pending {
+                let mut rows = vec![
+                    ScreenLine::plain(format!("Device: {}", pending.device_name)),
+                    ScreenLine::text(format!("Pairing code: {}", pending.code), Tone::Title),
+                ];
+                rows.extend(wrapped_rows("Address", &config.public_url, inner));
+                rows.push(ScreenLine::plain(
+                    "Enter this code in Muqun to finish pairing.",
+                ));
+                panel(
+                    &mut body,
+                    "Finish pairing in the App",
+                    rows,
+                    content,
+                    framed,
+                );
+            } else if show_qr {
+                body.push(ScreenLine::text("Pair a device", Tone::Title));
+                if data.qr.is_none() {
+                    body.push(ScreenLine::text(
+                        "Pairing unavailable. See the status message below.",
+                        Tone::Error,
+                    ));
+                } else {
+                    if let Some(qr) = data.qr.filter(|qr| {
+                        qr.lines().count() + 2 <= body_height
+                            && qr.lines().all(|row| display_width(row) <= content)
+                    }) {
+                        body.push(ScreenLine::plain(
+                            "Scan with Muqun; code appears after scan.",
+                        ));
+                        body.extend(qr.lines().map(|row| ScreenLine {
+                            spans: Vec::new(),
+                            qr: Some(row.to_owned()),
+                        }));
+                    } else {
+                        body.push(ScreenLine::text(
+                            "Resize for the full QR; Down for URL.",
+                            Tone::Warning,
+                        ));
+                        body.extend(wrapped_rows("Address", &config.public_url, inner));
+                        body.push(ScreenLine::plain(
+                            "In Muqun: add Gateway, enter this address, then the code.",
+                        ));
+                    }
+                }
+            } else {
+                ui.selected = ui.selected.min(data.devices.len().saturating_sub(1));
+                let mut rows = data
+                    .devices
+                    .iter()
+                    .rev()
+                    .enumerate()
+                    .map(|(index, device)| {
+                        ScreenLine::text(
+                            format!(
+                                "{} {}  (paired {})",
+                                if index == ui.selected { ">" } else { " " },
+                                device.name,
+                                relative_since(device.paired_unix_ms)
+                            ),
+                            if index == ui.selected {
+                                Tone::Selected
+                            } else {
+                                Tone::Normal
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if rows.is_empty() {
+                    rows.push(ScreenLine::plain("No devices paired yet."));
+                    rows.push(ScreenLine::text(
+                        "Press Enter to pair your first device with Muqun.",
+                        Tone::Accent,
+                    ));
+                }
+                panel(&mut body, "Paired devices", rows, content, framed);
+                if !data.devices.is_empty() {
+                    body.push(ScreenLine::plain(
+                        "Enter reviews revocation; the selected device will lose access.",
+                    ));
+                }
+            }
+        }
+        Section::Settings => {
+            ui.selected = ui.selected.min(3);
+            let settings = [
+                format!("Gateway login autostart: {}", data.autostart),
+                format!("Gateway address: {}", config.public_url),
+                format!(
+                    "Transport encryption: {}",
+                    config.transport_encryption.as_str()
+                ),
+                String::from("Stable Gateway updates: Enter checks; i installs with confirmation"),
+            ];
+            panel(
+                &mut body,
+                "Gateway settings - Enter changes selected",
+                settings
+                    .iter()
+                    .enumerate()
+                    .map(|(index, text)| {
+                        ScreenLine::text(
+                            format!("{} {text}", if index == ui.selected { ">" } else { " " }),
+                            if index == ui.selected {
+                                Tone::Selected
+                            } else {
+                                Tone::Normal
+                            },
+                        )
+                    })
+                    .collect(),
+                content,
+                framed,
+            );
+            let mut rows = vec![
+                ScreenLine::plain("Gateway login autostart starts Gateway when you log in."),
+                ScreenLine::plain("Terminal-server startup is separate: 2 Terminals, b."),
+                ScreenLine::plain("That starts opted-in terminal servers on Gateway start."),
+            ];
+            if config.transport_encryption == TransportEncryptionMode::Disabled {
+                rows.push(ScreenLine::text(
+                    "Warning: token-only mode. A leaked token can call the API.",
+                    Tone::Warning,
+                ));
+            }
+            rows.push(ScreenLine::plain(
+                "Address/encryption edits need a Gateway restart.",
+            ));
+            rows.push(ScreenLine::text(
+                "Encryption edits affect new pairings, not existing devices.",
+                Tone::Quiet,
+            ));
+            rows.push(ScreenLine::plain(
+                "Updates are manual only; never background-installed or downgraded.",
+            ));
+            panel(&mut body, "What these settings do", rows, content, framed);
+        }
     }
-    write_centered_panel(&lines)?;
+    let selected_line = body.iter().position(ScreenLine::selected);
+    // Pin only complete QR rows, never the scrollable address fallback.
+    if body.iter().any(|line| line.qr.is_some()) {
+        ui.scroll = 0;
+    }
+    ui.scroll = viewport_start(ui.scroll, selected_line, body.len(), body_height);
+    let mut lines = header;
+    lines.extend(body.into_iter().skip(ui.scroll).take(body_height));
+    while lines.len() + footer.len() < height {
+        lines.push(ScreenLine::plain(""));
+    }
+    lines.extend(footer);
+    lines.truncate(height);
+    for line in &mut lines {
+        if line.qr.is_none() {
+            let mut budget = content;
+            for (text, _) in &mut line.spans {
+                *text = clip_cells(text, budget).to_owned();
+                budget = budget.saturating_sub(display_width(text));
+            }
+        }
+    }
+    if margin > 0 {
+        for line in &mut lines {
+            if let Some(qr) = &mut line.qr {
+                qr.insert_str(0, &" ".repeat(margin));
+            } else {
+                line.spans.insert(0, (" ".repeat(margin), Tone::Normal));
+            }
+        }
+    }
+    lines
+}
+
+fn write_viewport(lines: &[ScreenLine], width: u16, height: u16) -> anyhow::Result<()> {
+    execute!(stdout(), Clear(ClearType::All))?;
+    for (row, line) in lines.iter().take(height as usize).enumerate() {
+        execute!(stdout(), MoveTo(0, row as u16))?;
+        stdout().write_all(line.render(width.saturating_sub(1) as usize).as_bytes())?;
+    }
+    stdout().flush()?;
     Ok(())
+}
+
+fn toggle_backend_autostart(id: &str) -> anyhow::Result<String> {
+    let mut config = load_config(None)?;
+    let session = config
+        .sessions
+        .iter()
+        .find(|session| session.id == id)
+        .context("selected backend disappeared")?;
+    if config.autostart_backends.contains(&session.id) {
+        config.autostart_backends.retain(|item| item != id);
+    } else {
+        crate::backend_startup::validate(session)?;
+        config.autostart_backends.push(id.to_owned());
+    }
+    write_config(&config_dir()?.join(CONFIG_FILE), &config)?;
+    Ok(format!(
+        "backend {id} autostart {}; applies on next gateway start",
+        if config.autostart_backends.iter().any(|item| item == id) {
+            "on"
+        } else {
+            "off"
+        }
+    ))
+}
+
+/// What `g` may do from what the service reader reports. Uninstalling needs
+/// the reader to confirm a registered, loaded service; installing needs it to
+/// confirm there is none (or only a file that would not autostart, which
+/// install repairs). A stopped-but-installed LaunchAgent is neither: `g` there
+/// would uninstall the very registration the owner just saw as "Installed",
+/// so it explains instead of acting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AutostartToggle {
+    Install,
+    Uninstall,
+    Refuse(String),
+}
+
+fn autostart_toggle(state: anyhow::Result<service::ServiceState>) -> AutostartToggle {
+    match state {
+        Ok(service::ServiceState::Installed) => AutostartToggle::Uninstall,
+        Ok(service::ServiceState::NotInstalled | service::ServiceState::FileOnly) => {
+            AutostartToggle::Install
+        }
+        Ok(service::ServiceState::Stopped) => AutostartToggle::Refuse(String::from(
+            "autostart is on and Gateway is stopped; press Enter on Overview to start it, \
+             or run `muqun-gateway service uninstall` to turn autostart off",
+        )),
+        Err(error) => AutostartToggle::Refuse(format!(
+            "autostart unchanged: cannot read service registration: {}",
+            first_line(&error.to_string())
+        )),
+    }
+}
+
+fn autostart_label(state: &anyhow::Result<service::ServiceState>) -> &'static str {
+    match state {
+        Ok(service::ServiceState::Installed) => "On - user service registered",
+        Ok(service::ServiceState::Stopped) => "On - Installed · stopped (starts at next login)",
+        Ok(service::ServiceState::FileOnly) => "Incomplete - service file only",
+        Ok(service::ServiceState::NotInstalled) => "Off - start Gateway manually",
+        Err(_) => "Unavailable - cannot read service registration",
+    }
+}
+
+fn confirm_gateway_autostart(enabled: bool) -> anyhow::Result<bool> {
+    confirm_action(&format!("Turn Gateway login autostart {}?", if enabled { "on" } else { "off" }), &[
+        String::from("This registers/removes only Gateway's user service."),
+        String::from("Enabling starts Gateway now and at login; disabling keeps its current running/stopped state."),
+        String::from("Terminal-server startup and paired devices are unchanged."),
+    ], "change login autostart")
+}
+
+#[derive(Default)]
+struct Confirmation {
+    yes: bool,
+}
+
+impl Confirmation {
+    fn key(&mut self, key: KeyCode) -> Option<bool> {
+        match key {
+            KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Tab
+            | KeyCode::BackTab => {
+                self.yes = !self.yes;
+                None
+            }
+            KeyCode::Enter => Some(self.yes),
+            KeyCode::Char('y' | 'Y') => Some(true),
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => Some(false),
+            _ => None,
+        }
+    }
+}
+
+fn confirm_action(title: &str, scope: &[String], verb: &str) -> anyhow::Result<bool> {
+    let mut confirmation = Confirmation::default();
+    loop {
+        let choice = ScreenLine {
+            spans: vec![
+                (
+                    " No, cancel ".into(),
+                    if confirmation.yes {
+                        Tone::Normal
+                    } else {
+                        Tone::Selected
+                    },
+                ),
+                (
+                    format!("  Yes, {verb} "),
+                    if confirmation.yes {
+                        Tone::Selected
+                    } else {
+                        Tone::Normal
+                    },
+                ),
+            ],
+            qr: None,
+        };
+        let mut lines = scope.to_vec();
+        lines.push(String::from(
+            "Arrows/Tab Choose | Enter Confirm selection | Esc Cancel",
+        ));
+        write_dialog(title, &lines, choice)?;
+        if let TerminalEvent::Key(event) = read_event()? {
+            if event.kind != KeyEventKind::Press {
+                continue;
+            }
+            if let Some(answer) = confirmation.key(event.code) {
+                return Ok(answer);
+            }
+        }
+    }
+}
+
+fn write_dialog(title: &str, details: &[String], choices: ScreenLine) -> anyhow::Result<()> {
+    let (width, height) = terminal_size().unwrap_or((100, 30));
+    let budget = (width.saturating_sub(1) as usize).min(92);
+    let framed = budget >= 48 && height >= 14;
+    let inner = if framed {
+        budget.saturating_sub(4)
+    } else {
+        budget
+    };
+    let mut rows = Vec::new();
+    for line in details {
+        rows.extend(wrapped_rows("", line, inner));
+    }
+    let mut lines = Vec::new();
+    panel(&mut lines, title, rows, budget, framed);
+    lines.truncate((height as usize).saturating_sub(2));
+    lines.push(choices);
+    write_viewport(&lines, width, height)
 }
 
 /// A compact "3m ago" / "2h ago" / "5d ago" for the manage device list. Falls
@@ -831,117 +1645,133 @@ pub(crate) fn relative_since(then_unix_ms: u128) -> String {
     }
 }
 
-pub(crate) fn push_line(output: &mut String, line: impl AsRef<str>) {
-    output.push_str(line.as_ref());
-    output.push_str("\r\n");
-}
-
-pub(crate) fn write_centered_panel(lines: &[String]) -> anyhow::Result<()> {
-    let terminal_width = terminal_size()
-        .map(|(width, _)| width as usize)
-        .unwrap_or(110);
-    let content_width = lines
-        .iter()
-        .map(|line| display_width(line))
-        .max()
-        .unwrap_or(0)
-        .max(56)
-        .min(terminal_width.saturating_sub(4));
-    let indent = terminal_width.saturating_sub(content_width) / 2;
-    // Popup interiors can be a few rows shorter than the child PTY reports.
-    // Keep content anchored at the top so a long QR never scrolls the controls
-    // out of view on smaller laptop terminals.
-    let mut output = String::new();
-
-    for line in lines {
-        let line_width = display_width(line);
-        let left_padding = if line.contains(':') || line.starts_with("> ") || line.starts_with("  ")
-        {
-            0
-        } else {
-            content_width.saturating_sub(line_width) / 2
-        };
-        push_line(
-            &mut output,
-            format!("{}{}{}", " ".repeat(indent + left_padding), line, "\x1b[0m"),
-        );
-    }
-
-    stdout().write_all(output.as_bytes())?;
-    stdout().flush()?;
-    Ok(())
-}
-
-pub(crate) fn write_two_column_panel(left: &[String], right: &[String]) -> anyhow::Result<()> {
-    let terminal_width = terminal_size()
-        .map(|(width, _)| width as usize)
-        .unwrap_or(92);
-    let left_width = left
-        .iter()
-        .map(|line| display_width(line))
-        .max()
-        .unwrap_or(0);
-    let right_width = right
-        .iter()
-        .map(|line| display_width(line))
-        .max()
-        .unwrap_or(0);
-    let gap = if left_width + right_width + 4 <= terminal_width {
-        4
-    } else {
-        1
-    };
-    let total_width = left_width + gap + right_width;
-
-    // Extremely narrow terminals cannot preserve QR geometry beside controls.
-    // Keep the controls visible first, then render the code below as a fallback.
-    if total_width > terminal_width {
-        let mut stacked = left.to_vec();
-        stacked.push(String::new());
-        stacked.extend_from_slice(right);
-        return write_centered_panel(&stacked);
-    }
-
-    let indent = terminal_width.saturating_sub(total_width) / 2;
-    let row_count = left.len().max(right.len());
-    let mut output = String::new();
-    for row in 0..row_count {
-        let left_line = left.get(row).map(String::as_str).unwrap_or("");
-        let right_line = right.get(row).map(String::as_str).unwrap_or("");
-        let left_padding = left_width.saturating_sub(display_width(left_line));
-        push_line(
-            &mut output,
-            format!(
-                "{}{}{}{}{}\x1b[0m",
-                " ".repeat(indent),
-                left_line,
-                " ".repeat(left_padding),
-                " ".repeat(gap),
-                right_line
-            ),
-        );
-    }
-    stdout().write_all(output.as_bytes())?;
-    stdout().flush()?;
-    Ok(())
-}
-
 pub(crate) fn display_width(value: &str) -> usize {
-    let mut chars = value.chars().peekable();
-    let mut width = 0;
-    while let Some(ch) = chars.next() {
-        if ch == '\x1b' && chars.peek() == Some(&'[') {
-            chars.next();
-            for control in chars.by_ref() {
-                if ('@'..='~').contains(&control) {
-                    break;
+    with_width_locale(|| {
+        let mut chars = value.chars().peekable();
+        let mut width = 0;
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' && chars.peek() == Some(&'[') {
+                chars.next();
+                for control in chars.by_ref() {
+                    if ('@'..='~').contains(&control) {
+                        break;
+                    }
                 }
+            } else {
+                width += character_cells(ch);
             }
-        } else {
-            width += 1;
+        }
+        width
+    })
+}
+
+// POSIX wcwidth supplies the host's Unicode cell-width tables without another
+// dependency. Use a cached *thread-local* UTF-8 locale, never setlocale: the
+// gateway runtime is multithreaded and changing its global locale is unsafe.
+#[cfg(unix)]
+struct WidthLocale(libc::locale_t);
+
+#[cfg(unix)]
+impl WidthLocale {
+    fn new() -> Self {
+        for name in [b"C.UTF-8\0".as_slice(), b"en_US.UTF-8\0", b"UTF-8\0"] {
+            // SAFETY: names are NUL-terminated; a fresh locale is privately owned.
+            let locale = unsafe {
+                libc::newlocale(
+                    libc::LC_CTYPE_MASK,
+                    name.as_ptr().cast(),
+                    std::ptr::null_mut(),
+                )
+            };
+            if !locale.is_null() {
+                return Self(locale);
+            }
+        }
+        Self(std::ptr::null_mut())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for WidthLocale {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: this thread owns the locale; every measurement restored
+            // its prior locale before the thread-local object can be dropped.
+            unsafe {
+                libc::freelocale(self.0);
+            }
         }
     }
-    width
+}
+
+#[cfg(unix)]
+fn with_width_locale<T>(measure: impl FnOnce() -> T) -> T {
+    thread_local! { static LOCALE: WidthLocale = WidthLocale::new(); }
+    struct RestoreLocale(libc::locale_t);
+    impl Drop for RestoreLocale {
+        fn drop(&mut self) {
+            // SAFETY: this is the still-live previous locale of this thread.
+            unsafe {
+                libc::uselocale(self.0);
+            }
+        }
+    }
+    LOCALE.with(|locale| {
+        let _restore = if locale.0.is_null() {
+            None
+        } else {
+            // SAFETY: immutable locale remains owned by this thread-local object.
+            let previous = unsafe { libc::uselocale(locale.0) };
+            (!previous.is_null()).then_some(RestoreLocale(previous))
+        };
+        measure()
+    })
+}
+
+#[cfg(not(unix))]
+fn with_width_locale<T>(measure: impl FnOnce() -> T) -> T {
+    measure()
+}
+
+fn character_cells(ch: char) -> usize {
+    if ch.is_control() {
+        return 0;
+    }
+    #[cfg(unix)]
+    {
+        extern "C" {
+            fn wcwidth(ch: libc::wchar_t) -> libc::c_int;
+        }
+        // SAFETY: Rust char is a valid scalar fitting POSIX wchar_t. Callers
+        // measure under with_width_locale, which restores the prior locale.
+        let cells = unsafe { wcwidth(ch as libc::wchar_t) };
+        if cells >= 0 {
+            return cells as usize;
+        }
+    }
+    // Unknown/unavailable Unicode tables: conservatively budget two cells, so
+    // an unfamiliar wide scalar cannot overflow a row. ASCII always occupies one.
+    if ch.is_ascii() {
+        1
+    } else {
+        2
+    }
+}
+
+fn clip_cells(value: &str, max_cells: usize) -> &str {
+    with_width_locale(|| {
+        let mut cells = 0;
+        let mut end = 0;
+        for (index, ch) in value.char_indices() {
+            let next = character_cells(ch);
+            if cells + next > max_cells {
+                break;
+            }
+            cells += next;
+            end = index + ch.len_utf8();
+        }
+        &value[..end]
+    })
 }
 
 pub(crate) fn truncate(value: &str, max_chars: usize) -> String {
@@ -960,22 +1790,42 @@ pub(crate) fn first_line(value: &str) -> String {
 }
 
 pub(crate) fn push_wrapped_field(lines: &mut Vec<String>, label: &str, value: &str, width: usize) {
-    let prefix = format!("{label}: ");
-    let continuation = " ".repeat(prefix.chars().count());
-    let first_width = width.saturating_sub(prefix.chars().count()).max(1);
-    let mut remaining = value.chars().peekable();
+    if width == 0 {
+        lines.push(String::new());
+        return;
+    }
+    let label = if label.is_empty() {
+        String::new()
+    } else {
+        format!("{}: ", safe_text(label))
+    };
+    // Leave room for a wide scalar even on a narrow viewport. The final writer
+    // applies the same display-cell clipping to every row.
+    let prefix = clip_cells(&label, width.saturating_sub(2));
+    let continuation = " ".repeat(display_width(prefix));
+    let first_width = width.saturating_sub(display_width(prefix));
+    let text = safe_text(value);
+    let mut remaining = text.as_str();
     let mut first = true;
-    while remaining.peek().is_some() {
-        let chunk = remaining.by_ref().take(first_width).collect::<String>();
+    while !remaining.is_empty() {
+        let chunk = clip_cells(remaining, first_width);
+        // A one-cell terminal cannot display a wide scalar. Consume it with a
+        // visible placeholder rather than wrapping it or looping forever.
+        let (chunk, consumed) = if chunk.is_empty() {
+            ("?", remaining.chars().next().unwrap().len_utf8())
+        } else {
+            (chunk, chunk.len())
+        };
         lines.push(format!(
             "{}{}",
-            if first { &prefix } else { &continuation },
+            if first { prefix } else { &continuation },
             chunk
         ));
+        remaining = &remaining[consumed..];
         first = false;
     }
     if first {
-        lines.push(prefix);
+        lines.push(prefix.to_owned());
     }
 }
 
@@ -987,20 +1837,27 @@ pub(crate) fn fetch_pending_pairing() -> anyhow::Result<Option<PendingPairing>> 
         .parse()
         .with_context(|| format!("invalid listen address {}", config.listen))?;
     let host_port = local_management_addr(listen).to_string();
-    let mut stream = std::net::TcpStream::connect(&host_port)?;
+    let address = local_management_addr(listen);
+    let mut stream = std::net::TcpStream::connect_timeout(&address, Duration::from_millis(250))?;
+    stream.set_read_timeout(Some(Duration::from_millis(500)))?;
+    stream.set_write_timeout(Some(Duration::from_millis(500)))?;
     let request = format!(
         "GET /api/pair/pending HTTP/1.1\r\nHost: {host_port}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
         pairing.payload.token
     );
     std::io::Write::write_all(&mut stream, request.as_bytes())?;
     let mut response = String::new();
-    std::io::Read::read_to_string(&mut stream, &mut response)?;
+    std::io::Read::read_to_string(
+        &mut std::io::Read::take(&mut stream, 64 * 1024),
+        &mut response,
+    )?;
     let Some((headers, body)) = response.split_once("\r\n\r\n") else {
         anyhow::bail!("invalid pending response");
     };
-    if !headers.starts_with("HTTP/1.1 200") && !headers.starts_with("HTTP/1.0 200") {
-        return Ok(None);
-    }
+    anyhow::ensure!(
+        headers.starts_with("HTTP/1.1 200 ") || headers.starts_with("HTTP/1.0 200 "),
+        "gateway refused local management request"
+    );
     let value: Value = serde_json::from_str(body)?;
     if value.get("pending").and_then(Value::as_bool) != Some(true) {
         return Ok(None);
@@ -1036,6 +1893,7 @@ pub(crate) fn fetch_pending_pairing() -> anyhow::Result<Option<PendingPairing>> 
 }
 
 pub(crate) fn revoke_managed_device(device_id: &str) -> anyhow::Result<bool> {
+    validate_session_id(device_id).context("invalid device id")?;
     let pairing = read_pairing_file()?;
     let config = load_config(None)?;
     let listen: SocketAddr = config
@@ -1065,7 +1923,10 @@ pub(crate) fn revoke_managed_device(device_id: &str) -> anyhow::Result<bool> {
     );
     std::io::Write::write_all(&mut stream, request.as_bytes())?;
     let mut response = String::new();
-    std::io::Read::read_to_string(&mut stream, &mut response)?;
+    std::io::Read::read_to_string(
+        &mut std::io::Read::take(&mut stream, 64 * 1024),
+        &mut response,
+    )?;
     let status_line = response.lines().next().unwrap_or_default();
     if status_line.contains(" 200 ") {
         return Ok(true);
@@ -1166,7 +2027,261 @@ pub(crate) fn render_qr(code: &QrCode) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        clip_cells, manage_lines, primary_action, safe_text, viewport_start, Confirmation, KeyCode,
+        ManageData, ManageView, ScreenLine, Section, Tone,
+    };
     use crate::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn tmux_availability_is_judged_on_the_service_path_and_labelled() {
+        use super::tmux_availability;
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = std::env::temp_dir().join(format!("manage-tmux-{}", uuid::Uuid::new_v4()));
+        let with = root.join("brew/bin");
+        let without = root.join("usr/bin");
+        std::fs::create_dir_all(&with).unwrap();
+        std::fs::create_dir_all(&without).unwrap();
+        let tmux = with.join(crate::backend::TMUX_PROGRAM);
+        std::fs::write(&tmux, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (with, without) = (with.display().to_string(), without.display().to_string());
+
+        let tmux = tmux.display().to_string();
+        assert_eq!(
+            tmux_availability(&with, None),
+            format!("tmux: found on CLI PATH ({tmux})")
+        );
+        assert_eq!(
+            tmux_availability(&without, None),
+            format!("tmux: NOT FOUND on CLI PATH ({without})")
+        );
+        assert_eq!(
+            tmux_availability(&without, Some(&with)),
+            format!("tmux: found on service PATH ({tmux})")
+        );
+        // The case the CLI alone cannot see: found here, not by the service.
+        let state = tmux_availability(&with, Some(&without));
+        assert!(
+            state.starts_with(&format!(
+                "tmux: NOT on service PATH ({without}); found on CLI PATH ({tmux})"
+            )),
+            "{state}"
+        );
+        assert!(tmux_availability(&without, Some(&without))
+            .starts_with("tmux: NOT FOUND on service PATH"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn autostart_toggle_never_uninstalls_a_stopped_or_unreadable_service() {
+        use super::{autostart_label, autostart_toggle, AutostartToggle};
+        use crate::platform::service::ServiceState::*;
+        assert_eq!(autostart_toggle(Ok(Installed)), AutostartToggle::Uninstall);
+        assert_eq!(autostart_toggle(Ok(NotInstalled)), AutostartToggle::Install);
+        assert_eq!(autostart_toggle(Ok(FileOnly)), AutostartToggle::Install);
+        for state in [Ok(Stopped), Err(anyhow::anyhow!("launchctl failed"))] {
+            assert!(matches!(
+                autostart_toggle(state),
+                AutostartToggle::Refuse(_)
+            ));
+        }
+        assert_eq!(
+            autostart_label(&Ok(Stopped)),
+            "On - Installed · stopped (starts at next login)"
+        );
+        assert!(!autostart_label(&Ok(Stopped)).contains("Incomplete"));
+    }
+
+    #[test]
+    fn manager_navigation_is_scoped_and_bounded() {
+        let mut ui = ManageView::default();
+        assert!(ui.navigate(KeyCode::BackTab, 0));
+        assert_eq!(ui.section, Section::Settings);
+        ui.navigate(KeyCode::Char('2'), 0);
+        assert_eq!(ui.section, Section::Terminals);
+        ui.navigate(KeyCode::End, 50);
+        assert_eq!(ui.selected, 49);
+        ui.navigate(KeyCode::Down, 50);
+        assert_eq!(ui.selected, 49);
+        ui.navigate(KeyCode::PageUp, 50);
+        assert_eq!(ui.selected, 39);
+        assert!(!ui.navigate(KeyCode::Char('g'), 50));
+        assert!(!Section::Terminals
+            .hints()
+            .contains("Gateway login autostart"));
+        assert!(Section::Settings
+            .hints()
+            .contains("Gateway login autostart"));
+        ui.navigate(KeyCode::Tab, 50);
+        assert_eq!(ui.selected, 0);
+        assert_eq!(ui.scroll, 0);
+    }
+
+    #[test]
+    fn manager_enter_actions_and_confirmation_cancel_are_explicit() {
+        assert_eq!(
+            primary_action(Section::Overview, 0, true, false, false, false),
+            Some('s')
+        );
+        assert_eq!(
+            primary_action(Section::Overview, 0, true, false, false, true),
+            Some('t')
+        );
+        assert_eq!(
+            primary_action(Section::Terminals, 3, false, false, false, false),
+            Some('f')
+        );
+        assert_eq!(
+            primary_action(Section::Terminals, 0, true, false, false, false),
+            Some('m')
+        );
+        assert_eq!(
+            primary_action(Section::Devices, 0, true, false, false, false),
+            Some('p')
+        );
+        assert_eq!(
+            primary_action(Section::Devices, 1, false, false, false, false),
+            Some('x')
+        );
+        assert_eq!(
+            primary_action(Section::Devices, 0, true, true, false, false),
+            Some('r')
+        );
+        for (index, action) in ['g', 'u', 'e'].iter().enumerate() {
+            assert_eq!(
+                primary_action(Section::Settings, index, true, false, false, false),
+                Some(*action)
+            );
+        }
+        let mut confirmation = Confirmation::default();
+        assert_eq!(confirmation.key(KeyCode::Enter), Some(false));
+        assert_eq!(confirmation.key(KeyCode::Right), None);
+        assert_eq!(confirmation.key(KeyCode::Enter), Some(true));
+        assert_eq!(confirmation.key(KeyCode::Esc), Some(false));
+    }
+
+    fn layout_config() -> crate::Config {
+        serde_json::from_value(serde_json::json!({
+            "server_id": "layout", "label": "工作站 e\u{301}\u{1b}[2J", "token_hash": "not-a-token",
+            "listen": "127.0.0.1:23100", "public_url": "http://localhost:23100",
+            "sessions": (0..40).map(|index| serde_json::json!({"id": format!("qa-{index:02}"),
+                "label": "中文 e\u{301}\u{1b}[2J", "backend": "tmux", "socket_path": "/isolated/absent.sock"})).collect::<Vec<_>>()
+        })).unwrap()
+    }
+
+    #[test]
+    fn manager_styled_layout_is_cell_bounded_through_resize_and_keeps_selection_visible() {
+        let config = layout_config();
+        let data = ManageData {
+            config: &config,
+            message: "Ready 中文e\u{301}",
+            pending: None,
+            devices: &[],
+            runtime: "stopped",
+            running: false,
+            autostart: "Off",
+            backend_states: &[],
+            qr: None,
+            changed: false,
+        };
+        for section in Section::ALL {
+            let mut ui = ManageView {
+                section,
+                selected: if section == Section::Terminals { 39 } else { 0 },
+                scroll: 0,
+            };
+            for width in [0_u16, 1, 2, 8, 24, 40, 60, 80, 100, 200] {
+                for height in [0_u16, 1, 5, 8, 18, 30] {
+                    let lines = manage_lines(&data, false, &mut ui, width, height);
+                    assert!(lines.len() <= height as usize);
+                    for line in &lines {
+                        let output = line.render(width.saturating_sub(1) as usize);
+                        assert!(
+                            display_width(&output) <= width.saturating_sub(1) as usize,
+                            "{output:?}"
+                        );
+                        assert!(
+                            !output.contains("\x1b[2J"),
+                            "untrusted label escaped: {output:?}"
+                        );
+                        assert!(
+                            !output.contains("\x1b[48;"),
+                            "forced background: {output:?}"
+                        );
+                        assert!(line.width() <= 98);
+                    }
+                    if section == Section::Terminals && width >= 40 && height >= 8 {
+                        assert!(lines
+                            .iter()
+                            .any(|line| line.selected() && line.render(100).contains("> qa-39")));
+                    }
+                }
+            }
+        }
+        let line = ScreenLine::text("中文e\u{301}X", Tone::Selected);
+        assert_eq!(display_width(&line.render(5)), 5);
+        assert!(line.render(5).contains("\x1b[7m"));
+        assert!(line.render(5).contains("中文e\u{301}"));
+    }
+
+    #[test]
+    fn manager_empty_states_and_default_marker_explain_next_actions() {
+        let config = layout_config();
+        let data = |config| ManageData {
+            config,
+            message: "ready",
+            pending: None,
+            devices: &[],
+            runtime: "stopped",
+            running: false,
+            autostart: "Off",
+            backend_states: &[],
+            qr: None,
+            changed: false,
+        };
+        let mut ui = ManageView {
+            section: Section::Terminals,
+            selected: 1,
+            scroll: 0,
+        };
+        let lines = manage_lines(&data(&config), false, &mut ui, 100, 30);
+        let selected = lines
+            .iter()
+            .find(|line| line.selected() && line.render(100).contains("qa-01"))
+            .unwrap()
+            .render(100);
+        assert!(selected.contains("> qa-01"));
+        assert!(!selected.contains("[default]"));
+        assert!(lines
+            .iter()
+            .any(|line| line.render(100).contains("qa-00 [default]")));
+        let mut empty_config = layout_config();
+        empty_config.sessions.clear();
+        let lines = manage_lines(&data(&empty_config), false, &mut ui, 100, 30);
+        assert!(lines
+            .iter()
+            .any(|line| line.render(100).contains("Enter Add tmux or h Add Herdr")));
+        ui.section = Section::Devices;
+        let lines = manage_lines(&data(&empty_config), false, &mut ui, 100, 30);
+        assert!(lines
+            .iter()
+            .any(|line| line.render(100).contains("Enter to pair your first device")));
+        assert!(lines
+            .iter()
+            .any(|line| line.render(100).contains("Enter Pair first device")));
+    }
+
+    #[test]
+    fn manager_selection_scrolls_and_survives_resize_or_deletion() {
+        assert_eq!(viewport_start(0, Some(49), 50, 10), 40);
+        assert_eq!(viewport_start(40, Some(49), 50, 3), 47);
+        assert_eq!(viewport_start(47, Some(49), 2, 10), 0);
+        assert_eq!(viewport_start(99, None, 20, 5), 15);
+        assert_eq!(viewport_start(99, None, 0, 0), 0);
+        assert_eq!(safe_text("phone\x1b[2J\r\n"), "phone[2J");
+    }
 
     #[test]
     fn manager_fields_wrap_without_losing_url_or_message_text() {
@@ -1186,6 +2301,53 @@ mod tests {
             .collect::<String>();
         assert_eq!(reconstructed, value);
         assert!(lines.iter().all(|line| display_width(line) <= 24));
+    }
+
+    #[test]
+    fn manager_clips_viewport_in_cells_and_keeps_combining_marks_with_their_base() {
+        assert_eq!(display_width("中文e\u{301}"), 5);
+        assert_eq!(display_width("\x1b[30;47m中文e\u{301}\x1b[0m"), 5);
+        assert_eq!(clip_cells("中文e\u{301}X", 5), "中文e\u{301}");
+        assert_eq!(clip_cells("e\u{301}中", 1), "e\u{301}");
+        assert_eq!(clip_cells("中", 1), "");
+        assert_eq!(clip_cells("中文", 0), "");
+        // The viewport reserves the final cell to avoid terminal autowrap.
+        for width in [0_u16, 1, 2, 3, 5, 20] {
+            let budget = width.saturating_sub(1) as usize;
+            let text = safe_text("中文e\u{301}\r\n\x1b[2J");
+            assert!(display_width(clip_cells(&text, budget)) <= budget);
+        }
+    }
+
+    #[test]
+    fn manager_wide_fields_wrap_in_cells_without_losing_combining_or_cjk_text() {
+        let value = "中文e\u{301}界a\u{308}中文";
+        for width in [8, 10, 20] {
+            let mut lines = Vec::new();
+            push_wrapped_field(&mut lines, "名称", value, width);
+            assert!(lines.iter().all(|line| display_width(line) <= width));
+            let reconstructed = lines
+                .iter()
+                .enumerate()
+                .map(|(index, line)| {
+                    if index == 0 {
+                        line.strip_prefix("名称: ").unwrap()
+                    } else {
+                        line.trim_start()
+                    }
+                })
+                .collect::<String>();
+            assert_eq!(reconstructed, value);
+            assert!(lines
+                .iter()
+                .all(|line| !line.trim_start().starts_with(['\u{301}', '\u{308}'])));
+        }
+        for width in 0..=3 {
+            let mut lines = Vec::new();
+            push_wrapped_field(&mut lines, "名称", value, width);
+            assert!(!lines.is_empty());
+            assert!(lines.iter().all(|line| display_width(line) <= width));
+        }
     }
 
     #[test]
@@ -1216,6 +2378,79 @@ mod tests {
             .lines()
             .all(|line| display_width(line) == expected_width));
         assert_eq!(display_width("\x1b[30;47m█▀ \x1b[0m"), 3);
+    }
+
+    #[test]
+    fn manager_qr_layout_shows_a_whole_qr_or_an_address_fallback() {
+        let mut config = layout_config();
+        config.public_url =
+            "https://gateway.example.test/a-long-address-for-isolated-pairing".into();
+        let qr = render_qr(
+            &QrCode::with_error_correction_level(b"isolated-qr-layout", EcLevel::L).unwrap(),
+        );
+        let data = ManageData {
+            config: &config,
+            message: "ready",
+            pending: None,
+            devices: &[],
+            runtime: "stopped",
+            running: false,
+            autostart: "Off",
+            backend_states: &[],
+            qr: Some(&qr),
+            changed: false,
+        };
+        let mut ui = ManageView {
+            section: Section::Devices,
+            selected: 0,
+            scroll: 99,
+        };
+        let lines = manage_lines(&data, true, &mut ui, 100, 50);
+        assert_eq!(
+            lines.iter().filter(|line| line.qr.is_some()).count(),
+            qr.lines().count()
+        );
+        assert_eq!(ui.scroll, 0);
+        let lines = manage_lines(&data, true, &mut ui, 40, 8);
+        assert!(lines.iter().all(|line| line.qr.is_none()));
+        assert!(lines
+            .iter()
+            .any(|line| line.render(39).contains("Resize for the full QR")));
+        assert!(lines
+            .iter()
+            .any(|line| line.render(39).contains("Down for URL")));
+        let plain = |line: &ScreenLine| {
+            line.spans
+                .iter()
+                .map(|(text, _)| text.as_str())
+                .collect::<String>()
+        };
+        let expected = super::wrapped_rows("Address", &config.public_url, 39)
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>();
+        assert!(expected.len() > 1, "regression requires a wrapped address");
+        let mut visible = lines
+            .iter()
+            .map(plain)
+            .collect::<std::collections::HashSet<_>>();
+        assert!(!expected.iter().all(|row| visible.contains(row)));
+        // Stay at 40x8: arrows must reveal every address segment without
+        // permitting a partial QR or making the operator resize the terminal.
+        for _ in 0..10 {
+            ui.navigate(KeyCode::Down, 0);
+            let lines = manage_lines(&data, true, &mut ui, 40, 8);
+            assert!(lines.iter().all(|line| line.qr.is_none()));
+            assert!(lines
+                .iter()
+                .all(|line| display_width(&line.render(39)) <= 39));
+            visible.extend(lines.iter().map(plain));
+        }
+        assert!(ui.scroll > 0);
+        assert!(
+            expected.iter().all(|row| visible.contains(row)),
+            "address segments are unreachable: {expected:?}"
+        );
     }
 
     #[test]
