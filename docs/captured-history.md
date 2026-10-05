@@ -92,7 +92,12 @@ but never allocate a whole copied buffer on each poll. After expiry a first page
 creates a fresh snapshot. Pages belonging to different snapshot IDs must not be
 merged. Cursors bind to the authenticated device and complete request shape.
 
-Capture-buffer eviction, front truncation, detected resize, policy switching to
+A capture at its row or byte cap drops its oldest rows as new ones arrive. That
+front truncation slides the capture; it is not a reset. A cursor keeps serving
+while its page's rows are still held, and answers 410 once they have been
+trimmed away, without disturbing the traversal's newer pages.
+
+Capture-buffer eviction, detected resize, policy switching to
 native history, observed pane disappearance or changed terminal/workspace/tab
 identity invalidate snapshots. A detected topology resize makes pagination
 unavailable until the next captured frame, without changing legacy tail folding.
@@ -105,7 +110,7 @@ epochs.
 Every production capture path (HTTP tail output, parts, streamed polling and
 Gateway-enriched events) takes an internal request-start fence **before backend
 I/O**. Only an already-observed, capture-eligible pane can issue a fence. Identity,
-policy, size, disappearance, replacement, truncation and eviction resets invalidate
+policy, size, disappearance, replacement and eviction resets invalidate
 pending reads. Thus an old A response arriving after an observed switch to B
 cannot recreate B's buffer or become its history. A rejected capture still returns
 or forwards the backend's raw output, without stitching B's cache underneath it.
@@ -124,7 +129,7 @@ unobserved destroy/recreate with identical native identity cannot be detected.
 | `400 invalid_history_limit`, `invalid_format`, `invalid_source`, `invalid_history_identity`, `invalid_history_cursor` | Invalid input. Correct it before retrying. Malformed/unknown query fields are Axum 400 query rejections. |
 | `404 session_not_found` / `pane_not_found` | First-page target does not exist. |
 | `409 history_cursor_mismatch` | Known cursor used with another device, session, pane, format, limit or generation; also a cursor request naming another source. Drop traversal and start without `before`. |
-| `410 history_cursor_gone` | Unknown/forged, expired, evicted or reset cursor, or vanished pane during traversal. Drop traversal and start without `before`. A cursor from before Gateway restart is unknown and returns 410. |
+| `410 history_cursor_gone` | Unknown/forged, expired, evicted or reset cursor, a page whose rows the capture has since trimmed off its front, or vanished pane during traversal. Drop traversal and start without `before`. A cursor from before Gateway restart is unknown and returns 410. |
 | `413 history_snapshot_too_large` | A historical row or snapshot exceeds byte limits; no partial/truncated row is silently served. |
 | `503 history_storage_unavailable` | Captured storage failed; an empty success is not substituted. |
 | normal backend error | Live topology could not be checked; not proof that captured history is empty. |
@@ -134,8 +139,9 @@ unobserved destroy/recreate with identical native identity cannot be detected.
 No new dependencies or persistence. Existing live retention stays at 5,000 rows
 and 2 MiB per read-shape buffer, 48 buffers/24 MiB total. Snapshots add at most
 **32 snapshots / 8 MiB** (row capacities and row/page-vector allocations counted),
-at most **8 per session**, **2 per pane**, and **2 MiB per snapshot** including
-row/page-vector allocations. Each page has at most `limit` rows and **256 KiB**
+at most **8 per session**, **2 per pane**, and **2 MiB of row text per snapshot**
+(the live capture's own cap, so a full pane always pins; its row/page-vector
+allocations count toward the 8 MiB total). Each page has at most `limit` rows and **256 KiB**
 of raw UTF-8 row bytes plus one byte per row; JSON escaping/envelope overhead
 can enlarge the serialized response. Oldest-created snapshots are evicted to
 honor all limits. Cursor/page records are bounded by the 5,000 captured rows,

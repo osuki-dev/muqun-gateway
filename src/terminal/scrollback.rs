@@ -626,6 +626,11 @@ struct PaneBuffer {
     /// Identity for pagination only; legacy tail folding does not use it.
     epoch: Option<uuid::Uuid>,
     snapshot_ready: bool,
+    /// Rows dropped off the front at the size cap, ever. A trim slides the
+    /// window over the same capture rather than starting a new one, so it
+    /// does not change `epoch`; this is how a cursor tells whether the rows it
+    /// points at are still held.
+    trimmed: u64,
     lines: VecDeque<String>,
     hashes: VecDeque<u64>,
     bytes: usize,
@@ -894,16 +899,17 @@ impl PaneBuffer {
     }
 
     fn trim(&mut self) {
-        if self.lines.len() > MAX_PANE_LINES || self.bytes > MAX_PANE_BYTES {
-            // Positions held for later move with the front.
-            self.covered = None;
-            self.epoch = Some(uuid::Uuid::new_v4());
-        }
+        let before = self.lines.len();
         if self.lines.len() > MAX_PANE_LINES {
             self.drop_front(self.lines.len() - MAX_PANE_LINES);
         }
         while self.bytes > MAX_PANE_BYTES && self.lines.len() > 1 {
             self.drop_front(1);
+        }
+        if self.lines.len() < before {
+            // Positions held for later move with the front.
+            self.covered = None;
+            self.trimmed += (before - self.lines.len()) as u64;
         }
     }
 }
@@ -1486,6 +1492,10 @@ impl ScrollbackStore {
     }
 
     pub(crate) fn capture_epoch(&self, scope: &super::history::HistoryScope) -> Option<uuid::Uuid> {
+        self.captured_buffer(scope).and_then(|buffer| buffer.epoch)
+    }
+
+    fn captured_buffer(&self, scope: &super::history::HistoryScope) -> Option<&PaneBuffer> {
         self.buffers
             .get(&read_key(
                 &scope.session,
@@ -1493,8 +1503,7 @@ impl ScrollbackStore {
                 "recent_unwrapped",
                 &scope.format,
             ))
-            .filter(|buffer| buffer.snapshot_ready)
-            .and_then(|buffer| buffer.epoch)
+            .filter(|buffer| buffer.snapshot_ready && buffer.epoch.is_some())
     }
 
     /// The memory adapter's capture projection. No pagination or pinned state
@@ -1504,24 +1513,21 @@ impl ScrollbackStore {
         scope: &super::history::HistoryScope,
         include_rows: bool,
     ) -> Result<Option<super::history::Capture>, super::history::HistoryError> {
-        let Some(epoch) = self.capture_epoch(scope) else {
+        let Some(buffer) = self.captured_buffer(scope) else {
             return Ok(None);
         };
         let rows = if include_rows {
-            let buffer = &self.buffers[&read_key(
-                &scope.session,
-                &scope.pane,
-                "recent_unwrapped",
-                &scope.format,
-            )];
             let count = buffer.lines.len().saturating_sub(buffer.screen);
+            // Row text only, the same measure the live cap holds the buffer
+            // to: a pane at its cap is exactly the pane with history worth
+            // paging. Per-row allocation overhead is the snapshot store's to
+            // count, once, against its own budget.
             let bytes = buffer
                 .lines
                 .iter()
                 .take(count)
                 .map(String::len)
-                .sum::<usize>()
-                + count * std::mem::size_of::<String>();
+                .sum::<usize>();
             if bytes > MAX_PANE_BYTES
                 || buffer
                     .lines
@@ -1535,7 +1541,11 @@ impl ScrollbackStore {
         } else {
             Vec::new()
         };
-        Ok(Some(super::history::Capture { epoch, rows }))
+        Ok(Some(super::history::Capture {
+            epoch: buffer.epoch.expect("captured buffers carry an epoch"),
+            trimmed: buffer.trimmed,
+            rows,
+        }))
     }
 }
 
@@ -1804,8 +1814,8 @@ mod tests {
     }
 
     #[test]
-    fn captured_history_buffer_eviction_front_truncation_and_rule_resize_reset() {
-        for reset in 0..3 {
+    fn captured_history_buffer_eviction_and_rule_resize_reset() {
+        for reset in [0, 2] {
             let mut store = captured_history_store();
             let epoch = store.capture_epoch(&history_scope()).unwrap();
             match reset {
@@ -1813,14 +1823,6 @@ mod tests {
                     for i in 0..MAX_BUFFERS {
                         store.record(&format!("other{i}"), "unrelated", false);
                     }
-                }
-                1 => {
-                    let key = read_key("s", "p", "recent_unwrapped", "text");
-                    let buffer = store.buffers.get_mut(&key).unwrap();
-                    for _ in 0..MAX_PANE_LINES {
-                        buffer.push("more".into());
-                    }
-                    buffer.trim();
                 }
                 _ => {
                     store.record_frame("s", "p", "recent_unwrapped", "text", "──────────\na\nb\nc");
@@ -1835,6 +1837,34 @@ mod tests {
             }
             assert_ne!(store.capture_epoch(&history_scope()), Some(epoch));
         }
+    }
+
+    #[test]
+    fn front_truncation_at_the_cap_slides_the_capture_instead_of_resetting_it() {
+        let mut store = captured_history_store();
+        let fence = store.begin_capture("s", "p");
+        let before = store
+            .captured_history(&history_scope(), false)
+            .unwrap()
+            .unwrap();
+        let key = read_key("s", "p", "recent_unwrapped", "text");
+        let buffer = store.buffers.get_mut(&key).unwrap();
+        for _ in 0..MAX_PANE_LINES {
+            buffer.push("more".into());
+        }
+        let held = buffer.lines.len();
+        buffer.trim();
+        let after = store
+            .captured_history(&history_scope(), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.epoch, before.epoch);
+        assert_eq!(
+            after.trimmed,
+            before.trimmed + (held - MAX_PANE_LINES) as u64
+        );
+        // A read in flight across a trim is still this capture's.
+        assert!(store.accepts_capture("s", "p", fence));
     }
 
     #[test]
@@ -1941,8 +1971,8 @@ mod tests {
     }
 
     #[test]
-    fn capture_fences_do_not_resurrect_evicted_or_front_truncated_buffers() {
-        for evict in [true, false] {
+    fn capture_fences_do_not_resurrect_evicted_buffers() {
+        for evict in [true] {
             let mut store = captured_history_store();
             let fence = store.begin_capture("s", "p");
             if evict {

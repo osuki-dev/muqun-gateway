@@ -89,10 +89,12 @@ impl HistoryRepository for MemoryHistoryRepository {
 
     fn pin(&self, snapshot: HistorySnapshot) -> HistoryFuture<'_, Arc<HistorySnapshot>> {
         Box::pin(async move {
-            let bytes = snapshot.bytes();
-            if bytes > MAX_PANE_BYTES {
+            // Row text is held to the live capture's own cap; allocation
+            // overhead is counted once, in `bytes`, against the total budget.
+            if snapshot.row_bytes() > MAX_PANE_BYTES {
                 return Err(HistoryError::TooLarge);
             }
+            let bytes = snapshot.bytes();
             let mut snapshots = self
                 .snapshots
                 .lock()
@@ -248,6 +250,101 @@ mod tests {
         assert!(repository.snapshots.lock().unwrap().is_empty());
     }
 
+    /// Rows of `size` bytes, numbered from `from`, as one read.
+    fn rows(from: usize, count: usize, size: usize) -> String {
+        (from..from + count)
+            .map(|i| format!("{i:08} {}", "x".repeat(size - 9)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn frame(repository: &MemoryHistoryRepository, scope: &HistoryScope, text: &str) {
+        repository.captures.lock().unwrap().record_frame(
+            &scope.session,
+            &scope.pane,
+            "recent_unwrapped",
+            "text",
+            text,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pane_at_its_byte_cap_pages_and_keeps_paging_while_it_trims() {
+        let repository =
+            MemoryHistoryRepository::new(Arc::new(Mutex::new(ScrollbackStore::default())));
+        let scope = scope("s", "busy", 500);
+        // More than the cap in 1 KiB rows: the live buffer trims to exactly
+        // its 2 MiB, which used to answer 413 because the row overhead was
+        // counted on top of a budget the rows alone already filled.
+        let size = 1024;
+        let count = MAX_PANE_BYTES / size + 200;
+        feed(
+            &repository,
+            &scope,
+            &rows(0, count, size)
+                .split('\n')
+                .map(String::from)
+                .collect::<Vec<_>>(),
+        );
+        let pane = |width: u32| {
+            json!({"pane_id": scope.pane, "width": width, "height": 40,
+                   "scroll": {"max_offset_from_bottom": 0}})
+        };
+        repository
+            .captures
+            .lock()
+            .unwrap()
+            .observe(&scope.session, &pane(80));
+        frame(&repository, &scope, &rows(500_000, 4, size));
+        let mut answer = read_page(&repository, scope.clone(), None).await.unwrap();
+        let mut cursors = Vec::new();
+        while let Some(cursor) = answer["next_before"].as_str() {
+            cursors.push(cursor.to_owned());
+            answer = read_page(&repository, scope.clone(), Some(cursor))
+                .await
+                .unwrap();
+        }
+        assert!(cursors.len() >= 4, "{}", cursors.len());
+
+        // The pane keeps producing output: each new screen trims a few rows
+        // off the front -- here 8, which may empty the short oldest page and
+        // reach into the one after it. Every page whose rows are still held
+        // keeps serving, under the same epoch.
+        frame(&repository, &scope, &rows(1_000_000, 4, size));
+        frame(&repository, &scope, &rows(2_000_000, 4, size));
+        for cursor in &cursors[..cursors.len() - 2] {
+            read_page(&repository, scope.clone(), Some(cursor))
+                .await
+                .unwrap();
+        }
+        // Enough output to trim the oldest page away: that cursor alone is 410.
+        frame(&repository, &scope, &rows(3_000_000, 400, size));
+        frame(&repository, &scope, &rows(4_000_000, 4, size));
+        assert_eq!(
+            read_page(
+                &repository,
+                scope.clone(),
+                cursors.last().map(String::as_str)
+            )
+            .await,
+            Err(HistoryError::Gone)
+        );
+        read_page(&repository, scope.clone(), Some(&cursors[0]))
+            .await
+            .unwrap();
+
+        // A resize is a genuine reset: every cursor of the traversal is 410.
+        repository
+            .captures
+            .lock()
+            .unwrap()
+            .observe(&scope.session, &pane(120));
+        assert_eq!(
+            read_page(&repository, scope.clone(), Some(&cursors[0])).await,
+            Err(HistoryError::Gone)
+        );
+    }
+
     #[tokio::test]
     async fn memory_history_global_session_bytes_counts_and_oversized_rows_are_bounded() {
         let repository =
@@ -268,7 +365,7 @@ mod tests {
                     snapshots.values().map(|snap| snap.bytes()).sum::<usize>() <= MAX_TOTAL_BYTES
                 );
                 for snap in snapshots.values() {
-                    assert!(snap.bytes() <= MAX_PANE_BYTES);
+                    assert!(snap.row_bytes() <= MAX_PANE_BYTES);
                     assert!(
                         snapshots
                             .values()
