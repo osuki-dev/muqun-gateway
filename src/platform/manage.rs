@@ -764,14 +764,15 @@ fn print_manage_screen(
         Err(error) => format!("Unavailable: {}", first_line(&error.to_string())),
     };
     let autostart = autostart_label(&service::state());
+    let service_path = service::installed_path_env();
     let backend_states = config
         .sessions
         .iter()
         .map(|session| match session.backend {
-            BackendKind::Tmux if backend_program_state(session).contains("NOT FOUND") => {
-                String::from("tmux executable not found")
-            }
-            BackendKind::Tmux => String::from("tmux executable available"),
+            BackendKind::Tmux => tmux_availability(
+                &std::env::var("PATH").unwrap_or_default(),
+                service_path.as_deref(),
+            ),
             BackendKind::Herdr => String::from("Herdr socket configured"),
         })
         .collect::<Vec<_>>();
@@ -814,6 +815,32 @@ fn print_manage_screen(
     };
     let lines = manage_lines(&data, show_qr, ui, width, height);
     write_viewport(&lines, width, height)
+}
+
+/// Whether tmux can be found by the gateway that will run it. With a service
+/// installed that is the unit's pinned `PATH`, not this shell's: a Homebrew
+/// tmux on the shell's `PATH` but not the unit's is what leaves the service's
+/// tmux backend unavailable while `tmux -V` works here.
+fn tmux_availability(shell_path: &str, service_path: Option<&str>) -> String {
+    let shell = crate::terminal::login_env::lookup(crate::backend::TMUX_PROGRAM, shell_path);
+    let Some(service_path) = service_path else {
+        return String::from(if shell.is_some() {
+            "tmux executable available"
+        } else {
+            "tmux executable not found"
+        });
+    };
+    match (
+        crate::terminal::login_env::lookup(crate::backend::TMUX_PROGRAM, service_path),
+        shell,
+    ) {
+        (Some(_), _) => String::from("tmux available to the service"),
+        (None, Some(found)) => format!(
+            "tmux NOT on the service's PATH (this shell has {}); reinstall the service from this shell",
+            found.display()
+        ),
+        (None, None) => String::from("tmux not found (service or this shell)"),
+    }
 }
 
 fn safe_text(value: &str) -> String {
@@ -1995,6 +2022,44 @@ mod tests {
         ManageData, ManageView, ScreenLine, Section, Tone,
     };
     use crate::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn tmux_availability_is_judged_on_the_service_path_and_labelled() {
+        use super::tmux_availability;
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = std::env::temp_dir().join(format!("manage-tmux-{}", uuid::Uuid::new_v4()));
+        let with = root.join("brew/bin");
+        let without = root.join("usr/bin");
+        std::fs::create_dir_all(&with).unwrap();
+        std::fs::create_dir_all(&without).unwrap();
+        let tmux = with.join(crate::backend::TMUX_PROGRAM);
+        std::fs::write(&tmux, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (with, without) = (with.display().to_string(), without.display().to_string());
+
+        assert_eq!(tmux_availability(&with, None), "tmux executable available");
+        assert_eq!(
+            tmux_availability(&without, None),
+            "tmux executable not found"
+        );
+        assert_eq!(
+            tmux_availability(&without, Some(&with)),
+            "tmux available to the service"
+        );
+        // The case the shell alone cannot see: found here, not by the service.
+        let state = tmux_availability(&with, Some(&without));
+        assert!(
+            state.starts_with("tmux NOT on the service's PATH"),
+            "{state}"
+        );
+        assert!(state.contains(&tmux.display().to_string()), "{state}");
+        assert_eq!(
+            tmux_availability(&without, Some(&without)),
+            "tmux not found (service or this shell)"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn autostart_toggle_never_uninstalls_a_stopped_or_unreadable_service() {

@@ -252,15 +252,52 @@ fn plist_program_arguments(contents: &str) -> Option<Vec<String>> {
     let mut rest = array;
     while let Some((_, tail)) = rest.split_once("<string>") {
         let (value, tail) = tail.split_once("</string>")?;
-        arguments.push(
-            value
-                .replace("&lt;", "<")
-                .replace("&gt;", ">")
-                .replace("&amp;", "&"),
-        );
+        arguments.push(xml_unescape(value));
         rest = tail;
     }
     Some(arguments)
+}
+
+fn xml_unescape(value: &str) -> String {
+    value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// The `PATH` the installed unit pins for the gateway, if a unit is installed.
+/// What the supervised gateway finds programs on -- not this shell's `PATH`.
+pub fn installed_path_env() -> Option<String> {
+    unit_path_env(&std::fs::read_to_string(unit_path().ok()?).ok()?)
+}
+
+/// `PATH` from either unit format: the plist's `EnvironmentVariables`, or the
+/// systemd unit's quoted `Environment="PATH=..."` (see `systemd_word`).
+fn unit_path_env(contents: &str) -> Option<String> {
+    if let Some((_, after)) = contents.split_once("<key>PATH</key>") {
+        let (value, _) = after
+            .trim_start()
+            .strip_prefix("<string>")?
+            .split_once("</string>")?;
+        return Some(xml_unescape(value));
+    }
+    let quoted = contents
+        .lines()
+        .find_map(|line| line.strip_prefix("Environment=\"PATH="))?
+        .strip_suffix('"')?;
+    let mut value = String::new();
+    let mut chars = quoted.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => value.extend(chars.next()),
+            '%' => {
+                chars.next();
+                value.push('%');
+            }
+            _ => value.push(ch),
+        }
+    }
+    Some(value)
 }
 
 /// Reload before inspecting: a later reload between validation and stop would
@@ -868,6 +905,21 @@ mod tests {
         assert!(!registers_at_login(
             &launch_agent_plist(&paths()).replace(SERVICE_LABEL, "dev.example.other")
         ));
+    }
+
+    #[test]
+    fn the_path_a_unit_pins_is_read_back_exactly_from_either_format() {
+        let mut fixture = paths();
+        fixture.path = String::from("/opt/a&b/bin:/home/x \"y\"/50%/bin:/usr/bin");
+        assert_eq!(
+            unit_path_env(&launch_agent_plist(&fixture)).as_deref(),
+            Some(fixture.path.as_str())
+        );
+        assert_eq!(
+            unit_path_env(&systemd_unit(&fixture).unwrap()).as_deref(),
+            Some(fixture.path.as_str())
+        );
+        assert_eq!(unit_path_env("[Service]\nExecStart=/bin/true\n"), None);
     }
 
     #[test]

@@ -9,6 +9,13 @@ use crate::{config_dir, load_config, process_matches_name, state_dir, supervisio
 
 pub(crate) use service::ServiceAction as Action;
 
+/// Where a supervised gateway's own diagnostics go besides its log file.
+#[cfg(target_os = "macos")]
+const SERVICE_LOGS: &str =
+    "launchd's view of it (`log show --last 10m --predicate 'process == \"launchd\"' | grep muqun`)";
+#[cfg(not(target_os = "macos"))]
+const SERVICE_LOGS: &str = "the service journal (`journalctl --user -u dev.osuki.muqun-gateway`)";
+
 pub(crate) fn running_pid() -> anyhow::Result<Option<u32>> {
     let owner = state_lock::running_owner(&state_dir()?)?;
     if let Some(pid) = owner {
@@ -142,7 +149,7 @@ impl Controller {
             })
             .with_context(|| {
                 format!(
-                    "gateway did not become ready; inspect {} and the service journal",
+                    "gateway did not become ready; inspect {} and {SERVICE_LOGS}",
                     state.join(crate::LOG_FILE).display()
                 )
             })?;

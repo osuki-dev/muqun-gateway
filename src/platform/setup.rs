@@ -978,10 +978,21 @@ pub(crate) fn stop_detached() -> anyhow::Result<()> {
             "a supervisor owns gateway pid {pid}; refusing a direct signal"
         );
         #[cfg(target_os = "macos")]
-        anyhow::ensure!(
-            !service::owns_pid(pid),
-            "launchd owns gateway pid {pid}; refusing a direct signal"
-        );
+        {
+            anyhow::ensure!(
+                !service::owns_pid(pid),
+                "launchd owns gateway pid {pid}; refusing a direct signal"
+            );
+            // macOS cannot tell a gateway this CLI detached from one another
+            // LaunchAgent (`brew services`, a hand-written plist) runs. Say
+            // what is about to happen, so a respawn loop has an explanation.
+            eprintln!(
+                "stopping gateway pid {pid} with SIGTERM: it is not run by the {} LaunchAgent. \
+                 If another LaunchAgent runs it, launchd will start it again; stop it with \
+                 `launchctl bootout gui/$(id -u)/<its label>` instead.",
+                service::SERVICE_LABEL
+            );
+        }
         stop_pid(pid)?;
         lifecycle::wait_for(std::time::Duration::from_secs(15), || {
             Ok(state_lock::running_owner(&state_dir()?)?.is_none())
