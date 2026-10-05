@@ -623,6 +623,9 @@ fn common_suffix(previous: &[u64], current: &[u64], carries: &[bool]) -> usize {
 
 #[derive(Debug, Default)]
 struct PaneBuffer {
+    /// Identity for pagination only; legacy tail folding does not use it.
+    epoch: Option<uuid::Uuid>,
+    snapshot_ready: bool,
     lines: VecDeque<String>,
     hashes: VecDeque<u64>,
     bytes: usize,
@@ -704,6 +707,9 @@ impl PaneBuffer {
         let settling = self.settling > 0;
         self.settling = self.settling.saturating_sub(1);
         if owns_screen || settling || self.lines.is_empty() {
+            if !self.lines.is_empty() {
+                self.epoch = Some(uuid::Uuid::new_v4());
+            }
             self.drop_back(self.lines.len());
             self.set_aside.clear();
             self.covered = None;
@@ -891,6 +897,7 @@ impl PaneBuffer {
         if self.lines.len() > MAX_PANE_LINES || self.bytes > MAX_PANE_BYTES {
             // Positions held for later move with the front.
             self.covered = None;
+            self.epoch = Some(uuid::Uuid::new_v4());
         }
         if self.lines.len() > MAX_PANE_LINES {
             self.drop_front(self.lines.len() - MAX_PANE_LINES);
@@ -923,9 +930,24 @@ pub struct ScrollbackStore {
     /// every agent pane (`is_editor_command`'s doc says why that has to be
     /// true).
     owns_screen: HashMap<String, bool>,
+    identities: HashMap<String, PaneObservation>,
     total_bytes: usize,
     clock: u64,
 }
+
+#[derive(Debug)]
+struct PaneObservation {
+    identity: Value,
+    size: Value,
+    /// Request-start fence, independent of buffer existence and read shape.
+    /// Rotated on observed pane/policy resets and destructive buffer resets.
+    capture_generation: uuid::Uuid,
+}
+
+/// A read can contribute only to the pane generation observed before its I/O.
+/// Unknown/ineligible panes get no fence and cannot become eligible mid-read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CaptureFence(uuid::Uuid);
 
 /// `session/pane`, the key the zero-backlog verdict is held under.
 fn pane_key(session_id: &str, pane_id: &str) -> String {
@@ -985,22 +1007,54 @@ impl ScrollbackStore {
     pub fn observe(&mut self, session_id: &str, value: &Value) {
         let mut passed_through = Vec::new();
         visit_panes(value, &mut |pane_id, pane| {
+            let key = pane_key(session_id, pane_id);
+            let identity = serde_json::json!([
+                pane.get("terminal_id"),
+                pane.get("workspace_id"),
+                pane.get("tab_id")
+            ]);
+            let size = serde_json::json!([pane.get("width"), pane.get("height")]);
+            if let Some(observed) = self.identities.get(&key) {
+                if observed.identity != identity {
+                    self.forget_pane(session_id, pane_id);
+                } else if observed.size != size {
+                    self.invalidate_capture(session_id, pane_id);
+                }
+            }
+            let capture_generation = self
+                .identities
+                .get(&key)
+                .map_or_else(uuid::Uuid::new_v4, |observed| observed.capture_generation);
+            self.identities.insert(
+                key,
+                PaneObservation {
+                    identity,
+                    size,
+                    capture_generation,
+                },
+            );
             if let Some(scroll) = pane.get("scroll").and_then(Value::as_object) {
                 if let Some(maximum) = scroll.get("max_offset_from_bottom").and_then(Value::as_f64)
                 {
                     let alternate = scroll.get("alternate_on").and_then(Value::as_bool);
                     let kept = alternate == Some(true) || maximum <= 0.0;
-                    self.kept.insert(pane_key(session_id, pane_id), kept);
+                    let was = self.kept.insert(pane_key(session_id, pane_id), kept);
+                    if was.is_some_and(|was| was != kept) {
+                        self.invalidate_capture(session_id, pane_id);
+                    }
                     if !kept {
                         passed_through.push(pane_id.to_owned());
                     }
                 }
             }
             if let Some(command) = pane.get("foreground_command").and_then(Value::as_str) {
-                self.owns_screen.insert(
-                    pane_key(session_id, pane_id),
-                    is_editor_command(Some(command)),
-                );
+                let owns_screen = is_editor_command(Some(command));
+                let was = self
+                    .owns_screen
+                    .insert(pane_key(session_id, pane_id), owns_screen);
+                if was.unwrap_or(false) != owns_screen {
+                    self.invalidate_capture(session_id, pane_id);
+                }
             }
         });
         for pane_id in passed_through {
@@ -1029,6 +1083,17 @@ impl ScrollbackStore {
             live.insert(pane_key(session_id, pane_id));
         });
         let prefix = format!("{session_id}/");
+        let gone: Vec<String> = self
+            .identities
+            .keys()
+            .filter(|key| key.starts_with(&prefix) && !live.contains(*key))
+            .map(|key| key[prefix.len()..].to_owned())
+            .collect();
+        for pane in gone {
+            self.forget_pane(session_id, &pane);
+        }
+        self.identities
+            .retain(|key, _| !key.starts_with(&prefix) || live.contains(key));
         self.kept
             .retain(|key, _| !key.starts_with(&prefix) || live.contains(key));
         self.owns_screen
@@ -1073,6 +1138,43 @@ impl ScrollbackStore {
             .unwrap_or(false)
     }
 
+    /// Take immediately before initiating a backend read; never hold a guard
+    /// during I/O. No mutable map entry is created for an unobserved pane.
+    pub(crate) fn begin_capture(&self, session_id: &str, pane_id: &str) -> Option<CaptureFence> {
+        if !self.keeps(session_id, pane_id) {
+            return None;
+        }
+        self.identities
+            .get(&pane_key(session_id, pane_id))
+            .map(|observed| CaptureFence(observed.capture_generation))
+    }
+
+    fn advance_capture_generation(&mut self, session_id: &str, pane_id: &str) {
+        if let Some(observed) = self.identities.get_mut(&pane_key(session_id, pane_id)) {
+            observed.capture_generation = uuid::Uuid::new_v4();
+        }
+    }
+
+    fn invalidate_capture(&mut self, session_id: &str, pane_id: &str) {
+        self.advance_capture_generation(session_id, pane_id);
+        let prefix = format!("{}/", pane_key(session_id, pane_id));
+        for (read, buffer) in &mut self.buffers {
+            if read.starts_with(&prefix) {
+                buffer.epoch = Some(uuid::Uuid::new_v4());
+                buffer.snapshot_ready = false;
+            }
+        }
+    }
+
+    fn accepts_capture(
+        &self,
+        session_id: &str,
+        pane_id: &str,
+        fence: Option<CaptureFence>,
+    ) -> bool {
+        fence.is_some() && fence == self.begin_capture(session_id, pane_id)
+    }
+
     /// What the observation rule alone says about this pane, with the feature
     /// switch left out of it. The switch is a shipping decision; the rule is
     /// the thing the tests are about.
@@ -1104,19 +1206,24 @@ impl ScrollbackStore {
     /// editor. The client fixes the identical mistake in `foldPaneRead`'s own
     /// `ownsScreen` (see `src/terminal/history.ts` in the Muqun repo, card
     /// #795, defect 2).
-    fn record(&mut self, key: &str, text: &str, owns_screen: bool) {
+    fn record(&mut self, key: &str, text: &str, owns_screen: bool) -> bool {
         let incoming = split_lines(text);
         if incoming.is_empty() {
-            return;
+            return false;
         }
         self.clock += 1;
         let clock = self.clock;
         let buffer = self.buffers.entry(key.to_owned()).or_default();
+        let previous_epoch = buffer.epoch;
+        buffer.epoch.get_or_insert_with(uuid::Uuid::new_v4);
+        buffer.snapshot_ready = true;
         let before = buffer.bytes;
         buffer.touched = clock;
         buffer.fold(incoming, owns_screen);
+        let reset = previous_epoch.is_some() && buffer.epoch != previous_epoch;
         self.total_bytes = self.total_bytes + buffer.bytes - before;
         self.evict();
+        reset
     }
 
     /// How many rows are held for one read shape of a pane.
@@ -1156,33 +1263,33 @@ impl ScrollbackStore {
     /// truthfully serve. Callers never compare bytes or assemble storage keys:
     /// history depth is a row property and the source/format pair is part of the
     /// store's identity for that read.
-    pub fn serve_read(
+    pub(crate) fn serve_read_fenced(
         &mut self,
         session_id: &str,
         pane_id: &str,
-        source: &str,
-        format: &str,
+        (source, format): (&str, &str),
         backend_text: &str,
         rows: usize,
+        fence: Option<CaptureFence>,
     ) -> String {
-        let kept = self.keeps(session_id, pane_id);
+        if !self.accepts_capture(session_id, pane_id, fence) {
+            // Do not stitch another generation's cache under a stale response.
+            return backend_text.to_owned();
+        }
         let owns_screen = self.owns_screen(session_id, pane_id);
         trace_read(
             session_id,
             pane_id,
             source,
             format,
-            kept,
+            true, // accepts_capture already checked the current keep policy.
             owns_screen,
             backend_text,
         );
-        if !kept {
-            self.forget_pane(session_id, pane_id);
-            return backend_text.to_owned();
-        }
-
         let key = read_key(session_id, pane_id, source, format);
-        self.record(&key, backend_text, owns_screen);
+        if self.record(&key, backend_text, owns_screen) {
+            self.advance_capture_generation(session_id, pane_id);
+        }
         let backend_rows = split_lines(backend_text).len();
         self.window(&key, rows)
             .filter(|served| split_lines(served).len() > backend_rows)
@@ -1192,6 +1299,57 @@ impl ScrollbackStore {
     /// Record a sampled stream frame under the same policy as a direct read.
     /// This deliberately returns nothing: serving is decided only when a client
     /// asks for a bounded read window.
+    pub(crate) fn record_frame_fenced(
+        &mut self,
+        session_id: &str,
+        pane_id: &str,
+        source: &str,
+        format: &str,
+        output: &str,
+        fence: Option<CaptureFence>,
+    ) {
+        if output.is_empty() || !self.accepts_capture(session_id, pane_id, fence) {
+            return;
+        }
+        let owns_screen = self.owns_screen(session_id, pane_id);
+        trace_read(
+            session_id,
+            pane_id,
+            source,
+            format,
+            true,
+            owns_screen,
+            output,
+        );
+        let key = read_key(session_id, pane_id, source, format);
+        if self.record(&key, output, owns_screen) {
+            self.advance_capture_generation(session_id, pane_id);
+        }
+    }
+
+    /// Synchronous test/replay ingestion has no intervening backend I/O.
+    #[cfg(test)]
+    pub fn serve_read(
+        &mut self,
+        session_id: &str,
+        pane_id: &str,
+        source: &str,
+        format: &str,
+        backend_text: &str,
+        rows: usize,
+    ) -> String {
+        let fence = self.begin_capture(session_id, pane_id);
+        self.serve_read_fenced(
+            session_id,
+            pane_id,
+            (source, format),
+            backend_text,
+            rows,
+            fence,
+        )
+    }
+
+    #[cfg(test)]
     pub fn record_frame(
         &mut self,
         session_id: &str,
@@ -1200,26 +1358,8 @@ impl ScrollbackStore {
         format: &str,
         output: &str,
     ) {
-        if output.is_empty() {
-            return;
-        }
-        let kept = self.keeps(session_id, pane_id);
-        let owns_screen = self.owns_screen(session_id, pane_id);
-        trace_read(
-            session_id,
-            pane_id,
-            source,
-            format,
-            kept,
-            owns_screen,
-            output,
-        );
-        if !kept {
-            self.forget_pane(session_id, pane_id);
-            return;
-        }
-        let key = read_key(session_id, pane_id, source, format);
-        self.record(&key, output, owns_screen);
+        let fence = self.begin_capture(session_id, pane_id);
+        self.record_frame_fenced(session_id, pane_id, source, format, output, fence);
     }
 
     /// Drop every buffer held for this pane.
@@ -1235,6 +1375,7 @@ impl ScrollbackStore {
     /// from the current screen loses nothing the reader needs: while the pane
     /// was passed through, Herdr's own history was what got served.
     fn forget_pane(&mut self, session_id: &str, pane_id: &str) {
+        self.advance_capture_generation(session_id, pane_id);
         let prefix = format!("{}/", pane_key(session_id, pane_id));
         let mut freed = 0;
         self.buffers.retain(|key, buffer| {
@@ -1331,8 +1472,70 @@ impl ScrollbackStore {
             };
             if let Some(buffer) = self.buffers.remove(&oldest) {
                 self.total_bytes = self.total_bytes.saturating_sub(buffer.bytes);
+                // A late read must not resurrect a buffer from before eviction.
+                // Buffer keys extend the existing pane key by `/source/format`.
+                for (pane, observed) in &mut self.identities {
+                    if oldest.starts_with(pane.as_str())
+                        && oldest.as_bytes().get(pane.len()) == Some(&b'/')
+                    {
+                        observed.capture_generation = uuid::Uuid::new_v4();
+                    }
+                }
             }
         }
+    }
+
+    pub(crate) fn capture_epoch(&self, scope: &super::history::HistoryScope) -> Option<uuid::Uuid> {
+        self.buffers
+            .get(&read_key(
+                &scope.session,
+                &scope.pane,
+                "recent_unwrapped",
+                &scope.format,
+            ))
+            .filter(|buffer| buffer.snapshot_ready)
+            .and_then(|buffer| buffer.epoch)
+    }
+
+    /// The memory adapter's capture projection. No pagination or pinned state
+    /// lives in the fold; metadata-only checks do not copy any rows.
+    pub(crate) fn captured_history(
+        &self,
+        scope: &super::history::HistoryScope,
+        include_rows: bool,
+    ) -> Result<Option<super::history::Capture>, super::history::HistoryError> {
+        let Some(epoch) = self.capture_epoch(scope) else {
+            return Ok(None);
+        };
+        let rows = if include_rows {
+            let buffer = &self.buffers[&read_key(
+                &scope.session,
+                &scope.pane,
+                "recent_unwrapped",
+                &scope.format,
+            )];
+            let count = buffer.lines.len().saturating_sub(buffer.screen);
+            let bytes = buffer
+                .lines
+                .iter()
+                .take(count)
+                .map(String::len)
+                .sum::<usize>()
+                + count * std::mem::size_of::<String>();
+            if bytes > MAX_PANE_BYTES
+                || buffer
+                    .lines
+                    .iter()
+                    .take(count)
+                    .any(|row| row.len() + 1 > super::history::MAX_PAGE_BYTES)
+            {
+                return Err(super::history::HistoryError::TooLarge);
+            }
+            buffer.lines.iter().take(count).cloned().collect()
+        } else {
+            Vec::new()
+        };
+        Ok(Some(super::history::Capture { epoch, rows }))
     }
 }
 
@@ -1494,6 +1697,278 @@ pub fn replace_read_text(value: &mut Value, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn history_scope() -> super::super::history::HistoryScope {
+        super::super::history::HistoryScope {
+            session: "s".into(),
+            pane: "p".into(),
+            format: "text".into(),
+            device: "d".into(),
+            generation: "g".into(),
+            limit: 2,
+        }
+    }
+
+    fn history_pane(width: u32, terminal: &str) -> Value {
+        serde_json::json!({"pane_id": "p", "terminal_id": terminal,
+            "workspace_id": "w", "tab_id": "t", "width": width, "height": 4,
+            "scroll": {"max_offset_from_bottom": 0, "viewport_rows": 4}})
+    }
+
+    fn captured_history_store() -> ScrollbackStore {
+        let mut store = ScrollbackStore::default();
+        store.observe_listing(
+            "s",
+            &serde_json::json!({"panes": [history_pane(80, "term")]}),
+        );
+        for top in 0..8 {
+            let frame = (top..top + 4)
+                .map(|i| format!("row {i}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            store.record_frame("s", "p", "recent_unwrapped", "text", &frame);
+        }
+        store
+    }
+
+    #[test]
+    fn captured_history_projection_excludes_viewport_and_does_not_convert_formats() {
+        let mut store = captured_history_store();
+        let first = store
+            .captured_history(&history_scope(), true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            first.rows,
+            (0..7).map(|i| format!("row {i}")).collect::<Vec<_>>()
+        );
+        assert!(store
+            .captured_history(&history_scope(), false)
+            .unwrap()
+            .unwrap()
+            .rows
+            .is_empty());
+        store.record_frame(
+            "s",
+            "p",
+            "recent_unwrapped",
+            "text",
+            "row 8\nrow 9\nrow 10\nrow 11",
+        );
+        store.record_frame(
+            "s",
+            "p",
+            "recent_unwrapped",
+            "text",
+            "row 8\nrow 9\nrow 10\nrepaint",
+        );
+        assert_eq!(store.capture_epoch(&history_scope()), Some(first.epoch));
+        let mut ansi = history_scope();
+        ansi.format = "ansi".into();
+        assert!(store.captured_history(&ansi, true).unwrap().is_none());
+    }
+
+    #[test]
+    fn captured_history_resize_identity_disappearance_and_native_policy_reset() {
+        for reset in 0..4 {
+            let mut store = captured_history_store();
+            let epoch = store.capture_epoch(&history_scope()).unwrap();
+            match reset {
+                0 => store.observe("s", &history_pane(120, "term")),
+                1 => store.observe("s", &history_pane(80, "recreated")),
+                2 => store.observe_listing("s", &serde_json::json!({"panes": []})),
+                _ => {
+                    let mut pane = history_pane(80, "term");
+                    pane["scroll"]["max_offset_from_bottom"] = serde_json::json!(200);
+                    store.observe("s", &pane);
+                }
+            }
+            assert_ne!(store.capture_epoch(&history_scope()), Some(epoch));
+            assert!(store
+                .captured_history(&history_scope(), true)
+                .unwrap()
+                .is_none());
+            if reset == 2 {
+                store.observe_listing(
+                    "s",
+                    &serde_json::json!({"panes": [history_pane(80, "term")]}),
+                );
+                store.record_frame("s", "p", "recent_unwrapped", "text", "new incarnation");
+                assert_eq!(
+                    store.depth("s", "p"),
+                    1,
+                    "no old rows leak after known ID reuse"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn captured_history_buffer_eviction_front_truncation_and_rule_resize_reset() {
+        for reset in 0..3 {
+            let mut store = captured_history_store();
+            let epoch = store.capture_epoch(&history_scope()).unwrap();
+            match reset {
+                0 => {
+                    for i in 0..MAX_BUFFERS {
+                        store.record(&format!("other{i}"), "unrelated", false);
+                    }
+                }
+                1 => {
+                    let key = read_key("s", "p", "recent_unwrapped", "text");
+                    let buffer = store.buffers.get_mut(&key).unwrap();
+                    for _ in 0..MAX_PANE_LINES {
+                        buffer.push("more".into());
+                    }
+                    buffer.trim();
+                }
+                _ => {
+                    store.record_frame("s", "p", "recent_unwrapped", "text", "──────────\na\nb\nc");
+                    store.record_frame(
+                        "s",
+                        "p",
+                        "recent_unwrapped",
+                        "text",
+                        "───────────────\na\nb\nc",
+                    );
+                }
+            }
+            assert_ne!(store.capture_epoch(&history_scope()), Some(epoch));
+        }
+    }
+
+    #[test]
+    fn capture_fences_reject_unknown_policy_and_observed_resets_without_stitching() {
+        let mut unknown = ScrollbackStore::default();
+        let fence = unknown.begin_capture("s", "p");
+        assert!(fence.is_none());
+        unknown.observe("s", &history_pane(80, "B"));
+        assert_eq!(
+            unknown.serve_read_fenced(
+                "s",
+                "p",
+                ("recent_unwrapped", "text"),
+                "unknown A",
+                200,
+                fence
+            ),
+            "unknown A"
+        );
+        assert_eq!(unknown.depth("s", "p"), 0);
+        for reset in 0..5 {
+            let mut store = captured_history_store();
+            let fence = store.begin_capture("s", "p");
+            assert!(fence.is_some());
+            match reset {
+                0 => store.observe("s", &history_pane(80, "B")),
+                1 => store.observe("s", &history_pane(120, "term")),
+                2 => {
+                    store.observe_listing("s", &serde_json::json!({"panes": []}));
+                    store.observe("s", &history_pane(80, "term"));
+                }
+                3 => {
+                    let mut pane = history_pane(80, "term");
+                    pane["scroll"]["max_offset_from_bottom"] = serde_json::json!(200);
+                    store.observe("s", &pane);
+                    store.observe("s", &history_pane(80, "term"));
+                }
+                _ => {
+                    let mut pane = history_pane(80, "term");
+                    pane["foreground_command"] = serde_json::json!("nvim");
+                    store.observe("s", &pane);
+                }
+            }
+            assert!(!store.accepts_capture("s", "p", fence));
+            let fresh = store.begin_capture("s", "p");
+            store.record_frame_fenced("s", "p", "recent_unwrapped", "text", "B frame", fresh);
+            let depth = store.depth("s", "p");
+            assert_eq!(
+                store.serve_read_fenced(
+                    "s",
+                    "p",
+                    ("recent_unwrapped", "text"),
+                    "A late",
+                    200,
+                    fence
+                ),
+                "A late"
+            );
+            store.record_frame_fenced("s", "p", "recent_unwrapped", "text", "A late", fence);
+            assert_eq!(store.depth("s", "p"), depth);
+        }
+    }
+
+    #[test]
+    fn full_editor_and_settling_replacements_rotate_epochs_but_normal_polls_do_not() {
+        for editor in [true, false] {
+            let mut store = captured_history_store();
+            let epoch = store.capture_epoch(&history_scope());
+            let fence = store.begin_capture("s", "p");
+            // Exercise the fold replacement itself independently of observation
+            // invalidation: editor ownership and resize-settling are both resets.
+            if editor {
+                store.owns_screen.insert(pane_key("s", "p"), true);
+            } else {
+                store
+                    .buffers
+                    .get_mut(&read_key("s", "p", "recent_unwrapped", "text"))
+                    .unwrap()
+                    .settling = 1;
+            }
+            store.record_frame_fenced("s", "p", "recent_unwrapped", "text", "new screen", fence);
+            assert_ne!(store.capture_epoch(&history_scope()), epoch);
+            assert!(!store.accepts_capture("s", "p", fence));
+            assert!(store
+                .captured_history(&history_scope(), true)
+                .unwrap()
+                .unwrap()
+                .rows
+                .is_empty());
+        }
+        let mut normal = captured_history_store();
+        let epoch = normal.capture_epoch(&history_scope());
+        let fence = normal.begin_capture("s", "p");
+        normal.record_frame_fenced(
+            "s",
+            "p",
+            "recent_unwrapped",
+            "text",
+            "row 7\nrow 8\nrow 9\nrow 10",
+            fence,
+        );
+        assert_eq!(normal.capture_epoch(&history_scope()), epoch);
+        assert!(normal.accepts_capture("s", "p", fence));
+    }
+
+    #[test]
+    fn capture_fences_do_not_resurrect_evicted_or_front_truncated_buffers() {
+        for evict in [true, false] {
+            let mut store = captured_history_store();
+            let fence = store.begin_capture("s", "p");
+            if evict {
+                for i in 0..MAX_BUFFERS {
+                    store.record(&format!("other{i}"), "unrelated", false);
+                }
+            } else {
+                let frame = (0..MAX_PANE_LINES)
+                    .map(|i| format!("new row {i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                store.record_frame_fenced("s", "p", "recent_unwrapped", "text", &frame, fence);
+            }
+            assert!(!store.accepts_capture("s", "p", fence));
+            let depth = store.depth("s", "p");
+            store.record_frame_fenced(
+                "s",
+                "p",
+                "recent_unwrapped",
+                "text",
+                "late old frame",
+                fence,
+            );
+            assert_eq!(store.depth("s", "p"), depth);
+        }
+    }
 
     /// Replay a captured pane through the store and measure what it kept.
     ///

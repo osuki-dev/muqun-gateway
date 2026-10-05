@@ -74,6 +74,10 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     );
     agent_runtime.spawn_supervisor();
 
+    let scrollback = Arc::new(Mutex::new(scrollback::ScrollbackStore::default()));
+    let history = Arc::new(terminal::history_memory::MemoryHistoryRepository::new(
+        scrollback.clone(),
+    ));
     let state = AppState {
         config,
         pending_pairing: Arc::new(Mutex::new(None)),
@@ -81,7 +85,8 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         push_tokens: Arc::new(Mutex::new(load_push_tokens_for_service())),
         devices: Arc::new(Mutex::new(load_devices_for_service()?)),
         assets: Arc::new(Mutex::new(AssetIndex::default())),
-        scrollback: Arc::new(Mutex::new(scrollback::ScrollbackStore::default())),
+        scrollback,
+        history,
         agent_events: Arc::new(Mutex::new(agent_events::AgentEventLog::default())),
         approval_events: tokio::sync::broadcast::channel(APPROVAL_EVENT_CAPACITY).0,
         activity: Arc::new(Mutex::new(HashMap::new())),

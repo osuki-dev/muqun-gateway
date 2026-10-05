@@ -49,6 +49,12 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
   - `scrollback.rs`: bounded scrollback retention and the application policy
     for observing frames and serving row-bounded reads. Callers do not assemble
     cache keys or compare output byte lengths.
+  - `history.rs`, `history_memory.rs`, `history_routes.rs`: captured-history
+    pagination use case and async repository port, the current memory adapter,
+    and authenticated HTTP boundary. Captured historical prefix only, separately
+    from native ranges and the mutable viewport; bounded ephemeral snapshots.
+    Storage is selected at server composition (memory only now); contract and
+    future persistence-switch constraints in `docs/captured-history.md`.
   - `login_env.rs`: the `PATH` and `LC_CTYPE` a backend actually needs,
     recovered from a login shell. An init system starts the gateway with neither,
     and the tmux adapter cannot spawn tmux without the first or parse its output

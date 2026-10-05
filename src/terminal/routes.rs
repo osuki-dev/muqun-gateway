@@ -106,6 +106,10 @@ pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
             get(pane_output),
         )
         .route(
+            "/api/sessions/{session_id}/panes/{pane_id}/history",
+            get(super::history_routes::pane_history),
+        )
+        .route(
             "/api/sessions/{session_id}/panes/{pane_id}/parts",
             get(pane_parts),
         )
@@ -430,9 +434,63 @@ pub(crate) fn keep_stream_frame(
     pane_id: &str,
     opts: &StreamOutputOpts,
     output: &str,
+    fence: Option<scrollback::CaptureFence>,
 ) {
     let Ok(mut store) = store.lock() else { return };
-    store.record_frame(session_id, pane_id, &opts.source, &opts.format, output);
+    store.record_frame_fenced(
+        session_id,
+        pane_id,
+        &opts.source,
+        &opts.format,
+        output,
+        fence,
+    );
+}
+
+fn begin_stream_capture(
+    store: &Arc<Mutex<scrollback::ScrollbackStore>>,
+    session_id: &str,
+    opts: &StreamOutputOpts,
+) -> Option<scrollback::CaptureFence> {
+    let pane_id = opts.pane.as_deref()?;
+    store.lock().ok()?.begin_capture(session_id, pane_id)
+}
+
+async fn poll_and_capture_stream(
+    backend: &dyn TerminalBackend,
+    store: &Arc<Mutex<scrollback::ScrollbackStore>>,
+    session_id: &str,
+    opts: &StreamOutputOpts,
+) -> Option<StreamPaneFrame> {
+    let fence = begin_stream_capture(store, session_id, opts);
+    let frame = poll_stream_pane_update(backend, opts).await?;
+    keep_stream_frame(
+        store,
+        session_id,
+        opts.pane.as_deref()?,
+        opts,
+        &frame.output,
+        fence,
+    );
+    Some(frame)
+}
+
+async fn enrich_and_capture_stream(
+    line: &str,
+    backend: &dyn TerminalBackend,
+    store: &Arc<Mutex<scrollback::ScrollbackStore>>,
+    session_id: &str,
+    opts: &StreamOutputOpts,
+    generation: &str,
+) -> Option<String> {
+    let fence = begin_stream_capture(store, session_id, opts);
+    let payload = enrich_pane_update(line, backend, opts, generation).await?;
+    // Only our successful sample has a certified read-start identity. Raw
+    // backend output events are forwarded separately, never captured by guessing.
+    if let (Some(pane_id), Some(output)) = (opts.pane.as_deref(), enriched_pane_output(&payload)) {
+        keep_stream_frame(store, session_id, pane_id, opts, &output, fence);
+    }
+    Some(payload)
 }
 
 /// The output an enriched `pane.updated` carries, so the same frame that
@@ -624,18 +682,13 @@ pub(crate) async fn events(
                             activity.name.is_empty() || set.contains(&activity.name)
                         });
                         if keep {
-                            let payload = if stream_opts.pane.is_some() {
-                                enrich_pane_update(&data, backend.as_ref(), &stream_opts, &generation)
+                            let enriched = if stream_opts.pane.is_some() {
+                                enrich_and_capture_stream(&data, backend.as_ref(), &scrollback_store, &session_id, &stream_opts, &generation)
                                     .await
-                                    .unwrap_or_else(|| data.clone())
                             } else {
-                                data.clone()
+                                None
                             };
-                            if let Some(pane_id) = stream_opts.pane.as_deref() {
-                                if let Some(output) = enriched_pane_output(&payload) {
-                                    keep_stream_frame(&scrollback_store, &session_id, pane_id, &stream_opts, &output);
-                                }
-                            }
+                            let payload = enriched.unwrap_or_else(|| data.clone());
                             if let Some(event) = stream_event(&mut sealer, "herdr", &payload) {
                                 yield Ok(event);
                             }
@@ -678,11 +731,10 @@ pub(crate) async fn events(
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 },
                 _ = output_interval.tick(), if stream_opts.pane.is_some() && pane_events => {
-                    if let Some(frame) = poll_stream_pane_update(backend.as_ref(), &stream_opts).await {
+                    if let Some(frame) = poll_and_capture_stream(backend.as_ref(), &scrollback_store, &session_id, &stream_opts).await {
                         if last_stream_output.as_deref() != Some(frame.output.as_str()) {
                             last_stream_output = Some(frame.output.clone());
                             if let Some(pane_id) = stream_opts.pane.as_deref() {
-                                keep_stream_frame(&scrollback_store, &session_id, pane_id, &stream_opts, &frame.output);
                                 if let Some(payload) = stream_pane_update_payload(&frame, pane_id, &generation) {
                                     if let Some(event) = stream_event(&mut sealer, "herdr", &payload) {
                                         yield Ok(event);
@@ -2245,6 +2297,8 @@ pub(crate) async fn pane_output(
         start: range.map(|(start, _)| start),
         end: range.map(|(_, end)| end),
     };
+    let fence =
+        lock_scrollback(&state).and_then(|store| store.begin_capture(&session_id, &pane_id));
     let output = terminal_backend(session)
         .read_pane(&request)
         .await
@@ -2265,13 +2319,13 @@ pub(crate) async fn pane_output(
     // ruled out.
     if range.is_none() {
         if let (Some(text), Some(mut store)) = (pane_read_text(&answer), lock_scrollback(&state)) {
-            let served = store.serve_read(
+            let served = store.serve_read_fenced(
                 &session_id,
                 &pane_id,
-                herdr_source,
-                &format,
+                (herdr_source, &format),
                 &text,
                 lines as usize,
+                fence,
             );
             if served != text {
                 scrollback::replace_read_text(&mut answer, &served);
@@ -2340,6 +2394,8 @@ pub(crate) async fn pane_parts(
     // `recent_unwrapped` is the only source worth normalizing: the dictionaries
     // key off line starts, and it is the one source where a long line is one
     // line rather than however many the pane happens to be wide.
+    let fence =
+        lock_scrollback(&state).and_then(|store| store.begin_capture(&session_id, &pane_id));
     let output = terminal_backend(&session)
         .read_pane(&BackendReadPane {
             pane_id: BackendPaneId::new(&pane_id),
@@ -2356,13 +2412,13 @@ pub(crate) async fn pane_parts(
     // has to be given the same rows: two views that disagree about where
     // history ends is the bug this whole thing is trying not to introduce.
     let text = match lock_scrollback(&state) {
-        Some(mut store) => store.serve_read(
+        Some(mut store) => store.serve_read_fenced(
             &session_id,
             &pane_id,
-            "recent_unwrapped",
-            "text",
+            ("recent_unwrapped", "text"),
             &backend_text,
             lines as usize,
+            fence,
         ),
         None => backend_text,
     };
@@ -3222,6 +3278,226 @@ mod tests {
     use crate::agents::session_routes::native_approval_data;
     use crate::connectivity::routes::revoke_paired_device;
     use crate::*;
+
+    struct HeldHistoryRead {
+        socket: PathBuf,
+        started: tokio::sync::oneshot::Receiver<()>,
+        release: Option<tokio::sync::oneshot::Sender<()>>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl HeldHistoryRead {
+        fn start() -> Self {
+            use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+            let socket = short_test_socket("hist-fence");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let (started_tx, started) = tokio::sync::oneshot::channel();
+            let (release, release_rx) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let mut started_tx = Some(started_tx);
+                let mut release_rx = Some(release_rx);
+                let mut reads = 0;
+                while let Ok((stream, _)) = listener.accept().await {
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.unwrap_or_default() == 0 {
+                        continue;
+                    }
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    let result = match request["method"].as_str().unwrap_or_default() {
+                        "pane.read" => {
+                            let text = match reads {
+                                0 => {
+                                    started_tx.take().unwrap().send(()).unwrap();
+                                    release_rx.take().unwrap().await.unwrap();
+                                    "A late 0\nA late 1\nA late 2\nA late 3"
+                                }
+                                1 => "B row 0\nB row 1\nB row 2\nB row 3",
+                                _ => "B row 1\nB row 2\nB row 3\nB row 4",
+                            };
+                            reads += 1;
+                            json!({ "read": { "text": text, "revision": reads } })
+                        }
+                        "pane.get" => {
+                            json!({ "pane": { "pane_id": "p", "workspace_id": "w", "tab_id": "t" } })
+                        }
+                        _ => json!({ "ok": true }),
+                    };
+                    let response = json!({ "id": request["id"], "result": result }).to_string();
+                    let mut stream = reader.into_inner();
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    stream.write_all(b"\n").await.unwrap();
+                }
+            });
+            Self {
+                socket,
+                started,
+                release: Some(release),
+                server,
+            }
+        }
+    }
+
+    impl Drop for HeldHistoryRead {
+        fn drop(&mut self) {
+            self.server.abort();
+            let _ = std::fs::remove_file(&self.socket);
+        }
+    }
+
+    fn fenced_history_pane(terminal: &str) -> Value {
+        json!({ "pane_id": "p", "terminal_id": terminal, "workspace_id": "w", "tab_id": "t", "width": 80, "height": 4, "scroll": { "max_offset_from_bottom": 0, "viewport_rows": 4 } })
+    }
+
+    async fn read_history_test_ingestor(state: AppState, kind: &str) -> String {
+        match kind {
+            "output" => {
+                let answer = pane_output(
+                    State(state),
+                    Path(("default".into(), "p".into())),
+                    Query(OutputQuery {
+                        source: None,
+                        format: None,
+                        lines: Some(200),
+                        start: None,
+                        end: None,
+                    }),
+                    bearer_headers("token"),
+                )
+                .await
+                .unwrap()
+                .0;
+                pane_read_text(&answer).unwrap()
+            }
+            "parts" => {
+                let answer = pane_parts(
+                    State(state),
+                    Path(("default".into(), "p".into())),
+                    Query(PartsQuery { lines: Some(200) }),
+                    bearer_headers("token"),
+                )
+                .await
+                .unwrap()
+                .0;
+                answer["data"]["parts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|part| part["fallback_text"].as_str().unwrap())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+            _ => {
+                let backend = terminal_backend(&state.config.sessions[0]);
+                let opts = StreamOutputOpts {
+                    pane: Some("p".into()),
+                    source: "recent_unwrapped".into(),
+                    format: "text".into(),
+                    lines: 200,
+                };
+                if kind == "poll" {
+                    super::poll_and_capture_stream(
+                        backend.as_ref(),
+                        &state.scrollback,
+                        "default",
+                        &opts,
+                    )
+                    .await
+                    .unwrap()
+                    .output
+                } else {
+                    let event = json!({ "event": "pane.updated", "data": { "pane": { "pane_id": "p", "revision": 1 } } }).to_string();
+                    let payload = super::enrich_and_capture_stream(
+                        &event,
+                        backend.as_ref(),
+                        &state.scrollback,
+                        "default",
+                        &opts,
+                        &state.generation,
+                    )
+                    .await
+                    .unwrap();
+                    enriched_pane_output(&payload).unwrap()
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn captured_history_fences_inflight_output_parts_poll_and_enriched_reads() {
+        use crate::terminal::history::{read_page, HistoryError, HistoryScope};
+        for kind in ["output", "parts", "poll", "enriched"] {
+            let mut held = HeldHistoryRead::start();
+            let mut state = test_state("admin", vec![test_device("d", "token")]);
+            state.config.sessions[0].socket_path = held.socket.to_string_lossy().into_owned();
+            {
+                let mut store = state.scrollback.lock().unwrap();
+                store.observe("default", &fenced_history_pane("A"));
+                for top in 0..8 {
+                    let frame = (top..top + 4)
+                        .map(|i| format!("A row {i}"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    store.record_frame("default", "p", "recent_unwrapped", "text", &frame);
+                }
+            }
+            let scope = HistoryScope {
+                session: "default".into(),
+                pane: "p".into(),
+                format: "text".into(),
+                device: "d".into(),
+                generation: state.generation.to_string(),
+                limit: 2,
+            };
+            let first = read_page(state.history.as_ref(), scope.clone(), None)
+                .await
+                .unwrap();
+            let cursor = first["next_before"].as_str().unwrap();
+            let read_state = state.clone();
+            let pending =
+                tokio::spawn(async move { read_history_test_ingestor(read_state, kind).await });
+            tokio::time::timeout(Duration::from_secs(5), &mut held.started)
+                .await
+                .unwrap()
+                .unwrap();
+            // A's read is actually awaiting its backend response. Observe B,
+            // then complete A before starting B's disjoint frames—no sleeps.
+            state
+                .scrollback
+                .lock()
+                .unwrap()
+                .observe("default", &fenced_history_pane("B"));
+            assert_eq!(
+                read_page(state.history.as_ref(), scope.clone(), Some(cursor)).await,
+                Err(HistoryError::Gone)
+            );
+            held.release.take().unwrap().send(()).unwrap();
+            assert_eq!(
+                pending.await.unwrap(),
+                "A late 0\nA late 1\nA late 2\nA late 3",
+                "{kind}: raw legacy response must survive rejection"
+            );
+            assert_eq!(
+                state.scrollback.lock().unwrap().depth("default", "p"),
+                0,
+                "{kind}: stale A cannot recreate B's capture"
+            );
+            read_history_test_ingestor(state.clone(), kind).await;
+            read_history_test_ingestor(state.clone(), kind).await;
+            let page = read_page(state.history.as_ref(), scope.clone(), None)
+                .await
+                .unwrap();
+            assert_eq!(
+                page["rows"],
+                json!(["B row 0"]),
+                "{kind}: no A row may leak into B's historical prefix"
+            );
+            assert_eq!(
+                read_page(state.history.as_ref(), scope, Some(cursor)).await,
+                Err(HistoryError::Gone)
+            );
+        }
+    }
 
     /// A structured agent's approval push names the agent session it is for,
     /// not a placeholder.
