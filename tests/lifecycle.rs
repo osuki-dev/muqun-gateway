@@ -551,16 +551,22 @@ impl ManagerPty {
     }
 
     fn until(&mut self, text: &str) -> String {
+        self.until_all(&[text])
+    }
+
+    /// Wait for every one of `texts`: a frame arrives in reads of any size,
+    /// so the first of two texts on one row can be read before the second.
+    fn until_all(&mut self, texts: &[&str]) -> String {
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut bytes = Vec::new();
         loop {
             let output = String::from_utf8_lossy(&bytes);
-            if output.contains(text) {
+            if texts.iter().all(|text| output.contains(text)) {
                 return output.into_owned();
             }
             assert!(
                 Instant::now() < deadline,
-                "manager did not render {text:?}: {output}"
+                "manager did not render {texts:?}: {output}"
             );
             let mut poll = libc::pollfd {
                 fd: self.master.as_raw_fd(),
@@ -571,7 +577,7 @@ impl ManagerPty {
             if unsafe { libc::poll(&mut poll, 1, 100) } > 0 {
                 let mut buffer = [0_u8; 8192];
                 let size = self.master.read(&mut buffer).unwrap();
-                assert!(size > 0, "manager closed before rendering {text:?}");
+                assert!(size > 0, "manager closed before rendering {texts:?}");
                 bytes.extend_from_slice(&buffer[..size]);
             }
         }
@@ -615,7 +621,7 @@ fn manager_pty_navigates_scrolls_resizes_and_keeps_start_failures_in_the_ui() {
         "active tab is not reversed: {output:?}"
     );
     manager.send(b"2\x1b[F");
-    let output = manager.until("> qa-39");
+    let output = manager.until_all(&["> qa-39", "终端 e\u{301} 39"]);
     assert!(
         output.contains("终端 e\u{301} 39"),
         "wide selected label missing: {output:?}"
