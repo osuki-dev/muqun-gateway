@@ -884,7 +884,8 @@ fn capabilities_discovery_responses() -> Value {
                                         "features": {
                                             "type": "object",
                                             "properties": {
-                                                "pagedHistory": { "type": "boolean", "description": "Whether ranged recent-unwrapped reads (start/end on the pane output route) are served, i.e. whether pull-to-load-more can page older history. true on a connected tmux backend; false on herdr, whose pane.read takes no range, and on a disconnected backend. Absent from gateways that predate it. Separate from Gateway capturedHistory." }
+                                                "pagedHistory": { "type": "boolean", "description": "Whether older terminal history can be pulled (pull-to-load-more): by range where rangeReads is true, otherwise by re-reading a longer tail (lines=N). true on a connected tmux or herdr backend; false on a disconnected backend. Absent from gateways that predate it. Separate from Gateway capturedHistory." },
+                                                "rangeReads": { "type": "boolean", "description": "Whether ranged recent-unwrapped reads (start/end on the pane output route) are served. true on a connected tmux backend; false on herdr, whose pane.read takes no range, and on a disconnected backend. Absent from gateways that predate it." }
                                             }
                                         }
                                     }

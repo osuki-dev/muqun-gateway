@@ -181,20 +181,26 @@ pub struct TerminalBackendDiscoveryInfo {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalBackendFeatures {
-    /// Ranged `recent-unwrapped` reads (`start`/`end` on the pane output
-    /// route), which is what pull-to-load-more pages with. The app hides the
-    /// pull when this is `false`.
+    /// Older history can be pulled: by range (`start`/`end`) where
+    /// `range_reads` is true, otherwise by re-reading a longer tail
+    /// (`lines=N`). The app hides pull-to-load-more when this is `false`.
     pub paged_history: bool,
+    /// Ranged `recent-unwrapped` reads (`start`/`end` on the pane output
+    /// route) are served. false on herdr, which pages by a longer tail.
+    pub range_reads: bool,
 }
 
 impl TerminalBackendFeatures {
     /// tmux serves a range on every version the gateway supports -- the
     /// wrap snap that needs tmux 3.7 is best-effort and never fails the read.
-    /// herdr's `pane.read` takes no range at all (see `herdr_pane_output`),
-    /// and a backend that is not connected serves nothing.
+    /// herdr's `pane.read` takes no range (see `herdr_pane_output`) but its
+    /// history still pages by re-reading a longer tail, so it gets
+    /// `paged_history` without `range_reads`. A backend that is not connected
+    /// serves nothing.
     pub(crate) fn for_backend(kind: BackendKind, connected: bool) -> Self {
         Self {
-            paged_history: connected && kind == BackendKind::Tmux,
+            paged_history: connected,
+            range_reads: connected && kind == BackendKind::Tmux,
         }
     }
 }
@@ -495,14 +501,16 @@ mod tests {
     }
 
     #[test]
-    fn paged_history_is_advertised_only_where_a_range_is_served() {
-        let paged =
-            |kind, connected| TerminalBackendFeatures::for_backend(kind, connected).paged_history;
-        assert!(paged(BackendKind::Tmux, true));
-        assert!(!paged(BackendKind::Tmux, false));
-        // herdr's `pane.read` has no range parameter.
-        assert!(!paged(BackendKind::Herdr, true));
-        assert!(!paged(BackendKind::Herdr, false));
+    fn paged_history_and_range_reads_follow_the_backend() {
+        let f = |kind, connected| {
+            let f = TerminalBackendFeatures::for_backend(kind, connected);
+            (f.paged_history, f.range_reads)
+        };
+        assert_eq!(f(BackendKind::Tmux, true), (true, true));
+        // herdr pages by a longer tail; its `pane.read` has no range.
+        assert_eq!(f(BackendKind::Herdr, true), (true, false));
+        assert_eq!(f(BackendKind::Tmux, false), (false, false));
+        assert_eq!(f(BackendKind::Herdr, false), (false, false));
 
         // An older gateway's backend entry, without the field, reads as
         // "cannot page" rather than failing to parse.
@@ -512,6 +520,7 @@ mod tests {
         }))
         .unwrap();
         assert!(!legacy.features.paged_history);
+        assert!(!legacy.features.range_reads);
     }
 
     #[test]
@@ -554,6 +563,7 @@ mod tests {
         assert_eq!(val["backends"][0]["keyboard"]["version"], 1);
         assert_eq!(val["backends"][0]["keyboard"]["extended"], true);
         assert_eq!(val["backends"][0]["features"]["pagedHistory"], true);
+        assert_eq!(val["backends"][0]["features"]["rangeReads"], true);
         assert_eq!(
             val["backends"][0]["keyboard"]["modifiers"],
             json!(["ctrl", "alt", "shift"])
