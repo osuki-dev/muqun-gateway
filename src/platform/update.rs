@@ -590,6 +590,7 @@ fn ensure_running_executable(exe: &Path) -> Result<()> {
                 .context("invalid process path")?;
             PathBuf::from(std::str::from_utf8(&buffer[..end])?)
         };
+        let running = fs::canonicalize(&running).unwrap_or(running);
         anyhow::ensure!(running == exe, "running gateway uses another executable; stop it using its own installation before updating");
     }
     Ok(())

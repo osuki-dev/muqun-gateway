@@ -856,6 +856,10 @@ pub(crate) fn executable_path() -> anyhow::Result<std::path::PathBuf> {
         return Ok(exe.clone());
     }
     let exe = std::env::current_exe().context("failed to find current executable")?;
+    // macOS reports the path the binary was started by -- a symlink, or
+    // `./muqun-gateway` -- not the file. Resolve it, so the plist written and
+    // the plist checked name the installed binary however the CLI was run.
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
     Ok(EXE.get_or_init(|| exe).clone())
 }
 

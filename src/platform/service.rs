@@ -110,7 +110,13 @@ pub fn ensure_current_install(paths: &ServicePaths) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         let contents = std::fs::read_to_string(unit_path()?)?;
-        validate_install_unit(&contents, paths)
+        validate_install_unit(&contents, paths)?;
+        // The file is what loads at the next login; what launchd runs now is
+        // whatever it loaded, which an edited plist does not change.
+        if let Some(print) = super::launchd::Launchctl::system()?.print() {
+            validate_loaded_program(&print, &paths.exe)?;
+        }
+        Ok(())
     }
     #[cfg(not(target_os = "macos"))]
     ensure_effective_unit(&format!("{SERVICE_LABEL}.service"), paths)
@@ -119,14 +125,7 @@ pub fn ensure_current_install(paths: &ServicePaths) -> Result<()> {
 #[cfg(any(target_os = "macos", test))]
 fn validate_install_unit(contents: &str, paths: &ServicePaths) -> Result<()> {
     if cfg!(target_os = "macos") {
-        anyhow::ensure!(
-            !contents.contains("<key>Program</key>")
-                && contents.matches("<key>ProgramArguments</key>").count() == 1,
-            "ambiguous LaunchAgent executable; reinstall the service from the standalone binary"
-        );
-        anyhow::ensure!(contents.contains(&format!(
-            "<key>ProgramArguments</key>\n  <array>\n    <string>{}</string>\n    <string>run</string>", xml(&paths.exe))),
-            "the installed LaunchAgent uses a different or ambiguous executable; reinstall the service from the standalone binary");
+        validate_launch_agent_program(contents, &paths.exe)?;
     }
     let config_matches = if cfg!(target_os = "macos") {
         contents.contains(&format!("<string>{}</string>", xml(&paths.config)))
@@ -160,6 +159,81 @@ fn validate_install_unit(contents: &str, paths: &ServicePaths) -> Result<()> {
     } else { contents.contains("KillMode=process") || contents.contains("KillMode=none") },
         "the service may terminate terminal tasks; update its child-process lifetime rules before controlling it");
     Ok(())
+}
+
+/// The plist runs this binary: one `ProgramArguments`, no `Program`, and
+/// `[<exe>, "run", ...]` where `<exe>` is the same file as `exe` however
+/// either is spelled.
+#[cfg(any(target_os = "macos", test))]
+fn validate_launch_agent_program(contents: &str, exe: &Path) -> Result<()> {
+    anyhow::ensure!(
+        !contents.contains("<key>Program</key>")
+            && contents.matches("<key>ProgramArguments</key>").count() == 1,
+        "ambiguous LaunchAgent executable; reinstall the service from the standalone binary"
+    );
+    let arguments = plist_program_arguments(contents).unwrap_or_default();
+    anyhow::ensure!(
+        arguments.get(1).is_some_and(|run| run == "run")
+            && arguments
+                .first()
+                .is_some_and(|program| same_executable(Path::new(program), exe)),
+        "the installed LaunchAgent runs {}, not this binary ({}); refusing to control another installation",
+        arguments.first().map_or("an unreadable program", String::as_str),
+        exe.display()
+    );
+    Ok(())
+}
+
+/// What launchd has loaded must be this binary too. `launchctl print` names
+/// the job's executable on its own top-level `program = ` line.
+#[cfg(any(target_os = "macos", test))]
+fn validate_loaded_program(print: &str, exe: &Path) -> Result<()> {
+    let program = print
+        .lines()
+        .find_map(|line| line.strip_prefix("\tprogram = "))
+        .map(str::trim);
+    anyhow::ensure!(
+        program.is_some_and(|program| same_executable(Path::new(program), exe)),
+        "launchd has the gateway loaded from {}, not this binary ({}); refusing to control another installation",
+        program.unwrap_or("an unknown program"),
+        exe.display()
+    );
+    Ok(())
+}
+
+/// Two spellings of one file: a symlink, `./muqun-gateway`, `bin/../bin/x`.
+/// A path that does not resolve matches only itself.
+#[cfg(any(target_os = "macos", test))]
+fn same_executable(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(a), Ok(b)) if a == b
+        )
+}
+
+/// `ProgramArguments`' strings, unescaped. `None` when the key is not followed
+/// by an array.
+#[cfg(any(target_os = "macos", test))]
+fn plist_program_arguments(contents: &str) -> Option<Vec<String>> {
+    let (_, after) = contents.split_once("<key>ProgramArguments</key>")?;
+    let (array, _) = after
+        .trim_start()
+        .strip_prefix("<array>")?
+        .split_once("</array>")?;
+    let mut arguments = Vec::new();
+    let mut rest = array;
+    while let Some((_, tail)) = rest.split_once("<string>") {
+        let (value, tail) = tail.split_once("</string>")?;
+        arguments.push(
+            value
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&amp;", "&"),
+        );
+        rest = tail;
+    }
+    Some(arguments)
 }
 
 /// Reload before inspecting: a later reload between validation and stop would
@@ -855,6 +929,55 @@ mod tests {
                 "<key>AbandonProcessGroup</key>\n  <false/>",
             );
         assert!(validate_install_unit(&unsafe_unit, &fixture).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_agent_ownership_accepts_any_spelling_of_this_binary_and_refuses_others() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/ownership-fixtures")
+            .join(uuid::Uuid::new_v4().to_string());
+        let bin = root.join("a&b/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let installed = bin.join("muqun-gateway");
+        std::fs::write(&installed, b"binary").unwrap();
+        let link = root.join("muqun-gateway");
+        std::os::unix::fs::symlink(&installed, &link).unwrap();
+        let other = root.join("other/muqun-gateway");
+        std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+        std::fs::write(&other, b"another install").unwrap();
+
+        let mut fixture = paths();
+        fixture.exe = installed.clone();
+        let plist = launch_agent_plist(&fixture);
+        // The CLI run through a symlink, or relatively, is still this install.
+        for exe in [
+            installed.clone(),
+            link.clone(),
+            bin.join("../bin/muqun-gateway"),
+        ] {
+            validate_launch_agent_program(&plist, &exe).unwrap();
+        }
+        // A plist written through the symlink names the same binary too.
+        fixture.exe = link.clone();
+        validate_launch_agent_program(&launch_agent_plist(&fixture), &installed).unwrap();
+        // A plist pointing at another installation is refused, naming it.
+        fixture.exe = other.clone();
+        let error = validate_launch_agent_program(&launch_agent_plist(&fixture), &installed)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&other.display().to_string()), "{error}");
+        // What launchd has loaded is checked the same way.
+        let print = |program: &Path| {
+            format!(
+                "gui/501/{SERVICE_LABEL} = {{\n\tstate = running\n\tprogram = {}\n\tpid = 7\n}}\n",
+                program.display()
+            )
+        };
+        validate_loaded_program(&print(&link), &installed).unwrap();
+        assert!(validate_loaded_program(&print(&other), &installed).is_err());
+        assert!(validate_loaded_program("\tstate = running\n", &installed).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(not(target_os = "macos"))]
