@@ -100,10 +100,13 @@ impl HistoryRepository for MemoryHistoryRepository {
                 .lock()
                 .map_err(|_| HistoryError::Unavailable)?;
             self.prune(&mut snapshots)?;
-            if let Some(held) = snapshots
-                .values()
-                .find(|held| held.scope == snapshot.scope && held.epoch == snapshot.epoch)
-            {
+            // Concurrent first pages of one unchanged capture share a copy.
+            if let Some(held) = snapshots.values().find(|held| {
+                held.scope == snapshot.scope
+                    && held.epoch == snapshot.epoch
+                    && held.base == snapshot.base
+                    && held.rows.len() == snapshot.rows.len()
+            }) {
                 return Ok(held.clone());
             }
             loop {
@@ -297,6 +300,7 @@ mod tests {
             .observe(&scope.session, &pane(80));
         frame(&repository, &scope, &rows(500_000, 4, size));
         let mut answer = read_page(&repository, scope.clone(), None).await.unwrap();
+        let first_id = answer["snapshot_id"].clone();
         let mut cursors = Vec::new();
         while let Some(cursor) = answer["next_before"].as_str() {
             cursors.push(cursor.to_owned());
@@ -317,21 +321,50 @@ mod tests {
                 .await
                 .unwrap();
         }
-        // Enough output to trim the oldest page away: that cursor alone is 410.
+        // Mid-traversal, a new traversal is not handed the old snapshot: the
+        // capture has moved, so its first page is the current newest rows.
+        let restarted = read_page(&repository, scope.clone(), None).await.unwrap();
+        assert_ne!(restarted["snapshot_id"], first_id);
+        assert!(
+            newest(&restarted).starts_with("01000003 "),
+            "{}",
+            newest(&restarted)
+        );
+
+        // Enough output to trim the oldest page away: that cursor is 410, and
+        // the snapshot goes with it instead of waiting out its TTL.
         frame(&repository, &scope, &rows(3_000_000, 400, size));
         frame(&repository, &scope, &rows(4_000_000, 4, size));
-        assert_eq!(
-            read_page(
-                &repository,
-                scope.clone(),
-                cursors.last().map(String::as_str)
-            )
-            .await,
-            Err(HistoryError::Gone)
+        let mut stale = restarted;
+        let mut oldest = None;
+        while let Some(cursor) = stale["next_before"].as_str().map(String::from) {
+            match read_page(&repository, scope.clone(), Some(&cursor)).await {
+                Ok(page) => stale = page,
+                Err(error) => {
+                    oldest = Some(error);
+                    break;
+                }
+            }
+        }
+        assert_eq!(oldest, Some(HistoryError::Gone));
+
+        // Starting again, as the 410 says, gives a fresh snapshot of the
+        // current rows, and that walk completes.
+        let mut answer = read_page(&repository, scope.clone(), None).await.unwrap();
+        assert!(
+            newest(&answer).starts_with("03000399 "),
+            "{}",
+            newest(&answer)
         );
-        read_page(&repository, scope.clone(), Some(&cursors[0]))
-            .await
-            .unwrap();
+        let fresh = answer["next_before"].as_str().unwrap().to_owned();
+        let mut pages = 1;
+        while let Some(cursor) = answer["next_before"].as_str().map(String::from) {
+            answer = read_page(&repository, scope.clone(), Some(&cursor))
+                .await
+                .unwrap();
+            pages += 1;
+        }
+        assert!(pages >= 4, "{pages}");
 
         // A resize is a genuine reset: every cursor of the traversal is 410.
         repository
@@ -340,9 +373,19 @@ mod tests {
             .unwrap()
             .observe(&scope.session, &pane(120));
         assert_eq!(
-            read_page(&repository, scope.clone(), Some(&cursors[0])).await,
+            read_page(&repository, scope.clone(), Some(&fresh)).await,
             Err(HistoryError::Gone)
         );
+    }
+
+    /// The newest row a page carries.
+    fn newest(page: &serde_json::Value) -> String {
+        page["rows"]
+            .as_array()
+            .and_then(|rows| rows.last())
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
     }
 
     #[tokio::test]

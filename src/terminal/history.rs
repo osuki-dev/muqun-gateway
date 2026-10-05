@@ -38,6 +38,9 @@ pub(crate) struct Capture {
     /// Rows the capture has dropped off its front so far. `rows[0]` is row
     /// `trimmed` of the capture; a trim moves this, never `epoch`.
     pub trimmed: u64,
+    /// How many historical rows the capture holds now, whether or not
+    /// `rows` was asked for: with `trimmed`, where its newest row is.
+    pub len: usize,
     pub rows: Vec<String>,
 }
 
@@ -96,18 +99,23 @@ pub(crate) async fn read_page(
             .iter()
             .position(|(held, _, _)| *held == token)
             .ok_or(HistoryError::Gone)?;
-        return match validity(repository, &scope, &snapshot, page).await? {
+        return match validity(repository, &scope, &snapshot, Some(page)).await? {
             Validity::Valid => Ok(render(&snapshot, page)),
-            // Newer pages of the same traversal still serve.
-            Validity::Trimmed => Err(HistoryError::Gone),
-            Validity::Reset => {
+            // A 410 tells the client to start again without a cursor, so the
+            // snapshot goes now: its rows are no longer the capture's.
+            Validity::Moved | Validity::Reset => {
                 repository.remove(id).await?;
                 Err(HistoryError::Gone)
             }
         };
     }
+    // A new traversal starts from the capture as it is now. A pinned snapshot
+    // is reused only while the capture has not moved since -- same epoch,
+    // nothing trimmed, nothing appended -- so a client restarting after a 410
+    // never walks into the same stale snapshot again. One that has moved is
+    // dropped here, not left to its TTL.
     if let Some(snapshot) = repository.find(&scope).await? {
-        if validity(repository, &scope, &snapshot, 0).await? == Validity::Valid {
+        if validity(repository, &scope, &snapshot, None).await? == Validity::Valid {
             return Ok(render(&snapshot, 0));
         }
         repository.remove(snapshot.id).await?;
@@ -122,7 +130,7 @@ pub(crate) async fn read_page(
     let snapshot = repository.pin(snapshot).await?;
     // A capture may reset while an async adapter pins it. Fail closed rather
     // than returning rows from the old incarnation after that boundary.
-    if validity(repository, &snapshot.scope, &snapshot, 0).await? != Validity::Valid {
+    if validity(repository, &snapshot.scope, &snapshot, Some(0)).await? != Validity::Valid {
         repository.remove(snapshot.id).await?;
         return Err(HistoryError::Gone);
     }
@@ -132,23 +140,24 @@ pub(crate) async fn read_page(
 #[derive(Debug, PartialEq, Eq)]
 enum Validity {
     Valid,
-    /// Same capture, but the page's rows have since been trimmed off its
-    /// front. The snapshot still holds them; serving them would show rows the
-    /// live capture no longer has, so the cursor is gone, and only it.
-    Trimmed,
+    /// Same capture, moved on: for a cursor, its page's rows have been
+    /// trimmed off the front (serving them would show rows the capture no
+    /// longer has); for a new traversal, anything was trimmed or appended.
+    Moved,
     /// Expired, or the capture was reset (resize, mode flip, replacement,
     /// eviction, disappearance): every cursor of the snapshot is gone.
     Reset,
 }
 
-/// Whether `page` of a pinned snapshot still serves. A capture trimmed at its
-/// size cap keeps its epoch, so a busy pane does not invalidate a traversal
-/// on every frame; only the pages whose rows were trimmed away go.
+/// Whether a pinned snapshot still serves `Some(page)` of a traversal, or
+/// (`None`) can stand in for a new one. A capture trimmed at its size cap
+/// keeps its epoch, so a busy pane does not invalidate a traversal on every
+/// frame; only the pages whose rows were trimmed away go.
 async fn validity(
     repository: &dyn HistoryRepository,
     scope: &HistoryScope,
     snapshot: &HistorySnapshot,
-    page: usize,
+    page: Option<usize>,
 ) -> Result<Validity, HistoryError> {
     if snapshot.created.elapsed() >= SNAPSHOT_TTL {
         return Ok(Validity::Reset);
@@ -159,11 +168,14 @@ async fn validity(
     if capture.epoch != snapshot.epoch {
         return Ok(Validity::Reset);
     }
-    let (_, start, _) = snapshot.pages[page];
-    Ok(if snapshot.base + start as u64 >= capture.trimmed {
+    let current = match page {
+        Some(page) => snapshot.base + snapshot.pages[page].1 as u64 >= capture.trimmed,
+        None => snapshot.is_current(&capture),
+    };
+    Ok(if current {
         Validity::Valid
     } else {
-        Validity::Trimmed
+        Validity::Moved
     })
 }
 
@@ -202,6 +214,14 @@ impl HistorySnapshot {
             rows: capture.rows,
             pages,
         })
+    }
+
+    /// Pinned from exactly this state of the capture: nothing has been
+    /// trimmed or appended since.
+    pub(crate) fn is_current(&self, capture: &Capture) -> bool {
+        capture.epoch == self.epoch
+            && capture.trimmed == self.base
+            && capture.len == self.rows.len()
     }
 
     /// Row text alone: the measure the live capture is capped by.
@@ -324,6 +344,7 @@ mod tests {
                     .map(|(epoch, rows)| Capture {
                         epoch: *epoch,
                         trimmed: *self.trimmed.lock().unwrap(),
+                        len: rows.len(),
                         rows: if include_rows { rows.clone() } else { vec![] },
                     }))
             })
@@ -353,10 +374,12 @@ mod tests {
             Box::pin(async move {
                 tokio::task::yield_now().await;
                 let mut snapshots = self.snapshots.lock().unwrap();
-                if let Some(held) = snapshots
-                    .values()
-                    .find(|held| held.scope == snapshot.scope && held.epoch == snapshot.epoch)
-                {
+                if let Some(held) = snapshots.values().find(|held| {
+                    held.scope == snapshot.scope
+                        && held.epoch == snapshot.epoch
+                        && held.base == snapshot.base
+                        && held.rows == snapshot.rows
+                }) {
                     return Ok(held.clone());
                 }
                 let snapshot = Arc::new(snapshot);
@@ -386,7 +409,13 @@ mod tests {
             .unwrap()
             .1
             .push("appended".into());
-        assert_eq!(read_page(&repository, scope(), None).await.unwrap(), first);
+        // An unchanged capture reuses its snapshot; a moved one does not.
+        let fresh = read_page(&repository, scope(), None).await.unwrap();
+        assert_ne!(fresh["snapshot_id"], first["snapshot_id"]);
+        assert_eq!(fresh["rows"], json!(["row 6", "appended"]));
+        assert_eq!(read_page(&repository, scope(), None).await.unwrap(), fresh);
+        repository.capture.lock().unwrap().as_mut().unwrap().1.pop();
+        let first = read_page(&repository, scope(), None).await.unwrap();
         let mut answer = first;
         let mut tiled = Vec::new();
         loop {
@@ -468,25 +497,49 @@ mod tests {
             answer = read_page(&repository, scope(), Some(cursor)).await.unwrap();
         }
         assert_eq!(cursors.len(), 3);
-        // The capture drops rows 0 and 1 off its front, same epoch.
+        // The capture drops rows 0 and 1 off its front, same epoch: pages
+        // whose rows are still held keep serving.
         *repository.trimmed.lock().unwrap() = 2;
+        repository
+            .capture
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .1
+            .drain(..2);
         assert_eq!(
             read_page(&repository, scope(), Some(&cursors[0]))
                 .await
                 .unwrap()["rows"],
             json!(["row 3", "row 4"])
         );
-        for gone in &cursors[1..] {
-            assert_eq!(
-                read_page(&repository, scope(), Some(gone)).await,
-                Err(HistoryError::Gone)
-            );
+        // The page holding rows 1-2 is gone, and with it the snapshot: the
+        // client starts again without a cursor and must not land in it.
+        assert_eq!(
+            read_page(&repository, scope(), Some(&cursors[1])).await,
+            Err(HistoryError::Gone)
+        );
+        assert!(repository.snapshots.lock().unwrap().is_empty());
+        assert_eq!(
+            read_page(&repository, scope(), Some(&cursors[0])).await,
+            Err(HistoryError::Gone)
+        );
+        let mut answer = read_page(&repository, scope(), None).await.unwrap();
+        let mut tiled = Vec::new();
+        loop {
+            let mut page: Vec<String> = serde_json::from_value(answer["rows"].clone()).unwrap();
+            page.extend(tiled);
+            tiled = page;
+            let Some(cursor) = answer["next_before"].as_str() else {
+                break;
+            };
+            answer = read_page(&repository, scope(), Some(cursor)).await.unwrap();
         }
-        // The traversal's newer pages are untouched by that 410.
-        assert!(read_page(&repository, scope(), Some(&cursors[0]))
-            .await
-            .is_ok());
-        assert_eq!(repository.snapshots.lock().unwrap().len(), 1);
+        assert_eq!(
+            tiled,
+            (2..7).map(|i| format!("row {i}")).collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]

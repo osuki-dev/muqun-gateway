@@ -1516,8 +1516,8 @@ impl ScrollbackStore {
         let Some(buffer) = self.captured_buffer(scope) else {
             return Ok(None);
         };
+        let count = buffer.lines.len().saturating_sub(buffer.screen);
         let rows = if include_rows {
-            let count = buffer.lines.len().saturating_sub(buffer.screen);
             // Row text only, the same measure the live cap holds the buffer
             // to: a pane at its cap is exactly the pane with history worth
             // paging. Per-row allocation overhead is the snapshot store's to
@@ -1544,6 +1544,7 @@ impl ScrollbackStore {
         Ok(Some(super::history::Capture {
             epoch: buffer.epoch.expect("captured buffers carry an epoch"),
             trimmed: buffer.trimmed,
+            len: count,
             rows,
         }))
     }

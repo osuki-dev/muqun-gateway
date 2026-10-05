@@ -86,16 +86,18 @@ viewport; never merge it by native coordinates with these pages.
 
 Nonempty snapshots are frozen for **60 seconds from creation**, not from last
 access. First-page requests with the same device/session/pane/format/limit and
-Gateway generation reuse that snapshot, even while live output appends or
-repaints. Thus repeated first pages may lag live captures by up to 60 seconds,
-but never allocate a whole copied buffer on each poll. After expiry a first page
-creates a fresh snapshot. Pages belonging to different snapshot IDs must not be
+Gateway generation reuse that snapshot only while the capture has not moved:
+same epoch, no rows trimmed and none appended. A first page after any change
+drops the old snapshot and pins the current rows, so a client restarting after a
+410 never lands in the stale snapshot again; an idle pane is still not copied
+on every poll. After expiry a first page creates a fresh snapshot. Pages belonging to different snapshot IDs must not be
 merged. Cursors bind to the authenticated device and complete request shape.
 
 A capture at its row or byte cap drops its oldest rows as new ones arrive. That
 front truncation slides the capture; it is not a reset. A cursor keeps serving
-while its page's rows are still held, and answers 410 once they have been
-trimmed away, without disturbing the traversal's newer pages.
+while its page's rows are still held. Once they have been trimmed away it
+answers 410 and its snapshot is dropped at once, since the client is told to
+start again without a cursor.
 
 Capture-buffer eviction, detected resize, policy switching to
 native history, observed pane disappearance or changed terminal/workspace/tab
