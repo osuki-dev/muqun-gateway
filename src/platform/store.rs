@@ -552,6 +552,17 @@ pub(crate) fn listener_pids_named(port: u16, process_name: &str) -> anyhow::Resu
     Ok(pids)
 }
 
+/// A process's short name as `ps` reports it, for naming it in a message.
+pub(crate) fn process_name(pid: u32) -> Option<String> {
+    let output = ProcessCommand::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+        .ok()?;
+    let name = String::from_utf8_lossy(&output.stdout);
+    let name = name.trim().rsplit('/').next()?.trim();
+    (output.status.success() && !name.is_empty()).then(|| name.to_owned())
+}
+
 /// Confirm a pid really belongs to a process named `process_name` before
 /// trusting it (e.g. before signalling it, or before refusing a directory
 /// migration on its account).

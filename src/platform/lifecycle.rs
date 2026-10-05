@@ -17,12 +17,70 @@ const SERVICE_LOGS: &str =
 const SERVICE_LOGS: &str = "the service journal (`journalctl --user -u dev.osuki.muqun-gateway`)";
 
 pub(crate) fn running_pid() -> anyhow::Result<Option<u32>> {
-    let owner = state_lock::running_owner(&state_dir()?)?;
-    if let Some(pid) = owner {
-        anyhow::ensure!(process_matches_name(pid, crate::GATEWAY_PROCESS_NAME),
-            "state directory is owned by an unrecognized process (pid {pid}); refusing lifecycle actions");
+    let state = state_dir()?;
+    settled_owner(
+        || state_lock::running_owner(&state),
+        |pid| process_matches_name(pid, crate::GATEWAY_PROCESS_NAME),
+        OWNER_SETTLE_ATTEMPTS,
+        OWNER_SETTLE_PAUSE,
+    )
+}
+
+/// How long a lock owner `ps` cannot name is given to either show up as the
+/// gateway or let go. A gateway exiting during startup -- its port already
+/// taken -- still holds the state lock for a moment after `ps` stops naming
+/// it, and was taken for a foreign owner; `start` then gave up after 0.3 s
+/// blaming "an unrecognized process" that was the gateway itself.
+const OWNER_SETTLE_ATTEMPTS: u32 = 10;
+const OWNER_SETTLE_PAUSE: Duration = Duration::from_millis(25);
+
+fn settled_owner(
+    mut owner: impl FnMut() -> anyhow::Result<Option<u32>>,
+    mut is_gateway: impl FnMut(u32) -> bool,
+    attempts: u32,
+    pause: Duration,
+) -> anyhow::Result<Option<u32>> {
+    let mut stranger = None;
+    for attempt in 1..=attempts {
+        let Some(pid) = owner()? else {
+            return Ok(None);
+        };
+        if is_gateway(pid) {
+            return Ok(Some(pid));
+        }
+        stranger = Some(pid);
+        if attempt < attempts {
+            std::thread::sleep(pause);
+        }
     }
-    Ok(owner)
+    anyhow::bail!(
+        "state directory is owned by an unrecognized process (pid {}); refusing lifecycle actions",
+        stranger.unwrap_or_default()
+    )
+}
+
+/// Why a gateway that did not come up most likely did not: something else
+/// listening on its configured port, named. `None` when nothing is.
+pub(crate) fn startup_failure_cause() -> Option<String> {
+    let config = load_config(None).ok()?;
+    let port: u16 = config.listen.rsplit(':').next()?.parse().ok()?;
+    let ours = running_pid().ok().flatten();
+    let holders: Vec<String> = crate::listener_pids_named(port, "")
+        .ok()?
+        .into_iter()
+        .filter(|pid| Some(*pid) != ours)
+        .map(|pid| match crate::process_name(pid) {
+            Some(name) => format!("{name} (pid {pid})"),
+            None => format!("pid {pid}"),
+        })
+        .collect();
+    (!holders.is_empty()).then(|| {
+        format!(
+            "port {port} ({}) is already in use by {}",
+            config.listen,
+            holders.join(", ")
+        )
+    })
 }
 
 pub(crate) fn summary() -> anyhow::Result<String> {
@@ -148,8 +206,11 @@ impl Controller {
                 Ok(running_pid()?.is_some() && crate::fetch_pending_pairing().is_ok())
             })
             .with_context(|| {
+                let cause = startup_failure_cause()
+                    .map(|cause| format!(": {cause}"))
+                    .unwrap_or_default();
                 format!(
-                    "gateway did not become ready; inspect {} and {SERVICE_LOGS}",
+                    "gateway did not become ready{cause}; inspect {} and {SERVICE_LOGS}",
                     state.join(crate::LOG_FILE).display()
                 )
             })?;
@@ -184,6 +245,27 @@ pub(crate) fn wait_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_owner_ps_cannot_name_yet_is_waited_out_before_it_is_called_foreign() {
+        let pause = Duration::ZERO;
+        // The gateway exiting: unnamed for a moment, then the lock is free.
+        let mut probes = [Some(41), Some(41), None].into_iter();
+        let owner = settled_owner(|| Ok(probes.next().flatten()), |_| false, 10, pause);
+        assert_eq!(owner.unwrap(), None);
+        // A gateway that ps names on the next look.
+        let mut named = false;
+        let owner = settled_owner(
+            || Ok(Some(42)),
+            |_| std::mem::replace(&mut named, true),
+            10,
+            pause,
+        );
+        assert_eq!(owner.unwrap(), Some(42));
+        // A process that keeps the lock and is never the gateway is refused.
+        let error = settled_owner(|| Ok(Some(43)), |_| false, 10, pause).unwrap_err();
+        assert!(error.to_string().contains("unrecognized process (pid 43)"));
+    }
 
     #[test]
     fn lifecycle_wait_reports_timeout_and_probe_failure() {

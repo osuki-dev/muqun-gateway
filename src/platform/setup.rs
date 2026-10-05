@@ -920,8 +920,11 @@ pub(crate) fn start_detached_at(exe: &std::path::Path) -> anyhow::Result<()> {
     }
     let outcome = lifecycle::wait_for(std::time::Duration::from_secs(15), || {
         if let Some(status) = child.try_wait()? {
+            let cause = lifecycle::startup_failure_cause()
+                .map(|cause| format!(": {cause}"))
+                .unwrap_or_default();
             anyhow::bail!(
-                "gateway exited during startup ({status}); inspect {}",
+                "gateway exited during startup ({status}){cause}; inspect {}",
                 state_dir.join(LOG_FILE).display()
             );
         }

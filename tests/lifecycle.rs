@@ -221,8 +221,17 @@ fn a_startup_bind_failure_is_reported_and_leaves_no_detached_child() {
     )
     .unwrap();
     let output = install.run(&["start"]);
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("exited during startup"));
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("exited during startup"), "{stderr}");
+    // The real cause, naming the holder -- this test process -- rather than
+    // mistaking the exiting gateway for an unrecognized lock owner.
+    assert!(stderr.contains("is already in use by"), "{stderr}");
+    assert!(
+        stderr.contains(&format!("(pid {})", std::process::id())),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("unrecognized process"), "{stderr}");
     assert!(!install.state.join("gateway.pid").exists());
 }
 
