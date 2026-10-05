@@ -32,26 +32,6 @@ pub(crate) fn backend_endpoint(session: &SessionConfig) -> String {
         .into_owned()
 }
 
-/// The program a session's backend has to spawn, and whether this process can
-/// see it.
-///
-/// Reported because "unavailable" is not a diagnosis. A tmux backend has
-/// exactly two ways to be unreachable -- no tmux server, or no tmux -- and only
-/// one of them is visible to the person reading, since `tmux -V` in their own
-/// shell answers happily while the daemon's `PATH` cannot find it at all. herdr
-/// has nothing to look up: it is a socket, and the endpoint column already
-/// names it.
-pub(crate) fn backend_program_state(session: &SessionConfig) -> String {
-    if session.backend != BackendKind::Tmux {
-        return String::new();
-    }
-    let path = std::env::var("PATH").unwrap_or_default();
-    match login_env::lookup(TMUX_PROGRAM, &path) {
-        Some(found) => format!("tmux={}", found.display()),
-        None => format!("tmux=NOT FOUND on PATH={path}"),
-    }
-}
-
 /// Say so at startup when a configured backend's program cannot be found.
 ///
 /// Without this the only symptom is one "terminal backend is unavailable" line

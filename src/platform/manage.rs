@@ -24,15 +24,24 @@ use super::{lifecycle, service, update};
 use crate::authority::{hash_token, DeviceRecord, PendingPairing};
 use crate::backend::BackendKind;
 use crate::{
-    auto_public_url, backend_endpoint, backend_program_state, config_changed_since_start,
-    config_dir, configured_port, ensure_pairing_transport_key, load_config, make_backend_default,
-    now_unix_ms, read_devices, read_pairing_file, revoke_device_by_id, start_background_inner,
-    stop_background_inner, upsert_backend_session, validate_session_id, write_config,
-    write_secret_file, SessionConfig, TransportEncryptionMode, CONFIG_FILE, DEFAULT_PORT,
-    MANAGE_REFRESH_INTERVAL, PAIRING_FILE,
+    auto_public_url, backend_endpoint, config_changed_since_start, config_dir, configured_port,
+    ensure_pairing_transport_key, load_config, make_backend_default, now_unix_ms, read_devices,
+    read_pairing_file, revoke_device_by_id, start_background_inner, stop_background_inner,
+    upsert_backend_session, validate_session_id, write_config, write_secret_file, SessionConfig,
+    TransportEncryptionMode, CONFIG_FILE, DEFAULT_PORT, MANAGE_REFRESH_INTERVAL, PAIRING_FILE,
 };
 
+/// What `status` prints after a session's endpoint: tmux's availability,
+/// judged and labelled the way manage's Overview does.
+fn backend_program_state(session: &SessionConfig, service_path: Option<&str>) -> String {
+    if session.backend != BackendKind::Tmux {
+        return String::new();
+    }
+    tmux_availability(&std::env::var("PATH").unwrap_or_default(), service_path)
+}
+
 pub(crate) fn status() -> anyhow::Result<()> {
+    let service_path = service::installed_path_env();
     let config = load_config(None)?;
     println!("server_id: {}", config.server_id);
     println!("label: {}", config.label);
@@ -48,7 +57,7 @@ pub(crate) fn status() -> anyhow::Result<()> {
             "session {}: backend={} endpoint={endpoint} {}",
             session.id,
             session.backend.as_str(),
-            backend_program_state(&session)
+            backend_program_state(&session, service_path.as_deref())
         );
     }
     println!("gateway: {}", lifecycle::summary()?);
@@ -817,29 +826,30 @@ fn print_manage_screen(
     write_viewport(&lines, width, height)
 }
 
-/// Whether tmux can be found by the gateway that will run it. With a service
-/// installed that is the unit's pinned `PATH`, not this shell's: a Homebrew
-/// tmux on the shell's `PATH` but not the unit's is what leaves the service's
-/// tmux backend unavailable while `tmux -V` works here.
-fn tmux_availability(shell_path: &str, service_path: Option<&str>) -> String {
-    let shell = crate::terminal::login_env::lookup(crate::backend::TMUX_PROGRAM, shell_path);
+/// Whether tmux can be found by the gateway that will run it, and on which
+/// PATH that was judged. With a service installed that is the unit's pinned
+/// `PATH`, not this shell's: a Homebrew tmux on the CLI's `PATH` but not the
+/// unit's is what leaves the service's tmux backend unavailable while
+/// `tmux -V` works here. `status` and manage's Overview both print this.
+fn tmux_availability(cli_path: &str, service_path: Option<&str>) -> String {
+    let lookup =
+        |path: &str| crate::terminal::login_env::lookup(crate::backend::TMUX_PROGRAM, path);
+    let cli = lookup(cli_path);
     let Some(service_path) = service_path else {
-        return String::from(if shell.is_some() {
-            "tmux executable available"
-        } else {
-            "tmux executable not found"
-        });
+        return match cli {
+            Some(found) => format!("tmux: found on CLI PATH ({})", found.display()),
+            None => format!("tmux: NOT FOUND on CLI PATH ({cli_path})"),
+        };
     };
-    match (
-        crate::terminal::login_env::lookup(crate::backend::TMUX_PROGRAM, service_path),
-        shell,
-    ) {
-        (Some(_), _) => String::from("tmux available to the service"),
+    match (lookup(service_path), cli) {
+        (Some(found), _) => format!("tmux: found on service PATH ({})", found.display()),
         (None, Some(found)) => format!(
-            "tmux NOT on the service's PATH (this shell has {}); reinstall the service from this shell",
+            "tmux: NOT on service PATH ({service_path}); found on CLI PATH ({}) -- reinstall the service from this shell",
             found.display()
         ),
-        (None, None) => String::from("tmux not found (service or this shell)"),
+        (None, None) => format!(
+            "tmux: NOT FOUND on service PATH ({service_path}) or CLI PATH ({cli_path})"
+        ),
     }
 }
 
@@ -2038,26 +2048,29 @@ mod tests {
         std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
         let (with, without) = (with.display().to_string(), without.display().to_string());
 
-        assert_eq!(tmux_availability(&with, None), "tmux executable available");
+        let tmux = tmux.display().to_string();
+        assert_eq!(
+            tmux_availability(&with, None),
+            format!("tmux: found on CLI PATH ({tmux})")
+        );
         assert_eq!(
             tmux_availability(&without, None),
-            "tmux executable not found"
+            format!("tmux: NOT FOUND on CLI PATH ({without})")
         );
         assert_eq!(
             tmux_availability(&without, Some(&with)),
-            "tmux available to the service"
+            format!("tmux: found on service PATH ({tmux})")
         );
-        // The case the shell alone cannot see: found here, not by the service.
+        // The case the CLI alone cannot see: found here, not by the service.
         let state = tmux_availability(&with, Some(&without));
         assert!(
-            state.starts_with("tmux NOT on the service's PATH"),
+            state.starts_with(&format!(
+                "tmux: NOT on service PATH ({without}); found on CLI PATH ({tmux})"
+            )),
             "{state}"
         );
-        assert!(state.contains(&tmux.display().to_string()), "{state}");
-        assert_eq!(
-            tmux_availability(&without, Some(&without)),
-            "tmux not found (service or this shell)"
-        );
+        assert!(tmux_availability(&without, Some(&without))
+            .starts_with("tmux: NOT FOUND on service PATH"));
         std::fs::remove_dir_all(root).unwrap();
     }
 
