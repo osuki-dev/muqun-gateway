@@ -205,7 +205,7 @@ pub fn openapi_spec() -> Value {
             "/api/assets/{assetId}/content": {
                 "get": {
                     "summary": "Stream one asset's bytes, read-only",
-                    "description": "The path must canonicalize to a regular file inside a workspace root the session currently has, so a symlink out of the root, a traversal, and an unknown id are all a 404. An asset indexed while its root was a live workspace outlives that workspace: when the roots no longer contain it, the entry's stored canonical path is replayed and served only if it canonicalizes back to itself byte-for-byte, so a symlink swapped into the old location is the same 404. A path that was never indexed has no entry to replay. The kind is sniffed again from the bytes on every read; a binary asset answers 415 with its metadata and no body. Assets larger than 10 MiB are refused with 413.",
+                    "description": "The path must canonicalize to a regular file inside a workspace root the session currently has, so a symlink out of the root, a traversal, and an unknown id are all a 404. An asset indexed while its root was a live workspace outlives that workspace: when the roots no longer contain it, the entry's stored canonical path is replayed and served only if it canonicalizes back to itself byte-for-byte, so a symlink swapped into the old location is the same 404. A path that was never indexed has no entry to replay. The one other source of ids is an agent text part's image_assets: an image its markdown embeds by path, resolved by the gateway and remembered with the session directory that fenced it, is served by the same id (the path-derived asset id) only while it still canonicalizes to a regular file inside that directory. The kind is sniffed again from the bytes on every read; a binary asset answers 415 with its metadata and no body. Assets larger than 10 MiB are refused with 413.",
                     "parameters": [path_param("assetId")],
                     "responses": asset_content_responses()
                 }
@@ -617,6 +617,7 @@ pub fn openapi_spec() -> Value {
             "/api/agent-sessions/{asid}": {
                 "get": {
                     "summary": "Get details of an AI agent session",
+                    "description": "The session snapshot: info, timeline, pending permissions and forms. A text part in the timeline whose markdown embeds images by host path (![alt](src) or <img src>, the src relative to the session directory, absolute, or file://) carries image_assets: [{src, asset_id, url, mime, width?, height?}], one per src that resolves to an image file inside the session directory, with url the /api/assets/{asset_id}/content route that serves it. The text itself is never rewritten; a client swaps src for url when it renders. Web URLs, data URIs, paths outside the directory and non-images are absent from the map. The same field rides on timeline rows from /timeline, /events replay, the SSE stream and /api/ws; capabilities.message_image_assets says the gateway sends it.",
                     "parameters": [path_param("asid")],
                     "responses": ok_response()
                 },
@@ -1119,8 +1120,14 @@ fn content_envelope_schema(data: Value) -> Value {
         "properties": {
             "schema_version": { "type": "string", "const": CONTENT_SCHEMA_VERSION },
             "capabilities": object_schema(
-                &[("parts", "boolean"), ("assets", "boolean"), ("image_upload", "boolean"), ("composer", "boolean")],
-                &["parts", "assets", "image_upload", "composer"],
+                &[
+                    ("parts", "boolean"),
+                    ("assets", "boolean"),
+                    ("image_upload", "boolean"),
+                    ("composer", "boolean"),
+                    ("message_image_assets", "boolean"),
+                ],
+                &["parts", "assets", "image_upload", "composer", "message_image_assets"],
             ),
             "data": data
         }

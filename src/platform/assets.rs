@@ -1137,6 +1137,16 @@ pub(crate) async fn asset_content(
     require_device(&state, &headers)?;
 
     let mut entry = lock_assets(&state)?.get(&asset_id);
+    // An image agent text embeds by path, which this gateway resolved for a
+    // client and remembered with the session directory that fenced it. Read
+    // against that directory again, now: the same canonicalize-then-contain
+    // gate as every other read, so a file moved out or swapped for a symlink
+    // out of the directory since is a 404.
+    if entry.is_none() {
+        if let Some(image) = state.message_images.served(&asset_id) {
+            return serve_message_image(asset_id, image).await;
+        }
+    }
     if entry.is_none() {
         // Cold start: the app may hold an id from before a restart, so rebuild
         // the index from the live sessions once before answering. Uploads
@@ -1185,6 +1195,43 @@ pub(crate) async fn asset_content(
         return Err(asset_not_found());
     };
 
+    stream_asset(entry, path).await
+}
+
+/// `asset_content` for an image named in agent text. See `message_images`.
+async fn serve_message_image(
+    asset_id: String,
+    image: crate::agents::message_images::ServedImage,
+) -> ApiResult<Response> {
+    let root = image.root.clone();
+    let stored = image.path.clone();
+    let Some(path) = tokio::task::spawn_blocking(move || resolve_asset_path(&stored, &[root]))
+        .await
+        .unwrap_or_default()
+    else {
+        return Err(asset_not_found());
+    };
+    let entry = AssetEntry {
+        id: asset_id,
+        name: path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+        path: path.clone(),
+        size: 0,
+        modified_unix_ms: 0,
+        root: image.root,
+        session_id: String::new(),
+        workspace_id: None,
+        tab_id: None,
+        pane_id: None,
+    };
+    stream_asset(entry, path).await
+}
+
+/// The read itself, once a path has passed its gate: size cap, sniff, stream.
+async fn stream_asset(entry: AssetEntry, path: PathBuf) -> ApiResult<Response> {
     let metadata = std::fs::metadata(&path).map_err(|_| asset_not_found())?;
     if metadata.len() > MAX_ASSET_CONTENT_BYTES {
         return Err(api_error(

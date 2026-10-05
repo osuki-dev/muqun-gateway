@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 
 use super::directories::expand_directory_param;
 use super::domain::{AgentSessionId, ModelRef, PermissionDecision, SessionQuery};
+use super::message_images;
 use super::ports::mirror::SessionMirrorPort;
 use crate::platform::git;
 use crate::platform::vcs_routes::{self, VcsDiscardBody, VcsFileQuery};
@@ -713,11 +714,14 @@ async fn do_get_agent_session(
 
     let manager = session_manager_or_err(state, asid).await?;
 
-    let snapshot = manager
+    let mut snapshot = manager
         .sessions()
         .get_snapshot(&AgentSessionId(asid.to_string()))
         .await
         .map_err(|e| api_error(StatusCode::NOT_FOUND, "session_not_found", &e.to_string()))?;
+    let directory = snapshot.info.directory.clone();
+    message_images::attach_to_items(state, asid, directory.as_deref(), &mut snapshot.timeline)
+        .await;
 
     // A session the reader is sitting on is polled and mostly unchanged; the
     // whole snapshot is the expensive thing to send twice.
@@ -742,7 +746,12 @@ async fn do_get_agent_session_events(
         .get_events_after(&AgentSessionId(asid.to_string()), after_seq)
         .await
     {
-        Some(events) => Ok(Json(content_envelope(json!(events)))),
+        Some(mut events) => {
+            for event in &mut events {
+                message_images::attach_to_event(state, event).await;
+            }
+            Ok(Json(content_envelope(json!(events))))
+        }
         None => Err(api_error(
             StatusCode::GONE,
             "resync_required",
@@ -761,10 +770,11 @@ async fn do_get_agent_session_timeline(
 
     let manager = session_manager_or_err(state, asid).await?;
 
-    let (items, status, resync, latest_seq) = manager
+    let (mut items, status, resync, latest_seq) = manager
         .mirror()
         .get_timeline_delta(&AgentSessionId(asid.to_string()), after_seq)
         .await;
+    message_images::attach_to_items(state, asid, None, &mut items).await;
 
     let payload = json!({
         "items": items,
@@ -1354,12 +1364,13 @@ async fn do_stream_agent_session(
                 next = rx.recv() => next,
             };
             match next {
-                Ok(ev) => {
+                Ok(mut ev) => {
                     // An event with no session -- a global resync, or a
                     // worktree change -- reaches every stream.
                     if !ev.asid().0.is_empty() && ev.asid() != &target_asid {
                         continue;
                     }
+                    message_images::attach_to_event(&devices, &mut ev).await;
                     let (ev_name, payload) = agent_event_record(&ev);
                     // `None` means the record could not be sealed. It is
                     // dropped rather than ever leaving in the clear.
@@ -3751,6 +3762,119 @@ mod tests {
             assert_eq!(
                 crate::test_support::error_body(&refusal)["error"]["code"],
                 "unknown_path"
+            );
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// An image the agent's markdown names by path reaches the phone as a map
+    /// on its text part -- on the snapshot, the timeline, the replayed events
+    /// and the live stream alike -- and the asset URL in the map serves it,
+    /// for exactly as long as the file is inside the session's directory.
+    #[tokio::test]
+    async fn text_parts_carry_servable_image_assets_and_keep_their_text() {
+        let root = std::env::temp_dir().join(format!("muqun-msg-img-{}", std::process::id()));
+        let work = root.join("work");
+        std::fs::create_dir_all(work.join("out")).unwrap();
+        let png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x02\x00\x00\x00\x03\x08\x06\x00\x00\x00";
+        std::fs::write(work.join("out/flow.png"), png).unwrap();
+        std::fs::write(root.join("secret.png"), png).unwrap();
+        let work = std::fs::canonicalize(&work).unwrap();
+
+        let mut agent = FakeAgent::new("opencode").with_sessions(&[("ses_img", 10)]);
+        agent.sessions[0].directory = Some(work.to_string_lossy().into_owned());
+        let state = state_with(vec![agent]).await;
+        let headers = device_headers();
+        let text = format!(
+            "![flow](./out/flow.png \"Flow\")\n![abs](file://{})\n![no](../secret.png)",
+            work.join("out/flow.png").display()
+        );
+        let manager = state
+            .agent_runtime
+            .manager_for_agent("opencode")
+            .await
+            .unwrap();
+        // The snapshot read seeds the mirror from the agent first.
+        do_get_agent_session(&state, "ses_img", &headers)
+            .await
+            .expect("gets");
+        let asid = AgentSessionId("ses_img".into());
+        let item = crate::agents::domain::TimelineItem {
+            id: "m1:t0".into(),
+            message_id: "m1".into(),
+            role: crate::agents::domain::TimelineRole::Assistant,
+            part: crate::agents::domain::AgentPart::Text { text: text.clone() },
+            seq: 0,
+            updated_ms: 0,
+            ordinal: 0,
+            attachments: None,
+            image_assets: None,
+        };
+        manager
+            .mirror()
+            .upsert_timeline_items(&asid, vec![item.clone()])
+            .await;
+
+        let snapshot = body_json(
+            do_get_agent_session(&state, "ses_img", &headers)
+                .await
+                .unwrap(),
+        )
+        .await;
+        let row = &snapshot["data"]["timeline"][0];
+        assert_eq!(row["part"]["text"], text, "the text is the agent's own");
+        let assets = row["image_assets"].as_array().expect("a map");
+        assert_eq!(assets.len(), 2, "{assets:?}");
+        assert_eq!(assets[0]["src"], "./out/flow.png");
+        assert_eq!(assets[0]["mime"], "image/png");
+        assert_eq!(
+            (assets[0]["width"].as_u64(), assets[0]["height"].as_u64()),
+            (Some(2), Some(3))
+        );
+
+        let Json(timeline) = do_get_agent_session_timeline(&state, "ses_img", 0, &headers)
+            .await
+            .unwrap();
+        assert_eq!(
+            timeline["data"]["items"][0]["image_assets"],
+            row["image_assets"]
+        );
+
+        // A streamed upsert gets the same map on its way out.
+        let mut event = crate::agents::domain::AgentDomainEvent::TimelineUpsert {
+            asid: asid.clone(),
+            items: vec![item],
+            seq: 9,
+        };
+        message_images::attach_to_event(&state, &mut event).await;
+        let (_, payload) = agent_event_record(&event);
+        assert!(payload.contains("\"image_assets\""), "{payload}");
+
+        // The URL serves the bytes.
+        let id = assets[0]["asset_id"].as_str().unwrap().to_owned();
+        assert_eq!(assets[0]["url"], format!("/api/assets/{id}/content"));
+        let response =
+            crate::asset_content(State(state.clone()), Path(id.clone()), headers.clone())
+                .await
+                .expect("serves");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "image/png");
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], &png[..]);
+
+        // Swapped for a symlink out of the directory, it is a 404.
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(work.join("out/flow.png")).unwrap();
+            std::os::unix::fs::symlink(root.join("secret.png"), work.join("out/flow.png")).unwrap();
+            let refused =
+                crate::asset_content(State(state.clone()), Path(id), headers.clone()).await;
+            assert_eq!(
+                refused.err().map(|(status, _)| status),
+                Some(StatusCode::NOT_FOUND)
             );
         }
 

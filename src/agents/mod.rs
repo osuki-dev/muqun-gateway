@@ -6,6 +6,7 @@ pub mod approvals;
 pub mod directories;
 pub mod domain;
 pub mod manager;
+pub mod message_images;
 pub mod ports;
 pub mod routes;
 pub mod runtime;

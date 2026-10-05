@@ -278,6 +278,32 @@ pub struct TimelineItem {
     pub ordinal: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attachments: Option<Vec<String>>,
+    /// The images a text part's markdown embeds by host path, each resolved to
+    /// the gateway asset that serves it. Never stored: attached on the way out
+    /// (see `agents::message_images`), so the text itself stays as the agent
+    /// wrote it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_assets: Option<Vec<MessageImageAsset>>,
+}
+
+/// One image a text part embeds, as the gateway can serve it.
+///
+/// `src` is the link destination exactly as written in the markdown (or the
+/// `<img src>` value), so a client can find it again and swap in `url`. Only
+/// sources that resolve to an image file inside the session's directory are
+/// listed; anything else -- a web URL, a data URI, a path outside the
+/// directory, a file that is not an image -- is absent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MessageImageAsset {
+    pub src: String,
+    pub asset_id: String,
+    /// Gateway-relative: `/api/assets/{asset_id}/content`.
+    pub url: String,
+    pub mime: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
 }
 
 impl TimelineItem {
