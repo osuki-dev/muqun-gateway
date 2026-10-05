@@ -47,7 +47,7 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     // The binding has to be named: `let _ = ...` would drop the lock on the
     // spot and leave this gateway believing it owned a directory it had
     // already released.
-    let _state_lock = state_lock::StateLock::acquire(&state_dir()?)?;
+    let _state_lock = state_lock::StateLock::acquire_owner(&state_dir()?)?;
     ensure_pairing_transport_key()?;
     let config = load_config(config_path)?;
     warn_about_missing_backend_programs(&config);
