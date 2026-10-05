@@ -501,7 +501,9 @@ impl ManagerPty {
     fn open(install: &Install) -> Self {
         let mut master = -1;
         let mut slave = -1;
-        let size = libc::winsize {
+        // macOS declares the termios and winsize arguments `*mut`, Linux
+        // `*const`; mutable pointers coerce to either.
+        let mut size = libc::winsize {
             ws_row: 40,
             ws_col: 100,
             ws_xpixel: 0,
@@ -514,8 +516,8 @@ impl ManagerPty {
                     &mut master,
                     &mut slave,
                     std::ptr::null_mut(),
-                    std::ptr::null(),
-                    &size,
+                    std::ptr::null_mut(),
+                    std::ptr::addr_of_mut!(size),
                 )
             },
             0
