@@ -23,6 +23,10 @@ use super::adapters::opencode::OpencodeEndpoint;
 use super::domain::AgentDomainEvent;
 use super::manager::AgentManager;
 
+mod t3;
+use t3::{catalog_entry, t3_features, T3State};
+pub use t3::{T3Config, DEFAULT_T3_URL};
+
 /// How often the supervisor checks a healthy agent.
 const HEALTHY_POLL: Duration = Duration::from_secs(15);
 /// How soon it retries after finding none.
@@ -47,9 +51,10 @@ const STREAM_LOSS_MAX_WAIT: Duration = Duration::from_secs(30);
 const MIN_OPENCODE_MAJOR: u64 = 2;
 
 /// Agent ids in primary-preference order. OpenCode is the established
-/// agent and DeepSeek is opt-in, so DeepSeek is primary only when OpenCode is
-/// not attached. Every place that names an agent by position reads this.
-pub const AGENT_PREFERENCE: [&str; 2] = ["opencode", "deepseek"];
+/// agent; DeepSeek and T3 Code are opt-in, so each is primary only when
+/// nothing ahead of it is attached. Every place that names an agent by
+/// position reads this.
+pub const AGENT_PREFERENCE: [&str; 3] = ["opencode", "deepseek", "t3"];
 /// Most session-to-agent routes remembered; the oldest go first.
 const MAX_SESSION_ROUTES: usize = 4096;
 /// How long an agent discovery result is reused.
@@ -221,6 +226,7 @@ pub struct AgentRuntime {
     events_tx: broadcast::Sender<AgentDomainEvent>,
     config: OpencodeConfig,
     deepseek_config: DeepseekConfig,
+    t3: T3State,
     origin: RwLock<AgentOrigin>,
     /// Serialize startup commands; OpenCode owns the background service.
     start_lock: Mutex<()>,
@@ -229,10 +235,25 @@ pub struct AgentRuntime {
 
 impl AgentRuntime {
     pub fn new(config: OpencodeConfig) -> Arc<Self> {
-        Self::with_configs(config, DeepseekConfig::default())
+        Self::with_configs(config, DeepseekConfig::default(), T3Config::default(), None)
     }
 
-    pub fn with_configs(config: OpencodeConfig, deepseek_config: DeepseekConfig) -> Arc<Self> {
+    /// `state_dir` is where credentials an agent hands the gateway (the T3
+    /// bearer) are kept; `None` keeps them in memory for this run only.
+    pub fn with_configs(
+        config: OpencodeConfig,
+        deepseek_config: DeepseekConfig,
+        t3_config: T3Config,
+        state_dir: Option<std::path::PathBuf>,
+    ) -> Arc<Self> {
+        Self::with_t3_state(config, deepseek_config, T3State::new(t3_config, state_dir))
+    }
+
+    fn with_t3_state(
+        config: OpencodeConfig,
+        deepseek_config: DeepseekConfig,
+        t3: T3State,
+    ) -> Arc<Self> {
         let (events_tx, _) = broadcast::channel(1024);
         Arc::new(Self {
             manager: RwLock::new(None),
@@ -243,6 +264,7 @@ impl AgentRuntime {
             events_tx,
             config,
             deepseek_config,
+            t3,
             origin: RwLock::new(AgentOrigin::None),
             start_lock: Mutex::new(()),
             supervising: AtomicBool::new(false),
@@ -259,6 +281,8 @@ impl AgentRuntime {
                 binary: None,
             },
             DeepseekConfig::default(),
+            T3Config::default(),
+            None,
         )
     }
 
@@ -468,15 +492,20 @@ impl AgentRuntime {
         let agents = AGENT_PREFERENCE
             .iter()
             .map(|id| {
-                let enabled = match *id {
-                    "opencode" => self.config.enabled,
-                    _ => self.deepseek_config.enabled || self.deepseek_config.endpoint.is_some(),
+                let (enabled, name, features) = match *id {
+                    "opencode" => (
+                        self.config.enabled,
+                        "OpenCode",
+                        opencode_features(false, false),
+                    ),
+                    "t3" => (self.t3.wanted(), "T3 Code", t3_features()),
+                    _ => (
+                        self.deepseek_config.enabled || self.deepseek_config.endpoint.is_some(),
+                        "DeepSeek",
+                        deepseek_features(false, false),
+                    ),
                 };
                 let manager = attached.iter().find(|(h, _)| h == id).map(|(_, m)| m);
-                let (name, features) = match *id {
-                    "opencode" => ("OpenCode", opencode_features(false, false)),
-                    _ => ("DeepSeek", deepseek_features(false, false)),
-                };
                 AgentDiscoveryInfo {
                     id: id.to_string(),
                     name: name.to_string(),
@@ -489,6 +518,7 @@ impl AgentRuntime {
                     enabled,
                     endpoint: manager.map(|m| m.endpoint_url().to_string()),
                     version: manager.and_then(|m| m.version()),
+                    reason: None,
                     models: Vec::new(),
                     modes: Vec::new(),
                     features,
@@ -509,7 +539,9 @@ impl AgentRuntime {
         }
     }
 
-    async fn probe_agents(&self) -> crate::discovery::AgentPlaneDiscovery {
+    /// One discovery pass, uncached and with no TTL or timeout. The routes go
+    /// through `discover_agents`; this is for the `agent` CLI only.
+    pub(crate) async fn probe_agents(&self) -> crate::discovery::AgentPlaneDiscovery {
         use crate::discovery::{
             AgentAvailability, AgentDiscoveryInfo, AgentPlaneDiscovery, AgentPlaneFeatures,
         };
@@ -528,24 +560,13 @@ impl AgentRuntime {
                 enabled: false,
                 endpoint: self.deepseek_config.endpoint.clone(),
                 version: None,
+                reason: None,
                 models: Vec::new(),
                 modes: Vec::new(),
                 features: deepseek_features(false, false),
             }
         } else if let Some(m) = self.manager_for_agent("deepseek").await {
-            let (models, modes) = match m.agent().get_catalog(None).await {
-                Ok(cat) => (
-                    cat.models
-                        .iter()
-                        .map(crate::discovery::model_info_to_agent_model)
-                        .collect::<Vec<_>>(),
-                    cat.modes
-                        .iter()
-                        .map(crate::discovery::mode_info_to_agent_mode)
-                        .collect::<Vec<_>>(),
-                ),
-                Err(_) => (Vec::new(), Vec::new()),
-            };
+            let (models, modes) = catalog_entry(m.agent().as_ref()).await;
             let supports_reasoning = models
                 .iter()
                 .any(|m| m.supports_reasoning || !m.reasoning_effort_tiers.is_empty());
@@ -559,20 +580,20 @@ impl AgentRuntime {
                 enabled: true,
                 endpoint: Some(m.endpoint_url().to_string()),
                 version: m.version(),
+                reason: None,
                 features: deepseek_features(supports_reasoning, has_models),
                 models,
                 modes,
             }
         } else {
             let ep = if let Some(ref url) = self.deepseek_config.endpoint {
-                Some(crate::agents::adapters::deepseek::DeepseekEndpoint::new(
-                    url.clone(),
-                    self.deepseek_config.token.clone(),
-                    self.deepseek_config
-                        .secret
-                        .clone()
-                        .or_else(crate::agents::adapters::deepseek::auth::load_local_secret),
-                ))
+                Some(
+                    crate::agents::adapters::deepseek::DeepseekEndpoint::with_fallbacks(
+                        url.clone(),
+                        self.deepseek_config.token.clone(),
+                        self.deepseek_config.secret.clone(),
+                    ),
+                )
             } else {
                 crate::agents::adapters::deepseek::DeepseekEndpoint::discover().await
             };
@@ -584,21 +605,7 @@ impl AgentRuntime {
                         let driver = crate::agents::adapters::deepseek::DeepseekDriver::new(
                             endpoint.clone(),
                         );
-                        let (models, modes) =
-                            match crate::agents::ports::AgentPort::get_catalog(&driver, None).await
-                            {
-                                Ok(cat) => (
-                                    cat.models
-                                        .iter()
-                                        .map(crate::discovery::model_info_to_agent_model)
-                                        .collect::<Vec<_>>(),
-                                    cat.modes
-                                        .iter()
-                                        .map(crate::discovery::mode_info_to_agent_mode)
-                                        .collect::<Vec<_>>(),
-                                ),
-                                Err(_) => (Vec::new(), Vec::new()),
-                            };
+                        let (models, modes) = catalog_entry(&driver).await;
                         (
                             AgentAvailability::Reachable,
                             Some(endpoint.url),
@@ -638,6 +645,7 @@ impl AgentRuntime {
                 enabled: true,
                 endpoint: endpoint_url,
                 version,
+                reason: None,
                 features: deepseek_features(supports_reasoning, has_models),
                 models,
                 modes,
@@ -656,24 +664,13 @@ impl AgentRuntime {
                 enabled: false,
                 endpoint: None,
                 version: None,
+                reason: None,
                 models: Vec::new(),
                 modes: Vec::new(),
                 features: opencode_features(false, false),
             }
         } else if let Some(m) = self.manager_for_agent("opencode").await {
-            let (models, modes) = match m.agent().get_catalog(None).await {
-                Ok(cat) => (
-                    cat.models
-                        .iter()
-                        .map(crate::discovery::model_info_to_agent_model)
-                        .collect::<Vec<_>>(),
-                    cat.modes
-                        .iter()
-                        .map(crate::discovery::mode_info_to_agent_mode)
-                        .collect::<Vec<_>>(),
-                ),
-                Err(_) => (Vec::new(), Vec::new()),
-            };
+            let (models, modes) = catalog_entry(m.agent().as_ref()).await;
             let supports_reasoning = models
                 .iter()
                 .any(|m| m.supports_reasoning || !m.reasoning_effort_tiers.is_empty());
@@ -687,73 +684,59 @@ impl AgentRuntime {
                 enabled: true,
                 endpoint: Some(m.endpoint_url().to_string()),
                 version: m.version(),
+                reason: None,
                 features: opencode_features(supports_reasoning, has_models),
                 models,
                 modes,
             }
         } else {
-            let (status, endpoint_url, version, models, modes) = match OpencodeEndpoint::discover()
-                .await
-            {
-                Some(endpoint) => {
-                    let client = probe_client();
-                    if endpoint.probe_healthy(&client).await {
-                        let driver = crate::agents::adapters::opencode::OpencodeDriver::new(
-                            endpoint.clone(),
-                        );
-                        let (models, modes) =
-                            match crate::agents::ports::AgentPort::get_catalog(&driver, None).await
-                            {
-                                Ok(cat) => (
-                                    cat.models
-                                        .iter()
-                                        .map(crate::discovery::model_info_to_agent_model)
-                                        .collect::<Vec<_>>(),
-                                    cat.modes
-                                        .iter()
-                                        .map(crate::discovery::mode_info_to_agent_mode)
-                                        .collect::<Vec<_>>(),
-                                ),
-                                Err(_) => (Vec::new(), Vec::new()),
-                            };
-                        (
-                            AgentAvailability::Reachable,
-                            Some(endpoint.url),
-                            endpoint.version,
-                            models,
-                            modes,
-                        )
-                    } else {
-                        (
-                            AgentAvailability::Offline,
-                            Some(endpoint.url),
-                            None,
-                            Vec::new(),
-                            Vec::new(),
-                        )
+            let (status, endpoint_url, version, models, modes) =
+                match OpencodeEndpoint::discover().await {
+                    Some(endpoint) => {
+                        let client = probe_client();
+                        if endpoint.probe_healthy(&client).await {
+                            let driver = crate::agents::adapters::opencode::OpencodeDriver::new(
+                                endpoint.clone(),
+                            );
+                            let (models, modes) = catalog_entry(&driver).await;
+                            (
+                                AgentAvailability::Reachable,
+                                Some(endpoint.url),
+                                endpoint.version,
+                                models,
+                                modes,
+                            )
+                        } else {
+                            (
+                                AgentAvailability::Offline,
+                                Some(endpoint.url),
+                                None,
+                                Vec::new(),
+                                Vec::new(),
+                            )
+                        }
                     }
-                }
-                None => {
-                    let installed = local_installation_status(&self.config);
-                    if installed == AgentInstallation::Installed {
-                        (
-                            AgentAvailability::Offline,
-                            None,
-                            None,
-                            Vec::new(),
-                            Vec::new(),
-                        )
-                    } else {
-                        (
-                            AgentAvailability::NotInstalled,
-                            None,
-                            None,
-                            Vec::new(),
-                            Vec::new(),
-                        )
+                    None => {
+                        let installed = local_installation_status(&self.config);
+                        if installed == AgentInstallation::Installed {
+                            (
+                                AgentAvailability::Offline,
+                                None,
+                                None,
+                                Vec::new(),
+                                Vec::new(),
+                            )
+                        } else {
+                            (
+                                AgentAvailability::NotInstalled,
+                                None,
+                                None,
+                                Vec::new(),
+                                Vec::new(),
+                            )
+                        }
                     }
-                }
-            };
+                };
 
             let supports_reasoning = models
                 .iter()
@@ -768,6 +751,7 @@ impl AgentRuntime {
                 enabled: true,
                 endpoint: endpoint_url,
                 version,
+                reason: None,
                 features: opencode_features(supports_reasoning, has_models),
                 models,
                 modes,
@@ -783,6 +767,9 @@ impl AgentRuntime {
                 .position(|id| *id == agent.id)
                 .unwrap_or(AGENT_PREFERENCE.len())
         });
+
+        // 3. T3 Code discovery
+        agents.push(self.t3_discovery().await);
 
         let supported = agents.iter().any(|h| {
             h.status == AgentAvailability::Connected || h.status == AgentAvailability::Reachable
@@ -867,29 +854,19 @@ impl AgentRuntime {
         let mut opencode_ok = false;
 
         // 1. Supervise DeepSeek
-        if let Some(mgr) = self.manager_for_agent("deepseek").await {
-            if mgr.agent().probe().await.unwrap_or(false) {
-                deepseek_ok = true;
-            } else {
-                tracing::warn!(
-                    url = mgr.endpoint_url(),
-                    "DeepSeek agent unhealthy, re-probing"
-                );
-                mgr.shutdown();
-                self.managers.write().await.remove("deepseek");
-            }
+        if self.keep_if_healthy("deepseek").await {
+            deepseek_ok = true;
         }
         if !deepseek_ok && (self.deepseek_config.enabled || self.deepseek_config.endpoint.is_some())
         {
             let ep = if let Some(ref url) = self.deepseek_config.endpoint {
-                Some(crate::agents::adapters::deepseek::DeepseekEndpoint::new(
-                    url.clone(),
-                    self.deepseek_config.token.clone(),
-                    self.deepseek_config
-                        .secret
-                        .clone()
-                        .or_else(crate::agents::adapters::deepseek::auth::load_local_secret),
-                ))
+                Some(
+                    crate::agents::adapters::deepseek::DeepseekEndpoint::with_fallbacks(
+                        url.clone(),
+                        self.deepseek_config.token.clone(),
+                        self.deepseek_config.secret.clone(),
+                    ),
+                )
             } else {
                 crate::agents::adapters::deepseek::DeepseekEndpoint::discover().await
             };
@@ -951,7 +928,10 @@ impl AgentRuntime {
             }
         }
 
-        if deepseek_ok || opencode_ok {
+        // 3. Supervise T3 Code
+        let t3_ok = self.supervise_t3().await;
+
+        if deepseek_ok || opencode_ok || t3_ok {
             *start_backoff = Duration::from_secs(2);
             let primary = pick_primary(&*self.managers.read().await).cloned();
             if let Some(mgr) = primary {
@@ -977,12 +957,8 @@ impl AgentRuntime {
             .pid
             .and_then(running_binary_path)
             .map(|p| p.display().to_string());
-        let manager = Arc::new(AgentManager::connect(endpoint, self.events_tx.clone()));
-        self.managers
-            .write()
-            .await
-            .insert("opencode".to_string(), manager);
-        self.promote_primary("opencode", origin).await;
+        let manager = AgentManager::connect(endpoint, self.events_tx.clone());
+        self.install("opencode", manager, origin).await;
         let path = path.unwrap_or_else(|| "unknown".to_string());
         match origin {
             AgentOrigin::Adopted => tracing::info!(
@@ -999,6 +975,41 @@ impl AgentRuntime {
             ),
             AgentOrigin::None => {}
         }
+    }
+
+    /// Register a freshly connected manager under its agent id and let the
+    /// preference order decide whether it is now the primary. Every attach
+    /// path ends here.
+    async fn install(&self, agent_id: &str, manager: AgentManager, origin: AgentOrigin) {
+        let replaced = self
+            .managers
+            .write()
+            .await
+            .insert(agent_id.to_string(), Arc::new(manager));
+        if let Some(old) = replaced {
+            old.shutdown();
+        }
+        self.promote_primary(agent_id, origin).await;
+    }
+
+    /// Whether the attached manager for `agent_id` still answers its probe.
+    /// One that does not is shut down and detached, so the next pass looks
+    /// for the agent afresh. `false` when nothing is attached.
+    async fn keep_if_healthy(&self, agent_id: &str) -> bool {
+        let Some(manager) = self.managers.read().await.get(agent_id).cloned() else {
+            return false;
+        };
+        if manager.agent().probe().await.unwrap_or(false) {
+            return true;
+        }
+        tracing::warn!(
+            agent_id,
+            url = manager.endpoint_url(),
+            "agent unhealthy, re-probing"
+        );
+        manager.shutdown();
+        self.managers.write().await.remove(agent_id);
+        false
     }
 
     /// Make the most preferred attached manager the primary; `origin` is
@@ -1026,15 +1037,8 @@ impl AgentRuntime {
     ) {
         let url = endpoint.url.clone();
         let version = endpoint.version.clone();
-        let manager = Arc::new(AgentManager::connect_deepseek(
-            endpoint,
-            self.events_tx.clone(),
-        ));
-        self.managers
-            .write()
-            .await
-            .insert("deepseek".to_string(), manager);
-        self.promote_primary("deepseek", origin).await;
+        let manager = AgentManager::connect_deepseek(endpoint, self.events_tx.clone());
+        self.install("deepseek", manager, origin).await;
         tracing::info!(
             url = %url,
             version = version.as_deref().unwrap_or("unknown"),
@@ -1170,7 +1174,7 @@ fn check_version(version: Option<&str>) -> Result<(), String> {
 /// per install, and a gateway reaching into one of its own would quietly run a
 /// different binary than the owner's shell does, which is the confusion this
 /// is here to end.
-fn resolve_binary(configured: Option<&str>) -> anyhow::Result<std::path::PathBuf> {
+pub(crate) fn resolve_binary(configured: Option<&str>) -> anyhow::Result<std::path::PathBuf> {
     resolve_binary_in(configured, std::env::var_os("PATH").as_deref())
 }
 
@@ -1310,7 +1314,7 @@ fn is_executable(path: &std::path::Path) -> bool {
 }
 
 /// What `<binary> --version` says, or `None` if it cannot be asked.
-fn binary_version(path: &std::path::Path) -> Option<String> {
+pub(crate) fn binary_version(path: &std::path::Path) -> Option<String> {
     let output = std::process::Command::new(path)
         .arg("--version")
         .output()
@@ -1376,15 +1380,18 @@ fn deepseek_features(
         tool_approvals: true,
         worktrees: false,
         revert: false,
+        staged_revert: false,
         inbox: false,
-        // Presets are the modes; the client refuses attachments and the driver
-        // leaves skills, commands, compaction and shells at `Unsupported`.
+        // Presets are the modes; attachments arrive as host paths in the
+        // prompt text, and the driver leaves skills, commands, compaction and
+        // shells at `Unsupported`.
         modes: true,
         skills: false,
         slash_commands: false,
         compaction: false,
         background_shells: false,
-        attachments: false,
+        attachments: true,
+        attachments_by_path: true,
         extra: std::collections::BTreeMap::from([(
             "modeSwitching".into(),
             serde_json::Value::Bool(false),
@@ -1403,6 +1410,7 @@ fn opencode_features(
         tool_approvals: true,
         worktrees: true,
         revert: true,
+        staged_revert: true,
         inbox: true,
         modes: true,
         skills: true,
@@ -1410,6 +1418,7 @@ fn opencode_features(
         compaction: true,
         background_shells: true,
         attachments: true,
+        attachments_by_path: false,
         extra: std::collections::BTreeMap::new(),
     }
 }
@@ -1417,6 +1426,32 @@ fn opencode_features(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_agent_serializes_the_capability_flags() {
+        let keys = [
+            "modes",
+            "skills",
+            "slashCommands",
+            "compaction",
+            "backgroundShells",
+            "attachments",
+            "stagedRevert",
+            "attachmentsByPath",
+        ];
+        let flags = |f: crate::discovery::AgentFeatures| {
+            let v = serde_json::to_value(f).unwrap();
+            keys.map(|k| v[k].as_bool().unwrap_or_else(|| panic!("{k} missing")))
+        };
+        assert_eq!(
+            flags(opencode_features(true, true)),
+            [true, true, true, true, true, true, true, false]
+        );
+        assert_eq!(
+            flags(deepseek_features(true, true)),
+            [true, false, false, false, false, true, false, true]
+        );
+    }
 
     #[cfg(unix)]
     #[tokio::test]
@@ -1840,6 +1875,10 @@ mod tests {
         map.insert("other".to_string(), 3);
         map.remove("opencode");
         assert_eq!(pick_primary(&map), Some(&2));
+        map.insert("t3".to_string(), 4);
+        assert_eq!(pick_primary(&map), Some(&2), "DeepSeek outranks T3");
+        map.remove("deepseek");
+        assert_eq!(pick_primary(&map), Some(&4));
     }
 
     #[test]
@@ -1883,6 +1922,7 @@ mod tests {
         let runtime = AgentRuntime::disabled();
         assert!(runtime.is_known_agent("opencode"));
         assert!(runtime.is_known_agent("deepseek"));
+        assert!(runtime.is_known_agent("t3"));
         assert!(!runtime.is_known_agent("claude"));
     }
 
@@ -1896,6 +1936,173 @@ mod tests {
         let ds = found.agents.iter().find(|a| a.id == "deepseek").unwrap();
         assert_eq!(ds.status, crate::discovery::AgentAvailability::Disabled);
         assert!(ds.endpoint.is_none());
+    }
+
+    fn t3_runtime(t3: T3Config) -> Arc<AgentRuntime> {
+        AgentRuntime::with_t3_state(
+            OpencodeConfig {
+                enabled: false,
+                autostart: false,
+                binary: None,
+            },
+            DeepseekConfig::default(),
+            T3State::with_env(t3, None, |_| None),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_disabled_t3_is_never_probed_attached_or_scanned_for() {
+        let runtime = t3_runtime(T3Config::default());
+        assert!(!runtime.supervise_t3().await);
+        assert!(runtime.manager_for_agent("t3").await.is_none());
+        let found = runtime.discover_agents().await;
+        let t3 = found.agents.iter().find(|a| a.id == "t3").unwrap();
+        assert_eq!(t3.status, crate::discovery::AgentAvailability::Disabled);
+        assert!(!t3.enabled);
+        assert!(t3.endpoint.is_none(), "no default URL is advertised");
+        assert!(runtime.status_for("t3").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_enabled_t3_without_a_server_is_offline_at_its_url() {
+        // Port 9 (discard) refuses on loopback: nothing answers there.
+        let runtime = t3_runtime(T3Config {
+            url: Some("http://127.0.0.1:9/".into()),
+            ..Default::default()
+        });
+        assert!(!runtime.supervise_t3().await);
+        assert!(runtime.manager_for_agent("t3").await.is_none());
+        let found = runtime.discover_agents().await;
+        let t3 = found.agents.iter().find(|a| a.id == "t3").unwrap();
+        assert_eq!(t3.name, "T3 Code");
+        assert_eq!(t3.kind, "t3");
+        assert!(t3.enabled);
+        assert_eq!(t3.status, crate::discovery::AgentAvailability::Offline);
+        assert_eq!(t3.endpoint.as_deref(), Some("http://127.0.0.1:9/"));
+        assert!(t3.modes.is_empty());
+        let f = &t3.features;
+        assert!(f.streaming && f.model_selection && f.tool_approvals && f.revert);
+        assert!(!f.reasoning_effort && !f.worktrees && !f.inbox);
+
+        let enabled = t3_runtime(T3Config {
+            enabled: true,
+            ..Default::default()
+        });
+        let found = enabled.attached_snapshot().await;
+        let t3 = found.agents.iter().find(|a| a.id == "t3").unwrap();
+        assert_eq!(t3.status, crate::discovery::AgentAvailability::Offline);
+        assert_eq!(enabled.t3.url(), t3::DEFAULT_T3_URL);
+    }
+
+    /// A T3 server that answers only its public descriptor.
+    async fn fake_t3_descriptor() -> String {
+        fake_t3_serving(r#"{"environmentId":"env","label":"t3","serverVersion":"0.9.1"}"#).await
+    }
+
+    /// A T3 server that answers `descriptor` at its well-known path.
+    async fn fake_t3_serving(descriptor: &'static str) -> String {
+        let app = axum::Router::new().route(
+            crate::agents::adapters::t3::endpoint::WELL_KNOWN_PATH,
+            axum::routing::get(move || async move { descriptor }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        url
+    }
+
+    #[tokio::test]
+    async fn a_t3_server_without_a_credential_is_unconfigured_not_reachable() {
+        let url = fake_t3_descriptor().await;
+        let runtime = t3_runtime(T3Config {
+            url: Some(url.clone()),
+            ..Default::default()
+        });
+        let t3 = runtime.t3_discovery().await;
+        assert_eq!(t3.status, crate::discovery::AgentAvailability::Unconfigured);
+        assert_eq!(t3.version.as_deref(), Some("0.9.1"));
+
+        // Holding a credential, the gateway will attach on first use.
+        let runtime = t3_runtime(T3Config {
+            url: Some(url),
+            token: Some("bearer".into()),
+            ..Default::default()
+        });
+        let t3 = runtime.t3_discovery().await;
+        assert_eq!(t3.status, crate::discovery::AgentAvailability::Reachable);
+    }
+
+    /// The live 0.0.45 descriptor, with the protocol version swapped in.
+    fn t3_descriptor_speaking(version: u64) -> &'static str {
+        let mut raw: serde_json::Value =
+            serde_json::from_str(include_str!("adapters/t3/fixtures/environment.json")).unwrap();
+        raw["serverVersion"] = "0.0.45".into();
+        raw["orchestrationProtocolVersion"] = version.into();
+        Box::leak(raw.to_string().into_boxed_str())
+    }
+
+    #[tokio::test]
+    async fn a_t3_server_on_a_newer_protocol_is_unsupported_and_never_attached() {
+        let url = fake_t3_serving(t3_descriptor_speaking(2)).await;
+        let runtime = t3_runtime(T3Config {
+            url: Some(url),
+            token: Some("bearer".into()),
+            ..Default::default()
+        });
+        assert!(!runtime.supervise_t3().await);
+        assert!(runtime.manager_for_agent("t3").await.is_none());
+        let t3 = runtime.t3_discovery().await;
+        assert_eq!(t3.status, crate::discovery::AgentAvailability::Unsupported);
+        assert_eq!(
+            t3.reason.as_deref(),
+            Some("T3 server speaks orchestration protocol 2; this gateway supports 1")
+        );
+        assert_eq!(t3.version.as_deref(), Some("0.0.45"));
+        assert!(t3.models.is_empty());
+        let wire = serde_json::to_value(&t3).unwrap();
+        assert_eq!(wire["status"], "unsupported");
+    }
+
+    #[tokio::test]
+    async fn a_t3_server_on_protocol_1_is_attached() {
+        let url = fake_t3_serving(t3_descriptor_speaking(1)).await;
+        let runtime = t3_runtime(T3Config {
+            url: Some(url),
+            token: Some("bearer".into()),
+            ..Default::default()
+        });
+        assert!(runtime.supervise_t3().await);
+        let manager = runtime.manager_for_agent("t3").await.expect("attached");
+        assert_eq!(manager.version().as_deref(), Some("0.0.45"));
+        let t3 = runtime.t3_discovery().await;
+        assert_eq!(t3.status, crate::discovery::AgentAvailability::Connected);
+        assert!(t3.reason.is_none());
+        manager.shutdown();
+    }
+
+    #[tokio::test]
+    async fn an_attached_t3_is_connected_with_its_server_version() {
+        let runtime = t3_runtime(T3Config {
+            enabled: true,
+            ..Default::default()
+        });
+        let driver = Arc::new(crate::agents::adapters::t3::T3Driver::new(
+            crate::agents::adapters::t3::T3Endpoint::new(
+                "http://127.0.0.1:9",
+                crate::agents::adapters::t3::T3Credential::None,
+            ),
+        ));
+        let client = driver.client().clone();
+        runtime
+            .attach_for_test(Arc::new(AgentManager::for_test(driver)))
+            .await;
+        let found = runtime.discover_agents().await;
+        let t3 = found.agents.iter().find(|a| a.id == "t3").unwrap();
+        assert_eq!(t3.status, crate::discovery::AgentAvailability::Connected);
+        assert!(found.supported);
+        let status = runtime.status_for("t3").await.expect("attached");
+        assert_eq!(status.agent_id.as_deref(), Some("t3"));
+        client.shutdown();
     }
 
     #[tokio::test]

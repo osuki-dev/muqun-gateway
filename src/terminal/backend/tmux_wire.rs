@@ -31,9 +31,9 @@ use std::path::PathBuf;
 
 use super::{
     Agent, BackendActivityStream, BackendError, BackendFuture, BackendMetadata, CreateTab,
-    CreateWorkspace, Pane, PaneId, PaneOutput, ReadPane, SendTextMode, SplitPane, StartAgent,
-    StartedAgent, Tab, TabId, TerminalBackend, Workspace, WorkspaceId, Worktree, WorktreePlacement,
-    WorktreeRequest,
+    CreateWorkspace, KeyboardVocabulary, Pane, PaneId, PaneOutput, ReadPane, SendTextMode,
+    SplitPane, StartAgent, StartedAgent, Tab, TabId, TerminalBackend, Workspace, WorkspaceId,
+    Worktree, WorktreePlacement, WorktreeRequest,
 };
 
 /// Wraps a tmux [`TerminalBackend`] so every id crossing it is in wire form.
@@ -384,6 +384,22 @@ impl TerminalBackend for TmuxWireIds {
             Ok(encode_worktree_placement(
                 self.inner.create_worktree(request).await?,
             ))
+        })
+    }
+
+    fn keyboard<'a>(
+        &'a self,
+        metadata: &'a BackendMetadata,
+    ) -> BackendFuture<'a, Option<KeyboardVocabulary>> {
+        // No id involved. Forwarded rather than left to the default, which
+        // would answer "no vocabulary" for every tmux session.
+        self.inner.keyboard(metadata)
+    }
+
+    fn pane_extended_keys<'a>(&'a self, id: &'a PaneId) -> BackendFuture<'a, Option<bool>> {
+        Box::pin(async move {
+            let native = decode_wire(id.as_str(), "pane")?;
+            self.inner.pane_extended_keys(&PaneId::new(native)).await
         })
     }
 

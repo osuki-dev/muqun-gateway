@@ -26,6 +26,7 @@ use crate::platform::assets::{
     MAX_ASSET_EVENTS_PER_WORKTREE,
 };
 use crate::platform::i18n::Locale;
+use crate::platform::vcs_routes::{self, VcsDiscardBody, VcsFileQuery, VcsFilesQuery};
 use crate::{
     agents, api_error, approvals, backend, backend_api_error, backend_endpoint, composer,
     content_envelope, current_server_label, find_session, generate_token, git, i18n, native,
@@ -123,6 +124,18 @@ pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
         .route(
             "/api/sessions/{session_id}/panes/{pane_id}/git/diff",
             get(pane_git_diff),
+        )
+        .route(
+            "/api/sessions/{session_id}/panes/{pane_id}/vcs/files",
+            get(pane_vcs_files),
+        )
+        .route(
+            "/api/sessions/{session_id}/panes/{pane_id}/vcs/file",
+            get(pane_vcs_file),
+        )
+        .route(
+            "/api/sessions/{session_id}/panes/{pane_id}/vcs/discard",
+            post(discard_pane_vcs_file),
         )
         .route(
             "/api/sessions/{session_id}/panes/{pane_id}/send-text",
@@ -305,7 +318,15 @@ pub(crate) fn pane_read_text(value: &Value) -> Option<String> {
 /// Convert one sampled frame into the enriched `pane_updated` payload consumed
 /// by Muqun. Output content, rather than revision, is used to decide whether to
 /// emit because Herdr can expose new text before its coalesced revision advances.
-pub(crate) fn stream_pane_update_payload(frame: &StreamPaneFrame, pane_id: &str) -> Option<String> {
+///
+/// `data.generation` is the gateway's instance generation, carried on every
+/// frame that carries output so a client can tell rows streamed by this
+/// process from rows it kept from a previous one.
+pub(crate) fn stream_pane_update_payload(
+    frame: &StreamPaneFrame,
+    pane_id: &str,
+    generation: &str,
+) -> Option<String> {
     let payload = json!({
         "event": "pane_updated",
         "data": {
@@ -313,7 +334,8 @@ pub(crate) fn stream_pane_update_payload(frame: &StreamPaneFrame, pane_id: &str)
                 "pane_id": pane_id,
                 "revision": frame.revision
             },
-            "output": frame.output
+            "output": frame.output,
+            "generation": generation
         }
     });
     serde_json::to_string(&payload).ok()
@@ -338,13 +360,15 @@ pub(crate) async fn poll_stream_pane_update(
 }
 
 /// If `line` is a `pane.updated` for the streamed pane, read that pane's output
-/// and fold it into the event as `data.output`. Returns `None` to forward the
+/// and fold it into the event as `data.output`, with the instance generation
+/// beside it as `data.generation`. Returns `None` to forward the
 /// line untouched (wrong pane, wrong event, or a read failure -- the client
 /// still has its revision and can fall back to a read).
 pub(crate) async fn enrich_pane_update(
     line: &str,
     backend: &dyn TerminalBackend,
     opts: &StreamOutputOpts,
+    generation: &str,
 ) -> Option<String> {
     let pane = opts.pane.as_deref()?;
     let mut value: Value = serde_json::from_str(line).ok()?;
@@ -369,10 +393,9 @@ pub(crate) async fn enrich_pane_update(
     .await
     .ok()?
     .ok()?;
-    value
-        .get_mut("data")
-        .and_then(Value::as_object_mut)?
-        .insert("output".into(), Value::String(read.text));
+    let data = value.get_mut("data").and_then(Value::as_object_mut)?;
+    data.insert("output".into(), Value::String(read.text));
+    data.insert("generation".into(), json!(generation));
     serde_json::to_string(&value).ok()
 }
 
@@ -567,6 +590,7 @@ pub(crate) async fn events(
     let devices = state.clone();
     let assets = state.assets.clone();
     let scrollback_store = state.scrollback.clone();
+    let generation = state.generation.clone();
     let backend = terminal_backend(&session);
     let mut activity = subscribe_activity(&state, &session);
     // The runtime's channel, not a manager's: a client's stream has to survive
@@ -601,7 +625,7 @@ pub(crate) async fn events(
                         });
                         if keep {
                             let payload = if stream_opts.pane.is_some() {
-                                enrich_pane_update(&data, backend.as_ref(), &stream_opts)
+                                enrich_pane_update(&data, backend.as_ref(), &stream_opts, &generation)
                                     .await
                                     .unwrap_or_else(|| data.clone())
                             } else {
@@ -659,7 +683,7 @@ pub(crate) async fn events(
                             last_stream_output = Some(frame.output.clone());
                             if let Some(pane_id) = stream_opts.pane.as_deref() {
                                 keep_stream_frame(&scrollback_store, &session_id, pane_id, &stream_opts, &frame.output);
-                                if let Some(payload) = stream_pane_update_payload(&frame, pane_id) {
+                                if let Some(payload) = stream_pane_update_payload(&frame, pane_id, &generation) {
                                     if let Some(event) = stream_event(&mut sealer, "herdr", &payload) {
                                         yield Ok(event);
                                     }
@@ -1091,37 +1115,216 @@ pub(crate) fn spawn_agent_permission_watchers(state: AppState) {
     let state = state.clone();
 
     tokio::spawn(async move {
-        while let Ok(event) = rx.recv().await {
-            if let agents::AgentDomainEvent::PermissionPending {
-                ref asid,
-                ref request,
-                ..
-            } = event
-            {
-                let tokens = match state.push_tokens.lock() {
-                    Ok(guard) => guard.clone(),
-                    Err(_) => Vec::new(),
-                };
-                if !tokens.is_empty() {
-                    let mut data = serde_json::Map::new();
-                    data.insert("type".to_string(), json!("approval"));
-                    data.insert("category".to_string(), json!("approval"));
-                    data.insert("session_id".to_string(), json!("default"));
-                    data.insert("asid".to_string(), json!(asid.0));
-                    data.insert("approval_id".to_string(), json!(request.id));
-                    data.insert("fingerprint".to_string(), json!(request.id));
-
-                    let _ = send_expo_push_notifications(
-                        &tokens,
-                        "Approval Required".to_string(),
-                        request.prompt.clone(),
-                        data,
-                    )
-                    .await;
+        let mut gates = AgentPushGates::default();
+        loop {
+            let event = match rx.recv().await {
+                Ok(event) => event,
+                // Falling behind loses the skipped events, not the watcher.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+            match gates.admit(&event) {
+                Some(AgentPendingPush::Approval { asid, request }) => {
+                    let tokens = match state.push_tokens.lock() {
+                        Ok(guard) => guard.clone(),
+                        Err(_) => Vec::new(),
+                    };
+                    if !tokens.is_empty() {
+                        let _ = send_expo_push_notifications(
+                            &tokens,
+                            "Approval Required".to_string(),
+                            request.prompt.clone(),
+                            agent_permission_push_data(&state.config.server_id, asid, &request.id),
+                        )
+                        .await;
+                    }
                 }
+                Some(AgentPendingPush::Form { asid, request }) => {
+                    // Naming the agent and the session can take a round trip
+                    // to the agent; the event loop does not wait for it.
+                    let state = state.clone();
+                    let asid = asid.to_owned();
+                    let request = request.clone();
+                    tokio::spawn(async move {
+                        deliver_agent_form_notice(&state, &asid, &request).await;
+                    });
+                }
+                None => {}
             }
         }
     });
+}
+
+/// A pending approval or question that has earned a push.
+#[derive(Debug, PartialEq)]
+pub(crate) enum AgentPendingPush<'a> {
+    Approval {
+        asid: &'a str,
+        request: &'a agents::PermissionRequest,
+    },
+    Form {
+        asid: &'a str,
+        request: &'a agents::FormRequest,
+    },
+}
+
+/// One push per pending request. T3 re-announces every open approval and
+/// question on each thread snapshot, so the same request id arrives as a
+/// fresh `*Pending` event many times; only the first is news. A resolve
+/// forgets the id. Events are per session, a child session's included --
+/// nothing here looks at `parent_id`.
+#[derive(Debug, Default)]
+pub(crate) struct AgentPushGates {
+    approvals: std::collections::HashSet<(String, String)>,
+    forms: std::collections::HashSet<(String, String)>,
+}
+
+/// Requests that are never resolved (an agent that went away) must not grow
+/// the gates forever; forgetting them all costs at most a repeat push.
+const AGENT_PUSH_GATE_CAPACITY: usize = 1024;
+
+impl AgentPushGates {
+    pub(crate) fn admit<'a>(
+        &mut self,
+        event: &'a agents::AgentDomainEvent,
+    ) -> Option<AgentPendingPush<'a>> {
+        use agents::AgentDomainEvent as E;
+        match event {
+            E::PermissionPending { asid, request, .. } => {
+                first_sighting(&mut self.approvals, &asid.0, &request.id).then_some(
+                    AgentPendingPush::Approval {
+                        asid: &asid.0,
+                        request,
+                    },
+                )
+            }
+            E::FormPending { asid, request, .. } => {
+                first_sighting(&mut self.forms, &asid.0, &request.id).then_some(
+                    AgentPendingPush::Form {
+                        asid: &asid.0,
+                        request,
+                    },
+                )
+            }
+            E::PermissionResolved {
+                asid, request_id, ..
+            } => {
+                self.approvals.remove(&(asid.0.clone(), request_id.clone()));
+                None
+            }
+            E::FormResolved { asid, form_id, .. } => {
+                self.forms.remove(&(asid.0.clone(), form_id.clone()));
+                None
+            }
+            _ => None,
+        }
+    }
+}
+
+fn first_sighting(
+    open: &mut std::collections::HashSet<(String, String)>,
+    asid: &str,
+    id: &str,
+) -> bool {
+    if open.len() >= AGENT_PUSH_GATE_CAPACITY {
+        open.clear();
+    }
+    open.insert((asid.to_owned(), id.to_owned()))
+}
+
+/// The data of a structured agent's approval push; `session_id` is the agent
+/// session the request belongs to.
+fn agent_permission_push_data(
+    server_id: &str,
+    asid: &str,
+    request_id: &str,
+) -> serde_json::Map<String, Value> {
+    let mut data = serde_json::Map::new();
+    data.insert("type".to_string(), json!("approval"));
+    data.insert("category".to_string(), json!("approval"));
+    data.insert("server_id".to_string(), json!(server_id));
+    data.insert("session_id".to_string(), json!(asid));
+    data.insert("asid".to_string(), json!(asid));
+    data.insert("approval_id".to_string(), json!(request_id));
+    data.insert("fingerprint".to_string(), json!(request_id));
+    data
+}
+
+/// The data of a structured agent's question push: an agent session -- a
+/// child's as much as a top-level one's -- asking the user to fill a form.
+fn agent_form_push_data(
+    server_id: &str,
+    agent_id: &str,
+    asid: &str,
+    form_id: &str,
+) -> serde_json::Map<String, Value> {
+    let mut data = serde_json::Map::new();
+    data.insert("type".to_string(), json!("question"));
+    data.insert("category".to_string(), json!("question"));
+    data.insert("server_id".to_string(), json!(server_id));
+    data.insert("agent_id".to_string(), json!(agent_id));
+    data.insert("session_id".to_string(), json!(asid));
+    data.insert("asid".to_string(), json!(asid));
+    data.insert("form_id".to_string(), json!(form_id));
+    data.insert("fingerprint".to_string(), json!(form_id));
+    data
+}
+
+/// An agent's own name, for a push about one of its sessions.
+fn agent_display_name(agent_id: &str) -> Option<&'static str> {
+    match agent_id {
+        "opencode" => Some("OpenCode"),
+        "deepseek" => Some("DeepSeek"),
+        "t3" => Some("T3 Code"),
+        _ => None,
+    }
+}
+
+/// The push a pending question sends, before it is put into words: "{name}
+/// needs your input", where the name is the session's title when there is one
+/// and the agent's otherwise. The form's own title is the body only when the
+/// owner turned `rich_agent_pushes` on.
+fn form_notification(
+    state: &AppState,
+    agent_id: &str,
+    session_title: Option<&str>,
+    asid: &str,
+    request: &agents::FormRequest,
+) -> AgentPushNotice {
+    let agent_name = session_title
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .or_else(|| agent_display_name(agent_id))
+        .map(str::to_owned);
+    AgentPushNotice {
+        notice: AgentNotice::AgentBlocked,
+        server_label: current_server_label(&state.config.label).trim().to_owned(),
+        agent_name,
+        data: agent_form_push_data(&state.config.server_id, agent_id, asid, &request.id),
+        choices: Vec::new(),
+        detail: state
+            .config
+            .rich_agent_pushes
+            .then(|| PushDetail::from_question(&request.title))
+            .flatten(),
+    }
+}
+
+async fn deliver_agent_form_notice(state: &AppState, asid: &str, request: &agents::FormRequest) {
+    let (agent_id, title) = match state.agent_runtime.manager_for_session(asid).await {
+        Some(manager) => {
+            let title =
+                tokio::time::timeout(Duration::from_secs(3), manager.sessions().get_session(asid))
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .map(|info| info.title);
+            (manager.agent().kind().to_owned(), title)
+        }
+        None => (String::new(), None),
+    };
+    let notice = form_notification(state, &agent_id, title.as_deref(), asid, request);
+    deliver_agent_notification(state, notice).await;
 }
 
 pub(crate) async fn watch_agent_notifications(state: AppState, session: SessionConfig) {
@@ -2075,7 +2278,22 @@ pub(crate) async fn pane_output(
             }
         }
     }
+    stamp_read_generation(&mut answer, &state.generation);
     Ok(Json(answer))
+}
+
+/// Put the instance generation beside `revision` in a `pane_read` answer, at
+/// `result.read.generation`. A read is only comparable with rows read in the
+/// same generation: the scrollback this gateway stitches in lives in memory,
+/// so after a restart it starts over and older rows must not be merged under
+/// the new ones.
+pub(crate) fn stamp_read_generation(answer: &mut Value, generation: &str) {
+    if let Some(read) = answer
+        .pointer_mut("/result/read")
+        .and_then(Value::as_object_mut)
+    {
+        read.insert("generation".into(), json!(generation));
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -2171,7 +2389,10 @@ pub(crate) async fn pane_parts(
     };
     let normalized = match &native {
         Some(read) => read.parts.clone(),
-        None => parts::normalize_json(&text, dictionary),
+        // The chat view hides the frozen bottom areas a Claude pane leaves in
+        // its real history; the raw output routes still serve them. See
+        // `parts::blank_frozen_status`.
+        None => parts::normalize_json(&parts::blank_frozen_status(&text), dictionary),
     };
 
     // Reading a workspace's own skills and commands is blocking filesystem
@@ -2195,6 +2416,8 @@ pub(crate) async fn pane_parts(
         },
         "lines": lines,
         "revision": revision,
+        // Instance generation; see `stamp_read_generation`.
+        "generation": &*state.generation,
         "pane": pane_capabilities(
             &pane_id,
             agent.as_deref(),
@@ -2609,6 +2832,90 @@ pub(crate) async fn pane_git_diff(
     Ok(Json(content_envelope(data)))
 }
 
+// ---------------------------------------------------------------------------
+// Changes (git): the same list, file and discard the agent sessions answer
+// ---------------------------------------------------------------------------
+//
+// The bodies are shared (`platform::vcs_routes`); a pane only differs in how
+// the checkout is found -- from the cwd the backend reports for it -- and in
+// answering `unknown_pane` where an agent session answers
+// `workspace_missing`.
+
+/// The checkout a pane's cwd belongs to: `None` when the pane reports no cwd,
+/// its cwd no longer exists, or the cwd is in no checkout. A pane the backend
+/// does not know is `404 unknown_pane`.
+async fn pane_checkout(
+    state: &AppState,
+    session_id: &str,
+    pane_id: &str,
+) -> ApiResult<Option<PathBuf>> {
+    let session = find_session(&state.config, session_id)?.clone();
+    let pane = terminal_backend(&session)
+        .get_pane(&BackendPaneId::new(pane_id))
+        .await
+        .map_err(|err| match err {
+            BackendError::InvalidTarget(_) => unknown_pane(),
+            BackendError::Refused {
+                code: Some(ref code),
+                ..
+            } if code == "pane_not_found" => unknown_pane(),
+            err => backend_api_error(err),
+        })?;
+    // A deleted directory would reach git as a spawn failure, which reads as
+    // "git is not installed"; it is "not in a repository".
+    let Some(cwd) = pane.cwd.filter(|cwd| cwd.is_dir()) else {
+        return Ok(None);
+    };
+    git::repository_root(&cwd).await.map_err(git_error)
+}
+
+fn unknown_pane() -> (StatusCode, Json<Value>) {
+    api_error(StatusCode::NOT_FOUND, "unknown_pane", "No pane has this id")
+}
+
+pub(crate) async fn pane_vcs_files(
+    State(state): State<AppState>,
+    Path((session_id, pane_id)): Path<(String, String)>,
+    Query(query): Query<VcsFilesQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let mode = vcs_routes::vcs_mode(query.mode.as_deref())?;
+    let toplevel = pane_checkout(&state, &session_id, &pane_id).await?;
+    vcs_routes::files(toplevel.as_deref(), mode).await
+}
+
+pub(crate) async fn pane_vcs_file(
+    State(state): State<AppState>,
+    Path((session_id, pane_id)): Path<(String, String)>,
+    Query(query): Query<VcsFileQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let mode = vcs_routes::vcs_mode(query.mode.as_deref())?;
+    let toplevel = pane_checkout(&state, &session_id, &pane_id).await?;
+    vcs_routes::file(toplevel.as_deref(), mode, &query).await
+}
+
+pub(crate) async fn discard_pane_vcs_file(
+    State(state): State<AppState>,
+    Path((session_id, pane_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<VcsDiscardBody>,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let toplevel = pane_checkout(&state, &session_id, &pane_id).await?;
+    let (action, answer) = vcs_routes::discard(toplevel.as_deref(), &body.path).await?;
+    tracing::info!(
+        session_id,
+        pane_id,
+        path = ?body.path,
+        action = action.as_str(),
+        "discarded a pane change"
+    );
+    Ok(answer)
+}
+
 /// Which agents have a key row and command list, and where to add one. Lets a
 /// client tell "this agent has no profile yet" from "the gateway is old".
 pub(crate) async fn keymaps(
@@ -2666,10 +2973,18 @@ pub(crate) async fn pane_shortcuts(
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty());
 
-    Ok(agents::routes::json_etag_response(
-        &headers,
-        shortcuts::resolve(agent, title, cwd),
-    ))
+    let mut body = shortcuts::resolve(agent, title, cwd);
+    // Pane state rather than table state, so `KEYMAP_VERSION` does not move
+    // with it; it is part of the body, so the ETag does. Best effort: a probe
+    // that fails leaves the field out and the client keeps the backend's
+    // answer alone.
+    if let Ok(Some(extended)) = terminal_backend(&session)
+        .pane_extended_keys(&BackendPaneId::new(&pane_id))
+        .await
+    {
+        body["keyboard"] = json!({ "extended": extended });
+    }
+    Ok(agents::routes::json_etag_response(&headers, body))
 }
 
 pub(crate) async fn send_pane_keys(
@@ -2907,6 +3222,93 @@ mod tests {
     use crate::agents::session_routes::native_approval_data;
     use crate::connectivity::routes::revoke_paired_device;
     use crate::*;
+
+    /// A structured agent's approval push names the agent session it is for,
+    /// not a placeholder.
+    #[test]
+    fn an_agent_permission_push_carries_its_agent_session_id() {
+        let data = super::agent_permission_push_data("server-1", "ses_42", "perm_1");
+        assert_eq!(data["server_id"], "server-1");
+        assert_eq!(data["session_id"], "ses_42");
+        assert_eq!(data["asid"], "ses_42");
+        assert_eq!(data["approval_id"], "perm_1");
+        assert_eq!(data["fingerprint"], "perm_1");
+        assert_eq!(data["type"], "approval");
+    }
+
+    /// A structured agent's question push names the server, the agent and the
+    /// agent session it is for, and the form to answer.
+    #[test]
+    fn an_agent_form_push_carries_its_agent_session_and_form_id() {
+        let data = super::agent_form_push_data("server-1", "t3", "ses_child", "form_1");
+        assert_eq!(data["type"], "question");
+        assert_eq!(data["category"], "question");
+        assert_eq!(data["server_id"], "server-1");
+        assert_eq!(data["agent_id"], "t3");
+        assert_eq!(data["session_id"], "ses_child");
+        assert_eq!(data["asid"], "ses_child");
+        assert_eq!(data["form_id"], "form_1");
+        assert_eq!(data["fingerprint"], "form_1");
+    }
+
+    /// One question is one push: T3 re-announces open forms on every thread
+    /// snapshot, so a repeat of the same id is not news until it is resolved.
+    /// A child session's form is admitted like any other.
+    #[test]
+    fn a_pending_form_pushes_once_until_it_is_resolved() {
+        use crate::agents::{AgentDomainEvent, AgentSessionId, FormRequest};
+        let pending = |asid: &str, id: &str| AgentDomainEvent::FormPending {
+            asid: AgentSessionId(asid.into()),
+            request: FormRequest {
+                id: id.into(),
+                asid: AgentSessionId(asid.into()),
+                title: "Which branch?".into(),
+                fields: Vec::new(),
+            },
+            seq: 1,
+        };
+        let mut gates = super::AgentPushGates::default();
+        let first = pending("ses_child", "form_1");
+        assert!(matches!(
+            gates.admit(&first),
+            Some(super::AgentPendingPush::Form { asid: "ses_child", request }) if request.id == "form_1"
+        ));
+        assert_eq!(gates.admit(&pending("ses_child", "form_1")), None);
+        assert!(gates.admit(&pending("ses_child", "form_2")).is_some());
+        assert!(gates.admit(&pending("ses_other", "form_1")).is_some());
+
+        let resolved = AgentDomainEvent::FormResolved {
+            asid: AgentSessionId("ses_child".into()),
+            form_id: "form_1".into(),
+            seq: 2,
+        };
+        assert_eq!(gates.admit(&resolved), None);
+        assert!(gates.admit(&pending("ses_child", "form_1")).is_some());
+    }
+
+    /// The question push says "{name} needs your input", naming the session
+    /// when it has a title and the agent when it does not.
+    #[test]
+    fn a_form_push_names_the_session_else_the_agent() {
+        use crate::agents::{AgentSessionId, FormRequest};
+        let state = test_state("admin", Vec::new());
+        let request = FormRequest {
+            id: "form_1".into(),
+            asid: AgentSessionId("ses_1".into()),
+            title: "Which branch?".into(),
+            fields: Vec::new(),
+        };
+        let titled = super::form_notification(&state, "t3", Some("Fix login"), "ses_1", &request);
+        assert_eq!(titled.notice, AgentNotice::AgentBlocked);
+        assert_eq!(titled.agent_name.as_deref(), Some("Fix login"));
+        assert_eq!(titled.detail, None);
+        let rendered = titled.render(Locale::default());
+        assert_eq!(rendered.body, "Fix login needs your input.");
+        assert_eq!(rendered.data["form_id"], "form_1");
+
+        let untitled = super::form_notification(&state, "deepseek", Some("  "), "ses_1", &request);
+        assert_eq!(untitled.agent_name.as_deref(), Some("DeepSeek"));
+    }
 
     /// The defect this hub exists for: `activity_stream()` used to be built
     /// once per subscriber, so N phones watching one tmux session meant N
@@ -3151,7 +3553,7 @@ mod tests {
             revision: 42,
             output: "hello\n".into(),
         };
-        let encoded = stream_pane_update_payload(&frame, "w1:p2").unwrap();
+        let encoded = stream_pane_update_payload(&frame, "w1:p2", "gen-1").unwrap();
         let payload: Value = serde_json::from_str(&encoded).unwrap();
 
         assert_eq!(frame.revision, 42);
@@ -3160,6 +3562,7 @@ mod tests {
         assert_eq!(payload["data"]["pane"]["revision"], 42);
         assert!(payload["data"]["pane"].get("source_revision").is_none());
         assert_eq!(payload["data"]["output"], "hello\n");
+        assert_eq!(payload["data"]["generation"], "gen-1");
     }
 
     /// A native adapter answers `parts: "native"`, and only when it actually
@@ -3485,6 +3888,95 @@ mod tests {
         assert_eq!(served, "row 3\nrow 4\nrow 5\nrow 6");
     }
 
+    /// The instance generation is one value for the life of a process, on
+    /// every route and frame a client merges rows from -- and a different one
+    /// for a different process, which is how a client knows the rows it kept
+    /// from before a restart no longer line up with what it reads now.
+    #[tokio::test]
+    async fn every_read_carries_one_generation_and_another_instance_has_another() {
+        let screens = repainting_screens();
+        let herdr = FakeHerdr::start(screens.iter().map(String::as_str).collect(), None);
+        let state = output_state(&herdr);
+        let generation = state.generation.to_string();
+        assert!(!generation.is_empty());
+
+        let output = |start: Option<u32>, end: Option<u32>| {
+            let state = state.clone();
+            async move {
+                pane_output(
+                    State(state),
+                    Path(("default".into(), "wM:p1".into())),
+                    Query(OutputQuery {
+                        source: Some("recent-unwrapped".into()),
+                        lines: Some(240),
+                        format: Some("text".into()),
+                        start,
+                        end,
+                    }),
+                    bearer_headers("token"),
+                )
+                .await
+                .unwrap()
+                .0
+            }
+        };
+        for answer in [
+            output(None, None).await,
+            output(None, None).await,
+            output(Some(0), Some(240)).await,
+        ] {
+            assert_eq!(answer["result"]["read"]["generation"], generation.as_str());
+        }
+
+        let parts = pane_parts(
+            State(state.clone()),
+            Path(("default".into(), "wM:p1".into())),
+            Query(PartsQuery { lines: Some(40) }),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(parts["data"]["generation"], generation.as_str());
+
+        let health = crate::platform::routes::health(State(state.clone()), bearer_headers("token"))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(health["generation"], generation.as_str());
+        let discovery =
+            crate::platform::routes::api_discovery(State(state.clone()), HeaderMap::new())
+                .await
+                .unwrap()
+                .0;
+        assert_eq!(discovery["generation"], generation.as_str());
+
+        // A streamed `pane.updated` for the watched pane gets the generation
+        // folded in beside the output.
+        let opts = StreamOutputOpts {
+            pane: Some("wM:p1".into()),
+            lines: 240,
+            source: "recent_unwrapped".into(),
+            format: "text".into(),
+        };
+        let line = json!({ "event": "pane.updated", "data": { "pane": { "pane_id": "wM:p1", "revision": 1 } } }).to_string();
+        let backend = terminal_backend(&state.config.sessions[0]);
+        let enriched = enrich_pane_update(&line, backend.as_ref(), &opts, &state.generation)
+            .await
+            .unwrap();
+        let enriched: Value = serde_json::from_str(&enriched).unwrap();
+        assert!(enriched["data"]["output"].is_string());
+        assert_eq!(enriched["data"]["generation"], generation.as_str());
+
+        let other = output_state(&herdr);
+        assert_ne!(*other.generation, *state.generation);
+        let other_health = crate::platform::routes::health(State(other), bearer_headers("token"))
+            .await
+            .unwrap()
+            .0;
+        assert_ne!(other_health["generation"], health["generation"]);
+    }
+
     /// And having kept them, it says so where the reader's affordance looks --
     /// on the pane, not on the output.
     #[tokio::test]
@@ -3541,5 +4033,187 @@ mod tests {
         let served = read_output(&state, 240).await;
 
         assert_eq!(served, screens.last().unwrap().as_str());
+    }
+
+    /// A key the backend cannot deliver is the caller's mistake, said plainly:
+    /// a 400 naming the key, never the 502 that reads as a broken backend, and
+    /// nothing reaches the pane.
+    #[tokio::test]
+    async fn a_key_the_backend_cannot_send_is_a_clean_400() {
+        let herdr = FakeHerdr::start(vec![""], None);
+        let session = herdr.session();
+        for keys in [vec!["hyper+x"], vec!["enter", "home", "hyper+x"]] {
+            let keys: Vec<String> = keys.into_iter().map(str::to_owned).collect();
+            let (status, Json(body)) = send_pane_keys(&session, "w1:p1", &keys)
+                .await
+                .expect_err("refused");
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body["error"]["code"], "key_unsupported");
+        }
+        assert!(herdr.enters().is_empty(), "nothing may be typed");
+
+        // The vocabulary itself goes through, in herdr's spelling.
+        let keys: Vec<String> = ["ctrl+enter", "Shift+Enter", "escape", " "]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        send_pane_keys(&session, "w1:p1", &keys).await.unwrap();
+        assert_eq!(
+            herdr.enters()[0]["params"]["keys"],
+            json!(["ctrl+enter", "shift+enter", "esc", "space"])
+        );
+    }
+
+    /// herdr has no names for the editing block, so those keys are typed as
+    /// the bytes a keyboard sends -- and a request that mixes them with named
+    /// keys still reaches the pane in the order it was written.
+    #[tokio::test]
+    async fn herdr_types_the_editing_block_in_order_with_named_keys() {
+        let herdr = FakeHerdr::start(vec![""], None);
+        let session = herdr.session();
+        let keys: Vec<String> = ["esc", "home", "ctrl+home", "x", "pagedown", "enter"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        send_pane_keys(&session, "w1:p1", &keys).await.unwrap();
+        let calls: Vec<Value> = herdr
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|call| json!([call["method"], call["params"]]))
+            .collect();
+        assert_eq!(
+            calls,
+            [
+                json!(["pane.send_keys", { "pane_id": "w1:p1", "keys": ["esc"] }]),
+                json!(["pane.send_text", { "pane_id": "w1:p1", "text": "\x1b[1~\x1b[1;5H" }]),
+                json!(["pane.send_keys", { "pane_id": "w1:p1", "keys": ["x"] }]),
+                json!(["pane.send_text", { "pane_id": "w1:p1", "text": "\x1b[6~" }]),
+                json!(["pane.send_keys", { "pane_id": "w1:p1", "keys": ["enter"] }]),
+            ]
+        );
+    }
+
+    /// The shortcuts response says whether chords reach this pane, and the
+    /// ETag follows it. On herdr the answer is always yes.
+    #[tokio::test]
+    async fn herdr_pane_shortcuts_report_extended_keys() {
+        let herdr = FakeHerdr::start(vec![""], None);
+        let mut state = test_state("admin", vec![test_device("phone-1", "device-token")]);
+        state.config.sessions = vec![herdr.session()];
+        let response = pane_shortcuts(
+            State(state),
+            Path(("default".to_owned(), "w1:p1".to_owned())),
+            bearer_headers("device-token"),
+        )
+        .await
+        .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["keyboard"], json!({ "extended": true }));
+        assert_eq!(body["version"], shortcuts::KEYMAP_VERSION);
+    }
+
+    /// On tmux the answer is live pane state: off until the program in the
+    /// pane asks for extended keys (or the server is set to `always`), and the
+    /// ETag changes with it so a client's conditional re-read sees the flip.
+    #[tokio::test]
+    #[ignore = "requires a tmux server"]
+    async fn tmux_pane_shortcuts_report_whether_chords_reach_the_pane() {
+        let socket = std::path::PathBuf::from(format!(
+            "/tmp/gw-keys-{}.sock",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
+        let tmux = backend::TmuxBackend::new(Some(socket.clone()));
+        let workspace = tmux
+            .create_workspace(&BackendCreateWorkspace {
+                cwd: Some(std::env::temp_dir()),
+                label: Some("gateway-keys".into()),
+                focus: true,
+            })
+            .await
+            .unwrap();
+        let set_option = |value: &str| {
+            let status = std::process::Command::new("tmux")
+                .arg("-S")
+                .arg(&socket)
+                .args(["set-option", "-s", "extended-keys", value])
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+        let mut state = test_state("admin", vec![test_device("phone-1", "device-token")]);
+        state.config.sessions = vec![SessionConfig {
+            id: "default".into(),
+            label: "Default".into(),
+            socket_path: socket.to_string_lossy().into_owned(),
+            backend: BackendKind::Tmux,
+        }];
+        let session = state.config.sessions[0].clone();
+        let pane = terminal_backend(&session)
+            .list_panes()
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .id;
+        let read = || {
+            let state = state.clone();
+            let pane = pane.as_str().to_owned();
+            async move {
+                let response = pane_shortcuts(
+                    State(state),
+                    Path(("default".to_owned(), pane)),
+                    bearer_headers("device-token"),
+                )
+                .await
+                .unwrap();
+                let etag = response.headers()[axum::http::header::ETAG].clone();
+                let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                (body["keyboard"]["extended"].clone(), etag)
+            }
+        };
+
+        set_option("off");
+        let (extended, off_etag) = read().await;
+        assert_eq!(extended, json!(false), "server without extended keys");
+
+        set_option("on");
+        let (extended, _) = read().await;
+        assert_eq!(extended, json!(false), "a shell that never asked");
+
+        set_option("always");
+        let (extended, always_etag) = read().await;
+        assert_eq!(extended, json!(true), "server set to always");
+        assert_ne!(off_etag, always_etag);
+
+        set_option("on");
+        terminal_backend(&session)
+            .send_text(&pane, "printf '\\033[>4;2m'", BackendSendTextMode::Keys)
+            .await
+            .unwrap();
+        terminal_backend(&session)
+            .send_keys(&pane, &["enter".to_owned()])
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if read().await.0 == json!(true) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the pane never reported extended keys after asking"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tmux.close_workspace(&workspace.id).await.ok();
     }
 }

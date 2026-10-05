@@ -64,6 +64,29 @@ through `fallback_text` exactly as rule 1 promises. The gateway's own
   } }
 ```
 
+### Instance generation
+
+Every answer a client merges terminal rows from carries the gateway's instance
+generation: an opaque string minted once when the gateway process starts and
+unchanged until it exits. The scrollback the gateway stitches into a pane read
+lives in memory, so a restarted gateway starts every pane's buffer over; rows
+held from a previous generation do not line up with rows read now and must be
+dropped, not merged under the new read.
+
+| Where | JSON path |
+|---|---|
+| `GET /api/sessions/{s}/panes/{p}/output` | `result.read.generation`, beside `revision` |
+| `GET /api/sessions/{s}/panes/{p}/parts` | `data.generation`, beside `revision` |
+| `GET /api/sessions/{s}/events?stream_pane=…` | `data.generation` on every `pane_updated` frame that carries `data.output` |
+| `GET /health`, `/api/meta`, `/api/discovery`, `/api/capabilities` | top-level `generation` |
+| `GET /api/ws` | `generation` in the `hello` frame |
+
+It is the same value everywhere within one process. Compare it for equality
+only; its format is not part of the contract. The field is additive: an older
+client ignores it, and a newer client talking to an older gateway sees none
+and keeps its old behaviour. Not a schema change, so `schema_version` is
+unchanged.
+
 ## Part
 
 A pane transcript normalizes to an ordered list of parts.
@@ -145,6 +168,17 @@ in exactly one part's `fallback_text`, in order. A dictionary that drifts when a
 agent upgrades therefore loses structure and cannot lose content. The fixture
 snapshots in `tests/fixtures/` pin each dictionary's output so that drift shows
 up as a reviewable diff; re-pin with `UPDATE_PART_SNAPSHOTS=1 cargo test`.
+
+**Chat-view rule: frozen bottom areas are blanked.** Before `/parts` normalizes
+a pane, every Claude Code prompt box but the last -- a rule, a `❯` line, a rule
+-- is blanked together with what is drawn around it: a spinner row, a feedback
+box and a right-aligned notice above it, the mode line and the agent roster
+below. Working on the normal screen, Claude Code leaves one such frozen copy in
+the terminal's real history each time it redraws a bottom area taller than it
+can erase; the last box is the live one. Rows are blanked rather than removed,
+so `range` still indexes the raw text, and the raw output routes are unchanged:
+they serve the pane's text exactly. A sent prompt in the transcript (`❯` without
+rules) and `✻ Waiting for N background agents` banners are never touched.
 
 ## Native protocol adapters (v1.4)
 
@@ -336,6 +370,36 @@ inside the checkout. Every process has a five-second timeout, an 8 MiB stdout
 cap and `kill_on_drop`; `--no-optional-locks` keeps a status from taking
 `index.lock` from the agent working in the same checkout; git's stderr goes to
 the log and never to a client.
+
+### Changes (git)
+
+Capability `pane_vcs_files`, and `features.vcsFiles` in `planes.terminal` of
+`/api/discovery`. The agent sessions' three Changes routes, on a pane:
+
+- `GET /api/sessions/{sessionId}/panes/{paneId}/vcs/files?mode=working|branch`
+- `GET /api/sessions/{sessionId}/panes/{paneId}/vcs/file?mode=&path=&context=`
+- `POST /api/sessions/{sessionId}/panes/{paneId}/vcs/discard` `{ "path" }` —
+  device token required, like every pane write; logged at info.
+
+Payloads, limits, path rules, statuses and error codes are those of
+`docs/agent-api.md`, "Changes (git)": the handler bodies are shared
+(`src/platform/vcs_routes.rs`), so the two cannot drift. Only where the
+checkout comes from, and what "gone" means, differ:
+
+- The checkout is `git rev-parse --show-toplevel` from the cwd the terminal
+  backend reports for the pane (`pane.get`, the cwd `shortcuts` scopes by).
+  Like the agent routes and unlike `git/status`, there is no fence: a pane in a
+  home directory that is a dotfiles repository lists it, and discard there is
+  refused with `403 repository_is_home`.
+- A pane the backend does not know is `404 unknown_pane`, where an agent
+  session answers `404 workspace_missing`.
+- A pane that reports no cwd, whose cwd has been deleted, or whose cwd is in no
+  checkout is "not a repository": `vcs/files` answers `200` with
+  `vcs: null, reason: "not_a_repository"`, and `vcs/file` and `vcs/discard`
+  answer `404 not_a_repository`, exactly as an agent session outside a
+  checkout does.
+
+`git/status` and `git/diff` above are unchanged and stay for older apps.
 
 ## Asset
 

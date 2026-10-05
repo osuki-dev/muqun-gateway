@@ -1328,6 +1328,7 @@ pub fn map_providers(data: &[Value], models: &[ModelInfo]) -> Vec<ProviderInfo> 
                     .get("activation")
                     .and_then(Value::as_str)
                     .map(str::to_string),
+                available: true,
                 models: Vec::new(),
             })
         })
@@ -1348,6 +1349,7 @@ pub fn map_providers(data: &[Value], models: &[ModelInfo]) -> Vec<ProviderInfo> 
                 id: model.provider_id.clone(),
                 name: model.provider_id.clone(),
                 activation: None,
+                available: true,
                 models: vec![entry],
             }),
         }

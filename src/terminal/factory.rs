@@ -94,6 +94,12 @@ pub(crate) fn terminal_backend(session: &SessionConfig) -> Box<dyn TerminalBacke
 }
 
 pub(crate) fn backend_api_error(error: BackendError) -> (StatusCode, Json<Value>) {
+    if let BackendError::KeyUnsupported(message) = &error {
+        // The one backend error whose message is written for the caller: it
+        // names the key the caller sent and, on tmux, the setting that would
+        // let it through. Nothing in it is local to this host.
+        return api_error(StatusCode::BAD_REQUEST, "key_unsupported", message);
+    }
     let (status, code, message) = match &error {
         BackendError::InvalidTarget(_) => (
             StatusCode::NOT_FOUND,
@@ -107,7 +113,8 @@ pub(crate) fn backend_api_error(error: BackendError) -> (StatusCode, Json<Value>
         ),
         BackendError::InvalidResponse(_)
         | BackendError::Refused { .. }
-        | BackendError::Unsupported(_) => (
+        | BackendError::Unsupported(_)
+        | BackendError::KeyUnsupported(_) => (
             StatusCode::BAD_GATEWAY,
             "backend_error",
             "terminal backend request failed",

@@ -108,6 +108,11 @@ mod tests {
         assert!(output.is_object());
         assert_eq!(output["parameters"][4]["name"], "start");
         assert_eq!(output["parameters"][5]["name"], "end");
+        assert_eq!(
+            output["responses"]["200"]["content"]["application/json"]["schema"]["properties"]
+                ["result"]["properties"]["read"]["properties"]["generation"]["type"],
+            "string"
+        );
         assert!(spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/zoom"].is_object());
         assert!(spec["paths"]["/api/sessions/{sessionId}/events"].is_object());
         assert!(spec["paths"]["/api/pair/request"].is_object());
@@ -424,6 +429,8 @@ mod tests {
             "/api/sessions/{sessionId}/panes/{paneId}/context",
             "/api/sessions/{sessionId}/panes/{paneId}/git/status",
             "/api/sessions/{sessionId}/panes/{paneId}/git/diff",
+            "/api/sessions/{sessionId}/panes/{paneId}/vcs/files",
+            "/api/sessions/{sessionId}/panes/{paneId}/vcs/file",
         ] {
             assert!(
                 spec["paths"][path]["get"].is_object(),
@@ -450,7 +457,11 @@ mod tests {
                 "lines"
             ]
         );
-        for capability in ["pane_context", "git_diff"] {
+        assert!(
+            spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/vcs/discard"]["post"]
+                .is_object()
+        );
+        for capability in ["pane_context", "git_diff", "pane_vcs_files"] {
             assert!(
                 API_CAPABILITIES.contains(&capability),
                 "{capability} is not announced"

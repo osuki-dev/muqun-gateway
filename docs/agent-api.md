@@ -18,6 +18,17 @@ verbatim, so their keys stay camelCase.
 - **Envelope.** A successful JSON body is wrapped:
   `{"schema_version": "...", "capabilities": {...}, "data": <payload>}`. The
   payload column below describes `data`.
+- **Instance generation.** The gateway mints one opaque string, `generation`,
+  when the process starts and never changes it while the process lives.
+  Everything it keeps only in memory — above all the per-pane scrollback it
+  stitches into terminal reads — is valid within one generation. It appears as
+  top-level `generation` on `GET /health`, `GET /api/meta`, `GET /api/discovery`
+  and `GET /api/capabilities`; as `generation` in the `hello` frame of
+  `GET /api/ws`; and on every pane read and streamed output frame (see
+  `docs/content-model.md`, "Instance generation"). Compare it for equality
+  only. When it changes, drop the terminal rows held from before and read
+  again instead of merging the new reads under them. A gateway that predates
+  the field sends none; treat absence as "unknown" and keep the old behaviour.
 - **Errors.** `{"error": {"code": "...", "message": "..."}}`. The codes used
   here are `agent_unavailable` (503, no agent attached),
   `agent_error` (502, OpenCode refused), `session_not_found` (404),
@@ -42,6 +53,17 @@ verbatim, so their keys stay camelCase.
   folder had simply been deleted. A 502 is now never blank either — an upstream
   failure with no body reads `OpenCode answered 500 to GET /api/vcs/diff`, so
   there is always a status and a route to go on.
+- **Directories may start with `~`.** Every agent route that takes a
+  directory — `POST /api/agent-sessions`, `?directory=` on the session list,
+  `agent-catalog`, the file search, `agent-shells` and the worktree routes, a
+  session move's target, and a task's `repo_path` / spawn's `cwd` — accepts
+  `~` and `~/…` for the gateway user's home as well as an absolute path. The
+  gateway expands it before any check and, when the folder exists, sends and
+  answers the canonical absolute path, so `~/Work/x` and `/home/u/Work/x` are
+  one project. `~user` is not expanded and fails as any non-absolute path does
+  (`400 invalid_directory` on create); a `~/…` that does not exist is the
+  route's usual not-found answer (`400 directory_not_found` on create,
+  `404 workspace_missing` with the expanded path elsewhere).
 - **Compression.** Responses are gzipped (or brotli'd) when the client asks
   with `Accept-Encoding` and the body is over 512 bytes. `text/event-stream`
   and already-compressed content such as an uploaded image are never touched.
@@ -85,11 +107,12 @@ verbatim, so their keys stay camelCase.
 ## Agents
 
 The gateway can have more than one agent attached at once. Today the ids are
-`opencode` and `deepseek`. OpenCode is preferred: when a request names no
-agent, the **primary** answers — `opencode` when it is attached, otherwise
-`deepseek`. The primary is only that internal preference order; the contract
-names no "active" agent. Inside an agent, a persona such as OpenCode's `build`
-or `plan` is a **mode**.
+`opencode`, `deepseek` and `t3` (T3 Code). OpenCode is preferred: when a
+request names no agent, the **primary** answers — the first attached of
+`opencode`, `deepseek`, `t3`, in that order. The primary is only that internal
+preference order; the contract names no "active" agent. Inside an agent, a
+persona such as OpenCode's `build` or `plan` is a **mode**; T3 Code has none,
+so its `modes[]` is empty.
 
 ### Feature gate
 
@@ -128,7 +151,9 @@ and `version` removed from every agent.
       "modes": [ { "id": "build", "name": "build", "description": "…" } ],
       "features": {
         "streaming": true, "reasoningEffort": true, "modelSelection": true,
-        "toolApprovals": true, "worktrees": true, "revert": true, "inbox": true
+        "toolApprovals": true, "worktrees": true, "revert": true, "stagedRevert": true,
+        "inbox": true, "modes": true, "skills": true, "slashCommands": true, "compaction": true,
+        "backgroundShells": true, "attachments": true, "attachmentsByPath": false
       }
     }
   ],
@@ -141,7 +166,30 @@ and `version` removed from every agent.
   the `agent_id` on that agent's sessions.
 - `status` values are snake_case: `connected` (attached and answering),
   `reachable` (an endpoint answers but it is not attached), `offline`,
-  `disabled`, `not_installed`, `unconfigured`. Only `connected` can be selected.
+  `disabled`, `not_installed`, `unconfigured`, `unsupported` (the agent
+  answers but speaks a protocol this gateway cannot drive; today only `t3`
+  when its server announces an `orchestrationProtocolVersion` above 1).
+  `connected` and `reachable` can
+  be selected: `reachable` means the gateway will attach on first use. The
+  rest cannot. `muqun-gateway agent` probes the same list from a shell on the
+  gateway host and prints the next step for each. It never attaches, so it
+  reports reachability only: never `connected`, and `reachable` where the
+  running gateway may say `connected`. It also checks a held T3 bearer and
+  reports `unconfigured` when the server refuses it.
+
+  | `status` | Next step `muqun-gateway agent` prints |
+  |---|---|
+  | `reachable` | none |
+  | `connected` | not shown by the CLI (only the running gateway knows) |
+  | `unconfigured` (t3: no bearer, or a refused one) | `muqun-gateway agent setup t3` |
+  | `disabled` | `muqun-gateway agent setup t3` / `muqun-gateway agent setup deepseek`; for OpenCode, set `opencode.enabled` |
+  | `offline` | the agent's own start command: `opencode service start`, `bunx @deepseek-ai/dsh web --no-open`, or "open T3 Code, or run `t3 service install`" |
+  | `not_installed` | install OpenCode 2 (or set `opencode.enabled` to false) / T3 Code; for DeepSeek, `bunx @deepseek-ai/dsh web --no-open` |
+  | `unsupported` (t3: newer orchestration protocol) | update muqun-gateway |
+- `reason` is a one-line, human-readable explanation, present only when the
+  status alone does not say why (today: with `unsupported`, e.g. "T3 server
+  speaks orchestration protocol 2; this gateway supports 1"). Show it, don't
+  parse it.
 - `endpoint` and `version` are omitted when unknown or redacted. `models[]` and
   `modes[]` are that agent's own catalog summary; `reasoningEffortTiers` is
   omitted when empty; `modes[].description` when unset.
@@ -159,10 +207,55 @@ and `version` removed from every agent.
 | `toolApprovals` | The agent raises permission requests the App answers. |
 | `worktrees` | The `/api/agent-worktrees` routes work against this agent. |
 | `revert` | Stage, commit and clear revert work. |
+| `stagedRevert` | Revert is two-step (`POST …/revert/stage`, then commit). When false, staging answers `501 feature_unsupported` and the agent reverts in one step. |
 | `inbox` | Queued and steered prompts (`/inbox`, `delivery`) work. |
+| `modes` | The agent has modes (personas or presets) to pick; `mode` on create and `POST …/mode` apply. `modes[]` and the catalog's `modes` are meaningful only when true. |
+| `skills` | The catalog `skills[]` list is the agent's and skill activation works. |
+| `slashCommands` | The catalog `commands[]` list is runnable (`POST /api/agent-sessions/{asid}/command`). |
+| `compaction` | `POST /api/agent-sessions/{asid}/compact` works. |
+| `backgroundShells` | The `/api/agent-shells` routes list, read and kill the agent's background shells. |
+| `attachments` | A prompt may carry `attachments`; when false the agent answers `501 feature_unsupported`. |
+| `attachmentsByPath` | The agent has no native attachment API: the gateway lists the attachments as host paths at the end of the prompt text and the agent opens them with its own tools. Only uploads are accepted (see [`POST …/prompt`](#post-apiagent-sessionsasidprompt)). |
+
+  The App renders agent-specific UI from these flags alone, never from the
+  agent's `kind`. Every flag is always present (booleans, never omitted).
 
   Flags reflect the agent's last probe (cached for about ten seconds).
   Unknown extra flags may appear; ignore them.
+
+  What each agent reports today:
+
+  | Flag | `opencode` | `deepseek` | `t3` |
+  |---|---|---|---|
+  | `streaming` | yes | yes | yes |
+  | `reasoningEffort` | when a model has effort variants | when a model has effort variants | no |
+  | `modelSelection` | when it lists models | when it lists models | yes |
+  | `toolApprovals` | yes | yes | yes |
+  | `worktrees` | yes | no | no |
+  | `revert` | yes | no | yes |
+  | `stagedRevert` | yes | no | no |
+  | `inbox` | yes | no | no |
+  | `modes` | yes | yes (presets) | no |
+  | `skills` | yes | no | no |
+  | `slashCommands` | yes | no | no |
+  | `compaction` | yes | no | no |
+  | `backgroundShells` | yes | no | no |
+  | `attachments` | yes | yes | yes |
+  | `attachmentsByPath` | no | yes | yes |
+
+  `t3` is `name: "T3 Code"`; its `version` is the T3 server version, its
+  `models[]` are every model of the providers T3 has ready (Claude Code,
+  Codex, …). While not attached it is `reachable` when the server answers and
+  the gateway holds a credential (a bearer or an unspent pairing token) it
+  will attach with, and `unconfigured` when the server answers but the
+  gateway holds no credential for it. A server announcing an
+  `orchestrationProtocolVersion` above 1 (Orchestrator V2, which accepts only
+  V2 clients) is `unsupported`: it is not attached, so no sessions or
+  streams, and an attached one is dropped if its server starts announcing
+  one. A T3 revert rolls back
+  whole turns: reverting to any row of a turn removes that turn and
+  everything after it (`agent.revert.changed` `committed`, then the timeline
+  is re-read); there is no staged state.
 - `features` (plane level): `multiAgent` (more than one agent may be
   attached), `catalogAggregation` (the unfiltered catalog is merged across
   attached agents), `sessionRouting` (per-session routes resolve to the
@@ -194,7 +287,7 @@ Errors, for every route above that takes `agent_id`:
 
 | Status | `error.code` | When |
 |---|---|---|
-| `400` | `invalid_agent` | The id is not one this gateway knows (`opencode`, `deepseek`). |
+| `400` | `invalid_agent` | The id is not one this gateway knows (`opencode`, `deepseek`, `t3`). |
 | `503` | `agent_unavailable` | The id is known but not attached; the message names it (`Agent 'deepseek' is not available`). |
 
 ### Compatibility
@@ -234,7 +327,7 @@ A subagent run creates a real session whose `parent_id` is the caller's. Without
 All four are optional; `agent_id` picks the agent (see [Agents](#agents)) and
 `mode` the session's mode. **Omitting `model` is the correct way to get the user's
 configured default** — the gateway no longer substitutes one. `directory` must
-be absolute and must exist. Returns `AgentSessionInfo`.
+be absolute or `~`-rooted and must exist; the session records it canonical. Returns `AgentSessionInfo`.
 
 ### `GET /api/agent-sessions/{asid}`
 
@@ -258,7 +351,8 @@ by `(message_id, ordinal)`.
 ### `GET /api/agent-sessions/{asid}/children`
 
 Same response as the list route, filtered to this session's children. Accepts
-the same `limit` / `order` / `search` / `cursor`.
+the same `limit` / `order` / `search` / `cursor`. Every adapter honours the
+parent filter; DeepSeek and T3 have no sub-agent sessions, so they list none.
 
 ### `DELETE /api/agent-sessions/{asid}`
 
@@ -303,6 +397,29 @@ An attachment the app uploaded is an absolute path into the gateway's upload
 directory — see [Attachments](#attachments) for how one gets there, and for the
 permission rule the gateway puts on the session so the agent can open it without
 an approval prompt.
+
+How attachments reach the agent depends on the agent:
+
+- **`opencode`** (`attachmentsByPath: false`) takes them natively as file
+  parts; absolute paths, `file://`, `https://` and `data:` URLs all work.
+- **`deepseek`** and **`t3`** (`attachmentsByPath: true`) have no file parts.
+  The gateway sends the agent an empty attachment list and appends the paths
+  to the prompt text instead:
+
+  ```text
+  <your text>
+
+  Attached files (on this host):
+  - /home/ryu/.local/share/muqun-gateway/uploads/6f1c….webp
+  ```
+
+  The agent reads them with its own file and image tools. Each attachment must
+  be an absolute path that resolves (after symlinks and `..`) to a regular file
+  inside the gateway's upload directory -- that is, a `path` returned by
+  `POST /api/uploads` within its 48-hour retention. Anything else (a relative
+  path, a URL, a file elsewhere on the host, an expired upload) is refused with
+  `400 invalid_request` before the agent sees the prompt, so a client cannot
+  point the agent at a file it did not upload.
 
 ### `POST /api/agent-sessions/{asid}/model`
 
@@ -680,6 +797,26 @@ with `404`.
 
 Forms are v2's question mechanism; there is no separate question event.
 
+### Push notifications
+
+Every registered device is pushed once per pending approval and once per
+pending form, for any agent session -- a child session's included. A repeat of
+the same request id (T3 re-announces open requests on every thread snapshot)
+pushes nothing until that request is resolved.
+
+| | approval | question (form) |
+|---|---|---|
+| `type`, `category` | `approval` | `question` |
+| `server_id` | the gateway's server id | the gateway's server id |
+| `session_id`, `asid` | the agent session | the agent session |
+| request id | `approval_id` | `form_id` |
+| `fingerprint` | the request id | the form id |
+| `agent_id` | — | the owning agent (`opencode`, `deepseek`, `t3`) |
+
+A question push reads "*name* needs your input", where *name* is the session's
+title, or the agent's name when the session has none. With `rich_agent_pushes`
+on, the body is the form's title instead and the data carries it as `question`.
+
 ---
 
 ## Files, diff, catalog, projects
@@ -697,8 +834,14 @@ empty list.
 ```json
 { "files": [ { "path": "src/a.rs", "patch": "@@ …", "additions": 3, "deletions": 1 } ],
   "vcs": "git",
-  "reason": null }
+  "reason": null,
+  "repo": { "branch": "feat/x", "head": "abc1234", "detached": false,
+            "upstream": "origin/feat/x", "ahead": 2, "behind": 0 } }
 ```
+
+`repo` is the same branch line as on [`vcs/files`](#changes-git), read by
+git in the session's directory; it is absent outside a repository and, best
+effort, when git cannot answer.
 
 > **Shape change.** This used to be a bare array. It is now an object, and the
 > array is under `files`. The two new fields are why — see below.
@@ -718,6 +861,120 @@ showed the same empty screen for both. So:
 A directory that no longer exists is not this case: that is
 [`404 workspace_missing`](#conventions).
 
+### Changes (git)
+
+Capability `agent_vcs_files`. Three routes that ask **git** in the session's
+directory rather than the agent, so they mean the same thing for OpenCode,
+DeepSeek Harness and T3 Code. `vcs/diff` above is unchanged. Paths are
+relative to the checkout's top level, which may be above the session's
+directory. Every git process is bounded by 5 s and 8 MB of output.
+
+A `path` is a file **name**, never a pattern: it must be repo-relative with no
+`..`, and it is matched by exact string equality against git's own list
+before anything uses it. `*`, `:(exclude)x`, `a[b].txt` and a directory name
+select nothing beyond the one file of exactly that name (and a directory
+selects nothing at all).
+
+**`GET /api/agent-sessions/{asid}/vcs/files?mode=working|branch`** (default
+`working`) — the list, with line totals and no patches:
+
+```json
+{ "vcs": "git", "reason": null, "mode": "branch", "base": "origin/main", "truncated": false,
+  "repo": { "branch": "feat/x", "head": "abc1234", "detached": false,
+            "upstream": "origin/feat/x", "ahead": 2, "behind": 0 },
+  "files": [
+    { "path": "src/a.rs", "status": "modified", "additions": 3, "deletions": 1, "binary": false },
+    { "path": "docs/new.md", "old_path": "docs/old.md", "status": "renamed", "additions": 0, "deletions": 0, "binary": false },
+    { "path": "notes.txt", "status": "untracked", "additions": 12, "deletions": 0, "binary": false }
+  ] }
+```
+
+- `working`: index and working tree against `HEAD`, plus every untracked file
+  (each file, not its directory). `base` still names the default branch a
+  `branch` list would compare with, when there is one, so a client can offer
+  that scope without asking for it first.
+- `branch`: everything since the merge-base with the default branch, committed
+  or not, plus untracked files. The default branch is `origin/HEAD` when the
+  clone recorded it, then `main`, `master`, `origin/main`, `origin/master`:
+  the first that exists **and** shares history with `HEAD`; `base` names it.
+  With none, `base` is absent, `reason` is `"no_default_branch"` and the list
+  is the working one.
+- `status` is one of `added`, `modified`, `deleted`, `renamed`, `untracked`,
+  `copied`, `typechange`, `conflicted` (an unmerged path). Treat an unknown
+  value as `modified`. A file missing from the working tree is `deleted`
+  whatever the index holds; a file removed from the index but still on disk
+  (`git rm --cached`) is one `modified` row. `old_path` is present for
+  `renamed` and `copied`.
+- `additions` is `null` for an untracked file whose lines were not counted
+  (over 1 MB, past the list's 16 MB read budget, or not a regular file). A
+  binary file has `binary: true` and zero totals.
+- At most 2000 files, cut before any file is read; `truncated` says the list
+  stopped there or git's output reached 8 MB.
+- `repo` is the checkout's branch line, read by the same `git status` that
+  lists the files, for both modes. `branch` is the checked-out branch, `null`
+  on a detached `HEAD` (`detached: true`) and on an unborn branch (no commit
+  yet). `head` is the abbreviated commit, `null` only on an unborn branch.
+  `upstream` is the tracking branch or `null`; `ahead`/`behind` count commits
+  against it and are `0` when there is none. `repo` is absent only outside a
+  repository.
+- `reason` is `null` inside a repository. Not a repository:
+  `200 { "vcs": null, "reason": "not_a_repository", "mode", "truncated": false, "files": [] }`.
+- Any other `mode` is `400 invalid_mode`.
+
+**`GET /api/agent-sessions/{asid}/vcs/file?mode=&path=&context=3`** — one
+file's whole patch:
+
+```json
+{ "path": "src/a.rs", "status": "modified", "additions": 3, "deletions": 1,
+  "binary": false, "patch": "diff --git a/src/a.rs b/src/a.rs\n…", "truncated": false }
+```
+
+`context` is 0–25 (default 3). The file is looked up by name alone, so a file
+past the list's 2000-file cut still answers. An untracked file is an
+all-additions patch against `/dev/null`; a binary file has `patch: ""`;
+`truncated` is true when the patch reached 8 MB. A tracked file with no
+change is `200` with `status: "unchanged"` and an empty patch. Any other path
+is `404 unknown_path`; outside a repository, `404 not_a_repository`.
+
+**`POST /api/agent-sessions/{asid}/vcs/discard`** `{ "path": "src/a.rs" }` →
+`{ "path": "src/a.rs", "action": "restored" | "deleted" }`. Device token
+required, like every session write; logged at info.
+
+- The path must be exactly one row of the **working** list (whatever `mode`
+  the app is showing); a file with no working change is `404 unknown_path`,
+  not a `200` that did nothing.
+- A tracked file is restored from `HEAD` in both the index and the working
+  tree (`git restore --staged --worktree`; `git checkout HEAD --` only on a
+  git that has no `restore`): `restored`. A staged rename restores its old
+  path too. A staged new file is removed: `deleted`. Any other git failure,
+  such as a held `index.lock`, is returned, not retried another way.
+- An untracked file is deleted: `deleted`. Never a directory. The unlink walks
+  the directories with `O_NOFOLLOW`, so a directory swapped for a symlink
+  after the checks fails rather than deleting outside the checkout.
+- A path that leads out of the checkout through a symlink, the file itself
+  or a directory on the way, is `403 path_outside_repository`.
+- A checkout whose top level is the user's home directory (a session opened in
+  `~` with a dotfiles repository) is `403 repository_is_home`: discard is
+  never offered there.
+- When git's answer for the path was cut at 8 MB the row cannot be trusted:
+  `409 listing_truncated`.
+
+Errors shared by the three routes:
+
+| Status | Code | When |
+|---|---|---|
+| 400 | `invalid_mode` | `mode` is not `working` or `branch` |
+| 403 | `path_outside_repository` | discard: the path leaves the checkout through a symlink |
+| 403 | `repository_is_home` | discard: the checkout is the home directory |
+| 404 | `unknown_path` | not a row of the list (or, for `vcs/file`, a tracked file) |
+| 404 | `not_a_repository` | `vcs/file`, `vcs/discard` outside a repository |
+| 404 | `workspace_missing` | the session's directory is gone |
+| 409 | `listing_truncated` | discard: git's answer was cut at 8 MB |
+| 500 | `discard_failed` | discard: the file could not be removed |
+| 501 | `git_missing` | git is not installed on the host |
+| 502 | `git_failed` | git exited with an error |
+| 504 | `git_timeout` | git took longer than 5 s |
+
 ### `GET /api/agent-catalog`
 
 `?directory=` · `?agent_id=` (one agent's catalog; absent merges all attached) · ETag + `304`. `data`:
@@ -728,12 +985,20 @@ A directory that no longer exists is not this case: that is
   "modes":    [ { "id", "name", "description?", "mode?", "color?", "hidden" } ],
   "mcp":      [ { "name", "status", "error?" } ],
   "skills":   [ { "id", "name", "description", "slash", "autoinvoke" } ],
-  "providers":[ { "id", "name", "activation?": "auto"|"enabled"|"disabled",
+  "providers":[ { "id", "name", "available", "activation?": "auto"|"enabled"|"disabled",
                   "models": [ { "id", "name", "enabled", "variants": [...], "limit?", "status?" } ] } ],
   "commands": [ { "name", "description?", "mode?", "template?" } ],
   "defaults": { "model?": {"provider_id", "model_id", "variant?"}, "mode?": "build" }
 }
 ```
+
+`providers[].name` is the display name (T3's own `displayName`, else a
+built-in one such as "Claude Code" for `claudeAgent`; OpenCode's name, else the
+id). `providers[].available` is `true` when the provider can start a session
+now (OpenCode and DeepSeek: always; T3: enabled, installed, not `disabled`, and
+offering at least one model). An unavailable provider is still listed so the
+App can grey it out; `activation` keeps the finer state. Providers are not part
+of `/api/discovery`, only of the catalog.
 
 `skills[].slash` and `skills[].autoinvoke` are `Skill.Info`'s own optional
 flags, and both default to `false` when the payload leaves them out — which most
@@ -800,7 +1065,34 @@ good, and `missing` is the whole of what the gateway can say about it.
 
 ### `GET /api/agent-directories`
 
-`?prefix=&query=` → `[{"name", "path"}]`, at most 50. Local filesystem only.
+`?prefix=` is what the user has typed, completed one level at a time. Local
+filesystem only, nothing cached.
+
+- The prefix splits at its last `/`: `~/Work/mu` lists `~/Work` for names
+  starting `mu`, case-insensitively; a trailing `/` (`~/Work/`) lists
+  everything there; `~` or an empty prefix lists the home directory. `/ho`
+  completes against the filesystem root, which is allowed: this lists names one
+  level down and never recurses, unlike the asset scan, whose fence keeps `/`
+  and a bare home out as *workspaces*.
+- A prefix that is neither `~`-rooted nor absolute, `~user`, or a directory that
+  does not exist answers an empty list.
+- Dot directories only when the partial starts with `.` (`~/.co`).
+  `node_modules`, `.git`, `target`, `build`, `dist`, `.cache` and
+  `__pycache__` are never offered.
+- A symlink is listed when it points at a directory; it is never read into.
+- At most 30 answers, sorted by name, from at most 2000 entries read in at most
+  50 ms. Hitting any bound sets `truncated`.
+
+`data` is still the bare list, so older Apps keep working; `home` (the absolute
+home directory, for display) and `truncated` sit beside it in the envelope:
+
+```json
+{ "schema_version": "…", "capabilities": {…},
+  "data": [{ "name": "muqun", "path": "/home/u/Work/muqun" }],
+  "home": "/home/u", "truncated": false }
+```
+
+`path` is under the canonical form of the directory being listed.
 
 ---
 
@@ -811,7 +1103,9 @@ good, and `missing` is the whole of what the gateway can say about it.
 | `GET /api/agent-shells` | `directory` | `[Shell.Info]` (verbatim) |
 | `GET /api/agent-shells/{shell_id}` | — | `Shell.Info` |
 | `GET /api/agent-shells/{shell_id}/output` | `cursor`, `limit` | `{output, cursor, size, truncated}` |
-| `DELETE /api/agent-shells/{shell_id}` | — | `{"killed": true}` |
+| `DELETE /api/agent-shells/{shell_id}` | — | `{"killed": true, "shell": Shell.Info}` |
+
+`DELETE` on OpenCode finishes the job itself: if the shell is still `running` after OpenCode's own kill (a reparented child), the Gateway verifies the pid belongs to OpenCode, sends SIGTERM, then SIGKILL after 2 s (Linux only). A shell that cannot be stopped answers an error naming the pid; one OpenCode already dropped has `shell.status: "gone"`.
 
 `Shell.Info` is OpenCode's own, camelCase:
 `{id, status: "running"|"exited"|"timeout"|"killed", command, cwd, shell, file, pid?, exit?, metadata, time}`.
@@ -895,6 +1189,49 @@ ERROR refusing to start /usr/local/bin/opencode: it reports version opencode 1.1
 
 A version that cannot be read is allowed through — silence is not evidence of
 being old — so only a legible version below 2.0 is refused.
+
+### Configuring T3 Code
+
+T3 Code (`t3 serve`) is off until `config.json` asks for it. The gateway never
+scans for it: it tries only the URL it is given, or T3's default
+`http://127.0.0.1:3773` when `enabled` is set without one.
+
+```json
+{ "t3": { "enabled": true, "url": "http://127.0.0.1:3773",
+          "pairing_token": "<token printed by t3 pair>",
+          "runtime_mode": "full-access" } }
+```
+
+| Key | Meaning |
+|---|---|
+| `enabled` | Attach to T3. Setting `url` also enables it. |
+| `url` | The T3 server, `http(s)://host:port`. |
+| `pairing_token` | A one-time pairing token. |
+| `token` | A bearer you already hold; used instead of pairing. |
+| `runtime_mode` | What new threads may do unasked: `full-access` (T3's default), `approval-required`, `auto-accept-edits` or `auto`. |
+
+`T3_URL`, `T3_TOKEN` and `T3_PAIRING_TOKEN` in the gateway's environment fill
+the matching keys when `config.json` leaves them unset; they never enable T3
+by themselves.
+
+`muqun-gateway agent setup t3` does the pairing on the gateway host: it
+mints a bearer with `t3 auth session issue` (or exchanges `--token <code>`),
+checks it against the server, stores it, and sets `enabled` and `url`. An
+issued bearer asks for a 30-day TTL (T3 may cap it); a paired one lasts what
+T3 grants, which setup prints. The gateway cannot renew either: when T3 stops
+accepting it, `muqun-gateway agent` shows T3 `unconfigured`, and re-running
+`agent setup t3` replaces it. When T3
+was already on for that URL the running gateway picks the new credential up on
+its next round without a restart.
+
+To pair by hand, run `t3 pair` on the T3 host (with the same `--base-dir` as the
+server, if it has one). It prints a pairing URL ending in `#token=…` and the
+token on its own line; put that token in `t3.pairing_token` and restart the
+gateway. The gateway exchanges it once for a bearer, keeps the bearer in
+`t3-credential.json` (mode `0600`) in its state directory, and forgets the
+pairing token, which T3 has now consumed; the stale value left in
+`config.json` is ignored while the stored bearer is accepted. If T3 revokes
+the bearer, pair again with a new token.
 
 ### Losing the agent
 
@@ -1086,7 +1423,7 @@ Server → client:
 
 | Frame | Meaning |
 |---|---|
-| `{"t":"hello","connection_id":"<uuid>","protocol":1}` | First frame, always. |
+| `{"t":"hello","connection_id":"<uuid>","protocol":1,"generation":"<id>"}` | First frame, always. `generation` is the gateway instance generation (see Conventions); a client that finds it changed since its last socket is talking to a restarted gateway. Older gateways omit it. |
 | `{"t":"subscribed","asid":"ses_1"}` · `{"t":"subscribed","all":true}` | The subscription is in effect: every event published from here on reaches this socket. Start catch-up after this, not before. |
 | `{"t":"event","asid":"ses_1","seq":12,"event":"agent.timeline.upsert","data":{…}}` | One domain event. `event` is the SSE `event:` name and `data` is the SSE `data:` payload **byte for byte**, embedded as JSON rather than as a string. `asid` and `seq` repeat the event's own (`asid` is `""` and `seq` 0 for `agent.worktree.changed` and `agent.resync`). |
 | `{"t":"resync","asid":"ses_1"}` | This socket fell behind the gateway's event backlog; refetch that session. `asid` `""` means every session. One per subscribed session, or a single `""` under `subscribe_all`. |

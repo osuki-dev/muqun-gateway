@@ -12,8 +12,12 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use super::directories::expand_directory_param;
 use super::domain::{AgentSessionId, ModelRef, PermissionDecision, SessionQuery};
 use super::ports::mirror::SessionMirrorPort;
+use crate::platform::git;
+use crate::platform::vcs_routes::{self, VcsDiscardBody, VcsFileQuery};
+use crate::terminal::routes::git_error;
 use crate::{
     api_error, content_envelope, require_device, still_paired, stream_event, validate_text,
     ApiResult, AppState, EncryptedStreamContext, EventStreamSealer, STREAM_DEVICE_RECHECK_INTERVAL,
@@ -21,8 +25,8 @@ use crate::{
 
 #[derive(Debug, Deserialize)]
 pub struct AgentDirectoriesQuery {
+    /// What the user has typed: `~/Work/mu`, `/ho`, `~/.co`.
     pub prefix: Option<String>,
-    pub query: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,7 +63,7 @@ const DEFAULT_SESSION_LIMIT: usize = 50;
 impl AgentSessionsQuery {
     fn to_session_query(&self) -> SessionQuery {
         SessionQuery {
-            directory: self.directory.clone(),
+            directory: expand_directory_param(self.directory.as_deref()),
             // OpenCode takes the literal string `null` for "roots only".
             parent_id: match (self.parent_id.as_deref(), self.roots) {
                 (Some(parent), _) if !parent.trim().is_empty() => Some(parent.to_string()),
@@ -412,6 +416,18 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
             get(get_agent_vcs_diff_global),
         )
         .route(
+            "/api/agent-sessions/{asid}/vcs/files",
+            get(get_agent_vcs_files),
+        )
+        .route(
+            "/api/agent-sessions/{asid}/vcs/file",
+            get(get_agent_vcs_file),
+        )
+        .route(
+            "/api/agent-sessions/{asid}/vcs/discard",
+            post(discard_agent_vcs_file),
+        )
+        .route(
             "/api/agent-sessions/{asid}/abort",
             post(interrupt_agent_session_global),
         )
@@ -637,7 +653,8 @@ async fn do_create_agent_session(
         })?,
     };
 
-    let validated_dir = match body.directory.as_deref() {
+    let directory = expand_directory_param(body.directory.as_deref());
+    let validated_dir = match directory.as_deref() {
         Some(dir) if !dir.trim().is_empty() => {
             let p = std::path::Path::new(dir.trim());
             if !p.is_absolute() {
@@ -663,7 +680,10 @@ async fn do_create_agent_session(
             }
             Some(canonical.to_string_lossy().to_string())
         }
-        _ => None,
+        // The App shows `~/` for a session it opens without naming a folder,
+        // so that is the folder it gets. Left as `None`, OpenCode used its own
+        // cwd and DeepSeek Harness refused the relative "." outright.
+        _ => dirs::home_dir().map(|home| home.to_string_lossy().to_string()),
     };
 
     let session = manager
@@ -792,6 +812,8 @@ async fn do_find_agent_files(
         ));
     };
 
+    let directory = expand_directory_param(directory);
+    let directory = directory.as_deref();
     require_directory(directory)?;
 
     let files = manager
@@ -842,7 +864,10 @@ async fn do_send_agent_prompt(
             body.delivery.as_deref(),
         )
         .await
-        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "agent_error", &e.to_string()))?;
+        .map_err(|e| match e {
+            super::ports::agent::AgentError::InvalidRequest(_) => agent_error(e),
+            _ => api_error(StatusCode::BAD_GATEWAY, "agent_error", &e.to_string()),
+        })?;
 
     Ok(Json(content_envelope(json!({ "submitted": true }))))
 }
@@ -1014,7 +1039,90 @@ async fn do_get_agent_vcs_diff(
         .as_deref()
         .map(super::adapters::opencode::driver::is_git_worktree)
         .unwrap_or(true);
-    Ok(Json(content_envelope(vcs_diff_body(json!(diffs), is_repo))))
+    let mut body = vcs_diff_body(json!(diffs), is_repo);
+    // The same `repo` the Changes list carries. Best effort: a git that
+    // cannot answer leaves it out rather than failing the diff.
+    if let Some(directory) = directory.as_deref().filter(|_| is_repo) {
+        if let Ok(line) = Box::pin(git::branch_line(std::path::Path::new(directory))).await {
+            body["repo"] = line.branch_json();
+        }
+    }
+    Ok(Json(content_envelope(body)))
+}
+
+// ---------------------------------------------------------------------------
+// Changes (git): the agent-independent list, one file, and discard
+// ---------------------------------------------------------------------------
+//
+// `vcs/diff` asks the agent and answers every patch at once; these ask git,
+// in the session's directory, so they mean the same thing for every agent.
+
+/// The checkout an agent session works in: `None` when the session has no
+/// directory or its directory is in no checkout. A directory that has been
+/// deleted is `404 workspace_missing`, as on every directory-scoped route; an
+/// agent that cannot say where the session is, or a git that cannot answer,
+/// is an error rather than "not a repository".
+async fn agent_session_checkout(
+    state: &AppState,
+    asid: &str,
+) -> ApiResult<Option<std::path::PathBuf>> {
+    let manager = session_manager_or_err(state, asid).await?;
+    let directory = manager
+        .agent()
+        .get_session(asid)
+        .await
+        .map_err(agent_error)?
+        .directory
+        .filter(|directory| !directory.trim().is_empty());
+    require_directory(directory.as_deref())?;
+    let Some(directory) = directory else {
+        return Ok(None);
+    };
+    git::repository_root(std::path::Path::new(&directory))
+        .await
+        .map_err(git_error)
+}
+
+async fn get_agent_vcs_files(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    Query(query): Query<AgentVcsDiffQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let mode = vcs_routes::vcs_mode(query.mode.as_deref())?;
+    let toplevel = agent_session_checkout(&state, &asid).await?;
+    vcs_routes::files(toplevel.as_deref(), mode).await
+}
+
+async fn get_agent_vcs_file(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    Query(query): Query<VcsFileQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let mode = vcs_routes::vcs_mode(query.mode.as_deref())?;
+    let toplevel = agent_session_checkout(&state, &asid).await?;
+    vcs_routes::file(toplevel.as_deref(), mode, &query).await
+}
+
+async fn discard_agent_vcs_file(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<VcsDiscardBody>,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let toplevel = agent_session_checkout(&state, &asid).await?;
+    let (action, answer) = vcs_routes::discard(toplevel.as_deref(), &body.path).await?;
+    tracing::info!(
+        asid,
+        path = ?body.path,
+        action = action.as_str(),
+        "discarded an agent session change"
+    );
+    Ok(answer)
 }
 
 /// Whether a catalog is one a client should be allowed to keep.
@@ -1143,6 +1251,9 @@ async fn do_list_agent_projects(
     ))
 }
 
+/// `GET /api/agent-directories`: a completer for the folder a session opens
+/// in. `data` stays the bare `[{name, path}]` list older Apps read; `home` and
+/// `truncated` sit beside it in the envelope.
 async fn do_list_agent_directories(
     state: &AppState,
     query: AgentDirectoriesQuery,
@@ -1150,64 +1261,13 @@ async fn do_list_agent_directories(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let search_dir = query.prefix.as_deref().unwrap_or("~");
-    let expanded = if search_dir.starts_with("~/") || search_dir == "~" {
-        if let Some(home) = dirs::home_dir() {
-            if search_dir == "~" {
-                home
-            } else {
-                home.join(&search_dir[2..])
-            }
-        } else {
-            std::path::PathBuf::from(search_dir)
-        }
-    } else {
-        std::path::PathBuf::from(search_dir)
-    };
-
-    let mut dirs_list = Vec::new();
-    let target = if expanded.is_dir() {
-        expanded
-    } else {
-        expanded
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| std::path::PathBuf::from("/"))
-    };
-
-    if let Ok(mut entries) = tokio::fs::read_dir(&target).await {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            if let Ok(file_type) = entry.file_type().await {
-                if file_type.is_dir() {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if !name.starts_with('.')
-                        || query
-                            .query
-                            .as_deref()
-                            .map(|q| q.starts_with('.'))
-                            .unwrap_or(false)
-                    {
-                        let full_path = entry.path().to_string_lossy().to_string();
-                        dirs_list.push(json!({
-                            "name": name,
-                            "path": full_path,
-                        }));
-                    }
-                }
-            }
-        }
-    }
-    dirs_list.sort_by(|a, b| {
-        a["name"]
-            .as_str()
-            .unwrap_or("")
-            .cmp(b["name"].as_str().unwrap_or(""))
-    });
-    if dirs_list.len() > 50 {
-        dirs_list.truncate(50);
-    }
-
-    Ok(Json(content_envelope(json!(dirs_list))))
+    let home = dirs::home_dir();
+    let completion =
+        super::directories::complete(query.prefix.as_deref().unwrap_or(""), home.as_deref()).await;
+    let mut body = content_envelope(json!(completion.directories));
+    body["home"] = json!(home.map(|h| h.to_string_lossy().into_owned()));
+    body["truncated"] = json!(completion.truncated);
+    Ok(Json(body))
 }
 
 /// The `event:` name and `data:` string one domain event is published under.
@@ -1325,10 +1385,11 @@ async fn do_stream_agent_session(
 
 pub async fn get_global_agent_catalog(
     State(state): State<AppState>,
-    Query(query): Query<AgentSessionsQuery>,
+    Query(mut query): Query<AgentSessionsQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     require_device(&state, &headers)?;
+    query.directory = expand_directory_param(query.directory.as_deref());
 
     let all_managers = managers_for_read(&state, query.agent_id.as_deref()).await?;
 
@@ -1875,6 +1936,9 @@ fn agent_error(err: super::ports::agent::AgentError) -> (StatusCode, Json<Value>
             "feature_unsupported",
             &format!("This agent does not support: {feature}"),
         ),
+        super::ports::agent::AgentError::InvalidRequest(message) => {
+            api_error(StatusCode::BAD_REQUEST, "invalid_request", message)
+        }
         _ => api_error(StatusCode::BAD_GATEWAY, "agent_error", &err.to_string()),
     }
 }
@@ -2062,10 +2126,11 @@ async fn forget_saved_agent_permission(
 /// made, and `DELETE` refuses it.
 async fn list_agent_worktrees(
     State(state): State<AppState>,
-    Query(query): Query<AgentWorktreesQuery>,
+    Query(mut query): Query<AgentWorktreesQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     let manager = manager_or_unavailable!(&state, &headers);
+    query.directory = expand_directory_param(query.directory.as_deref());
     require_directory(query.directory.as_deref())?;
     let items = manager
         .agent()
@@ -2078,9 +2143,10 @@ async fn list_agent_worktrees(
 async fn create_agent_worktree(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<CreateWorktreeBody>,
+    Json(mut body): Json<CreateWorktreeBody>,
 ) -> ApiResult<Json<Value>> {
     let manager = manager_or_unavailable!(&state, &headers);
+    body.directory = expand_directory_param(body.directory.as_deref());
     require_directory(body.directory.as_deref())?;
     // `Worktree.CreateInput` declares additionalProperties:false, so only the
     // fields the caller actually set are sent -- an explicit null is refused.
@@ -2106,11 +2172,13 @@ async fn create_agent_worktree(
 async fn remove_agent_worktree(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<RemoveWorktreeBody>,
+    Json(mut body): Json<RemoveWorktreeBody>,
 ) -> ApiResult<Json<Value>> {
     let manager = manager_or_unavailable!(&state, &headers);
+    body.directory = expand_directory_param(body.directory.as_deref());
     require_directory(body.directory.as_deref())?;
-    let worktree = body.worktree.trim();
+    let worktree = expand_directory_param(Some(&body.worktree)).unwrap_or_default();
+    let worktree = worktree.trim();
     if worktree.is_empty() {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
@@ -2133,6 +2201,7 @@ async fn refresh_agent_worktrees(
 ) -> ApiResult<Json<Value>> {
     let manager = manager_or_unavailable!(&state, &headers);
     let directory = body.and_then(|Json(b)| b.directory);
+    let directory = expand_directory_param(directory.as_deref());
     require_directory(directory.as_deref())?;
     manager
         .agent()
@@ -2161,7 +2230,8 @@ async fn move_agent_session(
     Json(body): Json<MoveSessionBody>,
 ) -> ApiResult<Json<Value>> {
     let manager = session_manager_or_err!(&state, &headers, &asid);
-    let directory = body.directory.trim();
+    let directory = expand_directory_param(Some(&body.directory)).unwrap_or_default();
+    let directory = directory.trim();
     if directory.is_empty() {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
@@ -2514,7 +2584,7 @@ async fn list_agent_shells(
     let manager = manager_or_unavailable!(&state, &headers);
     let shells = manager
         .agent()
-        .list_shells(query.directory.as_deref())
+        .list_shells(expand_directory_param(query.directory.as_deref()).as_deref())
         .await
         .map_err(agent_error)?;
     Ok(Json(content_envelope(json!(shells))))
@@ -2555,12 +2625,14 @@ async fn kill_agent_shell(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     let manager = manager_or_unavailable!(&state, &headers);
-    manager
+    let shell = manager
         .agent()
         .kill_shell(&shell_id)
         .await
         .map_err(agent_error)?;
-    Ok(Json(content_envelope(json!({ "killed": true }))))
+    Ok(Json(content_envelope(
+        json!({ "killed": true, "shell": shell }),
+    )))
 }
 
 #[cfg(test)]
@@ -2642,6 +2714,7 @@ mod tests {
             id: "opencode".into(),
             name: "OpenCode".into(),
             activation: None,
+            available: true,
             models: Vec::new(),
         }];
         catalog
@@ -2760,6 +2833,16 @@ mod tests {
         );
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert_eq!(body["error"]["code"], "agent_error");
+    }
+
+    /// Pointing the agent at a file nobody uploaded is the client's mistake.
+    #[test]
+    fn an_invalid_request_is_a_400() {
+        let (status, Json(body)) = agent_error(
+            super::super::ports::agent::AgentError::InvalidRequest("not an upload".into()),
+        );
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_request");
     }
 
     /// An empty diff from a repository and an empty diff from a directory that
@@ -3141,6 +3224,103 @@ mod tests {
         assert!(events.contains("\"agent_id\":\"deepseek\""), "{events}");
     }
 
+    /// `~` and `~/…` are the home directory, and the session records the
+    /// canonical absolute path so the App groups it with the same folder typed
+    /// in full. `~user`, a relative path and a missing folder are refused as
+    /// they always were.
+    #[tokio::test]
+    async fn create_session_expands_home_and_answers_the_canonical_path() {
+        let state = state_with(vec![FakeAgent::new("opencode")]).await;
+        let headers = device_headers();
+        let home = std::fs::canonicalize(dirs::home_dir().unwrap()).unwrap();
+        let create = |directory: &str| CreateAgentSessionBody {
+            directory: Some(directory.to_string()),
+            model: None,
+            mode: None,
+            agent_id: None,
+        };
+
+        // A real subdirectory of home, whatever this machine has.
+        let sub = std::fs::read_dir(&home)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|e| {
+                e.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                    && !e.file_name().to_string_lossy().starts_with('.')
+            })
+            .map(|e| e.file_name().to_string_lossy().into_owned());
+
+        let mut cases = vec![
+            ("~".to_string(), home.clone()),
+            ("~/".to_string(), home.clone()),
+        ];
+        if let Some(sub) = sub {
+            cases.push((
+                format!("~/{sub}"),
+                std::fs::canonicalize(home.join(&sub)).unwrap(),
+            ));
+        }
+        for (typed, expected) in cases {
+            let Json(created) = do_create_agent_session(&state, create(&typed), &headers)
+                .await
+                .unwrap_or_else(|e| panic!("{typed} creates: {:?}", e.1));
+            assert_eq!(
+                created["data"]["directory"],
+                expected.to_string_lossy().as_ref(),
+                "{typed}"
+            );
+        }
+
+        for (typed, code) in [
+            ("~nobody", "invalid_directory"),
+            ("~nobody/x", "invalid_directory"),
+            ("relative/dir", "invalid_directory"),
+            ("~/muqun-no-such-dir-for-tests", "directory_not_found"),
+        ] {
+            let refusal = do_create_agent_session(&state, create(typed), &headers)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{typed} is refused"));
+            assert_eq!(refusal.0, StatusCode::BAD_REQUEST, "{typed}");
+            assert_eq!(
+                crate::test_support::error_body(&refusal)["error"]["code"],
+                code,
+                "{typed}"
+            );
+        }
+    }
+
+    /// The directory-scoped routes expand `~` before the missing-folder check,
+    /// so a `~/…` that is gone is the usual 404 naming the absolute path.
+    #[tokio::test]
+    async fn a_missing_home_relative_workspace_is_a_404_with_the_expanded_path() {
+        let state = state_with(vec![FakeAgent::new("opencode")]).await;
+        let refusal = do_find_agent_files(
+            &state,
+            "x",
+            10,
+            Some("~/muqun-no-such-dir-for-tests"),
+            &device_headers(),
+        )
+        .await
+        .expect_err("a missing folder is refused");
+        assert_eq!(refusal.0, StatusCode::NOT_FOUND);
+        let body = crate::test_support::error_body(&refusal);
+        assert_eq!(body["error"]["code"], "workspace_missing");
+        let expected = dirs::home_dir()
+            .unwrap()
+            .join("muqun-no-such-dir-for-tests");
+        assert_eq!(
+            body["error"]["directory"],
+            expected.to_string_lossy().as_ref()
+        );
+
+        // And one that exists is let through.
+        let Json(_) = do_find_agent_files(&state, "x", 10, Some("~"), &device_headers())
+            .await
+            .expect("home is a workspace the agent can search");
+    }
+
     #[tokio::test]
     async fn the_session_list_merges_every_agent_and_routes_each_session() {
         let state = state_with(vec![
@@ -3397,5 +3577,183 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("deepseek"));
+    }
+
+    // -- changes (git) ----------------------------------------------------
+
+    /// A DeepSeek session -- an agent whose own `vcs/diff` answers nothing --
+    /// whose directory is a subdirectory of a real checkout, and one with no
+    /// checkout at all.
+    async fn vcs_state(name: &str) -> (AppState, std::path::PathBuf, std::path::PathBuf) {
+        let (root, repo) = crate::test_support::git_test_repo(name);
+        let plain = root.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let mut agent =
+            FakeAgent::new("deepseek").with_sessions(&[("ses_git", 10), ("ses_plain", 20)]);
+        agent.sessions[0].directory = Some(repo.join("src").to_string_lossy().into_owned());
+        agent.sessions[1].directory = Some(plain.to_string_lossy().into_owned());
+        (state_with(vec![agent]).await, root, repo)
+    }
+
+    fn file_query(mode: Option<&str>, path: &str) -> VcsFileQuery {
+        VcsFileQuery {
+            mode: mode.map(str::to_string),
+            path: Some(path.to_string()),
+            context: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn vcs_files_and_file_answer_from_git_for_any_agent() {
+        let (state, root, _repo) = vcs_state("agent-vcs-files").await;
+        let files = |asid: &str, mode: Option<&str>| {
+            get_agent_vcs_files(
+                State(state.clone()),
+                Path(asid.to_string()),
+                Query(AgentVcsDiffQuery {
+                    mode: mode.map(str::to_string),
+                }),
+                device_headers(),
+            )
+        };
+
+        let Json(answer) = files("ses_git", None).await.expect("lists");
+        let data = &answer["data"];
+        assert_eq!(data["vcs"], "git");
+        assert!(data["reason"].is_null());
+        assert_eq!(data["mode"], "working");
+        assert_eq!(data["truncated"], false);
+        assert_eq!(data["repo"]["branch"], "main");
+        assert_eq!(data["repo"]["head"].as_str().map(str::len), Some(7));
+        let list = data["files"].as_array().unwrap();
+        assert_eq!(list.len(), 2, "{list:?}");
+        let modified = list.iter().find(|f| f["path"] == "src/a.ts").unwrap();
+        assert_eq!(modified["status"], "modified");
+        assert_eq!(modified["additions"], 1);
+        assert_eq!(modified["deletions"], 1);
+        assert_eq!(modified["binary"], false);
+        let untracked = list.iter().find(|f| f["path"] == "notes.md").unwrap();
+        assert_eq!(untracked["status"], "untracked");
+
+        let Json(branch) = files("ses_git", Some("branch")).await.expect("lists");
+        assert_eq!(branch["data"]["mode"], "branch");
+        assert_eq!(branch["data"]["base"], "main");
+        assert_eq!(branch["data"]["repo"]["branch"], "main");
+
+        let refusal = files("ses_git", Some("committed"))
+            .await
+            .expect_err("committed is not a mode here");
+        assert_eq!(refusal.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            crate::test_support::error_body(&refusal)["error"]["code"],
+            "invalid_mode"
+        );
+
+        let Json(plain) = files("ses_plain", None).await.expect("answers");
+        assert!(plain["data"]["vcs"].is_null());
+        assert_eq!(plain["data"]["reason"], "not_a_repository");
+        assert_eq!(plain["data"]["files"], json!([]));
+        assert!(plain["data"].get("repo").is_none());
+
+        // The agent's own diff carries the same branch line.
+        let Json(diff) = do_get_agent_vcs_diff(&state, "ses_git", None, &device_headers())
+            .await
+            .expect("diff");
+        assert_eq!(diff["data"]["vcs"], "git");
+        assert_eq!(diff["data"]["repo"]["branch"], "main");
+        assert_eq!(diff["data"]["repo"]["detached"], false);
+        let Json(diff) = do_get_agent_vcs_diff(&state, "ses_plain", None, &device_headers())
+            .await
+            .expect("diff");
+        assert!(diff["data"].get("repo").is_none());
+
+        let file = |query: VcsFileQuery| {
+            get_agent_vcs_file(
+                State(state.clone()),
+                Path("ses_git".to_string()),
+                Query(query),
+                device_headers(),
+            )
+        };
+        let Json(one) = file(file_query(None, "src/a.ts")).await.expect("patch");
+        assert_eq!(one["data"]["path"], "src/a.ts");
+        assert_eq!(one["data"]["status"], "modified");
+        assert_eq!(one["data"]["truncated"], false);
+        assert!(one["data"]["patch"]
+            .as_str()
+            .unwrap()
+            .contains("\n-const b = 2;\n+const B = 2;\n"));
+
+        for unknown in ["nope.txt", "../x", "/etc/passwd", "*", "src"] {
+            let refusal = file(file_query(None, unknown))
+                .await
+                .expect_err("not a change");
+            assert_eq!(refusal.0, StatusCode::NOT_FOUND, "{unknown:?}");
+            assert_eq!(
+                crate::test_support::error_body(&refusal)["error"]["code"],
+                "unknown_path"
+            );
+        }
+        let refusal = file(file_query(Some("staged"), "src/a.ts"))
+            .await
+            .expect_err("bad mode");
+        assert_eq!(
+            crate::test_support::error_body(&refusal)["error"]["code"],
+            "invalid_mode"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn vcs_discard_restores_and_deletes_and_refuses_unknown_paths() {
+        let (state, root, repo) = vcs_state("agent-vcs-discard").await;
+        let discard = |path: &str, headers: HeaderMap| {
+            discard_agent_vcs_file(
+                State(state.clone()),
+                Path("ses_git".to_string()),
+                headers,
+                Json(VcsDiscardBody {
+                    path: path.to_string(),
+                }),
+            )
+        };
+
+        let refusal = discard("src/a.ts", crate::test_support::bearer_headers("wrong"))
+            .await
+            .expect_err("needs a device");
+        assert_eq!(refusal.0, StatusCode::FORBIDDEN);
+        assert!(std::fs::read_to_string(repo.join("src/a.ts"))
+            .unwrap()
+            .contains("const B"));
+
+        let Json(restored) = discard("src/a.ts", device_headers())
+            .await
+            .expect("restores");
+        assert_eq!(restored["data"]["path"], "src/a.ts");
+        assert_eq!(restored["data"]["action"], "restored");
+        assert!(std::fs::read_to_string(repo.join("src/a.ts"))
+            .unwrap()
+            .contains("const b"));
+
+        let Json(deleted) = discard("notes.md", device_headers())
+            .await
+            .expect("deletes");
+        assert_eq!(deleted["data"]["action"], "deleted");
+        assert!(!repo.join("notes.md").exists());
+
+        // Already restored, a glob, a directory: none is a row of the list.
+        for unknown in ["nope.txt", "../x", "src/a.ts", "*", "src"] {
+            let refusal = discard(unknown, device_headers())
+                .await
+                .expect_err("unknown");
+            assert_eq!(refusal.0, StatusCode::NOT_FOUND);
+            assert_eq!(
+                crate::test_support::error_body(&refusal)["error"]["code"],
+                "unknown_path"
+            );
+        }
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

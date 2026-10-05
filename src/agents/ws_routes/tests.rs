@@ -68,8 +68,8 @@ fn client_frames_parse_and_anything_else_is_refused() {
 #[test]
 fn server_frames_are_the_documented_strings() {
     assert_eq!(
-        hello_frame("c-1"),
-        r#"{"t":"hello","connection_id":"c-1","protocol":1}"#
+        hello_frame("c-1", "gen-1"),
+        r#"{"t":"hello","connection_id":"c-1","protocol":1,"generation":"gen-1"}"#
     );
     assert_eq!(resync_frame("ses_1"), r#"{"t":"resync","asid":"ses_1"}"#);
     assert_eq!(
@@ -328,6 +328,7 @@ async fn closes(client: &mut Client) -> bool {
 #[tokio::test]
 async fn a_plaintext_device_gets_a_plaintext_hello() {
     let state = test_state("admin", vec![test_device("phone-1", TOKEN)]);
+    let generation = state.generation.to_string();
     let addr = serve(state).await;
     let (mut client, response) = connect(addr, &bearer()).await.unwrap();
     assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
@@ -336,6 +337,7 @@ async fn a_plaintext_device_gets_a_plaintext_hello() {
     let hello = next_json(&mut client).await;
     assert_eq!(hello["t"], "hello");
     assert_eq!(hello["protocol"], 1);
+    assert_eq!(hello["generation"], generation.as_str());
     assert!(uuid::Uuid::parse_str(hello["connection_id"].as_str().unwrap()).is_ok());
 }
 

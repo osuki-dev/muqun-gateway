@@ -3,6 +3,7 @@
 pub mod adapters;
 pub mod agent_events;
 pub mod approvals;
+pub mod directories;
 pub mod domain;
 pub mod manager;
 pub mod ports;
@@ -14,4 +15,4 @@ pub mod use_cases;
 pub mod ws_routes;
 
 pub use domain::*;
-pub use runtime::{AgentRuntime, DeepseekConfig, OpencodeConfig};
+pub use runtime::{AgentRuntime, DeepseekConfig, OpencodeConfig, T3Config};

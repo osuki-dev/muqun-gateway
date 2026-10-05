@@ -27,6 +27,10 @@ pub enum AgentError {
     Network(String),
     Protocol(String),
     Unsupported(String),
+    /// The caller asked for something the gateway will not do on its behalf,
+    /// such as handing the agent a file it never uploaded. A `400`, not an
+    /// agent fault.
+    InvalidRequest(String),
 }
 
 impl fmt::Display for AgentError {
@@ -41,6 +45,7 @@ impl fmt::Display for AgentError {
             Self::Network(msg) => write!(f, "Network error communicating with the agent: {msg}"),
             Self::Protocol(msg) => write!(f, "Protocol error: {msg}"),
             Self::Unsupported(cap) => write!(f, "Agent does not support capability: {cap}"),
+            Self::InvalidRequest(msg) => write!(f, "Invalid request: {msg}"),
         }
     }
 }
@@ -53,6 +58,30 @@ pub struct FileDiffItem {
     pub patch: String,
     pub additions: usize,
     pub deletions: usize,
+}
+
+/// How a driver takes the files attached to a prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachmentMode {
+    /// The agent's own API carries file parts.
+    Native,
+    /// The agent has no attachment API but can read files off this host, so
+    /// the prompt use case lists the paths in the text instead.
+    ByPath,
+}
+
+/// `text` followed by a block listing `paths` for an agent that reads files
+/// itself. Unchanged when there are no paths.
+pub fn append_attachment_paths(text: &str, paths: &[String]) -> String {
+    if paths.is_empty() {
+        return text.to_string();
+    }
+    let mut out = format!("{text}\n\nAttached files (on this host):");
+    for path in paths {
+        out.push_str("\n- ");
+        out.push_str(path);
+    }
+    out
 }
 
 pub trait AgentPort: Send + Sync {
@@ -81,6 +110,12 @@ pub trait AgentPort: Send + Sync {
 
     /// Get session metadata
     fn get_session<'a>(&'a self, session_id: &'a str) -> AgentFuture<'a, AgentSessionInfo>;
+
+    /// Whether `send_prompt` takes attachments natively or wants them listed
+    /// in the text as host paths.
+    fn attachment_mode(&self) -> AttachmentMode {
+        AttachmentMode::Native
+    }
 
     /// Submit a prompt to a session
     fn send_prompt<'a>(
@@ -325,7 +360,7 @@ pub trait AgentPort: Send + Sync {
         Box::pin(async { Err(AgentError::Unsupported("get_shell_output".into())) })
     }
 
-    fn kill_shell<'a>(&'a self, _shell_id: &'a str) -> AgentFuture<'a, ()> {
+    fn kill_shell<'a>(&'a self, _shell_id: &'a str) -> AgentFuture<'a, serde_json::Value> {
         Box::pin(async { Err(AgentError::Unsupported("kill_shell".into())) })
     }
 

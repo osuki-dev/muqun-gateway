@@ -5,6 +5,7 @@
 //! not leak through this boundary.
 
 mod herdr;
+mod keys;
 mod model;
 mod registry;
 mod tmux;
@@ -13,6 +14,9 @@ mod tmux_wire;
 pub mod compat;
 
 pub use herdr::HerdrBackend;
+pub use keys::KeyboardVocabulary;
+#[cfg(test)]
+pub use keys::NamedKey;
 pub use model::version_at_least;
 pub use model::{
     Agent, AgentStatus, BackendActivity, BackendActivityStream, BackendError, BackendFuture,

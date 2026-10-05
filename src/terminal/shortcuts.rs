@@ -14,8 +14,11 @@ use serde_json::{json, Value};
 
 /// Bumped when the key row or command source changes. Version 7 makes the
 /// downloaded catalog the only slash-command source and adds key sequences,
-/// editor text actions, and the two bracket control chords.
-pub const KEYMAP_VERSION: u32 = 7;
+/// editor text actions, and the two bracket control chords. Version 8 adds a
+/// newline that does not submit to each agent profile, in the chord that
+/// agent takes in its own mode: Claude Code's backslash-Enter (a `keyActions`
+/// sequence), Codex's `ctrl+j`, opencode's `shift+enter` and `ctrl+enter`.
+pub const KEYMAP_VERSION: u32 = 8;
 
 /// Overlay file, read from the gateway's config directory on every request.
 /// Re-read rather than cached so an edit takes effect on the next pane switch
@@ -131,13 +134,12 @@ const fn sequence_key(
 
 /// Answering a prompt and getting out of one. Every pane needs these.
 ///
-/// `shift+enter` used to sit between them, for writing a multi-line message.
-/// It is gone because it never worked on tmux and did not need to: tmux has no
-/// portable name for Shift+Enter -- whether the terminal even distinguishes it
-/// from Enter depends on extended-keys mode -- and multi-line text from the
-/// composer already reaches the pane as a bracketed paste rather than as a
-/// stream of Enters. A key row that advertises a key one backend cannot press
-/// is worse than a shorter row.
+/// `shift+enter` is not here: it means something only to a program that
+/// tells it apart from Enter, so it sits in the profiles of the agents that
+/// document it as a newline. Whether a backend can deliver it at all is
+/// `keyboard.extended` in discovery -- tmux only with `extended-keys` on --
+/// and the app hides the key where it cannot, so the table lists it
+/// unconditionally.
 const PRIMARY: &[Shortcut] = &[key("↵", "enter", "Enter"), key("ESC", "esc", "Escape")];
 
 /// Still needed everywhere, but reached for less often than what the agent
@@ -228,10 +230,9 @@ const MAX_DISCOVERED_COMMANDS: usize = 64;
 #[cfg(test)]
 const MAX_COMMAND_FILE_BYTES: u64 = 64 * 1024;
 
-/// Herdr rejects `home`, `end`, `pageup`, `pagedown`, `delete` and `insert`
-/// with `invalid_key` -- checked by sending every key in this file to a real
-/// pane. Word motions are the accepted equivalents and are what a phone
-/// actually needs: jumping a word at a time beats hunting for a caret position.
+/// Word motions rather than `home`/`end`/`pageup`/`pagedown`: they are what a
+/// phone actually needs -- jumping a word at a time beats hunting for a caret
+/// position -- and the editing block lives on the full keyboard.
 const NAVIGATION: &[Shortcut] = &[
     key("←", "left", "Left"),
     key("↓", "down", "Down"),
@@ -243,9 +244,31 @@ const NAVIGATION: &[Shortcut] = &[
     key("⌥↓", "alt+down", "Alt down"),
 ];
 
+/// A line break in the agent's composer without submitting it.
+///
+/// Each agent gets the chord that works in its own input mode, so the row
+/// never depends on the terminal delivering a modified Enter: a tmux pane
+/// whose program has not asked for extended keys turns `shift+enter` into a
+/// plain Enter, which submits.
+const NEWLINE_SHIFT: Shortcut = key("⇧↵", "shift+enter", "Newline without sending");
+
+/// Claude Code's own newline that needs no modified key: a backslash right
+/// before Enter becomes a line break. Two keys, so it rides in `keyActions`,
+/// which older Apps that send only `key` never read.
+const CLAUDE_NEWLINE: Shortcut = sequence_key(
+    "\\↵",
+    "sequence:newline",
+    "Newline without sending",
+    &["\\", "enter"],
+);
+
 /// From Claude Code's own footer: "esc to interrupt · ctrl+t to hide tasks ·
 /// ctrl+b to run in background", and collapsed blocks marked "(ctrl+o to
 /// expand)".
+///
+/// Its newline is [`CLAUDE_NEWLINE`], in `keyActions`: Shift+Enter
+/// (`/terminal-setup`) needs a terminal that delivers it, and tmux does not
+/// until the program asks.
 const CLAUDE_KEYS: &[Shortcut] = &[
     key("⇧TAB", "shift+tab", "Cycle permission mode"),
     key("⌃O", "ctrl+o", "Expand output"),
@@ -256,8 +279,12 @@ const CLAUDE_KEYS: &[Shortcut] = &[
 ];
 
 /// From Codex's footer: "Esc to cancel · Tab to amend · ctrl+e to explain".
+/// Its newline is Ctrl+J, a classic control byte every terminal delivers;
+/// Shift+Enter would reach it as Enter under tmux, where Codex never asks for
+/// extended keys (its pane stays in `VT10x`).
 const CODEX_KEYS: &[Shortcut] = &[
     key("⇧TAB", "shift+tab", "Cycle approval mode"),
+    key("⌃J", "ctrl+j", "Newline without sending"),
     key("⌃E", "ctrl+e", "Explain"),
     key("⌃R", "ctrl+r", "Transcript"),
     key("⌃L", "ctrl+l", "Clear screen"),
@@ -275,9 +302,12 @@ const QODER_KEYS: &[Shortcut] = &[
 /// `command_list`, `variant_cycle`, `session_rename`, `session_background`) and
 /// its leader key, which is `ctrl+x`. The leader-prefixed bindings need two
 /// keystrokes and are not what a phone row is for; these are the ones that are
-/// one key on their own.
+/// one key on their own. Its `input_newline` default is
+/// `shift+return,ctrl+return,alt+return,ctrl+j`, so both chords are listed.
 const OPENCODE_KEYS: &[Shortcut] = &[
     key("⇧TAB", "shift+tab", "Cycle agent"),
+    NEWLINE_SHIFT,
+    key("⌃↵", "ctrl+enter", "Newline without sending"),
     key("⌃P", "ctrl+p", "List commands"),
     key("⌃T", "ctrl+t", "Cycle model variant"),
     key("⌃R", "ctrl+r", "Rename session"),
@@ -529,6 +559,7 @@ fn resolve_with(
         &["esc", "esc"],
     ))]
     .into_iter()
+    .chain((id == "claude").then(|| ResolvedShortcut::from(&CLAUDE_NEWLINE)))
     .chain(
         (id == "editor")
             .then(editor_text_actions)
@@ -965,6 +996,41 @@ mod tests {
     }
 
     #[test]
+    fn each_agent_offers_the_newline_its_own_mode_takes() {
+        let row = |agent: &str| key_names(&resolve(Some(agent), None, None));
+        let find = |value: &Value, field: &str, key: &str| {
+            value[field]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["key"] == key)
+                .cloned()
+        };
+
+        // Claude Code: backslash then Enter, a sequence, so in keyActions.
+        let claude = resolve(Some("claude"), None, None);
+        assert_eq!(claude["version"], 8);
+        let newline = find(&claude, "keyActions", "sequence:newline").unwrap();
+        assert_eq!(newline["keys"], json!(["\\", "enter"]));
+        assert_eq!(newline["label"], "\\↵");
+        assert_eq!(newline["description"], "Newline without sending");
+        assert!(!row("claude").iter().any(|k| k.ends_with("+enter")));
+
+        // Codex: Ctrl+J, a classic byte.
+        let codex = resolve(Some("codex"), None, None);
+        let newline = find(&codex, "keys", "ctrl+j").unwrap();
+        assert_eq!(newline["label"], "⌃J");
+        assert_eq!(newline["description"], "Newline without sending");
+        assert!(!row("codex").iter().any(|k| k.ends_with("+enter")));
+        assert!(find(&codex, "keyActions", "sequence:newline").is_none());
+
+        // opencode asks for modifyOtherKeys, so its own chords are kept.
+        let opencode = row("opencode");
+        assert_eq!(opencode[3], "shift+enter");
+        assert!(opencode.contains(&"ctrl+enter".to_string()));
+    }
+
+    #[test]
     fn discovery_reads_a_command_file_and_its_front_matter() {
         let (description, hint) =
             front_matter("---\ndescription: Ship a release\nargument-hint: [version]\n---\nbody\n");
@@ -1044,10 +1110,9 @@ mod tests {
             let keys = key_names(&resolve(agent, None, None));
             assert_eq!(keys[0], "enter");
             assert_eq!(keys[1], "esc");
-            // shift+enter is deliberately absent: tmux has no portable name
-            // for it, so advertising it put a key on the row that one backend
-            // could never press.
-            assert!(!keys.contains(&"shift+enter".to_string()));
+            // A modified Enter is the agent's, never the shell's: at a
+            // prompt it is just Enter.
+            assert!(!keys.contains(&"shift+enter".to_string()), "{agent:?}");
             assert_eq!(keys.last().unwrap(), "alt+down");
         }
     }

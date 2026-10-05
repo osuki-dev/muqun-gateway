@@ -1,0 +1,14 @@
+{
+  "id": "12bef036-a50a-42c2-8d32-f39feab1e363",
+  "tone": "approval",
+  "kind": "approval.requested",
+  "summary": "File-change approval requested",
+  "payload": {
+    "requestId": "a7256aec-07a3-4c14-96c5-fc04bdbb617e",
+    "requestKind": "file-change",
+    "requestType": "file_change_approval",
+    "detail": "Write: {\"file_path\":\"/home/user/work/t3proj/probe.txt\",\"content\":\"approval probe\"}"
+  },
+  "turnId": "278fd5b0-c000-4011-913c-04c43a1feb9a",
+  "createdAt": "2026-09-29T08:45:30.302Z"
+}

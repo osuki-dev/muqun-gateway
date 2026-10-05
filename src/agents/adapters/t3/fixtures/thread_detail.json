@@ -1,0 +1,184 @@
+{
+  "snapshotSequence": 260,
+  "thread": {
+    "id": "1da21c2f-be94-419b-ac83-ef799ff5c575",
+    "projectId": "3a794115-2b35-4b8b-a1af-6a0373191e88",
+    "title": "gateway probe approval2",
+    "modelSelection": {
+      "instanceId": "claudeAgent",
+      "model": "claude-haiku-4-5"
+    },
+    "runtimeMode": "approval-required",
+    "interactionMode": "default",
+    "branch": null,
+    "worktreePath": null,
+    "pullRequests": [],
+    "branchPullRequest": null,
+    "latestTurn": {
+      "turnId": "278fd5b0-c000-4011-913c-04c43a1feb9a",
+      "state": "completed",
+      "requestedAt": "2026-09-29T08:45:22.717Z",
+      "startedAt": "2026-09-29T08:45:22.717Z",
+      "completedAt": "2026-09-29T08:45:31.811Z",
+      "assistantMessageId": "assistant:a251d7d9-dda0-4600-a0fa-b02dad9fec50"
+    },
+    "createdAt": "2026-09-29T08:45:22.509Z",
+    "updatedAt": "2026-09-29T08:45:31.811Z",
+    "archivedAt": null,
+    "settledOverride": null,
+    "settledAt": null,
+    "unsettledAt": null,
+    "snoozedUntil": null,
+    "snoozedAt": null,
+    "pinnedAt": null,
+    "pinOrderKey": null,
+    "activeOrderKey": null,
+    "titleRegeneration": null,
+    "titleState": null,
+    "deletedAt": null,
+    "messages": [
+      {
+        "id": "be9969a5-11bf-4b77-9bd9-82eac2886b55",
+        "role": "user",
+        "text": "Use the Write tool to create a file named probe.txt in the project root containing the single line: approval probe. Then reply done.",
+        "attachments": [],
+        "turnId": null,
+        "streaming": false,
+        "createdAt": "2026-09-29T08:45:22.717Z",
+        "updatedAt": "2026-09-29T08:45:22.717Z"
+      },
+      {
+        "id": "assistant:a251d7d9-dda0-4600-a0fa-b02dad9fec50",
+        "role": "assistant",
+        "text": "done",
+        "turnId": "278fd5b0-c000-4011-913c-04c43a1feb9a",
+        "streaming": false,
+        "createdAt": "2026-09-29T08:45:31.796Z",
+        "updatedAt": "2026-09-29T08:45:31.796Z"
+      }
+    ],
+    "proposedPlans": [],
+    "activities": [
+      {
+        "id": "793a2afa-5917-4e38-94c0-fe4a377487ae",
+        "tone": "tool",
+        "kind": "tool.started",
+        "summary": "File change started",
+        "payload": {
+          "itemType": "file_change",
+          "toolCallId": "toolu_01LKYXpon3f8sEhX7etmqrYF",
+          "status": "inProgress",
+          "title": "File change",
+          "detail": "Write: {}",
+          "data": {
+            "toolName": "Write"
+          }
+        },
+        "turnId": "278fd5b0-c000-4011-913c-04c43a1feb9a",
+        "createdAt": "2026-09-29T08:45:29.536Z"
+      },
+      {
+        "id": "12bef036-a50a-42c2-8d32-f39feab1e363",
+        "tone": "approval",
+        "kind": "approval.requested",
+        "summary": "File-change approval requested",
+        "payload": {
+          "requestId": "a7256aec-07a3-4c14-96c5-fc04bdbb617e",
+          "requestKind": "file-change",
+          "requestType": "file_change_approval",
+          "detail": "Write: {\"file_path\":\"/home/user/work/t3proj/probe.txt\",\"content\":\"approval probe\"}"
+        },
+        "turnId": "278fd5b0-c000-4011-913c-04c43a1feb9a",
+        "createdAt": "2026-09-29T08:45:30.302Z"
+      },
+      {
+        "id": "dc7c5c1c-186f-4d3f-a877-e5b25377a66f",
+        "tone": "approval",
+        "kind": "approval.resolved",
+        "summary": "Approval resolved",
+        "payload": {
+          "requestId": "a7256aec-07a3-4c14-96c5-fc04bdbb617e",
+          "requestKind": "file-change",
+          "requestType": "file_change_approval",
+          "decision": "accept"
+        },
+        "turnId": "278fd5b0-c000-4011-913c-04c43a1feb9a",
+        "createdAt": "2026-09-29T08:45:30.552Z"
+      },
+      {
+        "id": "85af55c0-354a-476b-95da-0f0327fe4841",
+        "tone": "tool",
+        "kind": "tool.completed",
+        "summary": "File change",
+        "payload": {
+          "itemType": "file_change",
+          "toolCallId": "toolu_01LKYXpon3f8sEhX7etmqrYF",
+          "status": "completed",
+          "title": "File change",
+          "detail": "Write: {\"file_path\":\"/home/user/work/t3proj/probe.txt\",\"content\":\"approval probe\"}",
+          "data": {
+            "toolName": "Write"
+          }
+        },
+        "turnId": "278fd5b0-c000-4011-913c-04c43a1feb9a",
+        "createdAt": "2026-09-29T08:45:30.676Z"
+      },
+      {
+        "id": "4e9da2b8-e364-48ef-955b-4ebdd3dadd2d",
+        "tone": "info",
+        "kind": "context-window.updated",
+        "summary": "Context window updated",
+        "payload": {
+          "usedTokens": 28434,
+          "lastUsedTokens": 28434,
+          "totalProcessedTokens": 56765,
+          "inputTokens": 28432,
+          "outputTokens": 2,
+          "maxTokens": 200000
+        },
+        "turnId": "278fd5b0-c000-4011-913c-04c43a1feb9a",
+        "createdAt": "2026-09-29T08:45:31.811Z"
+      },
+      {
+        "id": "53fe226e-a724-40ce-8365-5e5a25eb5473",
+        "tone": "info",
+        "kind": "checkpoint.captured",
+        "summary": "Checkpoint captured",
+        "payload": {
+          "turnCount": 1,
+          "status": "ready"
+        },
+        "turnId": "278fd5b0-c000-4011-913c-04c43a1feb9a",
+        "createdAt": "2026-09-29T08:45:31.811Z"
+      }
+    ],
+    "checkpoints": [
+      {
+        "turnId": "278fd5b0-c000-4011-913c-04c43a1feb9a",
+        "checkpointTurnCount": 1,
+        "checkpointRef": "refs/t3/checkpoints/MWRhMjFjMmYtYmU5NC00MTliLWFjODMtZWY3OTlmZjVjNTc1/turn/1",
+        "status": "ready",
+        "files": [
+          {
+            "path": "probe.txt",
+            "kind": "modified",
+            "additions": 1,
+            "deletions": 0
+          }
+        ],
+        "assistantMessageId": "assistant:a251d7d9-dda0-4600-a0fa-b02dad9fec50",
+        "completedAt": "2026-09-29T08:45:31.811Z"
+      }
+    ],
+    "session": {
+      "threadId": "1da21c2f-be94-419b-ac83-ef799ff5c575",
+      "status": "ready",
+      "providerName": "claudeAgent",
+      "providerInstanceId": "claudeAgent",
+      "runtimeMode": "approval-required",
+      "activeTurnId": null,
+      "lastError": null,
+      "updatedAt": "2026-09-29T08:45:31.811Z"
+    }
+  }
+}

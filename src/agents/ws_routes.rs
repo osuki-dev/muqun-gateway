@@ -175,10 +175,14 @@ fn json_string(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| String::from("\"\""))
 }
 
-pub(crate) fn hello_frame(connection_id: &str) -> String {
+/// `generation` is the gateway's instance generation (see
+/// `AppState::generation`): a client that finds it changed since its last
+/// connection is talking to a restarted gateway and drops what it holds.
+pub(crate) fn hello_frame(connection_id: &str, generation: &str) -> String {
     format!(
-        r#"{{"t":"hello","connection_id":{},"protocol":{WS_PROTOCOL}}}"#,
-        json_string(connection_id)
+        r#"{{"t":"hello","connection_id":{},"protocol":{WS_PROTOCOL},"generation":{}}}"#,
+        json_string(connection_id),
+        json_string(generation)
     )
 }
 
@@ -612,7 +616,11 @@ impl Connection {
         mut events: broadcast::Receiver<AgentDomainEvent>,
         mut slot: WsSlot,
     ) {
-        if self.send(&hello_frame(&connection_id)).await.is_err() {
+        if self
+            .send(&hello_frame(&connection_id, &state.generation))
+            .await
+            .is_err()
+        {
             return;
         }
         let mut subscriptions = Subscriptions::default();

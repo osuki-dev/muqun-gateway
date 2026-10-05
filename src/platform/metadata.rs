@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use super::discovery;
-use crate::backend::{self, BackendError, BackendFuture, BackendKind, Pane};
+use crate::backend::{self, BackendError, BackendFuture, BackendKind, Pane, TerminalBackend};
 use crate::{
     backend_endpoint, terminal_backend, ApiResult, AppState, Config, SessionConfig,
     HERDR_PROTOCOL_MIN,
@@ -52,6 +52,9 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "agent_spawn",
     "agent_timeline",
     "agent_vcs",
+    // `vcs/files`, `vcs/file` and `vcs/discard` on an agent session: git in
+    // the session's directory, for every agent.
+    "agent_vcs_files",
     "assets",
     "device_revocation",
     "file_uploads",
@@ -66,6 +69,8 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "pane_parts",
     "pane_parts_native",
     "pane_shortcuts",
+    // The same three Changes routes on a terminal pane, in its cwd.
+    "pane_vcs_files",
     "configurable_agent_profiles",
     "per_device_tokens",
     "push_notifications",
@@ -81,6 +86,11 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "multiple_terminal_backends",
     "terminal_session_liveness",
     "terminal_input",
+    // `planes.terminal.backends[].keyboard` in `/api/discovery`: the key
+    // names and chords `send-keys` delivers per backend, and `400
+    // key_unsupported` for the rest. Lets the app feature-detect without
+    // parsing the planes.
+    "terminal_keyboard",
     // `GET /api/ws`: one WebSocket per device carrying the agent events of
     // any number of sessions. Also announced as `transports.websocket` in
     // `/api/discovery`. The per-session SSE stream stays the fallback.
@@ -234,6 +244,7 @@ pub(crate) async fn gateway_metadata(
         "gatewayVersion": env!("CARGO_PKG_VERSION"),
         "apiVersion": GATEWAY_API_VERSION,
         "apiMajor": GATEWAY_API_MAJOR,
+        "generation": &*state.generation,
         "minimumCompatibleApiVersion": "1.0.0",
         "legacyUnversionedApi": true,
         "capabilities": gateway_capabilities(collaboration_somewhere),
@@ -311,8 +322,48 @@ pub(crate) async fn session_metadata(session: &SessionConfig) -> (Value, Value) 
 }
 
 pub(crate) async fn session_metadata_uncached(session: &SessionConfig) -> (Value, Value) {
-    match terminal_backend(session).metadata().await {
+    let backend = terminal_backend(session);
+    backend_metadata(session, backend.as_ref()).await
+}
+
+/// `connected` is the live answer: the backend's server is up and answers.
+///
+/// `metadata()` alone is not that on tmux -- it is `tmux -V`, which only says
+/// the binary is installed, so a Mac with no tmux server running reported
+/// `connected: true` and the app sat on a loader instead of showing that the
+/// terminal is unavailable. `probe_reachable` asks the server itself
+/// (`list-sessions`, which never starts one) and is what decides. Herdr's
+/// `metadata()` is already a socket `ping`, and its probe is the trait default.
+/// The answer rides `session_metadata`'s one-second cache, so a server started
+/// later reads as connected on the next poll, with no gateway restart.
+pub(crate) async fn backend_metadata(
+    session: &SessionConfig,
+    backend: &dyn TerminalBackend,
+) -> (Value, Value) {
+    match backend.metadata().await {
+        Ok(metadata)
+            if !tokio::time::timeout(SESSION_PROBE_TIMEOUT, backend.probe_reachable())
+                .await
+                .is_ok_and(|reachable| reachable.unwrap_or(true)) =>
+        {
+            // An ordinary state, not a failure worth a warning on every poll:
+            // nobody has started a server yet.
+            tracing::debug!(
+                "terminal backend for session {} has no running server",
+                session.id
+            );
+            (
+                json!({ "kind": metadata.kind, "connected": false, "version": metadata.version }),
+                json!({ "connected": false, "error": "Terminal backend is unavailable" }),
+            )
+        }
         Ok(metadata) => {
+            if backend_came_back(&session.id) {
+                tracing::info!("terminal backend for session {} answers again", session.id);
+            }
+            // Asked here so it rides the same short-lived cache as the
+            // version: discovery is polled, and on tmux this is a process.
+            let keyboard = backend.keyboard(&metadata).await.ok().flatten();
             // A backend that does not report a protocol at all is taken at the
             // floor rather than refused: absent is not the same as too old.
             let compatibility_protocol = metadata.protocol.unwrap_or(HERDR_PROTOCOL_MIN);
@@ -340,23 +391,61 @@ pub(crate) async fn session_metadata_uncached(session: &SessionConfig) -> (Value
                     "connected": true,
                     "version": metadata.version,
                     "protocol": metadata.protocol,
+                    "keyboard": keyboard,
                 }),
                 compatibility,
             )
         }
         Err(err) => {
-            tracing::warn!(
-                "terminal metadata request failed for session {} (backend={}, endpoint={}): {err}",
-                session.id,
-                session.backend.as_str(),
-                backend_endpoint(session),
-            );
+            // Discovery polls this about once a second per client, so a backend
+            // that stays down would write the same warning every second for as
+            // long as it is down. Warned once when it goes down; debug after.
+            if backend_went_down(&session.id) {
+                tracing::warn!(
+                    "terminal metadata request failed for session {} (backend={}, endpoint={}): {err}; \
+                     further failures are logged at debug until it answers again",
+                    session.id,
+                    session.backend.as_str(),
+                    backend_endpoint(session),
+                );
+            } else {
+                tracing::debug!(
+                    "terminal metadata request failed for session {}: {err}",
+                    session.id
+                );
+            }
             (
                 json!({ "kind": session.backend, "connected": false }),
                 json!({ "connected": false, "error": "Terminal backend is unavailable" }),
             )
         }
     }
+}
+
+/// Sessions whose backend failed its last metadata request, so a backend that
+/// stays down is warned about once rather than on every discovery poll.
+static DOWN_SESSIONS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Whether this failure is the first since the session's backend last answered.
+fn backend_went_down(session_id: &str) -> bool {
+    let Ok(mut down) = DOWN_SESSIONS.lock() else {
+        return true;
+    };
+    if down.iter().any(|seen| seen == session_id) {
+        return false;
+    }
+    down.push(session_id.to_owned());
+    true
+}
+
+/// Whether this answer ends a run of failures for the session's backend.
+fn backend_came_back(session_id: &str) -> bool {
+    let Ok(mut down) = DOWN_SESSIONS.lock() else {
+        return false;
+    };
+    let before = down.len();
+    down.retain(|seen| seen != session_id);
+    down.len() != before
 }
 
 /// How much of "there's something to actually look at" a configured session
@@ -1065,5 +1154,146 @@ mod tests {
         assert!(herdr_protocol_supported(20));
         assert!(herdr_protocol_supported(99));
         assert!(herdr_protocol_supported(u64::MAX));
+    }
+
+    /// A stand-in tmux whose "server" is a marker file: `list-sessions` and
+    /// `show-options` fail with tmux's own no-server message until something
+    /// creates it, and only `new-session`/`start-server` would. Every call is
+    /// logged so a test can tell exactly what the gateway ran.
+    struct FakeTmux {
+        dir: std::path::PathBuf,
+    }
+
+    impl FakeTmux {
+        fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = std::env::temp_dir().join(format!("fake-tmux-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let script = format!(
+                "#!/bin/sh\ndir='{}'\necho \"$*\" >> \"$dir/log\"\n\
+                 case \"$1\" in\n  -V) echo 'tmux 3.5a'; exit 0;;\n  \
+                 new-session|start-server) : >> \"$dir/server\"; exit 0;;\nesac\n\
+                 if [ ! -f \"$dir/server\" ]; then\n  \
+                 echo 'no server running on /tmp/tmux-501/default' >&2; exit 1\nfi\n\
+                 case \"$1\" in\n  list-sessions) cat \"$dir/sessions\" 2>/dev/null; exit 0;;\n  \
+                 show-options) echo 'extended-keys on'; exit 0;;\nesac\nexit 1\n",
+                dir.display()
+            );
+            let binary = dir.join("tmux");
+            std::fs::write(&binary, script).unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+            Self { dir }
+        }
+
+        fn start_server(&self, sessions: &str) {
+            std::fs::write(self.dir.join("server"), "").unwrap();
+            std::fs::write(self.dir.join("sessions"), sessions).unwrap();
+        }
+
+        fn server_running(&self) -> bool {
+            self.dir.join("server").exists()
+        }
+
+        fn log(&self) -> String {
+            std::fs::read_to_string(self.dir.join("log")).unwrap_or_default()
+        }
+
+        async fn connected(&self) -> bool {
+            let backend = crate::backend::TmuxBackend::with_binary(self.dir.join("tmux"), None);
+            let session = SessionConfig {
+                id: "tmux".into(),
+                label: "tmux".into(),
+                socket_path: String::new(),
+                backend: BackendKind::Tmux,
+            };
+            let (metadata, compatibility) = backend_metadata(&session, &backend).await;
+            assert_eq!(metadata["connected"], compatibility["connected"]);
+            metadata["connected"].as_bool().unwrap()
+        }
+    }
+
+    impl Drop for FakeTmux {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn tmux_without_a_server_is_not_connected_even_though_the_binary_answers() {
+        let tmux = FakeTmux::new();
+        assert!(!tmux.connected().await);
+    }
+
+    #[tokio::test]
+    async fn tmux_with_a_server_and_no_sessions_is_connected() {
+        let tmux = FakeTmux::new();
+        tmux.start_server("");
+        assert!(tmux.connected().await);
+    }
+
+    #[tokio::test]
+    async fn tmux_with_a_server_and_sessions_is_connected() {
+        let tmux = FakeTmux::new();
+        tmux.start_server("main\nwork\n");
+        assert!(tmux.connected().await);
+    }
+
+    #[tokio::test]
+    async fn asking_whether_tmux_is_connected_never_starts_a_server() {
+        let tmux = FakeTmux::new();
+        assert!(!tmux.connected().await);
+        assert!(!tmux.server_running(), "the probe started a server");
+        let log = tmux.log();
+        assert!(log.contains("list-sessions"), "{log}");
+        for starts in ["new-session", "start-server", "new "] {
+            assert!(!log.contains(starts), "ran {starts:?}: {log}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tmux_server_started_later_reads_as_connected_without_a_restart() {
+        let tmux = FakeTmux::new();
+        assert!(!tmux.connected().await);
+        tmux.start_server("main\n");
+        assert!(tmux.connected().await);
+    }
+
+    /// The same against a real tmux on a private socket: not connected, and
+    /// asking left no socket behind, so no server was started.
+    #[tokio::test]
+    async fn a_real_tmux_with_no_server_is_not_connected_and_stays_serverless() {
+        if tokio::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let socket = crate::short_test_socket("gw-conn");
+        let session = SessionConfig {
+            id: "tmux".into(),
+            label: "tmux".into(),
+            socket_path: socket.to_string_lossy().into_owned(),
+            backend: BackendKind::Tmux,
+        };
+        let (metadata, _) = session_metadata_uncached(&session).await;
+        assert_eq!(metadata["connected"], false);
+        assert!(!socket.exists(), "discovery started a tmux server");
+    }
+
+    #[test]
+    fn a_backend_that_stays_down_is_warned_about_once() {
+        let session = "metadata-test-down-once";
+        assert!(super::backend_went_down(session));
+        assert!(!super::backend_went_down(session));
+        assert!(!super::backend_went_down(session));
+        assert!(super::backend_came_back(session));
+        assert!(!super::backend_came_back(session));
+        assert!(
+            super::backend_went_down(session),
+            "a second outage is warned about again"
+        );
+        assert!(super::backend_came_back(session));
     }
 }

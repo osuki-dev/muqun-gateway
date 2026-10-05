@@ -3,6 +3,7 @@ use serde_json::{json, Value};
 use std::time::Duration;
 
 use super::discovery::OpencodeEndpoint;
+use super::shell_kill;
 use crate::agents::ports::agent::AgentError;
 
 /// The optional filters `GET /api/session` accepts.
@@ -923,8 +924,53 @@ impl OpencodeClient {
         Ok(res.get("data").cloned().unwrap_or(res))
     }
 
+    /// Stop a background shell and return its final state.
+    ///
+    /// OpenCode's `DELETE` answers 204 yet leaves a reparented child running,
+    /// so when the shell is still `running` afterwards the Gateway signals
+    /// the verified pid itself: SIGTERM, then SIGKILL after 2 s. A shell
+    /// OpenCode has already dropped comes back as `{"id", "status": "gone"}`.
+    /// If it still runs, the error names the pid.
     pub async fn kill_shell(&self, shell_id: &str) -> Result<Value, AgentError> {
-        self.delete(&format!("/api/shell/{shell_id}")).await
+        self.delete(&format!("/api/shell/{shell_id}")).await?;
+        let mut shell = match self.get_shell(shell_id).await {
+            Ok(s) => s,
+            Err(_) => return Ok(json!({ "id": shell_id, "status": "gone" })),
+        };
+        let service_pid = self.endpoint.pid;
+        let decide = |shell: &Value| {
+            let info = shell_kill::shell_pid(shell).and_then(shell_kill::read_proc_info);
+            shell_kill::should_force_kill(shell, service_pid, info.as_ref())
+        };
+        let Some(pid) = shell_kill::shell_pid(&shell) else {
+            return Ok(shell);
+        };
+        if decide(&shell).is_none() {
+            return if shell_kill::is_running(&shell) {
+                Err(AgentError::RequestFailed(format!(
+                    "shell {shell_id} is still running; pid {pid} is not a child of OpenCode, so the Gateway left it alone"
+                )))
+            } else {
+                Ok(shell)
+            };
+        }
+        for signal in [shell_kill::Signal::Term, shell_kill::Signal::Kill] {
+            // The pid may have exited and been reused since the last check.
+            if decide(&shell).is_none() || !shell_kill::send_signal(pid, signal) {
+                break;
+            }
+            for _ in 0..20 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                match self.get_shell(shell_id).await {
+                    Ok(s) if shell_kill::is_running(&s) => shell = s,
+                    Ok(s) => return Ok(s),
+                    Err(_) => return Ok(json!({ "id": shell_id, "status": "gone" })),
+                }
+            }
+        }
+        Err(AgentError::RequestFailed(format!(
+            "could not stop shell {shell_id}: pid {pid} is still running"
+        )))
     }
 
     /// `GET /api/fs/find` (or `/api/fs/list` for an empty query). `/api/fs/list`

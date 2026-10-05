@@ -119,6 +119,16 @@ impl PushDetail {
                 .collect(),
         }
     }
+
+    /// A question with no answers to offer, such as a form's title; `None`
+    /// when there is no question to quote.
+    pub(crate) fn from_question(question: &str) -> Option<Self> {
+        let question = question.trim();
+        (!question.is_empty()).then(|| Self {
+            question: truncate(question, MAX_PUSH_QUESTION_CHARS),
+            option_labels: Vec::new(),
+        })
+    }
 }
 
 impl AgentPushNotice {

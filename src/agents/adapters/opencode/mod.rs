@@ -4,6 +4,7 @@ pub mod client;
 pub mod discovery;
 pub mod driver;
 pub mod mapper;
+pub mod shell_kill;
 pub mod sse;
 
 pub use client::OpencodeClient;

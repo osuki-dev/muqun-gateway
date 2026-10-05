@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::backend::BackendKind;
 use crate::{ordered_sessions, session_capabilities, session_metadata, AppState};
 
 /// Whether one agent can be used right now
@@ -21,6 +22,8 @@ pub enum AgentAvailability {
     Disabled,
     NotInstalled,
     Unconfigured,
+    /// The agent answers but speaks a protocol this gateway cannot drive.
+    Unsupported,
 }
 
 /// Metadata describing one discovered or configured agent
@@ -36,6 +39,10 @@ pub struct AgentDiscoveryInfo {
     pub endpoint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// Why the agent is not usable, when the status alone does not say
+    /// (today only with `unsupported`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     pub models: Vec<AgentModelInfo>,
     pub modes: Vec<AgentModeInfo>,
     pub features: AgentFeatures,
@@ -110,6 +117,9 @@ pub struct AgentFeatures {
     pub tool_approvals: bool,
     pub worktrees: bool,
     pub revert: bool,
+    /// Revert goes through `POST …/revert/stage` and commit; when false the
+    /// agent only reverts in one step and staging answers `501`.
+    pub staged_revert: bool,
     pub inbox: bool,
     /// The agent has modes (personas or presets) to pick from.
     pub modes: bool,
@@ -118,6 +128,9 @@ pub struct AgentFeatures {
     pub compaction: bool,
     pub background_shells: bool,
     pub attachments: bool,
+    /// Attachments reach the agent as host paths listed in the prompt text,
+    /// not as native file parts; the agent reads them with its own tools.
+    pub attachments_by_path: bool,
     #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
@@ -152,6 +165,38 @@ pub struct TerminalBackendDiscoveryInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub protocol: Option<String>,
     pub capabilities: Vec<String>,
+    /// The key names `send-keys` delivers on this backend. Absent while the
+    /// backend is unreachable, and from gateways that predate it; the app then
+    /// falls back to its own check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyboard: Option<crate::backend::KeyboardVocabulary>,
+    /// What reads this backend serves. Defaulted when absent, so a newer app
+    /// reading an older gateway sees every flag `false` and keeps its own
+    /// behaviour.
+    #[serde(default)]
+    pub features: TerminalBackendFeatures,
+}
+
+/// Per-backend read features, beside `keyboard`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalBackendFeatures {
+    /// Ranged `recent-unwrapped` reads (`start`/`end` on the pane output
+    /// route), which is what pull-to-load-more pages with. The app hides the
+    /// pull when this is `false`.
+    pub paged_history: bool,
+}
+
+impl TerminalBackendFeatures {
+    /// tmux serves a range on every version the gateway supports -- the
+    /// wrap snap that needs tmux 3.7 is best-effort and never fails the read.
+    /// herdr's `pane.read` takes no range at all (see `herdr_pane_output`),
+    /// and a backend that is not connected serves nothing.
+    pub(crate) fn for_backend(kind: BackendKind, connected: bool) -> Self {
+        Self {
+            paged_history: connected && kind == BackendKind::Tmux,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,6 +208,10 @@ pub struct TerminalFeatures {
     pub pane_shortcuts: bool,
     pub pane_context: bool,
     pub git_diff: bool,
+    /// `vcs/files`, `vcs/file` and `vcs/discard` on a pane: the agent
+    /// sessions' Changes routes, in the pane's cwd. Build-wide, like
+    /// `pane_shortcuts`.
+    pub vcs_files: bool,
 }
 
 /// The Terminal Plane discovery model
@@ -242,6 +291,11 @@ pub async fn build_terminal_plane_discovery(state: &AppState) -> TerminalPlaneDi
                 .and_then(Value::as_str)
                 .map(String::from),
             capabilities: capabilities.into_iter().map(String::from).collect(),
+            keyboard: metadata
+                .get("keyboard")
+                .cloned()
+                .and_then(|keyboard| serde_json::from_value(keyboard).ok()),
+            features: TerminalBackendFeatures::for_backend(session.backend, is_connected),
         });
     }
 
@@ -254,12 +308,6 @@ pub async fn build_terminal_plane_discovery(state: &AppState) -> TerminalPlaneDi
         None
     };
 
-    let has_git_diff = backends
-        .iter()
-        .any(|b| b.capabilities.iter().any(|c| c == "git_diff"));
-    let has_pane_context = backends
-        .iter()
-        .any(|b| b.capabilities.iter().any(|c| c == "pane_context"));
     let has_pty = backends
         .iter()
         .any(|b| b.kind == "tmux" || b.kind == "pty" || b.kind == "herdr");
@@ -274,8 +322,13 @@ pub async fn build_terminal_plane_discovery(state: &AppState) -> TerminalPlaneDi
             split_pane: supported,
             raw_pty: has_pty,
             pane_shortcuts: supported,
-            pane_context: has_pane_context,
-            git_diff: has_git_diff,
+            // Build-wide, like `vcs_files`: both are in `API_CAPABILITIES` and
+            // read the pane's cwd, not the backend. They used to be looked up in
+            // the per-session capability lists, which never carry them, so
+            // discovery said `false` on every gateway that served them.
+            pane_context: supported,
+            git_diff: supported,
+            vcs_files: supported,
         },
         degraded_reason,
     }
@@ -337,6 +390,10 @@ pub async fn build_discovery(state: &AppState, _sealed: bool, authenticated: boo
         "apiVersion": crate::GATEWAY_API_VERSION,
         "apiMajor": crate::GATEWAY_API_MAJOR,
         "platform": std::env::consts::OS,
+        // Instance generation: changes on every gateway restart, when every
+        // pane's scrollback buffer starts over. Not redacted -- it is a
+        // random id that says nothing but "this is a different process".
+        "generation": &*state.generation,
         "serverId": state.config.server_id,
         "label": state.config.label,
         "planes": planes,
@@ -372,6 +429,7 @@ mod tests {
             enabled: true,
             endpoint: Some("http://127.0.0.1:3080".to_string()),
             version: Some("0.1.0".to_string()),
+            reason: None,
             models: vec![
                 AgentModelInfo {
                     id: "deepseek-chat".to_string(),
@@ -403,13 +461,15 @@ mod tests {
                 tool_approvals: true,
                 worktrees: false,
                 revert: false,
+                staged_revert: false,
                 inbox: false,
                 modes: true,
                 skills: false,
                 slash_commands: false,
                 compaction: false,
                 background_shells: false,
-                attachments: false,
+                attachments: true,
+                attachments_by_path: true,
                 extra: BTreeMap::new(),
             },
         };
@@ -426,6 +486,28 @@ mod tests {
             json!(["low", "high"])
         );
         assert_eq!(val["features"]["reasoningEffort"], true);
+        assert_eq!(val["features"]["attachments"], true);
+        assert_eq!(val["features"]["attachmentsByPath"], true);
+    }
+
+    #[test]
+    fn paged_history_is_advertised_only_where_a_range_is_served() {
+        let paged =
+            |kind, connected| TerminalBackendFeatures::for_backend(kind, connected).paged_history;
+        assert!(paged(BackendKind::Tmux, true));
+        assert!(!paged(BackendKind::Tmux, false));
+        // herdr's `pane.read` has no range parameter.
+        assert!(!paged(BackendKind::Herdr, true));
+        assert!(!paged(BackendKind::Herdr, false));
+
+        // An older gateway's backend entry, without the field, reads as
+        // "cannot page" rather than failing to parse.
+        let legacy: TerminalBackendDiscoveryInfo = serde_json::from_value(json!({
+            "sessionId": "s1", "label": "t", "kind": "tmux", "connected": true,
+            "capabilities": []
+        }))
+        .unwrap();
+        assert!(!legacy.features.paged_history);
     }
 
     #[test]
@@ -442,6 +524,11 @@ mod tests {
                 version: Some("3.3a".to_string()),
                 protocol: None,
                 capabilities: vec!["agent_collaboration".to_string()],
+                keyboard: Some(crate::backend::KeyboardVocabulary::new(
+                    &crate::backend::NamedKey::ALL,
+                    true,
+                )),
+                features: TerminalBackendFeatures::for_backend(BackendKind::Tmux, true),
             }],
             features: TerminalFeatures {
                 multi_window: true,
@@ -450,6 +537,7 @@ mod tests {
                 pane_shortcuts: true,
                 pane_context: true,
                 git_diff: true,
+                vcs_files: true,
             },
             degraded_reason: None,
         };
@@ -458,8 +546,17 @@ mod tests {
         assert_eq!(val["supported"], true);
         assert_eq!(val["activeBackend"], "tmux");
         assert_eq!(val["backends"][0]["sessionId"], "s1");
+        assert_eq!(val["backends"][0]["keyboard"]["version"], 1);
+        assert_eq!(val["backends"][0]["keyboard"]["extended"], true);
+        assert_eq!(val["backends"][0]["features"]["pagedHistory"], true);
+        assert_eq!(
+            val["backends"][0]["keyboard"]["modifiers"],
+            json!(["ctrl", "alt", "shift"])
+        );
+        assert_eq!(val["backends"][0]["keyboard"]["bases"][0], "enter");
         assert_eq!(val["features"]["multiWindow"], true);
         assert_eq!(val["features"]["gitDiff"], true);
+        assert_eq!(val["features"]["vcsFiles"], true);
         assert!(val.get("degradedReason").is_none());
     }
 
@@ -477,6 +574,7 @@ mod tests {
                 pane_shortcuts: false,
                 pane_context: false,
                 git_diff: false,
+                vcs_files: false,
             },
             degraded_reason: Some("no_terminal_backend_configured".to_string()),
         };
@@ -501,6 +599,7 @@ mod tests {
                     pane_shortcuts: true,
                     pane_context: true,
                     git_diff: true,
+                    vcs_files: true,
                 },
                 degraded_reason: None,
             },

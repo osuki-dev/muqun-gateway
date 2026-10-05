@@ -1,0 +1,18 @@
+{
+  "id": "85af55c0-354a-476b-95da-0f0327fe4841",
+  "tone": "tool",
+  "kind": "tool.completed",
+  "summary": "File change",
+  "payload": {
+    "itemType": "file_change",
+    "toolCallId": "toolu_01LKYXpon3f8sEhX7etmqrYF",
+    "status": "completed",
+    "title": "File change",
+    "detail": "Write: {\"file_path\":\"/home/user/work/t3proj/probe.txt\",\"content\":\"approval probe\"}",
+    "data": {
+      "toolName": "Write"
+    }
+  },
+  "turnId": "278fd5b0-c000-4011-913c-04c43a1feb9a",
+  "createdAt": "2026-09-29T08:45:30.676Z"
+}

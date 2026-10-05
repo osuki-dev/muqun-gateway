@@ -33,7 +33,15 @@ fn agents_plane_schema() -> Value {
                                 "toolApprovals": { "type": "boolean" },
                                 "worktrees": { "type": "boolean" },
                                 "revert": { "type": "boolean" },
-                                "inbox": { "type": "boolean" }
+                                "stagedRevert": { "type": "boolean", "description": "Revert is staged (`POST …/revert/stage`) then committed; false means staging answers 501" },
+                                "inbox": { "type": "boolean" },
+                                "modes": { "type": "boolean" },
+                                "skills": { "type": "boolean" },
+                                "slashCommands": { "type": "boolean" },
+                                "compaction": { "type": "boolean" },
+                                "backgroundShells": { "type": "boolean" },
+                                "attachments": { "type": "boolean" },
+                                "attachmentsByPath": { "type": "boolean", "description": "Attachments reach the agent as host paths appended to the prompt text (the agent reads them with its own tools) rather than as native file parts" }
                             }
                         },
                         "models": {
@@ -96,7 +104,13 @@ pub fn openapi_spec() -> Value {
         },
         "security": [{ "bearerAuth": [] }],
         "paths": {
-            "/health": { "get": simple_endpoint("Gateway health") },
+            "/health": {
+                "get": {
+                    "summary": "Gateway health",
+                    "description": "Also carries the top-level instance generation (generation), the same value /api/discovery, every pane read and every streamed output frame carry.",
+                    "responses": ok_response()
+                }
+            },
             "/api/capabilities": {
                 "get": {
                     "summary": "Gateway Terminal and Agents dual-plane capability discovery",
@@ -200,7 +214,7 @@ pub fn openapi_spec() -> Value {
             "/api/sessions/{sessionId}/events": {
                 "get": {
                     "summary": "Stream Herdr lifecycle events as Server-Sent Events",
-                    "description": "Herdr events arrive as SSE `herdr` events. The gateway adds its own `asset.created` event, carrying one asset in the content-model envelope, when a Herdr worktree event reveals newly produced files. It obeys the same `types=` allow-list, under the name `asset.created`.",
+                    "description": "Herdr events arrive as SSE `herdr` events. With stream_pane set, every pane_updated frame for that pane that carries data.output also carries data.generation, the gateway instance generation (see /health). The gateway adds its own `asset.created` event, carrying one asset in the content-model envelope, when a Herdr worktree event reveals newly produced files. It obeys the same `types=` allow-list, under the name `asset.created`.",
                     "parameters": [path_param("sessionId")],
                     "responses": {
                         "200": { "description": "SSE stream of Herdr event JSON lines, plus gateway asset.created events" },
@@ -339,7 +353,7 @@ pub fn openapi_spec() -> Value {
                         "type": "object",
                         "required": ["repo_path", "agent"],
                         "properties": {
-                            "repo_path": { "type": "string", "description": "Absolute path, inside a workspace this session has open" },
+                            "repo_path": { "type": "string", "description": "Absolute path, or one starting ~ or ~/ for the gateway user's home (~user is not expanded), inside a workspace this session has open" },
                             "branch_name": { "type": "string", "description": "Branch for a dedicated worktree; omit to work in the repo as it stands" },
                             "agent": { "type": "string", "description": "Agent kind from GET /api/agents/catalog" },
                             "prompt": { "type": "string", "description": "Sent once the agent is interactive" },
@@ -361,7 +375,7 @@ pub fn openapi_spec() -> Value {
                         "required": ["agent"],
                         "properties": {
                             "agent": { "type": "string", "description": "Agent kind from GET /api/agents/catalog, or a profile named in agents.json" },
-                            "cwd": { "type": "string", "description": "Absolute path, inside a workspace this session has open; omit to take the backend's default" },
+                            "cwd": { "type": "string", "description": "Absolute path, or one starting ~ or ~/ for the gateway user's home (~user is not expanded), inside a workspace this session has open; omit to take the backend's default" },
                             "tab_id": { "type": "string", "description": "Split this tab's focused pane instead of opening a new tab" },
                             "prompt": { "type": "string", "description": "Sent once the agent is interactive" }
                         }
@@ -386,7 +400,12 @@ pub fn openapi_spec() -> Value {
                 }
             },
             "/api/sessions/{sessionId}/panes/{paneId}/shortcuts": {
-                "get": resource_endpoint("Key row and slash commands for a pane", "paneId")
+                "get": {
+                    "summary": "Key row and slash commands for a pane",
+                    "description": "`version` is the keymap table version (8). `keys` is the key row, one physical key per entry; `keyActions` holds multi-key sequences and text actions (e.g. Claude Code's newline, `sequence:newline` = [\"\\\\\", \"enter\"]), which older apps ignore. `keyboard.extended` is pane state, not table state, so it does not move `version` but is part of the body and therefore of the ETag: whether a modifier chord outside the classic set reaches this pane right now. On tmux it is true when the server's extended-keys is always, or on and the program in the pane has asked for extended keys (its key mode is not VT10x); on herdr it is always true. A client combines it with the backend's discovery `keyboard.extended` before drawing a chord. Absent when the backend cannot tell.",
+                    "parameters": [path_param("sessionId"), path_param("paneId")],
+                    "responses": ok_response()
+                }
             },
             "/api/sessions/{sessionId}/agents": { "get": session_endpoint("List agents") },
             "/api/sessions/{sessionId}/agents/{target}": { "get": resource_endpoint("Get an agent", "target") },
@@ -411,7 +430,7 @@ pub fn openapi_spec() -> Value {
                         query_param("end", "One past the last absolute line to read. Requires start. A range wins over lines, and is clamped to 5000 lines and to what the pane holds rather than refused."),
                         query_param("format", "Output format: text or ansi")
                     ],
-                    "responses": ok_response()
+                    "responses": pane_read_responses()
                 }
             },
             "/api/sessions/{sessionId}/panes/{paneId}/parts": {
@@ -472,6 +491,44 @@ pub fn openapi_spec() -> Value {
                     "responses": git_diff_responses()
                 }
             },
+            "/api/sessions/{sessionId}/panes/{paneId}/vcs/files": {
+                "get": {
+                    "summary": "List the files changed in the pane's git checkout: the same answer as GET /api/agent-sessions/{asid}/vcs/files, run in the checkout of the cwd the terminal backend reports for this pane. A pane with no cwd, a deleted cwd or a cwd in no checkout answers vcs: null, reason: not_a_repository. 404 unknown_pane, 400 invalid_mode, 501 git_missing, 502 git_failed, 504 git_timeout. Announced as pane_vcs_files",
+                    "parameters": [
+                        path_param("sessionId"),
+                        path_param("paneId"),
+                        query_param("mode", "working (default) or branch, as for the agent session route")
+                    ],
+                    "responses": ok_response()
+                }
+            },
+            "/api/sessions/{sessionId}/panes/{paneId}/vcs/file": {
+                "get": {
+                    "summary": "One changed file's whole unified patch in the pane's checkout: the same answer as GET /api/agent-sessions/{asid}/vcs/file. 404 unknown_pane, 404 not_a_repository, 404 unknown_path, 400 invalid_mode",
+                    "parameters": [
+                        path_param("sessionId"),
+                        path_param("paneId"),
+                        query_param("mode", "working (default) or branch, as for vcs/files"),
+                        query_param("path", "Repo-relative file name, matched exactly: a file in the change list, or a tracked file"),
+                        query_param("context", "Context lines per hunk, 0 to 25, default 3")
+                    ],
+                    "responses": ok_response()
+                }
+            },
+            "/api/sessions/{sessionId}/panes/{paneId}/vcs/discard": {
+                "post": {
+                    "summary": "Discard one file's uncommitted changes in the pane's checkout: the same rules and answer as POST /api/agent-sessions/{asid}/vcs/discard. data: { path, action }. 404 unknown_pane, 404 not_a_repository, 404 unknown_path, 403 path_outside_repository, 403 repository_is_home, 409 listing_truncated, 500 discard_failed, 501 git_missing, 502 git_failed, 504 git_timeout",
+                    "parameters": [path_param("sessionId"), path_param("paneId")],
+                    "requestBody": json_body(json!({
+                        "type": "object",
+                        "required": ["path"],
+                        "properties": {
+                            "path": { "type": "string", "description": "Repo-relative" }
+                        }
+                    })),
+                    "responses": ok_response()
+                }
+            },
             "/api/sessions/{sessionId}/panes/{paneId}/approval": {
                 "get": {
                     "summary": "Read whether the pane is blocked on an approval, and what it asks",
@@ -519,13 +576,14 @@ pub fn openapi_spec() -> Value {
             "/api/sessions/{sessionId}/panes/{paneId}/send-keys": {
                 "post": {
                     "summary": "Send key names to a pane",
+                    "description": "Each entry is one printable character or a key from the backend's keyboard vocabulary (planes.terminal.backends[].keyboard in /api/discovery): a base such as enter, esc, tab, backspace, space, up, home, pageup, delete or f1..f12, optionally prefixed by ctrl+, alt+ and shift+ in that order (ctrl+shift+enter, alt+left). The classic chords -- ctrl+<a-z>, ctrl+[, ctrl+], ctrl+\\, ctrl+space, shift+tab -- always work; every other modifier chord needs keyboard.extended. On tmux that is extended-keys on or always, and a chord is also refused when the program in the pane has not turned on extended keys and would receive it as a different key. Anything a backend cannot deliver is 400 key_unsupported and nothing is sent.",
                     "parameters": [path_param("sessionId"), path_param("paneId")],
                     "requestBody": json_body(json!({
                         "type": "object",
                         "required": ["keys"],
-                        "properties": { "keys": { "type": "array", "items": { "type": "string" } } }
+                        "properties": { "keys": { "type": "array", "minItems": 1, "maxItems": 32, "items": { "type": "string" } } }
                     })),
-                    "responses": ok_response()
+                    "responses": send_keys_responses()
                 }
             },
             "/api/agent-status": {
@@ -551,7 +609,7 @@ pub fn openapi_spec() -> Value {
                 },
                 "post": {
                     "summary": "Create a new AI agent session",
-                    "description": "Spawns an agent conversation session with the given model, mode, agent_id and workspace directory. Absent agent_id means the primary agent.",
+                    "description": "Spawns an agent conversation session with the given model, mode, agent_id and workspace directory. Absent agent_id means the primary agent. directory is absolute or starts ~ or ~/ for the gateway user's home (~user is not expanded); it must exist, and the session records it canonicalized, so ~/x and its absolute spelling are the same project. A relative path or ~user is 400 invalid_directory, a missing one 400 directory_not_found. Every other agent route that takes a directory expands ~ the same way.",
                     "requestBody": json_body(object_schema(&[("directory", "string"), ("mode", "string"), ("agent_id", "string")], &[])),
                     "responses": ok_response()
                 }
@@ -598,7 +656,7 @@ pub fn openapi_spec() -> Value {
             "/api/ws": {
                 "get": {
                     "summary": "Agent events for many sessions over one WebSocket",
-                    "description": "Upgrade to a WebSocket that carries the same agent events as the per-session SSE stream, for the sessions the client subscribes to (or all). Authenticated like the SSE stream; frames are sealed per connection on an encrypted device. See docs/agent-api.md, \"WebSocket events\". Announced as ws_events.",
+                    "description": "Upgrade to a WebSocket that carries the same agent events as the per-session SSE stream, for the sessions the client subscribes to (or all). Authenticated like the SSE stream; frames are sealed per connection on an encrypted device. The first frame is hello, carrying connection_id, protocol and generation (the gateway instance generation, see /health). See docs/agent-api.md, \"WebSocket events\". Announced as ws_events.",
                     "responses": {
                         "101": { "description": "Switched to the WebSocket protocol" },
                         "429": { "description": "too_many_connections: the gateway-wide socket cap is reached" }
@@ -639,8 +697,44 @@ pub fn openapi_spec() -> Value {
             },
             "/api/agent-sessions/{asid}/vcs/diff": {
                 "get": {
-                    "summary": "Get git diff produced by this agent session",
+                    "summary": "Get git diff produced by this agent session. data: { files, vcs: \"git\"|null, reason: null|\"not_a_repository\", repo?: the same branch line as vcs/files (omitted outside a repository or when git cannot answer) }",
                     "parameters": [path_param("asid")],
+                    "responses": ok_response()
+                }
+            },
+            "/api/agent-sessions/{asid}/vcs/files": {
+                "get": {
+                    "summary": "List the files changed in this agent session's git checkout, with line totals and no patches. data: { vcs: \"git\"|null, reason: null|\"not_a_repository\"|\"no_default_branch\", mode, base?, repo?: { branch: string|null (null when detached or unborn), head: string|null (7-char abbreviated, null when unborn), detached, upstream: string|null, ahead, behind (0 with no upstream) } (present whenever vcs is \"git\", for both modes), truncated, files: [{ path, old_path?, status: added|modified|deleted|renamed|untracked|copied|typechange|conflicted, additions (null when an untracked file was not counted), deletions, binary }] }. At most 2000 files. 400 invalid_mode, 501 git_missing, 502 git_failed, 504 git_timeout",
+                    "parameters": [
+                        path_param("asid"),
+                        query_param("mode", "working (default): index and working tree against HEAD, plus untracked files. branch: everything since the merge-base with the default branch (origin/HEAD, else main, master, origin/main, origin/master: the first sharing history with HEAD), plus untracked files; base names the ref, and reason is no_default_branch when none was found. A working list also carries base when a default branch exists, so a client can offer the branch comparison up front")
+                    ],
+                    "responses": ok_response()
+                }
+            },
+            "/api/agent-sessions/{asid}/vcs/file": {
+                "get": {
+                    "summary": "One changed file's whole unified patch. data: { path, old_path?, status, additions, deletions, binary, patch, truncated }. An untracked file is an all-additions patch; a binary file has an empty patch; a tracked file with no change is status unchanged with an empty patch; truncated when the patch reached 8 MB. 404 unknown_path, 404 not_a_repository, 400 invalid_mode",
+                    "parameters": [
+                        path_param("asid"),
+                        query_param("mode", "working (default) or branch, as for vcs/files"),
+                        query_param("path", "Repo-relative file name, matched exactly (never a pattern or a directory): a file in the change list, or a tracked file"),
+                        query_param("context", "Context lines per hunk, 0 to 25, default 3")
+                    ],
+                    "responses": ok_response()
+                }
+            },
+            "/api/agent-sessions/{asid}/vcs/discard": {
+                "post": {
+                    "summary": "Discard one file's uncommitted changes. The path must be exactly one row of the working list. A tracked file is restored from HEAD in the index and working tree (action restored; a staged new file is removed, action deleted); an untracked file is deleted (action deleted), never a directory. data: { path, action }. 404 unknown_path, 403 path_outside_repository, 403 repository_is_home, 404 not_a_repository, 409 listing_truncated, 500 discard_failed, 501 git_missing, 502 git_failed, 504 git_timeout",
+                    "parameters": [path_param("asid")],
+                    "requestBody": json_body(json!({
+                        "type": "object",
+                        "required": ["path"],
+                        "properties": {
+                            "path": { "type": "string", "description": "Repo-relative" }
+                        }
+                    })),
                     "responses": ok_response()
                 }
             }
@@ -731,6 +825,28 @@ fn agents_catalog_responses() -> Value {
     responses
 }
 
+fn send_keys_responses() -> Value {
+    let mut responses = ok_response();
+    responses["400"] = json!({
+        "description": "invalid_keys when the list is empty or longer than 32; key_unsupported, naming the key, when this backend cannot deliver it -- on tmux the message names the fix (tmux set -s extended-keys on)"
+    });
+    responses
+}
+
+fn keyboard_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Key names send-keys delivers on this backend. Absent while the backend is unreachable and from older gateways.",
+        "required": ["version", "bases", "modifiers", "extended"],
+        "properties": {
+            "version": { "type": "integer", "const": 1 },
+            "bases": { "type": "array", "items": { "type": "string" }, "description": "Named keys deliverable on their own: enter, esc, tab, backspace, space, up, down, left, right, home, end, pageup, pagedown, insert, delete, f1..f12. herdr delivers home/end/pageup/pagedown/insert/delete as typed vt220/xterm bytes, since its own key names lack them" },
+            "modifiers": { "type": "array", "items": { "type": "string", "enum": ["ctrl", "alt", "shift"] } },
+            "extended": { "type": "boolean", "description": "Whether modifier + special-key chords beyond the classic set reach the pane" }
+        }
+    })
+}
+
 fn capabilities_discovery_responses() -> Value {
     let mut responses = ok_response();
     responses["200"] = json!({
@@ -741,6 +857,7 @@ fn capabilities_discovery_responses() -> Value {
             "properties": {
                 "serverVersion": { "type": "string", "description": "Gateway binary semver" },
                 "protocolVersion": { "type": "string", "description": "Protocol revision date (e.g. 2026-09-28)" },
+                "generation": { "type": "string", "description": GENERATION_DOC },
                 "planes": {
                     "type": "object",
                     "required": ["terminal", "agents"],
@@ -752,6 +869,24 @@ fn capabilities_discovery_responses() -> Value {
                                 "supported": { "type": "boolean", "description": "Whether any terminal multiplexer is available" },
                                 "activeBackend": { "type": ["string", "null"], "description": "Currently active multiplexer backend (tmux, herdr, conpty)" },
                                 "availableBackends": { "type": "array", "items": { "type": "string" } },
+                                "backends": { "type": "array", "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "sessionId": { "type": "string" },
+                                        "label": { "type": "string" },
+                                        "kind": { "type": "string" },
+                                        "connected": { "type": "boolean" },
+                                        "version": { "type": "string" },
+                                        "capabilities": { "type": "array", "items": { "type": "string" } },
+                                        "keyboard": keyboard_schema(),
+                                        "features": {
+                                            "type": "object",
+                                            "properties": {
+                                                "pagedHistory": { "type": "boolean", "description": "Whether ranged recent-unwrapped reads (start/end on the pane output route) are served, i.e. whether pull-to-load-more can page older history. true on a connected tmux backend; false on herdr, whose pane.read takes no range, and on a disconnected backend. Absent from gateways that predate it." }
+                                            }
+                                        }
+                                    }
+                                } },
                                 "degradedReason": { "type": ["string", "null"], "description": "Reason terminal plane is unavailable if supported is false" },
                                 "features": {
                                     "type": "object",
@@ -782,6 +917,41 @@ fn capabilities_discovery_responses() -> Value {
                 }
             }
         }) } }
+    });
+    responses
+}
+
+/// What `generation` means, wherever it appears.
+const GENERATION_DOC: &str = "The gateway instance generation: an opaque string minted once at process start and unchanged until the process exits. Compare it for equality only. Rows read under a different generation came from a gateway whose in-memory scrollback has since started over, so a client drops them instead of merging new reads under them.";
+
+/// `GET .../output`: Herdr's `pane_read` result shape, plus the generation.
+fn pane_read_responses() -> Value {
+    let mut responses = ok_response();
+    responses["200"] = json!({
+        "description": "The pane's text",
+        "content": { "application/json": { "schema": {
+            "type": "object",
+            "required": ["result"],
+            "properties": {
+                "result": {
+                    "type": "object",
+                    "required": ["type", "read"],
+                    "properties": {
+                        "type": { "type": "string", "const": "pane_read" },
+                        "read": {
+                            "type": "object",
+                            "required": ["output", "generation"],
+                            "properties": {
+                                "output": { "type": "string" },
+                                "revision": { "type": ["integer", "null"] },
+                                "range": object_schema(&[("start", "integer"), ("end", "integer"), ("total", "integer")], &["start", "end", "total"]),
+                                "generation": { "type": "string", "description": GENERATION_DOC }
+                            }
+                        }
+                    }
+                }
+            }
+        } } }
     });
     responses
 }
@@ -1199,6 +1369,7 @@ fn parts_responses() -> Value {
                 "source": { "type": "string", "enum": ["recent-unwrapped", "native"], "description": "recent-unwrapped: the pane's own text, which is what the dictionaries key off. native: the agent's own protocol answered, and range spans the adapter's rendering -- which is the parts' fallback_text joined by newlines -- rather than terminal rows" },
                 "lines": { "type": "integer", "description": "How many lines were read, echoed back" },
                 "revision": { "type": ["integer", "null"], "description": "Herdr's pane revision for this read, when it reported one" },
+                "generation": { "type": "string", "description": GENERATION_DOC },
                 "pane": {
                     "type": "object",
                     "required": ["pane_id", "parts", "image_input"],

@@ -66,8 +66,12 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     // One background attempt per opted-in backend; no restart/logging loop.
     backend_startup::spawn(&config);
 
-    let agent_runtime =
-        agents::AgentRuntime::with_configs(config.opencode.clone(), config.deepseek.clone());
+    let agent_runtime = agents::AgentRuntime::with_configs(
+        config.opencode.clone(),
+        config.deepseek.clone(),
+        config.t3.clone(),
+        Some(state_dir()?),
+    );
     agent_runtime.spawn_supervisor();
 
     let state = AppState {
@@ -84,6 +88,7 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         session_liveness: Arc::new(Mutex::new(SessionLivenessCache::default())),
         agent_runtime,
         ws_connections: Arc::new(agents::ws_routes::WsRegistry::default()),
+        generation: crate::new_generation(),
     };
     spawn_agent_notification_watchers(state.clone());
     spawn_agent_permission_watchers(state.clone());

@@ -45,6 +45,7 @@ pub(crate) fn test_config(token: &str) -> Config {
         rich_agent_pushes: false,
         opencode: agents::OpencodeConfig::default(),
         deepseek: agents::DeepseekConfig::default(),
+        t3: agents::T3Config::default(),
     }
 }
 
@@ -76,6 +77,7 @@ pub(crate) fn test_state(admin_token: &str, devices: Vec<DeviceRecord>) -> AppSt
         session_liveness: Arc::new(Mutex::new(SessionLivenessCache::default())),
         agent_runtime: agents::AgentRuntime::disabled(),
         ws_connections: Arc::new(agents::ws_routes::WsRegistry::default()),
+        generation: new_generation(),
     }
 }
 
@@ -528,6 +530,13 @@ impl FakeHerdr {
                         enters += 1;
                         json!({ "ok": true })
                     }
+                    "pane.get" => json!({
+                        "pane": {
+                            "pane_id": request["params"]["pane_id"],
+                            "workspace_id": "w1",
+                            "tab_id": "w1:t1",
+                        }
+                    }),
                     _ => json!({ "ok": true }),
                 };
                 recorded.lock().unwrap().push(request.clone());
@@ -786,7 +795,7 @@ impl agents::ports::agent::AgentPort for FakeAgent {
     }
     fn create_session<'a>(
         &'a self,
-        _directory: Option<&'a str>,
+        directory: Option<&'a str>,
         _model: Option<&'a agents::domain::ModelRef>,
         _mode: Option<&'a str>,
     ) -> agents::ports::agent::AgentFuture<'a, agents::domain::AgentSessionInfo> {
@@ -794,7 +803,9 @@ impl agents::ports::agent::AgentPort for FakeAgent {
             if self.failing {
                 return self.fail();
             }
-            Ok(fake_session(&format!("{}_new", self.kind), 1))
+            let mut session = fake_session(&format!("{}_new", self.kind), 1);
+            session.directory = directory.map(str::to_string);
+            Ok(session)
         })
     }
     fn get_session<'a>(
