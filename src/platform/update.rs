@@ -893,6 +893,39 @@ mod tests {
     }
 
     #[test]
+    fn launchd_update_survives_the_eio_window_on_start_and_on_recovery_start() {
+        let launchd = super::super::launchd::fake::Fake::new();
+        let fixture = Fixture::new();
+        let backup = fixture.0.join(BACKUP);
+
+        // Stop, replace, then a start that hits launchd still releasing the
+        // old job: retried, not reported as a failed release.
+        launchd.load();
+        launchd.set("bootstrap", "5\n5\n0\n");
+        let exe = fixture.write("muqun-gateway", b"old");
+        let temporary = fixture.write("new", b"new");
+        install(&exe, &temporary, &backup, true, |action| {
+            launchd.launchctl().control(action)
+        })
+        .unwrap();
+        assert!(launchd.loaded());
+        assert_eq!(fs::read(&exe).unwrap(), b"new");
+
+        // The new image is refused outright; the recovery start of the old one
+        // then hits the EIO window too and must still bring the agent back.
+        launchd.set("bootstrap", "78\n5\n5\n0\n");
+        let temporary = fixture.write("newer", b"newer");
+        let error = install(&exe, &temporary, &backup, true, |action| {
+            launchd.launchctl().control(action)
+        })
+        .unwrap_err_string();
+        assert!(error.contains("running state restored"), "{error}");
+        assert!(launchd.loaded(), "the gateway was left unloaded");
+        assert_eq!(fs::read(&exe).unwrap(), b"new");
+        assert!(!backup.exists());
+    }
+
+    #[test]
     fn stale_backup_stop_failure_and_failed_recovery_do_not_overwrite_evidence() {
         let fixture = Fixture::new();
         let exe = fixture.write("muqun-gateway", b"old");

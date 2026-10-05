@@ -6,6 +6,8 @@ pub mod discovery;
 pub mod git;
 pub mod http;
 pub mod i18n;
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod launchd;
 pub mod lifecycle;
 pub mod manage;
 pub mod metadata;
