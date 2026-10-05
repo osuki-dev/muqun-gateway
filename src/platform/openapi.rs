@@ -878,7 +878,13 @@ fn capabilities_discovery_responses() -> Value {
                                         "connected": { "type": "boolean" },
                                         "version": { "type": "string" },
                                         "capabilities": { "type": "array", "items": { "type": "string" } },
-                                        "keyboard": keyboard_schema()
+                                        "keyboard": keyboard_schema(),
+                                        "features": {
+                                            "type": "object",
+                                            "properties": {
+                                                "pagedHistory": { "type": "boolean", "description": "Whether ranged recent-unwrapped reads (start/end on the pane output route) are served, i.e. whether pull-to-load-more can page older history. true on a connected tmux backend; false on herdr, whose pane.read takes no range, and on a disconnected backend. Absent from gateways that predate it." }
+                                            }
+                                        }
                                     }
                                 } },
                                 "degradedReason": { "type": ["string", "null"], "description": "Reason terminal plane is unavailable if supported is false" },

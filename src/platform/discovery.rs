@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::backend::BackendKind;
 use crate::{ordered_sessions, session_capabilities, session_metadata, AppState};
 
 /// Whether one agent can be used right now
@@ -169,6 +170,33 @@ pub struct TerminalBackendDiscoveryInfo {
     /// falls back to its own check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keyboard: Option<crate::backend::KeyboardVocabulary>,
+    /// What reads this backend serves. Defaulted when absent, so a newer app
+    /// reading an older gateway sees every flag `false` and keeps its own
+    /// behaviour.
+    #[serde(default)]
+    pub features: TerminalBackendFeatures,
+}
+
+/// Per-backend read features, beside `keyboard`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalBackendFeatures {
+    /// Ranged `recent-unwrapped` reads (`start`/`end` on the pane output
+    /// route), which is what pull-to-load-more pages with. The app hides the
+    /// pull when this is `false`.
+    pub paged_history: bool,
+}
+
+impl TerminalBackendFeatures {
+    /// tmux serves a range on every version the gateway supports -- the
+    /// wrap snap that needs tmux 3.7 is best-effort and never fails the read.
+    /// herdr's `pane.read` takes no range at all (see `herdr_pane_output`),
+    /// and a backend that is not connected serves nothing.
+    pub(crate) fn for_backend(kind: BackendKind, connected: bool) -> Self {
+        Self {
+            paged_history: connected && kind == BackendKind::Tmux,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -267,6 +295,7 @@ pub async fn build_terminal_plane_discovery(state: &AppState) -> TerminalPlaneDi
                 .get("keyboard")
                 .cloned()
                 .and_then(|keyboard| serde_json::from_value(keyboard).ok()),
+            features: TerminalBackendFeatures::for_backend(session.backend, is_connected),
         });
     }
 
@@ -462,6 +491,26 @@ mod tests {
     }
 
     #[test]
+    fn paged_history_is_advertised_only_where_a_range_is_served() {
+        let paged =
+            |kind, connected| TerminalBackendFeatures::for_backend(kind, connected).paged_history;
+        assert!(paged(BackendKind::Tmux, true));
+        assert!(!paged(BackendKind::Tmux, false));
+        // herdr's `pane.read` has no range parameter.
+        assert!(!paged(BackendKind::Herdr, true));
+        assert!(!paged(BackendKind::Herdr, false));
+
+        // An older gateway's backend entry, without the field, reads as
+        // "cannot page" rather than failing to parse.
+        let legacy: TerminalBackendDiscoveryInfo = serde_json::from_value(json!({
+            "sessionId": "s1", "label": "t", "kind": "tmux", "connected": true,
+            "capabilities": []
+        }))
+        .unwrap();
+        assert!(!legacy.features.paged_history);
+    }
+
+    #[test]
     fn terminal_plane_discovery_serializes_with_camel_case() {
         let info = TerminalPlaneDiscovery {
             supported: true,
@@ -479,6 +528,7 @@ mod tests {
                     &crate::backend::NamedKey::ALL,
                     true,
                 )),
+                features: TerminalBackendFeatures::for_backend(BackendKind::Tmux, true),
             }],
             features: TerminalFeatures {
                 multi_window: true,
@@ -498,6 +548,7 @@ mod tests {
         assert_eq!(val["backends"][0]["sessionId"], "s1");
         assert_eq!(val["backends"][0]["keyboard"]["version"], 1);
         assert_eq!(val["backends"][0]["keyboard"]["extended"], true);
+        assert_eq!(val["backends"][0]["features"]["pagedHistory"], true);
         assert_eq!(
             val["backends"][0]["keyboard"]["modifiers"],
             json!(["ctrl", "alt", "shift"])
