@@ -240,6 +240,13 @@ impl TmuxBackend {
 
     /// Wrap flags for absolute physical rows `[lo, hi)`, oldest first.
     ///
+    /// `-F` (per-row line flags) is new in tmux 3.7; older servers refuse
+    /// the whole command with `unknown flag -F`. What answers is the
+    /// *server*, not the `tmux` binary: a server started before an upgrade
+    /// keeps its old parser while `tmux -V` reports the new version. Callers
+    /// must therefore treat an error here as "no snap", not as a failed read
+    /// (see `read_pane`).
+    ///
     /// Un-joined and without `-e`: this exists purely to read tmux's own
     /// per-row `W` flag (see `row_flag_is_wrapped`), never to read content.
     /// Combining `-F` with `-J` corrupts the text -- measured live, the flag
@@ -711,9 +718,29 @@ impl TerminalBackend for TmuxBackend {
                 // joining, where no snap is needed: cutting a wrapped line's
                 // physical rows apart there is simply reading two physical
                 // rows, not splitting a logical one.
+                //
+                // The snap is a refinement, never a precondition: a server
+                // that cannot report wrap flags (`capture-pane -F` is tmux
+                // 3.7+, and a server started before an upgrade keeps refusing
+                // it) still pages, just with boundaries that may split a
+                // wrapped line into two fragments. Paging stays disjoint
+                // either way -- adjacent pages share the requested boundary
+                // as-is -- so the cost is cosmetic, where failing the read
+                // cost the client its whole history.
                 let range = if request.source == OutputSource::RecentUnwrapped {
-                    self.snap_to_logical_lines(&request.pane_id, history_size, range)
-                        .await?
+                    match self
+                        .snap_to_logical_lines(&request.pane_id, history_size, range)
+                        .await
+                    {
+                        Ok(snapped) => snapped,
+                        Err(error) => {
+                            tracing::debug!(
+                                "paged read of {} served unsnapped: wrap flags unavailable: {error}",
+                                request.pane_id.as_str()
+                            );
+                            range
+                        }
+                    }
                 } else {
                     range
                 };
@@ -2603,6 +2630,112 @@ mod tests {
         assert_eq!(capture_bounds(463, 464, 463), (0, 0));
         // A pane with no scrollback at all.
         assert_eq!(capture_bounds(0, 41, 0), (0, 40));
+    }
+
+    /// A stand-in `tmux` for paged reads: 20 rows of history over a 10-row
+    /// pane, `row <i>` on absolute row `i`, with rows 10 and 11 wrapping so
+    /// rows 10..13 are one logical line. `accepts_dash_f` picks between a
+    /// 3.7+ server and an older one, which refuses the whole `capture-pane`
+    /// with tmux's own wording.
+    #[cfg(unix)]
+    fn fake_paging_tmux(accepts_dash_f: bool) -> TmuxBackend {
+        use std::os::unix::fs::PermissionsExt as _;
+        let script = r#"#!/bin/sh
+HIST=20
+cmd=$1; shift
+case $cmd in
+display-message) printf '%s\t%s\n' "$HIST" 10; exit 0 ;;
+capture-pane) ;;
+*) echo "unexpected $cmd" >&2; exit 1 ;;
+esac
+F=0; J=0; S=0; E=0
+while [ $# -gt 0 ]; do
+  case $1 in
+  -F) F=1 ;;
+  -J) J=1 ;;
+  -S) S=$2; shift ;;
+  -E) E=$2; shift ;;
+  -t) shift ;;
+  esac
+  shift
+done
+if [ "$F" = 1 ] && [ "__ACCEPT__" = 0 ]; then
+  echo 'command capture-pane: unknown flag -F' >&2; exit 1
+fi
+i=$((S + HIST)); last=$((E + HIST))
+while [ "$i" -le "$last" ]; do
+  w=0
+  if [ "$i" = 10 ] || [ "$i" = 11 ]; then w=1; fi
+  if [ "$F" = 1 ]; then
+    if [ "$w" = 1 ]; then printf 'W row %s\n' "$i"; else printf -- '- row %s\n' "$i"; fi
+  elif [ "$J" = 1 ] && [ "$w" = 1 ] && [ "$i" -lt "$last" ]; then
+    printf 'row %s' "$i"
+  else
+    printf 'row %s\n' "$i"
+  fi
+  i=$((i + 1))
+done
+"#
+        .replace("__ACCEPT__", if accepts_dash_f { "1" } else { "0" });
+        let path = crate::short_test_socket("gw-fake-tmux").with_extension("sh");
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        TmuxBackend::with_binary(path, None)
+    }
+
+    #[cfg(unix)]
+    fn paged_read(start: u32, end: u32) -> ReadPane {
+        ReadPane {
+            pane_id: PaneId::new("%1"),
+            source: OutputSource::RecentUnwrapped,
+            format: OutputFormat::Text,
+            lines: 100,
+            start: Some(start),
+            end: Some(end),
+        }
+    }
+
+    /// The bug the Mac hit: a tmux server older than 3.7 (here, one started
+    /// before a Homebrew upgrade) refuses `capture-pane -F`, and the paged
+    /// read used to fail with it. The read must be served, unsnapped.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn paged_read_survives_a_server_that_refuses_dash_f() {
+        let backend = fake_paging_tmux(false);
+        let page = backend.read_pane(&paged_read(11, 20)).await.unwrap();
+        assert_eq!(
+            page.range,
+            Some(PaneRange {
+                start: 11,
+                end: 20,
+                total: 30
+            })
+        );
+        assert!(page.text.starts_with("row 11row 12\nrow 13\n"));
+        assert!(page.text.ends_with("row 19"));
+
+        // Pages that share a boundary stay disjoint without the snap.
+        let older = backend.read_pane(&paged_read(0, 11)).await.unwrap();
+        assert_eq!(older.range.unwrap().end, 11);
+        assert!(older.text.ends_with("row 9\nrow 10"));
+    }
+
+    /// A 3.7+ server keeps the snap: the same request widens to the wrapped
+    /// line's first row.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn paged_read_still_snaps_when_dash_f_is_accepted() {
+        let backend = fake_paging_tmux(true);
+        let page = backend.read_pane(&paged_read(11, 20)).await.unwrap();
+        assert_eq!(
+            page.range,
+            Some(PaneRange {
+                start: 10,
+                end: 20,
+                total: 30
+            })
+        );
+        assert!(page.text.starts_with("row 10row 11row 12\nrow 13\n"));
     }
 
     #[test]
