@@ -24,6 +24,10 @@ pub(crate) fn content_envelope(data: Value) -> Value {
             // Slash-command catalogue and `@` file search. A pane's own
             // descriptor still says whether this particular agent has a table.
             "composer": true,
+            // Agent text parts carry `image_assets`: the images their markdown
+            // embeds by host path, resolved to asset URLs. See
+            // `agents::message_images`.
+            "message_image_assets": true,
         },
         "data": data,
     })

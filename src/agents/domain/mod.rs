@@ -18,7 +18,8 @@ pub use session::{
 };
 pub use timeline::{
     part_item_id, push_input_partial, reasoning_item_id, text_item_id, tool_item_id, AgentPart,
-    CompactionStatus, TimelineItem, TimelineRole, TodoItem, ToolCall, ToolCallStatus, ToolTime,
+    CompactionStatus, MessageImageAsset, TimelineItem, TimelineRole, TodoItem, ToolCall,
+    ToolCallStatus, ToolTime,
 };
 
 #[cfg(test)]

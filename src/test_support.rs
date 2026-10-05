@@ -82,6 +82,7 @@ pub(crate) fn test_state(admin_token: &str, devices: Vec<DeviceRecord>) -> AppSt
         agent_runtime: agents::AgentRuntime::disabled(),
         ws_connections: Arc::new(agents::ws_routes::WsRegistry::default()),
         generation: new_generation(),
+        message_images: Arc::default(),
     }
 }
 

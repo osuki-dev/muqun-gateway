@@ -86,6 +86,10 @@ pub(crate) struct AppState {
     /// one generation, so a client that sees it change drops what it holds
     /// and reads again. See [`new_generation`].
     pub(crate) generation: Arc<str>,
+    /// The images agent text embeds by host path that this gateway has
+    /// resolved for a client, so the asset content route can serve them. See
+    /// `agents::message_images`.
+    pub(crate) message_images: Arc<agents::message_images::MessageImages>,
 }
 
 /// A fresh instance generation. Opaque to clients: they compare it for

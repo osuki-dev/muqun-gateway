@@ -287,6 +287,7 @@ pub fn map_message(message: &Value, seq: u64) -> Option<TimelineItem> {
         } else {
             Some(attachments)
         },
+        image_assets: None,
     })
 }
 
@@ -774,6 +775,7 @@ pub fn map_activity(
         updated_ms,
         ordinal: seq,
         attachments: None,
+        image_assets: None,
     })
 }
 

@@ -1261,6 +1261,7 @@ impl AgentManager {
             updated_ms,
             ordinal: 0,
             attachments: None,
+            image_assets: None,
         }
     }
 

@@ -341,6 +341,7 @@ pub fn map_message(msg: &Value, asid: &AgentSessionId) -> Vec<TimelineItem> {
                 updated_ms,
                 ordinal: $ordinal,
                 attachments: $attachments,
+                image_assets: None,
             })
         };
     }

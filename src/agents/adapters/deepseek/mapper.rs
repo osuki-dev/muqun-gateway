@@ -514,6 +514,7 @@ fn map_content_blocks(
             updated_ms: time,
             ordinal,
             attachments: None,
+            image_assets: None,
         });
     }
     items
@@ -568,6 +569,7 @@ pub fn map_record(event: &Value) -> Vec<TimelineItem> {
                 updated_ms: time,
                 ordinal: 0,
                 attachments: None,
+                image_assets: None,
             }]
         }
         _ => Vec::new(),

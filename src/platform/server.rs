@@ -94,6 +94,7 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         agent_runtime,
         ws_connections: Arc::new(agents::ws_routes::WsRegistry::default()),
         generation: crate::new_generation(),
+        message_images: Arc::default(),
     };
     spawn_agent_notification_watchers(state.clone());
     spawn_agent_permission_watchers(state.clone());

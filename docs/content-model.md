@@ -27,7 +27,7 @@ model, not new protocols.
 {
   "schema_version": "1.4.0",
   "capabilities": { "parts": true, "assets": true, "image_upload": true,
-                    "composer": true },
+                    "composer": true, "message_image_assets": true },
   "data": { }
 }
 ```
@@ -447,6 +447,53 @@ will stream something renderable.
   an empty list and `root: null` rather than an error, so this cannot be used to
   probe the host.
 - SSE additions: `asset.created`, `parts.updated` events on the existing stream.
+
+### Images in agent text (`image_assets`)
+
+An agent that renders a chart and answers `![flow](./out/flow.png)` -- or
+`file:///home/me/work/out/flow.png`, or the bare absolute path -- has written a
+reference only its own host can follow. The text is passed through exactly as
+written (copy, export and "copy as markdown" keep the original paths). Instead,
+every agent `text` part whose markdown embeds images by host path carries a
+resolution map next to `attachments`:
+
+```json
+{ "id": "msg_…:t0", "role": "assistant",
+  "part": { "type": "text", "text": "![flow](./out/flow.png \"Flow\")" },
+  "image_assets": [
+    { "src": "./out/flow.png", "asset_id": "as_3be1…",
+      "url": "/api/assets/as_3be1…/content", "mime": "image/png",
+      "width": 1280, "height": 720 } ] }
+```
+
+- Sources are the destination of `![alt](dest "title")` (without a `<…>`
+  wrapper) and the `src` of an HTML `<img>`, outside fenced code blocks and
+  inline code spans. `src` is the destination exactly as written, so a client
+  finds it again verbatim and swaps in `url` when it renders.
+- A relative source is resolved against the session's `directory`; an absolute
+  path and a `file://` URL (percent-decoded, `localhost` host allowed) as they
+  are; `~/` against the gateway account's home. Percent-encoded relative paths
+  are tried raw first, then decoded.
+- Listed only when the path canonicalizes to a regular file strictly inside the
+  canonical session directory (never the filesystem root) and its bytes sniff
+  as an image. Web URLs, data URIs, protocol-relative URLs, gateway URLs already
+  in the text, traversal or symlinks out of the directory, missing files and
+  non-images are simply absent; a client shows those as it always did (the alt
+  text, for an image it cannot load).
+- `asset_id` is the same path-derived id the workspace index uses, and
+  `GET /api/assets/{asset_id}/content` serves it: the gateway remembers each
+  image it listed with the directory that fenced it and re-checks containment
+  at read time, so a file moved out or replaced by a symlink is a 404. That
+  memory is a bounded window refilled by every read of the timeline, so after a
+  gateway restart an id is served again once the session has been read.
+- `width`/`height` come from the image header when it is cheap to read (PNG,
+  GIF, WebP, JPEG within the first 8 KiB) and are omitted otherwise.
+- Attached on the way out -- `GET /api/agent-sessions/{asid}` (the snapshot's
+  timeline), `/timeline`, `/events` replay, the per-session SSE stream and
+  `/api/ws` -- and never stored, so it applies to every agent backend
+  (OpenCode, T3 Code, DeepSeek) alike. Absent when a part has nothing to list;
+  an older gateway never sends it, and `capabilities.message_image_assets` says
+  this one does.
 
 ## Rollout slices
 

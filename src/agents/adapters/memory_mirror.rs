@@ -679,6 +679,7 @@ impl MemoryMirror {
                 role: TimelineRole::Assistant,
                 part,
                 attachments: None,
+                image_assets: None,
             };
             state.insert_item(item.clone());
             item
@@ -762,6 +763,7 @@ impl MemoryMirror {
                     updated_ms: now,
                     ordinal,
                     attachments: None,
+                    image_assets: None,
                 };
                 state.insert_item(item.clone());
                 item
@@ -841,6 +843,17 @@ impl MemoryMirror {
             .collect();
         items.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
         (items, status, false, current_seq)
+    }
+
+    /// The session's directory as the mirror last heard it, without cloning
+    /// anything else.
+    pub async fn session_directory(&self, asid: &str) -> Option<String> {
+        let sessions = self.sessions.read().await;
+        sessions
+            .get(&AgentSessionId(asid.to_owned()))?
+            .info
+            .directory
+            .clone()
     }
 
     pub async fn get_timeline_item(
@@ -1250,6 +1263,7 @@ mod tests {
             updated_ms: 1001,
             ordinal: 0,
             attachments: None,
+            image_assets: None,
         }
     }
 
