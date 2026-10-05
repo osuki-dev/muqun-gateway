@@ -308,20 +308,23 @@ pub(crate) fn manage() -> anyhow::Result<()> {
                         message = toggle_backend_autostart(&session.id)?;
                     }
                 }
-                (Section::Settings, "g") => {
-                    let enabled = service::state()? != service::ServiceState::NotInstalled;
-                    if confirm_gateway_autostart(!enabled)? {
-                        crate::run_service_command(if enabled {
-                            crate::ServiceCommand::Uninstall
+                (Section::Settings, "g") => match autostart_toggle(service::state()) {
+                    AutostartToggle::Refuse(reason) => message = reason,
+                    toggle => {
+                        let enable = toggle == AutostartToggle::Install;
+                        if confirm_gateway_autostart(enable)? {
+                            crate::run_service_command(if enable {
+                                crate::ServiceCommand::Install
+                            } else {
+                                crate::ServiceCommand::Uninstall
+                            })?;
+                            message =
+                                format!("gateway autostart {}", if enable { "on" } else { "off" });
                         } else {
-                            crate::ServiceCommand::Install
-                        })?;
-                        message =
-                            format!("gateway autostart {}", if enabled { "off" } else { "on" });
-                    } else {
-                        message = String::from("gateway autostart unchanged");
+                            message = String::from("gateway autostart unchanged");
+                        }
                     }
-                }
+                },
                 (Section::Settings, "c") => {
                     message =
                         String::from("Checking official stable release (no background polling)...");
@@ -760,12 +763,7 @@ fn print_manage_screen(
         Ok(None) => String::from("Stopped - press Enter to start"),
         Err(error) => format!("Unavailable: {}", first_line(&error.to_string())),
     };
-    let autostart = match service::state() {
-        Ok(service::ServiceState::Installed) => "On - user service registered",
-        Ok(service::ServiceState::FileOnly) => "Incomplete - service file only",
-        Ok(service::ServiceState::NotInstalled) => "Off - start Gateway manually",
-        Err(_) => "Unavailable - cannot read service registration",
-    };
+    let autostart = autostart_label(&service::state());
     let backend_states = config
         .sessions
         .iter()
@@ -1457,6 +1455,46 @@ fn toggle_backend_autostart(id: &str) -> anyhow::Result<String> {
     ))
 }
 
+/// What `g` may do from what the service reader reports. Uninstalling needs
+/// the reader to confirm a registered, loaded service; installing needs it to
+/// confirm there is none (or only a file that would not autostart, which
+/// install repairs). A stopped-but-installed LaunchAgent is neither: `g` there
+/// would uninstall the very registration the owner just saw as "Installed",
+/// so it explains instead of acting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AutostartToggle {
+    Install,
+    Uninstall,
+    Refuse(String),
+}
+
+fn autostart_toggle(state: anyhow::Result<service::ServiceState>) -> AutostartToggle {
+    match state {
+        Ok(service::ServiceState::Installed) => AutostartToggle::Uninstall,
+        Ok(service::ServiceState::NotInstalled | service::ServiceState::FileOnly) => {
+            AutostartToggle::Install
+        }
+        Ok(service::ServiceState::Stopped) => AutostartToggle::Refuse(String::from(
+            "autostart is on and Gateway is stopped; press Enter on Overview to start it, \
+             or run `muqun-gateway service uninstall` to turn autostart off",
+        )),
+        Err(error) => AutostartToggle::Refuse(format!(
+            "autostart unchanged: cannot read service registration: {}",
+            first_line(&error.to_string())
+        )),
+    }
+}
+
+fn autostart_label(state: &anyhow::Result<service::ServiceState>) -> &'static str {
+    match state {
+        Ok(service::ServiceState::Installed) => "On - user service registered",
+        Ok(service::ServiceState::Stopped) => "On - Installed · stopped (starts at next login)",
+        Ok(service::ServiceState::FileOnly) => "Incomplete - service file only",
+        Ok(service::ServiceState::NotInstalled) => "Off - start Gateway manually",
+        Err(_) => "Unavailable - cannot read service registration",
+    }
+}
+
 fn confirm_gateway_autostart(enabled: bool) -> anyhow::Result<bool> {
     confirm_action(&format!("Turn Gateway login autostart {}?", if enabled { "on" } else { "off" }), &[
         String::from("This registers/removes only Gateway's user service."),
@@ -1957,6 +1995,26 @@ mod tests {
         ManageData, ManageView, ScreenLine, Section, Tone,
     };
     use crate::*;
+
+    #[test]
+    fn autostart_toggle_never_uninstalls_a_stopped_or_unreadable_service() {
+        use super::{autostart_label, autostart_toggle, AutostartToggle};
+        use crate::platform::service::ServiceState::*;
+        assert_eq!(autostart_toggle(Ok(Installed)), AutostartToggle::Uninstall);
+        assert_eq!(autostart_toggle(Ok(NotInstalled)), AutostartToggle::Install);
+        assert_eq!(autostart_toggle(Ok(FileOnly)), AutostartToggle::Install);
+        for state in [Ok(Stopped), Err(anyhow::anyhow!("launchctl failed"))] {
+            assert!(matches!(
+                autostart_toggle(state),
+                AutostartToggle::Refuse(_)
+            ));
+        }
+        assert_eq!(
+            autostart_label(&Ok(Stopped)),
+            "On - Installed · stopped (starts at next login)"
+        );
+        assert!(!autostart_label(&Ok(Stopped)).contains("Incomplete"));
+    }
 
     #[test]
     fn manager_navigation_is_scoped_and_bounded() {

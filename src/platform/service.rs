@@ -40,10 +40,30 @@ pub const SERVICE_LABEL: &str = "dev.osuki.muqun-gateway";
 pub enum ServiceState {
     /// Registered with the init system, and it reports the gateway as loaded.
     Installed,
-    /// A unit file is on disk but the init system does not have it loaded,
-    /// which is what a half-finished install or a manual `bootout` leaves.
+    /// Registered for login autostart and not loaded right now. On macOS this
+    /// is what `stop` leaves: stopping a LaunchAgent unloads it (KeepAlive
+    /// would restart it otherwise), and the plist loads it again at the next
+    /// login or `start`. Never reported on Linux, where a stopped unit stays
+    /// enabled and reads `Installed`.
+    Stopped,
+    /// A unit file is on disk but would not autostart: not enabled (Linux) or
+    /// not a LaunchAgent for this label that runs at load (macOS).
     FileOnly,
     NotInstalled,
+}
+
+impl ServiceState {
+    /// From what the reader found: whether the unit file exists, whether the
+    /// init system has it loaded/enabled, and whether the file on its own
+    /// registers the gateway for login.
+    fn classify(file: bool, loaded: bool, registered: bool) -> Self {
+        match (file, loaded, registered) {
+            (false, _, _) => Self::NotInstalled,
+            (true, true, _) => Self::Installed,
+            (true, false, true) => Self::Stopped,
+            (true, false, false) => Self::FileOnly,
+        }
+    }
 }
 
 /// Everything the unit file needs to name. Passed in rather than resolved here
@@ -96,11 +116,18 @@ pub fn state() -> Result<ServiceState> {
     if !unit.exists() {
         return Ok(ServiceState::NotInstalled);
     }
-    Ok(if loaded() {
-        ServiceState::Installed
-    } else {
-        ServiceState::FileOnly
-    })
+    let loaded = loaded();
+    let registered = cfg!(target_os = "macos")
+        && !loaded
+        && std::fs::read_to_string(&unit).is_ok_and(|plist| registers_at_login(&plist));
+    Ok(ServiceState::classify(true, loaded, registered))
+}
+
+/// A plist for this label that launchd loads -- and so starts -- at login.
+fn registers_at_login(plist: &str) -> bool {
+    plist.contains(&format!(
+        "<key>Label</key>\n  <string>{SERVICE_LABEL}</string>"
+    )) && plist.contains("<key>RunAtLoad</key>\n  <true/>")
 }
 
 /// Refuse to control a same-label service belonging to another installation.
@@ -822,6 +849,25 @@ mod tests {
             path: String::from("/opt/homebrew/bin:/usr/bin:/bin"),
             lc_ctype: String::from("zh_CN.UTF-8"),
         }
+    }
+
+    #[test]
+    fn a_stopped_launch_agent_reads_as_installed_and_stopped_not_incomplete() {
+        use ServiceState::*;
+        assert_eq!(ServiceState::classify(false, false, false), NotInstalled);
+        assert_eq!(ServiceState::classify(true, true, true), Installed);
+        // `stop` unloads a LaunchAgent; its plist still starts it at login.
+        assert_eq!(ServiceState::classify(true, false, true), Stopped);
+        assert_eq!(ServiceState::classify(true, false, false), FileOnly);
+        assert!(registers_at_login(&launch_agent_plist(&paths())));
+        let manual = launch_agent_plist(&paths()).replace(
+            "<key>RunAtLoad</key>\n  <true/>",
+            "<key>RunAtLoad</key>\n  <false/>",
+        );
+        assert!(!registers_at_login(&manual));
+        assert!(!registers_at_login(
+            &launch_agent_plist(&paths()).replace(SERVICE_LABEL, "dev.example.other")
+        ));
     }
 
     #[test]

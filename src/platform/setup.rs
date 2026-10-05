@@ -825,6 +825,7 @@ pub(crate) fn change_gateway_autostart(enabled: bool) -> anyhow::Result<()> {
 fn print_service_status() -> anyhow::Result<()> {
     match service::state()? {
         service::ServiceState::Installed => println!("service: installed ({})", service::unit_path()?.display()),
+        service::ServiceState::Stopped => println!("service: installed, stopped ({}) -- starts at next login or with `muqun-gateway start`", service::unit_path()?.display()),
         service::ServiceState::FileOnly => println!("service: unit file only; run `muqun-gateway service install` to enable/repair autostart"),
         service::ServiceState::NotInstalled => println!("service: not installed -- gateway autostart is off"),
     }
