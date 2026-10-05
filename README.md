@@ -35,7 +35,7 @@ the far side. The gateway implements no SSH client or server itself.
 ┌──────────────────────────────────────────────────────────────────────────┐
 │ muqun-gateway — one binary, one user                                     │
 │                                                                          │
-│  src/main.rs · src/cli.rs — composition root and commands                │
+│  src/main.rs · src/cli/ — composition root and commands                  │
 │  src/platform/server.rs — startup + middleware: locale · security        │
 │    headers · known hosts · encrypted transport · compression · routing   │
 │                                                                          │
@@ -57,7 +57,7 @@ the far side. The gateway implements no SSH client or server itself.
 │  shared: config · store (identity, devices, secrets) · http (envelope,   │
 │    auth, validation) · metadata · uploads · assets · i18n (one catalog   │
 │    per language) · git · parts · discovery · openapi · manage ·          │
-│    service · state_lock                                                  │
+│    lifecycle · service · state_lock                                      │
 └──────────────────────────────────────────────────────────────────────────┘
         │
         ▼
@@ -111,23 +111,42 @@ Open the manager on your computer:
 muqun-gateway manage
 ```
 
-It shows a QR code. Scan it in Muqun, then type back the short code your
+Open **Devices** (`3`), then press Enter (first device) or `p` (new device)
+to see the QR code. Scan it in Muqun, then type back the short code your
 computer displays. That is the whole of pairing.
 
 No camera on the phone? Type the gateway's address into the app instead, and
 finish with the same short code.
 
-Keys in the manager:
+The manager has four views. `1`–`4`, Tab/Shift-Tab, or Left/Right switches
+views; Up/Down or `j`/`k` selects a row and Enter performs the visible primary
+action. PageUp/PageDown scrolls. Esc goes back from a view or cancels a dialog;
+at Overview, Esc closes the manager. `q` closes from any main view without
+stopping Gateway. Confirmations default to **cancel**: arrows/Tab choose,
+Enter accepts the selected answer. The footer shows full-word, view-specific
+actions. Long lists keep the selected item visible after a resize.
 
-| key | what it does |
+| view | keys |
 | --- | --- |
-| `p` | show the pairing QR again, to add another device |
-| `x` | revoke a paired device — its token stops working immediately |
-| `u` | change the address the app connects to |
-| `a` | detect that address again |
-| `h` / `m` | add a Herdr or tmux backend |
-| `f` | choose the default session |
-| `d` | remove a backend |
+| Overview (`1`) | `s` start, `t` stop, `r` restart the gateway |
+| Terminals (`2`) | `h` / `m` add Herdr / tmux; `f` make the selected backend default; `d` remove it; `b` toggle its backend autostart |
+| Devices (`3`) | `p` show pairing QR; `x` revoke the selected device after confirmation; `r` return to the device list |
+| Settings (`4`) | `u` edit URL; `a` detect URL; `e` toggle transport encryption; `g` enable/disable gateway autostart after confirmation |
+
+Enter starts/stops Gateway in Overview, makes the selected terminal backend
+the default in Terminals, pairs the first device or reviews revocation in
+Devices, and changes the selected setting in Settings. The `>` selection marker
+is separate from the explicit `[default]` backend label. Empty lists explain
+the next step. Gateway stop, backend removal, and device revocation explain
+their scope before you confirm; none closes terminal tasks.
+
+Runtime/connectivity/backend panels use the terminal's default background,
+with bold/reversed active tabs and rows, restrained status accents, and a
+bounded content width. Compact terminals use a simpler layout; CJK and combining
+characters are clipped/wrapped by display cells. Color is never the only status cue.
+
+On a small terminal the QR is replaced with address pairing instructions;
+resize to show the complete QR. No clipped QR is presented as usable.
 
 Backend and address changes take effect when the gateway restarts, and never
 close your terminal sessions.
@@ -135,12 +154,13 @@ close your terminal sessions.
 ## Run it
 
 ```sh
-muqun-gateway start     # start in the background
+muqun-gateway start     # start in the background, or through the installed user service
 muqun-gateway status    # whether it is running, and where it listens
 muqun-gateway stop      # stop it
+muqun-gateway restart   # restart through the same owner
 ```
 
-`start` keeps running after you close the terminal, but **not** after the
+Without a user service, `start` keeps running after you close the terminal, but **not** after the
 machine restarts. To have it come back on its own:
 
 ```sh
@@ -163,9 +183,57 @@ torn down when you log out and the phone can only reach the machine while
 somebody is signed in. If your host refuses it, the install still succeeds and
 says so.
 
-With a service installed, `muqun-gateway stop` stops the process but the service
-starts it again — that is what it is for. `service uninstall` is how you stop it
-for good.
+With a service installed, `start`, `stop`, and `restart` use systemd/launchd
+instead of signalling its process behind the supervisor's back. `stop` leaves
+autostart registered, but does not immediately respawn the gateway; it can start
+again at the next login/boot. `service uninstall` removes that registration and
+keeps a running gateway running as an ordinary background process. If it was
+already stopped, it stays stopped.
+
+On Linux, lifecycle actions reload and inspect the **effective** systemd unit,
+including drop-ins. They require process-only shutdown (`KillMode=process` or
+`none`) and matching executable, config, and state ownership. Inspection uses
+`systemctl` and systemd's `busctl`; if inspection fails, or an environment file
+or custom stop hook makes safety ambiguous, no stop/restart/removal is attempted.
+Older units without explicit directory pins also have their inherited user-manager
+environment checked. Repair an incompatible unit/drop-in before retrying.
+
+Lifecycle commands serialize per state directory, wait for a local authenticated
+management response on startup, and use the state lock's live owner rather than
+trusting a stale PID file or killing anything found on a port. Failure is reported
+without starting a competing replacement. Terminal servers and their tasks are
+not stopped. Custom systemd gateway units are controlled only as the user, and
+must exec the gateway as their MainPID and use `KillMode=process` (or `none`);
+system-wide units require the operator's
+own systemctl command.
+
+### Retired Herdr plugin
+
+Gateway is distributed only as the standalone binary/installer. The old
+`herdr.gateway` plugin manifest and plugin build/fetch script are no longer
+shipped. **Herdr remains a supported terminal backend** (0.7.5+); legacy App
+metadata and pairing formats are unchanged.
+
+For a prior plugin install, stop the legacy Gateway process and disable/remove
+the Gateway plugin in Herdr, not Herdr itself. Then run:
+
+```sh
+muqun-gateway import-herdr-plugin
+muqun-gateway start
+```
+
+The installer retains its guarded `import-herdr-plugin --if-present` migration.
+Import preserves the server identity and paired-device records, merges compatible
+configuration, and retains source files and backups. It refuses to import while
+a gateway owns the target state or the old gateway is running. Do not re-pair or
+delete plugin state to perform the migration.
+
+Old `HERDR_PLUGIN_CONFIG_DIR` / `HERDR_PLUGIN_STATE_DIR` environments remain
+supported until the import marker redirects ownership to standalone storage.
+Explicit `MUQUN_GATEWAY_CONFIG_DIR` / `MUQUN_GATEWAY_STATE_DIR` overrides take
+precedence, and newly installed units pin the resolved directories along with
+HOME, PATH, and LC_CTYPE. Lifecycle commands refuse to control a same-label unit
+that points to another installation.
 
 ### Agents at a glance
 

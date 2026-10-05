@@ -57,6 +57,19 @@ use anyhow::Context as _;
 /// removed -- see the module docs on why unlinking it would defeat the lock.
 pub const LOCK_FILE: &str = "gateway.lock";
 
+/// The owner has taken the lock but has not finished publishing its PID.
+/// Transition waits may retry this exact state; it never authorizes a signal.
+#[derive(Debug)]
+pub(crate) struct UnpublishedOwner;
+
+impl std::fmt::Display for UnpublishedOwner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("state directory lock is held but its owner PID is not published yet")
+    }
+}
+
+impl std::error::Error for UnpublishedOwner {}
+
 /// Ownership of one state directory, for as long as this value is alive.
 ///
 /// There is no explicit release, and deliberately so. `flock` is held against
@@ -92,6 +105,47 @@ impl StateLock {
 /// pid stays in the file, and the lock does not.
 pub fn holder_pid(path: &Path) -> Option<u32> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// Inspect an existing lock without stamping our PID or creating state. The
+/// recorded PID is meaningful only while another open description holds it.
+#[cfg(unix)]
+pub fn running_owner(state_dir: &Path) -> anyhow::Result<Option<u32>> {
+    use std::os::unix::io::AsRawFd as _;
+    let path = state_dir.join(LOCK_FILE);
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    // SAFETY: the file owns the descriptor; dropping it releases a probe lock.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(None);
+    }
+    let error = std::io::Error::last_os_error();
+    anyhow::ensure!(
+        error.kind() == std::io::ErrorKind::WouldBlock,
+        "cannot inspect state lock: {error}"
+    );
+    let contents = std::fs::read_to_string(&path)
+        .context("state directory is owned but its PID is unreadable")?;
+    if contents.is_empty() {
+        return Err(UnpublishedOwner.into());
+    }
+    contents
+        .trim()
+        .parse()
+        .map(Some)
+        .context("state directory is owned but its PID is unreadable")
+}
+
+#[cfg(not(unix))]
+pub fn running_owner(_state_dir: &Path) -> anyhow::Result<Option<u32>> {
+    anyhow::bail!("gateway lifecycle is supported on macOS and Linux only")
 }
 
 fn contended_message(state_dir: &Path, lock_path: &Path) -> String {
@@ -204,8 +258,8 @@ fn lock_exclusive(
 fn record_holder(file: &std::fs::File) {
     use std::io::{Seek as _, Write as _};
     let mut file = file;
-    // Best effort throughout: a pid that could not be recorded costs the next
-    // gateway a helpful line in an error message, and nothing else.
+    // Best effort: an unpublished PID prevents proving lifecycle ownership.
+    // Readiness waits retry the empty publication window; signals fail closed.
     let _ = file.set_len(0);
     let _ = file.rewind();
     let _ = file.write_all(format!("{}\n", std::process::id()).as_bytes());
@@ -271,6 +325,29 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_inspection_does_not_create_or_trust_stale_lock_files() {
+        let dir = scratch_dir("inspect");
+        assert_eq!(running_owner(&dir).unwrap(), None);
+        assert!(!dir.join(LOCK_FILE).exists());
+        std::fs::write(dir.join(LOCK_FILE), "12345\n").unwrap();
+        assert_eq!(running_owner(&dir).unwrap(), None);
+        assert_eq!(
+            std::fs::read_to_string(dir.join(LOCK_FILE)).unwrap(),
+            "12345\n"
+        );
+        let held = StateLock::acquire(&dir).unwrap();
+        assert_eq!(running_owner(&dir).unwrap(), Some(std::process::id()));
+        drop(held);
+        retry_while_directory_is_busy(|| {
+            anyhow::ensure!(running_owner(&dir)?.is_none(), "probe still held");
+            Ok(())
+        })
+        .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// The loss this file exists to prevent: two gateways against one state

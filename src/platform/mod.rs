@@ -6,6 +6,7 @@ pub mod discovery;
 pub mod git;
 pub mod http;
 pub mod i18n;
+pub mod lifecycle;
 pub mod manage;
 pub mod metadata;
 pub mod openapi;

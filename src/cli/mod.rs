@@ -48,6 +48,8 @@ pub(crate) enum Command {
     },
     Start,
     Stop,
+    /// Restart using the existing background or user-service owner.
+    Restart,
     Status,
     Manage,
     /// Keep the gateway running across a logout or a reboot.
@@ -194,6 +196,7 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Run { config } => run(config).await?,
         Command::Start => start_background()?,
         Command::Stop => stop_background()?,
+        Command::Restart => crate::restart_gateway(true)?,
         Command::Status => status()?,
         Command::Manage => manage()?,
         Command::Service { command } => run_service_command(command)?,

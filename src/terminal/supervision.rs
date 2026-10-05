@@ -18,8 +18,11 @@
 //! supervisor immediately undoes it, or worse, loses the lock race to
 //! whatever gets started next.
 //!
-//! Detection reads `/proc/<pid>/cgroup`, which systemd keeps authoritative
-//! for every process it manages, and applies two filters:
+//! Detection reads `/proc/<pid>/cgroup` and verifies the candidate unit's
+//! MainPID. Cgroup membership is inherited by terminal/CLI children, including
+//! detached gateways: it is not proof the unit supervises that child. A custom
+//! wrapper unit must exec the gateway so the gateway is its MainPID.
+//! The candidate parser applies two filters:
 //!
 //! - the *leaf* cgroup must be a `.service`. Every process in a login
 //!   session lives somewhere under `user@<uid>.service`, but terminal
@@ -62,16 +65,61 @@ impl SystemdUnit {
 /// that died between the caller finding the pid and this reading it, and for
 /// services that are not this gateway's.
 pub fn managing_gateway_unit(pid: u32) -> Option<SystemdUnit> {
+    gateway_supervisor(pid).ok().flatten()
+}
+
+/// Lifecycle callers must not turn an unavailable supervisor probe into
+/// permission to signal a possibly supervised process directly.
+pub fn gateway_supervisor(pid: u32) -> anyhow::Result<Option<SystemdUnit>> {
     #[cfg(target_os = "linux")]
     {
-        let contents = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
-        gateway_unit_from_cgroup(&contents)
+        let contents = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))?;
+        let Some(unit) = gateway_unit_from_cgroup(&contents) else {
+            return Ok(None);
+        };
+        let mut command = std::process::Command::new("systemctl");
+        if unit.user_manager {
+            command.arg("--user");
+        }
+        let output = command
+            .args(["show", &unit.unit, "--property=MainPID", "--value"])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()?;
+        let value = String::from_utf8_lossy(&output.stdout);
+        anyhow::ensure!(
+            output.status.success() && value.trim().parse::<u32>().is_ok(),
+            "cannot verify supervisor ownership for {}; refusing a direct signal",
+            unit.unit
+        );
+        if main_pid_matches(&value, pid) {
+            return Ok(Some(unit));
+        }
+        let main_pid = value.trim().parse::<u32>()?;
+        // A detached CLI child is tracked in our own state directory. A
+        // foreground child of another Gateway shares its cgroup too. Neither
+        // is supervised by the ancestor unit. Other wrappers are ambiguous:
+        // refuse rather than signal a child their supervisor may respawn.
+        anyhow::ensure!(
+            main_pid == 0
+                || crate::read_pid()? == Some(pid)
+                || crate::process_matches_name(main_pid, crate::GATEWAY_PROCESS_NAME),
+            "{} has a wrapper MainPID; use `{}` directly or exec the gateway from its unit",
+            unit.unit,
+            unit.systemctl("restart")
+        );
+        Ok(None)
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = pid;
-        None
+        Ok(None)
     }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn main_pid_matches(value: &str, pid: u32) -> bool {
+    pid != 0 && value.trim().parse::<u32>() == Ok(pid)
 }
 
 /// Pure parse of `/proc/<pid>/cgroup` contents.
@@ -102,6 +150,15 @@ fn gateway_unit_from_cgroup(contents: &str) -> Option<SystemdUnit> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inherited_cgroup_membership_is_not_service_ownership() {
+        assert!(main_pid_matches("42\n", 42));
+        assert!(!main_pid_matches("41\n", 42));
+        assert!(!main_pid_matches("0\n", 0));
+        assert!(!main_pid_matches("", 42));
+        assert!(!main_pid_matches("MainPID=42", 42));
+    }
 
     /// The incident case: a unit-managed gateway must be recognised so that
     /// `stop` refuses to kill it and refusals can name the systemctl command.

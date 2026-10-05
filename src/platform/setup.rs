@@ -11,7 +11,7 @@ use anyhow::Context as _;
 use serde::Serialize;
 use serde_json::Value;
 
-use super::{service, state_lock};
+use super::{lifecycle, service, state_lock};
 use crate::authority::DeviceRecord;
 use crate::backend::BackendKind;
 use crate::platform::metadata::transport_protection;
@@ -21,13 +21,13 @@ use crate::terminal::factory::{
 use crate::{
     agents, backend_startup, config_dir, default_herdr_plugin_config_dir,
     default_herdr_plugin_state_dir, gateway_listener_pids, generate_token, hash_token,
-    hostname_label, listen_for_explicit_public_url, load_config, login_env, process_running,
-    read_devices_at, read_pid, remove_pid_file, standalone_config_dir, standalone_state_dir,
-    state_dir, stop_pid, supervision, transport, validate_public_url, write_config,
-    write_secret_file, BackendAutostartMode, BackendCommand, Config, PairingFile, PairingPayload,
-    PublicUrlSelection, PushTokenRecord, ServiceCommand, SessionConfig, TransportEncryptionMode,
-    CONFIG_FILE, DEFAULT_PORT, DEVICES_FILE, HERDR_PLUGIN_IMPORT_MARKER, LOG_FILE,
-    MAX_WORKSPACE_LABEL_CHARS, PAIRING_FILE, PID_FILE, PUSH_TOKENS_FILE,
+    hostname_label, listen_for_explicit_public_url, load_config, login_env, read_devices_at,
+    remove_pid_file, standalone_config_dir, standalone_state_dir, state_dir, stop_pid, transport,
+    validate_public_url, write_config, write_secret_file, BackendAutostartMode, BackendCommand,
+    Config, PairingFile, PairingPayload, PublicUrlSelection, PushTokenRecord, ServiceCommand,
+    SessionConfig, TransportEncryptionMode, CONFIG_FILE, DEFAULT_PORT, DEVICES_FILE,
+    HERDR_PLUGIN_IMPORT_MARKER, LOG_FILE, MAX_WORKSPACE_LABEL_CHARS, PAIRING_FILE, PID_FILE,
+    PUSH_TOKENS_FILE,
 };
 
 /// What `setup --backend` configures when the flag is left off.
@@ -759,79 +759,78 @@ pub(crate) fn proxy_targets_port(proxy: &str, port: u16) -> bool {
 /// second gateway a moment later, which loses the port race, dies in the log,
 /// and leaves a machine that looks installed and answers nothing.
 pub(crate) fn run_service_command(command: ServiceCommand) -> anyhow::Result<()> {
-    match command {
-        ServiceCommand::Install => {
-            if !matches!(service::state()?, service::ServiceState::Installed) {
-                stop_background_inner(false)?;
+    if !matches!(command, ServiceCommand::Status) {
+        let _lock = state_lock::StateLock::acquire(&state_dir()?.join("lifecycle"))
+            .context("another lifecycle command is in progress")?;
+        return change_gateway_autostart(matches!(command, ServiceCommand::Install));
+    }
+    print_service_status()
+}
+
+pub(crate) fn change_gateway_autostart(enabled: bool) -> anyhow::Result<()> {
+    if enabled {
+        let config_dir = config_dir()?;
+        let install = load_existing_install(&config_dir.join(CONFIG_FILE), &config_dir.join(PAIRING_FILE))
+            .context("configure a consistent gateway identity with `muqun-gateway setup` before enabling autostart")?;
+        install
+            .config
+            .listen
+            .parse::<std::net::SocketAddr>()
+            .context("invalid gateway listen address")?;
+    }
+    let was_running = lifecycle::running_pid()?.is_some();
+    let existing = service::state()?;
+    if existing != service::ServiceState::NotInstalled {
+        service::ensure_current_install(&service_paths()?)?;
+    }
+    if enabled {
+        if let Some(pid) = lifecycle::running_pid()? {
+            let external = crate::supervision::gateway_supervisor(pid)?;
+            anyhow::ensure!(external.as_ref().is_none_or(|unit| unit.user_manager && unit.unit == format!("{}.service", service::SERVICE_LABEL)),
+                "an external supervisor owns the gateway; remove that registration before installing the user service");
+            #[cfg(target_os = "macos")]
+            let supervised = service::owns_pid(pid);
+            #[cfg(not(target_os = "macos"))]
+            let supervised = external.is_some();
+            if !supervised {
+                stop_detached()?;
             }
-            service::install(&service_paths()?)?;
-            println!("The gateway now starts when you log in, and restarts if it stops.");
-            println!("Undo it with: muqun-gateway service uninstall");
         }
-        ServiceCommand::Uninstall => {
-            service::uninstall()?;
-            // Removing the agent stops the process it was supervising, and the
-            // reader did not ask for their phone to lose the machine -- only
-            // for it to stop coming back by itself. So hand it back to the
-            // detached-child path it would have been on all along.
-            //
-            // The stop is not redundant. `launchctl bootout` returns before the
-            // process it booted out has gone, and that process still owns the
-            // state directory, so starting the replacement immediately loses
-            // the lock race and dies -- observed: uninstall then reported the
-            // lock error and left nothing running, which is the one outcome
-            // this branch exists to prevent. Nothing can revive it now that the
-            // unit is gone, so stopping first is safe as well as necessary.
-            stop_background_inner(false)?;
-            // Best effort by design. The registration is already gone, which is
-            // what was asked for; failing the whole command because the
-            // replacement did not come up would report the part that worked as
-            // a failure, and leave the reader with no idea which half happened.
-            match start_background_inner(false) {
-                Ok(()) => println!(
-                    "The gateway is still running, but it will not come back after a reboot."
-                ),
+        service::install(&service_paths()?)?;
+        lifecycle::wait_for(std::time::Duration::from_secs(15), || {
+            Ok(lifecycle::running_pid()?.is_some() && crate::fetch_pending_pairing().is_ok())
+        }).context("gateway autostart was installed, but readiness failed; inspect the user service before retrying")?;
+        println!("The gateway now starts when you log in, and restarts if it stops.");
+    } else {
+        if existing == service::ServiceState::NotInstalled {
+            println!("Gateway autostart is already off; the running gateway is unchanged.");
+            return Ok(());
+        }
+        service::uninstall()?;
+        if was_running {
+            lifecycle::wait_for(std::time::Duration::from_secs(15), || {
+                Ok(state_lock::running_owner(&state_dir()?)?.is_none())
+            })?;
+            match start_detached() {
+                Ok(()) => println!("The gateway is still running; gateway autostart is off."),
                 Err(error) => {
-                    println!("Autostart is removed, but the gateway did not restart: {error}");
-                    println!("Start it again with: muqun-gateway start");
+                    anyhow::bail!("autostart was removed, but the gateway did not restart: {error}")
                 }
             }
         }
-        ServiceCommand::Status => {
-            // Only ever asked once there is a config to ask about. Without one
-            // `configured_port` falls back to the default port, and the
-            // listener check then reports whatever else is on it -- another
-            // account's gateway, or one this install knows nothing about -- as
-            // "running". A fresh install would be told it was already up.
-            let running = match load_config(None) {
-                Ok(config) => Some(
-                    read_pid()?.is_some_and(process_running)
-                        || !gateway_listener_pids(config.port())?.is_empty(),
-                ),
-                Err(_) => None,
-            };
-            match service::state()? {
-                service::ServiceState::Installed => {
-                    println!("service: installed ({})", service::unit_path()?.display());
-                }
-                service::ServiceState::FileOnly => {
-                    println!(
-                        "service: a unit file exists at {} but the init system has not loaded it.",
-                        service::unit_path()?.display()
-                    );
-                    println!("Re-run `muqun-gateway service install` to repair it.");
-                }
-                service::ServiceState::NotInstalled => {
-                    println!("service: not installed -- the gateway will not survive a reboot.");
-                    println!("Install it with: muqun-gateway service install");
-                }
-            }
-            match running {
-                Some(true) => println!("gateway: running"),
-                Some(false) => println!("gateway: not running"),
-                None => println!("gateway: not configured yet -- run `muqun-gateway setup`"),
-            }
-        }
+    }
+    Ok(())
+}
+
+fn print_service_status() -> anyhow::Result<()> {
+    match service::state()? {
+        service::ServiceState::Installed => println!("service: installed ({})", service::unit_path()?.display()),
+        service::ServiceState::FileOnly => println!("service: unit file only; run `muqun-gateway service install` to enable/repair autostart"),
+        service::ServiceState::NotInstalled => println!("service: not installed -- gateway autostart is off"),
+    }
+    match load_config(None) {
+        Ok(_) => println!("gateway: {}", lifecycle::summary()?),
+        Err(_) => println!("gateway: not configured yet -- run `muqun-gateway setup`"),
     }
     Ok(())
 }
@@ -841,6 +840,7 @@ pub(crate) fn service_paths() -> anyhow::Result<service::ServicePaths> {
     Ok(service::ServicePaths {
         exe: std::env::current_exe().context("failed to find current executable")?,
         config: config_dir()?.join(CONFIG_FILE),
+        state: state_dir()?,
         log: state_dir()?.join(LOG_FILE),
         home: dirs::home_dir().context("failed to locate the home directory")?,
         path,
@@ -853,16 +853,19 @@ pub(crate) fn start_background() -> anyhow::Result<()> {
 }
 
 pub(crate) fn start_background_inner(verbose: bool) -> anyhow::Result<()> {
+    lifecycle::control(lifecycle::Action::Start, verbose)
+}
+
+pub(crate) fn restart_gateway(verbose: bool) -> anyhow::Result<()> {
+    lifecycle::control(lifecycle::Action::Restart, verbose)
+}
+
+pub(crate) fn start_detached() -> anyhow::Result<()> {
     let state_dir = state_dir()?;
     std::fs::create_dir_all(&state_dir)
         .with_context(|| format!("failed to create state dir {}", state_dir.display()))?;
-    if let Some(pid) = read_pid()? {
-        if process_running(pid) {
-            if verbose {
-                println!("gateway already running with pid {pid}");
-            }
-            return Ok(());
-        }
+    if lifecycle::running_pid()?.is_some() {
+        return Ok(());
     }
     // The pid file only knows about gateways this subcommand started. One
     // launched by systemd, or by hand, leaves no pid file at all -- and that
@@ -888,12 +891,31 @@ pub(crate) fn start_background_inner(verbose: bool) -> anyhow::Result<()> {
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(err));
     detach_background_process(&mut command);
-    let child = command.spawn().context("failed to start gateway")?;
+    let mut child = command.spawn().context("failed to start gateway")?;
     let pid = child.id();
-    std::fs::write(state_dir.join(PID_FILE), pid.to_string())?;
-    if verbose {
-        println!("gateway started with pid {pid}");
+    if let Err(error) = write_secret_file(&state_dir.join(PID_FILE), pid.to_string().as_bytes()) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error)
+            .context("gateway child was stopped because its PID could not be recorded");
     }
+    let outcome = lifecycle::wait_for(std::time::Duration::from_secs(15), || {
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "gateway exited during startup ({status}); inspect {}",
+                state_dir.join(LOG_FILE).display()
+            );
+        }
+        Ok(lifecycle::running_pid()? == Some(pid) && crate::fetch_pending_pairing().is_ok())
+    });
+    if outcome.is_err() {
+        // Only the child we just spawned. Never signal a discovered listener or
+        // its process group. A timed-out start must not leave an orphan retry.
+        let _ = child.kill();
+        let _ = child.wait();
+        remove_pid_file()?;
+    }
+    outcome?;
     Ok(())
 }
 
@@ -927,68 +949,26 @@ pub(crate) fn configured_port() -> u16 {
 }
 
 pub(crate) fn stop_background_inner(verbose: bool) -> anyhow::Result<()> {
-    let mut stopped = false;
-    // Killing a supervised gateway by pid is never what anyone means: a
-    // `Restart=always` unit immediately brings it back -- or, worse, loses
-    // the state-directory lock race to whatever this stop was making room
-    // for and then fails its restart every few seconds indefinitely. Skip
-    // such pids and tell the operator the command that actually works.
-    let mut supervised: Option<supervision::SystemdUnit> = None;
-    let mut refuse_or_stop = |pid: u32, label: &str| -> anyhow::Result<()> {
-        if let Some(unit) = supervision::managing_gateway_unit(pid) {
-            if verbose {
-                println!(
-                    "gateway pid {pid} is managed by systemd as {}; leaving it to its supervisor",
-                    unit.unit
-                );
-            }
-            supervised.get_or_insert(unit);
-            return Ok(());
-        }
+    lifecycle::control(lifecycle::Action::Stop, verbose)
+}
+
+pub(crate) fn stop_detached() -> anyhow::Result<()> {
+    if let Some(pid) = lifecycle::running_pid()? {
+        anyhow::ensure!(
+            crate::supervision::gateway_supervisor(pid)?.is_none(),
+            "a supervisor owns gateway pid {pid}; refusing a direct signal"
+        );
+        #[cfg(target_os = "macos")]
+        anyhow::ensure!(
+            !service::owns_pid(pid),
+            "launchd owns gateway pid {pid}; refusing a direct signal"
+        );
         stop_pid(pid)?;
-        stopped = true;
-        if verbose {
-            println!("gateway stopped {label} {pid}");
-        }
-        Ok(())
-    };
-
-    if let Some(pid) = read_pid()? {
-        if process_running(pid) {
-            refuse_or_stop(pid, "pid")?;
-        } else if verbose {
-            println!("gateway pid file exists, but pid {pid} is not running");
-        }
+        lifecycle::wait_for(std::time::Duration::from_secs(15), || {
+            Ok(state_lock::running_owner(&state_dir()?)?.is_none())
+        })?;
     }
-
-    let port = configured_port();
-    for pid in gateway_listener_pids(port)? {
-        if process_running(pid) {
-            refuse_or_stop(pid, "listener pid")?;
-        }
-    }
-
     remove_pid_file()?;
-    if let Some(unit) = supervised {
-        anyhow::bail!(
-            "the running gateway is managed by systemd as {}; stop it with `{}`",
-            unit.unit,
-            unit.systemctl("stop")
-        );
-    }
-    if verbose && !stopped {
-        println!("gateway is not running");
-    }
-    // Killing the process is not stopping it once an init system is watching:
-    // KeepAlive and Restart=always both put it straight back, so a reader who
-    // ran `stop` and then found it running would have every reason to think the
-    // command was broken. Say which one is holding it up instead.
-    if verbose && stopped && service::is_installed() {
-        println!(
-            "note: the installed service will start it again. Run `muqun-gateway service uninstall`\n\
-             to stop it for good."
-        );
-    }
     Ok(())
 }
 
