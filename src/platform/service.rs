@@ -118,6 +118,16 @@ pub fn ensure_current_install(paths: &ServicePaths) -> Result<()> {
 
 #[cfg(any(target_os = "macos", test))]
 fn validate_install_unit(contents: &str, paths: &ServicePaths) -> Result<()> {
+    if cfg!(target_os = "macos") {
+        anyhow::ensure!(
+            !contents.contains("<key>Program</key>")
+                && contents.matches("<key>ProgramArguments</key>").count() == 1,
+            "ambiguous LaunchAgent executable; reinstall the service from the standalone binary"
+        );
+        anyhow::ensure!(contents.contains(&format!(
+            "<key>ProgramArguments</key>\n  <array>\n    <string>{}</string>\n    <string>run</string>", xml(&paths.exe))),
+            "the installed LaunchAgent uses a different or ambiguous executable; reinstall the service from the standalone binary");
+    }
     let config_matches = if cfg!(target_os = "macos") {
         contents.contains(&format!("<string>{}</string>", xml(&paths.config)))
     } else {

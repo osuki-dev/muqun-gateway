@@ -86,7 +86,20 @@ jobs:
       - name: Stage binary
         run: cp "target/${{ matrix.target }}/release/muqun-gateway" "muqun-gateway-${{ matrix.target }}"
 
+      - name: Stage SHA256 integrity checksum (not publisher signing)
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="muqun-gateway-${{ matrix.target }}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$binary" > "$binary.sha256"
+          else
+            shasum -a 256 "$binary" > "$binary.sha256"
+          fi
+
       - name: Attach to release
         uses: softprops/action-gh-release@v2
         with:
-          files: muqun-gateway-${{ matrix.target }}
+          files: |
+            muqun-gateway-${{ matrix.target }}
+            muqun-gateway-${{ matrix.target }}.sha256

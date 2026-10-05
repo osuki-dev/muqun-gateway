@@ -17,6 +17,7 @@ pub mod service;
 pub mod setup;
 pub mod state_lock;
 pub mod store;
+pub(crate) mod update;
 pub mod uploads;
 pub mod vcs_routes;
 

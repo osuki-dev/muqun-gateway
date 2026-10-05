@@ -40,68 +40,115 @@ pub(crate) fn summary() -> anyhow::Result<String> {
 }
 
 pub(crate) fn control(action: Action, verbose: bool) -> anyhow::Result<()> {
-    // Validate configuration before creating state or changing any process.
-    load_config(None)?;
-    let state = state_dir()?;
-    let _command_lock = state_lock::StateLock::acquire(&state.join("lifecycle"))
-        .context("another lifecycle command is in progress; retry after it finishes")?;
-    let pid = running_pid()?;
-    let external = pid
-        .map(supervision::gateway_supervisor)
-        .transpose()?
-        .flatten();
-    if service::state()? != service::ServiceState::NotInstalled {
-        service::ensure_current_install(&setup::service_paths()?)?;
-        if let Some(pid) = pid {
-            #[cfg(target_os = "linux")]
-            anyhow::ensure!(external.as_ref().is_some_and(|unit|
-                unit.user_manager && unit.unit == format!("{}.service", service::SERVICE_LABEL)),
-                "gateway pid {pid} is not owned by the installed user service; stop it before transferring ownership");
-            #[cfg(target_os = "macos")]
-            anyhow::ensure!(
-                service::owns_pid(pid),
-                "gateway pid {pid} is not owned by the installed LaunchAgent"
-            );
-        }
-        service::control(action)?;
-    } else if let Some(unit) = external {
-        anyhow::ensure!(
-            unit.user_manager,
-            "gateway is managed by a system service; use `{}`",
-            unit.systemctl(action.verb())
-        );
-        #[cfg(not(target_os = "macos"))]
-        service::ensure_effective_unit(&unit.unit, &setup::service_paths()?)?;
-        service::checked_command("systemctl", &["--user", action.verb(), &unit.unit])?;
-    } else {
-        if matches!(action, Action::Stop | Action::Restart) {
-            setup::stop_detached()?;
-        }
-        if action != Action::Stop {
-            setup::start_detached()?;
-        }
-    }
-    if action == Action::Stop {
-        wait_for(Duration::from_secs(15), || {
-            Ok(state_lock::running_owner(&state)?.is_none())
-        })
-        .context("gateway did not stop; no replacement was started")?;
-    } else {
-        wait_for(Duration::from_secs(15), || {
-            Ok(running_pid()?.is_some() && crate::fetch_pending_pairing().is_ok())
-        })
-        .with_context(|| {
-            format!(
-                "gateway did not become ready; inspect {} and the service journal",
-                state.join(crate::LOG_FILE).display()
-            )
-        })?;
-    }
+    let controller = Controller::acquire(action)?;
+    controller.control(action)?;
     if verbose {
         println!("gateway: {}", summary()?);
         println!("config: {}", config_dir()?.join(CONFIG_FILE).display());
     }
     Ok(())
+}
+
+enum Owner {
+    Installed,
+    External(String),
+    Detached,
+}
+
+/// Retains the supervisor and executable across a stop/replace/start transaction.
+/// The command lock is held once; never call `control` while holding this guard.
+pub(crate) struct Controller {
+    _command_lock: state_lock::StateLock,
+    owner: Owner,
+    paths: service::ServicePaths,
+    pub(crate) was_running: bool,
+}
+
+impl Controller {
+    pub(crate) fn acquire(action: Action) -> anyhow::Result<Self> {
+        // Validate configuration before creating state or changing any process.
+        load_config(None)?;
+        let state = state_dir()?;
+        let command_lock = state_lock::StateLock::acquire_strict(&state.join("lifecycle"))
+            .context("another lifecycle command is in progress; retry after it finishes")?;
+        let pid = running_pid()?;
+        let external = pid
+            .map(supervision::gateway_supervisor)
+            .transpose()?
+            .flatten();
+        let paths = setup::service_paths()?;
+        let owner = if service::state()? != service::ServiceState::NotInstalled {
+            service::ensure_current_install(&paths)?;
+            if let Some(pid) = pid {
+                #[cfg(target_os = "linux")]
+                anyhow::ensure!(external.as_ref().is_some_and(|unit|
+                unit.user_manager && unit.unit == format!("{}.service", service::SERVICE_LABEL)),
+                "gateway pid {pid} is not owned by the installed user service; stop it before transferring ownership");
+                #[cfg(target_os = "macos")]
+                anyhow::ensure!(
+                    service::owns_pid(pid),
+                    "gateway pid {pid} is not owned by the installed LaunchAgent"
+                );
+            }
+            Owner::Installed
+        } else if let Some(unit) = external {
+            anyhow::ensure!(
+                unit.user_manager,
+                "gateway is managed by a system service; use `{}`",
+                unit.systemctl(action.verb())
+            );
+            #[cfg(not(target_os = "macos"))]
+            service::ensure_effective_unit(&unit.unit, &paths)?;
+            Owner::External(unit.unit)
+        } else {
+            Owner::Detached
+        };
+        Ok(Self {
+            _command_lock: command_lock,
+            owner,
+            paths,
+            was_running: pid.is_some(),
+        })
+    }
+
+    pub(crate) fn exe(&self) -> &std::path::Path {
+        &self.paths.exe
+    }
+
+    pub(crate) fn control(&self, action: Action) -> anyhow::Result<()> {
+        match &self.owner {
+            Owner::Installed => service::control(action)?,
+            Owner::External(unit) => {
+                service::checked_command("systemctl", &["--user", action.verb(), unit])?
+            }
+            Owner::Detached => {
+                if matches!(action, Action::Stop | Action::Restart) {
+                    setup::stop_detached()?;
+                }
+                if action != Action::Stop {
+                    setup::start_detached_at(&self.paths.exe)?;
+                }
+            }
+        }
+        let state = &self.paths.state;
+        if action == Action::Stop {
+            wait_for(Duration::from_secs(15), || {
+                Ok(state_lock::running_owner(state)?.is_none())
+            })
+            .context("gateway did not stop; no replacement was started")?;
+        } else {
+            wait_for(Duration::from_secs(15), || {
+                Ok(running_pid()?.is_some() && crate::fetch_pending_pairing().is_ok())
+            })
+            .with_context(|| {
+                format!(
+                    "gateway did not become ready; inspect {} and the service journal",
+                    state.join(crate::LOG_FILE).display()
+                )
+            })?;
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn wait_for(

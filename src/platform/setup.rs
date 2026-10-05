@@ -838,7 +838,7 @@ fn print_service_status() -> anyhow::Result<()> {
 pub(crate) fn service_paths() -> anyhow::Result<service::ServicePaths> {
     let (path, lc_ctype) = login_env::for_unit_file();
     Ok(service::ServicePaths {
-        exe: std::env::current_exe().context("failed to find current executable")?,
+        exe: executable_path()?,
         config: config_dir()?.join(CONFIG_FILE),
         state: state_dir()?,
         log: state_dir()?.join(LOG_FILE),
@@ -846,6 +846,17 @@ pub(crate) fn service_paths() -> anyhow::Result<service::ServicePaths> {
         path,
         lc_ctype,
     })
+}
+
+/// A self-updating manager keeps running the old mapped image. Linux reports
+/// that image's renamed/unlinked path; lifecycle must keep using the install path.
+pub(crate) fn executable_path() -> anyhow::Result<std::path::PathBuf> {
+    static EXE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    if let Some(exe) = EXE.get() {
+        return Ok(exe.clone());
+    }
+    let exe = std::env::current_exe().context("failed to find current executable")?;
+    Ok(EXE.get_or_init(|| exe).clone())
 }
 
 pub(crate) fn start_background() -> anyhow::Result<()> {
@@ -861,6 +872,10 @@ pub(crate) fn restart_gateway(verbose: bool) -> anyhow::Result<()> {
 }
 
 pub(crate) fn start_detached() -> anyhow::Result<()> {
+    start_detached_at(&executable_path()?)
+}
+
+pub(crate) fn start_detached_at(exe: &std::path::Path) -> anyhow::Result<()> {
     let state_dir = state_dir()?;
     std::fs::create_dir_all(&state_dir)
         .with_context(|| format!("failed to create state dir {}", state_dir.display()))?;
@@ -875,7 +890,6 @@ pub(crate) fn start_detached() -> anyhow::Result<()> {
     // where nobody is looking.
     drop(state_lock::StateLock::acquire(&state_dir)?);
 
-    let exe = std::env::current_exe().context("failed to find current executable")?;
     let config = config_dir()?.join(CONFIG_FILE);
     let log = std::fs::OpenOptions::new()
         .create(true)

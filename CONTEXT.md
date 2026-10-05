@@ -77,6 +77,11 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
     scope confirmations, selected-row scrolling and cell-safe resize handling.
   - `lifecycle.rs`: shared CLI/TUI start/stop/restart/status ownership and
     transition checks; serializes commands separately from the runtime state lock.
+  - `update.rs`: explicit stable-only official GitHub release checks and self-update;
+    requires the complete four-platform binary/checksum matrix, verifies bounded
+    HTTPS downloads, SHA256/native platform/version, then atomically replaces with
+    exact-image rollback. Retains one lifecycle controller across downtime; no
+    automatic update polling, downgrades or history database.
   - `metadata.rs`: capabilities, health metadata, and session liveness ordering.
   - `uploads.rs`, `assets.rs`: phone uploads and the workspace asset index.
   - `git.rs`: read-only, bounded `git` for one pane's checkout -- the

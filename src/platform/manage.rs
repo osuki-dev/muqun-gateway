@@ -20,7 +20,7 @@ use qrcode::render::unicode;
 use qrcode::{EcLevel, QrCode};
 use serde_json::Value;
 
-use super::{lifecycle, service};
+use super::{lifecycle, service, update};
 use crate::authority::{hash_token, DeviceRecord, PendingPairing};
 use crate::backend::BackendKind;
 use crate::{
@@ -133,7 +133,7 @@ pub(crate) fn manage() -> anyhow::Result<()> {
         let item_count = match ui.section {
             Section::Terminals => load_config(None)?.sessions.len(),
             Section::Devices if !show_qr && pending_pairing.is_none() => devices.len(),
-            Section::Settings => 3,
+            Section::Settings => 4,
             _ => 0,
         };
         if event.code == KeyCode::Esc {
@@ -320,6 +320,46 @@ pub(crate) fn manage() -> anyhow::Result<()> {
                             format!("gateway autostart {}", if enabled { "off" } else { "on" });
                     } else {
                         message = String::from("gateway autostart unchanged");
+                    }
+                }
+                (Section::Settings, "c") => {
+                    message =
+                        String::from("Checking official stable release (no background polling)...");
+                    print_manage_screen(
+                        &message,
+                        pending_pairing.as_ref(),
+                        &devices,
+                        show_qr,
+                        &mut ui,
+                    )?;
+                    let plan = update::in_thread(update::check)?;
+                    message = plan.summary();
+                }
+                (Section::Settings, "i") => {
+                    message =
+                        String::from("Checking official stable release before confirmation...");
+                    print_manage_screen(
+                        &message,
+                        pending_pairing.as_ref(),
+                        &devices,
+                        show_qr,
+                        &mut ui,
+                    )?;
+                    let plan = update::in_thread(update::check)?;
+                    if !plan.available() {
+                        message = plan.summary();
+                    } else if confirm_action("Install stable Gateway update?", &[
+                        plan.summary(),
+                        String::from("Download, SHA256, platform and version are checked before downtime."),
+                        String::from("Running Gateway restarts through its owner; stopped Gateway stays stopped."),
+                        String::from("Phone access pauses briefly. Pairings, config and terminal tasks stay unchanged."),
+                        String::from("This manager stays open on its old image; reopen it to load the new UI."),
+                    ], "update Gateway")? {
+                        message = String::from("Downloading/verifying, then updating. Please wait; do not close this manager.");
+                        print_manage_screen(&message, pending_pairing.as_ref(), &devices, show_qr, &mut ui)?;
+                        message = update::in_thread(move || update::apply(plan))?;
+                    } else {
+                        message = String::from("Gateway update cancelled; no binary downloaded or restart.");
                     }
                 }
                 _ => {}
@@ -612,7 +652,7 @@ impl Section {
             Self::Overview => "s Start gateway | t Stop gateway | r Restart gateway",
             Self::Terminals => "Enter Make selected default | b Toggle terminal-server startup | d Remove selected backend | h Add Herdr | m Add tmux",
             Self::Devices => "Enter Revoke selected device | p Pair new device",
-            Self::Settings => "Enter Change selected setting | g Gateway login autostart | u Edit address | a Detect address | e Toggle encryption",
+            Self::Settings => "Enter Change selected setting | c Check updates | i Install update | g Gateway login autostart | u Edit address | a Detect address | e Toggle encryption",
         }
     }
 }
@@ -630,7 +670,7 @@ fn primary_action(
         Section::Terminals => Some(if empty_items { 'm' } else { 'f' }),
         Section::Devices if show_qr || pending => Some('r'),
         Section::Devices => Some(if empty_items { 'p' } else { 'x' }),
-        Section::Settings => ['g', 'u', 'e'].get(selected).copied(),
+        Section::Settings => ['g', 'u', 'e', 'c'].get(selected).copied(),
     }
 }
 
@@ -965,7 +1005,7 @@ fn manage_lines(
     ui.selected = ui.selected.min(match ui.section {
         Section::Terminals => config.sessions.len().saturating_sub(1),
         Section::Devices => data.devices.len().saturating_sub(1),
-        Section::Settings => 2,
+        Section::Settings => 3,
         Section::Overview => 0,
     });
     let mut header = vec![ScreenLine {
@@ -1295,7 +1335,7 @@ fn manage_lines(
             }
         }
         Section::Settings => {
-            ui.selected = ui.selected.min(2);
+            ui.selected = ui.selected.min(3);
             let settings = [
                 format!("Gateway login autostart: {}", data.autostart),
                 format!("Gateway address: {}", config.public_url),
@@ -1303,6 +1343,7 @@ fn manage_lines(
                     "Transport encryption: {}",
                     config.transport_encryption.as_str()
                 ),
+                String::from("Stable Gateway updates: Enter checks; i installs with confirmation"),
             ];
             panel(
                 &mut body,
@@ -1341,6 +1382,9 @@ fn manage_lines(
             rows.push(ScreenLine::text(
                 "Encryption edits affect new pairings, not existing devices.",
                 Tone::Quiet,
+            ));
+            rows.push(ScreenLine::plain(
+                "Updates are manual only; never background-installed or downgraded.",
             ));
             panel(&mut body, "What these settings do", rows, content, framed);
         }

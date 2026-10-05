@@ -131,7 +131,7 @@ actions. Long lists keep the selected item visible after a resize.
 | Overview (`1`) | `s` start, `t` stop, `r` restart the gateway |
 | Terminals (`2`) | `h` / `m` add Herdr / tmux; `f` make the selected backend default; `d` remove it; `b` toggle its backend autostart |
 | Devices (`3`) | `p` show pairing QR; `x` revoke the selected device after confirmation; `r` return to the device list |
-| Settings (`4`) | `u` edit URL; `a` detect URL; `e` toggle transport encryption; `g` enable/disable gateway autostart after confirmation |
+| Settings (`4`) | `u` edit URL; `a` detect URL; `e` toggle transport encryption; `g` enable/disable gateway autostart; `c` check stable updates; `i` install an update after confirmation |
 
 Enter starts/stops Gateway in Overview, makes the selected terminal backend
 the default in Terminals, pairs the first device or reviews revocation in
@@ -206,6 +206,59 @@ not stopped. Custom systemd gateway units are controlled only as the user, and
 must exec the gateway as their MainPID and use `KillMode=process` (or `none`);
 system-wide units require the operator's
 own systemctl command.
+
+## Manual stable updates
+
+```sh
+muqun-gateway update --check   # metadata only: no binary download or restart
+muqun-gateway update           # explicitly download, verify and install a newer stable release
+muqun-gateway --version        # side-effect-free installed binary version
+```
+
+Settings (`4`) in `manage` has the same update/check use case. `c` checks;
+`i` checks and asks for confirmation before downloading or downtime. Nothing
+checks or installs updates in the background. Stable `vX.Y.Z` versions only;
+development/prerelease builds and downgrades are not supported.
+
+The updater locks one concrete release from **osuki-dev/muqun-gateway on
+GitHub**, and requires all four macOS/Linux binary assets and their individual
+`.sha256` assets to be fully uploaded. It refuses old releases without checksums
+and partially uploaded releases: wait for a newer checksum-equipped, complete
+release. It does not retrofit checksums to old releases or fall back to an
+unverified download. HTTPS, restricted redirects, bounded time/size, SHA256,
+native platform headers and the downloaded binary's `--version` are checked
+before stopping anything. **SHA256 is integrity checking, not publisher signing**:
+the official GitHub release account and HTTPS trust remain the authority.
+
+Self-update supports the owned, writable, regular standalone executable at
+`~/.local/bin/muqun-gateway`. For a custom installer directory, supply the same
+`MUQUN_GATEWAY_INSTALL_DIR` used by `install.sh`; it must be inside your home,
+without symlinks or shared-write permissions. Root/global installs, package
+manager paths, source `target` builds, plugin executables and ambiguous paths
+are refused; update those through their original installer/package manager.
+The installed user service and any running gateway must use that same executable
+and installation identity. No sudo or global install is attempted.
+
+A running gateway stops/starts through its existing user supervisor (or its
+ordinary background owner); a stopped one stays stopped. Terminal servers,
+sessions, backend tasks, configuration and pairings are not removed or rewritten.
+The binary is staged next to the destination, with one per-executable update lock
+and a single held lifecycle lock, and replaced by a same-filesystem atomic rename.
+An exact old-image backup is kept until readiness succeeds. A failed new startup
+gets one rollback/recovery attempt, restoring the old binary and running state;
+failed recovery is reported, never retried indefinitely.
+
+The manager stays open on its original mapped image after success: reopen
+`manage` to load the updated UI. Its lifecycle actions continue using the original
+installation path, not Linux's renamed/deleted executable path. Do not interrupt
+the replacement/restart phase. Abrupt termination or a failed recovery can leave
+`.muqun-gateway.update-backup` beside the executable. A later update refuses that
+backup rather than guessing: inspect the logs, stop the correct owner, restore
+the backup or recover using your original installer, then start only if previously
+running. Unique `.muqun-gateway.update-<UUID>` staging files can also survive a
+hard kill; inspect/remove them only with no update in progress. The update lock
+file is deliberately kept; never unlink a live lock. No state/config migration
+is part of this update command.
 
 ### Retired Herdr plugin
 

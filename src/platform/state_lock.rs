@@ -89,6 +89,21 @@ pub struct StateLock {
 }
 
 impl StateLock {
+    /// Transactions must fail closed on filesystems without working locks.
+    #[cfg(unix)]
+    pub(crate) fn acquire_strict(state_dir: &Path) -> anyhow::Result<Self> {
+        use std::os::fd::AsRawFd as _;
+        std::fs::create_dir_all(state_dir)?;
+        let file = open_lock_file(&state_dir.join(LOCK_FILE))?;
+        // SAFETY: file owns the descriptor until this guard is dropped.
+        anyhow::ensure!(
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
+            "another lifecycle command is in progress, or this filesystem cannot lock safely"
+        );
+        record_holder(&file);
+        Ok(Self { file })
+    }
+
     /// Take exclusive ownership of `state_dir`, or fail naming the holder.
     pub fn acquire(state_dir: &Path) -> anyhow::Result<Self> {
         std::fs::create_dir_all(state_dir)
