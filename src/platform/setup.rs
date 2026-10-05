@@ -1336,7 +1336,10 @@ mod tests {
 
         // ...unless a gateway is using it: stopping that is not the installer's call.
         {
-            let _running = state_lock::StateLock::acquire(&state).unwrap();
+            // Waited on, not exact: the lock the check above took and dropped
+            // can live on for a moment in another test thread's fork.
+            let _running =
+                state_lock::acquire_within(&state, state_lock::RELEASE_VISIBLE_WITHIN).unwrap();
             let reason = auto_import_skip_reason(&plugin, &standalone, &state)
                 .expect("a running standalone gateway must be left alone");
             assert!(reason.contains("running"), "{reason}");

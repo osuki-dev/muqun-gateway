@@ -2680,6 +2680,21 @@ done
         let path = crate::short_test_socket("gw-fake-tmux").with_extension("sh");
         std::fs::write(&path, script).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Another test thread forking while the script was open for writing
+        // holds that descriptor until its exec; running the script meanwhile
+        // fails with ETXTBSY. Wait that out before handing it to the backend.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::process::Command::new(&path)
+            .arg("display-message")
+            .output()
+            .is_err()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fake tmux never became executable"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         TmuxBackend::with_binary(path, None)
     }
 
