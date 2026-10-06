@@ -389,6 +389,27 @@ fn is_editor_title(title: &str) -> bool {
     EDITOR_PROGRAMS.contains(&head.as_str())
 }
 
+/// The agent and the program title a pane's profile is chosen from.
+///
+/// The title is how a program announces itself, but an editor does not have to:
+/// nvim without `set title` leaves the shell's "user@host:~/dir" in place, and a
+/// pane running `nvim .` then got the shell's keys. The backend's
+/// `foreground_command` is the process actually running, so an editor there wins
+/// over whatever the title says; anything else keeps the title, which is what
+/// agent detection by title reads.
+pub fn pane_identity(pane: &Value) -> (Option<&str>, Option<&str>) {
+    let field = |name: &str| {
+        pane.get(name)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+    };
+    let editor = field("foreground_command").filter(|command| is_editor_title(command));
+    (
+        field("agent"),
+        editor.or_else(|| field("terminal_title_stripped")),
+    )
+}
+
 /// Resolves what a pane is running into the keys and commands it responds to.
 ///
 /// An unrecognised agent falls back to the shell set rather than to nothing:
@@ -1094,6 +1115,30 @@ mod tests {
         assert!(!keys.contains(&"ctrl+p".to_string()));
         let commands = value["commands"].as_array().unwrap();
         assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn an_editor_found_by_process_beats_a_shell_title() {
+        // Herdr 0.9.1 pane `wT:p1` running `nvim .`: the title is still the
+        // shell's, and only `foreground_command` (from `pane.process_info`)
+        // says nvim.
+        let pane = json!({
+            "agent": null,
+            "foreground_command": "nvim",
+            "terminal_title_stripped": "ryu@osk:~/Work/skia-diagrams",
+        });
+        let (agent, title) = pane_identity(&pane);
+        assert_eq!(resolve(agent, title, None)["profile"], "editor");
+        assert_eq!(interrupt_key(agent, title), AGENT_INTERRUPT);
+
+        let shell = json!({
+            "agent": "",
+            "foreground_command": "bash",
+            "terminal_title_stripped": "ryu@osk:~/Work",
+        });
+        let (agent, title) = pane_identity(&shell);
+        assert_eq!((agent, title), (None, Some("ryu@osk:~/Work")));
+        assert_eq!(resolve(agent, title, None)["profile"], "shell");
     }
 
     #[test]

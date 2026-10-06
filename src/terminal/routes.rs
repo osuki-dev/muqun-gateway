@@ -2194,14 +2194,7 @@ pub(crate) async fn interrupt_pane(
     require_device(&state, &headers)?;
     let session = find_session(&state.config, &session_id)?.clone();
     let pane = pane_get(&session, &pane_id).await?;
-    let agent = pane
-        .get("agent")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty());
-    let title = pane
-        .get("terminal_title_stripped")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty());
+    let (agent, title) = shortcuts::pane_identity(&pane);
     let key = shortcuts::interrupt_key(agent, title);
 
     send_pane_keys(&session, &pane_id, std::slice::from_ref(&key)).await?;
@@ -3010,17 +3003,9 @@ pub(crate) async fn pane_shortcuts(
     let pane = pane_get(&session, &pane_id).await?;
     let pane = &pane;
 
-    // Herdr reports the agent on the pane itself when one is attached; the
-    // stripped title is what is left of the terminal title, which is how a
-    // full-screen program like an editor announces itself.
-    let agent = pane
-        .get("agent")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty());
-    let title = pane
-        .get("terminal_title_stripped")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty());
+    // Herdr reports the agent on the pane itself when one is attached; an
+    // editor is recognised by its process first and its title second.
+    let (agent, title) = shortcuts::pane_identity(pane);
 
     // The working directory scopes project-local commands, e.g. a repo's own
     // `.claude/commands`.
