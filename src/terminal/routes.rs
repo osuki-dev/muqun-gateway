@@ -814,7 +814,7 @@ pub(crate) async fn watch_pane_approvals(state: AppState, session: SessionConfig
         if let Some(mut store) = lock_scrollback(&state) {
             // The complete listing for this session, so it can also forget
             // the panes that have gone.
-            store.observe_listing(&session.id, &backend::compat::pane_list(panes.clone()));
+            store.observe_native_listing(&session.id, &panes);
         }
 
         // Every agent pane's screen in one request. On a socket backend this

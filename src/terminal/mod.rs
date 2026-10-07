@@ -8,6 +8,7 @@ pub mod factory;
 pub(crate) mod history;
 pub(crate) mod history_memory;
 pub(crate) mod history_routes;
+pub(crate) mod history_sqlite;
 pub mod login_env;
 pub mod native;
 pub mod routes;

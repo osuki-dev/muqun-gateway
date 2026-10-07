@@ -625,11 +625,12 @@ impl TerminalBackend for TmuxBackend {
                 "#{pane_pid}",
                 "#{cursor_x}",
                 "#{cursor_y}",
+                "#{pid}",
             ]);
             let output = self
                 .list_output(["list-panes", "-a", "-F", &format])
                 .await?;
-            let rows = parse_rows(&output, 16, "pane")?;
+            let rows = parse_rows(&output, 17, "pane")?;
             let mut panes = Vec::with_capacity(rows.len());
             let mut unresolved = Vec::new();
             for fields in rows {
@@ -637,7 +638,12 @@ impl TerminalBackend for TmuxBackend {
                 // process named itself needs a second look, and this is the
                 // only place the pid and the pane are in the same hand.
                 let pid = fields[13].parse::<u32>().ok();
-                let pane = pane_from_fields(fields)?;
+                let server = fields[16].parse::<u32>().ok();
+                let mut pane = pane_from_fields(fields)?;
+                if let (Some(server), Some(root)) = (server, pid) {
+                    pane.history_identity =
+                        super::process_identity::pane_incarnation(server, root).await;
+                }
                 if pane.agent.is_none() {
                     if let Some(pid) = pid {
                         unresolved.push((panes.len(), pid));
@@ -1201,6 +1207,7 @@ impl TerminalBackend for TmuxBackend {
 fn pane_from_fields(fields: Vec<String>) -> Result<Pane, BackendError> {
     let command = non_empty(&fields[10]);
     Ok(Pane {
+        history_identity: None,
         workspace_id: WorkspaceId::new(&fields[0]),
         tab_id: TabId::new(&fields[1]),
         id: PaneId::new(&fields[2]),

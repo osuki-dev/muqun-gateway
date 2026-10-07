@@ -53,8 +53,10 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
     pagination use case and async repository port, the current memory adapter,
     and authenticated HTTP boundary. Captured historical prefix only, separately
     from native ranges and the mutable viewport; bounded ephemeral snapshots.
-    Storage is selected at server composition (memory only now); contract and
-    future persistence-switch constraints in `docs/captured-history.md`.
+    `history_sqlite.rs` adds opt-in bundled SQLite checkpoints on one blocking
+    worker, with verified native identities, replacement recovery and private
+    bounded disk retention. Storage defaults to memory at server composition;
+    operational and recovery constraints are in `docs/captured-history.md`.
   - `login_env.rs`: the `PATH` and `LC_CTYPE` a backend actually needs,
     recovered from a login shell. An init system starts the gateway with neither,
     and the tmux adapter cannot spawn tmux without the first or parse its output

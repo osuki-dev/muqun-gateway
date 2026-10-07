@@ -7,6 +7,7 @@
 mod herdr;
 mod keys;
 mod model;
+mod process_identity;
 mod registry;
 mod tmux;
 mod tmux_wire;

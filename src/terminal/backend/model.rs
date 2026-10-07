@@ -147,6 +147,9 @@ impl AgentStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pane {
+    /// Adapter-verified server/root-process incarnation, never serialized by compat.
+    /// Absence explicitly denies adoption of captures from a previous gateway run.
+    pub(crate) history_identity: Option<String>,
     pub id: PaneId,
     /// Native terminal identifier when it differs from the pane identifier.
     /// Herdr exposes both; tmux uses the pane id for both roles.
