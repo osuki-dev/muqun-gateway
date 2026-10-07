@@ -226,6 +226,7 @@ mod tests {
     #[test]
     fn tmux_entities_keep_the_existing_mobile_envelope() {
         let response = pane_list(vec![Pane {
+            history_identity: None,
             id: PaneId::new("%9"),
             terminal_id: Some("%9".into()),
             workspace_id: WorkspaceId::new("$0"),
@@ -324,6 +325,7 @@ mod tests {
     #[test]
     fn the_snapshot_does_not_invent_agents_from_panes() {
         let pane = Pane {
+            history_identity: None,
             id: PaneId::new("%9"),
             terminal_id: Some("%9".into()),
             workspace_id: WorkspaceId::new("$0"),
@@ -357,6 +359,7 @@ mod tests {
     #[test]
     fn creation_envelopes_include_the_initial_terminal() {
         let pane = Pane {
+            history_identity: None,
             id: PaneId::new("%1"),
             terminal_id: Some("%1".into()),
             workspace_id: WorkspaceId::new("$1"),

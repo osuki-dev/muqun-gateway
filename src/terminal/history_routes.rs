@@ -8,8 +8,8 @@ use serde_json::Value;
 
 use super::history::{parse_cursor, HistoryError, HistoryScope, MAX_HISTORY_LIMIT};
 use crate::{
-    api_error, backend, backend_api_error, content_envelope, find_session, require_device,
-    terminal_backend, ApiResult, AppState,
+    api_error, backend_api_error, content_envelope, find_session, require_device, terminal_backend,
+    ApiResult, AppState,
 };
 
 #[derive(Debug, Default, Deserialize)]
@@ -38,7 +38,6 @@ pub(crate) async fn pane_history(
         .await
         .map_err(backend_api_error)?;
     let live = panes.iter().any(|pane| pane.id.as_str() == pane_id);
-    let listing = backend::compat::pane_list(panes);
     state
         .scrollback
         .lock()
@@ -49,7 +48,7 @@ pub(crate) async fn pane_history(
                 "failed to lock captured history",
             )
         })?
-        .observe_listing(&session_id, &listing);
+        .observe_native_listing(&session_id, &panes);
     if !live {
         return Err(if query.before.is_some() {
             history_error(HistoryError::Gone)
@@ -512,7 +511,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires tmux; creates only a private socket/server"]
-    async fn captured_history_real_isolated_tmux_pages_and_resize_reset() {
+    async fn captured_history_real_isolated_tmux_sqlite_restart_pages_and_resize_reset() {
         struct IsolatedTmux {
             directory: PathBuf,
             socket: PathBuf,
@@ -596,11 +595,24 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
         let panes = backend.list_panes().await.unwrap();
+        assert!(
+            pane.history_identity.is_some(),
+            "native server/root incarnation was not verified"
+        );
+        let old_repository = std::sync::Arc::new(
+            super::super::history_sqlite::SqliteHistoryRepository::open(
+                Ok(isolated.directory.join("history")),
+                state.config.clone(),
+                state.scrollback.clone(),
+            )
+            .await,
+        );
+        state.history = old_repository.clone();
         state
             .scrollback
             .lock()
             .unwrap()
-            .observe_listing("s", &backend::compat::pane_list(panes));
+            .observe_native_listing("s", &panes);
         for top in 0..8 {
             std::fs::write(&control, format!("{top}\n")).unwrap();
             let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -650,6 +662,49 @@ mod tests {
         let cursor = first.1["data"]["next_before"].as_str().unwrap();
         let second = get(app(), &format!("{uri}&before={cursor}"), Some("token")).await;
         assert_eq!(second.1["data"]["rows"], json!(["row 3", "row 4"]));
+        // Join the actual storage worker; do not use a timed guess that it closed.
+        state.history = std::sync::Arc::new(
+            super::super::history_memory::MemoryHistoryRepository::new(state.scrollback.clone()),
+        );
+        std::sync::Arc::try_unwrap(old_repository)
+            .ok()
+            .unwrap()
+            .close()
+            .await;
+        state.scrollback =
+            std::sync::Arc::new(std::sync::Mutex::new(scrollback::ScrollbackStore::default()));
+        state.generation = crate::new_generation();
+        state.history = std::sync::Arc::new(
+            super::super::history_sqlite::SqliteHistoryRepository::open(
+                Ok(isolated.directory.join("history")),
+                state.config.clone(),
+                state.scrollback.clone(),
+            )
+            .await,
+        );
+        let app = || {
+            crate::terminal::routes::mount(Router::new())
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    encrypted_transport,
+                ))
+                .layer(middleware::from_fn(security_headers))
+                .with_state(state.clone())
+        };
+        let gone = get(app(), &format!("{uri}&before={cursor}"), Some("token")).await;
+        assert_eq!(gone.0, StatusCode::GONE);
+        let recovered = get(app(), &uri, Some("token")).await;
+        assert_eq!(recovered.0, StatusCode::OK);
+        assert_eq!(recovered.1["data"]["rows"], first.1["data"]["rows"]);
+        assert_eq!(
+            state
+                .scrollback
+                .lock()
+                .unwrap()
+                .depth("s", pane.id.as_str()),
+            0
+        );
+        let cursor = recovered.1["data"]["next_before"].as_str().unwrap();
         let resized = ProcessCommand::new("tmux")
             .arg("-S")
             .arg(&isolated.socket)

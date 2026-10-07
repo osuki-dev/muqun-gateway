@@ -27,6 +27,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 pub(crate) fn test_config(token: &str) -> Config {
     Config {
+        history: Default::default(),
         server_id: "server-1".into(),
         label: "test".into(),
         autostart_backends: Vec::new(),

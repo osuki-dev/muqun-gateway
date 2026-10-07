@@ -67,6 +67,7 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "pane_interrupt",
     "pane_output_ansi",
     "pane_captured_history",
+    "pane_captured_history_sqlite_checkpoint",
     "pane_parts",
     "pane_parts_native",
     "pane_shortcuts",
@@ -730,6 +731,7 @@ mod tests {
     #[tokio::test]
     async fn session_liveness_reports_panes_present() {
         let panes = vec![Pane {
+            history_identity: None,
             id: BackendPaneId::new("p1"),
             terminal_id: None,
             workspace_id: BackendWorkspaceId::new("w1"),

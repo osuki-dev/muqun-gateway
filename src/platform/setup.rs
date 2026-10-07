@@ -122,6 +122,7 @@ pub(crate) fn setup(
     let mut config = match existing {
         Some(install) => install.config,
         None => Config {
+            history: Default::default(),
             server_id,
             label: hostname_label(),
             listen: listen.clone(),

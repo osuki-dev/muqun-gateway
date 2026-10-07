@@ -259,9 +259,43 @@ impl HerdrBackend {
     /// own -- `request_transport` is the only caller and it supplies one.
     #[cfg(unix)]
     async fn exchange(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+        Ok(self.exchange_with_peer(method, params).await?.0)
+    }
+
+    #[cfg(unix)]
+    async fn exchange_with_peer(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> anyhow::Result<(Value, Option<u32>)> {
         let mut stream = UnixStream::connect(&self.socket_path)
             .await
             .with_context(|| format!("failed to connect {}", self.socket_path.display()))?;
+        let peer = stream
+            .peer_cred()
+            .ok()
+            .and_then(|cred| cred.pid())
+            .and_then(|pid| u32::try_from(pid).ok());
+        #[cfg(target_os = "macos")]
+        let peer = peer.or_else(|| {
+            use std::os::fd::AsRawFd;
+            let mut pid: libc::pid_t = 0;
+            let mut size = std::mem::size_of_val(&pid) as libc::socklen_t;
+            // SAFETY: stream owns the fd and getsockopt receives a correctly
+            // sized pid output buffer. No bytes are consumed from the socket.
+            let result = unsafe {
+                libc::getsockopt(
+                    stream.as_raw_fd(),
+                    libc::SOL_LOCAL,
+                    libc::LOCAL_PEERPID,
+                    (&mut pid as *mut libc::pid_t).cast(),
+                    &mut size,
+                )
+            };
+            (result == 0 && size as usize == std::mem::size_of_val(&pid))
+                .then(|| u32::try_from(pid).ok())
+                .flatten()
+        });
         let request = json!({
             "id": format!("gateway:{}", uuid::Uuid::new_v4()),
             "method": method,
@@ -274,7 +308,7 @@ impl HerdrBackend {
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
         reader.read_line(&mut line).await?;
-        Ok(serde_json::from_str(&line)?)
+        Ok((serde_json::from_str(&line)?, peer))
     }
 }
 
@@ -876,17 +910,32 @@ impl HerdrBackend {
         if !self.process_info.load(Ordering::Relaxed) {
             return pane;
         }
-        let info = match self
-            .request("pane.process_info", json!({ "pane_id": pane.id.as_str() }))
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => {
+        let info = tokio::time::timeout(
+            self.request_timeout,
+            self.exchange_with_peer("pane.process_info", json!({ "pane_id": pane.id.as_str() })),
+        )
+        .await;
+        let (info, peer) = match info {
+            Ok(Ok((response, peer))) if response.get("error").is_none() => (response, peer),
+            Ok(Ok((response, _))) => {
+                let error = BackendError::Refused {
+                    code: response.pointer("/error/code").map(|code| {
+                        code.as_str()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| code.to_string())
+                    }),
+                    message: response
+                        .pointer("/error/message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("request refused")
+                        .to_owned(),
+                };
                 if unknown_method(&error) {
                     self.process_info.store(false, Ordering::Relaxed);
                 }
                 return pane;
             }
+            _ => return pane,
         };
         let info = info.pointer("/result/process_info").unwrap_or(&info);
         if pane.foreground_command.is_none() {
@@ -896,6 +945,9 @@ impl HerdrBackend {
             .get("shell_pid")
             .and_then(Value::as_u64)
             .and_then(|pid| u32::try_from(pid).ok());
+        if let (Some(server), Some(root)) = (peer, shell) {
+            pane.history_identity = super::process_identity::pane_incarnation(server, root).await;
+        }
         if let Some((columns, rows)) = shell.and_then(|pid| self.pane_grid(pid)) {
             if pane.width.is_none() {
                 pane.width = Some(columns);
@@ -1156,6 +1208,7 @@ fn tab_from_json(value: &Value) -> Result<Tab, BackendError> {
 
 fn pane_from_json(value: &Value) -> Result<Pane, BackendError> {
     Ok(Pane {
+        history_identity: None,
         id: PaneId::new(required_string(value, "pane_id", "pane")?),
         terminal_id: value
             .get("terminal_id")

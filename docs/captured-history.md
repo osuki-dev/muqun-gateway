@@ -8,8 +8,9 @@ This is independent of `backends[].features.pagedHistory`, which still describes
 `GET /api/sessions/{session_id}/panes/{pane_id}/history`
 
 Uses the same device authentication and encrypted transport as the other pane
-routes. Cursors are not credentials. Terminal contents remain memory-only; a
-Gateway restart loses captures and cursors. Existing `/output` tail stitching and
+routes. Cursors are not credentials. Storage defaults to memory. Optional SQLite
+storage can recover a verified live pane's last captured-prefix **checkpoint**;
+cursors always expire on Gateway restart. Existing `/output` tail stitching and
 native `start`/`end` range behavior are unchanged.
 
 ## Request
@@ -138,7 +139,7 @@ unobserved destroy/recreate with identical native identity cannot be detected.
 
 ## Resource bounds
 
-No new dependencies or persistence. Existing live retention stays at 5,000 rows
+Existing live retention stays at 5,000 rows
 and 2 MiB per read-shape buffer, 48 buffers/24 MiB total. Snapshots add at most
 **32 snapshots / 8 MiB** (row capacities and row/page-vector allocations counted),
 at most **8 per session**, **2 per pane**, and **2 MiB of row text per snapshot**
@@ -152,10 +153,129 @@ history repository operations; idle memory remains capped.
 
 This optional API is additive. Older Apps keep using `/output`; newer clients
 must check the capability and explain that a Gateway upgrade is needed when it
-is absent. There is no SQLite archive, native unified pagination, startup or
+is absent. There is no complete archive, native unified pagination, agent startup or
 prompt-delivery change in this feature.
 
-## Architecture and a future persistence switch (not available now)
+## Optional SQLite checkpoints
+
+While Gateway is stopped, set this block in its `config.json`, then start it
+through the normal lifecycle command. Changing storage requires a controlled
+restart; it is not a live toggle or a Manager UI setting.
+
+```json
+{"history": {"storage": "sqlite"}}
+```
+
+The accepted storage values are `memory` (default) and `sqlite`; unknown values
+are rejected. Omitting the block keeps existing config files compatible. The
+additional capability `pane_captured_history_sqlite_checkpoint` declares support
+for the option, **not** that the owner has enabled it or that disk writes have
+succeeded. `pane_captured_history` and the history response contract remain
+unchanged. No App source change or complete-archive UI is provided.
+
+SQLite stores only historical prefixes in the exact `recent_unwrapped`/text or
+ANSI shape. It never stores the live viewport, pinned snapshots, device tokens,
+cursor tokens, or a native absolute range. The current projection is replaced in
+a transaction, including shrink, repaint, reset and deletion; it is not an
+append-by-length log. Revisions coalesce to the latest fold state, so a crash can
+lose dirty work not yet flushed. This is a sampled checkpoint, not a write-ahead
+record of every accepted terminal frame.
+
+After restart, a history request first verifies live topology. Only a verified
+same native server and root-pane process can adopt an older prefix. That prefix
+gets a new runtime capture epoch with row base zero and remains separate from
+the live fold and `/output`. A mutable screen alone does not remove it. When the
+new run produces its first nonempty historical prefix, that fresh projection **replaces** the
+checkpoint outright; it is never concatenated across runs. This deliberately
+does not promise a seamless archive. The response still says
+`complete_archive: false` and `includes_live_viewport: false`. Old cursors return
+410 even when the checkpoint is readable with a new first-page request.
+
+Identity includes the installation `server_id`, configured backend type and
+canonical endpoint, a persisted per-backend configuration incarnation, native
+server/root-process incarnation, pane/workspace/tab identity, dimensions/editor
+policy, and source/format. tmux gets server and pane PIDs in the same listing;
+Herdr uses the socket peer and that pane's `process_info.shell_pid`. Adapters
+verify same-user process ancestry and kernel incarnation: Linux boot UUID plus
+PID start ticks; macOS kernel boot time plus PID start timestamps. PIDs alone,
+unknown peers, unavailable kernel probes, old Herdr without `process_info`, and
+unrelated root processes cannot authorize cross-restart recovery. Current-run
+capture still works under a run-private namespace when identity is unknown.
+Acquiring or losing verification on an already-observed pane discards its prior
+projection and invalidates outstanding reads; unverified rows are never promoted
+into a newly verified process's checkpoint. A first-ever verified observation
+can still recover its matching checkpoint.
+Native process metadata is private and never added to public pane JSON.
+
+The private SQLite backend registry is reconciled against startup configuration.
+Observed removal/re-addition and endpoint/install changes rotate its incarnation;
+orphan records are inaccessible and expire under retention. An identical manual
+remove/re-add entirely between SQLite-enabled runs (including while storage is
+off) cannot be detected from the final config alone. It must not be used as an
+implicit purge; stop Gateway and remove the history directory if that is the
+intent. A changed native server/root process still denies adoption independently.
+
+### Privacy, failure and disk bounds
+
+Files live under the resolved Gateway state directory's `history/`:
+`captures.sqlite3` and its SQLite sidecars. The directory is 0700 and files are
+0600. Symlinks, nonregular files, foreign ownership and multiply linked files
+are refused. Stored terminal text is **plaintext at rest** and may include
+credentials, private source or personal data. HTTP transport encryption does not
+encrypt the database.
+
+One dedicated blocking thread owns one bundled SQLite connection (rusqlite).
+No SQLite operation runs on the Tokio executor, and no fold mutex is held during
+disk I/O. Query/health requests have a bounded 16-command channel; dirty revisions
+remain coalesced in the bounded live fold. Each pass copies at most one 2 MiB
+projection under a short lock and writes it off-lock. Late recovery and write
+acknowledgements recheck the exact observation fence/revision; reset work cannot
+make an older revision clean. The reused memory snapshot cache retains its
+60-second TTL, atomic first-page deduplication and all device/scope quotas.
+
+Durable payload retention is at most **48 captures / 24 MiB**, **5,000 rows / 2 MiB
+of row text per shape**, for **7 days since the last actual projection change**,
+not the last read. Reads and unchanged polling do not extend age. Age pruning
+runs at startup and periodically for inactive records; logical quotas also run on writes. Oldest actual updates are
+evicted to satisfy logical quotas. Recovered checkpoints share the existing
+48-buffer/24-MiB live-memory budget; snapshots keep their separate 8-MiB budget.
+The bounded four-byte-per-row encoding overhead counts toward disk quotas,
+and recovered row/vector allocations count toward the total live-memory budget,
+not a second per-shape row-text cap. Front trims slide a live capture's row base
+without changing its epoch; checkpoints contain only retained rows, never trimmed
+rows or old cursor coordinates.
+The worker retains a bounded last-processed content fingerprint independently of
+the database row. An unchanged poll cannot recreate an age-pruned or quota-evicted
+projection; a genuine change in that exact format can be persisted again.
+
+The main database has a **64 MiB physical ceiling**, enforced with SQLite's page
+limit; freed pages are reused rather than automatically vacuumed. WAL has a
+**16 MiB ceiling** with bounded payload transactions and explicit truncate
+checkpoints before/after writes and retention deletes. `journal_size_limit` is
+not treated as a hard cap by itself. If a reader prevents checkpoint shrink,
+the worker stops history operations instead of continuing to grow WAL. External
+processes must not write this private database; Gateway does not promise to bound
+files another process deliberately enlarges.
+
+Initialization, worker loss, queue overload, lock/checkpoint failure, full disk,
+corruption or unsupported newer schema return `503 history_storage_unavailable`,
+including when a pinned snapshot exists. No empty result or successful memory
+fallback conceals the selected store's failure. Output/control/SSE continue
+independently. Permanent worker failures require resolving the cause and a
+controlled restart. Schema version 1 is initialized transactionally; migration
+failure rolls back. Corrupt/newer files are preserved, not automatically deleted
+or downgraded. Unknown identity without an eligible current-run capture returns
+the normal `not_captured`, not a claim that all old history was recovered.
+
+Turning storage off and restarting stops writes, leaves disk files retained but
+hidden, and does **not** resolve/open/import the history database in memory mode.
+For cleanup, stop Gateway and remove the **whole** `state/history/` directory;
+this destroys backend registry/checkpoints, not terminal sessions. For a coherent
+backup, stop Gateway and copy that whole directory, or use SQLite's backup API
+with an appropriately authorized local tool. Never copy just a live main file:
+its committed pages can still be in WAL. Do not unlink live sidecars.
+
+## Architecture
 
 `terminal/history.rs` owns the stable `read_page` application use case, row/page
 contract, cursor parsing/binding, capture-epoch/TTL checks and immutable page
@@ -166,7 +286,7 @@ port uses boxed Send futures, like the existing backend ports. Adapter failures
 are typed, not empty histories. The use-case contract tests use a genuinely
 asynchronous fake adapter, not the memory adapter's HashMap.
 
-`terminal/history_memory.rs` is the **only shipped adapter**. It reads the
+`terminal/history_memory.rs` reads the
 historical prefix from `ScrollbackStore` using short memory-only locks and keeps
 its separate bounded pinned-snapshot cache. `ScrollbackStore` still owns capture
 eligibility, live viewport replacement, heuristic folding and capture epochs; it
@@ -174,51 +294,10 @@ does not hold cursors or perform pagination. HTTP authenticates, validates,
 resolves/checks backend topology and calls the use case—it neither indexes the
 snapshot dictionary nor knows any database coordinates.
 
-`platform/server.rs` composes `AppState.history: Arc<dyn HistoryRepository>` with
-the memory adapter. That is the future **storage selection boundary**. There is
-no SQLite dependency, database, migration, or persistence configuration setting
-today; setting an invented SQLite flag will not enable anything. A later reviewed
-change can add a validated setting (for example a `history.storage` enum with
-`memory` as the default) in `platform/config.rs`, select a SQLite adapter here,
-and keep this App API unchanged. It must also add an explicit bounded ingestion
-path from the live fold's historical-prefix/epoch projection into that adapter:
-the current memory adapter queries the projection directly, and the read port
-does not pretend that persistent ingestion is already implemented. Ingestion
-must preserve the same capture policy and not persist the mutable viewport just
-because a backend read arrived.
-
-That future switch must be explicit opt-in: terminal history can contain
-credentials, source code and personal data. Turning persistence **on** would make
-selected captured rows survive process exit on disk; turning it **off** must
-stop writes and define whether existing records are deleted (with a separate
-confirmed purge) or merely retained but hidden. Default memory mode must never
-silently open/import an old database. Storage files/directories need the repo's
-secret-file permissions and a documented cleanup/backup policy; encryption at
-rest would require a separate reviewed key-management design, not a claim made
-by transport encryption.
-
-A SQLite adapter must retain quotas, row/page byte limits and TTL/pruning, add a
-bounded disk quota and explicit retention age, and run database operations in
-an async driver or bounded blocking worker. No live-fold mutex guard can be
-held across disk I/O or passed into such a worker. Ingestion should copy only a
-bounded epoch-tagged batch under the live lock, release it, then queue the write
-with backpressure; recheck epoch before publishing the retained version. Pinning
-must atomically deduplicate concurrent first-page requests, just as memory does.
-
-Persisted capture records would be keyed by stable configured session/backend
-identity, observed terminal incarnation/capture epoch and exact source/format—not
-by reusable pane ID alone. Removal/reconfiguration must invalidate active
-traversals and apply a documented delete/orphan-retention policy; re-adding a
-backend or reusing a pane ID must never automatically expose orphaned rows as
-the new pane's history. Backend-unobservable identical ID reuse remains an
-identity limitation to solve before promising durable cross-restart adoption.
-
-Pinned cursors are bound to the selected repository instance, Gateway generation,
-device and request shape. **Persisted records may outlive cursors; current cursors
-do not survive a Gateway restart or storage switch.** A new adapter/process must
-start with a new cursor namespace and invalidate old traversals, even if it can
-read older persisted records. Config changes should require a controlled restart
-or an explicit generation/storage-epoch transition. Schema migrations, rollback,
-corruption recovery and cleanup belong in that future adapter/composition change;
-database row IDs and migration versions must not enter the wire capability or
-cursor contract.
+`platform/server.rs` selects the repository at composition from the validated
+config. `terminal/history_sqlite.rs` owns secure initialization, schema/registry,
+the worker, transactions, retention and health. It wraps the existing memory
+adapter's bounded snapshot policy rather than duplicating it. `ScrollbackStore`
+owns dirty projection revisions, reset fences and separate recovered checkpoints;
+it performs no SQLite I/O. The async application repository port and HTTP cursor
+contract are unchanged.

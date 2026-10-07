@@ -75,9 +75,7 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     agent_runtime.spawn_supervisor();
 
     let scrollback = Arc::new(Mutex::new(scrollback::ScrollbackStore::default()));
-    let history = Arc::new(terminal::history_memory::MemoryHistoryRepository::new(
-        scrollback.clone(),
-    ));
+    let history = terminal::history_sqlite::repository(&config, scrollback.clone()).await;
     let state = AppState {
         config,
         pending_pairing: Arc::new(Mutex::new(None)),

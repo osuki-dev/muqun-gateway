@@ -45,6 +45,9 @@ impl From<SetupBackend> for BackendKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Config {
+    /// Captured-prefix storage selection; changing it requires a restart.
+    #[serde(default, skip_serializing_if = "HistoryConfig::is_default")]
+    pub(crate) history: HistoryConfig,
     pub(crate) server_id: String,
     pub(crate) label: String,
     pub(crate) listen: String,
@@ -104,6 +107,27 @@ pub(crate) struct Config {
     /// The T3 Code agent adapter: off unless `enabled` or `url` is set.
     #[serde(default, skip_serializing_if = "is_default_t3")]
     pub(crate) t3: agents::T3Config,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum HistoryStorage {
+    #[default]
+    Memory,
+    Sqlite,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HistoryConfig {
+    #[serde(default)]
+    pub(crate) storage: HistoryStorage,
+}
+
+impl HistoryConfig {
+    fn is_default(&self) -> bool {
+        self.storage == HistoryStorage::Memory
+    }
 }
 
 /// `skip_serializing_if` for the OpenCode block, so an existing `config.json`
@@ -333,6 +357,30 @@ pub(crate) const CONTENT_SCHEMA_VERSION: &str = "1.5.0";
 #[cfg(test)]
 mod tests {
     use crate::*;
+
+    #[test]
+    fn history_storage_defaults_to_memory_roundtrips_sqlite_and_rejects_unknown_modes() {
+        let base = json!({"server_id":"s", "label":"fixture", "listen":"127.0.0.1:23847", "public_url":"", "token_hash":"fixture", "sessions":[]});
+        let default: Config = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(default.history.storage, super::HistoryStorage::Memory);
+        assert!(serde_json::to_value(default)
+            .unwrap()
+            .get("history")
+            .is_none());
+        for storage in ["sqlite", "unknown"] {
+            let mut configured = base.clone();
+            configured["history"] = json!({"storage":storage});
+            let parsed = serde_json::from_value::<Config>(configured);
+            if storage == "sqlite" {
+                assert_eq!(
+                    serde_json::to_value(parsed.unwrap()).unwrap()["history"]["storage"],
+                    "sqlite"
+                );
+            } else {
+                assert!(parsed.is_err());
+            }
+        }
+    }
 
     #[test]
     fn the_t3_block_is_read_from_config_json_and_left_out_when_default() {
