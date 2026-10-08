@@ -48,6 +48,7 @@ use crate::{
 /// A phone previews artifacts, it does not download archives. Anything larger
 /// is refused rather than streamed, so one request can never tie up the host.
 pub(crate) const MAX_ASSET_CONTENT_BYTES: u64 = 10 * 1024 * 1024;
+pub(crate) const MAX_VIDEO_CONTENT_BYTES: u64 = 32 * 1024 * 1024;
 pub(crate) const ASSET_CONTENT_CHUNK_BYTES: usize = 64 * 1024;
 /// Enough of a file's head to decide what it is. The same bytes settle both the
 /// magic-number check and the "is this text" question.
@@ -1326,11 +1327,11 @@ async fn serve_message_image(
 /// The read itself, once a path has passed its gate: size cap, sniff, stream.
 async fn stream_asset(entry: AssetEntry, path: PathBuf, download: bool) -> ApiResult<Response> {
     let metadata = std::fs::metadata(&path).map_err(|_| asset_not_found())?;
-    if metadata.len() > MAX_ASSET_CONTENT_BYTES {
+    if metadata.len() > MAX_VIDEO_CONTENT_BYTES {
         return Err(api_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             "asset_too_large",
-            "the asset is larger than 10 MiB",
+            "the asset is larger than 32 MiB",
         ));
     }
 
@@ -1347,6 +1348,18 @@ async fn stream_asset(entry: AssetEntry, path: PathBuf, download: bool) -> ApiRe
                 )
             })?;
 
+    let limit = if asset_type.kind == AssetKind::Video {
+        MAX_VIDEO_CONTENT_BYTES
+    } else {
+        MAX_ASSET_CONTENT_BYTES
+    };
+    if metadata.len() > limit {
+        return Err(api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "asset_too_large",
+            "the asset exceeds its content size limit",
+        ));
+    }
     let mut entry = entry;
     entry.size = metadata.len();
     entry.modified_unix_ms = system_time_unix_ms(metadata.modified().ok());
@@ -1689,6 +1702,58 @@ mod tests {
         assert_eq!(names, vec![String::from("own.txt")]);
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn video_content_accepts_eleven_mib_but_keeps_other_files_and_video_bounded() {
+        let root = asset_test_dir("video-limit");
+        for (name, head, size, accepted) in [
+            (
+                "sample.mp4",
+                b"\x00\x00\x00\x18ftypisom".as_slice(),
+                11 * 1024 * 1024,
+                true,
+            ),
+            (
+                "sample.wav",
+                b"RIFF\x24\x00\x00\x00WAVEfmt ".as_slice(),
+                11 * 1024 * 1024,
+                false,
+            ),
+            (
+                "large.mp4",
+                b"\x00\x00\x00\x18ftypisom".as_slice(),
+                MAX_VIDEO_CONTENT_BYTES + 1,
+                false,
+            ),
+        ] {
+            let path = root.join(name);
+            std::fs::write(&path, head).unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(size)
+                .unwrap();
+            let entry = test_asset_entry(&path, &root, 1_000);
+            let state = asset_listing_state(&root, vec![entry.clone()]);
+            let response =
+                asset_content(State(state), Path(entry.id), bearer_headers("token")).await;
+            if accepted {
+                let response = response.unwrap();
+                assert_eq!(response.headers()["content-type"], "video/mp4");
+                assert_eq!(
+                    axum::body::to_bytes(response.into_body(), MAX_VIDEO_CONTENT_BYTES as usize)
+                        .await
+                        .unwrap()
+                        .len(),
+                    size as usize
+                );
+            } else {
+                assert_eq!(response.unwrap_err().0, StatusCode::PAYLOAD_TOO_LARGE);
+            }
+        }
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[tokio::test]
