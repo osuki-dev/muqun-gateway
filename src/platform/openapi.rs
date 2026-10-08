@@ -742,6 +742,7 @@ pub fn openapi_spec() -> Value {
         }
     });
     spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/history"] = captured_history_path();
+    spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/lazygit"] = lazygit_endpoints();
     spec
 }
 
@@ -1583,6 +1584,23 @@ pub const DOCS_HTML: &str = r#"<!doctype html>
   </body>
 </html>
 "#;
+
+fn lazygit_endpoints() -> Value {
+    json!({
+        "get": {
+            "summary": "Check whether lazygit can open for this pane",
+            "description": "Requires a paired device. Checks an executable lazygit on the Gateway host's PATH and the source pane's canonical Git checkout. No process is launched. Announced as pane_lazygit.",
+            "parameters": [path_param("sessionId"), path_param("paneId")],
+            "responses": ok_response()
+        },
+        "post": {
+            "summary": "Open lazygit in a dedicated terminal tab",
+            "description": "No client command or cwd is accepted. Creates an unfocused tab in the source pane's workspace and checkout, starts the installed lazygit once, and returns data.target with session_id, workspace_id, tab_id and pane_id plus started. A false started means inspect the created target, not automatically repeat the launch. Desktop focus is preserved.",
+            "parameters": [path_param("sessionId"), path_param("paneId")],
+            "responses": ok_response()
+        }
+    })
+}
 
 #[cfg(test)]
 mod history_contract_tests {

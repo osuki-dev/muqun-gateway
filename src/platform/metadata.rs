@@ -59,6 +59,7 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "device_revocation",
     "file_uploads",
     "git_diff",
+    "pane_lazygit",
     "one_time_pairing_codes",
     "pane_context",
     "pane_approvals",
