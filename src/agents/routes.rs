@@ -277,6 +277,10 @@ pub struct ReplyFormBody {
 
 pub fn mount(router: Router<AppState>) -> Router<AppState> {
     super::ws_routes::mount(router)
+        .route(
+            "/api/agent-sessions/{asid}/audio-asset",
+            get(message_images::audio_asset),
+        )
         // Standalone independent OpenCode agent routes (no tmux / herdr session required)
         .route(
             "/api/agent-sessions",

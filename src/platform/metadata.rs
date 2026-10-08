@@ -56,6 +56,7 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     // the session's directory, for every agent.
     "agent_vcs_files",
     "assets",
+    "agent_audio_assets",
     "device_revocation",
     "file_uploads",
     "git_diff",

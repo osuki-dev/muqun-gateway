@@ -743,7 +743,19 @@ pub fn openapi_spec() -> Value {
     });
     spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/history"] = captured_history_path();
     spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/lazygit"] = lazygit_endpoints();
+    spec["paths"]["/api/agent-sessions/{asid}/audio-asset"] = audio_asset_endpoint();
     spec
+}
+
+fn audio_asset_endpoint() -> Value {
+    json!({
+        "get": {
+            "summary": "Resolve an audio tool output inside the agent session directory",
+            "description": "Requires device authentication and agent_audio_assets capability. Resolves a relative, absolute or file:// URI inside the server-owned session directory, verifies audio bytes and returns data.asset metadata with an opaque id. GET /api/assets/{id}/content rechecks containment, requires authentication and limits content to 10 MiB. Web URIs, non-audio files and paths outside the directory return 404. Video is not supported.",
+            "parameters": [path_param("asid"), query_param("uri", "Audio file URI or path")],
+            "responses": ok_response()
+        }
+    })
 }
 
 fn task_steps_schema() -> Value {
