@@ -194,6 +194,25 @@ pub(crate) async fn audio_asset(
     axum::extract::Query(query): axum::extract::Query<AudioAssetQuery>,
     headers: axum::http::HeaderMap,
 ) -> ApiResult<axum::Json<serde_json::Value>> {
+    resolve_agent_file(state, asid, query, headers, Some(AssetKind::Audio)).await
+}
+
+pub(crate) async fn file_asset(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Path(asid): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<AudioAssetQuery>,
+    headers: axum::http::HeaderMap,
+) -> ApiResult<axum::Json<serde_json::Value>> {
+    resolve_agent_file(state, asid, query, headers, None).await
+}
+
+async fn resolve_agent_file(
+    state: AppState,
+    asid: String,
+    query: AudioAssetQuery,
+    headers: axum::http::HeaderMap,
+    expected: Option<AssetKind>,
+) -> ApiResult<axum::Json<serde_json::Value>> {
     require_device(&state, &headers)?;
     let not_found = || {
         api_error(
@@ -211,7 +230,7 @@ pub(crate) async fn audio_asset(
         let path = resolve_image_path(&query.uri, &owned_root)?;
         let name = path.file_name()?.to_string_lossy().into_owned();
         let kind = sniff_asset_type(&read_asset_head(&path), &name);
-        if kind.kind != AssetKind::Audio {
+        if expected.is_some_and(|expected| kind.kind != expected) {
             return None;
         }
         let metadata = std::fs::metadata(&path).ok()?;
@@ -708,6 +727,111 @@ mod tests {
                 asset_content(
                     State(state),
                     RoutePath(id.to_owned()),
+                    bearer_headers("token")
+                )
+                .await
+                .unwrap_err()
+                .0,
+                StatusCode::NOT_FOUND
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn file_outputs_resolve_video_and_download_binary_without_widening_the_root() {
+        use crate::platform::assets::{asset_content, asset_download};
+        use crate::{bearer_headers, test_device, test_state};
+        use axum::extract::{Path as RoutePath, Query, State};
+        use axum::http::{HeaderMap, StatusCode};
+        let (scratch, root) = workspace();
+        let video = b"\x00\x00\x00\x20ftypisom\x00\x00\x00\x00";
+        let binary = b"\x00\xff\x00\xff";
+        std::fs::write(root.join("out/clip.mp4"), video).unwrap();
+        std::fs::write(root.join("out/archive.bin"), binary).unwrap();
+        std::fs::write(scratch.path().join("outside.bin"), binary).unwrap();
+        let state = test_state("admin", vec![test_device("d1", "token")]);
+        state
+            .message_images
+            .remember_root("agent-files", root.to_str());
+        for (uri, kind, bytes) in [
+            ("out/clip.mp4", "video", video.as_slice()),
+            ("out/archive.bin", "binary", binary.as_slice()),
+        ] {
+            let response = file_asset(
+                State(state.clone()),
+                RoutePath("agent-files".into()),
+                Query(AudioAssetQuery { uri: uri.into() }),
+                bearer_headers("token"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.0["data"]["asset"]["kind"], kind);
+            let id = response.0["data"]["asset"]["id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert_eq!(
+                asset_download(
+                    State(state.clone()),
+                    RoutePath(id.clone()),
+                    HeaderMap::new()
+                )
+                .await
+                .unwrap_err()
+                .0,
+                StatusCode::UNAUTHORIZED
+            );
+            let download = asset_download(
+                State(state.clone()),
+                RoutePath(id.clone()),
+                bearer_headers("token"),
+            )
+            .await
+            .unwrap();
+            assert!(download.headers()["content-disposition"]
+                .to_str()
+                .unwrap()
+                .starts_with("attachment;"));
+            assert_eq!(
+                axum::body::to_bytes(download.into_body(), 1024)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                bytes
+            );
+            if kind == "binary" {
+                assert_eq!(
+                    asset_content(
+                        State(state.clone()),
+                        RoutePath(id.clone()),
+                        bearer_headers("token")
+                    )
+                    .await
+                    .unwrap()
+                    .status(),
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE
+                );
+            }
+            #[cfg(unix)]
+            {
+                std::fs::remove_file(root.join(uri)).unwrap();
+                std::os::unix::fs::symlink(scratch.path().join("outside.bin"), root.join(uri))
+                    .unwrap();
+                assert_eq!(
+                    asset_download(State(state.clone()), RoutePath(id), bearer_headers("token"))
+                        .await
+                        .unwrap_err()
+                        .0,
+                    StatusCode::NOT_FOUND
+                );
+            }
+        }
+        for uri in ["../outside.bin", "https://example.invalid/archive.bin"] {
+            assert_eq!(
+                file_asset(
+                    State(state.clone()),
+                    RoutePath("agent-files".into()),
+                    Query(AudioAssetQuery { uri: uri.into() }),
                     bearer_headers("token")
                 )
                 .await

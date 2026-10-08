@@ -57,6 +57,8 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "agent_vcs_files",
     "assets",
     "agent_audio_assets",
+    "agent_file_assets",
+    "asset_download",
     "device_revocation",
     "file_uploads",
     "git_diff",

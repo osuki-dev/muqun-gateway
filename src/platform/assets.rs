@@ -99,6 +99,7 @@ pub(crate) const ASSET_SKIP_DIRS: &[&str] = &[
 pub(crate) enum AssetKind {
     Image,
     Audio,
+    Video,
     Markdown,
     Text,
     Pdf,
@@ -110,6 +111,7 @@ impl AssetKind {
         match self {
             AssetKind::Image => "image",
             AssetKind::Audio => "audio",
+            AssetKind::Video => "video",
             AssetKind::Markdown => "markdown",
             AssetKind::Text => "text",
             AssetKind::Pdf => "pdf",
@@ -406,6 +408,25 @@ pub(crate) fn sniff_asset_type(bytes: &[u8], name: &str) -> AssetType {
         return AssetType {
             kind: AssetKind::Audio,
             mime,
+        };
+    }
+    if bytes.len() >= 12
+        && &bytes[4..8] == b"ftyp"
+        && matches!(
+            &bytes[8..12],
+            b"isom" | b"iso2" | b"mp41" | b"mp42" | b"avc1" | b"qt  " | b"M4V "
+        )
+        && name.rsplit_once('.').is_some_and(|(_, ext)| {
+            matches!(ext.to_ascii_lowercase().as_str(), "mp4" | "mov" | "m4v")
+        })
+    {
+        return AssetType {
+            kind: AssetKind::Video,
+            mime: if &bytes[8..12] == b"qt  " {
+                "video/quicktime"
+            } else {
+                "video/mp4"
+            },
         };
     }
     if !looks_textual(bytes) {
@@ -1188,6 +1209,23 @@ pub(crate) async fn asset_content(
     Path(asset_id): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
+    asset_response(state, asset_id, headers, false).await
+}
+
+pub(crate) async fn asset_download(
+    State(state): State<AppState>,
+    Path(asset_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    asset_response(state, asset_id, headers, true).await
+}
+
+async fn asset_response(
+    state: AppState,
+    asset_id: String,
+    headers: HeaderMap,
+    download: bool,
+) -> ApiResult<Response> {
     require_device(&state, &headers)?;
 
     let mut entry = lock_assets(&state)?.get(&asset_id);
@@ -1198,7 +1236,7 @@ pub(crate) async fn asset_content(
     // out of the directory since is a 404.
     if entry.is_none() {
         if let Some(image) = state.message_images.served(&asset_id) {
-            return serve_message_image(asset_id, image).await;
+            return serve_message_image(asset_id, image, download).await;
         }
     }
     if entry.is_none() {
@@ -1249,13 +1287,14 @@ pub(crate) async fn asset_content(
         return Err(asset_not_found());
     };
 
-    stream_asset(entry, path).await
+    stream_asset(entry, path, download).await
 }
 
 /// `asset_content` for an image named in agent text. See `message_images`.
 async fn serve_message_image(
     asset_id: String,
     image: crate::agents::message_images::ServedImage,
+    download: bool,
 ) -> ApiResult<Response> {
     let root = image.root.clone();
     let stored = image.path.clone();
@@ -1281,11 +1320,11 @@ async fn serve_message_image(
         tab_id: None,
         pane_id: None,
     };
-    stream_asset(entry, path).await
+    stream_asset(entry, path, download).await
 }
 
 /// The read itself, once a path has passed its gate: size cap, sniff, stream.
-async fn stream_asset(entry: AssetEntry, path: PathBuf) -> ApiResult<Response> {
+async fn stream_asset(entry: AssetEntry, path: PathBuf, download: bool) -> ApiResult<Response> {
     let metadata = std::fs::metadata(&path).map_err(|_| asset_not_found())?;
     if metadata.len() > MAX_ASSET_CONTENT_BYTES {
         return Err(api_error(
@@ -1311,7 +1350,7 @@ async fn stream_asset(entry: AssetEntry, path: PathBuf) -> ApiResult<Response> {
     let mut entry = entry;
     entry.size = metadata.len();
     entry.modified_unix_ms = system_time_unix_ms(metadata.modified().ok());
-    if !asset_type.kind.previewable() {
+    if !download && !asset_type.kind.previewable() {
         return Ok((
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Json(json!({
@@ -1352,7 +1391,11 @@ async fn stream_asset(entry: AssetEntry, path: PathBuf) -> ApiResult<Response> {
         .header("content-length", metadata.len())
         .header(
             "content-disposition",
-            format!("inline; filename=\"{}\"", header_safe_name(&entry.name)),
+            format!(
+                "{}; filename=\"{}\"",
+                if download { "attachment" } else { "inline" },
+                header_safe_name(&entry.name)
+            ),
         )
         .header("x-asset-kind", asset_type.kind.as_str())
         .header("x-content-schema-version", CONTENT_SCHEMA_VERSION)
@@ -1416,6 +1459,7 @@ pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
             get(session_assets),
         )
         .route("/api/assets/{asset_id}/content", get(asset_content))
+        .route("/api/assets/{asset_id}/download", get(asset_download))
 }
 
 #[cfg(test)]

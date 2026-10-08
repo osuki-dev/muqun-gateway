@@ -744,6 +744,16 @@ pub fn openapi_spec() -> Value {
     spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/history"] = captured_history_path();
     spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/lazygit"] = lazygit_endpoints();
     spec["paths"]["/api/agent-sessions/{asid}/audio-asset"] = audio_asset_endpoint();
+    spec["paths"]["/api/agent-sessions/{asid}/file-asset"] = json!({"get": {
+        "summary": "Resolve a local file output inside an agent session",
+        "description": "Requires device authentication and agent_file_assets capability. Resolves audio, video, images, documents and binary files inside the server-owned directory. Web URLs, path escapes and symlinks outside the root are refused. Returns data.asset metadata with an opaque id.",
+        "parameters": [path_param("asid"), query_param("uri", "Local file URI or path")], "responses": ok_response()
+    }});
+    spec["paths"]["/api/assets/{assetId}/download"] = json!({"get": {
+        "summary": "Save one authenticated asset, including binary files",
+        "description": "Requires device authentication and asset_download capability. Rechecks the indexed directory boundary and limits content to 10 MiB. Returns attachment content disposition; preview-only restrictions remain on the content endpoint.",
+        "parameters": [path_param("assetId")], "responses": ok_response()
+    }});
     spec
 }
 
@@ -1171,7 +1181,7 @@ fn asset_schema() -> Value {
             "id": { "type": "string" },
             "path": { "type": "string" },
             "name": { "type": "string" },
-            "kind": { "type": "string", "enum": ["image", "markdown", "text", "pdf", "binary"] },
+            "kind": { "type": "string", "enum": ["image", "audio", "video", "markdown", "text", "pdf", "binary"] },
             "mime": { "type": "string" },
             "size": { "type": "integer" },
             "modified_unix_ms": { "type": "integer" },
