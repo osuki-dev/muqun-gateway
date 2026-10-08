@@ -48,6 +48,7 @@ use crate::{
 /// A phone previews artifacts, it does not download archives. Anything larger
 /// is refused rather than streamed, so one request can never tie up the host.
 pub(crate) const MAX_ASSET_CONTENT_BYTES: u64 = 10 * 1024 * 1024;
+pub(crate) const MAX_VIDEO_CONTENT_BYTES: u64 = 32 * 1024 * 1024;
 pub(crate) const ASSET_CONTENT_CHUNK_BYTES: usize = 64 * 1024;
 /// Enough of a file's head to decide what it is. The same bytes settle both the
 /// magic-number check and the "is this text" question.
@@ -98,6 +99,8 @@ pub(crate) const ASSET_SKIP_DIRS: &[&str] = &[
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AssetKind {
     Image,
+    Audio,
+    Video,
     Markdown,
     Text,
     Pdf,
@@ -108,6 +111,8 @@ impl AssetKind {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             AssetKind::Image => "image",
+            AssetKind::Audio => "audio",
+            AssetKind::Video => "video",
             AssetKind::Markdown => "markdown",
             AssetKind::Text => "text",
             AssetKind::Pdf => "pdf",
@@ -400,6 +405,31 @@ pub(crate) fn sniff_asset_type(bytes: &[u8], name: &str) -> AssetType {
             mime: "application/pdf",
         };
     }
+    if let Some(mime) = sniff_audio_mime(bytes) {
+        return AssetType {
+            kind: AssetKind::Audio,
+            mime,
+        };
+    }
+    if bytes.len() >= 12
+        && &bytes[4..8] == b"ftyp"
+        && matches!(
+            &bytes[8..12],
+            b"isom" | b"iso2" | b"mp41" | b"mp42" | b"avc1" | b"qt  " | b"M4V "
+        )
+        && name.rsplit_once('.').is_some_and(|(_, ext)| {
+            matches!(ext.to_ascii_lowercase().as_str(), "mp4" | "mov" | "m4v")
+        })
+    {
+        return AssetType {
+            kind: AssetKind::Video,
+            mime: if &bytes[8..12] == b"qt  " {
+                "video/quicktime"
+            } else {
+                "video/mp4"
+            },
+        };
+    }
     if !looks_textual(bytes) {
         return AssetType {
             kind: AssetKind::Binary,
@@ -416,6 +446,52 @@ pub(crate) fn sniff_asset_type(bytes: &[u8], name: &str) -> AssetType {
         kind: AssetKind::Text,
         mime: "text/plain; charset=utf-8",
     }
+}
+
+/// Recognize audio signatures without treating every MP4 or Ogg container as audio.
+fn sniff_audio_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WAVE" {
+        return Some("audio/wav");
+    }
+    if bytes.starts_with(b"fLaC") {
+        return Some("audio/flac");
+    }
+    if bytes.starts_with(b"OggS")
+        && (bytes.windows(8).any(|window| window == b"OpusHead")
+            || bytes.windows(7).any(|window| window == b"\x01vorbis"))
+    {
+        return Some("audio/ogg");
+    }
+    if bytes.len() >= 12
+        && &bytes[4..8] == b"ftyp"
+        && matches!(&bytes[8..12], b"M4A " | b"M4B " | b"F4A ")
+    {
+        return Some("audio/mp4");
+    }
+    if bytes.len() >= 10
+        && bytes.starts_with(b"ID3")
+        && matches!(bytes[3], 2..=4)
+        && bytes[6..10].iter().all(|byte| byte & 0x80 == 0)
+    {
+        return Some("audio/mpeg");
+    }
+    if bytes.len() >= 7 && bytes[0] == 0xff && bytes[1] & 0xf6 == 0xf0 {
+        let sampling_index = (bytes[2] >> 2) & 0x0f;
+        if sampling_index < 13 {
+            return Some("audio/aac");
+        }
+    }
+    if bytes.len() >= 4
+        && bytes[0] == 0xff
+        && bytes[1] & 0xe0 == 0xe0
+        && bytes[1] & 0x18 != 0x08
+        && bytes[1] & 0x06 != 0
+        && matches!(bytes[2] >> 4, 1..=14)
+        && bytes[2] & 0x0c != 0x0c
+    {
+        return Some("audio/mpeg");
+    }
+    None
 }
 
 pub(crate) fn has_markdown_extension(name: &str) -> bool {
@@ -1134,6 +1210,23 @@ pub(crate) async fn asset_content(
     Path(asset_id): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
+    asset_response(state, asset_id, headers, false).await
+}
+
+pub(crate) async fn asset_download(
+    State(state): State<AppState>,
+    Path(asset_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    asset_response(state, asset_id, headers, true).await
+}
+
+async fn asset_response(
+    state: AppState,
+    asset_id: String,
+    headers: HeaderMap,
+    download: bool,
+) -> ApiResult<Response> {
     require_device(&state, &headers)?;
 
     let mut entry = lock_assets(&state)?.get(&asset_id);
@@ -1144,7 +1237,7 @@ pub(crate) async fn asset_content(
     // out of the directory since is a 404.
     if entry.is_none() {
         if let Some(image) = state.message_images.served(&asset_id) {
-            return serve_message_image(asset_id, image).await;
+            return serve_message_image(asset_id, image, download).await;
         }
     }
     if entry.is_none() {
@@ -1195,13 +1288,14 @@ pub(crate) async fn asset_content(
         return Err(asset_not_found());
     };
 
-    stream_asset(entry, path).await
+    stream_asset(entry, path, download).await
 }
 
 /// `asset_content` for an image named in agent text. See `message_images`.
 async fn serve_message_image(
     asset_id: String,
     image: crate::agents::message_images::ServedImage,
+    download: bool,
 ) -> ApiResult<Response> {
     let root = image.root.clone();
     let stored = image.path.clone();
@@ -1227,17 +1321,17 @@ async fn serve_message_image(
         tab_id: None,
         pane_id: None,
     };
-    stream_asset(entry, path).await
+    stream_asset(entry, path, download).await
 }
 
 /// The read itself, once a path has passed its gate: size cap, sniff, stream.
-async fn stream_asset(entry: AssetEntry, path: PathBuf) -> ApiResult<Response> {
+async fn stream_asset(entry: AssetEntry, path: PathBuf, download: bool) -> ApiResult<Response> {
     let metadata = std::fs::metadata(&path).map_err(|_| asset_not_found())?;
-    if metadata.len() > MAX_ASSET_CONTENT_BYTES {
+    if metadata.len() > MAX_VIDEO_CONTENT_BYTES {
         return Err(api_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             "asset_too_large",
-            "the asset is larger than 10 MiB",
+            "the asset is larger than 32 MiB",
         ));
     }
 
@@ -1254,10 +1348,22 @@ async fn stream_asset(entry: AssetEntry, path: PathBuf) -> ApiResult<Response> {
                 )
             })?;
 
+    let limit = if asset_type.kind == AssetKind::Video {
+        MAX_VIDEO_CONTENT_BYTES
+    } else {
+        MAX_ASSET_CONTENT_BYTES
+    };
+    if metadata.len() > limit {
+        return Err(api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "asset_too_large",
+            "the asset exceeds its content size limit",
+        ));
+    }
     let mut entry = entry;
     entry.size = metadata.len();
     entry.modified_unix_ms = system_time_unix_ms(metadata.modified().ok());
-    if !asset_type.kind.previewable() {
+    if !download && !asset_type.kind.previewable() {
         return Ok((
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Json(json!({
@@ -1298,7 +1404,11 @@ async fn stream_asset(entry: AssetEntry, path: PathBuf) -> ApiResult<Response> {
         .header("content-length", metadata.len())
         .header(
             "content-disposition",
-            format!("inline; filename=\"{}\"", header_safe_name(&entry.name)),
+            format!(
+                "{}; filename=\"{}\"",
+                if download { "attachment" } else { "inline" },
+                header_safe_name(&entry.name)
+            ),
         )
         .header("x-asset-kind", asset_type.kind.as_str())
         .header("x-content-schema-version", CONTENT_SCHEMA_VERSION)
@@ -1362,6 +1472,7 @@ pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
             get(session_assets),
         )
         .route("/api/assets/{asset_id}/content", get(asset_content))
+        .route("/api/assets/{asset_id}/download", get(asset_download))
 }
 
 #[cfg(test)]
@@ -1591,6 +1702,148 @@ mod tests {
         assert_eq!(names, vec![String::from("own.txt")]);
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn video_content_accepts_eleven_mib_but_keeps_other_files_and_video_bounded() {
+        let root = asset_test_dir("video-limit");
+        for (name, head, size, accepted) in [
+            (
+                "sample.mp4",
+                b"\x00\x00\x00\x18ftypisom".as_slice(),
+                11 * 1024 * 1024,
+                true,
+            ),
+            (
+                "sample.wav",
+                b"RIFF\x24\x00\x00\x00WAVEfmt ".as_slice(),
+                11 * 1024 * 1024,
+                false,
+            ),
+            (
+                "large.mp4",
+                b"\x00\x00\x00\x18ftypisom".as_slice(),
+                MAX_VIDEO_CONTENT_BYTES + 1,
+                false,
+            ),
+        ] {
+            let path = root.join(name);
+            std::fs::write(&path, head).unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(size)
+                .unwrap();
+            let entry = test_asset_entry(&path, &root, 1_000);
+            let state = asset_listing_state(&root, vec![entry.clone()]);
+            let response =
+                asset_content(State(state), Path(entry.id), bearer_headers("token")).await;
+            if accepted {
+                let response = response.unwrap();
+                assert_eq!(response.headers()["content-type"], "video/mp4");
+                assert_eq!(
+                    axum::body::to_bytes(response.into_body(), MAX_VIDEO_CONTENT_BYTES as usize)
+                        .await
+                        .unwrap()
+                        .len(),
+                    size as usize
+                );
+            } else {
+                assert_eq!(response.unwrap_err().0, StatusCode::PAYLOAD_TOO_LARGE);
+            }
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn audio_content_requires_device_auth_and_streams_only_the_indexed_file() {
+        let root = asset_test_dir("audio-content");
+        let path = root.join("sample.wav");
+        let bytes = b"RIFF\x24\x00\x00\x00WAVEfmt ";
+        std::fs::write(&path, bytes).unwrap();
+        let entry = test_asset_entry(&path, &root, 1_000);
+        let state = asset_listing_state(&root, vec![entry.clone()]);
+        let denied = asset_content(
+            State(state.clone()),
+            Path(entry.id.clone()),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(denied.0, StatusCode::UNAUTHORIZED);
+        let response = asset_content(
+            State(state.clone()),
+            Path(entry.id.clone()),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "audio/wav");
+        assert_eq!(response.headers()["x-asset-kind"], "audio");
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap()
+                .as_ref(),
+            bytes
+        );
+        assert_eq!(
+            listed_asset_names(&state, Some("audio"), 3).await,
+            vec!["sample.wav"]
+        );
+        #[cfg(unix)]
+        {
+            let outside = asset_test_dir("audio-outside");
+            std::fs::write(outside.join("private.wav"), bytes).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink(outside.join("private.wav"), &path).unwrap();
+            let refused = asset_content(State(state), Path(entry.id), bearer_headers("token"))
+                .await
+                .unwrap_err();
+            assert_eq!(refused.0, StatusCode::NOT_FOUND);
+            std::fs::remove_dir_all(outside).ok();
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn audio_signatures_are_previewable_and_video_containers_are_not() {
+        for (bytes, mime) in [
+            (&b"RIFF\x24\x00\x00\x00WAVEfmt "[..], "audio/wav"),
+            (&b"fLaC\x00\x00\x00\x22"[..], "audio/flac"),
+            (&b"OggS\x00\x00OpusHead"[..], "audio/ogg"),
+            (&b"OggS\x00\x00\x01vorbis"[..], "audio/ogg"),
+            (
+                &b"\x00\x00\x00\x20ftypM4A \x00\x00\x00\x00"[..],
+                "audio/mp4",
+            ),
+            (&b"ID3\x04\x00\x00\x00\x00\x00\x00"[..], "audio/mpeg"),
+            (&b"\xff\xfb\x90\x00"[..], "audio/mpeg"),
+            (&b"\xff\xf1\x50\x80\x00\x1f\xfc"[..], "audio/aac"),
+        ] {
+            let detected = sniff_asset_type(bytes, "misleading.bin");
+            assert_eq!(detected.kind, AssetKind::Audio);
+            assert_eq!(detected.mime, mime);
+            assert!(detected.kind.previewable());
+        }
+        for bytes in [
+            &b"\x00\x00\x00\x20ftypisom\x00\x00\x00\x00"[..],
+            &b"OggS\x00\x00\x80theora"[..],
+            &b"RIFF\x24\x00\x00\x00AVI "[..],
+            &b"\xff\xfe\xfd\xfc"[..],
+            &b"\xff\xf1\x7c\x80\x00\x1f\xfc"[..],
+        ] {
+            assert_eq!(
+                sniff_asset_type(bytes, "pretend.mp3").kind,
+                AssetKind::Binary
+            );
+        }
+        assert_eq!(
+            sniff_asset_type(b"not audio", "pretend.mp3").kind,
+            AssetKind::Text
+        );
     }
 
     #[test]

@@ -187,6 +187,13 @@ const EDITOR: &[Shortcut] = &[
     key("⌃V", "ctrl+v", "Visual block"),
 ];
 
+const LAZYGIT: &[Shortcut] = &[
+    key("q", "q", "Quit"),
+    key("?", "?", "Help"),
+    key("/", "/", "Search"),
+    key("SPACE", "space", "Toggle selection"),
+];
+
 const EDITOR_TEXT_ACTIONS: &[(&str, &str, &str, bool)] = &[
     ("/", "nvim:search", "/", false),
     (":", "nvim:cmd", ":", false),
@@ -375,6 +382,16 @@ const AGENT_PROFILES: &[Profile] = &[
 /// that module's own doc on `record`).
 pub(crate) const EDITOR_PROGRAMS: &[&str] = &["vim", "nvim", "nvi", "helix", "hx", "emacs", "nano"];
 
+pub(crate) fn is_lazygit_command(command: &str) -> bool {
+    command
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .rsplit('/')
+        .next()
+        == Some("lazygit")
+}
+
 /// Recognised from the pane title.
 fn is_editor_title(title: &str) -> bool {
     let head = title
@@ -403,7 +420,8 @@ pub fn pane_identity(pane: &Value) -> (Option<&str>, Option<&str>) {
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
     };
-    let editor = field("foreground_command").filter(|command| is_editor_title(command));
+    let editor = field("foreground_command")
+        .filter(|command| is_editor_title(command) || is_lazygit_command(command));
     (
         field("agent"),
         editor.or_else(|| field("terminal_title_stripped")),
@@ -491,6 +509,9 @@ fn select_profile<'a>(
             SHELL,
             AGENT_INTERRUPT,
         ),
+        (None, None) if pane_title.is_some_and(is_lazygit_command) => {
+            ("lazygit".to_owned(), LAZYGIT, AGENT_INTERRUPT)
+        }
         (None, None) if pane_title.is_some_and(is_editor_title) => {
             ("editor".to_owned(), EDITOR, AGENT_INTERRUPT)
         }

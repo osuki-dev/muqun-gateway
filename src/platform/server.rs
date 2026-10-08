@@ -18,7 +18,7 @@ use tower_http::compression::{
     CompressionLayer,
 };
 
-use super::assets::{AssetIndex, MAX_ASSET_CONTENT_BYTES};
+use super::assets::{AssetIndex, MAX_VIDEO_CONTENT_BYTES};
 use super::metadata::SessionLivenessCache;
 use super::store::{
     ensure_pairing_transport_key, load_devices_for_service, load_push_tokens_for_service,
@@ -533,7 +533,7 @@ pub(crate) async fn encrypt_transport_response(
     // every other route answers JSON well under the request limit.
     let body = match to_bytes(
         body,
-        MAX_ASSET_CONTENT_BYTES as usize + MAX_REQUEST_BODY_BYTES,
+        MAX_VIDEO_CONTENT_BYTES as usize + MAX_REQUEST_BODY_BYTES,
     )
     .await
     {
