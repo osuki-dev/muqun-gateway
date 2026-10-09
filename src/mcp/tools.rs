@@ -171,6 +171,9 @@ fn task_error(error: TaskError) -> CallToolResult {
         TaskError::UnknownModel(_) => invalid(
             "Unknown model for that agent. Use a model id from its catalog, or <provider_id>/<model_id>.",
         ),
+        TaskError::UnknownVariant(_) => invalid(
+            "variant needs a model, and must be one of that model's variants.",
+        ),
         TaskError::NoTimeline => invalid("Only a delegated task has a timeline."),
         TaskError::NoTerminal => fail(
             "no_terminal",
@@ -272,6 +275,9 @@ pub(crate) struct DelegateArgs {
     /// Model id for the agent, e.g. "claude-haiku-5-5" (or "<provider_id>/<model_id>"). Default: the agent's default.
     #[serde(default)]
     pub model: Option<String>,
+    /// Model variant (reasoning effort) from the model's catalog entry, e.g. "high". Needs `model`.
+    #[serde(default)]
+    pub variant: Option<String>,
     /// The computer to run on: "self" (default) or its machineId.
     #[serde(default)]
     pub machine: Option<String>,
@@ -292,6 +298,7 @@ impl DelegateArgs {
             agent_id: self.agent_id,
             mode: self.mode,
             model: self.model,
+            variant: self.variant,
             machine: self.machine,
             label: None,
         })
@@ -545,6 +552,7 @@ mod tests {
             agent_id: None,
             mode: None,
             model: None,
+            variant: None,
             machine: None,
         };
         let (error, _, body) = answer(mcp.tasks_delegate(Parameters(args)).await);
@@ -646,6 +654,7 @@ mod tests {
             agent_id: None,
             mode: None,
             model: None,
+            variant: None,
             machine: None,
         }
         .request()
@@ -659,6 +668,7 @@ mod tests {
             agent_id: None,
             mode: None,
             model: None,
+            variant: None,
             machine: None,
         };
         let (error, _, body) = answer(mcp.tasks_delegate(Parameters(args)).await);
@@ -805,5 +815,17 @@ mod tests {
                 "tasks.wait"
             ]
         );
+    }
+
+    #[test]
+    fn delegate_args_carry_an_optional_variant_and_tolerate_unknown_fields() {
+        let args: DelegateArgs = serde_json::from_value(json!({
+            "goal": "g", "model": "openai/gpt-6", "variant": "high", "later": true
+        }))
+        .unwrap();
+        let request = args.request().unwrap();
+        assert_eq!(request.variant.as_deref(), Some("high"));
+        let none: DelegateArgs = serde_json::from_value(json!({ "goal": "g" })).unwrap();
+        assert_eq!(none.request().unwrap().variant, None);
     }
 }

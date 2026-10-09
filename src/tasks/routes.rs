@@ -112,6 +112,8 @@ struct CreateBody {
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
+    variant: Option<String>,
+    #[serde(default)]
     label: Option<String>,
 }
 
@@ -156,7 +158,7 @@ impl CreateBody {
                 "goal must be non-empty and at most 32 KiB",
             ));
         }
-        let names = [&self.agent_id, &self.mode, &self.model];
+        let names = [&self.agent_id, &self.mode, &self.model, &self.variant];
         if names
             .iter()
             .filter_map(|name| name.as_deref())
@@ -183,6 +185,7 @@ impl CreateBody {
             agent_id: self.agent_id,
             mode: self.mode,
             model: self.model,
+            variant: self.variant,
             machine: None,
             label,
         })
@@ -245,6 +248,10 @@ fn create_failed(error: TaskError) -> (StatusCode, Json<Value>) {
                 "the agent could not start the task",
             )
         }
+        TaskError::UnknownVariant(_) => refused(
+            "unknown_variant",
+            "variant needs a model, and must be one of that model's variants.",
+        ),
         error => failed(error),
     }
 }
@@ -615,5 +622,47 @@ mod tests {
         assert_eq!(none["tasks"], json!([]));
         let (status, _) = call(&state, "GET", "/api/tasks?root=").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_device_may_name_the_model_variant_and_unknown_fields_are_tolerated() {
+        let state = state();
+        let mut agent =
+            crate::test_support::FakeAgent::new("opencode").with_sessions(&[("opencode_new", 1)]);
+        agent.catalog.models = vec![serde_json::from_value(json!({
+            "id": "gpt-6", "name": "GPT-6", "provider_id": "openai",
+            "variants": [{ "id": "low" }, { "id": "high" }]
+        }))
+        .unwrap()];
+        let created = agent.created_with.clone();
+        state.agent_runtime.attach_for_test(agent.manager()).await;
+
+        let open = json!({
+            "goal": "x", "cwd": std::env::temp_dir().canonicalize().unwrap(),
+            "model": "openai/gpt-6", "variant": "high", "from_a_newer_app": [1, 2]
+        });
+        let (status, task) = send(&state, "POST", "/api/tasks", Some(open), true).await;
+        assert_eq!(status, StatusCode::OK, "{task}");
+        let asked = created.lock().unwrap()[0].clone().unwrap();
+        assert_eq!(asked.variant.as_deref(), Some("high"));
+        assert_eq!(task.get("variant"), None, "the task view does not carry it");
+
+        for (body, code) in [
+            (
+                json!({ "goal": "x", "model": "gpt-6", "variant": "max" }),
+                "unknown_variant",
+            ),
+            (json!({ "goal": "x", "variant": "high" }), "unknown_variant"),
+            (
+                json!({ "goal": "x", "model": "gpt-6", "variant": " " }),
+                "invalid_request",
+            ),
+        ] {
+            let (status, answer) =
+                send(&state, "POST", "/api/tasks", Some(body.clone()), true).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(answer["error"]["code"], code, "{body}");
+        }
+        assert_eq!(created.lock().unwrap().len(), 1, "nothing else was created");
     }
 }

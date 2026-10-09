@@ -26,6 +26,7 @@ use crate::agents::domain::{
 };
 use crate::agents::manager::AgentManager;
 use crate::agents::ports::agent::AgentError;
+use crate::agents::ports::mirror::SessionMirrorPort;
 use crate::agents::runtime::AGENT_PREFERENCE;
 use crate::fleet::manifest::is_self;
 use crate::AppState;
@@ -58,6 +59,8 @@ pub(crate) struct DelegateRequest {
     pub agent_id: Option<String>,
     pub mode: Option<String>,
     pub model: Option<String>,
+    /// The model's variant (reasoning effort); needs `model`.
+    pub variant: Option<String>,
     pub machine: Option<String>,
     /// A short title for the task.
     pub label: Option<String>,
@@ -122,6 +125,8 @@ pub(crate) enum TaskError {
     AgentUnavailable(String),
     /// `model` names nothing in the agent's catalog for that directory.
     UnknownModel(String),
+    /// `variant` came without a `model`, or is not one the model lists.
+    UnknownVariant(String),
     /// No configured terminal session answers, so a command has nowhere to run.
     NoTerminal,
     /// A timeline was asked of a task that has none (a command).
@@ -139,6 +144,7 @@ impl std::fmt::Display for TaskError {
             Self::UnknownMachine(machine) => write!(f, "unknown machine '{machine}'"),
             Self::AgentUnavailable(agent) => write!(f, "agent '{agent}' is not available"),
             Self::UnknownModel(model) => write!(f, "unknown model '{model}'"),
+            Self::UnknownVariant(variant) => write!(f, "unknown variant '{variant}'"),
             Self::NoTerminal => write!(f, "{}", run_command::NO_TERMINAL),
             Self::NoTimeline => write!(f, "only a delegated task has a timeline"),
             Self::Store(error) => write!(f, "task store: {error:#}"),
@@ -330,6 +336,10 @@ impl TaskService {
         }
         let manager = agent_for(state, request.agent_id.as_deref()).await?;
         let agent_id = manager.agent().kind();
+        let variant = request.variant.as_deref();
+        if let (Some(variant), None) = (variant, request.model.as_deref()) {
+            return Err(TaskError::UnknownVariant(variant.to_owned()));
+        }
         let model = match request.model.as_deref() {
             Some(id) => {
                 let catalog = manager
@@ -337,8 +347,9 @@ impl TaskService {
                     .get_catalog(request.cwd.as_deref())
                     .await?;
                 Some(
-                    resolve_model(&catalog.models, id)
-                        .ok_or_else(|| TaskError::UnknownModel(id.to_owned()))?,
+                    resolve_model(&catalog.models, id, variant)
+                        .ok_or_else(|| TaskError::UnknownModel(id.to_owned()))?
+                        .map_err(TaskError::UnknownVariant)?,
                 )
             }
             None => None,
@@ -519,7 +530,7 @@ impl TaskService {
         };
         let answer = match &view.binding {
             TaskBinding::AgentSession { asid, .. } if view.state == TaskState::Done => {
-                full_answer(state, asid).await
+                full_answer(state, asid, task.created_ms).await
             }
             _ => None,
         };
@@ -565,16 +576,7 @@ impl TaskService {
                 }
                 Step::Idle if !seen_busy => continue,
                 Step::Idle => {
-                    let items = match manager.agent().get_timeline(asid, SUMMARY_ITEMS).await {
-                        Ok(items) => items,
-                        Err(error) => {
-                            tracing::warn!(
-                                "task {}: no summary, timeline read failed: {error}",
-                                task.id.0
-                            );
-                            Vec::new()
-                        }
-                    };
+                    let items = summary_timeline(&manager, asid, task.created_ms).await;
                     TaskChange {
                         summary: result_line(&items),
                         ..change(TaskState::Done)
@@ -928,15 +930,9 @@ impl TaskService {
         if !finished_since(&session, task.created_ms) {
             return None;
         }
-        let summary = match manager.agent().get_timeline(asid, SUMMARY_ITEMS).await {
-            Ok(items) => result_line(&items),
-            Err(error) => {
-                tracing::warn!(task = %task.id.0, %error, "task follower: no summary");
-                None
-            }
-        };
+        let items = summary_timeline(&manager, asid, task.created_ms).await;
         Some(TaskChange {
-            summary,
+            summary: result_line(&items),
             ..change(TaskState::Done)
         })
     }
@@ -952,21 +948,59 @@ pub(crate) const OPEN_STATES: [TaskState; 5] = [
 ];
 const FOLLOWER: &str = "task_follower";
 
+/// The timeline a finished delegation's summary is read from.
+///
+/// The agent's own read is asked first (OpenCode persists its answer before
+/// it goes idle). It can lag the stream, though: DeepSeek reports the turn's
+/// end from its live stream while `session/page` has yet to commit the final
+/// assistant message, and then holds no answer for this turn at all. The
+/// gateway's mirror of the session has the streamed rows by then, so when the
+/// agent's read lacks an assistant answer written since `since_ms` (the
+/// task's start), the mirror is read instead.
+pub(crate) async fn summary_timeline(
+    manager: &AgentManager,
+    asid: &str,
+    since_ms: u64,
+) -> Vec<TimelineItem> {
+    let read = match manager.agent().get_timeline(asid, SUMMARY_ITEMS).await {
+        Ok(items) => items,
+        Err(error) => {
+            tracing::warn!(asid, %error, "task summary: timeline read failed");
+            Vec::new()
+        }
+    };
+    if answered_since(&read, since_ms) {
+        return read;
+    }
+    match manager
+        .mirror()
+        .get_snapshot(&AgentSessionId(asid.to_owned()))
+        .await
+    {
+        Some(snapshot) if answered_since(&snapshot.timeline, since_ms) => snapshot.timeline,
+        _ => read,
+    }
+}
+
+/// Whether `items` end in an assistant answer written at or after `since_ms`.
+/// A row without a time (0) is taken to be current.
+fn answered_since(items: &[TimelineItem], since_ms: u64) -> bool {
+    items.iter().rev().any(|item| {
+        item.role == TimelineRole::Assistant
+            && matches!(&item.part, AgentPart::Text { text } if !text.trim().is_empty())
+            && (item.updated_ms == 0 || item.updated_ms >= since_ms)
+    })
+}
+
 /// A delegation's summary: the last assistant message as one line.
 pub(crate) fn result_line(items: &[TimelineItem]) -> Option<String> {
     last_assistant_text(items).map(|text| one_line(&text, SUMMARY_CHARS))
 }
 
 /// The last assistant message of `asid`, in full; `None` when it cannot be read.
-async fn full_answer(state: &AppState, asid: &str) -> Option<String> {
+async fn full_answer(state: &AppState, asid: &str, since_ms: u64) -> Option<String> {
     let manager = state.agent_runtime.manager_for_session(asid).await?;
-    match manager.agent().get_timeline(asid, SUMMARY_ITEMS).await {
-        Ok(items) => last_assistant_text(&items),
-        Err(error) => {
-            tracing::debug!(%error, "task wait: no answer");
-            None
-        }
-    }
+    last_assistant_text(&summary_timeline(&manager, asid, since_ms).await)
 }
 
 fn command_error(error: anyhow::Error) -> TaskError {
@@ -1188,7 +1222,15 @@ pub(crate) fn compact_item(item: &TimelineItem) -> Value {
 /// or a bare `<model_id>`. The qualified spelling wins, so a model id that
 /// two providers share can still be pinned to one of them; a bare id takes
 /// the first provider the catalog lists.
-fn resolve_model(models: &[ModelInfo], id: &str) -> Option<ModelRef> {
+///
+/// `variant` is kept as is when the model lists no variants (the catalog says
+/// nothing against it) and must be one of them otherwise. The outer `None` is
+/// an unknown model, the inner `Err` an unknown variant.
+fn resolve_model(
+    models: &[ModelInfo],
+    id: &str,
+    variant: Option<&str>,
+) -> Option<Result<ModelRef, String>> {
     let qualified = id.split_once('/').and_then(|(provider, model_id)| {
         models
             .iter()
@@ -1196,10 +1238,17 @@ fn resolve_model(models: &[ModelInfo], id: &str) -> Option<ModelRef> {
     });
     qualified
         .or_else(|| models.iter().find(|model| model.id == id))
-        .map(|found| ModelRef {
-            provider_id: found.provider_id.clone(),
-            model_id: found.id.clone(),
-            variant: None,
+        .map(|found| {
+            if let (Some(wanted), Some(listed)) = (variant, found.variants.as_deref()) {
+                if !listed.is_empty() && !listed.iter().any(|v| v.id == wanted) {
+                    return Err(wanted.to_owned());
+                }
+            }
+            Ok(ModelRef {
+                provider_id: found.provider_id.clone(),
+                model_id: found.id.clone(),
+                variant: variant.map(str::to_owned),
+            })
         })
 }
 
@@ -1233,6 +1282,7 @@ mod tests {
             agent_id: None,
             mode: None,
             model: None,
+            variant: None,
             machine: machine.map(str::to_owned),
             label: None,
         }
@@ -1364,21 +1414,27 @@ mod tests {
             model("anthropic", "claude-haiku-5-5"),
             model("openrouter", "anthropic/claude-opus"),
         ];
-        let bare = resolve_model(&models, "claude-haiku-5-5").unwrap();
+        let bare = resolve_model(&models, "claude-haiku-5-5", None)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             (bare.provider_id.as_str(), bare.model_id.as_str()),
             ("openrouter", "claude-haiku-5-5")
         );
-        let pinned = resolve_model(&models, "anthropic/claude-haiku-5-5").unwrap();
+        let pinned = resolve_model(&models, "anthropic/claude-haiku-5-5", None)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             (pinned.provider_id.as_str(), pinned.model_id.as_str()),
             ("anthropic", "claude-haiku-5-5")
         );
         // An id that itself carries a slash still matches as a bare id.
-        let slashed = resolve_model(&models, "anthropic/claude-opus").unwrap();
+        let slashed = resolve_model(&models, "anthropic/claude-opus", None)
+            .unwrap()
+            .unwrap();
         assert_eq!(slashed.provider_id, "openrouter");
-        assert_eq!(resolve_model(&models, "gpt-9"), None);
-        assert_eq!(resolve_model(&models, "anthropic/gpt-9"), None);
+        assert_eq!(resolve_model(&models, "gpt-9", None), None);
+        assert_eq!(resolve_model(&models, "anthropic/gpt-9", None), None);
     }
 
     #[tokio::test]
@@ -2209,5 +2265,179 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    fn model_with_variants(provider_id: &str, id: &str, variants: &[&str]) -> ModelInfo {
+        serde_json::from_value(json!({
+            "id": id, "name": id, "provider_id": provider_id,
+            "variants": variants.iter().map(|v| json!({ "id": v })).collect::<Vec<_>>()
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_variant_reaches_the_create_request_and_is_checked_against_the_catalog() {
+        let state = test_state("admin", Vec::new());
+        let mut agent = FakeAgent::new("opencode").with_sessions(&[(ASID, 1)]);
+        agent.catalog.models = vec![
+            model_with_variants("openai", "gpt-6", &["low", "high"]),
+            model("anthropic", "claude-haiku-5-5"),
+        ];
+        let calls = agent.calls.clone();
+        let created = agent.created_with.clone();
+        state.agent_runtime.attach_for_test(agent.manager()).await;
+        let open = |model: Option<&str>, variant: Option<&str>| {
+            let mut asked = request(None);
+            asked.model = model.map(str::to_owned);
+            asked.variant = variant.map(str::to_owned);
+            asked
+        };
+        let delegate = |asked| {
+            state
+                .tasks
+                .delegate(&state, Requested::mcp(assistant("a")), asked)
+        };
+
+        // A variant the model lists, a variant of a model that lists none
+        // (passed through), and no variant at all.
+        delegate(open(Some("openai/gpt-6"), Some("high")))
+            .await
+            .unwrap();
+        delegate(open(Some("claude-haiku-5-5"), Some("max")))
+            .await
+            .unwrap();
+        delegate(open(Some("gpt-6"), None)).await.unwrap();
+        let variants: Vec<_> = created
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|model| model.as_ref().and_then(|m| m.variant.clone()))
+            .collect();
+        assert_eq!(
+            variants,
+            [Some("high".to_owned()), Some("max".to_owned()), None]
+        );
+
+        // Not one of the model's variants, or no model to take it: refused,
+        // and nothing more is created.
+        let before = calls.lock().unwrap().len();
+        let unlisted = delegate(open(Some("gpt-6"), Some("max")))
+            .await
+            .unwrap_err();
+        assert!(matches!(unlisted, TaskError::UnknownVariant(ref v) if v == "max"));
+        let modelless = delegate(open(None, Some("high"))).await.unwrap_err();
+        assert!(matches!(modelless, TaskError::UnknownVariant(_)));
+        assert_eq!(calls.lock().unwrap().len(), before);
+    }
+
+    /// What the follower sees when a session ends its turn and the agent's
+    /// own read holds nothing for this turn: the answer is in the mirror.
+    async fn with_mirrored_answer(
+        driver_side: Vec<TimelineItem>,
+        message_id: &str,
+        text: &str,
+    ) -> (AppState, TaskId) {
+        let (state, id) = tracked(finished_agent(driver_side)).await;
+        let manager = state
+            .agent_runtime
+            .manager_for_agent("opencode")
+            .await
+            .unwrap();
+        let mut live = reply(message_id, text);
+        live.updated_ms = now_ms();
+        manager
+            .mirror()
+            .upsert_timeline_items(&AgentSessionId(ASID.into()), vec![live])
+            .await;
+        (state, id)
+    }
+
+    #[tokio::test]
+    async fn the_summary_comes_from_the_stream_when_the_agent_read_lags_it() {
+        // DeepSeek: `turn/end` (idle) is announced from the live stream, whose
+        // rows carry a provisional message id, before `session/page` has the
+        // committed assistant message.
+        let (state, id) =
+            with_mirrored_answer(Vec::new(), "s000000000008~attempt-1", "PONG\n").await;
+        assert!(
+            state
+                .tasks
+                .follow(&state, &status(AgentSessionStatus::Idle))
+                .await
+        );
+        let task = state.tasks.get_for_test(&id).await;
+        assert_eq!(task.state, TaskState::Done);
+        assert_eq!(task.summary.as_deref(), Some("PONG"));
+        let waited = state
+            .tasks
+            .wait(&state, &assistant("a"), &id, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(waited.answer.as_deref(), Some("PONG\n"));
+    }
+
+    #[tokio::test]
+    async fn a_previous_turns_answer_in_the_agent_read_does_not_become_the_summary() {
+        // The agent's page still ends in the last turn's answer (older than
+        // the task); this turn's is in the mirror.
+        let mut stale = reply("m1", "an old answer");
+        stale.updated_ms = 1;
+        let (state, id) = with_mirrored_answer(vec![stale], "m2~a", "fresh").await;
+        assert!(
+            state
+                .tasks
+                .follow(&state, &status(AgentSessionStatus::Idle))
+                .await
+        );
+        let task = state.tasks.get_for_test(&id).await;
+        assert_eq!(task.summary.as_deref(), Some("fresh"));
+    }
+
+    #[tokio::test]
+    async fn the_agent_read_wins_when_it_has_this_turns_answer() {
+        // OpenCode: persisted before idle; the mirror's copy may be older.
+        let (state, id) =
+            with_mirrored_answer(vec![reply("m1", "from the agent")], "m0", "x").await;
+        assert!(
+            state
+                .tasks
+                .follow(&state, &status(AgentSessionStatus::Idle))
+                .await
+        );
+        let task = state.tasks.get_for_test(&id).await;
+        assert_eq!(task.summary.as_deref(), Some("from the agent"));
+    }
+
+    #[tokio::test]
+    async fn a_waiter_gets_the_streamed_summary_too_and_a_failure_keeps_its_line() {
+        let (state, id) = with_mirrored_answer(Vec::new(), "m1~a", "all green").await;
+        let done = wait_through(
+            &state,
+            &id,
+            vec![
+                status(AgentSessionStatus::Busy),
+                status(AgentSessionStatus::Idle),
+            ],
+        )
+        .await;
+        assert_eq!(done.state, TaskState::Done);
+        assert_eq!(done.summary.as_deref(), Some("all green"));
+
+        // Failed: the error line, whatever the provider.
+        let (state, id) = tracked(FakeAgent::new("opencode").with_sessions(&[(ASID, 1)])).await;
+        let failed = AgentDomainEvent::StatusChanged {
+            asid: AgentSessionId(ASID.into()),
+            status: AgentSessionStatus::Failed,
+            error: Some(crate::agents::domain::AgentErrorInfo {
+                name: "TurnError".into(),
+                message: "the turn failed".into(),
+                status: None,
+            }),
+            seq: 0,
+        };
+        assert!(state.tasks.follow(&state, &failed).await);
+        let task = state.tasks.get_for_test(&id).await;
+        assert_eq!(task.state, TaskState::Failed);
+        assert_eq!(task.summary.as_deref(), Some("TurnError: the turn failed"));
     }
 }

@@ -955,6 +955,7 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
                         "cwd": { "type": "string", "description": "Absolute directory (~ expands); default: the home directory" },
                         "mode": { "type": "string" },
                         "model": { "type": "string", "description": "A model id from the agent's catalog, or provider_id/model_id" },
+                        "variant": { "type": "string", "description": "The model's variant (reasoning effort), applied when the session is created so the first turn uses it. Needs model; must be one of the model's catalog variants when it lists any" },
                         "label": { "type": "string", "description": "A short title, at most 200 characters" }
                     }
                 })),

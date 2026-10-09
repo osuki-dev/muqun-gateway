@@ -796,6 +796,8 @@ pub(crate) struct FakeAgent {
     /// Shared, so a test can answer them after the agent moved.
     pub permissions: Arc<Mutex<Vec<agents::domain::PermissionRequest>>>,
     pub calls: Arc<Mutex<Vec<String>>>,
+    /// The model each `create_session` was asked for.
+    pub created_with: Arc<Mutex<Vec<Option<agents::domain::ModelRef>>>>,
 }
 
 impl FakeAgent {
@@ -809,6 +811,7 @@ impl FakeAgent {
             session_timelines: HashMap::new(),
             permissions: Arc::default(),
             calls: Arc::default(),
+            created_with: Arc::default(),
         }
     }
 
@@ -894,7 +897,7 @@ impl agents::ports::agent::AgentPort for FakeAgent {
     fn create_session<'a>(
         &'a self,
         directory: Option<&'a str>,
-        _model: Option<&'a agents::domain::ModelRef>,
+        model: Option<&'a agents::domain::ModelRef>,
         _mode: Option<&'a str>,
     ) -> agents::ports::agent::AgentFuture<'a, agents::domain::AgentSessionInfo> {
         Box::pin(async move {
@@ -902,6 +905,7 @@ impl agents::ports::agent::AgentPort for FakeAgent {
                 return self.fail();
             }
             self.record("create_session");
+            self.created_with.lock().unwrap().push(model.cloned());
             let mut session = fake_session(&format!("{}_new", self.kind), 1);
             session.directory = directory.map(str::to_string);
             Ok(session)

@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use super::domain::one_line;
 use super::domain::{now_ms, Task, TaskBinding, TaskChange, TaskFilter, TaskState};
-use super::service::{finished_since, result_line, OPEN_STATES, SUMMARY_CHARS, SUMMARY_ITEMS};
+use super::service::{finished_since, result_line, summary_timeline, OPEN_STATES, SUMMARY_CHARS};
 use crate::agents::domain::AgentSessionStatus;
 use crate::agents::ports::agent::AgentError;
 use crate::{terminal_backend, AppState};
@@ -199,15 +199,9 @@ async fn settle_delegation(state: &AppState, task: &Task, agent_id: &str, asid: 
     if !finished_since(&session, task.created_ms) {
         return false;
     }
-    let summary = match manager.agent().get_timeline(asid, SUMMARY_ITEMS).await {
-        Ok(items) => result_line(&items),
-        Err(error) => {
-            tracing::warn!(task = %task.id.0, %error, "task driver: no summary");
-            None
-        }
-    };
+    let items = summary_timeline(&manager, asid, task.created_ms).await;
     let done = TaskChange {
-        summary,
+        summary: result_line(&items),
         ..change(TaskState::Done)
     };
     moved(state, task, done).await
