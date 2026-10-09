@@ -59,7 +59,7 @@ pub(crate) struct DelegateRequest {
     pub agent_id: Option<String>,
     pub mode: Option<String>,
     pub model: Option<String>,
-    /// The model's variant (reasoning effort); needs `model`.
+    /// The model's variant (reasoning effort); applied only together with `model`.
     pub variant: Option<String>,
     pub machine: Option<String>,
     /// A short title for the task.
@@ -125,7 +125,7 @@ pub(crate) enum TaskError {
     AgentUnavailable(String),
     /// `model` names nothing in the agent's catalog for that directory.
     UnknownModel(String),
-    /// `variant` came without a `model`, or is not one the model lists.
+    /// `variant` is not one the resolved model lists.
     UnknownVariant(String),
     /// No configured terminal session answers, so a command has nowhere to run.
     NoTerminal,
@@ -337,9 +337,6 @@ impl TaskService {
         let manager = agent_for(state, request.agent_id.as_deref()).await?;
         let agent_id = manager.agent().kind();
         let variant = request.variant.as_deref();
-        if let (Some(variant), None) = (variant, request.model.as_deref()) {
-            return Err(TaskError::UnknownVariant(variant.to_owned()));
-        }
         let model = match request.model.as_deref() {
             Some(id) => {
                 let catalog = manager
@@ -2318,16 +2315,16 @@ mod tests {
             [Some("high".to_owned()), Some("max".to_owned()), None]
         );
 
-        // Not one of the model's variants, or no model to take it: refused,
-        // and nothing more is created.
+        // Not one of the model's variants: refused, and nothing more is
+        // created. Without a model the variant is dropped.
         let before = calls.lock().unwrap().len();
         let unlisted = delegate(open(Some("gpt-6"), Some("max")))
             .await
             .unwrap_err();
         assert!(matches!(unlisted, TaskError::UnknownVariant(ref v) if v == "max"));
-        let modelless = delegate(open(None, Some("high"))).await.unwrap_err();
-        assert!(matches!(modelless, TaskError::UnknownVariant(_)));
         assert_eq!(calls.lock().unwrap().len(), before);
+        delegate(open(None, Some("high"))).await.unwrap();
+        assert_eq!(created.lock().unwrap().last().unwrap(), &None);
     }
 
     /// What the follower sees when a session ends its turn and the agent's

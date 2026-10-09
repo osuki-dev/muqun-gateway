@@ -250,7 +250,7 @@ fn create_failed(error: TaskError) -> (StatusCode, Json<Value>) {
         }
         TaskError::UnknownVariant(_) => refused(
             "unknown_variant",
-            "variant needs a model, and must be one of that model's variants.",
+            "variant is not one of that model's variants.",
         ),
         error => failed(error),
     }
@@ -652,7 +652,6 @@ mod tests {
                 json!({ "goal": "x", "model": "gpt-6", "variant": "max" }),
                 "unknown_variant",
             ),
-            (json!({ "goal": "x", "variant": "high" }), "unknown_variant"),
             (
                 json!({ "goal": "x", "model": "gpt-6", "variant": " " }),
                 "invalid_request",
@@ -664,5 +663,10 @@ mod tests {
             assert_eq!(answer["error"]["code"], code, "{body}");
         }
         assert_eq!(created.lock().unwrap().len(), 1, "nothing else was created");
+        let cwd = std::env::temp_dir().canonicalize().unwrap();
+        let body = json!({ "goal": "x", "cwd": cwd, "variant": "high" });
+        let (status, task) = send(&state, "POST", "/api/tasks", Some(body), true).await;
+        assert_eq!(status, StatusCode::OK, "a variant alone is dropped: {task}");
+        assert_eq!(created.lock().unwrap()[1], None);
     }
 }

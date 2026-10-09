@@ -127,7 +127,7 @@ says `"truncated": true` when it left older ones out. `tasks.wait` and
 | `fleet.list` | none | `{"machines": [{machineId, label, os, online, suitableFor, tasksActive}]}`. List the computers this gateway knows (this one only for now): alias, OS, what each is suitable for, how busy it is. |
 | `fleet.describe` | `machine?`: `"self"` (default) or a `machineId` | A compact manifest of that computer: `GET /api/fleet/self`'s fields, but each agent is only `{id, kind, status, version, modes, modelCount}` (mode ids, no model catalog) and each terminal backend `{sessionId, label, kind, connected, version}`. What a computer offers: its agents, terminal backends, toolchains with versions, task counts and what it is suitable for. |
 | `exec.run` | `cwd`: absolute directory; `command`: shell command, run as `sh -c <command>` (at most 16 KiB); `timeout_s?`: 1..=45, default 30 | `{task_id, state, exit_code, stdout_tail, duration_ms, pane}`. Run a shell command in a visible terminal pane on this computer and return its exit code and output tail. Blocks up to timeout_s (max 45); if still running, returns a task_id for tasks.wait. `exit_code` is null while it runs; `pane` is `{session_id, pane_id}`. |
-| `tasks.delegate` | `goal` (at most 32 KiB); `cwd?`: absolute directory; `agent_id?` (default: the primary agent); `mode?` (for example `build` or `plan`); `model?`: a model id from the agent's catalog for `cwd` (for example `claude-haiku-5-5`), or `<provider_id>/<model_id>` to pick one provider; default: the agent's default. An unknown id is `invalid_arguments` and nothing is created; `variant?`: the model's variant (reasoning effort, for example `high`), applied when the session is created so the first turn uses it; needs `model`, and must be one of the model's catalog variants when it lists any (else `invalid_arguments`); `machine?` | A task view (see [Tasks API](#tasks-api)), filed under the caller's task when the gateway can tell which one it is (see [Task tree](#task-tree)). Start a sub-task on an agent on this computer: a new session in cwd with your goal as the first prompt. Returns task_id; poll with tasks.wait. |
+| `tasks.delegate` | `goal` (at most 32 KiB); `cwd?`: absolute directory; `agent_id?` (default: the primary agent); `mode?` (for example `build` or `plan`); `model?`: a model id from the agent's catalog for `cwd` (for example `claude-haiku-5-5`), or `<provider_id>/<model_id>` to pick one provider; default: the agent's default. An unknown id is `invalid_arguments` and nothing is created; `variant?`: the model's variant (reasoning effort, for example `high`), applied when the session is created so the first turn uses it; applied only together with `model` (ignored otherwise), and must be one of the model's catalog variants when it lists any (else `invalid_arguments`); `machine?` | A task view (see [Tasks API](#tasks-api)), filed under the caller's task when the gateway can tell which one it is (see [Task tree](#task-tree)). Start a sub-task on an agent on this computer: a new session in cwd with your goal as the first prompt. Returns task_id; poll with tasks.wait. |
 | `tasks.wait` | `task_id`; `timeout_s?`: 1..=45, default 30 | The task view, plus `stdout_tail` for a command, and `answer` for a done delegation: the agent's last message in full (`summary` holds only its first 240 characters, on one line). Wait up to timeout_s (max 45) for a task to reach done/failed/waiting. Returns the current state and summary; call again while it says working. |
 | `tasks.read` | `task_id`; `what`: `summary` or `timeline`; `cursor?` (timeline only) | `summary`: the task view. `timeline`: `{task_id, items, cursor}`, the most recent agent items after `cursor`; pass the returned `cursor` to read on. Read a task you created: its summary or recent timeline. A command has no timeline. |
 | `tasks.cancel` | `task_id` | The task view after the cancel. Interrupt a task you created. |
@@ -241,8 +241,9 @@ expands) and defaults to the home directory, as for `POST
 /api/agent-sessions`; `model` is a model id from the agent's catalog or
 `<provider_id>/<model_id>`; `variant` is that model's variant (reasoning
 effort, for example `high`), applied when the session is created so the first
-turn already runs with it -- it needs `model` and must be one of the model's
-catalog variants when the catalog lists any; `label` is at most 200 characters.
+turn already runs with it -- it is applied only together with `model` (ignored
+otherwise) and must be one of the model's catalog variants when the catalog
+lists any; `label` is at most 200 characters.
 Fields the gateway does not know are ignored. The answer is
 the task view plus the session to open:
 
@@ -261,7 +262,7 @@ the task view plus the session to open:
 | `400 invalid_request` | An empty or oversized `goal`, a `label` over 200 characters, an empty or oversized (256 bytes) `agent_id`/`mode`/`model`/`variant`. |
 | `400 invalid_directory`, `directory_not_found`, `not_a_directory` | `cwd` is relative, missing, or not a directory. Nothing is created. |
 | `400 unknown_model` | `model` is not in the agent's catalog for `cwd`. Nothing is created. |
-| `400 unknown_variant` | `variant` without a `model`, or not one of the model's catalog variants. Nothing is created. |
+| `400 unknown_variant` | `variant` is not one of the resolved model's catalog variants (a variant without a `model` is ignored). Nothing is created. |
 | `503 agent_unavailable` | That agent (or, without `agent_id`, any agent) is not attached. |
 | `400 invalid_request` (body) | The body is not a JSON object of the shape above. Authentication is checked first, so without a valid device token this is `401`/`403` whatever the body. |
 | `502 agent_error` | The agent could not create the session or take the prompt; the task is recorded as `failed`, with the error as its `summary`. |

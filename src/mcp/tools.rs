@@ -172,7 +172,7 @@ fn task_error(error: TaskError) -> CallToolResult {
             "Unknown model for that agent. Use a model id from its catalog, or <provider_id>/<model_id>.",
         ),
         TaskError::UnknownVariant(_) => invalid(
-            "variant needs a model, and must be one of that model's variants.",
+            "variant is not one of that model's variants.",
         ),
         TaskError::NoTimeline => invalid("Only a delegated task has a timeline."),
         TaskError::NoTerminal => fail(
@@ -275,7 +275,7 @@ pub(crate) struct DelegateArgs {
     /// Model id for the agent, e.g. "claude-haiku-5-5" (or "<provider_id>/<model_id>"). Default: the agent's default.
     #[serde(default)]
     pub model: Option<String>,
-    /// Model variant (reasoning effort) from the model's catalog entry, e.g. "high". Needs `model`.
+    /// Model variant (reasoning effort) from the model's catalog entry, e.g. "high". Applied only together with `model`; ignored otherwise.
     #[serde(default)]
     pub variant: Option<String>,
     /// The computer to run on: "self" (default) or its machineId.
