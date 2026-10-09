@@ -1478,7 +1478,7 @@ Client → server:
 | `{"t":"subscribe","asid":"ses_1"}` | Add a session. The id is not looked up, so subscribing to a session that does not exist yet is allowed, and a subscription survives the agent restarting. Idempotent. |
 | `{"t":"unsubscribe","asid":"ses_1"}` | Drop a session. No acknowledgement. |
 | `{"t":"subscribe_all"}` | Every session. `unsubscribe` does not narrow it; `subscribe_tasks` switches to task-only delivery. |
-| `{"t":"subscribe_tasks"}` | Task updates only. Replaces the socket's session subscriptions; a later `subscribe` or `subscribe_all` switches back to session delivery. |
+| `{"t":"subscribe_tasks"}` | Task updates only. Replaces the socket's session subscriptions; a later `subscribe` or `subscribe_all` switches back to session delivery. That request's `subscribed` acknowledgement includes `"tasks":false` to report that `t:"task"` delivery ended (for example, `{"t":"subscribed","asid":"ses_1","tasks":false}` or `{"t":"subscribed","all":true,"tasks":false}`). Under `subscribe_all`, task updates still arrive as `t:"event"`. |
 | `{"t":"ping"}` | Application-level liveness; answered with `pong`. |
 
 Unknown extra fields are ignored. An unknown `t` is `unknown_type` and a

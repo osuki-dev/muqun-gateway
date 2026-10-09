@@ -239,10 +239,14 @@ pub(crate) fn task_resync_frame() -> String {
     String::from(r#"{"t":"resync","asid":"","tasks":true}"#)
 }
 
-pub(crate) fn subscribed_frame(asid: Option<&str>) -> String {
+pub(crate) fn subscribed_frame(asid: Option<&str>, tasks_ended: bool) -> String {
+    let tasks = if tasks_ended { r#","tasks":false"# } else { "" };
     match asid {
-        Some(asid) => format!(r#"{{"t":"subscribed","asid":{}}}"#, json_string(asid)),
-        None => String::from(r#"{"t":"subscribed","all":true}"#),
+        Some(asid) => format!(
+            r#"{{"t":"subscribed","asid":{}{tasks}}}"#,
+            json_string(asid)
+        ),
+        None => format!(r#"{{"t":"subscribed","all":true{tasks}}}"#),
     }
 }
 
@@ -397,8 +401,9 @@ impl Subscriptions {
                     return Err(FrameError::TooManySubscriptions);
                 }
                 self.sessions.insert(asid.clone());
+                let ack = subscribed_frame(Some(asid), self.tasks_only);
                 self.tasks_only = false;
-                Ok(Some(subscribed_frame(Some(asid))))
+                Ok(Some(ack))
             }
             ClientFrame::Unsubscribe(asid) => {
                 self.sessions.remove(asid);
@@ -406,8 +411,9 @@ impl Subscriptions {
             }
             ClientFrame::SubscribeAll => {
                 self.all = true;
+                let ack = subscribed_frame(None, self.tasks_only);
                 self.tasks_only = false;
-                Ok(Some(subscribed_frame(None)))
+                Ok(Some(ack))
             }
             ClientFrame::SubscribeTasks => {
                 self.all = false;

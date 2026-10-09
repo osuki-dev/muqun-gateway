@@ -82,10 +82,13 @@ fn server_frames_are_the_documented_strings() {
         r#"{"t":"resync","asid":"","tasks":true}"#
     );
     assert_eq!(
-        subscribed_frame(Some("ses_1")),
+        subscribed_frame(Some("ses_1"), false),
         r#"{"t":"subscribed","asid":"ses_1"}"#
     );
-    assert_eq!(subscribed_frame(None), r#"{"t":"subscribed","all":true}"#);
+    assert_eq!(
+        subscribed_frame(None, false),
+        r#"{"t":"subscribed","all":true}"#
+    );
     assert_eq!(
         subscribed_tasks_frame(),
         r#"{"t":"subscribed","tasks":true}"#
@@ -668,6 +671,22 @@ async fn subscribe_tasks_delivers_task_views_without_session_events() {
             .is_err(),
         "session events must not reach a task-only socket"
     );
+
+    for (subscribe, expected) in [
+        (
+            r#"{"t":"subscribe","asid":"ses_1"}"#,
+            json!({ "t": "subscribed", "asid": "ses_1", "tasks": false }),
+        ),
+        (
+            r#"{"t":"subscribe_all"}"#,
+            json!({ "t": "subscribed", "all": true, "tasks": false }),
+        ),
+    ] {
+        send_text(&mut client, r#"{"t":"subscribe_tasks"}"#).await;
+        next_json(&mut client).await;
+        send_text(&mut client, subscribe).await;
+        assert_eq!(next_json(&mut client).await, expected);
+    }
 }
 
 #[tokio::test]
