@@ -173,4 +173,53 @@ pub(super) const RU: &[(&str, &str)] = &[
         "branch_name не должен содержать пустой сегмент пути или сегмент, начинающийся или заканчивающийся точкой",
     ),
     ("branch_name must not end with .lock", "branch_name не должен заканчиваться на .lock"),
+    // -- tasks, lazygit and assets ------------------------------------------
+    (
+        "No terminal session is reachable on this computer",
+        "На этом компьютере нет доступного сеанса терминала",
+    ),
+    (
+        "That agent is not available",
+        "Этот агент недоступен",
+    ),
+    (
+        "Only a paused or waiting task opened on a device can be confirmed",
+        "Подтвердить можно только приостановленную или ожидающую задачу, открытую на устройстве",
+    ),
+    (
+        "the agent could not start the task",
+        "агенту не удалось запустить задачу",
+    ),
+    (
+        "label must be at most 200 characters",
+        "label должен содержать не более 200 символов",
+    ),
+    (
+        "goal must be non-empty and at most 32 KiB",
+        "goal не должен быть пустым и должен занимать не более 32 КиБ",
+    ),
+    (
+        "summary must be at most 32 KiB",
+        "summary должен занимать не более 32 КиБ",
+    ),
+    (
+        "Unknown model for that agent. Use a model id from its catalog, or <provider_id>/<model_id>.",
+        "Неизвестная модель для этого агента. Укажите id модели из его каталога или <provider_id>/<model_id>.",
+    ),
+    (
+        "Unknown variant '{variant}' (the model offers: {offered}).",
+        "Неизвестное значение variant '{variant}' (модель предлагает: {offered}).",
+    ),
+    (
+        "Install lazygit on the Gateway host",
+        "Установите lazygit на хост Gateway",
+    ),
+    (
+        "The source pane is not in an accessible Git repository",
+        "Исходная панель не находится в доступном Git-репозитории",
+    ),
+    (
+        "the asset exceeds its content size limit",
+        "файл превышает ограничение на размер содержимого",
+    ),
 ];

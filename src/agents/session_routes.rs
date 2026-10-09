@@ -381,7 +381,7 @@ pub(crate) async fn create_task(
         .unwrap_or(&repo_path);
     let mut agent_args = tasks::agent_launch_args(
         &body.agent,
-        Some(agent_cwd),
+        &trusted_folders(&state, Some(agent_cwd)),
         &state.config.agent_launch_args,
     );
     agent_args.extend(body.agent_args.iter().flatten().cloned());
@@ -710,8 +710,11 @@ pub(crate) async fn start_agent_in_place(
     // Without a `cwd` the agent runs wherever the new pane opened, which
     // the backend reports; Codex needs it to pre-trust the folder.
     let agent_cwd = cwd.map(PathBuf::from).or(place.cwd.clone());
-    let mut agent_args =
-        tasks::agent_launch_args(agent, agent_cwd.as_deref(), &state.config.agent_launch_args);
+    let mut agent_args = tasks::agent_launch_args(
+        agent,
+        &trusted_folders(state, agent_cwd.as_deref()),
+        &state.config.agent_launch_args,
+    );
     let launch_prompt = prompt
         .filter(|_| terminal_backend(session).takes_launch_prompt())
         .and_then(|prompt| Some((prompt, tasks::launch_prompt_args(agent, prompt)?)));
@@ -1600,6 +1603,16 @@ pub(crate) async fn submit_agent_prompt(
             },
             other => HerdrCallError::Unavailable(other.to_string()),
         })
+}
+
+/// The folders an agent started in `cwd` is told to trust on its command
+/// line (Codex's `-c projects=…`): none with `agent_trust_folders` off, else
+/// [`tasks::trusted_folders`], bounded to the user's home.
+fn trusted_folders(state: &AppState, cwd: Option<&FsPath>) -> Vec<PathBuf> {
+    match (state.config.agent_trust_folders, cwd, dirs::home_dir()) {
+        (true, Some(cwd), Some(home)) => tasks::trusted_folders(cwd, &home),
+        _ => Vec::new(),
+    }
 }
 
 /// Claude Code's folder trust, which lives in its user config rather than

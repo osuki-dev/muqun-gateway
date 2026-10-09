@@ -2,11 +2,11 @@
 //! something. Domains hand it closures; it hands back results. Namespaced
 //! migrations let the history checkpoints, tasks and tokens share a file.
 use std::any::Any;
-use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc};
+use std::path::Path;
+use std::sync::Arc;
 
 use rusqlite::Connection;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 use super::db_key::DbKey;
 
@@ -29,11 +29,10 @@ type Job = Box<dyn FnOnce(&mut Connection) -> anyhow::Result<Boxed> + Send>;
 type Reply = oneshot::Sender<anyhow::Result<Boxed>>;
 
 pub(crate) struct SqliteStore {
-    commands: Option<mpsc::SyncSender<(Job, Reply)>>,
+    /// A bounded queue: a burst waits its turn asynchronously, never by
+    /// blocking the tokio worker thread that sent it.
+    commands: Option<mpsc::Sender<(Job, Reply)>>,
     worker: Option<std::thread::JoinHandle<()>>,
-    // Unread until a caller needs the location (e.g. backup); remove or use then.
-    #[allow(dead_code)]
-    path: PathBuf,
 }
 
 impl SqliteStore {
@@ -47,11 +46,11 @@ impl SqliteStore {
         }
         let mut connection = open_connection(path, key.as_ref())?;
         migrate(&mut connection, migrations)?;
-        let (tx, rx) = mpsc::sync_channel::<(Job, Reply)>(64);
+        let (tx, mut rx) = mpsc::channel::<(Job, Reply)>(64);
         let worker = std::thread::Builder::new()
             .name("gateway-store".into())
             .spawn(move || {
-                while let Ok((job, reply)) = rx.recv() {
+                while let Some((job, reply)) = rx.blocking_recv() {
                     // A panicking job fails its own call, not the worker.
                     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         job(&mut connection)
@@ -63,7 +62,6 @@ impl SqliteStore {
         Ok(Arc::new(SqliteStore {
             commands: Some(tx),
             worker: Some(worker),
-            path: path.to_path_buf(),
         }))
     }
 
@@ -79,16 +77,12 @@ impl SqliteStore {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("store worker is gone"))?
             .send((boxed, tx))
+            .await
             .map_err(|_| anyhow::anyhow!("store worker is gone"))?;
         let out = rx
             .await
             .map_err(|_| anyhow::anyhow!("store worker dropped the reply"))??;
         Ok(*out.downcast::<T>().expect("job result type"))
-    }
-
-    #[allow(dead_code)] // see the `path` field
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
     }
 }
 
@@ -165,6 +159,7 @@ fn migrate(connection: &mut Connection, migrations: &[Migration]) -> anyhow::Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     const T: &[Migration] = &[Migration {
         namespace: "t",

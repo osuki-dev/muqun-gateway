@@ -310,7 +310,7 @@ pane, so these agents start with their own bypass flags by default:
 
 | Kind | Default launch arguments |
 |---|---|
-| `codex` | `--dangerously-bypass-approvals-and-sandbox -c projects={"<dir>"={trust_level="trusted"}, ...}` -- the task directory, its git checkout and, for a linked worktree, the main checkout. The path goes in the TOML value, not the key: Codex's `-c` splits keys on every `.`. |
+| `codex` | `--dangerously-bypass-approvals-and-sandbox -c projects={"<dir>"={trust_level="trusted"}, ...}` -- the task directory, its git checkout and, for a linked worktree, the main checkout, each only when strictly inside the user's home; left out with `"agent_trust_folders": false`. The path goes in the TOML value, not the key: Codex's `-c` splits keys on every `.`. The value replaces Codex's whole `projects` table for that run. |
 | `claude` | `--dangerously-skip-permissions` |
 | any other | none |
 
@@ -325,7 +325,7 @@ the gateway's environment) or `~/.claude.json`. Only that key is written,
 other keys keep their values and order, and only for a directory strictly
 inside the user's home, named without `..`. It is on by default, as the
 owner's choice for agents started from their phone; `"agent_trust_folders":
-false` in `config.json` leaves that file alone.
+false` in `config.json` leaves that file alone and drops Codex's `-c projects=…`.
 
 ```json
 {

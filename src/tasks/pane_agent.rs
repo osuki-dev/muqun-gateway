@@ -23,7 +23,8 @@
 //! The marker is looked for in the pane's recent output (not only its screen)
 //! on every poll, so the first poll after a gateway restart settles a task
 //! whose agent finished meanwhile. A task that is `idle_unconfirmed` is polled
-//! every [`PAUSED_POLL`] instead of every [`POLL`].
+//! every [`PAUSED_POLL`] instead of every [`POLL`], backing off to
+//! [`MAX_PAUSED_POLL`] while nothing changes ([`paused_poll`]).
 
 use std::time::Duration;
 
@@ -31,6 +32,7 @@ use serde_json::Value;
 
 use super::domain::{one_line, Task, TaskBinding, TaskChange, TaskId, TaskState};
 use super::service::SUMMARY_CHARS;
+use super::{may_touch, same_pane};
 use crate::agents::tasks as agent_kinds;
 use crate::backend::{AgentStatus, OutputFormat, OutputSource, PaneId, ReadPane};
 use crate::{
@@ -43,6 +45,9 @@ const POLL: Duration = Duration::from_secs(2);
 /// How often it is read while its task is `idle_unconfirmed`: an agent that
 /// never prints the marker must not cost a poll every two seconds forever.
 const PAUSED_POLL: Duration = Duration::from_secs(12);
+/// The longest wait between reads of a paused task's pane that stays as it
+/// is: a forgotten task costs a few backend calls every five minutes.
+const MAX_PAUSED_POLL: Duration = Duration::from_secs(5 * 60);
 /// Lines of recent output searched for the marker.
 const MARKER_LINES: u32 = 200;
 /// A tab and pane title's length, from the goal.
@@ -459,14 +464,9 @@ fn claude_rows(screen: &str) -> usize {
 async fn observe_agent(at: &Bound<'_>, rows: &mut Option<usize>) -> Option<(Seen, Option<String>)> {
     let backend = terminal_backend(at.session);
     let panes = backend.list_panes().await.ok()?;
-    let Some(pane) = panes.iter().find(|pane| pane.id.as_str() == at.pane_id) else {
+    // A pane whose shell pid cannot be told now is still followed.
+    if same_pane(&panes, at.pane_id, at.shell_pid) == Some(false) {
         return Some((Seen::Gone, None));
-    };
-    // tmux hands `%N` out again after a restart: another shell is another pane.
-    if let (Some(expected), Some(current)) = (at.shell_pid, pane.shell_pid) {
-        if expected != current {
-            return Some((Seen::Gone, None));
-        }
     }
     let agents = backend.list_agents().await.ok()?;
     let screen = read_pane_visible_text(at.session, at.pane_id).await.ok();
@@ -552,6 +552,10 @@ async fn run(state: &AppState, id: &TaskId) {
     // The screen last read: a closed pane's failure still says what was on it.
     let mut last_screen: Option<String> = None;
     let mut rows: Option<usize> = None;
+    // The task's seq and the pane as the last poll left them, and how many
+    // polls in a row have found a paused task just so.
+    let mut last: Option<(u64, Option<Seen>)> = None;
+    let mut quiet = 0;
     loop {
         let task = match state.tasks.task(id).await {
             Ok(Some(task)) if !task.state.is_terminal() => task,
@@ -565,8 +569,9 @@ async fn run(state: &AppState, id: &TaskId) {
         let Some(at) = bound(state, &task) else {
             return;
         };
-        let mut now = task.state;
+        let (mut now, mut seq, mut seen) = (task.state, task.seq, None);
         if let Some(observed) = observe(&at, &mut rows).await {
+            seen = Some(observed.seen);
             let marker = match observed.seen {
                 Seen::Gone => last_marker.take(),
                 _ => observed.marker,
@@ -588,7 +593,7 @@ async fn run(state: &AppState, id: &TaskId) {
             }
             if let Some(change) = change_for(verdict, at.agent_id, screen.as_deref()) {
                 match state.tasks.move_to(id, change).await {
-                    Ok(moved) => now = moved.state,
+                    Ok(moved) => (now, seq) = (moved.state, moved.seq),
                     Err(error) => {
                         tracing::debug!(task = %id.0, %error, "pane follower: move refused")
                     }
@@ -596,8 +601,15 @@ async fn run(state: &AppState, id: &TaskId) {
             }
             last_screen = screen;
         }
+        let unchanged = last == Some((seq, seen));
+        last = Some((seq, seen));
+        quiet = if now == TaskState::IdleUnconfirmed && unchanged {
+            quiet + 1
+        } else {
+            0
+        };
         let pause = if now == TaskState::IdleUnconfirmed {
-            PAUSED_POLL
+            paused_poll(quiet)
         } else {
             POLL
         };
@@ -605,16 +617,31 @@ async fn run(state: &AppState, id: &TaskId) {
     }
 }
 
-/// Send the pane agent its interrupt key (best effort).
+/// How long to wait before reading a paused (`idle_unconfirmed`) task's pane
+/// again, after `quiet` polls in a row that found it unchanged:
+/// [`PAUSED_POLL`], doubling up to [`MAX_PAUSED_POLL`]. Any change -- the
+/// task moved, the agent's state or state sequence -- starts again from the
+/// shortest.
+fn paused_poll(quiet: u32) -> Duration {
+    PAUSED_POLL
+        .saturating_mul(1 << quiet.min(8))
+        .min(MAX_PAUSED_POLL)
+}
+
+/// Send the pane agent its interrupt key (best effort), only while the pane
+/// is still the task's ([`may_touch`]).
 pub(crate) async fn interrupt(state: &AppState, task: &Task) {
     let Some(at) = bound(state, task) else {
         return;
     };
+    let backend = terminal_backend(at.session);
+    let pane_id = PaneId::new(at.pane_id);
+    if !may_touch(backend.as_ref(), &pane_id, at.shell_pid).await {
+        tracing::warn!(task = %task.id.0, "not interrupting: the pane is no longer the task's");
+        return;
+    }
     let key = crate::terminal::shortcuts::interrupt_key(at.agent_id, None);
-    if let Err(error) = terminal_backend(at.session)
-        .send_keys(&PaneId::new(at.pane_id), &[key])
-        .await
-    {
+    if let Err(error) = backend.send_keys(&pane_id, &[key]).await {
         tracing::warn!(task = %task.id.0, %error, "could not interrupt the pane agent");
     }
 }

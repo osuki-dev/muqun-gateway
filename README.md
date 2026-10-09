@@ -336,6 +336,23 @@ user service when the change needs one (`--yes` skips the question). `agent setu
 opencode` only shows the OpenCode binary the gateway would use: OpenCode needs
 no setup.
 
+### Agents started from the phone
+
+Nobody sits at the terminal of an agent the gateway starts for the phone or an
+MCP caller, so by default Codex starts with
+`--dangerously-bypass-approvals-and-sandbox` and Claude Code with
+`--dangerously-skip-permissions`, and the task directory is marked trusted
+for both (only directories inside your home). That agent then runs commands
+without asking. To keep the prompts, set the launch arguments per kind in
+`config.json` (an empty list means none) and turn folder trust off:
+
+```json
+{ "agent_launch_args": { "codex": [], "claude": [] }, "agent_trust_folders": false }
+```
+
+The gateway logs the launch arguments in effect at startup, and `manage` shows
+them under Settings. Details: [Agent API](docs/agent-api.md#terminal-agents-launched-for-remote-dispatch).
+
 ### The OpenCode agent
 
 The gateway's agent features require OpenCode 2 with `GET /api/info`. While the

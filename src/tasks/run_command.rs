@@ -14,6 +14,7 @@ use tokio::time::Instant;
 use super::domain::{
     now_ms, Requested, Task, TaskBinding, TaskChange, TaskId, TaskKind, TaskState,
 };
+use super::may_touch;
 use super::ports::TaskStore;
 use crate::backend::{
     CreateTab, OutputFormat, OutputSource, PaneId, ReadPane, SendTextMode, TabId, TerminalBackend,
@@ -87,26 +88,34 @@ async fn launch(
     // The new pane and its shell pid, which binds the task to this shell
     // rather than to an id tmux may hand out again after a restart.
     let listed = backend.list_panes().await;
-    let (pane_id, shell_pid) = match (tab.active_pane_id.clone(), listed) {
+    let tab_id = tab.id.clone();
+    let found = match (tab.active_pane_id.clone(), listed) {
         (Some(pane_id), Ok(panes)) => {
             let shell_pid = panes
                 .iter()
                 .find(|pane| pane.id == pane_id)
                 .and_then(|pane| pane.shell_pid);
-            (pane_id, shell_pid)
+            Ok((pane_id, shell_pid))
         }
         (Some(pane_id), Err(error)) => {
             tracing::warn!("exec.run: no shell pid for the new pane: {error}");
-            (pane_id, None)
+            Ok((pane_id, None))
         }
-        (None, listed) => listed
-            .context("list panes")?
-            .into_iter()
-            .find(|pane| pane.tab_id == tab.id)
-            .map(|pane| (pane.id, pane.shell_pid))
-            .ok_or_else(|| anyhow!("the new tab has no pane"))?,
+        (None, listed) => listed.context("list panes").and_then(|panes| {
+            panes
+                .into_iter()
+                .find(|pane| pane.tab_id == tab.id)
+                .map(|pane| (pane.id, pane.shell_pid))
+                .ok_or_else(|| anyhow!("the new tab has no pane"))
+        }),
     };
-    let tab_id = tab.id.clone();
+    let (pane_id, shell_pid) = match found {
+        Ok(found) => found,
+        Err(error) => {
+            close_unused(backend.as_ref(), &tab_id).await;
+            return Err(error);
+        }
+    };
     let now = now_ms();
     let recorded = async {
         let task = store
@@ -142,10 +151,7 @@ async fn launch(
     let task = match recorded.await {
         Ok(task) => task,
         Err(error) => {
-            // Nothing was typed into the tab: do not leave it behind.
-            if let Err(close) = backend.close_tab(&tab_id).await {
-                tracing::warn!("exec.run: could not close the unused tab: {close}");
-            }
+            close_unused(backend.as_ref(), &tab_id).await;
             return Err(error);
         }
     };
@@ -170,6 +176,13 @@ async fn launch(
         .transition(&task.id, change(TaskState::Working))
         .await?;
     poll(state, store, &task, deadline).await
+}
+
+/// Close a tab nothing was typed into, so a failed start leaves none behind.
+async fn close_unused(backend: &dyn TerminalBackend, tab_id: &TabId) {
+    if let Err(error) = backend.close_tab(tab_id).await {
+        tracing::warn!("exec.run: could not close the unused tab: {error}");
+    }
 }
 
 /// Read the task's pane until its exit marker shows or `deadline` passes.
@@ -249,21 +262,20 @@ pub(crate) async fn poll(
     }
 }
 
-/// Interrupt the command (Ctrl-C into its pane) and mark the task Cancelled.
-pub(crate) async fn cancel(
-    state: &AppState,
-    store: &dyn TaskStore,
-    task: &Task,
-) -> anyhow::Result<()> {
-    let (backend, pane_id, _) = pane_of(state, task).await?;
-    backend
-        .send_keys(&pane_id, &["ctrl+c".to_owned()])
-        .await
-        .context("interrupt the command")?;
-    store
-        .transition(&task.id, change(TaskState::Cancelled))
-        .await?;
-    Ok(())
+/// Interrupt the command: Ctrl-C into its pane, best effort -- a pane that
+/// is gone, or no longer the task's, is left alone, and the caller records
+/// the cancel either way.
+pub(crate) async fn interrupt(state: &AppState, task: &Task) {
+    let sent = match pane_of(state, task).await {
+        Ok((backend, pane_id, _)) => backend
+            .send_keys(&pane_id, &["ctrl+c".to_owned()])
+            .await
+            .map_err(anyhow::Error::from),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = sent {
+        tracing::warn!(task = %task.id.0, "exec.run: could not interrupt the command: {error:#}");
+    }
 }
 
 pub(crate) async fn reachable_session(
@@ -303,16 +315,8 @@ async fn pane_of(
         .ok_or_else(|| anyhow!("the task's terminal session is gone"))?;
     let backend = terminal_backend(session);
     let pane_id = PaneId::new(pane_id);
-    if let Some(expected) = shell_pid {
-        let same_shell = backend
-            .list_panes()
-            .await
-            .context("list panes")?
-            .iter()
-            .any(|pane| pane.id == pane_id && pane.shell_pid == Some(*expected));
-        if !same_shell {
-            return Err(anyhow!(PANE_GONE));
-        }
+    if !may_touch(backend.as_ref(), &pane_id, *shell_pid).await {
+        return Err(anyhow!(PANE_GONE));
     }
     Ok((backend, pane_id, tab_id.as_deref().map(TabId::new)))
 }
@@ -492,11 +496,9 @@ mod tests {
             }
         ));
 
-        cancel(&output_state(&herdr), &store, &task).await.unwrap();
+        interrupt(&output_state(&herdr), &task).await;
         let keys = methods(&herdr, "pane.send_keys");
         assert_eq!(keys.last().unwrap()["params"]["keys"], json!(["ctrl+c"]));
-        let task = store.get(&TaskId(ID.into())).await.unwrap().unwrap();
-        assert_eq!(task.state, TaskState::Cancelled);
     }
 
     #[tokio::test]
@@ -567,8 +569,7 @@ mod tests {
         };
         assert_eq!(error.to_string(), "the task's pane is gone");
         let reads = methods(&herdr, "pane.read").len();
-        let error = cancel(&state, &store, &task).await.unwrap_err();
-        assert_eq!(error.to_string(), "the task's pane is gone");
+        interrupt(&state, &task).await;
         assert!(methods(&herdr, "pane.send_keys")
             .iter()
             .all(|call| call["params"]["keys"] != json!(["ctrl+c"])));

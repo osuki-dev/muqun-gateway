@@ -186,4 +186,53 @@ pub(super) const ES: &[(&str, &str)] = &[
         "branch_name no puede tener un segmento de ruta vacío ni un segmento que empiece o termine con un punto",
     ),
     ("branch_name must not end with .lock", "branch_name no puede terminar en .lock"),
+    // -- tasks, lazygit and assets ------------------------------------------
+    (
+        "No terminal session is reachable on this computer",
+        "No hay ninguna sesión de terminal accesible en este equipo",
+    ),
+    (
+        "That agent is not available",
+        "Ese agente no está disponible",
+    ),
+    (
+        "Only a paused or waiting task opened on a device can be confirmed",
+        "Solo se puede confirmar una tarea en pausa o en espera abierta desde un dispositivo",
+    ),
+    (
+        "the agent could not start the task",
+        "el agente no pudo iniciar la tarea",
+    ),
+    (
+        "label must be at most 200 characters",
+        "label debe tener 200 caracteres como máximo",
+    ),
+    (
+        "goal must be non-empty and at most 32 KiB",
+        "goal no puede estar vacío y debe ocupar 32 KiB como máximo",
+    ),
+    (
+        "summary must be at most 32 KiB",
+        "summary debe ocupar 32 KiB como máximo",
+    ),
+    (
+        "Unknown model for that agent. Use a model id from its catalog, or <provider_id>/<model_id>.",
+        "Modelo desconocido para ese agente. Usa un id de modelo de su catálogo, o <provider_id>/<model_id>.",
+    ),
+    (
+        "Unknown variant '{variant}' (the model offers: {offered}).",
+        "Valor de variant desconocido '{variant}' (el modelo ofrece: {offered}).",
+    ),
+    (
+        "Install lazygit on the Gateway host",
+        "Instala lazygit en el host del Gateway",
+    ),
+    (
+        "The source pane is not in an accessible Git repository",
+        "El panel de origen no está en un repositorio Git accesible",
+    ),
+    (
+        "the asset exceeds its content size limit",
+        "el archivo supera su límite de tamaño de contenido",
+    ),
 ];

@@ -149,4 +149,53 @@ pub(super) const TH: &[(&str, &str)] = &[
         "branch_name ต้องไม่มีส่วนของเส้นทางที่ว่างเปล่า หรือส่วนที่ขึ้นต้นหรือลงท้ายด้วยจุด",
     ),
     ("branch_name must not end with .lock", "branch_name ต้องไม่ลงท้ายด้วย .lock"),
+    // -- tasks, lazygit and assets ------------------------------------------
+    (
+        "No terminal session is reachable on this computer",
+        "ไม่มีเซสชันเทอร์มินัลที่เชื่อมต่อได้บนคอมพิวเตอร์เครื่องนี้",
+    ),
+    (
+        "That agent is not available",
+        "ใช้เอเจนต์นั้นไม่ได้",
+    ),
+    (
+        "Only a paused or waiting task opened on a device can be confirmed",
+        "ยืนยันได้เฉพาะงานที่หยุดชั่วคราวหรือรออยู่ซึ่งเปิดจากอุปกรณ์เท่านั้น",
+    ),
+    (
+        "the agent could not start the task",
+        "เอเจนต์เริ่มงานไม่ได้",
+    ),
+    (
+        "label must be at most 200 characters",
+        "label ต้องมีความยาวไม่เกิน 200 ตัวอักษร",
+    ),
+    (
+        "goal must be non-empty and at most 32 KiB",
+        "goal ต้องไม่ว่างและมีขนาดไม่เกิน 32 KiB",
+    ),
+    (
+        "summary must be at most 32 KiB",
+        "summary ต้องมีขนาดไม่เกิน 32 KiB",
+    ),
+    (
+        "Unknown model for that agent. Use a model id from its catalog, or <provider_id>/<model_id>.",
+        "เอเจนต์นั้นไม่มีโมเดลนี้ ใช้ id ของโมเดลจากแค็ตตาล็อกของเอเจนต์ หรือ <provider_id>/<model_id>",
+    ),
+    (
+        "Unknown variant '{variant}' (the model offers: {offered}).",
+        "ไม่รู้จัก variant '{variant}' (โมเดลนี้มี: {offered})",
+    ),
+    (
+        "Install lazygit on the Gateway host",
+        "ติดตั้ง lazygit บนโฮสต์ของ Gateway",
+    ),
+    (
+        "The source pane is not in an accessible Git repository",
+        "เพนต้นทางไม่ได้อยู่ใน Git repository ที่เข้าถึงได้",
+    ),
+    (
+        "the asset exceeds its content size limit",
+        "ไฟล์มีขนาดเกินขีดจำกัดของเนื้อหา",
+    ),
 ];

@@ -76,7 +76,7 @@ issued it.
   with the local admin token), the gateway finds the terminal pane whose shell
   is the nearest ancestor, and answers with a token bound to that pane. It
   lives 7 days, and the gateway revokes it within 60 seconds of the pane
-  closing. The helper prints `{"Authorization": "Bearer <token>"}`, or only the
+  closing. A revoked or expired token row is deleted 7 days later. The helper prints `{"Authorization": "Bearer <token>"}`, or only the
   token with `--bearer`. Run outside any managed pane it exits 2 with a message;
   with MCP disabled it says so and exits 1; with the gateway down or refusing,
   it exits 1 with one fixed sentence (`MUQUN_LOG=debug` shows the details).
@@ -321,16 +321,19 @@ first prompt. Claude Code and Codex on a tmux session get it on their command
 line, `claude <launch args> -- '<goal>'` and `codex <launch args> -- '<goal>'`
 (one shell word, quoted so that sh, bash, zsh and fish all read it back
 unchanged: newlines, quotes, `$` and backticks are data, never shell syntax).
+That line is typed at the pane's shell, so the goal ends up in that shell's
+history and, while the agent runs, in the local process list.
 A goal with a backslash or any other control character (a Tab, an Esc, ...), any
 other agent, and every agent on Herdr (whose start waits for an idle agent)
 has it typed once the agent is up instead. Folder trust: Codex gets a `-c
-projects={...}` override for this run; for Claude Code,
+projects={...}` override for this run (only for directories inside the
+user's home); for Claude Code,
 `projects["<cwd>"].hasTrustDialogAccepted` is set in its user config
 (`$CLAUDE_CONFIG_DIR/.claude.json`, from `agent_env` or the gateway's
 environment, else `~/.claude.json`): merged in place, key order kept, only
 for a directory inside the user's home named without `..`, skipped when the
-file cannot be read, and not at all with `"agent_trust_folders": false` in
-`config.json` (see [Agent API](agent-api.md)). `cwd` defaults to the most recent
+file cannot be read. Neither agent's folder trust is set with
+`"agent_trust_folders": false` in `config.json` (see [Agent API](agent-api.md)). `cwd` defaults to the most recent
 task directory for that device (or home if it has none) for `POST /api/tasks`,
 and to wherever the backend opens the tab for `tasks.delegate`; it is not held
 to the spawn route's "a directory the session already has open" fence, as no
@@ -385,7 +388,8 @@ characters).
 
 The task follows the pane as the terminal backend reports it (Herdr's own
 agent state; on tmux, the state read off the screen), polled every 2 s (every
-12 s while it is `idle_unconfirmed`), recorded with source `pane_follower` and
+12 s while it is `idle_unconfirmed`, backing off to every 5 min while
+nothing changes), recorded with source `pane_follower` and
 published as `task.updated` like every change. The marker is checked first on
 every poll:
 
@@ -513,8 +517,13 @@ discovery (the task API stays snake_case).
 | `queued` | `dispatching`, `cancelled` |
 | `dispatching` | `working`, `failed`, `cancelled` |
 | `working` | `waiting`, `idle_unconfirmed`, `done`, `failed`, `cancelled` |
-| `waiting` | `working`, `cancelled` |
-| `idle_unconfirmed` | `working`, `done`, `cancelled` |
+| `waiting` | `working`, `idle_unconfirmed`, `done`, `failed`, `cancelled` |
+| `idle_unconfirmed` | `working`, `waiting`, `done`, `failed`, `cancelled` |
+
+A cancel always ends the task as `cancelled`: interrupting the agent or the
+command is best effort, and an agent or pane that cannot be reached does not
+keep it open. A task that ended more than 30 days ago is deleted with its
+events (not while a child of it is still open).
 
 ### Live updates
 

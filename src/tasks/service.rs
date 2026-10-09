@@ -5,6 +5,7 @@
 //! write through [`Publishing`] -- is broadcast as a [`TaskDomainEvent`].
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -42,6 +43,36 @@ pub(crate) const MAX_NAME_BYTES: usize = 256;
 pub(crate) fn valid_name(name: &str) -> bool {
     !name.trim().is_empty() && name.len() <= MAX_NAME_BYTES
 }
+/// The largest goal a delegation takes.
+const MAX_GOAL_BYTES: usize = 32 * 1024;
+/// Whether `goal` is usable: not blank, at most [`MAX_GOAL_BYTES`].
+pub(crate) fn valid_goal(goal: &str) -> bool {
+    !goal.trim().is_empty() && goal.len() <= MAX_GOAL_BYTES
+}
+
+/// Why a task's working directory was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BadDirectory {
+    NotAbsolute,
+    Missing,
+    NotADirectory,
+}
+
+/// `dir` as a task's working directory: absolute, existing, a directory,
+/// canonicalized. There is deliberately no other fence: the caller is the
+/// same user.
+pub(crate) fn task_directory(dir: &str) -> Result<PathBuf, BadDirectory> {
+    let path = Path::new(dir);
+    if !path.is_absolute() {
+        return Err(BadDirectory::NotAbsolute);
+    }
+    let canonical = path.canonicalize().map_err(|_| BadDirectory::Missing)?;
+    canonical
+        .is_dir()
+        .then_some(canonical)
+        .ok_or(BadDirectory::NotADirectory)
+}
+
 /// Timeline items read for a summary.
 pub(crate) const SUMMARY_ITEMS: usize = 50;
 /// A delegation's `summary`: its result as one line of at most this many
@@ -57,6 +88,23 @@ const SOURCE: &str = "task_service";
 /// The largest completion summary taken (`tasks.complete`, `/complete`),
 /// before it is cut to one line of [`SUMMARY_CHARS`].
 pub(crate) const MAX_SUMMARY_BYTES: usize = 32 * 1024;
+/// How long an ended task (done, failed, cancelled) and its events are kept:
+/// long enough to look back on, short of an ever-growing ledger (an
+/// `exec.run` summary alone holds up to 8 KiB of output).
+pub(crate) const TASK_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// [`TaskError::UnknownVariant`] as a caller reads it, in `locale`.
+pub(crate) fn unknown_variant_message(
+    locale: crate::i18n::Locale,
+    wanted: &str,
+    offered: &str,
+) -> String {
+    crate::i18n::t_slots(
+        locale,
+        "Unknown variant '{variant}' (the model offers: {offered}).",
+        &[("variant", wanted), ("offered", offered)],
+    )
+}
 
 /// A completion summary as stored: one line of at most [`SUMMARY_CHARS`];
 /// `None` when it is blank. Larger than [`MAX_SUMMARY_BYTES`] is refused.
@@ -186,8 +234,12 @@ pub(crate) enum TaskError {
     AgentUnavailable(String),
     /// `model` names nothing in the agent's catalog for that directory.
     UnknownModel(String),
-    /// `variant` is not one the resolved model lists.
-    UnknownVariant(String),
+    /// `variant` is not one the resolved model lists: the variant asked
+    /// for, and the ones it offers, comma-separated.
+    UnknownVariant {
+        wanted: String,
+        offered: String,
+    },
     /// No configured terminal session answers, so a command has nowhere to run.
     NoTerminal,
     /// A timeline was asked of a task that has none (a command).
@@ -211,7 +263,12 @@ impl std::fmt::Display for TaskError {
             Self::UnknownMachine(machine) => write!(f, "unknown machine '{machine}'"),
             Self::AgentUnavailable(agent) => write!(f, "agent '{agent}' is not available"),
             Self::UnknownModel(model) => write!(f, "unknown model '{model}'"),
-            Self::UnknownVariant(variant) => write!(f, "unknown variant {variant}"),
+            Self::UnknownVariant { wanted, offered } => {
+                write!(
+                    f,
+                    "unknown variant '{wanted}' (the model offers: {offered})"
+                )
+            }
             Self::NoTerminal => write!(f, "{}", run_command::NO_TERMINAL),
             Self::NoTimeline => write!(f, "only a delegated task has a timeline"),
             Self::InvalidSummary => write!(f, "summary must be non-empty and at most 32 KiB"),
@@ -313,6 +370,10 @@ impl TaskStore for Publishing<'_> {
         ids: Vec<TaskId>,
     ) -> TaskFuture<'a, HashMap<TaskId, ChildCounts>> {
         self.0.store.child_counts(ids)
+    }
+
+    fn purge_ended<'a>(&'a self, before_ms: u64) -> TaskFuture<'a, usize> {
+        self.0.store.purge_ended(before_ms)
     }
 }
 
@@ -614,7 +675,10 @@ impl TaskService {
                 Some(
                     resolve_model(&catalog.models, id, variant)
                         .ok_or_else(|| TaskError::UnknownModel(id.to_owned()))?
-                        .map_err(TaskError::UnknownVariant)?,
+                        .map_err(|(wanted, offered)| TaskError::UnknownVariant {
+                            wanted,
+                            offered,
+                        })?,
                 )
             }
             None => None,
@@ -1163,7 +1227,9 @@ impl TaskService {
         Ok(page)
     }
 
-    /// Interrupt the agent (or Ctrl-C the command) and mark the task Cancelled.
+    /// Interrupt the agent (or Ctrl-C the command), best effort, and mark the
+    /// task Cancelled: an agent or pane that cannot be reached must not keep
+    /// a task open that its owner gave up on.
     pub(crate) async fn cancel(
         &self,
         state: &AppState,
@@ -1178,26 +1244,34 @@ impl TaskService {
             TaskBinding::Pane { .. } if task.kind == TaskKind::Delegation => {
                 pane_agent::interrupt(state, &task).await;
             }
-            TaskBinding::Pane { .. } => {
-                run_command::cancel(state, &self.store(), &task)
-                    .await
-                    .map_err(|e| TaskError::Backend(format!("{e:#}")))?;
-                let task = self.store.get(&task.id).await?.ok_or(TaskError::NotFound)?;
-                return Ok(self.present(&task).await);
-            }
+            TaskBinding::Pane { .. } => run_command::interrupt(state, &task).await,
             TaskBinding::AgentSession { agent_id, asid } => {
-                session_manager(state, agent_id, asid)
-                    .await?
-                    .prompts()
-                    .interrupt(&AgentSessionId(asid.clone()))
-                    .await?;
+                let interrupted = match session_manager(state, agent_id, asid).await {
+                    Ok(manager) => manager
+                        .prompts()
+                        .interrupt(&AgentSessionId(asid.clone()))
+                        .await
+                        .map_err(TaskError::from),
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = interrupted {
+                    tracing::warn!(task = %task.id.0, %error, "could not interrupt the agent session");
+                }
             }
             TaskBinding::None => {}
         }
-        let task = self
+        let task = match self
             .store()
             .transition(&task.id, change(TaskState::Cancelled))
-            .await?;
+            .await
+        {
+            Ok(task) => task,
+            // It ended meanwhile (the interrupt finished it): that is the answer.
+            Err(error) => match self.store.get(&task.id).await? {
+                Some(ended) if ended.state.is_terminal() => ended,
+                _ => return Err(error.into()),
+            },
+        };
         Ok(self.present(&task).await)
     }
 
@@ -1279,6 +1353,13 @@ impl TaskService {
     /// Open tasks for the driver, as stored.
     pub(crate) async fn open_tasks(&self, filter: TaskFilter) -> anyhow::Result<Vec<Task>> {
         self.store.list(filter).await
+    }
+
+    /// Forget the tasks that ended more than [`TASK_RETENTION`] ago, with
+    /// their events. How many went.
+    pub(crate) async fn purge_ended(&self) -> anyhow::Result<usize> {
+        let before = now_ms().saturating_sub(TASK_RETENTION.as_millis() as u64);
+        self.store.purge_ended(before).await
     }
 
     /// Read a command task's pane once: it completes if it has exited.
@@ -1946,7 +2027,7 @@ fn resolve_model(
     models: &[ModelInfo],
     id: &str,
     variant: Option<&str>,
-) -> Option<Result<ModelRef, String>> {
+) -> Option<Result<ModelRef, (String, String)>> {
     let qualified = id.split_once('/').and_then(|(provider, model_id)| {
         models
             .iter()
@@ -1958,10 +2039,7 @@ fn resolve_model(
             if let (Some(wanted), Some(listed)) = (variant, found.variants.as_deref()) {
                 if !listed.is_empty() && !listed.iter().any(|v| v.id == wanted) {
                     let offered: Vec<&str> = listed.iter().map(|v| v.id.as_str()).collect();
-                    return Err(format!(
-                        "'{wanted}' (the model offers: {})",
-                        offered.join(", ")
-                    ));
+                    return Err((wanted.to_owned(), offered.join(", ")));
                 }
             }
             Ok(ModelRef {
@@ -2489,6 +2567,9 @@ mod tests {
         ) -> TaskFuture<'a, HashMap<TaskId, ChildCounts>> {
             self.inner.child_counts(ids)
         }
+        fn purge_ended<'a>(&'a self, before_ms: u64) -> TaskFuture<'a, usize> {
+            self.inner.purge_ended(before_ms)
+        }
     }
 
     /// The store fails once the session exists: the session is interrupted
@@ -2556,7 +2637,7 @@ mod tests {
     fn the_way_to_a_state_passes_the_states_between() {
         use TaskState::*;
         assert_eq!(steps_between(Queued, Failed), [Dispatching]);
-        assert_eq!(steps_between(Waiting, Failed), [Working]);
+        assert!(steps_between(Waiting, Failed).is_empty(), "a direct move");
         assert_eq!(steps_between(Dispatching, Done), [Working]);
         assert_eq!(steps_between(Queued, Done), [Dispatching, Working]);
         assert!(steps_between(Working, Done).is_empty());
@@ -2599,6 +2680,15 @@ mod tests {
             .map(|waited| waited.task)
             .unwrap();
         assert_eq!(waited.state, TaskState::Cancelled);
+
+        // An agent that no longer has the session cannot be interrupted, and
+        // the task is cancelled all the same.
+        let agent = FakeAgent::new("opencode");
+        let calls = agent.calls.clone();
+        let (state, id) = tracked(agent).await;
+        let cancelled = state.tasks.cancel(&state, &assistant("a"), &id).await;
+        assert_eq!(cancelled.unwrap().state, TaskState::Cancelled);
+        assert!(!calls.lock().unwrap().iter().any(|call| call == "interrupt"));
     }
 
     #[tokio::test]
@@ -2817,6 +2907,9 @@ mod tests {
             ids: Vec<TaskId>,
         ) -> TaskFuture<'a, HashMap<TaskId, ChildCounts>> {
             self.inner.child_counts(ids)
+        }
+        fn purge_ended<'a>(&'a self, before_ms: u64) -> TaskFuture<'a, usize> {
+            self.inner.purge_ended(before_ms)
         }
     }
 
@@ -3275,7 +3368,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(unlisted, TaskError::UnknownVariant(ref v) if v.contains("'max'") && v.contains("low, high"))
+            matches!(unlisted, TaskError::UnknownVariant { ref wanted, ref offered } if wanted == "max" && offered == "low, high")
         );
         assert_eq!(calls.lock().unwrap().len(), before);
         delegate(open(None, Some("high"))).await.unwrap();

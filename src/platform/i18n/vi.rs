@@ -176,4 +176,53 @@ pub(super) const VI: &[(&str, &str)] = &[
         "branch_name không được có đoạn đường dẫn trống hoặc đoạn bắt đầu hay kết thúc bằng dấu chấm",
     ),
     ("branch_name must not end with .lock", "branch_name không được kết thúc bằng .lock"),
+    // -- tasks, lazygit and assets ------------------------------------------
+    (
+        "No terminal session is reachable on this computer",
+        "Không có phiên terminal nào truy cập được trên máy tính này",
+    ),
+    (
+        "That agent is not available",
+        "Tác tử đó không khả dụng",
+    ),
+    (
+        "Only a paused or waiting task opened on a device can be confirmed",
+        "Chỉ có thể xác nhận tác vụ đang tạm dừng hoặc đang chờ được mở từ thiết bị",
+    ),
+    (
+        "the agent could not start the task",
+        "tác tử không thể bắt đầu tác vụ",
+    ),
+    (
+        "label must be at most 200 characters",
+        "label tối đa 200 ký tự",
+    ),
+    (
+        "goal must be non-empty and at most 32 KiB",
+        "goal không được để trống và tối đa 32 KiB",
+    ),
+    (
+        "summary must be at most 32 KiB",
+        "summary tối đa 32 KiB",
+    ),
+    (
+        "Unknown model for that agent. Use a model id from its catalog, or <provider_id>/<model_id>.",
+        "Tác tử đó không có model này. Hãy dùng id model trong danh mục của nó, hoặc <provider_id>/<model_id>.",
+    ),
+    (
+        "Unknown variant '{variant}' (the model offers: {offered}).",
+        "variant '{variant}' không hợp lệ (model này có: {offered}).",
+    ),
+    (
+        "Install lazygit on the Gateway host",
+        "Hãy cài lazygit trên máy chủ Gateway",
+    ),
+    (
+        "The source pane is not in an accessible Git repository",
+        "Pane nguồn không nằm trong kho Git có thể truy cập",
+    ),
+    (
+        "the asset exceeds its content size limit",
+        "tệp vượt quá giới hạn kích thước nội dung",
+    ),
 ];

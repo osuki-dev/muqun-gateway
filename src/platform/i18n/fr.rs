@@ -187,4 +187,53 @@ pub(super) const FR: &[(&str, &str)] = &[
         "branch_name ne doit pas comporter de segment de chemin vide, ni de segment commençant ou finissant par un point",
     ),
     ("branch_name must not end with .lock", "branch_name ne doit pas se terminer par .lock"),
+    // -- tasks, lazygit and assets ------------------------------------------
+    (
+        "No terminal session is reachable on this computer",
+        "Aucune session de terminal n’est joignable sur cet ordinateur",
+    ),
+    (
+        "That agent is not available",
+        "Cet agent n’est pas disponible",
+    ),
+    (
+        "Only a paused or waiting task opened on a device can be confirmed",
+        "Seule une tâche en pause ou en attente ouverte depuis un appareil peut être confirmée",
+    ),
+    (
+        "the agent could not start the task",
+        "l’agent n’a pas pu démarrer la tâche",
+    ),
+    (
+        "label must be at most 200 characters",
+        "label doit faire au plus 200 caractères",
+    ),
+    (
+        "goal must be non-empty and at most 32 KiB",
+        "goal ne doit pas être vide et doit faire au plus 32 KiB",
+    ),
+    (
+        "summary must be at most 32 KiB",
+        "summary doit faire au plus 32 KiB",
+    ),
+    (
+        "Unknown model for that agent. Use a model id from its catalog, or <provider_id>/<model_id>.",
+        "Modèle inconnu pour cet agent. Utilisez un id de modèle de son catalogue, ou <provider_id>/<model_id>.",
+    ),
+    (
+        "Unknown variant '{variant}' (the model offers: {offered}).",
+        "Valeur de variant inconnue '{variant}' (le modèle propose : {offered}).",
+    ),
+    (
+        "Install lazygit on the Gateway host",
+        "Installez lazygit sur l’hôte du Gateway",
+    ),
+    (
+        "The source pane is not in an accessible Git repository",
+        "Le panneau source n’est dans aucun dépôt Git accessible",
+    ),
+    (
+        "the asset exceeds its content size limit",
+        "le fichier dépasse sa taille maximale de contenu",
+    ),
 ];

@@ -176,4 +176,53 @@ pub(super) const ZH_CN: &[(&str, &str)] = &[
         "branch_name 不能有空的路径段，路径段也不能以点开头或结尾",
     ),
     ("branch_name must not end with .lock", "branch_name 不能以 .lock 结尾"),
+    // -- tasks, lazygit and assets ------------------------------------------
+    (
+        "No terminal session is reachable on this computer",
+        "这台电脑上没有可连接的终端会话",
+    ),
+    (
+        "That agent is not available",
+        "该代理不可用",
+    ),
+    (
+        "Only a paused or waiting task opened on a device can be confirmed",
+        "只有在设备上打开、已暂停或等待中的任务才能确认",
+    ),
+    (
+        "the agent could not start the task",
+        "代理无法启动这个任务",
+    ),
+    (
+        "label must be at most 200 characters",
+        "label 最多 200 个字符",
+    ),
+    (
+        "goal must be non-empty and at most 32 KiB",
+        "goal 不能为空，且最多 32 KiB",
+    ),
+    (
+        "summary must be at most 32 KiB",
+        "summary 最多 32 KiB",
+    ),
+    (
+        "Unknown model for that agent. Use a model id from its catalog, or <provider_id>/<model_id>.",
+        "该代理没有这个模型。请使用其目录中的模型 id，或 <provider_id>/<model_id>。",
+    ),
+    (
+        "Unknown variant '{variant}' (the model offers: {offered}).",
+        "未知的 variant '{variant}'（该模型提供：{offered}）。",
+    ),
+    (
+        "Install lazygit on the Gateway host",
+        "请在 Gateway 主机上安装 lazygit",
+    ),
+    (
+        "The source pane is not in an accessible Git repository",
+        "源面板不在可访问的 Git 仓库中",
+    ),
+    (
+        "the asset exceeds its content size limit",
+        "文件超过了其内容大小上限",
+    ),
 ];

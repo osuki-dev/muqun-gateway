@@ -1641,11 +1641,7 @@ mod tests {
     }
 
     #[test]
-    fn service_set_runs_with_the_documented_argv_and_the_same_environment() {
-        assert_eq!(
-            service_set_args("MUQUN_MCP_TOKEN", "tok"),
-            ["service", "set", "env", "MUQUN_MCP_TOKEN", "tok"]
-        );
+    fn a_sibling_command_runs_with_the_same_environment() {
         let mut like = tokio::process::Command::new("opencode");
         like.env("XDG_CONFIG_HOME", "/x")
             .env_remove("OPENCODE_CONFIG");

@@ -147,4 +147,53 @@ pub(super) const JA: &[(&str, &str)] = &[
         "branch_name に空のパスセグメントや、ドットで始まる・終わるセグメントは使えません",
     ),
     ("branch_name must not end with .lock", "branch_name の末尾に .lock は使えません"),
+    // -- tasks, lazygit and assets ------------------------------------------
+    (
+        "No terminal session is reachable on this computer",
+        "このコンピューターで接続できるターミナルセッションがありません",
+    ),
+    (
+        "That agent is not available",
+        "そのエージェントは利用できません",
+    ),
+    (
+        "Only a paused or waiting task opened on a device can be confirmed",
+        "確認できるのは、デバイスから開いた一時停止中または待機中のタスクだけです",
+    ),
+    (
+        "the agent could not start the task",
+        "エージェントがタスクを開始できませんでした",
+    ),
+    (
+        "label must be at most 200 characters",
+        "label は 200 文字以内にしてください",
+    ),
+    (
+        "goal must be non-empty and at most 32 KiB",
+        "goal は空にできません。32 KiB 以内にしてください",
+    ),
+    (
+        "summary must be at most 32 KiB",
+        "summary は 32 KiB 以内にしてください",
+    ),
+    (
+        "Unknown model for that agent. Use a model id from its catalog, or <provider_id>/<model_id>.",
+        "そのエージェントにこのモデルはありません。カタログのモデル id か <provider_id>/<model_id> を指定してください。",
+    ),
+    (
+        "Unknown variant '{variant}' (the model offers: {offered}).",
+        "不明な variant '{variant}' です（このモデルの候補: {offered}）。",
+    ),
+    (
+        "Install lazygit on the Gateway host",
+        "Gateway のホストに lazygit をインストールしてください",
+    ),
+    (
+        "The source pane is not in an accessible Git repository",
+        "元のパネルはアクセスできる Git リポジトリ内にありません",
+    ),
+    (
+        "the asset exceeds its content size limit",
+        "ファイルが内容サイズの上限を超えています",
+    ),
 ];

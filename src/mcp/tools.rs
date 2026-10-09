@@ -2,7 +2,7 @@
 //! Every result is one JSON text block of at most [`MAX_RESULT_BYTES`];
 //! long work returns a handle that `tasks.wait` polls.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -18,14 +18,15 @@ use super::tokens::AssistantSession;
 use crate::fleet::manifest::FleetService;
 use crate::tasks::domain::{clip, TaskBinding, TaskId, TaskPrincipal};
 use crate::tasks::run_command::{RunHandle, RunRequest};
-use crate::tasks::service::{summary_line, valid_name, DelegateRequest, ReadWhat, TaskError};
+use crate::tasks::service::{
+    summary_line, task_directory, valid_goal, valid_name, DelegateRequest, ReadWhat, TaskError,
+};
 use crate::AppState;
 
 pub(crate) const MAX_RESULT_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_WAIT_S: u64 = 45;
 pub(crate) const DEFAULT_WAIT_S: u64 = 30;
 const MAX_COMMAND_BYTES: usize = 16 * 1024;
-const MAX_GOAL_BYTES: usize = 32 * 1024;
 /// Room left for `"truncated":true` when a result is clipped.
 const CLIP_BUDGET: usize = MAX_RESULT_BYTES - 32;
 
@@ -171,7 +172,9 @@ fn task_error(error: TaskError) -> CallToolResult {
         TaskError::UnknownModel(_) => invalid(
             "Unknown model for that agent. Use a model id from its catalog, or <provider_id>/<model_id>.",
         ),
-        TaskError::UnknownVariant(detail) => invalid(&format!("Unknown variant {detail}.")),
+        TaskError::UnknownVariant { wanted, offered } => invalid(
+            &crate::tasks::service::unknown_variant_message(Default::default(), &wanted, &offered),
+        ),
         TaskError::NoTimeline => invalid("Only a delegated task has a timeline."),
         TaskError::InvalidSummary => invalid("summary must be non-empty and at most 32 KiB"),
         TaskError::NoTerminal => fail(
@@ -214,17 +217,7 @@ fn command_result(handle: RunHandle) -> Value {
 
 /// An absolute, existing directory, canonicalized.
 fn directory(cwd: &str) -> Result<PathBuf, CallToolResult> {
-    let not_a_directory = || invalid("cwd must be an existing absolute directory");
-    if !Path::new(cwd).is_absolute() {
-        return Err(not_a_directory());
-    }
-    let canonical = Path::new(cwd)
-        .canonicalize()
-        .map_err(|_| not_a_directory())?;
-    canonical
-        .is_dir()
-        .then_some(canonical)
-        .ok_or_else(not_a_directory)
+    task_directory(cwd).map_err(|_| invalid("cwd must be an existing absolute directory"))
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -284,7 +277,7 @@ pub(crate) struct DelegateArgs {
 
 impl DelegateArgs {
     fn request(self) -> Result<DelegateRequest, CallToolResult> {
-        if self.goal.trim().is_empty() || self.goal.len() > MAX_GOAL_BYTES {
+        if !valid_goal(&self.goal) {
             return Err(invalid("goal must be non-empty and at most 32 KiB"));
         }
         let names = [&self.agent_id, &self.mode, &self.model, &self.variant];

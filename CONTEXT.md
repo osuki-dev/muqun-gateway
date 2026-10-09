@@ -89,7 +89,9 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
   `TaskService` memory only, fed by timeline upserts and pane polls and
   published at most every 2 s per task.
   Every task carries `parent_task_id` and `origin`; `children` counts are
-  computed when a view is made, never stored.
+  computed when a view is made, never stored. The driver's pass deletes
+  tasks that ended over 30 days ago (`TASK_RETENTION`) with their events;
+  the MCP sweep deletes token rows revoked or expired over 7 days ago.
 - `src/fleet/`: this machine's capability manifest (agents, terminal backends,
   probed toolchains, task counts) behind `GET /api/fleet/self` and the
   `fleet.*` MCP tools.
@@ -188,7 +190,8 @@ unsent in the input box, and fails the task if it never leaves. `pane_agent::fol
 (resumed by `driver.rs` after a restart) reads the pane every 2 s: an agent
 starting or working is `working`, one blocked on a menu is `waiting`, one idle
 on two polls after it was seen busy (or after 30 s) is `idle_unconfirmed`
-(polled every 12 s), and a pane that closed or lost its agent is `failed`.
+(polled every 12 s, backing off to 5 min while nothing changes), and a pane
+that closed or lost its agent is `failed`.
 `done` needs an explicit signal: a `MUQUN_TASK_DONE: <summary>` line below the
 echoed request in the pane's recent output (`done_marker`), or the agent's
 `tasks.complete` call; an idle agent is never finished. Pane, launch and prompt
@@ -255,12 +258,14 @@ pairing mode; changing the gateway setting governs newly paired devices.
 Agents the gateway launches for remote dispatch (`POST …/tasks`, `POST …/spawn`,
 and a terminal-agent delegation through `POST /api/tasks` or `tasks.delegate`)
 have nobody at the terminal to answer a prompt. They start with their own
-bypass flags (`codex --dangerously-bypass-approvals-and-sandbox -c projects=…`
-trusting the task directory and its checkout; `claude
+bypass flags (`codex --dangerously-bypass-approvals-and-sandbox`, with
+`-c projects=…` trusting the task directory and its checkout; `claude
 --dangerously-skip-permissions`, with the directory marked trusted in
-`~/.claude.json` beforehand -- the owner's choice, on by default, switched
-off with `"agent_trust_folders": false`, and only for a directory inside
-their home), replaceable per kind with `agent_launch_args`
+`~/.claude.json` beforehand). Folder trust, for both, is the owner's choice:
+on by default, switched off with `"agent_trust_folders": false`, and only
+for directories strictly inside their home. The launch arguments in effect
+are logged once at startup and shown in `manage`'s Settings view. Agents
+start with these flags, replaceable per kind with `agent_launch_args`
 in `config.json` (an empty list disables them), and with `agent_env` (e.g. a
 proxy the gateway's own environment lacks) set on the pane they start in:
 tmux `-e` (3.2+ for a session, 3.0+ for a window or split), Herdr's pane

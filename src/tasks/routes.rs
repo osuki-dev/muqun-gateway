@@ -15,14 +15,14 @@ use serde::Deserialize;
 use super::domain::{
     PrincipalKind, Requested, TaskBinding, TaskId, TaskOrigin, TaskPrincipal, TaskState,
 };
-use super::service::{valid_name, DelegateRequest, TaskError};
+use super::service::{
+    task_directory, valid_goal, valid_name, BadDirectory, DelegateRequest, TaskError,
+};
 use crate::agents::directories::expand_directory_param;
 use crate::{api_error, lock_devices, require_device, ApiResult, AppState};
 
 const DEFAULT_LIMIT: usize = 50;
 const MAX_LIMIT: usize = 200;
-/// The same bound `tasks.delegate` puts on a goal.
-const MAX_GOAL_BYTES: usize = 32 * 1024;
 const MAX_LABEL_CHARS: usize = 200;
 pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
     router
@@ -121,35 +121,29 @@ fn refused(code: &str, message: &str) -> (StatusCode, Json<Value>) {
 
 /// An absolute, existing directory, canonicalized; `~` expands. None uses
 /// the home directory after the device's task history has been checked.
-fn task_directory(cwd: Option<&str>) -> ApiResult<Option<String>> {
+fn requested_directory(cwd: Option<&str>) -> ApiResult<Option<String>> {
     let Some(dir) = expand_directory_param(cwd).filter(|dir| !dir.trim().is_empty()) else {
         return Ok(dirs::home_dir().map(|home| home.to_string_lossy().into_owned()));
     };
-    let path = std::path::Path::new(dir.trim());
-    if !path.is_absolute() {
-        return Err(refused(
+    let canonical = task_directory(dir.trim()).map_err(|bad| match bad {
+        BadDirectory::NotAbsolute => refused(
             "invalid_directory",
             "Working directory must be an absolute path",
-        ));
-    }
-    let canonical = path.canonicalize().map_err(|_| {
-        refused(
+        ),
+        BadDirectory::Missing => refused(
             "directory_not_found",
             "Directory does not exist or is inaccessible",
-        )
+        ),
+        BadDirectory::NotADirectory => {
+            refused("not_a_directory", "Specified path is not a directory")
+        }
     })?;
-    if !canonical.is_dir() {
-        return Err(refused(
-            "not_a_directory",
-            "Specified path is not a directory",
-        ));
-    }
     Ok(Some(canonical.to_string_lossy().into_owned()))
 }
 
 impl CreateBody {
     fn request(self, default_cwd: Option<&str>) -> ApiResult<DelegateRequest> {
-        if self.goal.trim().is_empty() || self.goal.len() > MAX_GOAL_BYTES {
+        if !valid_goal(&self.goal) {
             return Err(refused(
                 "invalid_request",
                 "goal must be non-empty and at most 32 KiB",
@@ -182,7 +176,7 @@ impl CreateBody {
         let remembered = default_cwd.filter(|dir| std::path::Path::new(dir).is_dir());
         Ok(DelegateRequest {
             goal: self.goal,
-            cwd: task_directory(self.cwd.as_deref().or(remembered))?,
+            cwd: requested_directory(self.cwd.as_deref().or(remembered))?,
             agent_id: self.agent_id,
             mode: self.mode,
             model: self.model,
@@ -267,9 +261,9 @@ fn create_failed(error: TaskError) -> (StatusCode, Json<Value>) {
                 "the agent could not start the task",
             )
         }
-        TaskError::UnknownVariant(detail) => refused(
+        TaskError::UnknownVariant { wanted, offered } => refused(
             "unknown_variant",
-            &format!("Unknown variant {detail}."),
+            &super::service::unknown_variant_message(crate::i18n::current(), &wanted, &offered),
         ),
         error => failed(error),
     }

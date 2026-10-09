@@ -271,6 +271,25 @@ impl TaskStore for SqliteTaskStore {
         }))
     }
 
+    fn purge_ended<'a>(&'a self, before_ms: u64) -> TaskFuture<'a, usize> {
+        Box::pin(self.db.call(move |c| {
+            const ENDED: &str = "state IN ('done', 'failed', 'cancelled') AND updated_ms < ?1 \
+                AND NOT EXISTS (SELECT 1 FROM tasks AS child WHERE child.parent_task_id = tasks.id \
+                AND child.state NOT IN ('done', 'failed', 'cancelled'))";
+            let tx = c.transaction()?;
+            let before = before_ms as i64;
+            tx.execute(
+                &format!(
+                    "DELETE FROM task_events WHERE task_id IN (SELECT id FROM tasks WHERE {ENDED})"
+                ),
+                [before],
+            )?;
+            let purged = tx.execute(&format!("DELETE FROM tasks WHERE {ENDED}"), [before])?;
+            tx.commit()?;
+            Ok(purged)
+        }))
+    }
+
     fn events<'a>(&'a self, id: &'a TaskId) -> TaskFuture<'a, Vec<TaskEvent>> {
         let id = id.clone();
         Box::pin(self.db.call(move |c| {
@@ -481,6 +500,46 @@ mod tests {
         assert_eq!(events[0].from, None);
         assert_eq!(events[2].from, Some(TaskState::Dispatching));
         assert!(events.windows(2).all(|w| w[0].seq < w[1].seq));
+    }
+
+    #[tokio::test]
+    async fn only_tasks_that_ended_before_the_cutoff_are_purged_with_their_events() {
+        let store = SqliteTaskStore::new(temp_store("tasks-purge"));
+        let ended = |to| {
+            let store = &store;
+            async move {
+                let t = store.insert(&task("a")).await.unwrap();
+                for step in [TaskState::Dispatching, TaskState::Working, to] {
+                    store.transition(&t.id, change(step)).await.unwrap();
+                }
+                t
+            }
+        };
+        let done = ended(TaskState::Done).await;
+        let cancelled = ended(TaskState::Cancelled).await;
+        let open = store.insert(&task("a")).await.unwrap();
+        // An ended parent stays while a child of it is still open.
+        let parent = ended(TaskState::Failed).await;
+        let child = store
+            .insert(&Task {
+                parent: Some(parent.id.clone()),
+                ..task("a")
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(store.purge_ended(1).await.unwrap(), 0, "nothing that old");
+        assert_eq!(store.purge_ended(now_ms() + 1).await.unwrap(), 2);
+        for (id, kept) in [
+            (&done.id, false),
+            (&cancelled.id, false),
+            (&open.id, true),
+            (&parent.id, true),
+            (&child.id, true),
+        ] {
+            assert_eq!(store.get(id).await.unwrap().is_some(), kept, "{id:?}");
+            assert_eq!(!store.events(id).await.unwrap().is_empty(), kept, "{id:?}");
+        }
     }
 
     #[tokio::test]

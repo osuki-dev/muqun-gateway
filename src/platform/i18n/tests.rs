@@ -401,7 +401,7 @@ fn every_slot_in_a_source_string_survives_into_its_translation() {
     for &locale in Locale::ALL {
         let code = locale.as_str();
         for (english, translated) in locale.catalog() {
-            for slot in ["{index}", "{action}", "{name}"] {
+            for slot in ["{index}", "{action}", "{name}", "{variant}", "{offered}"] {
                 assert_eq!(
                     english.contains(slot),
                     translated.contains(slot),
@@ -437,6 +437,10 @@ fn api_vocabulary_inside_a_message_is_never_translated() {
                 "request_id",
                 "repo_path",
                 "GET /api/agents/catalog",
+                "<provider_id>/<model_id>",
+                "label",
+                "goal",
+                "summary",
             ] {
                 if english.contains(token) {
                     assert!(

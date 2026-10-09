@@ -193,4 +193,53 @@ pub(super) const DE: &[(&str, &str)] = &[
         "branch_name darf kein leeres Pfadsegment haben und kein Segment, das mit einem Punkt beginnt oder endet",
     ),
     ("branch_name must not end with .lock", "branch_name darf nicht auf .lock enden"),
+    // -- tasks, lazygit and assets ------------------------------------------
+    (
+        "No terminal session is reachable on this computer",
+        "Auf diesem Computer ist keine Terminal-Sitzung erreichbar",
+    ),
+    (
+        "That agent is not available",
+        "Dieser Agent ist nicht verfügbar",
+    ),
+    (
+        "Only a paused or waiting task opened on a device can be confirmed",
+        "Bestätigen lässt sich nur eine pausierte oder wartende Aufgabe, die auf einem Gerät geöffnet wurde",
+    ),
+    (
+        "the agent could not start the task",
+        "der Agent konnte die Aufgabe nicht starten",
+    ),
+    (
+        "label must be at most 200 characters",
+        "label darf höchstens 200 Zeichen lang sein",
+    ),
+    (
+        "goal must be non-empty and at most 32 KiB",
+        "goal darf nicht leer und höchstens 32 KiB groß sein",
+    ),
+    (
+        "summary must be at most 32 KiB",
+        "summary darf höchstens 32 KiB groß sein",
+    ),
+    (
+        "Unknown model for that agent. Use a model id from its catalog, or <provider_id>/<model_id>.",
+        "Unbekanntes Modell für diesen Agent. Verwende eine Modell-ID aus seinem Katalog oder <provider_id>/<model_id>.",
+    ),
+    (
+        "Unknown variant '{variant}' (the model offers: {offered}).",
+        "Unbekannte variant '{variant}' (das Modell bietet: {offered}).",
+    ),
+    (
+        "Install lazygit on the Gateway host",
+        "Installiere lazygit auf dem Gateway-Host",
+    ),
+    (
+        "The source pane is not in an accessible Git repository",
+        "Das Quell-Panel liegt in keinem zugänglichen Git-Repository",
+    ),
+    (
+        "the asset exceeds its content size limit",
+        "die Datei überschreitet ihre Größenbeschränkung",
+    ),
 ];

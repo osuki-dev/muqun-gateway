@@ -183,4 +183,53 @@ pub(super) const PT: &[(&str, &str)] = &[
         "branch_name não pode ter um segmento de caminho vazio nem um segmento que comece ou termine por ponto",
     ),
     ("branch_name must not end with .lock", "branch_name não pode terminar em .lock"),
+    // -- tasks, lazygit and assets ------------------------------------------
+    (
+        "No terminal session is reachable on this computer",
+        "Nenhuma sessão de terminal está acessível neste computador",
+    ),
+    (
+        "That agent is not available",
+        "Esse agente não está disponível",
+    ),
+    (
+        "Only a paused or waiting task opened on a device can be confirmed",
+        "Só é possível confirmar uma tarefa em pausa ou em espera aberta num dispositivo",
+    ),
+    (
+        "the agent could not start the task",
+        "o agente não conseguiu iniciar a tarefa",
+    ),
+    (
+        "label must be at most 200 characters",
+        "label tem de ter no máximo 200 caracteres",
+    ),
+    (
+        "goal must be non-empty and at most 32 KiB",
+        "goal não pode estar vazio e tem de ter no máximo 32 KiB",
+    ),
+    (
+        "summary must be at most 32 KiB",
+        "summary tem de ter no máximo 32 KiB",
+    ),
+    (
+        "Unknown model for that agent. Use a model id from its catalog, or <provider_id>/<model_id>.",
+        "Modelo desconhecido para esse agente. Use um id de modelo do seu catálogo, ou <provider_id>/<model_id>.",
+    ),
+    (
+        "Unknown variant '{variant}' (the model offers: {offered}).",
+        "Valor de variant desconhecido '{variant}' (o modelo oferece: {offered}).",
+    ),
+    (
+        "Install lazygit on the Gateway host",
+        "Instale o lazygit no anfitrião do Gateway",
+    ),
+    (
+        "The source pane is not in an accessible Git repository",
+        "O painel de origem não está num repositório Git acessível",
+    ),
+    (
+        "the asset exceeds its content size limit",
+        "o ficheiro excede o seu limite de tamanho de conteúdo",
+    ),
 ];

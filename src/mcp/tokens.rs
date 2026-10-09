@@ -126,4 +126,6 @@ pub(crate) trait AssistantTokenStore: Send + Sync {
     fn revoke_all<'a>(&'a self) -> TaskFuture<'a, usize>;
     /// Live tokens only, newest first.
     fn list<'a>(&'a self) -> TaskFuture<'a, Vec<TokenRow>>;
+    /// Delete the tokens revoked or expired before `before_ms`. How many went.
+    fn purge_dead<'a>(&'a self, before_ms: u64) -> TaskFuture<'a, usize>;
 }

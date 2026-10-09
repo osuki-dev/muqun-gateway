@@ -2,6 +2,18 @@
 
 ## Changes and fixes
 
+- **Agents the gateway starts now skip their own prompts by default.** Codex
+  and Claude Code started from the phone (`POST …/agents/spawn`,
+  `POST …/tasks`, `POST /api/tasks`) or by an MCP caller (`tasks.delegate`)
+  run with `--dangerously-bypass-approvals-and-sandbox` and
+  `--dangerously-skip-permissions`, and the task directory is marked trusted
+  for them (Codex's `-c projects=…`, Claude Code's `~/.claude.json`; only
+  directories inside your home). Before, they stopped at prompts nobody was
+  there to answer. To keep the prompts, set
+  `"agent_launch_args": { "codex": [], "claude": [] }` and
+  `"agent_trust_folders": false` in `config.json`. The launch arguments in
+  effect are logged at startup and shown in `manage` → Settings.
+
 - `agent_collaboration` is announced only where it works. It was in the static
   capability list, so a gateway attached to nothing but tmux told every app that
   agent collaboration was available; the refusal then arrived after the reader
@@ -36,7 +48,9 @@ in every respect except that they no longer claim a feature they cannot perform.
 
 ## Upgrade
 
-Restart the gateway. No configuration or migration is required.
+Restart the gateway. No configuration or migration is required, but read the
+first change above: agents started from the phone or by an MCP caller now run
+without their approval prompts unless `config.json` says otherwise.
 
 ## Validation
 

@@ -132,6 +132,15 @@ impl AssistantTokenStore for SqliteTokenStore {
         }))
     }
 
+    fn purge_dead<'a>(&'a self, before_ms: u64) -> TaskFuture<'a, usize> {
+        Box::pin(self.db.call(move |c| {
+            Ok(c.execute(
+                "DELETE FROM assistant_tokens WHERE revoked_ms < ?1 OR expires_ms < ?1",
+                [before_ms as i64],
+            )?)
+        }))
+    }
+
     fn list<'a>(&'a self) -> TaskFuture<'a, Vec<TokenRow>> {
         Box::pin(self.db.call(move |c| {
             let mut statement = c.prepare(&format!(
@@ -214,13 +223,31 @@ mod tests {
             session_id: "s1".into(),
             pane_id: "%3".into(),
         };
-        let issued = store.issue(pane, "claude".into(), 0).await.unwrap();
+        let issued = store.issue(pane.clone(), "claude".into(), 0).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         assert_eq!(
             store.resolve(&issued.token).await.unwrap(),
             Resolved::Expired
         );
         assert!(store.list().await.unwrap().is_empty());
+
+        // Purged once dead long enough: the expired and the revoked row go,
+        // the live one stays.
+        let live = store.issue(pane.clone(), "claude".into(), 60_000).await;
+        let revoked = store.issue(pane, "claude".into(), 60_000).await.unwrap();
+        store.revoke(&revoked.session.token_id).await.unwrap();
+        assert_eq!(store.purge_dead(1).await.unwrap(), 0, "nothing that old");
+        assert_eq!(store.purge_dead(now_ms() + 1).await.unwrap(), 2);
+        assert_eq!(
+            store.resolve(&issued.token).await.unwrap(),
+            Resolved::Invalid
+        );
+        assert!(store
+            .resolve(&live.unwrap().token)
+            .await
+            .unwrap()
+            .live()
+            .is_some());
     }
 
     #[tokio::test]

@@ -25,6 +25,9 @@ pub(crate) trait TaskStore: Send + Sync {
     /// absent from the map.
     fn child_counts<'a>(&'a self, ids: Vec<TaskId>)
         -> TaskFuture<'a, HashMap<TaskId, ChildCounts>>;
+    /// Delete the tasks that ended before `before_ms` (none of whose
+    /// children is still open), with their events. How many went.
+    fn purge_ended<'a>(&'a self, before_ms: u64) -> TaskFuture<'a, usize>;
 }
 
 #[derive(Debug)]

@@ -144,4 +144,53 @@ pub(super) const KO: &[(&str, &str)] = &[
         "branch_name에는 빈 경로 세그먼트나 점으로 시작 또는 끝나는 세그먼트가 있을 수 없습니다",
     ),
     ("branch_name must not end with .lock", "branch_name은 .lock으로 끝날 수 없습니다"),
+    // -- tasks, lazygit and assets ------------------------------------------
+    (
+        "No terminal session is reachable on this computer",
+        "이 컴퓨터에서 연결할 수 있는 터미널 세션이 없습니다",
+    ),
+    (
+        "That agent is not available",
+        "해당 에이전트를 사용할 수 없습니다",
+    ),
+    (
+        "Only a paused or waiting task opened on a device can be confirmed",
+        "기기에서 연 작업 중 일시 정지되었거나 대기 중인 작업만 확인할 수 있습니다",
+    ),
+    (
+        "the agent could not start the task",
+        "에이전트가 작업을 시작하지 못했습니다",
+    ),
+    (
+        "label must be at most 200 characters",
+        "label은 최대 200자여야 합니다",
+    ),
+    (
+        "goal must be non-empty and at most 32 KiB",
+        "goal은 비어 있을 수 없으며 최대 32 KiB여야 합니다",
+    ),
+    (
+        "summary must be at most 32 KiB",
+        "summary는 최대 32 KiB여야 합니다",
+    ),
+    (
+        "Unknown model for that agent. Use a model id from its catalog, or <provider_id>/<model_id>.",
+        "해당 에이전트에 없는 모델입니다. 카탈로그의 모델 id 또는 <provider_id>/<model_id>를 사용하세요.",
+    ),
+    (
+        "Unknown variant '{variant}' (the model offers: {offered}).",
+        "알 수 없는 variant '{variant}'입니다(이 모델이 제공하는 값: {offered}).",
+    ),
+    (
+        "Install lazygit on the Gateway host",
+        "Gateway 호스트에 lazygit을 설치하세요",
+    ),
+    (
+        "The source pane is not in an accessible Git repository",
+        "원본 패널이 접근 가능한 Git 저장소에 있지 않습니다",
+    ),
+    (
+        "the asset exceeds its content size limit",
+        "파일이 콘텐츠 크기 제한을 초과합니다",
+    ),
 ];

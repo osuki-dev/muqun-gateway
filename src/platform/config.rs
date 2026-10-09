@@ -93,13 +93,14 @@ pub(crate) struct Config {
     /// the gateway's own environment lacks. Values are never logged.
     #[serde(default, skip_serializing_if = "AgentEnv::is_empty")]
     pub(crate) agent_env: AgentEnv,
-    /// Mark the directory a Claude Code agent is launched in as trusted in
-    /// Claude Code's own config (`projects["<dir>"].hasTrustDialogAccepted`
-    /// in `~/.claude.json`), so it does not stop at "Do you trust the files in
-    /// this folder?" with nobody at the terminal. On by default -- the owner's
-    /// choice, for agents launched from their phone -- and only ever for a
-    /// directory inside their home; `false` leaves that file alone. Omitted
-    /// from a written config while on.
+    /// Mark the directory an agent is launched in as trusted, so it does not
+    /// stop at "Do you trust the files in this folder?" with nobody at the
+    /// terminal: in Claude Code's own config
+    /// (`projects["<dir>"].hasTrustDialogAccepted` in `~/.claude.json`), and
+    /// with Codex's `-c projects=…` for that run. On by default -- the
+    /// owner's choice, for agents launched from their phone -- and only ever
+    /// for directories inside their home; `false` does neither. Omitted from
+    /// a written config while on.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub(crate) agent_trust_folders: bool,
     /// Put the agent's own question, and the answers it is offering, into a

@@ -41,14 +41,18 @@ impl TaskState {
         matches!(self, Self::Done | Self::Failed | Self::Cancelled)
     }
 
+    /// Once it works, a task moves freely among working, waiting and
+    /// idle_unconfirmed, and can end from any of them: a confirm of a waiting
+    /// task, or a pane closing under a paused one, is a direct move, never a
+    /// walk through a `working` that did not happen.
     pub(crate) fn can_move_to(self, to: TaskState) -> bool {
         use TaskState::*;
         match self {
             Queued => matches!(to, Dispatching | Cancelled),
             Dispatching => matches!(to, Working | Failed | Cancelled),
-            Working => matches!(to, Waiting | IdleUnconfirmed | Done | Failed | Cancelled),
-            Waiting => matches!(to, Working | Cancelled),
-            IdleUnconfirmed => matches!(to, Working | Done | Cancelled),
+            Working | Waiting | IdleUnconfirmed => {
+                to != self && !matches!(to, Queued | Dispatching)
+            }
             Done | Failed | Cancelled => false,
         }
     }
@@ -84,7 +88,6 @@ pub(crate) enum TaskBinding {
 pub(crate) enum PrincipalKind {
     Device,
     Assistant,
-    Peer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -337,10 +340,17 @@ mod tests {
             (IdleUnconfirmed, Done),
             (Working, Failed),
             (Queued, Cancelled),
+            // Real outcomes of a paused task, with no `working` between.
+            (Waiting, Done),
+            (Waiting, Failed),
+            (IdleUnconfirmed, Failed),
+            (IdleUnconfirmed, Waiting),
         ] {
             assert!(a.can_move_to(b), "{a:?}->{b:?}");
         }
         assert!(!Queued.can_move_to(Working), "queued must dispatch first");
+        assert!(!Waiting.can_move_to(Dispatching), "never dispatched twice");
+        assert!(!Working.can_move_to(Working), "a move is a change");
         assert!(!Done.can_move_to(Working));
     }
 

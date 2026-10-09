@@ -93,10 +93,10 @@ pub(crate) struct AppState {
     /// resolved for a client, so the asset content route can serve them. See
     /// `agents::message_images`.
     pub(crate) message_images: Arc<agents::message_images::MessageImages>,
-    /// The shared SQLite store every persisting domain borrows. See
-    /// `platform::store::sqlite`.
-    // Cloned into the stores at composition; only tests read it back.
-    #[allow(dead_code)]
+    /// The shared SQLite store, for tests that build a store of their own on
+    /// it. The gateway hands it to each domain's store at composition and
+    /// never reads it back. See `platform::store::sqlite`.
+    #[cfg(test)]
     pub(crate) db: Arc<platform::store::sqlite::SqliteStore>,
     /// The assistant tokens `/mcp` accepts, kept in `db`. See `mcp::tokens`.
     pub(crate) mcp_tokens: Arc<dyn mcp::tokens::AssistantTokenStore>,

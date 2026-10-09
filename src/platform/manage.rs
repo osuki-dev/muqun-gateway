@@ -1865,6 +1865,28 @@ fn manage_lines(
                 "Updates are manual only; never background-installed or downgraded.",
             ));
             panel(&mut body, "What these settings do", rows, content, framed);
+            let mut agents: Vec<ScreenLine> = crate::agents::tasks::launch_defaults(
+                &config.agent_launch_args,
+                config.agent_trust_folders,
+            )
+            .into_iter()
+            .map(ScreenLine::plain)
+            .collect();
+            agents.push(ScreenLine::text(
+                "The default flags skip the agent's own approval prompts.",
+                Tone::Warning,
+            ));
+            agents.push(ScreenLine::text(
+                "Change: agent_launch_args, agent_trust_folders in config.json.",
+                Tone::Quiet,
+            ));
+            panel(
+                &mut body,
+                "Agents started from the phone",
+                agents,
+                content,
+                framed,
+            );
         }
     }
     let selected_line = body.iter().position(ScreenLine::selected);

@@ -19,10 +19,15 @@
 //!
 //! - A task bound to nothing (the gateway stopped between recording it and
 //!   dispatching it) fails ("never dispatched") once it is
-//!   [`NEVER_DISPATCHED_AFTER`] old.
+//!   [`NEVER_DISPATCHED_AFTER`] old; so does a session delegation left
+//!   `dispatching` that long, its session never having run.
 //!
 //! Everything else is left alone -- including tasks whose terminal backend or
 //! agent cannot be asked right now, since unreachable is not gone.
+//!
+//! Each pass also forgets the tasks that ended more than
+//! [`TASK_RETENTION`](super::service::TASK_RETENTION) (30 days) ago, with
+//! their events, unless a child of theirs is still open.
 //!
 //! Between passes, [`spawn_follower`] settles delegations from the agents'
 //! own events as they arrive (see [`TaskService::follow`]); the pass catches
@@ -35,19 +40,21 @@ use std::time::Duration;
 
 use super::domain::one_line;
 use super::domain::{now_ms, Task, TaskBinding, TaskChange, TaskFilter, TaskKind, TaskState};
-use super::pane_agent;
 use super::service::{
     finished_since, is_running, session_failure, summary_timeline, turn_end, OPEN_STATES,
     SUMMARY_CHARS,
 };
+use super::{pane_agent, same_pane};
 use crate::agents::domain::AgentSessionStatus;
 use crate::agents::ports::agent::AgentError;
+use crate::backend::Pane;
 use crate::{terminal_backend, AppState};
 
 const INTERVAL: Duration = Duration::from_secs(60);
 /// How long a task may stay bound to nothing before it is given up on;
 /// dispatching takes seconds.
 const NEVER_DISPATCHED_AFTER: Duration = Duration::from_secs(10 * 60);
+const NEVER_DISPATCHED: &str = "never dispatched";
 const SOURCE: &str = "task_driver";
 /// The store caps a page at 1000.
 const PAGE: usize = 1000;
@@ -62,6 +69,11 @@ pub(crate) fn spawn(state: AppState) {
             let moved = reconcile(&state).await;
             if moved > 0 {
                 tracing::info!(moved, "settled tasks nobody was waiting on");
+            }
+            match state.tasks.purge_ended().await {
+                Ok(0) => {}
+                Ok(purged) => tracing::info!(purged, "forgot tasks that ended long ago"),
+                Err(error) => tracing::warn!(%error, "task driver: could not purge old tasks"),
             }
         }
     });
@@ -128,9 +140,8 @@ pub(crate) async fn reconcile(state: &AppState) -> usize {
                 settle_delegation(state, &task, agent_id, asid).await
             }
             TaskBinding::None => {
-                let age = now_ms().saturating_sub(task.created_ms);
-                age > NEVER_DISPATCHED_AFTER.as_millis() as u64
-                    && fail(state, &task, "never dispatched").await
+                older_than(task.created_ms, NEVER_DISPATCHED_AFTER)
+                    && fail(state, &task, NEVER_DISPATCHED).await
             }
         };
         moved += usize::from(outcome);
@@ -138,13 +149,11 @@ pub(crate) async fn reconcile(state: &AppState) -> usize {
     moved
 }
 
-/// Each session's `(pane id, shell pid)` pairs; `None` when unreachable.
-type PaneCache = HashMap<String, Option<Vec<(String, Option<u32>)>>>;
+/// Each session's panes, listed once per pass; `None` when unreachable.
+type PaneCache = HashMap<String, Option<Vec<Pane>>>;
 
-/// Whether `pane_id` still exists in `session_id` and, when the task was
-/// bound with a shell pid, still runs that shell (tmux reuses `%N` ids after
-/// a restart). `None` when that cannot be told (no such session configured,
-/// its backend does not answer, or the pane's shell pid is not known now).
+/// [`same_pane`] on `session_id`'s listing; `None` also when no such session
+/// is configured or its backend does not answer.
 async fn pane_alive(
     state: &AppState,
     cache: &mut PaneCache,
@@ -157,23 +166,9 @@ async fn pane_alive(
             Some(session) => terminal_backend(session).list_panes().await.ok(),
             None => None,
         };
-        let ids = listed.map(|panes| {
-            panes
-                .into_iter()
-                .map(|pane| (pane.id.as_str().to_owned(), pane.shell_pid))
-                .collect()
-        });
-        cache.insert(session_id.to_owned(), ids);
+        cache.insert(session_id.to_owned(), listed);
     }
-    let panes = cache.get(session_id)?.as_ref()?;
-    let Some((_, current)) = panes.iter().find(|(id, _)| id == pane_id) else {
-        return Some(false);
-    };
-    match (shell_pid, current) {
-        (None, _) => Some(true),
-        (Some(expected), Some(current)) => Some(expected == *current),
-        (Some(_), None) => None,
-    }
+    same_pane(cache.get(session_id)?.as_ref()?, pane_id, shell_pid)
 }
 
 /// One marker read of a command's pane. Whether the task moved.
@@ -212,7 +207,12 @@ async fn settle_delegation(state: &AppState, task: &Task, agent_id: &str, asid: 
         return moved(state, task, change(TaskState::Working)).await;
     }
     if !finished_since(&session, task.created_ms) {
-        return false;
+        // Left dispatching by a stop between binding the session and sending
+        // its prompt: the session never ran it, and nothing else will move it.
+        let never_sent = task.state == TaskState::Dispatching
+            && !is_running(session.status)
+            && older_than(task.updated_ms, NEVER_DISPATCHED_AFTER);
+        return never_sent && fail(state, task, NEVER_DISPATCHED).await;
     }
     // Marker first: a turn that ended while the gateway was down is done
     // only if the agent said so.
@@ -255,6 +255,11 @@ async fn moved(state: &AppState, task: &Task, to: TaskChange) -> bool {
             false
         }
     }
+}
+
+/// Whether `since_ms` is more than `age` ago.
+fn older_than(since_ms: u64, age: Duration) -> bool {
+    now_ms().saturating_sub(since_ms) > age.as_millis() as u64
 }
 
 fn change(to: TaskState) -> TaskChange {
@@ -403,7 +408,7 @@ mod tests {
             image_assets: None,
         };
         let mut agent = FakeAgent::new("opencode").with_timeline(vec![reply]);
-        agent.sessions = vec![idle, busy];
+        agent.sessions = vec![idle, busy, fake_session("ses_quiet", 1)];
         agent.http_404 = vec!["ses_404".into()];
         state.agent_runtime.attach_for_test(agent.manager()).await;
 
@@ -412,8 +417,24 @@ mod tests {
         let gone_404 = working(&state, delegation("ses_404")).await;
         let done = working(&state, delegation("ses_idle")).await;
         let running = working(&state, delegation("ses_busy")).await;
+        // Left dispatching, its prompt never sent, its session never run:
+        // given up on once it is old, not before.
+        let dispatching = |age_ms: u64| {
+            let mut stuck = delegation("ses_quiet");
+            stuck.state = TaskState::Dispatching;
+            stuck.updated_ms = now_ms() - age_ms;
+            stuck
+        };
+        let stuck = state
+            .tasks
+            .insert_for_test(&dispatching(11 * 60 * 1000))
+            .await;
+        let fresh = state.tasks.insert_for_test(&dispatching(0)).await;
 
-        assert_eq!(reconcile(&state).await, 3);
+        assert_eq!(reconcile(&state).await, 4);
+        let never = state_of(&state, &stuck).await;
+        assert_eq!(never.summary.as_deref(), Some("never dispatched"));
+        assert_eq!(state_of(&state, &fresh).await.state, TaskState::Dispatching);
         assert_eq!(state_of(&state, &gone_404).await.state, TaskState::Failed);
         let failed = state_of(&state, &gone).await;
         assert_eq!(failed.state, TaskState::Failed);

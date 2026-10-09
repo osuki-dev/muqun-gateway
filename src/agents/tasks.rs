@@ -173,13 +173,16 @@ pub const CLAUDE_BYPASS_FLAG: &str = "--dangerously-skip-permissions";
 /// { "agent_launch_args": { "codex": [], "claude": ["--permission-mode", "acceptEdits"] } }
 /// ```
 ///
-/// For Codex, `cwd` (and the git checkout it belongs to) is also marked
-/// trusted for this run. Codex's `-c` splits its key on every `.`, so a path
-/// cannot be spelled in the key (`projects."/a.b".trust_level` would not
-/// parse as meant); the path goes in the TOML *value* instead, as a table.
+/// For Codex, `trusted` ([`trusted_folders`]: the task directory and its
+/// checkout) is also marked trusted for this run. Codex's `-c` splits its
+/// key on every `.`, so a path cannot be spelled in the key
+/// (`projects."/a.b".trust_level` would not parse as meant); the path goes in
+/// the TOML *value* instead, as a table. That value replaces Codex's whole
+/// `projects` table for the run, so other per-project settings in its config
+/// do not apply to an agent started this way.
 pub fn agent_launch_args(
     kind: &str,
-    cwd: Option<&Path>,
+    trusted: &[PathBuf],
     overrides: &BTreeMap<String, Vec<String>>,
 ) -> Vec<String> {
     if let Some(args) = overrides.get(kind) {
@@ -189,14 +192,65 @@ pub fn agent_launch_args(
         "claude" => vec![CLAUDE_BYPASS_FLAG.to_owned()],
         "codex" => {
             let mut args = vec![CODEX_BYPASS_FLAG.to_owned()];
-            if let Some(cwd) = cwd {
+            if !trusted.is_empty() {
                 args.push("-c".to_owned());
-                args.push(codex_trust_override(&trust_roots(cwd)));
+                args.push(codex_trust_override(trusted));
             }
             args
         }
         _ => Vec::new(),
     }
+}
+
+/// What the kinds with built-in defaults start with under this config, one
+/// line each (`codex: --dangerously-… ; folder trust on`), for the startup
+/// log and `manage`'s Settings view: the owner should not have to read the
+/// docs to learn that their agents skip their own prompts.
+pub fn launch_defaults(
+    overrides: &BTreeMap<String, Vec<String>>,
+    trust_folders: bool,
+) -> Vec<String> {
+    let trust = if trust_folders { "on" } else { "off" };
+    ["codex", "claude"]
+        .into_iter()
+        .map(|kind| {
+            let args = agent_launch_args(kind, &[], overrides);
+            let args = if args.is_empty() {
+                "no flags".to_owned()
+            } else {
+                args.join(" ")
+            };
+            format!("{kind}: {args}; folder trust {trust}")
+        })
+        .collect()
+}
+
+/// `cwd`, resolved, when an agent may be told to trust it: a directory
+/// strictly inside `home`, named without `..`.
+fn inside_home(cwd: &Path, home: &Path) -> Option<PathBuf> {
+    if cwd
+        .components()
+        .any(|part| part == std::path::Component::ParentDir)
+    {
+        return None;
+    }
+    let (cwd, home) = (cwd.canonicalize().ok()?, home.canonicalize().ok()?);
+    (cwd != home && cwd.starts_with(&home)).then_some(cwd)
+}
+
+/// The folders an agent started in `cwd` is told to trust: `cwd` itself,
+/// the checkout it is in, and -- for a linked worktree, whose `.git` is a
+/// file -- the main checkout, which is what Codex keys trust on. Each one
+/// strictly inside `home`, like Claude Code's ([`trust_folder_for_claude`]);
+/// none at all when `cwd` is not.
+pub fn trusted_folders(cwd: &Path, home: &Path) -> Vec<PathBuf> {
+    let Some(cwd) = inside_home(cwd, home) else {
+        return Vec::new();
+    };
+    trust_roots(&cwd)
+        .into_iter()
+        .filter(|root| inside_home(root, home).is_some())
+        .collect()
 }
 
 /// `projects={"/a"={trust_level="trusted"}, ...}` for Codex's `-c`.
@@ -230,9 +284,8 @@ fn toml_string(value: &str) -> String {
     out
 }
 
-/// The folders Codex may ask about for `cwd`: `cwd` itself, the checkout it
-/// is in, and -- for a linked worktree, whose `.git` is a file -- the main
-/// checkout, which is what Codex keys trust on.
+/// `cwd`, the checkout it is in and a linked worktree's main checkout,
+/// unbounded ([`trusted_folders`] bounds them).
 fn trust_roots(cwd: &Path) -> Vec<PathBuf> {
     let mut roots = vec![cwd.to_path_buf()];
     let Some(top) = cwd.ancestors().find(|dir| dir.join(".git").exists()) else {
@@ -296,18 +349,9 @@ pub fn claude_config_file(config_dir: Option<&str>, home: &Path) -> PathBuf {
 /// nothing at all when the file cannot be read or is not a JSON object
 /// (Claude Code has not been set up).
 pub fn trust_folder_for_claude(config: &Path, home: &Path, cwd: &Path) {
-    if cwd
-        .components()
-        .any(|part| part == std::path::Component::ParentDir)
-    {
-        return;
-    }
-    let (Ok(cwd), Ok(home)) = (cwd.canonicalize(), home.canonicalize()) else {
+    let Some(cwd) = inside_home(cwd, home) else {
         return;
     };
-    if cwd == home || !cwd.starts_with(&home) {
-        return;
-    }
     let Ok(text) = std::fs::read_to_string(config) else {
         return;
     };
@@ -878,26 +922,42 @@ mod tests {
     #[test]
     fn a_launched_agent_starts_with_its_bypass_flags_unless_config_says_otherwise() {
         let none = BTreeMap::new();
+        let w = [PathBuf::from("/w")];
         assert_eq!(
-            agent_launch_args("claude", Some(Path::new("/w")), &none),
+            agent_launch_args("claude", &w, &none),
             ["--dangerously-skip-permissions"]
         );
         assert_eq!(
-            agent_launch_args("codex", None, &none),
+            agent_launch_args("codex", &[], &none),
             ["--dangerously-bypass-approvals-and-sandbox"]
         );
-        assert!(agent_launch_args("gemini", Some(Path::new("/w")), &none).is_empty());
+        assert!(agent_launch_args("gemini", &w, &none).is_empty());
 
         let mut overrides = BTreeMap::new();
         overrides.insert("codex".to_owned(), Vec::new());
         overrides.insert("claude".to_owned(), vec!["--permission-mode".to_owned()]);
         overrides.insert("gemini".to_owned(), vec!["--yolo".to_owned()]);
-        assert!(agent_launch_args("codex", Some(Path::new("/w")), &overrides).is_empty());
+        assert!(agent_launch_args("codex", &w, &overrides).is_empty());
         assert_eq!(
-            agent_launch_args("claude", None, &overrides),
+            agent_launch_args("claude", &[], &overrides),
             ["--permission-mode"]
         );
-        assert_eq!(agent_launch_args("gemini", None, &overrides), ["--yolo"]);
+        assert_eq!(agent_launch_args("gemini", &[], &overrides), ["--yolo"]);
+        // What the startup log and `manage` announce.
+        assert_eq!(
+            launch_defaults(&none, true),
+            [
+                "codex: --dangerously-bypass-approvals-and-sandbox; folder trust on",
+                "claude: --dangerously-skip-permissions; folder trust on"
+            ]
+        );
+        assert_eq!(
+            launch_defaults(&overrides, false),
+            [
+                "codex: no flags; folder trust off",
+                "claude: --permission-mode; folder trust off"
+            ]
+        );
 
         // The first prompt rides on the command line only where the CLI takes
         // one, after `--` so it is never read as an option or a subcommand.
@@ -1023,7 +1083,7 @@ mod tests {
         // Not a checkout: only the directory itself.
         let dir = temp_dir("trust-plain").join("my.project \"x\"");
         std::fs::create_dir_all(&dir).unwrap();
-        let args = agent_launch_args("codex", Some(&dir), &BTreeMap::new());
+        let args = agent_launch_args("codex", std::slice::from_ref(&dir), &BTreeMap::new());
         assert_eq!(
             args[..2],
             ["--dangerously-bypass-approvals-and-sandbox", "-c"]
@@ -1040,8 +1100,10 @@ mod tests {
     }
 
     #[test]
-    fn codex_also_trusts_the_checkout_and_a_linked_worktree_s_main_checkout() {
+    fn codex_also_trusts_the_checkout_and_a_linked_worktree_s_main_checkout_inside_home() {
         let base = temp_dir("trust-git");
+        std::fs::create_dir_all(&base).unwrap();
+        let base = base.canonicalize().unwrap();
         let main = base.join("main");
         std::fs::create_dir_all(main.join(".git/worktrees/wt")).unwrap();
         let worktree = base.join("wt");
@@ -1057,7 +1119,19 @@ mod tests {
             [sub.clone(), worktree.clone(), main.clone()]
         );
         assert_eq!(trust_roots(&main), std::slice::from_ref(&main));
-        let args = agent_launch_args("codex", Some(&sub), &BTreeMap::new());
+        // Only what lies strictly inside home is trusted, as for Claude Code.
+        for (home, trusted) in [
+            (
+                base.clone(),
+                vec![sub.clone(), worktree.clone(), main.clone()],
+            ),
+            (worktree.clone(), vec![sub.clone()]),
+            (sub.clone(), vec![]),
+            (main.clone(), vec![]),
+        ] {
+            assert_eq!(trusted_folders(&sub, &home), trusted, "{home:?}");
+        }
+        let args = agent_launch_args("codex", &trusted_folders(&sub, &base), &BTreeMap::new());
         assert_eq!(args[2].matches("trust_level").count(), 3);
         std::fs::remove_dir_all(&base).unwrap();
     }

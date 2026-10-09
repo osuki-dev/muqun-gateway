@@ -16,9 +16,14 @@ use serde_json::Value;
 
 use super::tokens::{IssuedToken, TokenBinding, PANE_TOKEN_TTL_MS};
 use crate::backend::Pane;
+use crate::tasks::domain::now_ms;
 use crate::{api_error, terminal_backend, AppState};
 
 const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+/// How long a revoked or expired token row is kept before the sweep deletes
+/// it. A pane's helper mints a token per connection, so dead rows would
+/// otherwise pile up; a week still answers "expired" to a stale client.
+const DEAD_TOKEN_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct IssueRequest {
@@ -176,6 +181,12 @@ pub(crate) fn spawn_sweeper(state: AppState) {
             let revoked = sweep_closed_panes(&state).await;
             if revoked > 0 {
                 tracing::info!(revoked, "revoked assistant tokens of closed panes");
+            }
+            let before = now_ms().saturating_sub(DEAD_TOKEN_RETENTION.as_millis() as u64);
+            match state.mcp_tokens.purge_dead(before).await {
+                Ok(0) => {}
+                Ok(purged) => tracing::info!(purged, "deleted long-dead assistant tokens"),
+                Err(error) => tracing::warn!(%error, "could not purge dead assistant tokens"),
             }
         }
     });

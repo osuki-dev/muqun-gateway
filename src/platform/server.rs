@@ -118,6 +118,7 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         fleet: Arc::default(),
         tasks,
         task_events,
+        #[cfg(test)]
         db,
     };
     // After the token store exists, so the first OpenCode start already gets
@@ -132,6 +133,14 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
             ),
         }
     }
+    tracing::info!(
+        "agents started from a phone or an MCP caller launch with: {}",
+        crate::agents::tasks::launch_defaults(
+            &state.config.agent_launch_args,
+            state.config.agent_trust_folders
+        )
+        .join(" | ")
+    );
     state.agent_runtime.spawn_supervisor();
     spawn_agent_notification_watchers(state.clone());
     spawn_agent_permission_watchers(state.clone());

@@ -196,4 +196,53 @@ pub(super) const ZH_TW: &[(&str, &str)] = &[
         "branch_name must not end with .lock",
         "branch_name 不得以 .lock 結尾",
     ),
+    // -- tasks, lazygit and assets ------------------------------------------
+    (
+        "No terminal session is reachable on this computer",
+        "這台電腦上沒有可連線的終端機工作階段",
+    ),
+    (
+        "That agent is not available",
+        "該代理程式無法使用",
+    ),
+    (
+        "Only a paused or waiting task opened on a device can be confirmed",
+        "只有在裝置上開啟、已暫停或等待中的任務可以確認",
+    ),
+    (
+        "the agent could not start the task",
+        "代理程式無法啟動這個任務",
+    ),
+    (
+        "label must be at most 200 characters",
+        "label 最多 200 個字元",
+    ),
+    (
+        "goal must be non-empty and at most 32 KiB",
+        "goal 不能為空，且最多 32 KiB",
+    ),
+    (
+        "summary must be at most 32 KiB",
+        "summary 最多 32 KiB",
+    ),
+    (
+        "Unknown model for that agent. Use a model id from its catalog, or <provider_id>/<model_id>.",
+        "該代理程式沒有這個模型。請使用其目錄中的模型 id，或 <provider_id>/<model_id>。",
+    ),
+    (
+        "Unknown variant '{variant}' (the model offers: {offered}).",
+        "未知的 variant '{variant}'（這個模型提供：{offered}）。",
+    ),
+    (
+        "Install lazygit on the Gateway host",
+        "請在 Gateway 主機上安裝 lazygit",
+    ),
+    (
+        "The source pane is not in an accessible Git repository",
+        "來源面板不在可存取的 Git 存放庫中",
+    ),
+    (
+        "the asset exceeds its content size limit",
+        "檔案超過其內容大小上限",
+    ),
 ];
