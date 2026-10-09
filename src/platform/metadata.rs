@@ -118,6 +118,12 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     // task is `done` only on its MUQUN_TASK_DONE marker; an idle agent is
     // `idle_unconfirmed`.
     "task_ledger_pane",
+    // A delegation (session or terminal agent) is `done` only on an explicit
+    // signal: the agent's `tasks.complete` MCP call, its MUQUN_TASK_DONE
+    // marker line, or the device's `POST /api/tasks/{id}/complete` (for an
+    // `idle_unconfirmed` or `waiting` task it opened). A session agent whose
+    // turn ends without one is `idle_unconfirmed`, as a terminal agent is.
+    "task_ledger_complete",
     // `subscribe_tasks` on `/api/ws`: task views without session events.
     "task_ws_subscription",
 ];

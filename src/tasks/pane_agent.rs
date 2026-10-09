@@ -6,7 +6,9 @@
 //! An idle agent is not a finished one -- a terminal agent pauses (thinking,
 //! a tool, a long build) and comes back -- so only an explicit signal is
 //! `done`: the goal is typed with [`completion_request`], and the agent
-//! printing a [`DONE_MARKER`] line is that signal.
+//! printing a [`DONE_MARKER`] line (or calling `tasks.complete` from the
+//! pane's own token) is that signal. Session delegations follow the same
+//! rule (`service::turn_end`).
 //!
 //! | The pane | The task |
 //! |---|---|
@@ -77,11 +79,13 @@ pub(crate) fn is_available(state: &AppState, agent_id: &str) -> bool {
     agent_kinds::find_on_path(&command).is_some()
 }
 
-/// The prompt typed for `goal`: the goal, then the request to print the
-/// completion marker.
+/// The first prompt of every delegation to an agent (a terminal agent's
+/// pane or an agent session): the goal, then the request to say when it is
+/// finished -- the `tasks.complete` tool, or else the completion marker.
 pub(crate) fn completion_request(goal: &str) -> String {
     format!(
-        "{goal}\n\nWhen the whole task is finished, print one line exactly in this form: \
+        "{goal}\n\nWhen the whole task is finished, call the muqun tool tasks.complete with a \
+         one-line summary; if you cannot call it, print one line exactly in this form: \
          {DONE_MARKER} {SUMMARY_PLACEHOLDER}"
     )
 }

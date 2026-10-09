@@ -80,14 +80,19 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
   A delegation to a terminal agent (`codex`, `claude`, ...) is started through
   the spawn route's own `launch_agent` and bound to its pane
   (`binding.kind == "pane"` with `agent_id`); `pane_agent.rs` maps that pane
-  agent's backend state onto the task. Every task carries `parent_task_id` and `origin`; `children` counts are
+  agent's backend state onto the task. A delegation of either kind is `done`
+  only on an explicit signal -- the agent's `tasks.complete` MCP call, the
+  `MUQUN_TASK_DONE` marker (`pane_agent::done_marker`, read off the pane or
+  the session's last message by `service::turn_end`), or the device's
+  `POST /api/tasks/{id}/complete`; a stop without one is `idle_unconfirmed`.
+  Every task carries `parent_task_id` and `origin`; `children` counts are
   computed when a view is made, never stored.
 - `src/fleet/`: this machine's capability manifest (agents, terminal backends,
   probed toolchains, task counts) behind `GET /api/fleet/self` and the
   `fleet.*` MCP tools.
 - `src/mcp/`: the gateway as an MCP server for local agents: `/mcp` on the
   existing listener (loopback, proxy-header refusal, assistant token in
-  `auth.rs`), the seven tools in `tools.rs` (which file what they start under
+  `auth.rs`), the eight tools in `tools.rs` (which file what they start under
   the calling task through `lineage.rs`), assistant tokens (`tokens.rs`,
   `tokens_sqlite.rs`, pane-bound issue and sweep in `issue.rs`,
   `/api/mcp/tokens*` in `token_routes.rs`), and per-host client config in

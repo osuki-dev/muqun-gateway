@@ -828,7 +828,7 @@ fn task_state_schema() -> Value {
     json!({
         "type": "string",
         "enum": ["queued", "dispatching", "working", "waiting", "idle_unconfirmed", "done", "failed", "cancelled"],
-        "description": "done, failed and cancelled are terminal"
+        "description": "done, failed and cancelled are terminal. A delegation is done only on an explicit signal (task_ledger_complete: the agent's tasks.complete call or MUQUN_TASK_DONE marker, or POST /api/tasks/{id}/complete); an agent that stops without one is idle_unconfirmed, a pause whose summary is a hint"
     })
 }
 
@@ -912,6 +912,15 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
         ),
         "task_not_found",
     );
+    let mut complete_responses = not_found(
+        json_ok(
+            "The task, now done; a task already done is answered as it stands",
+            task_view(),
+        ),
+        "task_not_found",
+    );
+    complete_responses["400"] = json!({ "description": "invalid_request: the body is not a JSON object with an optional string summary" });
+    complete_responses["409"] = json!({ "description": "task_not_confirmable: the task was not opened on a device (origin device), or it is neither idle_unconfirmed nor waiting" });
     let mut issue_responses = json_ok(
         "A fresh pane-bound assistant token. The token is shown only here",
         json!({
@@ -978,6 +987,23 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
                 "summary": "Interrupt the agent or send Ctrl-C to the command",
                 "parameters": [path_param("id")],
                 "responses": cancel_responses
+            }}),
+        ),
+        (
+            "/api/tasks/{id}/complete",
+            json!({ "post": {
+                "summary": "Confirm that a delegation the device opened, paused (idle_unconfirmed) or waiting on the user, is finished: it becomes done and task.updated is published. Requires the task_ledger_complete capability and a device token",
+                "parameters": [path_param("id")],
+                "requestBody": {
+                    "required": false,
+                    "content": { "application/json": { "schema": {
+                        "type": "object",
+                        "properties": {
+                            "summary": { "type": "string", "description": "The new summary, one line, cut to 240 characters; without it the task keeps its hint" }
+                        }
+                    }}}
+                },
+                "responses": complete_responses
             }}),
         ),
         (
@@ -1943,6 +1969,7 @@ mod history_contract_tests {
             ("/api/tasks", "get"),
             ("/api/tasks/{id}", "get"),
             ("/api/tasks/{id}/cancel", "post"),
+            ("/api/tasks/{id}/complete", "post"),
             ("/api/fleet/self", "get"),
             ("/api/mcp/tokens", "post"),
             ("/api/mcp/tokens", "get"),

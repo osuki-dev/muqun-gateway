@@ -29,6 +29,7 @@ pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
         .route("/api/tasks", get(list).post(create))
         .route("/api/tasks/{id}", get(read))
         .route("/api/tasks/{id}/cancel", post(cancel))
+        .route("/api/tasks/{id}/complete", post(complete))
 }
 
 fn invalid_request() -> (StatusCode, Json<Value>) {
@@ -289,6 +290,42 @@ async fn cancel(
     Ok(Json(json!(task)))
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct CompleteBody {
+    #[serde(default)]
+    summary: Option<String>,
+}
+
+/// `POST /api/tasks/{id}/complete`: the user confirms that a delegation the
+/// phone opened, paused (`idle_unconfirmed`) or waiting on them, is finished.
+/// The body (`{"summary"?}`) may be left out.
+async fn complete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let body: CompleteBody = if body.iter().all(u8::is_ascii_whitespace) {
+        CompleteBody::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|_| invalid_request())?
+    };
+    let task = state
+        .tasks
+        .confirm(&TaskId(id), body.summary.as_deref())
+        .await
+        .map_err(|error| match error {
+            TaskError::NotConfirmable => api_error(
+                StatusCode::CONFLICT,
+                "task_not_confirmable",
+                "Only a paused or waiting task opened on a device can be confirmed",
+            ),
+            error => failed(error),
+        })?;
+    Ok(Json(json!(task)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -465,6 +502,83 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// The phone confirms a paused task it opened; nothing else is confirmable.
+    #[tokio::test]
+    async fn a_device_confirms_a_paused_task_it_opened() {
+        let state = state();
+        let opened = |origin| {
+            let now = now_ms();
+            Task {
+                id: TaskId::new(),
+                kind: TaskKind::Delegation,
+                goal: "g".into(),
+                cwd: None,
+                binding: TaskBinding::None,
+                state: TaskState::Queued,
+                summary: Some("Shall I push?".into()),
+                exit_code: None,
+                created_by: principal("d1".into()),
+                created_ms: now,
+                updated_ms: now,
+                seq: 0,
+                parent: None,
+                origin,
+                label: None,
+                requester_name: Some("phone".into()),
+            }
+        };
+        let mut ids = Vec::new();
+        for (origin, to) in [
+            (TaskOrigin::Device, TaskState::IdleUnconfirmed),
+            (TaskOrigin::Device, TaskState::Waiting),
+            (TaskOrigin::Device, TaskState::Working),
+            (TaskOrigin::Mcp, TaskState::IdleUnconfirmed),
+        ] {
+            let id = state.tasks.insert_for_test(&opened(origin)).await;
+            let to = crate::tasks::domain::TaskChange {
+                to,
+                source: "test".into(),
+                ..Default::default()
+            };
+            state.tasks.move_to(&id, to).await.unwrap();
+            ids.push(id.0);
+        }
+        let mut updates = state.task_events.subscribe();
+        let path = |id: &str| format!("/api/tasks/{id}/complete");
+
+        // No body: the hint stays the summary.
+        let (status, body) = call(&state, "POST", &path(&ids[0])).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["state"], "done");
+        assert_eq!(body["summary"], "Shall I push?");
+        assert!(updates.try_recv().is_ok(), "task.updated is published");
+        let again = send(&state, "POST", &path(&ids[0]), Some(json!({})), true).await;
+        assert_eq!(again.0, StatusCode::OK, "confirming twice answers the task");
+
+        let summary = Some(json!({ "summary": "pushed\nand tagged" }));
+        let (status, body) = send(&state, "POST", &path(&ids[1]), summary, true).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            (&body["state"], &body["summary"]),
+            (&json!("done"), &json!("pushed and tagged"))
+        );
+
+        for (id, why) in [
+            (&ids[2], "still working"),
+            (&ids[3], "not opened on a device"),
+        ] {
+            let (status, body) = call(&state, "POST", &path(id)).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{why}");
+            assert_eq!(body["error"]["code"], "task_not_confirmable");
+        }
+        let (status, _) = call(&state, "POST", &path("nope")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = send(&state, "POST", &path(&ids[2]), None, false).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let bad = send(&state, "POST", &path(&ids[2]), Some(json!("x")), true).await;
+        assert_eq!(bad.0, StatusCode::BAD_REQUEST);
     }
 
     /// A state whose OpenCode fake answers a new session `opencode_new`.

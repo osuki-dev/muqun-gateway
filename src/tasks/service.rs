@@ -141,6 +141,9 @@ pub(crate) enum TaskError {
     NoTerminal,
     /// A timeline was asked of a task that has none (a command).
     NoTimeline,
+    /// The device confirmed a task that is not its own paused or waiting
+    /// delegation.
+    NotConfirmable,
     Store(anyhow::Error),
     Agent(AgentError),
     Backend(String),
@@ -157,6 +160,10 @@ impl std::fmt::Display for TaskError {
             Self::UnknownVariant(variant) => write!(f, "unknown variant {variant}"),
             Self::NoTerminal => write!(f, "{}", run_command::NO_TERMINAL),
             Self::NoTimeline => write!(f, "only a delegated task has a timeline"),
+            Self::NotConfirmable => write!(
+                f,
+                "only a paused or waiting task the device opened can be confirmed"
+            ),
             Self::Store(error) => write!(f, "task store: {error:#}"),
             Self::Agent(error) => write!(f, "agent: {error}"),
             Self::Backend(message) => write!(f, "{message}"),
@@ -265,7 +272,7 @@ enum Step {
     Stay,
     /// The agent picked the prompt up.
     Busy,
-    /// Idle: done, if the agent went busy first.
+    /// Idle: the turn ended, if the agent went busy first (see [`turn_end`]).
     Idle,
     Move(TaskChange),
 }
@@ -444,9 +451,11 @@ impl TaskService {
                 ..change(TaskState::Dispatching)
             };
             self.store().transition(&task.id, dispatching).await?;
+            // Asked for an explicit end: a turn that stops is only a pause.
+            let prompt = pane_agent::completion_request(&request.goal);
             manager
                 .prompts()
-                .send_prompt(&asid, &request.goal, &[], None)
+                .send_prompt(&asid, &prompt, &[], None)
                 .await?;
             let task = self
                 .store()
@@ -644,7 +653,8 @@ impl TaskService {
 
     /// A just-dispatched task whose session already finished its turn (its
     /// idle event came before the task was Working, when the follower could
-    /// not settle it): done now, not at the driver's next pass.
+    /// not settle it): settled now (see [`turn_end`]), not at the driver's
+    /// next pass.
     async fn settle_if_finished(&self, state: &AppState, task: Task) -> Task {
         let Some(done) = self.finished_change(state, &task).await else {
             return task;
@@ -678,8 +688,10 @@ impl TaskService {
     }
 
     /// Wait up to `timeout` (1..=45 s) for the task to move: to done, failed
-    /// or cancelled, or to waiting on the user. A command's answer carries
-    /// what it printed so far.
+    /// or cancelled, to waiting on the user, or (a delegation) to
+    /// `idle_unconfirmed`, its agent stopped without saying it is finished. A
+    /// command's answer carries what it printed so far; a session
+    /// delegation's, done or paused, the agent's last message (`answer`).
     pub(crate) async fn wait(
         &self,
         state: &AppState,
@@ -709,7 +721,9 @@ impl TaskService {
             TaskBinding::None => self.present(&task).await,
         };
         let answer = match &view.binding {
-            TaskBinding::AgentSession { asid, .. } if view.state == TaskState::Done => {
+            TaskBinding::AgentSession { asid, .. }
+                if matches!(view.state, TaskState::Done | TaskState::IdleUnconfirmed) =>
+            {
                 full_answer(state, asid, task.created_ms).await
             }
             _ => None,
@@ -755,22 +769,22 @@ impl TaskService {
                     continue;
                 }
                 Step::Idle if !seen_busy => continue,
-                Step::Idle => {
-                    let items = summary_timeline(&manager, asid, task.created_ms).await;
-                    TaskChange {
-                        summary: result_line(&items),
-                        ..change(TaskState::Done)
-                    }
-                }
+                Step::Idle => turn_end(&summary_timeline(&manager, asid, task.created_ms).await),
                 Step::Move(to) => to,
             };
             if to.to == task.state {
-                // Still waiting on the user: say so now, there is nothing to
-                // wait for until they answer.
-                if task.state == TaskState::Waiting {
-                    return Ok(self.present(&task).await);
+                // The follower may have moved it since it was read (a paused
+                // task working again).
+                let now = self.store.get(&task.id).await?.ok_or(TaskError::NotFound)?;
+                if now.state == task.state {
+                    // Still waiting on the user, or still paused: say so now,
+                    // there is nothing to wait for until someone acts.
+                    if paused(task.state) {
+                        return Ok(self.present(&task).await);
+                    }
+                    continue;
                 }
-                continue;
+                task = now;
             }
             let target = to.to;
             task = match self.settle(&task, to).await {
@@ -782,16 +796,17 @@ impl TaskService {
                 }
                 Err(error) => return Err(error),
             };
-            if task.state.is_terminal() || target == TaskState::Waiting {
+            if task.state.is_terminal() || paused(target) {
                 return Ok(self.present(&task).await);
             }
         }
     }
 
-    /// Wait for the task to be recorded as finished or waiting on the user
-    /// (by whoever moves it), or for `deadline`; the task as it then stands.
+    /// Wait for the task to be recorded as finished, waiting on the user or
+    /// paused (by whoever moves it), or for `deadline`; the task as it then
+    /// stands.
     async fn wait_published(&self, id: &TaskId, deadline: Instant) -> Result<TaskView, TaskError> {
-        let settled = |task: &Task| task.state.is_terminal() || task.state == TaskState::Waiting;
+        let settled = |task: &Task| task.state.is_terminal() || paused(task.state);
         // Subscribe before reading, so nothing falls between.
         let mut events = self.events.subscribe();
         loop {
@@ -1066,15 +1081,18 @@ impl TaskService {
 
     /// Settle the open task bound to the session an agent event is about, as
     /// it happens, so the ledger moves without anyone waiting: a finished
-    /// turn is done with its result line, a failed session failed with its
-    /// error line, an interrupted one cancelled, a pending request waiting.
-    /// Whether a task moved.
+    /// turn is done on its completion marker and `idle_unconfirmed` without
+    /// one (see [`turn_end`]), a paused task whose session runs again
+    /// working, a failed session failed with its error line, an interrupted
+    /// one cancelled, a pending request waiting. Whether a task moved.
     pub(crate) async fn follow(&self, state: &AppState, event: &AgentDomainEvent) -> bool {
         let asid = match event {
             AgentDomainEvent::StatusChanged {
                 asid,
                 status:
                     AgentSessionStatus::Idle
+                    | AgentSessionStatus::Busy
+                    | AgentSessionStatus::Retry
                     | AgentSessionStatus::Failed
                     | AgentSessionStatus::Interrupted,
                 ..
@@ -1107,6 +1125,8 @@ impl TaskService {
                 Some(done) => done,
                 None => return false,
             },
+            // A new turn after a pause: the user (or the agent) went on.
+            Step::Busy if task.state == TaskState::IdleUnconfirmed => change(TaskState::Working),
             Step::Move(to) if to.to != task.state => to,
             _ => return false,
         };
@@ -1124,8 +1144,9 @@ impl TaskService {
         }
     }
 
-    /// Done with its result line, if `task`'s session went idle after the
-    /// task was created (it worked on the prompt in between).
+    /// What the ended turn makes of `task` ([`turn_end`]), if its session
+    /// went idle after the task was created (it worked on the prompt in
+    /// between) and that moves the task.
     async fn finished_change(&self, state: &AppState, task: &Task) -> Option<TaskChange> {
         let TaskBinding::AgentSession { agent_id, asid } = &task.binding else {
             return None;
@@ -1135,11 +1156,91 @@ impl TaskService {
         if !finished_since(&session, task.created_ms) {
             return None;
         }
-        let items = summary_timeline(&manager, asid, task.created_ms).await;
-        Some(TaskChange {
-            summary: result_line(&items),
+        let to = turn_end(&summary_timeline(&manager, asid, task.created_ms).await);
+        (to.to != task.state).then_some(to)
+    }
+
+    /// The agent working on `id` says it is finished (`tasks.complete`; the
+    /// caller has checked the agent owns the task): done, with `summary`.
+    /// A task that has already ended is answered as it stands.
+    pub(crate) async fn complete(&self, id: &TaskId, summary: &str) -> Result<TaskView, TaskError> {
+        let done = TaskChange {
+            summary: Some(one_line(summary, SUMMARY_CHARS)),
+            source: "tasks_complete".into(),
             ..change(TaskState::Done)
-        })
+        };
+        self.finish(id, done).await
+    }
+
+    /// The device confirms that a delegation it opened, paused
+    /// (`idle_unconfirmed`) or waiting on the user, is finished: done, with
+    /// `summary` when one is given and the hint it had otherwise. Confirming
+    /// a done task again answers it as it stands.
+    pub(crate) async fn confirm(
+        &self,
+        id: &TaskId,
+        summary: Option<&str>,
+    ) -> Result<TaskView, TaskError> {
+        let task = self.store.get(id).await?.ok_or(TaskError::NotFound)?;
+        if task.state == TaskState::Done && task.origin == TaskOrigin::Device {
+            return Ok(self.present(&task).await);
+        }
+        let confirmable = task.kind == TaskKind::Delegation
+            && task.origin == TaskOrigin::Device
+            && paused(task.state);
+        if !confirmable {
+            return Err(TaskError::NotConfirmable);
+        }
+        let done = TaskChange {
+            summary: summary
+                .map(|text| one_line(text, SUMMARY_CHARS))
+                .filter(|text| !text.is_empty()),
+            source: "device_confirm".into(),
+            ..change(TaskState::Done)
+        };
+        self.finish(id, done).await
+    }
+
+    /// `to` (done) through the states between; a task that ended meanwhile
+    /// is answered as it stands.
+    async fn finish(&self, id: &TaskId, to: TaskChange) -> Result<TaskView, TaskError> {
+        match self.move_to(id, to).await {
+            Ok(task) => Ok(self.present(&task).await),
+            Err(error) if is_illegal_transition(&error) => {
+                let now = self.store.get(id).await?.ok_or(TaskError::NotFound)?;
+                if now.state.is_terminal() {
+                    return Ok(self.present(&now).await);
+                }
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// Stopped short of an end: waiting on the user, or paused without saying
+/// it is finished.
+fn paused(state: TaskState) -> bool {
+    matches!(state, TaskState::Waiting | TaskState::IdleUnconfirmed)
+}
+
+/// What an ended turn makes of a session delegation. A stop is not an end
+/// -- the agent may be asking something, have stopped early, or go on after
+/// a tool round -- so only the completion marker ([`pane_agent::DONE_MARKER`]
+/// at the start of a line of its last message, the rule a terminal agent's
+/// screen is read by) is `done`, with the marker's summary. Without it the
+/// task is `idle_unconfirmed`, its summary the last message's line as a hint.
+pub(crate) fn turn_end(items: &[TimelineItem]) -> TaskChange {
+    let last = last_assistant_text(items);
+    match last.as_deref().and_then(pane_agent::done_marker) {
+        Some(summary) => TaskChange {
+            summary: Some(summary),
+            ..change(TaskState::Done)
+        },
+        None => TaskChange {
+            summary: last.map(|text| one_line(&text, SUMMARY_CHARS)),
+            ..change(TaskState::IdleUnconfirmed)
+        },
     }
 }
 
@@ -1204,11 +1305,6 @@ fn newest_answer(items: &[TimelineItem], since_ms: u64) -> Option<u64> {
         })
         .map(|item| item.updated_ms)
         .max()
-}
-
-/// A delegation's summary: the last assistant message as one line.
-pub(crate) fn result_line(items: &[TimelineItem]) -> Option<String> {
-    last_assistant_text(items).map(|text| one_line(&text, SUMMARY_CHARS))
 }
 
 /// The last assistant message of `asid`, in full; `None` when it cannot be read.
@@ -1613,9 +1709,12 @@ mod tests {
     #[tokio::test]
     async fn delegate_creates_a_session_and_a_working_task() {
         let agent = FakeAgent::new("opencode");
-        let calls = agent.calls.clone();
+        let (calls, prompts) = (agent.calls.clone(), agent.prompts.clone());
         let (state, id) = delegated(agent).await;
         assert_eq!(*calls.lock().unwrap(), ["create_session", "send_prompt"]);
+        // Asked for an explicit end; the goal is stored as given.
+        let sent = [pane_agent::completion_request("fix the build")];
+        assert_eq!(*prompts.lock().unwrap(), sent);
         let view = state
             .tasks
             .list_for(None, None, 10)
@@ -1623,6 +1722,7 @@ mod tests {
             .unwrap()
             .remove(0);
         assert_eq!(view.task_id, id.0);
+        assert_eq!(view.goal, "fix the build");
         assert_eq!(view.state, TaskState::Working);
         assert_eq!(view.kind, TaskKind::Delegation);
         assert_eq!(
@@ -1754,7 +1854,7 @@ mod tests {
             status(AgentSessionStatus::Idle),
         ];
         let done = wait_through(&state, &id, busy_then_idle).await;
-        assert_eq!(done.state, TaskState::Done);
+        assert_eq!(done.state, TaskState::IdleUnconfirmed);
         assert_eq!(done.summary.as_deref(), Some("all green"));
     }
 
@@ -1778,7 +1878,7 @@ mod tests {
             .await
             .map(|waited| waited.task)
             .unwrap();
-        assert_eq!(done.state, TaskState::Done);
+        assert_eq!(done.state, TaskState::IdleUnconfirmed);
         assert_eq!(done.summary.as_deref(), Some("ok"));
     }
 
@@ -1795,7 +1895,7 @@ mod tests {
             status(AgentSessionStatus::Idle),
         ];
         let done = wait_through(&state, &id, finished).await;
-        assert_eq!(done.state, TaskState::Done);
+        assert_eq!(done.state, TaskState::IdleUnconfirmed);
     }
 
     /// A request raised between two waits is seen by the next one.
@@ -1821,7 +1921,7 @@ mod tests {
             status(AgentSessionStatus::Idle),
         ];
         let done = wait_through(&state, &id, finished).await;
-        assert_eq!(done.state, TaskState::Done);
+        assert_eq!(done.state, TaskState::IdleUnconfirmed);
     }
 
     /// Already waiting with the request still pending: answer at once.
@@ -2190,7 +2290,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_finished_turn_settles_the_task_with_its_result_line_as_it_happens() {
+    async fn a_finished_turn_pauses_the_task_with_its_result_line_as_it_happens() {
         let long = format!("Fixed it.\n\nThe build was {}", "very ".repeat(80));
         let (state, id) = tracked(finished_agent(vec![reply("m1", &long)])).await;
         let mut updates = state.task_events.subscribe();
@@ -2216,7 +2316,7 @@ mod tests {
                 .await
         );
         let task = state.tasks.get_for_test(&id).await;
-        assert_eq!(task.state, TaskState::Done);
+        assert_eq!(task.state, TaskState::IdleUnconfirmed);
         let summary = task.summary.unwrap();
         assert!(
             summary.starts_with("Fixed it. The build was very"),
@@ -2226,7 +2326,7 @@ mod tests {
         assert!(summary.chars().count() <= SUMMARY_CHARS && summary.ends_with('…'));
         assert_eq!(task.exit_code, None);
         let TaskDomainEvent::Updated { task: frame, .. } = updates.try_recv().unwrap();
-        assert_eq!(frame.state, TaskState::Done);
+        assert_eq!(frame.state, TaskState::IdleUnconfirmed);
         assert_eq!(frame.summary.as_deref(), Some(summary.as_str()));
         let sources: Vec<String> = state
             .tasks
@@ -2293,7 +2393,7 @@ mod tests {
     /// The turn ended before `delegate` recorded Working (the follower could
     /// not settle a task that was still dispatching): `delegate` settles it.
     #[tokio::test]
-    async fn a_turn_that_ends_during_dispatch_is_done_when_delegate_returns() {
+    async fn a_turn_that_ends_during_dispatch_is_settled_when_delegate_returns() {
         let state = test_state("admin", Vec::new());
         let agent = finished_agent(vec![reply("m1", "quick")]);
         state.agent_runtime.attach_for_test(agent.manager()).await;
@@ -2302,7 +2402,7 @@ mod tests {
             .delegate(&state, Requested::mcp(assistant("a")), request(None))
             .await
             .unwrap();
-        assert_eq!(view.state, TaskState::Done);
+        assert_eq!(view.state, TaskState::IdleUnconfirmed);
         assert_eq!(view.summary.as_deref(), Some("quick"));
     }
 
@@ -2395,6 +2495,109 @@ mod tests {
         let task = state.tasks.get_for_test(&id).await;
         assert_eq!(task.state, TaskState::Failed);
         assert_eq!(task.summary.as_deref(), Some("the agent session failed"));
+    }
+
+    /// A session delegation is done only on an explicit end: the marker in
+    /// the agent's last message, or `tasks.complete`. A turn that just stops
+    /// is a pause; a new turn takes it back to working.
+    #[tokio::test]
+    async fn a_session_task_is_done_only_when_the_agent_says_so() {
+        enum Input {
+            Event(Box<AgentDomainEvent>),
+            Complete(&'static str),
+        }
+        use Input::*;
+        use TaskState::*;
+        let idle = || Event(Box::new(status(AgentSessionStatus::Idle)));
+        let marked = "Done.\n\nMUQUN_TASK_DONE: the build is green";
+        let rows = [
+            (
+                "a turn that stops",
+                Working,
+                "Shall I update the docs too?",
+                idle(),
+                IdleUnconfirmed,
+                Some("Shall I update the docs too?"),
+            ),
+            (
+                "the marker",
+                Working,
+                marked,
+                idle(),
+                Done,
+                Some("the build is green"),
+            ),
+            (
+                "the marker's placeholder",
+                Working,
+                "MUQUN_TASK_DONE: <one-line summary>",
+                idle(),
+                IdleUnconfirmed,
+                None,
+            ),
+            (
+                "a question the gateway sees",
+                Working,
+                "",
+                Event(Box::new(permission(ASID))),
+                Waiting,
+                None,
+            ),
+            (
+                "a new turn after a pause",
+                IdleUnconfirmed,
+                "",
+                Event(Box::new(status(AgentSessionStatus::Busy))),
+                Working,
+                None,
+            ),
+            (
+                "the marker after a pause",
+                IdleUnconfirmed,
+                marked,
+                idle(),
+                Done,
+                Some("the build is green"),
+            ),
+            (
+                "tasks.complete",
+                Working,
+                "",
+                Complete("tests pass"),
+                Done,
+                Some("tests pass"),
+            ),
+            (
+                "tasks.complete while waiting",
+                Waiting,
+                "",
+                Complete("tests pass"),
+                Done,
+                Some("tests pass"),
+            ),
+        ];
+        for (name, from, last, input, to, summary) in rows {
+            let timeline = if last.is_empty() {
+                Vec::new()
+            } else {
+                vec![reply("m1", last)]
+            };
+            let (state, id) = tracked(finished_agent(timeline)).await;
+            if from != Working {
+                state.tasks.move_to(&id, change(from)).await.unwrap();
+            }
+            match input {
+                Event(event) => assert!(state.tasks.follow(&state, &event).await, "{name}"),
+                Complete(text) => {
+                    state.tasks.complete(&id, text).await.unwrap();
+                }
+            }
+            let task = state.tasks.get_for_test(&id).await;
+            assert_eq!(task.state, to, "{name}");
+            if summary.is_some() || to == Done {
+                assert_eq!(task.summary.as_deref(), summary, "{name}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -2601,7 +2804,7 @@ mod tests {
                 .await
         );
         let task = state.tasks.get_for_test(&id).await;
-        assert_eq!(task.state, TaskState::Done);
+        assert_eq!(task.state, TaskState::IdleUnconfirmed);
         assert_eq!(task.summary.as_deref(), Some("PONG"));
         let waited = state
             .tasks
@@ -2655,7 +2858,7 @@ mod tests {
             ],
         )
         .await;
-        assert_eq!(done.state, TaskState::Done);
+        assert_eq!(done.state, TaskState::IdleUnconfirmed);
         assert_eq!(done.summary.as_deref(), Some("all green"));
 
         // Failed: the error line, whatever the provider.

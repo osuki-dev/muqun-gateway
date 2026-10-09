@@ -293,6 +293,7 @@ mod tests {
         assert!(API_CAPABILITIES.contains(&"task_ledger"));
         assert!(API_CAPABILITIES.contains(&"task_ledger_create"));
         assert!(API_CAPABILITIES.contains(&"task_ledger_pane"));
+        assert!(API_CAPABILITIES.contains(&"task_ledger_complete"));
         assert!(API_CAPABILITIES.contains(&"agent_catalog"));
         assert!(API_CAPABILITIES.contains(&"terminal_backends"));
         assert!(API_CAPABILITIES.contains(&"multiple_terminal_backends"));

@@ -798,6 +798,8 @@ pub(crate) struct FakeAgent {
     pub calls: Arc<Mutex<Vec<String>>>,
     /// The model each `create_session` was asked for.
     pub created_with: Arc<Mutex<Vec<Option<agents::domain::ModelRef>>>>,
+    /// The text of every prompt sent.
+    pub prompts: Arc<Mutex<Vec<String>>>,
 }
 
 impl FakeAgent {
@@ -812,6 +814,7 @@ impl FakeAgent {
             permissions: Arc::default(),
             calls: Arc::default(),
             created_with: Arc::default(),
+            prompts: Arc::default(),
         }
     }
 
@@ -926,11 +929,12 @@ impl agents::ports::agent::AgentPort for FakeAgent {
     fn send_prompt<'a>(
         &'a self,
         _session_id: &'a str,
-        _text: &'a str,
+        text: &'a str,
         _attachments: &'a [String],
         _delivery: Option<&'a str>,
     ) -> agents::ports::agent::AgentFuture<'a, ()> {
         self.record("send_prompt");
+        self.prompts.lock().unwrap().push(text.to_owned());
         Box::pin(async { Ok(()) })
     }
     fn revert_session<'a>(

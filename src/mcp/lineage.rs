@@ -15,12 +15,17 @@
 //!
 //! None or several fit: no parent. A wrong parent would misfile work on the
 //! phone; a missing one only leaves it at the top level.
+//!
+//! `tasks.complete` finds the caller's own task the same way ([`own_task`]):
+//! a session may complete only the task it is working on.
 
 use futures::future::join_all;
 
 use super::tokens::{AssistantSession, TokenBinding};
 use crate::agents::domain::{AgentPart, ToolCallStatus};
-use crate::tasks::domain::{Requested, Task, TaskBinding, TaskFilter, TaskId, TaskOrigin};
+use crate::tasks::domain::{
+    Requested, Task, TaskBinding, TaskFilter, TaskId, TaskKind, TaskOrigin,
+};
 use crate::tasks::service::OPEN_STATES;
 use crate::AppState;
 
@@ -57,6 +62,36 @@ pub(crate) async fn requested(
 }
 
 async fn parent_of(state: &AppState, binding: &TokenBinding, call: &Call<'_>) -> Option<TaskId> {
+    match <[Task; 1]>::try_from(fitting(state, binding, call).await) {
+        Ok([task]) => Some(task.id),
+        Err(_) => None,
+    }
+}
+
+/// The open delegation `session` works on, for `tasks.complete` (`call`):
+/// `wanted` when it is given and fits, else the one task that fits. Fits
+/// the way a parent does -- the open task bound to a pane token's pane, or
+/// the open delegation of an agent token's agent whose session is running
+/// this very call -- so a session can only complete its own task.
+pub(crate) async fn own_task(
+    state: &AppState,
+    session: &AssistantSession,
+    call: &Call<'_>,
+    wanted: Option<&TaskId>,
+) -> Option<TaskId> {
+    let fits = fitting(state, &session.binding, call).await;
+    let mut fits = fits
+        .into_iter()
+        .filter(|task| task.kind == TaskKind::Delegation)
+        .filter(|task| wanted.is_none_or(|id| task.id == *id));
+    match (fits.next(), fits.next()) {
+        (Some(task), None) => Some(task.id),
+        _ => None,
+    }
+}
+
+/// The open tasks `binding` could be calling from (see the module docs).
+async fn fitting(state: &AppState, binding: &TokenBinding, call: &Call<'_>) -> Vec<Task> {
     let filter = match binding {
         TokenBinding::Pane {
             session_id,
@@ -73,17 +108,13 @@ async fn parent_of(state: &AppState, binding: &TokenBinding, call: &Call<'_>) ->
     let candidates = match state.tasks.open_tasks(filter).await {
         Ok(tasks) => tasks,
         Err(error) => {
-            tracing::debug!(%error, "MCP call: parent lookup failed");
-            return None;
+            tracing::debug!(%error, "MCP call: task lookup failed");
+            return Vec::new();
         }
     };
-    let found = match binding {
+    match binding {
         TokenBinding::Pane { .. } => candidates,
         TokenBinding::Agent { agent_id } => calling(state, agent_id, candidates, call).await,
-    };
-    match <[Task; 1]>::try_from(found) {
-        Ok([task]) => Some(task.id),
-        Err(_) => None,
     }
 }
 
@@ -372,6 +403,59 @@ mod tests {
         assert_eq!(
             (elsewhere.parent, elsewhere.origin),
             (None, TaskOrigin::Mcp)
+        );
+    }
+
+    /// `tasks.complete` reaches only the caller's own task: the session
+    /// running the call (agent token) or the task in its pane (pane token).
+    #[tokio::test]
+    async fn only_the_session_working_on_a_task_may_complete_it() {
+        let input = json!({ "summary": "all green" });
+        let state = state_with(&[
+            (
+                "ses_mine",
+                calling("muqun_tasks_complete", "running", input),
+            ),
+            ("ses_other", Vec::new()),
+        ])
+        .await;
+        let mine = working(&state, session_of("ses_mine")).await;
+        let other = working(&state, session_of("ses_other")).await;
+        let complete = Call {
+            tool: "tasks.complete",
+            args: vec![("summary", "all green")],
+        };
+        let agent = agent_token();
+        assert_eq!(
+            own_task(&state, &agent, &complete, None).await,
+            Some(mine.clone())
+        );
+        let with_id = Call {
+            tool: "tasks.complete",
+            args: vec![("summary", "all green"), ("task_id", &other.0)],
+        };
+        assert_eq!(
+            own_task(&state, &agent, &with_id, Some(&other)).await,
+            None,
+            "another session's task, named by id"
+        );
+
+        let pane = |pane_id: &str| TaskBinding::Pane {
+            session_id: "default".into(),
+            pane_id: pane_id.into(),
+            tab_id: None,
+            shell_pid: None,
+            agent_id: Some("claude".into()),
+        };
+        let in_pane = working(&state, pane("%4")).await;
+        assert_eq!(
+            own_task(&state, &pane_token("%4"), &complete, Some(&in_pane)).await,
+            Some(in_pane.clone())
+        );
+        assert_eq!(
+            own_task(&state, &pane_token("%5"), &complete, Some(&in_pane)).await,
+            None,
+            "another pane"
         );
     }
 

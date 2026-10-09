@@ -3,7 +3,10 @@
 Capabilities: `mcp_server` (the `/mcp` endpoint; present only while
 `mcp.enabled` is true), `fleet`, `task_ledger`, `task_ledger_create`
 (`POST /api/tasks` and the task tree), `task_ledger_pane` (a terminal agent
-as `agent_id`, bound to its pane) and `task_ws_subscription` (`subscribe_tasks`
+as `agent_id`, bound to its pane), `task_ledger_complete` (a delegation is
+`done` only on an explicit signal: `tasks.complete`, the `MUQUN_TASK_DONE`
+marker, or the device's `POST /api/tasks/{id}/complete`; see
+[Finishing a delegation](#finishing-a-delegation)) and `task_ws_subscription` (`subscribe_tasks`
 on `/api/ws`). Discovery also announces
 `transports.mcp`. (`tasks` is a different, older capability: `POST
 /api/sessions/{id}/tasks`.)
@@ -130,15 +133,16 @@ says `"truncated": true` when it left older ones out. `tasks.wait` and
 | `fleet.describe` | `machine?`: `"self"` (default) or a `machineId` | A compact manifest of that computer: `GET /api/fleet/self`'s fields, but each agent is only `{id, kind, status, version, modes, modelCount}` (mode ids, no model catalog) and each terminal backend `{sessionId, label, kind, connected, version}`. What a computer offers: its agents, terminal backends, toolchains with versions, task counts and what it is suitable for. |
 | `exec.run` | `cwd`: absolute directory; `command`: shell command, run as `sh -c <command>` (at most 16 KiB); `timeout_s?`: 1..=45, default 30 | `{task_id, state, exit_code, stdout_tail, duration_ms, pane}`. Run a shell command in a visible terminal pane on this computer and return its exit code and output tail. Blocks up to timeout_s (max 45); if still running, returns a task_id for tasks.wait. `exit_code` is null while it runs; `pane` is `{session_id, pane_id}`. |
 | `tasks.delegate` | `goal` (at most 32 KiB); `cwd?`: absolute directory; `agent_id?` (default: the primary agent; a terminal agent kind such as `codex` or `claude` starts it in a new pane instead, see [Delegating to a terminal agent](#delegating-to-a-terminal-agent)); `mode?` (for example `build` or `plan`); `model?`: a model id from the agent's catalog for `cwd` (for example `claude-haiku-5-5`), or `<provider_id>/<model_id>` to pick one provider; default: the agent's default. An unknown id is `invalid_arguments` and nothing is created; `variant?`: the model's variant (reasoning effort, for example `high`), applied when the session is created so the first turn uses it; applied only together with `model` (ignored otherwise), and must be one of the model's catalog variants when it lists any (else `invalid_arguments`); `machine?` | A task view (see [Tasks API](#tasks-api)), filed under the caller's task when the gateway can tell which one it is (see [Task tree](#task-tree)). Start a sub-task on an agent on this computer: a new session in cwd with your goal as the first prompt (for a terminal agent such as codex or claude, a new terminal pane running it). Returns task_id; poll with tasks.wait. |
-| `tasks.wait` | `task_id`; `timeout_s?`: 1..=45, default 30 | The task view, plus `stdout_tail` for a command, and `answer` for a done delegation: the agent's last message in full (`summary` holds only its first 240 characters, on one line). Wait up to timeout_s (max 45) for a task to reach done/failed/waiting. Returns the current state and summary; call again while it says working. |
+| `tasks.wait` | `task_id`; `timeout_s?`: 1..=45, default 30 | The task view, plus `stdout_tail` for a command, and `answer` for a session delegation that is done or `idle_unconfirmed`: the agent's last message in full (`summary` holds only its first 240 characters, on one line). Returns once the task is done, failed, cancelled, `waiting` or `idle_unconfirmed` (its agent stopped without saying it is finished), or when the time is up. Wait up to timeout_s (max 45) for a task to reach done/failed/waiting, or idle_unconfirmed (its agent stopped without completing). Returns the current state and summary; call again while it says working. |
 | `tasks.read` | `task_id`; `what`: `summary` or `timeline`; `cursor?` (timeline only) | `summary`: the task view. `timeline`: `{task_id, items, cursor}`, the most recent agent items after `cursor`; pass the returned `cursor` to read on. Read a task you created: its summary or recent timeline. A command has no timeline. |
 | `tasks.cancel` | `task_id` | The task view after the cancel. Interrupt a task you created. |
+| `tasks.complete` | `summary`: what was done, one line (non-empty, at most 32 KiB; stored cut to 240 characters); `task_id?`: default, the task the calling session works on | The task view, now `done` with that summary. Say that the task you were given is finished. Only the session working on the task may complete it (see [Finishing a delegation](#finishing-a-delegation)); any other task, or none found, is `task_not_found`. A task that has already ended is answered as it stands. |
 
 Error codes:
 
 | Code | When |
 |---|---|
-| `invalid_arguments` | A bad argument: an empty or oversized `command` or `goal`, a `cwd` that is not an existing absolute directory, an unknown `model` for `tasks.delegate`, `tasks.read` timeline of a command. |
+| `invalid_arguments` | A bad argument: an empty or oversized `command`, `goal` or `summary`, a `cwd` that is not an existing absolute directory, an unknown `model` for `tasks.delegate`, `tasks.read` timeline of a command. |
 | `task_not_found` | No task with that `task_id`, or it belongs to another assistant. |
 | `machine_unknown` | `machine` names a computer other than this one. |
 | `agent_unavailable` | The requested agent is not available on this computer. |
@@ -172,8 +176,11 @@ device sees all of them. Announced as the `task_ledger` capability;
 `task_ledger_create`.
 
 A delegation follows its agent session as the agent reports it: when the
-session finishes a turn (idle after it was busy) the task is done, with the
-last assistant message as its `summary`, on one line and cut to 240
+session finishes a turn (idle after it was busy) the task is `done` if the
+agent's last message carries the completion marker, and `idle_unconfirmed`
+otherwise (see [Finishing a delegation](#finishing-a-delegation)); a paused
+task whose session runs again is `working`. The paused task's `summary` is
+the last assistant message as a hint, on one line and cut to 240
 characters, whichever agent it is (the agent's own timeline read first; when
 that holds no answer written since the task began -- DeepSeek announces the
 end of a turn from its live stream before its page has the final message --
@@ -189,8 +196,11 @@ no assistant waits on it: a command whose pane is gone fails with summary
 marker (and completes, closing an exit-0 tab, if it has exited); a
 delegation whose agent no longer has the session fails with `session gone`;
 a delegation whose session failed fails with its error line as `summary`;
-a delegation whose session went idle after the task was created is done,
-with the last assistant text as its summary; a task still bound to nothing
+a delegation whose session went idle after the task was created is `done`
+when the agent's last message carries the completion marker (read first, so
+a turn that ended while the gateway was down is settled by it) and
+`idle_unconfirmed` with the last assistant text as a hint otherwise; a paused
+delegation whose session runs again is `working`; a task still bound to nothing
 10 minutes after it was created (the gateway stopped before dispatching it)
 fails with `never dispatched`. A task whose terminal backend
 or agent cannot be reached is left as it is.
@@ -205,6 +215,7 @@ unknown id is `404 task_not_found`; any other failure is `500 task_failed`.
 | `POST /api/tasks` | Opens a delegation from the device; see below. |
 | `GET /api/tasks/{id}` | `{"task": TaskView, "events": [TaskEvent]}`; `events` is the task's state history, oldest first. |
 | `POST /api/tasks/{id}/cancel` | The `TaskView` after the cancel. Interrupts the agent or sends Ctrl-C to the command. Cancelling a finished task changes nothing. |
+| `POST /api/tasks/{id}/complete` | The `TaskView`, now `done`. The user confirms that a delegation opened on a device (`origin: device`; any paired device may confirm it, as any may cancel it) that is `idle_unconfirmed` or `waiting` is finished. Body `{"summary"?: string}`, optional (the body may be left out): the new `summary`, one line, cut to 240 characters; without it the task keeps the hint it had. Published as `task.updated`. A task already `done` is answered as it stands; any other state or origin is `409 task_not_confirmable`; a body that is not that JSON object is `400 invalid_request`. |
 
 `TaskView`: `task_id`, `state`, `kind` (`delegation` or `command`), `goal`
 (the delegated goal or the command line), `summary`, `exit_code`, `binding`,
@@ -317,7 +328,7 @@ finishes the task. The goal is typed with one more paragraph:
 ```
 <goal>
 
-When the whole task is finished, print one line exactly in this form: MUQUN_TASK_DONE: <one-line summary>
+When the whole task is finished, call the muqun tool tasks.complete with a one-line summary; if you cannot call it, print one line exactly in this form: MUQUN_TASK_DONE: <one-line summary>
 ```
 
 (the stored `goal` is the goal as given). The marker is looked for in the
@@ -351,9 +362,9 @@ message and no exit code for a pane agent, so there is no `answer` from
 `tasks.wait` and no `exit_code`, and an agent that leaves its pane without
 printing the marker fails whatever its exit status. The marker is checked on
 the follower's first poll too, so after a gateway restart a task whose agent
-finished meanwhile is settled `done` at once. There is no MCP tool yet for an
-agent to complete its own pane-bound task by id; the marker is the only
-completion signal.
+finished meanwhile is settled `done` at once. An assistant in the pane that
+holds the pane's own token can also call `tasks.complete` (see [Finishing a
+delegation](#finishing-a-delegation)).
 
 `tasks.wait` on such a task waits for that follower to record `done`,
 `failed`, `cancelled` or `waiting`; `tasks.read` has no timeline for it
@@ -366,6 +377,52 @@ is filed under this task (see [Task tree](#task-tree)).
 
 There is no separate rate limit, as for the other device routes that start
 work (`POST /api/agent-sessions`, `POST /api/sessions/{id}/tasks`).
+
+### Finishing a delegation
+
+An agent that stops is not finished: it may be asking something, have
+stopped early, or go on after a tool round. So a delegation, to an agent
+session or to a terminal agent, is `done` only on one of three explicit
+signals:
+
+1. **`tasks.complete`**, called by the agent working on the task with a
+   one-line `summary`. Ownership: a pane-bound token completes only the open
+   delegation bound to its own pane; an agent-bound token (shared by every
+   session of the agent service) completes only the open delegation to that
+   agent whose session is running this very `tasks.complete` call, with the
+   same arguments -- the rule [Task tree](#task-tree) uses for parents. A
+   `task_id` narrows the choice and must name that task. Anything else is
+   `task_not_found`. Recorded with source `tasks_complete`.
+2. **The marker line** `MUQUN_TASK_DONE: <one-line summary>` at the start of
+   a line of the agent's final message (a session) or of its pane's output (a
+   terminal agent), not the placeholder or a piece of it. The summary is the
+   marker's text.
+3. **The device**, `POST /api/tasks/{id}/complete`, for a task it opened that
+   is `idle_unconfirmed` or `waiting` ("确认完成" on the phone). Recorded with
+   source `device_confirm`.
+
+The first prompt of every delegation is the goal followed by one closing
+paragraph (the stored `goal` is the goal alone):
+
+```text
+When the whole task is finished, call the muqun tool tasks.complete with a one-line summary; if you cannot call it, print one line exactly in this form: MUQUN_TASK_DONE: <one-line summary>
+```
+
+A session delegation moves like this (moves pass the states between, so a
+`waiting` task that is completed passes `working`):
+
+| The session | The task |
+|---|---|
+| the turn ends (idle after busy), the last message carries the marker | `done`, `summary` = the marker's summary |
+| the turn ends without the marker | `idle_unconfirmed`, `summary` = the last message as a hint |
+| a permission request or question form is pending | `waiting` (back to `working` when answered) |
+| busy again after a pause | `working` |
+| the session failed / was interrupted | `failed` with the error line / `cancelled` |
+
+A question the agent asks in plain text, without a form the gateway can see,
+cannot be told from a pause: it is `idle_unconfirmed`, and the question is
+its hint. `exec.run` command tasks are not delegations: their exit code
+finishes them, as before.
 
 ### Task tree
 

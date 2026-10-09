@@ -9,7 +9,9 @@
 //! - A delegation whose session the agent no longer has fails ("session
 //!   gone"); one whose session failed fails with the error line as its
 //!   summary; one whose session went idle after the task was created is
-//!   done, with the last assistant text as its summary.
+//!   done when the agent's last message carries the completion marker and
+//!   `idle_unconfirmed` (the last message's line as a hint) otherwise; a
+//!   paused one whose session runs again is working.
 //!
 //! - A terminal agent's delegation (bound to a pane, with `agent_id`) gets
 //!   its pane follower started if none runs (after a restart, say), which
@@ -34,7 +36,7 @@ use std::time::Duration;
 use super::domain::one_line;
 use super::domain::{now_ms, Task, TaskBinding, TaskChange, TaskFilter, TaskKind, TaskState};
 use super::pane_agent;
-use super::service::{finished_since, result_line, summary_timeline, OPEN_STATES, SUMMARY_CHARS};
+use super::service::{finished_since, summary_timeline, turn_end, OPEN_STATES, SUMMARY_CHARS};
 use crate::agents::domain::AgentSessionStatus;
 use crate::agents::ports::agent::AgentError;
 use crate::{terminal_backend, AppState};
@@ -207,15 +209,27 @@ async fn settle_delegation(state: &AppState, task: &Task, agent_id: &str, asid: 
         );
         return fail(state, task, &why).await;
     }
+    let running = matches!(
+        session.status,
+        AgentSessionStatus::Busy | AgentSessionStatus::Retry
+    );
+    if running && task.state == TaskState::IdleUnconfirmed {
+        return moved(state, task, change(TaskState::Working)).await;
+    }
     if !finished_since(&session, task.created_ms) {
         return false;
     }
-    let items = summary_timeline(&manager, asid, task.created_ms).await;
-    let done = TaskChange {
-        summary: result_line(&items),
-        ..change(TaskState::Done)
+    // Marker first: a turn that ended while the gateway was down is done
+    // only if the agent said so.
+    let ended = turn_end(&summary_timeline(&manager, asid, task.created_ms).await);
+    if ended.to == task.state {
+        return false;
+    }
+    let ended = TaskChange {
+        source: SOURCE.into(),
+        ..ended
     };
-    moved(state, task, done).await
+    moved(state, task, ended).await
 }
 
 /// A session the agent says it does not have. OpenCode answers a deleted
@@ -371,7 +385,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_delegation_whose_session_is_gone_fails_and_an_idle_one_is_done() {
+    async fn a_delegation_whose_session_is_gone_fails_and_one_idle_with_its_marker_is_done() {
         let state = test_state("admin", Vec::new());
         let mut idle = fake_session("ses_idle", 1);
         idle.time_idle = Some(now_ms() + 60_000);
@@ -385,7 +399,7 @@ mod tests {
             message_id: "m1".into(),
             role: crate::agents::domain::TimelineRole::Assistant,
             part: crate::agents::domain::AgentPart::Text {
-                text: "all green".into(),
+                text: "all green\n\nMUQUN_TASK_DONE: the build is green".into(),
             },
             seq: 1,
             updated_ms: 0,
@@ -407,7 +421,8 @@ mod tests {
         assert_eq!(failed.summary.as_deref(), Some("session gone"));
         let finished = state_of(&state, &done).await;
         assert_eq!(finished.state, TaskState::Done);
-        assert_eq!(finished.summary.as_deref(), Some("all green"));
+        // Marker first, after a restart too: the agent's own summary.
+        assert_eq!(finished.summary.as_deref(), Some("the build is green"));
         assert_eq!(state_of(&state, &running).await.state, TaskState::Working);
     }
 

@@ -351,6 +351,15 @@ pub(crate) struct CancelArgs {
     pub task_id: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct CompleteArgs {
+    /// The task you are working on; default: the one this session was given.
+    #[serde(default)]
+    pub task_id: Option<String>,
+    /// What was done, in one line (cut to 240 characters).
+    pub summary: String,
+}
+
 #[derive(Clone)]
 pub(crate) struct MuqunMcp {
     state: AppState,
@@ -443,7 +452,7 @@ impl MuqunMcp {
 
     #[tool(
         name = "tasks.wait",
-        description = "Wait up to timeout_s (max 45) for a task to reach done/failed/waiting. Returns the current state and summary; call again while it says working."
+        description = "Wait up to timeout_s (max 45) for a task to reach done/failed/waiting, or idle_unconfirmed (its agent stopped without completing). Returns the current state and summary; call again while it says working."
     )]
     async fn tasks_wait(
         &self,
@@ -472,6 +481,32 @@ impl MuqunMcp {
         )
     }
 
+    #[tool(
+        name = "tasks.complete",
+        description = "Say that the task you were given is finished, with a one-line summary. Only the session (or terminal pane) working on the task can complete it; stopping or going idle does not."
+    )]
+    async fn tasks_complete(
+        &self,
+        Parameters(args): Parameters<CompleteArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if args.summary.trim().is_empty() || args.summary.len() > MAX_GOAL_BYTES {
+            return Ok(invalid("summary must be non-empty and at most 32 KiB"));
+        }
+        let mut call = lineage::Call {
+            tool: "tasks.complete",
+            args: vec![("summary", &args.summary)],
+        };
+        if let Some(id) = &args.task_id {
+            call.args.push(("task_id", id));
+        }
+        let wanted = args.task_id.clone().map(TaskId);
+        let own = lineage::own_task(&self.state, &self.session, &call, wanted.as_ref()).await;
+        let Some(id) = own else {
+            return Ok(task_error(TaskError::NotFound));
+        };
+        reply(self.state.tasks.complete(&id, &args.summary).await)
+    }
+
     #[tool(name = "tasks.cancel", description = "Interrupt a task you created.")]
     async fn tasks_cancel(
         &self,
@@ -493,7 +528,8 @@ impl ServerHandler for MuqunMcp {
             .with_instructions(
                 "Muqun Gateway on this computer. fleet.describe says what it has, exec.run \
                  runs short commands, tasks.delegate + tasks.wait hand work to a coding agent. \
-                 Waits are capped at 45 s; call tasks.wait again while it says working.",
+                 Waits are capped at 45 s; call tasks.wait again while it says working. \
+                 When you finish a task you were given, call tasks.complete.",
             )
     }
 }
@@ -859,6 +895,7 @@ mod tests {
                 "fleet.describe",
                 "fleet.list",
                 "tasks.cancel",
+                "tasks.complete",
                 "tasks.delegate",
                 "tasks.read",
                 "tasks.wait"
