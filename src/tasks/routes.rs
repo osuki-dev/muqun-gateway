@@ -15,7 +15,7 @@ use serde::Deserialize;
 use super::domain::{
     PrincipalKind, Requested, TaskBinding, TaskId, TaskOrigin, TaskPrincipal, TaskState,
 };
-use super::service::{DelegateRequest, TaskError};
+use super::service::{valid_name, DelegateRequest, TaskError};
 use crate::agents::directories::expand_directory_param;
 use crate::{api_error, lock_devices, require_device, ApiResult, AppState};
 
@@ -24,9 +24,6 @@ const MAX_LIMIT: usize = 200;
 /// The same bound `tasks.delegate` puts on a goal.
 const MAX_GOAL_BYTES: usize = 32 * 1024;
 const MAX_LABEL_CHARS: usize = 200;
-/// `agent_id`, `mode` and `model` are names, not text.
-const MAX_NAME_BYTES: usize = 256;
-
 pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
     router
         .route("/api/tasks", get(list).post(create))
@@ -162,7 +159,7 @@ impl CreateBody {
         if names
             .iter()
             .filter_map(|name| name.as_deref())
-            .any(|name| name.trim().is_empty() || name.len() > MAX_NAME_BYTES)
+            .any(|name| !valid_name(name))
         {
             return Err(invalid_request());
         }
@@ -248,9 +245,9 @@ fn create_failed(error: TaskError) -> (StatusCode, Json<Value>) {
                 "the agent could not start the task",
             )
         }
-        TaskError::UnknownVariant(_) => refused(
+        TaskError::UnknownVariant(detail) => refused(
             "unknown_variant",
-            "variant is not one of that model's variants.",
+            &format!("Unknown variant {detail}."),
         ),
         error => failed(error),
     }

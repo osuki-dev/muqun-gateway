@@ -18,7 +18,7 @@ use super::tokens::AssistantSession;
 use crate::fleet::manifest::FleetService;
 use crate::tasks::domain::{clip, TaskBinding, TaskId, TaskPrincipal};
 use crate::tasks::run_command::{RunHandle, RunRequest};
-use crate::tasks::service::{DelegateRequest, ReadWhat, TaskError};
+use crate::tasks::service::{valid_name, DelegateRequest, ReadWhat, TaskError};
 use crate::AppState;
 
 pub(crate) const MAX_RESULT_BYTES: usize = 16 * 1024;
@@ -171,9 +171,7 @@ fn task_error(error: TaskError) -> CallToolResult {
         TaskError::UnknownModel(_) => invalid(
             "Unknown model for that agent. Use a model id from its catalog, or <provider_id>/<model_id>.",
         ),
-        TaskError::UnknownVariant(_) => invalid(
-            "variant is not one of that model's variants.",
-        ),
+        TaskError::UnknownVariant(detail) => invalid(&format!("Unknown variant {detail}.")),
         TaskError::NoTimeline => invalid("Only a delegated task has a timeline."),
         TaskError::NoTerminal => fail(
             "no_terminal",
@@ -287,6 +285,12 @@ impl DelegateArgs {
     fn request(self) -> Result<DelegateRequest, CallToolResult> {
         if self.goal.trim().is_empty() || self.goal.len() > MAX_GOAL_BYTES {
             return Err(invalid("goal must be non-empty and at most 32 KiB"));
+        }
+        let names = [&self.agent_id, &self.mode, &self.model, &self.variant];
+        if !names.iter().filter_map(|n| n.as_deref()).all(valid_name) {
+            return Err(invalid(
+                "agent_id, mode, model and variant must be non-empty and at most 256 bytes",
+            ));
         }
         let cwd = match self.cwd {
             Some(cwd) => Some(directory(&cwd)?.to_string_lossy().into_owned()),
@@ -827,5 +831,15 @@ mod tests {
         assert_eq!(request.variant.as_deref(), Some("high"));
         let none: DelegateArgs = serde_json::from_value(json!({ "goal": "g" })).unwrap();
         assert_eq!(none.request().unwrap().variant, None);
+    }
+
+    #[test]
+    fn delegate_names_are_checked_like_the_routes_do() {
+        for bad in ["", "  ", &"v".repeat(257)] {
+            let args: DelegateArgs =
+                serde_json::from_value(json!({ "goal": "g", "model": "m", "variant": bad }))
+                    .unwrap();
+            assert!(args.request().is_err(), "{bad:?}");
+        }
     }
 }

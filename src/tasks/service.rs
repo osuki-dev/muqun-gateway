@@ -34,6 +34,12 @@ use crate::AppState;
 /// The longest a `wait` blocks, and the shortest.
 const MAX_WAIT: Duration = Duration::from_secs(45);
 const MIN_WAIT: Duration = Duration::from_secs(1);
+/// The longest `agent_id`, `mode`, `model` or `variant` accepted.
+pub(crate) const MAX_NAME_BYTES: usize = 256;
+/// Whether `name` is usable as an `agent_id`, `mode`, `model` or `variant`.
+pub(crate) fn valid_name(name: &str) -> bool {
+    !name.trim().is_empty() && name.len() <= MAX_NAME_BYTES
+}
 /// Timeline items read for a summary.
 pub(crate) const SUMMARY_ITEMS: usize = 50;
 /// A delegation's `summary`: its result as one line of at most this many
@@ -144,7 +150,7 @@ impl std::fmt::Display for TaskError {
             Self::UnknownMachine(machine) => write!(f, "unknown machine '{machine}'"),
             Self::AgentUnavailable(agent) => write!(f, "agent '{agent}' is not available"),
             Self::UnknownModel(model) => write!(f, "unknown model '{model}'"),
-            Self::UnknownVariant(variant) => write!(f, "unknown variant '{variant}'"),
+            Self::UnknownVariant(variant) => write!(f, "unknown variant {variant}"),
             Self::NoTerminal => write!(f, "{}", run_command::NO_TERMINAL),
             Self::NoTimeline => write!(f, "only a delegated task has a timeline"),
             Self::Store(error) => write!(f, "task store: {error:#}"),
@@ -966,27 +972,36 @@ pub(crate) async fn summary_timeline(
             Vec::new()
         }
     };
-    if answered_since(&read, since_ms) {
-        return read;
-    }
-    match manager
+    let streamed = manager
         .mirror()
         .get_snapshot(&AgentSessionId(asid.to_owned()))
         .await
-    {
-        Some(snapshot) if answered_since(&snapshot.timeline, since_ms) => snapshot.timeline,
+        .map(|snapshot| snapshot.timeline)
+        .unwrap_or_default();
+    // The newer answer wins; the agent's read wins a tie, or when it has no times.
+    match (
+        newest_answer(&read, since_ms),
+        newest_answer(&streamed, since_ms),
+    ) {
+        (Some(agent), Some(mirror)) if agent != 0 && mirror > agent => streamed,
+        (None, Some(_)) => streamed,
         _ => read,
     }
 }
 
-/// Whether `items` end in an assistant answer written at or after `since_ms`.
-/// A row without a time (0) is taken to be current.
-fn answered_since(items: &[TimelineItem], since_ms: u64) -> bool {
-    items.iter().rev().any(|item| {
-        item.role == TimelineRole::Assistant
-            && matches!(&item.part, AgentPart::Text { text } if !text.trim().is_empty())
-            && (item.updated_ms == 0 || item.updated_ms >= since_ms)
-    })
+/// The time of the newest assistant text row in `items` written at or after
+/// `since_ms`, if any. A row without a time (0) is taken to be current: a
+/// delegation's session is created for it, so no earlier turn is in it.
+fn newest_answer(items: &[TimelineItem], since_ms: u64) -> Option<u64> {
+    items
+        .iter()
+        .filter(|item| {
+            item.role == TimelineRole::Assistant
+                && matches!(&item.part, AgentPart::Text { text } if !text.trim().is_empty())
+                && (item.updated_ms == 0 || item.updated_ms >= since_ms)
+        })
+        .map(|item| item.updated_ms)
+        .max()
 }
 
 /// A delegation's summary: the last assistant message as one line.
@@ -1238,7 +1253,11 @@ fn resolve_model(
         .map(|found| {
             if let (Some(wanted), Some(listed)) = (variant, found.variants.as_deref()) {
                 if !listed.is_empty() && !listed.iter().any(|v| v.id == wanted) {
-                    return Err(wanted.to_owned());
+                    let offered: Vec<&str> = listed.iter().map(|v| v.id.as_str()).collect();
+                    return Err(format!(
+                        "'{wanted}' (the model offers: {})",
+                        offered.join(", ")
+                    ));
                 }
             }
             Ok(ModelRef {
@@ -2321,7 +2340,9 @@ mod tests {
         let unlisted = delegate(open(Some("gpt-6"), Some("max")))
             .await
             .unwrap_err();
-        assert!(matches!(unlisted, TaskError::UnknownVariant(ref v) if v == "max"));
+        assert!(
+            matches!(unlisted, TaskError::UnknownVariant(ref v) if v.contains("'max'") && v.contains("low, high"))
+        );
         assert_eq!(calls.lock().unwrap().len(), before);
         delegate(open(None, Some("high"))).await.unwrap();
         assert_eq!(created.lock().unwrap().last().unwrap(), &None);
@@ -2436,5 +2457,35 @@ mod tests {
         let task = state.tasks.get_for_test(&id).await;
         assert_eq!(task.state, TaskState::Failed);
         assert_eq!(task.summary.as_deref(), Some("TurnError: the turn failed"));
+    }
+
+    #[tokio::test]
+    async fn this_turns_commentary_in_the_agent_read_does_not_hide_the_streamed_answer() {
+        // The agent page holds "Let me look..." (before a tool call); the
+        // final message exists only in the mirror (T3 and DeepSeek both feed
+        // the mirror through `upsert_timeline_items`, rows stamped by the
+        // adapter).
+        let mut commentary = reply("m1", "Let me look at the build.");
+        commentary.updated_ms = now_ms() + 1_000;
+        let (state, id) = tracked(finished_agent(vec![commentary])).await;
+        let manager = state
+            .agent_runtime
+            .manager_for_agent("opencode")
+            .await
+            .unwrap();
+        let mut last = reply("m2", "Fixed: the build is green.");
+        last.updated_ms = now_ms() + 2_000;
+        manager
+            .mirror()
+            .upsert_timeline_items(&AgentSessionId(ASID.into()), vec![last])
+            .await;
+        assert!(
+            state
+                .tasks
+                .follow(&state, &status(AgentSessionStatus::Idle))
+                .await
+        );
+        let task = state.tasks.get_for_test(&id).await;
+        assert_eq!(task.summary.as_deref(), Some("Fixed: the build is green."));
     }
 }
