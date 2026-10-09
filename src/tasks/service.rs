@@ -715,35 +715,75 @@ impl TaskService {
         let cwd = request.cwd.clone();
         let prompt = pane_agent::completion_request(&request.goal);
         tokio::spawn(async move {
-            let launched = crate::agents::session_routes::start_placed_agent(
-                &state,
-                &session,
-                &kind,
-                cwd.as_deref(),
+            let start = tokio::spawn(start_terminal_agent(
+                state.clone(),
+                session,
+                kind,
+                cwd,
                 placed,
-                Some(&prompt),
-            )
-            .await;
-            let tasks = &state.tasks;
-            let to = match failed_step(&launched.steps.value()) {
-                Some(why) => {
-                    tasks
-                        .record_failure(&task, noted(TaskState::Failed, why))
-                        .await;
-                    return;
-                }
-                None => change(TaskState::Working),
-            };
-            // A follower or a cancel may have moved it meanwhile; follow
-            // whatever is still open.
-            if let Err(error) = tasks.store().transition(&task.id, to).await {
-                tracing::debug!(task = %task.id.0, %error, "terminal task: not moved to working");
+                prompt,
+                task.clone(),
+            ));
+            // A start that panicked must not leave the task dispatching.
+            if let Err(error) = start.await {
+                let why = format!("the agent start failed: {error}");
+                state
+                    .tasks
+                    .record_failure(&task, noted(TaskState::Failed, why))
+                    .await;
             }
-            pane_agent::follow(&state, &task);
         });
         Ok(view)
     }
+}
 
+/// The background half of [`TaskService::delegate_to_pane`]: start the agent
+/// in its placed pane, type the goal unless the task ended meanwhile (a
+/// cancel, or a follower that gave up on it), then move the task to working
+/// and follow it -- or fail it naming the step.
+pub(crate) async fn start_terminal_agent(
+    state: AppState,
+    session: crate::SessionConfig,
+    kind: String,
+    cwd: Option<String>,
+    placed: crate::agents::session_routes::PlacedAgent,
+    prompt: String,
+    task: Task,
+) {
+    use crate::agents::session_routes::{start_agent_in_place, type_agent_prompt};
+    let tasks = &state.tasks;
+    let (mut launched, started) =
+        start_agent_in_place(&state, &session, &kind, cwd.as_deref(), placed).await;
+    if let Some(started) = started {
+        let ended = match tasks.store.get(&task.id).await {
+            Ok(Some(now)) => now.state.is_terminal(),
+            Ok(None) => true,
+            Err(_) => false,
+        };
+        if ended {
+            tracing::debug!(task = %task.id.0, "terminal task ended while its agent started: goal not typed");
+            return;
+        }
+        type_agent_prompt(&session, &started, Some(&prompt), &mut launched).await;
+    }
+    let to = match failed_step(&launched.steps.value()) {
+        Some(why) => {
+            tasks
+                .record_failure(&task, noted(TaskState::Failed, why))
+                .await;
+            return;
+        }
+        None => change(TaskState::Working),
+    };
+    // A follower or a cancel may have moved it meanwhile; follow whatever is
+    // still open.
+    if let Err(error) = tasks.store().transition(&task.id, to).await {
+        tracing::debug!(task = %task.id.0, %error, "terminal task: not moved to working");
+    }
+    pane_agent::follow(&state, &task);
+}
+
+impl TaskService {
     /// Move `task` as `to` says, through whatever states lie between
     /// (Queued passes Dispatching, Waiting passes Working), reading the
     /// task's current state first. The steps carry `to`'s source.

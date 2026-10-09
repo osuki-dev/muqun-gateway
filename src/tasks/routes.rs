@@ -697,6 +697,34 @@ mod tests {
         );
         assert_eq!(task["goal"], "fix the build");
 
+        // A task cancelled while its agent was starting gets no goal typed.
+        let session = state.config.sessions[0].clone();
+        let placed =
+            crate::agents::session_routes::place_agent(&state, &session, "codex", None, None)
+                .await
+                .unwrap();
+        let cancelled = insert(&state, "late", Some(TaskState::Cancelled)).await;
+        let cancelled = state.tasks.get_for_test(&TaskId(cancelled)).await;
+        let prompts = || {
+            let calls = herdr.calls.lock().unwrap();
+            calls
+                .iter()
+                .filter(|c| c["method"] == "agent.prompt")
+                .count()
+        };
+        let before = prompts();
+        crate::tasks::service::start_terminal_agent(
+            state.clone(),
+            session,
+            "codex".into(),
+            None,
+            placed,
+            "late".into(),
+            cancelled,
+        )
+        .await;
+        assert_eq!(prompts(), before);
+
         // Neither an unknown agent nor an unattached session agent (OpenCode
         // is in the terminal catalog too) is started in a pane.
         for agent_id in ["no-such-agent", "opencode"] {

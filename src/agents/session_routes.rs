@@ -607,6 +607,28 @@ pub(crate) async fn start_placed_agent(
     placed: PlacedAgent,
     prompt: Option<&str>,
 ) -> AgentLaunch {
+    let (mut launch, started) = start_agent_in_place(state, session, agent, cwd, placed).await;
+    if let Some(started) = started {
+        type_agent_prompt(session, &started, prompt, &mut launch).await;
+    }
+    launch
+}
+
+/// Where a started agent takes its prompt.
+pub(crate) struct StartedAgent {
+    pane_id: String,
+    prompt_target: String,
+}
+
+/// Start the agent in the placed pane; `None` beside the launch when it did
+/// not start (the launch's steps say why).
+pub(crate) async fn start_agent_in_place(
+    state: &AppState,
+    session: &SessionConfig,
+    agent: &str,
+    cwd: Option<&str>,
+    placed: PlacedAgent,
+) -> (AgentLaunch, Option<StartedAgent>) {
     let PlacedAgent {
         place,
         mut payload,
@@ -663,10 +685,26 @@ pub(crate) async fn start_placed_agent(
             steps.failed("agent", err.code(), &err.message());
             // The pane is real and the user can type in it, so this is a 207
             // rather than an error that implies nothing was created.
-            return AgentLaunch { payload, steps };
+            return (AgentLaunch { payload, steps }, None);
         }
     }
+    let started = StartedAgent {
+        pane_id: place.pane_id,
+        prompt_target,
+    };
+    (AgentLaunch { payload, steps }, Some(started))
+}
 
+/// Type `prompt` into a started agent, retrying until it is ready, and
+/// submit it; recorded in `launch`.
+pub(crate) async fn type_agent_prompt(
+    session: &SessionConfig,
+    started: &StartedAgent,
+    prompt: Option<&str>,
+    launch: &mut AgentLaunch,
+) {
+    let AgentLaunch { payload, steps } = launch;
+    let prompt_target = &started.prompt_target;
     match prompt {
         None => steps.skipped("prompt", "no prompt was given"),
         Some(prompt) => {
@@ -684,14 +722,14 @@ pub(crate) async fn start_placed_agent(
                 if attempt > 0 {
                     tokio::time::sleep(SPAWN_PROMPT_INTERVAL).await;
                 }
-                submitted = submit_agent_prompt(session, &prompt_target, prompt).await;
+                submitted = submit_agent_prompt(session, prompt_target, prompt).await;
                 if !submitted.as_ref().is_err_and(|err| err.can_retry_prompt()) {
                     break;
                 }
             }
             match submitted {
                 Ok(_) => {
-                    schedule_submit_keypress(session.clone(), place.pane_id.clone());
+                    schedule_submit_keypress(session.clone(), started.pane_id.clone());
                     steps.ok("prompt", json!({ "bytes": prompt.len() }));
                     payload["prompt_submitted"] = json!(true);
                 }
@@ -699,8 +737,6 @@ pub(crate) async fn start_placed_agent(
             }
         }
     }
-
-    AgentLaunch { payload, steps }
 }
 
 pub(crate) async fn agents(

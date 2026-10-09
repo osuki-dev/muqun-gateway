@@ -13,10 +13,10 @@
 //! | The pane | The task |
 //! |---|---|
 //! | a `MUQUN_TASK_DONE: <summary>` line below the echoed request, the agent not busy | `done`, with that summary |
-//! | agent starting / working | `working` (back from `waiting` or `idle_unconfirmed`) |
+//! | agent starting / working | `working` (from `dispatching`, or back from `waiting` or `idle_unconfirmed`) |
 //! | agent blocked on a menu (approval, question) | `waiting` |
 //! | agent idle on two polls, after it was seen working (or its state sequence moved), or for [`UNCONFIRMED_AFTER`] | `idle_unconfirmed` |
-//! | no agent in the pane (two polls running) | `failed`: the agent exited |
+//! | no agent in the pane (two polls running; for a `dispatching` task, only after [`START_GRACE`]) | `failed`: the agent exited |
 //! | the pane is gone | `failed`: the pane closed |
 //!
 //! The marker is looked for in the pane's recent output (not only its screen)
@@ -52,6 +52,10 @@ pub(crate) const UNCONFIRMED_AFTER: Duration = Duration::from_secs(30);
 /// and in a row idle before a pause counts, so one listing taken mid-redraw
 /// (or a screen read between two tool calls) does not move the task.
 const IN_A_ROW: u32 = 2;
+/// How long a `dispatching` task's pane may show no agent: the agent is
+/// still being started (its start timeout) and given its goal.
+const START_GRACE: Duration =
+    Duration::from_millis(agent_kinds::DEFAULT_AGENT_START_TIMEOUT_MS + 15_000);
 pub(crate) const PANE_CLOSED: &str = "the pane closed";
 pub(crate) const AGENT_EXITED: &str = "the agent exited before it finished";
 /// The line a terminal agent prints when the delegated goal is finished.
@@ -177,6 +181,10 @@ pub(crate) fn judge(
         }
         (Seen::Gone | Seen::NoAgent, Some(summary)) => return Verdict::Done(summary.to_owned()),
         (Seen::Gone, None) => return Verdict::Failed(PANE_CLOSED),
+        // Not started yet, not exited.
+        (Seen::NoAgent, None) if task == TaskState::Dispatching && elapsed < START_GRACE => {
+            return Verdict::Stay
+        }
         (Seen::NoAgent, None) => {
             progress.absent += 1;
             if progress.absent >= IN_A_ROW {
@@ -198,7 +206,9 @@ pub(crate) fn judge(
         AgentStatus::Starting | AgentStatus::Working => {
             progress.busy = true;
             match task {
-                TaskState::Waiting | TaskState::IdleUnconfirmed => Verdict::Working,
+                TaskState::Dispatching | TaskState::Waiting | TaskState::IdleUnconfirmed => {
+                    Verdict::Working
+                }
                 _ => Verdict::Stay,
             }
         }
@@ -552,6 +562,19 @@ mod tests {
                 "a pause that stays paused is not moved again",
                 vec![(T::IdleUnconfirmed, agent(Idle, None), None, late)],
                 Verdict::Stay,
+            ),
+            (
+                "an agent still being started has not exited",
+                vec![
+                    (T::Dispatching, Seen::NoAgent, None, soon),
+                    (T::Dispatching, Seen::NoAgent, None, soon),
+                ],
+                Verdict::Stay,
+            ),
+            (
+                "an agent at work moves its dispatching task to working",
+                vec![(T::Dispatching, agent(Working, None), None, soon)],
+                Verdict::Working,
             ),
             (
                 "a pause that runs again works",

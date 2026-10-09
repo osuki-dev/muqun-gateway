@@ -331,7 +331,9 @@ the answer of `POST /api/tasks` carries `"pane_id"` (the pane to open)
 instead of `"asid"`. The agent is started and given the goal in the
 background (that can take up to half a minute); the task then moves to
 `working`, or to `failed` with a `summary` naming the step (`agent: …`,
-`prompt: …`), published as `task.updated`. A command task's pane binding has
+`prompt: …`, or `the agent start failed: …` if the start itself broke),
+published as `task.updated`. A task cancelled (or failed) while its agent
+starts is not typed into. A command task's pane binding has
 no `agent_id`, so `binding.kind == "pane"` with an `agent_id` is how a client
 tells a terminal agent's task from a command. A terminal agent that is not on
 `PATH` is `503 agent_unavailable`, and no reachable terminal session `503
@@ -367,10 +369,10 @@ every poll:
 | The pane | The task |
 |---|---|
 | the marker, as above | `done`, `summary` = the marker's summary |
-| the agent starting or working | `working` (back from `waiting` or `idle_unconfirmed`) |
+| the agent starting or working | `working` (from `dispatching`, or back from `waiting` or `idle_unconfirmed`) |
 | the agent blocked on a menu: an approval or a question | `waiting` |
 | the agent idle on two polls in a row, after it was seen working (or after its Herdr state sequence moved), or 30 s after the start | `idle_unconfirmed`, `summary` = a hint: the agent's last prose block when the gateway has a transcript dictionary for it (Claude Code, Codex, ...), else the screen's last line with any letter or digit in it |
-| no agent running in the pane, on two polls in a row, and no marker | `failed`, `summary` = `the agent exited before it finished: <last screen line>` |
+| no agent running in the pane, on two polls in a row, and no marker (a `dispatching` task's agent is given its start timeout plus 15 s first) | `failed`, `summary` = `the agent exited before it finished: <last screen line>` |
 | the pane is gone (or another shell holds its id), and no marker was read before | `failed`, `summary` = `the pane closed: <the last screen line read>` |
 
 `idle_unconfirmed` is a pause, not an end: the task stays open, and moves back
