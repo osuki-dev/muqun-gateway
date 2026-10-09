@@ -647,7 +647,7 @@ fn manager_pty_navigates_scrolls_resizes_and_keeps_start_failures_in_the_ui() {
     manager.send(b"3");
     manager.until("No devices paired yet.");
     manager.send(b"\r");
-    manager.until("Scan with Muqun");
+    manager.until("1 Scan the QR in Muqun");
     let size = libc::winsize {
         ws_row: 8,
         ws_col: 40,
@@ -672,7 +672,7 @@ fn manager_pty_navigates_scrolls_resizes_and_keeps_start_failures_in_the_ui() {
     );
     // Confirm the larger frame before sending a standalone Esc: resize
     // notification and key decoding are asynchronous, separate transitions.
-    manager.until("Scan with Muqun");
+    manager.until("1 Scan the QR in Muqun");
     manager.send(b"\x1b");
     manager.until("No devices paired yet.");
     manager.send(b"4\r");
@@ -755,10 +755,10 @@ fn manager_compact_pairing_keeps_the_full_address_reachable_without_resizing() {
     );
     // Wait for the resized Overview frame before starting pairing, so PTY
     // resize delivery cannot overlap the navigation input being asserted.
-    manager.until("Tab Views | Esc Back | q Close");
+    manager.until("Tab Views | Esc Back | q Close manager");
     manager.send(b"3\r");
     let output = manager.until(&address[..30]);
-    assert!(output.contains("Down for URL"));
+    assert!(output.contains("Resize for the full QR"));
     // Address has a nine-cell prefix, leaving thirty cells per wrapped segment.
     for segment in address.as_bytes().chunks(30).skip(1) {
         manager.send(b"\x1b[B");

@@ -22,7 +22,10 @@ impl std::fmt::Display for GatewayNotRunning {
 
 impl std::error::Error for GatewayNotRunning {}
 
-const MAX_RESPONSE: u64 = 64 * 1024;
+// Bounds what a stray listener on the port can make the CLI buffer. The
+// gateway's own discovery answer (`/api/capabilities`, with every agent's model
+// catalogue) is already past 64 KiB, which silently read as "no planes".
+const MAX_RESPONSE: u64 = 4 * 1024 * 1024;
 
 fn build_request(
     method: &str,

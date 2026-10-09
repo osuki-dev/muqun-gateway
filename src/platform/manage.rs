@@ -80,19 +80,29 @@ pub(crate) fn manage() -> anyhow::Result<()> {
             Vec::new()
         }
     };
-    // False by default so a finished pairing lands on the device list; `p` flips
-    // it on to add another device.
-    let mut show_qr = false;
+    // The pairing view is open while a phone is being paired: `p` opens it, a
+    // phone that has already asked for a code opens it on its own, and Esc,
+    // Enter or `r` return to the device list.
+    let mut pairing = PairingView {
+        open: pending_pairing.is_some(),
+        paired: None,
+    };
+    let links = spawn_link_poller();
+    let mut connectivity = Connectivity::default();
     let mut ui = ManageView::default();
     print_manage_screen(
         &message,
         pending_pairing.as_ref(),
         &devices,
-        show_qr,
+        &pairing,
+        connectivity,
         &mut ui,
     )?;
 
     loop {
+        if let Some(latest) = links.try_iter().last() {
+            connectivity = latest;
+        }
         if !poll_event(MANAGE_REFRESH_INTERVAL)? {
             let next_pending_pairing = fetch_pending_pairing().ok().flatten();
             // A refresh that cannot read the file keeps showing the last list
@@ -101,11 +111,27 @@ pub(crate) fn manage() -> anyhow::Result<()> {
                 continue;
             };
             if next_pending_pairing != pending_pairing || next_devices != devices {
-                // A newly paired device flips off the QR so the screen settles on
-                // the device list instead of showing a fresh code.
+                // A phone that scanned the QR (or typed the address) opens the
+                // pairing view on its code step; a finished pairing keeps the
+                // view open on its "Done" step, naming the new device.
                 if next_devices.len() > devices.len() {
-                    show_qr = false;
-                    message = String::from("device paired");
+                    let name = next_devices
+                        .last()
+                        .map(|device| device.name.clone())
+                        .unwrap_or_default();
+                    message = format!("paired as {}", truncate(&name, 32));
+                    pairing.open = true;
+                    pairing.paired = Some(name);
+                } else if next_pending_pairing.is_some()
+                    && next_pending_pairing.as_ref().map(|p| &p.request_id)
+                        != pending_pairing.as_ref().map(|p| &p.request_id)
+                {
+                    pairing.open = true;
+                    pairing.paired = None;
+                    ui.scroll = 0;
+                    if ui.section != Section::Devices {
+                        message = String::from("A phone is waiting for its code: open 3 Devices.");
+                    }
                 }
                 pending_pairing = next_pending_pairing;
                 devices = next_devices;
@@ -114,7 +140,8 @@ pub(crate) fn manage() -> anyhow::Result<()> {
                 &message,
                 pending_pairing.as_ref(),
                 &devices,
-                show_qr,
+                &pairing,
+                connectivity,
                 &mut ui,
             )?;
             continue;
@@ -127,7 +154,8 @@ pub(crate) fn manage() -> anyhow::Result<()> {
                     &message,
                     pending_pairing.as_ref(),
                     &devices,
-                    show_qr,
+                    &pairing,
+                    connectivity,
                     &mut ui,
                 )?;
             }
@@ -141,13 +169,14 @@ pub(crate) fn manage() -> anyhow::Result<()> {
         }
         let item_count = match ui.section {
             Section::Terminals => load_config(None)?.sessions.len(),
-            Section::Devices if !show_qr && pending_pairing.is_none() => devices.len(),
+            Section::Devices if !pairing.open => devices.len(),
             Section::Settings => 4,
             _ => 0,
         };
         if event.code == KeyCode::Esc {
-            if ui.section == Section::Devices && show_qr {
-                show_qr = false;
+            // One level back: pairing view -> device list -> Overview -> closed.
+            if ui.section == Section::Devices && pairing.open {
+                pairing.close();
                 message = String::from("Pairing view closed; existing devices are unchanged.");
             } else if ui.section != Section::Overview {
                 ui = ManageView::default();
@@ -158,7 +187,8 @@ pub(crate) fn manage() -> anyhow::Result<()> {
                 &message,
                 pending_pairing.as_ref(),
                 &devices,
-                show_qr,
+                &pairing,
+                connectivity,
                 &mut ui,
             )?;
             continue;
@@ -168,7 +198,8 @@ pub(crate) fn manage() -> anyhow::Result<()> {
                 &message,
                 pending_pairing.as_ref(),
                 &devices,
-                show_qr,
+                &pairing,
+                connectivity,
                 &mut ui,
             )?;
             continue;
@@ -179,8 +210,7 @@ pub(crate) fn manage() -> anyhow::Result<()> {
                 ui.section,
                 ui.selected,
                 item_count == 0,
-                show_qr,
-                pending_pairing.is_some(),
+                pairing.open,
                 lifecycle::running_pid().is_ok_and(|pid| pid.is_some()),
             )
             .map(|ch| ch.to_string())
@@ -226,11 +256,12 @@ pub(crate) fn manage() -> anyhow::Result<()> {
                     message = String::from("gateway restarted");
                 }
                 (Section::Devices, "p") => {
-                    show_qr = true;
+                    pairing.open = true;
+                    pairing.paired = None;
                     ui.scroll = 0;
                     message = String::from("scan to pair another device");
                 }
-                (Section::Devices, "x") if !show_qr && pending_pairing.is_none() => {
+                (Section::Devices, "x") if !pairing.open => {
                     if devices.is_empty() {
                         message = String::from("no paired devices to revoke");
                     } else if let Some(device) = devices.iter().rev().nth(ui.selected).cloned() {
@@ -251,7 +282,8 @@ pub(crate) fn manage() -> anyhow::Result<()> {
                                 // this app's credential. Return straight to the
                                 // pairing QR instead of leaving them on the
                                 // remaining device list.
-                                show_qr = true;
+                                pairing.open = true;
+                                pairing.paired = None;
                             }
                             Ok(false) => message = String::from("device was already revoked"),
                             Err(error) => message = first_line(&format!("{error:#}")),
@@ -261,11 +293,8 @@ pub(crate) fn manage() -> anyhow::Result<()> {
                     }
                 }
                 (Section::Devices, "r") => {
-                    show_qr = false;
+                    pairing.close();
                     ui.scroll = 0;
-                    if pending_pairing.is_some() {
-                        ui.section = Section::Overview;
-                    }
                     message = String::from("Pairing view closed; paired devices are unchanged.");
                 }
                 (Section::Settings, "u") => match prompt_public_url()? {
@@ -341,7 +370,8 @@ pub(crate) fn manage() -> anyhow::Result<()> {
                         &message,
                         pending_pairing.as_ref(),
                         &devices,
-                        show_qr,
+                        &pairing,
+                        connectivity,
                         &mut ui,
                     )?;
                     let plan = update::in_thread(update::check)?;
@@ -354,7 +384,8 @@ pub(crate) fn manage() -> anyhow::Result<()> {
                         &message,
                         pending_pairing.as_ref(),
                         &devices,
-                        show_qr,
+                        &pairing,
+                        connectivity,
                         &mut ui,
                     )?;
                     let plan = update::in_thread(update::check)?;
@@ -368,7 +399,7 @@ pub(crate) fn manage() -> anyhow::Result<()> {
                         String::from("This manager stays open on its old image; reopen it to load the new UI."),
                     ], "update Gateway")? {
                         message = String::from("Downloading/verifying, then updating. Please wait; do not close this manager.");
-                        print_manage_screen(&message, pending_pairing.as_ref(), &devices, show_qr, &mut ui)?;
+                        print_manage_screen(&message, pending_pairing.as_ref(), &devices, &pairing, connectivity, &mut ui)?;
                         message = update::in_thread(move || update::apply(plan))?;
                     } else {
                         message = String::from("Gateway update cancelled; no binary downloaded or restart.");
@@ -391,7 +422,8 @@ pub(crate) fn manage() -> anyhow::Result<()> {
             &message,
             pending_pairing.as_ref(),
             &devices,
-            show_qr,
+            &pairing,
+            connectivity,
             &mut ui,
         )?;
     }
@@ -659,28 +691,295 @@ impl Section {
         Self::Devices,
         Self::Settings,
     ];
-    fn hints(self) -> &'static str {
-        match self {
-            Self::Overview => "s Start gateway | t Stop gateway | r Restart gateway",
-            Self::Terminals => "Enter Make selected default | b Toggle terminal-server startup | d Remove selected backend | h Add Herdr | m Add tmux",
-            Self::Devices => "Enter Revoke selected device | p Pair new device",
-            Self::Settings => "Enter Change selected setting | c Check updates | i Install update | g Gateway login autostart | u Edit address | a Detect address | e Toggle encryption",
+}
+
+/// The Devices view's pairing flow. `open` shows it instead of the device
+/// list; `paired` is the device a just-finished pairing produced, which keeps
+/// the flow on its "Done" step until the operator leaves or pairs another.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct PairingView {
+    open: bool,
+    paired: Option<String>,
+}
+
+impl PairingView {
+    fn close(&mut self) {
+        self.open = false;
+        self.paired = None;
+    }
+    /// Which of the three steps the operator is on, given whether a phone has
+    /// asked for its code.
+    fn stage(&self, pending: bool) -> PairingStage {
+        if self.paired.is_some() {
+            PairingStage::Done
+        } else if pending {
+            PairingStage::Code
+        } else {
+            PairingStage::Scan
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PairingStage {
+    Scan,
+    Code,
+    Done,
+}
+
+/// One row of the pairing flow: "1 Scan the QR in Muqun · 2 Type this code on
+/// the phone · 3 Done", with the current step highlighted.
+fn pairing_steps(stage: PairingStage) -> ScreenLine {
+    let steps = [
+        (PairingStage::Scan, "1 Scan the QR in Muqun"),
+        (PairingStage::Code, "2 Type this code on the phone"),
+        (PairingStage::Done, "3 Done"),
+    ];
+    let mut spans = Vec::new();
+    for (index, (step, text)) in steps.iter().enumerate() {
+        if index > 0 {
+            spans.push((" · ".into(), Tone::Quiet));
+        }
+        spans.push((
+            (*text).into(),
+            if *step == stage {
+                Tone::Badge
+            } else {
+                Tone::Quiet
+            },
+        ));
+    }
+    ScreenLine { spans, qr: None }
+}
+
+/// Whether one of the gateway's services answers, as the header shows it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Link {
+    /// Nothing could be asked: the gateway is stopped or has not answered yet.
+    #[default]
+    Unknown,
+    Connected,
+    Offline,
+    NotConfigured,
+}
+
+impl Link {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Connected => "connected",
+            Self::Offline => "offline",
+            Self::NotConfigured => "none",
+        }
+    }
+}
+
+/// What the running gateway reports about its backends and agents.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Connectivity {
+    herdr: Link,
+    agents: Link,
+}
+
+/// Everything the one-line header says.
+struct HeaderStatus<'a> {
+    version: &'a str,
+    listen: &'a str,
+    running: bool,
+    links: Connectivity,
+    devices: usize,
+}
+
+/// The persistent header: version, where the gateway listens, whether Herdr
+/// and the agent service answer, and how many phones are paired. Falls back
+/// to a shorter form when the full one does not fit the width.
+fn header_line(status: &HeaderStatus<'_>, width: usize) -> String {
+    let devices = format!(
+        "{} device{}",
+        status.devices,
+        if status.devices == 1 { "" } else { "s" }
+    );
+    let links = format!(
+        "Herdr {} · Agents {}",
+        status.links.herdr.label(),
+        status.links.agents.label()
+    );
+    let full = if status.running {
+        format!(
+            "Muqun Gateway v{} · Running {} · {links} · {devices}",
+            status.version, status.listen
+        )
+    } else {
+        format!(
+            "Muqun Gateway v{} · Stopped · listens on {} when started · {devices}",
+            status.version, status.listen
+        )
+    };
+    if display_width(&full) <= width {
+        return full;
+    }
+    let state = if status.running { "Running" } else { "Stopped" };
+    let compact = if status.running {
+        format!(
+            "v{} · {state} {} · {links} · {devices}",
+            status.version, status.listen
+        )
+    } else {
+        format!(
+            "v{} · {state} · {} · {devices}",
+            status.version, status.listen
+        )
+    };
+    if display_width(&compact) <= width {
+        return compact;
+    }
+    format!("v{} · {state} · {}", status.version, status.listen)
+}
+
+/// Read `GET /api/capabilities` into the header's two links: the Herdr
+/// backend's `connected` flag and whether any agent answers.
+fn connectivity_from_discovery(value: &Value) -> Connectivity {
+    let planes = &value["planes"];
+    let herdr: Vec<bool> = planes["terminal"]["backends"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|backend| backend["kind"] == "herdr")
+        .map(|backend| backend["connected"] == true)
+        .collect();
+    let agents: Vec<&str> = planes["agents"]["agents"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|agent| agent["status"].as_str())
+        .collect();
+    let link = |answering: bool, configured: bool| {
+        if answering {
+            Link::Connected
+        } else if configured {
+            Link::Offline
+        } else {
+            Link::NotConfigured
+        }
+    };
+    Connectivity {
+        herdr: link(herdr.contains(&true), !herdr.is_empty()),
+        agents: link(
+            agents
+                .iter()
+                .any(|status| matches!(*status, "connected" | "reachable")),
+            agents
+                .iter()
+                .any(|status| matches!(*status, "offline" | "unsupported")),
+        ),
+    }
+}
+
+fn fetch_connectivity() -> Connectivity {
+    let Ok(config) = load_config(None) else {
+        return Connectivity::default();
+    };
+    // The gateway's own backend and agent probes take up to a few seconds
+    // when their caches are cold; this runs off the UI thread, so waiting is
+    // fine, and a gateway that is not running leaves both links unknown.
+    match crate::cli::local_api::admin_request_with_timeouts(
+        &config,
+        "GET",
+        "/api/capabilities",
+        None,
+        Duration::from_millis(250),
+        Duration::from_secs(8),
+    ) {
+        Ok((200, value)) => connectivity_from_discovery(&value),
+        _ => Connectivity::default(),
+    }
+}
+
+const CONNECTIVITY_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Ask the gateway about its links every couple of seconds, off the UI
+/// thread, so the header is current without a key press and a slow probe
+/// never stalls key handling. The thread ends when the manager drops the
+/// receiver.
+fn spawn_link_poller() -> std::sync::mpsc::Receiver<Connectivity> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || loop {
+        if sender.send(fetch_connectivity()).is_err() {
+            break;
+        }
+        std::thread::sleep(CONNECTIVITY_POLL_INTERVAL);
+    });
+    receiver
+}
+
+/// What the footer's hints depend on besides the view.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct FooterContext {
+    running: bool,
+    no_backends: bool,
+    no_devices: bool,
+    /// `Some` while the pairing flow is shown instead of the device list.
+    pairing: Option<PairingStage>,
+}
+
+/// The footer's two hint rows: the view's actions, then navigation. Every
+/// hint is a key followed by the full words for what it does; Esc is always
+/// one level back and `q` always closes the manager. Hints are separated by
+/// " | " so narrow terminals can wrap them.
+fn footer_hints(section: Section, context: &FooterContext) -> (String, String) {
+    let actions = match (section, context.pairing) {
+        (Section::Overview, _) => format!(
+            "Enter {} gateway | s Start gateway | t Stop gateway | r Restart gateway",
+            if context.running { "Stop" } else { "Start" }
+        ),
+        (Section::Terminals, _) if context.no_backends => {
+            String::from("Enter Add tmux backend | m Add tmux backend | h Add Herdr backend")
+        }
+        (Section::Terminals, _) => String::from(
+            "Enter Make selected default | f Make selected default | b Toggle terminal-server startup | d Remove selected backend | h Add Herdr backend | m Add tmux backend",
+        ),
+        (Section::Devices, Some(PairingStage::Done)) => {
+            String::from("Enter Back to device list | p Pair another device | r Back to device list")
+        }
+        (Section::Devices, Some(_)) => {
+            String::from("Enter Back to device list | r Back to device list")
+        }
+        (Section::Devices, None) if context.no_devices => {
+            String::from("Enter Pair first device | p Pair new device")
+        }
+        (Section::Devices, None) => String::from(
+            "Enter Revoke selected device | x Revoke selected device | p Pair new device",
+        ),
+        (Section::Settings, _) => String::from(
+            "Enter Change selected setting | g Gateway login autostart | u Edit address | a Detect address | e Toggle encryption | c Check updates | i Install update",
+        ),
+    };
+    let navigation = match (section, context.pairing) {
+        (Section::Overview, _) => String::from(
+            "Views: 1 Overview (status) · 2 Terminals (backends) · 3 Devices (pair phones) · 4 Settings (address, autostart, updates) | Tab Next view | Esc or q Close manager",
+        ),
+        (Section::Devices, Some(_)) => {
+            String::from("Tab Next view | Esc Back to device list | q Close manager")
+        }
+        _ => String::from(
+            "Tab Next view | Up/Down Select | PageUp/PageDown Scroll | Esc Back to Overview | q Close manager",
+        ),
+    };
+    (actions, navigation)
 }
 
 fn primary_action(
     section: Section,
     selected: usize,
     empty_items: bool,
-    show_qr: bool,
-    pending: bool,
+    pairing_open: bool,
     running: bool,
 ) -> Option<char> {
     match section {
         Section::Overview => Some(if running { 't' } else { 's' }),
         Section::Terminals => Some(if empty_items { 'm' } else { 'f' }),
-        Section::Devices if show_qr || pending => Some('r'),
+        // The pairing view (QR, code, or done) returns to the list on Enter.
+        Section::Devices if pairing_open => Some('r'),
         Section::Devices => Some(if empty_items { 'p' } else { 'x' }),
         Section::Settings => ['g', 'u', 'e', 'c'].get(selected).copied(),
     }
@@ -760,7 +1059,8 @@ fn print_manage_screen(
     message: &str,
     pending_pairing: Option<&PendingPairing>,
     devices: &[DeviceRecord],
-    show_qr: bool,
+    pairing: &PairingView,
+    connectivity: Connectivity,
     ui: &mut ManageView,
 ) -> anyhow::Result<()> {
     let config = load_config(None)?;
@@ -786,7 +1086,10 @@ fn print_manage_screen(
         })
         .collect::<Vec<_>>();
     let qr_result =
-        if ui.section == Section::Devices && show_qr && pending_pairing.is_none() {
+        if ui.section == Section::Devices
+            && pairing.open
+            && pairing.stage(pending_pairing.is_some()) == PairingStage::Scan
+        {
             Some((|| -> anyhow::Result<String> {
                 let pairing = read_pairing_file()?;
                 anyhow::ensure!(hash_token(&pairing.payload.token) == config.token_hash,
@@ -821,8 +1124,10 @@ fn print_manage_screen(
         backend_states: &backend_states,
         qr: qr.map(String::as_str),
         changed: running && config_changed_since_start(),
+        connectivity,
+        pairing,
     };
-    let lines = manage_lines(&data, show_qr, ui, width, height);
+    let lines = manage_lines(&data, ui, width, height);
     write_viewport(&lines, width, height)
 }
 
@@ -867,6 +1172,9 @@ enum Tone {
     Error,
     Selected,
     Title,
+    /// Looks like `Selected` (bold, reversed) but is not a list selection, so
+    /// the viewport does not pin it: the current pairing step and the code.
+    Badge,
 }
 
 impl Tone {
@@ -880,10 +1188,10 @@ impl Tone {
             Self::Error => Some(Color::DarkRed),
             _ => None,
         };
-        if matches!(self, Self::Title | Self::Selected) {
+        if matches!(self, Self::Title | Self::Selected | Self::Badge) {
             style.attributes.set(Attribute::Bold);
         }
-        if self == Self::Selected {
+        if matches!(self, Self::Selected | Self::Badge) {
             style.attributes.set(Attribute::Reverse);
         }
         style
@@ -949,6 +1257,8 @@ struct ManageData<'a> {
     backend_states: &'a [String],
     qr: Option<&'a str>,
     changed: bool,
+    connectivity: Connectivity,
+    pairing: &'a PairingView,
 }
 
 fn panel(
@@ -1000,12 +1310,12 @@ fn wrapped_rows(label: &str, value: &str, width: usize) -> Vec<ScreenLine> {
     lines.into_iter().map(ScreenLine::plain).collect()
 }
 
-fn shortcut_rows(hints: &str, width: usize) -> Vec<ScreenLine> {
+fn shortcut_rows(hints: &str, width: usize, tone: Tone) -> Vec<ScreenLine> {
     let mut rows = Vec::new();
     let mut line = String::new();
     for hint in hints.split(" | ") {
         if !line.is_empty() && display_width(&line) + 3 + display_width(hint) > width {
-            rows.push(ScreenLine::text(&line, Tone::Accent));
+            rows.push(ScreenLine::text(&line, tone));
             line.clear();
         }
         if !line.is_empty() {
@@ -1014,14 +1324,13 @@ fn shortcut_rows(hints: &str, width: usize) -> Vec<ScreenLine> {
         line.push_str(hint);
     }
     if !line.is_empty() {
-        rows.push(ScreenLine::text(line, Tone::Accent));
+        rows.push(ScreenLine::text(line, tone));
     }
     rows
 }
 
 fn manage_lines(
     data: &ManageData<'_>,
-    show_qr: bool,
     ui: &mut ManageView,
     width: u16,
     height: u16,
@@ -1043,10 +1352,32 @@ fn manage_lines(
         Section::Settings => 3,
         Section::Overview => 0,
     });
+    let status = header_line(
+        &HeaderStatus {
+            version: env!("CARGO_PKG_VERSION"),
+            listen: &config.listen,
+            running: data.running,
+            links: data.connectivity,
+            devices: data.devices.len(),
+        },
+        content,
+    );
+    // The product name is the bold part; the rest reads as status.
+    let (title, rest) = status
+        .split_once(" · ")
+        .map(|(title, rest)| (title.to_owned(), format!(" · {rest}")))
+        .unwrap_or((status.clone(), String::new()));
     let mut header = vec![ScreenLine {
         spans: vec![
-            ("Muqun Gateway".into(), Tone::Title),
-            (format!("  v{}", env!("CARGO_PKG_VERSION")), Tone::Quiet),
+            (title, Tone::Title),
+            (
+                rest,
+                if data.running {
+                    Tone::Normal
+                } else {
+                    Tone::Warning
+                },
+            ),
         ],
         qr: None,
     }];
@@ -1072,35 +1403,19 @@ fn manage_lines(
     if framed {
         header.push(ScreenLine::plain(""));
     }
-    let hints = match ui.section {
-        Section::Terminals if config.sessions.is_empty() => {
-            "Enter Add tmux backend | h Add Herdr backend"
-        }
-        Section::Overview => {
-            if data.running {
-                "Enter Stop gateway | s Start gateway | r Restart gateway"
-            } else {
-                "Enter Start gateway | t Stop gateway | r Restart gateway"
-            }
-        }
-        Section::Devices if data.pending.is_some() => {
-            "Enter Back to Overview | Esc Back to Overview"
-        }
-        Section::Devices if show_qr => "Enter Back to device list | Esc Cancel pairing view",
-        Section::Devices if data.devices.is_empty() => {
-            "Enter Pair first device | p Pair new device"
-        }
-        _ => ui.section.hints(),
-    };
-    let mut footer = shortcut_rows(hints, content);
-    footer.push(ScreenLine::text(
-        if ui.section == Section::Overview {
-            "Tab Views | Arrows Select | PageUp/Down Scroll | Esc/q Close"
-        } else {
-            "Tab Views | Arrows Select | Esc Back | q Close"
+    let pairing_stage = data.pairing.stage(data.pending.is_some());
+    let show_pairing = data.pairing.open;
+    let (hints, navigation) = footer_hints(
+        ui.section,
+        &FooterContext {
+            running: data.running,
+            no_backends: config.sessions.is_empty(),
+            no_devices: data.devices.is_empty(),
+            pairing: show_pairing.then_some(pairing_stage),
         },
-        Tone::Quiet,
-    ));
+    );
+    let mut footer = shortcut_rows(&hints, content, Tone::Accent);
+    footer.extend(shortcut_rows(&navigation, content, Tone::Quiet));
     footer.push(ScreenLine::text(
         format!(
             "{}{}",
@@ -1120,9 +1435,9 @@ fn manage_lines(
     // Small windows keep one primary action and one status row, not a wall of shortcuts.
     if height < 14 {
         footer.truncate(1);
-        footer[0] = ScreenLine::text(hints.split(" | ").next().unwrap_or(hints), Tone::Accent);
+        footer[0] = ScreenLine::text(hints.split(" | ").next().unwrap_or(&hints), Tone::Accent);
         footer.push(ScreenLine::text(
-            "Tab Views | Esc Back | q Close",
+            "Tab Views | Esc Back | q Close manager",
             Tone::Quiet,
         ));
         footer.push(ScreenLine::plain(format!("Status: {}", data.message)));
@@ -1285,49 +1600,80 @@ fn manage_lines(
             ));
         }
         Section::Devices => {
-            if let Some(pending) = data.pending {
-                let mut rows = vec![
-                    ScreenLine::plain(format!("Device: {}", pending.device_name)),
-                    ScreenLine::text(format!("Pairing code: {}", pending.code), Tone::Title),
-                ];
-                rows.extend(wrapped_rows("Address", &config.public_url, inner));
-                rows.push(ScreenLine::plain(
-                    "Enter this code in Muqun to finish pairing.",
-                ));
-                panel(
-                    &mut body,
-                    "Finish pairing in the App",
-                    rows,
-                    content,
-                    framed,
-                );
-            } else if show_qr {
-                body.push(ScreenLine::text("Pair a device", Tone::Title));
-                if data.qr.is_none() {
-                    body.push(ScreenLine::text(
-                        "Pairing unavailable. See the status message below.",
-                        Tone::Error,
-                    ));
-                } else {
-                    if let Some(qr) = data.qr.filter(|qr| {
-                        qr.lines().count() + 2 <= body_height
-                            && qr.lines().all(|row| display_width(row) <= content)
-                    }) {
-                        body.push(ScreenLine::plain(
-                            "Scan with Muqun; code appears after scan.",
-                        ));
-                        body.extend(qr.lines().map(|row| ScreenLine {
-                            spans: Vec::new(),
-                            qr: Some(row.to_owned()),
-                        }));
-                    } else {
+            if show_pairing {
+                // The QR with its step line and state line, if it fits at all.
+                let qr = data.qr.filter(|qr| {
+                    qr.lines().count() + 2 <= body_height
+                        && qr.lines().all(|row| display_width(row) <= content)
+                });
+                // The step line names the task on its own; the title and a
+                // spacer are only added where there is room for them without
+                // costing the QR, so a short terminal keeps the QR or the
+                // next instruction on screen.
+                let roomy =
+                    body_height >= 10 && qr.is_none_or(|qr| qr.lines().count() + 4 <= body_height);
+                if roomy {
+                    body.push(ScreenLine::text("Pair a device", Tone::Title));
+                }
+                body.push(pairing_steps(pairing_stage));
+                if roomy {
+                    body.push(ScreenLine::plain(""));
+                }
+                match (pairing_stage, data.pending, data.pairing.paired.as_deref()) {
+                    (PairingStage::Code, Some(pending), _) => {
+                        // The code is the one thing to read from across the
+                        // room: spaced out on a bold reversed badge.
+                        let spaced = pending
+                            .code
+                            .chars()
+                            .map(|ch| ch.to_string())
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        let badge = " ".repeat(display_width(&spaced) + 8);
+                        body.push(ScreenLine::text(&badge, Tone::Badge));
+                        body.push(ScreenLine::text(format!("    {spaced}    "), Tone::Badge));
+                        body.push(ScreenLine::text(&badge, Tone::Badge));
+                        body.push(ScreenLine::plain(""));
                         body.push(ScreenLine::text(
-                            "Resize for the full QR; Down for URL.",
-                            Tone::Warning,
+                            format!(
+                                "Waiting for the phone… {} is asking for this code.",
+                                pending.device_name
+                            ),
+                            Tone::Accent,
                         ));
                         body.extend(wrapped_rows("Address", &config.public_url, inner));
+                    }
+                    (PairingStage::Done, _, paired) => {
+                        body.push(ScreenLine::text(
+                            format!("Paired as {}.", paired.unwrap_or("new device")),
+                            Tone::Good,
+                        ));
                         body.push(ScreenLine::plain(
-                            "In Muqun: add Gateway, enter this address, then the code.",
+                            "The phone can open this Gateway now. Press p to pair another device.",
+                        ));
+                    }
+                    _ if data.qr.is_none() => {
+                        body.push(ScreenLine::text(
+                            "Pairing unavailable. See the status message below.",
+                            Tone::Error,
+                        ));
+                    }
+                    _ => {
+                        if let Some(qr) = qr {
+                            body.extend(qr.lines().map(|row| ScreenLine {
+                                spans: Vec::new(),
+                                qr: Some(row.to_owned()),
+                            }));
+                        } else {
+                            body.push(ScreenLine::text(
+                                "Resize for the full QR, or type this address into Muqun:",
+                                Tone::Warning,
+                            ));
+                            body.extend(wrapped_rows("Address", &config.public_url, inner));
+                        }
+                        body.push(ScreenLine::text(
+                            "Waiting for the phone… the code appears here after the scan.",
+                            Tone::Accent,
                         ));
                     }
                 }
@@ -1362,6 +1708,15 @@ fn manage_lines(
                     ));
                 }
                 panel(&mut body, "Paired devices", rows, content, framed);
+                if let Some(pending) = data.pending {
+                    body.push(ScreenLine::text(
+                        format!(
+                            "{} is waiting for its pairing code: press p to show it.",
+                            pending.device_name
+                        ),
+                        Tone::Warning,
+                    ));
+                }
                 if !data.devices.is_empty() {
                     body.push(ScreenLine::plain(
                         "Enter reviews revocation; the selected device will lose access.",
@@ -2071,6 +2426,147 @@ mod tests {
     }
 
     #[test]
+    fn header_line_reports_status_and_shrinks_to_fit() {
+        use super::{header_line, Connectivity, HeaderStatus, Link};
+        let links = Connectivity {
+            herdr: Link::Connected,
+            agents: Link::Offline,
+        };
+        let cases = [
+            (
+                HeaderStatus { version: "1.2.3", listen: "0.0.0.0:23100", running: true, links, devices: 2 },
+                96,
+                "Muqun Gateway v1.2.3 · Running 0.0.0.0:23100 · Herdr connected · Agents offline · 2 devices",
+            ),
+            (
+                HeaderStatus { version: "1.2.3", listen: "0.0.0.0:23100", running: true, links, devices: 1 },
+                80,
+                "v1.2.3 · Running 0.0.0.0:23100 · Herdr connected · Agents offline · 1 device",
+            ),
+            (
+                HeaderStatus { version: "1.2.3", listen: "127.0.0.1:23100", running: false, links: Connectivity::default(), devices: 0 },
+                96,
+                "Muqun Gateway v1.2.3 · Stopped · listens on 127.0.0.1:23100 when started · 0 devices",
+            ),
+            (
+                HeaderStatus { version: "1.2.3", listen: "127.0.0.1:23100", running: false, links: Connectivity::default(), devices: 0 },
+                40,
+                "v1.2.3 · Stopped · 127.0.0.1:23100",
+            ),
+        ];
+        for (status, width, expected) in &cases {
+            assert_eq!(header_line(status, *width), *expected, "width {width}");
+        }
+        let discovered = super::connectivity_from_discovery(&serde_json::json!({
+            "planes": {
+                "terminal": { "backends": [
+                    { "kind": "tmux", "connected": false },
+                    { "kind": "herdr", "connected": true },
+                ]},
+                "agents": { "agents": [ { "status": "offline" }, { "status": "unconfigured" } ] },
+            }
+        }));
+        assert_eq!(discovered, links);
+    }
+
+    #[test]
+    fn footer_hints_name_every_action_and_always_offer_esc_and_q() {
+        use super::{footer_hints, FooterContext, PairingStage};
+        let base = FooterContext::default();
+        let cases: [(Section, FooterContext, &[&str]); 7] = [
+            (
+                Section::Overview,
+                FooterContext {
+                    running: true,
+                    ..base
+                },
+                &[
+                    "Enter Stop gateway",
+                    "1 Overview",
+                    "2 Terminals",
+                    "3 Devices",
+                    "4 Settings",
+                    "Esc or q Close manager",
+                ],
+            ),
+            (
+                Section::Overview,
+                base,
+                &["Enter Start gateway", "Esc or q Close manager"],
+            ),
+            (
+                Section::Terminals,
+                FooterContext {
+                    no_backends: true,
+                    ..base
+                },
+                &[
+                    "Enter Add tmux backend",
+                    "h Add Herdr backend",
+                    "Esc Back to Overview",
+                    "q Close manager",
+                ],
+            ),
+            (
+                Section::Terminals,
+                base,
+                &[
+                    "Enter Make selected default",
+                    "d Remove selected backend",
+                    "Esc Back to Overview",
+                    "q Close manager",
+                ],
+            ),
+            (
+                Section::Devices,
+                FooterContext {
+                    pairing: Some(PairingStage::Scan),
+                    ..base
+                },
+                &[
+                    "Enter Back to device list",
+                    "Esc Back to device list",
+                    "q Close manager",
+                ],
+            ),
+            (
+                Section::Devices,
+                FooterContext {
+                    pairing: Some(PairingStage::Done),
+                    ..base
+                },
+                &[
+                    "p Pair another device",
+                    "Esc Back to device list",
+                    "q Close manager",
+                ],
+            ),
+            (
+                Section::Settings,
+                base,
+                &[
+                    "Enter Change selected setting",
+                    "i Install update",
+                    "Esc Back to Overview",
+                    "q Close manager",
+                ],
+            ),
+        ];
+        for (section, context, expected) in cases {
+            let (actions, navigation) = footer_hints(section, &context);
+            let footer = format!("{actions} | {navigation}");
+            for text in expected {
+                assert!(
+                    footer.contains(text),
+                    "{section:?} {context:?}: missing {text:?} in {footer:?}"
+                );
+            }
+            assert!(footer.contains("Esc"), "{section:?}: Esc missing");
+            assert!(footer.contains("q Close manager"), "{section:?}: q missing");
+        }
+    }
+
+    #[test]
     fn manager_navigation_is_scoped_and_bounded() {
         let mut ui = ManageView::default();
         assert!(ui.navigate(KeyCode::BackTab, 0));
@@ -2084,11 +2580,12 @@ mod tests {
         ui.navigate(KeyCode::PageUp, 50);
         assert_eq!(ui.selected, 39);
         assert!(!ui.navigate(KeyCode::Char('g'), 50));
-        assert!(!Section::Terminals
-            .hints()
+        let context = super::FooterContext::default();
+        assert!(!super::footer_hints(Section::Terminals, &context)
+            .0
             .contains("Gateway login autostart"));
-        assert!(Section::Settings
-            .hints()
+        assert!(super::footer_hints(Section::Settings, &context)
+            .0
             .contains("Gateway login autostart"));
         ui.navigate(KeyCode::Tab, 50);
         assert_eq!(ui.selected, 0);
@@ -2098,36 +2595,36 @@ mod tests {
     #[test]
     fn manager_enter_actions_and_confirmation_cancel_are_explicit() {
         assert_eq!(
-            primary_action(Section::Overview, 0, true, false, false, false),
+            primary_action(Section::Overview, 0, true, false, false),
             Some('s')
         );
         assert_eq!(
-            primary_action(Section::Overview, 0, true, false, false, true),
+            primary_action(Section::Overview, 0, true, false, true),
             Some('t')
         );
         assert_eq!(
-            primary_action(Section::Terminals, 3, false, false, false, false),
+            primary_action(Section::Terminals, 3, false, false, false),
             Some('f')
         );
         assert_eq!(
-            primary_action(Section::Terminals, 0, true, false, false, false),
+            primary_action(Section::Terminals, 0, true, false, false),
             Some('m')
         );
         assert_eq!(
-            primary_action(Section::Devices, 0, true, false, false, false),
+            primary_action(Section::Devices, 0, true, false, false),
             Some('p')
         );
         assert_eq!(
-            primary_action(Section::Devices, 1, false, false, false, false),
+            primary_action(Section::Devices, 1, false, false, false),
             Some('x')
         );
         assert_eq!(
-            primary_action(Section::Devices, 0, true, true, false, false),
+            primary_action(Section::Devices, 0, true, true, false),
             Some('r')
         );
         for (index, action) in ['g', 'u', 'e'].iter().enumerate() {
             assert_eq!(
-                primary_action(Section::Settings, index, true, false, false, false),
+                primary_action(Section::Settings, index, true, false, false),
                 Some(*action)
             );
         }
@@ -2161,6 +2658,8 @@ mod tests {
             backend_states: &[],
             qr: None,
             changed: false,
+            connectivity: super::Connectivity::default(),
+            pairing: &super::PairingView::default(),
         };
         for section in Section::ALL {
             let mut ui = ManageView {
@@ -2170,7 +2669,7 @@ mod tests {
             };
             for width in [0_u16, 1, 2, 8, 24, 40, 60, 80, 100, 200] {
                 for height in [0_u16, 1, 5, 8, 18, 30] {
-                    let lines = manage_lines(&data, false, &mut ui, width, height);
+                    let lines = manage_lines(&data, &mut ui, width, height);
                     assert!(lines.len() <= height as usize);
                     for line in &lines {
                         let output = line.render(width.saturating_sub(1) as usize);
@@ -2205,6 +2704,7 @@ mod tests {
     #[test]
     fn manager_empty_states_and_default_marker_explain_next_actions() {
         let config = layout_config();
+        let pairing = super::PairingView::default();
         let data = |config| ManageData {
             config,
             message: "ready",
@@ -2216,13 +2716,15 @@ mod tests {
             backend_states: &[],
             qr: None,
             changed: false,
+            connectivity: super::Connectivity::default(),
+            pairing: &pairing,
         };
         let mut ui = ManageView {
             section: Section::Terminals,
             selected: 1,
             scroll: 0,
         };
-        let lines = manage_lines(&data(&config), false, &mut ui, 100, 30);
+        let lines = manage_lines(&data(&config), &mut ui, 100, 30);
         let selected = lines
             .iter()
             .find(|line| line.selected() && line.render(100).contains("qa-01"))
@@ -2235,12 +2737,12 @@ mod tests {
             .any(|line| line.render(100).contains("qa-00 [default]")));
         let mut empty_config = layout_config();
         empty_config.sessions.clear();
-        let lines = manage_lines(&data(&empty_config), false, &mut ui, 100, 30);
+        let lines = manage_lines(&data(&empty_config), &mut ui, 100, 30);
         assert!(lines
             .iter()
             .any(|line| line.render(100).contains("Enter Add tmux or h Add Herdr")));
         ui.section = Section::Devices;
-        let lines = manage_lines(&data(&empty_config), false, &mut ui, 100, 30);
+        let lines = manage_lines(&data(&empty_config), &mut ui, 100, 30);
         assert!(lines
             .iter()
             .any(|line| line.render(100).contains("Enter to pair your first device")));
@@ -2375,26 +2877,28 @@ mod tests {
             backend_states: &[],
             qr: Some(&qr),
             changed: false,
+            connectivity: super::Connectivity::default(),
+            pairing: &super::PairingView {
+                open: true,
+                paired: None,
+            },
         };
         let mut ui = ManageView {
             section: Section::Devices,
             selected: 0,
             scroll: 99,
         };
-        let lines = manage_lines(&data, true, &mut ui, 100, 50);
+        let lines = manage_lines(&data, &mut ui, 100, 50);
         assert_eq!(
             lines.iter().filter(|line| line.qr.is_some()).count(),
             qr.lines().count()
         );
         assert_eq!(ui.scroll, 0);
-        let lines = manage_lines(&data, true, &mut ui, 40, 8);
+        let lines = manage_lines(&data, &mut ui, 40, 8);
         assert!(lines.iter().all(|line| line.qr.is_none()));
         assert!(lines
             .iter()
             .any(|line| line.render(39).contains("Resize for the full QR")));
-        assert!(lines
-            .iter()
-            .any(|line| line.render(39).contains("Down for URL")));
         let plain = |line: &ScreenLine| {
             line.spans
                 .iter()
@@ -2415,7 +2919,7 @@ mod tests {
         // permitting a partial QR or making the operator resize the terminal.
         for _ in 0..10 {
             ui.navigate(KeyCode::Down, 0);
-            let lines = manage_lines(&data, true, &mut ui, 40, 8);
+            let lines = manage_lines(&data, &mut ui, 40, 8);
             assert!(lines.iter().all(|line| line.qr.is_none()));
             assert!(lines
                 .iter()
@@ -2427,6 +2931,9 @@ mod tests {
             expected.iter().all(|row| visible.contains(row)),
             "address segments are unreachable: {expected:?}"
         );
+        assert!(visible
+            .iter()
+            .any(|row| row.contains("Waiting for the phone")));
     }
 
     #[test]

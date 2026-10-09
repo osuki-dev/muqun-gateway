@@ -111,26 +111,39 @@ Open the manager on your computer:
 muqun-gateway manage
 ```
 
-Open **Devices** (`3`), then press Enter (first device) or `p` (new device)
-to see the QR code. Scan it in Muqun, then type back the short code your
-computer displays. That is the whole of pairing.
+Open **Devices** (`3`), then press Enter (first device) or `p` (new device).
+The pairing flow is three steps, shown on screen as
+"1 Scan the QR in Muqun · 2 Type this code on the phone · 3 Done": scan the
+QR, type the short code your computer displays into the phone, and the
+screen reports "Paired as <name>" on its own. The state line under the QR
+("Waiting for the phone…") updates without a key press, and a phone that
+scans the QR opens the code step by itself. Esc, Enter, or `r` returns to the
+device list; `p` pairs another device.
 
 No camera on the phone? Type the gateway's address into the app instead, and
 finish with the same short code.
 
-The manager has four views. `1`–`4`, Tab/Shift-Tab, or Left/Right switches
-views; Up/Down or `j`/`k` selects a row and Enter performs the visible primary
-action. PageUp/PageDown scrolls. Esc goes back from a view or cancels a dialog;
+Every view starts with a one-line header: Gateway version, whether it is
+running and where it listens, whether Herdr and the agent service answer,
+and how many devices are paired. It refreshes every few seconds while the
+manager is open.
+
+The manager has four views, and the Overview footer explains them in one
+line. `1`–`4`, Tab/Shift-Tab, or Left/Right switches views; Up/Down or
+`j`/`k` selects a row and Enter performs the visible primary action.
+PageUp/PageDown scrolls. Esc always goes one level back: from the pairing
+flow to the device list, from a view to Overview, from a dialog to its view;
 at Overview, Esc closes the manager. `q` closes from any main view without
 stopping Gateway. Confirmations default to **cancel**: arrows/Tab choose,
-Enter accepts the selected answer. The footer shows full-word, view-specific
-actions. Long lists keep the selected item visible after a resize.
+Enter accepts the selected answer. The footer lists every key of the view
+with full words, then the navigation keys. Long lists keep the selected item
+visible after a resize.
 
 | view | keys |
 | --- | --- |
 | Overview (`1`) | `s` start, `t` stop, `r` restart the gateway |
 | Terminals (`2`) | `h` / `m` add Herdr / tmux; `f` make the selected backend default; `d` remove it; `b` toggle its backend autostart |
-| Devices (`3`) | `p` show pairing QR; `x` revoke the selected device after confirmation; `r` return to the device list |
+| Devices (`3`) | `p` show pairing QR (or pair another device after one finishes); `x` revoke the selected device after confirmation; `r` return to the device list |
 | Settings (`4`) | `u` edit URL; `a` detect URL; `e` toggle transport encryption; `g` enable/disable gateway autostart; `c` check stable updates; `i` install an update after confirmation |
 
 Enter starts/stops Gateway in Overview, makes the selected terminal backend
