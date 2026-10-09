@@ -1662,6 +1662,11 @@ pub(crate) fn infer_tmux_agent_status(agent: Option<&str>, visible: &str) -> bac
     if approvals::detect(visible).is_some() {
         return backend::AgentStatus::Blocked;
     }
+    // A live working line wins over the input prompt drawn below it: Codex
+    // keeps `› Ask Codex to do anything` on screen while it works.
+    if visible.lines().any(is_working_line) {
+        return backend::AgentStatus::Working;
+    }
     let Some(dictionary) = parts::dictionary_for(agent) else {
         return backend::AgentStatus::Unknown;
     };
@@ -1675,6 +1680,16 @@ pub(crate) fn infer_tmux_agent_status(agent: Option<&str>, visible: &str) -> bac
         Some("status") | Some("tool-block") => backend::AgentStatus::Working,
         _ => backend::AgentStatus::Unknown,
     }
+}
+
+/// A line an agent draws only while it works: Codex's `• Working (25s • esc
+/// to interrupt)` and `Waiting for background terminal (…)`, and the
+/// `esc to interrupt` footer Codex and Claude Code show during a turn.
+fn is_working_line(line: &str) -> bool {
+    let text = line.trim_start_matches(|c: char| c.is_whitespace() || "•◦".contains(c));
+    text.starts_with("Working (")
+        || text.starts_with("Waiting for background terminal (")
+        || line.contains("esc to interrupt")
 }
 
 /// One agent status change, after the bookkeeping and before anyone decides

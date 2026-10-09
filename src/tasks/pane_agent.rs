@@ -655,5 +655,26 @@ mod tests {
             "the agent exited before it finished: panic: no config"
         );
         assert_eq!(failure_line(PANE_CLOSED, None), "the pane closed");
+
+        // tmux status off the screen: Codex keeps its input prompt drawn
+        // below a live working line.
+        let prompt = "\n\u{203a} Ask Codex to do anything\n\n  gpt-6 high · ~/w\n";
+        for (screen, status) in [
+            (
+                format!("• Working (25s • esc to interrupt){prompt}"),
+                AgentStatus::Working,
+            ),
+            (
+                format!("• Waiting for background terminal (cargo test){prompt}"),
+                AgentStatus::Working,
+            ),
+            (format!("• Fixed the build.{prompt}"), AgentStatus::Idle),
+        ] {
+            assert_eq!(
+                infer_tmux_agent_status(Some("codex"), &screen),
+                status,
+                "{screen}"
+            );
+        }
     }
 }
