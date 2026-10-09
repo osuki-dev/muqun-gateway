@@ -31,6 +31,10 @@ pub(super) const ES: &[(&str, &str)] = &[
     ("Expo push service request failed", "La solicitud al servicio push de Expo falló"),
     ("Herdr did not return the created pane id", "Herdr no devolvió el id del panel creado"),
     ("Herdr is unavailable", "Herdr no está disponible"),
+    ("No terminal pane belongs to the calling process", "Ningún panel de terminal pertenece al proceso que llama"),
+    ("Task not found", "Tarea no encontrada"),
+    ("Token expired", "Token caducado"),
+    ("Token not found", "Token no encontrado"),
     (
         "agent is not one this gateway offers; see GET /api/agents/catalog",
         "el agente indicado no está entre los que ofrece este gateway; consulta GET /api/agents/catalog",
@@ -92,6 +96,14 @@ pub(super) const ES: &[(&str, &str)] = &[
     ("invalid Authorization header", "header Authorization no válido"),
     ("invalid pairing code", "código de vinculación no válido"),
     ("invalid token", "token no válido"),
+    (
+        "the MCP endpoint answers only local callers on this machine",
+        "el endpoint MCP solo responde a llamadas locales en esta máquina",
+    ),
+    (
+        "the assistant token store is unavailable",
+        "el almacén de tokens del asistente no está disponible",
+    ),
     ("keys must contain 1 to 32 entries", "keys debe contener entre 1 y 32 elementos"),
     ("missing Authorization header", "falta el header Authorization"),
     ("mode must be on, off, or toggle", "mode debe ser on, off o toggle"),
@@ -134,6 +146,7 @@ pub(super) const ES: &[(&str, &str)] = &[
     ("the file field must carry a filename", "el campo file debe llevar un nombre de archivo"),
     ("the pane is not waiting on an approval", "el panel no está esperando ninguna aprobación"),
     ("the pane is waiting on a different approval", "el panel está esperando otra aprobación"),
+    ("the task request failed", "la solicitud de la tarea ha fallado"),
     ("the upload must be at most 25 MiB", "el archivo subido debe ocupar 25 MiB como máximo"),
     (
         "this approval has no option with that number",

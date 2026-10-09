@@ -17,7 +17,7 @@ fn agents_plane_schema() -> Value {
                     "type": "object",
                     "required": ["id", "name", "kind", "status", "enabled", "features", "models", "modes"],
                     "properties": {
-                        "id": { "type": "string", "enum": ["opencode", "deepseek"] },
+                        "id": { "type": "string", "enum": ["opencode", "deepseek", "t3"] },
                         "name": { "type": "string" },
                         "kind": { "type": "string" },
                         "status": { "type": "string", "enum": ["connected", "reachable", "offline", "disabled", "not_installed", "unconfigured"] },
@@ -95,6 +95,18 @@ pub fn openapi_spec() -> Value {
             "description": "Token-protected mobile API for controlling local terminal workspaces through a configured tmux or Herdr backend. Human-readable text is localized: send X-Muqun-Locale (or Accept-Language) with one of `en`, `zh-TW`, `zh-CN`, `ja`, `ko`, `de`, `fr`, `es`, `pt`, `ru`, `vi`, `th`. Error `code` values, decision names and other wire vocabulary are the same bytes in every locale."
         },
         "components": {
+            "schemas": {
+                "TaskState": task_state_schema(),
+                "TaskView": task_view_schema(),
+                "TaskEvent": task_event_schema(),
+                "TokenBinding": {
+                    "type": "object",
+                    "description": "`pane` (session_id, pane_id) or `agent` (agent_id)",
+                    "required": ["kind"],
+                    "properties": { "kind": { "type": "string", "enum": ["pane", "agent"] } },
+                    "additionalProperties": true
+                }
+            },
             "securitySchemes": {
                 "bearerAuth": {
                     "type": "http",
@@ -347,7 +359,7 @@ pub fn openapi_spec() -> Value {
             "/api/sessions/{sessionId}/tasks": {
                 "post": {
                     "summary": "Start a new task: a checkout, a workspace, an agent, and the first prompt",
-                    "description": "With `branch_name`, the task gets its own git worktree; without it, the task runs in the repo as it stands. `repo_path` must be, or be inside, a workspace this session already has open -- anything else is 403, and a symlink out of one resolves to the outside path and fails there too. `branch_name` is held to letters, digits, dot, underscore, dash and slash, with `..`, a leading dash, and dot-leading segments refused, so it can only ever be a ref and never an argument. The agent is started, then the gateway waits for it to become interactive before the prompt is sent. Asking twice for the same branch reuses the existing checkout rather than making a second one.",
+                    "description": "With `branch_name`, the task gets its own git worktree; without it, the task runs in the repo as it stands. `repo_path` must be, or be inside, a workspace this session already has open -- anything else is 403, and a symlink out of one resolves to the outside path and fails there too. `branch_name` is held to letters, digits, dot, underscore, dash and slash, with `..`, a leading dash, and dot-leading segments refused, so it can only ever be a ref and never an argument. The agent is started, then the gateway waits for it to become interactive before the prompt is sent. Asking twice for the same branch reuses the existing checkout rather than making a second one. Nobody is at the terminal to answer an approval prompt, so `codex` starts with `--dangerously-bypass-approvals-and-sandbox` plus a `-c projects=...` override that trusts the task directory, and `claude` with `--dangerously-skip-permissions`; `agent_launch_args` in config.json replaces these per kind (an empty list turns them off), and `agent_args` follow them. `agent_env` in config.json is set in the new pane's environment (values are never logged).",
                     "parameters": [path_param("sessionId")],
                     "requestBody": json_body(json!({
                         "type": "object",
@@ -358,7 +370,7 @@ pub fn openapi_spec() -> Value {
                             "agent": { "type": "string", "description": "Agent kind from GET /api/agents/catalog" },
                             "prompt": { "type": "string", "description": "Sent once the agent is interactive" },
                             "workspace_label": { "type": "string" },
-                            "agent_args": { "type": "array", "items": { "type": "string" } },
+                            "agent_args": { "type": "array", "items": { "type": "string" }, "description": "Appended after the launch defaults (see agent_launch_args)" },
                             "startup_timeout_ms": { "type": "integer", "description": "How long to wait for the agent to become interactive, 3001 to 300000, default 30000" }
                         }
                     })),
@@ -368,7 +380,7 @@ pub fn openapi_spec() -> Value {
             "/api/sessions/{sessionId}/spawn": {
                 "post": {
                     "summary": "Start an agent in a new pane, without describing a repository",
-                    "description": "The light half of task dispatch: run this agent, here. The agent must be one this gateway offers -- a Herdr kind or a profile in agents.json -- and cwd, when given, must be a directory this session already works in, exactly the fence repo_path is under; anything else is 403. With tab_id the pane is split off whatever that tab has focused, so a second agent lands beside the first; without it the agent gets a tab of its own. GET recent-cwds answers with the directories cwd will accept. The reply names the pane and says whether the agent came up and whether the prompt landed; a 207 means the pane exists and something after it did not, which is not the same as nothing having happened.",
+                    "description": "The light half of task dispatch: run this agent, here. The agent must be one this gateway offers -- a Herdr kind or a profile in agents.json -- and cwd, when given, must be a directory this session already works in, exactly the fence repo_path is under; anything else is 403. With tab_id the pane is split off whatever that tab has focused, so a second agent lands beside the first; without it the agent gets a tab of its own. GET recent-cwds answers with the directories cwd will accept. The reply names the pane and says whether the agent came up and whether the prompt landed; a 207 means the pane exists and something after it did not, which is not the same as nothing having happened. The agent starts with the same launch defaults and `agent_env` as task dispatch.",
                     "parameters": [path_param("sessionId")],
                     "requestBody": json_body(json!({
                         "type": "object",
@@ -749,12 +761,305 @@ pub fn openapi_spec() -> Value {
         "description": "Requires device authentication and agent_file_assets capability. Resolves audio, video, images, documents and binary files inside the server-owned directory. Web URLs, path escapes and symlinks outside the root are refused. Returns data.asset metadata with an opaque id.",
         "parameters": [path_param("asid"), query_param("uri", "Local file URI or path")], "responses": ok_response()
     }});
+    for (path, item) in tasks_fleet_mcp_paths() {
+        spec["paths"][path] = item;
+    }
     spec["paths"]["/api/assets/{assetId}/download"] = json!({"get": {
         "summary": "Save one authenticated asset, including binary files",
         "description": "Requires device authentication and asset_download capability. Rechecks the indexed directory boundary and limits content to 10 MiB. Returns attachment content disposition; preview-only restrictions remain on the content endpoint.",
         "parameters": [path_param("assetId")], "responses": ok_response()
     }});
     spec
+}
+
+fn task_view_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["task_id", "state", "kind", "goal", "summary", "exit_code", "binding", "updated_ms", "parent_task_id", "origin", "label", "requested_by", "children"],
+        "properties": {
+            "task_id": { "type": "string", "description": "`t_` followed by 22 URL-safe characters" },
+            "state": { "$ref": "#/components/schemas/TaskState" },
+            "kind": { "type": "string", "enum": ["delegation", "command"] },
+            "goal": { "type": "string", "description": "The delegated goal, or the command line of a command task" },
+            "summary": { "type": ["string", "null"], "description": "A delegation's result as one line of at most 240 characters (or its error line when it failed); a command's output tail" },
+            "exit_code": { "type": ["integer", "null"] },
+            "binding": {
+                "type": "object",
+                "description": "What the task runs in. `kind` is `none`, `agent_session` (with agent_id, asid) or `pane` (with session_id, pane_id, tab_id)",
+                "required": ["kind"],
+                "properties": { "kind": { "type": "string", "enum": ["none", "agent_session", "pane"] } },
+                "additionalProperties": true
+            },
+            "updated_ms": { "type": "integer" },
+            "parent_task_id": { "type": ["string", "null"], "description": "The open task this one was started from, when the gateway could tell" },
+            "origin": { "type": "string", "enum": ["device", "agent", "mcp"], "description": "device: POST /api/tasks; agent: started by work the gateway tracks (its agent service, or the pane of an open task); mcp: any other MCP host. Tasks stored before origins existed are mcp" },
+            "label": { "type": ["string", "null"], "description": "A short title the requester gave" },
+            "requested_by": {
+                "description": "The device that opened the task (origin device); otherwise null",
+                "oneOf": [
+                    { "type": "null" },
+                    {
+                        "type": "object",
+                        "required": ["kind", "id", "name"],
+                        "properties": {
+                            "kind": { "type": "string", "enum": ["device"] },
+                            "id": { "type": "string" },
+                            "name": { "type": "string" }
+                        }
+                    }
+                ]
+            },
+            "children": {
+                "type": "object",
+                "description": "Direct children, counted when the view is made. active: not finished and not waiting",
+                "required": ["total", "active", "waiting", "failed"],
+                "properties": {
+                    "total": { "type": "integer" },
+                    "active": { "type": "integer" },
+                    "waiting": { "type": "integer" },
+                    "failed": { "type": "integer" }
+                }
+            }
+        }
+    })
+}
+
+fn task_state_schema() -> Value {
+    json!({
+        "type": "string",
+        "enum": ["queued", "dispatching", "working", "waiting", "idle_unconfirmed", "done", "failed", "cancelled"],
+        "description": "done, failed and cancelled are terminal"
+    })
+}
+
+fn task_event_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["task_id", "seq", "at_ms", "from", "to", "source", "note"],
+        "properties": {
+            "task_id": { "type": "string" },
+            "seq": { "type": "integer" },
+            "at_ms": { "type": "integer" },
+            "from": { "oneOf": [{ "$ref": "#/components/schemas/TaskState" }, { "type": "null" }] },
+            "to": { "$ref": "#/components/schemas/TaskState" },
+            "source": { "type": "string" },
+            "note": { "type": ["string", "null"] }
+        }
+    })
+}
+
+fn json_ok(description: &str, schema: Value) -> Value {
+    json!({
+        "200": {
+            "description": description,
+            "content": { "application/json": { "schema": schema } }
+        },
+        "401": { "description": "Missing or invalid authorization" },
+        "403": { "description": "Invalid token" }
+    })
+}
+
+/// `/api/tasks*`, `/api/fleet/self` and `/api/mcp/tokens*`. The last pair is
+/// mounted only while `mcp.enabled` is true (the default).
+fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
+    let task_view = || json!({ "$ref": "#/components/schemas/TaskView" });
+    let not_found = |mut responses: Value, text: &str| {
+        responses["404"] = json!({ "description": text });
+        responses
+    };
+    let mut list_responses = json_ok(
+        "Tasks, newest update first",
+        json!({
+            "type": "object",
+            "required": ["tasks"],
+            "properties": { "tasks": { "type": "array", "items": task_view() } }
+        }),
+    );
+    list_responses["400"] = json!({ "description": "invalid_request: an unknown state name, a limit that is not a positive integer, or an empty root" });
+    let mut create_responses = json_ok(
+        "The new task's view, plus the agent session to open",
+        json!({
+            "allOf": [task_view(), {
+                "type": "object",
+                "required": ["asid"],
+                "properties": { "asid": { "type": "string" } }
+            }]
+        }),
+    );
+    create_responses["400"] = json!({ "description": "invalid_request (empty or oversized goal, oversized label, empty name), invalid_directory, directory_not_found, not_a_directory, unknown_model" });
+    create_responses["502"] = json!({ "description": "agent_error: the agent could not start the session or take the prompt" });
+    create_responses["503"] = json!({ "description": "agent_unavailable" });
+    let read_responses = not_found(
+        json_ok(
+            "The task and its state history, oldest first",
+            json!({
+                "type": "object",
+                "required": ["task", "events"],
+                "properties": {
+                    "task": task_view(),
+                    "events": { "type": "array", "items": { "$ref": "#/components/schemas/TaskEvent" } }
+                }
+            }),
+        ),
+        "task_not_found",
+    );
+    let cancel_responses = not_found(
+        json_ok(
+            "The task after the cancel; cancelling a finished task changes nothing",
+            task_view(),
+        ),
+        "task_not_found",
+    );
+    let mut issue_responses = json_ok(
+        "A fresh pane-bound assistant token. The token is shown only here",
+        json!({
+            "type": "object",
+            "required": ["token", "token_id", "expires_ms", "binding"],
+            "properties": {
+                "token": { "type": "string" },
+                "token_id": { "type": "string" },
+                "expires_ms": { "type": ["integer", "null"], "description": "null for an agent token, which does not expire" },
+                "binding": { "$ref": "#/components/schemas/TokenBinding" }
+            }
+        }),
+    );
+    issue_responses["400"] = json!({ "description": "invalid_request" });
+    issue_responses["404"] = json!({ "description": "None of ancestor_pids is the shell of a pane the gateway manages" });
+    let revoke_responses = not_found(
+        json!({
+            "204": { "description": "Revoked; /mcp refuses the token from the next call" },
+            "401": { "description": "Missing or invalid authorization" },
+            "403": { "description": "Invalid token" }
+        }),
+        "token_not_found",
+    );
+    vec![
+        (
+            "/api/tasks",
+            json!({ "get": {
+                "summary": "List tasks. Requires the task_ledger capability and a device token",
+                "parameters": [
+                    query_param("state", "Comma list of task states; empty is no filter"),
+                    query_param("limit", "Page size, default 50, at most 200"),
+                    query_param("root", "Only this task and its descendants (task_ledger_create); an unknown id lists nothing")
+                ],
+                "responses": list_responses
+            }, "post": {
+                "summary": "Open a delegation from the device: a new agent session with the goal as its first prompt. Requires the task_ledger_create capability and a device token",
+                "requestBody": json_body(json!({
+                    "type": "object",
+                    "required": ["goal"],
+                    "properties": {
+                        "goal": { "type": "string", "description": "At most 32 KiB" },
+                        "agent_id": { "type": "string", "description": "Default: the primary agent" },
+                        "cwd": { "type": "string", "description": "Absolute directory (~ expands); default: the home directory" },
+                        "mode": { "type": "string" },
+                        "model": { "type": "string", "description": "A model id from the agent's catalog, or provider_id/model_id" },
+                        "label": { "type": "string", "description": "A short title, at most 200 characters" }
+                    }
+                })),
+                "responses": create_responses
+            }}),
+        ),
+        (
+            "/api/tasks/{id}",
+            json!({ "get": {
+                "summary": "Read one task and its state history",
+                "parameters": [path_param("id")],
+                "responses": read_responses
+            }}),
+        ),
+        (
+            "/api/tasks/{id}/cancel",
+            json!({ "post": {
+                "summary": "Interrupt the agent or send Ctrl-C to the command",
+                "parameters": [path_param("id")],
+                "responses": cancel_responses
+            }}),
+        ),
+        (
+            "/api/fleet/self",
+            json!({ "get": {
+                "summary": "This machine's capability manifest. Requires the fleet capability",
+                "responses": json_ok("The manifest", json!({
+                    "type": "object",
+                    "required": ["machineId", "label", "hostname", "os", "arch", "gatewayVersion", "agents", "terminal", "toolchains", "tasks", "suitableFor"],
+                    "properties": {
+                        "machineId": { "type": "string" },
+                        "label": { "type": "string" },
+                        "hostname": { "type": "string" },
+                        "os": { "type": "string" },
+                        "arch": { "type": "string" },
+                        "gatewayVersion": { "type": "string" },
+                        "agents": { "type": "array", "items": { "type": "object" } },
+                        "terminal": { "type": "array", "items": { "type": "object" } },
+                        "toolchains": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "required": ["id", "version", "path"],
+                                "properties": {
+                                    "id": { "type": "string" },
+                                    "version": { "type": ["string", "null"] },
+                                    "path": { "type": ["string", "null"] }
+                                }
+                            }
+                        },
+                        "tasks": {
+                            "type": "object",
+                            "properties": { "active": { "type": "integer" }, "waiting": { "type": "integer" } }
+                        },
+                        "suitableFor": { "type": "array", "items": { "type": "string" } }
+                    }
+                }))
+            }}),
+        ),
+        (
+            "/api/mcp/tokens",
+            json!({
+                "post": {
+                    "summary": "Issue an assistant token for the pane the caller runs in. Requires the admin token (the `muqun-gateway mcp token-helper` command uses it); present only while mcp.enabled is true",
+                    "requestBody": json_body(json!({
+                        "type": "object",
+                        "required": ["ancestor_pids"],
+                        "properties": {
+                            "ancestor_pids": { "type": "array", "items": { "type": "integer" }, "description": "The caller's own pid first, then its parent, and so on up" },
+                            "label": { "type": "string" }
+                        }
+                    })),
+                    "responses": issue_responses
+                },
+                "get": {
+                    "summary": "List assistant tokens, never the tokens themselves. Requires a device token",
+                    "responses": json_ok("Issued tokens", json!({
+                        "type": "object",
+                        "required": ["tokens"],
+                        "properties": { "tokens": { "type": "array", "items": {
+                            "type": "object",
+                            "required": ["id", "binding", "label", "issued_ms", "expires_ms", "last_used_ms", "revoked_ms"],
+                            "properties": {
+                                "id": { "type": "string" },
+                                "binding": { "$ref": "#/components/schemas/TokenBinding" },
+                                "label": { "type": "string" },
+                                "issued_ms": { "type": "integer" },
+                                "expires_ms": { "type": ["integer", "null"], "description": "null for an agent token, which does not expire" },
+                                "last_used_ms": { "type": ["integer", "null"] },
+                                "revoked_ms": { "type": ["integer", "null"] }
+                            }
+                        }}}
+                    }))
+                }
+            }),
+        ),
+        (
+            "/api/mcp/tokens/{id}",
+            json!({ "delete": {
+                "summary": "Revoke an assistant token. Requires a device token",
+                "parameters": [path_param("id")],
+                "responses": revoke_responses
+            }}),
+        ),
+    ]
 }
 
 fn audio_asset_endpoint() -> Value {
@@ -1627,6 +1932,30 @@ fn lazygit_endpoints() -> Value {
 #[cfg(test)]
 mod history_contract_tests {
     use super::*;
+
+    #[test]
+    fn tasks_fleet_and_mcp_token_paths_are_in_the_spec() {
+        let spec = openapi_spec();
+        for (path, method) in [
+            ("/api/tasks", "get"),
+            ("/api/tasks/{id}", "get"),
+            ("/api/tasks/{id}/cancel", "post"),
+            ("/api/fleet/self", "get"),
+            ("/api/mcp/tokens", "post"),
+            ("/api/mcp/tokens", "get"),
+            ("/api/mcp/tokens/{id}", "delete"),
+        ] {
+            assert!(spec["paths"][path][method].is_object(), "{method} {path}");
+        }
+        assert_eq!(
+            spec["paths"]["/api/mcp/tokens/{id}"]["delete"]["responses"]["204"]["description"],
+            "Revoked; /mcp refuses the token from the next call"
+        );
+        assert!(spec["components"]["schemas"]["TaskState"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("idle_unconfirmed")));
+    }
 
     #[test]
     fn captured_history_openapi_capability_and_bounded_contract_are_explicit() {

@@ -7,6 +7,7 @@
 mod herdr;
 mod keys;
 mod model;
+mod process_identity;
 mod registry;
 mod tmux;
 mod tmux_wire;
@@ -21,10 +22,11 @@ pub use model::version_at_least;
 pub use model::{
     Agent, AgentStatus, BackendActivity, BackendActivityStream, BackendError, BackendFuture,
     BackendKind, BackendMetadata, CreateTab, CreateWorkspace, OutputFormat, OutputSource, Pane,
-    PaneId, PaneOutput, PaneRange, ReadPane, SendTextMode, SplitDirection, SplitPane, StartAgent,
-    StartedAgent, Tab, TabId, TerminalBackend, Workspace, WorkspaceId, Worktree, WorktreePlacement,
-    WorktreeRequest,
+    PaneEnvVia, PaneId, PaneOutput, PaneRange, ReadPane, SendTextMode, SplitDirection, SplitPane,
+    StartAgent, StartedAgent, Tab, TabId, TerminalBackend, Workspace, WorkspaceId, Worktree,
+    WorktreePlacement, WorktreeRequest,
 };
+pub(crate) use process_identity::SUPPORTED as PROCESS_IDENTITY_SUPPORTED;
 pub use registry::BackendRegistry;
 pub use tmux::{TmuxBackend, TMUX_PROGRAM};
 pub use tmux_wire::TmuxWireIds;

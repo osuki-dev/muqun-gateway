@@ -1,5 +1,6 @@
 use super::*;
 use crate::agents::domain::{AgentSessionId, AgentSessionStatus};
+use crate::tasks::events::TaskDomainEvent;
 use crate::*;
 
 use futures::{SinkExt as _, StreamExt as _};
@@ -72,6 +73,10 @@ fn server_frames_are_the_documented_strings() {
         r#"{"t":"hello","connection_id":"c-1","protocol":1,"generation":"gen-1"}"#
     );
     assert_eq!(resync_frame("ses_1"), r#"{"t":"resync","asid":"ses_1"}"#);
+    assert_eq!(
+        task_resync_frame(),
+        r#"{"t":"resync","asid":"","tasks":true}"#
+    );
     assert_eq!(
         subscribed_frame(Some("ses_1")),
         r#"{"t":"subscribed","asid":"ses_1"}"#
@@ -575,6 +580,89 @@ async fn subscribe_all_delivers_every_session() {
     runtime.publish_for_test(status_event("ses_b", 1));
     assert_eq!(next_json(&mut client).await["asid"], "ses_a");
     assert_eq!(next_json(&mut client).await["asid"], "ses_b");
+}
+
+fn task_update(seq: u64) -> TaskDomainEvent {
+    TaskDomainEvent::Updated {
+        task: crate::tasks::service::TaskView {
+            task_id: "task-1".into(),
+            state: crate::tasks::domain::TaskState::Working,
+            kind: crate::tasks::domain::TaskKind::Command,
+            goal: "make test".into(),
+            summary: None,
+            exit_code: None,
+            binding: crate::tasks::domain::TaskBinding::None,
+            updated_ms: 5,
+            parent_task_id: None,
+            origin: Default::default(),
+            label: None,
+            requested_by: None,
+            children: Default::default(),
+        },
+        seq,
+    }
+}
+
+#[test]
+fn only_subscribe_all_wants_task_events() {
+    let mut subs = Subscriptions::default();
+    assert!(!subs.wants_tasks());
+    subs.apply(&ClientFrame::Subscribe("ses_1".into())).unwrap();
+    assert!(!subs.wants_tasks());
+    subs.apply(&ClientFrame::SubscribeAll).unwrap();
+    assert!(subs.wants_tasks());
+}
+
+#[tokio::test]
+async fn a_subscribe_all_socket_gets_task_updates_and_a_session_socket_does_not() {
+    let state = test_state("admin", vec![test_device("phone-1", TOKEN)]);
+    let tasks = state.task_events.clone();
+    let runtime = state.agent_runtime.clone();
+    let addr = serve(state).await;
+    let (mut all, _) = connect(addr, &bearer()).await.unwrap();
+    let (mut one, _) = connect(addr, &bearer()).await.unwrap();
+    next_json(&mut all).await;
+    next_json(&mut one).await;
+    send_text(&mut all, r#"{"t":"subscribe_all"}"#).await;
+    assert_eq!(next_json(&mut all).await["t"], "subscribed");
+    send_text(&mut one, r#"{"t":"subscribe","asid":"ses_1"}"#).await;
+    assert_eq!(next_json(&mut one).await["t"], "subscribed");
+
+    tasks.send(task_update(3)).unwrap();
+    assert_eq!(
+        next_text(&mut all).await.unwrap(),
+        r#"{"t":"event","asid":null,"seq":3,"event":"task.updated","data":{"task_id":"task-1","state":"working","kind":"command","goal":"make test","summary":null,"exit_code":null,"binding":{"kind":"none"},"updated_ms":5,"parent_task_id":null,"origin":"mcp","label":null,"requested_by":null,"children":{"total":0,"active":0,"waiting":0,"failed":0}}}"#
+    );
+
+    // The session socket's next frame is the agent event, not the task one.
+    runtime.publish_for_test(status_event("ses_1", 1));
+    assert_eq!(next_json(&mut one).await["event"], "agent.status.changed");
+}
+
+#[tokio::test]
+async fn a_socket_that_falls_behind_the_task_events_is_told_to_refetch_them() {
+    let state = test_state("admin", vec![test_device("phone-1", TOKEN)]);
+    let tasks = state.task_events.clone();
+    let addr = serve(state).await;
+    let (mut all, _) = connect(addr, &bearer()).await.unwrap();
+    next_json(&mut all).await;
+    send_text(&mut all, r#"{"t":"subscribe_all"}"#).await;
+    assert_eq!(next_json(&mut all).await["t"], "subscribed");
+
+    // Sent without yielding, so the socket's receiver overflows before it
+    // reads anything.
+    let overflow = crate::tasks::events::TASK_EVENT_CAPACITY as u64 + 8;
+    for seq in 1..=overflow {
+        tasks.send(task_update(seq)).unwrap();
+    }
+    assert_eq!(
+        next_text(&mut all).await.unwrap(),
+        r#"{"t":"resync","asid":"","tasks":true}"#
+    );
+    // What is still buffered follows, oldest first.
+    let next = next_json(&mut all).await;
+    assert_eq!(next["event"], "task.updated");
+    assert!(next["seq"].as_u64().unwrap() > 8);
 }
 
 #[tokio::test]

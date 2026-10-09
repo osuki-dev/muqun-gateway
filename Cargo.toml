@@ -50,9 +50,11 @@ tokio-tungstenite = { version = "0.30.0", default-features = false, features = [
 # the socket task, its ping timer and every subscription together. Already in
 # the tree through reqwest, so this adds no compiled crate.
 tokio-util = "0.7.19"
-
-[dev-dependencies]
-# Only for driving a Router in tests (`ServiceExt::oneshot`).
+rmcp = { version = "3", features = ["server", "transport-streamable-http-server", "macros"] }
+rusqlite = { version = "0.40", features = ["bundled-sqlcipher-vendored-openssl"] }
+hex = "0.4"
+# `ServiceExt::oneshot`: `/mcp` drives a per-request rmcp service with it, and
+# tests drive a Router. Already in the tree through axum.
 tower = { version = "0.5", default-features = false, features = ["util"] }
 
 [profile.release]

@@ -32,6 +32,10 @@ pub(super) const DE: &[(&str, &str)] = &[
         "Herdr hat die id des erstellten Panels nicht zurückgegeben",
     ),
     ("Herdr is unavailable", "Herdr ist nicht erreichbar"),
+    ("No terminal pane belongs to the calling process", "Kein Terminal-Panel gehört zum aufrufenden Prozess"),
+    ("Task not found", "Aufgabe nicht gefunden"),
+    ("Token expired", "Token abgelaufen"),
+    ("Token not found", "Token nicht gefunden"),
     (
         "agent is not one this gateway offers; see GET /api/agents/catalog",
         "agent ist keiner, den dieses Gateway anbietet; siehe GET /api/agents/catalog",
@@ -93,6 +97,14 @@ pub(super) const DE: &[(&str, &str)] = &[
     ("invalid Authorization header", "ungültiger Authorization-Header"),
     ("invalid pairing code", "ungültiger Kopplungscode"),
     ("invalid token", "ungültiges Token"),
+    (
+        "the MCP endpoint answers only local callers on this machine",
+        "der MCP-Endpunkt antwortet nur lokalen Aufrufern auf dieser Maschine",
+    ),
+    (
+        "the assistant token store is unavailable",
+        "der Speicher für Assistenten-Tokens ist nicht verfügbar",
+    ),
     ("keys must contain 1 to 32 entries", "keys muss 1 bis 32 Einträge enthalten"),
     ("missing Authorization header", "fehlender Authorization-Header"),
     ("mode must be on, off, or toggle", "mode muss on, off oder toggle sein"),
@@ -138,6 +150,7 @@ pub(super) const DE: &[(&str, &str)] = &[
     ("the file field must carry a filename", "das file-Feld muss einen Dateinamen enthalten"),
     ("the pane is not waiting on an approval", "das Panel wartet nicht auf eine Freigabe"),
     ("the pane is waiting on a different approval", "das Panel wartet auf eine andere Freigabe"),
+    ("the task request failed", "die Aufgabenanfrage ist fehlgeschlagen"),
     ("the upload must be at most 25 MiB", "der Upload darf höchstens 25 MiB groß sein"),
     (
         "this approval has no option with that number",

@@ -31,9 +31,9 @@ use std::path::PathBuf;
 
 use super::{
     Agent, BackendActivityStream, BackendError, BackendFuture, BackendMetadata, CreateTab,
-    CreateWorkspace, KeyboardVocabulary, Pane, PaneId, PaneOutput, ReadPane, SendTextMode,
-    SplitPane, StartAgent, StartedAgent, Tab, TabId, TerminalBackend, Workspace, WorkspaceId,
-    Worktree, WorktreePlacement, WorktreeRequest,
+    CreateWorkspace, KeyboardVocabulary, Pane, PaneEnvVia, PaneId, PaneOutput, ReadPane,
+    SendTextMode, SplitPane, StartAgent, StartedAgent, Tab, TabId, TerminalBackend, Workspace,
+    WorkspaceId, Worktree, WorktreePlacement, WorktreeRequest,
 };
 
 /// Wraps a tmux [`TerminalBackend`] so every id crossing it is in wire form.
@@ -348,6 +348,10 @@ impl TerminalBackend for TmuxWireIds {
         })
     }
 
+    fn applies_pane_env(&self, via: PaneEnvVia) -> BackendFuture<'_, bool> {
+        self.inner.applies_pane_env(via)
+    }
+
     fn start_agent<'a>(&'a self, request: &'a StartAgent) -> BackendFuture<'a, StartedAgent> {
         Box::pin(async move {
             let native = decode_wire(request.pane_id.as_str(), "pane")?;
@@ -540,6 +544,7 @@ mod tests {
                 cwd: Some(std::env::temp_dir()),
                 label: Some("gateway-wire-contract".into()),
                 focus: true,
+                env: None,
             })
             .await
             .unwrap();
@@ -564,6 +569,7 @@ mod tests {
                     cwd: Some(std::env::temp_dir()),
                     label: None,
                     focus: false,
+                    env: None,
                 })
                 .await
                 .unwrap();

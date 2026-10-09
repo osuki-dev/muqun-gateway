@@ -27,6 +27,10 @@ pub(super) const VI: &[(&str, &str)] = &[
     ("Expo push service request failed", "yêu cầu tới dịch vụ thông báo đẩy của Expo thất bại"),
     ("Herdr did not return the created pane id", "Herdr không trả về id của ngăn vừa tạo"),
     ("Herdr is unavailable", "không kết nối được với Herdr"),
+    ("No terminal pane belongs to the calling process", "Không có pane terminal nào thuộc về tiến trình đang gọi"),
+    ("Task not found", "Không tìm thấy tác vụ"),
+    ("Token expired", "Token đã hết hạn"),
+    ("Token not found", "Không tìm thấy token"),
     (
         "agent is not one this gateway offers; see GET /api/agents/catalog",
         "agent không nằm trong số tác tử mà gateway này cung cấp; xem GET /api/agents/catalog",
@@ -85,6 +89,11 @@ pub(super) const VI: &[(&str, &str)] = &[
     ("invalid Authorization header", "header Authorization không hợp lệ"),
     ("invalid pairing code", "mã ghép nối không hợp lệ"),
     ("invalid token", "token không hợp lệ"),
+    (
+        "the MCP endpoint answers only local callers on this machine",
+        "endpoint MCP chỉ trả lời các lời gọi cục bộ trên máy này",
+    ),
+    ("the assistant token store is unavailable", "kho token của trợ lý không khả dụng"),
     ("keys must contain 1 to 32 entries", "keys phải chứa từ 1 đến 32 mục"),
     ("missing Authorization header", "thiếu header Authorization"),
     ("mode must be on, off, or toggle", "mode phải là on, off hoặc toggle"),
@@ -130,6 +139,7 @@ pub(super) const VI: &[(&str, &str)] = &[
     ("the file field must carry a filename", "trường file phải kèm tên tệp"),
     ("the pane is not waiting on an approval", "ngăn này không đang chờ chấp thuận"),
     ("the pane is waiting on a different approval", "ngăn này đang chờ một chấp thuận khác"),
+    ("the task request failed", "yêu cầu tác vụ thất bại"),
     ("the upload must be at most 25 MiB", "tệp tải lên tối đa 25 MiB"),
     (
         "this approval has no option with that number",

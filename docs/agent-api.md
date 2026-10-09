@@ -301,6 +301,46 @@ advertised: an older gateway ignores the parameter.
 
 ---
 
+### Terminal agents launched for remote dispatch
+
+`POST /api/sessions/{id}/tasks` and `POST /api/sessions/{id}/spawn` start a
+CLI agent (Codex, Claude Code, ...) in a terminal pane. Whoever asked is on a
+phone and cannot answer an approval or a "trust this folder?" prompt in that
+pane, so these agents start with their own bypass flags by default:
+
+| Kind | Default launch arguments |
+|---|---|
+| `codex` | `--dangerously-bypass-approvals-and-sandbox -c projects={"<dir>"={trust_level="trusted"}, ...}` -- the task directory, its git checkout and, for a linked worktree, the main checkout. The path goes in the TOML value, not the key: Codex's `-c` splits keys on every `.`. |
+| `claude` | `--dangerously-skip-permissions` |
+| any other | none |
+
+`config.json` changes this per kind: a non-empty list replaces the defaults,
+an empty list turns them off. A task's own `agent_args` come after them.
+
+```json
+{
+  "agent_launch_args": { "codex": [], "claude": ["--permission-mode", "acceptEdits"] },
+  "agent_env": { "HTTPS_PROXY": "http://127.0.0.1:7890", "HTTP_PROXY": "http://127.0.0.1:7890" }
+}
+```
+
+`agent_env` is for what the owner's interactive shell sets but the gateway's
+own environment (started by systemd or launchd) lacks -- typically a proxy,
+without which the agent fails with "Connection refused". The variables are set
+on the pane the agent starts in: tmux `-e KEY=VALUE` on `new-session` (tmux
+3.2+) and on `new-window` / `split-window` (3.0+), Herdr's `env` on
+`tab.create`, `workspace.create` and `pane.split`. When the backend cannot set
+a pane's environment -- an older tmux, or a worktree pane that Herdr's
+`worktree.create` / `worktree.open` made -- the variables go on the launch
+instead: tmux, which types the launch line itself, prefixes it with
+`env 'KEY=VALUE' ...` (so they also show in that pane's scrollback). Herdr's
+`agent.start` takes no environment, so there the task's `steps` record `env`
+as skipped. Names must be `[A-Za-z_][A-Za-z0-9_]*`; others are ignored with a
+warning naming the key. Values are never logged, but they are not secret from
+the host: `tmux -e KEY=VALUE` and the `env` prefix put them on a command line,
+which any local user can read in the process list while it runs. Put nothing
+in `agent_env` that must stay hidden from other accounts on the machine.
+
 ## Session lifecycle
 
 ### `GET /api/agent-sessions`
@@ -1426,7 +1466,7 @@ Server → client:
 | `{"t":"hello","connection_id":"<uuid>","protocol":1,"generation":"<id>"}` | First frame, always. `generation` is the gateway instance generation (see Conventions); a client that finds it changed since its last socket is talking to a restarted gateway. Older gateways omit it. |
 | `{"t":"subscribed","asid":"ses_1"}` · `{"t":"subscribed","all":true}` | The subscription is in effect: every event published from here on reaches this socket. Start catch-up after this, not before. |
 | `{"t":"event","asid":"ses_1","seq":12,"event":"agent.timeline.upsert","data":{…}}` | One domain event. `event` is the SSE `event:` name and `data` is the SSE `data:` payload **byte for byte**, embedded as JSON rather than as a string. `asid` and `seq` repeat the event's own (`asid` is `""` and `seq` 0 for `agent.worktree.changed` and `agent.resync`). |
-| `{"t":"resync","asid":"ses_1"}` | This socket fell behind the gateway's event backlog; refetch that session. `asid` `""` means every session. One per subscribed session, or a single `""` under `subscribe_all`. |
+| `{"t":"resync","asid":"ses_1"}` | This socket fell behind the gateway's event backlog; refetch that session. `asid` `""` means every session. One per subscribed session, or a single `""` under `subscribe_all`. With `"tasks":true` it is about task updates instead: refetch `GET /api/tasks`. |
 | `{"t":"pong"}` | Answer to `ping`. |
 | `{"t":"error","code":"…"}` | Sent immediately before the gateway closes the socket (close code 1008). |
 
@@ -1460,6 +1500,17 @@ reach every SSE stream.
 | Sockets per gateway | 64. Past it the upgrade is `429 too_many_connections`. |
 | Server heartbeat | A WebSocket ping every 25 s; two unanswered pings drop the socket. Any client frame counts as an answer. |
 | Revocation | Checked every 5 s; a revoked device's socket is closed without an `error` frame, as its SSE stream is. |
+
+**Task updates.** A socket that sent `subscribe_all` also receives one
+`{"t":"event","asid":null,"seq":<n>,"event":"task.updated","data":<TaskView>}`
+frame for every change to a task (capability `task_ledger`; see `docs/mcp.md`),
+and one for its parent task, whose `children` counts moved, when it has one. A
+socket subscribed to individual sessions does not get them. `data` is the whole
+task, so a client keeps the newest frame per `task_id`. A socket that falls
+behind the task events gets one `{"t":"resync","asid":"","tasks":true}` frame:
+refetch `GET /api/tasks` (a client that ignores `tasks` reads it as a resync
+of every session, which also covers it). Refetch `GET /api/tasks` after a
+reconnect as well.
 
 **Catch-up is unchanged.** The socket delivers live events only. After a
 (re)connect, re-subscribe, wait for `subscribed`, then catch up each session

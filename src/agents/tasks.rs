@@ -156,6 +156,106 @@ pub fn agent_command(kind: &str, overrides: &BTreeMap<String, String>) -> String
         .unwrap_or_else(|| kind.to_owned())
 }
 
+/// Codex's flag that skips every approval prompt and its sandbox.
+pub const CODEX_BYPASS_FLAG: &str = "--dangerously-bypass-approvals-and-sandbox";
+/// Claude Code's flag that skips every permission prompt.
+pub const CLAUDE_BYPASS_FLAG: &str = "--dangerously-skip-permissions";
+
+/// The arguments an agent the gateway launches starts with, before any the
+/// caller adds.
+///
+/// An agent started from a phone has nobody at the terminal to answer an
+/// approval or a "trust this folder?" prompt, so the built-in defaults start
+/// it with its own bypass flags. `agent_launch_args` in `config.json`
+/// replaces them per kind; an empty list turns them off:
+///
+/// ```json
+/// { "agent_launch_args": { "codex": [], "claude": ["--permission-mode", "acceptEdits"] } }
+/// ```
+///
+/// For Codex, `cwd` (and the git checkout it belongs to) is also marked
+/// trusted for this run. Codex's `-c` splits its key on every `.`, so a path
+/// cannot be spelled in the key (`projects."/a.b".trust_level` would not
+/// parse as meant); the path goes in the TOML *value* instead, as a table.
+pub fn agent_launch_args(
+    kind: &str,
+    cwd: Option<&Path>,
+    overrides: &BTreeMap<String, Vec<String>>,
+) -> Vec<String> {
+    if let Some(args) = overrides.get(kind) {
+        return args.clone();
+    }
+    match kind {
+        "claude" => vec![CLAUDE_BYPASS_FLAG.to_owned()],
+        "codex" => {
+            let mut args = vec![CODEX_BYPASS_FLAG.to_owned()];
+            if let Some(cwd) = cwd {
+                args.push("-c".to_owned());
+                args.push(codex_trust_override(&trust_roots(cwd)));
+            }
+            args
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// `projects={"/a"={trust_level="trusted"}, ...}` for Codex's `-c`.
+fn codex_trust_override(paths: &[PathBuf]) -> String {
+    let entries = paths
+        .iter()
+        .map(|path| {
+            format!(
+                "{}={{trust_level=\"trusted\"}}",
+                toml_string(&path.to_string_lossy())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("projects={{{entries}}}")
+}
+
+/// A TOML basic string.
+fn toml_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// The folders Codex may ask about for `cwd`: `cwd` itself, the checkout it
+/// is in, and -- for a linked worktree, whose `.git` is a file -- the main
+/// checkout, which is what Codex keys trust on.
+fn trust_roots(cwd: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![cwd.to_path_buf()];
+    let Some(top) = cwd.ancestors().find(|dir| dir.join(".git").exists()) else {
+        return roots;
+    };
+    roots.push(top.to_path_buf());
+    let main = std::fs::read_to_string(top.join(".git"))
+        .ok()
+        .and_then(|text| {
+            let gitdir = text.trim().strip_prefix("gitdir:")?.trim().to_owned();
+            let (main, _) = gitdir.split_once("/.git/worktrees/")?;
+            Some(PathBuf::from(main))
+        });
+    roots.extend(main);
+    let mut unique = Vec::with_capacity(roots.len());
+    for root in roots {
+        if !unique.contains(&root) {
+            unique.push(root);
+        }
+    }
+    unique
+}
+
 /// Whether a kind is one the gateway will offer and accept.
 pub fn is_known_agent_kind(kind: &str, overrides: &BTreeMap<String, String>) -> bool {
     AGENT_KINDS.contains(&kind) || overrides.contains_key(kind)
@@ -657,6 +757,81 @@ mod tests {
         assert!(resolve_repo_path(root.to_str().unwrap(), &[]).is_none());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_launched_agent_starts_with_its_bypass_flags_unless_config_says_otherwise() {
+        let none = BTreeMap::new();
+        assert_eq!(
+            agent_launch_args("claude", Some(Path::new("/w")), &none),
+            ["--dangerously-skip-permissions"]
+        );
+        assert_eq!(
+            agent_launch_args("codex", None, &none),
+            ["--dangerously-bypass-approvals-and-sandbox"]
+        );
+        assert!(agent_launch_args("gemini", Some(Path::new("/w")), &none).is_empty());
+
+        let mut overrides = BTreeMap::new();
+        overrides.insert("codex".to_owned(), Vec::new());
+        overrides.insert("claude".to_owned(), vec!["--permission-mode".to_owned()]);
+        overrides.insert("gemini".to_owned(), vec!["--yolo".to_owned()]);
+        assert!(agent_launch_args("codex", Some(Path::new("/w")), &overrides).is_empty());
+        assert_eq!(
+            agent_launch_args("claude", None, &overrides),
+            ["--permission-mode"]
+        );
+        assert_eq!(agent_launch_args("gemini", None, &overrides), ["--yolo"]);
+    }
+
+    #[test]
+    fn codex_trusts_the_task_directory_through_a_toml_value_not_a_dotted_key() {
+        // Not a checkout: only the directory itself.
+        let dir = temp_dir("trust-plain").join("my.project \"x\"");
+        std::fs::create_dir_all(&dir).unwrap();
+        let args = agent_launch_args("codex", Some(&dir), &BTreeMap::new());
+        assert_eq!(
+            args[..2],
+            ["--dangerously-bypass-approvals-and-sandbox", "-c"]
+        );
+        let quoted = dir
+            .to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
+        assert_eq!(
+            args[2],
+            format!(r#"projects={{"{quoted}"={{trust_level="trusted"}}}}"#)
+        );
+        assert_eq!(args.len(), 3);
+    }
+
+    #[test]
+    fn codex_also_trusts_the_checkout_and_a_linked_worktree_s_main_checkout() {
+        let base = temp_dir("trust-git");
+        let main = base.join("main");
+        std::fs::create_dir_all(main.join(".git/worktrees/wt")).unwrap();
+        let worktree = base.join("wt");
+        std::fs::create_dir_all(worktree.join("src")).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", main.join(".git/worktrees/wt").display()),
+        )
+        .unwrap();
+        let sub = worktree.join("src");
+        assert_eq!(
+            trust_roots(&sub),
+            [sub.clone(), worktree.clone(), main.clone()]
+        );
+        assert_eq!(trust_roots(&main), std::slice::from_ref(&main));
+        let args = agent_launch_args("codex", Some(&sub), &BTreeMap::new());
+        assert_eq!(args[2].matches("trust_level").count(), 3);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_toml_string_escapes_what_toml_requires() {
+        assert_eq!(toml_string(r#"a"b\c"#), r#""a\"b\\c""#);
+        assert_eq!(toml_string("a\tb"), r#""a\u0009b""#);
     }
 
     #[test]

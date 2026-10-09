@@ -39,6 +39,7 @@ use tokio::sync::{broadcast, oneshot};
 
 use super::domain::AgentDomainEvent;
 use super::routes::agent_event_record;
+use crate::tasks::events::TaskDomainEvent;
 use crate::{
     api_error, require_device, still_paired, transport, AppState, EncryptedStreamContext,
     STREAM_DEVICE_RECHECK_INTERVAL,
@@ -200,8 +201,30 @@ pub(crate) fn event_frame(event: &AgentDomainEvent) -> String {
     )
 }
 
+/// A task change, to a socket that asked for everything. There is no session,
+/// so `asid` is `null`; `data` is the task as `GET /api/tasks` shows it.
+pub(crate) fn task_event_frame(event: &TaskDomainEvent) -> String {
+    let data = serde_json::to_string(match event {
+        TaskDomainEvent::Updated { task, .. } => task,
+    })
+    .unwrap_or_else(|_| String::from("null"));
+    format!(
+        r#"{{"t":"event","asid":null,"seq":{},"event":{},"data":{}}}"#,
+        event.seq(),
+        json_string(event.event_name()),
+        data
+    )
+}
+
 pub(crate) fn resync_frame(asid: &str) -> String {
     format!(r#"{{"t":"resync","asid":{}}}"#, json_string(asid))
+}
+
+/// After task events were dropped: `asid` `""` (every session, which is how
+/// an App reads a resync aimed at its task listeners) plus `"tasks":true`
+/// so a client can tell this one apart and refetch only `GET /api/tasks`.
+pub(crate) fn task_resync_frame() -> String {
+    String::from(r#"{"t":"resync","asid":"","tasks":true}"#)
 }
 
 pub(crate) fn subscribed_frame(asid: Option<&str>) -> String {
@@ -384,6 +407,12 @@ impl Subscriptions {
         self.sessions.contains(asid)
     }
 
+    /// Whether task changes go out on this connection: only to a socket that
+    /// asked for everything.
+    pub(crate) fn wants_tasks(&self) -> bool {
+        self.all
+    }
+
     /// The sessions to tell to resync after this connection fell behind the
     /// broadcast. `""` means every session, as it does on `agent.resync`.
     pub(crate) fn resync_targets(&self) -> Vec<String> {
@@ -547,6 +576,7 @@ async fn open_event_socket(
     // Subscribed before the upgrade completes, so nothing published between
     // the 101 and the first poll of the connection is missed.
     let events = state.agent_runtime.subscribe_events();
+    let tasks = state.task_events.subscribe();
     upgrade
         .max_message_size(MAX_INBOUND_FRAME_BYTES)
         .max_frame_size(MAX_INBOUND_FRAME_BYTES)
@@ -557,7 +587,7 @@ async fn open_event_socket(
                 timings: state.ws_connections.timings,
             };
             connection
-                .run(state, device_id, connection_id, events, slot)
+                .run(state, device_id, connection_id, events, tasks, slot)
                 .await;
         })
 }
@@ -614,6 +644,7 @@ impl Connection {
         device_id: String,
         connection_id: String,
         mut events: broadcast::Receiver<AgentDomainEvent>,
+        mut tasks: broadcast::Receiver<TaskDomainEvent>,
         mut slot: WsSlot,
     ) {
         if self
@@ -723,6 +754,32 @@ impl Connection {
                             }
                         }
                     }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        self.close().await;
+                        return;
+                    }
+                },
+                task = tasks.recv() => match task {
+                    Ok(task) => {
+                        if subscriptions.wants_tasks()
+                            && self.send(&task_event_frame(&task)).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                    // Fell behind the task broadcast: a task that changed in
+                    // the dropped stretch may never change again, so "the next
+                    // event supersedes it" is not enough. Ask for a refetch of
+                    // `GET /api/tasks` with the one frame the App already
+                    // reads that way: a resync for every session.
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        if subscriptions.wants_tasks()
+                            && self.send(&task_resync_frame()).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                    // The sender lives in `AppState`, which this task holds.
                     Err(broadcast::error::RecvError::Closed) => {
                         self.close().await;
                         return;

@@ -1830,35 +1830,24 @@ pub(crate) fn push_wrapped_field(lines: &mut Vec<String>, label: &str, value: &s
 }
 
 pub(crate) fn fetch_pending_pairing() -> anyhow::Result<Option<PendingPairing>> {
-    let pairing = read_pairing_file()?;
     let config = load_config(None)?;
-    let listen: SocketAddr = config
-        .listen
-        .parse()
-        .with_context(|| format!("invalid listen address {}", config.listen))?;
-    let host_port = local_management_addr(listen).to_string();
-    let address = local_management_addr(listen);
-    let mut stream = std::net::TcpStream::connect_timeout(&address, Duration::from_millis(250))?;
-    stream.set_read_timeout(Some(Duration::from_millis(500)))?;
-    stream.set_write_timeout(Some(Duration::from_millis(500)))?;
-    let request = format!(
-        "GET /api/pair/pending HTTP/1.1\r\nHost: {host_port}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
-        pairing.payload.token
-    );
-    std::io::Write::write_all(&mut stream, request.as_bytes())?;
-    let mut response = String::new();
-    std::io::Read::read_to_string(
-        &mut std::io::Read::take(&mut stream, 64 * 1024),
-        &mut response,
+    let (status, value) = crate::cli::local_api::admin_request_with_timeouts(
+        &config,
+        "GET",
+        "/api/pair/pending",
+        None,
+        Duration::from_millis(250),
+        Duration::from_millis(500),
     )?;
-    let Some((headers, body)) = response.split_once("\r\n\r\n") else {
-        anyhow::bail!("invalid pending response");
-    };
-    anyhow::ensure!(
-        headers.starts_with("HTTP/1.1 200 ") || headers.starts_with("HTTP/1.0 200 "),
-        "gateway refused local management request"
-    );
-    let value: Value = serde_json::from_str(body)?;
+    pending_from_answer(status, &value)
+}
+
+/// `setup` and `lifecycle` use the pending probe as a readiness check, so a
+/// 200 that is not the gateway's JSON object (a stray listener on the port)
+/// is an error, not "nothing pending".
+fn pending_from_answer(status: u16, value: &Value) -> anyhow::Result<Option<PendingPairing>> {
+    anyhow::ensure!(status == 200, "gateway refused local management request");
+    anyhow::ensure!(value.is_object(), "unexpected answer to the pending probe");
     if value.get("pending").and_then(Value::as_bool) != Some(true) {
         return Ok(None);
     }
@@ -1894,47 +1883,23 @@ pub(crate) fn fetch_pending_pairing() -> anyhow::Result<Option<PendingPairing>> 
 
 pub(crate) fn revoke_managed_device(device_id: &str) -> anyhow::Result<bool> {
     validate_session_id(device_id).context("invalid device id")?;
-    let pairing = read_pairing_file()?;
     let config = load_config(None)?;
-    let listen: SocketAddr = config
-        .listen
-        .parse()
-        .with_context(|| format!("invalid listen address {}", config.listen))?;
-    let address = local_management_addr(listen);
-    let mut stream = match std::net::TcpStream::connect_timeout(&address, Duration::from_secs(1)) {
-        Ok(stream) => stream,
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut
-            ) =>
-        {
-            // With no running gateway there is no in-memory token list to
-            // invalidate, so updating the persisted records is sufficient.
-            return revoke_device_by_id(device_id);
+    match crate::cli::local_api::admin_request(
+        &config,
+        "DELETE",
+        &format!("/api/pairings/{device_id}"),
+        None,
+    ) {
+        Ok((200, _)) => Ok(true),
+        Ok((404, _)) => Ok(false),
+        Ok((status, _)) => anyhow::bail!("gateway refused device revocation: HTTP {status}"),
+        // With no running gateway there is no in-memory token list to
+        // invalidate, so updating the persisted records is sufficient.
+        Err(error) if error.is::<crate::cli::local_api::GatewayNotRunning>() => {
+            revoke_device_by_id(device_id)
         }
-        Err(error) => return Err(error.into()),
-    };
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-    let request = format!(
-        "DELETE /api/pairings/{device_id} HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
-        pairing.payload.token
-    );
-    std::io::Write::write_all(&mut stream, request.as_bytes())?;
-    let mut response = String::new();
-    std::io::Read::read_to_string(
-        &mut std::io::Read::take(&mut stream, 64 * 1024),
-        &mut response,
-    )?;
-    let status_line = response.lines().next().unwrap_or_default();
-    if status_line.contains(" 200 ") {
-        return Ok(true);
+        Err(error) => Err(error),
     }
-    if status_line.contains(" 404 ") {
-        return Ok(false);
-    }
-    anyhow::bail!("gateway refused device revocation: {status_line}")
 }
 
 pub(crate) fn local_management_addr(listen: SocketAddr) -> SocketAddr {
@@ -2027,6 +1992,17 @@ pub(crate) fn render_qr(code: &QrCode) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_pending_probe_needs_a_json_object() {
+        use serde_json::json;
+        assert!(super::pending_from_answer(200, &json!("ok")).is_err());
+        assert!(super::pending_from_answer(200, &json!(null)).is_err());
+        assert!(super::pending_from_answer(500, &json!({})).is_err());
+        assert!(super::pending_from_answer(200, &json!({"pending": false}))
+            .unwrap()
+            .is_none());
+    }
+
     use super::{
         clip_cells, manage_lines, primary_action, safe_text, viewport_start, Confirmation, KeyCode,
         ManageData, ManageView, ScreenLine, Section, Tone,

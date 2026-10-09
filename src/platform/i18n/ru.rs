@@ -27,6 +27,10 @@ pub(super) const RU: &[(&str, &str)] = &[
     ("Expo push service request failed", "запрос к push-сервису Expo не выполнен"),
     ("Herdr did not return the created pane id", "Herdr не вернул id созданной панели"),
     ("Herdr is unavailable", "Herdr недоступен"),
+    ("No terminal pane belongs to the calling process", "Ни одна панель терминала не принадлежит вызывающему процессу"),
+    ("Task not found", "Задача не найдена"),
+    ("Token expired", "Срок действия токена истёк"),
+    ("Token not found", "Токен не найден"),
     (
         "agent is not one this gateway offers; see GET /api/agents/catalog",
         "agent не входит в число агентов, которые предлагает этот Gateway; см. GET /api/agents/catalog",
@@ -82,6 +86,11 @@ pub(super) const RU: &[(&str, &str)] = &[
     ("invalid Authorization header", "недопустимый заголовок Authorization"),
     ("invalid pairing code", "недопустимый код привязки"),
     ("invalid token", "недопустимый токен"),
+    (
+        "the MCP endpoint answers only local callers on this machine",
+        "конечная точка MCP отвечает только локальным вызовам на этой машине",
+    ),
+    ("the assistant token store is unavailable", "хранилище токенов ассистента недоступно"),
     ("keys must contain 1 to 32 entries", "keys должен содержать от 1 до 32 элементов"),
     ("missing Authorization header", "отсутствует заголовок Authorization"),
     ("mode must be on, off, or toggle", "mode должен быть on, off или toggle"),
@@ -127,6 +136,7 @@ pub(super) const RU: &[(&str, &str)] = &[
     ("the file field must carry a filename", "поле file должно содержать имя файла"),
     ("the pane is not waiting on an approval", "панель не ожидает разрешения"),
     ("the pane is waiting on a different approval", "панель ожидает другого разрешения"),
+    ("the task request failed", "запрос задачи не выполнен"),
     ("the upload must be at most 25 MiB", "размер загружаемого файла не должен превышать 25 МиБ"),
     (
         "this approval has no option with that number",

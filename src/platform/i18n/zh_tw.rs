@@ -32,6 +32,10 @@ pub(super) const ZH_TW: &[(&str, &str)] = &[
         "Herdr 沒有回傳所建立面板的 id",
     ),
     ("Herdr is unavailable", "無法連線到 Herdr"),
+    ("No terminal pane belongs to the calling process", "沒有屬於呼叫程序的終端機面板"),
+    ("Task not found", "找不到任務"),
+    ("Token expired", "token 已過期"),
+    ("Token not found", "找不到 token"),
     (
         "agent is not one this gateway offers; see GET /api/agents/catalog",
         "這個 Gateway 未提供該代理程式；請參閱 GET /api/agents/catalog",
@@ -96,6 +100,8 @@ pub(super) const ZH_TW: &[(&str, &str)] = &[
     ("invalid Authorization header", "Authorization 標頭無效"),
     ("invalid pairing code", "配對碼無效"),
     ("invalid token", "token 無效"),
+    ("the MCP endpoint answers only local callers on this machine", "MCP 端點只回應本機上的本地呼叫端"),
+    ("the assistant token store is unavailable", "助理 token 儲存區無法使用"),
     ("keys must contain 1 to 32 entries", "keys 必須包含 1 到 32 個項目"),
     ("missing Authorization header", "缺少 Authorization 標頭"),
     ("mode must be on, off, or toggle", "mode 必須是 on、off 或 toggle"),
@@ -144,6 +150,7 @@ pub(super) const ZH_TW: &[(&str, &str)] = &[
         "the pane is waiting on a different approval",
         "這個面板正在等待的是另一個核准",
     ),
+    ("the task request failed", "任務請求失敗"),
     ("the upload must be at most 25 MiB", "上傳的檔案最多 25 MiB"),
     (
         "this approval has no option with that number",

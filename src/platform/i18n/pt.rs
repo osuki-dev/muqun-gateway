@@ -28,6 +28,10 @@ pub(super) const PT: &[(&str, &str)] = &[
     ("Expo push service request failed", "o pedido ao serviço de push da Expo falhou"),
     ("Herdr did not return the created pane id", "o Herdr não devolveu o id do painel criado"),
     ("Herdr is unavailable", "o Herdr está indisponível"),
+    ("No terminal pane belongs to the calling process", "Nenhum painel de terminal pertence ao processo chamador"),
+    ("Task not found", "Tarefa não encontrada"),
+    ("Token expired", "Token expirado"),
+    ("Token not found", "Token não encontrado"),
     (
         "agent is not one this gateway offers; see GET /api/agents/catalog",
         "agent não é um dos que este gateway oferece; consulte GET /api/agents/catalog",
@@ -89,6 +93,14 @@ pub(super) const PT: &[(&str, &str)] = &[
     ("invalid Authorization header", "cabeçalho Authorization inválido"),
     ("invalid pairing code", "código de emparelhamento inválido"),
     ("invalid token", "token inválido"),
+    (
+        "the MCP endpoint answers only local callers on this machine",
+        "o endpoint MCP só responde a chamadas locais nesta máquina",
+    ),
+    (
+        "the assistant token store is unavailable",
+        "o armazenamento de tokens do assistente está indisponível",
+    ),
     ("keys must contain 1 to 32 entries", "keys tem de conter entre 1 e 32 entradas"),
     ("missing Authorization header", "falta o cabeçalho Authorization"),
     ("mode must be on, off, or toggle", "mode tem de ser on, off ou toggle"),
@@ -131,6 +143,7 @@ pub(super) const PT: &[(&str, &str)] = &[
     ("the file field must carry a filename", "o campo file tem de incluir um nome de ficheiro"),
     ("the pane is not waiting on an approval", "o painel não está à espera de nenhuma aprovação"),
     ("the pane is waiting on a different approval", "o painel está à espera de outra aprovação"),
+    ("the task request failed", "a solicitação da tarefa falhou"),
     ("the upload must be at most 25 MiB", "o ficheiro carregado tem de ter no máximo 25 MiB"),
     (
         "this approval has no option with that number",

@@ -1,0 +1,370 @@
+# Gateway as an MCP server
+
+Capabilities: `mcp_server` (the `/mcp` endpoint; present only while
+`mcp.enabled` is true), `fleet`, `task_ledger` and `task_ledger_create`
+(`POST /api/tasks` and the task tree). Discovery also announces
+`transports.mcp`. (`tasks` is a different, older capability: `POST
+/api/sessions/{id}/tasks`.)
+
+An assistant running on this machine (Claude Code, OpenCode, Codex, Pi) can use
+the gateway as a tool server: ask what this computer offers, run a command in a
+visible terminal pane, or hand a goal to an agent and follow it to the end.
+There are three channels onto the same work. The assistant speaks MCP to
+`/mcp`; the paired phone reads and cancels the same work through the Tasks API
+below and a live `task.updated` frame on `/api/ws`; and the owner manages
+assistant tokens with `muqun-gateway mcp ...` or `/api/mcp/tokens`. Everything
+the assistant starts is a task, so the phone sees it.
+
+> **Warning: `exec.run` runs outside the host's sandbox.** It types the
+> command into a terminal pane of the user's own shell. The host's sandbox,
+> permission rules and approval prompts do not apply to what that command
+> does; the host only approves the `exec.run` tool call itself. An approval
+> card on the phone for destructive commands is planned for P2 and does not
+> exist yet. Codex users: `default_tools_approval_mode` (and per-tool
+> approval settings) for the `muqun` server decide whether Codex asks before
+> calling `exec.run` at all -- leave it on approval if you want to see each
+> command first.
+>
+> A delegated session is an ordinary agent session with the same `muqun`
+> tools, so it can delegate again. P1 does not bound that recursion.
+
+### What pane binding is
+
+A pane-bound token says which pane's assistant made a call, so its work is
+attributed to that pane and only it can wait on or cancel that work. It is
+attribution, not isolation: any process running as the same user that can
+read the gateway's `pairing.json` can mint a token for any pane, and every
+OpenCode session shares the one agent-bound principal `agent:opencode`.
+
+## Endpoint and authentication
+
+`POST /mcp` on the gateway's own listener (MCP Streamable HTTP, stateless, JSON
+responses; MCP 2026-07-28, older handshakes are served per request too). A
+request is checked in this order and refused at the first failure:
+
+1. The peer address is loopback (`127.0.0.1`, `::1`). Otherwise
+   `403 mcp_loopback_only`.
+2. The request carries none of the proxy headers `Forwarded`,
+   `X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto`, `X-Real-IP`,
+   `Tailscale-User-Login`. A request relayed by a reverse proxy or Tailscale
+   Serve arrives from loopback too; these headers tell it apart. Otherwise
+   `403 mcp_loopback_only`.
+3. An `Authorization: Bearer <token>` header. Otherwise `401`.
+4. The token resolves to a live assistant token. An expired one is
+   `401 token_expired`; an unknown or revoked one is `403 invalid_token`; a
+   store failure is `500 token_store_unavailable`.
+
+An assistant token authorises `/mcp` and nothing else, and a paired device's
+token is not an assistant token. Each call is served for the session its token
+resolves to, and every task it creates is owned by that session: it can read,
+wait for and cancel its own tasks, and another assistant's task id answers
+`task_not_found`.
+
+## Tokens
+
+Tokens are stored as hashes; the token itself exists only in the response that
+issued it.
+
+- **Pane-bound** (Claude Code, Codex, Pi, and OpenCode run by hand). The host
+  runs `muqun-gateway mcp token-helper` before connecting. The helper sends its
+  own process ancestry to the gateway (`POST /api/mcp/tokens`, authenticated
+  with the local admin token), the gateway finds the terminal pane whose shell
+  is the nearest ancestor, and answers with a token bound to that pane. It
+  lives 7 days, and the gateway revokes it within 60 seconds of the pane
+  closing. The helper prints `{"Authorization": "Bearer <token>"}`, or only the
+  token with `--bearer`. Run outside any managed pane it exits 2 with a message;
+  with MCP disabled it says so and exits 1; with the gateway down or refusing,
+  it exits 1 with one fixed sentence (`MUQUN_LOG=debug` shows the details).
+  `--config-dir <dir>` names the gateway's config directory; `mcp enable`
+  writes it into the helper command whenever that directory is not the
+  default, because hosts may run the helper without your environment (Codex
+  does), and `MUQUN_GATEWAY_CONFIG_DIR` would then be lost.
+- **Agent-bound** (the OpenCode service the gateway starts). The gateway issues
+  a token bound to the agent `opencode` that does not expire (`expires_ms` is
+  `null`), hands it to the service with `opencode service set
+  env`, and also sets it in the service's process environment, as
+  `MUQUN_MCP_TOKEN` and `MUQUN_MCP_URL`. The next OpenCode start the gateway
+  makes replaces it (the old one is revoked only after the start worked), and
+  `mcp revoke` ends it.
+- **OpenCode run by hand** is not pane-bound by itself: it reads
+  `MUQUN_MCP_TOKEN` from its environment. From inside a pane the gateway
+  manages, `export MUQUN_MCP_TOKEN=$(muqun-gateway mcp token-helper --bearer)`
+  before starting it; the token is then bound to that pane.
+
+When a token expires, `/mcp` answers 401 so the host fetches a new one:
+
+- Claude Code runs `headersHelper` on every connection and, when a tool call
+  returns 401 or 403, re-runs it, reconnects and retries the call once
+  (Claude Code MCP documentation).
+- Codex caches the helper's headers per connection and, after a 401 or 403,
+  runs `http_headers_helper` again once and retries if the headers changed
+  (Codex MCP documentation).
+
+`MUQUN_MCP_URL` and the default URL `mcp enable` uses are
+`http://<listen host>:<port>/mcp`, with `127.0.0.1` for a wildcard listen
+address (`0.0.0.0`, `[::]`). `/mcp` still answers loopback peers only, so on
+a gateway bound to a non-loopback address a local caller is refused: `mcp
+enable` prints a warning, and the gateway logs one and gives OpenCode no
+`MUQUN_MCP_*` environment.
+
+`muqun-gateway mcp revoke --all` or `--id <token-id>` revokes tokens from the
+CLI; a running gateway sees it on the next call. Paired devices can also
+`GET /api/mcp/tokens` (the list never contains tokens) and
+`DELETE /api/mcp/tokens/{id}` (`204`, or `404 token_not_found`).
+
+## Tools
+
+Every result is one JSON text block of at most 16 KiB; a larger result loses
+the tail items of its largest array first, then has its longest strings
+clipped (keeping their ends), and carries `"truncated": true`. A
+`tasks.read` timeline page keeps the newest items that fit about 12 KiB and
+says `"truncated": true` when it left older ones out. `tasks.wait` and
+`exec.run` block for at most 45 seconds. Errors are tool errors whose text is
+`{"error": "<code>", "message": "..."}`.
+
+| Tool | Arguments | Result |
+|---|---|---|
+| `fleet.list` | none | `{"machines": [{machineId, label, os, online, suitableFor, tasksActive}]}`. List the computers this gateway knows (this one only for now): alias, OS, what each is suitable for, how busy it is. |
+| `fleet.describe` | `machine?`: `"self"` (default) or a `machineId` | A compact manifest of that computer: `GET /api/fleet/self`'s fields, but each agent is only `{id, kind, status, version, modes, modelCount}` (mode ids, no model catalog) and each terminal backend `{sessionId, label, kind, connected, version}`. What a computer offers: its agents, terminal backends, toolchains with versions, task counts and what it is suitable for. |
+| `exec.run` | `cwd`: absolute directory; `command`: shell command, run as `sh -c <command>` (at most 16 KiB); `timeout_s?`: 1..=45, default 30 | `{task_id, state, exit_code, stdout_tail, duration_ms, pane}`. Run a shell command in a visible terminal pane on this computer and return its exit code and output tail. Blocks up to timeout_s (max 45); if still running, returns a task_id for tasks.wait. `exit_code` is null while it runs; `pane` is `{session_id, pane_id}`. |
+| `tasks.delegate` | `goal` (at most 32 KiB); `cwd?`: absolute directory; `agent_id?` (default: the primary agent); `mode?` (for example `build` or `plan`); `model?`: a model id from the agent's catalog for `cwd` (for example `claude-haiku-5-5`), or `<provider_id>/<model_id>` to pick one provider; default: the agent's default. An unknown id is `invalid_arguments` and nothing is created; `machine?` | A task view (see [Tasks API](#tasks-api)), filed under the caller's task when the gateway can tell which one it is (see [Task tree](#task-tree)). Start a sub-task on an agent on this computer: a new session in cwd with your goal as the first prompt. Returns task_id; poll with tasks.wait. |
+| `tasks.wait` | `task_id`; `timeout_s?`: 1..=45, default 30 | The task view, plus `stdout_tail` for a command, and `answer` for a done delegation: the agent's last message in full (`summary` holds only its first 240 characters, on one line). Wait up to timeout_s (max 45) for a task to reach done/failed/waiting. Returns the current state and summary; call again while it says working. |
+| `tasks.read` | `task_id`; `what`: `summary` or `timeline`; `cursor?` (timeline only) | `summary`: the task view. `timeline`: `{task_id, items, cursor}`, the most recent agent items after `cursor`; pass the returned `cursor` to read on. Read a task you created: its summary or recent timeline. A command has no timeline. |
+| `tasks.cancel` | `task_id` | The task view after the cancel. Interrupt a task you created. |
+
+Error codes:
+
+| Code | When |
+|---|---|
+| `invalid_arguments` | A bad argument: an empty or oversized `command` or `goal`, a `cwd` that is not an existing absolute directory, an unknown `model` for `tasks.delegate`, `tasks.read` timeline of a command. |
+| `task_not_found` | No task with that `task_id`, or it belongs to another assistant. |
+| `machine_unknown` | `machine` names a computer other than this one. |
+| `agent_unavailable` | The requested agent is not available on this computer. |
+| `no_terminal` | `exec.run` found no reachable terminal session. |
+| `internal` | Anything else; the details are in the gateway log. |
+
+## Host setup
+
+`muqun-gateway mcp enable <host>` points a host at the gateway. `--url`
+overrides the default `http://127.0.0.1:<port>/mcp`; `--project <dir>` is
+where a project file is written. `muqun-gateway mcp disable <host>` removes the
+`muqun` entry again and touches nothing else. No entry ever contains a token.
+
+| Host | `enable` writes (with `--project <dir>`) | `enable` prints |
+|---|---|---|
+| `claude` | `<project>/.mcp.json`: `mcpServers.muqun` with `"type": "http"` and `"headersHelper": "muqun-gateway mcp token-helper"` | Without `--project`: the `claude mcp add-json --scope user muqun '<entry>'` command. |
+| `opencode` | `<project>/opencode.json`: `mcp.muqun` as a remote server whose `Authorization` header is `Bearer {env:MUQUN_MCP_TOKEN}` | Without `--project`: the entry for `opencode.json` in OpenCode's user config directory. It also says the gateway sets `MUQUN_MCP_TOKEN` only for an OpenCode service it starts. |
+| `codex` | Nothing | A `[mcp_servers.muqun]` table for Codex's `config.toml`, with `url` and `http_headers_helper = "muqun-gateway mcp token-helper"`. |
+| `pi` | Nothing | `{"mcpServers": {"muqun": …}}` for `~/.pi/agent/mcp.json` (all projects) or `.pi/mcp.json` (one project, once trusted), whose `Authorization` header is the command `!echo Bearer $(muqun-gateway mcp token-helper --bearer)`. |
+
+With a non-default config directory, every helper command above reads
+`muqun-gateway mcp token-helper --config-dir <dir>`. Running `enable` twice
+changes nothing the second time.
+
+## Tasks API
+
+Tasks are the work the gateway tracks: an agent session an assistant or the
+phone delegated a goal to, or a command run through the gateway. A paired
+device sees all of them. Announced as the `task_ledger` capability;
+`POST /api/tasks`, `?root=` and the tree fields of a task view as
+`task_ledger_create`.
+
+A delegation follows its agent session as the agent reports it: when the
+session finishes a turn (idle after it was busy) the task is done, with the
+last assistant message as its `summary`, on one line and cut to 240
+characters; when the session fails the task fails, with the error
+(`<name>: <message>`, one line) as its `summary`; an interrupted session
+cancels it; a pending permission or question makes it `waiting` until it is
+answered. These moves are recorded with the source `task_follower` and
+published at once. A command's `summary` is its output tail, as before.
+
+Tasks are reconciled at startup and every 60 s, so a task moves even when
+no assistant waits on it: a command whose pane is gone fails with summary
+`pane closed`; a command whose pane is there gets one read of its exit
+marker (and completes, closing an exit-0 tab, if it has exited); a
+delegation whose agent no longer has the session fails with `session gone`;
+a delegation whose session failed fails with its error line as `summary`;
+a delegation whose session went idle after the task was created is done,
+with the last assistant text as its summary; a task still bound to nothing
+10 minutes after it was created (the gateway stopped before dispatching it)
+fails with `never dispatched`. A task whose terminal backend
+or agent cannot be reached is left as it is.
+
+All routes need a device token. `{id}` is the `task_id` of a task view; an
+unknown id is `404 task_not_found`; any other failure is `500 task_failed`.
+
+| Route | Answer |
+|---|---|
+| `GET /api/tasks?state=a,b&limit=50` | `{"tasks": [TaskView]}`, newest update first. `state` is a comma list of the states below; an unknown name is `400 invalid_request`. `limit` defaults to 50 and is capped at 200. |
+| `GET /api/tasks?root=<task_id>` | The same list, of that task and every task below it (its children, theirs, and so on); `state` and `limit` apply too. An unknown id lists nothing; an empty `root` is `400 invalid_request`. |
+| `POST /api/tasks` | Opens a delegation from the device; see below. |
+| `GET /api/tasks/{id}` | `{"task": TaskView, "events": [TaskEvent]}`; `events` is the task's state history, oldest first. |
+| `POST /api/tasks/{id}/cancel` | The `TaskView` after the cancel. Interrupts the agent or sends Ctrl-C to the command. Cancelling a finished task changes nothing. |
+
+`TaskView`: `task_id`, `state`, `kind` (`delegation` or `command`), `goal`
+(the delegated goal or the command line), `summary`, `exit_code`, `binding`,
+`updated_ms`, and:
+
+- `parent_task_id`: the task this one was started from, or `null`.
+- `origin`: `device` (opened with `POST /api/tasks`), `agent` (started by work
+  the gateway tracks: a session of the agent service the gateway runs, or an
+  assistant in the pane of an open task) or `mcp` (any other MCP host). Tasks
+  stored before origins existed read as `mcp`.
+- `label`: the short title the requester gave, or `null`.
+- `requested_by`: `{"kind": "device", "id": "<device id>", "name": "<device
+  name>"}` for a device's task; `null` otherwise.
+- `children`: `{"total", "active", "waiting", "failed"}`, the task's direct
+  children by state, counted when the view is made (`active` is every state
+  that is not finished and not `waiting`; `done` and `cancelled` count only in
+  `total`).
+
+`TaskEvent`: `task_id`, `seq`, `at_ms`, `from`, `to`, `source`, `note`.
+
+### Opening a task from the device
+
+`POST /api/tasks` with a device token does what `tasks.delegate` does: it
+creates a session on the agent, sends the goal as its first prompt, and
+records a `delegation` task bound to that session, with `origin: "device"`,
+the device as its owner and the device's name in `requested_by`.
+
+```json
+{ "goal": "fix the failing test", "agent_id": "opencode", "cwd": "~/Work/app",
+  "mode": "build", "model": "anthropic/claude-haiku-5-5", "label": "fix test" }
+```
+
+Only `goal` is required (non-empty, at most 32 KiB). `agent_id` defaults to
+the primary agent; `cwd` must be an existing absolute directory (`~`
+expands) and defaults to the home directory, as for `POST
+/api/agent-sessions`; `model` is a model id from the agent's catalog or
+`<provider_id>/<model_id>`; `label` is at most 200 characters. The answer is
+the task view plus the session to open:
+
+```json
+{ "task_id": "t_…", "state": "working", "kind": "delegation", "goal": "fix the failing test",
+  "summary": null, "exit_code": null,
+  "binding": { "kind": "agent_session", "agent_id": "opencode", "asid": "ses_…" },
+  "updated_ms": 1760000000000, "parent_task_id": null, "origin": "device", "label": "fix test",
+  "requested_by": { "kind": "device", "id": "dev_…", "name": "Pixel" },
+  "children": { "total": 0, "active": 0, "waiting": 0, "failed": 0 },
+  "asid": "ses_…" }
+```
+
+| Error | When |
+|---|---|
+| `400 invalid_request` | An empty or oversized `goal`, a `label` over 200 characters, an empty or oversized (256 bytes) `agent_id`/`mode`/`model`. |
+| `400 invalid_directory`, `directory_not_found`, `not_a_directory` | `cwd` is relative, missing, or not a directory. Nothing is created. |
+| `400 unknown_model` | `model` is not in the agent's catalog for `cwd`. Nothing is created. |
+| `503 agent_unavailable` | That agent (or, without `agent_id`, any agent) is not attached. |
+| `400 invalid_request` (body) | The body is not a JSON object of the shape above. Authentication is checked first, so without a valid device token this is `401`/`403` whatever the body. |
+| `502 agent_error` | The agent could not create the session or take the prompt; the task is recorded as `failed`, with the error as its `summary`. |
+
+If the session fails (or finishes) while the prompt is being sent, the
+answer is still `200` with the task as it then stands -- `failed` with the
+error line as `summary`, or `done` -- since the task and its session exist.
+
+There is no separate rate limit, as for the other device routes that start
+work (`POST /api/agent-sessions`, `POST /api/sessions/{id}/tasks`).
+
+### Task tree
+
+A task started through `exec.run` or `tasks.delegate` is filed under the
+open task it was started from, when the gateway can tell which one that is.
+A token names who is calling, not from which task, so the gateway looks:
+
+- **Pane-bound token**: the open task bound to the caller's pane (an
+  assistant running inside an `exec.run` pane).
+- **Agent-bound token** (every session of the agent service the gateway runs
+  shares it): among the open delegations to that agent, the one whose session
+  is running this very call -- its latest timeline shows a *running* call of
+  the same tool (OpenCode names it `muqun_tasks_delegate`, `muqun_exec_run`)
+  whose arguments are the request's own: `command` and `cwd` for `exec.run`,
+  `goal` for `tasks.delegate`, as the caller sent them.
+
+When no task, or more than one, fits, the new task has no parent: a wrong
+parent would misfile work, a missing one only leaves it at the top level.
+So a session the gateway does not track, calling the same tool while a
+tracked one waits in it, is not filed under the tracked task; two tracked
+sessions running the identical call at the same moment give their children
+no parent.
+
+`children` is computed at read time. When a task with a parent changes, the
+parent's view is published again too (with its `seq` unchanged), so a
+client's roll-up stays current without refetching.
+
+A command task is bound to its pane's shell process, not only to the pane id
+(`binding.shell_pid` when the backend reports it): a pane that has since been
+replaced by another shell under the same id (tmux reuses `%N` after a server
+restart) counts as gone, so it is never read or interrupted and the task fails
+with `pane closed`.
+
+`GET /api/fleet/self` (capability `fleet`, device token) answers with this
+computer's full manifest, model catalogs included; `fleet.describe` returns
+the compact form described under Tools. Manifest fields are camelCase, like
+discovery (the task API stays snake_case).
+
+### States
+
+`queued`, `dispatching`, `working`, `waiting`, `idle_unconfirmed`, `done`,
+`failed`, `cancelled`. The last three are terminal.
+
+| From | May move to |
+|---|---|
+| `queued` | `dispatching`, `cancelled` |
+| `dispatching` | `working`, `failed`, `cancelled` |
+| `working` | `waiting`, `idle_unconfirmed`, `done`, `failed`, `cancelled` |
+| `waiting` | `working`, `cancelled` |
+| `idle_unconfirmed` | `working`, `done`, `cancelled` |
+
+### Live updates
+
+A socket on `GET /api/ws` that sent `subscribe_all` also receives every task
+change, with no session:
+
+```json
+{"t":"event","asid":null,"seq":12,"event":"task.updated","data":{"task_id":"…","state":"working","…":"…"}}
+```
+
+`data` is the whole `TaskView`, so the latest frame for a task replaces what
+the client holds. A change to a task with a parent is followed by a frame for
+the parent, whose `children` moved (its `seq` is the parent's own, unchanged).
+That parent frame is built after the child's change and sent without
+ordering against the parent's own changes, so it can arrive after a newer
+frame for the parent: keep the view with the larger `updated_ms` (on a tie,
+the later frame).
+Frames are not replayed: after a reconnect, `GET /api/tasks`.
+
+## Disabling
+
+```json
+{ "mcp": { "enabled": false } }
+```
+
+in the gateway's `config.json` (the default is `true`; there are no other `mcp`
+keys, and an unknown key is a config error). With it off, the gateway:
+
+- does not mount `/mcp` or `/api/mcp/tokens*`, so they answer 404;
+- does not run the pane-token sweeper;
+- gives the OpenCode service it starts no `MUQUN_MCP_*` environment from then
+  on. OpenCode's saved service environment keeps the earlier values until you
+  remove them: `opencode service unset env MUQUN_MCP_TOKEN` and
+  `opencode service unset env MUQUN_MCP_URL`;
+- omits `transports.mcp` from `/api/discovery` and `mcp_server` from the
+  capability lists.
+
+`/api/tasks*` and `/api/fleet/self` stay, and tasks are still reconciled,
+because the phone uses them regardless.
+
+## Platform notes
+
+- macOS: the toolchain probes behind `fleet.*` run `python3 --version` and
+  `git --version`. On a Mac without the Xcode Command Line Tools, those
+  commands are stubs that may open the "install the command line developer
+  tools" dialog.
+
+## What P2 adds
+
+- Peers: other gateways as machines in `fleet.list`, with `machine` selecting one.
+- Grants and @mentions: which assistants may act on which computers, and
+  addressing an agent from a conversation.
+- Remote machines: delegating and running commands on another computer, with
+  the same tasks and the same phone view.

@@ -49,12 +49,15 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
   - `scrollback.rs`: bounded scrollback retention and the application policy
     for observing frames and serving row-bounded reads. Callers do not assemble
     cache keys or compare output byte lengths.
-  - `history.rs`, `history_memory.rs`, `history_routes.rs`: captured-history
-    pagination use case and async repository port, the current memory adapter,
-    and authenticated HTTP boundary. Captured historical prefix only, separately
-    from native ranges and the mutable viewport; bounded ephemeral snapshots.
-    Storage is selected at server composition (memory only now); contract and
-    future persistence-switch constraints in `docs/captured-history.md`.
+  - `history.rs`, `history_memory.rs`, `history_sqlite.rs`, `history_routes.rs`:
+    captured-history pagination use case and async repository port, the memory
+    adapter, the opt-in SQLite checkpoint adapter, and authenticated HTTP
+    boundary. Captured historical prefix only, separately from native ranges and
+    the mutable viewport; bounded ephemeral snapshots. Storage is selected at
+    composition from `config.history.storage` (default `memory`); `sqlite` keeps
+    checkpoints in the shared store's `history` namespace, with verified native
+    identities, replacement recovery and bounded retention. Operational and
+    recovery constraints are in `docs/captured-history.md`.
   - `login_env.rs`: the `PATH` and `LC_CTYPE` a backend actually needs,
     recovered from a login shell. An init system starts the gateway with neither,
     and the tmux adapter cannot spawn tmux without the first or parse its output
@@ -67,7 +70,29 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
   - `routes.rs`: pairing and push-token registration routes.
   - `push.rs`: Expo notification payloads and the device records that receive
     them.
+- `src/tasks/`: the work the gateway tracks. Domain types and the state
+  machine (`domain.rs`), the `TaskStore` port with its SQLite adapter, the
+  `TaskService` (delegate, wait, read, cancel, list, the task tree), command
+  runs in a visible pane (`run_command.rs`), the startup/60 s reconcile of
+  tasks nobody waits on and the follower that settles delegations from agent
+  events as they arrive (`driver.rs`), change events for `/api/ws`, and
+  `/api/tasks*` (including `POST /api/tasks`, a device opening a delegation).
+  Every task carries `parent_task_id` and `origin`; `children` counts are
+  computed when a view is made, never stored.
+- `src/fleet/`: this machine's capability manifest (agents, terminal backends,
+  probed toolchains, task counts) behind `GET /api/fleet/self` and the
+  `fleet.*` MCP tools.
+- `src/mcp/`: the gateway as an MCP server for local agents: `/mcp` on the
+  existing listener (loopback, proxy-header refusal, assistant token in
+  `auth.rs`), the seven tools in `tools.rs` (which file what they start under
+  the calling task through `lineage.rs`), assistant tokens (`tokens.rs`,
+  `tokens_sqlite.rs`, pane-bound issue and sweep in `issue.rs`,
+  `/api/mcp/tokens*` in `token_routes.rs`), and per-host client config in
+  `hosts.rs`. Off with `mcp.enabled: false`; contract in `docs/mcp.md`.
 - `src/platform/`: shared infrastructure.
+  - `store/`: the shared SQLite store (`sqlite.rs`, one worker thread,
+    migrations per domain) and its optional SQLCipher key file (`db_key.rs`);
+    selected by `store.encryption`.
   - `config.rs`: configuration types and the shared tuning constants.
   - `store.rs`: config/device/pairing/push-token persistence, PID files, and
     secret-file permissions.
@@ -100,6 +125,7 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
     language), pane-output parsing,
     capability discovery, the OpenAPI/Scalar spec, the platform routes, service
     unit files, and the single-owner state lock.
+- `docs/mcp.md`: the MCP server, assistant tokens, host setup and the Tasks API.
 - `docs/content-model.md`, `docs/agent-api.md`: the two wire contracts shared
   with the app team -- the versioned content envelope and part set, and the
   agent-session field names. Contract tests in `platform/parts.rs` and
@@ -194,6 +220,20 @@ Tailscale IPv4 address. HTTPS is preferred. Application transport encryption is
 device, so its bearer token is not sufficient by itself. `disabled` is an
 explicit token-only compatibility mode. Existing device records retain their
 pairing mode; changing the gateway setting governs newly paired devices.
+
+Agents the gateway launches for remote dispatch (`POST …/tasks`, `POST …/spawn`)
+have nobody at the terminal to answer a prompt. They start with their own
+bypass flags (`codex --dangerously-bypass-approvals-and-sandbox -c projects=…`
+trusting the task directory and its checkout; `claude
+--dangerously-skip-permissions`), replaceable per kind with `agent_launch_args`
+in `config.json` (an empty list disables them), and with `agent_env` (e.g. a
+proxy the gateway's own environment lacks) set on the pane they start in:
+tmux `-e` (3.2+ for a session, 3.0+ for a window or split), Herdr's pane
+`env`, or, when the backend cannot set a pane's environment, an `env K=V …`
+prefix on the launch line tmux types. Herdr's `agent.start` takes no env, so a
+worktree pane Herdr made itself does not get `agent_env` (the task's steps say
+so). `-e` and the prefix put values on a command line (visible in the local
+process list). `agent_env` values are never logged; `Debug` redacts them.
 
 ## Verification
 

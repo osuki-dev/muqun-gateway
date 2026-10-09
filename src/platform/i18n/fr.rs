@@ -29,6 +29,10 @@ pub(super) const FR: &[(&str, &str)] = &[
     ("Expo push service request failed", "Échec de la requête au service push Expo"),
     ("Herdr did not return the created pane id", "Herdr n’a pas renvoyé l’id du panneau créé"),
     ("Herdr is unavailable", "Herdr est indisponible"),
+    ("No terminal pane belongs to the calling process", "Aucun panneau de terminal n'appartient au processus appelant"),
+    ("Task not found", "Tâche introuvable"),
+    ("Token expired", "Jeton expiré"),
+    ("Token not found", "Jeton introuvable"),
     (
         "agent is not one this gateway offers; see GET /api/agents/catalog",
         "cet agent n’est pas proposé par ce Gateway ; voir GET /api/agents/catalog",
@@ -96,6 +100,14 @@ pub(super) const FR: &[(&str, &str)] = &[
     ("invalid Authorization header", "en-tête Authorization invalide"),
     ("invalid pairing code", "code d’appairage invalide"),
     ("invalid token", "token invalide"),
+    (
+        "the MCP endpoint answers only local callers on this machine",
+        "le point de terminaison MCP ne répond qu'aux appelants locaux de cette machine",
+    ),
+    (
+        "the assistant token store is unavailable",
+        "le stockage des tokens d'assistant est indisponible",
+    ),
     ("keys must contain 1 to 32 entries", "keys doit contenir de 1 à 32 entrées"),
     ("missing Authorization header", "en-tête Authorization manquant"),
     ("mode must be on, off, or toggle", "mode doit être on, off ou toggle"),
@@ -138,6 +150,7 @@ pub(super) const FR: &[(&str, &str)] = &[
     ("the file field must carry a filename", "le champ file doit comporter un nom de fichier"),
     ("the pane is not waiting on an approval", "ce panneau n’attend aucune approbation"),
     ("the pane is waiting on a different approval", "ce panneau attend une autre approbation"),
+    ("the task request failed", "la requête de tâche a échoué"),
     ("the upload must be at most 25 MiB", "le fichier envoyé ne doit pas dépasser 25 MiB"),
     (
         "this approval has no option with that number",

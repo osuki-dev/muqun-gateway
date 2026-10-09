@@ -27,6 +27,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 pub(crate) fn test_config(token: &str) -> Config {
     Config {
+        history: Default::default(),
         server_id: "server-1".into(),
         label: "test".into(),
         autostart_backends: Vec::new(),
@@ -42,10 +43,14 @@ pub(crate) fn test_config(token: &str) -> Config {
             backend: BackendKind::Herdr,
         }],
         agent_commands: BTreeMap::new(),
+        agent_launch_args: BTreeMap::new(),
+        agent_env: Default::default(),
         rich_agent_pushes: false,
         opencode: agents::OpencodeConfig::default(),
         deepseek: agents::DeepseekConfig::default(),
         t3: agents::T3Config::default(),
+        store: crate::platform::config::StoreConfig::default(),
+        mcp: crate::platform::config::McpConfig::default(),
     }
 }
 
@@ -64,8 +69,21 @@ pub(crate) fn test_device(id: &str, token: &str) -> DeviceRecord {
 
 pub(crate) fn test_state(admin_token: &str, devices: Vec<DeviceRecord>) -> AppState {
     let scrollback = Arc::new(Mutex::new(scrollback::ScrollbackStore::default()));
+    let db = platform::store::sqlite::SqliteStore::open(
+        &test_state_dir().join(format!("{}.sqlite3", uuid::Uuid::new_v4())),
+        None,
+        platform::store::sqlite::ALL_MIGRATIONS,
+    )
+    .expect("the test store opens");
+    let config = test_config(admin_token);
+    let task_events = tokio::sync::broadcast::channel(crate::tasks::events::TASK_EVENT_CAPACITY).0;
+    let tasks = Arc::new(crate::tasks::service::TaskService::new(
+        Arc::new(crate::tasks::store_sqlite::SqliteTaskStore::new(db.clone())),
+        task_events.clone(),
+        config.server_id.clone(),
+    ));
     AppState {
-        config: test_config(admin_token),
+        config,
         pending_pairing: Arc::new(Mutex::new(None)),
         pairing_requests: Arc::new(Mutex::new(VecDeque::new())),
         push_tokens: Arc::new(Mutex::new(Vec::new())),
@@ -83,6 +101,11 @@ pub(crate) fn test_state(admin_token: &str, devices: Vec<DeviceRecord>) -> AppSt
         ws_connections: Arc::new(agents::ws_routes::WsRegistry::default()),
         generation: new_generation(),
         message_images: Arc::default(),
+        mcp_tokens: Arc::new(crate::mcp::tokens_sqlite::SqliteTokenStore::new(db.clone())),
+        fleet: Arc::default(),
+        tasks,
+        task_events,
+        db,
     }
 }
 
@@ -477,6 +500,10 @@ pub(crate) fn approval_data_menu(
 pub(crate) struct FakeHerdr {
     pub(crate) socket_path: PathBuf,
     pub(crate) calls: Arc<Mutex<Vec<Value>>>,
+    /// What `pane.list` answers once set (entries may carry a test-only
+    /// `shell_pid` that `pane.process_info` answers with); unset, both
+    /// methods answer a bare `ok` as before.
+    panes: Arc<Mutex<Option<Value>>>,
 }
 
 impl FakeHerdr {
@@ -491,6 +518,8 @@ impl FakeHerdr {
         let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
         let calls: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
         let recorded = Arc::clone(&calls);
+        let panes: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+        let listed = Arc::clone(&panes);
         let screens: Vec<String> = screens.into_iter().map(str::to_owned).collect();
         tokio::spawn(async move {
             let mut reads = 0usize;
@@ -503,8 +532,17 @@ impl FakeHerdr {
                 }
                 let request: Value = serde_json::from_str(&line).unwrap();
                 let method = request["method"].as_str().unwrap_or_default().to_owned();
-                let result = match method.as_str() {
-                    "pane.read" => {
+                let panes = listed.lock().unwrap().clone();
+                let result = match (method.as_str(), panes) {
+                    ("pane.list", Some(panes)) => json!({ "panes": panes }),
+                    ("pane.process_info", Some(panes)) => {
+                        let pane = panes.as_array().and_then(|all| {
+                            all.iter()
+                                .find(|p| p["pane_id"] == request["params"]["pane_id"])
+                        });
+                        json!({ "process_info": { "shell_pid": pane.map(|p| p["shell_pid"].clone()) } })
+                    }
+                    ("pane.read", _) => {
                         let screen = screens
                             .get(reads)
                             .or_else(|| screens.last())
@@ -513,7 +551,7 @@ impl FakeHerdr {
                         reads += 1;
                         json!({ "read": { "text": screen, "revision": reads } })
                     }
-                    "agent.list" => {
+                    ("agent.list", _) => {
                         let agents = match advance_after {
                             None => json!([]),
                             Some(threshold) => {
@@ -531,11 +569,19 @@ impl FakeHerdr {
                         };
                         json!({ "agents": agents })
                     }
-                    "pane.send_keys" => {
+                    ("pane.send_keys", _) => {
                         enters += 1;
                         json!({ "ok": true })
                     }
-                    "pane.get" => json!({
+                    // One new tab with one pane, for `exec.run`.
+                    ("tab.create", _) => json!({
+                        "tab": {
+                            "tab_id": "w1:t9",
+                            "workspace_id": "w1",
+                            "active_pane_id": "w1:p9",
+                        }
+                    }),
+                    ("pane.get", _) => json!({
                         "pane": {
                             "pane_id": request["params"]["pane_id"],
                             "workspace_id": "w1",
@@ -552,7 +598,16 @@ impl FakeHerdr {
                 stream.flush().await.unwrap();
             }
         });
-        Self { socket_path, calls }
+        Self {
+            socket_path,
+            calls,
+            panes,
+        }
+    }
+
+    /// Answer `pane.list` (and `pane.process_info`) from `panes` from now on.
+    pub(crate) fn set_panes(&self, panes: Value) {
+        *self.panes.lock().unwrap() = Some(panes);
     }
 
     pub(crate) fn session(&self) -> SessionConfig {
@@ -607,6 +662,7 @@ pub(crate) fn repainting_screens() -> Vec<String> {
 /// live tmux server.
 pub(crate) struct FakePaneListHerdr {
     pub(crate) socket_path: PathBuf,
+    panes: Arc<Mutex<Value>>,
 }
 
 impl FakePaneListHerdr {
@@ -616,6 +672,8 @@ impl FakePaneListHerdr {
             uuid::Uuid::new_v4().simple()
         ));
         let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let panes = Arc::new(Mutex::new(panes));
+        let live = Arc::clone(&panes);
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let mut reader = BufReader::new(stream);
@@ -624,18 +682,31 @@ impl FakePaneListHerdr {
                     continue;
                 }
                 let request: Value = serde_json::from_str(&line).unwrap_or_default();
-                let response = json!({
-                    "id": request["id"],
-                    "result": { "panes": panes.clone() }
-                })
-                .to_string();
+                let panes = live.lock().unwrap().clone();
+                // `pane.process_info` answers with the `shell_pid` the pane
+                // entry carries (a test-only field `pane.list` consumers ignore).
+                let result = if request["method"] == "pane.process_info" {
+                    let pane = panes.as_array().and_then(|all| {
+                        all.iter()
+                            .find(|p| p["pane_id"] == request["params"]["pane_id"])
+                    });
+                    json!({ "process_info": { "shell_pid": pane.map(|p| p["shell_pid"].clone()) } })
+                } else {
+                    json!({ "panes": panes })
+                };
+                let response = json!({ "id": request["id"], "result": result }).to_string();
                 let mut stream = reader.into_inner();
                 let _ = stream.write_all(response.as_bytes()).await;
                 let _ = stream.write_all(b"\n").await;
                 let _ = stream.flush().await;
             }
         });
-        Self { socket_path }
+        Self { socket_path, panes }
+    }
+
+    /// Replace what `pane.list` answers from now on (a pane closing).
+    pub(crate) fn set_panes(&self, panes: Value) {
+        *self.panes.lock().unwrap() = panes;
     }
 
     pub(crate) fn session(&self, id: &str) -> SessionConfig {
@@ -710,12 +781,21 @@ impl Drop for FakeHerdr {
 }
 
 /// An agent that answers from canned data, for route and service
-/// tests. `failing` makes every read error.
+/// tests. `failing` makes every read error. `calls` records the writes it
+/// was asked for (`create_session`, `send_prompt`, `interrupt`), and is shared
+/// so a test can read it after the agent moved into a manager.
 pub(crate) struct FakeAgent {
     pub kind: &'static str,
     pub sessions: Vec<agents::domain::AgentSessionInfo>,
     pub failing: bool,
     pub catalog: agents::domain::AgentCatalog,
+    pub timeline: Vec<agents::domain::TimelineItem>,
+    /// A session's own timeline, in place of `timeline`, by asid.
+    pub session_timelines: HashMap<String, Vec<agents::domain::TimelineItem>>,
+    /// Permission requests `get_pending_permissions` reports, per their asid.
+    /// Shared, so a test can answer them after the agent moved.
+    pub permissions: Arc<Mutex<Vec<agents::domain::PermissionRequest>>>,
+    pub calls: Arc<Mutex<Vec<String>>>,
 }
 
 impl FakeAgent {
@@ -725,7 +805,20 @@ impl FakeAgent {
             sessions: Vec::new(),
             failing: false,
             catalog: Default::default(),
+            timeline: Vec::new(),
+            session_timelines: HashMap::new(),
+            permissions: Arc::default(),
+            calls: Arc::default(),
         }
+    }
+
+    pub fn with_timeline(mut self, timeline: Vec<agents::domain::TimelineItem>) -> Self {
+        self.timeline = timeline;
+        self
+    }
+
+    fn record(&self, call: &str) {
+        self.calls.lock().unwrap().push(call.to_string());
     }
 
     pub fn with_sessions(mut self, sessions: &[(&str, u64)]) -> Self {
@@ -808,6 +901,7 @@ impl agents::ports::agent::AgentPort for FakeAgent {
             if self.failing {
                 return self.fail();
             }
+            self.record("create_session");
             let mut session = fake_session(&format!("{}_new", self.kind), 1);
             session.directory = directory.map(str::to_string);
             Ok(session)
@@ -832,6 +926,7 @@ impl agents::ports::agent::AgentPort for FakeAgent {
         _attachments: &'a [String],
         _delivery: Option<&'a str>,
     ) -> agents::ports::agent::AgentFuture<'a, ()> {
+        self.record("send_prompt");
         Box::pin(async { Ok(()) })
     }
     fn revert_session<'a>(
@@ -842,6 +937,7 @@ impl agents::ports::agent::AgentPort for FakeAgent {
         Box::pin(async { Ok(()) })
     }
     fn interrupt<'a>(&'a self, _session_id: &'a str) -> agents::ports::agent::AgentFuture<'a, ()> {
+        self.record("interrupt");
         Box::pin(async { Ok(()) })
     }
     fn switch_model<'a>(
@@ -903,9 +999,18 @@ impl agents::ports::agent::AgentPort for FakeAgent {
     }
     fn get_pending_permissions<'a>(
         &'a self,
-        _session_id: &'a str,
+        session_id: &'a str,
     ) -> agents::ports::agent::AgentFuture<'a, Vec<agents::domain::PermissionRequest>> {
-        Box::pin(async { Ok(Vec::new()) })
+        Box::pin(async move {
+            Ok(self
+                .permissions
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| p.asid.0 == session_id)
+                .cloned()
+                .collect())
+        })
     }
     fn get_pending_forms<'a>(
         &'a self,
@@ -915,9 +1020,15 @@ impl agents::ports::agent::AgentPort for FakeAgent {
     }
     fn get_timeline<'a>(
         &'a self,
-        _session_id: &'a str,
+        session_id: &'a str,
         _limit: usize,
     ) -> agents::ports::agent::AgentFuture<'a, Vec<agents::domain::TimelineItem>> {
-        Box::pin(async { Ok(Vec::new()) })
+        Box::pin(async move {
+            Ok(self
+                .session_timelines
+                .get(session_id)
+                .unwrap_or(&self.timeline)
+                .clone())
+        })
     }
 }

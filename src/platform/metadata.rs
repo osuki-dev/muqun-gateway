@@ -100,6 +100,16 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     // any number of sessions. Also announced as `transports.websocket` in
     // `/api/discovery`. The per-session SSE stream stays the fallback.
     "ws_events",
+    // `GET /api/fleet/self`: this machine's capability manifest.
+    "fleet",
+    // `/api/tasks*` (the task ledger: delegations and command runs) and the
+    // `task.updated` frame on `/api/ws`. Not `tasks`, which is the older
+    // `POST /api/sessions/{id}/tasks` dispatch.
+    "task_ledger",
+    // `POST /api/tasks` (a device opens a delegation) and, in the same build,
+    // the task tree: `parent_task_id`, `origin`, `label`, `requested_by` and
+    // `children` on every task view and `GET /api/tasks?root=<id>`.
+    "task_ledger_create",
 ];
 
 /// Handing a task to an agent the app did not start, and following it home.
@@ -132,6 +142,17 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
 ///    machine", not "on the session you are looking at".
 pub(crate) const AGENT_COLLABORATION_CAPABILITY: &str = "agent_collaboration";
 
+/// `/mcp` on this listener: the gateway as an MCP server for agents on this
+/// machine (loopback, assistant token). Also `transports.mcp` in discovery.
+/// Conditional on `mcp.enabled`, because switching it off removes the route.
+pub(crate) const MCP_SERVER_CAPABILITY: &str = "mcp_server";
+
+/// Captured-history checkpoints are kept on disk and recovered after a
+/// restart. Conditional on `history.storage: sqlite`, because with `memory`
+/// there is nothing to recover and an App must not offer it, and on a platform
+/// that can verify process identity, without which nothing is ever recovered.
+pub(crate) const HISTORY_CHECKPOINT_CAPABILITY: &str = "pane_captured_history_sqlite_checkpoint";
+
 /// The first Herdr that puts an opaque agent instance id on the wire.
 ///
 /// The same floor `herdr_owns_prompt_submission` uses, and not a coincidence:
@@ -159,15 +180,28 @@ pub(crate) fn session_capabilities(
     }
 }
 
-/// The gateway-wide list: the build's own capabilities, plus collaboration if
-/// at least one configured session can actually deliver it.
+/// The gateway-wide list: the build's own capabilities, plus `mcp_server`
+/// while `mcp.enabled` is true, plus the history checkpoint capability while
+/// `history.storage` is `sqlite`, plus collaboration if at least one
+/// configured session can actually deliver it.
 ///
 /// Nothing else in the list is conditional, and nothing else should become
-/// conditional without the same justification: a capability that comes and goes
+/// conditional without the same justification (both config-gated entries have
+/// it: the config switch removes the behaviour): a capability that comes and goes
 /// with a socket is a capability a client has to re-check, and every entry in
 /// [`API_CAPABILITIES`] is true for as long as this binary is running.
-pub(crate) fn gateway_capabilities(collaboration_somewhere: bool) -> Vec<&'static str> {
+pub(crate) fn gateway_capabilities(
+    collaboration_somewhere: bool,
+    mcp_enabled: bool,
+    history_checkpoints: bool,
+) -> Vec<&'static str> {
     let mut capabilities: Vec<&'static str> = API_CAPABILITIES.to_vec();
+    if mcp_enabled {
+        capabilities.push(MCP_SERVER_CAPABILITY);
+    }
+    if history_checkpoints && crate::terminal::backend::PROCESS_IDENTITY_SUPPORTED {
+        capabilities.push(HISTORY_CHECKPOINT_CAPABILITY);
+    }
     if collaboration_somewhere {
         capabilities.push(AGENT_COLLABORATION_CAPABILITY);
     }
@@ -252,7 +286,11 @@ pub(crate) async fn gateway_metadata(
         "generation": &*state.generation,
         "minimumCompatibleApiVersion": "1.0.0",
         "legacyUnversionedApi": true,
-        "capabilities": gateway_capabilities(collaboration_somewhere),
+        "capabilities": gateway_capabilities(
+            collaboration_somewhere,
+            state.config.mcp.enabled,
+            state.config.history.storage == crate::platform::config::HistoryStorage::Sqlite,
+        ),
         "planes": planes,
         "serverId": state.config.server_id,
         "label": state.config.label,
@@ -734,6 +772,7 @@ mod tests {
     #[tokio::test]
     async fn session_liveness_reports_panes_present() {
         let panes = vec![Pane {
+            history_identity: None,
             id: BackendPaneId::new("p1"),
             terminal_id: None,
             workspace_id: BackendWorkspaceId::new("w1"),
@@ -753,6 +792,7 @@ mod tests {
             alternate_on: None,
             cursor_x: None,
             cursor_y: None,
+            shell_pid: None,
         }];
         let outcome = session_liveness(
             Box::pin(async move { Ok(panes) }),
@@ -990,6 +1030,7 @@ mod tests {
                 cwd: Some(std::env::temp_dir()),
                 label: Some("gateway-sessions-live".into()),
                 focus: true,
+                env: None,
             })
             .await
             .unwrap();
@@ -1112,12 +1153,44 @@ mod tests {
         assert!(session_capabilities(BackendKind::Herdr, false, Some("0.9.0")).is_empty());
     }
 
+    /// The checkpoint capability means "enabled": an App offers restart-surviving
+    /// history only on a gateway whose storage is `sqlite`.
+    #[tokio::test]
+    async fn the_history_checkpoint_capability_follows_the_storage_setting() {
+        assert!(!API_CAPABILITIES.contains(&HISTORY_CHECKPOINT_CAPABILITY));
+        let supported = crate::terminal::backend::PROCESS_IDENTITY_SUPPORTED;
+        assert_eq!(
+            supported,
+            cfg!(any(target_os = "linux", target_os = "macos"))
+        );
+        assert_eq!(
+            gateway_capabilities(false, false, true).contains(&HISTORY_CHECKPOINT_CAPABILITY),
+            supported,
+            "sqlite storage announces checkpoints only where identity is verifiable"
+        );
+        assert!(!gateway_capabilities(false, false, false).contains(&HISTORY_CHECKPOINT_CAPABILITY));
+        for (storage, announced) in [
+            (crate::platform::config::HistoryStorage::Memory, false),
+            (crate::platform::config::HistoryStorage::Sqlite, true),
+        ] {
+            let mut state = crate::test_state("admin", Vec::new());
+            state.config.history.storage = storage;
+            let meta = gateway_metadata(&state, false).await.unwrap();
+            let listed = meta["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c == HISTORY_CHECKPOINT_CAPABILITY);
+            assert_eq!(listed, announced && supported, "{storage:?}");
+        }
+    }
+
     /// The gateway-wide list is the weaker, older-app-facing claim: it says
     /// "somewhere on this machine", and it must not disturb anything else.
     #[test]
     fn the_gateway_wide_list_adds_collaboration_and_changes_nothing_else() {
-        let without = gateway_capabilities(false);
-        let with = gateway_capabilities(true);
+        let without = gateway_capabilities(false, false, false);
+        let with = gateway_capabilities(true, false, false);
 
         assert!(!without.contains(&AGENT_COLLABORATION_CAPABILITY));
         assert!(with.contains(&AGENT_COLLABORATION_CAPABILITY));

@@ -389,10 +389,14 @@ pub async fn build_discovery(state: &AppState, _sealed: bool, authenticated: boo
             .iter()
             .any(|c| c == crate::AGENT_COLLABORATION_CAPABILITY)
     });
-    let legacy_capabilities: Vec<String> = crate::gateway_capabilities(collaboration_somewhere)
-        .into_iter()
-        .map(String::from)
-        .collect();
+    let legacy_capabilities: Vec<String> = crate::gateway_capabilities(
+        collaboration_somewhere,
+        state.config.mcp.enabled,
+        state.config.history.storage == crate::platform::config::HistoryStorage::Sqlite,
+    )
+    .into_iter()
+    .map(String::from)
+    .collect();
 
     json!({
         "ok": true,
@@ -409,25 +413,73 @@ pub async fn build_discovery(state: &AppState, _sealed: bool, authenticated: boo
         "planes": planes,
         // Not redacted for anyone: a path and a protocol number say nothing
         // an unauthenticated caller could not learn by trying the upgrade.
-        "transports": transports_discovery(),
+        "transports": transports_discovery(
+            state
+                .config
+                .mcp
+                .enabled
+                .then(crate::mcp::hosts::helper_for_this_gateway)
+                .as_deref(),
+        ),
         "capabilities": legacy_capabilities,
     })
 }
 
 /// The App-facing transports beyond plain HTTP, keyed by name. An App that
-/// does not know a key ignores it and keeps using HTTP and SSE.
-pub fn transports_discovery() -> Value {
-    json!({
+/// does not know a key ignores it and keeps using HTTP and SSE. `mcp_helper`
+/// is the token helper command while MCP is enabled.
+pub fn transports_discovery(mcp_helper: Option<&str>) -> Value {
+    let mut transports = json!({
         "websocket": {
             "path": crate::agents::ws_routes::WS_PATH,
             "protocol": crate::agents::ws_routes::WS_PROTOCOL,
-        }
-    })
+        },
+    });
+    if let Some(helper) = mcp_helper {
+        // Loopback only; agents on this machine, not the App. The helper
+        // command is a name, not a secret.
+        transports["mcp"] = json!({
+            "path": crate::mcp::MCP_PATH,
+            "loopback_only": true,
+            "token_helper": helper,
+        });
+    }
+    transports
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transports_announce_mcp_only_when_enabled() {
+        let on = transports_discovery(Some(crate::mcp::hosts::HELPER));
+        assert_eq!(
+            on["mcp"],
+            json!({
+                "path": "/mcp",
+                "loopback_only": true,
+                "token_helper": "muqun-gateway mcp token-helper",
+            })
+        );
+        assert!(on["websocket"].is_object());
+        assert!(transports_discovery(None).get("mcp").is_none());
+        let custom = transports_discovery(Some("muqun-gateway mcp token-helper --config-dir /c"));
+        assert_eq!(
+            custom["mcp"]["token_helper"],
+            "muqun-gateway mcp token-helper --config-dir /c"
+        );
+    }
+
+    #[test]
+    fn mcp_server_capability_follows_the_config() {
+        assert!(!crate::API_CAPABILITIES.contains(&"mcp_server"));
+        for capability in ["fleet", "task_ledger"] {
+            assert!(crate::API_CAPABILITIES.contains(&capability));
+        }
+        assert!(crate::gateway_capabilities(false, true, false).contains(&"mcp_server"));
+        assert!(!crate::gateway_capabilities(false, false, false).contains(&"mcp_server"));
+    }
 
     #[test]
     fn agent_discovery_info_serializes_with_camel_case() {

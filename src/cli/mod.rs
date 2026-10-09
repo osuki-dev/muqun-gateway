@@ -1,12 +1,15 @@
 //! Command-line interface: arguments, subcommands, and dispatch.
 
 mod agent;
+pub(crate) mod local_api;
+mod mcp;
 
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
 pub(crate) use agent::AgentCommand;
+pub(crate) use mcp::McpCommand;
 
 use crate::{
     auto_import_skip_reason, command_catalog, configure_backend, default_herdr_plugin_config_dir,
@@ -108,6 +111,11 @@ pub(crate) enum Command {
         /// Print the discovery agents array as JSON.
         #[arg(long)]
         json: bool,
+    },
+    /// The gateway as an MCP server for agents on this machine.
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
     },
 }
 
@@ -282,6 +290,7 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Devices => list_devices()?,
         Command::Revoke { device_id, all } => revoke_device(device_id, all)?,
         Command::Agent { command, json } => agent::run_agent_command(command, json).await?,
+        Command::Mcp { command } => mcp::run_mcp_command(command).await?,
     }
     Ok(())
 }

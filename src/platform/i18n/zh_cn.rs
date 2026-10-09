@@ -30,6 +30,10 @@ pub(super) const ZH_CN: &[(&str, &str)] = &[
     ("Expo push service request failed", "Expo 推送服务请求失败"),
     ("Herdr did not return the created pane id", "Herdr 没有返回所创建面板的 id"),
     ("Herdr is unavailable", "无法连接到 Herdr"),
+    ("No terminal pane belongs to the calling process", "没有属于调用进程的终端面板"),
+    ("Task not found", "未找到任务"),
+    ("Token expired", "token 已过期"),
+    ("Token not found", "未找到 token"),
     (
         "agent is not one this gateway offers; see GET /api/agents/catalog",
         "这个 Gateway 未提供该代理；请参阅 GET /api/agents/catalog",
@@ -85,6 +89,8 @@ pub(super) const ZH_CN: &[(&str, &str)] = &[
     ("invalid Authorization header", "Authorization 请求头无效"),
     ("invalid pairing code", "配对码无效"),
     ("invalid token", "token 无效"),
+    ("the MCP endpoint answers only local callers on this machine", "MCP 端点只响应本机上的本地调用方"),
+    ("the assistant token store is unavailable", "助手 token 存储不可用"),
     ("keys must contain 1 to 32 entries", "keys 必须包含 1 到 32 个条目"),
     ("missing Authorization header", "缺少 Authorization 请求头"),
     ("mode must be on, off, or toggle", "mode 必须是 on、off 或 toggle"),
@@ -133,6 +139,7 @@ pub(super) const ZH_CN: &[(&str, &str)] = &[
         "the pane is waiting on a different approval",
         "这个面板正在等待的是另一个批准",
     ),
+    ("the task request failed", "任务请求失败"),
     ("the upload must be at most 25 MiB", "上传的文件最多 25 MiB"),
     (
         "this approval has no option with that number",

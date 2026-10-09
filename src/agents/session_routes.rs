@@ -1,6 +1,7 @@
 //! Multiplexer session agent HTTP routes: task orchestration, agent dispatch,
 //! prompt delivery, approval responses, and agent event history.
 
+use std::collections::BTreeMap;
 use std::path::{Path as FsPath, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -26,7 +27,7 @@ use crate::{
     terminal::{backend, native, shortcuts},
     terminal_backend, validate_agent_args, validate_text, ApiResult, AppState, BackendCreateTab,
     BackendCreateWorkspace, BackendError, BackendPaneId, BackendSplitDirection, BackendSplitPane,
-    BackendStartAgent, BackendWorkspaceId, BackendWorktreeRequest, Pane, SessionConfig,
+    BackendStartAgent, BackendWorkspaceId, BackendWorktreeRequest, Pane, PaneEnvVia, SessionConfig,
     MAX_WORKSPACE_LABEL_CHARS,
 };
 
@@ -321,6 +322,8 @@ pub(crate) async fn create_task(
     }
 
     let mut steps = tasks::StepLog::new();
+    let agent_env = state.config.agent_env.usable();
+    let pane_env = pane_env(&agent_env);
     let label = body
         .workspace_label
         .clone()
@@ -328,13 +331,29 @@ pub(crate) async fn create_task(
 
     let place = match body.branch_name.as_deref() {
         Some(branch) => {
-            match prepare_worktree(&session, &repo_path, branch, label.as_deref(), &mut steps).await
+            match prepare_worktree(
+                &session,
+                &repo_path,
+                branch,
+                label.as_deref(),
+                &pane_env,
+                &mut steps,
+            )
+            .await
             {
                 Ok(place) => place,
                 Err(err) => return Ok(task_failure(err, &steps)),
             }
         }
-        None => match prepare_workspace(&session, &repo_path, label.as_deref(), &mut steps).await {
+        None => match prepare_workspace(
+            &session,
+            &repo_path,
+            label.as_deref(),
+            &pane_env,
+            &mut steps,
+        )
+        .await
+        {
             Ok(place) => place,
             Err(err) => return Ok(task_failure(err, &steps)),
         },
@@ -355,13 +374,29 @@ pub(crate) async fn create_task(
 
     let mut prompt_target = place.pane_id.clone();
     let agent_command = tasks::agent_command(&body.agent, &state.config.agent_commands);
+    let agent_cwd = place
+        .worktree_path
+        .as_deref()
+        .map(FsPath::new)
+        .unwrap_or(&repo_path);
+    let mut agent_args = tasks::agent_launch_args(
+        &body.agent,
+        Some(agent_cwd),
+        &state.config.agent_launch_args,
+    );
+    agent_args.extend(body.agent_args.iter().flatten().cloned());
     match start_backend_agent(
         &session,
         &place.pane_id,
         &body.agent,
         &agent_command,
-        body.agent_args.as_deref().unwrap_or_default(),
+        &agent_args,
         timeout_ms,
+        if place.env_applied {
+            BTreeMap::new()
+        } else {
+            agent_env
+        },
     )
     .await
     {
@@ -374,6 +409,12 @@ pub(crate) async fn create_task(
                     "argv": value.pointer("/result/argv").cloned()
                 }),
             );
+            if value.pointer("/result/env_applied") == Some(&json!(false)) {
+                steps.skipped(
+                    "env",
+                    "this terminal backend could not give agent_env to the agent's pane",
+                );
+            }
             payload["agent_started"] = json!(true);
             if let Some(target) = value.pointer("/result/target").and_then(Value::as_str) {
                 prompt_target = target.to_owned();
@@ -483,7 +524,16 @@ pub(crate) async fn spawn_agent(
     };
 
     let mut steps = tasks::StepLog::new();
-    let place = spawn_place(&session, body.tab_id.as_deref(), cwd.as_deref(), &mut steps).await?;
+    let agent_env = state.config.agent_env.usable();
+    let pane_env = pane_env(&agent_env);
+    let place = spawn_place(
+        &session,
+        body.tab_id.as_deref(),
+        cwd.as_deref(),
+        &pane_env,
+        &mut steps,
+    )
+    .await?;
 
     let mut payload = json!({
         "session_id": session_id,
@@ -497,13 +547,26 @@ pub(crate) async fn spawn_agent(
 
     let mut prompt_target = place.pane_id.clone();
     let agent_command = tasks::agent_command(&body.agent, &state.config.agent_commands);
+    // Without a `cwd` the agent runs wherever the new pane opened, which
+    // the backend reports; Codex needs it to pre-trust the folder.
+    let agent_cwd = cwd.as_deref().map(PathBuf::from).or(place.cwd.clone());
+    let agent_args = tasks::agent_launch_args(
+        &body.agent,
+        agent_cwd.as_deref(),
+        &state.config.agent_launch_args,
+    );
     match start_backend_agent(
         &session,
         &place.pane_id,
         &body.agent,
         &agent_command,
-        &[],
+        &agent_args,
         tasks::DEFAULT_AGENT_START_TIMEOUT_MS,
+        if place.env_applied {
+            BTreeMap::new()
+        } else {
+            agent_env
+        },
     )
     .await
     {
@@ -516,6 +579,12 @@ pub(crate) async fn spawn_agent(
                     "argv": value.pointer("/result/argv").cloned()
                 }),
             );
+            if value.pointer("/result/env_applied") == Some(&json!(false)) {
+                steps.skipped(
+                    "env",
+                    "this terminal backend could not give agent_env to the agent's pane",
+                );
+            }
             payload["agent_started"] = json!(true);
             if let Some(target) = value.pointer("/result/target").and_then(Value::as_str) {
                 prompt_target = target.to_owned();
@@ -820,9 +889,39 @@ pub(crate) async fn answer_pane_approval(
 }
 
 /// Where a spawned agent will run.
+/// `agent_env` in the shape pane creation takes; `None` when there is none,
+/// so a backend without pane environments is never asked for one.
+type PaneEnv = Option<serde_json::Map<String, Value>>;
+
+fn pane_env(env: &BTreeMap<String, String>) -> PaneEnv {
+    (!env.is_empty()).then(|| {
+        env.iter()
+            .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+            .collect()
+    })
+}
+
 pub(crate) struct SpawnPlace {
     pub(crate) pane_id: String,
     pub(crate) tab_id: Option<String>,
+    /// The new pane's working directory, as the backend reports it.
+    pub(crate) cwd: Option<PathBuf>,
+    /// Whether the pane was created with `agent_env` (see [`TaskPlace`]).
+    pub(crate) env_applied: bool,
+}
+
+/// What to pass as `env` when creating a pane `via` this call, and whether
+/// the variables will reach it. A backend that cannot set them there -- tmux
+/// older than 3.2 for a session, 3.0 for a window or split -- gets no `env`,
+/// and the agent's launch carries them instead.
+async fn pane_env_for(session: &SessionConfig, via: PaneEnvVia, env: &PaneEnv) -> (PaneEnv, bool) {
+    let Some(env) = env else {
+        return (None, true);
+    };
+    match terminal_backend(session).applies_pane_env(via).await {
+        Ok(true) => (Some(env.clone()), true),
+        _ => (None, false),
+    }
 }
 
 /// Make somewhere for the agent to run: a split of the named tab, or a tab of
@@ -836,12 +935,13 @@ async fn spawn_place(
     session: &SessionConfig,
     tab_id: Option<&str>,
     cwd: Option<&str>,
+    env: &PaneEnv,
     steps: &mut tasks::StepLog,
 ) -> ApiResult<SpawnPlace> {
     let Some(tab_id) = tab_id else {
-        return spawn_in_new_tab(session, cwd, None, steps).await;
+        return spawn_in_new_tab(session, cwd, None, env, steps).await;
     };
-    spawn_beside(session, tab_id, cwd, steps).await
+    spawn_beside(session, tab_id, cwd, env, steps).await
 }
 
 /// A task that asked for no particular tab, and the fallback for one whose tab
@@ -850,8 +950,10 @@ async fn spawn_in_new_tab(
     session: &SessionConfig,
     cwd: Option<&str>,
     workspace_id: Option<&str>,
+    env: &PaneEnv,
     steps: &mut tasks::StepLog,
 ) -> ApiResult<SpawnPlace> {
+    let (env, env_applied) = pane_env_for(session, PaneEnvVia::Tab, env).await;
     let backend = terminal_backend(session);
     let tab = backend
         .create_tab(&BackendCreateTab {
@@ -859,16 +961,16 @@ async fn spawn_in_new_tab(
             cwd: cwd.map(PathBuf::from),
             label: None,
             focus: false,
+            env,
         })
         .await
         .map_err(backend_api_error)?;
-    let pane_id = backend
+    let pane = backend
         .list_panes()
         .await
         .map_err(backend_api_error)?
         .into_iter()
         .find(|pane| pane.tab_id == tab.id)
-        .map(|pane| pane.id.as_str().to_owned())
         .ok_or_else(|| {
             api_error(
                 StatusCode::BAD_GATEWAY,
@@ -876,9 +978,15 @@ async fn spawn_in_new_tab(
                 "terminal backend did not return the created pane",
             )
         })?;
+    let pane_id = pane.id.as_str().to_owned();
     let tab_id = Some(tab.id.as_str().to_owned());
     steps.ok("pane", json!({ "pane_id": pane_id, "tab_id": tab_id }));
-    Ok(SpawnPlace { pane_id, tab_id })
+    Ok(SpawnPlace {
+        pane_id,
+        tab_id,
+        cwd: pane.cwd,
+        env_applied,
+    })
 }
 
 /// A task placed beside what the reader was already looking at.
@@ -886,6 +994,7 @@ async fn spawn_beside(
     session: &SessionConfig,
     tab_id: &str,
     cwd: Option<&str>,
+    env: &PaneEnv,
     steps: &mut tasks::StepLog,
 ) -> ApiResult<SpawnPlace> {
     let host = pane_in_tab(session, tab_id).await.ok_or_else(|| {
@@ -904,7 +1013,7 @@ async fn spawn_beside(
             "split",
             "not enough terminal rows; using a tab in the same workspace",
         );
-        return spawn_in_new_tab(session, cwd, Some(host.workspace_id.as_str()), steps).await;
+        return spawn_in_new_tab(session, cwd, Some(host.workspace_id.as_str()), env, steps).await;
     }
     // A split that Ghostty refuses -- a tab already carrying as many panes as
     // its layout will hold, which is the ordinary state of a tab someone works
@@ -912,13 +1021,14 @@ async fn spawn_beside(
     // the request was "start this agent". So a refusal falls back to a tab of
     // its own, recorded as such rather than passed off as the split that was
     // asked for.
+    let (split_env, env_applied) = pane_env_for(session, PaneEnvVia::Split, env).await;
     let split = terminal_backend(session)
         .split_pane(&BackendSplitPane {
             pane_id: host.id.clone(),
             direction: BackendSplitDirection::Down,
             ratio: None,
             cwd: cwd.map(PathBuf::from),
-            env: None,
+            env: split_env,
         })
         .await;
     let pane = match split {
@@ -928,7 +1038,8 @@ async fn spawn_beside(
                 "split",
                 &format!("{err} -- starting in a tab of its own instead"),
             );
-            return spawn_in_new_tab(session, cwd, Some(host.workspace_id.as_str()), steps).await;
+            return spawn_in_new_tab(session, cwd, Some(host.workspace_id.as_str()), env, steps)
+                .await;
         }
     };
     let pane_id = pane.id.as_str().to_owned();
@@ -939,6 +1050,8 @@ async fn spawn_beside(
     Ok(SpawnPlace {
         pane_id,
         tab_id: Some(tab_id.to_owned()),
+        cwd: pane.cwd,
+        env_applied,
     })
 }
 
@@ -963,6 +1076,9 @@ pub(crate) struct TaskPlace {
     pub(crate) pane_id: String,
     pub(crate) worktree_path: Option<String>,
     pub(crate) reused: bool,
+    /// Whether the pane was created with `agent_env`. A worktree pane Herdr
+    /// made or reopened was not, so the variables have to ride the launch.
+    pub(crate) env_applied: bool,
 }
 
 /// The no-branch case: a workspace on the repo as it stands.
@@ -970,15 +1086,18 @@ async fn prepare_workspace(
     session: &SessionConfig,
     repo_path: &FsPath,
     label: Option<&str>,
+    env: &PaneEnv,
     steps: &mut tasks::StepLog,
 ) -> Result<TaskPlace, HerdrCallError> {
     steps.skipped("worktree", "no branch_name was given");
+    let (env, env_applied) = pane_env_for(session, PaneEnvVia::Workspace, env).await;
     let backend = terminal_backend(session);
     let workspace = match backend
         .create_workspace(&BackendCreateWorkspace {
             cwd: Some(repo_path.to_owned()),
             label: label.map(str::to_owned),
             focus: false,
+            env,
         })
         .await
     {
@@ -1001,6 +1120,7 @@ async fn prepare_workspace(
         pane_id: pane.id.as_str().to_owned(),
         worktree_path: None,
         reused: false,
+        env_applied,
     };
     steps.ok(
         "workspace",
@@ -1022,6 +1142,7 @@ async fn prepare_worktree(
     repo_path: &FsPath,
     branch: &str,
     label: Option<&str>,
+    env: &PaneEnv,
     steps: &mut tasks::StepLog,
 ) -> Result<TaskPlace, HerdrCallError> {
     let backend = terminal_backend(session);
@@ -1054,6 +1175,7 @@ async fn prepare_worktree(
                     pane_id: placement.pane_id.as_str().to_owned(),
                     worktree_path: Some(path.clone()),
                     reused: true,
+                    env_applied: false,
                 };
                 steps.ok(
                     "worktree",
@@ -1082,6 +1204,7 @@ async fn prepare_worktree(
                 pane_id: placement.pane_id.as_str().to_owned(),
                 worktree_path: path.clone(),
                 reused: false,
+                env_applied: false,
             };
             steps.ok(
                 "worktree",
@@ -1094,7 +1217,7 @@ async fn prepare_worktree(
             Ok(place)
         }
         Err(BackendError::Unsupported(_)) => {
-            prepare_worktree_with_git(session, repo_path, branch, label, steps).await
+            prepare_worktree_with_git(session, repo_path, branch, label, env, steps).await
         }
         Err(err) => {
             let err = backend_call_error("worktree.create", err);
@@ -1112,6 +1235,7 @@ async fn prepare_worktree_with_git(
     repo_path: &FsPath,
     branch: &str,
     label: Option<&str>,
+    env: &PaneEnv,
     steps: &mut tasks::StepLog,
 ) -> Result<TaskPlace, HerdrCallError> {
     let repo = repo_path.to_owned();
@@ -1148,12 +1272,14 @@ async fn prepare_worktree_with_git(
         json!({ "path": path, "branch": branch, "reused": !added.created }),
     );
 
+    let (env, env_applied) = pane_env_for(session, PaneEnvVia::Workspace, env).await;
     let backend = terminal_backend(session);
     let created = match backend
         .create_workspace(&BackendCreateWorkspace {
             cwd: Some(PathBuf::from(&path)),
             label: label.map(str::to_owned),
             focus: false,
+            env,
         })
         .await
     {
@@ -1169,6 +1295,7 @@ async fn prepare_worktree_with_git(
                 pane_id: pane.id.as_str().to_owned(),
                 worktree_path: Some(path.clone()),
                 reused: !added.created,
+                env_applied,
             })
             .ok_or_else(|| HerdrCallError::malformed("workspace.create")),
     };
@@ -1311,6 +1438,7 @@ async fn start_backend_agent(
     command: &str,
     args: &[String],
     timeout_ms: u64,
+    env: BTreeMap<String, String>,
 ) -> Result<Value, HerdrCallError> {
     let started = terminal_backend(session)
         .start_agent(&BackendStartAgent {
@@ -1320,12 +1448,16 @@ async fn start_backend_agent(
             executable: tasks::find_on_path(command),
             args: args.to_vec(),
             timeout_ms,
+            env,
         })
         .await
         .map_err(|err| backend_call_error("agent.start", err))?;
-    Ok(
-        json!({ "result": { "argv": started.argv, "instance_id": started.instance_id, "target": started.target } }),
-    )
+    Ok(json!({ "result": {
+        "argv": started.argv,
+        "instance_id": started.instance_id,
+        "target": started.target,
+        "env_applied": started.env_applied,
+    } }))
 }
 
 /// Belt and braces for a paste-vs-keypress race in agent TUIs: when the prompt
@@ -1735,6 +1867,7 @@ fn decision_named(name: &str) -> ApiResult<approvals::Decision> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::tasks;
     use crate::*;
 
     #[test]

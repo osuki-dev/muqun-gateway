@@ -1,6 +1,7 @@
 //! Terminal plane HTTP routes and event streaming: sessions, workspaces, tabs,
 //! panes, pane output/parts/git views, prompt delivery, and the SSE hub.
 
+use crate::agents::tasks;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path as FsPath, PathBuf};
 use std::pin::Pin;
@@ -27,11 +28,12 @@ use crate::platform::assets::{
 };
 use crate::platform::i18n::Locale;
 use crate::platform::vcs_routes::{self, VcsDiscardBody, VcsFileQuery, VcsFilesQuery};
+use crate::terminal::exit_marker::strip_exit_markers;
 use crate::{
     agents, api_error, approvals, backend, backend_api_error, backend_endpoint, composer,
     content_envelope, current_server_label, find_session, generate_token, git, i18n, native,
     now_unix_ms, ordered_sessions, parts, require_device, scrollback, send_expo_push_notifications,
-    shortcuts, still_paired, tasks, terminal_backend, transport, validate_text, AgentNotice,
+    shortcuts, still_paired, terminal_backend, transport, validate_text, AgentNotice,
     AgentPushNotice, ApiResult, AppState, BackendCreateTab, BackendCreateWorkspace,
     BackendOutputFormat, BackendOutputSource, BackendPaneId, BackendReadPane, BackendSendTextMode,
     BackendSplitDirection, BackendSplitPane, BackendTabId, BackendWorkspaceId,
@@ -323,6 +325,16 @@ pub(crate) fn pane_read_text(value: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// [`strip_exit_markers`] on the text of a `pane_read` answer: the marker line
+/// `exec.run` leaves in its pane is never served.
+fn strip_read_answer(answer: &mut Value) {
+    if let Some(text) = pane_read_text(answer) {
+        if let std::borrow::Cow::Owned(stripped) = strip_exit_markers(&text) {
+            scrollback::replace_read_text(answer, &stripped);
+        }
+    }
+}
+
 /// Convert one sampled frame into the enriched `pane_updated` payload consumed
 /// by Muqun. Output content, rather than revision, is used to decide whether to
 /// emit because Herdr can expose new text before its coalesced revision advances.
@@ -342,7 +354,7 @@ pub(crate) fn stream_pane_update_payload(
                 "pane_id": pane_id,
                 "revision": frame.revision
             },
-            "output": frame.output,
+            "output": strip_exit_markers(&frame.output),
             "generation": generation
         }
     });
@@ -402,7 +414,7 @@ pub(crate) async fn enrich_pane_update(
     .ok()?
     .ok()?;
     let data = value.get_mut("data").and_then(Value::as_object_mut)?;
-    data.insert("output".into(), Value::String(read.text));
+    data.insert("output".into(), json!(strip_exit_markers(&read.text)));
     data.insert("generation".into(), json!(generation));
     serde_json::to_string(&value).ok()
 }
@@ -818,7 +830,7 @@ pub(crate) async fn watch_pane_approvals(state: AppState, session: SessionConfig
         if let Some(mut store) = lock_scrollback(&state) {
             // The complete listing for this session, so it can also forget
             // the panes that have gone.
-            store.observe_listing(&session.id, &backend::compat::pane_list(panes.clone()));
+            store.observe_native_listing(&session.id, &panes);
         }
 
         // Every agent pane's screen in one request. On a socket backend this
@@ -1852,6 +1864,7 @@ pub(crate) async fn create_workspace(
             cwd: body.cwd.map(PathBuf::from),
             label: body.label,
             focus: body.focus.unwrap_or(false),
+            env: None,
         })
         .await
         .map_err(backend_api_error)?;
@@ -1946,6 +1959,7 @@ pub(crate) async fn create_tab(
             cwd: body.cwd.map(PathBuf::from),
             label: body.label,
             focus: body.focus.unwrap_or(false),
+            env: None,
         })
         .await
         .map_err(backend_api_error)?;
@@ -2329,6 +2343,7 @@ pub(crate) async fn pane_output(
             }
         }
     }
+    strip_read_answer(&mut answer);
     stamp_read_generation(&mut answer, &state.generation);
     Ok(Json(answer))
 }
@@ -2445,7 +2460,10 @@ pub(crate) async fn pane_parts(
         // The chat view hides the frozen bottom areas a Claude pane leaves in
         // its real history; the raw output routes still serve them. See
         // `parts::blank_frozen_status`.
-        None => parts::normalize_json(&parts::blank_frozen_status(&text), dictionary),
+        None => parts::normalize_json(
+            &parts::blank_frozen_status(&strip_exit_markers(&text)),
+            dictionary,
+        ),
     };
 
     // Reading a workspace's own skills and commands is blocking filesystem
@@ -3638,6 +3656,7 @@ mod tests {
                 cwd: Some(std::env::temp_dir()),
                 label: Some("gateway-revoke".into()),
                 focus: true,
+                env: None,
             })
             .await
             .unwrap();
@@ -4242,6 +4261,64 @@ mod tests {
         assert_ne!(other_health["generation"], health["generation"]);
     }
 
+    /// A pane `exec.run` typed into shows its exit marker line; no client
+    /// read does, raw or normalized.
+    #[tokio::test]
+    async fn exit_marker_lines_are_not_served_by_output_or_parts() {
+        let screen = "$ sh -c 'echo hi'\nhi\n\u{1f}muqun-exit:t_1:0\u{1f}\nmuqun-exit:t_1:0\n$ ";
+        let herdr = FakeHerdr::start(vec![screen], None);
+        let state = output_state(&herdr);
+
+        let text = read_output(&state, 40).await;
+        assert!(
+            text.contains("hi") && !text.contains("muqun-exit"),
+            "{text:?}"
+        );
+
+        let parts = pane_parts(
+            State(state.clone()),
+            Path(("default".into(), "wM:p1".into())),
+            Query(PartsQuery { lines: Some(40) }),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap()
+        .0
+        .to_string();
+        assert!(
+            parts.contains("hi") && !parts.contains("muqun-exit"),
+            "{parts}"
+        );
+
+        // Nor does the live stream: the polled frame and the enriched event.
+        let frame = StreamPaneFrame {
+            revision: 1,
+            output: screen.into(),
+        };
+        let polled = stream_pane_update_payload(&frame, "wM:p1", "gen").unwrap();
+        let opts = StreamOutputOpts {
+            pane: Some("wM:p1".into()),
+            lines: 40,
+            source: "recent_unwrapped".into(),
+            format: "text".into(),
+        };
+        let line = json!({ "event": "pane.updated", "data": { "pane": { "pane_id": "wM:p1", "revision": 1 } } }).to_string();
+        let backend = terminal_backend(&state.config.sessions[0]);
+        let enriched = enrich_pane_update(&line, backend.as_ref(), &opts, "gen")
+            .await
+            .unwrap();
+        for payload in [polled, enriched] {
+            let output = serde_json::from_str::<Value>(&payload).unwrap()["data"]["output"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(
+                output.contains("hi") && !output.contains("muqun-exit"),
+                "{output:?}"
+            );
+        }
+    }
+
     /// And having kept them, it says so where the reader's affordance looks --
     /// on the pane, not on the output.
     #[tokio::test]
@@ -4398,6 +4475,7 @@ mod tests {
                 cwd: Some(std::env::temp_dir()),
                 label: Some("gateway-keys".into()),
                 focus: true,
+                env: None,
             })
             .await
             .unwrap();

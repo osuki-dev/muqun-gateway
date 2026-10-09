@@ -290,6 +290,8 @@ mod tests {
         assert!(API_CAPABILITIES.contains(&"ws_events"));
         assert_eq!(GATEWAY_API_MAJOR, 1);
         assert!(API_CAPABILITIES.contains(&"tasks"));
+        assert!(API_CAPABILITIES.contains(&"task_ledger"));
+        assert!(API_CAPABILITIES.contains(&"task_ledger_create"));
         assert!(API_CAPABILITIES.contains(&"agent_catalog"));
         assert!(API_CAPABILITIES.contains(&"terminal_backends"));
         assert!(API_CAPABILITIES.contains(&"multiple_terminal_backends"));
@@ -416,10 +418,10 @@ mod tests {
     fn the_session_snapshot_is_announced_as_a_capability() {
         assert!(API_CAPABILITIES.contains(&"session_snapshot"));
         assert!(
-            gateway_capabilities(false).contains(&"session_snapshot"),
+            gateway_capabilities(false, true, false).contains(&"session_snapshot"),
             "it is a property of this build, not of a session's backend"
         );
-        assert!(gateway_capabilities(true).contains(&"session_snapshot"));
+        assert!(gateway_capabilities(true, true, false).contains(&"session_snapshot"));
     }
 
     #[test]
