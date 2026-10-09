@@ -759,14 +759,9 @@ impl TaskService {
                 Ok(placed) if !placed.place.pane_id.is_empty() => placed,
                 outcome => {
                     let message = match outcome {
-                        Err((_, body)) => body
-                            .0
-                            .pointer("/error/message")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned),
-                        Ok(_) => None,
+                        Err(error) => error.to_string(),
+                        Ok(_) => "no pane could be made".to_owned(),
                     };
-                    let message = message.unwrap_or_else(|| "no pane could be made".into());
                     let error = TaskError::Backend(format!("{kind}: {message}"));
                     self.record_failure(&task, noted(TaskState::Failed, error.to_string()))
                         .await;

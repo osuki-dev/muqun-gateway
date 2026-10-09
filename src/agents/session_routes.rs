@@ -19,8 +19,8 @@ use super::agent_events;
 use super::approvals;
 use super::tasks;
 use crate::{
-    api_error, approval_data, backend_agent_list, backend_api_error, content_envelope,
-    find_session, interrupt_pane, is_scannable_root, pane_agent_and_root,
+    api_error, approval_data, backend_agent_list, backend_api_error, backend_api_parts,
+    content_envelope, find_session, interrupt_pane, is_scannable_root, pane_agent_and_root,
     platform::i18n,
     read_pane_approval, read_pane_visible_text, require_device, send_pane_keys,
     session_asset_roots,
@@ -579,7 +579,7 @@ pub(crate) async fn place_agent(
     agent: &str,
     cwd: Option<&str>,
     tab_id: Option<&str>,
-) -> ApiResult<PlacedAgent> {
+) -> Result<PlacedAgent, PlaceAgentError> {
     let mut steps = tasks::StepLog::new();
     let agent_env = state.config.agent_env.usable();
     let pane_env = pane_env(&agent_env);
@@ -598,6 +598,63 @@ pub(crate) async fn place_agent(
         payload,
         steps,
     })
+}
+
+/// Why [`place_agent`] made no pane. A caller that answers HTTP converts it
+/// with `?` (or [`From`]) and gets the spawn route's status, code and message;
+/// one that does not matches on it instead of reading that answer back.
+#[derive(Debug)]
+pub(crate) enum PlaceAgentError {
+    /// The `tab_id` asked for names a tab with no pane to split.
+    TabNotFound,
+    /// The backend made the tab but did not list a pane in it.
+    PaneNotReported,
+    /// The backend refused or failed a pane call.
+    Backend(BackendError),
+}
+
+impl PlaceAgentError {
+    /// The status, wire code and caller-safe message this is answered with.
+    fn api_parts(&self) -> (StatusCode, &'static str, &str) {
+        match self {
+            Self::TabNotFound => (
+                StatusCode::NOT_FOUND,
+                "tab_not_found",
+                "that tab has no pane to split",
+            ),
+            Self::PaneNotReported => (
+                StatusCode::BAD_GATEWAY,
+                "backend_malformed_response",
+                "terminal backend did not return the created pane",
+            ),
+            Self::Backend(error) => backend_api_parts(error),
+        }
+    }
+}
+
+impl std::fmt::Display for PlaceAgentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.api_parts().2)
+    }
+}
+
+impl From<BackendError> for PlaceAgentError {
+    fn from(error: BackendError) -> Self {
+        Self::Backend(error)
+    }
+}
+
+impl From<PlaceAgentError> for (StatusCode, Json<Value>) {
+    fn from(error: PlaceAgentError) -> Self {
+        match error {
+            // Logs the adapter's diagnostic as every backend answer does.
+            PlaceAgentError::Backend(error) => backend_api_error(error),
+            other => {
+                let (status, code, message) = other.api_parts();
+                api_error(status, code, message)
+            }
+        }
+    }
 }
 
 /// [`launch_agent`]'s second half: start the agent in the placed pane with
@@ -1063,7 +1120,7 @@ async fn spawn_place(
     cwd: Option<&str>,
     env: &PaneEnv,
     steps: &mut tasks::StepLog,
-) -> ApiResult<SpawnPlace> {
+) -> Result<SpawnPlace, PlaceAgentError> {
     let Some(tab_id) = tab_id else {
         return spawn_in_new_tab(session, cwd, None, env, steps).await;
     };
@@ -1078,7 +1135,7 @@ async fn spawn_in_new_tab(
     workspace_id: Option<&str>,
     env: &PaneEnv,
     steps: &mut tasks::StepLog,
-) -> ApiResult<SpawnPlace> {
+) -> Result<SpawnPlace, PlaceAgentError> {
     let (env, env_applied) = pane_env_for(session, PaneEnvVia::Tab, env).await;
     let backend = terminal_backend(session);
     let tab = backend
@@ -1089,21 +1146,13 @@ async fn spawn_in_new_tab(
             focus: false,
             env,
         })
-        .await
-        .map_err(backend_api_error)?;
+        .await?;
     let pane = backend
         .list_panes()
-        .await
-        .map_err(backend_api_error)?
+        .await?
         .into_iter()
         .find(|pane| pane.tab_id == tab.id)
-        .ok_or_else(|| {
-            api_error(
-                StatusCode::BAD_GATEWAY,
-                "backend_malformed_response",
-                "terminal backend did not return the created pane",
-            )
-        })?;
+        .ok_or(PlaceAgentError::PaneNotReported)?;
     let pane_id = pane.id.as_str().to_owned();
     let tab_id = Some(tab.id.as_str().to_owned());
     steps.ok("pane", json!({ "pane_id": pane_id, "tab_id": tab_id }));
@@ -1122,14 +1171,10 @@ async fn spawn_beside(
     cwd: Option<&str>,
     env: &PaneEnv,
     steps: &mut tasks::StepLog,
-) -> ApiResult<SpawnPlace> {
-    let host = pane_in_tab(session, tab_id).await.ok_or_else(|| {
-        api_error(
-            StatusCode::NOT_FOUND,
-            "tab_not_found",
-            "that tab has no pane to split",
-        )
-    })?;
+) -> Result<SpawnPlace, PlaceAgentError> {
+    let host = pane_in_tab(session, tab_id)
+        .await
+        .ok_or(PlaceAgentError::TabNotFound)?;
     // Repeated downward splits can leave an assistant only five rows tall:
     // even its own transcript no longer renders the response there. Keep a
     // normal 24-row terminal for both halves, or use a background tab in the
