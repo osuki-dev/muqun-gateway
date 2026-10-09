@@ -22,7 +22,9 @@
 use futures::future::join_all;
 
 use super::tokens::{AssistantSession, TokenBinding};
-use crate::agents::domain::{AgentPart, ToolCallStatus};
+use crate::agents::domain::{AgentPart, AgentSessionId, TimelineItem, ToolCallStatus};
+use crate::agents::manager::AgentManager;
+use crate::agents::ports::mirror::SessionMirrorPort;
 use crate::tasks::domain::{
     Requested, Task, TaskBinding, TaskFilter, TaskId, TaskKind, TaskOrigin,
 };
@@ -139,13 +141,14 @@ async fn calling(
     let Some(manager) = state.agent_runtime.manager_for_agent(agent_id).await else {
         return Vec::new();
     };
-    let agent = manager.agent();
     let probes = candidates.iter().map(|task| async {
         let TaskBinding::AgentSession { asid, .. } = &task.binding else {
             return false;
         };
-        match agent.get_timeline(asid, PROBE_ITEMS).await {
-            Ok(items) => items.iter().any(|item| match &item.part {
+        session_items(&manager, asid)
+            .await
+            .iter()
+            .any(|item| match &item.part {
                 AgentPart::Tool(part) => {
                     part.state == ToolCallStatus::Running
                         && names_tool(&part.name, call.tool)
@@ -154,9 +157,7 @@ async fn calling(
                         })
                 }
                 _ => false,
-            }),
-            Err(_) => false,
-        }
+            })
     });
     let calling = join_all(probes).await;
     candidates
@@ -164,6 +165,31 @@ async fn calling(
         .zip(calling)
         .filter_map(|(task, calling)| calling.then_some(task))
         .collect()
+}
+
+/// A session's latest timeline items as both sources hold them: the agent's
+/// own read, then the gateway's mirror of its stream. DeepSeek and T3 show a
+/// call in the stream before their page has it, so a call running right now
+/// may be in either.
+async fn session_items(manager: &AgentManager, asid: &str) -> Vec<TimelineItem> {
+    let mut items = manager
+        .agent()
+        .get_timeline(asid, PROBE_ITEMS)
+        .await
+        .unwrap_or_default();
+    if let Some(snapshot) = manager
+        .mirror()
+        .get_snapshot(&AgentSessionId(asid.to_owned()))
+        .await
+    {
+        let streamed = snapshot.timeline;
+        items.extend(
+            streamed[streamed.len().saturating_sub(PROBE_ITEMS)..]
+                .iter()
+                .cloned(),
+        );
+    }
+    items
 }
 
 /// Whether a host's name for a tool is `tool`. Hosts prefix MCP tools with
@@ -417,6 +443,7 @@ mod tests {
                 calling("muqun_tasks_complete", "running", input),
             ),
             ("ses_other", Vec::new()),
+            ("ses_streamed", Vec::new()),
         ])
         .await;
         let mine = working(&state, session_of("ses_mine")).await;
@@ -438,6 +465,29 @@ mod tests {
             own_task(&state, &agent, &with_id, Some(&other)).await,
             None,
             "another session's task, named by id"
+        );
+        // DeepSeek and T3: the running call is only in the streamed mirror.
+        let streamed = working(&state, session_of("ses_streamed")).await;
+        let manager = state
+            .agent_runtime
+            .manager_for_agent("opencode")
+            .await
+            .unwrap();
+        let input = json!({ "summary": "done here", "task_id": streamed.0 });
+        manager
+            .mirror()
+            .upsert_timeline_items(
+                &crate::agents::domain::AgentSessionId("ses_streamed".into()),
+                calling("muqun_tasks_complete", "running", input),
+            )
+            .await;
+        let from_stream = Call {
+            tool: "tasks.complete",
+            args: vec![("summary", "done here"), ("task_id", &streamed.0)],
+        };
+        assert_eq!(
+            own_task(&state, &agent, &from_stream, Some(&streamed)).await,
+            Some(streamed.clone())
         );
 
         let pane = |pane_id: &str| TaskBinding::Pane {

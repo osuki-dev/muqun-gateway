@@ -37,7 +37,8 @@ use super::domain::one_line;
 use super::domain::{now_ms, Task, TaskBinding, TaskChange, TaskFilter, TaskKind, TaskState};
 use super::pane_agent;
 use super::service::{
-    failure_detail, finished_since, summary_timeline, turn_end, OPEN_STATES, SUMMARY_CHARS,
+    finished_since, is_running, session_failure, summary_timeline, turn_end, OPEN_STATES,
+    SUMMARY_CHARS,
 };
 use crate::agents::domain::AgentSessionStatus;
 use crate::agents::ports::agent::AgentError;
@@ -203,17 +204,11 @@ async fn settle_delegation(state: &AppState, task: &Task, agent_id: &str, asid: 
         }
     };
     if session.status == AgentSessionStatus::Failed {
-        let why = match session.error.as_ref() {
-            Some(e) => one_line(&format!("{}: {}", e.name, e.message), SUMMARY_CHARS),
-            None => failure_detail(&manager, asid, task.created_ms).await,
-        };
+        let error = session.error.as_ref();
+        let why = session_failure(Some(&manager), error, asid, task.created_ms).await;
         return fail(state, task, &why).await;
     }
-    let running = matches!(
-        session.status,
-        AgentSessionStatus::Busy | AgentSessionStatus::Retry
-    );
-    if running && task.state == TaskState::IdleUnconfirmed {
+    if is_running(session.status) && task.state == TaskState::IdleUnconfirmed {
         return moved(state, task, change(TaskState::Working)).await;
     }
     if !finished_since(&session, task.created_ms) {

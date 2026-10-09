@@ -32,7 +32,9 @@ use super::domain::{one_line, Task, TaskBinding, TaskChange, TaskId, TaskState};
 use super::service::SUMMARY_CHARS;
 use crate::agents::tasks as agent_kinds;
 use crate::backend::{AgentStatus, OutputFormat, OutputSource, PaneId, ReadPane};
-use crate::{infer_tmux_agent_status, parts, read_pane_visible_text, terminal_backend};
+use crate::{
+    infer_tmux_agent_status, is_working_line, parts, read_pane_visible_text, terminal_backend,
+};
 use crate::{AppState, SessionConfig};
 
 /// How often a followed pane is read.
@@ -112,6 +114,62 @@ pub(crate) fn done_marker(output: &str) -> Option<String> {
             || summary.trim_matches(|c| c == '.' || c == '…').is_empty();
         (!placeholder).then(|| one_line(summary, SUMMARY_CHARS))
     })
+}
+
+/// The failure of a goal typed into an agent's input box but never sent.
+pub(crate) const NOT_ACCEPTED: &str = "the goal was not accepted by the agent";
+/// How long a typed goal may sit in the input box before Enter is pressed
+/// once more, and again after that, and how often the pane is read meanwhile.
+const ACCEPT_WAIT: Duration = Duration::from_secs(8);
+const ACCEPT_POLL: Duration = Duration::from_secs(1);
+
+/// Whether `prompt` still sits unsent in the agent's input box on `screen`:
+/// the box is what lies between the last two rules drawn across the pane
+/// (Claude Code's), and it holds the prompt's start or a collapsed paste.
+/// A screen with no such box says nothing, so it is never pending.
+pub(crate) fn goal_pending(screen: &str, prompt: &str) -> bool {
+    let lines: Vec<&str> = screen.lines().collect();
+    let rule = |line: &&str| {
+        let line = line.trim();
+        line.chars().count() >= 10 && line.chars().all(|c| c == '─')
+    };
+    let rules: Vec<usize> = (0..lines.len()).filter(|&i| rule(&lines[i])).collect();
+    let [.., top, bottom] = rules[..] else {
+        return false;
+    };
+    let start: String = prompt.trim().chars().take(24).collect();
+    lines[top + 1..bottom]
+        .iter()
+        .any(|line| line.contains("[Pasted text") || (!start.is_empty() && line.contains(&start)))
+}
+
+/// Wait until the goal typed into pane `pane_id` has left the agent's input
+/// box, pressing Enter once more if it has not after [`ACCEPT_WAIT`].
+/// Whether it was sent; a pane that cannot be read is taken as sent.
+pub(crate) async fn goal_accepted(session: &SessionConfig, pane_id: &str, prompt: &str) -> bool {
+    for round in 0..2 {
+        let deadline = tokio::time::Instant::now() + ACCEPT_WAIT;
+        loop {
+            tokio::time::sleep(ACCEPT_POLL).await;
+            match read_pane_visible_text(session, pane_id).await {
+                Ok(screen) if goal_pending(&screen, prompt) => {}
+                _ => return true,
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+        }
+        if round == 0 {
+            let keys = ["Enter".to_owned()];
+            if let Err(error) = terminal_backend(session)
+                .send_keys(&PaneId::new(pane_id), &keys)
+                .await
+            {
+                tracing::debug!(%error, "terminal task: Enter not sent again");
+            }
+        }
+    }
+    false
 }
 
 /// A terminal task's tab and pane title: its label, else the start of its
@@ -203,6 +261,8 @@ pub(crate) fn judge(
     let baseline = *progress.baseline.get_or_insert(seq);
     let moved = matches!((seq, baseline), (Some(now), Some(first)) if now > first);
     match status {
+        // An agent coming up has not taken its goal yet.
+        AgentStatus::Starting if task == TaskState::Dispatching => Verdict::Stay,
         AgentStatus::Starting | AgentStatus::Working => {
             progress.busy = true;
             match task {
@@ -220,6 +280,12 @@ pub(crate) fn judge(
                 Verdict::Waiting
             }
         }
+        // Idle while its goal is still being typed: not a pause.
+        AgentStatus::Idle | AgentStatus::Completed
+            if task == TaskState::Dispatching && elapsed < START_GRACE =>
+        {
+            Verdict::Stay
+        }
         AgentStatus::Idle | AgentStatus::Completed => {
             let paused = progress.busy || moved || elapsed >= UNCONFIRMED_AFTER;
             if paused && progress.idle >= IN_A_ROW && task != TaskState::IdleUnconfirmed {
@@ -232,9 +298,9 @@ pub(crate) fn judge(
     }
 }
 
-/// A paused pane agent's hint, as one line: its last prose block when
-/// `agent` has a transcript dictionary, else the screen's last line with any
-/// letter or digit in it.
+/// A pane agent's hint (paused) or progress (working), as one line: its last
+/// prose block when `agent` has a transcript dictionary, else the screen's
+/// last meaningful line -- never decoration (see [`meaningful`]).
 pub(crate) fn screen_summary(agent: Option<&str>, visible: &str) -> Option<String> {
     let prose = parts::dictionary_for(agent).and_then(|dictionary| {
         parts::normalize_json(visible, Some(dictionary))
@@ -242,11 +308,44 @@ pub(crate) fn screen_summary(agent: Option<&str>, visible: &str) -> Option<Strin
             .rev()
             .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
             .filter_map(|part| part.get("markdown").and_then(Value::as_str))
-            .find(|text| !text.trim().is_empty())
-            .map(str::to_owned)
+            .find_map(|text| {
+                let lines: Vec<&str> = text.lines().filter_map(meaningful).collect();
+                (!lines.is_empty()).then(|| lines.join(" "))
+            })
     });
     let text = prose.or_else(|| last_line(visible))?;
     Some(one_line(&text, SUMMARY_CHARS))
+}
+
+/// Footer and hint text agents draw around their input, not their work.
+const CHROME: [&str; 9] = [
+    "bypass permissions",
+    "? for shortcuts",
+    "esc to interrupt",
+    "shift+tab",
+    "ctrl+",
+    "auto mode",
+    "accept edits",
+    "\u{23f5}\u{23f5}",
+    "Ask Codex to do anything",
+];
+
+/// `line`'s text when it says something: not box drawing or a rule, not
+/// the input prompt (`❯`, `›`, `>`, `$`), not a spinner or a footer hint,
+/// and with at least three letters or digits.
+fn meaningful(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    if trimmed.starts_with(['❯', '›', '>', '$']) || CHROME.iter().any(|c| trimmed.contains(c)) {
+        return None;
+    }
+    let text =
+        trimmed.trim_start_matches(|c: char| !c.is_alphanumeric() && !"([{\"'`/~.".contains(c));
+    let words = text.chars().filter(|c| c.is_alphanumeric()).count();
+    let drawing = text
+        .chars()
+        .filter(|c| ('\u{2500}'..='\u{259f}').contains(c))
+        .count();
+    (words >= 3 && drawing <= words).then_some(text.trim_end())
 }
 
 /// A failed pane task's summary: why, and the screen's last line when the
@@ -262,8 +361,8 @@ fn last_line(visible: &str) -> Option<String> {
     visible
         .lines()
         .rev()
-        .find(|line| line.chars().any(char::is_alphanumeric))
-        .map(|line| line.trim().to_owned())
+        .find_map(meaningful)
+        .map(str::to_owned)
 }
 
 struct Bound<'a> {
@@ -303,8 +402,8 @@ struct Observed {
 
 /// One read of the pane, its agent, its screen and its recent output; `None`
 /// when the backend cannot say.
-async fn observe(at: &Bound<'_>) -> Option<Observed> {
-    let (seen, screen) = observe_agent(at).await?;
+async fn observe(at: &Bound<'_>, rows: &mut Option<usize>) -> Option<Observed> {
+    let (seen, screen) = observe_agent(at, rows).await?;
     let marker = match seen {
         Seen::Gone => None,
         _ => terminal_backend(at.session)
@@ -327,7 +426,19 @@ async fn observe(at: &Bound<'_>) -> Option<Observed> {
     })
 }
 
-async fn observe_agent(at: &Bound<'_>) -> Option<(Seen, Option<String>)> {
+/// Claude Code's tool and message rows (`⏺`) on `screen`.
+fn claude_rows(screen: &str) -> usize {
+    screen
+        .lines()
+        .filter(|line| line.trim_start().starts_with('⏺'))
+        .count()
+}
+
+/// The pane's agent and screen. `rows` carries Claude Code's `⏺` row count
+/// from the poll before: a Claude Code agent reported working counts as
+/// working only with its `esc to interrupt` footer on screen or a row added
+/// since then -- text typed into its input box is not work.
+async fn observe_agent(at: &Bound<'_>, rows: &mut Option<usize>) -> Option<(Seen, Option<String>)> {
     let backend = terminal_backend(at.session);
     let panes = backend.list_panes().await.ok()?;
     let Some(pane) = panes.iter().find(|pane| pane.id.as_str() == at.pane_id) else {
@@ -350,6 +461,16 @@ async fn observe_agent(at: &Bound<'_>) -> Option<(Seen, Option<String>)> {
     let mut status = agent.status;
     if let (AgentStatus::Unknown, Some(_), Some(text)) = (status, &agent.kind, &screen) {
         status = infer_tmux_agent_status(agent.kind.as_deref(), text);
+    }
+    let claude = parts::dictionary_for(agent.kind.as_deref().or(at.agent_id))
+        .is_some_and(|dictionary| dictionary.id == "claude");
+    if let (true, Some(text)) = (claude, &screen) {
+        let now = claude_rows(text);
+        let fresh = rows.is_some_and(|before| now > before);
+        *rows = Some(now);
+        if status == AgentStatus::Working && !fresh && !text.lines().any(is_working_line) {
+            status = AgentStatus::Idle;
+        }
     }
     let seen = Seen::Agent {
         status,
@@ -412,6 +533,7 @@ async fn run(state: &AppState, id: &TaskId) {
     let mut last_marker: Option<String> = None;
     // The screen last read: a closed pane's failure still says what was on it.
     let mut last_screen: Option<String> = None;
+    let mut rows: Option<usize> = None;
     loop {
         let task = match state.tasks.task(id).await {
             Ok(Some(task)) if !task.state.is_terminal() => task,
@@ -426,7 +548,7 @@ async fn run(state: &AppState, id: &TaskId) {
             return;
         };
         let mut now = task.state;
-        if let Some(observed) = observe(&at).await {
+        if let Some(observed) = observe(&at, &mut rows).await {
             let marker = match observed.seen {
                 Seen::Gone => last_marker.take(),
                 _ => observed.marker,
@@ -444,7 +566,7 @@ async fn run(state: &AppState, id: &TaskId) {
                 .as_deref()
                 .and_then(|text| screen_summary(at.agent_id, text))
             {
-                state.tasks.note_progress(id, &line).await;
+                state.tasks.note_progress(state, id, &line).await;
             }
             if let Some(change) = change_for(verdict, at.agent_id, screen.as_deref()) {
                 match state.tasks.move_to(id, change).await {
@@ -568,6 +690,15 @@ mod tests {
                 vec![
                     (T::Dispatching, Seen::NoAgent, None, soon),
                     (T::Dispatching, Seen::NoAgent, None, soon),
+                ],
+                Verdict::Stay,
+            ),
+            (
+                "an agent coming up and idle until its goal is typed is not paused",
+                vec![
+                    (T::Dispatching, agent(Starting, None), None, soon),
+                    (T::Dispatching, agent(Idle, None), None, soon),
+                    (T::Dispatching, agent(Idle, None), None, soon),
                 ],
                 Verdict::Stay,
             ),
@@ -699,5 +830,30 @@ mod tests {
                 "{screen}"
             );
         }
+        // Claude Code: a goal typed but not sent is not work; its footer is.
+        let rule = "─".repeat(40);
+        let unsent = format!(
+            "⏺ Ready.\n{rule}\n❯ [Pasted text #1 +3 lines]\n{rule}\n  ⏵⏵ bypass permissions on\n"
+        );
+        let working = format!("✶ Thinking… (3s · esc to interrupt)\n{rule}\n❯ \n{rule}\n");
+        assert_eq!(
+            infer_tmux_agent_status(Some("claude"), &unsent),
+            AgentStatus::Idle
+        );
+        assert_eq!(
+            infer_tmux_agent_status(Some("claude"), &working),
+            AgentStatus::Working
+        );
+        assert!(goal_pending(&unsent, "fix the build"));
+        assert!(!goal_pending(&working, "fix the build"), "an empty box");
+        assert!(
+            !goal_pending("$ fix the build\n", "fix the build"),
+            "no box: cannot tell"
+        );
+        // The hint and progress skip rules, the prompt and footer hints.
+        assert_eq!(
+            screen_summary(Some("some-agent"), &unsent).as_deref(),
+            Some("Ready.")
+        );
     }
 }

@@ -136,7 +136,7 @@ says `"truncated": true` when it left older ones out. `tasks.wait` and
 | `tasks.wait` | `task_id`; `timeout_s?`: 1..=45, default 30 | The task view, plus `stdout_tail` for a command, and `answer` for a session delegation that is done or `idle_unconfirmed`: the agent's last message in full (`summary` holds only its first 240 characters, on one line). Returns once the task is done, failed, cancelled, `waiting` or `idle_unconfirmed` (its agent stopped without saying it is finished), or when the time is up. Wait up to timeout_s (max 45) for a task to reach done/failed/waiting, or idle_unconfirmed (its agent stopped without completing). Returns the current state and summary; call again while it says working. |
 | `tasks.read` | `task_id`; `what`: `summary` or `timeline`; `cursor?` (timeline only) | `summary`: the task view. `timeline`: `{task_id, items, cursor}`, the most recent agent items after `cursor`; pass the returned `cursor` to read on. Read a task you created: its summary or recent timeline. A command has no timeline. |
 | `tasks.cancel` | `task_id` | The task view after the cancel. Interrupt a task you created. |
-| `tasks.complete` | `summary`: what was done, one line (non-empty, at most 32 KiB; stored cut to 240 characters); `task_id?`: default, the task the calling session works on | The task view, now `done` with that summary. Say that the task you were given is finished. Only the session working on the task may complete it (see [Finishing a delegation](#finishing-a-delegation)); any other task, or none found, is `task_not_found`. A task that has already ended is answered as it stands. |
+| `tasks.complete` | `summary`: what was done, one line (non-empty, at most 32 KiB; stored cut to 240 characters); `task_id?`: default, the task the calling session works on | The task view, now `done` with that summary. Say that the task you were given is finished. Only the session working on the task may complete it (see [Finishing a delegation](#finishing-a-delegation)); any other task, none found, or a task that has already ended is `task_not_found`, whose message tells the agent to print the `MUQUN_TASK_DONE: <one-line summary>` line instead. |
 
 Error codes:
 
@@ -234,11 +234,14 @@ unknown id is `404 task_not_found`; any other failure is `500 task_failed`.
   characters -- for a session delegation the agent's current tool call (its
   title, else its name and command or file; a failed call with its error) or
   the start of its latest message, for a terminal agent the pane's last prose
-  line (the line its hint is read from). A change publishes `task.updated` at
-  most once every 2 s per task (a state change publishes it at once); it is
-  kept in memory, so after a gateway restart it is absent until the agent
-  moves again, and it is dropped when the task ends (the `summary` then says
-  how it ended).
+  line that is not decoration (rules, box drawing, the input prompt,
+  spinners, footer hints such as "bypass permissions on"). Every line is kept
+  as it comes; `task.updated` for it is published at most once every 2 s per
+  task, and a line held back is published when the 2 s are up (a state change
+  publishes it at once). It is kept in memory, so after a gateway restart it
+  is absent until the agent moves again, and it is dropped when the task
+  pauses (`idle_unconfirmed`, `waiting`) or ends: the `summary` then says
+  why.
 - A `failed` task's `summary` is the error as the agent, provider or backend
   gave it: `<name>: <message>` from the session, else the session's last
   failed tool call, status line or message (`the agent session failed:
@@ -332,7 +335,11 @@ instead of `"asid"`. The agent is started and given the goal in the
 background (that can take up to half a minute); the task then moves to
 `working`, or to `failed` with a `summary` naming the step (`agent: …`,
 `prompt: …`, or `the agent start failed: …` if the start itself broke),
-published as `task.updated`. A task cancelled (or failed) while its agent
+published as `task.updated`. A typed goal must leave the agent's input
+box: the pane is read every second, Enter is pressed once more after 8 s,
+and a goal still sitting there 8 s later fails the task with `the goal was
+not accepted by the agent` (a pane with no input box drawn as rules -- Claude
+Code's -- cannot be told and counts as sent). A task cancelled (or failed) while its agent
 starts is not typed into. A command task's pane binding has
 no `agent_id`, so `binding.kind == "pane"` with an `agent_id` is how a client
 tells a terminal agent's task from a command. A terminal agent that is not on
@@ -369,7 +376,7 @@ every poll:
 | The pane | The task |
 |---|---|
 | the marker, as above | `done`, `summary` = the marker's summary |
-| the agent starting or working | `working` (from `dispatching`, or back from `waiting` or `idle_unconfirmed`) |
+| the agent working | `working` (from `dispatching`, or back from `waiting` or `idle_unconfirmed`); an agent still starting, or idle, while its task is `dispatching` (within the start grace) leaves it there. Claude Code counts as working only with its `esc to interrupt` footer on screen or a new `⏺` row since the poll before |
 | the agent blocked on a menu: an approval or a question | `waiting` |
 | the agent idle on two polls in a row, after it was seen working (or after its Herdr state sequence moved), or 30 s after the start | `idle_unconfirmed`, `summary` = a hint: the agent's last prose block when the gateway has a transcript dictionary for it (Claude Code, Codex, ...), else the screen's last line with any letter or digit in it |
 | no agent running in the pane, on two polls in a row, and no marker (a `dispatching` task's agent is given its start timeout plus 15 s first) | `failed`, `summary` = `the agent exited before it finished: <last screen line>` |

@@ -782,7 +782,7 @@ fn task_view_schema() -> Value {
             "kind": { "type": "string", "enum": ["delegation", "command"] },
             "goal": { "type": "string", "description": "The delegated goal, or the command line of a command task" },
             "summary": { "type": ["string", "null"], "description": "A delegation's result as one line of at most 240 characters: the agent's own summary when done, a hint (its last message) when idle_unconfirmed, and when failed the error the agent, provider or backend gave (never a bare word); a command's exit code and output tail" },
-            "progress": { "type": "string", "description": "Only while the task is open, and once something is known (task_ledger_complete): what it is doing now, one line of at most 120 characters -- a session agent's current tool call or the start of its latest message, a terminal agent's last prose line. Updates are published as task.updated at most every 2 s per task; kept in memory, so absent after a gateway restart until the agent moves again" },
+            "progress": { "type": "string", "description": "Only while the task is working (not paused, waiting or ended), and once something is known (task_ledger_complete): what it is doing now, one line of at most 120 characters -- a session agent's current tool call or the start of its latest message, a terminal agent's last prose line. Updates are published as task.updated at most every 2 s per task, a held-back line when the 2 s are up; kept in memory, so absent after a gateway restart until the agent moves again" },
             "exit_code": { "type": ["integer", "null"] },
             "binding": {
                 "type": "object",

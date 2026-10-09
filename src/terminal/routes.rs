@@ -1662,15 +1662,27 @@ pub(crate) fn infer_tmux_agent_status(agent: Option<&str>, visible: &str) -> bac
     if approvals::detect(visible).is_some() {
         return backend::AgentStatus::Blocked;
     }
+    let Some(dictionary) = parts::dictionary_for(agent) else {
+        return backend::AgentStatus::Unknown;
+    };
     // A live working line wins over the input prompt drawn below it: Codex
     // keeps `› Ask Codex to do anything` on screen while it works.
     if visible.lines().any(is_working_line) {
         return backend::AgentStatus::Working;
     }
-    let Some(dictionary) = parts::dictionary_for(agent) else {
-        return backend::AgentStatus::Unknown;
-    };
     let normalized = parts::normalize_json(visible, Some(dictionary));
+    // Claude Code shows its `esc to interrupt` footer for as long as a turn
+    // runs: without it, typed text or a finished tool row is not work.
+    if dictionary.id == "claude" {
+        let prompt = normalized
+            .iter()
+            .any(|part| part.get("type").and_then(Value::as_str) == Some("prompt"));
+        return if prompt {
+            backend::AgentStatus::Idle
+        } else {
+            backend::AgentStatus::Unknown
+        };
+    }
     match normalized
         .last()
         .and_then(|part| part.get("type"))
@@ -1685,7 +1697,7 @@ pub(crate) fn infer_tmux_agent_status(agent: Option<&str>, visible: &str) -> bac
 /// A line an agent draws only while it works: Codex's `• Working (25s • esc
 /// to interrupt)` and `Waiting for background terminal (…)`, and the
 /// `esc to interrupt` footer Codex and Claude Code show during a turn.
-fn is_working_line(line: &str) -> bool {
+pub(crate) fn is_working_line(line: &str) -> bool {
     let text = line.trim_start_matches(|c: char| c.is_whitespace() || "•◦".contains(c));
     text.starts_with("Working (")
         || text.starts_with("Waiting for background terminal (")

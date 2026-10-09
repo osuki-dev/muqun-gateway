@@ -18,7 +18,7 @@ use super::tokens::AssistantSession;
 use crate::fleet::manifest::FleetService;
 use crate::tasks::domain::{clip, TaskBinding, TaskId, TaskPrincipal};
 use crate::tasks::run_command::{RunHandle, RunRequest};
-use crate::tasks::service::{valid_name, DelegateRequest, ReadWhat, TaskError};
+use crate::tasks::service::{summary_line, valid_name, DelegateRequest, ReadWhat, TaskError};
 use crate::AppState;
 
 pub(crate) const MAX_RESULT_BYTES: usize = 16 * 1024;
@@ -173,6 +173,7 @@ fn task_error(error: TaskError) -> CallToolResult {
         ),
         TaskError::UnknownVariant(detail) => invalid(&format!("Unknown variant {detail}.")),
         TaskError::NoTimeline => invalid("Only a delegated task has a timeline."),
+        TaskError::InvalidSummary => invalid("summary must be non-empty and at most 32 KiB"),
         TaskError::NoTerminal => fail(
             "no_terminal",
             "No terminal session is reachable on this computer.",
@@ -452,7 +453,7 @@ impl MuqunMcp {
 
     #[tool(
         name = "tasks.wait",
-        description = "Wait up to timeout_s (max 45) for a task to reach done/failed/waiting, or idle_unconfirmed (its agent stopped without completing). Returns the current state and summary; call again while it says working."
+        description = "Wait up to timeout_s (max 45) for a task to reach done/failed/waiting, or idle_unconfirmed (its agent stopped without completing: read its answer and decide; do not call again while it says idle_unconfirmed). Returns the current state and summary; call again while it says working."
     )]
     async fn tasks_wait(
         &self,
@@ -489,8 +490,8 @@ impl MuqunMcp {
         &self,
         Parameters(args): Parameters<CompleteArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        if args.summary.trim().is_empty() || args.summary.len() > MAX_GOAL_BYTES {
-            return Ok(invalid("summary must be non-empty and at most 32 KiB"));
+        if !matches!(summary_line(&args.summary), Ok(Some(_))) {
+            return Ok(task_error(TaskError::InvalidSummary));
         }
         let mut call = lineage::Call {
             tool: "tasks.complete",
@@ -502,7 +503,11 @@ impl MuqunMcp {
         let wanted = args.task_id.clone().map(TaskId);
         let own = lineage::own_task(&self.state, &self.session, &call, wanted.as_ref()).await;
         let Some(id) = own else {
-            return Ok(task_error(TaskError::NotFound));
+            return Ok(fail(
+                "task_not_found",
+                "No open task of this session was found. If you finished it, print the line \
+                 MUQUN_TASK_DONE: <one-line summary> instead.",
+            ));
         };
         reply(self.state.tasks.complete(&id, &args.summary).await)
     }

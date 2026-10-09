@@ -321,6 +321,9 @@ async fn complete(
                 "task_not_confirmable",
                 "Only a paused or waiting task opened on a device can be confirmed",
             ),
+            TaskError::InvalidSummary => {
+                refused("invalid_request", "summary must be at most 32 KiB")
+            }
             error => failed(error),
         })?;
     Ok(Json(json!(task)))
@@ -662,7 +665,7 @@ mod tests {
                     "tab_id": "w1:t9", "shell_pid": 4242, "agent_id": "codex" })
         );
         let id = TaskId(task["task_id"].as_str().unwrap().into());
-        for _ in 0..200 {
+        for _ in 0..400 {
             if state.tasks.get_for_test(&id).await.state != TaskState::Dispatching {
                 break;
             }
