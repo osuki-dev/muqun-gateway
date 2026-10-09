@@ -836,9 +836,9 @@ impl TaskService {
 }
 
 /// The background half of [`TaskService::delegate_to_pane`]: start the agent
-/// in its placed pane with the goal (on its command line where it takes one;
-/// otherwise typed, unless the task ended meanwhile -- a cancel, or a
-/// follower that gave up on it), then move the task to working and follow
+/// in its placed pane with the goal (on its command line where it takes one,
+/// otherwise typed) unless the task ended meanwhile -- a cancel, or a
+/// follower that gave up on it -- then move the task to working and follow
 /// it -- or fail it naming the step.
 pub(crate) async fn start_terminal_agent(
     state: AppState,
@@ -851,6 +851,19 @@ pub(crate) async fn start_terminal_agent(
 ) {
     use crate::agents::session_routes::{start_agent_in_place, type_agent_prompt};
     let tasks = &state.tasks;
+    // A cancel (or a follower that gave up) while the pane was made or the
+    // agent started: nothing more is started or typed.
+    let ended = || async {
+        match tasks.store.get(&task.id).await {
+            Ok(Some(now)) => now.state.is_terminal(),
+            Ok(None) => true,
+            Err(_) => false,
+        }
+    };
+    if ended().await {
+        tracing::debug!(task = %task.id.0, "terminal task ended before its agent started");
+        return;
+    }
     let pane_id = placed.place.pane_id.clone();
     let (mut launched, to_type) = start_agent_in_place(
         &state,
@@ -863,12 +876,7 @@ pub(crate) async fn start_terminal_agent(
     .await;
     let typed = to_type.is_some();
     if let Some(started) = to_type {
-        let ended = match tasks.store.get(&task.id).await {
-            Ok(Some(now)) => now.state.is_terminal(),
-            Ok(None) => true,
-            Err(_) => false,
-        };
-        if ended {
+        if ended().await {
             tracing::debug!(task = %task.id.0, "terminal task ended while its agent started: goal not typed");
             return;
         }

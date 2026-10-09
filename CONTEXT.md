@@ -238,7 +238,9 @@ have nobody at the terminal to answer a prompt. They start with their own
 bypass flags (`codex --dangerously-bypass-approvals-and-sandbox -c projects=…`
 trusting the task directory and its checkout; `claude
 --dangerously-skip-permissions`, with the directory marked trusted in
-`~/.claude.json` beforehand), replaceable per kind with `agent_launch_args`
+`~/.claude.json` beforehand -- the owner's choice, on by default, switched
+off with `"agent_trust_folders": false`, and only for a directory inside
+their home), replaceable per kind with `agent_launch_args`
 in `config.json` (an empty list disables them), and with `agent_env` (e.g. a
 proxy the gateway's own environment lacks) set on the pane they start in:
 tmux `-e` (3.2+ for a session, 3.0+ for a window or split), Herdr's pane

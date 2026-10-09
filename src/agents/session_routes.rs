@@ -385,7 +385,7 @@ pub(crate) async fn create_task(
         &state.config.agent_launch_args,
     );
     agent_args.extend(body.agent_args.iter().flatten().cloned());
-    trust_claude_folder(&body.agent, Some(agent_cwd)).await;
+    trust_claude_folder(&state, &body.agent, Some(agent_cwd)).await;
     match start_backend_agent(
         &session,
         &place.pane_id,
@@ -718,7 +718,7 @@ pub(crate) async fn start_agent_in_place(
     if let Some((_, args)) = &launch_prompt {
         agent_args.extend(args.iter().cloned());
     }
-    trust_claude_folder(agent, agent_cwd.as_deref()).await;
+    trust_claude_folder(state, agent, agent_cwd.as_deref()).await;
     match start_backend_agent(
         session,
         &place.pane_id,
@@ -1604,13 +1604,27 @@ pub(crate) async fn submit_agent_prompt(
 
 /// Claude Code's folder trust, which lives in its user config rather than
 /// in a flag (Codex's is in its launch arguments): set for `cwd` before
-/// `claude` starts there.
-async fn trust_claude_folder(agent: &str, cwd: Option<&FsPath>) {
-    let (Some(cwd), Some(home), "claude") = (cwd, dirs::home_dir(), agent) else {
+/// `claude` starts there, unless `agent_trust_folders` is off. Bounded by
+/// [`tasks::trust_folder_for_claude`].
+async fn trust_claude_folder(state: &AppState, agent: &str, cwd: Option<&FsPath>) {
+    let (Some(cwd), Some(home), "claude", true) = (
+        cwd,
+        dirs::home_dir(),
+        agent,
+        state.config.agent_trust_folders,
+    ) else {
         return;
     };
-    let (config, cwd) = (home.join(".claude.json"), cwd.to_path_buf());
-    let trust = move || tasks::trust_folder_for_claude(&config, &cwd);
+    // Where the agent's Claude Code reads it: its `agent_env`, then ours.
+    let config_dir = state
+        .config
+        .agent_env
+        .usable()
+        .remove("CLAUDE_CONFIG_DIR")
+        .or_else(|| std::env::var("CLAUDE_CONFIG_DIR").ok());
+    let config = tasks::claude_config_file(config_dir.as_deref(), &home);
+    let cwd = cwd.to_path_buf();
+    let trust = move || tasks::trust_folder_for_claude(&config, &home, &cwd);
     if let Err(error) = tokio::task::spawn_blocking(trust).await {
         tracing::debug!(%error, "claude folder trust skipped");
     }

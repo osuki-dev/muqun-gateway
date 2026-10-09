@@ -135,6 +135,7 @@ pub(crate) fn setup(
             agent_commands: BTreeMap::new(),
             agent_launch_args: BTreeMap::new(),
             agent_env: Default::default(),
+            agent_trust_folders: true,
             rich_agent_pushes: false,
             opencode: agents::OpencodeConfig::default(),
             deepseek: agents::DeepseekConfig::default(),

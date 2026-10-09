@@ -261,63 +261,110 @@ fn trust_roots(cwd: &Path) -> Vec<PathBuf> {
 /// [OPTIONS] [PROMPT]`); `None` for the others, which have it typed. `--`
 /// keeps a prompt that starts with `-` or names a subcommand (`review`) a
 /// prompt, and stops an option that takes several values from eating it.
+///
+/// Also `None` for a prompt with a control character other than a newline:
+/// the launch line is pasted at a shell, and a shell without bracketed paste
+/// reads a Tab, an Esc or a Ctrl-C there as a key, which could edit the line
+/// or leave the quote. Such a prompt is typed into the agent instead.
 pub fn launch_prompt_args(kind: &str, prompt: &str) -> Option<[String; 2]> {
-    matches!(kind, "claude" | "codex").then(|| ["--".to_owned(), prompt.to_owned()])
+    let plain = !prompt.chars().any(|c| c.is_control() && c != '\n');
+    (plain && matches!(kind, "claude" | "codex")).then(|| ["--".to_owned(), prompt.to_owned()])
 }
 
-/// Mark `cwd` trusted for Claude Code in its user config (`~/.claude.json`),
-/// so an agent started there from a phone does not stop at "Do you trust the
+/// Claude Code's user config: `$CLAUDE_CONFIG_DIR/.claude.json` when that is
+/// set (`config_dir`), else `~/.claude.json`.
+pub fn claude_config_file(config_dir: Option<&str>, home: &Path) -> PathBuf {
+    match config_dir.filter(|dir| !dir.is_empty()) {
+        Some(dir) => Path::new(dir).join(".claude.json"),
+        None => home.join(".claude.json"),
+    }
+}
+
+/// Mark `cwd` trusted for Claude Code in its user config `config`, so an
+/// agent started there from a phone does not stop at "Do you trust the
 /// files in this folder?" with nobody at the terminal to answer. Only
-/// `projects["<cwd>"].hasTrustDialogAccepted` is set; every other key is kept.
-/// Nothing is written when it is already set, and nothing at all when the file
-/// cannot be read or is not a JSON object (Claude Code has not been set up).
-pub fn trust_folder_for_claude(config: &Path, cwd: &Path) {
-    let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-    let Some(mut root) = std::fs::read_to_string(config)
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .filter(Value::is_object)
-    else {
-        return;
-    };
-    let key = cwd.to_string_lossy().into_owned();
-    if root
-        .pointer("/projects")
-        .and_then(|projects| projects.get(&key))
-        .and_then(|project| project.get("hasTrustDialogAccepted"))
-        == Some(&Value::Bool(true))
+/// `projects["<cwd>"].hasTrustDialogAccepted` is set; every other key is
+/// kept, in its order.
+///
+/// Bounded: only a directory strictly inside `home`, named without `..`,
+/// once resolved. Nothing is written when the flag is already set, and
+/// nothing at all when the file cannot be read or is not a JSON object
+/// (Claude Code has not been set up).
+pub fn trust_folder_for_claude(config: &Path, home: &Path, cwd: &Path) {
+    if cwd
+        .components()
+        .any(|part| part == std::path::Component::ParentDir)
     {
         return;
     }
-    let projects = &mut root["projects"];
-    if !projects.is_object() {
-        *projects = json!({});
+    let (Ok(cwd), Ok(home)) = (cwd.canonicalize(), home.canonicalize()) else {
+        return;
+    };
+    if cwd == home || !cwd.starts_with(&home) {
+        return;
     }
-    let project = &mut projects[&key];
-    if !project.is_object() {
-        *project = json!({});
-    }
-    project["hasTrustDialogAccepted"] = Value::Bool(true);
-    if let Err(error) = replace_file(config, &root) {
+    let Ok(text) = std::fs::read_to_string(config) else {
+        return;
+    };
+    let Some(trusted) = with_trust(&text, &cwd.to_string_lossy()) else {
+        return;
+    };
+    if let Err(error) = replace_file(config, &trusted) {
         tracing::debug!(%error, "claude folder trust not written");
     }
 }
 
-/// Write `value` to `path` through a sibling file renamed over it, so a
-/// reader never sees half a file, keeping the file's permissions.
-fn replace_file(path: &Path, value: &Value) -> std::io::Result<()> {
-    let mut text = serde_json::to_string_pretty(value)?;
+/// A JSON object read in order, its values kept as they were written.
+type RawObject = indexmap::IndexMap<String, Box<serde_json::value::RawValue>>;
+
+/// `text` (Claude Code's config) with `projects[key].hasTrustDialogAccepted`
+/// set; `None` when it is already set or `text` is not a JSON object. Keys
+/// keep their order, and every value off that path its exact text.
+fn with_trust(text: &str, key: &str) -> Option<String> {
+    use serde_json::value::{to_raw_value, RawValue};
+    const FLAG: &str = "hasTrustDialogAccepted";
+    let object = |raw: Option<&Box<RawValue>>| -> RawObject {
+        raw.and_then(|raw| serde_json::from_str(raw.get()).ok())
+            .unwrap_or_default()
+    };
+    let mut root: RawObject = serde_json::from_str(text).ok()?;
+    let mut projects = object(root.get("projects"));
+    let mut project = object(projects.get(key));
+    if project.get(FLAG).map(|flag| flag.get()) == Some("true") {
+        return None;
+    }
+    project.insert(FLAG.to_owned(), to_raw_value(&true).ok()?);
+    projects.insert(key.to_owned(), to_raw_value(&project).ok()?);
+    root.insert("projects".to_owned(), to_raw_value(&projects).ok()?);
+    let mut text = serde_json::to_string_pretty(&root).ok()?;
     text.push('\n');
+    Some(text)
+}
+
+/// Write `text` to `path` -- to its target, when it is a symlink -- through
+/// a sibling file renamed over it, so a reader never sees half a file. The
+/// sibling is private (0600) from the start, synced before the rename, and
+/// given the file's own permissions.
+fn replace_file(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let path = path.canonicalize()?;
+    let permissions = std::fs::metadata(&path)?.permissions();
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let temp = path.with_file_name(format!(".{name}.muqun-{}", uuid::Uuid::new_v4().simple()));
-    std::fs::write(&temp, text)?;
-    let renamed = std::fs::metadata(path)
-        .and_then(|meta| std::fs::set_permissions(&temp, meta.permissions()))
-        .and_then(|()| std::fs::rename(&temp, path));
-    if renamed.is_err() {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let written = options.open(&temp).and_then(|mut file| {
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        std::fs::set_permissions(&temp, permissions)?;
+        std::fs::rename(&temp, &path)
+    });
+    if written.is_err() {
         std::fs::remove_file(&temp).ok();
     }
-    renamed
+    written
 }
 
 /// Whether a kind is one the gateway will offer and accept.
@@ -853,6 +900,11 @@ mod tests {
             ("claude", "-fix it", Some(["--", "-fix it"])),
             ("codex", "review", Some(["--", "review"])),
             ("gemini", "fix it", None),
+            // A newline is fine; other controls would be keys at the shell.
+            ("claude", "a\nb", Some(["--", "a\nb"])),
+            ("claude", "a\tb", None),
+            ("codex", "a\u{1b}[201~b", None),
+            ("codex", "a\rb", None),
         ] {
             assert_eq!(
                 launch_prompt_args(kind, prompt),
@@ -864,11 +916,15 @@ mod tests {
 
     #[test]
     fn claude_trusts_the_task_folder_through_its_user_config() {
-        let dir = temp_dir("claude-trust");
-        std::fs::create_dir_all(&dir).unwrap();
-        let cwd = dir.canonicalize().unwrap();
+        let home = {
+            let home = temp_dir("claude-trust");
+            std::fs::create_dir_all(&home).unwrap();
+            home.canonicalize().unwrap()
+        };
+        let cwd = home.join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
         let key = cwd.to_string_lossy().into_owned();
-        let config = dir.join(".claude.json");
+        let config = home.join(".claude.json");
         let trusted = json!({ "hasTrustDialogAccepted": true });
         // (file before, file after); `None` is no file / left as it was.
         for (before, after) in [
@@ -886,7 +942,7 @@ mod tests {
                                                            "hasTrustDialogAccepted": true } } })),
             ),
             (
-                Some(json!({})),
+                Some(json!({ "projects": "?" })),
                 Some(json!({ "projects": { key.as_str(): trusted } })),
             ),
             // Claude Code not set up: nothing written.
@@ -896,19 +952,59 @@ mod tests {
             if let Some(before) = &before {
                 std::fs::write(&config, before.to_string()).unwrap();
             }
-            trust_folder_for_claude(&config, &dir);
+            trust_folder_for_claude(&config, &home, &cwd);
             let now = std::fs::read_to_string(&config).ok();
             let now = now.map(|text| serde_json::from_str::<Value>(&text).unwrap());
             assert_eq!(now, after, "{before:?}");
         }
-        // Already trusted, or not JSON: the file is left exactly as it was.
+
+        // Already trusted, not JSON, or a folder it may not trust (outside
+        // home, home itself, named with `..`): the file is left as it was.
         let compact = json!({ "projects": { key.as_str(): trusted } }).to_string();
-        for text in [compact.as_str(), "{ broken"] {
+        let outside = temp_dir("claude-trust-outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        for (text, folder) in [
+            (compact.as_str(), cwd.clone()),
+            ("{ broken", cwd.clone()),
+            ("{}", outside.clone()),
+            ("{}", home.clone()),
+            ("{}", cwd.join("..").join("proj")),
+        ] {
             std::fs::write(&config, text).unwrap();
-            trust_folder_for_claude(&config, &dir);
-            assert_eq!(std::fs::read_to_string(&config).unwrap(), text);
+            trust_folder_for_claude(&config, &home, &folder);
+            assert_eq!(
+                std::fs::read_to_string(&config).unwrap(),
+                text,
+                "{folder:?}"
+            );
         }
-        std::fs::remove_dir_all(&dir).ok();
+
+        // A symlinked config is written at its target, in its key order and
+        // with its mode.
+        let target = home.join("dotfiles.json");
+        std::fs::write(&target, r#"{"zeta":1,"alpha":2}"#).unwrap();
+        std::fs::remove_file(&config).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::os::unix::fs::symlink(&target, &config).unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+            trust_folder_for_claude(&config, &home, &cwd);
+            assert!(config.symlink_metadata().unwrap().is_symlink());
+            let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o640);
+            let written = std::fs::read_to_string(&target).unwrap();
+            let at = |key: &str| written.find(&format!("\"{key}\"")).unwrap();
+            assert!(at("zeta") < at("alpha") && at("alpha") < at("projects"));
+        }
+
+        assert_eq!(
+            claude_config_file(Some("/c"), &home),
+            Path::new("/c/.claude.json")
+        );
+        assert_eq!(claude_config_file(Some(""), &home), config);
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&outside).ok();
     }
 
     #[test]

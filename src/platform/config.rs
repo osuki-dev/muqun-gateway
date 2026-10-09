@@ -93,6 +93,15 @@ pub(crate) struct Config {
     /// the gateway's own environment lacks. Values are never logged.
     #[serde(default, skip_serializing_if = "AgentEnv::is_empty")]
     pub(crate) agent_env: AgentEnv,
+    /// Mark the directory a Claude Code agent is launched in as trusted in
+    /// Claude Code's own config (`projects["<dir>"].hasTrustDialogAccepted`
+    /// in `~/.claude.json`), so it does not stop at "Do you trust the files in
+    /// this folder?" with nobody at the terminal. On by default -- the owner's
+    /// choice, for agents launched from their phone -- and only ever for a
+    /// directory inside their home; `false` leaves that file alone. Omitted
+    /// from a written config while on.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub(crate) agent_trust_folders: bool,
     /// Put the agent's own question, and the answers it is offering, into a
     /// blocked push.
     ///
@@ -219,6 +228,15 @@ pub(crate) fn is_required_transport(mode: &TransportEncryptionMode) -> bool {
 /// `skip_serializing_if` for a flag whose absence is its default.
 pub(crate) fn is_false(value: &bool) -> bool {
     !*value
+}
+
+/// `skip_serializing_if` for a flag that is on when absent.
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// `agent_env`: a map whose `Debug` names the variables but never shows a
@@ -639,6 +657,7 @@ mod tests {
         .unwrap();
         assert_eq!(config.agent_launch_args["codex"], Vec::<String>::new());
         assert_eq!(config.agent_launch_args["claude"], ["--model", "opus"]);
+        assert!(config.agent_trust_folders, "on unless switched off");
         assert!(!format!("{config:?}").contains("pw-q7xz"));
         assert!(format!("{config:?}").contains("HTTPS_PROXY"));
         let usable = config.agent_env.usable();

@@ -325,10 +325,8 @@ pub(crate) fn screen_summary(agent: Option<&str>, visible: &str) -> Option<Strin
 /// Banners, tips and the footer hints agents draw around their input, not
 /// their work. Specific phrases, not words: prose may well mention `ctrl+c`
 /// or auto mode.
-const CHROME: [&str; 14] = [
-    "Update available",
+const CHROME: [&str; 12] = [
     "mise upgrade",
-    "Tip:",
     "? for shortcuts",
     "esc to interrupt",
     "shift+tab to cycle",
@@ -342,6 +340,9 @@ const CHROME: [&str; 14] = [
     "/model to change",
 ];
 
+/// Banner and tip lines, by how they start once their decoration is cut.
+const CHROME_START: [&str; 2] = ["Update available", "Tip:"];
+
 /// `line`'s text when it says something: not box drawing or a rule, not
 /// the agent's input prompt (`❯`, `›`), not a spinner, banner or footer
 /// hint, and with at least three letters or digits. A box's right edge is
@@ -354,6 +355,9 @@ fn meaningful(line: &str) -> Option<&str> {
     let text = trimmed
         .trim_start_matches(|c: char| !c.is_alphanumeric() && !"([{\"'`/~.>$".contains(c))
         .trim_end_matches(|c: char| c == '│' || c.is_whitespace());
+    if CHROME_START.iter().any(|start| text.starts_with(start)) {
+        return None;
+    }
     let words = text.chars().filter(|c| c.is_alphanumeric()).count();
     let drawing = text
         .chars()
@@ -888,6 +892,7 @@ mod tests {
                 "• Press ctrl+c to stop the server; auto mode and accept edits stay on.\n",
                 Some("Press ctrl+c to stop the server; auto mode and accept edits stay on."),
             ),
+            ("Pro Tip: run it twice\n", Some("Pro Tip: run it twice")),
             ("$ cargo test\n", Some("$ cargo test")),
             ("> make check\n› \n", Some("> make check")),
         ] {

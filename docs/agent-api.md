@@ -317,6 +317,16 @@ pane, so these agents start with their own bypass flags by default:
 `config.json` changes this per kind: a non-empty list replaces the defaults,
 an empty list turns them off. A task's own `agent_args` come after them.
 
+Claude Code keeps folder trust in its own config, not in a flag. Before
+`claude` starts in a directory, the gateway sets
+`projects["<dir>"].hasTrustDialogAccepted = true` in
+`$CLAUDE_CONFIG_DIR/.claude.json` (`CLAUDE_CONFIG_DIR` from `agent_env`, else
+the gateway's environment) or `~/.claude.json`. Only that key is written,
+other keys keep their values and order, and only for a directory strictly
+inside the user's home, named without `..`. It is on by default, as the
+owner's choice for agents started from their phone; `"agent_trust_folders":
+false` in `config.json` leaves that file alone.
+
 ```json
 {
   "agent_launch_args": { "codex": [], "claude": ["--permission-mode", "acceptEdits"] },

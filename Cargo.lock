@@ -1487,6 +1487,7 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac",
+ "indexmap",
  "libc",
  "qrcode",
  "reqwest",
