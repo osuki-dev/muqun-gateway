@@ -256,6 +256,70 @@ fn trust_roots(cwd: &Path) -> Vec<PathBuf> {
     unique
 }
 
+/// The arguments that give `kind` its first prompt on its command line, for
+/// the kinds whose CLI takes one (`claude [options] [prompt]`, `codex
+/// [OPTIONS] [PROMPT]`); `None` for the others, which have it typed. `--`
+/// keeps a prompt that starts with `-` or names a subcommand (`review`) a
+/// prompt, and stops an option that takes several values from eating it.
+pub fn launch_prompt_args(kind: &str, prompt: &str) -> Option<[String; 2]> {
+    matches!(kind, "claude" | "codex").then(|| ["--".to_owned(), prompt.to_owned()])
+}
+
+/// Mark `cwd` trusted for Claude Code in its user config (`~/.claude.json`),
+/// so an agent started there from a phone does not stop at "Do you trust the
+/// files in this folder?" with nobody at the terminal to answer. Only
+/// `projects["<cwd>"].hasTrustDialogAccepted` is set; every other key is kept.
+/// Nothing is written when it is already set, and nothing at all when the file
+/// cannot be read or is not a JSON object (Claude Code has not been set up).
+pub fn trust_folder_for_claude(config: &Path, cwd: &Path) {
+    let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let Some(mut root) = std::fs::read_to_string(config)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .filter(Value::is_object)
+    else {
+        return;
+    };
+    let key = cwd.to_string_lossy().into_owned();
+    if root
+        .pointer("/projects")
+        .and_then(|projects| projects.get(&key))
+        .and_then(|project| project.get("hasTrustDialogAccepted"))
+        == Some(&Value::Bool(true))
+    {
+        return;
+    }
+    let projects = &mut root["projects"];
+    if !projects.is_object() {
+        *projects = json!({});
+    }
+    let project = &mut projects[&key];
+    if !project.is_object() {
+        *project = json!({});
+    }
+    project["hasTrustDialogAccepted"] = Value::Bool(true);
+    if let Err(error) = replace_file(config, &root) {
+        tracing::debug!(%error, "claude folder trust not written");
+    }
+}
+
+/// Write `value` to `path` through a sibling file renamed over it, so a
+/// reader never sees half a file, keeping the file's permissions.
+fn replace_file(path: &Path, value: &Value) -> std::io::Result<()> {
+    let mut text = serde_json::to_string_pretty(value)?;
+    text.push('\n');
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let temp = path.with_file_name(format!(".{name}.muqun-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::write(&temp, text)?;
+    let renamed = std::fs::metadata(path)
+        .and_then(|meta| std::fs::set_permissions(&temp, meta.permissions()))
+        .and_then(|()| std::fs::rename(&temp, path));
+    if renamed.is_err() {
+        std::fs::remove_file(&temp).ok();
+    }
+    renamed
+}
+
 /// Whether a kind is one the gateway will offer and accept.
 pub fn is_known_agent_kind(kind: &str, overrides: &BTreeMap<String, String>) -> bool {
     AGENT_KINDS.contains(&kind) || overrides.contains_key(kind)
@@ -782,6 +846,69 @@ mod tests {
             ["--permission-mode"]
         );
         assert_eq!(agent_launch_args("gemini", None, &overrides), ["--yolo"]);
+
+        // The first prompt rides on the command line only where the CLI takes
+        // one, after `--` so it is never read as an option or a subcommand.
+        for (kind, prompt, args) in [
+            ("claude", "-fix it", Some(["--", "-fix it"])),
+            ("codex", "review", Some(["--", "review"])),
+            ("gemini", "fix it", None),
+        ] {
+            assert_eq!(
+                launch_prompt_args(kind, prompt),
+                args.map(|args| args.map(str::to_owned)),
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_trusts_the_task_folder_through_its_user_config() {
+        let dir = temp_dir("claude-trust");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cwd = dir.canonicalize().unwrap();
+        let key = cwd.to_string_lossy().into_owned();
+        let config = dir.join(".claude.json");
+        let trusted = json!({ "hasTrustDialogAccepted": true });
+        // (file before, file after); `None` is no file / left as it was.
+        for (before, after) in [
+            // Other keys and projects kept; the entry made.
+            (
+                Some(json!({ "numStartups": 3, "projects": { "/other": { "x": 1 } } })),
+                Some(json!({ "numStartups": 3,
+                             "projects": { "/other": { "x": 1 }, key.as_str(): trusted } })),
+            ),
+            // An entry of its own keeps its fields.
+            (
+                Some(json!({ "projects": { key.as_str(): { "allowedTools": ["a"],
+                                                           "hasTrustDialogAccepted": false } } })),
+                Some(json!({ "projects": { key.as_str(): { "allowedTools": ["a"],
+                                                           "hasTrustDialogAccepted": true } } })),
+            ),
+            (
+                Some(json!({})),
+                Some(json!({ "projects": { key.as_str(): trusted } })),
+            ),
+            // Claude Code not set up: nothing written.
+            (None, None),
+        ] {
+            std::fs::remove_file(&config).ok();
+            if let Some(before) = &before {
+                std::fs::write(&config, before.to_string()).unwrap();
+            }
+            trust_folder_for_claude(&config, &dir);
+            let now = std::fs::read_to_string(&config).ok();
+            let now = now.map(|text| serde_json::from_str::<Value>(&text).unwrap());
+            assert_eq!(now, after, "{before:?}");
+        }
+        // Already trusted, or not JSON: the file is left exactly as it was.
+        let compact = json!({ "projects": { key.as_str(): trusted } }).to_string();
+        for text in [compact.as_str(), "{ broken"] {
+            std::fs::write(&config, text).unwrap();
+            trust_folder_for_claude(&config, &dir);
+            assert_eq!(std::fs::read_to_string(&config).unwrap(), text);
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

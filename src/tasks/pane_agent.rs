@@ -5,7 +5,8 @@
 //!
 //! An idle agent is not a finished one -- a terminal agent pauses (thinking,
 //! a tool, a long build) and comes back -- so only an explicit signal is
-//! `done`: the goal is typed with [`completion_request`], and the agent
+//! `done`: the goal is given with [`completion_request`] (on the agent's
+//! command line where it takes one, else typed), and the agent
 //! printing a [`DONE_MARKER`] line (or calling `tasks.complete` from the
 //! pane's own token) is that signal. Session delegations follow the same
 //! rule (`service::turn_end`).
@@ -309,7 +310,11 @@ pub(crate) fn screen_summary(agent: Option<&str>, visible: &str) -> Option<Strin
             .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
             .filter_map(|part| part.get("markdown").and_then(Value::as_str))
             .find_map(|text| {
-                let lines: Vec<&str> = text.lines().filter_map(meaningful).collect();
+                let lines: Vec<&str> = text
+                    .lines()
+                    .filter(|line| !line.trim_start().starts_with(['>', '$']))
+                    .filter_map(meaningful)
+                    .collect();
                 (!lines.is_empty()).then(|| lines.join(" "))
             })
     });
@@ -317,35 +322,44 @@ pub(crate) fn screen_summary(agent: Option<&str>, visible: &str) -> Option<Strin
     Some(one_line(&text, SUMMARY_CHARS))
 }
 
-/// Footer and hint text agents draw around their input, not their work.
-const CHROME: [&str; 9] = [
-    "bypass permissions",
+/// Banners, tips and the footer hints agents draw around their input, not
+/// their work. Specific phrases, not words: prose may well mention `ctrl+c`
+/// or auto mode.
+const CHROME: [&str; 14] = [
+    "Update available",
+    "mise upgrade",
+    "Tip:",
     "? for shortcuts",
     "esc to interrupt",
-    "shift+tab",
-    "ctrl+",
-    "auto mode",
-    "accept edits",
+    "shift+tab to cycle",
+    "bypass permissions on",
     "\u{23f5}\u{23f5}",
+    "\u{23f8} plan mode",
     "Ask Codex to do anything",
+    "% context left",
+    "\u{23ce} send",
+    ">_ OpenAI Codex",
+    "/model to change",
 ];
 
 /// `line`'s text when it says something: not box drawing or a rule, not
-/// the input prompt (`❯`, `›`, `>`, `$`), not a spinner or a footer hint,
-/// and with at least three letters or digits.
+/// the agent's input prompt (`❯`, `›`), not a spinner, banner or footer
+/// hint, and with at least three letters or digits. A box's right edge is
+/// cut off.
 fn meaningful(line: &str) -> Option<&str> {
     let trimmed = line.trim();
-    if trimmed.starts_with(['❯', '›', '>', '$']) || CHROME.iter().any(|c| trimmed.contains(c)) {
+    if trimmed.starts_with(['❯', '›']) || CHROME.iter().any(|c| trimmed.contains(c)) {
         return None;
     }
-    let text =
-        trimmed.trim_start_matches(|c: char| !c.is_alphanumeric() && !"([{\"'`/~.".contains(c));
+    let text = trimmed
+        .trim_start_matches(|c: char| !c.is_alphanumeric() && !"([{\"'`/~.>$".contains(c))
+        .trim_end_matches(|c: char| c == '│' || c.is_whitespace());
     let words = text.chars().filter(|c| c.is_alphanumeric()).count();
     let drawing = text
         .chars()
         .filter(|c| ('\u{2500}'..='\u{259f}').contains(c))
         .count();
-    (words >= 3 && drawing <= words).then_some(text.trim_end())
+    (words >= 3 && drawing <= words).then_some(text)
 }
 
 /// A failed pane task's summary: why, and the screen's last line when the
@@ -850,10 +864,38 @@ mod tests {
             !goal_pending("$ fix the build\n", "fix the build"),
             "no box: cannot tell"
         );
-        // The hint and progress skip rules, the prompt and footer hints.
-        assert_eq!(
-            screen_summary(Some("some-agent"), &unsent).as_deref(),
-            Some("Ready.")
-        );
+        // The hint and progress skip rules, the prompt, banners, tips and
+        // footer hints, but not prose that names a key or a mode.
+        for (screen, hint) in [
+            (unsent.as_str(), Some("Ready.")),
+            (
+                "│ Update available! 0.160.0 -> 0.161.0 │\n│ Run mise upgrade codex │\n",
+                None,
+            ),
+            ("  ⎿  Tip: Use /memory to edit memory\n", None),
+            (
+                "│ >_ OpenAI Codex (v0.161.0) │\n│ model: gpt-6 high  /model to change │\n",
+                None,
+            ),
+            ("  ? for shortcuts    100% context left\n", None),
+            ("  ⏎ send   ⌃J newline   ⌃C quit\n", None),
+            ("  ⏸ plan mode on (shift+tab to cycle)\n", None),
+            (
+                "│ the fix is in parse.rs  │\n",
+                Some("the fix is in parse.rs"),
+            ),
+            (
+                "• Press ctrl+c to stop the server; auto mode and accept edits stay on.\n",
+                Some("Press ctrl+c to stop the server; auto mode and accept edits stay on."),
+            ),
+            ("$ cargo test\n", Some("$ cargo test")),
+            ("> make check\n› \n", Some("> make check")),
+        ] {
+            assert_eq!(
+                screen_summary(Some("some-agent"), screen).as_deref(),
+                hint,
+                "{screen}"
+            );
+        }
     }
 }

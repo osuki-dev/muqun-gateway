@@ -957,7 +957,7 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
                 ],
                 "responses": list_responses
             }, "post": {
-                "summary": "Open a delegation from the device: a new agent session with the goal as its first prompt, or, for a terminal agent from the agent catalog (codex, claude, ...), a new pane running it with the goal typed in. Requires the task_ledger_create capability and a device token; a terminal agent needs task_ledger_pane",
+                "summary": "Open a delegation from the device: a new agent session with the goal as its first prompt, or, for a terminal agent from the agent catalog (codex, claude, ...), a new pane running it with the goal as its first prompt (on the command line for codex and claude on tmux, else typed in). Requires the task_ledger_create capability and a device token; a terminal agent needs task_ledger_pane",
                 "requestBody": json_body(json!({
                     "type": "object",
                     "required": ["goal"],

@@ -352,6 +352,10 @@ impl TerminalBackend for TmuxWireIds {
         self.inner.applies_pane_env(via)
     }
 
+    fn takes_launch_prompt(&self) -> bool {
+        self.inner.takes_launch_prompt()
+    }
+
     fn start_agent<'a>(&'a self, request: &'a StartAgent) -> BackendFuture<'a, StartedAgent> {
         Box::pin(async move {
             let native = decode_wire(request.pane_id.as_str(), "pane")?;

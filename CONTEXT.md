@@ -237,7 +237,8 @@ and a terminal-agent delegation through `POST /api/tasks` or `tasks.delegate`)
 have nobody at the terminal to answer a prompt. They start with their own
 bypass flags (`codex --dangerously-bypass-approvals-and-sandbox -c projects=…`
 trusting the task directory and its checkout; `claude
---dangerously-skip-permissions`), replaceable per kind with `agent_launch_args`
+--dangerously-skip-permissions`, with the directory marked trusted in
+`~/.claude.json` beforehand), replaceable per kind with `agent_launch_args`
 in `config.json` (an empty list disables them), and with `agent_env` (e.g. a
 proxy the gateway's own environment lacks) set on the pane they start in:
 tmux `-e` (3.2+ for a session, 3.0+ for a window or split), Herdr's pane
@@ -246,6 +247,10 @@ prefix on the launch line tmux types. Herdr's `agent.start` takes no env, so a
 worktree pane Herdr made itself does not get `agent_env` (the task's steps say
 so). `-e` and the prefix put values on a command line (visible in the local
 process list). `agent_env` values are never logged; `Debug` redacts them.
+On tmux, the spawn route's prompt and a terminal delegation's goal reach
+Claude Code and Codex as the launch line's last argument (`-- '<goal>'`),
+so the goal is on that command line too; other agents, and Herdr, have it
+typed once the agent is up.
 
 ## Verification
 

@@ -841,9 +841,10 @@ impl TaskService {
 }
 
 /// The background half of [`TaskService::delegate_to_pane`]: start the agent
-/// in its placed pane, type the goal unless the task ended meanwhile (a
-/// cancel, or a follower that gave up on it), then move the task to working
-/// and follow it -- or fail it naming the step.
+/// in its placed pane with the goal (on its command line where it takes one;
+/// otherwise typed, unless the task ended meanwhile -- a cancel, or a
+/// follower that gave up on it), then move the task to working and follow
+/// it -- or fail it naming the step.
 pub(crate) async fn start_terminal_agent(
     state: AppState,
     session: crate::SessionConfig,
@@ -856,9 +857,17 @@ pub(crate) async fn start_terminal_agent(
     use crate::agents::session_routes::{start_agent_in_place, type_agent_prompt};
     let tasks = &state.tasks;
     let pane_id = placed.place.pane_id.clone();
-    let (mut launched, started) =
-        start_agent_in_place(&state, &session, &kind, cwd.as_deref(), placed).await;
-    if let Some(started) = started {
+    let (mut launched, to_type) = start_agent_in_place(
+        &state,
+        &session,
+        &kind,
+        cwd.as_deref(),
+        placed,
+        Some(&prompt),
+    )
+    .await;
+    let typed = to_type.is_some();
+    if let Some(started) = to_type {
         let ended = match tasks.store.get(&task.id).await {
             Ok(Some(now)) => now.state.is_terminal(),
             Ok(None) => true,
@@ -873,7 +882,7 @@ pub(crate) async fn start_terminal_agent(
     let why = match failed_step(&launched.steps.value()) {
         Some(why) => Some(why),
         // Typed is not sent: Claude Code can keep a pasted goal in its box.
-        None if !pane_agent::goal_accepted(&session, &pane_id, &prompt).await => {
+        None if typed && !pane_agent::goal_accepted(&session, &pane_id, &prompt).await => {
             Some(pane_agent::NOT_ACCEPTED.to_owned())
         }
         None => None,

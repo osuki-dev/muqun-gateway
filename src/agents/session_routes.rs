@@ -385,6 +385,7 @@ pub(crate) async fn create_task(
         &state.config.agent_launch_args,
     );
     agent_args.extend(body.agent_args.iter().flatten().cloned());
+    trust_claude_folder(&body.agent, Some(agent_cwd)).await;
     match start_backend_agent(
         &session,
         &place.pane_id,
@@ -552,7 +553,9 @@ pub(crate) struct PlacedAgent {
 
 /// The spawn route after its checks: a pane (a split of `tab_id`, or a tab
 /// of its own), the agent started in it with its launch arguments and
-/// `agent_env`, and `prompt` typed and submitted. Shared with the task
+/// `agent_env`, and `prompt` given to it -- on its command line where the
+/// agent and the backend allow (see [`start_agent_in_place`]), else typed and
+/// submitted once it is up. Shared with the task
 /// ledger's terminal delegations (`TaskService::delegate`), so both start an
 /// agent the same way. An `Err` means nothing was created; a failed agent or
 /// prompt step leaves the pane and says so in `steps`.
@@ -597,8 +600,9 @@ pub(crate) async fn place_agent(
     })
 }
 
-/// [`launch_agent`]'s second half: start the agent in the placed pane and
-/// type `prompt` once it is up. Takes as long as the agent takes to start.
+/// [`launch_agent`]'s second half: start the agent in the placed pane with
+/// `prompt`, typing it once the agent is up when it could not go on the
+/// command line. Takes as long as the agent takes to start.
 pub(crate) async fn start_placed_agent(
     state: &AppState,
     session: &SessionConfig,
@@ -607,7 +611,8 @@ pub(crate) async fn start_placed_agent(
     placed: PlacedAgent,
     prompt: Option<&str>,
 ) -> AgentLaunch {
-    let (mut launch, started) = start_agent_in_place(state, session, agent, cwd, placed).await;
+    let (mut launch, started) =
+        start_agent_in_place(state, session, agent, cwd, placed, prompt).await;
     if let Some(started) = started {
         type_agent_prompt(session, &started, prompt, &mut launch).await;
     }
@@ -620,14 +625,22 @@ pub(crate) struct StartedAgent {
     prompt_target: String,
 }
 
-/// Start the agent in the placed pane; `None` beside the launch when it did
-/// not start (the launch's steps say why).
+/// Start the agent in the placed pane. Claude Code and Codex get `prompt`
+/// as their command line's last argument (`-- <prompt>`) on a backend that
+/// takes one: a goal typed into a TUI's input box can sit there unsent. Any
+/// other agent, or backend, is handed back to have it typed
+/// ([`type_agent_prompt`]).
+///
+/// Beside the launch, the agent when it started and its prompt (if any) is
+/// still to be typed; `None` when it did not start or its prompt went with it
+/// (the launch's steps say which).
 pub(crate) async fn start_agent_in_place(
     state: &AppState,
     session: &SessionConfig,
     agent: &str,
     cwd: Option<&str>,
     placed: PlacedAgent,
+    prompt: Option<&str>,
 ) -> (AgentLaunch, Option<StartedAgent>) {
     let PlacedAgent {
         place,
@@ -640,8 +653,15 @@ pub(crate) async fn start_agent_in_place(
     // Without a `cwd` the agent runs wherever the new pane opened, which
     // the backend reports; Codex needs it to pre-trust the folder.
     let agent_cwd = cwd.map(PathBuf::from).or(place.cwd.clone());
-    let agent_args =
+    let mut agent_args =
         tasks::agent_launch_args(agent, agent_cwd.as_deref(), &state.config.agent_launch_args);
+    let launch_prompt = prompt
+        .filter(|_| terminal_backend(session).takes_launch_prompt())
+        .and_then(|prompt| Some((prompt, tasks::launch_prompt_args(agent, prompt)?)));
+    if let Some((_, args)) = &launch_prompt {
+        agent_args.extend(args.iter().cloned());
+    }
+    trust_claude_folder(agent, agent_cwd.as_deref()).await;
     match start_backend_agent(
         session,
         &place.pane_id,
@@ -687,6 +707,11 @@ pub(crate) async fn start_agent_in_place(
             // rather than an error that implies nothing was created.
             return (AgentLaunch { payload, steps }, None);
         }
+    }
+    if let Some((prompt, _)) = launch_prompt {
+        steps.ok("prompt", json!({ "bytes": prompt.len(), "via": "argv" }));
+        payload["prompt_submitted"] = json!(true);
+        return (AgentLaunch { payload, steps }, None);
     }
     let started = StartedAgent {
         pane_id: place.pane_id,
@@ -1530,6 +1555,20 @@ pub(crate) async fn submit_agent_prompt(
             },
             other => HerdrCallError::Unavailable(other.to_string()),
         })
+}
+
+/// Claude Code's folder trust, which lives in its user config rather than
+/// in a flag (Codex's is in its launch arguments): set for `cwd` before
+/// `claude` starts there.
+async fn trust_claude_folder(agent: &str, cwd: Option<&FsPath>) {
+    let (Some(cwd), Some(home), "claude") = (cwd, dirs::home_dir(), agent) else {
+        return;
+    };
+    let (config, cwd) = (home.join(".claude.json"), cwd.to_path_buf());
+    let trust = move || tasks::trust_folder_for_claude(&config, &cwd);
+    if let Err(error) = tokio::task::spawn_blocking(trust).await {
+        tracing::debug!(%error, "claude folder trust skipped");
+    }
 }
 
 async fn start_backend_agent(

@@ -315,8 +315,15 @@ and `tasks.delegate` alike, the gateway opens a new tab in `cwd` in the first
 reachable terminal session, names the tab and pane after the task (its
 `label`, else the first 40 characters of the goal), starts the agent in it
 exactly as `POST /api/sessions/{id}/agents/spawn` does (its bypass launch
-arguments, `agent_env`, Codex's folder trust for `cwd`) and types the goal as
-its first prompt. `cwd` defaults to the home directory for `POST /api/tasks`
+arguments, `agent_env`, folder trust for `cwd`) and gives it the goal as its
+first prompt. Claude Code and Codex on a tmux session get it on their command
+line, `claude <launch args> -- '<goal>'` and `codex <launch args> -- '<goal>'`
+(one single-quoted shell word; newlines, quotes and backticks arrive as
+written); any other agent, and every agent on Herdr (whose start waits for an
+idle agent), has it typed once the agent is up. Folder trust: Codex gets a
+`-c projects={...}` override for this run; for Claude Code,
+`projects["<cwd>"].hasTrustDialogAccepted` is set in `~/.claude.json`
+(merged, nothing else touched, skipped when that file cannot be read). `cwd` defaults to the home directory for `POST /api/tasks`
 and to wherever the backend opens the tab for `tasks.delegate`; it is not held
 to the spawn route's "a directory the session already has open" fence, as no
 other `POST /api/tasks` directory is. `mode`, `model` and `variant` do not
@@ -335,7 +342,8 @@ instead of `"asid"`. The agent is started and given the goal in the
 background (that can take up to half a minute); the task then moves to
 `working`, or to `failed` with a `summary` naming the step (`agent: …`,
 `prompt: …`, or `the agent start failed: …` if the start itself broke),
-published as `task.updated`. A typed goal must leave the agent's input
+published as `task.updated`. A typed goal (not one given on the command
+line) must leave the agent's input
 box: the pane is read every second, Enter is pressed once more after 8 s,
 and a goal still sitting there 8 s later fails the task with `the goal was
 not accepted by the agent` (a pane with no input box drawn as rules -- Claude
@@ -349,7 +357,7 @@ could not be made is `502 agent_error`, the task recorded `failed`.
 
 An idle terminal agent is not a finished one -- it pauses to think, run a
 tool or wait on a long build, and comes back -- so only an explicit signal
-finishes the task. The goal is typed with one more paragraph:
+finishes the task. The goal is given with one more paragraph:
 
 ```
 <goal>

@@ -1187,6 +1187,12 @@ impl TerminalBackend for TmuxBackend {
         })
     }
 
+    /// The launch line is typed at a shell, and the start returns once the
+    /// agent is the pane's program, busy or not.
+    fn takes_launch_prompt(&self) -> bool {
+        true
+    }
+
     fn start_agent<'a>(&'a self, request: &'a StartAgent) -> BackendFuture<'a, StartedAgent> {
         Box::pin(async move {
             let executable = request

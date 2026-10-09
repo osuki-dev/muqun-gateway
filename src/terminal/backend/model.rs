@@ -503,6 +503,14 @@ pub trait TerminalBackend: Send + Sync {
         Box::pin(async { Ok(true) })
     }
     fn start_agent<'a>(&'a self, request: &'a StartAgent) -> BackendFuture<'a, StartedAgent>;
+    /// Whether `start_agent` may be handed the agent's first prompt among
+    /// its arguments. False -- the default -- for a backend whose start waits
+    /// for the agent to sit idle at its input (Herdr's readiness wait), which
+    /// an agent already working on a prompt would not do; it gets the prompt
+    /// typed once it is up.
+    fn takes_launch_prompt(&self) -> bool {
+        false
+    }
     /// Whether `env` on this kind of creation reaches the new pane. False --
     /// the default, and the answer of a backend too old for it -- means the
     /// backend leaves `env` out and the caller has to deliver the variables
