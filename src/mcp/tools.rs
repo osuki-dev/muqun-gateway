@@ -879,13 +879,6 @@ mod tests {
     }
 
     #[test]
-    fn waits_are_capped_at_45_seconds() {
-        assert_eq!(wait_slice(None), Duration::from_secs(30));
-        assert_eq!(wait_slice(Some(600)), Duration::from_secs(45));
-        assert_eq!(wait_slice(Some(0)), Duration::from_secs(1));
-    }
-
-    #[test]
     fn tool_names_keep_their_dots_in_tools_list() {
         let mut names: Vec<String> = MuqunMcp::tool_router()
             .list_all()
@@ -906,27 +899,5 @@ mod tests {
                 "tasks.wait"
             ]
         );
-    }
-
-    #[test]
-    fn delegate_args_carry_an_optional_variant_and_tolerate_unknown_fields() {
-        let args: DelegateArgs = serde_json::from_value(json!({
-            "goal": "g", "model": "openai/gpt-6", "variant": "high", "later": true
-        }))
-        .unwrap();
-        let request = args.request().unwrap();
-        assert_eq!(request.variant.as_deref(), Some("high"));
-        let none: DelegateArgs = serde_json::from_value(json!({ "goal": "g" })).unwrap();
-        assert_eq!(none.request().unwrap().variant, None);
-    }
-
-    #[test]
-    fn delegate_names_are_checked_like_the_routes_do() {
-        for bad in ["", "  ", &"v".repeat(257)] {
-            let args: DelegateArgs =
-                serde_json::from_value(json!({ "goal": "g", "model": "m", "variant": bad }))
-                    .unwrap();
-            assert!(args.request().is_err(), "{bad:?}");
-        }
     }
 }

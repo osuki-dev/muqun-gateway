@@ -800,6 +800,9 @@ pub(crate) struct FakeAgent {
     pub created_with: Arc<Mutex<Vec<Option<agents::domain::ModelRef>>>>,
     /// The text of every prompt sent.
     pub prompts: Arc<Mutex<Vec<String>>>,
+    /// Sessions answered the way OpenCode answers a deleted one: a plain
+    /// HTTP 404 rather than `SessionNotFound`.
+    pub http_404: Vec<String>,
 }
 
 impl FakeAgent {
@@ -815,6 +818,7 @@ impl FakeAgent {
             calls: Arc::default(),
             created_with: Arc::default(),
             prompts: Arc::default(),
+            http_404: Vec::new(),
         }
     }
 
@@ -919,6 +923,11 @@ impl agents::ports::agent::AgentPort for FakeAgent {
         session_id: &'a str,
     ) -> agents::ports::agent::AgentFuture<'a, agents::domain::AgentSessionInfo> {
         Box::pin(async move {
+            if self.http_404.iter().any(|asid| asid == session_id) {
+                return Err(agents::ports::agent::AgentError::RequestFailed(
+                    "HTTP 404 Not Found: no such session".into(),
+                ));
+            }
             self.sessions
                 .iter()
                 .find(|s| s.asid.0 == session_id)

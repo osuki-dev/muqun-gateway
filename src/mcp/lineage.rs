@@ -332,80 +332,95 @@ mod tests {
         }
     }
 
+    /// For an agent token, the parent is the one tracked session running
+    /// this very call (tool and arguments) right now; anything less certain
+    /// is no parent.
     #[tokio::test]
     async fn the_agent_session_running_this_very_call_is_the_parent() {
         let goal = json!({ "goal": "write the tests" });
-        let state = state_with(&[
-            (
+        let sleep = json!({ "command": "sleep 40", "cwd": "/w" });
+        let make = json!({ "command": "make", "cwd": "/w" });
+        let several = || {
+            vec![
+                (
+                    "ses_parent",
+                    calling("muqun_tasks_delegate", "running", goal.clone()),
+                ),
+                (
+                    "ses_waiting",
+                    calling("muqun_tasks_wait", "running", json!({})),
+                ),
+                (
+                    "ses_done",
+                    calling("muqun_tasks_delegate", "completed", goal.clone()),
+                ),
+                // Still streaming its arguments: not yet calling anything.
+                (
+                    "ses_typing",
+                    calling("muqun_tasks_delegate", "pending", goal.clone()),
+                ),
+            ]
+        };
+        let one_in_sleep = || {
+            vec![(
                 "ses_parent",
-                calling("muqun_tasks_delegate", "running", goal.clone()),
+                calling("muqun_exec_run", "running", sleep.clone()),
+            )]
+        };
+        let rows = [
+            (
+                "the session running the call",
+                several(),
+                delegate("write the tests"),
+                true,
+            ),
+            ("another goal", several(), delegate("something else"), false),
+            ("another tool", several(), run("make", "/w"), false),
+            // An untracked session calling exec.run meanwhile is not the
+            // tracked one waiting in its own long exec.run.
+            (
+                "another command",
+                one_in_sleep(),
+                run("cargo test", "/w"),
+                false,
             ),
             (
-                "ses_waiting",
-                calling("muqun_tasks_wait", "running", json!({})),
+                "the same command",
+                one_in_sleep(),
+                run("sleep 40", "/w"),
+                true,
             ),
             (
-                "ses_done",
-                calling("muqun_tasks_delegate", "completed", goal.clone()),
+                "the same command elsewhere",
+                one_in_sleep(),
+                run("sleep 40", "/x"),
+                false,
             ),
-            // Still streaming its arguments: not yet calling anything.
             (
-                "ses_typing",
-                calling("muqun_tasks_delegate", "pending", goal),
+                "two sessions running the same call",
+                vec![
+                    ("ses_a", calling("muqun_exec_run", "running", make.clone())),
+                    ("ses_b", calling("muqun_exec_run", "running", make.clone())),
+                ],
+                run("make", "/w"),
+                false,
             ),
-        ])
-        .await;
-        let parent = working(&state, session_of("ses_parent")).await;
-        for asid in ["ses_waiting", "ses_done", "ses_typing"] {
-            working(&state, session_of(asid)).await;
+        ];
+        for (name, sessions, call, has_parent) in rows {
+            let state = state_with(&sessions).await;
+            let mut parent = None;
+            for (asid, _) in &sessions {
+                let id = working(&state, session_of(asid)).await;
+                if *asid == "ses_parent" {
+                    parent = Some(id);
+                }
+            }
+            let asked = requested(&state, &agent_token(), &call).await;
+            let expected = if has_parent { parent } else { None };
+            assert_eq!(asked.parent, expected, "{name}");
+            assert_eq!(asked.origin, TaskOrigin::Agent, "{name}");
+            assert_eq!(asked.by.id, "agent:opencode");
         }
-
-        let asked = requested(&state, &agent_token(), &delegate("write the tests")).await;
-        assert_eq!(asked.parent, Some(parent));
-        assert_eq!(asked.origin, TaskOrigin::Agent);
-        assert_eq!(asked.by.id, "agent:opencode");
-        // Another goal, or another tool, is not what any of them is running.
-        let other = requested(&state, &agent_token(), &delegate("something else")).await;
-        assert_eq!((other.parent, other.origin), (None, TaskOrigin::Agent));
-        let other = requested(&state, &agent_token(), &run("make", "/w")).await;
-        assert_eq!(other.parent, None);
-    }
-
-    /// A tracked delegation sits in a long `exec.run` while a session the
-    /// gateway does not track calls `exec.run` too: the untracked call is not
-    /// filed under the tracked task.
-    #[tokio::test]
-    async fn an_untracked_session_s_call_of_the_same_tool_gets_no_parent() {
-        let state = state_with(&[(
-            "ses_tracked",
-            calling(
-                "muqun_exec_run",
-                "running",
-                json!({ "command": "sleep 40", "cwd": "/w" }),
-            ),
-        )])
-        .await;
-        let tracked = working(&state, session_of("ses_tracked")).await;
-        let untracked = requested(&state, &agent_token(), &run("cargo test", "/w")).await;
-        assert_eq!(untracked.parent, None);
-        let same = requested(&state, &agent_token(), &run("sleep 40", "/w")).await;
-        assert_eq!(same.parent, Some(tracked), "the positive control");
-        let elsewhere = requested(&state, &agent_token(), &run("sleep 40", "/x")).await;
-        assert_eq!(elsewhere.parent, None);
-    }
-
-    #[tokio::test]
-    async fn two_sessions_running_the_same_call_give_no_parent() {
-        let input = json!({ "command": "make", "cwd": "/w" });
-        let state = state_with(&[
-            ("ses_a", calling("muqun_exec_run", "running", input.clone())),
-            ("ses_b", calling("muqun_exec_run", "running", input)),
-        ])
-        .await;
-        working(&state, session_of("ses_a")).await;
-        working(&state, session_of("ses_b")).await;
-        let asked = requested(&state, &agent_token(), &run("make", "/w")).await;
-        assert_eq!(asked.parent, None, "ambiguous: filed at the top level");
     }
 
     #[tokio::test]

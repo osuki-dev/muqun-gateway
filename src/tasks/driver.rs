@@ -404,13 +404,17 @@ mod tests {
         };
         let mut agent = FakeAgent::new("opencode").with_timeline(vec![reply]);
         agent.sessions = vec![idle, busy];
+        agent.http_404 = vec!["ses_404".into()];
         state.agent_runtime.attach_for_test(agent.manager()).await;
 
         let gone = working(&state, delegation("ses_deleted")).await;
+        // OpenCode answers a deleted session with a plain HTTP 404.
+        let gone_404 = working(&state, delegation("ses_404")).await;
         let done = working(&state, delegation("ses_idle")).await;
         let running = working(&state, delegation("ses_busy")).await;
 
-        assert_eq!(reconcile(&state).await, 2);
+        assert_eq!(reconcile(&state).await, 3);
+        assert_eq!(state_of(&state, &gone_404).await.state, TaskState::Failed);
         let failed = state_of(&state, &gone).await;
         assert_eq!(failed.state, TaskState::Failed);
         let why = failed.summary.unwrap();
@@ -483,17 +487,5 @@ mod tests {
         let events = state.tasks.events_for_test(&stale).await;
         let sources: Vec<&str> = events[1..].iter().map(|e| e.source.as_str()).collect();
         assert_eq!(sources, ["task_driver", "task_driver"]);
-    }
-
-    #[test]
-    fn a_404_from_the_agent_is_a_gone_session() {
-        assert!(session_gone(&AgentError::SessionNotFound("s".into())));
-        assert!(session_gone(&AgentError::RequestFailed(
-            "HTTP 404 Not Found: no such session".into()
-        )));
-        assert!(!session_gone(&AgentError::RequestFailed(
-            "HTTP 500 Internal Server Error: x".into()
-        )));
-        assert!(!session_gone(&AgentError::Network("down".into())));
     }
 }

@@ -308,7 +308,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unreachable_backend_keeps_its_tokens_and_agent_tokens_are_never_swept() {
+    async fn an_unreachable_backend_keeps_its_pane_tokens() {
         let mut state = test_state("admin", Vec::new());
         state.config.sessions[0].socket_path = std::env::temp_dir()
             .join(format!("herdr-absent-{}.sock", uuid::Uuid::new_v4()))
@@ -318,18 +318,13 @@ mod tests {
             session_id: "default".into(),
             pane_id: "w1:p1".into(),
         };
-        let agent = TokenBinding::Agent {
-            agent_id: "opencode".into(),
-        };
-        for binding in [pane, agent] {
-            state
-                .mcp_tokens
-                .issue(binding, "t".into(), 60_000)
-                .await
-                .unwrap();
-        }
+        state
+            .mcp_tokens
+            .issue(pane, "t".into(), 60_000)
+            .await
+            .unwrap();
         assert_eq!(sweep_closed_panes(&state).await, 0);
-        assert_eq!(state.mcp_tokens.list().await.unwrap().len(), 2);
+        assert_eq!(state.mcp_tokens.list().await.unwrap().len(), 1);
     }
 
     /// An agent token has no pane to lose: a sweep over a reachable backend

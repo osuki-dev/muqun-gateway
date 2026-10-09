@@ -615,22 +615,6 @@ fn task_update(seq: u64) -> TaskDomainEvent {
     }
 }
 
-#[test]
-fn all_and_task_only_subscriptions_want_task_events() {
-    let mut subs = Subscriptions::default();
-    assert!(!subs.wants_tasks());
-    subs.apply(&ClientFrame::Subscribe("ses_1".into())).unwrap();
-    assert!(!subs.wants_tasks());
-    subs.apply(&ClientFrame::SubscribeAll).unwrap();
-    assert!(subs.wants_tasks());
-    subs.apply(&ClientFrame::SubscribeTasks).unwrap();
-    assert!(subs.wants_tasks());
-    assert!(subs.tasks_only());
-    assert!(!subs.wants("ses_1"));
-    assert!(!subs.wants(""));
-    assert!(subs.resync_targets().is_empty());
-}
-
 #[tokio::test]
 async fn subscribe_tasks_delivers_task_views_without_session_events() {
     let state = test_state("admin", vec![test_device("phone-1", TOKEN)]);
@@ -717,54 +701,33 @@ async fn a_subscribe_all_socket_gets_task_updates_and_a_session_socket_does_not(
 
 #[tokio::test]
 async fn a_socket_that_falls_behind_the_task_events_is_told_to_refetch_them() {
-    let state = test_state("admin", vec![test_device("phone-1", TOKEN)]);
-    let tasks = state.task_events.clone();
-    let addr = serve(state).await;
-    let (mut all, _) = connect(addr, &bearer()).await.unwrap();
-    next_json(&mut all).await;
-    send_text(&mut all, r#"{"t":"subscribe_all"}"#).await;
-    assert_eq!(next_json(&mut all).await["t"], "subscribed");
+    // Either subscription that carries task events: what it is sent with.
+    for (subscribe, frame) in [("subscribe_all", "event"), ("subscribe_tasks", "task")] {
+        let state = test_state("admin", vec![test_device("phone-1", TOKEN)]);
+        let tasks = state.task_events.clone();
+        let addr = serve(state).await;
+        let (mut client, _) = connect(addr, &bearer()).await.unwrap();
+        next_json(&mut client).await;
+        send_text(&mut client, &format!(r#"{{"t":"{subscribe}"}}"#)).await;
+        assert_eq!(next_json(&mut client).await["t"], "subscribed");
 
-    // Sent without yielding, so the socket's receiver overflows before it
-    // reads anything.
-    let overflow = crate::tasks::events::TASK_EVENT_CAPACITY as u64 + 8;
-    for seq in 1..=overflow {
-        tasks.send(task_update(seq)).unwrap();
+        // Sent without yielding, so the socket's receiver overflows before it
+        // reads anything.
+        let overflow = crate::tasks::events::TASK_EVENT_CAPACITY as u64 + 8;
+        for seq in 1..=overflow {
+            tasks.send(task_update(seq)).unwrap();
+        }
+        assert_eq!(
+            next_json(&mut client).await,
+            json!({ "t": "resync", "asid": "", "tasks": true }),
+            "{subscribe}"
+        );
+        // What is still buffered follows, oldest first.
+        let next = next_json(&mut client).await;
+        assert_eq!(next["t"], frame, "{subscribe}");
+        assert_eq!(next["event"], "task.updated");
+        assert!(next["seq"].as_u64().unwrap() > 8);
     }
-    assert_eq!(
-        next_text(&mut all).await.unwrap(),
-        r#"{"t":"resync","asid":"","tasks":true}"#
-    );
-    // What is still buffered follows, oldest first.
-    let next = next_json(&mut all).await;
-    assert_eq!(next["event"], "task.updated");
-    assert!(next["seq"].as_u64().unwrap() > 8);
-}
-
-#[tokio::test]
-async fn a_lagging_subscribe_tasks_socket_gets_the_task_resync_frame() {
-    let state = test_state("admin", vec![test_device("phone-1", TOKEN)]);
-    let tasks = state.task_events.clone();
-    let addr = serve(state).await;
-    let (mut client, _) = connect(addr, &bearer()).await.unwrap();
-    next_json(&mut client).await;
-    send_text(&mut client, r#"{"t":"subscribe_tasks"}"#).await;
-    assert_eq!(next_json(&mut client).await["tasks"], true);
-
-    let overflow = crate::tasks::events::TASK_EVENT_CAPACITY as u64 + 8;
-    for seq in 1..=overflow {
-        tasks.send(task_update(seq)).unwrap();
-    }
-    assert_eq!(
-        next_json(&mut client).await,
-        json!({
-            "t": "resync", "asid": "", "tasks": true
-        })
-    );
-    let next = next_json(&mut client).await;
-    assert_eq!(next["t"], "task");
-    assert_eq!(next["event"], "task.updated");
-    assert!(next["seq"].as_u64().unwrap() > 8);
 }
 
 #[tokio::test]

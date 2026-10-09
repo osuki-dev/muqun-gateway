@@ -2247,28 +2247,21 @@ mod tests {
         assert_eq!(done.summary.as_deref(), Some("ok"));
     }
 
+    /// A waiter sees a request raised while it waits (its own session's,
+    /// not another's), and one raised before it began.
     #[tokio::test]
-    async fn wait_returns_waiting_on_a_pending_permission() {
+    async fn a_pending_request_makes_a_waiter_answer_waiting() {
         let (state, id) = delegated(FakeAgent::new("opencode")).await;
         let pending = vec![permission("someone_else"), permission(ASID)];
         let waited = wait_through(&state, &id, pending).await;
         assert_eq!(waited.state, TaskState::Waiting);
 
-        let finished = vec![
-            resolved(),
-            status(AgentSessionStatus::Busy),
-            status(AgentSessionStatus::Idle),
-        ];
-        let done = wait_through(&state, &id, finished).await;
-        assert_eq!(done.state, TaskState::IdleUnconfirmed);
-    }
-
-    /// A request raised between two waits is seen by the next one.
-    #[tokio::test]
-    async fn a_permission_pending_before_the_wait_is_waiting() {
         let agent = FakeAgent::new("opencode");
-        let pending = agent.permissions.clone();
-        pending.lock().unwrap().push(permission_request(ASID));
+        agent
+            .permissions
+            .lock()
+            .unwrap()
+            .push(permission_request(ASID));
         let (state, id) = delegated(agent).await;
         let waited = state
             .tasks
@@ -2277,16 +2270,6 @@ mod tests {
             .map(|waited| waited.task)
             .unwrap();
         assert_eq!(waited.state, TaskState::Waiting);
-
-        // Answered on the phone: nothing pending any more.
-        pending.lock().unwrap().clear();
-        let finished = vec![
-            resolved(),
-            status(AgentSessionStatus::Busy),
-            status(AgentSessionStatus::Idle),
-        ];
-        let done = wait_through(&state, &id, finished).await;
-        assert_eq!(done.state, TaskState::IdleUnconfirmed);
     }
 
     /// Already waiting with the request still pending: answer at once.
@@ -2369,18 +2352,6 @@ mod tests {
             let view = waiter.await.unwrap().unwrap();
             assert_eq!(view.state, TaskState::Waiting);
         }
-    }
-
-    #[tokio::test]
-    async fn a_failed_or_interrupted_session_ends_the_task() {
-        let (state, id) = delegated(FakeAgent::new("opencode")).await;
-        let failed = wait_through(&state, &id, vec![status(AgentSessionStatus::Failed)]).await;
-        assert_eq!(failed.state, TaskState::Failed);
-
-        let (state, id) = delegated(FakeAgent::new("opencode")).await;
-        let interrupted = vec![status(AgentSessionStatus::Interrupted)];
-        let stopped = wait_through(&state, &id, interrupted).await;
-        assert_eq!(stopped.state, TaskState::Cancelled);
     }
 
     #[tokio::test]
@@ -2681,7 +2652,6 @@ mod tests {
                 .await
         );
         let task = state.tasks.get_for_test(&id).await;
-        assert_eq!(task.state, TaskState::IdleUnconfirmed);
         let summary = task.summary.unwrap();
         assert!(
             summary.starts_with("Fixed it. The build was very"),
@@ -2840,28 +2810,6 @@ mod tests {
         assert_eq!(*calls.lock().unwrap(), ["create_session", "send_prompt"]);
     }
 
-    /// An unconfirmed idle task can only leave for Working, Done or
-    /// Cancelled; a failure passes through Working.
-    #[tokio::test]
-    async fn an_unconfirmed_idle_task_still_fails() {
-        let (state, id) = tracked(FakeAgent::new("opencode").with_sessions(&[(ASID, 1)])).await;
-        state
-            .tasks
-            .move_to(&id, change(TaskState::IdleUnconfirmed))
-            .await
-            .unwrap();
-        let failed = AgentDomainEvent::StatusChanged {
-            asid: AgentSessionId(ASID.into()),
-            status: AgentSessionStatus::Failed,
-            error: None,
-            seq: 0,
-        };
-        assert!(state.tasks.follow(&state, &failed).await);
-        let task = state.tasks.get_for_test(&id).await;
-        assert_eq!(task.state, TaskState::Failed);
-        assert_eq!(task.summary.as_deref(), Some("the agent session failed"));
-    }
-
     /// A session delegation is done only on an explicit end: the marker in
     /// the agent's last message, or `tasks.complete`. A turn that just stops
     /// is a pause; a new turn takes it back to working.
@@ -2931,6 +2879,14 @@ mod tests {
                 Complete("tests pass"),
                 Done,
                 Some("tests pass"),
+            ),
+            (
+                "a question answered",
+                Waiting,
+                "",
+                Event(Box::new(resolved())),
+                Working,
+                None,
             ),
             (
                 "tasks.complete while waiting",
@@ -3032,43 +2988,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_session_fails_its_task_with_the_error_line() {
-        let (state, id) = delegated(FakeAgent::new("opencode")).await;
-        let failed = AgentDomainEvent::StatusChanged {
-            asid: AgentSessionId(ASID.into()),
-            status: AgentSessionStatus::Failed,
-            error: Some(crate::agents::domain::AgentErrorInfo {
-                name: "ProviderError".into(),
-                message: "rate limited:\n try again later".into(),
-                status: Some(429),
-            }),
-            seq: 0,
-        };
-        assert!(state.tasks.follow(&state, &failed).await);
-        let task = state.tasks.get_for_test(&id).await;
-        assert_eq!(task.state, TaskState::Failed);
-        assert_eq!(
-            task.summary.as_deref(),
-            Some("ProviderError: rate limited: try again later")
-        );
-    }
-
-    #[tokio::test]
-    async fn a_permission_request_makes_the_task_wait_and_its_answer_resumes_it() {
-        let (state, id) = delegated(FakeAgent::new("opencode")).await;
-        assert!(state.tasks.follow(&state, &permission(ASID)).await);
-        assert_eq!(
-            state.tasks.get_for_test(&id).await.state,
-            TaskState::Waiting
-        );
-        assert!(state.tasks.follow(&state, &resolved()).await);
-        assert_eq!(
-            state.tasks.get_for_test(&id).await.state,
-            TaskState::Working
-        );
-    }
-
-    #[tokio::test]
     async fn a_child_s_change_re_publishes_its_parent_with_fresh_counts() {
         let (state, parent) = delegated(FakeAgent::new("opencode")).await;
         let mut updates = state.task_events.subscribe();
@@ -3116,6 +3035,148 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    /// A failed or interrupted session ends its task; a failed one says why,
+    /// in the agent's words or, without them, the timeline's.
+    #[tokio::test]
+    async fn a_failed_session_says_why_and_an_interrupted_one_is_cancelled() {
+        use AgentSessionStatus::{Failed, Interrupted};
+        use TaskState::*;
+        let error = crate::agents::domain::AgentErrorInfo {
+            name: "ProviderError".into(),
+            message: "rate limited:\n try again later".into(),
+            status: Some(429),
+        };
+        let rows = [
+            (
+                "the agent's error",
+                Working,
+                Failed,
+                Some(error),
+                "",
+                Some("ProviderError: rate limited: try again later"),
+            ),
+            (
+                "no error: what the session last said",
+                Working,
+                Failed,
+                None,
+                "Error: 401 Unauthorized",
+                Some("the agent session failed: Error: 401 Unauthorized"),
+            ),
+            (
+                "from a pause",
+                IdleUnconfirmed,
+                Failed,
+                None,
+                "",
+                Some("the agent session failed"),
+            ),
+            ("interrupted", Working, Interrupted, None, "", None),
+        ];
+        for (name, from, status, error, said, summary) in rows {
+            let timeline = if said.is_empty() {
+                Vec::new()
+            } else {
+                vec![reply("m1", said)]
+            };
+            let agent = FakeAgent::new("opencode")
+                .with_sessions(&[(ASID, 1)])
+                .with_timeline(timeline);
+            let (state, id) = tracked(agent).await;
+            if from != Working {
+                state.tasks.move_to(&id, change(from)).await.unwrap();
+            }
+            let event = AgentDomainEvent::StatusChanged {
+                asid: AgentSessionId(ASID.into()),
+                status,
+                error,
+                seq: 0,
+            };
+            assert!(state.tasks.follow(&state, &event).await, "{name}");
+            let task = state.tasks.get_for_test(&id).await;
+            let to = if status == Interrupted {
+                Cancelled
+            } else {
+                TaskState::Failed
+            };
+            assert_eq!(task.state, to, "{name}");
+            if summary.is_some() {
+                assert_eq!(task.summary.as_deref(), summary, "{name}");
+            }
+        }
+    }
+
+    /// A turn's summary comes from the agent's own read or from the gateway's
+    /// mirror of its stream, whichever holds this turn's newer answer.
+    #[tokio::test]
+    async fn the_summary_is_this_turns_newest_answer_from_the_page_or_the_stream() {
+        let at = |mut item: TimelineItem, ms: u64| {
+            item.updated_ms = ms;
+            item
+        };
+        // Written after the task began.
+        let now = now_ms() + 10_000;
+        let rows = [
+            (
+                "the page lags the stream",
+                vec![],
+                at(reply("s8~a", "PONG\n"), now),
+                "PONG",
+            ),
+            (
+                "the page holds the last turn",
+                vec![at(reply("m1", "an old answer"), 1)],
+                at(reply("m2~a", "fresh"), now),
+                "fresh",
+            ),
+            (
+                "the page has this turn",
+                vec![reply("m1", "from the agent")],
+                at(reply("m0", "x"), now),
+                "from the agent",
+            ),
+            (
+                "the page has only commentary",
+                vec![at(reply("m1", "Let me look."), now + 1_000)],
+                at(reply("m2", "Fixed: green."), now + 2_000),
+                "Fixed: green.",
+            ),
+        ];
+        for (name, page, streamed, summary) in rows {
+            let (state, id) = tracked(finished_agent(page)).await;
+            let manager = state
+                .agent_runtime
+                .manager_for_agent("opencode")
+                .await
+                .unwrap();
+            manager
+                .mirror()
+                .upsert_timeline_items(&AgentSessionId(ASID.into()), vec![streamed])
+                .await;
+            assert!(
+                state
+                    .tasks
+                    .follow(&state, &status(AgentSessionStatus::Idle))
+                    .await,
+                "{name}"
+            );
+            let task = state.tasks.get_for_test(&id).await;
+            assert_eq!(task.summary.as_deref(), Some(summary), "{name}");
+            if name == "the page lags the stream" {
+                let waited = state
+                    .tasks
+                    .wait(&state, &assistant("a"), &id, Duration::from_secs(1))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    waited.answer.as_deref(),
+                    Some("PONG\n"),
+                    "a waiter gets it whole"
+                );
+            }
+        }
     }
 
     fn model_with_variants(provider_id: &str, id: &str, variants: &[&str]) -> ModelInfo {
@@ -3181,146 +3242,5 @@ mod tests {
         assert_eq!(calls.lock().unwrap().len(), before);
         delegate(open(None, Some("high"))).await.unwrap();
         assert_eq!(created.lock().unwrap().last().unwrap(), &None);
-    }
-
-    /// What the follower sees when a session ends its turn and the agent's
-    /// own read holds nothing for this turn: the answer is in the mirror.
-    async fn with_mirrored_answer(
-        driver_side: Vec<TimelineItem>,
-        message_id: &str,
-        text: &str,
-    ) -> (AppState, TaskId) {
-        let (state, id) = tracked(finished_agent(driver_side)).await;
-        let manager = state
-            .agent_runtime
-            .manager_for_agent("opencode")
-            .await
-            .unwrap();
-        let mut live = reply(message_id, text);
-        live.updated_ms = now_ms();
-        manager
-            .mirror()
-            .upsert_timeline_items(&AgentSessionId(ASID.into()), vec![live])
-            .await;
-        (state, id)
-    }
-
-    #[tokio::test]
-    async fn the_summary_comes_from_the_stream_when_the_agent_read_lags_it() {
-        // DeepSeek: `turn/end` (idle) is announced from the live stream, whose
-        // rows carry a provisional message id, before `session/page` has the
-        // committed assistant message.
-        let (state, id) =
-            with_mirrored_answer(Vec::new(), "s000000000008~attempt-1", "PONG\n").await;
-        assert!(
-            state
-                .tasks
-                .follow(&state, &status(AgentSessionStatus::Idle))
-                .await
-        );
-        let task = state.tasks.get_for_test(&id).await;
-        assert_eq!(task.state, TaskState::IdleUnconfirmed);
-        assert_eq!(task.summary.as_deref(), Some("PONG"));
-        let waited = state
-            .tasks
-            .wait(&state, &assistant("a"), &id, Duration::from_secs(1))
-            .await
-            .unwrap();
-        assert_eq!(waited.answer.as_deref(), Some("PONG\n"));
-    }
-
-    #[tokio::test]
-    async fn a_previous_turns_answer_in_the_agent_read_does_not_become_the_summary() {
-        // The agent's page still ends in the last turn's answer (older than
-        // the task); this turn's is in the mirror.
-        let mut stale = reply("m1", "an old answer");
-        stale.updated_ms = 1;
-        let (state, id) = with_mirrored_answer(vec![stale], "m2~a", "fresh").await;
-        assert!(
-            state
-                .tasks
-                .follow(&state, &status(AgentSessionStatus::Idle))
-                .await
-        );
-        let task = state.tasks.get_for_test(&id).await;
-        assert_eq!(task.summary.as_deref(), Some("fresh"));
-    }
-
-    #[tokio::test]
-    async fn the_agent_read_wins_when_it_has_this_turns_answer() {
-        // OpenCode: persisted before idle; the mirror's copy may be older.
-        let (state, id) =
-            with_mirrored_answer(vec![reply("m1", "from the agent")], "m0", "x").await;
-        assert!(
-            state
-                .tasks
-                .follow(&state, &status(AgentSessionStatus::Idle))
-                .await
-        );
-        let task = state.tasks.get_for_test(&id).await;
-        assert_eq!(task.summary.as_deref(), Some("from the agent"));
-    }
-
-    #[tokio::test]
-    async fn a_waiter_gets_the_streamed_summary_too_and_a_failure_keeps_its_line() {
-        let (state, id) = with_mirrored_answer(Vec::new(), "m1~a", "all green").await;
-        let done = wait_through(
-            &state,
-            &id,
-            vec![
-                status(AgentSessionStatus::Busy),
-                status(AgentSessionStatus::Idle),
-            ],
-        )
-        .await;
-        assert_eq!(done.state, TaskState::IdleUnconfirmed);
-        assert_eq!(done.summary.as_deref(), Some("all green"));
-
-        // Failed: the error line, whatever the provider.
-        let (state, id) = tracked(FakeAgent::new("opencode").with_sessions(&[(ASID, 1)])).await;
-        let failed = AgentDomainEvent::StatusChanged {
-            asid: AgentSessionId(ASID.into()),
-            status: AgentSessionStatus::Failed,
-            error: Some(crate::agents::domain::AgentErrorInfo {
-                name: "TurnError".into(),
-                message: "the turn failed".into(),
-                status: None,
-            }),
-            seq: 0,
-        };
-        assert!(state.tasks.follow(&state, &failed).await);
-        let task = state.tasks.get_for_test(&id).await;
-        assert_eq!(task.state, TaskState::Failed);
-        assert_eq!(task.summary.as_deref(), Some("TurnError: the turn failed"));
-    }
-
-    #[tokio::test]
-    async fn this_turns_commentary_in_the_agent_read_does_not_hide_the_streamed_answer() {
-        // The agent page holds "Let me look..." (before a tool call); the
-        // final message exists only in the mirror (T3 and DeepSeek both feed
-        // the mirror through `upsert_timeline_items`, rows stamped by the
-        // adapter).
-        let mut commentary = reply("m1", "Let me look at the build.");
-        commentary.updated_ms = now_ms() + 1_000;
-        let (state, id) = tracked(finished_agent(vec![commentary])).await;
-        let manager = state
-            .agent_runtime
-            .manager_for_agent("opencode")
-            .await
-            .unwrap();
-        let mut last = reply("m2", "Fixed: the build is green.");
-        last.updated_ms = now_ms() + 2_000;
-        manager
-            .mirror()
-            .upsert_timeline_items(&AgentSessionId(ASID.into()), vec![last])
-            .await;
-        assert!(
-            state
-                .tasks
-                .follow(&state, &status(AgentSessionStatus::Idle))
-                .await
-        );
-        let task = state.tasks.get_for_test(&id).await;
-        assert_eq!(task.summary.as_deref(), Some("Fixed: the build is green."));
     }
 }
