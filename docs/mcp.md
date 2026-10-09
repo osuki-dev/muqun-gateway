@@ -388,7 +388,7 @@ characters).
 
 The task follows the pane as the terminal backend reports it (Herdr's own
 agent state; on tmux, the state read off the screen), polled every 2 s (every
-12 s while it is `idle_unconfirmed`, backing off to every 5 min while
+12 s while it is `idle_unconfirmed`, backing off to every 60 s while
 nothing changes), recorded with source `pane_follower` and
 published as `task.updated` like every change. The marker is checked first on
 every poll:

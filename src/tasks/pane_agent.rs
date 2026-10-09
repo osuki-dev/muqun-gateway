@@ -46,8 +46,9 @@ const POLL: Duration = Duration::from_secs(2);
 /// never prints the marker must not cost a poll every two seconds forever.
 const PAUSED_POLL: Duration = Duration::from_secs(12);
 /// The longest wait between reads of a paused task's pane that stays as it
-/// is: a forgotten task costs a few backend calls every five minutes.
-const MAX_PAUSED_POLL: Duration = Duration::from_secs(5 * 60);
+/// is: a forgotten task costs a few backend calls a minute, and a card on
+/// the phone is never more than a minute behind its pane.
+const MAX_PAUSED_POLL: Duration = Duration::from_secs(60);
 /// Lines of recent output searched for the marker.
 const MARKER_LINES: u32 = 200;
 /// A tab and pane title's length, from the goal.
@@ -603,29 +604,28 @@ async fn run(state: &AppState, id: &TaskId) {
         }
         let unchanged = last == Some((seq, seen));
         last = Some((seq, seen));
-        quiet = if now == TaskState::IdleUnconfirmed && unchanged {
-            quiet + 1
-        } else {
-            0
-        };
-        let pause = if now == TaskState::IdleUnconfirmed {
-            paused_poll(quiet)
-        } else {
-            POLL
-        };
+        let (next, pause) = paused_poll(quiet, now, unchanged);
+        quiet = next;
         tokio::time::sleep(pause).await;
     }
 }
 
-/// How long to wait before reading a paused (`idle_unconfirmed`) task's pane
-/// again, after `quiet` polls in a row that found it unchanged:
-/// [`PAUSED_POLL`], doubling up to [`MAX_PAUSED_POLL`]. Any change -- the
-/// task moved, the agent's state or state sequence -- starts again from the
-/// shortest.
-fn paused_poll(quiet: u32) -> Duration {
-    PAUSED_POLL
+/// The quiet count and the wait before the next read, given `quiet` polls
+/// in a row that found a paused (`idle_unconfirmed`) task unchanged before
+/// this one, the task's state `now`, and whether this poll found it
+/// `unchanged`. A paused task waits [`PAUSED_POLL`], doubling with each
+/// unchanged poll up to [`MAX_PAUSED_POLL`]; any change -- the task moved,
+/// the agent's state or state sequence -- starts again from the shortest.
+/// Any other state is read every [`POLL`].
+fn paused_poll(quiet: u32, now: TaskState, unchanged: bool) -> (u32, Duration) {
+    if now != TaskState::IdleUnconfirmed {
+        return (0, POLL);
+    }
+    let quiet = if unchanged { quiet + 1 } else { 0 };
+    let pause = PAUSED_POLL
         .saturating_mul(1 << quiet.min(8))
-        .min(MAX_PAUSED_POLL)
+        .min(MAX_PAUSED_POLL);
+    (quiet, pause)
 }
 
 /// Send the pane agent its interrupt key (best effort), only while the pane
@@ -649,6 +649,35 @@ pub(crate) async fn interrupt(state: &AppState, task: &Task) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_paused_task_is_read_less_often_while_nothing_changes() {
+        use TaskState::{IdleUnconfirmed as Paused, Working};
+        let s = Duration::from_secs;
+        // Successive polls of one follower: (task state, unchanged since the
+        // last poll) and the wait before the next read.
+        let mut quiet = 0;
+        for (step, (now, unchanged, wait)) in [
+            (Paused, false, s(12)),
+            (Paused, true, s(24)),
+            (Paused, true, s(48)),
+            (Paused, true, s(60)),
+            (Paused, true, s(60)),
+            // A change starts the curve again.
+            (Paused, false, s(12)),
+            (Paused, true, s(24)),
+            // Not paused: the ordinary poll, and the count is gone.
+            (Working, true, POLL),
+            (Paused, true, s(24)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (next, pause) = paused_poll(quiet, now, unchanged);
+            assert_eq!(pause, wait, "poll {step}");
+            quiet = next;
+        }
+    }
 
     #[test]
     fn the_pane_agent_s_state_moves_the_task() {

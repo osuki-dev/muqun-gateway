@@ -2083,6 +2083,22 @@ mod tests {
     use crate::*;
 
     #[test]
+    fn folder_trust_off_trusts_no_folder() {
+        // This checkout: inside home wherever the tests run from one.
+        let cwd = FsPath::new(env!("CARGO_MANIFEST_DIR"));
+        let inside_home = dirs::home_dir().is_some_and(|home| {
+            let (cwd, home) = (cwd.canonicalize().unwrap(), home.canonicalize().unwrap());
+            cwd != home && cwd.starts_with(home)
+        });
+        for (trust_folders, trusted) in [(false, false), (true, inside_home)] {
+            let mut state = test_state("admin", Vec::new());
+            state.config.agent_trust_folders = trust_folders;
+            let folders = trusted_folders(&state, Some(cwd));
+            assert_eq!(!folders.is_empty(), trusted, "{trust_folders}");
+        }
+    }
+
+    #[test]
     fn agent_splits_preserve_a_readable_terminal() {
         for rows in [0, 5, 20, 40, 47] {
             assert!(!can_split_agent_pane(Some(rows)));

@@ -190,7 +190,7 @@ unsent in the input box, and fails the task if it never leaves. `pane_agent::fol
 (resumed by `driver.rs` after a restart) reads the pane every 2 s: an agent
 starting or working is `working`, one blocked on a menu is `waiting`, one idle
 on two polls after it was seen busy (or after 30 s) is `idle_unconfirmed`
-(polled every 12 s, backing off to 5 min while nothing changes), and a pane
+(polled every 12 s, backing off to 60 s while nothing changes), and a pane
 that closed or lost its agent is `failed`.
 `done` needs an explicit signal: a `MUQUN_TASK_DONE: <summary>` line below the
 echoed request in the pane's recent output (`done_marker`), or the agent's
