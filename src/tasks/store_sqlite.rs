@@ -6,7 +6,8 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use super::domain::{
-    now_ms, ChildCounts, Task, TaskBinding, TaskChange, TaskEvent, TaskFilter, TaskId, TaskState,
+    now_ms, ChildCounts, Task, TaskBinding, TaskChange, TaskEvent, TaskFilter, TaskId,
+    TaskPrincipal, TaskState,
 };
 use super::ports::{TaskFuture, TaskStore, TaskStoreError};
 use crate::platform::store::sqlite::{Migration, SqliteStore};
@@ -85,6 +86,28 @@ impl TaskStore for SqliteTaskStore {
     fn get<'a>(&'a self, id: &'a TaskId) -> TaskFuture<'a, Option<Task>> {
         let id = id.clone();
         Box::pin(self.db.call(move |c| load(c, &id)))
+    }
+
+    fn latest_device_cwd<'a>(
+        &'a self,
+        device: &'a TaskPrincipal,
+    ) -> TaskFuture<'a, Option<String>> {
+        let owner = json_text(device);
+        Box::pin(async move {
+            let owner = owner?;
+            self.db
+                .call(move |c| {
+                    Ok(c.query_row(
+                        "SELECT cwd FROM tasks WHERE created_by = ?1 AND origin = 'device' \
+                         ORDER BY created_ms DESC, rowid DESC LIMIT 1",
+                        [owner],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .flatten())
+                })
+                .await
+        })
     }
 
     fn list<'a>(&'a self, filter: TaskFilter) -> TaskFuture<'a, Vec<Task>> {

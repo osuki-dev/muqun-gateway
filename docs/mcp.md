@@ -270,8 +270,9 @@ the device as its owner and the device's name in `requested_by`.
 
 Only `goal` is required (non-empty, at most 32 KiB). `agent_id` defaults to
 the primary agent; `cwd` must be an existing absolute directory (`~`
-expands) and defaults to the home directory, as for `POST
-/api/agent-sessions`; `model` is a model id from the agent's catalog or
+expands). When omitted, it uses the cwd of the most recent task opened by
+the same device, or the home directory if that device has no previous task.
+`model` is a model id from the agent's catalog or
 `<provider_id>/<model_id>`; `variant` is that model's variant (reasoning
 effort, for example `high`), applied when the session is created so the first
 turn already runs with it -- it is applied only together with `model` (ignored
@@ -328,8 +329,9 @@ projects={...}` override for this run; for Claude Code,
 environment, else `~/.claude.json`): merged in place, key order kept, only
 for a directory inside the user's home named without `..`, skipped when the
 file cannot be read, and not at all with `"agent_trust_folders": false` in
-`config.json` (see [Agent API](agent-api.md)). `cwd` defaults to the home
-directory for `POST /api/tasks` and to wherever the backend opens the tab for `tasks.delegate`; it is not held
+`config.json` (see [Agent API](agent-api.md)). `cwd` defaults to the most recent
+task directory for that device (or home if it has none) for `POST /api/tasks`,
+and to wherever the backend opens the tab for `tasks.delegate`; it is not held
 to the spawn route's "a directory the session already has open" fence, as no
 other `POST /api/tasks` directory is. `mode`, `model` and `variant` do not
 apply and are ignored.

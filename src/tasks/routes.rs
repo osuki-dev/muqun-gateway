@@ -119,9 +119,8 @@ fn refused(code: &str, message: &str) -> (StatusCode, Json<Value>) {
     api_error(StatusCode::BAD_REQUEST, code, message)
 }
 
-/// An absolute, existing directory, canonicalized; `~` expands. None: the
-/// home directory, which is what the App shows for a session it opens
-/// without naming a folder.
+/// An absolute, existing directory, canonicalized; `~` expands. None uses
+/// the home directory after the device's task history has been checked.
 fn task_directory(cwd: Option<&str>) -> ApiResult<Option<String>> {
     let Some(dir) = expand_directory_param(cwd).filter(|dir| !dir.trim().is_empty()) else {
         return Ok(dirs::home_dir().map(|home| home.to_string_lossy().into_owned()));
@@ -149,7 +148,7 @@ fn task_directory(cwd: Option<&str>) -> ApiResult<Option<String>> {
 }
 
 impl CreateBody {
-    fn request(self) -> ApiResult<DelegateRequest> {
+    fn request(self, default_cwd: Option<&str>) -> ApiResult<DelegateRequest> {
         if self.goal.trim().is_empty() || self.goal.len() > MAX_GOAL_BYTES {
             return Err(refused(
                 "invalid_request",
@@ -179,7 +178,7 @@ impl CreateBody {
         }
         Ok(DelegateRequest {
             goal: self.goal,
-            cwd: task_directory(self.cwd.as_deref())?,
+            cwd: task_directory(self.cwd.as_deref().or(default_cwd))?,
             agent_id: self.agent_id,
             mode: self.mode,
             model: self.model,
@@ -202,14 +201,24 @@ async fn create(
     // Who is asking comes first: a stranger learns nothing about the body.
     let device_id = require_device(&state, &headers)?;
     let Json(body) = body.map_err(|_| invalid_request())?;
-    let request = body.request()?;
+    let by_device = principal(device_id.clone());
+    let previous_cwd = if body.cwd.is_none() {
+        state
+            .tasks
+            .latest_device_cwd(&by_device)
+            .await
+            .map_err(|error| failed(error.into()))?
+    } else {
+        None
+    };
+    let request = body.request(previous_cwd.as_deref())?;
     let name = lock_devices(&state)?
         .iter()
         .find(|device| device.id == device_id)
         .map(|device| device.name.clone())
         .unwrap_or_else(|| device_id.clone());
     let by = Requested {
-        by: principal(device_id),
+        by: by_device,
         origin: TaskOrigin::Device,
         parent: None,
         name: Some(name),
@@ -634,6 +643,70 @@ mod tests {
 
         let (_, listed) = call(&state, "GET", "/api/tasks").await;
         assert_eq!(listed["tasks"][0]["origin"], "device");
+    }
+
+    #[tokio::test]
+    async fn device_task_directory_defaults() {
+        let home = dirs::home_dir().unwrap();
+        let previous = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let explicit = std::env::temp_dir().canonicalize().unwrap();
+        let cases = [
+            ("previous task", true, None, previous.as_path()),
+            ("no previous task", false, None, home.as_path()),
+            (
+                "explicit cwd",
+                true,
+                Some(explicit.as_path()),
+                explicit.as_path(),
+            ),
+        ];
+
+        for (name, has_previous, cwd, expected) in cases {
+            let state = with_agent().await;
+            let store = SqliteTaskStore::new(state.db.clone());
+            // Creation order wins over updates, and another device is ignored.
+            for (device_id, directory, created_ms, updated_ms) in [
+                ("d1", explicit.as_path(), 5, 100),
+                ("d1", previous.as_path(), 10, 10),
+                ("d2", explicit.as_path(), 20, 20),
+            ] {
+                if device_id == "d1" && !has_previous {
+                    continue;
+                }
+                store
+                    .insert(&Task {
+                        id: TaskId::new(),
+                        kind: TaskKind::Delegation,
+                        goal: "earlier task".into(),
+                        cwd: Some(directory.to_string_lossy().into_owned()),
+                        binding: TaskBinding::None,
+                        state: TaskState::Queued,
+                        summary: None,
+                        exit_code: None,
+                        created_by: principal(device_id.into()),
+                        created_ms,
+                        updated_ms,
+                        seq: 0,
+                        parent: None,
+                        origin: TaskOrigin::Device,
+                        label: None,
+                        requester_name: None,
+                    })
+                    .await
+                    .unwrap();
+            }
+            let mut body = json!({ "goal": name, "agent_id": "opencode" });
+            if let Some(cwd) = cwd {
+                body["cwd"] = json!(cwd);
+            }
+            let (status, view) = send(&state, "POST", "/api/tasks", Some(body), true).await;
+            assert_eq!(status, StatusCode::OK, "{name}: {view}");
+            let task = state
+                .tasks
+                .get_for_test(&TaskId(view["task_id"].as_str().unwrap().into()))
+                .await;
+            assert_eq!(task.cwd.as_deref(), expected.to_str(), "{name}");
+        }
     }
 
     #[tokio::test]

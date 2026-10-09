@@ -285,6 +285,13 @@ impl TaskStore for Publishing<'_> {
         self.0.store.get(id)
     }
 
+    fn latest_device_cwd<'a>(
+        &'a self,
+        device: &'a TaskPrincipal,
+    ) -> TaskFuture<'a, Option<String>> {
+        self.0.store.latest_device_cwd(device)
+    }
+
     fn list<'a>(&'a self, filter: TaskFilter) -> TaskFuture<'a, Vec<Task>> {
         self.0.store.list(filter)
     }
@@ -556,6 +563,13 @@ impl TaskService {
     /// The task `id` as stored.
     pub(crate) async fn task(&self, id: &TaskId) -> anyhow::Result<Option<Task>> {
         self.store.get(id).await
+    }
+
+    pub(crate) async fn latest_device_cwd(
+        &self,
+        device: &TaskPrincipal,
+    ) -> anyhow::Result<Option<String>> {
+        self.store.latest_device_cwd(device).await
     }
 
     fn store(&self) -> Publishing<'_> {
@@ -2451,6 +2465,12 @@ mod tests {
         fn get<'a>(&'a self, id: &'a TaskId) -> TaskFuture<'a, Option<Task>> {
             self.inner.get(id)
         }
+        fn latest_device_cwd<'a>(
+            &'a self,
+            device: &'a TaskPrincipal,
+        ) -> TaskFuture<'a, Option<String>> {
+            self.inner.latest_device_cwd(device)
+        }
         fn list<'a>(&'a self, filter: TaskFilter) -> TaskFuture<'a, Vec<Task>> {
             self.inner.list(filter)
         }
@@ -2765,6 +2785,12 @@ mod tests {
         }
         fn get<'a>(&'a self, id: &'a TaskId) -> TaskFuture<'a, Option<Task>> {
             self.inner.get(id)
+        }
+        fn latest_device_cwd<'a>(
+            &'a self,
+            device: &'a TaskPrincipal,
+        ) -> TaskFuture<'a, Option<String>> {
+            self.inner.latest_device_cwd(device)
         }
         fn list<'a>(&'a self, filter: TaskFilter) -> TaskFuture<'a, Vec<Task>> {
             self.inner.list(filter)
