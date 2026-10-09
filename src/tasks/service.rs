@@ -4,8 +4,8 @@
 //! Every change the service records -- its own and `run_command`'s, which
 //! write through [`Publishing`] -- is broadcast as a [`TaskDomainEvent`].
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -18,6 +18,7 @@ use super::domain::{
     TaskEvent, TaskFilter, TaskId, TaskKind, TaskOrigin, TaskPrincipal, TaskState,
 };
 use super::events::TaskDomainEvent;
+use super::pane_agent;
 use super::ports::{TaskFuture, TaskStore, TaskStoreError};
 use super::run_command::{self, RunHandle, RunRequest};
 use crate::agents::domain::{
@@ -57,6 +58,8 @@ pub(crate) struct TaskService {
     store: Arc<dyn TaskStore>,
     events: broadcast::Sender<TaskDomainEvent>,
     machine_id: String,
+    /// Pane delegations a follower is running for (see [`pane_agent::follow`]).
+    following: Mutex<HashSet<TaskId>>,
 }
 
 pub(crate) struct DelegateRequest {
@@ -317,7 +320,27 @@ impl TaskService {
             store,
             events,
             machine_id,
+            following: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Whether the caller is now the one follower of `id`'s pane agent.
+    pub(crate) fn claim_follow(&self, id: &TaskId) -> bool {
+        self.following
+            .lock()
+            .map(|mut ids| ids.insert(id.clone()))
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn release_follow(&self, id: &TaskId) {
+        if let Ok(mut ids) = self.following.lock() {
+            ids.remove(id);
+        }
+    }
+
+    /// The task `id` as stored.
+    pub(crate) async fn task(&self, id: &TaskId) -> anyhow::Result<Option<Task>> {
+        self.store.get(id).await
     }
 
     fn store(&self) -> Publishing<'_> {
@@ -339,6 +362,13 @@ impl TaskService {
             return Err(TaskError::UnknownMachine(
                 request.machine.unwrap_or_default(),
             ));
+        }
+        if let Some(kind) = request.agent_id.as_deref() {
+            if state.agent_runtime.manager_for_agent(kind).await.is_none()
+                && pane_agent::is_terminal_agent(state, kind)
+            {
+                return self.delegate_to_pane(state, by, request).await;
+            }
         }
         let manager = agent_for(state, request.agent_id.as_deref()).await?;
         let agent_id = manager.agent().kind();
@@ -452,6 +482,117 @@ impl TaskService {
         }
     }
 
+    /// Hand `request.goal` to a terminal agent (`request.agent_id`, a kind
+    /// the agent catalog lists): a new pane in the first reachable terminal
+    /// session, the agent started in it and the goal typed as its first
+    /// prompt (asking for the completion marker, see [`pane_agent`]), the
+    /// way the spawn route does it. `mode`, `model` and
+    /// `variant` do not apply and are ignored.
+    ///
+    /// Nothing is recorded when the agent is not on `PATH` or no terminal
+    /// answers. Once the pane exists, an agent that did not start or a goal
+    /// that could not be typed fails the task, and the answer is the failed
+    /// task (the pane is still there to look at).
+    async fn delegate_to_pane(
+        &self,
+        state: &AppState,
+        by: Requested,
+        request: DelegateRequest,
+    ) -> Result<TaskView, TaskError> {
+        let kind = request.agent_id.clone().unwrap_or_default();
+        if !pane_agent::is_available(state, &kind) {
+            return Err(TaskError::AgentUnavailable(kind));
+        }
+        let session = run_command::reachable_session(state)
+            .await
+            .ok_or(TaskError::NoTerminal)?
+            .0;
+        let now = now_ms();
+        let task = self
+            .store()
+            .insert(&Task {
+                id: TaskId::new(),
+                kind: TaskKind::Delegation,
+                goal: request.goal.clone(),
+                cwd: request.cwd.clone(),
+                binding: TaskBinding::None,
+                state: TaskState::Queued,
+                summary: None,
+                exit_code: None,
+                created_by: by.by,
+                created_ms: now,
+                updated_ms: now,
+                seq: 0,
+                parent: by.parent,
+                origin: by.origin,
+                label: request.label.clone(),
+                requester_name: by.name,
+            })
+            .await?;
+        let launched = crate::agents::session_routes::launch_agent(
+            state,
+            &session,
+            &kind,
+            request.cwd.as_deref(),
+            None,
+            Some(&pane_agent::completion_request(&request.goal)),
+        )
+        .await;
+        let launched = match launched {
+            Ok(launched) => launched,
+            Err((_, body)) => {
+                let message = body
+                    .0
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("the pane could not be created")
+                    .to_owned();
+                let error = TaskError::Backend(format!("{kind}: {message}"));
+                self.record_failure(&task, noted(TaskState::Failed, error.to_string()))
+                    .await;
+                return Err(error);
+            }
+        };
+        let field = |name: &str| {
+            launched
+                .payload
+                .get(name)
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        };
+        let pane_id = field("pane_id").unwrap_or_default();
+        let shell_pid = crate::terminal_backend(&session)
+            .list_panes()
+            .await
+            .ok()
+            .and_then(|panes| panes.into_iter().find(|p| p.id.as_str() == pane_id))
+            .and_then(|pane| pane.shell_pid);
+        let binding = TaskBinding::Pane {
+            session_id: session.id.clone(),
+            pane_id,
+            tab_id: field("tab_id"),
+            shell_pid,
+            agent_id: Some(kind.clone()),
+        };
+        let dispatching = TaskChange {
+            binding: Some(binding),
+            ..change(TaskState::Dispatching)
+        };
+        self.store().transition(&task.id, dispatching).await?;
+        if let Some(why) = failed_step(&launched.steps.value()) {
+            self.record_failure(&task, noted(TaskState::Failed, why))
+                .await;
+            let task = self.store.get(&task.id).await?.ok_or(TaskError::NotFound)?;
+            return Ok(self.present(&task).await);
+        }
+        let task = self
+            .store()
+            .transition(&task.id, change(TaskState::Working))
+            .await?;
+        pane_agent::follow(state, &task);
+        Ok(self.present(&task).await)
+    }
+
     /// Move `task` as `to` says, through whatever states lie between
     /// (Queued passes Dispatching, Waiting passes Working), reading the
     /// task's current state first. The steps carry `to`'s source.
@@ -517,6 +658,9 @@ impl TaskService {
         let task = self.owned(by, id).await?;
         let view = match &task.binding {
             _ if task.state.is_terminal() => self.present(&task).await,
+            TaskBinding::Pane { .. } if task.kind == TaskKind::Delegation => {
+                self.wait_published(&task.id, deadline).await?
+            }
             TaskBinding::Pane { .. } => {
                 let handle = self.poll_command(state, &task, deadline).await?;
                 return Ok(Waited {
@@ -611,6 +755,28 @@ impl TaskService {
         }
     }
 
+    /// Wait for the task to be recorded as finished or waiting on the user
+    /// (by whoever moves it), or for `deadline`; the task as it then stands.
+    async fn wait_published(&self, id: &TaskId, deadline: Instant) -> Result<TaskView, TaskError> {
+        let settled = |task: &Task| task.state.is_terminal() || task.state == TaskState::Waiting;
+        // Subscribe before reading, so nothing falls between.
+        let mut events = self.events.subscribe();
+        loop {
+            let task = self.store.get(id).await?.ok_or(TaskError::NotFound)?;
+            if settled(&task) {
+                return Ok(self.present(&task).await);
+            }
+            loop {
+                match tokio::time::timeout_at(deadline, events.recv()).await {
+                    Ok(Ok(TaskDomainEvent::Updated { task, .. })) if task.task_id == id.0 => break,
+                    Ok(Ok(_)) => {}
+                    Ok(Err(RecvError::Lagged(_))) => break,
+                    Ok(Err(RecvError::Closed)) | Err(_) => return Ok(self.present(&task).await),
+                }
+            }
+        }
+    }
+
     /// Move `task` as `to` says, through the states between (a task waiting
     /// on the user that finishes passes Working; so does an unconfirmed idle
     /// one that fails).
@@ -675,6 +841,9 @@ impl TaskService {
             return Ok(self.present(&task).await);
         }
         match &task.binding {
+            TaskBinding::Pane { .. } if task.kind == TaskKind::Delegation => {
+                pane_agent::interrupt(state, &task).await;
+            }
             TaskBinding::Pane { .. } => {
                 run_command::cancel(state, &self.store(), &task)
                     .await
@@ -1013,6 +1182,21 @@ pub(crate) fn result_line(items: &[TimelineItem]) -> Option<String> {
 async fn full_answer(state: &AppState, asid: &str, since_ms: u64) -> Option<String> {
     let manager = state.agent_runtime.manager_for_session(asid).await?;
     last_assistant_text(&summary_timeline(&manager, asid, since_ms).await)
+}
+
+/// `"<step>: <message>"` for the first failed step of a launch.
+fn failed_step(steps: &Value) -> Option<String> {
+    let step = steps
+        .as_array()?
+        .iter()
+        .find(|step| step.get("status").and_then(Value::as_str) == Some("failed"))?;
+    Some(format!(
+        "{}: {}",
+        step.get("step").and_then(Value::as_str).unwrap_or("launch"),
+        step.pointer("/error/message")
+            .and_then(Value::as_str)
+            .unwrap_or("failed")
+    ))
 }
 
 fn command_error(error: anyhow::Error) -> TaskError {

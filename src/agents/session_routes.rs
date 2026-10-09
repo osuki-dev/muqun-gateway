@@ -523,42 +523,66 @@ pub(crate) async fn spawn_agent(
         }
     };
 
+    let launched = launch_agent(
+        &state,
+        &session,
+        &body.agent,
+        cwd.as_deref(),
+        body.tab_id.as_deref(),
+        body.prompt.as_deref(),
+    )
+    .await?;
+    Ok(task_partial(launched.payload, &launched.steps))
+}
+
+/// What [`launch_agent`] made: the spawn route's answer, before its steps
+/// are folded in, and the steps themselves.
+pub(crate) struct AgentLaunch {
+    pub(crate) payload: Value,
+    pub(crate) steps: tasks::StepLog,
+}
+
+/// The spawn route after its checks: a pane (a split of `tab_id`, or a tab
+/// of its own), the agent started in it with its launch arguments and
+/// `agent_env`, and `prompt` typed and submitted. Shared with the task
+/// ledger's terminal delegations (`TaskService::delegate`), so both start an
+/// agent the same way. An `Err` means nothing was created; a failed agent or
+/// prompt step leaves the pane and says so in `steps`.
+pub(crate) async fn launch_agent(
+    state: &AppState,
+    session: &SessionConfig,
+    agent: &str,
+    cwd: Option<&str>,
+    tab_id: Option<&str>,
+    prompt: Option<&str>,
+) -> ApiResult<AgentLaunch> {
+    let session_id = &session.id;
     let mut steps = tasks::StepLog::new();
     let agent_env = state.config.agent_env.usable();
     let pane_env = pane_env(&agent_env);
-    let place = spawn_place(
-        &session,
-        body.tab_id.as_deref(),
-        cwd.as_deref(),
-        &pane_env,
-        &mut steps,
-    )
-    .await?;
+    let place = spawn_place(session, tab_id, cwd, &pane_env, &mut steps).await?;
 
     let mut payload = json!({
         "session_id": session_id,
         "pane_id": place.pane_id,
         "tab_id": place.tab_id,
-        "agent": body.agent,
+        "agent": agent,
         "cwd": cwd,
         "agent_started": false,
         "prompt_submitted": false,
     });
 
     let mut prompt_target = place.pane_id.clone();
-    let agent_command = tasks::agent_command(&body.agent, &state.config.agent_commands);
+    let agent_command = tasks::agent_command(agent, &state.config.agent_commands);
     // Without a `cwd` the agent runs wherever the new pane opened, which
     // the backend reports; Codex needs it to pre-trust the folder.
-    let agent_cwd = cwd.as_deref().map(PathBuf::from).or(place.cwd.clone());
-    let agent_args = tasks::agent_launch_args(
-        &body.agent,
-        agent_cwd.as_deref(),
-        &state.config.agent_launch_args,
-    );
+    let agent_cwd = cwd.map(PathBuf::from).or(place.cwd.clone());
+    let agent_args =
+        tasks::agent_launch_args(agent, agent_cwd.as_deref(), &state.config.agent_launch_args);
     match start_backend_agent(
-        &session,
+        session,
         &place.pane_id,
-        &body.agent,
+        agent,
         &agent_command,
         &agent_args,
         tasks::DEFAULT_AGENT_START_TIMEOUT_MS,
@@ -574,7 +598,7 @@ pub(crate) async fn spawn_agent(
             steps.ok(
                 "agent",
                 json!({
-                    "kind": body.agent,
+                    "kind": agent,
                     "pane_id": place.pane_id,
                     "argv": value.pointer("/result/argv").cloned()
                 }),
@@ -598,11 +622,11 @@ pub(crate) async fn spawn_agent(
             steps.failed("agent", err.code(), &err.message());
             // The pane is real and the user can type in it, so this is a 207
             // rather than an error that implies nothing was created.
-            return Ok(task_partial(payload, &steps));
+            return Ok(AgentLaunch { payload, steps });
         }
     }
 
-    match body.prompt.as_deref() {
+    match prompt {
         None => steps.skipped("prompt", "no prompt was given"),
         Some(prompt) => {
             // An agent that has just been launched is not a named agent yet --
@@ -619,7 +643,7 @@ pub(crate) async fn spawn_agent(
                 if attempt > 0 {
                     tokio::time::sleep(SPAWN_PROMPT_INTERVAL).await;
                 }
-                submitted = submit_agent_prompt(&session, &prompt_target, prompt).await;
+                submitted = submit_agent_prompt(session, &prompt_target, prompt).await;
                 if !submitted.as_ref().is_err_and(|err| err.can_retry_prompt()) {
                     break;
                 }
@@ -635,7 +659,7 @@ pub(crate) async fn spawn_agent(
         }
     }
 
-    Ok(task_partial(payload, &steps))
+    Ok(AgentLaunch { payload, steps })
 }
 
 pub(crate) async fn agents(

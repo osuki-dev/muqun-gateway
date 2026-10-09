@@ -191,7 +191,8 @@ impl CreateBody {
 
 /// `POST /api/tasks`: what `tasks.delegate` does -- a new agent session with
 /// the goal as its first prompt, recorded as a delegation -- opened by the
-/// device. Answers the task view plus the session's `asid`.
+/// device. Answers the task view plus the session's `asid`; for a terminal
+/// agent (`codex`, `claude`, ...) the pane it was started in, `pane_id`.
 async fn create(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -217,18 +218,20 @@ async fn create(
         .delegate(&state, by, request)
         .await
         .map_err(create_failed)?;
-    let asid = match &task.binding {
-        TaskBinding::AgentSession { asid, .. } => Value::String(asid.clone()),
-        _ => Value::Null,
-    };
     let mut answer = json!(task);
-    answer["asid"] = asid;
+    // Where the app opens the task: the agent session, or the terminal
+    // agent's pane.
+    match &task.binding {
+        TaskBinding::Pane { pane_id, .. } => answer["pane_id"] = json!(pane_id),
+        TaskBinding::AgentSession { asid, .. } => answer["asid"] = json!(asid),
+        _ => answer["asid"] = Value::Null,
+    }
     Ok(Json(answer))
 }
 
 fn create_failed(error: TaskError) -> (StatusCode, Json<Value>) {
     match error {
-        TaskError::AgentUnavailable(_) => api_error(
+        TaskError::AgentUnavailable(_) | TaskError::NoTerminal => api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_unavailable",
             "That agent is not available",
@@ -237,7 +240,7 @@ fn create_failed(error: TaskError) -> (StatusCode, Json<Value>) {
             "unknown_model",
             "Unknown model for that agent. Use a model id from its catalog, or <provider_id>/<model_id>.",
         ),
-        TaskError::Agent(error) => {
+        TaskError::Agent(_) | TaskError::Backend(_) => {
             tracing::warn!(%error, "device task: the agent refused");
             api_error(
                 StatusCode::BAD_GATEWAY,
@@ -509,6 +512,58 @@ mod tests {
 
         let (_, listed) = call(&state, "GET", "/api/tasks").await;
         assert_eq!(listed["tasks"][0]["origin"], "device");
+    }
+
+    #[tokio::test]
+    async fn a_terminal_agent_opens_in_a_pane_bound_to_its_task() {
+        let herdr = crate::FakeHerdr::start(vec!["$ "], None);
+        herdr.set_panes(json!([
+            { "pane_id": "w1:p9", "workspace_id": "w1", "tab_id": "w1:t9", "shell_pid": 4242 }
+        ]));
+        let mut state = state();
+        state.config.sessions[0].socket_path = herdr.session().socket_path;
+        // The catalog's `codex`, run as a program that is on every PATH.
+        state
+            .config
+            .agent_commands
+            .insert("codex".into(), "sh".into());
+        let dir = std::env::temp_dir().canonicalize().unwrap();
+        let body =
+            json!({ "goal": "fix the build", "cwd": dir, "agent_id": "codex", "model": "ignored" });
+        let (status, task) = send(&state, "POST", "/api/tasks", Some(body), true).await;
+        assert_eq!(status, StatusCode::OK, "{task}");
+        assert_eq!(task["pane_id"], "w1:p9");
+        assert!(task.get("asid").is_none(), "{task}");
+        assert_eq!(task["state"], "working");
+        assert_eq!(task["origin"], "device");
+        assert_eq!(
+            task["binding"],
+            json!({ "kind": "pane", "session_id": "default", "pane_id": "w1:p9",
+                    "tab_id": "w1:t9", "shell_pid": 4242, "agent_id": "codex" })
+        );
+        // Started the spawn route's way: bypass flags, then the goal as its prompt.
+        let calls = herdr.calls.lock().unwrap().clone();
+        let start = calls.iter().find(|c| c["method"] == "agent.start").unwrap();
+        assert_eq!(start["params"]["kind"], "codex");
+        assert_eq!(
+            start["params"]["args"][0],
+            crate::agents::tasks::CODEX_BYPASS_FLAG
+        );
+        let prompt = calls
+            .iter()
+            .find(|c| c["method"] == "agent.prompt")
+            .unwrap();
+        // The goal, asking for the completion marker that alone makes it done.
+        assert_eq!(
+            prompt["params"]["text"],
+            crate::tasks::pane_agent::completion_request("fix the build")
+        );
+        assert_eq!(task["goal"], "fix the build");
+
+        let unknown = json!({ "goal": "x", "agent_id": "no-such-agent" });
+        let (status, body) = send(&state, "POST", "/api/tasks", Some(unknown), true).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"]["code"], "agent_unavailable");
     }
 
     #[tokio::test]

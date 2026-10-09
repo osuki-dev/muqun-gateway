@@ -72,6 +72,10 @@ pub(crate) enum TaskBinding {
         /// this existed, or a backend that could not tell) matches by id only.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         shell_pid: Option<u32>,
+        /// The terminal agent kind (`codex`, `claude`, ...) a delegation
+        /// started in this pane; absent for a command task.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
     },
 }
 
@@ -296,6 +300,7 @@ mod tests {
                 pane_id: "%3".into(),
                 tab_id: None,
                 shell_pid: None,
+                agent_id: None,
             }
         );
         assert_eq!(serde_json::to_string(&binding).unwrap(), stored);
@@ -304,6 +309,7 @@ mod tests {
             pane_id: "%3".into(),
             tab_id: None,
             shell_pid: Some(42),
+            agent_id: None,
         };
         let json = serde_json::to_string(&pinned).unwrap();
         assert_eq!(serde_json::from_str::<TaskBinding>(&json).unwrap(), pinned);

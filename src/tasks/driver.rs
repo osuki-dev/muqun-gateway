@@ -11,6 +11,10 @@
 //!   summary; one whose session went idle after the task was created is
 //!   done, with the last assistant text as its summary.
 //!
+//! - A terminal agent's delegation (bound to a pane, with `agent_id`) whose
+//!   pane is gone fails ("pane closed"); otherwise its pane follower is
+//!   started if none runs (after a restart, say) -- see `pane_agent`.
+//!
 //! - A task bound to nothing (the gateway stopped between recording it and
 //!   dispatching it) fails ("never dispatched") once it is
 //!   [`NEVER_DISPATCHED_AFTER`] old.
@@ -28,7 +32,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use super::domain::one_line;
-use super::domain::{now_ms, Task, TaskBinding, TaskChange, TaskFilter, TaskState};
+use super::domain::{now_ms, Task, TaskBinding, TaskChange, TaskFilter, TaskKind, TaskState};
+use super::pane_agent;
 use super::service::{finished_since, result_line, summary_timeline, OPEN_STATES, SUMMARY_CHARS};
 use crate::agents::domain::AgentSessionStatus;
 use crate::agents::ports::agent::AgentError;
@@ -105,6 +110,11 @@ pub(crate) async fn reconcile(state: &AppState) -> usize {
                 ..
             } => match pane_alive(state, &mut panes, session_id, pane_id, *shell_pid).await {
                 Some(false) => fail(state, &task, "pane closed").await,
+                // A terminal agent's delegation: its follower moves it.
+                _ if task.kind == TaskKind::Delegation => {
+                    pane_agent::follow(state, &task);
+                    false
+                }
                 Some(true) => poll_command(state, &task).await,
                 None => false,
             },
@@ -313,6 +323,7 @@ mod tests {
             pane_id: pane_id.into(),
             tab_id: None,
             shell_pid: None,
+            agent_id: None,
         };
         let gone = working(&state, task(pane("w1:p7"), TaskKind::Command)).await;
         let unknown_session = TaskBinding::Pane {
@@ -320,6 +331,7 @@ mod tests {
             pane_id: "w1:p7".into(),
             tab_id: None,
             shell_pid: None,
+            agent_id: None,
         };
         let unknown = working(&state, task(unknown_session, TaskKind::Command)).await;
 
@@ -343,6 +355,7 @@ mod tests {
             pane_id: "w1:p1".into(),
             tab_id: None,
             shell_pid,
+            agent_id: None,
         };
         let reused = working(&state, task(pane(Some(100)), TaskKind::Command)).await;
         let same = working(&state, task(pane(Some(200)), TaskKind::Command)).await;

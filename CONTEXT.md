@@ -77,7 +77,10 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
   tasks nobody waits on and the follower that settles delegations from agent
   events as they arrive (`driver.rs`), change events for `/api/ws`, and
   `/api/tasks*` (including `POST /api/tasks`, a device opening a delegation).
-  Every task carries `parent_task_id` and `origin`; `children` counts are
+  A delegation to a terminal agent (`codex`, `claude`, ...) is started through
+  the spawn route's own `launch_agent` and bound to its pane
+  (`binding.kind == "pane"` with `agent_id`); `pane_agent.rs` maps that pane
+  agent's backend state onto the task. Every task carries `parent_task_id` and `origin`; `children` counts are
   computed when a view is made, never stored.
 - `src/fleet/`: this machine's capability manifest (agents, terminal backends,
   probed toolchains, task counts) behind `GET /api/fleet/self` and the
@@ -221,7 +224,8 @@ device, so its bearer token is not sufficient by itself. `disabled` is an
 explicit token-only compatibility mode. Existing device records retain their
 pairing mode; changing the gateway setting governs newly paired devices.
 
-Agents the gateway launches for remote dispatch (`POST …/tasks`, `POST …/spawn`)
+Agents the gateway launches for remote dispatch (`POST …/tasks`, `POST …/spawn`,
+and a terminal-agent delegation through `POST /api/tasks` or `tasks.delegate`)
 have nobody at the terminal to answer a prompt. They start with their own
 bypass flags (`codex --dangerously-bypass-approvals-and-sandbox -c projects=…`
 trusting the task directory and its checkout; `claude

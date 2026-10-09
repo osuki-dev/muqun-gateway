@@ -361,6 +361,7 @@ mod tests {
                 pane_id: "%4".into(),
                 tab_id: None,
                 shell_pid: None,
+                agent_id: None,
             },
         )
         .await;

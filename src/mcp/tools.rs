@@ -264,7 +264,7 @@ pub(crate) struct DelegateArgs {
     /// Absolute project directory on this computer.
     #[serde(default)]
     pub cwd: Option<String>,
-    /// Structured agent to use, e.g. "opencode". Default: the primary agent.
+    /// Agent to use: a structured agent, e.g. "opencode", or a terminal agent from the agent catalog, e.g. "codex" or "claude" (started in a new terminal pane; mode, model and variant do not apply). Default: the primary agent.
     #[serde(default)]
     pub agent_id: Option<String>,
     /// Agent mode, e.g. "build" or "plan".
@@ -422,7 +422,7 @@ impl MuqunMcp {
 
     #[tool(
         name = "tasks.delegate",
-        description = "Start a sub-task on an agent on this computer: a new session in cwd with your goal as the first prompt. Returns task_id; poll with tasks.wait."
+        description = "Start a sub-task on an agent on this computer: a new session in cwd with your goal as the first prompt (for a terminal agent such as codex or claude, a new terminal pane running it). Returns task_id; poll with tasks.wait."
     )]
     async fn tasks_delegate(
         &self,
@@ -581,6 +581,51 @@ mod tests {
         assert_eq!(
             body["pane"],
             json!({ "session_id": "default", "pane_id": "w1:p9" })
+        );
+    }
+
+    #[tokio::test]
+    async fn an_agent_delegates_to_a_terminal_agent_and_cancels_it() {
+        let herdr = FakeHerdr::start(vec!["$ "], None);
+        herdr.set_panes(json!([
+            { "pane_id": "w1:p9", "workspace_id": "w1", "tab_id": "w1:t9" }
+        ]));
+        let mut state = output_state(&herdr);
+        state
+            .config
+            .agent_commands
+            .insert("claude".into(), "sh".into());
+        let mcp = MuqunMcp::new(state, session("%1"));
+        let args = DelegateArgs {
+            goal: "review the diff".into(),
+            cwd: None,
+            agent_id: Some("claude".into()),
+            mode: None,
+            model: None,
+            variant: None,
+            machine: None,
+        };
+        let (error, _, task) = answer(mcp.tasks_delegate(Parameters(args)).await);
+        assert!(!error, "{task}");
+        assert_eq!(task["state"], "working", "{task}");
+        assert_eq!(task["binding"]["kind"], "pane");
+        assert_eq!(task["binding"]["pane_id"], "w1:p9");
+        assert_eq!(task["binding"]["agent_id"], "claude");
+
+        let args = CancelArgs {
+            task_id: task["task_id"].as_str().unwrap().into(),
+        };
+        let (error, _, cancelled) = answer(mcp.tasks_cancel(Parameters(args)).await);
+        assert!(!error, "{cancelled}");
+        assert_eq!(cancelled["state"], "cancelled");
+        let key = crate::terminal::shortcuts::interrupt_key(Some("claude"), None);
+        assert!(
+            herdr.calls.lock().unwrap().iter().any(|call| {
+                call["method"] == "pane.send_keys"
+                    && call["params"]["pane_id"] == "w1:p9"
+                    && call["params"]["keys"][0] == key.as_str()
+            }),
+            "the pane agent was interrupted with {key}"
         );
     }
 

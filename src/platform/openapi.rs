@@ -785,7 +785,7 @@ fn task_view_schema() -> Value {
             "exit_code": { "type": ["integer", "null"] },
             "binding": {
                 "type": "object",
-                "description": "What the task runs in. `kind` is `none`, `agent_session` (with agent_id, asid) or `pane` (with session_id, pane_id, tab_id)",
+                "description": "What the task runs in. `kind` is `none`, `agent_session` (with agent_id, asid) or `pane` (with session_id, pane_id, tab_id; plus agent_id, the terminal agent kind, for a delegation to a terminal agent -- absent for a command)",
                 "required": ["kind"],
                 "properties": { "kind": { "type": "string", "enum": ["none", "agent_session", "pane"] } },
                 "additionalProperties": true
@@ -877,18 +877,20 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
     );
     list_responses["400"] = json!({ "description": "invalid_request: an unknown state name, a limit that is not a positive integer, or an empty root" });
     let mut create_responses = json_ok(
-        "The new task's view, plus the agent session to open",
+        "The new task's view, plus where to open it: the agent session (asid), or for a terminal agent the pane it runs in (pane_id). A terminal agent whose launch failed after its pane was made answers 200 with state failed",
         json!({
             "allOf": [task_view(), {
                 "type": "object",
-                "required": ["asid"],
-                "properties": { "asid": { "type": "string" } }
+                "properties": {
+                    "asid": { "type": ["string", "null"], "description": "Present unless the agent is a terminal agent" },
+                    "pane_id": { "type": "string", "description": "Present for a terminal agent (binding.kind pane)" }
+                }
             }]
         }),
     );
     create_responses["400"] = json!({ "description": "invalid_request (empty or oversized goal, oversized label, empty name), invalid_directory, directory_not_found, not_a_directory, unknown_model" });
-    create_responses["502"] = json!({ "description": "agent_error: the agent could not start the session or take the prompt" });
-    create_responses["503"] = json!({ "description": "agent_unavailable" });
+    create_responses["502"] = json!({ "description": "agent_error: the agent could not start the session or take the prompt, or no pane could be made for a terminal agent" });
+    create_responses["503"] = json!({ "description": "agent_unavailable: the agent is not attached, a terminal agent is not on PATH, or no terminal session answers" });
     let read_responses = not_found(
         json_ok(
             "The task and its state history, oldest first",
@@ -945,16 +947,16 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
                 ],
                 "responses": list_responses
             }, "post": {
-                "summary": "Open a delegation from the device: a new agent session with the goal as its first prompt. Requires the task_ledger_create capability and a device token",
+                "summary": "Open a delegation from the device: a new agent session with the goal as its first prompt, or, for a terminal agent from the agent catalog (codex, claude, ...), a new pane running it with the goal typed in. Requires the task_ledger_create capability and a device token; a terminal agent needs task_ledger_pane",
                 "requestBody": json_body(json!({
                     "type": "object",
                     "required": ["goal"],
                     "properties": {
                         "goal": { "type": "string", "description": "At most 32 KiB" },
-                        "agent_id": { "type": "string", "description": "Default: the primary agent" },
+                        "agent_id": { "type": "string", "description": "An attached agent (opencode, ...) or a terminal agent kind from GET /api/agents/catalog (codex, claude, ...). Default: the primary agent" },
                         "cwd": { "type": "string", "description": "Absolute directory (~ expands); default: the home directory" },
-                        "mode": { "type": "string" },
-                        "model": { "type": "string", "description": "A model id from the agent's catalog, or provider_id/model_id" },
+                        "mode": { "type": "string", "description": "Ignored for a terminal agent" },
+                        "model": { "type": "string", "description": "A model id from the agent's catalog, or provider_id/model_id. Ignored for a terminal agent, as is variant" },
                         "variant": { "type": "string", "description": "The model's variant (reasoning effort), applied when the session is created so the first turn uses it. Applied only together with model (ignored otherwise); must be one of the model's catalog variants when it lists any" },
                         "label": { "type": "string", "description": "A short title, at most 200 characters" }
                     }

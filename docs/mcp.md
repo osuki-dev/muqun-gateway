@@ -1,8 +1,9 @@
 # Gateway as an MCP server
 
 Capabilities: `mcp_server` (the `/mcp` endpoint; present only while
-`mcp.enabled` is true), `fleet`, `task_ledger` and `task_ledger_create`
-(`POST /api/tasks` and the task tree). Discovery also announces
+`mcp.enabled` is true), `fleet`, `task_ledger`, `task_ledger_create`
+(`POST /api/tasks` and the task tree) and `task_ledger_pane` (a terminal agent
+as `agent_id`, bound to its pane). Discovery also announces
 `transports.mcp`. (`tasks` is a different, older capability: `POST
 /api/sessions/{id}/tasks`.)
 
@@ -127,7 +128,7 @@ says `"truncated": true` when it left older ones out. `tasks.wait` and
 | `fleet.list` | none | `{"machines": [{machineId, label, os, online, suitableFor, tasksActive}]}`. List the computers this gateway knows (this one only for now): alias, OS, what each is suitable for, how busy it is. |
 | `fleet.describe` | `machine?`: `"self"` (default) or a `machineId` | A compact manifest of that computer: `GET /api/fleet/self`'s fields, but each agent is only `{id, kind, status, version, modes, modelCount}` (mode ids, no model catalog) and each terminal backend `{sessionId, label, kind, connected, version}`. What a computer offers: its agents, terminal backends, toolchains with versions, task counts and what it is suitable for. |
 | `exec.run` | `cwd`: absolute directory; `command`: shell command, run as `sh -c <command>` (at most 16 KiB); `timeout_s?`: 1..=45, default 30 | `{task_id, state, exit_code, stdout_tail, duration_ms, pane}`. Run a shell command in a visible terminal pane on this computer and return its exit code and output tail. Blocks up to timeout_s (max 45); if still running, returns a task_id for tasks.wait. `exit_code` is null while it runs; `pane` is `{session_id, pane_id}`. |
-| `tasks.delegate` | `goal` (at most 32 KiB); `cwd?`: absolute directory; `agent_id?` (default: the primary agent); `mode?` (for example `build` or `plan`); `model?`: a model id from the agent's catalog for `cwd` (for example `claude-haiku-5-5`), or `<provider_id>/<model_id>` to pick one provider; default: the agent's default. An unknown id is `invalid_arguments` and nothing is created; `variant?`: the model's variant (reasoning effort, for example `high`), applied when the session is created so the first turn uses it; applied only together with `model` (ignored otherwise), and must be one of the model's catalog variants when it lists any (else `invalid_arguments`); `machine?` | A task view (see [Tasks API](#tasks-api)), filed under the caller's task when the gateway can tell which one it is (see [Task tree](#task-tree)). Start a sub-task on an agent on this computer: a new session in cwd with your goal as the first prompt. Returns task_id; poll with tasks.wait. |
+| `tasks.delegate` | `goal` (at most 32 KiB); `cwd?`: absolute directory; `agent_id?` (default: the primary agent; a terminal agent kind such as `codex` or `claude` starts it in a new pane instead, see [Delegating to a terminal agent](#delegating-to-a-terminal-agent)); `mode?` (for example `build` or `plan`); `model?`: a model id from the agent's catalog for `cwd` (for example `claude-haiku-5-5`), or `<provider_id>/<model_id>` to pick one provider; default: the agent's default. An unknown id is `invalid_arguments` and nothing is created; `variant?`: the model's variant (reasoning effort, for example `high`), applied when the session is created so the first turn uses it; applied only together with `model` (ignored otherwise), and must be one of the model's catalog variants when it lists any (else `invalid_arguments`); `machine?` | A task view (see [Tasks API](#tasks-api)), filed under the caller's task when the gateway can tell which one it is (see [Task tree](#task-tree)). Start a sub-task on an agent on this computer: a new session in cwd with your goal as the first prompt (for a terminal agent such as codex or claude, a new terminal pane running it). Returns task_id; poll with tasks.wait. |
 | `tasks.wait` | `task_id`; `timeout_s?`: 1..=45, default 30 | The task view, plus `stdout_tail` for a command, and `answer` for a done delegation: the agent's last message in full (`summary` holds only its first 240 characters, on one line). Wait up to timeout_s (max 45) for a task to reach done/failed/waiting. Returns the current state and summary; call again while it says working. |
 | `tasks.read` | `task_id`; `what`: `summary` or `timeline`; `cursor?` (timeline only) | `summary`: the task view. `timeline`: `{task_id, items, cursor}`, the most recent agent items after `cursor`; pass the returned `cursor` to read on. Read a task you created: its summary or recent timeline. A command has no timeline. |
 | `tasks.cancel` | `task_id` | The task view after the cancel. Interrupt a task you created. |
@@ -270,6 +271,87 @@ the task view plus the session to open:
 If the session fails (or finishes) while the prompt is being sent, the
 answer is still `200` with the task as it then stands -- `failed` with the
 error line as `summary`, or `done` -- since the task and its session exist.
+
+### Delegating to a terminal agent
+
+`agent_id` may also name a terminal agent the agent catalog lists (`GET
+/api/agents/catalog`: `codex`, `claude`, ...) that is not an attached agent
+service. Then, for `POST /api/tasks` and `tasks.delegate` alike, the gateway
+opens a new tab in the first reachable terminal session, starts the agent in
+it exactly as `POST /api/sessions/{id}/agents/spawn` does (its bypass launch
+arguments, `agent_env`, Codex's folder trust for `cwd`) and types the goal as
+its first prompt. `cwd` defaults to the home directory for `POST /api/tasks`
+and to wherever the backend opens the tab for `tasks.delegate`; it is not held
+to the spawn route's "a directory the session already has open" fence, as no
+other `POST /api/tasks` directory is. `mode`, `model` and `variant` do not
+apply and are ignored.
+
+The task is a `delegation`, bound to the pane:
+
+```json
+"binding": { "kind": "pane", "session_id": "default", "pane_id": "w1:p9",
+             "tab_id": "w1:t9", "shell_pid": 4242, "agent_id": "codex" }
+```
+
+and the answer of `POST /api/tasks` carries `"pane_id"` (the pane to open)
+instead of `"asid"`. A command task's pane binding has no `agent_id`, so
+`binding.kind == "pane"` with an `agent_id` is how a client tells a terminal
+agent's task from a command. A terminal agent that is not on `PATH`, or no
+reachable terminal session, is `503 agent_unavailable` (`agent_unavailable` /
+`no_terminal` over MCP) with nothing created; a pane that could not be made is
+`502 agent_error`, the task recorded `failed`. Once the pane exists, an agent
+that did not start or a goal that could not be typed answers `200` with the
+task `failed` (its `summary` names the step), since the pane is there to look
+at.
+
+An idle terminal agent is not a finished one -- it pauses to think, run a
+tool or wait on a long build, and comes back -- so only an explicit signal
+finishes the task. The goal is typed with one more paragraph:
+
+```
+<goal>
+
+When the whole task is finished, print one line exactly in this form: MUQUN_TASK_DONE: <one-line summary>
+```
+
+(the stored `goal` is the goal as given). A line starting with
+`MUQUN_TASK_DONE:` (after any bullet the agent draws) on the pane's screen,
+with a summary other than the placeholder, makes the task `done` with that
+summary (one line, at most 240 characters); the request echoed inside the
+prompt does not count, since there the marker is not at the start of a line.
+
+The task follows the pane as the terminal backend reports it (Herdr's own
+agent state; on tmux, the state read off the screen), polled every 2 s,
+recorded with source `pane_follower` and published as `task.updated` like
+every change. The marker is checked first on every poll:
+
+| The pane | The task |
+|---|---|
+| a `MUQUN_TASK_DONE: <summary>` line on screen | `done`, `summary` = that summary |
+| the agent starting or working | `working` (back from `waiting` or `idle_unconfirmed`) |
+| the agent blocked on a menu: an approval or a question | `waiting` |
+| the agent idle after it was seen working (or after its Herdr state sequence moved), or idle 30 s after the start | `idle_unconfirmed`, `summary` = a hint: the agent's last prose block when the gateway has a transcript dictionary for it (Claude Code, Codex, ...), else the screen's last line with any letter or digit in it |
+| no agent running in the pane, on two polls in a row, and no marker | `failed`, `summary` = `the agent exited before it finished: <last screen line>` |
+| the pane is gone (or another shell holds its id) | `failed`, `summary` = `the pane closed` |
+
+`idle_unconfirmed` is a pause, not an end: the task stays open, and moves back
+to `working` when the agent runs again. The backend exposes no assistant
+message and no exit code for a pane agent, so there is no `answer` from
+`tasks.wait` and no `exit_code`, and an agent that leaves its pane without
+printing the marker fails whatever its exit status. The marker is checked on
+the follower's first poll too, so after a gateway restart a task whose agent
+finished meanwhile is settled `done` at once. There is no MCP tool yet for an
+agent to complete its own pane-bound task by id; the marker is the only
+completion signal.
+
+`tasks.wait` on such a task waits for that follower to record `done`,
+`failed`, `cancelled` or `waiting`; `tasks.read` has no timeline for it
+(`invalid_arguments`); cancelling sends the agent its interrupt key (the key
+the pane interrupt route sends) and marks the task `cancelled`, leaving the
+pane open. The startup and 60 s reconcile fails such a task whose pane is gone
+and otherwise restarts its follower, so a gateway restart does not orphan it.
+An assistant running in the pane that calls `exec.run` or `tasks.delegate`
+with a pane-bound token is filed under this task (see [Task tree](#task-tree)).
 
 There is no separate rate limit, as for the other device routes that start
 work (`POST /api/agent-sessions`, `POST /api/sessions/{id}/tasks`).

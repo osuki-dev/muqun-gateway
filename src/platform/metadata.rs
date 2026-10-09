@@ -110,6 +110,13 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     // the task tree: `parent_task_id`, `origin`, `label`, `requested_by` and
     // `children` on every task view and `GET /api/tasks?root=<id>`.
     "task_ledger_create",
+    // `POST /api/tasks` and `tasks.delegate` take a terminal agent kind
+    // (`codex`, `claude`, ...) as `agent_id`: the task is bound to the pane
+    // the agent was started in (`binding.kind == "pane"` with `agent_id`)
+    // and the create answer carries `pane_id` instead of `asid`. Such a
+    // task is `done` only on its MUQUN_TASK_DONE marker; an idle agent is
+    // `idle_unconfirmed`.
+    "task_ledger_pane",
 ];
 
 /// Handing a task to an agent the app did not start, and following it home.

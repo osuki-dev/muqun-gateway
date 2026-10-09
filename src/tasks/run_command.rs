@@ -120,6 +120,7 @@ async fn launch(
                     pane_id: pane_id.as_str().to_owned(),
                     tab_id: Some(tab.id.as_str().to_owned()),
                     shell_pid,
+                    agent_id: None,
                 },
                 state: TaskState::Queued,
                 summary: None,
@@ -263,7 +264,9 @@ pub(crate) async fn cancel(
     Ok(())
 }
 
-async fn reachable_session(state: &AppState) -> Option<(SessionConfig, Box<dyn TerminalBackend>)> {
+pub(crate) async fn reachable_session(
+    state: &AppState,
+) -> Option<(SessionConfig, Box<dyn TerminalBackend>)> {
     for session in &state.config.sessions {
         let backend = terminal_backend(session);
         if matches!(backend.probe_reachable().await, Ok(true)) {
@@ -285,6 +288,7 @@ async fn pane_of(
         pane_id,
         tab_id,
         shell_pid,
+        ..
     } = &task.binding
     else {
         return Err(anyhow!("not a command task"));
@@ -481,6 +485,7 @@ mod tests {
             task.binding,
             TaskBinding::Pane {
                 shell_pid: None,
+                agent_id: None,
                 ..
             }
         ));
@@ -548,6 +553,7 @@ mod tests {
             handle.task.binding,
             TaskBinding::Pane {
                 shell_pid: Some(100),
+                agent_id: None,
                 ..
             }
         ));

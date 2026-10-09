@@ -623,6 +623,7 @@ mod tests {
                 pane_id: "%3".into(),
                 tab_id: None,
                 shell_pid: Some(9),
+                agent_id: None,
             }))
             .await
             .unwrap();
