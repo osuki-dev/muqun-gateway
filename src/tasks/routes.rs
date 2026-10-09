@@ -176,9 +176,13 @@ impl CreateBody {
                 "label must be at most 200 characters",
             ));
         }
+        // A remembered directory that has since gone away is no error: the
+        // task opens at home, as if nothing were remembered. Only a directory
+        // the device asked for by name is refused when it is missing.
+        let remembered = default_cwd.filter(|dir| std::path::Path::new(dir).is_dir());
         Ok(DelegateRequest {
             goal: self.goal,
-            cwd: task_directory(self.cwd.as_deref().or(default_cwd))?,
+            cwd: task_directory(self.cwd.as_deref().or(remembered))?,
             agent_id: self.agent_id,
             mode: self.mode,
             model: self.model,
@@ -648,37 +652,65 @@ mod tests {
     #[tokio::test]
     async fn device_task_directory_defaults() {
         let home = dirs::home_dir().unwrap();
-        let previous = std::env::current_dir().unwrap().canonicalize().unwrap();
-        let explicit = std::env::temp_dir().canonicalize().unwrap();
+        let temp = |name: &str| {
+            let dir =
+                crate::test_state_dir().join(format!("task-cwd-{name}-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            dir.canonicalize().unwrap()
+        };
+        let previous = temp("previous");
+        let explicit = temp("explicit");
+        let deleted = temp("deleted");
+        std::fs::remove_dir(&deleted).unwrap();
+
+        // Each case: the device's earlier tasks as (cwd, created_ms,
+        // updated_ms), the cwd it asks for now, and where the task opens.
         let cases = [
-            ("previous task", true, None, previous.as_path()),
-            ("no previous task", false, None, home.as_path()),
+            (
+                "previous task",
+                vec![(Some(&explicit), 5, 100), (Some(&previous), 10, 10)],
+                None,
+                previous.as_path(),
+            ),
+            ("no previous task", vec![], None, home.as_path()),
             (
                 "explicit cwd",
-                true,
+                vec![(Some(&explicit), 5, 100), (Some(&previous), 10, 10)],
                 Some(explicit.as_path()),
                 explicit.as_path(),
             ),
+            (
+                "deleted directory",
+                vec![(Some(&previous), 5, 5), (Some(&deleted), 10, 10)],
+                None,
+                home.as_path(),
+            ),
+            (
+                "newest task without a directory",
+                vec![(Some(&previous), 10, 10), (None, 15, 15)],
+                None,
+                previous.as_path(),
+            ),
         ];
 
-        for (name, has_previous, cwd, expected) in cases {
+        for (name, earlier, cwd, expected) in cases {
             let state = with_agent().await;
             let store = SqliteTaskStore::new(state.db.clone());
             // Creation order wins over updates, and another device is ignored.
-            for (device_id, directory, created_ms, updated_ms) in [
-                ("d1", explicit.as_path(), 5, 100),
-                ("d1", previous.as_path(), 10, 10),
-                ("d2", explicit.as_path(), 20, 20),
-            ] {
-                if device_id == "d1" && !has_previous {
-                    continue;
-                }
+            let other = ("d2", Some(&explicit), 20, 20);
+            for (device_id, directory, created_ms, updated_ms) in earlier
+                .into_iter()
+                .map(|(directory, created_ms, updated_ms)| {
+                    ("d1", directory, created_ms, updated_ms)
+                })
+                .chain([other])
+            {
                 store
                     .insert(&Task {
                         id: TaskId::new(),
                         kind: TaskKind::Delegation,
                         goal: "earlier task".into(),
-                        cwd: Some(directory.to_string_lossy().into_owned()),
+                        cwd: directory.map(|dir| dir.to_string_lossy().into_owned()),
                         binding: TaskBinding::None,
                         state: TaskState::Queued,
                         summary: None,

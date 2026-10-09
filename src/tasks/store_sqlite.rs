@@ -32,6 +32,8 @@ ALTER TABLE tasks ADD COLUMN label TEXT;
 ALTER TABLE tasks ADD COLUMN requester_name TEXT;
 CREATE INDEX tasks_by_parent ON tasks(parent_task_id, state);
 CREATE INDEX tasks_by_asid ON tasks(json_extract(binding, '$.asid'));
+", "
+CREATE INDEX tasks_device_cwd ON tasks(created_by, origin, created_ms DESC) WHERE cwd IS NOT NULL;
 "],
 };
 
@@ -99,7 +101,7 @@ impl TaskStore for SqliteTaskStore {
                 .call(move |c| {
                     Ok(c.query_row(
                         "SELECT cwd FROM tasks WHERE created_by = ?1 AND origin = 'device' \
-                         ORDER BY created_ms DESC, rowid DESC LIMIT 1",
+                         AND cwd IS NOT NULL ORDER BY created_ms DESC, rowid DESC LIMIT 1",
                         [owner],
                         |row| row.get(0),
                     )
@@ -530,6 +532,18 @@ mod tests {
             .unwrap();
         }
         let store = SqliteTaskStore::new(SqliteStore::open(&path, None, &[MIGRATION]).unwrap());
+        let indexed: bool = store
+            .db
+            .call(|c| {
+                Ok(c.query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = 'tasks_device_cwd'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )? == 1)
+            })
+            .await
+            .unwrap();
+        assert!(indexed, "the device cwd index is created on upgrade");
         let old = store.get(&TaskId("t_old".into())).await.unwrap().unwrap();
         assert_eq!(old.origin, TaskOrigin::Mcp);
         assert_eq!(old.parent, None);
