@@ -54,6 +54,11 @@ const TIMELINE_PAGE: usize = 50;
 /// kept, so the page fits an MCP result whole.
 const TIMELINE_PAGE_BYTES: usize = 12 * 1024;
 const SOURCE: &str = "task_service";
+/// A task's `progress`: one line of at most this many characters.
+pub(crate) const PROGRESS_CHARS: usize = 120;
+/// The most often a task's progress alone publishes it, and the most often a
+/// session's timeline is read for it.
+const PROGRESS_EVERY: Duration = Duration::from_secs(2);
 
 pub(crate) struct TaskService {
     store: Arc<dyn TaskStore>,
@@ -61,6 +66,17 @@ pub(crate) struct TaskService {
     machine_id: String,
     /// Pane delegations a follower is running for (see [`pane_agent::follow`]).
     following: Mutex<HashSet<TaskId>>,
+    /// What each open task is doing now (see [`TaskService::note_progress`]).
+    /// Kept in memory: it is live state, gone with the task's end or a restart.
+    live: Mutex<Live>,
+}
+
+#[derive(Default)]
+struct Live {
+    /// Each open task's progress line, and when it last published the task.
+    lines: HashMap<TaskId, (String, Option<Instant>)>,
+    /// When each agent session's timeline last fed a progress line.
+    sessions: HashMap<String, Instant>,
 }
 
 pub(crate) struct DelegateRequest {
@@ -103,6 +119,12 @@ pub(crate) struct TaskView {
     pub requested_by: Option<RequestedBy>,
     /// The direct children, counted by state when the view is made.
     pub children: ChildCounts,
+    /// What an open task is doing now, one line: the agent's current tool
+    /// call or the start of its latest message (a session), or the pane's
+    /// last prose line (a terminal agent). Absent when nothing is known yet,
+    /// and once the task has ended.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<String>,
 }
 
 /// A task as [`TaskService::wait`] leaves it, with a command's
@@ -191,6 +213,9 @@ impl Publishing<'_> {
     /// Tell listeners about `task` and, since its counts moved, its parent.
     async fn publish(&self, task: &Task) {
         let service = self.0;
+        if task.state.is_terminal() {
+            service.forget_progress(task);
+        }
         if service.events.receiver_count() == 0 {
             return;
         }
@@ -292,7 +317,7 @@ fn step(event: &AgentDomainEvent, asid: &str) -> Step {
                 let line = error.as_ref().map(|e| format!("{}: {}", e.name, e.message));
                 Step::Move(TaskChange {
                     summary: Some(one_line(
-                        line.as_deref().unwrap_or("the agent session failed"),
+                        line.as_deref().unwrap_or(SESSION_FAILED),
                         SUMMARY_CHARS,
                     )),
                     note: line,
@@ -329,6 +354,90 @@ impl TaskService {
             events,
             machine_id,
             following: Mutex::new(HashSet::new()),
+            live: Mutex::default(),
+        }
+    }
+
+    /// `line` is what open task `id` is doing now: kept for its views, and
+    /// published as `task.updated` when it changed, at most once per
+    /// [`PROGRESS_EVERY`] (a state change publishes it anyway).
+    pub(crate) async fn note_progress(&self, id: &TaskId, line: &str) {
+        let line = one_line(line, PROGRESS_CHARS);
+        if line.is_empty() {
+            return;
+        }
+        let publish = {
+            let Ok(mut live) = self.live.lock() else {
+                return;
+            };
+            let entry = live.lines.entry(id.clone()).or_default();
+            if entry.0 == line {
+                return;
+            }
+            entry.0 = line;
+            let due = entry
+                .1
+                .is_none_or(|published| published.elapsed() >= PROGRESS_EVERY);
+            if due {
+                entry.1 = Some(Instant::now());
+            }
+            due
+        };
+        if !publish {
+            return;
+        }
+        match self.store.get(id).await {
+            Ok(Some(task)) if !task.state.is_terminal() => self.store().publish(&task).await,
+            Ok(_) => {}
+            Err(error) => tracing::debug!(task = %id.0, %error, "task progress not published"),
+        }
+    }
+
+    fn progress_of(&self, task: &Task) -> Option<String> {
+        if task.state.is_terminal() {
+            return None;
+        }
+        let live = self.live.lock().ok()?;
+        live.lines.get(&task.id).map(|(line, _)| line.clone())
+    }
+
+    fn forget_progress(&self, task: &Task) {
+        if let Ok(mut live) = self.live.lock() {
+            live.lines.remove(&task.id);
+            if let TaskBinding::AgentSession { asid, .. } = &task.binding {
+                live.sessions.remove(asid);
+            }
+        }
+    }
+
+    /// A session's timeline changed: the open task bound to it is doing
+    /// what its newest item says. Read at most once per [`PROGRESS_EVERY`]
+    /// per session, so a streaming answer does not query the store per token.
+    async fn follow_progress(&self, asid: &str, items: &[TimelineItem]) {
+        let Some(line) = items.iter().rev().find_map(progress_line) else {
+            return;
+        };
+        {
+            let Ok(mut live) = self.live.lock() else {
+                return;
+            };
+            let last = live.sessions.get(asid);
+            if last.is_some_and(|last| last.elapsed() < PROGRESS_EVERY) {
+                return;
+            }
+            live.sessions.insert(asid.to_owned(), Instant::now());
+        }
+        let open = self
+            .store
+            .list(TaskFilter {
+                asid: Some(asid.to_owned()),
+                states: Some(OPEN_STATES.to_vec()),
+                limit: 1,
+                ..Default::default()
+            })
+            .await;
+        if let Ok(Some(task)) = open.map(|tasks| tasks.into_iter().next()) {
+            self.note_progress(&task.id, &line).await;
         }
     }
 
@@ -770,7 +879,7 @@ impl TaskService {
                 }
                 Step::Idle if !seen_busy => continue,
                 Step::Idle => turn_end(&summary_timeline(&manager, asid, task.created_ms).await),
-                Step::Move(to) => to,
+                Step::Move(to) => self.with_failure_detail(state, &task, to).await,
             };
             if to.to == task.state {
                 // The follower may have moved it since it was read (a paused
@@ -1040,7 +1149,10 @@ impl TaskService {
                 ChildCounts::default()
             }
         };
-        Self::view(task, counts)
+        TaskView {
+            progress: self.progress_of(task),
+            ..Self::view(task, counts)
+        }
     }
 
     /// [`Self::present`] for a page of tasks, counted in one query.
@@ -1049,7 +1161,10 @@ impl TaskService {
         let counts = self.store.child_counts(ids).await?;
         Ok(tasks
             .iter()
-            .map(|task| Self::view(task, counts.get(&task.id).copied().unwrap_or_default()))
+            .map(|task| TaskView {
+                progress: self.progress_of(task),
+                ..Self::view(task, counts.get(&task.id).copied().unwrap_or_default())
+            })
             .collect())
     }
 
@@ -1076,6 +1191,7 @@ impl TaskService {
             label: task.label.clone(),
             requested_by,
             children,
+            progress: None,
         }
     }
 
@@ -1086,6 +1202,10 @@ impl TaskService {
     /// working, a failed session failed with its error line, an interrupted
     /// one cancelled, a pending request waiting. Whether a task moved.
     pub(crate) async fn follow(&self, state: &AppState, event: &AgentDomainEvent) -> bool {
+        if let AgentDomainEvent::TimelineUpsert { asid, items, .. } = event {
+            self.follow_progress(&asid.0, items).await;
+            return false;
+        }
         let asid = match event {
             AgentDomainEvent::StatusChanged {
                 asid,
@@ -1132,7 +1252,7 @@ impl TaskService {
         };
         let to = TaskChange {
             source: FOLLOWER.into(),
-            ..to
+            ..self.with_failure_detail(state, &task, to).await
         };
         match self.settle(&task, to).await {
             Ok(_) => true,
@@ -1141,6 +1261,29 @@ impl TaskService {
                 tracing::debug!(task = %task.id.0, %error, "task follower: move refused");
                 false
             }
+        }
+    }
+
+    /// `to`, with what went wrong read off the timeline when it fails the
+    /// session task without an error of the agent's own.
+    async fn with_failure_detail(
+        &self,
+        state: &AppState,
+        task: &Task,
+        to: TaskChange,
+    ) -> TaskChange {
+        let TaskBinding::AgentSession { asid, .. } = &task.binding else {
+            return to;
+        };
+        if to.to != TaskState::Failed || to.note.is_some() {
+            return to;
+        }
+        let Some(manager) = state.agent_runtime.manager_for_session(asid).await else {
+            return to;
+        };
+        TaskChange {
+            summary: Some(failure_detail(&manager, asid, task.created_ms).await),
+            ..to
         }
     }
 
@@ -1218,6 +1361,35 @@ impl TaskService {
     }
 }
 
+/// What a timeline item says an agent is doing, as a progress line: a tool
+/// call (its title, else its name and command or file; a failed call with
+/// its error), or the start of an assistant message. Nothing for the rest.
+fn progress_line(item: &TimelineItem) -> Option<String> {
+    match &item.part {
+        AgentPart::Tool(call) => {
+            let what = call.title.clone().unwrap_or_else(|| {
+                let target = ["command", "filePath", "file_path", "path", "pattern", "url"]
+                    .iter()
+                    .find_map(|key| call.input.get(*key).and_then(Value::as_str));
+                match target {
+                    Some(target) => format!("{} {target}", call.name),
+                    None => call.name.clone(),
+                }
+            });
+            Some(match &call.error {
+                Some(error) => format!("{what} failed: {}: {}", error.name, error.message),
+                None => what,
+            })
+        }
+        AgentPart::Text { text } if item.role == TimelineRole::Assistant => text
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(str::to_owned),
+        _ => None,
+    }
+}
+
 /// Stopped short of an end: waiting on the user, or paused without saying
 /// it is finished.
 fn paused(state: TaskState) -> bool {
@@ -1253,6 +1425,25 @@ pub(crate) const OPEN_STATES: [TaskState; 5] = [
     TaskState::IdleUnconfirmed,
 ];
 const FOLLOWER: &str = "task_follower";
+/// A failed session's summary when the agent gave no error.
+pub(crate) const SESSION_FAILED: &str = "the agent session failed";
+
+/// `failed`, as the session's failure without an error of its own: the
+/// last thing the session's timeline says went wrong (a failed tool call, a
+/// status line) or said, so the summary is never just "failed".
+pub(crate) async fn failure_detail(manager: &AgentManager, asid: &str, since_ms: u64) -> String {
+    let items = summary_timeline(manager, asid, since_ms).await;
+    let detail = items.iter().rev().find_map(|item| match &item.part {
+        AgentPart::Tool(call) if call.error.is_some() => progress_line(item),
+        AgentPart::Status { text } if !text.trim().is_empty() => Some(text.clone()),
+        AgentPart::Text { .. } => progress_line(item),
+        _ => None,
+    });
+    match detail {
+        Some(detail) => one_line(&format!("{SESSION_FAILED}: {detail}"), SUMMARY_CHARS),
+        None => SESSION_FAILED.to_owned(),
+    }
+}
 
 /// The timeline a finished delegation's summary is read from.
 ///
@@ -2598,6 +2789,28 @@ mod tests {
                 assert_eq!(task.summary.as_deref(), summary, "{name}");
             }
         }
+
+        // While it works, the view says what it is doing: the running tool.
+        let (state, id) = tracked(finished_agent(Vec::new())).await;
+        let mut call = reply("m1", "");
+        call.part = AgentPart::Tool(
+            serde_json::from_value(json!({
+                "id": "c1", "name": "bash", "title": "cargo test",
+                "input": { "command": "cargo test" }, "state": "running", "status": "running"
+            }))
+            .unwrap(),
+        );
+        let upsert = AgentDomainEvent::TimelineUpsert {
+            asid: AgentSessionId(ASID.into()),
+            items: vec![call],
+            seq: 1,
+        };
+        state.tasks.follow(&state, &upsert).await;
+        let view = state
+            .tasks
+            .present(&state.tasks.get_for_test(&id).await)
+            .await;
+        assert_eq!(view.progress.as_deref(), Some("cargo test"));
     }
 
     #[tokio::test]

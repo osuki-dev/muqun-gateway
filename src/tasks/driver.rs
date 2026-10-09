@@ -36,7 +36,9 @@ use std::time::Duration;
 use super::domain::one_line;
 use super::domain::{now_ms, Task, TaskBinding, TaskChange, TaskFilter, TaskKind, TaskState};
 use super::pane_agent;
-use super::service::{finished_since, summary_timeline, turn_end, OPEN_STATES, SUMMARY_CHARS};
+use super::service::{
+    failure_detail, finished_since, summary_timeline, turn_end, OPEN_STATES, SUMMARY_CHARS,
+};
 use crate::agents::domain::AgentSessionStatus;
 use crate::agents::ports::agent::AgentError;
 use crate::{terminal_backend, AppState};
@@ -192,21 +194,19 @@ async fn settle_delegation(state: &AppState, task: &Task, agent_id: &str, asid: 
     };
     let session = match manager.sessions().get_session(asid).await {
         Ok(session) => session,
-        Err(error) if session_gone(&error) => return fail(state, task, "session gone").await,
+        Err(error) if session_gone(&error) => {
+            return fail(state, task, &format!("session gone: {error}")).await
+        }
         Err(error) => {
             tracing::debug!(task = %task.id.0, %error, "task driver: session read failed");
             return false;
         }
     };
     if session.status == AgentSessionStatus::Failed {
-        let why = session
-            .error
-            .as_ref()
-            .map(|e| format!("{}: {}", e.name, e.message));
-        let why = one_line(
-            why.as_deref().unwrap_or("the agent session failed"),
-            SUMMARY_CHARS,
-        );
+        let why = match session.error.as_ref() {
+            Some(e) => one_line(&format!("{}: {}", e.name, e.message), SUMMARY_CHARS),
+            None => failure_detail(&manager, asid, task.created_ms).await,
+        };
         return fail(state, task, &why).await;
     }
     let running = matches!(
@@ -245,7 +245,7 @@ fn session_gone(error: &AgentError) -> bool {
 async fn fail(state: &AppState, task: &Task, why: &str) -> bool {
     let failed = TaskChange {
         note: Some(why.to_owned()),
-        summary: Some(why.to_owned()),
+        summary: Some(one_line(why, SUMMARY_CHARS)),
         ..change(TaskState::Failed)
     };
     moved(state, task, failed).await
@@ -418,7 +418,11 @@ mod tests {
         assert_eq!(reconcile(&state).await, 2);
         let failed = state_of(&state, &gone).await;
         assert_eq!(failed.state, TaskState::Failed);
-        assert_eq!(failed.summary.as_deref(), Some("session gone"));
+        let why = failed.summary.unwrap();
+        assert!(
+            why.starts_with("session gone: "),
+            "the agent's own error: {why}"
+        );
         let finished = state_of(&state, &done).await;
         assert_eq!(finished.state, TaskState::Done);
         // Marker first, after a restart too: the agent's own summary.

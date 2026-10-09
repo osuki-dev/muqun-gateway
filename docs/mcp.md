@@ -194,7 +194,7 @@ Tasks are reconciled at startup and every 60 s, so a task moves even when
 no assistant waits on it: a command whose pane is gone fails with summary
 `pane closed`; a command whose pane is there gets one read of its exit
 marker (and completes, closing an exit-0 tab, if it has exited); a
-delegation whose agent no longer has the session fails with `session gone`;
+delegation whose agent no longer has the session fails with `session gone: <the agent's error>`;
 a delegation whose session failed fails with its error line as `summary`;
 a delegation whose session went idle after the task was created is `done`
 when the agent's last message carries the completion marker (read first, so
@@ -229,6 +229,23 @@ unknown id is `404 task_not_found`; any other failure is `500 task_failed`.
 - `label`: the short title the requester gave, or `null`.
 - `requested_by`: `{"kind": "device", "id": "<device id>", "name": "<device
   name>"}` for a device's task; `null` otherwise.
+- `progress` (present only while the task is open and something is known;
+  `task_ledger_complete`): what it is doing now, one line of at most 120
+  characters -- for a session delegation the agent's current tool call (its
+  title, else its name and command or file; a failed call with its error) or
+  the start of its latest message, for a terminal agent the pane's last prose
+  line (the line its hint is read from). A change publishes `task.updated` at
+  most once every 2 s per task (a state change publishes it at once); it is
+  kept in memory, so after a gateway restart it is absent until the agent
+  moves again, and it is dropped when the task ends (the `summary` then says
+  how it ended).
+- A `failed` task's `summary` is the error as the agent, provider or backend
+  gave it: `<name>: <message>` from the session, else the session's last
+  failed tool call, status line or message (`the agent session failed:
+  <detail>`), `session gone: <the agent's error>`, `the agent exited before it
+  finished: <last screen line>`, `the pane closed: <last screen line>`, a
+  launch step's `<step>: <message>`, a command's `exit <code>` and output
+  tail, or `the command could not be typed: <error>`.
 - `children`: `{"total", "active", "waiting", "failed"}`, the task's direct
   children by state, counted when the view is made (`active` is every state
   that is not finished and not `waiting`; `done` and `cancelled` count only in
@@ -354,7 +371,7 @@ every poll:
 | the agent blocked on a menu: an approval or a question | `waiting` |
 | the agent idle on two polls in a row, after it was seen working (or after its Herdr state sequence moved), or 30 s after the start | `idle_unconfirmed`, `summary` = a hint: the agent's last prose block when the gateway has a transcript dictionary for it (Claude Code, Codex, ...), else the screen's last line with any letter or digit in it |
 | no agent running in the pane, on two polls in a row, and no marker | `failed`, `summary` = `the agent exited before it finished: <last screen line>` |
-| the pane is gone (or another shell holds its id), and no marker was read before | `failed`, `summary` = `the pane closed` |
+| the pane is gone (or another shell holds its id), and no marker was read before | `failed`, `summary` = `the pane closed: <the last screen line read>` |
 
 `idle_unconfirmed` is a pause, not an end: the task stays open, and moves back
 to `working` when the agent runs again. The backend exposes no assistant

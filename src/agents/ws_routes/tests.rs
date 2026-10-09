@@ -606,6 +606,7 @@ fn task_update(seq: u64) -> TaskDomainEvent {
             label: None,
             requested_by: None,
             children: Default::default(),
+            progress: None,
         },
         seq,
     }

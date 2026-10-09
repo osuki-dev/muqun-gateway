@@ -400,6 +400,8 @@ async fn run(state: &AppState, id: &TaskId) {
     // The marker last read: a pane closed right after its agent printed it
     // still finished its task.
     let mut last_marker: Option<String> = None;
+    // The screen last read: a closed pane's failure still says what was on it.
+    let mut last_screen: Option<String> = None;
     loop {
         let task = match state.tasks.task(id).await {
             Ok(Some(task)) if !task.state.is_terminal() => task,
@@ -427,7 +429,14 @@ async fn run(state: &AppState, id: &TaskId) {
                 started.elapsed(),
             );
             last_marker = marker;
-            if let Some(change) = change_for(verdict, at.agent_id, observed.screen.as_deref()) {
+            let screen = observed.screen.or_else(|| last_screen.take());
+            if let Some(line) = screen
+                .as_deref()
+                .and_then(|text| screen_summary(at.agent_id, text))
+            {
+                state.tasks.note_progress(id, &line).await;
+            }
+            if let Some(change) = change_for(verdict, at.agent_id, screen.as_deref()) {
                 match state.tasks.move_to(id, change).await {
                     Ok(moved) => now = moved.state,
                     Err(error) => {
@@ -435,6 +444,7 @@ async fn run(state: &AppState, id: &TaskId) {
                     }
                 }
             }
+            last_screen = screen;
         }
         let pause = if now == TaskState::IdleUnconfirmed {
             PAUSED_POLL

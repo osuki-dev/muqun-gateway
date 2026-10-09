@@ -85,6 +85,9 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
   `MUQUN_TASK_DONE` marker (`pane_agent::done_marker`, read off the pane or
   the session's last message by `service::turn_end`), or the device's
   `POST /api/tasks/{id}/complete`; a stop without one is `idle_unconfirmed`.
+  An open task's `progress` line (what it is doing now) lives in
+  `TaskService` memory only, fed by timeline upserts and pane polls and
+  published at most every 2 s per task.
   Every task carries `parent_task_id` and `origin`; `children` counts are
   computed when a view is made, never stored.
 - `src/fleet/`: this machine's capability manifest (agents, terminal backends,

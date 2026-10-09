@@ -157,8 +157,10 @@ async fn launch(
         backend.send_keys(&pane_id, &["Enter".to_owned()]).await
     };
     if let Err(error) = typed.await {
+        let why = format!("the command could not be typed: {error:#}");
         let failed = TaskChange {
-            note: Some("the command could not be typed".into()),
+            summary: Some(super::domain::one_line(&why, super::service::SUMMARY_CHARS)),
+            note: Some(why),
             ..change(TaskState::Failed)
         };
         store.transition(&task.id, failed).await?;
