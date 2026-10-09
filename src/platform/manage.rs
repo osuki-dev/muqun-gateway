@@ -2,7 +2,7 @@
 
 use std::io::{stdout, Write as _};
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use crossterm::cursor::MoveTo;
@@ -65,10 +65,13 @@ pub(crate) fn status() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The status line when nothing has happened on the current view yet.
+const IDLE_STATUS: &str = "ready";
+
 pub(crate) fn manage() -> anyhow::Result<()> {
     ensure_pairing_transport_key()?;
     let _terminal = TerminalModeGuard::enter()?;
-    let mut message = auto_upgrade_local_public_url()?.unwrap_or_else(|| String::from("ready"));
+    let mut message = auto_upgrade_local_public_url()?.unwrap_or_else(|| String::from(IDLE_STATUS));
     let mut pending_pairing = fetch_pending_pairing().ok().flatten();
     let mut devices = match read_devices() {
         Ok(devices) => devices,
@@ -180,6 +183,7 @@ pub(crate) fn manage() -> anyhow::Result<()> {
                 message = String::from("Pairing view closed; existing devices are unchanged.");
             } else if ui.section != Section::Overview {
                 ui = ManageView::default();
+                message = String::from(IDLE_STATUS);
             } else {
                 break;
             }
@@ -193,7 +197,13 @@ pub(crate) fn manage() -> anyhow::Result<()> {
             )?;
             continue;
         }
+        let section = ui.section;
         if ui.navigate(event.code, item_count) {
+            // A status line describes the last action on the view it was
+            // taken on; carried to another view it reads as that view's.
+            if ui.section != section {
+                message = String::from(IDLE_STATUS);
+            }
             print_manage_screen(
                 &message,
                 pending_pairing.as_ref(),
@@ -206,15 +216,11 @@ pub(crate) fn manage() -> anyhow::Result<()> {
         }
         let input = match event.code {
             KeyCode::Char(ch) => ch.to_string(),
-            KeyCode::Enter => primary_action(
-                ui.section,
-                ui.selected,
-                item_count == 0,
-                pairing.open,
-                lifecycle::running_pid().is_ok_and(|pid| pid.is_some()),
-            )
-            .map(|ch| ch.to_string())
-            .unwrap_or_default(),
+            KeyCode::Enter => {
+                primary_action(ui.section, ui.selected, item_count == 0, pairing.open)
+                    .map(|ch| ch.to_string())
+                    .unwrap_or_default()
+            }
             _ => String::new(),
         };
         if input == "q" {
@@ -728,12 +734,14 @@ enum PairingStage {
 }
 
 /// One row of the pairing flow: "1 Scan the QR in Muqun · 2 Type this code on
-/// the phone · 3 Done", with the current step highlighted.
-fn pairing_steps(stage: PairingStage) -> ScreenLine {
+/// the phone · 3 Done", with the current step highlighted. Where that row
+/// does not fit in `width` cells, only the current step is shown, as
+/// "Step N of 3: <text>", rather than a row clipped mid-step.
+fn pairing_steps(stage: PairingStage, width: usize) -> ScreenLine {
     let steps = [
-        (PairingStage::Scan, "1 Scan the QR in Muqun"),
-        (PairingStage::Code, "2 Type this code on the phone"),
-        (PairingStage::Done, "3 Done"),
+        (PairingStage::Scan, "Scan the QR in Muqun"),
+        (PairingStage::Code, "Type this code on the phone"),
+        (PairingStage::Done, "Done"),
     ];
     let mut spans = Vec::new();
     for (index, (step, text)) in steps.iter().enumerate() {
@@ -741,7 +749,7 @@ fn pairing_steps(stage: PairingStage) -> ScreenLine {
             spans.push((" · ".into(), Tone::Quiet));
         }
         spans.push((
-            (*text).into(),
+            format!("{} {text}", index + 1),
             if *step == stage {
                 Tone::Badge
             } else {
@@ -749,7 +757,25 @@ fn pairing_steps(stage: PairingStage) -> ScreenLine {
             },
         ));
     }
-    ScreenLine { spans, qr: None }
+    let full = ScreenLine { spans, qr: None };
+    if full.width() <= width {
+        return full;
+    }
+    let (index, (_, text)) = steps
+        .iter()
+        .enumerate()
+        .find(|(_, (step, _))| *step == stage)
+        .expect("every stage is a step");
+    ScreenLine {
+        spans: vec![
+            (
+                format!("Step {} of {}: ", index + 1, steps.len()),
+                Tone::Quiet,
+            ),
+            ((*text).into(), Tone::Badge),
+        ],
+        qr: None,
+    }
 }
 
 /// Whether one of the gateway's services answers, as the header shows it.
@@ -895,19 +921,39 @@ fn fetch_connectivity() -> Connectivity {
     }
 }
 
-const CONNECTIVITY_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// The gap between two link probes. `/api/capabilities` is the only answer
+/// that names both links, and it carries every agent's model catalogue, so
+/// it is not asked for more often than the header needs.
+const CONNECTIVITY_POLL_INTERVAL: Duration = Duration::from_secs(8);
+/// How often the poller looks at whether the gateway is running at all.
+const RUNNING_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Ask the gateway about its links every couple of seconds, off the UI
+/// Ask the running gateway about its links every few seconds, off the UI
 /// thread, so the header is current without a key press and a slow probe
-/// never stalls key handling. The thread ends when the manager drops the
-/// receiver.
+/// never stalls key handling. A stopped gateway is not asked: its links are
+/// unknown, and the first probe after it starts is immediate. The thread
+/// ends when the manager drops the receiver.
 fn spawn_link_poller() -> std::sync::mpsc::Receiver<Connectivity> {
     let (sender, receiver) = std::sync::mpsc::channel();
-    std::thread::spawn(move || loop {
-        if sender.send(fetch_connectivity()).is_err() {
-            break;
+    std::thread::spawn(move || {
+        let mut next_probe = Instant::now();
+        loop {
+            let running = lifecycle::running_pid().is_ok_and(|pid| pid.is_some());
+            let links = if !running {
+                next_probe = Instant::now();
+                Some(Connectivity::default())
+            } else if Instant::now() >= next_probe {
+                let links = fetch_connectivity();
+                next_probe = Instant::now() + CONNECTIVITY_POLL_INTERVAL;
+                Some(links)
+            } else {
+                None
+            };
+            if links.is_some_and(|links| sender.send(links).is_err()) {
+                break;
+            }
+            std::thread::sleep(RUNNING_CHECK_INTERVAL);
         }
-        std::thread::sleep(CONNECTIVITY_POLL_INTERVAL);
     });
     receiver
 }
@@ -915,68 +961,90 @@ fn spawn_link_poller() -> std::sync::mpsc::Receiver<Connectivity> {
 /// What the footer's hints depend on besides the view.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct FooterContext {
-    running: bool,
     no_backends: bool,
     no_devices: bool,
     /// `Some` while the pairing flow is shown instead of the device list.
     pairing: Option<PairingStage>,
 }
 
-/// The footer's two hint rows: the view's actions, then navigation. Every
-/// hint is a key followed by the full words for what it does; Esc is always
-/// one level back and `q` always closes the manager. Hints are separated by
-/// " | " so narrow terminals can wrap them.
-fn footer_hints(section: Section, context: &FooterContext) -> (String, String) {
+/// The footer's hint rows: the view's actions, then navigation.
+struct FooterHints {
+    /// The view's own keys, one key per action, each followed by the full
+    /// words for what it does.
+    actions: String,
+    /// Switching views, selecting, and leaving: Esc is always one level back
+    /// and `q` always closes the manager.
+    navigation: String,
+    /// The navigation row a short terminal shows instead: the same views,
+    /// Tab, Esc and `q`, in fewer words and without the selection keys.
+    compact_navigation: String,
+}
+
+/// Hints are separated by " | " so narrow terminals can wrap them.
+fn footer_hints(section: Section, context: &FooterContext) -> FooterHints {
     let actions = match (section, context.pairing) {
-        (Section::Overview, _) => format!(
-            "Enter {} gateway | s Start gateway | t Stop gateway | r Restart gateway",
-            if context.running { "Stop" } else { "Start" }
-        ),
+        (Section::Overview, _) => {
+            String::from("s Start gateway | t Stop gateway | r Restart gateway")
+        }
         (Section::Terminals, _) if context.no_backends => {
-            String::from("Enter Add tmux backend | m Add tmux backend | h Add Herdr backend")
+            String::from("m Add tmux backend | h Add Herdr backend")
         }
         (Section::Terminals, _) => String::from(
-            "Enter Make selected default | f Make selected default | b Toggle terminal-server startup | d Remove selected backend | h Add Herdr backend | m Add tmux backend",
+            "f Make selected default | b Toggle terminal-server startup | d Remove selected backend | h Add Herdr backend | m Add tmux backend",
         ),
-        (Section::Devices, Some(PairingStage::Done)) => {
-            String::from("Enter Back to device list | p Pair another device | r Back to device list")
+        // Leaving the pairing flow is Esc's job, listed under navigation;
+        // `r` does the same and is not listed twice.
+        (Section::Devices, Some(PairingStage::Done)) => String::from("p Pair another device"),
+        (Section::Devices, Some(_)) => String::new(),
+        (Section::Devices, None) if context.no_devices => String::from("p Pair first device"),
+        (Section::Devices, None) => {
+            String::from("x Revoke selected device | p Pair new device")
         }
-        (Section::Devices, Some(_)) => {
-            String::from("Enter Back to device list | r Back to device list")
-        }
-        (Section::Devices, None) if context.no_devices => {
-            String::from("Enter Pair first device | p Pair new device")
-        }
-        (Section::Devices, None) => String::from(
-            "Enter Revoke selected device | x Revoke selected device | p Pair new device",
-        ),
         (Section::Settings, _) => String::from(
             "Enter Change selected setting | g Gateway login autostart | u Edit address | a Detect address | e Toggle encryption | c Check updates | i Install update",
         ),
     };
-    let navigation = match (section, context.pairing) {
-        (Section::Overview, _) => String::from(
-            "Views: 1 Overview (status) · 2 Terminals (backends) · 3 Devices (pair phones) · 4 Settings (address, autostart, updates) | Tab Next view | Esc or q Close manager",
+    let views = (section == Section::Overview)
+        .then_some("1 Overview · 2 Terminals · 3 Devices · 4 Settings");
+    let select = (section != Section::Overview && context.pairing.is_none())
+        .then_some("Up/Down Select | PageUp/PageDown Scroll");
+    let (back, compact_back) = match (section, context.pairing) {
+        (Section::Overview, _) => ("Esc or q Close manager", "Esc or q Close manager"),
+        (Section::Devices, Some(_)) => (
+            "Esc Back to device list | q Close manager",
+            "Esc Back | q Close manager",
         ),
-        (Section::Devices, Some(_)) => {
-            String::from("Tab Next view | Esc Back to device list | q Close manager")
-        }
-        _ => String::from(
-            "Tab Next view | Up/Down Select | PageUp/PageDown Scroll | Esc Back to Overview | q Close manager",
+        _ => (
+            "Esc Back to Overview | q Close manager",
+            "Esc Back | q Close manager",
         ),
     };
-    (actions, navigation)
+    let join = |hints: &[Option<&str>]| {
+        hints
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
+    FooterHints {
+        actions,
+        navigation: join(&[views, Some("Tab Next view"), select, Some(back)]),
+        compact_navigation: join(&[views, Some("Tab Views"), Some(compact_back)]),
+    }
 }
 
+/// The key Enter stands in for on a view. Overview has none: its actions
+/// start, stop and restart the gateway, and none of those belongs on the key
+/// an operator leans on to look around.
 fn primary_action(
     section: Section,
     selected: usize,
     empty_items: bool,
     pairing_open: bool,
-    running: bool,
 ) -> Option<char> {
     match section {
-        Section::Overview => Some(if running { 't' } else { 's' }),
+        Section::Overview => None,
         Section::Terminals => Some(if empty_items { 'm' } else { 'f' }),
         // The pairing view (QR, code, or done) returns to the list on Enter.
         Section::Devices if pairing_open => Some('r'),
@@ -1069,7 +1137,7 @@ fn print_manage_screen(
     let running = matches!(owner, Ok(Some(_)));
     let runtime = match owner {
         Ok(Some(pid)) => format!("Running - process {pid}"),
-        Ok(None) => String::from("Stopped - press Enter to start"),
+        Ok(None) => String::from("Stopped - press s to start"),
         Err(error) => format!("Unavailable: {}", first_line(&error.to_string())),
     };
     let autostart = autostart_label(&service::state());
@@ -1310,6 +1378,8 @@ fn wrapped_rows(label: &str, value: &str, width: usize) -> Vec<ScreenLine> {
     lines.into_iter().map(ScreenLine::plain).collect()
 }
 
+/// Hints wrap at " | "; a hint wider than the row on its own, such as the
+/// views list, wraps at " · " rather than being clipped mid-word.
 fn shortcut_rows(hints: &str, width: usize, tone: Tone) -> Vec<ScreenLine> {
     let mut rows = Vec::new();
     let mut line = String::new();
@@ -1317,6 +1387,19 @@ fn shortcut_rows(hints: &str, width: usize, tone: Tone) -> Vec<ScreenLine> {
         if !line.is_empty() && display_width(&line) + 3 + display_width(hint) > width {
             rows.push(ScreenLine::text(&line, tone));
             line.clear();
+        }
+        if line.is_empty() && display_width(hint) > width && hint.contains(" · ") {
+            for part in hint.split(" · ") {
+                if !line.is_empty() && display_width(&line) + 3 + display_width(part) > width {
+                    rows.push(ScreenLine::text(&line, tone));
+                    line.clear();
+                }
+                if !line.is_empty() {
+                    line.push_str(" · ");
+                }
+                line.push_str(part);
+            }
+            continue;
         }
         if !line.is_empty() {
             line.push_str(" | ");
@@ -1405,17 +1488,16 @@ fn manage_lines(
     }
     let pairing_stage = data.pairing.stage(data.pending.is_some());
     let show_pairing = data.pairing.open;
-    let (hints, navigation) = footer_hints(
+    let hints = footer_hints(
         ui.section,
         &FooterContext {
-            running: data.running,
             no_backends: config.sessions.is_empty(),
             no_devices: data.devices.is_empty(),
             pairing: show_pairing.then_some(pairing_stage),
         },
     );
-    let mut footer = shortcut_rows(&hints, content, Tone::Accent);
-    footer.extend(shortcut_rows(&navigation, content, Tone::Quiet));
+    let mut footer = shortcut_rows(&hints.actions, content, Tone::Accent);
+    footer.extend(shortcut_rows(&hints.navigation, content, Tone::Quiet));
     footer.push(ScreenLine::text(
         format!(
             "{}{}",
@@ -1434,10 +1516,16 @@ fn manage_lines(
     ));
     // Small windows keep one primary action and one status row, not a wall of shortcuts.
     if height < 14 {
-        footer.truncate(1);
-        footer[0] = ScreenLine::text(hints.split(" | ").next().unwrap_or(&hints), Tone::Accent);
-        footer.push(ScreenLine::text(
-            "Tab Views | Esc Back | q Close manager",
+        footer = hints
+            .actions
+            .split(" | ")
+            .next()
+            .filter(|hint| !hint.is_empty())
+            .map(|hint| vec![ScreenLine::text(hint, Tone::Accent)])
+            .unwrap_or_default();
+        footer.extend(shortcut_rows(
+            &hints.compact_navigation,
+            content,
             Tone::Quiet,
         ));
         footer.push(ScreenLine::plain(format!("Status: {}", data.message)));
@@ -1615,7 +1703,7 @@ fn manage_lines(
                 if roomy {
                     body.push(ScreenLine::text("Pair a device", Tone::Title));
                 }
-                body.push(pairing_steps(pairing_stage));
+                body.push(pairing_steps(pairing_stage, content));
                 if roomy {
                     body.push(ScreenLine::plain(""));
                 }
@@ -1867,7 +1955,7 @@ fn autostart_toggle(state: anyhow::Result<service::ServiceState>) -> AutostartTo
             AutostartToggle::Install
         }
         Ok(service::ServiceState::Stopped) => AutostartToggle::Refuse(String::from(
-            "autostart is on and Gateway is stopped; press Enter on Overview to start it, \
+            "autostart is on and Gateway is stopped; press s on Overview to start it, \
              or run `muqun-gateway service uninstall` to turn autostart off",
         )),
         Err(error) => AutostartToggle::Refuse(format!(
@@ -2473,26 +2561,16 @@ mod tests {
     fn footer_hints_name_every_action_and_always_offer_esc_and_q() {
         use super::{footer_hints, FooterContext, PairingStage};
         let base = FooterContext::default();
-        let cases: [(Section, FooterContext, &[&str]); 7] = [
-            (
-                Section::Overview,
-                FooterContext {
-                    running: true,
-                    ..base
-                },
-                &[
-                    "Enter Stop gateway",
-                    "1 Overview",
-                    "2 Terminals",
-                    "3 Devices",
-                    "4 Settings",
-                    "Esc or q Close manager",
-                ],
-            ),
+        let cases: [(Section, FooterContext, &[&str]); 6] = [
             (
                 Section::Overview,
                 base,
-                &["Enter Start gateway", "Esc or q Close manager"],
+                &[
+                    "s Start gateway",
+                    "t Stop gateway",
+                    "1 Overview · 2 Terminals · 3 Devices · 4 Settings",
+                    "Esc or q Close manager",
+                ],
             ),
             (
                 Section::Terminals,
@@ -2501,7 +2579,7 @@ mod tests {
                     ..base
                 },
                 &[
-                    "Enter Add tmux backend",
+                    "m Add tmux backend",
                     "h Add Herdr backend",
                     "Esc Back to Overview",
                     "q Close manager",
@@ -2511,7 +2589,7 @@ mod tests {
                 Section::Terminals,
                 base,
                 &[
-                    "Enter Make selected default",
+                    "f Make selected default",
                     "d Remove selected backend",
                     "Esc Back to Overview",
                     "q Close manager",
@@ -2523,11 +2601,7 @@ mod tests {
                     pairing: Some(PairingStage::Scan),
                     ..base
                 },
-                &[
-                    "Enter Back to device list",
-                    "Esc Back to device list",
-                    "q Close manager",
-                ],
+                &["Esc Back to device list", "q Close manager"],
             ),
             (
                 Section::Devices,
@@ -2553,16 +2627,44 @@ mod tests {
             ),
         ];
         for (section, context, expected) in cases {
-            let (actions, navigation) = footer_hints(section, &context);
-            let footer = format!("{actions} | {navigation}");
+            let hints = footer_hints(section, &context);
+            let footer = format!("{} | {}", hints.actions, hints.navigation);
             for text in expected {
                 assert!(
                     footer.contains(text),
                     "{section:?} {context:?}: missing {text:?} in {footer:?}"
                 );
             }
-            assert!(footer.contains("Esc"), "{section:?}: Esc missing");
-            assert!(footer.contains("q Close manager"), "{section:?}: q missing");
+            if section == Section::Overview {
+                assert!(!footer.contains("Enter"), "Overview offers Enter");
+            }
+            // No action is listed under two keys.
+            let mut described: Vec<&str> = footer
+                .split(" | ")
+                .filter_map(|hint| hint.split_once(' ').map(|(_, what)| what))
+                .collect();
+            described.sort_unstable();
+            let before = described.len();
+            described.dedup();
+            assert_eq!(
+                described.len(),
+                before,
+                "{section:?}: an action is listed twice"
+            );
+            for row in [&hints.navigation, &hints.compact_navigation] {
+                assert!(row.contains("Esc"), "{section:?}: Esc missing in {row:?}");
+                assert!(
+                    row.contains("q Close manager"),
+                    "{section:?}: q missing in {row:?}"
+                );
+                assert!(row.contains("Tab"), "{section:?}: Tab missing in {row:?}");
+                assert_eq!(
+                    row.contains("1 Overview · 2 Terminals · 3 Devices · 4 Settings"),
+                    section == Section::Overview,
+                    "{section:?}: views explainer in {row:?}"
+                );
+            }
+            assert!(!hints.compact_navigation.contains("Select"));
         }
     }
 
@@ -2582,10 +2684,10 @@ mod tests {
         assert!(!ui.navigate(KeyCode::Char('g'), 50));
         let context = super::FooterContext::default();
         assert!(!super::footer_hints(Section::Terminals, &context)
-            .0
+            .actions
             .contains("Gateway login autostart"));
         assert!(super::footer_hints(Section::Settings, &context)
-            .0
+            .actions
             .contains("Gateway login autostart"));
         ui.navigate(KeyCode::Tab, 50);
         assert_eq!(ui.selected, 0);
@@ -2594,37 +2696,22 @@ mod tests {
 
     #[test]
     fn manager_enter_actions_and_confirmation_cancel_are_explicit() {
+        // Enter never starts or stops the gateway from the landing view.
+        assert_eq!(primary_action(Section::Overview, 0, true, false), None);
         assert_eq!(
-            primary_action(Section::Overview, 0, true, false, false),
-            Some('s')
-        );
-        assert_eq!(
-            primary_action(Section::Overview, 0, true, false, true),
-            Some('t')
-        );
-        assert_eq!(
-            primary_action(Section::Terminals, 3, false, false, false),
+            primary_action(Section::Terminals, 3, false, false),
             Some('f')
         );
         assert_eq!(
-            primary_action(Section::Terminals, 0, true, false, false),
+            primary_action(Section::Terminals, 0, true, false),
             Some('m')
         );
-        assert_eq!(
-            primary_action(Section::Devices, 0, true, false, false),
-            Some('p')
-        );
-        assert_eq!(
-            primary_action(Section::Devices, 1, false, false, false),
-            Some('x')
-        );
-        assert_eq!(
-            primary_action(Section::Devices, 0, true, true, false),
-            Some('r')
-        );
+        assert_eq!(primary_action(Section::Devices, 0, true, false), Some('p'));
+        assert_eq!(primary_action(Section::Devices, 1, false, false), Some('x'));
+        assert_eq!(primary_action(Section::Devices, 0, true, true), Some('r'));
         for (index, action) in ['g', 'u', 'e'].iter().enumerate() {
             assert_eq!(
-                primary_action(Section::Settings, index, true, false, false),
+                primary_action(Section::Settings, index, true, false),
                 Some(*action)
             );
         }
@@ -2748,7 +2835,7 @@ mod tests {
             .any(|line| line.render(100).contains("Enter to pair your first device")));
         assert!(lines
             .iter()
-            .any(|line| line.render(100).contains("Enter Pair first device")));
+            .any(|line| line.render(100).contains("p Pair first device")));
     }
 
     #[test]

@@ -622,7 +622,7 @@ fn manager_pty_navigates_scrolls_resizes_and_keeps_start_failures_in_the_ui() {
     )
     .unwrap();
     let mut manager = ManagerPty::open(&install);
-    let output = manager.until("Enter Start gateway");
+    let output = manager.until("s Start gateway");
     assert!(output.contains("Runtime"));
     assert!(output.contains("Connectivity"));
     assert!(
@@ -684,7 +684,10 @@ fn manager_pty_navigates_scrolls_resizes_and_keeps_start_failures_in_the_ui() {
     manager.until("Edit Gateway address");
     manager.send(b"\x1b");
     manager.until("url unchanged");
+    // Enter is not the start key on Overview; `s` is.
     manager.send(b"1\r");
+    manager.until("Status: ready");
+    manager.send(b"s");
     manager.until("Action failed: gateway exited during startup");
     assert!(
         manager.child.try_wait().unwrap().is_none(),
@@ -714,7 +717,7 @@ fn manager_enter_targets_the_selected_device_and_esc_only_cancels_revocation() {
     ])).unwrap();
     fs::write(&file, &records).unwrap();
     let mut manager = ManagerPty::open(&install);
-    manager.until("Enter Start gateway");
+    manager.until("s Start gateway");
     manager.send(b"3\x1b[B\r");
     let output = manager.until("Enter Confirm selection");
     assert!(output.contains("Selected: First phone 中文 e\u{301}"));
@@ -741,7 +744,7 @@ fn manager_compact_pairing_keeps_the_full_address_reachable_without_resizing() {
     )
     .unwrap();
     let mut manager = ManagerPty::open(&install);
-    manager.until("Enter Start gateway");
+    manager.until("s Start gateway");
     let size = libc::winsize {
         ws_row: 8,
         ws_col: 40,
@@ -755,7 +758,7 @@ fn manager_compact_pairing_keeps_the_full_address_reachable_without_resizing() {
     );
     // Wait for the resized Overview frame before starting pairing, so PTY
     // resize delivery cannot overlap the navigation input being asserted.
-    manager.until("Tab Views | Esc Back | q Close manager");
+    manager.until("Tab Views");
     manager.send(b"3\r");
     let output = manager.until(&address[..30]);
     assert!(output.contains("Resize for the full QR"));

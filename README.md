@@ -113,9 +113,10 @@ muqun-gateway manage
 
 Open **Devices** (`3`), then press Enter (first device) or `p` (new device).
 The pairing flow is three steps, shown on screen as
-"1 Scan the QR in Muqun · 2 Type this code on the phone · 3 Done": scan the
-QR, type the short code your computer displays into the phone, and the
-screen reports "Paired as <name>" on its own. The state line under the QR
+"1 Scan the QR in Muqun · 2 Type this code on the phone · 3 Done" (a narrow
+terminal shows only the current step, as "Step 1 of 3: Scan the QR in
+Muqun"): scan the QR, type the short code your computer displays into the
+phone, and the screen reports "Paired as <name>" on its own. The state line under the QR
 ("Waiting for the phone…") updates without a key press, and a phone that
 scans the QR opens the code step by itself. Esc, Enter, or `r` returns to the
 device list; `p` pairs another device.
@@ -125,19 +126,21 @@ finish with the same short code.
 
 Every view starts with a one-line header: Gateway version, whether it is
 running and where it listens, whether Herdr and the agent service answer,
-and how many devices are paired. It refreshes every few seconds while the
-manager is open.
+and how many devices are paired. While Gateway runs, the links refresh
+every few seconds; a stopped Gateway is not asked.
 
-The manager has four views, and the Overview footer explains them in one
-line. `1`–`4`, Tab/Shift-Tab, or Left/Right switches views; Up/Down or
-`j`/`k` selects a row and Enter performs the visible primary action.
-PageUp/PageDown scrolls. Esc always goes one level back: from the pairing
-flow to the device list, from a view to Overview, from a dialog to its view;
-at Overview, Esc closes the manager. `q` closes from any main view without
-stopping Gateway. Confirmations default to **cancel**: arrows/Tab choose,
-Enter accepts the selected answer. The footer lists every key of the view
-with full words, then the navigation keys. Long lists keep the selected item
-visible after a resize.
+The manager has four views, and the Overview footer lists them as
+"1 Overview · 2 Terminals · 3 Devices · 4 Settings". `1`–`4`, Tab/Shift-Tab,
+or Left/Right switches views; Up/Down or `j`/`k` selects a row and Enter
+performs the visible primary action, except on Overview, where Enter does
+nothing. PageUp/PageDown scrolls. Esc always goes one level back: from the
+pairing flow to the device list, from a view to Overview, from a dialog to
+its view; at Overview, Esc closes the manager. `q` closes from any main view
+without stopping Gateway. Confirmations default to **cancel**: arrows/Tab
+choose, Enter accepts the selected answer. The footer lists every key of the
+view with full words, one key per action, then the navigation keys; the
+status line under them belongs to the current view and resets when you
+switch views. Long lists keep the selected item visible after a resize.
 
 | view | keys |
 | --- | --- |
@@ -146,9 +149,9 @@ visible after a resize.
 | Devices (`3`) | `p` show pairing QR (or pair another device after one finishes); `x` revoke the selected device after confirmation; `r` return to the device list |
 | Settings (`4`) | `u` edit URL; `a` detect URL; `e` toggle transport encryption; `g` enable/disable gateway autostart; `c` check stable updates; `i` install an update after confirmation |
 
-Enter starts/stops Gateway in Overview, makes the selected terminal backend
-the default in Terminals, pairs the first device or reviews revocation in
-Devices, and changes the selected setting in Settings. The `>` selection marker
+Enter makes the selected terminal backend the default in Terminals, pairs the
+first device or reviews revocation in Devices, and changes the selected
+setting in Settings; starting and stopping Gateway always take `s` and `t`. The `>` selection marker
 is separate from the explicit `[default]` backend label. Empty lists explain
 the next step. Gateway stop, backend removal, and device revocation explain
 their scope before you confirm; none closes terminal tasks.
