@@ -854,6 +854,35 @@ mod tests {
     }
 
     #[test]
+    fn waits_and_delegations_are_checked_before_anything_runs() {
+        for (asked, slice) in [(None, 30), (Some(600), 45), (Some(0), 1)] {
+            assert_eq!(wait_slice(asked), Duration::from_secs(slice), "{asked:?}");
+        }
+        let long = "v".repeat(257);
+        // (arguments, the variant the request carries; `None` when refused)
+        for (args, variant) in [
+            (
+                json!({ "goal": "g", "model": "openai/gpt-6", "variant": "high", "later": true }),
+                Some(Some("high")),
+            ),
+            (json!({ "goal": "g" }), Some(None)),
+            (json!({ "goal": "g", "model": "m", "variant": "" }), None),
+            (json!({ "goal": "g", "model": "m", "variant": "  " }), None),
+            (json!({ "goal": "g", "model": "m", "variant": long }), None),
+            (json!({ "goal": "g", "agent_id": "" }), None),
+            (json!({ "goal": "g", "mode": long }), None),
+        ] {
+            let parsed: DelegateArgs = serde_json::from_value(args.clone()).unwrap();
+            let request = parsed.request().ok();
+            assert_eq!(
+                request.map(|request| request.variant),
+                variant.map(|variant| variant.map(str::to_owned)),
+                "{args}"
+            );
+        }
+    }
+
+    #[test]
     fn a_large_array_loses_its_tail_before_strings_are_clipped() {
         let ids: Vec<String> = (0..3000).map(|i| format!("model-{i}")).collect();
         let (error, text, body) = answer(Ok(ok(json!({ "note": "keep me", "ids": ids }))));

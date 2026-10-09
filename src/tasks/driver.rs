@@ -427,6 +427,22 @@ mod tests {
         // Marker first, after a restart too: the agent's own summary.
         assert_eq!(finished.summary.as_deref(), Some("the build is green"));
         assert_eq!(state_of(&state, &running).await.state, TaskState::Working);
+
+        // Only "no such session" is gone; a failing or unreachable agent is not.
+        for (error, gone) in [
+            (AgentError::SessionNotFound("s".into()), true),
+            (
+                AgentError::RequestFailed("HTTP 404 Not Found: x".into()),
+                true,
+            ),
+            (
+                AgentError::RequestFailed("HTTP 500 Internal Server Error: x".into()),
+                false,
+            ),
+            (AgentError::Network("down".into()), false),
+        ] {
+            assert_eq!(session_gone(&error), gone, "{error:?}");
+        }
     }
 
     #[tokio::test]
