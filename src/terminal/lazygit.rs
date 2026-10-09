@@ -18,7 +18,7 @@ use super::routes::{checkout_of, pane_fenced_cwd};
 fn launch_command(executable: &FsPath) -> String {
     // Only a resolved executable is interpolated. The repository is passed as
     // the new tab's native cwd, never as text through the shell.
-    format!("'{}'", executable.to_string_lossy().replace('\'', "'\\''"))
+    super::shell_word::shell_word(&executable.to_string_lossy())
 }
 
 async fn repository(

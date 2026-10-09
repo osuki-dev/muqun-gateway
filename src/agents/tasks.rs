@@ -265,9 +265,14 @@ fn trust_roots(cwd: &Path) -> Vec<PathBuf> {
 /// Also `None` for a prompt with a control character other than a newline:
 /// the launch line is pasted at a shell, and a shell without bracketed paste
 /// reads a Tab, an Esc or a Ctrl-C there as a key, which could edit the line
-/// or leave the quote. Such a prompt is typed into the agent instead.
+/// or leave the quote. And for one with a backslash: `shell_word` quotes it
+/// for sh, bash, zsh and fish alike, but a pane may run a shell with escape
+/// rules of its own, and a goal from a device or an MCP caller is not worth
+/// that bet. Such a prompt is typed into the agent instead.
 pub fn launch_prompt_args(kind: &str, prompt: &str) -> Option<[String; 2]> {
-    let plain = !prompt.chars().any(|c| c.is_control() && c != '\n');
+    let plain = !prompt
+        .chars()
+        .any(|c| c == '\\' || (c.is_control() && c != '\n'));
     (plain && matches!(kind, "claude" | "codex")).then(|| ["--".to_owned(), prompt.to_owned()])
 }
 
@@ -905,6 +910,12 @@ mod tests {
             ("claude", "a\tb", None),
             ("codex", "a\u{1b}[201~b", None),
             ("codex", "a\rb", None),
+            // Quotes, `$` and backticks are data inside the quoted word
+            // (`shell_word`'s own table runs it through bash, zsh and fish);
+            // a backslash is typed instead.
+            ("claude", "it's $HOME `id`", Some(["--", "it's $HOME `id`"])),
+            ("claude", r"x\'; touch /tmp/pwned; echo \'", None),
+            ("codex", r"C:\dir", None),
         ] {
             assert_eq!(
                 launch_prompt_args(kind, prompt),

@@ -271,7 +271,9 @@ so). `-e` and the prefix put values on a command line (visible in the local
 process list). `agent_env` values are never logged; `Debug` redacts them.
 On tmux, the spawn route's prompt and a terminal delegation's goal reach
 Claude Code and Codex as the launch line's last argument (`-- '<goal>'`),
-so the goal is on that command line too; other agents, and Herdr, have it
+so the goal is on that command line too, quoted by `shell_word` to read
+back unchanged in sh, bash, zsh and fish; a goal with a backslash or a
+control character other than a newline, other agents, and Herdr have it
 typed once the agent is up.
 
 ## Verification

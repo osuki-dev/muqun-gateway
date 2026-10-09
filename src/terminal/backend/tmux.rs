@@ -2693,13 +2693,6 @@ mod tests {
     }
 
     #[test]
-    fn agent_arguments_are_shell_quoted_as_single_words() {
-        assert_eq!(shell_word("plain"), "'plain'");
-        assert_eq!(shell_word("two words"), "'two words'");
-        assert_eq!(shell_word("a'b;$(touch nope)"), "'a'\\''b;$(touch nope)'");
-    }
-
-    #[test]
     fn an_absent_tmux_server_is_an_empty_topology() {
         assert!(means_no_tmux_server(
             "no server running on /tmp/tmux-1000/default"

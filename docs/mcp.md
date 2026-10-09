@@ -319,8 +319,9 @@ exactly as `POST /api/sessions/{id}/agents/spawn` does (its bypass launch
 arguments, `agent_env`, folder trust for `cwd`) and gives it the goal as its
 first prompt. Claude Code and Codex on a tmux session get it on their command
 line, `claude <launch args> -- '<goal>'` and `codex <launch args> -- '<goal>'`
-(one single-quoted shell word; newlines, quotes and backticks arrive as
-written). A goal with any other control character (a Tab, an Esc, ...), any
+(one shell word, quoted so that sh, bash, zsh and fish all read it back
+unchanged: newlines, quotes, `$` and backticks are data, never shell syntax).
+A goal with a backslash or any other control character (a Tab, an Esc, ...), any
 other agent, and every agent on Herdr (whose start waits for an idle agent)
 has it typed once the agent is up instead. Folder trust: Codex gets a `-c
 projects={...}` override for this run; for Claude Code,
