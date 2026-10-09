@@ -1464,8 +1464,9 @@ Server → client:
 | Frame | Meaning |
 |---|---|
 | `{"t":"hello","connection_id":"<uuid>","protocol":1,"generation":"<id>"}` | First frame, always. `generation` is the gateway instance generation (see Conventions); a client that finds it changed since its last socket is talking to a restarted gateway. Older gateways omit it. |
-| `{"t":"subscribed","asid":"ses_1"}` · `{"t":"subscribed","all":true}` | The subscription is in effect: every event published from here on reaches this socket. Start catch-up after this, not before. |
+| `{"t":"subscribed","asid":"ses_1"}` · `{"t":"subscribed","all":true}` · `{"t":"subscribed","tasks":true}` | The subscription is in effect: matching events published from here on reach this socket. Start catch-up after this, not before. |
 | `{"t":"event","asid":"ses_1","seq":12,"event":"agent.timeline.upsert","data":{…}}` | One domain event. `event` is the SSE `event:` name and `data` is the SSE `data:` payload **byte for byte**, embedded as JSON rather than as a string. `asid` and `seq` repeat the event's own (`asid` is `""` and `seq` 0 for `agent.worktree.changed` and `agent.resync`). |
+| `{"t":"task","asid":null,"seq":12,"event":"task.updated","data":{…}}` | One full `TaskView` on a `subscribe_tasks` socket. |
 | `{"t":"resync","asid":"ses_1"}` | This socket fell behind the gateway's event backlog; refetch that session. `asid` `""` means every session. One per subscribed session, or a single `""` under `subscribe_all`. With `"tasks":true` it is about task updates instead: refetch `GET /api/tasks`. |
 | `{"t":"pong"}` | Answer to `ping`. |
 | `{"t":"error","code":"…"}` | Sent immediately before the gateway closes the socket (close code 1008). |
@@ -1476,7 +1477,8 @@ Client → server:
 |---|---|
 | `{"t":"subscribe","asid":"ses_1"}` | Add a session. The id is not looked up, so subscribing to a session that does not exist yet is allowed, and a subscription survives the agent restarting. Idempotent. |
 | `{"t":"unsubscribe","asid":"ses_1"}` | Drop a session. No acknowledgement. |
-| `{"t":"subscribe_all"}` | Every session, for the life of the connection. `unsubscribe` does not narrow it; reconnect to narrow. |
+| `{"t":"subscribe_all"}` | Every session. `unsubscribe` does not narrow it; `subscribe_tasks` switches to task-only delivery. |
+| `{"t":"subscribe_tasks"}` | Task updates only. Replaces the socket's session subscriptions; a later `subscribe` or `subscribe_all` switches back to session delivery. |
 | `{"t":"ping"}` | Application-level liveness; answered with `pong`. |
 
 Unknown extra fields are ignored. An unknown `t` is `unknown_type` and a
@@ -1511,6 +1513,12 @@ behind the task events gets one `{"t":"resync","asid":"","tasks":true}` frame:
 refetch `GET /api/tasks` (a client that ignores `tasks` reads it as a resync
 of every session, which also covers it). Refetch `GET /api/tasks` after a
 reconnect as well.
+
+When `task_ws_subscription` is advertised, `subscribe_tasks` receives the same
+task views with `"t":"task"`, and no
+agent-session or pane traffic. It still receives the initial `hello` and a
+`{"t":"subscribed","tasks":true}` acknowledgement. Task lag uses the same
+task resync frame.
 
 **Catch-up is unchanged.** The socket delivers live events only. After a
 (re)connect, re-subscribe, wait for `subscribed`, then catch up each session

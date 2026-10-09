@@ -131,6 +131,7 @@ pub(crate) enum ClientFrame {
     Subscribe(String),
     Unsubscribe(String),
     SubscribeAll,
+    SubscribeTasks,
     Ping,
 }
 
@@ -159,6 +160,7 @@ impl ClientFrame {
             "subscribe" => Ok(Self::Subscribe(asid()?)),
             "unsubscribe" => Ok(Self::Unsubscribe(asid()?)),
             "subscribe_all" => Ok(Self::SubscribeAll),
+            "subscribe_tasks" => Ok(Self::SubscribeTasks),
             "ping" => Ok(Self::Ping),
             _ => Err(FrameError::UnknownType),
         }
@@ -201,19 +203,29 @@ pub(crate) fn event_frame(event: &AgentDomainEvent) -> String {
     )
 }
 
-/// A task change, to a socket that asked for everything. There is no session,
-/// so `asid` is `null`; `data` is the task as `GET /api/tasks` shows it.
-pub(crate) fn task_event_frame(event: &TaskDomainEvent) -> String {
+/// A task change. There is no session, so `asid` is `null`; `data` is the task
+/// as `GET /api/tasks` shows it. The all-subscription keeps its existing
+/// `event` type, while a task-only subscription uses `task`.
+fn task_frame(event: &TaskDomainEvent, kind: &str) -> String {
     let data = serde_json::to_string(match event {
         TaskDomainEvent::Updated { task, .. } => task,
     })
     .unwrap_or_else(|_| String::from("null"));
     format!(
-        r#"{{"t":"event","asid":null,"seq":{},"event":{},"data":{}}}"#,
+        r#"{{"t":{},"asid":null,"seq":{},"event":{},"data":{}}}"#,
+        json_string(kind),
         event.seq(),
         json_string(event.event_name()),
         data
     )
+}
+
+pub(crate) fn task_event_frame(event: &TaskDomainEvent) -> String {
+    task_frame(event, "event")
+}
+
+pub(crate) fn task_only_frame(event: &TaskDomainEvent) -> String {
+    task_frame(event, "task")
 }
 
 pub(crate) fn resync_frame(asid: &str) -> String {
@@ -232,6 +244,10 @@ pub(crate) fn subscribed_frame(asid: Option<&str>) -> String {
         Some(asid) => format!(r#"{{"t":"subscribed","asid":{}}}"#, json_string(asid)),
         None => String::from(r#"{"t":"subscribed","all":true}"#),
     }
+}
+
+pub(crate) fn subscribed_tasks_frame() -> String {
+    String::from(r#"{"t":"subscribed","tasks":true}"#)
 }
 
 pub(crate) fn error_frame(error: FrameError) -> String {
@@ -366,13 +382,14 @@ impl FrameCodec {
 #[derive(Debug, Default)]
 pub(crate) struct Subscriptions {
     all: bool,
+    tasks_only: bool,
     sessions: BTreeSet<String>,
 }
 
 impl Subscriptions {
     /// Apply a subscription frame, answering the acknowledgement to send.
-    /// `subscribe_all` is sticky for the life of the connection; an
-    /// `unsubscribe` after it only drops the asid from the explicit set.
+    /// `subscribe_all` is unaffected by `unsubscribe`; `subscribe_tasks`
+    /// switches to task-only delivery and clears session subscriptions.
     pub(crate) fn apply(&mut self, frame: &ClientFrame) -> Result<Option<String>, FrameError> {
         match frame {
             ClientFrame::Subscribe(asid) => {
@@ -380,6 +397,7 @@ impl Subscriptions {
                     return Err(FrameError::TooManySubscriptions);
                 }
                 self.sessions.insert(asid.clone());
+                self.tasks_only = false;
                 Ok(Some(subscribed_frame(Some(asid))))
             }
             ClientFrame::Unsubscribe(asid) => {
@@ -388,7 +406,14 @@ impl Subscriptions {
             }
             ClientFrame::SubscribeAll => {
                 self.all = true;
+                self.tasks_only = false;
                 Ok(Some(subscribed_frame(None)))
+            }
+            ClientFrame::SubscribeTasks => {
+                self.all = false;
+                self.sessions.clear();
+                self.tasks_only = true;
+                Ok(Some(subscribed_tasks_frame()))
             }
             ClientFrame::Ping => Ok(Some(PONG_FRAME.to_owned())),
         }
@@ -407,10 +432,13 @@ impl Subscriptions {
         self.sessions.contains(asid)
     }
 
-    /// Whether task changes go out on this connection: only to a socket that
-    /// asked for everything.
+    /// Whether task changes go out on this connection.
     pub(crate) fn wants_tasks(&self) -> bool {
-        self.all
+        self.all || self.tasks_only
+    }
+
+    pub(crate) fn tasks_only(&self) -> bool {
+        self.tasks_only
     }
 
     /// The sessions to tell to resync after this connection fell behind the
@@ -761,10 +789,15 @@ impl Connection {
                 },
                 task = tasks.recv() => match task {
                     Ok(task) => {
-                        if subscriptions.wants_tasks()
-                            && self.send(&task_event_frame(&task)).await.is_err()
-                        {
-                            return;
+                        if subscriptions.wants_tasks() {
+                            let frame = if subscriptions.tasks_only() {
+                                task_only_frame(&task)
+                            } else {
+                                task_event_frame(&task)
+                            };
+                            if self.send(&frame).await.is_err() {
+                                return;
+                            }
                         }
                     }
                     // Fell behind the task broadcast: a task that changed in

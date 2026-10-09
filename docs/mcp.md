@@ -2,8 +2,9 @@
 
 Capabilities: `mcp_server` (the `/mcp` endpoint; present only while
 `mcp.enabled` is true), `fleet`, `task_ledger`, `task_ledger_create`
-(`POST /api/tasks` and the task tree) and `task_ledger_pane` (a terminal agent
-as `agent_id`, bound to its pane). Discovery also announces
+(`POST /api/tasks` and the task tree), `task_ledger_pane` (a terminal agent
+as `agent_id`, bound to its pane) and `task_ws_subscription` (`subscribe_tasks`
+on `/api/ws`). Discovery also announces
 `transports.mcp`. (`tasks` is a different, older capability: `POST
 /api/sessions/{id}/tasks`.)
 
@@ -414,6 +415,14 @@ change, with no session:
 ```json
 {"t":"event","asid":null,"seq":12,"event":"task.updated","data":{"task_id":"…","state":"working","…":"…"}}
 ```
+
+A phone that only needs the task ledger can send `{"t":"subscribe_tasks"}`
+when the gateway advertises `task_ws_subscription`.
+After `{"t":"subscribed","tasks":true}`, it receives task changes as
+`{"t":"task","asid":null,"seq":12,"event":"task.updated","data":<TaskView>}`
+and no pane or agent-session events. If it falls behind, it receives
+`{"t":"resync","asid":"","tasks":true}` and should refetch `GET /api/tasks`.
+The initial `hello` and subscription acknowledgement still precede updates.
 
 `data` is the whole `TaskView`, so the latest frame for a task replaces what
 the client holds. A change to a task with a parent is followed by a frame for

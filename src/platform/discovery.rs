@@ -474,7 +474,7 @@ mod tests {
     #[test]
     fn mcp_server_capability_follows_the_config() {
         assert!(!crate::API_CAPABILITIES.contains(&"mcp_server"));
-        for capability in ["fleet", "task_ledger"] {
+        for capability in ["fleet", "task_ledger", "task_ws_subscription"] {
             assert!(crate::API_CAPABILITIES.contains(&capability));
         }
         assert!(crate::gateway_capabilities(false, true, false).contains(&"mcp_server"));

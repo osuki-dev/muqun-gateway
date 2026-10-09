@@ -1,5 +1,5 @@
 use super::*;
-use crate::agents::domain::{AgentSessionId, AgentSessionStatus};
+use crate::agents::domain::{AgentSessionId, AgentSessionStatus, WorktreeState};
 use crate::tasks::events::TaskDomainEvent;
 use crate::*;
 
@@ -35,6 +35,10 @@ fn client_frames_parse_and_anything_else_is_refused() {
     assert_eq!(
         ClientFrame::parse(r#"{"t":"subscribe_all"}"#),
         Ok(ClientFrame::SubscribeAll)
+    );
+    assert_eq!(
+        ClientFrame::parse(r#"{"t":"subscribe_tasks"}"#),
+        Ok(ClientFrame::SubscribeTasks)
     );
     assert_eq!(ClientFrame::parse(r#"{"t":"ping"}"#), Ok(ClientFrame::Ping));
 
@@ -82,6 +86,10 @@ fn server_frames_are_the_documented_strings() {
         r#"{"t":"subscribed","asid":"ses_1"}"#
     );
     assert_eq!(subscribed_frame(None), r#"{"t":"subscribed","all":true}"#);
+    assert_eq!(
+        subscribed_tasks_frame(),
+        r#"{"t":"subscribed","tasks":true}"#
+    );
     assert_eq!(
         error_frame(FrameError::OutOfOrder),
         r#"{"t":"error","code":"out_of_order"}"#
@@ -604,13 +612,61 @@ fn task_update(seq: u64) -> TaskDomainEvent {
 }
 
 #[test]
-fn only_subscribe_all_wants_task_events() {
+fn all_and_task_only_subscriptions_want_task_events() {
     let mut subs = Subscriptions::default();
     assert!(!subs.wants_tasks());
     subs.apply(&ClientFrame::Subscribe("ses_1".into())).unwrap();
     assert!(!subs.wants_tasks());
     subs.apply(&ClientFrame::SubscribeAll).unwrap();
     assert!(subs.wants_tasks());
+    subs.apply(&ClientFrame::SubscribeTasks).unwrap();
+    assert!(subs.wants_tasks());
+    assert!(subs.tasks_only());
+    assert!(!subs.wants("ses_1"));
+    assert!(!subs.wants(""));
+    assert!(subs.resync_targets().is_empty());
+}
+
+#[tokio::test]
+async fn subscribe_tasks_delivers_task_views_without_session_events() {
+    let state = test_state("admin", vec![test_device("phone-1", TOKEN)]);
+    let tasks = state.task_events.clone();
+    let runtime = state.agent_runtime.clone();
+    let addr = serve(state).await;
+    let (mut client, _) = connect(addr, &bearer()).await.unwrap();
+    assert_eq!(next_json(&mut client).await["t"], "hello");
+    send_text(&mut client, r#"{"t":"subscribe_tasks"}"#).await;
+    assert_eq!(
+        next_json(&mut client).await,
+        json!({ "t": "subscribed", "tasks": true })
+    );
+
+    runtime.publish_for_test(status_event("ses_1", 1));
+    runtime.publish_for_test(AgentDomainEvent::WorktreeChanged {
+        asid: AgentSessionId(String::new()),
+        state: WorktreeState::Updated,
+        directory: None,
+        project_id: None,
+        name: None,
+        branch: None,
+        error: None,
+    });
+    tasks.send(task_update(3)).unwrap();
+    let frame = next_json(&mut client).await;
+    assert_eq!(frame["t"], "task");
+    assert_eq!(frame["asid"], Value::Null);
+    assert_eq!(frame["seq"], 3);
+    assert_eq!(frame["event"], "task.updated");
+    assert_eq!(frame["data"]["task_id"], "task-1");
+    assert_eq!(frame["data"]["state"], "working");
+
+    runtime.publish_for_test(status_event("ses_1", 2));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), next_text(&mut client))
+            .await
+            .is_err(),
+        "session events must not reach a task-only socket"
+    );
 }
 
 #[tokio::test]
@@ -661,6 +717,32 @@ async fn a_socket_that_falls_behind_the_task_events_is_told_to_refetch_them() {
     );
     // What is still buffered follows, oldest first.
     let next = next_json(&mut all).await;
+    assert_eq!(next["event"], "task.updated");
+    assert!(next["seq"].as_u64().unwrap() > 8);
+}
+
+#[tokio::test]
+async fn a_lagging_subscribe_tasks_socket_gets_the_task_resync_frame() {
+    let state = test_state("admin", vec![test_device("phone-1", TOKEN)]);
+    let tasks = state.task_events.clone();
+    let addr = serve(state).await;
+    let (mut client, _) = connect(addr, &bearer()).await.unwrap();
+    next_json(&mut client).await;
+    send_text(&mut client, r#"{"t":"subscribe_tasks"}"#).await;
+    assert_eq!(next_json(&mut client).await["tasks"], true);
+
+    let overflow = crate::tasks::events::TASK_EVENT_CAPACITY as u64 + 8;
+    for seq in 1..=overflow {
+        tasks.send(task_update(seq)).unwrap();
+    }
+    assert_eq!(
+        next_json(&mut client).await,
+        json!({
+            "t": "resync", "asid": "", "tasks": true
+        })
+    );
+    let next = next_json(&mut client).await;
+    assert_eq!(next["t"], "task");
     assert_eq!(next["event"], "task.updated");
     assert!(next["seq"].as_u64().unwrap() > 8);
 }

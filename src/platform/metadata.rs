@@ -117,6 +117,8 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     // task is `done` only on its MUQUN_TASK_DONE marker; an idle agent is
     // `idle_unconfirmed`.
     "task_ledger_pane",
+    // `subscribe_tasks` on `/api/ws`: task views without session events.
+    "task_ws_subscription",
 ];
 
 /// Handing a task to an agent the app did not start, and following it home.
