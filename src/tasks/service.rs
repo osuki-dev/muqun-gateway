@@ -29,6 +29,7 @@ use crate::agents::manager::AgentManager;
 use crate::agents::ports::agent::AgentError;
 use crate::agents::ports::mirror::SessionMirrorPort;
 use crate::agents::runtime::AGENT_PREFERENCE;
+use crate::backend::{PaneId, TabId};
 use crate::fleet::manifest::is_self;
 use crate::AppState;
 
@@ -364,7 +365,10 @@ impl TaskService {
             ));
         }
         if let Some(kind) = request.agent_id.as_deref() {
-            if state.agent_runtime.manager_for_agent(kind).await.is_none()
+            // A session agent (OpenCode, DeepSeek, T3) is never started in a
+            // pane: unattached, it is unavailable.
+            if !AGENT_PREFERENCE.contains(&kind)
+                && state.agent_runtime.manager_for_agent(kind).await.is_none()
                 && pane_agent::is_terminal_agent(state, kind)
             {
                 return self.delegate_to_pane(state, by, request).await;
@@ -486,13 +490,14 @@ impl TaskService {
     /// the agent catalog lists): a new pane in the first reachable terminal
     /// session, the agent started in it and the goal typed as its first
     /// prompt (asking for the completion marker, see [`pane_agent`]), the
-    /// way the spawn route does it. `mode`, `model` and
-    /// `variant` do not apply and are ignored.
+    /// way the spawn route does it. `mode`, `model` and `variant` do not
+    /// apply and are ignored.
     ///
     /// Nothing is recorded when the agent is not on `PATH` or no terminal
-    /// answers. Once the pane exists, an agent that did not start or a goal
-    /// that could not be typed fails the task, and the answer is the failed
-    /// task (the pane is still there to look at).
+    /// answers. The answer comes as soon as the pane exists: the task is
+    /// `dispatching`, bound to the pane, and moves to `working` once the agent
+    /// is up and has the goal -- or to `failed`, naming the step -- in the
+    /// background, since starting an agent can take half a minute.
     async fn delegate_to_pane(
         &self,
         state: &AppState,
@@ -529,48 +534,50 @@ impl TaskService {
                 requester_name: by.name,
             })
             .await?;
-        let launched = crate::agents::session_routes::launch_agent(
-            state,
-            &session,
-            &kind,
-            request.cwd.as_deref(),
-            None,
-            Some(&pane_agent::completion_request(&request.goal)),
-        )
-        .await;
-        let launched = match launched {
-            Ok(launched) => launched,
-            Err((_, body)) => {
-                let message = body
-                    .0
-                    .pointer("/error/message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("the pane could not be created")
-                    .to_owned();
-                let error = TaskError::Backend(format!("{kind}: {message}"));
-                self.record_failure(&task, noted(TaskState::Failed, error.to_string()))
-                    .await;
-                return Err(error);
-            }
-        };
-        let field = |name: &str| {
-            launched
-                .payload
-                .get(name)
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        };
-        let pane_id = field("pane_id").unwrap_or_default();
-        let shell_pid = crate::terminal_backend(&session)
+        let cwd = request.cwd.as_deref();
+        let placed =
+            match crate::agents::session_routes::place_agent(state, &session, &kind, cwd, None)
+                .await
+            {
+                Ok(placed) if !placed.place.pane_id.is_empty() => placed,
+                outcome => {
+                    let message = match outcome {
+                        Err((_, body)) => body
+                            .0
+                            .pointer("/error/message")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        Ok(_) => None,
+                    };
+                    let message = message.unwrap_or_else(|| "no pane could be made".into());
+                    let error = TaskError::Backend(format!("{kind}: {message}"));
+                    self.record_failure(&task, noted(TaskState::Failed, error.to_string()))
+                        .await;
+                    return Err(error);
+                }
+            };
+        let pane_id = placed.place.pane_id.clone();
+        let backend = crate::terminal_backend(&session);
+        let shell_pid = backend
             .list_panes()
             .await
             .ok()
             .and_then(|panes| panes.into_iter().find(|p| p.id.as_str() == pane_id))
             .and_then(|pane| pane.shell_pid);
+        // Named for the task rather than for the directory or the command.
+        let title = pane_agent::pane_title(request.label.as_deref(), &request.goal);
+        if let Some(tab_id) = &placed.place.tab_id {
+            if let Err(error) = backend.rename_tab(&TabId::new(tab_id), &title).await {
+                tracing::debug!(%error, "terminal task: the tab keeps its name");
+            }
+        }
+        if let Err(error) = backend.rename_pane(&PaneId::new(&pane_id), &title).await {
+            tracing::debug!(%error, "terminal task: the pane keeps its title");
+        }
         let binding = TaskBinding::Pane {
             session_id: session.id.clone(),
-            pane_id,
-            tab_id: field("tab_id"),
+            pane_id: pane_id.clone(),
+            tab_id: placed.place.tab_id.clone(),
             shell_pid,
             agent_id: Some(kind.clone()),
         };
@@ -578,19 +585,45 @@ impl TaskService {
             binding: Some(binding),
             ..change(TaskState::Dispatching)
         };
-        self.store().transition(&task.id, dispatching).await?;
-        if let Some(why) = failed_step(&launched.steps.value()) {
-            self.record_failure(&task, noted(TaskState::Failed, why))
-                .await;
-            let task = self.store.get(&task.id).await?.ok_or(TaskError::NotFound)?;
-            return Ok(self.present(&task).await);
-        }
-        let task = self
-            .store()
-            .transition(&task.id, change(TaskState::Working))
-            .await?;
-        pane_agent::follow(state, &task);
-        Ok(self.present(&task).await)
+        let task = match self.store().transition(&task.id, dispatching).await {
+            Ok(task) => task,
+            Err(error) => {
+                tracing::warn!(task = %task.id.0, pane = %pane_id, "terminal task: pane left unbound");
+                return Err(error.into());
+            }
+        };
+        let view = self.present(&task).await;
+        let state = state.clone();
+        let cwd = request.cwd.clone();
+        let prompt = pane_agent::completion_request(&request.goal);
+        tokio::spawn(async move {
+            let launched = crate::agents::session_routes::start_placed_agent(
+                &state,
+                &session,
+                &kind,
+                cwd.as_deref(),
+                placed,
+                Some(&prompt),
+            )
+            .await;
+            let tasks = &state.tasks;
+            let to = match failed_step(&launched.steps.value()) {
+                Some(why) => {
+                    tasks
+                        .record_failure(&task, noted(TaskState::Failed, why))
+                        .await;
+                    return;
+                }
+                None => change(TaskState::Working),
+            };
+            // A follower or a cancel may have moved it meanwhile; follow
+            // whatever is still open.
+            if let Err(error) = tasks.store().transition(&task.id, to).await {
+                tracing::debug!(task = %task.id.0, %error, "terminal task: not moved to working");
+            }
+            pane_agent::follow(&state, &task);
+        });
+        Ok(view)
     }
 
     /// Move `task` as `to` says, through whatever states lie between

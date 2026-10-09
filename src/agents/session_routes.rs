@@ -542,6 +542,14 @@ pub(crate) struct AgentLaunch {
     pub(crate) steps: tasks::StepLog,
 }
 
+/// The first half of [`launch_agent`]: the pane exists, nothing runs in it
+/// yet.
+pub(crate) struct PlacedAgent {
+    pub(crate) place: SpawnPlace,
+    pub(crate) payload: Value,
+    pub(crate) steps: tasks::StepLog,
+}
+
 /// The spawn route after its checks: a pane (a split of `tab_id`, or a tab
 /// of its own), the agent started in it with its launch arguments and
 /// `agent_env`, and `prompt` typed and submitted. Shared with the task
@@ -556,14 +564,25 @@ pub(crate) async fn launch_agent(
     tab_id: Option<&str>,
     prompt: Option<&str>,
 ) -> ApiResult<AgentLaunch> {
-    let session_id = &session.id;
+    let placed = place_agent(state, session, agent, cwd, tab_id).await?;
+    Ok(start_placed_agent(state, session, agent, cwd, placed, prompt).await)
+}
+
+/// [`launch_agent`]'s pane: made in about the time one backend call takes,
+/// so a caller can answer with it before the agent is up.
+pub(crate) async fn place_agent(
+    state: &AppState,
+    session: &SessionConfig,
+    agent: &str,
+    cwd: Option<&str>,
+    tab_id: Option<&str>,
+) -> ApiResult<PlacedAgent> {
     let mut steps = tasks::StepLog::new();
     let agent_env = state.config.agent_env.usable();
     let pane_env = pane_env(&agent_env);
     let place = spawn_place(session, tab_id, cwd, &pane_env, &mut steps).await?;
-
-    let mut payload = json!({
-        "session_id": session_id,
+    let payload = json!({
+        "session_id": session.id,
         "pane_id": place.pane_id,
         "tab_id": place.tab_id,
         "agent": agent,
@@ -571,7 +590,29 @@ pub(crate) async fn launch_agent(
         "agent_started": false,
         "prompt_submitted": false,
     });
+    Ok(PlacedAgent {
+        place,
+        payload,
+        steps,
+    })
+}
 
+/// [`launch_agent`]'s second half: start the agent in the placed pane and
+/// type `prompt` once it is up. Takes as long as the agent takes to start.
+pub(crate) async fn start_placed_agent(
+    state: &AppState,
+    session: &SessionConfig,
+    agent: &str,
+    cwd: Option<&str>,
+    placed: PlacedAgent,
+    prompt: Option<&str>,
+) -> AgentLaunch {
+    let PlacedAgent {
+        place,
+        mut payload,
+        mut steps,
+    } = placed;
+    let agent_env = state.config.agent_env.usable();
     let mut prompt_target = place.pane_id.clone();
     let agent_command = tasks::agent_command(agent, &state.config.agent_commands);
     // Without a `cwd` the agent runs wherever the new pane opened, which
@@ -622,7 +663,7 @@ pub(crate) async fn launch_agent(
             steps.failed("agent", err.code(), &err.message());
             // The pane is real and the user can type in it, so this is a 207
             // rather than an error that implies nothing was created.
-            return Ok(AgentLaunch { payload, steps });
+            return AgentLaunch { payload, steps };
         }
     }
 
@@ -659,7 +700,7 @@ pub(crate) async fn launch_agent(
         }
     }
 
-    Ok(AgentLaunch { payload, steps })
+    AgentLaunch { payload, steps }
 }
 
 pub(crate) async fn agents(

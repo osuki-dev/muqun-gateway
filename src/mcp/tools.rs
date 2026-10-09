@@ -261,7 +261,7 @@ impl ExecRunArgs {
 pub(crate) struct DelegateArgs {
     /// What the agent should do, in plain language.
     pub goal: String,
-    /// Absolute project directory on this computer.
+    /// Absolute project directory on this computer (any existing one; for a terminal agent, where its pane opens).
     #[serde(default)]
     pub cwd: Option<String>,
     /// Agent to use: a structured agent, e.g. "opencode", or a terminal agent from the agent catalog, e.g. "codex" or "claude" (started in a new terminal pane; mode, model and variant do not apply). Default: the primary agent.
@@ -607,7 +607,7 @@ mod tests {
         };
         let (error, _, task) = answer(mcp.tasks_delegate(Parameters(args)).await);
         assert!(!error, "{task}");
-        assert_eq!(task["state"], "working", "{task}");
+        assert_eq!(task["state"], "dispatching", "{task}");
         assert_eq!(task["binding"]["kind"], "pane");
         assert_eq!(task["binding"]["pane_id"], "w1:p9");
         assert_eq!(task["binding"]["agent_id"], "claude");

@@ -11,9 +11,9 @@
 //!   summary; one whose session went idle after the task was created is
 //!   done, with the last assistant text as its summary.
 //!
-//! - A terminal agent's delegation (bound to a pane, with `agent_id`) whose
-//!   pane is gone fails ("pane closed"); otherwise its pane follower is
-//!   started if none runs (after a restart, say) -- see `pane_agent`.
+//! - A terminal agent's delegation (bound to a pane, with `agent_id`) gets
+//!   its pane follower started if none runs (after a restart, say), which
+//!   settles it from the pane -- see `pane_agent`.
 //!
 //! - A task bound to nothing (the gateway stopped between recording it and
 //!   dispatching it) fails ("never dispatched") once it is
@@ -109,12 +109,13 @@ pub(crate) async fn reconcile(state: &AppState) -> usize {
                 shell_pid,
                 ..
             } => match pane_alive(state, &mut panes, session_id, pane_id, *shell_pid).await {
-                Some(false) => fail(state, &task, "pane closed").await,
-                // A terminal agent's delegation: its follower moves it.
+                // A terminal agent's delegation: its follower moves it, and
+                // fails it ("the pane closed") when its pane is gone.
                 _ if task.kind == TaskKind::Delegation => {
                     pane_agent::follow(state, &task);
                     false
                 }
+                Some(false) => fail(state, &task, "pane closed").await,
                 Some(true) => poll_command(state, &task).await,
                 None => false,
             },

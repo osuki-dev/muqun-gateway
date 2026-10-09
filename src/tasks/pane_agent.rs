@@ -10,15 +10,17 @@
 //!
 //! | The pane | The task |
 //! |---|---|
-//! | a `MUQUN_TASK_DONE: <summary>` line on screen | `done`, with that summary |
+//! | a `MUQUN_TASK_DONE: <summary>` line below the echoed request, the agent not busy | `done`, with that summary |
 //! | agent starting / working | `working` (back from `waiting` or `idle_unconfirmed`) |
 //! | agent blocked on a menu (approval, question) | `waiting` |
-//! | agent idle after it was seen working (or its state sequence moved), or for [`UNCONFIRMED_AFTER`] | `idle_unconfirmed` |
+//! | agent idle on two polls, after it was seen working (or its state sequence moved), or for [`UNCONFIRMED_AFTER`] | `idle_unconfirmed` |
 //! | no agent in the pane (two polls running) | `failed`: the agent exited |
 //! | the pane is gone | `failed`: the pane closed |
 //!
-//! The marker is looked for on every poll, so the first poll after a gateway
-//! restart settles a task whose agent finished meanwhile.
+//! The marker is looked for in the pane's recent output (not only its screen)
+//! on every poll, so the first poll after a gateway restart settles a task
+//! whose agent finished meanwhile. A task that is `idle_unconfirmed` is polled
+//! every [`PAUSED_POLL`] instead of every [`POLL`].
 
 use std::time::Duration;
 
@@ -27,24 +29,41 @@ use serde_json::Value;
 use super::domain::{one_line, Task, TaskBinding, TaskChange, TaskId, TaskState};
 use super::service::SUMMARY_CHARS;
 use crate::agents::tasks as agent_kinds;
-use crate::backend::{AgentStatus, PaneId};
+use crate::backend::{AgentStatus, OutputFormat, OutputSource, PaneId, ReadPane};
 use crate::{infer_tmux_agent_status, parts, read_pane_visible_text, terminal_backend};
 use crate::{AppState, SessionConfig};
 
 /// How often a followed pane is read.
 const POLL: Duration = Duration::from_secs(2);
+/// How often it is read while its task is `idle_unconfirmed`: an agent that
+/// never prints the marker must not cost a poll every two seconds forever.
+const PAUSED_POLL: Duration = Duration::from_secs(12);
+/// Lines of recent output searched for the marker.
+const MARKER_LINES: u32 = 200;
+/// A tab and pane title's length, from the goal.
+const TITLE_CHARS: usize = 40;
 /// How long an agent may sit idle, never seen working, before its task is
 /// `idle_unconfirmed`: a reply quicker than [`POLL`] on a backend without a
 /// state sequence (tmux) is never seen busy.
 pub(crate) const UNCONFIRMED_AFTER: Duration = Duration::from_secs(30);
 /// Polls in a row without an agent in the pane before it counts as exited,
-/// so one listing taken mid-redraw does not fail the task.
-const EXITED_AFTER: u32 = 2;
+/// and in a row idle before a pause counts, so one listing taken mid-redraw
+/// (or a screen read between two tool calls) does not move the task.
+const IN_A_ROW: u32 = 2;
 pub(crate) const PANE_CLOSED: &str = "the pane closed";
 pub(crate) const AGENT_EXITED: &str = "the agent exited before it finished";
 /// The line a terminal agent prints when the delegated goal is finished.
 pub(crate) const DONE_MARKER: &str = "MUQUN_TASK_DONE:";
 const SUMMARY_PLACEHOLDER: &str = "<one-line summary>";
+/// Words of the typed request that can only come from its echo; a marker
+/// counts only below the last line holding one. Several, since a narrow
+/// pane wraps the echo anywhere.
+const ECHO_WORDS: [&str; 4] = [
+    "exactly in this form",
+    "<one-line",
+    "one-line summary>",
+    "summary>",
+];
 const SOURCE: &str = "pane_follower";
 
 /// Whether `agent_id` is a terminal agent kind the agent catalog lists.
@@ -67,16 +86,30 @@ pub(crate) fn completion_request(goal: &str) -> String {
     )
 }
 
-/// The summary of the last completion marker line on `screen`. A marker
-/// counts only at the start of a line (after any bullet the agent draws), so
-/// the request echoed inside the prompt does not, nor does its placeholder.
-pub(crate) fn done_marker(screen: &str) -> Option<String> {
-    screen.lines().rev().find_map(|line| {
+/// The summary of the last completion marker line in `output`. A marker
+/// counts only at the start of a line (after any bullet the agent draws),
+/// below the request echoed in the prompt, and with a summary that is not
+/// the placeholder or a piece of it.
+pub(crate) fn done_marker(output: &str) -> Option<String> {
+    let lines: Vec<&str> = output.lines().collect();
+    let below_echo = lines
+        .iter()
+        .rposition(|line| ECHO_WORDS.iter().any(|word| line.contains(word)))
+        .map_or(0, |echo| echo + 1);
+    lines[below_echo..].iter().rev().find_map(|line| {
         let line = line.trim_start_matches(|c: char| !c.is_alphanumeric());
         let summary = line.strip_prefix(DONE_MARKER)?.trim();
-        (!summary.is_empty() && summary != SUMMARY_PLACEHOLDER)
-            .then(|| one_line(summary, SUMMARY_CHARS))
+        let placeholder = summary.starts_with('<')
+            || SUMMARY_PLACEHOLDER.starts_with(summary)
+            || summary.trim_matches(|c| c == '.' || c == '…').is_empty();
+        (!placeholder).then(|| one_line(summary, SUMMARY_CHARS))
     })
+}
+
+/// A terminal task's tab and pane title: its label, else the start of its
+/// goal.
+pub(crate) fn pane_title(label: Option<&str>, goal: &str) -> String {
+    one_line(label.unwrap_or(goal), TITLE_CHARS)
 }
 
 /// The pane agent as one poll found it.
@@ -99,6 +132,7 @@ pub(crate) struct Progress {
     /// The first state sequence seen; `Some(None)` once seen without one.
     baseline: Option<Option<u64>>,
     absent: u32,
+    idle: u32,
 }
 
 /// Where a poll moves the task.
@@ -125,19 +159,35 @@ pub(crate) fn judge(
     if task.is_terminal() {
         return Verdict::Stay;
     }
+    // A marker counts once the agent has stopped: one mentioned mid-stream
+    // is not the end, and a real one is followed by the idle prompt.
+    let busy = |status| {
+        matches!(
+            status,
+            AgentStatus::Starting | AgentStatus::Working | AgentStatus::Blocked
+        )
+    };
     let (status, seq) = match (seen, marker) {
-        (Seen::Gone, _) => return Verdict::Failed(PANE_CLOSED),
-        (_, Some(summary)) => return Verdict::Done(summary.to_owned()),
+        (Seen::Agent { status, .. }, Some(summary)) if !busy(status) => {
+            return Verdict::Done(summary.to_owned())
+        }
+        (Seen::Gone | Seen::NoAgent, Some(summary)) => return Verdict::Done(summary.to_owned()),
+        (Seen::Gone, None) => return Verdict::Failed(PANE_CLOSED),
         (Seen::NoAgent, None) => {
             progress.absent += 1;
-            if progress.absent >= EXITED_AFTER {
+            if progress.absent >= IN_A_ROW {
                 return Verdict::Failed(AGENT_EXITED);
             }
             return Verdict::Stay;
         }
-        (Seen::Agent { status, seq }, None) => (status, seq),
+        (Seen::Agent { status, seq }, _) => (status, seq),
     };
     progress.absent = 0;
+    if busy(status) || status == AgentStatus::Unknown {
+        progress.idle = 0;
+    } else {
+        progress.idle += 1;
+    }
     let baseline = *progress.baseline.get_or_insert(seq);
     let moved = matches!((seq, baseline), (Some(now), Some(first)) if now > first);
     match status {
@@ -158,7 +208,7 @@ pub(crate) fn judge(
         }
         AgentStatus::Idle | AgentStatus::Completed => {
             let paused = progress.busy || moved || elapsed >= UNCONFIRMED_AFTER;
-            if paused && task != TaskState::IdleUnconfirmed {
+            if paused && progress.idle >= IN_A_ROW && task != TaskState::IdleUnconfirmed {
                 Verdict::Unconfirmed
             } else {
                 Verdict::Stay
@@ -229,9 +279,41 @@ fn bound<'a>(state: &'a AppState, task: &'a Task) -> Option<Bound<'a>> {
     })
 }
 
-/// One read of the pane, its agent and its screen; `None` when the backend
-/// cannot say.
-async fn observe(at: &Bound<'_>) -> Option<(Seen, Option<String>)> {
+/// What one poll read: the pane agent, its screen, and the marker's summary
+/// from its recent output.
+struct Observed {
+    seen: Seen,
+    screen: Option<String>,
+    marker: Option<String>,
+}
+
+/// One read of the pane, its agent, its screen and its recent output; `None`
+/// when the backend cannot say.
+async fn observe(at: &Bound<'_>) -> Option<Observed> {
+    let (seen, screen) = observe_agent(at).await?;
+    let marker = match seen {
+        Seen::Gone => None,
+        _ => terminal_backend(at.session)
+            .read_pane(&ReadPane {
+                pane_id: PaneId::new(at.pane_id),
+                source: OutputSource::RecentUnwrapped,
+                format: OutputFormat::Text,
+                lines: MARKER_LINES,
+                start: None,
+                end: None,
+            })
+            .await
+            .ok()
+            .and_then(|output| done_marker(&output.text)),
+    };
+    Some(Observed {
+        seen,
+        screen,
+        marker,
+    })
+}
+
+async fn observe_agent(at: &Bound<'_>) -> Option<(Seen, Option<String>)> {
     let backend = terminal_backend(at.session);
     let panes = backend.list_panes().await.ok()?;
     let Some(pane) = panes.iter().find(|pane| pane.id.as_str() == at.pane_id) else {
@@ -311,6 +393,9 @@ pub(crate) fn follow(state: &AppState, task: &Task) {
 async fn run(state: &AppState, id: &TaskId) {
     let started = tokio::time::Instant::now();
     let mut progress = Progress::default();
+    // The marker last read: a pane closed right after its agent printed it
+    // still finished its task.
+    let mut last_marker: Option<String> = None;
     loop {
         let task = match state.tasks.task(id).await {
             Ok(Some(task)) if !task.state.is_terminal() => task,
@@ -324,22 +409,35 @@ async fn run(state: &AppState, id: &TaskId) {
         let Some(at) = bound(state, &task) else {
             return;
         };
-        if let Some((seen, screen)) = observe(&at).await {
-            let marker = screen.as_deref().and_then(done_marker);
+        let mut now = task.state;
+        if let Some(observed) = observe(&at).await {
+            let marker = match observed.seen {
+                Seen::Gone => last_marker.take(),
+                _ => observed.marker,
+            };
             let verdict = judge(
                 task.state,
-                seen,
+                observed.seen,
                 marker.as_deref(),
                 &mut progress,
                 started.elapsed(),
             );
-            if let Some(change) = change_for(verdict, at.agent_id, screen.as_deref()) {
-                if let Err(error) = state.tasks.move_to(id, change).await {
-                    tracing::debug!(task = %id.0, %error, "pane follower: move refused");
+            last_marker = marker;
+            if let Some(change) = change_for(verdict, at.agent_id, observed.screen.as_deref()) {
+                match state.tasks.move_to(id, change).await {
+                    Ok(moved) => now = moved.state,
+                    Err(error) => {
+                        tracing::debug!(task = %id.0, %error, "pane follower: move refused")
+                    }
                 }
             }
         }
-        tokio::time::sleep(POLL).await;
+        let pause = if now == TaskState::IdleUnconfirmed {
+            PAUSED_POLL
+        } else {
+            POLL
+        };
+        tokio::time::sleep(pause).await;
     }
 }
 
@@ -389,9 +487,28 @@ mod tests {
                 done(),
             ),
             (
-                "busy then idle is only a pause",
+                "a marker while the agent still works is not the end yet",
+                vec![(T::Working, agent(Working, None), Some("all green"), soon)],
+                Verdict::Stay,
+            ),
+            (
+                "a marker read before the pane closed is done",
+                vec![(T::Working, Seen::Gone, Some("all green"), soon)],
+                done(),
+            ),
+            (
+                "busy then idle once is a read between two tool calls",
                 vec![
                     (T::Working, agent(Working, None), None, soon),
+                    (T::Working, agent(Idle, None), None, soon),
+                ],
+                Verdict::Stay,
+            ),
+            (
+                "busy then idle twice is only a pause",
+                vec![
+                    (T::Working, agent(Working, None), None, soon),
+                    (T::Working, agent(Idle, None), None, soon),
                     (T::Working, agent(Idle, None), None, soon),
                 ],
                 Verdict::Unconfirmed,
@@ -411,7 +528,10 @@ mod tests {
             ),
             (
                 "idle, never busy, for long is a pause",
-                vec![(T::Working, agent(Idle, None), None, late)],
+                vec![
+                    (T::Working, agent(Idle, None), None, late),
+                    (T::Working, agent(Idle, None), None, late),
+                ],
                 Verdict::Unconfirmed,
             ),
             (
@@ -487,6 +607,23 @@ mod tests {
             done_marker(&finished).as_deref(),
             Some("build fixed, 12 tests pass")
         );
+        // A narrow pane wraps the echo so the marker starts a line, and an
+        // agent restating the request writes a placeholder of its own.
+        for not_yet in [
+            "> When the whole task is finished, print one line exactly in this form:\n  MUQUN_TASK_DONE: <one-line\n  summary>\n",
+            "> ... print one line exactly in this\n  form:\n  MUQUN_TASK_DONE: <one-\n  line summary>\n",
+            "⏺ I will end with\n  MUQUN_TASK_DONE: <summary>\n",
+            "⏺ I will end with\n  MUQUN_TASK_DONE: …\n",
+        ] {
+            assert_eq!(done_marker(not_yet), None, "{not_yet}");
+        }
+        assert_eq!(
+            pane_title(None, &"fix the build ".repeat(9))
+                .chars()
+                .count(),
+            40
+        );
+        assert_eq!(pane_title(Some("build"), "fix the build"), "build");
 
         let claude =
             "⏺ Bash(cargo test)\n  ⎿  ok\n\n⏺ All 12 tests pass.\n\n❯ \n  ? for shortcuts\n";

@@ -266,6 +266,7 @@ the task view plus the session to open:
 | `400 unknown_model` | `model` is not in the agent's catalog for `cwd`. Nothing is created. |
 | `400 unknown_variant` | `variant` is not one of the resolved model's catalog variants (a variant without a `model` is ignored). Nothing is created. |
 | `503 agent_unavailable` | That agent (or, without `agent_id`, any agent) is not attached. |
+| `503 no_terminal` | A terminal agent was named and no terminal session answers. Nothing is created. |
 | `400 invalid_request` (body) | The body is not a JSON object of the shape above. Authentication is checked first, so without a valid device token this is `401`/`403` whatever the body. |
 | `502 agent_error` | The agent could not create the session or take the prompt; the task is recorded as `failed`, with the error as its `summary`. |
 
@@ -276,10 +277,13 @@ error line as `summary`, or `done` -- since the task and its session exist.
 ### Delegating to a terminal agent
 
 `agent_id` may also name a terminal agent the agent catalog lists (`GET
-/api/agents/catalog`: `codex`, `claude`, ...) that is not an attached agent
-service. Then, for `POST /api/tasks` and `tasks.delegate` alike, the gateway
-opens a new tab in the first reachable terminal session, starts the agent in
-it exactly as `POST /api/sessions/{id}/agents/spawn` does (its bypass launch
+/api/agents/catalog`: `codex`, `claude`, ...) that is not a session agent
+(`opencode`, `deepseek` and `t3` are session agents: unattached, they are
+`503 agent_unavailable`, never started in a pane). Then, for `POST /api/tasks`
+and `tasks.delegate` alike, the gateway opens a new tab in `cwd` in the first
+reachable terminal session, names the tab and pane after the task (its
+`label`, else the first 40 characters of the goal), starts the agent in it
+exactly as `POST /api/sessions/{id}/agents/spawn` does (its bypass launch
 arguments, `agent_env`, Codex's folder trust for `cwd`) and types the goal as
 its first prompt. `cwd` defaults to the home directory for `POST /api/tasks`
 and to wherever the backend opens the tab for `tasks.delegate`; it is not held
@@ -294,16 +298,17 @@ The task is a `delegation`, bound to the pane:
              "tab_id": "w1:t9", "shell_pid": 4242, "agent_id": "codex" }
 ```
 
-and the answer of `POST /api/tasks` carries `"pane_id"` (the pane to open)
-instead of `"asid"`. A command task's pane binding has no `agent_id`, so
-`binding.kind == "pane"` with an `agent_id` is how a client tells a terminal
-agent's task from a command. A terminal agent that is not on `PATH`, or no
-reachable terminal session, is `503 agent_unavailable` (`agent_unavailable` /
-`no_terminal` over MCP) with nothing created; a pane that could not be made is
-`502 agent_error`, the task recorded `failed`. Once the pane exists, an agent
-that did not start or a goal that could not be typed answers `200` with the
-task `failed` (its `summary` names the step), since the pane is there to look
-at.
+The answer comes as soon as the pane exists: the task is `dispatching`, and
+the answer of `POST /api/tasks` carries `"pane_id"` (the pane to open)
+instead of `"asid"`. The agent is started and given the goal in the
+background (that can take up to half a minute); the task then moves to
+`working`, or to `failed` with a `summary` naming the step (`agent: …`,
+`prompt: …`), published as `task.updated`. A command task's pane binding has
+no `agent_id`, so `binding.kind == "pane"` with an `agent_id` is how a client
+tells a terminal agent's task from a command. A terminal agent that is not on
+`PATH` is `503 agent_unavailable`, and no reachable terminal session `503
+no_terminal` (the same codes over MCP), with nothing created; a pane that
+could not be made is `502 agent_error`, the task recorded `failed`.
 
 An idle terminal agent is not a finished one -- it pauses to think, run a
 tool or wait on a long build, and comes back -- so only an explicit signal
@@ -315,25 +320,30 @@ finishes the task. The goal is typed with one more paragraph:
 When the whole task is finished, print one line exactly in this form: MUQUN_TASK_DONE: <one-line summary>
 ```
 
-(the stored `goal` is the goal as given). A line starting with
-`MUQUN_TASK_DONE:` (after any bullet the agent draws) on the pane's screen,
-with a summary other than the placeholder, makes the task `done` with that
-summary (one line, at most 240 characters); the request echoed inside the
-prompt does not count, since there the marker is not at the start of a line.
+(the stored `goal` is the goal as given). The marker is looked for in the
+pane's recent output (its last 200 lines, unwrapped), not only on its screen,
+so one that scrolled off still counts. It counts when the line starts with
+`MUQUN_TASK_DONE:` (after any bullet the agent draws), lies below the last
+line of the echoed request (a narrow pane can wrap the echo so that the marker
+starts a line), carries a summary that is not the placeholder or a piece of
+it (`<…`, `…`), and the agent is not working, starting or blocked at that
+poll. The task is then `done` with that summary (one line, at most 240
+characters).
 
 The task follows the pane as the terminal backend reports it (Herdr's own
-agent state; on tmux, the state read off the screen), polled every 2 s,
-recorded with source `pane_follower` and published as `task.updated` like
-every change. The marker is checked first on every poll:
+agent state; on tmux, the state read off the screen), polled every 2 s (every
+12 s while it is `idle_unconfirmed`), recorded with source `pane_follower` and
+published as `task.updated` like every change. The marker is checked first on
+every poll:
 
 | The pane | The task |
 |---|---|
-| a `MUQUN_TASK_DONE: <summary>` line on screen | `done`, `summary` = that summary |
+| the marker, as above | `done`, `summary` = the marker's summary |
 | the agent starting or working | `working` (back from `waiting` or `idle_unconfirmed`) |
 | the agent blocked on a menu: an approval or a question | `waiting` |
-| the agent idle after it was seen working (or after its Herdr state sequence moved), or idle 30 s after the start | `idle_unconfirmed`, `summary` = a hint: the agent's last prose block when the gateway has a transcript dictionary for it (Claude Code, Codex, ...), else the screen's last line with any letter or digit in it |
+| the agent idle on two polls in a row, after it was seen working (or after its Herdr state sequence moved), or 30 s after the start | `idle_unconfirmed`, `summary` = a hint: the agent's last prose block when the gateway has a transcript dictionary for it (Claude Code, Codex, ...), else the screen's last line with any letter or digit in it |
 | no agent running in the pane, on two polls in a row, and no marker | `failed`, `summary` = `the agent exited before it finished: <last screen line>` |
-| the pane is gone (or another shell holds its id) | `failed`, `summary` = `the pane closed` |
+| the pane is gone (or another shell holds its id), and no marker was read before | `failed`, `summary` = `the pane closed` |
 
 `idle_unconfirmed` is a pause, not an end: the task stays open, and moves back
 to `working` when the agent runs again. The backend exposes no assistant
@@ -349,10 +359,10 @@ completion signal.
 `failed`, `cancelled` or `waiting`; `tasks.read` has no timeline for it
 (`invalid_arguments`); cancelling sends the agent its interrupt key (the key
 the pane interrupt route sends) and marks the task `cancelled`, leaving the
-pane open. The startup and 60 s reconcile fails such a task whose pane is gone
-and otherwise restarts its follower, so a gateway restart does not orphan it.
-An assistant running in the pane that calls `exec.run` or `tasks.delegate`
-with a pane-bound token is filed under this task (see [Task tree](#task-tree)).
+pane open. The startup and 60 s reconcile restarts the follower of such a task
+when none runs, so a gateway restart does not orphan it. An assistant running
+in the pane that calls `exec.run` or `tasks.delegate` with a pane-bound token
+is filed under this task (see [Task tree](#task-tree)).
 
 There is no separate rate limit, as for the other device routes that start
 work (`POST /api/agent-sessions`, `POST /api/sessions/{id}/tasks`).

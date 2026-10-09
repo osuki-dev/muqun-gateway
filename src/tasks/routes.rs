@@ -231,7 +231,12 @@ async fn create(
 
 fn create_failed(error: TaskError) -> (StatusCode, Json<Value>) {
     match error {
-        TaskError::AgentUnavailable(_) | TaskError::NoTerminal => api_error(
+        TaskError::NoTerminal => api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_terminal",
+            "No terminal session is reachable on this computer",
+        ),
+        TaskError::AgentUnavailable(_) => api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_unavailable",
             "That agent is not available",
@@ -528,21 +533,39 @@ mod tests {
             .agent_commands
             .insert("codex".into(), "sh".into());
         let dir = std::env::temp_dir().canonicalize().unwrap();
-        let body =
-            json!({ "goal": "fix the build", "cwd": dir, "agent_id": "codex", "model": "ignored" });
+        let body = json!({ "goal": "fix the build", "cwd": dir, "agent_id": "codex",
+                           "model": "ignored", "label": "build" });
         let (status, task) = send(&state, "POST", "/api/tasks", Some(body), true).await;
         assert_eq!(status, StatusCode::OK, "{task}");
+        // Answered once the pane exists; the agent starts in the background.
         assert_eq!(task["pane_id"], "w1:p9");
         assert!(task.get("asid").is_none(), "{task}");
-        assert_eq!(task["state"], "working");
+        assert_eq!(task["state"], "dispatching");
         assert_eq!(task["origin"], "device");
         assert_eq!(
             task["binding"],
             json!({ "kind": "pane", "session_id": "default", "pane_id": "w1:p9",
                     "tab_id": "w1:t9", "shell_pid": 4242, "agent_id": "codex" })
         );
-        // Started the spawn route's way: bypass flags, then the goal as its prompt.
+        let id = TaskId(task["task_id"].as_str().unwrap().into());
+        for _ in 0..200 {
+            if state.tasks.get_for_test(&id).await.state != TaskState::Dispatching {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            state.tasks.get_for_test(&id).await.state,
+            TaskState::Working
+        );
+        // In the asked directory, named for the task, started the spawn
+        // route's way: bypass flags, then the goal as its prompt.
         let calls = herdr.calls.lock().unwrap().clone();
+        let tab = calls.iter().find(|c| c["method"] == "tab.create").unwrap();
+        assert_eq!(tab["params"]["cwd"], json!(dir));
+        assert!(calls
+            .iter()
+            .any(|c| c["method"] == "tab.rename" && c["params"]["label"] == "build"));
         let start = calls.iter().find(|c| c["method"] == "agent.start").unwrap();
         assert_eq!(start["params"]["kind"], "codex");
         assert_eq!(
@@ -560,10 +583,14 @@ mod tests {
         );
         assert_eq!(task["goal"], "fix the build");
 
-        let unknown = json!({ "goal": "x", "agent_id": "no-such-agent" });
-        let (status, body) = send(&state, "POST", "/api/tasks", Some(unknown), true).await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body["error"]["code"], "agent_unavailable");
+        // Neither an unknown agent nor an unattached session agent (OpenCode
+        // is in the terminal catalog too) is started in a pane.
+        for agent_id in ["no-such-agent", "opencode"] {
+            let body = json!({ "goal": "x", "agent_id": agent_id });
+            let (status, body) = send(&state, "POST", "/api/tasks", Some(body), true).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{agent_id}");
+            assert_eq!(body["error"]["code"], "agent_unavailable");
+        }
     }
 
     #[tokio::test]

@@ -113,7 +113,8 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     // `POST /api/tasks` and `tasks.delegate` take a terminal agent kind
     // (`codex`, `claude`, ...) as `agent_id`: the task is bound to the pane
     // the agent was started in (`binding.kind == "pane"` with `agent_id`)
-    // and the create answer carries `pane_id` instead of `asid`. Such a
+    // and the create answer (state `dispatching`) carries `pane_id` instead
+    // of `asid`. Such a
     // task is `done` only on its MUQUN_TASK_DONE marker; an idle agent is
     // `idle_unconfirmed`.
     "task_ledger_pane",

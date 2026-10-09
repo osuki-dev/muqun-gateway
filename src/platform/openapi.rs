@@ -877,7 +877,7 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
     );
     list_responses["400"] = json!({ "description": "invalid_request: an unknown state name, a limit that is not a positive integer, or an empty root" });
     let mut create_responses = json_ok(
-        "The new task's view, plus where to open it: the agent session (asid), or for a terminal agent the pane it runs in (pane_id). A terminal agent whose launch failed after its pane was made answers 200 with state failed",
+        "The new task's view, plus where to open it: the agent session (asid), or for a terminal agent the pane it runs in (pane_id). A terminal agent's task answers dispatching as soon as its pane exists, and moves to working or failed once the agent is started in the background",
         json!({
             "allOf": [task_view(), {
                 "type": "object",
@@ -890,7 +890,7 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
     );
     create_responses["400"] = json!({ "description": "invalid_request (empty or oversized goal, oversized label, empty name), invalid_directory, directory_not_found, not_a_directory, unknown_model" });
     create_responses["502"] = json!({ "description": "agent_error: the agent could not start the session or take the prompt, or no pane could be made for a terminal agent" });
-    create_responses["503"] = json!({ "description": "agent_unavailable: the agent is not attached, a terminal agent is not on PATH, or no terminal session answers" });
+    create_responses["503"] = json!({ "description": "agent_unavailable: the agent is not attached (a session agent is never started in a pane) or a terminal agent is not on PATH; no_terminal: no terminal session answers" });
     let read_responses = not_found(
         json_ok(
             "The task and its state history, oldest first",
