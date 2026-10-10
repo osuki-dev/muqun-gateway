@@ -203,7 +203,9 @@ An agent gets the muqun server one of two ways:
    out when `agent_launch_args.claude` already appends a system prompt),
    Codex through `-c developer_instructions=<the user's own
    developer_instructions, read from their config.toml and never written,
-   then the sentence>` for that run. Only a Claude Code seen to start that
+   then the sentence>` for that run (only the top-level value is read: a
+   Codex launched with `-p <profile>` has that profile's
+   `developer_instructions` replaced by this for the run). Only a Claude Code seen to start that
    way and gone again at once, its pane back at a shell with no Claude Code
    left under it, is started once more with the sentence typed after the
    goal; a start that times out is never retried. The launch line shows in
