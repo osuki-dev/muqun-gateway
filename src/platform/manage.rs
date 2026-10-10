@@ -1550,21 +1550,57 @@ fn toggle_mcp() -> anyhow::Result<String> {
     ))
 }
 
+/// What the running Gateway's SQLite history store holds, for the caption
+/// beside its setting: "12 checkpoints · WAL 1.2 MiB". `None` when the
+/// Gateway does not answer at once.
+fn history_storage_caption(config: &crate::Config) -> Option<String> {
+    let (status, value) = crate::cli::local_api::admin_request_with_timeouts(
+        config,
+        "GET",
+        "/api/history/storage",
+        None,
+        Duration::from_millis(250),
+        Duration::from_millis(500),
+    )
+    .ok()?;
+    if status != 200 || value["storage"] != "sqlite" {
+        return None;
+    }
+    let count = value["checkpoints"].as_u64()?;
+    let wal = value["wal_bytes"].as_u64()?;
+    let wal = if wal < 1024 * 1024 {
+        format!("{} KiB", wal.div_ceil(1024))
+    } else {
+        format!("{:.1} MiB", wal as f64 / (1024.0 * 1024.0))
+    };
+    let failing = if value["healthy"] == true {
+        ""
+    } else {
+        " · failing, retrying"
+    };
+    Some(format!(
+        "{count} checkpoint{} · WAL {wal}{failing}",
+        if count == 1 { "" } else { "s" }
+    ))
+}
+
 /// Enter on "History checkpoints": a chooser; the pick is written and needs
 /// a restart. `None` when nothing changed.
 fn choose_history_storage() -> anyhow::Result<Option<String>> {
-    let current = load_config(None)?.history.storage;
+    let config = load_config(None)?;
+    let current = config.history.storage;
+    // True to the store this Gateway keeps: encrypted unless it was turned off.
+    let sqlite = match config.store.encryption {
+        crate::StoreEncryption::File => "survives restarts · encrypted store",
+        crate::StoreEncryption::Off => "survives restarts · plaintext store",
+    };
     let options = [
         (
             crate::HistoryStorage::Memory,
             "memory",
             "only while Gateway runs",
         ),
-        (
-            crate::HistoryStorage::Sqlite,
-            "SQLite",
-            "survives restarts · encrypted store",
-        ),
+        (crate::HistoryStorage::Sqlite, "SQLite", sqlite),
     ];
     let start = options
         .iter()
@@ -1898,7 +1934,13 @@ fn print_manage_screen(
         .and_then(|result| result.as_ref().err())
         .map(|error| format!("Action failed: {}", first_line(&error.to_string())));
     let qr = qr_result.as_ref().and_then(|result| result.as_ref().ok());
+    let history_caption = (ui.section == Section::Settings
+        && running
+        && config.history.storage == crate::HistoryStorage::Sqlite)
+        .then(|| history_storage_caption(&config))
+        .flatten();
     let data = ManageData {
+        history_caption: history_caption.as_deref(),
         config: &config,
         message: qr_error.as_deref().unwrap_or(message),
         pending: pending_pairing,
@@ -2032,6 +2074,8 @@ impl ScreenLine {
 }
 
 struct ManageData<'a> {
+    /// What the SQLite history store holds now, shown beside its setting.
+    history_caption: Option<&'a str>,
     config: &'a crate::Config,
     message: &'a str,
     pending: Option<&'a PendingPairing>,
@@ -2517,6 +2561,10 @@ fn manage_lines(
                     body.push(ScreenLine::text(group, Tone::Title));
                 }
                 let mut value = setting_value(*setting, config, data.autostart);
+                if let (Setting::HistoryStorage, Some(caption)) = (setting, data.history_caption) {
+                    value.push_str(" · ");
+                    value.push_str(caption);
+                }
                 if data.changed && ui.restart.contains(setting) {
                     value.push_str(" · restart needed");
                 }
@@ -3429,6 +3477,7 @@ mod tests {
         // a 60-column terminal, cutting with … rather than mid-word.
         let config = config(serde_json::json!({}));
         let data = ManageData {
+            history_caption: None,
             config: &config,
             message: "ready",
             pending: None,
@@ -3473,6 +3522,7 @@ mod tests {
         // At a real terminal's height the last row, its explanation and the
         // view's end are reachable; a changed row says it needs a restart.
         let changed = ManageData {
+            history_caption: None,
             changed: true,
             ..data
         };
@@ -3615,6 +3665,7 @@ mod tests {
     fn manager_styled_layout_is_cell_bounded_through_resize_and_keeps_selection_visible() {
         let config = layout_config();
         let data = ManageData {
+            history_caption: None,
             config: &config,
             message: "Ready 中文e\u{301}",
             pending: None,
@@ -3673,6 +3724,7 @@ mod tests {
         let config = layout_config();
         let pairing = super::PairingView::default();
         let data = |config| ManageData {
+            history_caption: None,
             config,
             message: "ready",
             pending: None,
@@ -3835,6 +3887,7 @@ mod tests {
             &QrCode::with_error_correction_level(b"isolated-qr-layout", EcLevel::L).unwrap(),
         );
         let data = ManageData {
+            history_caption: None,
             config: &config,
             message: "ready",
             pending: None,

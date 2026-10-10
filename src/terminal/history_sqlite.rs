@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 use super::history::{
     Capture, HistoryError, HistoryFuture, HistoryRepository, HistoryScope, HistorySnapshot,
+    StorageStats,
 };
 use super::history_memory::MemoryHistoryRepository;
 use super::scrollback::{ProjectionStamp, ScrollbackStore, MAX_PANE_BYTES, MAX_PANE_LINES};
@@ -229,6 +230,17 @@ impl HistoryRepository for SqliteHistoryRepository {
     fn remove(&self, id: Uuid) -> HistoryFuture<'_, ()> {
         Box::pin(async move { self.memory.remove(id).await })
     }
+    fn stats(&self) -> Option<StorageStats> {
+        Some(
+            self.checkpoints
+                .as_ref()
+                .map_or_else(StorageStats::default, |checkpoints| StorageStats {
+                    healthy: checkpoints.healthy.load(Ordering::Acquire),
+                    checkpoints: checkpoints.stored.load(Ordering::Relaxed),
+                    wal_bytes: checkpoints.wal.load(Ordering::Relaxed),
+                }),
+        )
+    }
 }
 
 /// What the write loop and checkpoint reads share. Its SQL runs only in jobs
@@ -246,6 +258,9 @@ struct Checkpoints {
     wakes: std::sync::atomic::AtomicU64,
     /// When a pass last committed a change, for the idle WAL checkpoint.
     last_write: Mutex<Instant>,
+    /// Stored checkpoints and WAL bytes as of the last pass, for `stats`.
+    stored: std::sync::atomic::AtomicU64,
+    wal: std::sync::atomic::AtomicU64,
 }
 
 /// `(session, pane, format)`.
@@ -287,9 +302,10 @@ impl Checkpoints {
             .call(move |connection| {
                 let namespaces = reconcile_backends(connection, &config)?;
                 prune(connection, now_seconds(), &[])?;
-                Ok(namespaces)
+                Ok((namespaces, stored_count(connection)?, wal_bytes(connection)))
             })
             .await?;
+        let (namespaces, stored, wal) = namespaces;
         Ok(Arc::new(Self {
             db,
             captures,
@@ -302,6 +318,8 @@ impl Checkpoints {
             }),
             wakes: std::sync::atomic::AtomicU64::new(0),
             last_write: Mutex::new(Instant::now()),
+            stored: std::sync::atomic::AtomicU64::new(stored),
+            wal: std::sync::atomic::AtomicU64::new(wal),
         }))
     }
 
@@ -388,6 +406,9 @@ impl Checkpoints {
                             prune(connection, now, &live)?;
                         }
                         this.fold_wal(connection, prune_due)?;
+                        this.stored
+                            .store(stored_count(connection)?, Ordering::Relaxed);
+                        this.wal.store(wal_bytes(connection), Ordering::Relaxed);
                         Ok(idle)
                     });
                 connection.pragma_update(None, "synchronous", "FULL")?;
@@ -744,6 +765,14 @@ fn enforce_quotas(transaction: &Transaction<'_>, live: &[String]) -> anyhow::Res
         );
     }
     Ok(())
+}
+
+/// How many checkpoints are stored, over the covering index.
+fn stored_count(connection: &Connection) -> anyhow::Result<u64> {
+    let count: i64 = connection.query_row("SELECT count(*) FROM history_captures", [], |row| {
+        row.get(0)
+    })?;
+    Ok(count.max(0) as u64)
 }
 
 /// The size of the store's WAL file; 0 when it has none.

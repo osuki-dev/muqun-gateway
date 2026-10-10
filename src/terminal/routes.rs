@@ -116,6 +116,10 @@ pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
             get(super::history_routes::pane_history),
         )
         .route(
+            "/api/history/storage",
+            get(super::history_routes::history_storage),
+        )
+        .route(
             "/api/sessions/{session_id}/panes/{pane_id}/parts",
             get(pane_parts),
         )

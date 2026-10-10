@@ -158,16 +158,27 @@ prompt-delivery change in this feature.
 
 ## Optional SQLite checkpoints
 
-While Gateway is stopped, set this block in its `config.json`, then start it
-through the normal lifecycle command. Changing storage requires a controlled
-restart; it is not a live toggle or a Manager UI setting.
+Pick SQLite under Settings › "History checkpoints" in `muqun-gateway manage`
+(or, while Gateway is stopped, set this block in its `config.json`), then
+restart Gateway. Changing storage requires a controlled restart; it is not a
+live toggle.
 
 ```json
 {"history": {"storage": "sqlite"}}
 ```
 
 The accepted storage values are `memory` (default) and `sqlite`; unknown values
-are rejected. Omitting the block keeps existing config files compatible. The
+are rejected. Omitting the block keeps existing config files compatible and
+takes the default, which is one constant (`DEFAULT_HISTORY_STORAGE` in
+`platform/config.rs`); a config that names its storage keeps it whatever the
+default.
+
+`GET /api/history/storage` (the admin token or a device) answers which storage
+runs -- as read from `config.json` at startup, like the capability below -- and,
+for SQLite, `healthy`, `checkpoints` (stored, one per pane and format) and
+`wal_bytes`, from counters the write loop keeps, never a query on the request.
+`manage` shows them beside the setting while Gateway runs, for example
+`SQLite · 12 checkpoints · WAL 1.2 MiB`. The
 additional capability `pane_captured_history_sqlite_checkpoint` is announced
 only while `history.storage` is `sqlite` on a platform that can verify process
 identity (Linux, macOS): it means the checkpoints are

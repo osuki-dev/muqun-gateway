@@ -79,6 +79,21 @@ pub(crate) trait HistoryRepository: Send + Sync {
     fn load(&self, id: Uuid) -> HistoryFuture<'_, Option<Arc<HistorySnapshot>>>;
     fn pin(&self, snapshot: HistorySnapshot) -> HistoryFuture<'_, Arc<HistorySnapshot>>;
     fn remove(&self, id: Uuid) -> HistoryFuture<'_, ()>;
+    /// What a durable adapter holds now, from counters it keeps (never a
+    /// query on the request path); `None` for memory.
+    fn stats(&self) -> Option<StorageStats> {
+        None
+    }
+}
+
+/// A durable history store as `GET /api/history/storage` reports it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct StorageStats {
+    pub healthy: bool,
+    /// Stored checkpoints (one per pane and format).
+    pub checkpoints: u64,
+    /// The store's WAL file, in bytes, as of the last write pass.
+    pub wal_bytes: u64,
 }
 
 /// Stable application use case. Backend liveness is established before calling;

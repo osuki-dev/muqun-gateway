@@ -754,6 +754,19 @@ pub fn openapi_spec() -> Value {
         }
     });
     spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/history"] = captured_history_path();
+    spec["paths"]["/api/history/storage"] = json!({ "get": {
+        "summary": "Which captured-history storage this Gateway runs with (memory or sqlite, from config.json at startup) and, for sqlite, what it holds, from counters the write loop keeps. Requires the admin token or a device",
+        "responses": json_ok("The storage", json!({
+            "type": "object",
+            "required": ["storage"],
+            "properties": {
+                "storage": { "type": "string", "enum": ["memory", "sqlite"] },
+                "healthy": { "type": "boolean", "description": "sqlite only: the last write pass worked (a failing store retries on its own)" },
+                "checkpoints": { "type": "integer", "description": "sqlite only: stored checkpoints, one per pane and format" },
+                "wal_bytes": { "type": "integer", "description": "sqlite only: the store's WAL file, as of the last write pass" }
+            }
+        }))
+    }});
     spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/lazygit"] = lazygit_endpoints();
     spec["paths"]["/api/agent-sessions/{asid}/audio-asset"] = audio_asset_endpoint();
     spec["paths"]["/api/agent-sessions/{asid}/file-asset"] = json!({"get": {
@@ -2140,6 +2153,7 @@ mod history_contract_tests {
             ("/api/tasks/{id}/cancel", "post"),
             ("/api/tasks/{id}/complete", "post"),
             ("/api/fleet/self", "get"),
+            ("/api/history/storage", "get"),
             ("/api/mcp/tokens", "post"),
             ("/api/mcp/tokens", "get"),
             ("/api/mcp/tokens/{id}", "delete"),
