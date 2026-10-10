@@ -156,6 +156,9 @@ struct Live {
     /// ([`TaskService::is_task_session`]); a delegation's session is marked
     /// when it is bound, before its first prompt.
     task_sessions: HashMap<String, bool>,
+    /// The agent sessions running a turn now (their last status was busy):
+    /// their last line may still be being written ([`super::transcript`]).
+    busy: HashSet<String>,
 }
 
 /// One open task's progress.
@@ -406,6 +409,10 @@ impl TaskStore for Publishing<'_> {
                 if let Ok(mut live) = self.0.live.lock() {
                     live.titles.remove(id);
                     live.idled.remove(id);
+                    // Asked about again, it is read from the store again.
+                    if let TaskBinding::AgentSession { asid, .. } = &task.binding {
+                        live.task_sessions.remove(asid);
+                    }
                 }
             }
             self.publish(&task).await;
@@ -644,6 +651,12 @@ impl TaskService {
                 .insert(asid.to_owned(), (Some(id.clone()), Instant::now()));
             live.task_sessions.insert(asid.to_owned(), true);
         }
+    }
+
+    /// Whether agent session `asid` is running a turn, as the follower last
+    /// saw its status.
+    pub(crate) fn is_busy(&self, asid: &str) -> bool {
+        self.live.lock().is_ok_and(|live| live.busy.contains(asid))
     }
 
     /// Whether any task, open or ended, is bound to agent session `asid`:
@@ -1607,8 +1620,9 @@ impl TaskService {
         }
     }
 
-    /// `task`'s title from its session's name: the live name for an open task, the one kept when it ended for the
-    /// rest; never its asid, nor its goal restated or cut short.
+    /// `task`'s title from its session's name: the live name for an open
+    /// task, the one kept when it ended for the rest; never its asid, nor its
+    /// goal restated or cut short.
     fn title_of(&self, task: &Task) -> Option<String> {
         let TaskBinding::AgentSession { asid, .. } = &task.binding else {
             return None;
@@ -1664,6 +1678,15 @@ impl TaskService {
     /// working, a failed session failed with its error line, an interrupted
     /// one cancelled, a pending request waiting. Whether a task moved.
     pub(crate) async fn follow(&self, state: &AppState, event: &AgentDomainEvent) -> bool {
+        if let AgentDomainEvent::StatusChanged { asid, status, .. } = event {
+            if let Ok(mut live) = self.live.lock() {
+                if matches!(status, AgentSessionStatus::Busy | AgentSessionStatus::Retry) {
+                    live.busy.insert(asid.0.clone());
+                } else {
+                    live.busy.remove(&asid.0);
+                }
+            }
+        }
         match event {
             AgentDomainEvent::TimelineUpsert { asid, items, .. } => {
                 self.follow_progress(state, &asid.0, items).await;
@@ -1969,7 +1992,7 @@ fn progress_line(item: &TimelineItem) -> Option<String> {
         }
         // The marker line is the end, said to the gateway, not progress.
         AgentPart::Text { text } if item.role == TimelineRole::Assistant => {
-            super::transcript::without_markers(text)
+            super::transcript::without_markers(text, super::transcript::Streaming(false))
                 .unwrap_or_else(|| text.clone())
                 .lines()
                 .map(str::trim)

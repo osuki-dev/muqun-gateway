@@ -16,10 +16,10 @@
 //! - an assistant text or reasoning without its marker lines (a line outside
 //!   a code fence that starts, after bullets and markup, with a marker), and
 //!   dropped when nothing else is left. A streamed text is served as
-//!   snapshots of the whole text so far, so a last line still being written
-//!   that could only be the start of a marker (bare markup such as `- `
-//!   included) is held back too: the marker never flashes before its turn
-//!   ends. A streamed row left with nothing is removed
+//!   snapshots of the whole text so far, so while the session runs a turn
+//!   a last line that could only be the start of a marker (bare markup such
+//!   as `- ` included) is held back too: the marker never flashes before
+//!   its turn ends, and a finished message is never cut but for markers. A streamed row left with nothing is removed
 //!   (`agent.timeline.removed`) rather than left out, so a client never keeps
 //!   an older version of it.
 //!
@@ -33,15 +33,25 @@ use super::pane_agent::{
 use crate::agents::domain::{AgentDomainEvent, AgentPart, TimelineItem, TimelineRole};
 use crate::AppState;
 
-/// Whether session `asid`'s transcript is served without the plumbing: a
-/// task is (or was) bound to it.
-pub(crate) async fn for_session(state: &AppState, asid: &str) -> bool {
-    state.tasks.is_task_session(asid).await
+/// How session `asid`'s transcript is served: `None` as it is, no task
+/// being (or having been) bound to it; else without the plumbing, holding
+/// back a last line still being written when it is `streaming` (running a
+/// turn).
+pub(crate) async fn for_session(state: &AppState, asid: &str) -> Option<Streaming> {
+    if !state.tasks.is_task_session(asid).await {
+        return None;
+    }
+    Some(Streaming(state.tasks.is_busy(asid)))
 }
 
+/// Whether the session is running a turn: its rows' last lines may still
+/// be being written. A finished message is never cut but for its markers.
+#[derive(Clone, Copy)]
+pub(crate) struct Streaming(pub(crate) bool);
+
 /// `items` as the reader sees them.
-pub(crate) fn hide_in_items(items: &mut Vec<TimelineItem>) {
-    items.retain_mut(|item| hide_in_item(item) != Served::Emptied);
+pub(crate) fn hide_in_items(items: &mut Vec<TimelineItem>, streaming: Streaming) {
+    items.retain_mut(|item| hide_in_item(item, streaming) != Served::Emptied);
 }
 
 #[derive(PartialEq)]
@@ -50,7 +60,7 @@ enum Served {
     Emptied,
 }
 
-fn hide_in_item(item: &mut TimelineItem) -> Served {
+fn hide_in_item(item: &mut TimelineItem, streaming: Streaming) -> Served {
     let (text, served) = match (item.role, &mut item.part) {
         (TimelineRole::User, AgentPart::Text { text }) | (_, AgentPart::Synthetic { text, .. }) => {
             let served = without_request(text);
@@ -58,7 +68,7 @@ fn hide_in_item(item: &mut TimelineItem) -> Served {
         }
         (TimelineRole::Assistant, AgentPart::Text { text })
         | (TimelineRole::Assistant, AgentPart::Reasoning { text, .. }) => {
-            let served = without_markers(text);
+            let served = without_markers(text, streaming);
             (text, served)
         }
         _ => return Served::Kept,
@@ -74,12 +84,12 @@ fn hide_in_item(item: &mut TimelineItem) -> Served {
 
 /// `event` as the reader sees it. An upsert whose every row is left with
 /// nothing becomes the removal of those rows.
-pub(crate) fn hide_in_event(event: &mut AgentDomainEvent) {
+pub(crate) fn hide_in_event(event: &mut AgentDomainEvent, streaming: Streaming) {
     match event {
         AgentDomainEvent::TimelineUpsert { asid, items, seq } => {
             let mut emptied = Vec::new();
             items.retain_mut(|item| {
-                let kept = hide_in_item(item) == Served::Kept;
+                let kept = hide_in_item(item, streaming) == Served::Kept;
                 if !kept {
                     emptied.push(item.id.clone());
                 }
@@ -132,10 +142,10 @@ fn without_request(text: &str) -> Option<String> {
         .then(|| before.trim_end().to_owned())
 }
 
-/// `text` without its marker lines, if it has any (or ends in what may be
-/// the start of one). Lines inside a code fence are the agent quoting, and
-/// stay.
-pub(crate) fn without_markers(text: &str) -> Option<String> {
+/// `text` without its marker lines, if it has any (or, `streaming`, ends in
+/// what may be the start of one). Lines inside a code fence are the agent
+/// quoting, and stay.
+pub(crate) fn without_markers(text: &str, streaming: Streaming) -> Option<String> {
     let lines: Vec<&str> = text.split('\n').collect();
     let last = lines.len() - 1;
     let mut fenced = false;
@@ -145,23 +155,23 @@ pub(crate) fn without_markers(text: &str) -> Option<String> {
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
             fenced = !fenced;
         }
-        if fenced || !is_marker_line(line, at == last) {
+        if fenced || !is_marker_line(line, streaming.0 && at == last) {
             kept.push(line);
         }
     }
     (kept.len() < lines.len()).then(|| kept.join("\n").trim_end().to_owned())
 }
 
-/// Whether `line` is a marker line -- or, as the `last` line still being
-/// written, could become one: a marker's start, or bare list or emphasis
+/// Whether `line` is a marker line -- or, as the last line still being
+/// `written`, could become one: a marker's start, or bare list or emphasis
 /// markup (not a `---` rule).
-fn is_marker_line(line: &str, last: bool) -> bool {
+fn is_marker_line(line: &str, written: bool) -> bool {
     let body = line.trim_start_matches(|c: char| !c.is_alphanumeric());
     let markers = [DONE_MARKER, BLOCKED_MARKER];
     if markers.iter().any(|marker| body.starts_with(marker)) {
         return true;
     }
-    if !last {
+    if !written {
         return false;
     }
     if !body.is_empty() {
@@ -250,12 +260,6 @@ mod tests {
                 None,
             ),
             (
-                "marker still streaming",
-                Assistant,
-                text("All green.\n\nMUQUN_TA"),
-                Some("All green."),
-            ),
-            (
                 "a marker mid-text",
                 Assistant,
                 text("one\nMUQUN_TASK_DONE: x\ntwo"),
@@ -280,12 +284,6 @@ mod tests {
                 Some("The line:\n```\nMUQUN_TASK_DONE: x\n```"),
             ),
             (
-                "bare bullet still streaming",
-                Assistant,
-                text("All green.\n- "),
-                Some("All green."),
-            ),
-            (
                 "a closing rule",
                 Assistant,
                 text("All green.\n---"),
@@ -293,12 +291,27 @@ mod tests {
             ),
         ] {
             let mut items = vec![item(role, part)];
-            hide_in_items(&mut items);
+            hide_in_items(&mut items, Streaming(false));
             let got = items.first().map(|item| match &item.part {
                 AgentPart::Text { text } | AgentPart::Synthetic { text, .. } => text.as_str(),
                 _ => unreachable!(),
             });
             assert_eq!(got, served, "{name}");
+        }
+        // A last line that may become a marker is held back only while the
+        // turn runs; a finished message keeps it.
+        for (last, streaming, served) in [
+            ("MUQUN_TA", true, "All green."),
+            ("- ", true, "All green."),
+            ("- ", false, "All green.\n- "),
+            ("MUQUN_TA", false, "All green.\nMUQUN_TA"),
+        ] {
+            let mut items = vec![item(Assistant, text(&format!("All green.\n{last}")))];
+            hide_in_items(&mut items, Streaming(streaming));
+            assert!(
+                matches!(&items[0].part, AgentPart::Text { text } if text == served),
+                "{last:?} {streaming}"
+            );
         }
         // The inbox holds the instruction for a moment before the turn runs.
         let mut inbox = vec![
@@ -315,7 +328,7 @@ mod tests {
             items: vec![item(Assistant, text("- **MUQUN"))],
             seq: 7,
         };
-        hide_in_event(&mut event);
+        hide_in_event(&mut event, Streaming(true));
         assert!(
             matches!(&event, AgentDomainEvent::TimelineRemoved { ids, seq: 7, .. } if ids == &["i"]),
             "{event:?}"

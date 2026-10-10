@@ -1370,9 +1370,10 @@ Every other session is served as it is:
 - An assistant `text` or `reasoning` row is served without its marker lines: a
   line outside a code fence that starts, after bullets and markup, with
   `MUQUN_TASK_DONE:` or `MUQUN_TASK_BLOCKED:`. A row left with nothing else is
-  left out. While the row streams, a last line that can only be the start of a
-  marker (or is bare list or emphasis markup, such as `- `) is held back too,
-  so the marker never shows mid-turn. An `agent.timeline.upsert` whose rows
+  left out. While the session runs a turn, a last line that can only be the
+  start of a marker (or is bare list or emphasis markup, such as `- `) is held
+  back too, so the marker never shows mid-turn; a finished message loses only
+  its marker lines. An `agent.timeline.upsert` whose rows
   are all left with nothing arrives as `agent.timeline.removed` for them.
   `seq` keeps counting, so a client may see a gap where a row was left out.
 - An inbox item (`GET …/inbox`, the snapshot's `inbox`,

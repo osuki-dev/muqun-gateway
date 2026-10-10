@@ -128,10 +128,12 @@ pub(crate) fn is_available(state: &AppState, agent_id: &str) -> bool {
 /// its configured launch arguments append one of their own) and is cut from
 /// the served transcript otherwise ([`super::transcript`]). A Claude Code
 /// seen to start with `--append-system-prompt-file` and gone again within
-/// [`SETTLE`], its pane back at a shell ([`exited_to_shell`]), is started
-/// once more with the instruction typed after its goal, rather than failing
-/// the task; a start that times out is never retried. Codex and other terminal agents get it typed: a terminal shows what
-/// was typed. It opens with [`REQUEST_OPENING`].
+/// [`SETTLE`] -- its pane back at a shell with no Claude Code process left
+/// under it ([`exited_to_shell`]) -- is started once more with the
+/// instruction typed after its goal, rather than failing the task; a start
+/// that times out is never retried. Codex and other terminal agents get it
+/// typed: a terminal shows what was typed. It opens with
+/// [`REQUEST_OPENING`].
 pub(crate) fn completion_instruction() -> String {
     format!(
         "{REQUEST_OPENING}call the muqun tool tasks.complete with a \
@@ -176,9 +178,11 @@ pub(crate) async fn completion_instruction_file() -> Option<std::path::PathBuf> 
     Some(path)
 }
 
-/// How long an agent started with its instruction out of band is given to
-/// show it stays up: one that refuses the flag exits at once.
+/// How long an agent started with its instruction out of band is watched
+/// for an exit: one that refuses the flag exits at once. The watch ends as
+/// soon as the agent's prompt is up.
 const SETTLE: Duration = Duration::from_secs(3);
+const SETTLE_POLL: Duration = Duration::from_millis(200);
 /// The shells a pane goes back to when its agent exits.
 const SHELLS: [&str; 13] = [
     "sh", "bash", "zsh", "fish", "ksh", "mksh", "dash", "ash", "tcsh", "csh", "nu", "xonsh",
@@ -186,28 +190,91 @@ const SHELLS: [&str; 13] = [
 ];
 
 /// Whether the `kind` agent just started in `pane_id` exited again within
-/// [`SETTLE`]: the pane no longer runs it and its foreground is a shell.
-/// A pane that cannot be read, or runs anything else, says no.
+/// [`SETTLE`]: the pane no longer runs it, its foreground is a shell, and no
+/// `kind` process is left anywhere under the pane's shell (a launcher script
+/// can put a shell in the foreground of a running agent). Watched until
+/// the agent's prompt is up (Herdr reports its state; on tmux, its input
+/// box is drawn), at most [`SETTLE`]. A pane or process table that cannot be
+/// read says no: a launch that cannot be shown to have failed is never
+/// started twice.
 pub(crate) async fn exited_to_shell(session: &SessionConfig, pane_id: &str, kind: &str) -> bool {
-    tokio::time::sleep(SETTLE).await;
-    terminal_backend(session)
-        .get_pane(&PaneId::new(pane_id))
-        .await
-        .is_ok_and(|pane| {
-            at_shell(
-                pane.agent.as_deref(),
-                pane.foreground_command.as_deref(),
-                kind,
-            )
-        })
+    let backend = terminal_backend(session);
+    let deadline = tokio::time::Instant::now() + SETTLE;
+    loop {
+        tokio::time::sleep(SETTLE_POLL).await;
+        let Ok(pane) = backend.get_pane(&PaneId::new(pane_id)).await else {
+            return false;
+        };
+        let foreground = pane.foreground_command.as_deref();
+        if at_shell(pane.agent.as_deref(), foreground, kind) {
+            return match pane.shell_pid {
+                Some(shell) => process_table()
+                    .await
+                    .is_some_and(|table| !runs_under(&table, shell, kind)),
+                None => false,
+            };
+        }
+        let ready = pane.agent.as_deref() == Some(kind)
+            && (matches!(
+                pane.agent_status,
+                AgentStatus::Idle | AgentStatus::Working | AgentStatus::Blocked
+            ) || read_pane_visible_text(session, pane_id)
+                .await
+                .is_ok_and(|screen| input_box(&screen).is_some()));
+        if ready || tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+    }
 }
 
 fn at_shell(agent: Option<&str>, foreground: Option<&str>, kind: &str) -> bool {
-    let shell = foreground.is_some_and(|command| {
-        let name = command.rsplit('/').next().unwrap_or(command);
-        SHELLS.contains(&name.trim_start_matches('-'))
-    });
+    let shell = foreground.is_some_and(|command| SHELLS.contains(&command_name(command)));
     agent != Some(kind) && shell
+}
+
+/// A command's name: its path's last part, without a login shell's `-`.
+fn command_name(command: &str) -> &str {
+    let name = command.rsplit('/').next().unwrap_or(command);
+    name.trim_start_matches('-')
+}
+
+/// `ps -A -o pid=,ppid=,comm=`: every process's pid, parent and command.
+async fn process_table() -> Option<String> {
+    let out = tokio::process::Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid=,comm="])
+        .output()
+        .await
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Whether a process named `name` is `root` or below it in `table` (the
+/// output of [`process_table`]).
+fn runs_under(table: &str, root: u32, name: &str) -> bool {
+    let rows: Vec<(u32, u32, &str)> = table
+        .lines()
+        .filter_map(|line| {
+            let (pid, rest) = line.trim_start().split_once(char::is_whitespace)?;
+            let (ppid, command) = rest.trim_start().split_once(char::is_whitespace)?;
+            Some((pid.parse().ok()?, ppid.parse().ok()?, command.trim()))
+        })
+        .collect();
+    let mut tree = vec![root];
+    let mut at = 0;
+    while at < tree.len() {
+        let parent = tree[at];
+        tree.extend(
+            rows.iter()
+                .filter(|(pid, ppid, _)| *ppid == parent && !tree.contains(pid))
+                .map(|(pid, _, _)| *pid)
+                .collect::<Vec<_>>(),
+        );
+        at += 1;
+    }
+    rows.iter()
+        .any(|(pid, _, command)| tree.contains(pid) && command_name(command) == name)
 }
 
 /// How an agent said its task ended, with its one line.
@@ -285,6 +352,18 @@ const ACCEPT_POLL: Duration = Duration::from_secs(1);
 /// (Claude Code's), and it holds the prompt's start or a collapsed paste.
 /// A screen with no such box says nothing, so it is never pending.
 pub(crate) fn goal_pending(screen: &str, prompt: &str) -> bool {
+    let Some(inside) = input_box(screen) else {
+        return false;
+    };
+    let start: String = prompt.trim().chars().take(24).collect();
+    inside
+        .iter()
+        .any(|line| line.contains("[Pasted text") || (!start.is_empty() && line.contains(&start)))
+}
+
+/// The lines of the agent's input box on `screen`: what lies between the
+/// last two rules drawn across the pane (Claude Code's), if there are two.
+fn input_box(screen: &str) -> Option<Vec<&str>> {
     let lines: Vec<&str> = screen.lines().collect();
     let rule = |line: &&str| {
         let line = line.trim();
@@ -292,12 +371,9 @@ pub(crate) fn goal_pending(screen: &str, prompt: &str) -> bool {
     };
     let rules: Vec<usize> = (0..lines.len()).filter(|&i| rule(&lines[i])).collect();
     let [.., top, bottom] = rules[..] else {
-        return false;
+        return None;
     };
-    let start: String = prompt.trim().chars().take(24).collect();
-    lines[top + 1..bottom]
-        .iter()
-        .any(|line| line.contains("[Pasted text") || (!start.is_empty() && line.contains(&start)))
+    Some(lines[top + 1..bottom].to_vec())
 }
 
 /// Wait until the goal typed into pane `pane_id` has left the agent's input
@@ -1308,6 +1384,18 @@ mod tests {
                 back,
                 "{foreground:?}"
             );
+        }
+        // ... and only once no such process is left under the pane's shell.
+        let table = "  1     0 init\n 40     1 -zsh\n 41    40 /usr/local/bin/claude-shim\n \
+                     42    41 sh\n 43    42 claude\n 50     1 claude\n";
+        for (root, gone) in [
+            (40, false),
+            (42, false),
+            (41, false),
+            (50, false),
+            (7, true),
+        ] {
+            assert_eq!(!runs_under(table, root, "claude"), gone, "{root}");
         }
 
         // A title: the label, the session's name, else the goal's first
