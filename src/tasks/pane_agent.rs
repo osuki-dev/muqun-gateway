@@ -343,9 +343,13 @@ fn echoes_goal(line: &str, goal: &str) -> bool {
         let anchor: String = last.chars().skip(count - 16).collect();
         return line.contains(&anchor);
     }
-    line.trim_start_matches(|c: char| !c.is_alphanumeric())
-        .trim_end()
-        == last
+    // Trimmed alike: a goal such as `/review` is echoed as `› /review`.
+    let bare = |text: &str| {
+        text.trim_start_matches(|c: char| !c.is_alphanumeric())
+            .trim_end()
+            .to_owned()
+    };
+    !bare(last).is_empty() && bare(line) == bare(last)
 }
 
 /// Whether `line` opens or closes a markdown code fence (for display:
@@ -1464,6 +1468,16 @@ mod tests {
         assert_eq!(
             marker_after(pane, Some("run ls")),
             Some(Marker::Done("listed three files".into()))
+        );
+        // A goal that starts with punctuation is found in its echo too: only
+        // what follows it counts.
+        let pane = "• MUQUN_TASK_BLOCKED: why\n› /review\n• MUQUN_TASK_BLOCKED: why\n";
+        assert_eq!(
+            marker_after(pane, Some("/review")),
+            Some(Marker::Blocked {
+                reason: "why".into(),
+                count: 1
+            })
         );
         let pane = "› make sure the tests pass\n• MUQUN_TASK_DONE: tests pass\n";
         assert_eq!(
