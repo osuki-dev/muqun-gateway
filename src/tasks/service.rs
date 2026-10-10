@@ -821,7 +821,10 @@ impl TaskService {
 
     /// Whether `by` works for a task another computer opened here, itself or
     /// through its ancestors: such a task stays on this computer, so two
-    /// computers can never hand one goal back and forth.
+    /// computers can never hand one goal back and forth. Best effort: a
+    /// caller whose task could not be told (`by.parent` is `None` when no
+    /// open task, or several, fit the call) passes, so a loop takes two
+    /// such misses in a row.
     async fn handed_by_a_peer(&self, by: &Requested) -> bool {
         if by.origin == TaskOrigin::Peer {
             return true;

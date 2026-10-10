@@ -703,7 +703,10 @@ peer_server_id, remote_task_id, peer_name}`.
   still does not answer, `machine_unreachable` and nothing is created.
 - One hop only: an agent working on a task another computer handed here
   (the task or an ancestor has `origin: "peer"`) gets `delegation_loop` when
-  it names a linked computer; it may still delegate on this computer.
+  it names a linked computer; it may still delegate on this computer. This is
+  best effort: it needs the caller's own task, found as for the
+  [task tree](#task-tree); a call the gateway cannot tie to one task (none
+  or several fit) is not checked.
 - The mirror follows the task there over one task socket per computer
   (`subscribe_tasks`, the frames the phone reads), while any mirror of it is
   open; when the socket is down, the driver's pass (every 60 s) reads the
