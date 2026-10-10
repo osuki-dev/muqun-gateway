@@ -215,14 +215,28 @@ pub(crate) async fn goal_accepted(session: &SessionConfig, pane_id: &str, prompt
 /// A task's title (and a terminal task's tab and pane title): its label,
 /// else the name its agent session gave itself, else its goal's first
 /// sentence -- up to the first `.` or `?`/`!` followed by a space, a
-/// `。`/`？`/`！`, or a line end -- cut at a word to [`TITLE_CHARS`].
+/// `。`/`？`/`！`, or a line end -- each cut at a word to [`TITLE_CHARS`].
 pub(crate) fn title(label: Option<&str>, session_title: Option<&str>, goal: &str) -> String {
-    if let Some(label) = label.or(session_title) {
-        return one_line(label, TITLE_CHARS);
+    let text = match label.or(session_title) {
+        Some(name) => name,
+        None => first_sentence(goal),
+    };
+    let text = one_line(text, usize::MAX);
+    let line = one_line(&text, TITLE_CHARS);
+    let Some(cut) = line.strip_suffix('…') else {
+        return line;
+    };
+    // Cut mid-word unless a space came next: back to the last whole word.
+    let whole = text[cut.len()..].starts_with(' ');
+    match cut.rsplit_once(' ') {
+        Some((words, _)) if !whole && !words.is_empty() => format!("{words}…"),
+        _ => line,
     }
-    let goal = goal.trim();
-    let mut chars = goal.char_indices().peekable();
-    let mut end = goal.len();
+}
+
+fn first_sentence(text: &str) -> &str {
+    let text = text.trim();
+    let mut chars = text.char_indices().peekable();
     while let Some((at, c)) = chars.next() {
         let spaced = chars.peek().is_none_or(|(_, next)| next.is_whitespace());
         let cut = match c {
@@ -232,21 +246,10 @@ pub(crate) fn title(label: Option<&str>, session_title: Option<&str>, goal: &str
             _ => None,
         };
         if let Some(cut) = cut {
-            end = cut;
-            break;
+            return &text[..cut];
         }
     }
-    let sentence = one_line(&goal[..end], usize::MAX);
-    let line = one_line(&sentence, TITLE_CHARS);
-    let Some(cut) = line.strip_suffix('…') else {
-        return line;
-    };
-    // Cut mid-word unless a space came next: back to the last whole word.
-    let whole = sentence[cut.len()..].starts_with(' ');
-    match cut.rsplit_once(' ') {
-        Some((words, _)) if !whole && !words.is_empty() => format!("{words}…"),
-        _ => line,
-    }
+    text
 }
 
 /// The pane agent as one poll found it.
@@ -1067,6 +1070,12 @@ mod tests {
         for (label, session, goal, expected) in [
             (Some("build"), Some("Fix CI"), "fix the build", "build"),
             (None, Some("Fix CI"), "fix the build", "Fix CI"),
+            (
+                None,
+                Some("Creating the requested file and verifying it exists. And more"),
+                "make a file",
+                "Creating the requested file and verifying it exists. And…",
+            ),
             (
                 None,
                 None,
