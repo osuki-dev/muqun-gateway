@@ -577,6 +577,10 @@ pub(crate) struct RemoteTask {
     pub exit_code: Option<i32>,
     #[serde(default)]
     pub progress: Option<String>,
+    /// What the task is called over there: its label, or its session's
+    /// name once it has one, else its goal's first sentence.
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 /// What a peer's task socket says.

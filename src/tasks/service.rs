@@ -2008,12 +2008,15 @@ impl TaskService {
         }
     }
 
-    /// `task`'s title from its session's name: the live name for an open
-    /// task, the one kept when it ended for the rest; never its asid, nor its
-    /// goal restated or cut short.
+    /// `task`'s title from its session's name -- for a mirror, the title the
+    /// task over there shows: the live name for an open task, the one kept
+    /// when it ended for the rest; never its asid, nor its goal restated or
+    /// cut short.
     fn title_of(&self, task: &Task) -> Option<String> {
-        let TaskBinding::AgentSession { asid, .. } = &task.binding else {
-            return None;
+        let asid = match &task.binding {
+            TaskBinding::AgentSession { asid, .. } => asid.as_str(),
+            TaskBinding::Peer { .. } => "",
+            _ => return None,
         };
         if task.label.is_some() {
             return None;
@@ -2025,7 +2028,7 @@ impl TaskService {
         let name = one_line(&name, usize::MAX);
         let short = name.trim_end_matches(['…', '.']).trim_end();
         let goal = one_line(&task.goal, usize::MAX);
-        let says_more = !short.is_empty() && name != *asid && !goal.starts_with(short);
+        let says_more = !short.is_empty() && name != asid && !goal.starts_with(short);
         says_more.then(|| pane_agent::title(None, Some(&name), &task.goal))
     }
 
@@ -2040,6 +2043,23 @@ impl TaskService {
     /// "DeepSeek Agent Session", T3's "New thread"; see
     /// `untitled_placeholder`), which never names a task, as an empty title
     /// does not.
+    /// Mirror `id`'s task over there shows `title`: the mirror shows it too,
+    /// so one task reads the same on both computers' cards.
+    pub(crate) async fn mirror_titled(&self, id: &TaskId, title: &str) {
+        let title = one_line(title, SUMMARY_CHARS);
+        if title.is_empty() {
+            return;
+        }
+        let changed = self.live.lock().is_ok_and(|mut live| {
+            live.titles.insert(id.clone(), title.clone()).as_deref() != Some(title.as_str())
+        });
+        if changed {
+            if let Ok(Some(task)) = self.store.get(id).await {
+                self.store().publish(&task).await;
+            }
+        }
+    }
+
     pub(crate) async fn session_named(&self, asid: &str, title: &str) {
         let title = title.trim();
         if title.is_empty() || untitled_placeholder(asid, title) {

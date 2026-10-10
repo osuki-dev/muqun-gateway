@@ -233,6 +233,10 @@ pub(crate) async fn apply(state: &AppState, mirror: &Task, remote: &RemoteTask) 
     if let (Some(line), false) = (&remote.progress, remote.state.is_terminal()) {
         state.tasks.note_progress(state, &mirror.id, line).await;
     }
+    // Before any move: an ending mirror keeps the title it had.
+    if let (Some(title), false) = (&remote.title, mirror.state.is_terminal()) {
+        state.tasks.mirror_titled(&mirror.id, title).await;
+    }
     let Some(change) = mirror_change(mirror, remote) else {
         return false;
     };
@@ -677,6 +681,7 @@ mod tests {
             summary: summary.map(Into::into),
             exit_code: None,
             progress: None,
+            title: None,
         }
     }
 
@@ -1018,6 +1023,36 @@ mod tests {
             .await;
         let error = delegate_as(&coding, "mini", "goal").await.unwrap_err();
         assert_eq!(error["error"], "delegation_loop", "{error}");
+    }
+
+    /// A mirror reads as the task over there does: its goal's sentence until
+    /// that one has a name of its own, then the name.
+    #[tokio::test]
+    async fn a_mirror_takes_the_title_the_task_over_there_shows() {
+        let state = crate::test_support::test_state("admin", vec![]);
+        let id = state
+            .tasks
+            .insert_for_test(&Task {
+                goal: "Run xcodebuild -version, then sleep 90".into(),
+                ..mirror(TaskState::Working, None)
+            })
+            .await;
+        for (theirs, shown) in [
+            (None, "Run xcodebuild -version, then sleep 90"),
+            (Some("Checking Xcode version"), "Checking Xcode version"),
+        ] {
+            let mirrored = state.tasks.get_for_test(&id).await;
+            let remote = RemoteTask {
+                title: theirs.map(Into::into),
+                ..remote(TaskState::Working, None)
+            };
+            apply(&state, &mirrored, &remote).await;
+            let view = state
+                .tasks
+                .present(&state.tasks.get_for_test(&id).await)
+                .await;
+            assert_eq!(view.title, shown, "{theirs:?}");
+        }
     }
 
     /// A task is not done while a child it delegated is still out -- working,
