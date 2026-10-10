@@ -73,6 +73,22 @@ impl PeerStore for SqlitePeerStore {
         )
     }
 
+    fn edit<'a>(
+        &'a self,
+        peer_id: &'a str,
+        name: Option<String>,
+        url: Option<String>,
+    ) -> TaskFuture<'a, bool> {
+        let peer_id = peer_id.to_owned();
+        Box::pin(self.db.call(move |c| {
+            Ok(c.execute(
+                "UPDATE peers SET name = COALESCE(?2, name), url = COALESCE(?3, url)
+                 WHERE peer_id = ?1",
+                params![peer_id, name, url],
+            )? > 0)
+        }))
+    }
+
     fn seen<'a>(
         &'a self,
         peer_id: &'a str,

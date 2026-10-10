@@ -132,6 +132,14 @@ pub(crate) trait PeerStore: Send + Sync {
     fn put<'a>(&'a self, peer: &'a Peer) -> TaskFuture<'a, ()>;
     fn list<'a>(&'a self) -> TaskFuture<'a, Vec<Peer>>;
     fn remove<'a>(&'a self, peer_id: &'a str) -> TaskFuture<'a, bool>;
+    /// Change only `name` and/or `url` of the row, when it is still there:
+    /// never a whole row from an older read. Whether it was.
+    fn edit<'a>(
+        &'a self,
+        peer_id: &'a str,
+        name: Option<String>,
+        url: Option<String>,
+    ) -> TaskFuture<'a, bool>;
     /// It answered at `at_ms`; `capabilities`/`manifest` replace the cached ones when given.
     fn seen<'a>(
         &'a self,
@@ -200,6 +208,11 @@ pub(crate) enum RenameError {
     Invalid,
     /// Another peer already holds that name.
     Taken,
+    /// Nothing answered at the new URL.
+    Unreachable,
+    /// Something answered at the new URL but did not take this link's
+    /// token: not that computer. Its error code.
+    Refused(String),
     Store(anyhow::Error),
 }
 
@@ -678,29 +691,66 @@ impl PeerService {
         })
     }
 
-    /// Call `peer_id` `name` here (§10.16). `None`: no such peer.
-    pub(crate) async fn rename(
+    /// Call `peer_id` `name` here (§10.16), and/or reach it at `url` from now
+    /// on (its address changed): a new URL is proven first with one call
+    /// carrying this link's token, so it is that computer. `None`: no such peer.
+    pub(crate) async fn edit(
         &self,
         peer_id: &str,
-        name: &str,
+        name: Option<&str>,
+        url: Option<&str>,
     ) -> Result<Option<Peer>, RenameError> {
-        let name = name.trim();
-        if name.is_empty() || !crate::valid_device_name(name) || reserved_name(name) {
+        let name = name.map(str::trim);
+        if name.is_some_and(|name| {
+            name.is_empty() || !crate::valid_device_name(name) || reserved_name(name)
+        }) {
             return Err(RenameError::Invalid);
         }
         let peers = self.store.list().await.map_err(RenameError::Store)?;
-        if peers
-            .iter()
-            .any(|peer| peer.peer_id != peer_id && same_name(&peer.name, name))
-        {
-            return Err(RenameError::Taken);
+        if let Some(name) = name {
+            if peers
+                .iter()
+                .any(|peer| peer.peer_id != peer_id && same_name(&peer.name, name))
+            {
+                return Err(RenameError::Taken);
+            }
         }
         let Some(mut peer) = peers.into_iter().find(|peer| peer.peer_id == peer_id) else {
             return Ok(None);
         };
-        peer.name = name.to_owned();
-        self.store.put(&peer).await.map_err(RenameError::Store)?;
+        let url = url
+            .map(|url| url.trim().trim_end_matches('/').to_owned())
+            .filter(|url| *url != peer.url);
+        if let Some(url) = &url {
+            let moved = Peer {
+                url: url.clone(),
+                ..peer.clone()
+            };
+            let client = PeerClient::for_peer(&moved).map_err(RenameError::Store)?;
+            client.ping().await.map_err(|error| match error {
+                PeerError::Unreachable(_) | PeerError::NoAnswer(_) => RenameError::Unreachable,
+                PeerError::Unauthorized => RenameError::Refused("invalid_token".into()),
+                PeerError::Refused { code, .. } => RenameError::Refused(code),
+            })?;
+            peer.url = url.clone();
+        }
+        if let Some(name) = name {
+            peer.name = name.to_owned();
+        }
+        let kept = self
+            .store
+            .edit(peer_id, name.map(str::to_owned), url.clone())
+            .await
+            .map_err(RenameError::Store)?;
+        if !kept {
+            return Ok(None);
+        }
         self.refresh_names().await;
+        if url.is_some() {
+            // The socket to the old address ends; the next pass follows the new one.
+            self.mark_seen(peer_id).await;
+            self.sockets.stop(peer_id);
+        }
         Ok(Some(peer))
     }
 

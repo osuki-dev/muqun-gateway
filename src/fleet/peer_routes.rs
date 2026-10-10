@@ -83,6 +83,12 @@ fn refusal_reason(code: &str) -> &'static str {
     }
 }
 
+/// An address a peer is reached at: http(s), at most [`MAX_URL_BYTES`].
+fn valid_url(url: &str) -> bool {
+    let url = url.trim();
+    url.len() <= MAX_URL_BYTES && (url.starts_with("http://") || url.starts_with("https://"))
+}
+
 fn valid_name(name: &str) -> bool {
     let name = name.trim();
     !name.is_empty() && valid_device_name(name) && !super::peers::reserved_name(name)
@@ -128,8 +134,7 @@ async fn link(
     let Json(body) = body.map_err(|_| invalid_request())?;
     let url = body.url.trim();
     let code = body.code.trim();
-    if url.len() > MAX_URL_BYTES
-        || !(url.starts_with("http://") || url.starts_with("https://"))
+    if !valid_url(url)
         || !valid_name(&body.name)
         || !valid_request_id(&body.request_id)
         || code.is_empty()
@@ -187,10 +192,15 @@ async fn link(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RenameBody {
-    name: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
 }
 
-/// `PATCH /api/peers/{peer_id}`: what this computer calls that one (§10.16).
+/// `PATCH /api/peers/{peer_id}`: what this computer calls that one (§10.16),
+/// and/or where it is reached now (its address changed), proven with one
+/// call before it is kept.
 async fn rename(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -199,10 +209,17 @@ async fn rename(
 ) -> ApiResult<Json<Value>> {
     owner(&state, &headers)?;
     let Json(body) = body.map_err(|_| invalid_request())?;
-    own_name(&state, &body.name)?;
+    if (body.name.is_none() && body.url.is_none())
+        || body.url.as_deref().is_some_and(|url| !valid_url(url))
+    {
+        return Err(invalid_request());
+    }
+    if let Some(name) = &body.name {
+        own_name(&state, name)?;
+    }
     let peer = state
         .peers
-        .rename(&peer_id, &body.name)
+        .edit(&peer_id, body.name.as_deref(), body.url.as_deref())
         .await
         .map_err(|error| match error {
             RenameError::Invalid => invalid_request(),
@@ -211,6 +228,20 @@ async fn rename(
                 "peer_name_taken",
                 "another computer already has that name",
             ),
+            RenameError::Unreachable => api_error(
+                StatusCode::BAD_GATEWAY,
+                "peer_unreachable",
+                "nothing answered at the new address",
+            ),
+            RenameError::Refused(code) => {
+                let (status, Json(mut body)) = api_error(
+                    StatusCode::CONFLICT,
+                    "peer_refused",
+                    "what answered at the new address does not know this link",
+                );
+                body["error"]["reason"] = json!(refusal_reason(&code));
+                (status, Json(body))
+            }
             RenameError::Store(error) => store_failed(error),
         })?
         .ok_or_else(peer_not_found)?;
@@ -460,6 +491,47 @@ mod tests {
                 .map(|peer| peer.server_id),
             Some("srv-mini".to_owned())
         );
+        // Its address changed: kept once the link's token works there; an
+        // address where another computer answers, or nothing, is refused.
+        let renamed_host = url.replace("127.0.0.1", "localhost");
+        for (moved, expected, code) in [
+            (format!("{renamed_host}/"), StatusCode::OK, Value::Null),
+            (
+                other_url.clone(),
+                StatusCode::CONFLICT,
+                json!("peer_refused"),
+            ),
+            (
+                "http://127.0.0.1:9".to_owned(),
+                StatusCode::BAD_GATEWAY,
+                json!("peer_unreachable"),
+            ),
+            (
+                "ftp://mini".to_owned(),
+                StatusCode::BAD_REQUEST,
+                json!("invalid_request"),
+            ),
+        ] {
+            let (status, answer) = call(
+                &coding,
+                "PATCH",
+                &format!("/api/peers/{mini_id}"),
+                "token",
+                Some(json!({ "url": moved })),
+            )
+            .await;
+            assert_eq!(
+                (status, &answer["error"]["code"]),
+                (expected, &code),
+                "{moved}: {answer}"
+            );
+            let kept = coding.peers.get(&mini_id).await.unwrap();
+            assert_eq!(
+                (kept.url.as_str(), kept.name.as_str()),
+                (renamed_host.as_str(), "mac mini"),
+                "{moved}"
+            );
+        }
         // Nor this computer's own name: the agent could not tell them apart.
         let (status, refused) = call(
             &coding,

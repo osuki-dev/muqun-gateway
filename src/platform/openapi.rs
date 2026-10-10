@@ -1165,17 +1165,21 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
             "/api/peers/{id}",
             json!({
                 "patch": {
-                    "summary": "Rename a linked gateway",
+                    "summary": "Rename a linked gateway and/or change the address it is reached at; a new url is proven with one call carrying the link's token before it is kept",
                     "parameters": [path_param("id")],
                     "requestBody": json_body(json!({
                         "type": "object",
-                        "required": ["name"],
-                        "properties": { "name": { "type": "string" } }
+                        "minProperties": 1,
+                        "properties": {
+                            "name": { "type": "string" },
+                            "url": { "type": "string", "description": "http:// or https://, at most 512 bytes" }
+                        }
                     })),
-                    "responses": with_errors(json_ok("The renamed peer", peer_view()), &[
+                    "responses": with_errors(json_ok("The changed peer", peer_view()), &[
                         ("400", "invalid_request"),
                         ("404", "peer_not_found"),
-                        ("409", "peer_name_taken: another peer has that name"),
+                        ("409", "peer_name_taken: another peer has that name. name_conflict: this computer's own name. peer_refused: what answers at the new url does not know this link (error.reason)"),
+                        ("502", "peer_unreachable: nothing answered at the new url"),
                     ])
                 },
                 "delete": {
