@@ -24,6 +24,10 @@ const LOOKBACK: Duration = Duration::from_secs(24 * 60 * 60);
 const BATCH: usize = 50;
 /// A pass also runs this often: a pane agent going idle sends no event.
 const SWEEP: Duration = Duration::from_secs(30);
+/// How long a pane whose agent is not in front (suspended with Ctrl-Z, say)
+/// is tried again before its result is given up: it may come back with `fg`.
+const IN_FRONT_WITHIN: Duration = Duration::from_secs(60 * 60);
+
 /// The longest result a line carries.
 const MAX_RESULT_CHARS: usize = 4000;
 
@@ -73,7 +77,7 @@ pub(crate) async fn deliver(state: &AppState) -> usize {
     for (child, target) in pending {
         let readiness = match parent_ended(state, &child).await {
             Some(why) => Ready::Never(why),
-            None => ready(state, &target).await,
+            None => ready(state, &child, &target).await,
         };
         match readiness {
             Ready::NotYet => continue,
@@ -90,6 +94,10 @@ pub(crate) async fn deliver(state: &AppState) -> usize {
             Ok(Sent::Delivered) => {
                 state.tasks.told(&child.id, child.state).await;
                 told += 1;
+            }
+            // Not in front right now: tried again on a later pass, for a while.
+            Ok(Sent::Withdrawn(why)) if recent(&child) => {
+                tracing::info!(task = %child.id.0, why, "notices: the parent is told later");
             }
             Ok(Sent::Withdrawn(why)) => {
                 tracing::info!(task = %child.id.0, why, "notices: the parent is not told");
@@ -132,7 +140,13 @@ enum Ready {
 
 /// A session not running a turn; a pane whose own delegation's follower saw
 /// its agent stop, with that agent still alive in it.
-async fn ready(state: &AppState, target: &NoticeTarget) -> Ready {
+/// Whether `child`'s untold move is recent enough to wait for its pane's
+/// agent to come back to the front.
+fn recent(child: &Task) -> bool {
+    now_ms().saturating_sub(child.updated_ms) < IN_FRONT_WITHIN.as_millis() as u64
+}
+
+async fn ready(state: &AppState, child: &Task, target: &NoticeTarget) -> Ready {
     match target {
         NoticeTarget::Session { agent_id, asid } => {
             if state.tasks.is_busy(asid) {
@@ -178,8 +192,10 @@ async fn ready(state: &AppState, target: &NoticeTarget) -> Ready {
             };
             if super::pane_agent::agent_in_foreground(session, pane_id, &kind).await {
                 Ready::Now
+            } else if recent(child) {
+                Ready::NotYet
             } else {
-                Ready::Never("the pane's agent is not in its foreground")
+                Ready::Never("the pane's agent has not been in its foreground for an hour")
             }
         }
     }
@@ -232,48 +248,130 @@ async fn send(state: &AppState, target: &NoticeTarget, line: &str) -> anyhow::Re
     Ok(Sent::Delivered)
 }
 
-/// Type `line` into the `kind` agent in `pane_id`, looking at the pane's
-/// foreground right before the paste and again before each Enter: once a
-/// shell has the terminal, the pasted line is cleared (Ctrl-U) and Enter is
-/// never pressed.
+/// Type `line` into the `kind` agent in `pane_id` ([`type_line`]).
 async fn send_to_pane(
     session: &crate::platform::config::SessionConfig,
     pane_id: &str,
     kind: &str,
     line: &str,
 ) -> anyhow::Result<Sent> {
-    use super::pane_agent::agent_in_foreground;
-    use crate::terminal::backend::PaneId;
-    const NOT_IN_FRONT: &str = "the pane's agent left its foreground";
-    if !agent_in_foreground(session, pane_id, kind).await {
+    let typist = PaneTypist {
+        session,
+        pane: crate::terminal::backend::PaneId::new(pane_id),
+        kind,
+        line,
+    };
+    type_line(&typist).await
+}
+
+/// What [`type_line`] does to a pane, one step at a time.
+trait Typist {
+    /// Whether the agent holds the terminal now.
+    fn in_front(&self) -> BoxFuture<'_, bool>;
+    /// The agent's own prompt call: a bracketed paste on tmux.
+    fn paste(&self) -> BoxFuture<'_, anyhow::Result<()>>;
+    /// Whether an Enter must follow the paste (Herdr's `agent.prompt`
+    /// submits by itself).
+    fn needs_enter(&self) -> BoxFuture<'_, bool>;
+    fn enter(&self) -> BoxFuture<'_, anyhow::Result<()>>;
+    /// Ctrl-U: the pasted line off the input again.
+    fn clear(&self) -> BoxFuture<'_, ()>;
+    /// Whether the line still sits in the agent's input box.
+    fn still_typed(&self) -> BoxFuture<'_, bool>;
+}
+
+type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+/// Paste the line once the agent holds the terminal, and look again before
+/// each Enter: once something else has it, the pasted line is cleared and
+/// Enter is never pressed.
+async fn type_line(typist: &impl Typist) -> anyhow::Result<Sent> {
+    const NOT_IN_FRONT: &str = "the pane's agent is not in its foreground";
+    if !typist.in_front().await {
         return Ok(Sent::Withdrawn(NOT_IN_FRONT));
     }
-    // The agent's own prompt call: a bracketed paste on tmux; Herdr's
-    // `agent.prompt` submits it itself.
-    crate::agents::session_routes::submit_agent_prompt(session, pane_id, line)
-        .await
-        .map_err(|error| anyhow::anyhow!(error.message()))?;
-    let backend = crate::terminal_backend(session);
-    if !backend.needs_submit_keypress().await.unwrap_or(true) {
+    typist.paste().await?;
+    if !typist.needs_enter().await {
         return Ok(Sent::Delivered);
     }
-    let pane = PaneId::new(pane_id);
     for _ in 0..2 {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        if !agent_in_foreground(session, pane_id, kind).await {
-            let _ = backend.send_keys(&pane, &["ctrl+u".to_owned()]).await;
+        if !typist.in_front().await {
+            typist.clear().await;
             return Ok(Sent::Withdrawn(NOT_IN_FRONT));
         }
-        backend.send_keys(&pane, &["Enter".to_owned()]).await?;
-        tokio::time::sleep(Duration::from_millis(700)).await;
-        let still_typed = crate::read_pane_visible_text(session, pane_id)
-            .await
-            .is_ok_and(|screen| super::pane_agent::goal_pending(&screen, line));
-        if !still_typed {
+        typist.enter().await?;
+        if !typist.still_typed().await {
             break;
         }
     }
     Ok(Sent::Delivered)
+}
+
+struct PaneTypist<'a> {
+    session: &'a crate::platform::config::SessionConfig,
+    pane: crate::terminal::backend::PaneId,
+    kind: &'a str,
+    line: &'a str,
+}
+
+impl Typist for PaneTypist<'_> {
+    fn in_front(&self) -> BoxFuture<'_, bool> {
+        Box::pin(super::pane_agent::agent_in_foreground(
+            self.session,
+            self.pane.as_str(),
+            self.kind,
+        ))
+    }
+    fn paste(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        Box::pin(async move {
+            crate::agents::session_routes::submit_agent_prompt(
+                self.session,
+                self.pane.as_str(),
+                self.line,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| anyhow::anyhow!(error.message()))
+        })
+    }
+    fn needs_enter(&self) -> BoxFuture<'_, bool> {
+        Box::pin(async move {
+            let needs = crate::terminal_backend(self.session)
+                .needs_submit_keypress()
+                .await
+                .unwrap_or(true);
+            // Let the paste settle before the first look and Enter.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            needs
+        })
+    }
+    fn enter(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        Box::pin(async move {
+            crate::terminal_backend(self.session)
+                .send_keys(&self.pane, &["Enter".to_owned()])
+                .await?;
+            Ok(())
+        })
+    }
+    fn clear(&self) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            let _ = crate::terminal_backend(self.session)
+                .send_keys(&self.pane, &["ctrl+u".to_owned()])
+                .await;
+        })
+    }
+    fn still_typed(&self) -> BoxFuture<'_, bool> {
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            let typed = crate::read_pane_visible_text(self.session, self.pane.as_str())
+                .await
+                .is_ok_and(|screen| super::pane_agent::goal_pending(&screen, self.line));
+            if typed {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            typed
+        })
+    }
 }
 
 /// `text` as one line of plain prose: escape sequences (CSI, OSC and other
@@ -642,22 +740,77 @@ mod tests {
                 ..child(TaskState::IdleUnconfirmed, None)
             })
             .await;
-        let id = app
-            .tasks
-            .insert_for_test(&Task {
-                parent: Some(pane),
-                ..child(TaskState::Done, Some("built"))
-            })
-            .await;
         let target = NoticeTarget::Pane {
             session_id: "default".into(),
             pane_id: "%9".into(),
         };
-        app.tasks.notify(&id, &target).await;
-        assert_eq!(deliver(&app).await, 0);
-        assert!(
-            app.tasks.pending_notices(0, 10).await.unwrap().is_empty(),
-            "given up, not retried"
-        );
+        // Nothing typed; within the hour it waits for the agent to come back
+        // to the front (`fg`), after that it is given up.
+        for (age_ms, pending) in [(0, 1), (2 * 60 * 60 * 1000, 0)] {
+            let id = app
+                .tasks
+                .insert_for_test(&Task {
+                    parent: Some(pane.clone()),
+                    updated_ms: now_ms() - age_ms,
+                    ..child(TaskState::Done, Some("built"))
+                })
+                .await;
+            app.tasks.notify(&id, &target).await;
+            assert_eq!(deliver(&app).await, 0);
+            let left = app.tasks.pending_notices(0, 10).await.unwrap();
+            assert_eq!(
+                left.iter().filter(|(task, _)| task.id == id).count(),
+                pending,
+                "{age_ms}"
+            );
+        }
+    }
+
+    /// The agent left the front between the paste and Enter: the pasted line
+    /// is cleared and Enter is never pressed.
+    #[tokio::test]
+    async fn a_line_pasted_before_the_agent_left_is_cleared_not_submitted() {
+        use std::sync::Mutex;
+        struct Scripted {
+            in_front: Mutex<Vec<bool>>,
+            steps: Mutex<Vec<&'static str>>,
+        }
+        impl Typist for Scripted {
+            fn in_front(&self) -> BoxFuture<'_, bool> {
+                let next = self.in_front.lock().unwrap().remove(0);
+                Box::pin(async move { next })
+            }
+            fn paste(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+                self.steps.lock().unwrap().push("paste");
+                Box::pin(async { Ok(()) })
+            }
+            fn needs_enter(&self) -> BoxFuture<'_, bool> {
+                Box::pin(async { true })
+            }
+            fn enter(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+                self.steps.lock().unwrap().push("enter");
+                Box::pin(async { Ok(()) })
+            }
+            fn clear(&self) -> BoxFuture<'_, ()> {
+                self.steps.lock().unwrap().push("ctrl-u");
+                Box::pin(async {})
+            }
+            fn still_typed(&self) -> BoxFuture<'_, bool> {
+                Box::pin(async { false })
+            }
+        }
+        for (in_front, steps, delivered) in [
+            (vec![true, true], vec!["paste", "enter"], true),
+            (vec![true, false], vec!["paste", "ctrl-u"], false),
+            (vec![false], vec![], false),
+        ] {
+            let typist = Scripted {
+                in_front: Mutex::new(in_front),
+                steps: Mutex::new(Vec::new()),
+            };
+            let sent = type_line(&typist).await.unwrap();
+            assert_eq!(matches!(sent, Sent::Delivered), delivered);
+            assert_eq!(*typist.steps.lock().unwrap(), steps);
+        }
     }
 }

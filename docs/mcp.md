@@ -682,10 +682,13 @@ plain line, as a user message would be:
 A session still in its turn -- inside a `tasks.wait`, say -- is sent nothing:
 the wait answers it, and a state a wait returned is never sent again. A pane
 is told when its own delegation's follower saw the agent stop
-(`idle_unconfirmed` or `done`) and that agent is the pane's foreground
-program -- a shell in front of it (the agent suspended with Ctrl-Z, or run
-with `&`) is a no, whatever runs behind it; otherwise nothing is typed, since
-a shell would run the text, and that state is given up, not retried. The
+(`idle_unconfirmed` or `done`) and the agent itself holds the pane's
+terminal: an agent process under the pane's shell whose process group is the
+terminal's foreground group. Anything else in front -- a shell, `ssh`, `sudo`,
+an editor, the agent suspended with Ctrl-Z or run with `&` -- means nothing is
+typed, since that program would receive the text; the result is tried again
+on later passes for an hour (the agent may come back with `fg`), then given
+up. The
 line is sent the way a goal is (the agent's prompt call, a bracketed paste on
 tmux), and the foreground is looked at again before each Enter: if a shell
 has the terminal by then, the pasted line is cleared (Ctrl-U) and Enter is

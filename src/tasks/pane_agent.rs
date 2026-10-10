@@ -182,36 +182,84 @@ pub(crate) async fn exited_to_shell(session: &SessionConfig, pane_id: &str, kind
     }
 }
 
-/// Whether the `kind` agent is the program in `pane_id`'s foreground now --
-/// what typed text reaches. A shell in front (the agent suspended with
-/// Ctrl-Z, or run with `&`) is a no, whatever runs behind it; so is a pane
-/// that cannot be read. The caller is about to type there.
+/// Whether the `kind` agent itself holds `pane_id`'s terminal now -- what
+/// typed text reaches: an agent process under the pane's shell whose process
+/// group is its terminal's foreground group. Anything else in front (a
+/// shell, `ssh`, `sudo`, an editor, the agent suspended with Ctrl-Z or run
+/// with `&`) is a no; so is a pane or process table that cannot be read.
+/// The caller is about to type there.
 pub(crate) async fn agent_in_foreground(
     session: &SessionConfig,
     pane_id: &str,
     kind: &str,
 ) -> bool {
-    terminal_backend(session)
+    let Ok(pane) = terminal_backend(session)
         .get_pane(&PaneId::new(pane_id))
         .await
-        .is_ok_and(|pane| {
-            foreground_is(
-                pane.agent.as_deref(),
-                pane.foreground_command.as_deref(),
-                kind,
-            )
-        })
+    else {
+        return false;
+    };
+    let Some(root) = pane.shell_pid else {
+        return false;
+    };
+    let Ok(out) = tokio::process::Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid=,pgid=,tpgid=,args="])
+        .kill_on_drop(true)
+        .output()
+        .await
+    else {
+        return false;
+    };
+    out.status.success() && agent_in_front(&String::from_utf8_lossy(&out.stdout), root, kind)
 }
 
-/// [`agent_in_foreground`] on what the backend reports: the foreground
-/// program when it names one (a shell is never the agent), else the agent
-/// the backend detected.
-fn foreground_is(agent: Option<&str>, foreground: Option<&str>, kind: &str) -> bool {
-    match foreground.map(command_name) {
-        Some(name) if SHELLS.contains(&name) => false,
-        Some(name) if name == kind => true,
-        _ => agent == Some(kind),
+/// [`agent_in_foreground`] on a process table (`ps -o
+/// pid=,ppid=,pgid=,tpgid=,args=`): a `kind` process at or under `root`
+/// (its program, or the script a runtime runs, named `kind`) whose process
+/// group is the foreground group of its terminal.
+fn agent_in_front(table: &str, root: u32, kind: &str) -> bool {
+    let rows: Vec<(u32, u32, i64, i64, String)> = table
+        .lines()
+        .filter_map(|line| {
+            // Four numeric columns, then the arguments as they are.
+            let field = |rest: &str| -> Option<(String, String)> {
+                let rest = rest.trim_start();
+                let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+                Some((rest[..end].to_owned(), rest[end..].to_owned()))
+            };
+            let (pid, rest) = field(line)?;
+            let (ppid, rest) = field(&rest)?;
+            let (pgid, rest) = field(&rest)?;
+            let (tpgid, rest) = field(&rest)?;
+            Some((
+                pid.parse().ok()?,
+                ppid.parse().ok()?,
+                pgid.parse().ok()?,
+                tpgid.parse().ok()?,
+                rest.trim().to_owned(),
+            ))
+        })
+        .collect();
+    let names_kind = |args: &str| {
+        args.split_whitespace().take(2).any(|word| {
+            let name = command_name(word).to_ascii_lowercase();
+            name == kind || name.starts_with(&format!("{kind}-"))
+        })
+    };
+    let mut tree = vec![root];
+    let mut at = 0;
+    while at < tree.len() && tree.len() < 512 {
+        let parent = tree[at];
+        for (pid, ppid, ..) in &rows {
+            if *ppid == parent && !tree.contains(pid) {
+                tree.push(*pid);
+            }
+        }
+        at += 1;
     }
+    rows.iter().any(|(pid, _, pgid, tpgid, args)| {
+        tree.contains(pid) && *tpgid > 0 && pgid == tpgid && names_kind(args)
+    })
 }
 
 fn at_shell(agent: Option<&str>, foreground: Option<&str>, kind: &str) -> bool {
@@ -1179,25 +1227,36 @@ pub(crate) async fn interrupt(state: &AppState, task: &Task) {
 #[cfg(test)]
 mod tests {
 
-    /// Only the agent in the pane's foreground is typed to: a shell in front
-    /// of a suspended or backgrounded agent gets nothing.
+    /// Only the agent that holds the pane's terminal is typed to: anything
+    /// in front of a suspended or backgrounded agent gets nothing.
     #[test]
-    fn only_the_agent_in_the_foreground_is_typed_to() {
-        for (agent, foreground, typed) in [
-            (Some("claude"), Some("claude"), true),
-            (None, Some("claude"), true),
-            (Some("claude"), None, true),
-            // Ctrl-Z: Herdr still names the agent, the shell has the terminal.
-            (Some("claude"), Some("zsh"), false),
-            (None, Some("-bash"), false),
-            (None, Some("node"), false),
-            (None, None, false),
+    fn only_the_agent_holding_the_terminal_is_typed_to() {
+        // pid ppid pgid tpgid args; the pane's shell is 100.
+        let table = |rows: &[&str]| rows.join("\n");
+        let claude_front = table(&[
+            "100 1 100 200 -zsh",
+            "200 100 200 200 /usr/local/bin/claude --resume",
+        ]);
+        let renamed = table(&["100 1 100 200 -zsh", "200 100 200 200 node /opt/bin/claude"]);
+        let suspended_ssh = table(&[
+            "100 1 100 300 -zsh",
+            "200 100 200 300 claude",
+            "300 100 300 300 ssh prod",
+        ]);
+        let suspended_shell = table(&["100 1 100 100 -zsh", "200 100 200 100 claude"]);
+        let other_pane = table(&["100 1 100 100 -zsh", "900 1 900 900 claude"]);
+        for (name, rows, typed) in [
+            ("the agent in front", &claude_front, true),
+            ("a runtime running the agent's script", &renamed, true),
+            (
+                "(claude, ssh): ssh in front of a suspended agent",
+                &suspended_ssh,
+                false,
+            ),
+            ("a shell in front", &suspended_shell, false),
+            ("an agent in another pane", &other_pane, false),
         ] {
-            assert_eq!(
-                foreground_is(agent, foreground, "claude"),
-                typed,
-                "{agent:?} {foreground:?}"
-            );
+            assert_eq!(agent_in_front(rows, 100, "claude"), typed, "{name}");
         }
     }
     use super::*;
