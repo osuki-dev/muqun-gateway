@@ -92,6 +92,10 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
             "/api/pair/pending",
             get(pair_pending).post(mint_pairing_code),
         )
+        .route(
+            "/api/pair/pending/{request_id}",
+            axum::routing::delete(cancel_minted_code),
+        )
         .route("/api/pairings", get(list_paired_devices))
         .route(
             "/api/pairings/{device_id}",
@@ -145,7 +149,7 @@ pub(crate) async fn pair_request(
         )
     })?;
     if let Some(pending) = pending_pairing.as_ref() {
-        if !authority::pairing_code_expired(pending, now, PAIRING_CODE_TTL_MS) {
+        if holds_the_slot(pending, now) {
             if pending.request_id == body.request_id {
                 return pairing_response(
                     pair_request_response(&state.config, &body.request_id),
@@ -176,6 +180,7 @@ pub(crate) async fn pair_request(
         code_hash: hash_token(&code),
         created_unix_ms: now,
         failed_attempts: 0,
+        minted_by: None,
     };
     *pending_pairing = Some(pending);
     pairing_response(
@@ -670,7 +675,7 @@ pub(crate) async fn mint_pairing_code(
     headers: HeaderMap,
     body: Result<Json<MintCodeBody>, JsonRejection>,
 ) -> ApiResult<Json<Value>> {
-    require_pairing_manager(&state, &headers)?;
+    let minter = require_pairing_manager(&state, &headers)?;
     let Json(body) = body.map_err(|_| {
         api_error(
             StatusCode::BAD_REQUEST,
@@ -678,6 +683,14 @@ pub(crate) async fn mint_pairing_code(
             "invalid request",
         )
     })?;
+    // Only another gateway is linked this way; an app pairs in front of the screen.
+    if body.kind != DeviceKind::Gateway {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "kind must be gateway",
+        ));
+    }
     let device_name = body.device_name.trim().to_owned();
     if device_name.is_empty() || !valid_device_name(&device_name) {
         return Err(api_error(
@@ -696,7 +709,7 @@ pub(crate) async fn mint_pairing_code(
     })?;
     if pending
         .as_ref()
-        .is_some_and(|value| !authority::pairing_code_expired(value, now, PAIRING_CODE_TTL_MS))
+        .is_some_and(|value| holds_the_slot(value, now))
     {
         return Err(api_error(
             StatusCode::CONFLICT,
@@ -717,12 +730,61 @@ pub(crate) async fn mint_pairing_code(
         code_hash: hash_token(&code),
         created_unix_ms: now,
         failed_attempts: 0,
+        minted_by: Some(minter),
     });
     Ok(Json(json!({
         "request_id": request_id,
         "code": code,
         "expires_in_ms": PAIRING_CODE_TTL_MS,
     })))
+}
+
+/// How long a minted code holds the one pending slot. The other gateway
+/// claims it within a second of the mint, so a code still unclaimed after
+/// this is a link that failed: a new pairing (a phone's, or the next link
+/// attempt) takes its place rather than waiting out the code's 5 minutes.
+const MINTED_HOLDS_MS: u128 = 60 * 1000;
+
+/// Whether `pending` still keeps a new pairing out at `now`.
+fn holds_the_slot(pending: &PendingPairing, now: u128) -> bool {
+    let ttl = if pending.minted_by.is_some() {
+        MINTED_HOLDS_MS
+    } else {
+        PAIRING_CODE_TTL_MS
+    };
+    !authority::pairing_code_expired(pending, now, ttl)
+}
+
+/// `DELETE /api/pair/pending/{request_id}`: take back a code minted with
+/// `POST /api/pair/pending` -- the owner's link attempt failed -- so it
+/// holds the slot no longer. Only whoever minted it (the same device token,
+/// or the admin token for one the admin minted) may; any other pending
+/// pairing, or none, is `404 pairing_not_found`.
+pub(crate) async fn cancel_minted_code(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(request_id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    let caller = require_pairing_manager(&state, &headers)?;
+    let mut pending = state.pending_pairing.lock().map_err(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "pairing_lock_failed",
+            "failed to lock pending pairing state",
+        )
+    })?;
+    let theirs = pending.as_ref().is_some_and(|value| {
+        value.request_id == request_id && value.minted_by.as_deref() == Some(caller.as_str())
+    });
+    if !theirs {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            "pairing_not_found",
+            "no code of yours with that request_id is pending",
+        ));
+    }
+    *pending = None;
+    Ok(Json(json!({ "cancelled": true })))
 }
 
 pub(crate) async fn register_push_token(
@@ -1219,6 +1281,7 @@ mod tests {
             code,
             created_unix_ms: 0,
             failed_attempts: 0,
+            minted_by: None,
         });
 
         let (status, Json(body)) = pair_claim(

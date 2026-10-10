@@ -29,6 +29,11 @@ pub struct PendingPairing {
     pub created_unix_ms: u128,
     #[serde(default)]
     pub failed_attempts: u8,
+    /// Who minted it on the owner's behalf (`POST /api/pair/pending`): the
+    /// device id, or `admin`. Only they may cancel it; `None` for a pairing
+    /// a device asked for itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minted_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

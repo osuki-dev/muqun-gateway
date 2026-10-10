@@ -239,11 +239,12 @@ pub(crate) fn require_admin(config: &Config, headers: &HeaderMap) -> ApiResult<(
     Ok(())
 }
 
-pub(crate) fn require_pairing_manager(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
+/// The admin token (answered as `admin`) or an app device (its id).
+pub(crate) fn require_pairing_manager(state: &AppState, headers: &HeaderMap) -> ApiResult<String> {
     if require_admin(&state.config, headers).is_ok() {
-        return Ok(());
+        return Ok("admin".into());
     }
-    require_device(state, headers).map(|_| ())
+    require_device(state, headers)
 }
 
 pub(crate) fn lock_devices(

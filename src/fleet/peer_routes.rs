@@ -385,6 +385,15 @@ mod tests {
                 StatusCode::CONFLICT,
                 json!("peer_conflict"),
             ),
+            // This computer's own name: refused before the claim, so the
+            // code is still pending over there until its minter takes it back.
+            (
+                &other,
+                &other_url,
+                "Coding",
+                StatusCode::CONFLICT,
+                json!("name_conflict"),
+            ),
             (
                 &other,
                 &other_url,
@@ -422,6 +431,16 @@ mod tests {
                 peer.get("token").is_none(),
                 "the token never leaves the gateway"
             );
+            if code == json!("name_conflict") {
+                let cancel = format!(
+                    "/api/pair/pending/{}",
+                    minted["request_id"].as_str().unwrap()
+                );
+                for expected in [StatusCode::OK, StatusCode::NOT_FOUND] {
+                    let (status, _) = call(target, "DELETE", &cancel, "token", None).await;
+                    assert_eq!(status, expected, "cancel the unclaimed code");
+                }
+            }
             if status == StatusCode::OK {
                 assert_eq!(peer["server_id"], "srv-mini");
                 assert_ne!(peer["peer_id"], "srv-mini", "keyed by coding's own id");
@@ -453,6 +472,30 @@ mod tests {
             gateways(&other).is_empty(),
             "a refused link revokes what it enrolled"
         );
+
+        // An app is never paired this way. A minted code nobody claimed
+        // within a minute (a link that failed) gives its place to the next.
+        let mint = |kind: &str| json!({ "device_name": "coding", "kind": kind, "server_id": "srv-coding" });
+        for (kind, stale, expected) in [
+            ("app", false, StatusCode::BAD_REQUEST),
+            ("gateway", false, StatusCode::OK),
+            ("gateway", false, StatusCode::CONFLICT),
+            ("gateway", true, StatusCode::OK),
+        ] {
+            if stale {
+                let mut pending = other.pending_pairing.lock().unwrap();
+                pending.as_mut().unwrap().created_unix_ms -= 61_000;
+            }
+            let (status, _) = call(
+                &other,
+                "POST",
+                "/api/pair/pending",
+                "token",
+                Some(mint(kind)),
+            )
+            .await;
+            assert_eq!(status, expected, "{kind}, stale: {stale}");
+        }
 
         for (body, accept) in [
             (json!({ "accept_delegations": false }), false),
@@ -705,6 +748,7 @@ mod tests {
             ("PATCH", "/api/peers/srv-x", StatusCode::FORBIDDEN),
             ("DELETE", "/api/peers/srv-x", StatusCode::FORBIDDEN),
             ("POST", "/api/pair/pending", StatusCode::FORBIDDEN),
+            ("DELETE", "/api/pair/pending/mint-1", StatusCode::FORBIDDEN),
             ("GET", "/api/peers", StatusCode::FORBIDDEN),
             ("PUT", "/api/fleet/settings", StatusCode::FORBIDDEN),
             (

@@ -261,6 +261,7 @@ pub(crate) fn test_pending_pairing(created_unix_ms: u128) -> Option<PendingPairi
         code,
         created_unix_ms,
         failed_attempts: 0,
+        minted_by: None,
     })
 }
 

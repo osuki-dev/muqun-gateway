@@ -1108,7 +1108,7 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
                     "required": ["device_name"],
                     "properties": {
                         "device_name": { "type": "string", "description": "At most 80 characters, no control characters" },
-                        "kind": { "type": "string", "enum": ["app", "gateway"], "description": "Default app" },
+                        "kind": { "type": "string", "enum": ["gateway"], "description": "Must be gateway; an app pairs in front of the screen" },
                         "server_id": { "type": "string", "description": "kind gateway: the claiming gateway's own server id, kept on its device record so DELETE /api/peers/{id} on this computer can revoke it; never used to replace or evict a device" }
                     }
                 })),
@@ -1122,8 +1122,22 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
                     }
                 })), &[
                     ("400", "invalid_request, invalid_device_name"),
-                    ("409", "pairing_in_progress: another code is pending"),
+                    ("409", "pairing_in_progress: another pairing is pending (a minted code holds the slot for a minute only)"),
                     ("429", "pairing_rate_limited"),
+                ])
+            }}),
+        ),
+        (
+            "/api/pair/pending/{request_id}",
+            json!({ "delete": {
+                "summary": "Take back a code minted with POST /api/pair/pending (the link attempt failed), freeing the pending slot. Only the device token (or the admin token) that minted it; another gateway's token is refused (peer_forbidden)",
+                "parameters": [path_param("request_id")],
+                "responses": with_errors(json_ok("Cancelled", json!({
+                    "type": "object",
+                    "required": ["cancelled"],
+                    "properties": { "cancelled": { "type": "boolean" } }
+                })), &[
+                    ("404", "pairing_not_found: no code of this caller's with that request_id is pending"),
                 ])
             }}),
         ),
@@ -2129,6 +2143,7 @@ mod history_contract_tests {
             ("/api/mcp/tokens", "get"),
             ("/api/mcp/tokens/{id}", "delete"),
             ("/api/pair/pending", "post"),
+            ("/api/pair/pending/{request_id}", "delete"),
             ("/api/peers", "get"),
             ("/api/peers", "post"),
             ("/api/peers/{id}", "patch"),

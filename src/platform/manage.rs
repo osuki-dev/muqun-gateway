@@ -3031,6 +3031,7 @@ fn pending_from_answer(status: u16, value: &Value) -> anyhow::Result<Option<Pend
             .map(u128::from)
             .unwrap_or_default(),
         failed_attempts: 0,
+        minted_by: None,
     }))
 }
 
