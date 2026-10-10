@@ -517,7 +517,7 @@ impl MuqunMcp {
 
     #[tool(
         name = "tasks.delegate",
-        description = "Start a sub-task on an agent, on this computer or (machine) on a linked one: a new session in cwd with your goal as the first prompt (for a terminal agent such as codex or claude, a new terminal pane running it). Returns task_id; poll with tasks.wait. One hop only: a task another computer handed here cannot hand work to a linked computer (delegation_loop)."
+        description = "Start a sub-task on an agent, on this computer or (machine) on a linked one: a new session in cwd with your goal as the first prompt (for a terminal agent such as codex or claude, a new terminal pane running it). Returns task_id. If the work will take long, end your turn after delegating; you will be told when it finishes. Use tasks.wait only for short jobs. One hop only: a task another computer handed here cannot hand work to a linked computer (delegation_loop)."
     )]
     async fn tasks_delegate(
         &self,
@@ -565,7 +565,7 @@ impl MuqunMcp {
 
     #[tool(
         name = "tasks.wait",
-        description = "Wait up to timeout_s (max 45) for a task to reach done/failed/waiting, or idle_unconfirmed (its agent stopped without completing: read its answer and decide; do not call again while it says idle_unconfirmed). Returns the current state and summary; call again while it says working."
+        description = "Wait up to timeout_s (max 45) for a task to reach done/failed/waiting, or idle_unconfirmed (its agent stopped without completing: read its answer and decide; do not call again while it says idle_unconfirmed). Returns the current state and summary. If the work will take long, end your turn after delegating; you will be told when it finishes. Use tasks.wait only for short jobs."
     )]
     async fn tasks_wait(
         &self,
@@ -695,8 +695,9 @@ impl ServerHandler for MuqunMcp {
 pub(crate) fn instructions(in_task: bool) -> String {
     let about = "Muqun Gateway on this computer. fleet.describe says what it has and which \
                  other computers are linked to it, exec.run runs short commands, \
-                 tasks.delegate + tasks.wait hand work to a coding agent (waits are capped at \
-                 45 s; call tasks.wait again while it says working); tasks.delegate(machine) \
+                 tasks.delegate hands work to a coding agent -- if the work will take long, \
+                 end your turn after delegating; you will be told when it finishes. Use \
+                 tasks.wait (at most 45 s) only for short jobs; tasks.delegate(machine) \
                  sends work to a linked computer, and your task's summary (tasks.read without \
                  a task_id) lists the ones the user named (mentions).";
     let finish = "call tasks.complete with a one-line summary; when you stop because you \
