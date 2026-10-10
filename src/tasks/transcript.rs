@@ -193,9 +193,13 @@ fn hide_in_item(item: &mut TimelineItem, streaming: Streaming) -> Served {
             return Served::Emptied;
         }
         // The agent reporting the task's end is how the ledger hears it, not
-        // the reader's business: `tasks.complete` under any host's prefix.
+        // the reader's business: muqun's own `tasks.complete`, done without
+        // an error. A report that failed stays, so the reader sees why the
+        // task is still open; another server's tool of that name stays.
         (_, AgentPart::Tool(call))
-            if call.name.ends_with("tasks.complete") || call.name.ends_with("tasks_complete") =>
+            if is_muqun_tasks_complete(&call.name)
+                && call.status == ToolCallStatus::Completed
+                && call.error.is_none() =>
         {
             return Served::Emptied;
         }
@@ -269,6 +273,17 @@ pub(crate) fn hide_in_inbox(items: &mut Vec<serde_json::Value>) {
         *text = served.into();
         keep
     });
+}
+
+/// Whether a tool row's `name` is muqun's `tasks.complete`: bare, or under
+/// the prefix a host gives the muqun server's tools (`muqun_`, `muqun.`,
+/// `mcp__muqun__`).
+fn is_muqun_tasks_complete(name: &str) -> bool {
+    let bare = ["mcp__muqun__", "muqun__", "muqun_", "muqun."]
+        .iter()
+        .find_map(|prefix| name.strip_prefix(prefix))
+        .unwrap_or(name);
+    matches!(bare, "tasks.complete" | "tasks_complete")
 }
 
 /// The first line of OpenCode's notice that its Code Mode tool catalog
@@ -658,6 +673,30 @@ mod tests {
                 Assistant,
                 tool("muqun_tasks_complete", "completed", serde_json::Value::Null),
                 None,
+            ),
+            (
+                "Claude Code's name for it",
+                Assistant,
+                tool("mcp__muqun__tasks.complete", "completed", serde_json::Value::Null),
+                None,
+            ),
+            (
+                "a report that failed",
+                Assistant,
+                tool("muqun_tasks_complete", "error", serde_json::Value::Null),
+                Some("<code>"),
+            ),
+            (
+                "another server's tool of that name",
+                Assistant,
+                tool("todo_tasks_complete", "completed", serde_json::Value::Null),
+                Some("<code>"),
+            ),
+            (
+                "another muqun tool",
+                Assistant,
+                tool("muqun_tasks_delegate", "completed", serde_json::Value::Null),
+                Some("<code>"),
             ),
             (
                 "the task's per-session instruction notice",
