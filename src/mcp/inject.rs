@@ -98,7 +98,7 @@ pub(crate) async fn terminal_args(config: &crate::Config, kind: &str) -> Vec<Str
         return Vec::new();
     }
     let url = super::local_url(&config.listen);
-    let helper = hosts::helper_for_this_gateway();
+    let helper = hosts::helper_for_url(&url);
     let file = if kind == "claude" {
         claude_file(&url, &helper).await
     } else {

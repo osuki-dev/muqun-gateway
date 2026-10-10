@@ -174,23 +174,67 @@ pub(crate) fn recorded_url(listen: &str) -> String {
     local_url(listen)
 }
 
-/// `/mcp` alone, for the loopback listener -- none of the device routes --
-/// and the public capability list, whose `serverId` lets a client check it
-/// is talking to this gateway before it sends a token ([`verify_identity`]).
+/// The `/mcp` address that does not depend on a run of the gateway: the
+/// loopback listener's configured port for a non-loopback listen address,
+/// else the listen address itself. What a config written to last is given.
+pub(crate) fn configured_url(listen: &str) -> String {
+    if loopback_warning(listen).is_some() {
+        let port = listen.parse::<SocketAddr>().map_or(0, |addr| addr.port());
+        return format!("http://127.0.0.1:{port}{MCP_PATH}");
+    }
+    let addr = match listen.parse::<SocketAddr>() {
+        Ok(addr) if !addr.ip().is_unspecified() => addr,
+        Ok(addr) => SocketAddr::from(([127, 0, 0, 1], addr.port())),
+        Err(_) => SocketAddr::from(([127, 0, 0, 1], crate::DEFAULT_PORT)),
+    };
+    format!("http://{addr}{MCP_PATH}")
+}
+
+/// `/mcp` alone, for the loopback listener: none of the device routes.
 pub(crate) fn loopback_router(state: AppState) -> Router {
     mount(Router::new())
-        .route(
-            "/api/capabilities",
-            axum::routing::get(crate::platform::routes::api_capabilities),
-        )
         .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
 }
 
-/// Whether what answers at `url` (an `http://<host:port>/mcp` address on
-/// this computer) is the gateway `server_id`: asked with no credential, so a
-/// process squatting a stale address never sees a token. `Err` says why not.
-pub(crate) fn verify_identity(url: &str, server_id: &str) -> Result<(), String> {
+/// This gateway process's identity: a random secret, minted at startup and
+/// written to [`identity_file`] (0600). Only a loopback caller with no proxy
+/// headers is told it ([`identity`]), so a process squatting an old `/mcp`
+/// address cannot know it, and the public address never serves it.
+static IDENTITY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+pub(crate) fn identity_file() -> anyhow::Result<std::path::PathBuf> {
+    Ok(crate::platform::store::state_dir()?.join("mcp-identity"))
+}
+
+/// Mint this process's identity and write it where the token helper (the
+/// same user) reads it.
+pub(crate) fn mint_identity() -> anyhow::Result<()> {
+    let secret =
+        uuid::Uuid::new_v4().simple().to_string() + &uuid::Uuid::new_v4().simple().to_string();
+    crate::platform::store::write_secret_file(&identity_file()?, secret.as_bytes())?;
+    let _ = IDENTITY.set(secret);
+    Ok(())
+}
+
+/// `GET /mcp/identity`: the identity, to a loopback caller only.
+async fn identity(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if !auth::is_loopback(Some(peer)) || auth::refuse_for_proxy(&headers) {
+        return axum::http::StatusCode::FORBIDDEN.into_response();
+    }
+    match IDENTITY.get() {
+        Some(identity) => axum::Json(serde_json::json!({ "identity": identity })).into_response(),
+        None => axum::http::StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// Whether what answers at `url` -- the exact address the host was given --
+/// is this gateway: it must tell, unasked for any credential, the identity
+/// in [`identity_file`]. Otherwise no token goes there. `Err` says why not.
+pub(crate) fn verify_identity(url: &str, expected: &str) -> Result<(), String> {
     let at = url
         .trim_start_matches("http://")
         .trim_end_matches(MCP_PATH)
@@ -198,8 +242,13 @@ pub(crate) fn verify_identity(url: &str, server_id: &str) -> Result<(), String> 
     let address: SocketAddr = at
         .parse()
         .map_err(|_| format!("muqun: {url} is not an address on this computer"))?;
+    if !address.ip().is_loopback() {
+        return Err(format!(
+            "muqun: {url} is not on this computer's loopback; not sending the token"
+        ));
+    }
     match crate::cli::local_api::identity_at(address) {
-        Ok(Some(answered)) if answered == server_id => Ok(()),
+        Ok(Some(answered)) if !expected.is_empty() && answered == expected => Ok(()),
         Ok(_) => Err(format!(
             "muqun: another process answers on {at}; not sending the token"
         )),
@@ -222,7 +271,11 @@ pub(crate) fn local_url(listen: &str) -> String {
 }
 
 pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
-    token_routes::mount(router.route(MCP_PATH, any(serve)))
+    token_routes::mount(
+        router
+            .route(MCP_PATH, any(serve))
+            .route("/mcp/identity", axum::routing::get(identity)),
+    )
 }
 
 /// The request reaches rmcp unread, so axum's `DefaultBodyLimit` does not
@@ -618,12 +671,14 @@ mod tests {
         });
         let squatter = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let squatter_at = squatter.local_addr().unwrap();
+        // It can answer anything public; it cannot know the secret.
         let imposter = Router::new().route(
-            "/api/capabilities",
-            axum::routing::get(|| async { axum::Json(json!({ "serverId": "someone-else" })) }),
+            "/mcp/identity",
+            axum::routing::get(|| async { axum::Json(json!({ "identity": "a guess" })) }),
         );
         tokio::spawn(async move { axum::serve(squatter, imposter).await });
-        let own = state.config.server_id.clone();
+        mint_identity().unwrap();
+        let own = IDENTITY.get().unwrap().clone();
         let checks = tokio::task::spawn_blocking(move || {
             (
                 verify_identity(&format!("http://{ours_at}{MCP_PATH}"), &own),
@@ -639,6 +694,13 @@ mod tests {
                 "muqun: another process answers on {squatter_at}; not sending the token"
             ))
         );
+        // The public address never tells it.
+        let remote = Request::get("/mcp/identity")
+            .extension(ConnectInfo("100.64.0.5:1".parse::<SocketAddr>().unwrap()))
+            .body(Body::empty())
+            .unwrap();
+        let answer = self::tests::app(&state).oneshot(remote).await.unwrap();
+        assert_eq!(answer.status(), StatusCode::FORBIDDEN);
     }
 
     #[test]

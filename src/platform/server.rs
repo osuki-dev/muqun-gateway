@@ -64,6 +64,9 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
 
     // Bind successfully before starting anything on the user's behalf.
     let listener = gateway_listener::bind(addr).await?;
+    if config.mcp.enabled {
+        crate::mcp::mint_identity()?;
+    }
     // A non-loopback listen address: `/mcp` gets its own loopback listener,
     // whose URL every agent registration uses from here on.
     let mcp_listeners = if config.mcp.enabled {

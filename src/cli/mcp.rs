@@ -24,6 +24,10 @@ pub(crate) enum McpCommand {
         /// writes this flag rather than relying on MUQUN_GATEWAY_CONFIG_DIR.
         #[arg(long, value_name = "DIR")]
         config_dir: Option<PathBuf>,
+        /// The `/mcp` address the host was given: checked to be this gateway
+        /// before a token is printed.
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
     },
     /// Revoke assistant tokens. A running gateway sees it on the next call.
     #[command(group(clap::ArgGroup::new("which").required(true).args(["all", "id"])))]
@@ -57,7 +61,9 @@ pub(crate) enum McpCommand {
 
 fn default_url() -> String {
     match crate::load_config(None) {
-        Ok(config) => crate::mcp::recorded_url(&config.listen),
+        // Never an ephemeral fallback port: a config written now outlives
+        // this run of the gateway.
+        Ok(config) => crate::mcp::configured_url(&config.listen),
         Err(_) => crate::mcp::local_url(""),
     }
 }
@@ -151,7 +157,11 @@ fn helper_outcome(status: u16, body: &Value) -> Result<(), (i32, String)> {
     }
 }
 
-fn token_helper(bearer: bool, config_dir: Option<PathBuf>) -> anyhow::Result<()> {
+fn token_helper(
+    bearer: bool,
+    config_dir: Option<PathBuf>,
+    url: Option<String>,
+) -> anyhow::Result<()> {
     let fail = |code: i32, message: String| -> ! {
         eprintln!("{message}");
         std::process::exit(code)
@@ -166,11 +176,16 @@ fn token_helper(bearer: bool, config_dir: Option<PathBuf>) -> anyhow::Result<()>
         tracing::debug!("token-helper: {error:#}");
         fail(1, HELPER_FAILED.into())
     });
-    // Identity before credentials: the host sends this token to the loopback
-    // MCP address, so that address must be this gateway, not a process that
+    // Identity before credentials: the host sends this token to the address
+    // it was given at launch, so that address must be this gateway -- it
+    // knows the secret identity this gateway wrote -- not a process that
     // took over a stale port.
-    let url = crate::mcp::recorded_url(&config.listen);
-    if let Err(refused) = crate::mcp::verify_identity(&url, &config.server_id) {
+    let url = url.unwrap_or_else(|| crate::mcp::recorded_url(&config.listen));
+    let expected = crate::mcp::identity_file()
+        .ok()
+        .and_then(|file| std::fs::read_to_string(file).ok())
+        .unwrap_or_default();
+    if let Err(refused) = crate::mcp::verify_identity(&url, expected.trim()) {
         tracing::warn!("{refused}");
         fail(1, refused);
     }
@@ -223,11 +238,15 @@ async fn revoke(all: bool, id: Option<String>) -> anyhow::Result<()> {
 
 pub(crate) async fn run_mcp_command(command: McpCommand) -> anyhow::Result<()> {
     match command {
-        McpCommand::TokenHelper { bearer, config_dir } => token_helper(bearer, config_dir)?,
+        McpCommand::TokenHelper {
+            bearer,
+            config_dir,
+            url,
+        } => token_helper(bearer, config_dir, url)?,
         McpCommand::Revoke { all, id } => revoke(all, id).await?,
         McpCommand::Enable { host, project, url } => {
             let url = url.unwrap_or_else(default_url);
-            let helper = hosts::helper_for_this_gateway();
+            let helper = hosts::helper_for_url(&url);
             if let Some(warning) = listen_warning_for_this_gateway() {
                 println!("{warning}");
             }
@@ -359,15 +378,23 @@ mod tests {
             "--bearer",
             "--config-dir",
             "/tmp/demo/config",
+            "--url",
+            "http://127.0.0.1:23847/mcp",
         ])
         .unwrap();
         let crate::cli::Command::Mcp {
-            command: McpCommand::TokenHelper { bearer, config_dir },
+            command:
+                McpCommand::TokenHelper {
+                    bearer,
+                    config_dir,
+                    url,
+                },
         } = cli.command
         else {
             panic!("not token-helper");
         };
         assert!(bearer);
         assert_eq!(config_dir, Some(PathBuf::from("/tmp/demo/config")));
+        assert_eq!(url.as_deref(), Some("http://127.0.0.1:23847/mcp"));
     }
 }

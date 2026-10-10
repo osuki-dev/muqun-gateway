@@ -36,6 +36,13 @@ pub(crate) fn non_default_dir(
     (resolved != default).then_some(resolved)
 }
 
+/// The helper command for this gateway's config directory, told the exact
+/// `/mcp` address the host is given, which it checks before any token goes
+/// there.
+pub(crate) fn helper_for_url(url: &str) -> String {
+    format!("{} --url {}", helper_for_this_gateway(), quoted(url))
+}
+
 /// The helper command for this gateway's config directory.
 pub(crate) fn helper_for_this_gateway() -> String {
     let baked = match (
