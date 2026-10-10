@@ -207,16 +207,7 @@ impl TmuxBackend {
             .await
             .map_err(|_| BackendError::Unavailable)?;
         if !output.status.success() {
-            return Err(BackendError::Refused {
-                code: None,
-                // tmux diagnostics name commands and targets, never pane
-                // output. Clamp them before this crosses an adapter boundary.
-                message: String::from_utf8_lossy(&output.stderr)
-                    .trim()
-                    .chars()
-                    .take(240)
-                    .collect(),
-            });
+            return Err(refused(&output.stderr));
         }
         String::from_utf8(output.stdout).map_err(|_| BackendError::InvalidResponse("UTF-8 output"))
     }
@@ -1382,14 +1373,25 @@ fn paste_buffer_args<'a>(buffer: &'a str, pane_id: &'a str, mode: SendTextMode) 
     args
 }
 
+/// tmux's refusal as a backend error. A target that does not exist (a pane,
+/// window or session closed since the caller saw it) is `InvalidTarget` --
+/// `404 backend_target_not_found`, so a client polling it retires it -- not
+/// a failure worth a warning. Anything else keeps tmux's own words, clamped:
+/// they name commands and targets, never pane output.
 fn refused(stderr: &[u8]) -> BackendError {
+    let message: String = String::from_utf8_lossy(stderr)
+        .trim()
+        .chars()
+        .take(240)
+        .collect();
+    for kind in ["pane", "window", "session"] {
+        if message.starts_with(&format!("can't find {kind}")) {
+            return BackendError::InvalidTarget(kind);
+        }
+    }
     BackendError::Refused {
         code: None,
-        message: String::from_utf8_lossy(stderr)
-            .trim()
-            .chars()
-            .take(240)
-            .collect(),
+        message,
     }
 }
 
@@ -2713,6 +2715,20 @@ mod tests {
             "error connecting to /tmp/theirs.sock (Permission denied)"
         ));
         assert!(!means_no_tmux_server("can't find pane: %99"));
+        // A target gone since it was listed: not found, not a failure.
+        for (stderr, gone) in [
+            ("can't find pane: %32", true),
+            ("can't find window: @4", true),
+            ("can't find session: work", true),
+            ("unknown command: x", false),
+        ] {
+            let error = refused(stderr.as_bytes());
+            assert_eq!(
+                matches!(error, BackendError::InvalidTarget(_)),
+                gone,
+                "{stderr}"
+            );
+        }
     }
 
     /// The exact masking the test above documents, from the other side:
