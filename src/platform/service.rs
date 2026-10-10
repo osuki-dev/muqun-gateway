@@ -108,6 +108,10 @@ pub fn uninstall() -> Result<()> {
     }
     #[cfg(not(target_os = "macos"))]
     run_quiet("systemctl", &["--user", "daemon-reload"]);
+    // The domain a stop found the LaunchAgent in belongs to that install.
+    if let Ok(state) = crate::state_dir() {
+        let _ = std::fs::remove_file(state.join("launchd-domain"));
+    }
     Ok(())
 }
 

@@ -102,19 +102,22 @@ impl Launchctl {
         if loaded_in(&user) {
             return user;
         }
+        let exists = |domain: &str| {
+            self.run(&["print", domain])
+                .is_ok_and(|output| output.status.success())
+        };
+        // Only while that domain still exists: a gui/<uid> recorded at a
+        // console login is gone after a reboot with none.
         let recorded = self
             .domain_record
             .as_ref()
             .and_then(|file| std::fs::read_to_string(file).ok())
             .map(|domain| domain.trim().to_owned())
-            .filter(|domain| *domain == gui || *domain == user);
+            .filter(|domain| (*domain == gui || *domain == user) && exists(domain));
         if let Some(domain) = recorded {
             return domain;
         }
-        let gui_exists = self
-            .run(&["print", &gui])
-            .is_ok_and(|output| output.status.success());
-        if gui_exists {
+        if exists(&gui) {
             gui
         } else {
             user
@@ -325,6 +328,11 @@ next() {
 }
 case "$1" in
   print)
+    case "$2" in */*/*) ;; *)
+      # A domain alone: it exists unless a `domains` file lists others.
+      if [ -s "$dir/domains" ] && ! grep -qx "$2" "$dir/domains"; then echo 'Bad request' >&2; exit 113; fi
+      echo "$2 = {}"; exit 0 ;;
+    esac
     [ -f "$dir/loaded" ] || { echo 'Could not find service' >&2; exit 113; }
     if [ -s "$dir/domain" ]; then
       case "$2" in "$(cat "$dir/domain")"/*) ;; *) echo 'Could not find service' >&2; exit 113 ;; esac
@@ -539,6 +547,11 @@ mod tests {
         launchctl.control(ServiceAction::Stop).unwrap();
         assert!(!fake.loaded());
         // Stopped, it is in no domain: start goes back where stop found it.
+        assert_eq!(fake.launchctl().loaded_domain(501), "user/501");
+        // A recorded gui/501 that no longer exists (rebooted, no console
+        // login) is passed over for user/501.
+        std::fs::write(fake.dir.join("launchd-domain"), "gui/501").unwrap();
+        fake.set("domains", "user/501\n");
         assert_eq!(fake.launchctl().loaded_domain(501), "user/501");
     }
 
