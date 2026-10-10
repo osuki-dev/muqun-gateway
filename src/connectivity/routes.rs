@@ -265,12 +265,13 @@ pub(crate) async fn pair_claim(
         let server_id = pending.as_ref().and_then(|value| value.server_id.clone());
         let kind = pending.as_ref().map(|value| value.kind).unwrap_or_default();
         let code = body.code.trim().to_ascii_uppercase();
+        let ttl = pending.as_ref().map_or(PAIRING_CODE_TTL_MS, code_ttl);
         authority::consume_pairing_code(
             &mut pending,
             &body.request_id,
             &code,
             now_unix_ms(),
-            PAIRING_CODE_TTL_MS,
+            ttl,
             MAX_PAIRING_CODE_ATTEMPTS,
         )
         .map_err(|error| match error {
@@ -634,12 +635,14 @@ pub(crate) async fn pair_pending(
             "failed to lock pending pairing state",
         )
     })?;
-    if pending.as_ref().is_some_and(|value| {
-        authority::pairing_code_expired(value, now_unix_ms(), PAIRING_CODE_TTL_MS)
-    }) {
+    if pending
+        .as_ref()
+        .is_some_and(|value| !holds_the_slot(value, now_unix_ms()))
+    {
         *pending = None;
     }
     if let Some(pending) = pending.as_ref() {
+        let expires = pending.created_unix_ms + code_ttl(pending);
         return Ok(Json(json!({
             "pending": true,
             "request_id": pending.request_id,
@@ -647,8 +650,8 @@ pub(crate) async fn pair_pending(
             "kind": pending.kind,
             "code": pending.code,
             "created_unix_ms": pending.created_unix_ms,
-            "expires_unix_ms": pending.created_unix_ms + PAIRING_CODE_TTL_MS,
-            "expires_in_ms": (pending.created_unix_ms + PAIRING_CODE_TTL_MS).saturating_sub(now_unix_ms())
+            "expires_unix_ms": expires,
+            "expires_in_ms": expires.saturating_sub(now_unix_ms())
         })));
     }
     Ok(Json(json!({ "pending": false })))
@@ -735,24 +738,29 @@ pub(crate) async fn mint_pairing_code(
     Ok(Json(json!({
         "request_id": request_id,
         "code": code,
-        "expires_in_ms": PAIRING_CODE_TTL_MS,
+        "expires_in_ms": MINTED_CODE_TTL_MS,
     })))
 }
 
-/// How long a minted code holds the one pending slot. The other gateway
-/// claims it within a second of the mint, so a code still unclaimed after
-/// this is a link that failed: a new pairing (a phone's, or the next link
-/// attempt) takes its place rather than waiting out the code's 5 minutes.
-const MINTED_HOLDS_MS: u128 = 60 * 1000;
+/// How long a minted code lives. The other gateway claims it within a
+/// second of the mint, so a code still unclaimed after this is a link that
+/// failed: it is neither shown, claimable, nor holding the one pending slot,
+/// and a new pairing (a phone's, or the next link attempt) takes its place.
+const MINTED_CODE_TTL_MS: u128 = 60 * 1000;
+
+/// How long `pending`'s code lives: a minted one [`MINTED_CODE_TTL_MS`],
+/// one a device asked for itself [`PAIRING_CODE_TTL_MS`].
+fn code_ttl(pending: &PendingPairing) -> u128 {
+    if pending.minted_by.is_some() {
+        MINTED_CODE_TTL_MS
+    } else {
+        PAIRING_CODE_TTL_MS
+    }
+}
 
 /// Whether `pending` still keeps a new pairing out at `now`.
 fn holds_the_slot(pending: &PendingPairing, now: u128) -> bool {
-    let ttl = if pending.minted_by.is_some() {
-        MINTED_HOLDS_MS
-    } else {
-        PAIRING_CODE_TTL_MS
-    };
-    !authority::pairing_code_expired(pending, now, ttl)
+    !authority::pairing_code_expired(pending, now, code_ttl(pending))
 }
 
 /// `DELETE /api/pair/pending/{request_id}`: take back a code minted with

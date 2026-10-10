@@ -474,7 +474,8 @@ mod tests {
         );
 
         // An app is never paired this way. A minted code nobody claimed
-        // within a minute (a link that failed) gives its place to the next.
+        // within a minute (a link that failed) gives its place to the next,
+        // and is neither shown nor claimable.
         let mint = |kind: &str| json!({ "device_name": "coding", "kind": kind, "server_id": "srv-coding" });
         for (kind, stale, expected) in [
             ("app", false, StatusCode::BAD_REQUEST),
@@ -496,6 +497,51 @@ mod tests {
             .await;
             assert_eq!(status, expected, "{kind}, stale: {stale}");
         }
+        let (_, minted) = call(&other, "GET", "/api/pair/pending", "admin", None).await;
+        other
+            .pending_pairing
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .created_unix_ms -= 61_000;
+        let (_, shown) = call(&other, "GET", "/api/pair/pending", "admin", None).await;
+        assert_eq!(
+            (minted["pending"].clone(), shown["pending"].clone()),
+            (json!(true), json!(false))
+        );
+        *other.pending_pairing.lock().unwrap() = None;
+        let (_, minted) = call(
+            &other,
+            "POST",
+            "/api/pair/pending",
+            "token",
+            Some(mint("gateway")),
+        )
+        .await;
+        other
+            .pending_pairing
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .created_unix_ms -= 61_000;
+        let (status, refused) = call(
+            &coding,
+            "POST",
+            "/api/peers",
+            "token",
+            Some(json!({
+                "url": other_url, "name": "other",
+                "request_id": minted["request_id"], "code": minted["code"],
+            })),
+        )
+        .await;
+        assert_eq!(
+            (status, &refused["error"]["reason"]),
+            (StatusCode::CONFLICT, &json!("pairing_code_expired")),
+            "{refused}"
+        );
 
         for (body, accept) in [
             (json!({ "accept_delegations": false }), false),

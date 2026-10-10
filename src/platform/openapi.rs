@@ -1123,7 +1123,7 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
                     }
                 })), &[
                     ("400", "invalid_request, invalid_device_name"),
-                    ("409", "pairing_in_progress: another pairing is pending (a minted code holds the slot for a minute only)"),
+                    ("409", "pairing_in_progress: another pairing is pending (a minted code lives a minute only: then it is neither shown nor claimable)"),
                     ("429", "pairing_rate_limited"),
                 ])
             }}),
