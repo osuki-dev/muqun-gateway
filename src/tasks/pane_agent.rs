@@ -17,8 +17,8 @@
 //!
 //! | The pane | The task |
 //! |---|---|
-//! | a `MUQUN_TASK_DONE: <summary>` below the echoed request (at a line's start or after the agent's words on it), the agent not busy | `done`, with that summary |
-//! | a new `MUQUN_TASK_BLOCKED: <reason>` line below the echoed request, the agent not busy | `waiting` (*blocked*), with that reason (replacing an earlier one) |
+//! | a `MUQUN_TASK_DONE: <summary>` below the echo of the goal (at a line's start or after the agent's words on it; never text the goal holds), the agent not busy | `done`, with that summary |
+//! | a new `MUQUN_TASK_BLOCKED: <reason>` below the echo of the goal, the agent not busy | `waiting` (*blocked*), with that reason (replacing an earlier one) |
 //! | *blocked*: agent idle, or still busy before it was seen idle on two polls | stays `waiting` |
 //! | *blocked*: agent starting / working after it was seen idle on two polls (the user answered) | `working` |
 //! | agent starting / working | `working` (from `dispatching`, or back from `waiting` or `idle_unconfirmed`) |
@@ -149,7 +149,15 @@ pub(crate) enum Marker {
 /// reads one, below the request echoed in the prompt. Code fences are not
 /// looked at: a pane's window of output can start inside one.
 pub(crate) fn marker(output: &str) -> Option<Marker> {
-    let found = marker_lines(output);
+    marker_after(output, None)
+}
+
+/// [`marker`] for a pane, below the echo of `goal` too: the goal is on the
+/// shell's launch line and in the agent's own echo of it, and nothing in it
+/// may complete its task -- a marker counts only below the last line that
+/// echoes the goal's end, and never one whose text is part of the goal.
+pub(crate) fn marker_after(output: &str, goal: Option<&str>) -> Option<Marker> {
+    let found = marker_lines(output, goal);
     match &found.last()?.2 {
         Marker::Blocked { reason, .. } => {
             let same = |(_, _, m): &&(usize, usize, Marker)| matches!(m, Marker::Blocked { reason: r, .. } if r == reason);
@@ -168,18 +176,26 @@ pub(crate) fn marker(output: &str) -> Option<Marker> {
 /// leaves out ([`super::transcript`]), so a marker the ledger ignores stays
 /// in view.
 pub(crate) fn consumed_marker(output: &str) -> Option<(usize, usize)> {
-    marker_lines(output)
+    marker_lines(output, None)
         .last()
         .map(|(line, start, _)| (*line, *start))
 }
 
 /// Every marker that counts in `output`: its line, where it starts on it,
-/// and what it says.
-fn marker_lines(output: &str) -> Vec<(usize, usize, Marker)> {
+/// and what it says. Only below the last line that echoes a request -- the
+/// completion instruction older gateways typed, or the end of `goal` -- and
+/// never one whose text the goal itself holds.
+fn marker_lines(output: &str, goal: Option<&str>) -> Vec<(usize, usize, Marker)> {
     let lines: Vec<&str> = output.lines().collect();
+    let anchor = goal.map(goal_anchor).filter(|anchor| !anchor.is_empty());
     let below_echo = lines
         .iter()
-        .rposition(|line| ECHO_WORDS.iter().any(|word| line.contains(word)))
+        .rposition(|line| {
+            ECHO_WORDS.iter().any(|word| line.contains(word))
+                || anchor
+                    .as_deref()
+                    .is_some_and(|anchor| line.contains(anchor))
+        })
         .map_or(0, |echo| echo + 1);
     lines
         .iter()
@@ -187,9 +203,28 @@ fn marker_lines(output: &str) -> Vec<(usize, usize, Marker)> {
         .skip(below_echo)
         .filter_map(|(at, line)| {
             let (start, marker) = marker_line(line)?;
+            let said = match &marker {
+                Marker::Done(text) | Marker::Blocked { reason: text, .. } => text,
+            };
+            if goal.is_some_and(|goal| one_line(goal, usize::MAX).contains(said.as_str())) {
+                return None;
+            }
             Some((at, start, marker))
         })
         .collect()
+}
+
+/// The end of a goal as a pane shows its echo: the last 16 characters of
+/// its last line, short enough to stay on one row when the echo wraps.
+fn goal_anchor(goal: &str) -> String {
+    let last = goal
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    let count = last.chars().count();
+    last.chars().skip(count.saturating_sub(16)).collect()
 }
 
 /// Whether `line` opens or closes a markdown code fence (for display:
@@ -213,7 +248,9 @@ fn marker_line(line: &str) -> Option<(usize, Marker)> {
             let before = &line[..*at];
             let at_start = !before.chars().any(char::is_alphanumeric);
             let previous = before.chars().next_back();
-            let in_word = previous.is_some_and(|c| c.is_alphanumeric() || c == '_');
+            // ASCII only: text in a script without spaces runs into the
+            // marker ("已完成MUQUN_TASK_DONE: …") and still counts.
+            let in_word = previous.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
             let quoted = previous.is_some_and(|c| matches!(c, '`' | '"' | '\'' | '“' | '‘'));
             at_start || !(in_word || quoted)
         })
@@ -225,7 +262,16 @@ fn marker_line(line: &str) -> Option<(usize, Marker)> {
         } else {
             (BLOCKED_MARKER, REASON_PLACEHOLDER)
         };
-        let text = line[at + token.len()..].trim();
+        let mut text = line[at + token.len()..].trim();
+        // Markup that opened the marker (`` ` ``, `**`) closes it, not the summary.
+        let opener: String = line[..at]
+            .chars()
+            .rev()
+            .take_while(|c| matches!(c, '`' | '*' | '"' | '_'))
+            .collect();
+        if !opener.is_empty() {
+            text = text.trim_end_matches(|c| opener.contains(c)).trim_end();
+        }
         let stand_in = text.starts_with('<')
             || placeholder.starts_with(text)
             || text.trim_matches(|c| c == '.' || c == '…').is_empty();
@@ -671,6 +717,8 @@ fn last_line(visible: &str) -> Option<String> {
 
 struct Bound<'a> {
     session: &'a SessionConfig,
+    /// The task's goal, echoed on the pane: no marker in it counts.
+    goal: &'a str,
     pane_id: &'a str,
     shell_pid: Option<u32>,
     agent_id: Option<&'a str>,
@@ -690,6 +738,7 @@ fn bound<'a>(state: &'a AppState, task: &'a Task) -> Option<Bound<'a>> {
     let session = state.config.sessions.iter().find(|s| &s.id == session_id)?;
     Some(Bound {
         session,
+        goal: &task.goal,
         pane_id,
         shell_pid: *shell_pid,
         agent_id: agent_id.as_deref(),
@@ -721,7 +770,7 @@ async fn observe(at: &Bound<'_>, rows: &mut Option<usize>) -> Option<Observed> {
             })
             .await
             .ok()
-            .and_then(|output| marker(&output.text)),
+            .and_then(|output| marker_after(&output.text, Some(at.goal))),
     };
     Some(Observed {
         seen,
@@ -1279,7 +1328,22 @@ mod tests {
         }
         assert_eq!(
             marker("`MUQUN_TASK_DONE: fixed`"),
-            Some(Marker::Done("fixed`".into()))
+            Some(Marker::Done("fixed".into()))
+        );
+        // CJK runs into the marker without a space and still counts.
+        assert_eq!(
+            marker("已完成MUQUN_TASK_DONE: 文档已更新"),
+            Some(Marker::Done("文档已更新".into()))
+        );
+        // On a pane, the goal's own text never completes its task: a marker
+        // counts only below the goal's echo, and never one the goal holds.
+        let goal = "make MUQUN_TASK_DONE: lines count mid-line";
+        let pane = format!("$ claude -- '{goal}'\n> {goal}\n⏺ Working on it\n");
+        assert_eq!(marker_after(&pane, Some(goal)), None);
+        let finished = format!("{pane}⏺ MUQUN_TASK_DONE: mid-line markers count\n");
+        assert_eq!(
+            marker_after(&finished, Some(goal)),
+            Some(Marker::Done("mid-line markers count".into()))
         );
         // A window of output that starts inside a code fence still finds
         // the agent's marker after the fence closes.

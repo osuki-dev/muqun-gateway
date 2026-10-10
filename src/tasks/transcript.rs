@@ -133,22 +133,32 @@ fn without_marker_line(
             == 1
     };
     let consumed = consumed.filter(|&(at, _)| at <= last && !fenced(at));
-    let held = streaming && !fenced(last) && may_become_marker(lines[last]);
-    if consumed.is_none() && !held {
+    // While streaming, the last line is held from where a marker may be
+    // starting: the whole line, or what follows the agent's words on it.
+    let held = if streaming && !fenced(last) {
+        held_from(lines[last])
+    } else {
+        None
+    };
+    if consumed.is_none() && held.is_none() {
         return None;
     }
     // The marker runs from where it starts to the line's end; the agent's
     // words before it on that line stay, bare bullets or markup do not.
-    let kept: Vec<&str> = lines
+    let cut = |line: &'_ str, start: usize| -> Option<String> {
+        let before = line.get(..start).unwrap_or("").trim_end();
+        before
+            .chars()
+            .any(char::is_alphanumeric)
+            .then(|| before.to_owned())
+    };
+    let kept: Vec<String> = lines
         .iter()
         .enumerate()
-        .filter(|&(at, _)| !(held && at == last))
-        .filter_map(|(at, line)| match consumed {
-            Some((line_at, start)) if line_at == at => {
-                let before = line.get(..start).unwrap_or("").trim_end();
-                before.chars().any(char::is_alphanumeric).then_some(before)
-            }
-            _ => Some(*line),
+        .filter_map(|(at, line)| match (consumed, held) {
+            (Some((line_at, start)), _) if line_at == at => cut(line, start),
+            (_, Some(start)) if at == last => cut(line, start),
+            _ => Some((*line).to_owned()),
         })
         .collect();
     Some(kept.join("\n").trim_end().to_owned())
@@ -421,6 +431,26 @@ pub(crate) fn without_any_marker(text: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Where `line`, the last line still being written, may be starting a
+/// marker: 0 when the whole line may become one, else the byte after the
+/// agent's words where a marker's start follows them ("help?MUQUN_TASK_DO").
+fn held_from(line: &str) -> Option<usize> {
+    if may_become_marker(line) {
+        return Some(0);
+    }
+    let start = line
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !(c.is_ascii_alphanumeric() || *c == '_' || *c == ':'))
+        .map_or(0, |(at, c)| at + c.len_utf8());
+    let tail = &line[start..];
+    let partial = !tail.is_empty()
+        && [DONE_MARKER, BLOCKED_MARKER]
+            .iter()
+            .any(|marker| marker.starts_with(tail) || tail.starts_with(marker));
+    (partial && start > 0).then_some(start)
 }
 
 /// Whether `line`, the last line still being written, may become a marker
@@ -781,6 +811,12 @@ mod tests {
             })
             .collect();
         assert_eq!(texts, ["first\n- ", "second"]);
+        // A marker being written after the agent's words is held from there.
+        let mut items = vec![item(Assistant, text("Hello. How can I help?MUQUN_TASK_DO"))];
+        hide_in_items(&mut items, Streaming(true));
+        assert!(
+            matches!(&items[0].part, AgentPart::Text { text } if text == "Hello. How can I help?")
+        );
         // A last line that may become a marker is held back only while the
         // turn runs; a finished message keeps it.
         for (last, streaming, served) in [

@@ -227,8 +227,8 @@ starting or working is `working`, one blocked on a menu is `waiting`, one idle
 on two polls after it was seen busy (or after 30 s) is `idle_unconfirmed`
 (polled every 12 s, backing off to 60 s while nothing changes), and a pane
 that closed or lost its agent is `failed`.
-`done` needs an explicit signal: a `MUQUN_TASK_DONE: <summary>` line below the
-echoed request in the pane's recent output (`marker`), or the agent's
+`done` needs an explicit signal: a `MUQUN_TASK_DONE: <summary>` below the
+echo of the goal in the pane's recent output (`marker_after`), or the agent's
 `tasks.complete` call; an idle agent is never finished. A
 `MUQUN_TASK_BLOCKED: <reason>` line (or `tasks.complete` with outcome
 `blocked`) makes it `waiting` until the user's answer sets it working. Pane, launch and prompt

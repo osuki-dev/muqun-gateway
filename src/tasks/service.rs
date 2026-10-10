@@ -1055,28 +1055,20 @@ pub(crate) async fn start_terminal_agent(
         return;
     }
     let pane_id = placed.place.pane_id.clone();
-    let prompt = goal;
-    let (mut launched, to_type) = start_agent_in_place(
-        &state,
-        &session,
-        &kind,
-        cwd.as_deref(),
-        placed,
-        Some(&prompt),
-    )
-    .await;
+    let (mut launched, to_type) =
+        start_agent_in_place(&state, &session, &kind, cwd.as_deref(), placed, Some(&goal)).await;
     let typed = to_type.is_some();
     if let Some(started) = to_type {
         if ended().await {
             tracing::debug!(task = %task.id.0, "terminal task ended while its agent started: goal not typed");
             return;
         }
-        type_agent_prompt(&session, &started, Some(&prompt), &mut launched).await;
+        type_agent_prompt(&session, &started, Some(&goal), &mut launched).await;
     }
     let why = match failed_step(&launched.steps.value()) {
         Some(why) => Some(why),
         // Typed is not sent: Claude Code can keep a pasted goal in its box.
-        None if typed && !pane_agent::goal_accepted(&session, &pane_id, &prompt).await => {
+        None if typed && !pane_agent::goal_accepted(&session, &pane_id, &goal).await => {
             Some(pane_agent::NOT_ACCEPTED.to_owned())
         }
         None => None,

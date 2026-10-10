@@ -545,7 +545,6 @@ pub(crate) struct AgentLaunch {
 
 /// The first half of [`launch_agent`]: the pane exists, nothing runs in it
 /// yet.
-#[derive(Clone)]
 pub(crate) struct PlacedAgent {
     pub(crate) place: SpawnPlace,
     pub(crate) payload: Value,
@@ -1088,7 +1087,6 @@ fn pane_env(env: &BTreeMap<String, String>) -> PaneEnv {
     })
 }
 
-#[derive(Clone)]
 pub(crate) struct SpawnPlace {
     pub(crate) pane_id: String,
     pub(crate) tab_id: Option<String>,

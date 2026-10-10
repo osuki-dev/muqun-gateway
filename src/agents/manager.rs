@@ -1219,10 +1219,7 @@ impl AgentManager {
         asid: &AgentSessionId,
         info: crate::agents::domain::AgentSessionInfo,
     ) -> crate::agents::domain::AgentSessionInfo {
-        ctx.mirror
-            .get_snapshot(asid)
-            .await
-            .map_or(info, |snapshot| snapshot.info)
+        ctx.mirror.session_info(asid).await.unwrap_or(info)
     }
 
     async fn apply_usage(ctx: &EventContext, asid: &AgentSessionId, data: &Value) {

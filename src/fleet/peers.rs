@@ -436,8 +436,8 @@ impl PeerService {
         self.presence.seen(peer_id, Some(now));
     }
 
-    /// The peers' names, for the completion instruction (G5).
-    #[allow(dead_code)] // the completion instruction from Task G5
+    /// The peers' names, for the `mentions` a task's `tasks.read` will list (G5).
+    #[allow(dead_code)] // read by `tasks.read` `mentions` from Task G5
     pub(crate) fn names(&self) -> Vec<String> {
         self.names
             .read()

@@ -409,9 +409,10 @@ so one that scrolled off still counts. It counts when `MUQUN_TASK_DONE:`
 starts a line (after any bullet or markup the agent draws) or follows the
 agent's own words on it (`Done.MUQUN_TASK_DONE: …`; not inside a word, not
 quoted after a backtick or quote mid-sentence), runs to the line's end
-(that rest is the summary), lies below the last
-line of the echoed request (a narrow pane can wrap the echo so that the marker
-starts a line), carries a summary that is not the placeholder or a piece of
+(that rest is the summary), lies below the last line that echoes the
+goal's end (the shell's launch line and the agent's echo of the goal; nothing
+in the goal can complete its task, and a marker whose text the goal holds
+never counts), carries a summary that is not the placeholder or a piece of
 it (`<…`, `…`), and the agent is not working, starting or blocked at that
 poll. The task is then `done` with that summary (one line, at most 240
 characters). The blocked marker, `MUQUN_TASK_BLOCKED: <reason>`, is read by
@@ -496,8 +497,9 @@ end with the line MUQUN_TASK_DONE: <summary> (or MUQUN_TASK_BLOCKED:
 <reason>)."), and the `tasks.complete` description says the same. An agent
 without the muqun tools (T3 Code, DeepSeek) is told nothing: its task ends
 `idle_unconfirmed` for the device to confirm, unless it prints a marker of
-its own accord. The machines a task mentions are not written into its goal
-either: the `tasks.read` of the agent's own task lists them (`mentions`).
+its own accord. The machines a task mentions will not be written into its
+goal either: the `tasks.read` of the agent's own task is planned to list
+them (`mentions`, with the mesh's G5).
 
 Sessions from before goals went alone still hold the completion
 instruction this gateway used to send; the served transcript cuts it and the

@@ -920,6 +920,12 @@ impl MemoryMirror {
         sessions.get(asid).map(|s| s.event_log.len()).unwrap_or(0)
     }
 
+    /// The session's info as held, without the rest of its snapshot.
+    pub async fn session_info(&self, asid: &AgentSessionId) -> Option<AgentSessionInfo> {
+        let sessions = self.sessions.read().await;
+        sessions.get(asid).map(|state| state.info.clone())
+    }
+
     #[cfg(test)]
     pub async fn session_count(&self) -> usize {
         self.sessions.read().await.len()

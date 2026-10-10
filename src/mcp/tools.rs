@@ -485,7 +485,7 @@ impl MuqunMcp {
 
     #[tool(
         name = "tasks.complete",
-        description = "Call this when the task you were given is finished, with a one-line summary (outcome done, the default) -- or when you stop because you need the user, with outcome blocked and the reason (a missing file, an unclear request, a permission you cannot get). Only the session (or terminal pane) working on the task can complete it; stopping or going idle does not, and a blocked task stays open until you call this again with done."
+        description = "If this session was started as a Muqun task, call this when that task is finished, with a one-line summary (outcome done, the default) -- or when you stop because you need the user, with outcome blocked and the reason (a missing file, an unclear request, a permission you cannot get). Only the session (or terminal pane) working on the task can complete it; stopping or going idle does not, and a blocked task stays open until you call this again with done."
     )]
     async fn tasks_complete(
         &self,
@@ -541,11 +541,12 @@ impl ServerHandler for MuqunMcp {
                 "Muqun Gateway on this computer. fleet.describe says what it has, exec.run \
                  runs short commands, tasks.delegate + tasks.wait hand work to a coding agent \
                  (waits are capped at 45 s; call tasks.wait again while it says working). \
-                 You may be running inside a Muqun task: when the whole task you were given \
-                 is finished, call tasks.complete with a one-line summary; when you stop \
-                 because you need the user, call it with outcome \"blocked\" and the reason. \
-                 If you cannot call it, end with the line MUQUN_TASK_DONE: <summary> (or \
-                 MUQUN_TASK_BLOCKED: <reason>).",
+                 If this session was started as a Muqun task: when the whole task is \
+                 finished, call tasks.complete with a one-line summary; when you stop \
+                 because you need the user, call it with outcome \"blocked\" and the reason; \
+                 if you cannot call it, end with the line MUQUN_TASK_DONE: <summary> (or \
+                 MUQUN_TASK_BLOCKED: <reason>). If tasks.complete answers task_not_found, \
+                 this session is not a Muqun task: do not call it again and print no marker.",
             )
     }
 }
