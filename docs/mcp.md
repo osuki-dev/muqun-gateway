@@ -132,8 +132,8 @@ says `"truncated": true` when it left older ones out. `tasks.wait` and
 
 | Tool | Arguments | Result |
 |---|---|---|
-| `fleet.list` | none | `{"machines": [{machineId, label, os, online, suitableFor, tasksActive}]}`: this computer first, then every linked computer (`label` is the name this gateway gives it, `online` whether it is reachable; `os`, `suitableFor` and `tasksActive` come from its cached manifest, empty or 0 while none was fetched). List the computers this gateway can hand work to: this one and every linked one, with OS, what each is suitable for, whether it is reachable and how busy it is. |
-| `fleet.describe` | `machine?`: `"self"` (default), this computer's `machineId` or label, or a linked computer's name (any case) | A compact manifest of that computer: `GET /api/fleet/self`'s fields, but each agent is only `{id, kind, status, version, modes, modelCount}` (mode ids, no model catalog) and each terminal backend `{sessionId, label, kind, connected, version}`. For this computer it also carries `peers`: one `{name, reachable, lastSeen, capabilities, agents, suitableFor}` per linked computer (see [Linked computers](#linked-computers)). What a computer offers: its agents, terminal backends, toolchains with versions, task counts and what it is suitable for. Without machine, this computer plus a short entry per linked computer (peers). |
+| `fleet.list` | none | `{"machines": [{machineId, label, os, online, suitableFor, tasksActive}]}`: this computer first, then every linked computer (`machineId` is the id it gave for itself, which `fleet.describe` takes; `label` is the name this gateway gives it; `online` whether it is reachable, `null` while it was not checked in the last minute; `os`, `suitableFor` and `tasksActive` come from its cached manifest, empty or 0 while none was fetched). Answered at once from what this gateway last heard (see [Linked computers](#linked-computers)). List the computers this gateway can hand work to: this one and every linked one, with OS, what each is suitable for, whether it is reachable and how busy it is. |
+| `fleet.describe` | `machine?`: `"self"` (default, any case), this computer's `machineId` or label, or a linked computer's name (any case) or `machineId` from `fleet.list` | A compact manifest of that computer: `GET /api/fleet/self`'s fields, but each agent is only `{id, kind, status, version, modes, modelCount}` (mode ids, no model catalog) and each terminal backend `{sessionId, label, kind, connected, version}`. For this computer it also carries `peers`: one `{name, reachable, lastSeen, capabilities, agents, suitableFor}` per linked computer, answered at once from what this gateway last heard (`reachable` is `null` while it was not checked in the last minute; see [Linked computers](#linked-computers)). Naming a linked computer is the one call that may wait on it: one check and, when it answers, one manifest fetch. What a computer offers: its agents, terminal backends, toolchains with versions, task counts and what it is suitable for. Without machine, this computer plus a short entry per linked computer (peers). |
 | `exec.run` | `cwd`: absolute directory; `command`: shell command, run as `sh -c <command>` (at most 16 KiB); `timeout_s?`: 1..=45, default 30 | `{task_id, state, exit_code, stdout_tail, duration_ms, pane}`. Run a shell command in a visible terminal pane on this computer and return its exit code and output tail. Blocks up to timeout_s (max 45); if still running, returns a task_id for tasks.wait. `exit_code` is null while it runs; `pane` is `{session_id, pane_id}`. |
 | `tasks.delegate` | `goal` (at most 32 KiB); `cwd?`: absolute directory; `agent_id?` (default: the primary agent; a terminal agent kind such as `codex` or `claude` starts it in a new pane instead, see [Delegating to a terminal agent](#delegating-to-a-terminal-agent)); `mode?` (for example `build` or `plan`); `model?`: a model id from the agent's catalog for `cwd` (for example `claude-haiku-5-5`), or `<provider_id>/<model_id>` to pick one provider; default: the agent's default. An unknown id is `invalid_arguments` and nothing is created; `variant?`: the model's variant (reasoning effort, for example `high`), applied when the session is created so the first turn uses it; applied only together with `model` (ignored otherwise), and must be one of the model's catalog variants when it lists any (else `invalid_arguments`); `machine?` | A task view (see [Tasks API](#tasks-api)), filed under the caller's task when the gateway can tell which one it is (see [Task tree](#task-tree)). Start a sub-task on an agent on this computer: a new session in cwd with your goal as the first prompt (for a terminal agent such as codex or claude, a new terminal pane running it). Returns task_id; poll with tasks.wait. |
 | `tasks.wait` | `task_id`; `timeout_s?`: 1..=45, default 30 | The task view, plus `stdout_tail` for a command, and `answer` for a session delegation that is done or `idle_unconfirmed`: the agent's last message in full (`summary` holds only its first 240 characters, on one line). Returns once the task is done, failed, cancelled, `waiting` or `idle_unconfirmed` (its agent stopped without saying it is finished), or when the time is up. Wait up to timeout_s (max 45) for a task to reach done/failed/waiting, or idle_unconfirmed (its agent stopped without completing). Returns the current state and summary; call again while it says working. |
@@ -149,6 +149,7 @@ Error codes:
 | `task_not_found` | No task with that `task_id`, or it belongs to another assistant. |
 | `machine_unknown` | `machine` names neither this computer nor a linked one; the message lists the names that work. |
 | `machine_unreachable` | `fleet.describe` named a linked computer that does not answer now. |
+| `manifest_unavailable` | `fleet.describe` named a linked computer that answers but gave no manifest, and none is cached (for example an older gateway). |
 | `agent_unavailable` | The requested agent is not available on this computer. |
 | `no_terminal` | `exec.run` found no reachable terminal session. |
 | `internal` | Anything else; the details are in the gateway log. |
@@ -366,7 +367,8 @@ otherwise) and must be one of the model's catalog variants when the catalog
 lists any; `label` is at most 200 characters; `mentions` names the
 computers the user `@`-named in the goal: at most 8, each a linked
 computer's name (any case) or `self`. They are stored on the task as this
-gateway names them, once each in the order given, and shown as the task
+gateway names them at that moment (a later rename of a computer does not
+change the tasks that named it), once each in the order given, and shown as the task
 view's `mentions`; the goal is sent as it is, and the agent finds them with
 `tasks.read` of its own task.
 Fields the gateway does not know are ignored. The answer is
@@ -668,14 +670,19 @@ discovery (the task API stays snake_case).
 
 Another of the owner's gateways that this one was paired with (capability
 `fleet_peers`; see [Linked gateways](agent-api.md#linked-gateways-fleet_peers)).
-There is no heartbeat: what `fleet.describe` and `fleet.list` show is what
-this gateway last heard. A computer whose last answer is over 60 s old is
-pinged when one of them is called (one that no longer knows this gateway's
-token is forgotten and left out); it is `reachable` while its last answer is
-under 2 minutes old. Its manifest (`GET /api/fleet/self` on it, compacted
-as above) is fetched again when it is over 60 s old and kept in the peer
-row, so an unreachable computer still shows its last agents and
-`suitableFor`. `lastSeen` is ms since the epoch, null if it never answered.
+There is no heartbeat, and `fleet.describe` and `fleet.list` never wait on
+another computer: they answer with what this gateway last heard. A computer
+neither heard from nor pinged in the last 60 s is `reachable: null` (not
+checked yet); the call starts a check of it in the background -- one at a
+time per computer -- so the next call knows (one that no longer knows this
+gateway's token is forgotten and left out). After a check it is `reachable`
+while its last answer is under 2 minutes old. Its manifest (`GET
+/api/fleet/self` on it, compacted to the keys above, each list at most 64
+items) is fetched again in the same background step when it is over 60 s
+old, and kept in the peer row, so a computer that does not answer still
+shows its last agents and `suitableFor`. `lastSeen` is ms since the epoch,
+null if it never answered. Names match in any case (Unicode-aware); no
+linked computer may be called `self`.
 
 ### States
 
@@ -753,7 +760,7 @@ because the phone uses them regardless.
 
 - Relaying through the phone: a linked computer is reached at the URL the
   phone used for it, or not at all.
-- Queueing for an offline computer: work for a computer that does not answer
-  is refused (`machine_unreachable`), never held until it is back.
+- Queueing for an offline computer: nothing is held for a computer that
+  does not answer until it is back.
 - Remote files: `cwd` and `@`-mentioned files are always on the computer the
   task runs on; nothing is copied between computers.

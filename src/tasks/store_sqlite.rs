@@ -397,6 +397,16 @@ fn read_row(r: &Row<'_>) -> rusqlite::Result<anyhow::Result<Task>> {
     let requester_name: Option<String> = r.get(15)?;
     let session_title: Option<String> = r.get(16)?;
     let mentions: Option<String> = r.get(17)?;
+    // Only this gateway writes the column; a value it cannot read costs the
+    // task its mentions, never the whole row.
+    let mentions: Vec<String> = mentions
+        .map(|text| {
+            serde_json::from_str(&text).unwrap_or_else(|error| {
+                tracing::warn!(task = %id, "unreadable mentions, read as none: {error}");
+                Vec::new()
+            })
+        })
+        .unwrap_or_default();
     Ok((|| {
         Ok(Task {
             id: TaskId(id),
@@ -416,10 +426,7 @@ fn read_row(r: &Row<'_>) -> rusqlite::Result<anyhow::Result<Task>> {
             label,
             requester_name,
             session_title,
-            mentions: match mentions {
-                Some(text) => serde_json::from_str(&text)?,
-                None => Vec::new(),
-            },
+            mentions,
         })
     })())
 }

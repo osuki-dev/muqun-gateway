@@ -20,6 +20,7 @@ use super::service::{
 };
 use crate::agents::directories::expand_directory_param;
 use crate::connectivity::authority::DeviceKind;
+use crate::fleet::peers::same_name;
 use crate::platform::http::{peer_forbidden, require_device_or_peer, Caller};
 use crate::{api_error, require_device, ApiResult, AppState};
 
@@ -172,10 +173,10 @@ fn known_mentions(mentions: Vec<String>, linked: &[String]) -> ApiResult<Vec<Str
     let mut known: Vec<String> = Vec::new();
     for wanted in mentions {
         let wanted = wanted.trim();
-        let name = if wanted.eq_ignore_ascii_case("self") {
+        let name = if crate::fleet::peers::reserved_name(wanted) {
             "self".to_owned()
         } else {
-            let peer = linked.iter().find(|name| name.eq_ignore_ascii_case(wanted));
+            let peer = linked.iter().find(|name| same_name(name, wanted));
             peer.ok_or_else(refusal)?.clone()
         };
         if !known.contains(&name) {

@@ -111,8 +111,10 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
 - `src/fleet/`: this machine's capability manifest (agents, terminal backends,
   probed toolchains, task counts) behind `GET /api/fleet/self` and the
   `fleet.*` MCP tools, which also list the linked computers from what this
-  gateway last heard (`FleetService::describe`/`list` over
-  `PeerService::checked` and `manifest_of`, each answer cached 60 s).
+  gateway last heard, at once (`FleetService::describe`/`list` over
+  `PeerService::reachability`); a stale peer is checked and its manifest
+  fetched in the background, one refresh per peer at a time
+  (`refresh_later`).
   The owner's other gateways (`peers.rs`, `peers_sqlite.rs`, `/api/peers*`
   and `PUT /api/fleet/settings` in `peer_routes.rs`, `muqun-gateway peers`):
   a peer is linked by pairing with it as a phone does, as a device of
@@ -252,7 +254,8 @@ reaches only the peer routes (`require_device_or_peer`). Nothing pings a
 peer on a timer: `PeerService::checked` pings one whose last answer is over
 60 s old when something needs it (`GET /api/peers`, `fleet.*`), and it is
 reachable while that answer is under 2 minutes old; a 401 forgets it. Its
-compact manifest is cached in its row for 60 s (`manifest_of`). The
+compact manifest is cached in its row for 60 s (`manifest_of`). `fleet.*`
+never waits on a peer except `fleet.describe(machine: <peer>)`. The
 computers the user `@`-named when opening a task (`POST /api/tasks`
 `mentions`, checked against the peer names) are stored on the task
 (`Task::mentions`) and reach the agent only through `tasks.read` of its own

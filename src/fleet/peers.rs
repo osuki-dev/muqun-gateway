@@ -4,7 +4,7 @@
 //! the shared store; whether a peer is reachable is derived from when it
 //! last answered, never stored as a state.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -78,6 +78,20 @@ impl std::fmt::Debug for Peer {
             .field("last_seen_ms", &self.last_seen_ms)
             .finish_non_exhaustive()
     }
+}
+
+/// Whether two computer names are the same name: any case, Unicode-aware.
+pub(crate) fn same_name(a: &str, b: &str) -> bool {
+    a.trim().to_lowercase() == b.trim().to_lowercase()
+}
+
+/// `self` always means this computer, so no peer may be called that.
+pub(crate) fn reserved_name(name: &str) -> bool {
+    same_name(name, "self")
+}
+
+fn within(at: Option<u64>, now_ms: u64, span: Duration) -> bool {
+    at.is_some_and(|at| now_ms.saturating_sub(at) < span.as_millis() as u64)
 }
 
 fn recent(seen: Option<u64>, now_ms: u64) -> bool {
@@ -327,6 +341,10 @@ pub(crate) struct PeerService {
     /// When each peer's cached manifest was fetched; in memory, so the first
     /// look after a restart fetches it again.
     manifests_at: Mutex<HashMap<String, u64>>,
+    /// When each peer was last pinged, answered or not.
+    pinged_at: Mutex<HashMap<String, u64>>,
+    /// Peers a background refresh is running for: one at a time per peer.
+    refreshing: Mutex<HashSet<String>>,
     /// Shared with the task service (G3).
     pub(crate) presence: Arc<PeerPresence>,
     pub(crate) sockets: PeerSockets,
@@ -347,6 +365,8 @@ impl PeerService {
             config_path,
             names: RwLock::default(),
             manifests_at: Mutex::default(),
+            pinged_at: Mutex::default(),
+            refreshing: Mutex::default(),
             presence,
             sockets: PeerSockets::default(),
         }
@@ -380,12 +400,75 @@ impl PeerService {
         peers.into_iter().find(|peer| peer.peer_id == peer_id)
     }
 
-    /// A peer by its name (any case) or its id.
+    /// A peer by its name (any case), this gateway's id for it, or the id it
+    /// gave for itself (`machineId` in `fleet.list`).
     pub(crate) async fn resolve(&self, machine: &str) -> Option<Peer> {
         let peers = self.store.list().await.ok()?;
-        peers
-            .into_iter()
-            .find(|peer| peer.name.eq_ignore_ascii_case(machine) || peer.peer_id == machine)
+        peers.into_iter().find(|peer| {
+            same_name(&peer.name, machine) || peer.peer_id == machine || peer.server_id == machine
+        })
+    }
+
+    /// Whether `peer` answers, as far as is known without asking it now:
+    /// `None` when it was neither heard from nor pinged in the last [`CHECK_EVERY`].
+    pub(crate) fn reachability(&self, peer: &Peer, now: u64) -> Option<bool> {
+        if within(peer.last_seen_ms, now, CHECK_EVERY) {
+            return Some(true);
+        }
+        let pinged = self
+            .pinged_at
+            .lock()
+            .ok()
+            .and_then(|at| at.get(&peer.peer_id).copied());
+        within(pinged, now, CHECK_EVERY).then(|| peer.reachable(now))
+    }
+
+    fn manifest_fresh(&self, peer: &Peer, now: u64) -> bool {
+        let fetched = self
+            .manifests_at
+            .lock()
+            .ok()
+            .and_then(|at| at.get(&peer.peer_id).copied());
+        peer.manifest.is_some() && within(fetched, now, CHECK_EVERY)
+    }
+
+    /// Bring what is known of `peer` up to date in the background, unless it
+    /// is current or a refresh of it already runs: a ping when its
+    /// reachability is unknown, then its manifest when that is stale.
+    pub(crate) fn refresh_later(self: &Arc<Self>, peer: Peer) {
+        let now = now_ms();
+        let current = match self.reachability(&peer, now) {
+            None => false,
+            Some(true) => self.manifest_fresh(&peer, now),
+            Some(false) => true,
+        };
+        if current {
+            return;
+        }
+        let started =
+            (self.refreshing.lock()).is_ok_and(|mut running| running.insert(peer.peer_id.clone()));
+        if !started {
+            return;
+        }
+        /// Ends the refresh however its task ends.
+        struct Running(Arc<PeerService>, String);
+        impl Drop for Running {
+            fn drop(&mut self) {
+                if let Ok(mut running) = self.0.refreshing.lock() {
+                    running.remove(&self.1);
+                }
+            }
+        }
+        let running = Running(self.clone(), peer.peer_id.clone());
+        tokio::spawn(async move {
+            let service = running.0.clone();
+            if let Some(peer) = service.checked(peer).await {
+                if peer.reachable(now_ms()) {
+                    service.manifest_of(&peer).await;
+                }
+            }
+            drop(running);
+        });
     }
 
     /// `peer`, pinged first when its last answer is older than [`CHECK_EVERY`].
@@ -402,12 +485,17 @@ impl PeerService {
         let Ok(client) = PeerClient::for_peer(&peer) else {
             return Some(peer);
         };
-        match tokio::time::timeout(PING_TIMEOUT, client.ping()).await {
+        // The public capability list is asked alongside: a check costs one timeout.
+        let (pinged, capabilities) = tokio::join!(
+            tokio::time::timeout(PING_TIMEOUT, client.ping()),
+            tokio::time::timeout(PING_TIMEOUT, client.capabilities()),
+        );
+        if let Ok(mut at) = self.pinged_at.lock() {
+            at.insert(peer.peer_id.clone(), now_ms());
+        }
+        match pinged {
             Ok(Ok(())) => {
-                let capabilities = tokio::time::timeout(PING_TIMEOUT, client.capabilities())
-                    .await
-                    .ok()
-                    .and_then(Result::ok);
+                let capabilities = capabilities.ok().and_then(Result::ok);
                 let now = now_ms();
                 if let Err(error) = self
                     .store
@@ -437,14 +525,7 @@ impl PeerService {
     /// otherwise fetched and cached -- or, when the fetch fails, the cached one
     /// however old. `None`: none was ever fetched and this fetch failed.
     pub(crate) async fn manifest_of(&self, peer: &Peer) -> Option<Value> {
-        let fetched_at = self
-            .manifests_at
-            .lock()
-            .ok()
-            .and_then(|at| at.get(&peer.peer_id).copied());
-        let fresh = fetched_at
-            .is_some_and(|at| now_ms().saturating_sub(at) < CHECK_EVERY.as_millis() as u64);
-        if fresh && peer.manifest.is_some() {
+        if self.manifest_fresh(peer, now_ms()) {
             return peer.manifest.clone();
         }
         let client = PeerClient::for_peer(peer).ok()?;
@@ -531,10 +612,7 @@ impl PeerService {
             // it (the id is only what the claimant said); remove the first.
             return Err(LinkError::Conflict);
         }
-        if peers
-            .iter()
-            .any(|other| other.name.eq_ignore_ascii_case(&peer.name))
-        {
+        if peers.iter().any(|other| same_name(&other.name, &peer.name)) {
             return Err(LinkError::NameTaken);
         }
         // The first authenticated call proves the new credentials (and, sealed,
@@ -585,13 +663,13 @@ impl PeerService {
         name: &str,
     ) -> Result<Option<Peer>, RenameError> {
         let name = name.trim();
-        if name.is_empty() || !crate::valid_device_name(name) {
+        if name.is_empty() || !crate::valid_device_name(name) || reserved_name(name) {
             return Err(RenameError::Invalid);
         }
         let peers = self.store.list().await.map_err(RenameError::Store)?;
         if peers
             .iter()
-            .any(|peer| peer.peer_id != peer_id && peer.name.eq_ignore_ascii_case(name))
+            .any(|peer| peer.peer_id != peer_id && same_name(&peer.name, name))
         {
             return Err(RenameError::Taken);
         }

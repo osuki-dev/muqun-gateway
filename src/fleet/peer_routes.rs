@@ -72,7 +72,7 @@ fn refusal_reason(code: &str) -> &'static str {
 
 fn valid_name(name: &str) -> bool {
     let name = name.trim();
-    !name.is_empty() && valid_device_name(name)
+    !name.is_empty() && valid_device_name(name) && !super::peers::reserved_name(name)
 }
 
 /// `GET /api/peers`: the switch and every peer, those not heard from for a
@@ -429,6 +429,16 @@ mod tests {
                 .map(|peer| peer.server_id),
             Some("srv-mini".to_owned())
         );
+        // `self` always means the computer asked, so no peer may take it.
+        let (status, _) = call(
+            &coding,
+            "PATCH",
+            &format!("/api/peers/{mini_id}"),
+            "token",
+            Some(json!({ "name": "Self" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
         let (status, _) = call(
             &coding,
             "PATCH",

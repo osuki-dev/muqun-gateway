@@ -253,7 +253,7 @@ fn directory(cwd: &str) -> Result<PathBuf, CallToolResult> {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct DescribeArgs {
-    /// The computer to describe: "self" (default) or a linked computer's name (from `peers`).
+    /// The computer to describe: "self" (default), or a linked computer's name (from `peers`) or machineId (from fleet.list).
     #[serde(default)]
     pub machine: Option<String>,
 }
@@ -472,6 +472,10 @@ impl MuqunMcp {
                 Err(DescribeError::Unreachable(name)) => fail(
                     "machine_unreachable",
                     &format!("{name} cannot be reached right now."),
+                ),
+                Err(DescribeError::NoManifest(name)) => fail(
+                    "manifest_unavailable",
+                    &format!("{name} answers but did not say what it offers."),
                 ),
             },
         )
@@ -1037,9 +1041,9 @@ mod tests {
     }
 
     /// An agent learns the linked computers from fleet.describe and
-    /// fleet.list, from what this gateway last heard -- no call goes out to
-    /// a peer while its answer is fresh -- and, from its own task, which of
-    /// them the user named.
+    /// fleet.list, answered at once from what this gateway last heard (a
+    /// peer not checked lately is `null` until a check in the background
+    /// answers), and, from its own task, which of them the user named.
     #[tokio::test]
     async fn an_agent_sees_the_linked_computers_and_the_ones_the_user_named() {
         use crate::fleet::peers::Peer;
@@ -1053,7 +1057,7 @@ mod tests {
             "tasks": { "active": 2, "waiting": 0 },
             "agents": [{ "id": "opencode", "kind": "opencode", "status": "connected", "modes": [], "modelCount": 3 }],
         });
-        // nas never answered: it is pinged, and 127.0.0.1:9 refuses at once.
+        // nas never answered: nothing is known of it yet; pinged, 127.0.0.1:9 refuses at once.
         for (id, name, seen) in [("srv-mini", "mini", Some(now)), ("srv-nas", "nas", None)] {
             state
                 .peers
@@ -1102,13 +1106,14 @@ mod tests {
             peers,
             [
                 (json!("mini"), json!(true), json!(["ios-build"])),
-                (json!("nas"), json!(false), json!([])),
+                (json!("nas"), Value::Null, json!([])),
             ]
         );
         assert_eq!(body["peers"][0]["agents"][0]["id"], "opencode");
 
         for (machine, expected) in [
             ("MINI", Ok("srv-mini")),
+            ("srv-mini", Ok("srv-mini")),
             ("nas", Err("machine_unreachable")),
             ("printer", Err("machine_unknown")),
         ] {

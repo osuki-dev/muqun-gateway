@@ -3,7 +3,6 @@
 
 use std::time::{Duration, Instant};
 
-use futures::future::join_all;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
@@ -117,40 +116,71 @@ impl Manifest {
     }
 }
 
+/// The most items of a list a peer's compact manifest keeps.
+const PEER_LIST_CAP: usize = 64;
+
 /// [`Manifest::compact`] over another computer's `GET /api/fleet/self`
-/// answer, field by field, so a peer on another gateway version still reads.
-pub(crate) fn compact_json(mut full: Value) -> Value {
-    let list = |value: &Value| value.as_array().cloned().unwrap_or_default();
+/// answer: the [`CompactManifest`] keys only, field by field (so a peer on
+/// another gateway version still reads), each list cut at [`PEER_LIST_CAP`].
+pub(crate) fn compact_json(full: Value) -> Value {
+    let list = |value: &Value| -> Vec<Value> {
+        let items = value.as_array().map(Vec::as_slice).unwrap_or_default();
+        items[..items.len().min(PEER_LIST_CAP)].to_vec()
+    };
+    let pick = |item: &Value, keys: &[&str]| -> Value {
+        keys.iter()
+            .map(|key| (key.to_string(), item[*key].clone()))
+            .collect::<serde_json::Map<_, _>>()
+            .into()
+    };
     let agents: Vec<Value> = list(&full["agents"])
         .iter()
         .map(|agent| {
-            json!({
-                "id": agent["id"],
-                "kind": agent["kind"],
-                "status": agent["status"],
-                "version": agent["version"],
-                "modes": list(&agent["modes"]).iter().map(|mode| mode["id"].clone()).collect::<Vec<_>>(),
-                "modelCount": list(&agent["models"]).len(),
-            })
+            let mut compact = pick(agent, &["id", "kind", "status", "version"]);
+            let modes = list(&agent["modes"])
+                .iter()
+                .map(|mode| mode["id"].clone())
+                .collect::<Vec<_>>();
+            compact["modes"] = modes.into();
+            let models = agent["models"].as_array().map_or(0, Vec::len);
+            compact["modelCount"] = models.into();
+            compact
         })
         .collect();
     let terminal: Vec<Value> = list(&full["terminal"])
         .iter()
         .map(|backend| {
-            json!({
-                "sessionId": backend["sessionId"],
-                "label": backend["label"],
-                "kind": backend["kind"],
-                "connected": backend["connected"],
-                "version": backend["version"],
-            })
+            pick(
+                backend,
+                &["sessionId", "label", "kind", "connected", "version"],
+            )
         })
         .collect();
-    if let Some(fields) = full.as_object_mut() {
-        fields.insert("agents".into(), agents.into());
-        fields.insert("terminal".into(), terminal.into());
-    }
-    full
+    let toolchains: Vec<Value> = list(&full["toolchains"])
+        .iter()
+        .map(|toolchain| pick(toolchain, &["id", "version", "path"]))
+        .collect();
+    let mut compact = pick(
+        &full,
+        &[
+            "machineId",
+            "label",
+            "hostname",
+            "os",
+            "arch",
+            "gatewayVersion",
+        ],
+    );
+    compact["agents"] = agents.into();
+    compact["terminal"] = terminal.into();
+    compact["toolchains"] = toolchains.into();
+    compact["tasks"] = pick(&full["tasks"], &["active", "waiting"]);
+    compact["suitableFor"] = list(&full["suitableFor"])
+        .into_iter()
+        .filter(Value::is_string)
+        .collect::<Vec<_>>()
+        .into();
+    compact
 }
 
 /// A linked computer, as `fleet.describe` lists it beside this one: what
@@ -159,7 +189,8 @@ pub(crate) fn compact_json(mut full: Value) -> Value {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PeerEntry {
     pub name: String,
-    pub reachable: bool,
+    /// `null`: not checked in the last minute (a check is under way).
+    pub reachable: Option<bool>,
     /// When it last answered, ms since the epoch.
     pub last_seen: Option<u64>,
     pub capabilities: Vec<String>,
@@ -175,28 +206,31 @@ pub(crate) enum DescribeError {
     Unknown(Vec<String>),
     /// A linked computer that does not answer now.
     Unreachable(String),
+    /// A linked computer that answers but gave no manifest (none cached).
+    NoManifest(String),
 }
 
-/// A linked computer as last heard: checked when its answer is over a minute
-/// old, with its manifest (fetched again when that is over a minute old).
+/// A linked computer as last heard, without asking it now.
 struct Heard {
     peer: Peer,
-    reachable: bool,
-    manifest: Option<Value>,
+    reachable: Option<bool>,
 }
 
 impl Heard {
     fn strings(&self, field: &str) -> Vec<String> {
-        self.manifest.as_ref().map_or_else(Vec::new, |manifest| {
-            manifest[field]
-                .as_array()
-                .map(|list| {
-                    list.iter()
-                        .filter_map(|item| item.as_str().map(str::to_owned))
-                        .collect()
-                })
-                .unwrap_or_default()
-        })
+        self.peer
+            .manifest
+            .as_ref()
+            .map_or_else(Vec::new, |manifest| {
+                manifest[field]
+                    .as_array()
+                    .map(|list| {
+                        list.iter()
+                            .filter_map(|item| item.as_str().map(str::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
     }
 
     fn entry(&self) -> PeerEntry {
@@ -206,6 +240,7 @@ impl Heard {
             last_seen: self.peer.last_seen_ms,
             capabilities: self.peer.capabilities.clone(),
             agents: self
+                .peer
                 .manifest
                 .as_ref()
                 .and_then(|manifest| manifest["agents"].as_array().cloned())
@@ -215,28 +250,27 @@ impl Heard {
     }
 
     fn summary(&self) -> MachineSummary {
-        let field = |name: &str| {
-            self.manifest
-                .as_ref()
-                .and_then(|manifest| manifest[name].as_str().map(str::to_owned))
-        };
+        let manifest = self.peer.manifest.as_ref();
         MachineSummary {
-            machine_id: field("machineId").unwrap_or_else(|| self.peer.server_id.clone()),
+            // What `fleet.describe` takes for it.
+            machine_id: self.peer.server_id.clone(),
             label: self.peer.name.clone(),
-            os: field("os").unwrap_or_default(),
+            os: manifest
+                .and_then(|manifest| manifest["os"].as_str())
+                .unwrap_or_default()
+                .to_owned(),
             online: self.reachable,
             suitable_for: self.strings("suitableFor"),
-            tasks_active: self
-                .manifest
-                .as_ref()
+            tasks_active: manifest
                 .and_then(|manifest| manifest["tasks"]["active"].as_u64())
                 .unwrap_or(0) as usize,
         }
     }
 }
 
-/// Every linked computer, checked concurrently; one that no longer knows
-/// this gateway is dropped (it was forgotten).
+/// Every linked computer as last heard, answered at once; those whose
+/// reachability or manifest is stale are refreshed in the background (one
+/// refresh per peer at a time), for the next call to see.
 async fn heard(state: &AppState) -> Vec<Heard> {
     let peers = match state.peers.list().await {
         Ok(peers) => peers,
@@ -245,20 +279,17 @@ async fn heard(state: &AppState) -> Vec<Heard> {
             return Vec::new();
         }
     };
-    let checks = peers.into_iter().map(|peer| async {
-        let peer = state.peers.checked(peer).await?;
-        let reachable = peer.reachable(now_ms());
-        let manifest = match reachable {
-            true => state.peers.manifest_of(&peer).await,
-            false => peer.manifest.clone(),
-        };
-        Some(Heard {
-            peer,
-            reachable,
-            manifest,
+    let now = now_ms();
+    peers
+        .into_iter()
+        .map(|peer| {
+            state.peers.refresh_later(peer.clone());
+            Heard {
+                reachable: state.peers.reachability(&peer, now),
+                peer,
+            }
         })
-    });
-    join_all(checks).await.into_iter().flatten().collect()
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -282,16 +313,20 @@ pub(crate) struct MachineSummary {
     pub machine_id: String,
     pub label: String,
     pub os: String,
-    pub online: bool,
+    /// `null`: a linked computer not checked in the last minute.
+    pub online: Option<bool>,
     pub suitable_for: Vec<String>,
     pub tasks_active: usize,
 }
 
-/// Whether `machine` names this computer: unnamed, `"self"`, its id, or its
-/// own label in any case (the agent knows it by the name the phone shows).
+/// Whether `machine` names this computer: unnamed, `"self"` (any case), its
+/// id, or its own label (any case; the agent knows it by the name the phone
+/// shows).
 pub(crate) fn is_self(machine: Option<&str>, machine_id: &str, label: &str) -> bool {
     machine.is_none_or(|machine| {
-        machine == "self" || machine == machine_id || machine.eq_ignore_ascii_case(label)
+        super::peers::reserved_name(machine)
+            || machine == machine_id
+            || super::peers::same_name(machine, label)
     })
 }
 
@@ -396,7 +431,8 @@ impl FleetService {
 
     /// What `fleet.describe` answers for `machine`: this computer's compact
     /// manifest plus an entry per linked computer (`peers`), or a linked
-    /// computer's own compact manifest (by name in any case, or peer id).
+    /// computer's own compact manifest (by name in any case, or either id):
+    /// the one call that may wait on a peer, for one check and one fetch.
     pub(crate) async fn describe(
         &self,
         state: &AppState,
@@ -416,7 +452,7 @@ impl FleetService {
             return Err(DescribeError::Unreachable(peer.name));
         }
         let manifest = state.peers.manifest_of(&peer).await;
-        manifest.ok_or(DescribeError::Unreachable(peer.name))
+        manifest.ok_or(DescribeError::NoManifest(peer.name))
     }
 
     /// What `fleet.list` answers: this computer, then every linked one.
@@ -426,7 +462,7 @@ impl FleetService {
             machine_id: manifest.machine_id.clone(),
             label: manifest.label.clone(),
             os: manifest.os.to_owned(),
-            online: true,
+            online: Some(true),
             suitable_for: manifest.suitable_for.clone(),
             tasks_active: manifest.tasks.active,
         }];
@@ -454,12 +490,33 @@ mod tests {
         for (machine, expected) in [
             (None, true),
             (Some("self"), true),
+            (Some("SELF"), true),
             (Some("srv-1"), true),
             (Some("CODING"), true),
             (Some("mini"), false),
         ] {
             assert_eq!(is_self(machine, "srv-1", "coding"), expected, "{machine:?}");
         }
+    }
+
+    /// A peer's manifest keeps the compact keys only, model catalogs counted.
+    #[test]
+    fn a_peer_manifest_keeps_only_the_compact_keys() {
+        let full = serde_json::json!({
+            "machineId": "srv-mini", "os": "macos", "secret": "x", "suitableFor": ["web", 1],
+            "agents": [{ "id": "opencode", "models": [{}, {}], "modes": [{ "id": "build", "name": "Build" }], "env": "x" }],
+            "toolchains": (0..100).map(|i| serde_json::json!({ "id": format!("t{i}") })).collect::<Vec<_>>(),
+        });
+        let compact = compact_json(full);
+        assert_eq!(compact.get("secret"), None);
+        assert_eq!(compact["agents"][0]["modelCount"], 2);
+        assert_eq!(compact["agents"][0]["modes"], serde_json::json!(["build"]));
+        assert_eq!(compact["agents"][0].get("env"), None);
+        assert_eq!(
+            compact["toolchains"].as_array().unwrap().len(),
+            PEER_LIST_CAP
+        );
+        assert_eq!(compact["suitableFor"], serde_json::json!(["web"]));
     }
 
     #[test]
