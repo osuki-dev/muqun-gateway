@@ -1552,9 +1552,9 @@ client without the socket.
   (an untitled session has an empty `title` -- adapters no longer make one
   up -- and a name that is the asid, or the goal restated or cut short, is
   not used); else the goal's first sentence -- cut to 60 characters with
-  `…`, back to a word boundary when that keeps at least 30 characters. An open task's follows the session's name as it changes;
-  an ended one keeps the name it had when it ended. Show it instead of the
-  raw `goal`.
+  `…`, back to a word boundary when that keeps at least 30 characters. An
+  open task's follows the session's name as it changes; an ended one keeps
+  the name it had when it ended. Show it instead of the raw `goal`.
 - Agent sessions (`GET /api/agent-sessions`, …) carry an empty `title` until
   the provider names them; OpenCode's adapter no longer fills in the asid,
   DeepSeek's no longer `DeepSeek Agent Session`, T3's no longer reports the

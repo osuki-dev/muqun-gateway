@@ -1764,8 +1764,9 @@ impl TaskService {
     /// turn of its session after the one that reported the block (the user
     /// answered) is work again -- for a marker, any turn that runs, as the
     /// reporting one had ended when it was read; for `tasks.complete`, one
-    /// that ran after the reporting one went idle. A pane task's follower
-    /// keeps the same rule itself ([`pane_agent::judge`]).
+    /// after the follower saw the session go idle since the call, or any
+    /// once this gateway started after it. A pane task's follower keeps the
+    /// same rule itself ([`pane_agent::judge`]).
     async fn holds(&self, task: &Task, to: TaskState) -> bool {
         if !matches!(to, TaskState::Working | TaskState::IdleUnconfirmed) {
             return false;
@@ -1811,7 +1812,9 @@ impl TaskService {
     /// task store cannot be read.
     pub(crate) async fn default_cwd(&self, device: &TaskPrincipal) -> Option<String> {
         match self.store.latest_device_cwd(device).await {
-            Ok(Some(dir)) if Path::new(&dir).is_dir() => Some(home_relative(&dir)),
+            Ok(Some(dir)) if Path::new(&dir).is_dir() => {
+                Some(home_relative(&dir, dirs::home_dir().as_deref()))
+            }
             Ok(_) => Some("~".to_owned()),
             Err(error) => {
                 tracing::debug!(%error, "default folder not read");
@@ -1916,29 +1919,38 @@ fn tool_line(call: &ToolCall) -> Option<String> {
                 .map(str::trim)
         })
     };
-    let target = arg(&["filePath", "file_path", "path"])
+    let whole = arg(&["filePath", "file_path", "path"])
         .or_else(patched)
-        .or_else(|| arg(&["command", "pattern", "query", "url"]))
-        .map(|target| target.lines().next().unwrap_or(target).trim());
+        .or_else(|| arg(&["command", "pattern", "query", "url"]));
     let title = call
         .title
         .as_deref()
         .map(str::trim)
         .filter(|title| !title.is_empty() && *title != call.name);
-    let line = match (target, title) {
-        (Some(target), Some(title)) if !target.ends_with(title) => title.to_owned(),
-        (Some(target), _) => format!("{} {}", call.name, code(target)),
-        (None, title) => title?.to_owned(),
+    let Some(whole) = whole else {
+        return title.map(str::to_owned);
+    };
+    let target = whole.lines().next().unwrap_or(whole).trim();
+    let restates = |title: &str| target.ends_with(title) || whole.ends_with(title);
+    let line = match title {
+        Some(title) if !restates(title) => title.to_owned(),
+        // The whole line fits the progress line, so its fence is never cut.
+        _ => {
+            let room = PROGRESS_CHARS.saturating_sub(call.name.chars().count() + 1);
+            format!("{} {}", call.name, code(target, room))
+        }
     };
     Some(line)
 }
 
-/// `text` as inline code: the app reads progress as markdown, and a path
-/// like `src/__tests__/a.ts` must not turn bold. The fence is one backtick
+/// `text` as inline code of at most `room` characters, `text` cut with `…`
+/// to fit: the app reads progress as markdown, and a path like
+/// `src/__tests__/a.ts` must not turn bold. The fence is one backtick
 /// longer than any run inside.
-fn code(text: &str) -> String {
+fn code(text: &str, room: usize) -> String {
     let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
     let fence = "`".repeat(longest + 1);
+    let text = one_line(text, room.saturating_sub(2 * fence.len() + 2).max(1));
     let pad = if text.starts_with('`') || text.ends_with('`') {
         " "
     } else {
@@ -2012,12 +2024,12 @@ async fn form_waiting(manager: &AgentManager, task: &Task, title: &str) -> TaskC
 /// `dir` named from the home directory: `~` itself, `~/<rest>` below it,
 /// else as it is. Both are canonicalized first, so a home reached through a
 /// symlink still reads `~`.
-fn home_relative(dir: &str) -> String {
-    let Some(home) = dirs::home_dir() else {
+fn home_relative(dir: &str, home: Option<&Path>) -> String {
+    let Some(home) = home else {
         return dir.to_owned();
     };
     let real = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_owned());
-    match real(Path::new(dir)).strip_prefix(real(&home)) {
+    match real(Path::new(dir)).strip_prefix(real(home)) {
         Ok(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
         Ok(rest) => format!("~/{}", rest.display()),
         Err(_) => dir.to_owned(),
@@ -3643,14 +3655,18 @@ mod tests {
 
     #[test]
     fn a_folder_is_named_from_home() {
-        let home = dirs::home_dir().unwrap();
-        let home = home.to_str().unwrap();
+        // A home of its own, reached through a symlink as some are.
+        let root = crate::test_state_dir().join(format!("home-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("real/src/app")).unwrap();
+        let home = root.join("home");
+        std::os::unix::fs::symlink(root.join("real"), &home).unwrap();
+        let under = |rest: &str| home.join(rest).to_str().unwrap().to_owned();
         for (dir, named) in [
-            (home.to_owned(), "~"),
-            (format!("{home}/src/app"), "~/src/app"),
+            (under(""), "~"),
+            (under("src/app"), "~/src/app"),
             ("/opt/elsewhere".to_owned(), "/opt/elsewhere"),
         ] {
-            assert_eq!(home_relative(&dir), named, "{dir}");
+            assert_eq!(home_relative(&dir, Some(&home)), named, "{dir}");
         }
     }
 
@@ -3706,6 +3722,11 @@ mod tests {
             (
                 call("glob", Some("a`b"), json!({ "pattern": "a`b" })),
                 Some("glob ``a`b``"),
+            ),
+            // A long command is cut inside its fence, which stays closed.
+            (
+                call("bash", None, json!({ "command": "x".repeat(200) })),
+                Some(&*format!("bash `{}…`", "x".repeat(110))),
             ),
             (call("todowrite", None, json!({ "todos": [] })), None),
             (call("execute", None, json!({})), None),

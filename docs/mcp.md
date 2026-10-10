@@ -242,8 +242,8 @@ unknown id is `404 task_not_found`; any other failure is `500 task_failed`.
   a `.` running one sentence into the next as in `done.Next`, a `。`, `？` or
   `！`, or a line end; a goal that starts with a stop gives its first line).
   At most 60 characters, ending in `…` when cut: cut back to a word
-  boundary when that keeps at least 30 characters, else cut hard at 60. An open task's follows the
-  session's name as the agent renames it (a rename re-publishes the task;
+  boundary when that keeps at least 30 characters, else cut hard at 60.
+  An open task's follows the session's name as the agent renames it (a rename re-publishes the task;
   the name is held in memory, and the 60 s reconcile reads it again after a
   restart); when a session delegation ends, the name it had is stored with
   the task, which keeps it. A terminal agent's tab and pane are named the
@@ -258,7 +258,8 @@ unknown id is `404 task_not_found`; any other failure is `500 task_failed`.
   files included, else a command's first line, a pattern, a query or a url
   -- as inline code, since the app reads the line as markdown and a path
   like `src/__tests__/a.ts` must not turn bold; a title that only restates
-  the argument, as OpenCode's adapter derives them, counts as the argument; a
+  the argument, as OpenCode's adapter derives them, counts as the argument;
+  the argument is cut with `…` inside its backticks so the line fits; a
   failed call with its error; never a bare tool name -- a call whose
   arguments name nothing readable, or have not streamed in yet, leaves the
   line before) or

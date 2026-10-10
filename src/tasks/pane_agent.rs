@@ -250,8 +250,9 @@ pub(crate) async fn goal_accepted(session: &SessionConfig, pane_id: &str, prompt
 
 /// A task's title (and a terminal task's tab and pane title): its label,
 /// else the first sentence of the name its agent session gave itself, else
-/// its goal's first sentence ([`first_sentence`]) -- cut at a word to
-/// [`TITLE_CHARS`].
+/// its goal's first sentence ([`first_sentence`]) -- cut to
+/// [`TITLE_CHARS`] with `…`, back to a word when that keeps
+/// [`MIN_TITLE_CUT`] characters.
 pub(crate) fn title(label: Option<&str>, session_title: Option<&str>, goal: &str) -> String {
     let text = match (label, session_title) {
         (Some(label), _) => label,
