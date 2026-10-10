@@ -1249,6 +1249,26 @@ fn setting_value(setting: Setting, config: &crate::Config, autostart: &str) -> S
     }
 }
 
+/// `text` broken at spaces into lines of at most `width` cells; a word wider
+/// than that is cut with `…` on its own line.
+fn word_wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if !line.is_empty() && display_width(&line) + 1 + display_width(word) > width {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines.into_iter().map(|line| fit(&line, width)).collect()
+}
+
 /// `text` in at most `cells` cells, cut with `…` when it does not fit.
 fn fit(text: &str, cells: usize) -> String {
     if display_width(text) <= cells {
@@ -1973,8 +1993,13 @@ fn manage_lines(
         spans: Vec::new(),
         qr: None,
     };
+    let all_tabs: usize = Section::ALL
+        .iter()
+        .enumerate()
+        .map(|(index, section)| display_width(&format!(" {} {:?}  ", index + 1, section)))
+        .sum();
     for (index, section) in Section::ALL.iter().enumerate() {
-        if content < 60 && *section != ui.section {
+        if all_tabs > content && *section != ui.section {
             continue;
         }
         tabs.spans.push((
@@ -2130,13 +2155,12 @@ fn manage_lines(
             }
             body.push(ScreenLine::plain(""));
             body.extend(
-                wrapped_rows(
-                    "",
+                word_wrap(
                     "Enter opens the backend's actions. Removing a backend never closes its terminals.",
                     content,
                 )
                 .into_iter()
-                .map(|line| ScreenLine::text(line.spans[0].0.trim_start(), Tone::Quiet)),
+                .map(|line| ScreenLine::text(line, Tone::Quiet)),
             );
             body.push(ScreenLine::text(
                 "Changes apply after a Gateway restart.",
@@ -2301,9 +2325,9 @@ fn manage_lines(
                         "A gateway device is another of your computers; revoking it stops that computer sending work here.",
                     ] {
                         body.extend(
-                            wrapped_rows("", text, content)
+                            word_wrap(text, content)
                                 .into_iter()
-                                .map(|line| ScreenLine::text(line.spans[0].0.trim_start(), Tone::Quiet)),
+                                .map(|line| ScreenLine::text(line, Tone::Quiet)),
                         );
                     }
                 }
