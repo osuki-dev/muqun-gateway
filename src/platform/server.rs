@@ -64,9 +64,15 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
 
     // Bind successfully before starting anything on the user's behalf.
     let listener = gateway_listener::bind(addr).await?;
-    if config.mcp.enabled {
-        crate::mcp::mint_identity()?;
-    }
+    // Per process: minted now, removed when the gateway stops.
+    let identity = if config.mcp.enabled {
+        Some(crate::mcp::mint_identity()?)
+    } else {
+        if let Ok(file) = crate::mcp::identity_file() {
+            let _ = std::fs::remove_file(file);
+        }
+        None
+    };
     // A non-loopback listen address: `/mcp` gets its own loopback listener,
     // whose URL every agent registration uses from here on.
     let mcp_listeners = if config.mcp.enabled {
@@ -74,7 +80,7 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     } else {
         None
     };
-    let _endpoint_record = match mcp_listeners
+    let endpoint_record = match mcp_listeners
         .as_ref()
         .and_then(|listeners| listeners.first())
     {
@@ -86,6 +92,16 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
             None
         }
     };
+    // Kept for the life of the process; removed when it stops.
+    let records = [identity.as_ref(), endpoint_record.as_ref()];
+    let kept: Vec<_> = records
+        .iter()
+        .flatten()
+        .map(|record| record.path().to_owned())
+        .collect();
+    if !kept.is_empty() {
+        crate::mcp::remove_on_stop(kept);
+    }
     // One background attempt per opted-in backend; no restart/logging loop.
     backend_startup::spawn(&config);
 

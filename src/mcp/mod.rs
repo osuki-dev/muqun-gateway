@@ -92,7 +92,7 @@ pub(crate) async fn bind_loopback(
 /// it. On any other port, the address is written to [`endpoint_file`]
 /// (0600, atomically) and the returned record removes it again -- when it is
 /// dropped, or on SIGTERM/SIGINT, so no stale address outlives the gateway.
-pub(crate) fn announce_loopback(port: u16, configured: u16) -> Option<EndpointRecord> {
+pub(crate) fn announce_loopback(port: u16, configured: u16) -> Option<FileRecord> {
     let url = format!("http://127.0.0.1:{port}{MCP_PATH}");
     tracing::info!("MCP for this computer's agents on {url}");
     let _ = LOOPBACK_URL.set(url.clone());
@@ -101,27 +101,25 @@ pub(crate) fn announce_loopback(port: u16, configured: u16) -> Option<EndpointRe
         let _ = std::fs::remove_file(&file);
         return None;
     }
-    let record = record_endpoint(file, &url)?;
-    remove_on_stop(record.0.clone());
-    Some(record)
+    record_endpoint(file, &url)
 }
 
 /// Write `url` to `file` and hold it there until the record is dropped or
 /// the process is told to stop.
-fn record_endpoint(file: std::path::PathBuf, url: &str) -> Option<EndpointRecord> {
+fn record_endpoint(file: std::path::PathBuf, url: &str) -> Option<FileRecord> {
     if let Err(error) = crate::platform::store::write_secret_file(&file, url.as_bytes()) {
         tracing::warn!(%error, "could not record the loopback MCP address");
         return None;
     }
-    Some(EndpointRecord(file))
+    Some(FileRecord(file))
 }
 
-/// On SIGTERM or SIGINT, remove `file`, then exit: a gateway stopped by its
-/// service manager leaves no stale address behind.
-fn remove_on_stop(file: std::path::PathBuf) {
+/// On SIGTERM or SIGINT, remove `files`, then exit: a gateway stopped by its
+/// service manager leaves no stale address or identity behind.
+pub(crate) fn remove_on_stop(files: Vec<std::path::PathBuf>) {
     #[cfg(unix)]
     {
-        let on_stop = file;
+        let on_stop = files;
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 use tokio::signal::unix::{signal, SignalKind};
@@ -135,19 +133,28 @@ fn remove_on_stop(file: std::path::PathBuf) {
                     _ = term.recv() => {}
                     _ = int.recv() => {}
                 }
-                let _ = std::fs::remove_file(&on_stop);
+                for file in &on_stop {
+                    let _ = std::fs::remove_file(file);
+                }
                 std::process::exit(0);
             });
         }
     }
     #[cfg(not(unix))]
-    let _ = file;
+    let _ = files;
 }
 
-/// The recorded loopback address, removed when this is dropped.
-pub(crate) struct EndpointRecord(std::path::PathBuf);
+/// A file this gateway process keeps (its loopback address, its identity),
+/// removed when this is dropped.
+pub(crate) struct FileRecord(std::path::PathBuf);
 
-impl Drop for EndpointRecord {
+impl FileRecord {
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for FileRecord {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
@@ -198,43 +205,103 @@ pub(crate) fn loopback_router(state: AppState) -> Router {
 }
 
 /// This gateway process's identity: a random secret, minted at startup and
-/// written to [`identity_file`] (0600). Only a loopback caller with no proxy
-/// headers is told it ([`identity`]), so a process squatting an old `/mcp`
-/// address cannot know it, and the public address never serves it.
-static IDENTITY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+/// written to [`identity_file`] (0600, removed when the gateway stops). It
+/// is never served: `POST /mcp/identity` answers a caller's fresh challenge
+/// with an HMAC under it ([`identity`]), which only a process holding the
+/// file -- the token helper, as the same user -- can check.
+static IDENTITY: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
 
 pub(crate) fn identity_file() -> anyhow::Result<std::path::PathBuf> {
     Ok(crate::platform::store::state_dir()?.join("mcp-identity"))
 }
 
-/// Mint this process's identity and write it where the token helper (the
-/// same user) reads it.
-pub(crate) fn mint_identity() -> anyhow::Result<()> {
+/// Mint this process's identity and write it where the token helper reads
+/// it; the returned record removes the file again when dropped.
+pub(crate) fn mint_identity() -> anyhow::Result<FileRecord> {
     let secret =
         uuid::Uuid::new_v4().simple().to_string() + &uuid::Uuid::new_v4().simple().to_string();
-    crate::platform::store::write_secret_file(&identity_file()?, secret.as_bytes())?;
-    let _ = IDENTITY.set(secret);
-    Ok(())
+    let file = identity_file()?;
+    crate::platform::store::write_secret_file(&file, secret.as_bytes())?;
+    if let Ok(mut identity) = IDENTITY.write() {
+        *identity = Some(secret);
+    }
+    Ok(FileRecord(file))
 }
 
-/// `GET /mcp/identity`: the identity, to a loopback caller only.
+/// `HMAC-SHA256(secret, challenge)`, hex.
+pub(crate) fn identity_proof(secret: &str, challenge: &str) -> String {
+    use hmac::{KeyInit as _, Mac as _};
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes())
+        .expect("HMAC takes a key of any length");
+    mac.update(challenge.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
+
+/// At most this many identity proofs a second: the check is cheap, but
+/// there is no reason to serve thousands.
+const IDENTITY_PROOFS_PER_SECOND: u32 = 20;
+static IDENTITY_RATE: std::sync::Mutex<Option<(std::time::Instant, u32)>> =
+    std::sync::Mutex::new(None);
+
+fn identity_rate_allows() -> bool {
+    let Ok(mut rate) = IDENTITY_RATE.lock() else {
+        return false;
+    };
+    let now = std::time::Instant::now();
+    let (since, count) = rate.get_or_insert((now, 0));
+    if now.duration_since(*since) >= std::time::Duration::from_secs(1) {
+        (*since, *count) = (now, 0);
+    }
+    *count += 1;
+    *count <= IDENTITY_PROOFS_PER_SECOND
+}
+
+#[derive(serde::Deserialize)]
+struct Challenge {
+    challenge: String,
+}
+
+/// `POST /mcp/identity {challenge}`: `{proof}`, this gateway's identity
+/// applied to the caller's fresh challenge. Loopback callers without proxy
+/// headers only; the secret itself never leaves the process.
 async fn identity(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: axum::http::HeaderMap,
+    body: Result<axum::Json<Challenge>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    use axum::http::StatusCode;
     if !auth::is_loopback(Some(peer)) || auth::refuse_for_proxy(&headers) {
-        return axum::http::StatusCode::FORBIDDEN.into_response();
+        return StatusCode::FORBIDDEN.into_response();
     }
-    match IDENTITY.get() {
-        Some(identity) => axum::Json(serde_json::json!({ "identity": identity })).into_response(),
-        None => axum::http::StatusCode::NOT_FOUND.into_response(),
+    if !identity_rate_allows() {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
+    let Ok(axum::Json(Challenge { challenge })) = body else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if challenge.len() < 32 || challenge.len() > 128 {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let secret = IDENTITY.read().ok().and_then(|identity| identity.clone());
+    match secret {
+        Some(secret) => {
+            axum::Json(serde_json::json!({ "proof": identity_proof(&secret, &challenge) }))
+                .into_response()
+        }
+        None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
 /// Whether what answers at `url` -- the exact address the host was given --
-/// is this gateway: it must tell, unasked for any credential, the identity
-/// in [`identity_file`]. Otherwise no token goes there. `Err` says why not.
-pub(crate) fn verify_identity(url: &str, expected: &str) -> Result<(), String> {
+/// is this gateway: asked, with no credential, to prove it holds `secret`
+/// (the content of [`identity_file`]) on a fresh challenge. Otherwise no
+/// token goes there. An empty `secret` is no gateway running. `Err` says why not.
+pub(crate) fn verify_identity(url: &str, secret: &str) -> Result<(), String> {
+    if secret.is_empty() {
+        return Err(String::from(
+            "muqun: the gateway is not running; not sending a token",
+        ));
+    }
     let at = url
         .trim_start_matches("http://")
         .trim_end_matches(MCP_PATH)
@@ -247,8 +314,10 @@ pub(crate) fn verify_identity(url: &str, expected: &str) -> Result<(), String> {
             "muqun: {url} is not on this computer's loopback; not sending the token"
         ));
     }
-    match crate::cli::local_api::identity_at(address) {
-        Ok(Some(answered)) if !expected.is_empty() && answered == expected => Ok(()),
+    let challenge =
+        uuid::Uuid::new_v4().simple().to_string() + &uuid::Uuid::new_v4().simple().to_string();
+    match crate::cli::local_api::identity_proof_at(address, &challenge) {
+        Ok(Some(proof)) if proves(secret, &challenge, &proof) => Ok(()),
         Ok(_) => Err(format!(
             "muqun: another process answers on {at}; not sending the token"
         )),
@@ -256,6 +325,18 @@ pub(crate) fn verify_identity(url: &str, expected: &str) -> Result<(), String> {
             "muqun: nothing answers on {at}; not sending the token"
         )),
     }
+}
+
+/// Whether `proof` is `secret` applied to `challenge`, compared in constant time.
+fn proves(secret: &str, challenge: &str, proof: &str) -> bool {
+    use hmac::{KeyInit as _, Mac as _};
+    let Ok(proof) = hex::decode(proof) else {
+        return false;
+    };
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes())
+        .expect("HMAC takes a key of any length");
+    mac.update(challenge.as_bytes());
+    mac.verify_slice(&proof).is_ok()
 }
 
 pub(crate) fn local_url(listen: &str) -> String {
@@ -274,7 +355,7 @@ pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
     token_routes::mount(
         router
             .route(MCP_PATH, any(serve))
-            .route("/mcp/identity", axum::routing::get(identity)),
+            .route("/mcp/identity", axum::routing::post(identity)),
     )
 }
 
@@ -671,33 +752,43 @@ mod tests {
         });
         let squatter = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let squatter_at = squatter.local_addr().unwrap();
-        // It can answer anything public; it cannot know the secret.
+        // It may even have read an old answer; it cannot prove a fresh one.
         let imposter = Router::new().route(
             "/mcp/identity",
-            axum::routing::get(|| async { axum::Json(json!({ "identity": "a guess" })) }),
+            axum::routing::post(|| async { axum::Json(json!({ "proof": "00".repeat(32) })) }),
         );
         tokio::spawn(async move { axum::serve(squatter, imposter).await });
-        mint_identity().unwrap();
-        let own = IDENTITY.get().unwrap().clone();
+        let record = mint_identity().unwrap();
+        let own = std::fs::read_to_string(record.path()).unwrap();
         let checks = tokio::task::spawn_blocking(move || {
-            (
+            [
                 verify_identity(&format!("http://{ours_at}{MCP_PATH}"), &own),
                 verify_identity(&format!("http://{squatter_at}{MCP_PATH}"), &own),
-            )
+                // No identity file: no gateway running, no token.
+                verify_identity(&format!("http://{ours_at}{MCP_PATH}"), ""),
+            ]
         })
         .await
         .unwrap();
-        assert_eq!(checks.0, Ok(()));
         assert_eq!(
-            checks.1,
-            Err(format!(
-                "muqun: another process answers on {squatter_at}; not sending the token"
-            ))
+            checks,
+            [
+                Ok(()),
+                Err(format!(
+                    "muqun: another process answers on {squatter_at}; not sending the token"
+                )),
+                Err(String::from(
+                    "muqun: the gateway is not running; not sending a token"
+                )),
+            ]
         );
         // The public address never tells it.
-        let remote = Request::get("/mcp/identity")
+        let remote = Request::post("/mcp/identity")
+            .header("content-type", "application/json")
             .extension(ConnectInfo("100.64.0.5:1".parse::<SocketAddr>().unwrap()))
-            .body(Body::empty())
+            .body(Body::from(
+                json!({ "challenge": "c".repeat(64) }).to_string(),
+            ))
             .unwrap();
         let answer = self::tests::app(&state).oneshot(remote).await.unwrap();
         assert_eq!(answer.status(), StatusCode::FORBIDDEN);

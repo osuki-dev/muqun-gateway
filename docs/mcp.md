@@ -124,14 +124,17 @@ when it stops (SIGTERM/SIGINT or a normal exit). `mcp enable` reads it, and
 configured address keeps refusing `/mcp` (`403 mcp_loopback_only`).
 
 Identity comes before credentials. At startup the gateway mints a random
-secret identity, writes it to `<state>/mcp-identity` (0600), and tells it on
-`GET /mcp/identity` to a loopback caller with no proxy headers only, never on
-the public address. Every helper command the gateway hands out (and `mcp
-enable` writes) carries the exact `/mcp` address the host was given (`mcp
-token-helper --url <url>`); before printing a token, the helper asks that
-address for its identity, with no credential, and compares it with the file.
-Anything else answering there -- a process that took a stale port -- cannot
-know the secret and gets nothing: the helper prints `another process answers
+secret identity and writes it to `<state>/mcp-identity` (0600, removed when it
+stops); the secret is never served. `POST /mcp/identity {challenge}` answers
+`{proof}`, `HMAC-SHA256(secret, challenge)` in hex, to a loopback caller with
+no proxy headers only, at most 20 a second. Every helper command the gateway
+hands out (and `mcp enable` writes) carries the exact `/mcp` address the host
+was given (`mcp token-helper --url <url>`); before printing a token, the
+helper reads the identity file itself, sends that address a fresh random
+challenge with no credential, and checks the proof in constant time. No
+identity file means no gateway running: no token. Anything else answering
+there -- a process that took a stale port -- cannot prove the secret and gets
+nothing: the helper prints `another process answers
 on 127.0.0.1:<port>; not sending the token` and exits 1. `mcp enable` writes
 the configured port's address, never an ephemeral fallback.
 

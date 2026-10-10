@@ -64,22 +64,28 @@ fn parse_response(response: &str) -> anyhow::Result<(u16, Value)> {
     Ok((status, serde_json::from_str(body).unwrap_or(Value::Null)))
 }
 
-/// What answers at `address` gives as its loopback identity
-/// (`GET /mcp/identity`) -- asked with no credential at all, so a stranger
-/// on that port learns nothing. `None`: it answered without one.
-pub(crate) fn identity_at(address: SocketAddr) -> anyhow::Result<Option<String>> {
+/// What answers at `address` gives as proof of its identity for
+/// `challenge` (`POST /mcp/identity`) -- asked with no credential at all, so
+/// a stranger on that port learns nothing. `None`: it answered without one.
+pub(crate) fn identity_proof_at(
+    address: SocketAddr,
+    challenge: &str,
+) -> anyhow::Result<Option<String>> {
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(1))?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-    let request =
-        format!("GET /mcp/identity HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
+    let body = serde_json::json!({ "challenge": challenge }).to_string();
+    let request = format!(
+        "POST /mcp/identity HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
     stream.write_all(request.as_bytes())?;
     let mut response = String::new();
     (&mut stream)
         .take(MAX_RESPONSE)
         .read_to_string(&mut response)?;
     let (_, value) = parse_response(&response)?;
-    Ok(value["identity"].as_str().map(str::to_owned))
+    Ok(value["proof"].as_str().map(str::to_owned))
 }
 
 /// Send one authenticated request to the gateway on this machine.
