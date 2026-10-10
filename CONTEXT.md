@@ -133,8 +133,11 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
   `auth.rs`), the eight tools in `tools.rs` (which file what they start under
   the calling task through `lineage.rs`), assistant tokens (`tokens.rs`,
   `tokens_sqlite.rs`, pane-bound issue and sweep in `issue.rs`,
-  `/api/mcp/tokens*` in `token_routes.rs`), and per-host client config in
-  `hosts.rs`. Off with `mcp.enabled: false`; contract in `docs/mcp.md`.
+  `/api/mcp/tokens*` in `token_routes.rs`), per-host client config in
+  `hosts.rs`, and the server handed at launch to the agents the gateway
+  starts (`inject.rs`: Claude Code's `--mcp-config`, Codex's `-c`, OpenCode's
+  runtime API; no user file is written). Off with `mcp.enabled: false`;
+  contract in `docs/mcp.md`.
 - `src/platform/`: shared infrastructure.
   - `store/`: the shared SQLite store (`sqlite.rs`, one worker thread,
     migrations per domain) and its optional SQLCipher key file (`db_key.rs`);

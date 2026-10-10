@@ -148,6 +148,11 @@ pub(crate) struct Config {
 pub(crate) struct McpConfig {
     #[serde(default = "mcp_enabled_default")]
     pub(crate) enabled: bool,
+    /// Give the agents the gateway starts the muqun server at launch
+    /// (`mcp::inject`), without writing their configuration. Omitted from
+    /// a written config while on.
+    #[serde(default = "mcp_enabled_default", skip_serializing_if = "is_true")]
+    pub(crate) inject_into_agents: bool,
 }
 
 fn mcp_enabled_default() -> bool {
@@ -156,7 +161,10 @@ fn mcp_enabled_default() -> bool {
 
 impl Default for McpConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            inject_into_agents: true,
+        }
     }
 }
 

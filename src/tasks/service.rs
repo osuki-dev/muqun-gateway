@@ -849,7 +849,15 @@ impl TaskService {
             };
             self.store().transition(&task.id, dispatching).await?;
             self.bind_session(&asid.0, &task.id);
-            // The goal alone: how to say it ended is the MCP server's.
+            // The goal alone: how to say it ended is the MCP server's, which
+            // the agent's service is given now if it does not have it.
+            crate::mcp::inject::ensure_session_agent(
+                &state.config,
+                state.mcp_tokens.as_ref(),
+                manager.agent().as_ref(),
+                request.cwd.as_deref(),
+            )
+            .await;
             manager
                 .prompts()
                 .send_prompt(&asid, &request.goal, &[], None)

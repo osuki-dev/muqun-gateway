@@ -409,6 +409,7 @@ pub(crate) fn manage() -> anyhow::Result<()> {
                         Setting::AgentBypass => message = toggle_agent_bypass()?,
                         Setting::AgentTrust => message = toggle_agent_trust()?,
                         Setting::Mcp => message = toggle_mcp()?,
+                        Setting::McpInject => message = toggle_mcp_inject()?,
                         Setting::StoreEncryption | Setting::AgentEnv | Setting::McpLoopback => {
                             message = setting.read_only().unwrap_or(IDLE_STATUS).to_owned();
                         }
@@ -1073,11 +1074,12 @@ enum Setting {
     AgentTrust,
     AgentEnv,
     Mcp,
+    McpInject,
     McpLoopback,
 }
 
 impl Setting {
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 13] = [
         Self::Autostart,
         Self::Address,
         Self::DetectAddress,
@@ -1089,6 +1091,7 @@ impl Setting {
         Self::AgentTrust,
         Self::AgentEnv,
         Self::Mcp,
+        Self::McpInject,
         Self::McpLoopback,
     ];
 
@@ -1103,7 +1106,7 @@ impl Setting {
             Self::AgentBypass | Self::AgentTrust | Self::AgentEnv => {
                 "AGENTS STARTED FROM THE PHONE"
             }
-            Self::Mcp | Self::McpLoopback => "ASSISTANT ACCESS",
+            Self::Mcp | Self::McpInject | Self::McpLoopback => "ASSISTANT ACCESS",
         }
     }
 
@@ -1120,6 +1123,7 @@ impl Setting {
             Self::AgentTrust => "Trust the task folder automatically",
             Self::AgentEnv => "Environment passed to agents",
             Self::Mcp => "MCP server",
+            Self::McpInject => "Give started agents the muqun tools",
             Self::McpLoopback => "Loopback only",
         }
     }
@@ -1144,6 +1148,9 @@ impl Setting {
             }
             Self::AgentEnv => "Variables every agent the gateway starts receives.",
             Self::Mcp => "Lets agents on this computer use the muqun tools (tasks, fleet).",
+            Self::McpInject => {
+                "Agents Gateway starts get the tools at launch; your agent configs stay untouched."
+            }
             Self::McpLoopback => "The MCP endpoint answers this computer only.",
         }
     }
@@ -1162,6 +1169,7 @@ impl Setting {
             Self::AgentTrust => "Pre-accepts the folder trust dialog.",
             Self::AgentEnv => "Variables agents receive.",
             Self::Mcp => "Agents here use the muqun tools.",
+            Self::McpInject => "Started agents get the tools at launch.",
             Self::McpLoopback => "Answers this computer only.",
         }
     }
@@ -1172,6 +1180,7 @@ impl Setting {
             Self::AgentBypass => "Skip approval prompts",
             Self::AgentTrust => "Trust task folder",
             Self::AgentEnv => "Agent environment",
+            Self::McpInject => "Tools for started agents",
             other => other.label(),
         }
     }
@@ -1188,6 +1197,7 @@ impl Setting {
             Self::AgentTrust => Some("config.json › agent_trust_folders"),
             Self::AgentEnv => Some("config.json › agent_env"),
             Self::Mcp => Some("config.json › mcp.enabled"),
+            Self::McpInject => Some("config.json › mcp.inject_into_agents"),
             Self::DetectAddress | Self::Updates | Self::McpLoopback => None,
         }
     }
@@ -1204,6 +1214,7 @@ impl Setting {
                 | Self::AgentBypass
                 | Self::AgentTrust
                 | Self::Mcp
+                | Self::McpInject
         )
     }
 
@@ -1286,6 +1297,7 @@ fn setting_value(setting: Setting, config: &crate::Config, autostart: &str) -> S
             }
         }
         Setting::Mcp => on_off(config.mcp.enabled).to_owned(),
+        Setting::McpInject => on_off(config.mcp.inject_into_agents).to_owned(),
         Setting::McpLoopback => String::from("On · read-only"),
     }
 }
@@ -1492,6 +1504,15 @@ fn toggle_agent_trust() -> anyhow::Result<String> {
     Ok(format!(
         "Trust the task folder automatically: {}; press r to restart Gateway and apply.",
         on_off(trust)
+    ))
+}
+
+fn toggle_mcp_inject() -> anyhow::Result<String> {
+    let inject = !load_config(None)?.mcp.inject_into_agents;
+    write_config_key(&["mcp", "inject_into_agents"], Some(Value::Bool(inject)))?;
+    Ok(format!(
+        "Give started agents the muqun tools: {}; press r to restart Gateway and apply.",
+        on_off(inject)
     ))
 }
 
@@ -3347,6 +3368,11 @@ mod tests {
                 "Off",
             ),
             (Setting::Autostart, serde_json::json!({}), "Off"),
+            (
+                Setting::McpInject,
+                serde_json::json!({ "mcp": { "inject_into_agents": false } }),
+                "Off",
+            ),
         ];
         for (setting, change, value) in cases {
             assert_eq!(
@@ -3368,6 +3394,7 @@ mod tests {
                     | Setting::AgentBypass
                     | Setting::AgentTrust
                     | Setting::Mcp
+                    | Setting::McpInject
             );
             assert_eq!(setting.needs_restart(), restarts, "{setting:?}");
         }

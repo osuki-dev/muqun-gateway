@@ -715,6 +715,8 @@ pub(crate) async fn start_agent_in_place(
         &trusted_folders(state, agent_cwd.as_deref()),
         &state.config.agent_launch_args,
     );
+    // The muqun server for the agent's own process, never its config.
+    agent_args.extend(crate::mcp::inject::terminal_args(&state.config, agent).await);
     let launch_prompt = prompt
         .filter(|_| terminal_backend(session).takes_launch_prompt())
         .and_then(|prompt| Some((prompt, tasks::launch_prompt_args(agent, prompt)?)));

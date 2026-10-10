@@ -154,6 +154,31 @@ Error codes:
 
 ## Host setup
 
+An agent gets the muqun server one of two ways:
+
+1. **The gateway hands it to the agents it starts**, at launch, without
+   writing any of the user's files (`mcp.inject_into_agents`, on by default;
+   off with it or with `mcp.enabled: false`; "Give started agents the muqun
+   tools" in `manage` › Settings):
+   - Claude Code starts with `--mcp-config <state dir>/mcp-claude.json`: the
+     same entry `mcp enable claude` writes (URL and token helper, no token),
+     added to the user's own servers (`--strict-mcp-config` is never used).
+   - Codex starts with `-c mcp_servers.muqun.url="…"` and
+     `-c mcp_servers.muqun.http_headers_helper="…"`, which set those keys for
+     that run only and leave the user's other servers alone.
+   - OpenCode, a running service, is given the server through its runtime
+     API before a delegation (`PUT /api/experimental/mcp/muqun` for the
+     task's directory, an agent-bound token in its `Authorization` header,
+     Code Mode off so `tasks.complete` is a direct tool) when it is not
+     already connected; it lasts until the service restarts and is given
+     again on the next delegation. The service is shared, so the user's own
+     OpenCode sessions in that directory see the tools too; the server's
+     instructions tell them they are not in a task.
+   - T3 Code and DeepSeek take no MCP server: their tasks end
+     `idle_unconfirmed`, or on a marker.
+2. **The user registers it** with `mcp enable` below, for agents they start
+   by hand.
+
 `muqun-gateway mcp enable <host>` points a host at the gateway. `--url`
 overrides the default `http://127.0.0.1:<port>/mcp`; `--project <dir>` is
 where a project file is written. `muqun-gateway mcp disable <host>` removes the

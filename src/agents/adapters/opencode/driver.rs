@@ -519,6 +519,36 @@ impl AgentPort for OpencodeDriver {
         })
     }
 
+    fn adds_mcp_servers(&self) -> bool {
+        true
+    }
+
+    fn mcp_server_connected<'a>(
+        &'a self,
+        name: &'a str,
+        directory: Option<&'a str>,
+    ) -> AgentFuture<'a, bool> {
+        Box::pin(async move {
+            let servers = self.client.get_mcp(directory).await?;
+            Ok(servers.iter().any(|server| {
+                server.get("name").and_then(Value::as_str) == Some(name)
+                    && server.pointer("/status/status").and_then(Value::as_str) == Some("connected")
+            }))
+        })
+    }
+
+    fn add_mcp_server<'a>(
+        &'a self,
+        name: &'a str,
+        config: &'a Value,
+        directory: Option<&'a str>,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            self.client.add_mcp_server(name, config, directory).await?;
+            Ok(())
+        })
+    }
+
     fn revert_session<'a>(
         &'a self,
         session_id: &'a str,

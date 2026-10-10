@@ -126,6 +126,37 @@ pub trait AgentPort: Send + Sync {
         delivery: Option<&'a str>,
     ) -> AgentFuture<'a, ()>;
 
+    /// Whether the agent's service takes an MCP server at runtime
+    /// ([`AgentPort::add_mcp_server`]).
+    fn adds_mcp_servers(&self) -> bool {
+        false
+    }
+
+    /// Whether the MCP server `name` is connected for `directory`.
+    fn mcp_server_connected<'a>(
+        &'a self,
+        _name: &'a str,
+        _directory: Option<&'a str>,
+    ) -> AgentFuture<'a, bool> {
+        Box::pin(async { Ok(false) })
+    }
+
+    /// Register (or replace) the MCP server `name` with `config` for
+    /// `directory` until the service restarts; no configuration file is
+    /// written.
+    fn add_mcp_server<'a>(
+        &'a self,
+        _name: &'a str,
+        _config: &'a serde_json::Value,
+        _directory: Option<&'a str>,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async {
+            Err(AgentError::InvalidRequest(
+                "this agent takes no MCP server at runtime".into(),
+            ))
+        })
+    }
+
     /// Revert session to a previous message and roll back file changes
     fn revert_session<'a>(
         &'a self,

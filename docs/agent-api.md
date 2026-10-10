@@ -314,6 +314,11 @@ pane, so these agents start with their own bypass flags by default:
 | `claude` | `--dangerously-skip-permissions` |
 | any other | none |
 
+Claude Code and Codex started this way also get the muqun MCP server on their
+launch line (`--mcp-config …`, `-c mcp_servers.muqun.…`) unless
+`mcp.inject_into_agents` is off; see [docs/mcp.md](mcp.md#host-setup). Their
+own configuration files are never written.
+
 `config.json` changes this per kind: a non-empty list replaces the defaults,
 an empty list turns them off. A task's own `agent_args` come after them.
 

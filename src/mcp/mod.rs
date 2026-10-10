@@ -11,6 +11,7 @@
 
 pub(crate) mod auth;
 pub(crate) mod hosts;
+pub(crate) mod inject;
 pub(crate) mod issue;
 pub(crate) mod lineage;
 pub(crate) mod token_routes;
