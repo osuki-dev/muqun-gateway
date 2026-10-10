@@ -104,6 +104,37 @@ pub(crate) fn announce_loopback(port: u16, configured: u16) -> Option<FileRecord
     record_endpoint(file, &url)
 }
 
+/// What [`endpoint_file`] holds when the loopback listener could not be
+/// bound: agents here get no muqun tools.
+pub(crate) const NOT_LISTENING: &str = "not listening";
+
+/// The loopback listener a non-loopback gateway needs could not be bound:
+/// recorded for `manage` (and removed with the gateway).
+pub(crate) fn announce_not_listening() -> Option<FileRecord> {
+    record_endpoint(endpoint_file().ok()?, NOT_LISTENING)
+}
+
+/// Whether this gateway's own agents can reach `/mcp` on loopback: its
+/// listen address serves loopback, or the loopback listener beside it runs.
+pub(crate) fn serves_agents(listen: &str) -> bool {
+    loopback_warning(listen).is_none() || LOOPBACK_URL.get().is_some()
+}
+
+/// What `manage` shows for `/mcp`: `127.0.0.1:<port>`, or `not listening`
+/// when the running gateway could not bind its loopback listener.
+pub(crate) fn listening_line(listen: &str) -> String {
+    let recorded = endpoint_file()
+        .ok()
+        .and_then(|file| std::fs::read_to_string(file).ok());
+    if recorded.as_deref().map(str::trim) == Some(NOT_LISTENING) {
+        return NOT_LISTENING.to_owned();
+    }
+    recorded_url(listen)
+        .trim_start_matches("http://")
+        .trim_end_matches(MCP_PATH)
+        .to_owned()
+}
+
 /// Write `url` to `file` and hold it there until the record is dropped or
 /// the process is told to stop.
 fn record_endpoint(file: std::path::PathBuf, url: &str) -> Option<FileRecord> {
@@ -804,6 +835,19 @@ mod tests {
             .unwrap();
         let answer = self::tests::app(&state).oneshot(remote).await.unwrap();
         assert_eq!(answer.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// A tailnet-only gateway whose loopback listener could not be bound does
+    /// not claim agents can reach /mcp (capabilities, manage).
+    #[test]
+    fn mcp_is_claimed_only_where_agents_reach_it() {
+        for (listen, reached) in [
+            ("127.0.0.1:23847", true),
+            ("0.0.0.0:23847", true),
+            ("100.64.0.7:23847", false),
+        ] {
+            assert_eq!(serves_agents(listen), reached, "{listen}");
+        }
     }
 
     #[test]

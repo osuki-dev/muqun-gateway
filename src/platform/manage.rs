@@ -2279,10 +2279,7 @@ fn manage_lines(
             if config.mcp.enabled {
                 // Where this computer's agents reach /mcp: the loopback
                 // listener a non-loopback gateway runs beside its own.
-                let url = crate::mcp::recorded_url(&config.listen);
-                let at = url
-                    .trim_start_matches("http://")
-                    .trim_end_matches(crate::mcp::MCP_PATH);
+                let at = crate::mcp::listening_line(&config.listen);
                 rows.push(ScreenLine::plain(format!("MCP: {at}")));
             }
             let gateways = data

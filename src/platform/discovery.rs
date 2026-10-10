@@ -391,7 +391,7 @@ pub async fn build_discovery(state: &AppState, _sealed: bool, authenticated: boo
     });
     let legacy_capabilities: Vec<String> = crate::gateway_capabilities(
         collaboration_somewhere,
-        state.config.mcp.enabled,
+        state.config.mcp.enabled && crate::mcp::serves_agents(&state.config.listen),
         state.config.history.storage == crate::platform::config::HistoryStorage::Sqlite,
     )
     .into_iter()

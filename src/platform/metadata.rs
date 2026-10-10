@@ -322,7 +322,9 @@ pub(crate) async fn gateway_metadata(
         "legacyUnversionedApi": true,
         "capabilities": gateway_capabilities(
             collaboration_somewhere,
-            state.config.mcp.enabled,
+            // Not when this gateway's agents cannot reach /mcp (its loopback
+            // listener could not be bound).
+            state.config.mcp.enabled && crate::mcp::serves_agents(&state.config.listen),
             state.config.history.storage == crate::platform::config::HistoryStorage::Sqlite,
         ),
         "planes": planes,

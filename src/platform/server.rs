@@ -90,6 +90,10 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         .and_then(|listeners| listeners.first())
     {
         Some(listener) => crate::mcp::announce_loopback(listener.local_addr()?.port(), addr.port()),
+        // Needed and not bound: say so where manage and the CLI look.
+        None if config.mcp.enabled && crate::mcp::loopback_warning(&config.listen).is_some() => {
+            crate::mcp::announce_not_listening()
+        }
         None => {
             if let Ok(file) = crate::mcp::endpoint_file() {
                 let _ = std::fs::remove_file(file);
