@@ -734,7 +734,10 @@ neither heard from nor pinged in the last 60 s is `reachable: null` (not
 checked yet); the call starts a check of it in the background -- one at a
 time per computer -- so the next call knows (one that no longer knows this
 gateway's token is marked `unauthorized` and `reachable: false`). After a check it is `reachable`
-while its last answer is under 2 minutes old. Its manifest (`GET
+while its last answer is under 2 minutes old -- and not reachable at once,
+its last answer kept (`peer_last_seen_ms`), when its task socket closes or a
+call to it fails, until it answers again; the driver's 60 s pass is the
+fallback. Its manifest (`GET
 /api/fleet/self` on it, compacted to the keys above: strings of at most 256
 characters, numbers and booleans, each list at most 64 items) is asked for
 again in the same background step at most once a minute, answered or not,

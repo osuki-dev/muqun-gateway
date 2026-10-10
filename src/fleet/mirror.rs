@@ -66,7 +66,7 @@ pub(crate) async fn delegate(
     let Some(peer) = state.peers.checked(state, peer).await else {
         return Err(TaskError::PeerUnauthorized(name));
     };
-    if !peer.reachable(now_ms()) {
+    if !state.peers.reachable(&peer, now_ms()) {
         return Err(TaskError::MachineUnreachable(name));
     }
     let now = now_ms();
@@ -286,15 +286,19 @@ async fn follow(state: AppState, peer_id: String) {
                 match follow_feed(&state, &client, &peer, &mut feed).await {
                     Ended::Idle => return leave(&state, &peer_id).await,
                     Ended::Forgotten => return,
+                    // The socket closing is the peer going away: unreachable
+                    // now, not once its last answer is two minutes old.
                     Ended::Socket if opened.elapsed() >= IDLE_CHECK => {
+                        state.peers.presence.down(&peer_id);
                         retry = RETRY_FIRST;
                         continue;
                     }
-                    Ended::Socket => {}
+                    Ended::Socket => state.peers.presence.down(&peer_id),
                 }
             }
             Err(PeerError::Unauthorized) => return unauthorized(&state, &peer_id).await,
             Err(_) => {
+                state.peers.presence.down(&peer_id);
                 if !read_all(&state, &client, &peer).await {
                     return;
                 }
@@ -426,6 +430,7 @@ async fn refresh(
         // `peer_reachable`/`peer_last_seen_ms` (§10.12) reach the phone and
         // a blocked `tasks.wait` wakes to them.
         Err(_) => {
+            state.peers.presence.down(&peer.peer_id);
             state.tasks.republish(mirror).await;
             Some(false)
         }
@@ -1021,15 +1026,21 @@ mod tests {
     async fn a_mirror_says_whether_its_computer_answers() {
         let state = crate::test_support::test_state("admin", vec![]);
         let now = now_ms();
-        for (seen, reachable) in [
-            (Some(now), true),
-            (Some(now - 5 * 60_000), false),
-            (None, false),
+        for (seen, down, reachable) in [
+            (Some(now), false, true),
+            (Some(now - 5 * 60_000), false, false),
+            (None, false, false),
+            // Its task socket just closed: unreachable at once, its last
+            // answer kept.
+            (Some(now), true, false),
         ] {
             state
                 .peers
                 .store_for_test(peer("srv-mini", "mini", "http://127.0.0.1:9", seen))
                 .await;
+            if down {
+                state.peers.presence.down("srv-mini");
+            }
             let id = state
                 .tasks
                 .insert_for_test(&mirror(TaskState::Working, None))

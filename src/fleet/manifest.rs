@@ -494,7 +494,7 @@ impl FleetService {
         let Some(peer) = state.peers.checked(state, peer).await else {
             return Err(DescribeError::Unauthorized(name));
         };
-        if !peer.reachable(now_ms()) {
+        if !state.peers.reachable(&peer, now_ms()) {
             return Err(DescribeError::Unreachable(peer.name));
         }
         let manifest = state.peers.manifest_of(&peer).await;

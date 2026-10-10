@@ -166,14 +166,32 @@ pub(crate) trait PeerStore: Send + Sync {
 /// When each peer last answered, in memory: written by [`PeerService`],
 /// read (from Task G3) by the task service to present mirrors without a
 /// store round trip.
+/// With each, whether it is known to be down right now (its task socket
+/// closed, a call to it failed): unreachable at once, whatever its last
+/// answer says, until it answers again.
 #[derive(Default)]
-pub(crate) struct PeerPresence(RwLock<HashMap<String, Option<u64>>>);
+pub(crate) struct PeerPresence(RwLock<HashMap<String, (Option<u64>, bool)>>);
 
 impl PeerPresence {
     pub(crate) fn seen(&self, peer_id: &str, at_ms: Option<u64>) {
         if let Ok(mut map) = self.0.write() {
-            map.insert(peer_id.to_owned(), at_ms);
+            map.insert(peer_id.to_owned(), (at_ms, false));
         }
+    }
+
+    /// `peer_id` stopped answering just now; its last answer is kept.
+    pub(crate) fn down(&self, peer_id: &str) {
+        if let Ok(mut map) = self.0.write() {
+            map.entry(peer_id.to_owned()).or_insert((None, true)).1 = true;
+        }
+    }
+
+    pub(crate) fn is_down(&self, peer_id: &str) -> bool {
+        self.0
+            .read()
+            .ok()
+            .and_then(|map| map.get(peer_id).map(|(_, down)| *down))
+            .unwrap_or(false)
     }
 
     pub(crate) fn gone(&self, peer_id: &str) {
@@ -184,13 +202,13 @@ impl PeerPresence {
 
     /// `(reachable, last_seen_ms)`; an unknown peer (unlinked, forgotten) is unreachable, never seen.
     pub(crate) fn of(&self, peer_id: &str, now_ms: u64) -> (bool, Option<u64>) {
-        let seen = self
+        let (seen, down) = self
             .0
             .read()
             .ok()
             .and_then(|map| map.get(peer_id).copied())
-            .flatten();
-        (recent(seen, now_ms), seen)
+            .unwrap_or((None, false));
+        (!down && recent(seen, now_ms), seen)
     }
 }
 
@@ -445,6 +463,9 @@ impl PeerService {
     /// Whether `peer` answers, as far as is known without asking it now:
     /// `None` when it was neither heard from nor pinged in the last [`CHECK_EVERY`].
     pub(crate) fn reachability(&self, peer: &Peer, now: u64) -> Option<bool> {
+        if self.presence.is_down(&peer.peer_id) {
+            return Some(false);
+        }
         if within(peer.last_seen_ms, now, CHECK_EVERY) {
             return Some(true);
         }
@@ -453,7 +474,7 @@ impl PeerService {
             .lock()
             .ok()
             .and_then(|at| at.get(&peer.peer_id).copied());
-        within(pinged, now, CHECK_EVERY).then(|| peer.reachable(now))
+        within(pinged, now, CHECK_EVERY).then(|| self.reachable(peer, now))
     }
 
     /// Whether `peer`'s manifest was asked for in the last [`CHECK_EVERY`]:
@@ -508,7 +529,7 @@ impl PeerService {
         tokio::spawn(async move {
             let service = running.0.clone();
             if let Some(peer) = service.checked(&state, peer).await {
-                if peer.reachable(now_ms()) {
+                if service.reachable(&peer, now_ms()) {
                     service.manifest_of(&peer).await;
                 }
             }
@@ -524,9 +545,10 @@ impl PeerService {
             return None;
         }
         let now = now_ms();
-        if peer
-            .last_seen_ms
-            .is_some_and(|seen| now.saturating_sub(seen) < CHECK_EVERY.as_millis() as u64)
+        if !self.presence.is_down(&peer.peer_id)
+            && peer
+                .last_seen_ms
+                .is_some_and(|seen| now.saturating_sub(seen) < CHECK_EVERY.as_millis() as u64)
         {
             return Some(peer);
         }
@@ -563,8 +585,18 @@ impl PeerService {
                 super::mirror::unauthorized(state, &peer.peer_id).await;
                 None
             }
-            Ok(Err(_)) | Err(_) => Some(peer),
+            // Unreachable at once, not after its last answer ages out.
+            Ok(Err(_)) | Err(_) => {
+                self.presence.down(&peer.peer_id);
+                Some(peer)
+            }
         }
+    }
+
+    /// Whether `peer` answers, as far as is known now: its last answer is
+    /// recent and nothing since said it went down.
+    pub(crate) fn reachable(&self, peer: &Peer, now_ms: u64) -> bool {
+        !self.presence.is_down(&peer.peer_id) && peer.reachable(now_ms)
     }
 
     /// `peer`'s manifest as `fleet.describe` shows it (its `GET /api/fleet/self`,
@@ -811,7 +843,10 @@ impl PeerService {
     pub(crate) async fn mark_seen(&self, peer_id: &str) {
         let now = now_ms();
         if let (_, Some(seen)) = self.presence.of(peer_id, now) {
-            if now.saturating_sub(seen) < SEEN_WRITE_EVERY.as_millis() as u64 {
+            // A peer known to be down is up again at once, written or not.
+            if now.saturating_sub(seen) < SEEN_WRITE_EVERY.as_millis() as u64
+                && !self.presence.is_down(peer_id)
+            {
                 return;
             }
         }

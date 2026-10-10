@@ -2125,7 +2125,7 @@ line. On a `failed` mirror: `peer_unlinked` (unlinked here, or the other
 computer no longer takes this one's token), `peer_lost_task` (the other
 computer no longer has the task), `peer_not_confirmed` (a create that got no
 answer never turned up there). On an open mirror: `peer_unreachable` while
-its computer has not answered in the last 2 minutes. Absent otherwise, and on
+its computer has not answered in the last 2 minutes, or went away just now (its task socket closed, a call to it failed). Absent otherwise, and on
 every task that is not a mirror. (`delegation_loop` is never a view reason:
 that delegation creates nothing; it is the MCP error code.) A task
 another computer opened here (`origin: "peer"`) can be confirmed from the phone

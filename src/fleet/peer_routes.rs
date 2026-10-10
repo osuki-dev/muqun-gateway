@@ -12,7 +12,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::peers::{LinkError, LinkRequest, RenameError};
+use super::peers::{LinkError, LinkRequest, PeerView, RenameError};
 use crate::tasks::domain::now_ms;
 use crate::{
     api_error, require_admin, require_device, valid_device_name, valid_request_id, ApiResult,
@@ -109,7 +109,13 @@ async fn list(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Js
     // marked so, and is listed as `unauthorized` for the phone to link again.
     let peers = state.peers.list().await.map_err(store_failed)?;
     let now = now_ms();
-    let views: Vec<_> = peers.iter().map(|peer| peer.view(now)).collect();
+    let views: Vec<_> = peers
+        .iter()
+        .map(|peer| PeerView {
+            reachable: state.peers.reachable(peer, now),
+            ..peer.view(now)
+        })
+        .collect();
     Ok(Json(json!({
         "accept_delegations": state.peers.accepts_delegations(),
         "peers": views,
