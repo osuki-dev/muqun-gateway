@@ -131,8 +131,9 @@ pub(crate) fn task_args(
             }
         }
         "codex" => {
+            // A multi-line value of the user's stays multi-line: the backends
+            // carry it as one argument (goals already are).
             let text = match own.map(str::trim).filter(|own| !own.is_empty()) {
-                // One line: the launch line is typed into a shell.
                 Some(own) => format!("{own} {TASK_SENTENCE}"),
                 None => TASK_SENTENCE.to_owned(),
             };
@@ -158,27 +159,73 @@ pub(crate) async fn terminal_task_args(config: &crate::Config, kind: &str) -> Ve
     } else {
         None
     };
-    let own = if kind == "codex" {
-        codex_developer_instructions().await
-    } else {
-        None
+    // The value Codex would otherwise run with: one the launch arguments
+    // set (ours comes after and would replace it), else the user's config.
+    let own = match kind {
+        "codex" => match configured_developer_instructions(&configured) {
+            Some(own) => Some(own),
+            None => codex_developer_instructions(config).await,
+        },
+        _ => None,
     };
     task_args(kind, &configured, file.as_deref(), own.as_deref())
 }
 
-/// The user's own Codex `developer_instructions`, if their config sets one.
-async fn codex_developer_instructions() -> Option<String> {
-    let home = std::env::var_os("CODEX_HOME")
+/// The `developer_instructions` a `-c`/`--config` in `configured` sets, as
+/// Codex reads it: a TOML string, or the raw text when it is not TOML.
+fn configured_developer_instructions(configured: &[String]) -> Option<String> {
+    let mut found = None;
+    let mut args = configured.iter();
+    while let Some(arg) = args.next() {
+        let value = match arg.as_str() {
+            "-c" | "--config" => args.next().map(String::as_str),
+            other => other.strip_prefix("--config="),
+        };
+        if let Some(raw) = value.and_then(|value| value.strip_prefix("developer_instructions=")) {
+            let parsed = toml::from_str::<toml::Table>(&format!("v = {raw}"))
+                .ok()
+                .and_then(|table| {
+                    table
+                        .get("v")
+                        .and_then(toml::Value::as_str)
+                        .map(str::to_owned)
+                });
+            found = Some(parsed.unwrap_or_else(|| raw.to_owned()));
+        }
+    }
+    found
+}
+
+/// The user's own Codex `developer_instructions`, if their config sets one,
+/// from `CODEX_HOME` as the agent will see it (`agent_env` first). Read
+/// only; a file that cannot be read or parsed gives nothing, logged, and the
+/// launch carries the sentence alone.
+async fn codex_developer_instructions(config: &crate::Config) -> Option<String> {
+    let home = config
+        .agent_env
+        .usable()
+        .get("CODEX_HOME")
         .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("CODEX_HOME").map(std::path::PathBuf::from))
         .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))?;
-    let text = tokio::fs::read_to_string(home.join("config.toml"))
-        .await
-        .ok()?;
-    let table: toml::Table = toml::from_str(&text).ok()?;
-    table
-        .get("developer_instructions")
-        .and_then(toml::Value::as_str)
-        .map(str::to_owned)
+    let text = match tokio::fs::read_to_string(home.join("config.toml")).await {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            tracing::warn!(%error, "Codex's config was not read; its task gets the sentence alone");
+            return None;
+        }
+    };
+    match toml::from_str::<toml::Table>(&text) {
+        Ok(table) => table
+            .get("developer_instructions")
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned),
+        Err(error) => {
+            tracing::warn!(%error, "Codex's config did not parse; its task gets the sentence alone");
+            None
+        }
+    }
 }
 
 /// `<state dir>/<name>` holding `content`, written (0600) when it differs.
@@ -449,6 +496,33 @@ mod tests {
                 task_args(kind, configured, Some(file), own),
                 args,
                 "{kind} {own:?}"
+            );
+        }
+        // A two-line value of the user's goes through as valid TOML holding
+        // both lines and the sentence.
+        let args = task_args("codex", &[], None, Some("Line one.\nLine two."));
+        let table: toml::Table = toml::from_str(&args[1]).unwrap();
+        assert_eq!(
+            table["developer_instructions"].as_str().unwrap(),
+            format!("Line one.\nLine two. {sentence}")
+        );
+        // A value the launch arguments set is the one extended.
+        let set = |args: &[&str]| args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+        for (configured, own) in [
+            (
+                set(&["-c", "developer_instructions=\"Be terse.\""]),
+                Some("Be terse."),
+            ),
+            (
+                set(&["--config=developer_instructions=Plain words"]),
+                Some("Plain words"),
+            ),
+            (set(&["-c", "model=\"x\""]), None),
+        ] {
+            assert_eq!(
+                configured_developer_instructions(&configured).as_deref(),
+                own,
+                "{configured:?}"
             );
         }
     }
