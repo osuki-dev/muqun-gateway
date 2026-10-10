@@ -56,6 +56,13 @@ const PRUNE_EVERY: Duration = Duration::from_secs(60);
 const WRITE_DEBOUNCE: Duration = Duration::from_secs(3);
 /// Checkpoint reads waiting on the shared store; one more is a 503.
 const MAX_PENDING_READS: usize = 16;
+/// How long the write loop waits after a failed pass before it tries again:
+/// each failure moves one step on, and a pass that works starts over.
+const RETRY_AFTER: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(5),
+    Duration::from_secs(30),
+];
 
 pub(crate) struct SqliteHistoryRepository {
     memory: MemoryHistoryRepository,
@@ -114,6 +121,8 @@ impl SqliteHistoryRepository {
         }
     }
 
+    /// The store, while its last operation worked. Only what needs it --
+    /// recovering a checkpoint -- asks; what memory holds is served either way.
     fn health(&self) -> Result<&Arc<Checkpoints>, HistoryError> {
         self.checkpoints
             .as_ref()
@@ -181,7 +190,6 @@ impl HistoryRepository for SqliteHistoryRepository {
         include_rows: bool,
     ) -> HistoryFuture<'a, Option<Capture>> {
         Box::pin(async move {
-            self.health()?;
             if include_rows {
                 let has_rows = self
                     .memory
@@ -199,28 +207,16 @@ impl HistoryRepository for SqliteHistoryRepository {
         &'a self,
         scope: &'a HistoryScope,
     ) -> HistoryFuture<'a, Option<Arc<HistorySnapshot>>> {
-        Box::pin(async move {
-            self.health()?;
-            self.memory.find(scope).await
-        })
+        Box::pin(async move { self.memory.find(scope).await })
     }
     fn load(&self, id: Uuid) -> HistoryFuture<'_, Option<Arc<HistorySnapshot>>> {
-        Box::pin(async move {
-            self.health()?;
-            self.memory.load(id).await
-        })
+        Box::pin(async move { self.memory.load(id).await })
     }
     fn pin(&self, snapshot: HistorySnapshot) -> HistoryFuture<'_, Arc<HistorySnapshot>> {
-        Box::pin(async move {
-            self.health()?;
-            self.memory.pin(snapshot).await
-        })
+        Box::pin(async move { self.memory.pin(snapshot).await })
     }
     fn remove(&self, id: Uuid) -> HistoryFuture<'_, ()> {
-        Box::pin(async move {
-            self.health()?;
-            self.memory.remove(id).await
-        })
+        Box::pin(async move { self.memory.remove(id).await })
     }
 }
 
@@ -304,7 +300,8 @@ impl Checkpoints {
         // no-op, so the loop sleeps until the fold changes or pruning is due.
         let mut settled: Option<u64> = None;
         let mut pruned = Instant::now();
-        while self.healthy.load(Ordering::Acquire) {
+        let mut failures = 0usize;
+        loop {
             if settled.is_some() {
                 tokio::select! {
                     () = changes.notified() => {}
@@ -321,7 +318,7 @@ impl Checkpoints {
                 Err(_) => {
                     tracing::error!("captured history fold lock poisoned");
                     self.healthy.store(false, Ordering::Release);
-                    break;
+                    return;
                 }
             };
             let Some((version, stamps)) = snapshot else {
@@ -330,15 +327,22 @@ impl Checkpoints {
             if prune_due {
                 pruned = Instant::now();
             }
-            match self
+            let passed = self
                 .pass(now_seconds(), prune_due, stamps, self.debounce)
-                .await
-            {
-                Ok(true) => settled = Some(version),
-                Ok(false) => settled = None,
+                .await;
+            if passed.is_ok() && !self.healthy.swap(true, Ordering::AcqRel) {
+                tracing::info!("captured history storage works again");
+            }
+            match passed {
+                Ok(true) => (settled, failures) = (Some(version), 0),
+                Ok(false) => (settled, failures) = (None, 0),
                 Err(error) => {
-                    tracing::error!(%error, "captured history storage failed; realtime output remains available");
+                    let wait = RETRY_AFTER[failures.min(RETRY_AFTER.len() - 1)];
+                    tracing::error!(%error, retry_in_s = wait.as_secs(), "captured history storage failed; realtime output and captured rows in memory remain available");
                     self.healthy.store(false, Ordering::Release);
+                    failures += 1;
+                    settled = None;
+                    tokio::time::sleep(wait).await;
                 }
             }
         }

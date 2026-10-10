@@ -134,7 +134,7 @@ unobserved destroy/recreate with identical native identity cannot be detected.
 | `409 history_cursor_mismatch` | Known cursor used with another device, session, pane, format, limit or generation; also a cursor request naming another source. Drop traversal and start without `before`. |
 | `410 history_cursor_gone` | Unknown/forged, expired, evicted or reset cursor, a page whose rows the capture has since trimmed off its front, or vanished pane during traversal. Drop traversal and start without `before`. A cursor from before Gateway restart is unknown and returns 410. |
 | `413 history_snapshot_too_large` | A historical row or snapshot exceeds byte limits; no partial/truncated row is silently served. |
-| `503 history_storage_unavailable` | Captured storage failed; an empty success is not substituted. |
+| `503 history_storage_unavailable` | Captured storage failed while the answer needed it (a checkpoint recovery); an empty success is not substituted. The store retries on its own; try again shortly. |
 | normal backend error | Live topology could not be checked; not proof that captured history is empty. |
 
 ## Resource bounds
@@ -274,13 +274,16 @@ A store that cannot be opened (wrong key, corruption, a schema newer than this
 Gateway) stops Gateway at startup; that is the shared store's rule for every
 domain, and the file is never rewritten or downgraded. The `history` migration
 runs in a transaction like every shared-store step, so a failed migration rolls
-back and records no schema version. Once Gateway is running,
-a failed history initialization, a failed checkpoint write or read, a full disk
-or read overload returns `503 history_storage_unavailable`, including when a
-pinned snapshot exists. No empty result or successful memory fallback conceals
-the selected store's failure. Output/control/SSE continue independently. A
-failed write stops further history writes until the cause is resolved and
-Gateway is restarted in a controlled way. Unknown identity without an eligible
+back and records no schema version. Once Gateway is running, a storage
+failure never takes away what memory holds: a first page or traversal of the
+current run's capture, and any pinned snapshot, is served as with `memory`.
+Only an answer that needs the store -- recovering a checkpoint for a pane whose
+current run has no historical rows yet -- returns `503
+history_storage_unavailable` while a failed initialization, a failed checkpoint
+write or read, a full disk or read overload stands; no empty result conceals
+it. A failed write pass is retried after 1 s, then 5 s, then every 30 s, and
+the first pass that works makes the store available again, with no restart.
+Output/control/SSE continue independently. Unknown identity without an eligible
 current-run capture returns the normal `not_captured`, not a claim that all old
 history was recovered.
 

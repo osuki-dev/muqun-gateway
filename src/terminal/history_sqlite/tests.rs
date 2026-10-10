@@ -861,20 +861,29 @@ async fn sqlite_formats_are_independent_and_destructive_shrink_removes_durable_p
 }
 
 #[tokio::test]
-async fn initialization_and_storage_failures_are_visible_not_memory_success() {
-    // A store without the history namespace cannot initialize.
+async fn storage_failures_spare_memory_and_heal_on_the_next_working_pass() {
+    // A store without the history namespace cannot initialize: what memory
+    // holds is still served; only a recovery that needs the store is a 503.
     let fixture = Fixture::new();
     let db = SqliteStore::open(&fixture.db_path(), None, &[]).unwrap();
     let repository =
         SqliteHistoryRepository::open(db, &fixture.config, captures(Some("A"), true)).await;
+    assert_eq!(
+        read_page(&repository, scope(), None).await.unwrap()["rows"],
+        json!(["row 5", "row 6"])
+    );
+    repository.close().await;
+    let db = SqliteStore::open(&fixture.db_path(), None, &[]).unwrap();
+    let repository =
+        SqliteHistoryRepository::open(db, &fixture.config, captures(Some("A"), false)).await;
     assert_eq!(
         read_page(&repository, scope(), None).await,
         Err(HistoryError::Unavailable)
     );
     repository.close().await;
 
-    // A write that fails stops the loop and fails every later operation,
-    // including a traversal whose snapshot is still pinned in memory.
+    // A write that fails marks the store unhealthy; the traversal pinned in
+    // memory goes on, and the loop retries until a pass works again.
     let fixture = Fixture::new();
     let fold = captures(Some("A"), true);
     let repository = fixture.open(fold.clone()).await;
@@ -899,11 +908,26 @@ async fn initialization_and_storage_failures_are_visible_not_memory_success() {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    drop(checkpoints);
+    assert!(!checkpoints.healthy.load(Ordering::Acquire));
     assert_eq!(
-        read_page(&repository, scope(), first["next_before"].as_str()).await,
-        Err(HistoryError::Unavailable)
+        read_page(&repository, scope(), first["next_before"].as_str())
+            .await
+            .unwrap()["rows"],
+        json!(["row 3", "row 4"])
     );
+    checkpoints
+        .db
+        .call(|c| Ok(c.execute_batch("CREATE TABLE history_captures(identity TEXT PRIMARY KEY, policy TEXT NOT NULL, rows BLOB NOT NULL, bytes INTEGER NOT NULL, updated INTEGER NOT NULL); CREATE INDEX history_capture_quota ON history_captures(updated, identity, bytes);")?))
+        .await
+        .unwrap();
+    for _ in 0..400 {
+        if checkpoints.healthy.load(Ordering::Acquire) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(checkpoints.healthy.load(Ordering::Acquire), "healed");
+    drop(checkpoints);
     repository.close().await;
 }
 
