@@ -564,9 +564,13 @@ pub(crate) fn instructions(in_task: bool) -> String {
                   MUQUN_TASK_BLOCKED: <reason>). If tasks.complete answers task_not_found, \
                   this session is not a Muqun task: do not call it again and print no marker.";
     if in_task {
+        // First and imperative: a host may show this beside many other
+        // instructions, and an agent that just stops leaves its task paused.
         format!(
-            "{about} Muqun started you to work on a task: its goal is your first prompt. \
-             When that whole task is finished, {finish}"
+            "IMPORTANT: Muqun started you to work on one task, given as your first \
+             prompt, and the person who sent it sees it as unfinished until you report \
+             back. As your last action for that task, after answering, call the muqun \
+             tool tasks.complete -- {finish} {about}"
         )
     } else {
         format!("{about} If this session was started as a Muqun task: when the whole task is finished, {finish}")
@@ -603,7 +607,7 @@ mod tests {
         for (in_task, says, not) in [
             (
                 true,
-                "Muqun started you to work on a task",
+                "Muqun started you to work on one task",
                 "If this session was started",
             ),
             (
