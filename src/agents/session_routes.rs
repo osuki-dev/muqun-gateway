@@ -1538,10 +1538,7 @@ pub(crate) fn task_failure(err: HerdrCallError, steps: &tasks::StepLog) -> Respo
     // Herdr refusing is the user's request being wrong -- a path it does not
     // recognise, a branch already checked out somewhere it will not touch.
     // Anything else is the gateway or the socket failing, which is not.
-    let status = match err {
-        HerdrCallError::Herdr { .. } => StatusCode::BAD_REQUEST,
-        _ => StatusCode::BAD_GATEWAY,
-    };
+    let status = err.status();
     (
         status,
         Json(json!({
@@ -1931,17 +1928,29 @@ impl HerdrCallError {
         }
     }
 
-    pub(crate) fn into_api_error(self, method: &str) -> (StatusCode, Json<Value>) {
-        let status = match self {
+    /// Herdr refusing is the request being wrong (400), a target gone since
+    /// it was listed is not found (404); anything else is the gateway or the
+    /// socket failing (502).
+    pub(crate) fn status(&self) -> StatusCode {
+        match self {
+            Self::Herdr { .. } if self.code() == TARGET_NOT_FOUND => StatusCode::NOT_FOUND,
             Self::Herdr { .. } => StatusCode::BAD_REQUEST,
             _ => StatusCode::BAD_GATEWAY,
-        };
+        }
+    }
+
+    pub(crate) fn into_api_error(self, method: &str) -> (StatusCode, Json<Value>) {
+        let status = self.status();
         let code = self.code().to_owned();
         let message = self.message();
         tracing::warn!("Herdr request {method} failed: {message}");
         api_error(status, &code, &message)
     }
 }
+
+/// The code a target gone since it was listed answers with, as on the
+/// terminal routes.
+const TARGET_NOT_FOUND: &str = "backend_target_not_found";
 
 pub(crate) fn backend_call_error(method: &str, error: BackendError) -> HerdrCallError {
     match error {
@@ -1957,7 +1966,12 @@ pub(crate) fn backend_call_error(method: &str, error: BackendError) -> HerdrCall
         other @ (BackendError::Unavailable | BackendError::Unsupported(_)) => {
             HerdrCallError::Unavailable(other.to_string())
         }
-        other @ BackendError::InvalidTarget(_) => HerdrCallError::Unavailable(other.to_string()),
+        // A pane, window or session gone since it was listed: not found, as
+        // the terminal routes answer it -- never "the backend is down".
+        other @ BackendError::InvalidTarget(_) => HerdrCallError::Herdr {
+            method: method.to_owned(),
+            error: json!({ "code": TARGET_NOT_FOUND, "message": other.to_string() }),
+        },
     }
 }
 
@@ -2104,6 +2118,38 @@ mod tests {
     use super::*;
     use crate::agents::tasks;
     use crate::*;
+
+    /// What a backend error answers on these routes: a refusal is the
+    /// request's fault, a target gone since it was listed is not found, and
+    /// only a backend that cannot be reached is the gateway's. None of them
+    /// is a prompt worth sending again.
+    #[test]
+    fn a_gone_pane_is_not_found_not_an_unavailable_backend() {
+        for (error, status, code) in [
+            (
+                BackendError::Refused {
+                    code: None,
+                    message: "no".into(),
+                },
+                StatusCode::BAD_REQUEST,
+                "herdr_error",
+            ),
+            (
+                BackendError::InvalidTarget("pane"),
+                StatusCode::NOT_FOUND,
+                "backend_target_not_found",
+            ),
+            (
+                BackendError::Unavailable,
+                StatusCode::BAD_GATEWAY,
+                "herdr_unavailable",
+            ),
+        ] {
+            let call = backend_call_error("pane.read", error);
+            assert_eq!((call.status(), call.code()), (status, code));
+            assert!(!call.can_retry_prompt(), "{code}");
+        }
+    }
 
     #[test]
     fn folder_trust_off_trusts_no_folder() {
