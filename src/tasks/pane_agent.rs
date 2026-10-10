@@ -133,6 +133,105 @@ pub(crate) const LAST_REQUEST: &str = "When the whole task is finished, call the
     cannot get); if you cannot call it, print one line exactly in this form: \
     MUQUN_TASK_DONE: <one-line summary> -- or, blocked, MUQUN_TASK_BLOCKED: <one-line reason>";
 
+/// How long an agent started with its task sentence out of band is watched
+/// for an exit: one that refuses the flag exits at once. The watch ends as
+/// soon as the agent's prompt is up.
+const SETTLE: Duration = Duration::from_secs(3);
+const SETTLE_POLL: Duration = Duration::from_millis(200);
+/// The shells a pane goes back to when its agent exits.
+const SHELLS: [&str; 13] = [
+    "sh", "bash", "zsh", "fish", "ksh", "mksh", "dash", "ash", "tcsh", "csh", "nu", "xonsh",
+    "elvish",
+];
+
+/// Whether the `kind` agent just started in `pane_id` exited again within
+/// [`SETTLE`]: the pane no longer runs it, its foreground is a shell, and no
+/// `kind` process is left anywhere under the pane's shell (a launcher script
+/// can put a shell in the foreground of a running agent). Watched until
+/// the agent's prompt is up (Herdr reports its state; on tmux, its input
+/// box is drawn), at most [`SETTLE`]. A pane or process table that cannot be
+/// read says no: a launch that cannot be shown to have failed is never
+/// started twice.
+pub(crate) async fn exited_to_shell(session: &SessionConfig, pane_id: &str, kind: &str) -> bool {
+    let backend = terminal_backend(session);
+    let deadline = tokio::time::Instant::now() + SETTLE;
+    loop {
+        tokio::time::sleep(SETTLE_POLL).await;
+        let Ok(pane) = backend.get_pane(&PaneId::new(pane_id)).await else {
+            return false;
+        };
+        let foreground = pane.foreground_command.as_deref();
+        if at_shell(pane.agent.as_deref(), foreground, kind) {
+            return match pane.shell_pid {
+                Some(shell) => process_table()
+                    .await
+                    .is_some_and(|table| !runs_under(&table, shell, kind)),
+                None => false,
+            };
+        }
+        let ready = pane.agent.as_deref() == Some(kind)
+            && (matches!(
+                pane.agent_status,
+                AgentStatus::Idle | AgentStatus::Working | AgentStatus::Blocked
+            ) || read_pane_visible_text(session, pane_id)
+                .await
+                .is_ok_and(|screen| input_box(&screen).is_some()));
+        if ready || tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+    }
+}
+
+fn at_shell(agent: Option<&str>, foreground: Option<&str>, kind: &str) -> bool {
+    let shell = foreground.is_some_and(|command| SHELLS.contains(&command_name(command)));
+    agent != Some(kind) && shell
+}
+
+/// A command's name: its path's last part, without a login shell's `-`.
+fn command_name(command: &str) -> &str {
+    let name = command.rsplit('/').next().unwrap_or(command);
+    name.trim_start_matches('-')
+}
+
+/// `ps -A -o pid=,ppid=,comm=`: every process's pid, parent and command.
+async fn process_table() -> Option<String> {
+    let out = tokio::process::Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid=,comm="])
+        .output()
+        .await
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Whether a process named `name` is `root` or below it in `table` (the
+/// output of [`process_table`]).
+fn runs_under(table: &str, root: u32, name: &str) -> bool {
+    let rows: Vec<(u32, u32, &str)> = table
+        .lines()
+        .filter_map(|line| {
+            let (pid, rest) = line.trim_start().split_once(char::is_whitespace)?;
+            let (ppid, command) = rest.trim_start().split_once(char::is_whitespace)?;
+            Some((pid.parse().ok()?, ppid.parse().ok()?, command.trim()))
+        })
+        .collect();
+    let mut tree = vec![root];
+    let mut at = 0;
+    while at < tree.len() {
+        let parent = tree[at];
+        tree.extend(
+            rows.iter()
+                .filter(|(pid, ppid, _)| *ppid == parent && !tree.contains(pid))
+                .map(|(pid, _, _)| *pid)
+                .collect::<Vec<_>>(),
+        );
+        at += 1;
+    }
+    rows.iter()
+        .any(|(pid, _, command)| tree.contains(pid) && command_name(command) == name)
+}
+
 /// How an agent said its task ended, with its one line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Marker {
@@ -182,41 +281,54 @@ pub(crate) fn consumed_marker(output: &str) -> Option<(usize, usize)> {
 }
 
 /// Every marker that counts in `output`: its line, where it starts on it,
-/// and what it says. Only below the last line that echoes a request -- the
-/// completion instruction older gateways typed, or the end of `goal` -- and
-/// never one whose text the goal itself holds.
+/// and what it says. Below the last line holding the completion instruction
+/// older gateways typed; with a `goal`, never a marker the goal itself holds
+/// (its token and its text), and only below the last line, above the last
+/// marker, that echoes the goal's end -- so the goal on the launch line and
+/// in the agent's echo can never complete its own task, while an agent that
+/// restates the goal in its summary still can.
 fn marker_lines(output: &str, goal: Option<&str>) -> Vec<(usize, usize, Marker)> {
     let lines: Vec<&str> = output.lines().collect();
-    let anchor = goal.map(goal_anchor).filter(|anchor| !anchor.is_empty());
     let below_echo = lines
         .iter()
-        .rposition(|line| {
-            ECHO_WORDS.iter().any(|word| line.contains(word))
-                || anchor
-                    .as_deref()
-                    .is_some_and(|anchor| line.contains(anchor))
-        })
+        .rposition(|line| ECHO_WORDS.iter().any(|word| line.contains(word)))
         .map_or(0, |echo| echo + 1);
-    lines
+    let goal_text = goal.map(|goal| one_line(goal, usize::MAX));
+    let mut found: Vec<(usize, usize, Marker)> = lines
         .iter()
         .enumerate()
         .skip(below_echo)
         .filter_map(|(at, line)| {
             let (start, marker) = marker_line(line)?;
-            let said = match &marker {
-                Marker::Done(text) | Marker::Blocked { reason: text, .. } => text,
-            };
-            if goal.is_some_and(|goal| one_line(goal, usize::MAX).contains(said.as_str())) {
-                return None;
-            }
-            Some((at, start, marker))
+            let held = goal_text.as_deref().is_some_and(|goal| {
+                let (token, said) = match &marker {
+                    Marker::Done(text) => (DONE_MARKER, text),
+                    Marker::Blocked { reason, .. } => (BLOCKED_MARKER, reason),
+                };
+                // As the shell's launch line quotes it, too.
+                let said = said.trim_end_matches(['\'', '"', '`']);
+                goal.contains(&format!("{token} {said}"))
+                    || goal.contains(&format!("{token}{said}"))
+            });
+            (!held).then_some((at, start, marker))
         })
-        .collect()
+        .collect();
+    if let (Some(goal), Some(last)) = (goal, found.last().map(|(at, _, _)| *at)) {
+        if let Some(echo) = (below_echo..last)
+            .rev()
+            .find(|&at| echoes_goal(lines[at], goal))
+        {
+            found.retain(|(at, _, _)| *at > echo);
+        }
+    }
+    found
 }
 
-/// The end of a goal as a pane shows its echo: the last 16 characters of
-/// its last line, short enough to stay on one row when the echo wraps.
-fn goal_anchor(goal: &str) -> String {
+/// Whether `line` echoes the end of `goal`: holds the last 16 characters of
+/// its last line (short enough to stay on one row when the echo wraps), or,
+/// for a goal shorter than that, is that line after any prompt glyph -- a
+/// short goal ("hi") is part of too many other lines.
+fn echoes_goal(line: &str, goal: &str) -> bool {
     let last = goal
         .lines()
         .rev()
@@ -224,7 +336,16 @@ fn goal_anchor(goal: &str) -> String {
         .unwrap_or("")
         .trim();
     let count = last.chars().count();
-    last.chars().skip(count.saturating_sub(16)).collect()
+    if count == 0 {
+        return false;
+    }
+    if count >= 16 {
+        let anchor: String = last.chars().skip(count - 16).collect();
+        return line.contains(&anchor);
+    }
+    line.trim_start_matches(|c: char| !c.is_alphanumeric())
+        .trim_end()
+        == last
 }
 
 /// Whether `line` opens or closes a markdown code fence (for display:
@@ -1330,6 +1451,25 @@ mod tests {
             marker("`MUQUN_TASK_DONE: fixed`"),
             Some(Marker::Done("fixed".into()))
         );
+        // A summary that restates the goal's end still counts, and a short
+        // goal is not found in the screen's chrome below the marker.
+        let goal = "fix the typo in README";
+        let pane = format!("> {goal}\n⏺ MUQUN_TASK_DONE: Fixed the typo in README\n");
+        assert_eq!(
+            marker_after(&pane, Some(goal)),
+            Some(Marker::Done("Fixed the typo in README".into()))
+        );
+        let pane =
+            "› run ls\n• MUQUN_TASK_DONE: listed three files\n  shift+tab to cycle · run ls\n";
+        assert_eq!(
+            marker_after(pane, Some("run ls")),
+            Some(Marker::Done("listed three files".into()))
+        );
+        let pane = "› make sure the tests pass\n• MUQUN_TASK_DONE: tests pass\n";
+        assert_eq!(
+            marker_after(pane, Some("make sure the tests pass")),
+            Some(Marker::Done("tests pass".into()))
+        );
         // CJK runs into the marker without a space and still counts.
         assert_eq!(
             marker("已完成MUQUN_TASK_DONE: 文档已更新"),
@@ -1360,6 +1500,34 @@ mod tests {
             "⏺ Otherwise\n  MUQUN_TASK_BLOCKED: <one-\n",
         ] {
             assert_eq!(marker(not_yet), None, "{not_yet}");
+        }
+
+        // An agent started with its task sentence out of band that refused it
+        // is gone and its pane back at a shell; a slow or running one is not.
+        for (agent, foreground, back) in [
+            (None, Some("-zsh"), true),
+            (None, Some("/usr/bin/bash"), true),
+            (Some("claude"), Some("claude"), false),
+            (None, Some("node"), false),
+            (None, None, false),
+        ] {
+            assert_eq!(
+                at_shell(agent, foreground, "claude"),
+                back,
+                "{foreground:?}"
+            );
+        }
+        // ... and only once no such process is left under the pane's shell.
+        let table = "  1     0 init\n 40     1 -zsh\n 41    40 /usr/local/bin/claude-shim\n \
+                     42    41 sh\n 43    42 claude\n 50     1 claude\n";
+        for (root, gone) in [
+            (40, false),
+            (42, false),
+            (41, false),
+            (50, false),
+            (7, true),
+        ] {
+            assert_eq!(!runs_under(table, root, "claude"), gone, "{root}");
         }
 
         // A title: the label, the session's name, else the goal's first

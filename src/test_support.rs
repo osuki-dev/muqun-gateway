@@ -859,6 +859,18 @@ pub(crate) struct FakeAgent {
     /// Sessions answered the way OpenCode answers a deleted one: a plain
     /// HTTP 404 rather than `SessionNotFound`.
     pub http_404: Vec<String>,
+    /// An agent whose service takes MCP servers at runtime.
+    pub mcp: Option<Arc<Mutex<FakeMcp>>>,
+}
+
+/// A fake agent service's MCP registration.
+#[derive(Default)]
+pub(crate) struct FakeMcp {
+    pub connected: bool,
+    /// Refuse the next registrations.
+    pub refuse: bool,
+    /// How many registrations it took.
+    pub added: usize,
 }
 
 impl FakeAgent {
@@ -875,6 +887,7 @@ impl FakeAgent {
             created_with: Arc::default(),
             prompts: Arc::default(),
             http_404: Vec::new(),
+            mcp: None,
         }
     }
 
@@ -923,6 +936,46 @@ pub(crate) fn fake_session(asid: &str, updated_ms: u64) -> agents::domain::Agent
 }
 
 impl agents::ports::agent::AgentPort for FakeAgent {
+    fn adds_mcp_servers(&self) -> bool {
+        self.mcp.is_some()
+    }
+
+    fn mcp_server_connected<'a>(
+        &'a self,
+        _name: &'a str,
+        _directory: Option<&'a str>,
+    ) -> agents::ports::agent::AgentFuture<'a, bool> {
+        let connected = self
+            .mcp
+            .as_ref()
+            .is_some_and(|mcp| mcp.lock().unwrap().connected);
+        Box::pin(async move { Ok(connected) })
+    }
+
+    fn add_mcp_server<'a>(
+        &'a self,
+        _name: &'a str,
+        _config: &'a serde_json::Value,
+        _directory: Option<&'a str>,
+    ) -> agents::ports::agent::AgentFuture<'a, ()> {
+        let outcome = match &self.mcp {
+            Some(mcp) => {
+                let mut mcp = mcp.lock().unwrap();
+                if mcp.refuse {
+                    Err(agents::ports::agent::AgentError::RequestFailed(
+                        "HTTP 400: Authorization Bearer secret-token".into(),
+                    ))
+                } else {
+                    mcp.connected = true;
+                    mcp.added += 1;
+                    Ok(())
+                }
+            }
+            None => self.fail(),
+        };
+        Box::pin(async move { outcome })
+    }
+
     fn kind(&self) -> &'static str {
         self.kind
     }

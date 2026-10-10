@@ -1140,17 +1140,11 @@ impl Setting {
             Self::Updates => "Enter checks for a stable release. Installing always asks first.",
             Self::HistoryStorage => "Keeps agent panes' scrollback across restarts.",
             Self::StoreEncryption => "How tokens and history are encrypted at rest.",
-            Self::AgentBypass => {
-                "Launches with the bypass flags so a task never stalls on a prompt."
-            }
-            Self::AgentTrust => {
-                "Pre-accepts the agent's folder trust dialog for the task's folder."
-            }
+            Self::AgentBypass => "Starts agents with bypass flags; tasks never stall.",
+            Self::AgentTrust => "Pre-accepts the folder trust dialog for the task.",
             Self::AgentEnv => "Variables every agent the gateway starts receives.",
             Self::Mcp => "Lets agents on this computer use the muqun tools (tasks, fleet).",
-            Self::McpInject => {
-                "Agents Gateway starts get the tools at launch; your agent configs stay untouched."
-            }
+            Self::McpInject => "Started agents get the tools; agent configs untouched.",
             Self::McpLoopback => "The MCP endpoint answers this computer only.",
         }
     }
@@ -1297,6 +1291,9 @@ fn setting_value(setting: Setting, config: &crate::Config, autostart: &str) -> S
             }
         }
         Setting::Mcp => on_off(config.mcp.enabled).to_owned(),
+        Setting::McpInject if !config.mcp.enabled => {
+            format!("{} · MCP server off", on_off(config.mcp.inject_into_agents))
+        }
         Setting::McpInject => on_off(config.mcp.inject_into_agents).to_owned(),
         Setting::McpLoopback => String::from("On · read-only"),
     }
@@ -1418,35 +1415,27 @@ fn set_config_key(
     value: Option<Value>,
 ) -> anyhow::Result<crate::Config> {
     let text = std::fs::read_to_string(file)?;
-    let mut doc: indexmap::IndexMap<String, Value> = serde_json::from_str(&text)?;
-    let (first, rest) = path.split_first().context("an empty config key")?;
-    match (rest.split_last(), value) {
-        (None, Some(value)) => {
-            doc.insert((*first).to_owned(), value);
+    // Read in written order at every depth (serde_json's own maps sort).
+    let mut doc: Ordered = serde_json::from_str(&text)?;
+    let (last, parents) = path.split_last().context("an empty config key")?;
+    let mut at = &mut doc;
+    for key in parents {
+        let Ordered::Object(object) = at else {
+            anyhow::bail!("config key is not an object");
+        };
+        at = object
+            .entry((*key).to_owned())
+            .or_insert_with(|| Ordered::Object(indexmap::IndexMap::new()));
+    }
+    let Ordered::Object(object) = at else {
+        anyhow::bail!("config key is not an object");
+    };
+    match value {
+        Some(value) => {
+            object.insert((*last).to_owned(), serde_json::from_value(value)?);
         }
-        (None, None) => {
-            doc.shift_remove(*first);
-        }
-        (Some((last, middle)), value) => {
-            let mut at = doc
-                .entry((*first).to_owned())
-                .or_insert_with(|| Value::Object(Default::default()));
-            for key in middle {
-                at = at
-                    .as_object_mut()
-                    .context("config key is not an object")?
-                    .entry(*key)
-                    .or_insert_with(|| Value::Object(Default::default()));
-            }
-            let object = at.as_object_mut().context("config key is not an object")?;
-            match value {
-                Some(value) => {
-                    object.insert((*last).to_owned(), value);
-                }
-                None => {
-                    object.remove(*last);
-                }
-            }
+        None => {
+            object.shift_remove(*last);
         }
     }
     let rendered = serde_json::to_vec_pretty(&doc)?;
@@ -1454,6 +1443,15 @@ fn set_config_key(
         serde_json::from_slice(&rendered).context("the change would not load")?;
     write_secret_file(file, &rendered)?;
     Ok(config)
+}
+
+/// A JSON document that keeps every object's keys in written order.
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(untagged)]
+enum Ordered {
+    Object(indexmap::IndexMap<String, Ordered>),
+    Array(Vec<Ordered>),
+    Other(Value),
 }
 
 fn write_config_key(path: &[&str], value: Option<Value>) -> anyhow::Result<crate::Config> {
@@ -1473,9 +1471,11 @@ fn toggle_agent_bypass() -> anyhow::Result<String> {
         ));
     }
     if states.iter().all(|(_, state)| *state == "On") {
-        for kind in ["codex", "claude"] {
-            write_config_key(&["agent_launch_args", kind], Some(Value::Array(Vec::new())))?;
-        }
+        write_launch_args(|args| {
+            for kind in ["codex", "claude"] {
+                args.insert(kind.to_owned(), Vec::new());
+            }
+        })?;
         return Ok(String::from(
             "Approval prompts on; press r to restart Gateway and apply. A task may then wait for you.",
         ));
@@ -1490,12 +1490,27 @@ fn toggle_agent_bypass() -> anyhow::Result<String> {
     )? {
         return Ok(String::from("Approval prompts unchanged."));
     }
-    for kind in ["codex", "claude"] {
-        write_config_key(&["agent_launch_args", kind], None)?;
-    }
+    write_launch_args(|args| {
+        for kind in ["codex", "claude"] {
+            args.remove(kind);
+        }
+    })?;
     Ok(String::from(
         "Approval prompts skipped; press r to restart Gateway and apply.",
     ))
+}
+
+/// `agent_launch_args` changed by `change`, written in one replacement.
+fn write_launch_args(
+    change: impl FnOnce(&mut std::collections::BTreeMap<String, Vec<String>>),
+) -> anyhow::Result<()> {
+    let mut args = load_config(None)?.agent_launch_args;
+    change(&mut args);
+    let value = (!args.is_empty())
+        .then(|| serde_json::to_value(&args))
+        .transpose()?;
+    write_config_key(&["agent_launch_args"], value)?;
+    Ok(())
 }
 
 fn toggle_agent_trust() -> anyhow::Result<String> {
@@ -1620,11 +1635,15 @@ fn choose(
         }
         let mut lines = Vec::new();
         panel(&mut lines, title, rows, budget, framed);
-        lines.truncate((height as usize).saturating_sub(1));
+        lines.truncate((height as usize).saturating_sub(2));
         lines.push(ScreenLine::text(
             fit("↑↓ choose · Enter pick · Esc cancel", budget),
             Tone::Quiet,
         ));
+        lines.push(ScreenLine::plain(fit(
+            &format!("Status: choosing {title}"),
+            budget,
+        )));
         write_viewport(&lines, width, height)?;
         if let TerminalEvent::Key(event) = read_event()? {
             if event.kind != KeyEventKind::Press {
@@ -3385,17 +3404,13 @@ mod tests {
         // A change applies after a restart for every key the running
         // gateway read at startup.
         for setting in Setting::ALL {
-            let restarts = matches!(
-                setting,
-                Setting::Address
-                    | Setting::DetectAddress
-                    | Setting::TransportEncryption
-                    | Setting::HistoryStorage
-                    | Setting::AgentBypass
-                    | Setting::AgentTrust
-                    | Setting::Mcp
-                    | Setting::McpInject
-            );
+            // Every config.json key a row changes is read at startup; Detect
+            // address changes one too.
+            let writes_config = setting
+                .source()
+                .is_some_and(|source| source.starts_with("config.json ›"))
+                && setting.read_only().is_none();
+            let restarts = writes_config || setting == Setting::DetectAddress;
             assert_eq!(setting.needs_restart(), restarts, "{setting:?}");
         }
         // The view lists every row in order, each under its group, and fits
@@ -3483,7 +3498,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("config.json");
         let mut original = serde_json::to_value(layout_config()).unwrap();
-        original["zz_unknown"] = serde_json::json!({ "kept": true });
+        original["zz_unknown"] = serde_json::json!({ "zz": 1, "aa": 2 });
         original["agent_trust_folders"] = serde_json::json!(true);
         // An order of the owner's own: unknown key first.
         let mut ordered = indexmap::IndexMap::new();
@@ -3518,7 +3533,12 @@ mod tests {
             assert_eq!(kept, keys.iter().collect::<Vec<_>>(), "{path:?}: order");
             for key in &keys {
                 if key != path[0] {
-                    assert_eq!(after[key], ordered[key], "{path:?}: {key} changed");
+                    // Bytes, not values: a reordered nested object fails.
+                    assert_eq!(
+                        serde_json::to_string(&after[key]).unwrap(),
+                        serde_json::to_string(&ordered[key]).unwrap(),
+                        "{path:?}: {key} changed"
+                    );
                 }
             }
             assert!(

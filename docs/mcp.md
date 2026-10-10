@@ -171,11 +171,31 @@ An agent gets the muqun server one of two ways:
      task's directory, an agent-bound token in its `Authorization` header,
      Code Mode off so `tasks.complete` is a direct tool) when it is not
      already connected; it lasts until the service restarts and is given
-     again on the next delegation. The service is shared, so the user's own
-     OpenCode sessions in that directory see the tools too; the server's
-     instructions tell them they are not in a task.
+     again on the next delegation; each directory has its own token, and
+     with injection off they are revoked at startup. The service is shared,
+     so every OpenCode session in that directory sees the tools -- phone chats
+     and the user's own sessions too. None is told it is a task: all get the
+     conditional wording, and `tasks.read` without a task_id tells a session
+     without a task to ignore the protocol.
    - T3 Code and DeepSeek take no MCP server: their tasks end
      `idle_unconfirmed`, or on a marker.
+
+   How a task's agent learns to report its end comes three ways, none of
+   them in the conversation: OpenCode and any host that reads them get the
+   server's `initialize` instructions (written plainly for a caller started
+   for a task); Claude Code and Codex, which do not act on those, are given
+   one sentence out of band at launch -- "You were started for a Muqun task:
+   when it is finished call the muqun tool tasks.complete (outcome blocked if
+   you need the user)." -- Claude Code through
+   `--append-system-prompt-file <state dir>/task-instruction.md` (0600; left
+   out when `agent_launch_args.claude` already appends a system prompt),
+   Codex through `-c developer_instructions=<the user's own
+   developer_instructions, read from their config.toml and never written,
+   then the sentence>` for that run. Only a Claude Code seen to start that
+   way and gone again at once, its pane back at a shell with no Claude Code
+   left under it, is started once more with the sentence typed after the
+   goal; a start that times out is never retried. The launch line shows in
+   the pane as any terminal's does.
 2. **The user registers it** with `mcp enable` below, for agents they start
    by hand.
 
@@ -514,19 +534,17 @@ signals:
 
 Every delegation is given its goal alone. How to say it ended is
 declaration-level knowledge, never conversation text: the MCP server's
-`initialize` answer carries `instructions`, written for the caller: to one
-started for a task -- a pane-bound token whose pane holds an open task, or
-the token the gateway hands a session agent's service (see
-[Host setup](#host-setup)) -- "Muqun started you to work on a task: its goal
-is your first prompt. When that whole task is finished, call tasks.complete
-with a one-line summary; when you stop because you need the user, call it
-with outcome "blocked" and the reason; if you cannot call it, end with the
-line MUQUN_TASK_DONE: <summary> (or MUQUN_TASK_BLOCKED: <reason>). If
-tasks.complete answers task_not_found, this session is not a Muqun task: do
-not call it again and print no marker."; to anyone else the same, opening
-"If this session was started as a Muqun task". The `tasks.complete`
-description says when to call it, and that `task_not_found` means not to
-call it again. An agent
+`initialize` answer carries `instructions` written for the caller. A
+pane-bound token whose pane holds an open task is told plainly, first and
+imperatively, that it was started for one task and must call
+`tasks.complete` as its last action (outcome `blocked` when it needs the
+user; a marker line if it cannot call it). Any other caller -- an
+agent-bound token is shared by every session of its service, task or not --
+is told the same only on condition: if this session was started as a Muqun
+task, which `tasks.read` without a task_id answers (the session's task, or
+"this session has no Muqun task: ignore the task protocol"). `tasks.complete`
+from a session without a task answers `task_not_found`: not a task, do not
+call again, print no marker. An agent
 without the muqun tools (T3 Code, DeepSeek) is told nothing: its task ends
 `idle_unconfirmed` for the device to confirm, unless it prints a marker of
 its own accord. The machines a task mentions will not be written into its

@@ -1078,8 +1078,45 @@ pub(crate) async fn start_terminal_agent(
         return;
     }
     let pane_id = placed.place.pane_id.clone();
-    let (mut launched, to_type) =
-        start_agent_in_place(&state, &session, &kind, cwd.as_deref(), placed, Some(&goal)).await;
+    let mut goal = goal;
+    let (mut launched, mut to_type) = start_agent_in_place(
+        &state,
+        &session,
+        &kind,
+        cwd.as_deref(),
+        placed.clone(),
+        Some(&goal),
+        true,
+    )
+    .await;
+    // A Claude Code seen to start with the sentence out of band and gone
+    // again, its pane back at a shell with no Claude Code left under it (it
+    // refused the flag), is started once more with the sentence typed after
+    // the goal. A start that timed out is a failed launch: a slow agent may
+    // still come up, and must not start twice.
+    let out_of_band = kind == "claude"
+        && crate::mcp::inject::enabled(&state.config)
+        && !crate::mcp::inject::terminal_task_args(&state.config, &kind)
+            .await
+            .is_empty();
+    if out_of_band
+        && failed_step(&launched.steps.value()).is_none()
+        && pane_agent::exited_to_shell(&session, &pane_id, &kind).await
+        && !ended().await
+    {
+        tracing::info!(task = %task.id.0, "terminal task: started again with the sentence typed");
+        goal = format!("{goal}\n\n{}", crate::mcp::inject::TASK_SENTENCE);
+        (launched, to_type) = start_agent_in_place(
+            &state,
+            &session,
+            &kind,
+            cwd.as_deref(),
+            placed,
+            Some(&goal),
+            false,
+        )
+        .await;
+    }
     let typed = to_type.is_some();
     if let Some(started) = to_type {
         if ended().await {
@@ -1532,6 +1569,13 @@ impl TaskService {
         run_command::poll(state, &self.store(), task, deadline)
             .await
             .map_err(command_error)
+    }
+
+    /// Task `id` as clients see it, whoever asks: for a session reading its
+    /// own task (`tasks.read` without a task_id).
+    pub(crate) async fn own_view(&self, id: &TaskId) -> Result<TaskView, TaskError> {
+        let task = self.store.get(id).await?.ok_or(TaskError::NotFound)?;
+        Ok(self.present(&task).await)
     }
 
     /// `task` as clients see it, with its children counted.

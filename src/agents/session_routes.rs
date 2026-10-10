@@ -545,6 +545,7 @@ pub(crate) struct AgentLaunch {
 
 /// The first half of [`launch_agent`]: the pane exists, nothing runs in it
 /// yet.
+#[derive(Clone)]
 pub(crate) struct PlacedAgent {
     pub(crate) place: SpawnPlace,
     pub(crate) payload: Value,
@@ -669,7 +670,7 @@ pub(crate) async fn start_placed_agent(
     prompt: Option<&str>,
 ) -> AgentLaunch {
     let (mut launch, started) =
-        start_agent_in_place(state, session, agent, cwd, placed, prompt).await;
+        start_agent_in_place(state, session, agent, cwd, placed, prompt, false).await;
     if let Some(started) = started {
         type_agent_prompt(session, &started, prompt, &mut launch).await;
     }
@@ -698,6 +699,7 @@ pub(crate) async fn start_agent_in_place(
     cwd: Option<&str>,
     placed: PlacedAgent,
     prompt: Option<&str>,
+    for_task: bool,
 ) -> (AgentLaunch, Option<StartedAgent>) {
     let PlacedAgent {
         place,
@@ -717,6 +719,10 @@ pub(crate) async fn start_agent_in_place(
     );
     // The muqun server for the agent's own process, never its config.
     agent_args.extend(crate::mcp::inject::terminal_args(&state.config, agent).await);
+    // A task's agent is told, out of band, how to report the task's end.
+    if for_task {
+        agent_args.extend(crate::mcp::inject::terminal_task_args(&state.config, agent).await);
+    }
     let launch_prompt = prompt
         .filter(|_| terminal_backend(session).takes_launch_prompt())
         .and_then(|prompt| Some((prompt, tasks::launch_prompt_args(agent, prompt)?)));
@@ -1089,6 +1095,7 @@ fn pane_env(env: &BTreeMap<String, String>) -> PaneEnv {
     })
 }
 
+#[derive(Clone)]
 pub(crate) struct SpawnPlace {
     pub(crate) pane_id: String,
     pub(crate) tab_id: Option<String>,

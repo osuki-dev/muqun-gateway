@@ -322,13 +322,20 @@ pub(crate) enum What {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct ReadArgs {
-    /// A task_id you created.
-    pub task_id: String,
+    /// A task_id you created. Leave it out to ask whether this session is
+    /// working on a Muqun task, and which.
+    #[serde(default)]
+    pub task_id: Option<String>,
     /// "summary": the task as it stands. "timeline": its recent agent items.
+    #[serde(default = "summary")]
     pub what: What,
     /// Timeline only: items after this cursor (from a previous read).
     #[serde(default)]
     pub cursor: Option<u64>,
+}
+
+fn summary() -> What {
+    What::Summary
 }
 
 impl ReadArgs {
@@ -477,14 +484,32 @@ impl MuqunMcp {
 
     #[tool(
         name = "tasks.read",
-        description = "Read a task you created: its summary or recent timeline."
+        description = "Read a task you created: its summary or recent timeline. Without task_id: whether this session itself is working on a Muqun task, and that task."
     )]
     async fn tasks_read(
         &self,
         Parameters(args): Parameters<ReadArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let what = args.what();
-        let id = TaskId(args.task_id);
+        let Some(task_id) = args.task_id else {
+            let call = lineage::Call {
+                tool: "tasks.read",
+                args: Vec::new(),
+            };
+            let own = lineage::own_task(&self.state, &self.session, &call, None).await;
+            return Ok(match own {
+                Some(id) => match self.state.tasks.own_view(&id).await {
+                    Ok(task) => CallToolResult::structured(json!({
+                        "your_task": task,
+                        "when_finished": "call tasks.complete with a one-line summary \
+                                          (outcome blocked and the reason if you need the user)",
+                    })),
+                    Err(error) => task_error(error),
+                },
+                None => CallToolResult::structured(json!({ "your_task": null, "note": NO_TASK })),
+            });
+        };
+        let id = TaskId(task_id);
         let tasks = &self.state.tasks;
         reply(
             tasks
@@ -516,9 +541,8 @@ impl MuqunMcp {
         let Some(id) = own else {
             return Ok(fail(
                 "task_not_found",
-                "No open task of this session was found. If you finished it, print the line \
-                 MUQUN_TASK_DONE: <one-line summary> instead (or, blocked, \
-                 MUQUN_TASK_BLOCKED: <one-line reason>).",
+                "No open task of this session was found: this session is not working on a \
+                 Muqun task. Do not call tasks.complete again and print no marker.",
             ));
         };
         reply(
@@ -573,23 +597,29 @@ pub(crate) fn instructions(in_task: bool) -> String {
              tool tasks.complete -- {finish} {about}"
         )
     } else {
-        format!("{about} If this session was started as a Muqun task: when the whole task is finished, {finish}")
+        format!(
+            "{about} If this session was started as a Muqun task -- tasks.read without a \
+             task_id tells you -- then when the whole task is finished, {finish} If \
+             tasks.read says this session has no task, ignore the task protocol."
+        )
     }
 }
 
+/// What `tasks.read` without a task_id answers a session that has no task.
+const NO_TASK: &str = "This session has no Muqun task: ignore the task protocol -- do not call \
+     tasks.complete and print no marker.";
+
 /// Whether the caller of `/mcp` was started for a task: a pane-bound token
-/// whose pane holds an open task, or the token the gateway handed a
-/// session agent's service for the tasks it delegates there
-/// ([`super::inject`]).
+/// whose pane holds an open task. An agent-bound token is shared by every
+/// session of its agent's service (task or not), so it never is: those
+/// sessions get the conditional wording and ask `tasks.read`.
 pub(crate) async fn started_for_task(state: &AppState, session: &AssistantSession) -> bool {
     match &session.binding {
         crate::mcp::tokens::TokenBinding::Pane {
             session_id,
             pane_id,
         } => state.tasks.open_task_in_pane(session_id, pane_id).await,
-        crate::mcp::tokens::TokenBinding::Agent { .. } => {
-            session.label == super::inject::RUNTIME_LABEL
-        }
+        crate::mcp::tokens::TokenBinding::Agent { .. } => false,
     }
 }
 
@@ -755,7 +785,7 @@ mod tests {
         };
         let (_, _, run) = answer(mcp.exec_run(Parameters(args)).await);
         let args = ReadArgs {
-            task_id: run["task_id"].as_str().unwrap().into(),
+            task_id: Some(run["task_id"].as_str().unwrap().into()),
             what: What::Timeline,
             cursor: None,
         };
@@ -770,7 +800,7 @@ mod tests {
         let id = delegated(FakeAgent::new("opencode"), &owner).await;
         let other = MuqunMcp::new(owner.state.clone(), session("%2"));
         let args = ReadArgs {
-            task_id: id,
+            task_id: Some(id),
             what: What::Summary,
             cursor: None,
         };
@@ -778,6 +808,36 @@ mod tests {
         assert!(error);
         assert_eq!(body["error"], "task_not_found", "{body}");
         assert!(body["message"].is_string());
+    }
+
+    #[tokio::test]
+    async fn a_session_without_a_task_is_told_to_ignore_the_protocol() {
+        // No task in this pane: tasks.read says so plainly, and
+        // tasks.complete answers not found without asking for a marker.
+        let mcp = MuqunMcp::new(test_state("admin", Vec::new()), session("%9"));
+        let args = ReadArgs {
+            task_id: None,
+            what: What::Summary,
+            cursor: None,
+        };
+        let (error, _, body) = answer(mcp.tasks_read(Parameters(args)).await);
+        assert!(!error, "{body}");
+        assert!(
+            body["your_task"].is_null() && body["note"] == NO_TASK,
+            "{body}"
+        );
+        let args = CompleteArgs {
+            summary: "done".into(),
+            outcome: Outcome::Done,
+            task_id: None,
+        };
+        let (error, _, body) = answer(mcp.tasks_complete(Parameters(args)).await);
+        assert!(error);
+        assert_eq!(body["error"], "task_not_found", "{body}");
+        assert!(!body["message"]
+            .as_str()
+            .unwrap()
+            .contains("MUQUN_TASK_DONE:"));
     }
 
     /// A device's delegation whose OpenCode session is mid-`tasks.delegate`:
@@ -862,7 +922,7 @@ mod tests {
             .collect();
         let id = delegated(FakeAgent::new("opencode").with_timeline(timeline), &mcp).await;
         let args = ReadArgs {
-            task_id: id,
+            task_id: Some(id),
             what: What::Timeline,
             cursor: None,
         };

@@ -137,7 +137,9 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
   `hosts.rs`, and the server handed at launch to the agents the gateway
   starts (`inject.rs`: Claude Code's `--mcp-config`, Codex's `-c`, OpenCode's
   runtime API; no user file is written). Off with `mcp.enabled: false`;
-  contract in `docs/mcp.md`.
+  contract in `docs/mcp.md`. `McpConfig` denies unknown fields: a config.json
+  that sets `mcp.inject_into_agents` does not load in a build from before
+  it, so rolling back to such a binary means removing that key first.
 - `src/platform/`: shared infrastructure.
   - `store/`: the shared SQLite store (`sqlite.rs`, one worker thread,
     migrations per domain) and its optional SQLCipher key file (`db_key.rs`);
