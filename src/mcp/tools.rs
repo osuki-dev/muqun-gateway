@@ -362,6 +362,7 @@ impl DelegateArgs {
             mentions: Vec::new(),
             client_ref: None,
             session_id: self.terminal,
+            attachments: Vec::new(),
         })
     }
 }

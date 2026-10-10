@@ -208,6 +208,10 @@ pub(crate) struct DelegateRequest {
     /// The terminal session a terminal agent starts in (a tmux session or
     /// Herdr, by its id in the config); `None`: the first that answers.
     pub session_id: Option<String>,
+    /// Files sent with the goal, as the session prompt takes them (uploaded
+    /// asset references or file paths on this computer): handed to a
+    /// session agent with its first prompt.
+    pub attachments: Vec<String>,
 }
 
 /// Who asked for a task, as a task view shows it.
@@ -360,6 +364,9 @@ pub(crate) enum TaskError {
     NoTerminal,
     /// The request named a terminal session this computer has no such id for.
     TerminalUnknown(String),
+    /// Attachments sent where they cannot go along: a terminal agent, or
+    /// another computer (they are references on this one).
+    AttachmentsUnsupported,
     /// A timeline was asked of a task that has none (a command).
     NoTimeline,
     /// The device confirmed a task that is not its own paused or waiting
@@ -402,6 +409,9 @@ impl std::fmt::Display for TaskError {
             }
             Self::NoTerminal => write!(f, "{}", run_command::NO_TERMINAL),
             Self::TerminalUnknown(id) => write!(f, "no terminal session '{id}'"),
+            Self::AttachmentsUnsupported => {
+                write!(f, "attachments go only to a session agent on this computer")
+            }
             Self::NoTimeline => write!(f, "only a delegated task has a timeline"),
             Self::InvalidSummary => write!(f, "summary must be non-empty and at most 32 KiB"),
             Self::NotConfirmable => write!(
@@ -1062,6 +1072,9 @@ impl TaskService {
             &state.config.label,
             &state.peers.names(),
         ) {
+            if !request.attachments.is_empty() {
+                return Err(TaskError::AttachmentsUnsupported);
+            }
             let wanted = request.machine.clone().unwrap_or_default();
             let Some(peer) = state.peers.resolve(&wanted).await else {
                 let known = state.peers.names();
@@ -1079,6 +1092,9 @@ impl TaskService {
         }
         if let Some(kind) = request.agent_id.as_deref() {
             if runs_in_pane(state, kind).await {
+                if !request.attachments.is_empty() {
+                    return Err(TaskError::AttachmentsUnsupported);
+                }
                 return self.delegate_to_pane(state, by, request).await;
             }
         }
@@ -1205,7 +1221,7 @@ impl TaskService {
             .await;
             manager
                 .prompts()
-                .send_prompt(&asid, &request.goal, &[], None)
+                .send_prompt(&asid, &request.goal, &request.attachments, None)
                 .await?;
             let task = self
                 .store()
@@ -3279,6 +3295,7 @@ mod tests {
             mentions: Vec::new(),
             client_ref: None,
             session_id: None,
+            attachments: Vec::new(),
         }
     }
 

@@ -186,7 +186,14 @@ struct CreateBody {
     /// absent: the first that answers.
     #[serde(default)]
     session_id: Option<String>,
+    /// Files sent with the goal, as `POST /api/agent-sessions/{asid}/prompt`
+    /// takes them.
+    #[serde(default)]
+    attachments: Vec<String>,
 }
+
+/// How many attachments one task's goal may carry.
+const MAX_ATTACHMENTS: usize = 16;
 
 fn refused(code: &str, message: &str) -> (StatusCode, Json<Value>) {
     api_error(StatusCode::BAD_REQUEST, code, message)
@@ -279,6 +286,17 @@ impl CreateBody {
                 "label must be at most 200 characters",
             ));
         }
+        if self.attachments.len() > MAX_ATTACHMENTS
+            || self
+                .attachments
+                .iter()
+                .any(|reference| reference.trim().is_empty() || reference.len() > 4096)
+        {
+            return Err(refused(
+                "invalid_request",
+                "attachments must be at most 16 non-empty references",
+            ));
+        }
         let mentions = known_mentions(self.mentions, linked)?;
         if self
             .client_ref
@@ -306,6 +324,7 @@ impl CreateBody {
             mentions,
             client_ref: self.client_ref,
             session_id: self.session_id,
+            attachments: self.attachments,
         })
     }
 }
@@ -380,6 +399,10 @@ fn create_failed(error: TaskError) -> (StatusCode, Json<Value>) {
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_unavailable",
             "That agent is not available",
+        ),
+        TaskError::AttachmentsUnsupported => refused(
+            "attachments_unsupported",
+            "Attachments go only to a session agent on this computer",
         ),
         TaskError::TerminalUnknown(_) => refused(
             "terminal_unknown",
@@ -755,14 +778,19 @@ mod tests {
 
     #[tokio::test]
     async fn a_device_opens_a_delegation_and_is_told_its_session() {
-        let state = with_agent().await;
+        let state = state();
+        let agent =
+            crate::test_support::FakeAgent::new("opencode").with_sessions(&[("opencode_new", 1)]);
+        let (prompts, attached) = (agent.prompts.clone(), agent.attached.clone());
+        state.agent_runtime.attach_for_test(agent.manager()).await;
         let dir = std::env::temp_dir().canonicalize().unwrap();
         let body = json!({
             "goal": "fix the build",
             "cwd": dir,
             "label": "  build  ",
             "agent_id": "opencode",
-            "mode": "build"
+            "mode": "build",
+            "attachments": ["asset_shot", "/home/u/notes.txt"]
         });
         let (status, task) = send(&state, "POST", "/api/tasks", Some(body), true).await;
         assert_eq!(status, StatusCode::OK, "{task}");
@@ -791,6 +819,16 @@ mod tests {
             .await;
         assert_eq!(stored.cwd.as_deref(), Some(dir.to_str().unwrap()));
         assert_eq!(stored.created_by, principal("d1".into()));
+
+        // The goal and both attachments, as the session prompt sends them.
+        assert_eq!(*prompts.lock().unwrap(), ["fix the build"]);
+        assert_eq!(
+            *attached.lock().unwrap(),
+            [vec![
+                "asset_shot".to_owned(),
+                "/home/u/notes.txt".to_owned()
+            ]]
+        );
 
         let (_, listed) = call(&state, "GET", "/api/tasks").await;
         assert_eq!(listed["tasks"][0]["origin"], "device");
