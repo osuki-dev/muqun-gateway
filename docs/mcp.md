@@ -693,8 +693,11 @@ terminal, in that terminal's foreground process group, whose executable --
 resolved by the system (`/proc/<pid>/exe` on Linux, the kernel's command
 name on macOS), never read from its arguments -- is the agent's (a binary
 named for it, Codex's `codex-<target>`, or Claude Code's
-`…/claude/versions/<version>`; an agent run through `node` or `bun` does not
-count, so such a pane is never typed into). Anything else in front -- a shell, `ssh`, `sudo`,
+`…/claude/versions/<version>`). A `node` or `bun` process counts only when the
+script it runs -- its first argument that is not an option, canonicalised,
+and a file that really exists -- lies in the agent's own package
+(`@anthropic-ai/claude-code`, `@openai/codex`, an `opencode` package); its
+arguments alone never do. Anything else in front -- a shell, `ssh`, `sudo`,
 an editor, the agent suspended with Ctrl-Z or run with `&` -- means nothing is
 typed, since that program would receive the text; the result is tried again
 on later passes for an hour (the agent may come back with `fg`), then given

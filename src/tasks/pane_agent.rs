@@ -227,8 +227,56 @@ pub(crate) async fn agent_in_foreground(
     };
     for row in &mut rows {
         row.exe = resolved_executable(row.pid, &row.exe);
+        if is_runtime(&row.exe) {
+            row.script = runtime_script(row.pid).await;
+        }
     }
     holds_terminal(&rows, root, kind)
+}
+
+/// Whether `exe` is a JavaScript runtime an agent's CLI can run under.
+fn is_runtime(exe: &str) -> bool {
+    matches!(command_name(exe), "node" | "bun")
+}
+
+/// The script a runtime process `pid` runs: its first argument after the
+/// runtime that is not an option, canonicalised. `None` unless that path
+/// resolves to a real file -- the argument alone never counts.
+async fn runtime_script(pid: u32) -> Option<String> {
+    let args: Vec<String> = if cfg!(target_os = "linux") {
+        let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+        raw.split(|byte| *byte == 0)
+            .filter(|arg| !arg.is_empty())
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+            .collect()
+    } else {
+        let out = tokio::process::Command::new("ps")
+            .args(["-o", "args=", "-p", &pid.to_string()])
+            .kill_on_drop(true)
+            .output()
+            .await
+            .ok()?;
+        String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect()
+    };
+    let script = args.iter().skip(1).find(|arg| !arg.starts_with('-'))?;
+    let path = std::fs::canonicalize(script).ok()?;
+    path.is_file().then(|| path.to_string_lossy().into_owned())
+}
+
+/// Whether a runtime's canonical `script` lies in the `kind` agent's own
+/// package: `@anthropic-ai/claude-code` (Claude Code), `@openai/codex`
+/// (Codex), an `opencode` package (OpenCode's CLI).
+fn agent_script(script: &str, kind: &str) -> bool {
+    let package = match kind {
+        "claude" => "/@anthropic-ai/claude-code/",
+        "codex" => "/@openai/codex/",
+        "opencode" => "/opencode",
+        _ => return false,
+    };
+    script.contains(package)
 }
 
 /// One `ps -o pid=,ppid=,pgid=,tpgid=,tty=,comm=` row; `exe` is the command
@@ -241,6 +289,9 @@ struct Proc {
     tpgid: i64,
     tty: String,
     exe: String,
+    /// For a runtime (`node`, `bun`): the script it runs, canonicalised --
+    /// `None` unless that file really exists.
+    script: Option<String>,
 }
 
 /// The rows of a process table, by fixed columns: four numbers, the
@@ -271,6 +322,7 @@ fn process_rows(table: &str) -> Option<Vec<Proc>> {
                 tpgid,
                 tty,
                 exe,
+                script: None,
             })
         })
         .collect()
@@ -292,8 +344,8 @@ fn resolved_executable(pid: u32, comm: &str) -> String {
 
 /// Whether executable `exe` is the `kind` agent: a binary named `kind`
 /// (or `kind-<target>`, as Codex ships), or for Claude Code its versioned
-/// binary under `…/claude/versions/`. A runtime (`node`, `bun`) or a shell
-/// never is, whatever script it runs.
+/// binary under `…/claude/versions/`. A runtime (`node`, `bun`) counts only
+/// through the script it runs ([`agent_script`]); a shell never does.
 fn agent_executable(exe: &str, kind: &str) -> bool {
     let name = command_name(exe).to_ascii_lowercase();
     name == kind
@@ -327,7 +379,12 @@ fn holds_terminal(rows: &[Proc], root: u32, kind: &str) -> bool {
             && tree.contains(&row.pid)
             && row.tty == *pane_tty
             && row.pgid == foreground
-            && agent_executable(&row.exe, kind)
+            && (agent_executable(&row.exe, kind)
+                || (is_runtime(&row.exe)
+                    && row
+                        .script
+                        .as_deref()
+                        .is_some_and(|script| agent_script(script, kind))))
     })
 }
 
@@ -1302,6 +1359,11 @@ mod tests {
     fn only_the_agent_holding_the_pane_terminal_is_typed_to() {
         // pid ppid pgid tpgid tty exe; the pane's shell is 100 on pts/3.
         let rows = |lines: &[&str]| process_rows(&lines.join("\n")).unwrap();
+        // The canonical script of the runtime row, as the probe resolves it.
+        let script = |mut rows: Vec<Proc>, path: &str| {
+            rows[1].script = Some(path.to_owned());
+            rows
+        };
         let shell = "100 1 100 200 pts/3 /usr/bin/zsh";
         for (name, table, typed) in [
             (
@@ -1344,8 +1406,24 @@ mod tests {
                 false,
             ),
             (
-                "an agent run by a runtime",
+                "a runtime with no script that exists",
                 rows(&[shell, "200 100 200 200 pts/3 /usr/bin/node"]),
+                false,
+            ),
+            (
+                "node running the real Claude Code package",
+                script(
+                    rows(&[shell, "200 100 200 200 pts/3 /usr/bin/node"]),
+                    "/home/u/.local/share/mise/installs/node/24/lib/node_modules/@anthropic-ai/claude-code/cli.js",
+                ),
+                true,
+            ),
+            (
+                "node running a script elsewhere named claude",
+                script(
+                    rows(&[shell, "200 100 200 200 pts/3 /usr/bin/node"]),
+                    "/tmp/claude/claude.js",
+                ),
                 false,
             ),
         ] {
