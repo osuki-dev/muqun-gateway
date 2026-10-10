@@ -184,7 +184,7 @@ async fn refusal(state: &AppState, peer: &Peer, error: PeerError) -> TaskError {
             TaskError::MachineUnreachable(machine)
         }
         PeerError::Unauthorized => {
-            forget(state, &peer.peer_id).await;
+            unauthorized(state, &peer.peer_id).await;
             TaskError::PeerUnauthorized(machine)
         }
         PeerError::Refused { code, .. } if code == "delegations_disabled" => {
@@ -265,7 +265,12 @@ pub(crate) fn watch(state: &AppState, peer_id: &str) {
 async fn follow(state: AppState, peer_id: String) {
     let mut retry = RETRY_FIRST;
     loop {
-        let Some(peer) = state.peers.get(&peer_id).await else {
+        let Some(peer) = state
+            .peers
+            .get(&peer_id)
+            .await
+            .filter(|peer| !peer.unauthorized)
+        else {
             return;
         };
         let Ok(client) = PeerClient::for_peer(&peer) else {
@@ -288,7 +293,7 @@ async fn follow(state: AppState, peer_id: String) {
                     Ended::Socket => {}
                 }
             }
-            Err(PeerError::Unauthorized) => return forget(&state, &peer_id).await,
+            Err(PeerError::Unauthorized) => return unauthorized(&state, &peer_id).await,
             Err(_) => {
                 if !read_all(&state, &client, &peer).await {
                     return;
@@ -414,7 +419,7 @@ async fn refresh(
             Some(moved)
         }
         Err(PeerError::Unauthorized) => {
-            forget(state, &peer.peer_id).await;
+            unauthorized(state, &peer.peer_id).await;
             None
         }
         // Quiet: the mirror keeps its state. Published anyway, so its view's
@@ -462,16 +467,18 @@ async fn adopt(
 /// The peer answered 401/403: it was unlinked there, or this computer's
 /// login revoked. Its open mirrors fail (reason `peer_unlinked`): the task over
 /// there can never be read again, since a new link is a new login. Then the
-/// peer is forgotten (§10.10) -- last, since this may run in its follower,
-/// which forgetting ends. Every path that finds a link gone comes here.
-pub(crate) async fn forget(state: &AppState, peer_id: &str) {
-    tracing::info!(peer = %peer_id, "a peer no longer knows this gateway; forgetting it");
+/// peer is marked `unauthorized`, not forgotten: a delegation there says why,
+/// and the phone's next link under its name replaces it -- last, since this
+/// may run in its follower, which marking ends. Every path that finds a link
+/// gone comes here.
+pub(crate) async fn unauthorized(state: &AppState, peer_id: &str) {
+    tracing::info!(peer = %peer_id, "a peer no longer takes this gateway's token");
     state.peers.presence.gone(peer_id);
     for mirror in open_mirrors(state, peer_id).await {
         let why = ended(&mirror, UNLINKED_THERE);
         state.tasks.record_failure(&mirror, why).await;
     }
-    state.peers.forget(peer_id).await;
+    state.peers.mark_unauthorized(peer_id).await;
 }
 
 /// The open mirrors of `peer_id`.
@@ -509,9 +516,14 @@ pub(crate) async fn converge(state: &AppState, mirror: &Task) -> bool {
     if live && !remote_task_id.is_empty() {
         return false;
     }
-    let Some(peer) = state.peers.get(peer_id).await else {
-        // Forgotten (a restart between the forget and its mirrors' end):
-        // nothing can read its task again.
+    let Some(peer) = state
+        .peers
+        .get(peer_id)
+        .await
+        .filter(|peer| !peer.unauthorized)
+    else {
+        // Unlinked, or no longer taking this token (a restart between the
+        // mark and its mirrors' end): nothing can read its task again.
         let why = ended(mirror, NO_LONGER_LINKED);
         state.tasks.record_failure(mirror, why).await;
         return true;
@@ -676,6 +688,7 @@ mod tests {
             last_seen_ms: seen,
             capabilities: vec![],
             manifest: None,
+            unauthorized: false,
         }
     }
 
@@ -946,10 +959,12 @@ mod tests {
                 );
             }
         }
-        assert!(
-            coding.peers.get("srv-old").await.is_none(),
-            "a revoked link is forgotten"
-        );
+        // A revoked link is kept, marked: the next delegation there still
+        // names the reason, never machine_unknown, and the phone sees it.
+        let old = coding.peers.get("srv-old").await.unwrap();
+        assert!(old.unauthorized && old.view(now_ms()).unauthorized);
+        let again = delegate_as(&coding, "old", "goal").await.unwrap_err();
+        assert_eq!(again["error"], "unauthorized", "{again}");
         let stranded = coding.tasks.get_for_test(&stranded).await;
         assert_eq!(
             (stranded.state, stranded.summary.as_deref()),

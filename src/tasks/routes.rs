@@ -980,6 +980,7 @@ mod tests {
                 last_seen_ms: None,
                 capabilities: Vec::new(),
                 manifest: None,
+                unauthorized: false,
             })
             .await;
         let (status, _) = send(

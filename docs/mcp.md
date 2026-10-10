@@ -156,7 +156,7 @@ Error codes:
 | `machine_unreachable` | `fleet.describe` or `tasks.delegate` named a linked computer that does not answer now; nothing was started there. |
 | `delegation_loop` | `tasks.delegate(machine)` named a linked computer from a task another computer handed here (itself or an ancestor `origin: "peer"`): one hop only, so two computers never hand a goal back and forth; nothing is created. |
 | `delegations_disabled` | `tasks.delegate` named a linked computer whose owner switched off work from other computers. |
-| `unauthorized` | `tasks.delegate` named a linked computer that no longer knows this one; the link is forgotten here, and the owner's phone links it again. |
+| `unauthorized` | `tasks.delegate` or `fleet.describe` named a linked computer that no longer takes this one's token ("mini no longer accepts this computer; link again from your phone"); the link is kept, marked `unauthorized`, until the owner's phone links it again. |
 | *the computer's own code* | `tasks.delegate`: the linked computer refused the task (for example `directory_not_found`, `agent_unavailable`); an argument it refused (`invalid_request`, `unknown_model`, `unknown_variant`) is `invalid_arguments`. The message names the computer. |
 | `manifest_unavailable` | `fleet.describe` named a linked computer that answers but gave no manifest, and none is cached (for example an older gateway). |
 | `agent_unavailable` | The requested agent is not available on this computer. |
@@ -723,7 +723,7 @@ another computer: they answer with what this gateway last heard. A computer
 neither heard from nor pinged in the last 60 s is `reachable: null` (not
 checked yet); the call starts a check of it in the background -- one at a
 time per computer -- so the next call knows (one that no longer knows this
-gateway's token is forgotten and left out). After a check it is `reachable`
+gateway's token is marked `unauthorized` and `reachable: false`). After a check it is `reachable`
 while its last answer is under 2 minutes old. Its manifest (`GET
 /api/fleet/self` on it, compacted to the keys above: strings of at most 256
 characters, numbers and booleans, each list at most 64 items) is asked for
@@ -770,7 +770,9 @@ peer_server_id, remote_task_id, peer_name}`.
   one's token (unlinked or revoked there: it answers `401`/`403`), its open
   mirrors fail (view `reason: "peer_unlinked"`, a plain summary) -- the task
   there can never be read again, since a new link is a new login -- and the
-  computer is forgotten (`unauthorized` on the next delegation). A mirror's
+  computer is marked `unauthorized`, not forgotten: the next delegation
+  there answers `unauthorized` (never `machine_unknown`, which is for names
+  never linked), and the phone's next link under its name replaces it. A mirror's
   `reason` field is described in [agent-api.md](agent-api.md#linked-gateways-fleet_peers).
 
 ### States

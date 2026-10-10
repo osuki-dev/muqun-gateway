@@ -19,7 +19,7 @@ impl SqlitePeerStore {
     }
 }
 
-const COLUMNS: &str = "peer_id, name, url, token, device_id, transport_key, added_ms, last_seen_ms, capabilities, manifest, server_id";
+const COLUMNS: &str = "peer_id, name, url, token, device_id, transport_key, added_ms, last_seen_ms, capabilities, manifest, server_id, unauthorized";
 
 impl PeerStore for SqlitePeerStore {
     fn put<'a>(&'a self, peer: &'a Peer) -> TaskFuture<'a, ()> {
@@ -29,12 +29,12 @@ impl PeerStore for SqlitePeerStore {
             let manifest = peer.manifest.as_ref().map(Value::to_string);
             c.execute(
                 &format!(
-                    "INSERT INTO peers({COLUMNS}) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                    "INSERT INTO peers({COLUMNS}) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                      ON CONFLICT(peer_id) DO UPDATE SET name = excluded.name, url = excluded.url,
                        token = excluded.token, device_id = excluded.device_id,
                        transport_key = excluded.transport_key, added_ms = excluded.added_ms,
                        last_seen_ms = excluded.last_seen_ms, capabilities = excluded.capabilities,
-                       manifest = excluded.manifest, server_id = excluded.server_id"
+                       manifest = excluded.manifest, server_id = excluded.server_id, unauthorized = excluded.unauthorized"
                 ),
                 params![
                     peer.peer_id,
@@ -48,6 +48,7 @@ impl PeerStore for SqlitePeerStore {
                     capabilities,
                     manifest,
                     peer.server_id,
+                    peer.unauthorized,
                 ],
             )?;
             Ok(())
@@ -89,6 +90,17 @@ impl PeerStore for SqlitePeerStore {
         }))
     }
 
+    fn set_unauthorized<'a>(&'a self, peer_id: &'a str) -> TaskFuture<'a, ()> {
+        let peer_id = peer_id.to_owned();
+        Box::pin(self.db.call(move |c| {
+            c.execute(
+                "UPDATE peers SET unauthorized = 1 WHERE peer_id = ?1",
+                [peer_id],
+            )?;
+            Ok(())
+        }))
+    }
+
     fn seen<'a>(
         &'a self,
         peer_id: &'a str,
@@ -124,6 +136,7 @@ fn read_row(row: &Row<'_>) -> rusqlite::Result<anyhow::Result<Peer>> {
     let capabilities: String = row.get(8)?;
     let manifest: Option<String> = row.get(9)?;
     let server_id: String = row.get(10)?;
+    let unauthorized: bool = row.get(11)?;
     let (peer_id, name, url, token, device_id, transport_key) = (
         row.get(0)?,
         row.get(1)?,
@@ -147,6 +160,7 @@ fn read_row(row: &Row<'_>) -> rusqlite::Result<anyhow::Result<Peer>> {
             manifest: manifest
                 .map(|text| serde_json::from_str(&text))
                 .transpose()?,
+            unauthorized,
         })
     })())
 }

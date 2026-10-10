@@ -38,6 +38,9 @@ ALTER TABLE peers ADD COLUMN server_id TEXT;
 UPDATE peers SET server_id = peer_id;
 CREATE UNIQUE INDEX peers_by_server ON peers(server_id);
 ",
+        "
+ALTER TABLE peers ADD COLUMN unauthorized INTEGER NOT NULL DEFAULT 0;
+",
     ],
 };
 
@@ -65,6 +68,10 @@ pub(crate) struct Peer {
     pub last_seen_ms: Option<u64>,
     pub capabilities: Vec<String>,
     pub manifest: Option<Value>,
+    /// The peer answered 401/403: it no longer takes this computer's token
+    /// (unlinked there, or this login revoked). Kept, not forgotten, so a
+    /// delegation names the reason; a link under its name replaces it.
+    pub unauthorized: bool,
 }
 
 /// Never the token or the transport key.
@@ -100,7 +107,7 @@ fn recent(seen: Option<u64>, now_ms: u64) -> bool {
 
 impl Peer {
     pub(crate) fn reachable(&self, now_ms: u64) -> bool {
-        recent(self.last_seen_ms, now_ms)
+        !self.unauthorized && recent(self.last_seen_ms, now_ms)
     }
 
     pub(crate) fn view(&self, now_ms: u64) -> PeerView {
@@ -111,6 +118,7 @@ impl Peer {
             url: self.url.clone(),
             reachable: self.reachable(now_ms),
             last_seen_ms: self.last_seen_ms,
+            unauthorized: self.unauthorized,
         }
     }
 }
@@ -124,6 +132,9 @@ pub(crate) struct PeerView {
     pub url: String,
     pub reachable: bool,
     pub last_seen_ms: Option<u64>,
+    /// It no longer takes this computer's token: link it again.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub unauthorized: bool,
 }
 
 pub(crate) trait PeerStore: Send + Sync {
@@ -132,6 +143,8 @@ pub(crate) trait PeerStore: Send + Sync {
     fn put<'a>(&'a self, peer: &'a Peer) -> TaskFuture<'a, ()>;
     fn list<'a>(&'a self) -> TaskFuture<'a, Vec<Peer>>;
     fn remove<'a>(&'a self, peer_id: &'a str) -> TaskFuture<'a, bool>;
+    /// Mark `peer_id` as no longer taking this computer's token.
+    fn set_unauthorized<'a>(&'a self, peer_id: &'a str) -> TaskFuture<'a, ()>;
     /// Change only `name` and/or `url` of the row, when it is still there:
     /// never a whole row from an older read. Whether it was.
     fn edit<'a>(
@@ -504,9 +517,12 @@ impl PeerService {
     }
 
     /// `peer`, pinged first when its last answer is older than [`CHECK_EVERY`].
-    /// A peer that no longer knows this gateway's token is forgotten (§10.10),
-    /// its open mirrors failed, and answered as `None`.
+    /// A peer that no longer knows this gateway's token is marked so, its
+    /// open mirrors failed, and answered as `None` (as is one already marked).
     pub(crate) async fn checked(&self, state: &AppState, peer: Peer) -> Option<Peer> {
+        if peer.unauthorized {
+            return None;
+        }
         let now = now_ms();
         if peer
             .last_seen_ms
@@ -544,7 +560,7 @@ impl PeerService {
                 })
             }
             Ok(Err(PeerError::Unauthorized)) => {
-                super::mirror::forget(state, &peer.peer_id).await;
+                super::mirror::unauthorized(state, &peer.peer_id).await;
                 None
             }
             Ok(Err(_)) | Err(_) => Some(peer),
@@ -622,6 +638,7 @@ impl PeerService {
             last_seen_ms: Some(now),
             capabilities: Vec::new(),
             manifest: None,
+            unauthorized: false,
         };
         match self.keep(own_id, peer.clone()).await {
             Ok(peer) => Ok(peer),
@@ -638,6 +655,20 @@ impl PeerService {
             return Err(LinkError::IsSelf);
         }
         let peers = self.store.list().await.map_err(LinkError::Store)?;
+        // A link that stopped working is what the phone links again: the new
+        // one takes its place (same computer, or the same name).
+        let replaced: Vec<String> = peers
+            .iter()
+            .filter(|other| {
+                other.unauthorized
+                    && (other.server_id == peer.server_id || same_name(&other.name, &peer.name))
+            })
+            .map(|other| other.peer_id.clone())
+            .collect();
+        let peers: Vec<Peer> = peers
+            .into_iter()
+            .filter(|other| !replaced.contains(&other.peer_id))
+            .collect();
         if peers.iter().any(|other| other.server_id == peer.server_id) {
             // Already linked under that id: a second link is never merged into
             // it (the id is only what the claimant said); remove the first.
@@ -657,6 +688,11 @@ impl PeerService {
         })?;
         peer.last_seen_ms = Some(now_ms());
         peer.capabilities = client.capabilities().await.unwrap_or_default();
+        for old in &replaced {
+            self.store.remove(old).await.map_err(LinkError::Store)?;
+            self.presence.gone(old);
+            self.drop_memory(old);
+        }
         self.store.put(&peer).await.map_err(LinkError::Store)?;
         self.presence.seen(&peer.peer_id, peer.last_seen_ms);
         self.refresh_names().await;
@@ -754,17 +790,18 @@ impl PeerService {
         Ok(Some(peer))
     }
 
-    /// Drop the row only (the peer answered 401/403: it no longer knows us).
-    /// Its login here stays: it may still be linked to this computer. Called
-    /// through [`mirror::forget`](super::mirror::forget), which ends its
-    /// open mirrors first.
-    pub(super) async fn forget(&self, peer_id: &str) {
-        if let Err(error) = self.store.remove(peer_id).await {
-            tracing::warn!(peer = %peer_id, "failed to forget a peer: {error:#}");
+    /// Mark the row (the peer answered 401/403: it no longer takes this
+    /// computer's token). The row and its name stay, so a delegation there
+    /// says `unauthorized`, and a new link under that name replaces it. Its
+    /// login here stays too: it may still be linked to this computer. Called
+    /// through [`mirror::unauthorized`](super::mirror::unauthorized), which
+    /// ends its open mirrors first.
+    pub(super) async fn mark_unauthorized(&self, peer_id: &str) {
+        if let Err(error) = self.store.set_unauthorized(peer_id).await {
+            tracing::warn!(peer = %peer_id, "failed to mark a peer unauthorized: {error:#}");
         }
         self.presence.gone(peer_id);
         self.drop_memory(peer_id);
-        self.refresh_names().await;
         // Last: the caller may be the follower itself.
         self.sockets.stop(peer_id);
     }

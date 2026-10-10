@@ -1268,7 +1268,8 @@ fn peer_view() -> Value {
             "name": { "type": "string" },
             "url": { "type": "string" },
             "reachable": { "type": "boolean", "description": "It answered within the last 2 minutes" },
-            "last_seen_ms": { "type": ["integer", "null"] }
+            "last_seen_ms": { "type": ["integer", "null"] },
+            "unauthorized": { "type": "boolean", "description": "Present (true) when it no longer takes this gateway's token: link it again; a link for the same computer or name replaces it" }
         }
     })
 }

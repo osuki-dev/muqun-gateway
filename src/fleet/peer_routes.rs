@@ -99,15 +99,17 @@ fn valid_name(name: &str) -> bool {
 async fn list(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     owner(&state, &headers)?;
     let peers = state.peers.list().await.map_err(store_failed)?;
-    let peers = futures::future::join_all(
+    futures::future::join_all(
         peers
             .into_iter()
             .map(|peer| state.peers.checked(&state, peer)),
     )
     .await;
+    // Read again: a peer that no longer takes this gateway's token was just
+    // marked so, and is listed as `unauthorized` for the phone to link again.
+    let peers = state.peers.list().await.map_err(store_failed)?;
     let now = now_ms();
-    // A peer that no longer knows this gateway was just forgotten.
-    let views: Vec<_> = peers.iter().flatten().map(|peer| peer.view(now)).collect();
+    let views: Vec<_> = peers.iter().map(|peer| peer.view(now)).collect();
     Ok(Json(json!({
         "accept_delegations": state.peers.accepts_delegations(),
         "peers": views,
@@ -654,6 +656,51 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
 
+        // Mini stops taking coding's token: the link is kept and shown as
+        // unauthorized, and linking again under its name replaces it.
+        mini.devices
+            .lock()
+            .unwrap()
+            .retain(|device| device.kind != DeviceKind::Gateway);
+        crate::fleet::mirror::unauthorized(&coding, &mini_id).await;
+        let (_, listed) = call(&coding, "GET", "/api/peers", "token", None).await;
+        assert_eq!(
+            (
+                &listed["peers"][0]["unauthorized"],
+                &listed["peers"][0]["reachable"]
+            ),
+            (&json!(true), &json!(false))
+        );
+        let (status, minted) = call(
+            &mini,
+            "POST",
+            "/api/pair/pending",
+            "token",
+            Some(json!({ "device_name": "coding", "kind": "gateway", "server_id": "srv-coding" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{minted}");
+        let (status, relinked) = call(
+            &coding,
+            "POST",
+            "/api/peers",
+            "token",
+            Some(json!({
+                "url": url, "name": "Mac Mini",
+                "request_id": minted["request_id"], "code": minted["code"],
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{relinked}");
+        assert!(relinked.get("unauthorized").is_none(), "{relinked}");
+        let (_, listed) = call(&coding, "GET", "/api/peers", "token", None).await;
+        assert_eq!(
+            listed["peers"].as_array().unwrap().len(),
+            1,
+            "replaced, not added"
+        );
+        mini_id = relinked["peer_id"].as_str().unwrap().to_owned();
+
         // Mini's own login here, and records that only look like it: unlinking
         // mini takes back both directions, and only a gateway device that
         // paired as exactly mini's id.
@@ -746,6 +793,7 @@ mod tests {
                     last_seen_ms: None,
                     capabilities: vec![],
                     manifest: None,
+                    unauthorized: false,
                 })
                 .await;
             if login {

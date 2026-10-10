@@ -873,6 +873,7 @@ mod tests {
                 last_seen_ms: None,
                 capabilities: vec![],
                 manifest: None,
+                unauthorized: false,
             })
             .unwrap();
 

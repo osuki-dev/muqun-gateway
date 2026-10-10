@@ -186,7 +186,7 @@ fn task_error(error: TaskError) -> CallToolResult {
         TaskError::PeerUnauthorized(name) => fail(
             "unauthorized",
             &format!(
-                "{name} no longer accepts this computer's link; it is linked again from the owner's phone."
+                "{name} no longer accepts this computer; link again from your phone."
             ),
         ),
         // An argument the computer there refused is the same mistake as here.
@@ -488,6 +488,10 @@ impl MuqunMcp {
                 Err(DescribeError::NoManifest(name)) => fail(
                     "manifest_unavailable",
                     &format!("{name} answers but did not say what it offers."),
+                ),
+                Err(DescribeError::Unauthorized(name)) => fail(
+                    "unauthorized",
+                    &format!("{name} no longer accepts this computer; link again from your phone."),
                 ),
             },
         )
@@ -1113,6 +1117,7 @@ mod tests {
                     last_seen_ms: seen,
                     capabilities: vec!["fleet_peers".into()],
                     manifest: seen.map(|_| manifest.clone()),
+                    unauthorized: false,
                 })
                 .await;
         }
