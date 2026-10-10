@@ -182,7 +182,10 @@ pub(crate) fn manage() -> anyhow::Result<()> {
                 pairing.close();
                 message = String::from("Pairing view closed; existing devices are unchanged.");
             } else if ui.section != Section::Overview {
-                ui = ManageView::default();
+                ui = ManageView {
+                    restart: std::mem::take(&mut ui.restart),
+                    ..ManageView::default()
+                };
                 message = String::from(IDLE_STATUS);
             } else {
                 break;
@@ -342,7 +345,7 @@ pub(crate) fn manage() -> anyhow::Result<()> {
                                 }
                             }
                         },
-                        Setting::Address => match prompt_public_url()? {
+                        Setting::Address => match prompt_public_url(None)? {
                             Some(url) => {
                                 let listen =
                                     listen_for_explicit_public_url(&url, configured_port());
@@ -356,11 +359,18 @@ pub(crate) fn manage() -> anyhow::Result<()> {
                         Setting::DetectAddress => {
                             let port = configured_port();
                             let selection = auto_public_url(port);
-                            update_public_url(
-                                &selection.url,
-                                &format!("{}:{port}", selection.listen_host),
-                            )?;
-                            message = format!("auto url: {}", truncate(&selection.url, 36));
+                            match prompt_public_url(Some(&selection.url))? {
+                                Some(url) => {
+                                    let listen = if url == selection.url {
+                                        format!("{}:{port}", selection.listen_host)
+                                    } else {
+                                        listen_for_explicit_public_url(&url, port)
+                                    };
+                                    update_public_url(&url, &listen)?;
+                                    message = format!("url updated: {}", truncate(&url, 36));
+                                }
+                                None => message = String::from("url unchanged"),
+                            }
                         }
                         Setting::TransportEncryption => message = toggle_transport_encryption()?,
                         Setting::Updates => {
@@ -511,11 +521,12 @@ pub(crate) fn confirm_remove_backend(session: &SessionConfig) -> anyhow::Result<
     )
 }
 
-pub(crate) fn prompt_public_url() -> anyhow::Result<Option<String>> {
+pub(crate) fn prompt_public_url(offered: Option<&str>) -> anyhow::Result<Option<String>> {
     let current = load_config(None)
         .map(|config| config.public_url)
         .unwrap_or_else(|_| auto_public_url(configured_port()).url);
-    let mut value = current;
+    // An offered address (Detect address) is shown for Enter to apply.
+    let mut value = offered.map_or(current, str::to_owned);
     let mut invalid = false;
     loop {
         render_public_url_prompt(&value, invalid)?;
@@ -555,10 +566,7 @@ fn render_public_url_prompt(value: &str, invalid: bool) -> anyhow::Result<()> {
     write_dialog(
         "Edit Gateway address",
         &lines,
-        ScreenLine::text(
-            "Enter Save address | Esc Cancel | Backspace Delete",
-            Tone::Accent,
-        ),
+        ScreenLine::text("Enter save · Esc cancel · Backspace delete", Tone::Accent),
     )
 }
 
@@ -984,7 +992,11 @@ fn footer(section: Section, context: &FooterContext) -> Footer {
         (Section::Devices, None) => "Enter details",
         _ => "Enter change",
     };
-    let navigation = format!("↑↓ select · {enter} · Tab next view · q quit");
+    let navigation = if section == Section::Overview {
+        String::from("Tab next view · q quit")
+    } else {
+        format!("↑↓ select · {enter} · Tab next view · q quit")
+    };
     let actions = match (section, context.pairing) {
         (Section::Overview, _) => Some("s start · t stop · r restart"),
         (Section::Terminals, _) => Some("h add Herdr · m add tmux"),
@@ -992,7 +1004,7 @@ fn footer(section: Section, context: &FooterContext) -> Footer {
         (Section::Devices, Some(_)) => Some("Esc back"),
         (Section::Devices, None) if context.no_devices => Some("p pair a device"),
         (Section::Devices, None) => Some("p pair a device · x revoke"),
-        (Section::Settings, _) => Some("PgUp/PgDn scroll · r restart"),
+        (Section::Settings, _) => Some("PgUp/PgDn page · r restart"),
     };
     Footer {
         navigation,
@@ -1118,11 +1130,9 @@ impl Setting {
             Self::Autostart => "Starts Gateway when you log in.",
             Self::Address => "What the App dials. Enter edits it.",
             Self::DetectAddress => {
-                "Finds this computer's LAN or tailnet address and uses it as the address."
+                "Finds this computer's LAN or tailnet address and offers it as the address."
             }
-            Self::TransportEncryption => {
-                "Encrypts new pairings. Devices already paired keep what they have."
-            }
+            Self::TransportEncryption => "Encrypts new pairings; paired devices keep theirs.",
             Self::Updates => "Enter checks for a stable release. Installing always asks first.",
             Self::HistoryStorage => "Keeps agent panes' scrollback across restarts.",
             Self::StoreEncryption => "How tokens and history are encrypted at rest.",
@@ -1138,6 +1148,34 @@ impl Setting {
         }
     }
 
+    /// The explanation where the full one does not fit.
+    fn short_explanation(self) -> &'static str {
+        match self {
+            Self::Autostart => "Starts Gateway at login.",
+            Self::Address => "What the App dials.",
+            Self::DetectAddress => "Offers this computer's LAN or tailnet address.",
+            Self::TransportEncryption => "Encrypts new pairings only.",
+            Self::Updates => "Enter checks; installing asks.",
+            Self::HistoryStorage => "Keeps scrollback across restarts.",
+            Self::StoreEncryption => "How secrets are encrypted at rest.",
+            Self::AgentBypass => "Agents never stall on a prompt.",
+            Self::AgentTrust => "Pre-accepts the folder trust dialog.",
+            Self::AgentEnv => "Variables agents receive.",
+            Self::Mcp => "Agents here use the muqun tools.",
+            Self::McpLoopback => "Answers this computer only.",
+        }
+    }
+
+    /// The label where the full one would hide the value.
+    fn short_label(self) -> &'static str {
+        match self {
+            Self::AgentBypass => "Skip approval prompts",
+            Self::AgentTrust => "Trust task folder",
+            Self::AgentEnv => "Agent environment",
+            other => other.label(),
+        }
+    }
+
     /// Where the setting lives, shown in grey beside its explanation.
     fn source(self) -> Option<&'static str> {
         match self {
@@ -1146,15 +1184,16 @@ impl Setting {
             Self::TransportEncryption => Some("config.json › transport_encryption"),
             Self::HistoryStorage => Some("config.json › history.storage"),
             Self::StoreEncryption => Some("config.json › store.encryption"),
-            Self::AgentBypass => Some("agent_launch_args"),
-            Self::AgentTrust => Some("agent_trust_folders"),
-            Self::AgentEnv => Some("agent_env"),
-            Self::Mcp => Some("mcp.enabled"),
+            Self::AgentBypass => Some("config.json › agent_launch_args"),
+            Self::AgentTrust => Some("config.json › agent_trust_folders"),
+            Self::AgentEnv => Some("config.json › agent_env"),
+            Self::Mcp => Some("config.json › mcp.enabled"),
             Self::DetectAddress | Self::Updates | Self::McpLoopback => None,
         }
     }
 
-    /// Whether a change takes effect only once Gateway restarts.
+    /// Whether a change takes effect only once Gateway restarts: every
+    /// setting the running gateway read from config.json when it started.
     fn needs_restart(self) -> bool {
         matches!(
             self,
@@ -1162,6 +1201,8 @@ impl Setting {
                 | Self::DetectAddress
                 | Self::TransportEncryption
                 | Self::HistoryStorage
+                | Self::AgentBypass
+                | Self::AgentTrust
                 | Self::Mcp
         )
     }
@@ -1229,7 +1270,7 @@ fn setting_value(setting: Setting, config: &crate::Config, autostart: &str) -> S
             crate::HistoryStorage::Sqlite => String::from("SQLite"),
         },
         Setting::StoreEncryption => match config.store.encryption {
-            crate::StoreEncryption::File => String::from("file key · read-only"),
+            crate::StoreEncryption::File => String::from("key in store.key · read-only"),
             crate::StoreEncryption::Off => String::from("off · read-only"),
         },
         Setting::AgentBypass => bypass_states(&config.agent_launch_args)
@@ -1300,7 +1341,19 @@ fn fit(text: &str, cells: usize) -> String {
 /// A row with its label on the left and its value on the right, in `width`
 /// cells; the value is cut with `…` before the label is.
 fn value_row(label: &str, value: &str, selected: bool, width: usize) -> ScreenLine {
-    let left = safe_text(&format!("{}{label}", if selected { "▌ " } else { "  " }));
+    value_row_or(label, label, value, selected, width)
+}
+
+/// [`value_row`] that falls back to `short` for the label when the full one
+/// would leave the value cut.
+fn value_row_or(label: &str, short: &str, value: &str, selected: bool, width: usize) -> ScreenLine {
+    let marker = if selected { "▌ " } else { "  " };
+    let label = if display_width(marker) + display_width(label) + 2 + display_width(value) > width {
+        short
+    } else {
+        label
+    };
+    let left = safe_text(&format!("{marker}{label}"));
     let room = width.saturating_sub(display_width(&left) + 2);
     let value = fit(&safe_text(value), room);
     let pad = width.saturating_sub(display_width(&left) + display_width(&value));
@@ -1321,8 +1374,12 @@ fn value_row(label: &str, value: &str, selected: bool, width: usize) -> ScreenLi
 
 /// A row's explanation, indented, with where it lives right-aligned in grey
 /// when both fit.
-fn help_row(explanation: &str, source: Option<&str>, width: usize) -> ScreenLine {
-    let text = format!("   {explanation}");
+fn help_row(explanation: &str, short: &str, source: Option<&str>, width: usize) -> ScreenLine {
+    let text = if 3 + display_width(explanation) <= width {
+        format!("   {explanation}")
+    } else {
+        format!("   {short}")
+    };
     match source {
         Some(source) if display_width(&text) + 2 + display_width(source) <= width => {
             let pad = width - display_width(&text) - display_width(source);
@@ -1339,11 +1396,56 @@ fn help_row(explanation: &str, source: Option<&str>, width: usize) -> ScreenLine
     }
 }
 
-fn write_config_with(change: impl FnOnce(&mut crate::Config)) -> anyhow::Result<crate::Config> {
-    let mut config = load_config(None)?;
-    change(&mut config);
-    write_config(&config_dir()?.join(CONFIG_FILE), &config)?;
+/// Set (or, with `None`, remove) the key at `path` in the config file
+/// `file`, leaving every other key as it was written -- unknown keys, keys
+/// that hold defaults, and the top-level order -- then check the result
+/// still loads before it replaces the file.
+fn set_config_key(
+    file: &std::path::Path,
+    path: &[&str],
+    value: Option<Value>,
+) -> anyhow::Result<crate::Config> {
+    let text = std::fs::read_to_string(file)?;
+    let mut doc: indexmap::IndexMap<String, Value> = serde_json::from_str(&text)?;
+    let (first, rest) = path.split_first().context("an empty config key")?;
+    match (rest.split_last(), value) {
+        (None, Some(value)) => {
+            doc.insert((*first).to_owned(), value);
+        }
+        (None, None) => {
+            doc.shift_remove(*first);
+        }
+        (Some((last, middle)), value) => {
+            let mut at = doc
+                .entry((*first).to_owned())
+                .or_insert_with(|| Value::Object(Default::default()));
+            for key in middle {
+                at = at
+                    .as_object_mut()
+                    .context("config key is not an object")?
+                    .entry(*key)
+                    .or_insert_with(|| Value::Object(Default::default()));
+            }
+            let object = at.as_object_mut().context("config key is not an object")?;
+            match value {
+                Some(value) => {
+                    object.insert((*last).to_owned(), value);
+                }
+                None => {
+                    object.remove(*last);
+                }
+            }
+        }
+    }
+    let rendered = serde_json::to_vec_pretty(&doc)?;
+    let config: crate::Config =
+        serde_json::from_slice(&rendered).context("the change would not load")?;
+    write_secret_file(file, &rendered)?;
     Ok(config)
+}
+
+fn write_config_key(path: &[&str], value: Option<Value>) -> anyhow::Result<crate::Config> {
+    set_config_key(&config_dir()?.join(CONFIG_FILE), path, value)
 }
 
 /// Enter on "Skip the agent's own approval prompts": off by an empty
@@ -1359,13 +1461,11 @@ fn toggle_agent_bypass() -> anyhow::Result<String> {
         ));
     }
     if states.iter().all(|(_, state)| *state == "On") {
-        write_config_with(|config| {
-            for kind in ["codex", "claude"] {
-                config.agent_launch_args.insert(kind.to_owned(), Vec::new());
-            }
-        })?;
+        for kind in ["codex", "claude"] {
+            write_config_key(&["agent_launch_args", kind], Some(Value::Array(Vec::new())))?;
+        }
         return Ok(String::from(
-            "Agents now start with their own approval prompts; a task may wait for you.",
+            "Approval prompts on; press r to restart Gateway and apply. A task may then wait for you.",
         ));
     }
     if !confirm_action(
@@ -1378,31 +1478,29 @@ fn toggle_agent_bypass() -> anyhow::Result<String> {
     )? {
         return Ok(String::from("Approval prompts unchanged."));
     }
-    write_config_with(|config| {
-        for kind in ["codex", "claude"] {
-            config.agent_launch_args.remove(kind);
-        }
-    })?;
+    for kind in ["codex", "claude"] {
+        write_config_key(&["agent_launch_args", kind], None)?;
+    }
     Ok(String::from(
-        "Agents started from the phone skip their own approval prompts.",
+        "Approval prompts skipped; press r to restart Gateway and apply.",
     ))
 }
 
 fn toggle_agent_trust() -> anyhow::Result<String> {
-    let config = write_config_with(|config| {
-        config.agent_trust_folders = !config.agent_trust_folders;
-    })?;
+    let trust = !load_config(None)?.agent_trust_folders;
+    write_config_key(&["agent_trust_folders"], Some(Value::Bool(trust)))?;
     Ok(format!(
-        "Trust the task folder automatically: {}; applies to the next agent started.",
-        on_off(config.agent_trust_folders)
+        "Trust the task folder automatically: {}; press r to restart Gateway and apply.",
+        on_off(trust)
     ))
 }
 
 fn toggle_mcp() -> anyhow::Result<String> {
-    let config = write_config_with(|config| config.mcp.enabled = !config.mcp.enabled)?;
+    let enabled = !load_config(None)?.mcp.enabled;
+    write_config_key(&["mcp", "enabled"], Some(Value::Bool(enabled)))?;
     Ok(format!(
         "MCP server: {}; press r to restart Gateway and apply.",
-        on_off(config.mcp.enabled)
+        on_off(enabled)
     ))
 }
 
@@ -1442,7 +1540,10 @@ fn choose_history_storage() -> anyhow::Result<Option<String>> {
     if storage == current {
         return Ok(None);
     }
-    write_config_with(|config| config.history.storage = storage)?;
+    write_config_key(
+        &["history", "storage"],
+        Some(serde_json::to_value(storage)?),
+    )?;
     Ok(Some(format!(
         "History checkpoints: {label}; press r to restart Gateway and apply."
     )))
@@ -2111,9 +2212,10 @@ fn manage_lines(
                 .enumerate()
                 .map(|(index, session)| {
                     ScreenLine::plain(format!(
-                        "{}{} · {}",
+                        "{} · {}{} · {}",
                         session.id,
-                        if index == 0 { " default" } else { "" },
+                        session.label,
+                        if index == 0 { " · default" } else { "" },
                         data.backend_states
                             .get(index)
                             .map(String::as_str)
@@ -2368,29 +2470,51 @@ fn manage_lines(
                 if data.changed && ui.restart.contains(setting) {
                     value.push_str(" · restart needed");
                 }
-                body.push(value_row(
+                body.push(value_row_or(
                     setting.label(),
+                    setting.short_label(),
                     &value,
                     index == ui.selected,
                     content,
                 ));
-                body.push(help_row(setting.explanation(), setting.source(), content));
+                body.push(help_row(
+                    setting.explanation(),
+                    setting.short_explanation(),
+                    setting.source(),
+                    content,
+                ));
             }
             // Linking this computer with your others gets its own row here.
             body.push(ScreenLine::plain(""));
             body.push(ScreenLine::text("OTHER COMPUTERS", Tone::Title));
-            body.push(ScreenLine::text(
-                "  Linking between your computers appears here once it is available.",
-                Tone::Quiet,
-            ));
+            body.extend(
+                word_wrap(
+                    "Linking between your computers appears here once it is available.",
+                    content.saturating_sub(2),
+                )
+                .into_iter()
+                .map(|line| ScreenLine::text(format!("  {line}"), Tone::Quiet)),
+            );
         }
     }
     let selected_line = body.iter().position(ScreenLine::selected);
+    // A setting is its value row and its help row; the last one shows
+    // everything below it too, to the end of the view.
+    let selected_end = match (ui.section, selected_line) {
+        (Section::Settings, Some(_)) if ui.selected + 1 == Setting::ALL.len() => {
+            Some(body.len().saturating_sub(1))
+        }
+        (Section::Settings, Some(line)) => Some(line + 1),
+        _ => selected_line,
+    };
     // Pin only complete QR rows, never the scrollable address fallback.
     if body.iter().any(|line| line.qr.is_some()) {
         ui.scroll = 0;
     }
-    ui.scroll = viewport_start(ui.scroll, selected_line, body.len(), body_height);
+    ui.scroll = viewport_start(ui.scroll, selected_end, body.len(), body_height);
+    if let Some(line) = selected_line.filter(|line| *line < ui.scroll) {
+        ui.scroll = line;
+    }
     let mut lines = header;
     lines.extend(body.into_iter().skip(ui.scroll).take(body_height));
     while lines.len() + footer.len() < height {
@@ -2569,9 +2693,7 @@ fn confirm_action(title: &str, scope: &[String], verb: &str) -> anyhow::Result<b
             qr: None,
         };
         let mut lines = scope.to_vec();
-        lines.push(String::from(
-            "Arrows/Tab Choose | Enter Confirm selection | Esc Cancel",
-        ));
+        lines.push(String::from("←→ choose · Enter confirm · Esc cancel"));
         write_dialog(title, &lines, choice)?;
         if let TerminalEvent::Key(event) = read_event()? {
             if event.kind != KeyEventKind::Press {
@@ -3102,7 +3224,7 @@ mod tests {
             (
                 Section::Overview,
                 base,
-                "Enter change",
+                "",
                 Some("s start · t stop · r restart"),
             ),
             (
@@ -3139,16 +3261,18 @@ mod tests {
                 Section::Settings,
                 base,
                 "Enter change",
-                Some("PgUp/PgDn scroll · r restart"),
+                Some("PgUp/PgDn page · r restart"),
             ),
         ];
         for (section, context, enter, actions) in cases {
             let shape = footer(section, &context);
-            assert_eq!(
-                shape.navigation,
-                format!("↑↓ select · {enter} · Tab next view · q quit"),
-                "{section:?}"
-            );
+            // Overview has no rows, so no Enter.
+            let navigation = if enter.is_empty() {
+                String::from("Tab next view · q quit")
+            } else {
+                format!("↑↓ select · {enter} · Tab next view · q quit")
+            };
+            assert_eq!(shape.navigation, navigation, "{section:?}");
             assert_eq!(shape.actions.as_deref(), actions, "{section:?}");
             // One line where it fits, two where it does not; never clipped.
             assert_eq!(footer_lines(&shape, 110).len(), 1, "{section:?}");
@@ -3190,7 +3314,7 @@ mod tests {
             (
                 Setting::StoreEncryption,
                 serde_json::json!({}),
-                "file key · read-only",
+                "key in store.key · read-only",
             ),
             (
                 Setting::StoreEncryption,
@@ -3232,6 +3356,21 @@ mod tests {
             );
             assert!(!setting.explanation().is_empty());
         }
+        // A change applies after a restart for every key the running
+        // gateway read at startup.
+        for setting in Setting::ALL {
+            let restarts = matches!(
+                setting,
+                Setting::Address
+                    | Setting::DetectAddress
+                    | Setting::TransportEncryption
+                    | Setting::HistoryStorage
+                    | Setting::AgentBypass
+                    | Setting::AgentTrust
+                    | Setting::Mcp
+            );
+            assert_eq!(setting.needs_restart(), restarts, "{setting:?}");
+        }
         // The view lists every row in order, each under its group, and fits
         // a 60-column terminal, cutting with … rather than mid-word.
         let config = config(serde_json::json!({}));
@@ -3265,8 +3404,10 @@ mod tests {
             }
             let mut at = 0;
             for setting in Setting::ALL {
-                let found = text[at..]
-                    .find(setting.label())
+                let found = [setting.label(), setting.short_label()]
+                    .iter()
+                    .filter_map(|label| text[at..].find(label))
+                    .min()
                     .unwrap_or_else(|| panic!("{setting:?} missing at {width}: {text}"));
                 at += found;
             }
@@ -3275,6 +3416,90 @@ mod tests {
                 assert!(text.contains("config.json › history.storage"));
             }
         }
+        // At a real terminal's height the last row, its explanation and the
+        // view's end are reachable; a changed row says it needs a restart.
+        let changed = ManageData {
+            changed: true,
+            ..data
+        };
+        for (width, height) in [(110_u16, 32_u16), (61, 24)] {
+            let mut ui = ManageView {
+                section: Section::Settings,
+                selected: Setting::ALL.len() - 1,
+                restart: vec![Setting::HistoryStorage],
+                ..Default::default()
+            };
+            let text: String = manage_lines(&changed, &mut ui, width, height)
+                .iter()
+                .map(|line| line.render(300) + "\n")
+                .collect();
+            assert!(text.contains("OTHER COMPUTERS"), "{width}x{height}: {text}");
+            assert!(
+                text.contains("Answers this computer only")
+                    || text.contains("The MCP endpoint answers")
+            );
+            ui.selected = 5;
+            let text: String = manage_lines(&changed, &mut ui, width, height)
+                .iter()
+                .map(|line| line.render(300) + "\n")
+                .collect();
+            assert!(
+                text.contains("memory · restart needed"),
+                "{width}x{height}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_settings_change_keeps_the_rest_of_config_json() {
+        let dir = std::env::temp_dir().join(format!("muqun-config-key-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("config.json");
+        let mut original = serde_json::to_value(layout_config()).unwrap();
+        original["zz_unknown"] = serde_json::json!({ "kept": true });
+        original["agent_trust_folders"] = serde_json::json!(true);
+        // An order of the owner's own: unknown key first.
+        let mut ordered = indexmap::IndexMap::new();
+        ordered.insert("zz_unknown".to_owned(), original["zz_unknown"].clone());
+        for (key, value) in original.as_object().unwrap() {
+            ordered.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+        let keys: Vec<String> = ordered.keys().cloned().collect();
+        for (path, value) in [
+            (
+                vec!["history", "storage"],
+                Some(serde_json::json!("sqlite")),
+            ),
+            (vec!["mcp", "enabled"], Some(serde_json::json!(false))),
+            (vec!["agent_trust_folders"], Some(serde_json::json!(false))),
+            (
+                vec!["agent_launch_args", "codex"],
+                Some(serde_json::json!([])),
+            ),
+            (vec!["agent_launch_args", "codex"], None),
+        ] {
+            std::fs::write(&file, serde_json::to_vec_pretty(&ordered).unwrap()).unwrap();
+            super::set_config_key(&file, &path, value).unwrap();
+            let after: indexmap::IndexMap<String, serde_json::Value> =
+                serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+            let after_keys: Vec<String> = after.keys().cloned().collect();
+            let added: Vec<&String> = after_keys
+                .iter()
+                .filter(|key| !keys.contains(key))
+                .collect();
+            let kept: Vec<&String> = after_keys.iter().filter(|key| keys.contains(key)).collect();
+            assert_eq!(kept, keys.iter().collect::<Vec<_>>(), "{path:?}: order");
+            for key in &keys {
+                if key != path[0] {
+                    assert_eq!(after[key], ordered[key], "{path:?}: {key} changed");
+                }
+            }
+            assert!(
+                added.iter().all(|key| *key == path[0]),
+                "{path:?}: {added:?}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

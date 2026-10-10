@@ -689,6 +689,28 @@ fn manager_pty_navigates_scrolls_resizes_and_keeps_start_failures_in_the_ui() {
     manager.until("Edit Gateway address");
     manager.send(b"\x1b");
     manager.until("url unchanged");
+    // Detect address offers the address; Esc leaves config.json as it was.
+    let before = fs::read(install.config.join("config.json")).unwrap();
+    manager.send(b"\x1b[B\r");
+    manager.until("Edit Gateway address");
+    manager.send(b"\x1b");
+    manager.until("url unchanged");
+    assert_eq!(
+        fs::read(install.config.join("config.json")).unwrap(),
+        before
+    );
+    // History checkpoints: the chooser writes the one key it changes.
+    manager.send(b"\x1b[B\x1b[B\x1b[B\r");
+    manager.until("only while Gateway runs");
+    manager.send(b"\x1b[B\r");
+    manager.until("History checkpoints: SQLite");
+    let mut after: serde_json::Value =
+        serde_json::from_slice(&fs::read(install.config.join("config.json")).unwrap()).unwrap();
+    assert_eq!(after["history"]["storage"], "sqlite");
+    after.as_object_mut().unwrap().remove("history");
+    let mut before: serde_json::Value = serde_json::from_slice(&before).unwrap();
+    before.as_object_mut().unwrap().remove("history");
+    assert_eq!(after, before, "only history.storage changed");
     // Enter is not the start key on Overview; `s` is.
     manager.send(b"1\r");
     manager.until("Status: ready");
@@ -728,7 +750,7 @@ fn manager_enter_targets_the_selected_device_and_esc_only_cancels_revocation() {
     let output = manager.until("x revoke · Esc back");
     assert!(output.contains("First phone 中文 e\u{301}"));
     manager.send(b"x");
-    let output = manager.until("Enter Confirm selection");
+    let output = manager.until("Enter confirm");
     assert!(output.contains("Selected: First phone 中文 e\u{301}"));
     assert!(output.contains("loses Gateway access immediately"));
     manager.send(b"\x1b");
@@ -767,7 +789,7 @@ fn manager_compact_pairing_keeps_the_full_address_reachable_without_resizing() {
     );
     // Wait for the resized Overview frame before starting pairing, so PTY
     // resize delivery cannot overlap the navigation input being asserted.
-    manager.until("↑↓ select · Enter");
+    manager.until("Tab next view · q quit");
     manager.send(b"3\r");
     let output = manager.until(&address[..30]);
     assert!(output.contains("Resize for the full QR"));

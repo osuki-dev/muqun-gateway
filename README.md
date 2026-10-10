@@ -139,15 +139,16 @@ Overview → closed); `q` closes from any main view without stopping Gateway.
 Confirmations default to **cancel**.
 
 The footer is one line of the same shape on every view,
-`↑↓ select · Enter change · Tab next view · q quit`, plus the view's own keys
-for actions that are not a row:
+`↑↓ select · Enter change · Tab next view · q quit` (Overview, which has no
+rows, shows `Tab next view · q quit`), plus the view's own keys for actions
+that are not a row:
 
 | view | rows (Enter) | own keys |
 | --- | --- | --- |
 | Overview (`1`) | — | `s` start, `t` stop, `r` restart the gateway |
 | Terminals (`2`) | a backend's actions: make default, start with Gateway on/off, remove | `h` / `m` add Herdr / tmux |
-| Devices (`3`) | the device's kind, pairing and last-seen times; `x` there revokes it | `p` pair a device; `x` revoke the selected one |
-| Settings (`4`) | change the selected setting | `r` restart the gateway |
+| Devices (`3`) | the device's kind, pairing and last-seen times (last seen is saved every few minutes, so it can lag); `x` there revokes it | `p` pair a device; `x` revoke the selected one |
+| Settings (`4`) | change the selected setting (Detect address offers the address; Enter applies it) | `PgUp`/`PgDn` page; `r` restart the gateway |
 
 Settings lists every setting as one row with its current value, a one-line
 explanation of the feature it switches, and, in grey, where it lives
@@ -156,8 +157,9 @@ address, detect address, transport encryption, updates), *Storage* (history
 checkpoints memory/SQLite, store encryption, read-only), *Agents started from
 the phone* (skipping the agents' own approval prompts, trusting the task
 folder, the environment passed to agents, values never shown), and
-*Assistant access* (the MCP server, loopback only). A change that applies only
-after a restart says `restart needed` on its row, and the header shows
+*Assistant access* (the MCP server, loopback only), and *Other computers*
+(where linking with your other computers will appear). A change that applies
+only after a restart says `restart needed` on its row, and the header shows
 `Restart needed` until `r` restarts Gateway. Rows longer than the terminal end
 in `…` rather than a clipped word. Empty lists explain the next step. Gateway
 stop, backend removal, and device revocation explain their scope before you
