@@ -182,30 +182,35 @@ pub(crate) async fn exited_to_shell(session: &SessionConfig, pane_id: &str, kind
     }
 }
 
-/// Whether a `kind` agent lives in `pane_id` now: the backend names it the
-/// pane's agent, it is the pane's foreground program, or it runs somewhere
-/// under the pane's shell. Anything that cannot be read says no -- the
-/// caller is about to type into the pane, and a shell must never receive it.
-pub(crate) async fn agent_lives_in(session: &SessionConfig, pane_id: &str, kind: &str) -> bool {
-    let Ok(pane) = terminal_backend(session)
+/// Whether the `kind` agent is the program in `pane_id`'s foreground now --
+/// what typed text reaches. A shell in front (the agent suspended with
+/// Ctrl-Z, or run with `&`) is a no, whatever runs behind it; so is a pane
+/// that cannot be read. The caller is about to type there.
+pub(crate) async fn agent_in_foreground(
+    session: &SessionConfig,
+    pane_id: &str,
+    kind: &str,
+) -> bool {
+    terminal_backend(session)
         .get_pane(&PaneId::new(pane_id))
         .await
-    else {
-        return false;
-    };
-    if pane.agent.as_deref() == Some(kind)
-        || pane
-            .foreground_command
-            .as_deref()
-            .is_some_and(|command| command_name(command) == kind)
-    {
-        return true;
-    }
-    match pane.shell_pid {
-        Some(shell) => process_table()
-            .await
-            .is_some_and(|table| runs_under(&table, shell, kind)),
-        None => false,
+        .is_ok_and(|pane| {
+            foreground_is(
+                pane.agent.as_deref(),
+                pane.foreground_command.as_deref(),
+                kind,
+            )
+        })
+}
+
+/// [`agent_in_foreground`] on what the backend reports: the foreground
+/// program when it names one (a shell is never the agent), else the agent
+/// the backend detected.
+fn foreground_is(agent: Option<&str>, foreground: Option<&str>, kind: &str) -> bool {
+    match foreground.map(command_name) {
+        Some(name) if SHELLS.contains(&name) => false,
+        Some(name) if name == kind => true,
+        _ => agent == Some(kind),
     }
 }
 
@@ -1173,6 +1178,28 @@ pub(crate) async fn interrupt(state: &AppState, task: &Task) {
 
 #[cfg(test)]
 mod tests {
+
+    /// Only the agent in the pane's foreground is typed to: a shell in front
+    /// of a suspended or backgrounded agent gets nothing.
+    #[test]
+    fn only_the_agent_in_the_foreground_is_typed_to() {
+        for (agent, foreground, typed) in [
+            (Some("claude"), Some("claude"), true),
+            (None, Some("claude"), true),
+            (Some("claude"), None, true),
+            // Ctrl-Z: Herdr still names the agent, the shell has the terminal.
+            (Some("claude"), Some("zsh"), false),
+            (None, Some("-bash"), false),
+            (None, Some("node"), false),
+            (None, None, false),
+        ] {
+            assert_eq!(
+                foreground_is(agent, foreground, "claude"),
+                typed,
+                "{agent:?} {foreground:?}"
+            );
+        }
+    }
     use super::*;
 
     #[test]

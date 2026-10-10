@@ -81,14 +81,26 @@ pub(crate) async fn deliver(state: &AppState) -> usize {
         }
         let line = message(state, &child).await;
         match send(state, &target, &line).await {
-            Ok(()) => {
+            Ok(Sent::Delivered) => {
                 state.tasks.told(&child.id, child.state).await;
                 told += 1;
+            }
+            Ok(Sent::Withdrawn(why)) => {
+                tracing::info!(task = %child.id.0, why, "notices: the parent is not told");
+                state.tasks.told(&child.id, child.state).await;
             }
             Err(error) => tracing::debug!(task = %child.id.0, %error, "notices: not told yet"),
         }
     }
     told
+}
+
+/// How a send ended.
+enum Sent {
+    Delivered,
+    /// The pane's foreground stopped being its agent before Enter: the
+    /// pasted line was cleared, never submitted.
+    Withdrawn(&'static str),
 }
 
 /// Whether a target can be told now.
@@ -144,10 +156,10 @@ async fn ready(state: &AppState, target: &NoticeTarget) -> Ready {
             let Some(session) = terminal_session(state, session_id) else {
                 return Ready::Never("the terminal session is gone");
             };
-            if super::pane_agent::agent_lives_in(session, pane_id, &kind).await {
+            if super::pane_agent::agent_in_foreground(session, pane_id, &kind).await {
                 Ready::Now
             } else {
-                Ready::Never("the pane's agent has exited")
+                Ready::Never("the pane's agent is not in its foreground")
             }
         }
     }
@@ -164,7 +176,7 @@ fn terminal_session<'a>(
         .find(|session| session.id == session_id)
 }
 
-async fn send(state: &AppState, target: &NoticeTarget, line: &str) -> anyhow::Result<()> {
+async fn send(state: &AppState, target: &NoticeTarget, line: &str) -> anyhow::Result<Sent> {
     match target {
         NoticeTarget::Session { agent_id, asid } => {
             let manager = state
@@ -188,18 +200,60 @@ async fn send(state: &AppState, target: &NoticeTarget, line: &str) -> anyhow::Re
         } => {
             let session = terminal_session(state, session_id)
                 .ok_or_else(|| anyhow::anyhow!("no terminal session {session_id}"))?;
-            // As the goal is sent: the agent's own prompt call (a bracketed
-            // paste on tmux), then Enter once the paste has settled.
-            crate::agents::session_routes::submit_agent_prompt(session, pane_id, line)
+            let kind = state
+                .tasks
+                .pane_task(session_id, pane_id)
                 .await
-                .map_err(|error| anyhow::anyhow!(error.message()))?;
-            crate::agents::session_routes::schedule_submit_keypress(
-                session.clone(),
-                pane_id.clone(),
-            );
+                .and_then(|(_, kind)| kind)
+                .ok_or_else(|| anyhow::anyhow!("no agent runs in that pane"))?;
+            return send_to_pane(session, pane_id, &kind, line).await;
         }
     }
-    Ok(())
+    Ok(Sent::Delivered)
+}
+
+/// Type `line` into the `kind` agent in `pane_id`, looking at the pane's
+/// foreground right before the paste and again before each Enter: once a
+/// shell has the terminal, the pasted line is cleared (Ctrl-U) and Enter is
+/// never pressed.
+async fn send_to_pane(
+    session: &crate::platform::config::SessionConfig,
+    pane_id: &str,
+    kind: &str,
+    line: &str,
+) -> anyhow::Result<Sent> {
+    use super::pane_agent::agent_in_foreground;
+    use crate::terminal::backend::PaneId;
+    const NOT_IN_FRONT: &str = "the pane's agent left its foreground";
+    if !agent_in_foreground(session, pane_id, kind).await {
+        return Ok(Sent::Withdrawn(NOT_IN_FRONT));
+    }
+    // The agent's own prompt call: a bracketed paste on tmux; Herdr's
+    // `agent.prompt` submits it itself.
+    crate::agents::session_routes::submit_agent_prompt(session, pane_id, line)
+        .await
+        .map_err(|error| anyhow::anyhow!(error.message()))?;
+    let backend = crate::terminal_backend(session);
+    if !backend.needs_submit_keypress().await.unwrap_or(true) {
+        return Ok(Sent::Delivered);
+    }
+    let pane = PaneId::new(pane_id);
+    for _ in 0..2 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if !agent_in_foreground(session, pane_id, kind).await {
+            let _ = backend.send_keys(&pane, &["ctrl+u".to_owned()]).await;
+            return Ok(Sent::Withdrawn(NOT_IN_FRONT));
+        }
+        backend.send_keys(&pane, &["Enter".to_owned()]).await?;
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let still_typed = crate::read_pane_visible_text(session, pane_id)
+            .await
+            .is_ok_and(|screen| super::pane_agent::goal_pending(&screen, line));
+        if !still_typed {
+            break;
+        }
+    }
+    Ok(Sent::Delivered)
 }
 
 /// `text` as one line of plain prose: escape sequences (CSI, OSC and other

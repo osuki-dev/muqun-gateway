@@ -674,12 +674,14 @@ plain line, as a user message would be:
 A session still in its turn -- inside a `tasks.wait`, say -- is sent nothing:
 the wait answers it, and a state a wait returned is never sent again. A pane
 is told when its own delegation's follower saw the agent stop
-(`idle_unconfirmed` or `done`) and that agent still lives in the pane (the
-backend names it, it is the foreground program, or it runs under the pane's
-shell); otherwise nothing is typed -- a pane back at its shell would run the
-text -- and that state is given up, not retried. The line is sent the way a
-goal is (the agent's prompt call, a bracketed paste on tmux, Enter once it
-has settled). What the child wrote is untrusted, so the line is one line of
+(`idle_unconfirmed` or `done`) and that agent is the pane's foreground
+program -- a shell in front of it (the agent suspended with Ctrl-Z, or run
+with `&`) is a no, whatever runs behind it; otherwise nothing is typed, since
+a shell would run the text, and that state is given up, not retried. The
+line is sent the way a goal is (the agent's prompt call, a bracketed paste on
+tmux), and the foreground is looked at again before each Enter: if a shell
+has the terminal by then, the pasted line is cleared (Ctrl-U) and Enter is
+never pressed. What the child wrote is untrusted, so the line is one line of
 plain text: escape sequences and control characters removed, line breaks
 and tabs turned into spaces, capped after that, and it always begins with
 the computer's name or the task's title, never with `/`, `!` or `:`. Each state is told once, recorded in the task
