@@ -703,6 +703,12 @@ impl TaskService {
         }
     }
 
+    fn mark_task_session(&self, asid: &str) {
+        if let Ok(mut live) = self.live.lock() {
+            live.task_sessions.insert(asid.to_owned(), true);
+        }
+    }
+
     /// Whether agent session `asid` is running a turn, as the follower last
     /// saw its status.
     pub(crate) fn is_busy(&self, asid: &str) -> bool {
@@ -746,6 +752,11 @@ impl TaskService {
             return false;
         };
         if let Ok(mut live) = self.live.lock() {
+            // Bounded: the "not a task" answers are dropped first (read
+            // again when asked); a task's session stays until its task ends.
+            if live.task_sessions.len() >= TASK_SESSION_CACHE {
+                live.task_sessions.retain(|_, bound| *bound);
+            }
             // A bind meanwhile wins over the read.
             let entry = live.task_sessions.entry(asid.to_owned()).or_insert(bound);
             return *entry;
@@ -922,6 +933,9 @@ impl TaskService {
         // ends (`driver::spawn_instruction_cleanup`).
         let mut unannounced = None;
         if crate::mcp::inject::enabled(&state.config) && manager.agent().adds_mcp_servers() {
+            // Served as a task's session from here, so the notice the
+            // instruction may leave at once is stripped like the rest.
+            self.mark_task_session(&asid.0);
             match manager
                 .agent()
                 .set_session_instruction(
@@ -2254,6 +2268,10 @@ fn code(text: &str, room: usize) -> String {
     };
     format!("{fence}{pad}{text}{pad}{fence}")
 }
+
+/// How many sessions' "is it a task's?" answers are remembered before the
+/// negative ones are dropped.
+const TASK_SESSION_CACHE: usize = 4096;
 
 /// Whether `title` is what an adapter shows for a session that has not been
 /// named (its id, T3's "New thread", DeepSeek's placeholder): never a
