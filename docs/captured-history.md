@@ -344,8 +344,11 @@ Only an answer that needs the store -- recovering a checkpoint for a pane whose
 current run has no historical rows yet -- returns `503
 history_storage_unavailable` while a failed initialization, a failed checkpoint
 write or read, a full disk or read overload stands; no empty result conceals
-it. A failed write pass is retried after 1 s, then 5 s, then every 30 s, and
-the first pass that works makes the store available again, with no restart.
+it. A pane that could never have a checkpoint (unverified identity, a reset,
+native scrollback) is answered from memory -- `not_captured` or an empty
+capture -- whatever the store's health. A failed write pass, and a failed
+initialization, is retried after 1 s, then 5 s, then every 30 s, and the first
+attempt that works makes the store available again, with no restart.
 Output/control/SSE continue independently. Unknown identity without an eligible
 current-run capture returns the normal `not_captured`, not a claim that all old
 history was recovered.

@@ -78,9 +78,12 @@ const RETRY_AFTER: [Duration; 3] = [
 
 pub(crate) struct SqliteHistoryRepository {
     memory: MemoryHistoryRepository,
-    /// `None` when initialization failed: every operation then answers 503.
-    checkpoints: Option<Arc<Checkpoints>>,
+    captures: Arc<Mutex<ScrollbackStore>>,
+    /// `None` until initialization works; a failed one is retried on the
+    /// write loop's backoff ([`RETRY_AFTER`]).
+    checkpoints: Arc<std::sync::RwLock<Option<Arc<Checkpoints>>>>,
     reads: Semaphore,
+    /// The write loop, or the initialization retrying before it.
     flusher: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -115,29 +118,57 @@ impl SqliteHistoryRepository {
         debounce: Duration,
     ) -> Self {
         let memory = MemoryHistoryRepository::new(captures.clone());
-        let checkpoints = match Checkpoints::open(db, config, captures, debounce).await {
-            Ok(checkpoints) => Some(checkpoints),
+        let slot = Arc::new(std::sync::RwLock::new(None));
+        let opened = Checkpoints::open(db.clone(), config, captures.clone(), debounce).await;
+        let flusher = match opened {
+            Ok(checkpoints) => {
+                if let Ok(mut slot) = slot.write() {
+                    *slot = Some(checkpoints.clone());
+                }
+                tokio::spawn(checkpoints.flush_forever())
+            }
             Err(error) => {
-                tracing::error!(%error, "captured history initialization failed; realtime output remains available");
-                None
+                tracing::error!(%error, "captured history initialization failed; retrying, realtime output remains available");
+                let (slot, config, captures) = (slot.clone(), config.clone(), captures.clone());
+                tokio::spawn(async move {
+                    for failures in 0usize.. {
+                        tokio::time::sleep(RETRY_AFTER[failures.min(RETRY_AFTER.len() - 1)]).await;
+                        match Checkpoints::open(db.clone(), &config, captures.clone(), debounce)
+                            .await
+                        {
+                            Ok(checkpoints) => {
+                                tracing::info!("captured history storage initialized");
+                                if let Ok(mut slot) = slot.write() {
+                                    *slot = Some(checkpoints.clone());
+                                }
+                                return checkpoints.flush_forever().await;
+                            }
+                            Err(error) => {
+                                tracing::debug!(%error, "captured history initialization failed again")
+                            }
+                        }
+                    }
+                })
             }
         };
-        let flusher = checkpoints
-            .clone()
-            .map(|checkpoints| tokio::spawn(checkpoints.flush_forever()));
         Self {
             memory,
-            checkpoints,
+            captures,
+            checkpoints: slot,
             reads: Semaphore::new(MAX_PENDING_READS),
-            flusher,
+            flusher: Some(flusher),
         }
+    }
+
+    /// The store, once initialized.
+    fn checkpoints(&self) -> Option<Arc<Checkpoints>> {
+        self.checkpoints.read().ok()?.clone()
     }
 
     /// The store, while its last operation worked. Only what needs it --
     /// recovering a checkpoint -- asks; what memory holds is served either way.
-    fn health(&self) -> Result<&Arc<Checkpoints>, HistoryError> {
-        self.checkpoints
-            .as_ref()
+    fn health(&self) -> Result<Arc<Checkpoints>, HistoryError> {
+        self.checkpoints()
             .filter(|checkpoints| checkpoints.healthy.load(Ordering::Acquire))
             .ok_or(HistoryError::Unavailable)
     }
@@ -161,9 +192,13 @@ impl SqliteHistoryRepository {
         }
     }
 
+    /// Adopt the pane's checkpoint, when one could be read: a verified,
+    /// unreset pane. Eligibility first, from the fold alone -- a pane that
+    /// could never have one answers from memory (`not_captured`, an empty
+    /// capture) whatever the store's health; only a read the store must
+    /// serve answers 503 while it fails.
     async fn recover(&self, scope: &HistoryScope) -> Result<(), HistoryError> {
-        let checkpoints = self.health()?;
-        let stamp = checkpoints
+        let stamp = self
             .captures
             .lock()
             .map_err(|_| HistoryError::Unavailable)?
@@ -172,6 +207,7 @@ impl SqliteHistoryRepository {
         else {
             return Ok(());
         };
+        let checkpoints = self.health()?;
         let _queued = self
             .reads
             .try_acquire()
@@ -232,8 +268,7 @@ impl HistoryRepository for SqliteHistoryRepository {
     }
     fn stats(&self) -> Option<StorageStats> {
         Some(
-            self.checkpoints
-                .as_ref()
+            self.checkpoints()
                 .map_or_else(StorageStats::default, |checkpoints| StorageStats {
                     healthy: checkpoints.healthy.load(Ordering::Acquire),
                     checkpoints: checkpoints.stored.load(Ordering::Relaxed),

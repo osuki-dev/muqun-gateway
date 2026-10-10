@@ -642,7 +642,7 @@ async fn persisted(repository: &SqliteHistoryRepository) {
 
 /// Wait for the write loop to store the fold's current projection.
 async fn persisted_scope(repository: &SqliteHistoryRepository, scope: &HistoryScope) {
-    let checkpoints = repository.checkpoints.as_ref().unwrap();
+    let checkpoints = repository.checkpoints().unwrap();
     let (stamp, expected) = {
         let store = checkpoints.captures.lock().unwrap();
         (
@@ -853,7 +853,7 @@ async fn sqlite_formats_are_independent_and_destructive_shrink_removes_durable_p
         json!([])
     );
     // Give both dirty shapes a pass on the store worker.
-    let checkpoints = repository.checkpoints.clone().unwrap();
+    let checkpoints = repository.checkpoints().unwrap();
     passes(&checkpoints, now_seconds()).await;
     drop(checkpoints);
     repository.close().await;
@@ -885,6 +885,27 @@ async fn storage_failures_spare_memory_and_heal_on_the_next_working_pass() {
         Err(HistoryError::Unavailable)
     );
     repository.close().await;
+    // A pane that could never have a checkpoint answers from memory as it
+    // would with a working store.
+    let db = SqliteStore::open(&fixture.db_path(), None, &[]).unwrap();
+    let repository =
+        SqliteHistoryRepository::open(db.clone(), &fixture.config, captures(None, false)).await;
+    assert_eq!(
+        read_page(&repository, scope(), None).await.unwrap()["availability"],
+        "not_captured"
+    );
+    // Initialization is retried: once the store can hold history, it heals.
+    db.call(|c| Ok(c.execute_batch(&MIGRATION.steps.join(""))?))
+        .await
+        .unwrap();
+    for _ in 0..400 {
+        if repository.checkpoints().is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(repository.checkpoints().is_some(), "initialization healed");
+    repository.close().await;
 
     // A write that fails marks the store unhealthy; the traversal pinned in
     // memory goes on, and the loop retries until a pass works again.
@@ -893,7 +914,7 @@ async fn storage_failures_spare_memory_and_heal_on_the_next_working_pass() {
     let repository = fixture.open(fold.clone()).await;
     persisted(&repository).await;
     let first = read_page(&repository, scope(), None).await.unwrap();
-    let checkpoints = repository.checkpoints.clone().unwrap();
+    let checkpoints = repository.checkpoints().unwrap();
     checkpoints
         .db
         .call(|c| Ok(c.execute_batch("DROP TABLE history_captures")?))
@@ -1160,7 +1181,7 @@ async fn an_idle_fold_does_not_wake_the_writer() {
     let fold = captures(Some("A"), true);
     let repository = fixture.open(fold.clone()).await;
     persisted(&repository).await;
-    let checkpoints = repository.checkpoints.clone().unwrap();
+    let checkpoints = repository.checkpoints().unwrap();
     let count = || checkpoints.wakes.load(Ordering::Relaxed);
     tokio::time::sleep(Duration::from_millis(300)).await;
     let settled = count();
