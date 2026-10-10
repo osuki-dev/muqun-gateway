@@ -110,6 +110,16 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
 - `src/fleet/`: this machine's capability manifest (agents, terminal backends,
   probed toolchains, task counts) behind `GET /api/fleet/self` and the
   `fleet.*` MCP tools.
+  The owner's other gateways (`peers.rs`, `peers_sqlite.rs`, `/api/peers*`
+  and `PUT /api/fleet/settings` in `peer_routes.rs`, `muqun-gateway peers`):
+  a peer is linked by pairing with it as a phone does, as a device of
+  `kind: gateway`, and its token, device id and transport key live in the
+  shared store's `peers` table. `peer_client.rs` speaks to it through its
+  device API, sealed when it issued a transport key. On the receiving side a
+  gateway token reaches only `require_device_or_peer` routes (the task
+  routes but `POST`/`complete`, `subscribe_tasks`, `GET /api/fleet/self`,
+  its own `DELETE /api/pairings/{id}`); `require_device` refuses it with
+  `peer_forbidden`. `fleet.accept_delegations` is the accept switch.
 - `src/mcp/`: the gateway as an MCP server for local agents: `/mcp` on the
   existing listener (loopback, proxy-header refusal, assistant token in
   `auth.rs`), the eight tools in `tools.rs` (which file what they start under

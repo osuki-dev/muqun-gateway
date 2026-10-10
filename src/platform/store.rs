@@ -18,14 +18,20 @@ use crate::{
     PAIRING_FILE, PID_FILE, PUSH_TOKENS_FILE,
 };
 
-pub(crate) fn load_config(config_path: Option<String>) -> anyhow::Result<Config> {
+/// The config file `run` reads: the `--config` path when given, else the
+/// standard one.
+pub(crate) fn config_file_path(config_path: Option<&str>) -> anyhow::Result<PathBuf> {
     // Resolved lazily on purpose: `config_dir` consults the rename migration,
     // which loads the pre-rename config by explicit path. An eagerly evaluated
     // default would recurse between the two until the stack ran out.
-    let path = match config_path {
+    Ok(match config_path {
         Some(path) => PathBuf::from(path),
         None => config_dir()?.join(CONFIG_FILE),
-    };
+    })
+}
+
+pub(crate) fn load_config(config_path: Option<String>) -> anyhow::Result<Config> {
+    let path = config_file_path(config_path.as_deref())?;
     let bytes = std::fs::read(&path)
         .with_context(|| format!("failed to read config {}", path.display()))?;
     Ok(serde_json::from_slice(&bytes)?)
@@ -316,7 +322,7 @@ pub(crate) fn list_devices() -> anyhow::Result<()> {
         println!(
             "{}  {}  paired {}  last seen {}",
             device.id,
-            truncate(&device.name, 32),
+            truncate(&device.listed_name(), 42),
             format_unix_ms(device.paired_unix_ms),
             format_unix_ms(device.last_seen_unix_ms)
         );

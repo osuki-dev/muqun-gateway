@@ -136,6 +136,9 @@ pub(crate) struct Config {
     /// The `/mcp` endpoint for agents on this machine. On unless switched off.
     #[serde(default, skip_serializing_if = "McpConfig::is_default")]
     pub(crate) mcp: McpConfig,
+    /// The owner's other computers. See `FleetConfig`.
+    #[serde(default, skip_serializing_if = "FleetConfig::is_default")]
+    pub(crate) fleet: FleetConfig,
 }
 
 /// `{"mcp": {"enabled": false}}` removes `/mcp` and `/api/mcp/tokens*`, stops
@@ -160,6 +163,31 @@ impl Default for McpConfig {
 impl McpConfig {
     pub(crate) fn is_default(&self) -> bool {
         *self == McpConfig::default()
+    }
+}
+
+/// `{"fleet": {"accept_delegations": false}}`: other computers this one is
+/// linked with may not open tasks here (`POST /api/tasks` with a gateway
+/// token answers 403 `delegations_disabled`). On by default; the phone's
+/// "Accept work from other computers" switch writes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FleetConfig {
+    #[serde(default = "default_true")]
+    pub(crate) accept_delegations: bool,
+}
+
+impl Default for FleetConfig {
+    fn default() -> Self {
+        Self {
+            accept_delegations: true,
+        }
+    }
+}
+
+impl FleetConfig {
+    pub(crate) fn is_default(&self) -> bool {
+        *self == FleetConfig::default()
     }
 }
 

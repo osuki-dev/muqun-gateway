@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use super::i18n::{self, Locale};
 use crate::{
     authority, hash_token, identify_device, now_unix_ms, write_devices, ApiResult, AppState,
-    Config, DeviceRecord, PushTokenRecord, SessionConfig, TransportEncryptionMode,
+    Config, DeviceKind, DeviceRecord, PushTokenRecord, SessionConfig, TransportEncryptionMode,
     CONTENT_SCHEMA_VERSION, DEVICE_LAST_SEEN_FLUSH_MS, MAX_AGENT_ARGS, MAX_AGENT_ARG_CHARS,
     MAX_SEND_TEXT_BYTES, TRANSPORT_PROOF_HEADER,
 };
@@ -63,10 +63,52 @@ pub(crate) fn bearer_token(headers: &HeaderMap) -> ApiResult<&str> {
     Ok(token)
 }
 
+/// Who a device token belongs to, for the routes another gateway may use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Caller {
+    pub(crate) device_id: String,
+    pub(crate) kind: DeviceKind,
+    pub(crate) name: String,
+}
+
+pub(crate) fn peer_forbidden() -> (StatusCode, Json<Value>) {
+    api_error(
+        StatusCode::FORBIDDEN,
+        "peer_forbidden",
+        "another computer's token cannot use this route",
+    )
+}
+
+/// Every device route that is not one of the peer routes. A gateway's token
+/// is refused here, so a computer the owner linked can open, read, follow
+/// and cancel tasks and nothing else -- it cannot type into a pane, pair a
+/// device, answer an approval or change a setting.
+pub(crate) fn require_device(state: &AppState, headers: &HeaderMap) -> ApiResult<String> {
+    let caller = require_device_or_peer(state, headers)?;
+    if caller.kind == DeviceKind::Gateway {
+        return Err(peer_forbidden());
+    }
+    Ok(caller.device_id)
+}
+
+/// A paired device of either kind: the routes another gateway may use (the
+/// task routes, the event socket, the read-only manifest, its own
+/// revocation) take this, and look at `Caller::kind` themselves.
+pub(crate) fn require_device_or_peer(state: &AppState, headers: &HeaderMap) -> ApiResult<Caller> {
+    let device_id = authenticated_device(state, headers)?;
+    let devices = lock_devices(state)?;
+    let record = devices.iter().find(|device| device.id == device_id);
+    Ok(Caller {
+        kind: record.map_or(DeviceKind::App, |device| device.kind),
+        name: record.map_or_else(|| device_id.clone(), |device| device.name.clone()),
+        device_id,
+    })
+}
+
 /// Control routes are for paired devices only. The admin token deliberately
 /// does not authorise these: it sits in plaintext on disk for the manage UI,
 /// and these routes can run commands on the host.
-pub(crate) fn require_device(state: &AppState, headers: &HeaderMap) -> ApiResult<String> {
+fn authenticated_device(state: &AppState, headers: &HeaderMap) -> ApiResult<String> {
     if state.config.transport_encryption == TransportEncryptionMode::Disabled {
         // Cleartext mode drops the envelope and the per-device transport
         // proof; it does not drop authentication. A device paired while

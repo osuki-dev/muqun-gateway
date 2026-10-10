@@ -49,6 +49,7 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     // already released.
     let _state_lock = state_lock::StateLock::acquire_owner(&state_dir()?)?;
     ensure_pairing_transport_key()?;
+    let config_file = platform::store::config_file_path(config_path.as_deref())?;
     let config = load_config(config_path)?;
     warn_about_missing_backend_programs(&config);
     let addr: SocketAddr = config
@@ -95,6 +96,14 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         task_events.clone(),
         config.server_id.clone(),
     ));
+    let presence = Arc::new(crate::fleet::peers::PeerPresence::default());
+    let peers = Arc::new(crate::fleet::peers::PeerService::new(
+        Arc::new(crate::fleet::peers_sqlite::SqlitePeerStore::new(db.clone())),
+        &config.fleet,
+        Some(config_file),
+        presence,
+    ));
+    peers.load_names().await;
     let history =
         terminal::history_sqlite::repository(&config, db.clone(), scrollback.clone()).await;
     let state = AppState {
@@ -116,6 +125,7 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         message_images: Arc::default(),
         mcp_tokens: Arc::new(crate::mcp::tokens_sqlite::SqliteTokenStore::new(db.clone())),
         fleet: Arc::default(),
+        peers,
         tasks,
         task_events,
         #[cfg(test)]
@@ -163,6 +173,7 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     let app = platform::uploads::mount(app);
     let app = platform::assets::mount(app);
     let app = crate::fleet::routes::mount(app);
+    let app = crate::fleet::peer_routes::mount(app);
     let app = crate::tasks::routes::mount(app);
     let app = if state.config.mcp.enabled {
         crate::mcp::mount(app)

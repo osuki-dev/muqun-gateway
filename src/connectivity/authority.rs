@@ -16,6 +16,8 @@ pub struct PendingPairing {
     pub device_name: String,
     #[serde(default)]
     pub install_id: Option<String>,
+    #[serde(default, skip_serializing_if = "DeviceKind::is_app")]
+    pub kind: DeviceKind,
     pub code: String,
     pub code_hash: String,
     pub created_unix_ms: u128,
@@ -28,6 +30,24 @@ pub enum PairingCodeError {
     Missing,
     Expired,
     Invalid,
+}
+
+/// What holds a device token: the owner's app, or another of the owner's
+/// gateways that pairs itself to hand this one work (see `fleet::peers`).
+/// A gateway's token reaches only the routes that take `Caller`s
+/// (`require_device_or_peer`); every other device route refuses it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceKind {
+    #[default]
+    App,
+    Gateway,
+}
+
+impl DeviceKind {
+    pub fn is_app(&self) -> bool {
+        *self == Self::App
+    }
 }
 
 /// One paired device. The raw bearer token is returned only once during claim;
@@ -46,6 +66,18 @@ pub struct DeviceRecord {
     pub last_seen_unix_ms: u128,
     #[serde(default)]
     pub install_id: Option<String>,
+    #[serde(default, skip_serializing_if = "DeviceKind::is_app")]
+    pub kind: DeviceKind,
+}
+
+impl DeviceRecord {
+    /// The name a device list shows: `coding (gateway)` for another computer.
+    pub fn listed_name(&self) -> String {
+        match self.kind {
+            DeviceKind::App => self.name.clone(),
+            DeviceKind::Gateway => format!("{} (gateway)", self.name),
+        }
+    }
 }
 
 pub fn hash_token(token: &str) -> String {
@@ -166,6 +198,7 @@ mod tests {
     fn device(id: &str, token: &str, install_id: Option<&str>) -> DeviceRecord {
         DeviceRecord {
             id: id.into(),
+            kind: DeviceKind::App,
             name: id.into(),
             token_hash: hash_token(token),
             transport_key: None,

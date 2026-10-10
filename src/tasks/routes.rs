@@ -19,6 +19,8 @@ use super::service::{
     task_directory, valid_goal, valid_name, BadDirectory, DelegateRequest, TaskError,
 };
 use crate::agents::directories::expand_directory_param;
+use crate::connectivity::authority::DeviceKind;
+use crate::platform::http::{peer_forbidden, require_device_or_peer, Caller};
 use crate::{api_error, lock_devices, require_device, ApiResult, AppState};
 
 const DEFAULT_LIMIT: usize = 50;
@@ -45,6 +47,18 @@ fn principal(device_id: String) -> TaskPrincipal {
     TaskPrincipal {
         kind: PrincipalKind::Device,
         id: device_id,
+    }
+}
+
+/// The routes another gateway may use answer it as itself: a `Gateway`
+/// principal, which sees and cancels only the tasks it opened.
+fn caller_principal(caller: &Caller) -> TaskPrincipal {
+    TaskPrincipal {
+        kind: match caller.kind {
+            DeviceKind::App => PrincipalKind::Device,
+            DeviceKind::Gateway => PrincipalKind::Gateway,
+        },
+        id: caller.device_id.clone(),
     }
 }
 
@@ -76,7 +90,13 @@ async fn list(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult<Json<Value>> {
-    let by = principal(require_device(&state, &headers)?);
+    let caller = require_device_or_peer(&state, &headers)?;
+    // A task tree is not narrowed to its asker; another computer reads only
+    // its own tasks, one at a time or listed.
+    if caller.kind == DeviceKind::Gateway && query.contains_key("root") {
+        return Err(peer_forbidden());
+    }
+    let by = caller_principal(&caller);
     let states = match query.get("state").filter(|text| !text.is_empty()) {
         Some(text) => Some(parse_states(text).ok_or_else(invalid_request)?),
         None => None,
@@ -286,7 +306,7 @@ async fn read(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    let by = principal(require_device(&state, &headers)?);
+    let by = caller_principal(&require_device_or_peer(&state, &headers)?);
     let (task, events) = state
         .tasks
         .history(&by, &TaskId(id))
@@ -300,7 +320,7 @@ async fn cancel(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    let by = principal(require_device(&state, &headers)?);
+    let by = caller_principal(&require_device_or_peer(&state, &headers)?);
     let task = state
         .tasks
         .cancel(&state, &by, &TaskId(id))

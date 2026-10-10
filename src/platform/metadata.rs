@@ -136,6 +136,13 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     // /api/tasks/defaults` and the `defaults` frame on `subscribe_tasks`
     // (`default_cwd`, named from `~`).
     "task_defaults",
+    // Other computers of the owner: `GET/POST /api/peers`,
+    // `PATCH/DELETE /api/peers/{id}`, `POST /api/pair/pending` (a code minted for
+    // another gateway), `PUT /api/fleet/settings` (`accept_delegations`),
+    // `kind: "gateway"` devices, and -- from Task G3 -- `tasks.delegate`
+    // with `machine`, mirror tasks (`binding.kind == "peer"`) and
+    // `requested_by.kind == "gateway"`.
+    "fleet_peers",
 ];
 
 /// Handing a task to an agent the app did not start, and following it home.

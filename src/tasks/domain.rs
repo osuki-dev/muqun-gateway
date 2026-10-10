@@ -90,6 +90,9 @@ pub(crate) enum TaskBinding {
 pub(crate) enum PrincipalKind {
     Device,
     Assistant,
+    /// Another of the owner's gateways, through the device token it was
+    /// paired with (`DeviceKind::Gateway`). Sees only what it opened.
+    Gateway,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

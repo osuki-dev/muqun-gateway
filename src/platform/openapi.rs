@@ -860,7 +860,8 @@ fn json_ok(description: &str, schema: Value) -> Value {
     })
 }
 
-/// `/api/tasks*`, `/api/fleet/self` and `/api/mcp/tokens*`. The last pair is
+/// `/api/tasks*`, `/api/fleet/self`, the peer routes (`/api/peers*`,
+/// `POST /api/pair/pending`, `/api/fleet/settings`) and `/api/mcp/tokens*`. The last pair is
 /// mounted only while `mcp.enabled` is true (the default).
 fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
     let task_view = || json!({ "$ref": "#/components/schemas/TaskView" });
@@ -1089,7 +1090,136 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
                 "responses": revoke_responses
             }}),
         ),
+        (
+            "/api/pair/pending",
+            json!({ "post": {
+                "summary": "Mint a pairing code on the owner's behalf for a device not in front of this computer: another gateway being linked (kind gateway). Requires the admin token or an app device; another gateway's token is refused (peer_forbidden). Requires the fleet_peers capability",
+                "requestBody": json_body(json!({
+                    "type": "object",
+                    "required": ["device_name"],
+                    "properties": {
+                        "device_name": { "type": "string", "description": "At most 80 characters, no control characters" },
+                        "kind": { "type": "string", "enum": ["app", "gateway"], "description": "Default app" }
+                    }
+                })),
+                "responses": with_errors(json_ok("What POST /api/pair/claim takes", json!({
+                    "type": "object",
+                    "required": ["request_id", "code", "expires_in_ms"],
+                    "properties": {
+                        "request_id": { "type": "string" },
+                        "code": { "type": "string" },
+                        "expires_in_ms": { "type": "integer" }
+                    }
+                })), &[
+                    ("400", "invalid_request, invalid_device_name"),
+                    ("409", "pairing_in_progress: another code is pending"),
+                    ("429", "pairing_rate_limited"),
+                ])
+            }}),
+        ),
+        (
+            "/api/peers",
+            json!({
+                "get": {
+                    "summary": "The accept switch and this computer's linked gateways; a peer not heard from for a minute is pinged first. Requires the fleet_peers capability and the admin token or an app device",
+                    "responses": json_ok("Peers", json!({
+                        "type": "object",
+                        "required": ["accept_delegations", "peers"],
+                        "properties": {
+                            "accept_delegations": { "type": "boolean" },
+                            "peers": { "type": "array", "items": peer_view() }
+                        }
+                    }))
+                },
+                "post": {
+                    "summary": "Pair this gateway with the one at url through a code minted there (POST /api/pair/pending), and remember it as name",
+                    "requestBody": json_body(json!({
+                        "type": "object",
+                        "required": ["url", "name", "request_id", "code"],
+                        "properties": {
+                            "url": { "type": "string", "description": "http:// or https://, at most 512 bytes; the address the phone uses for it" },
+                            "name": { "type": "string" },
+                            "request_id": { "type": "string" },
+                            "code": { "type": "string" }
+                        }
+                    })),
+                    "responses": with_errors(json_ok("The new peer", peer_view()), &[
+                        ("400", "invalid_request; peer_is_self: the url is this gateway"),
+                        ("409", "peer_refused: the other gateway refused the code (expired or invalid)"),
+                        ("502", "peer_unreachable: nothing answered at url"),
+                    ])
+                }
+            }),
+        ),
+        (
+            "/api/peers/{id}",
+            json!({
+                "patch": {
+                    "summary": "Rename a linked gateway",
+                    "parameters": [path_param("id")],
+                    "requestBody": json_body(json!({
+                        "type": "object",
+                        "required": ["name"],
+                        "properties": { "name": { "type": "string" } }
+                    })),
+                    "responses": with_errors(json_ok("The renamed peer", peer_view()), &[
+                        ("400", "invalid_request"),
+                        ("404", "peer_not_found"),
+                        ("409", "peer_name_taken: another peer has that name"),
+                    ])
+                },
+                "delete": {
+                    "summary": "Unlink a gateway: forget it here and ask it to revoke this gateway's token (best effort)",
+                    "parameters": [path_param("id")],
+                    "responses": {
+                        "204": { "description": "Unlinked" },
+                        "401": { "description": "Missing or invalid authorization" },
+                        "403": { "description": "Invalid token, or peer_forbidden" },
+                        "404": { "description": "peer_not_found" }
+                    }
+                }
+            }),
+        ),
+        (
+            "/api/fleet/settings",
+            json!({ "put": {
+                "summary": "The accept switch: whether linked gateways may open tasks here. Written to config.json (fleet.accept_delegations). Requires the fleet_peers capability and the admin token or an app device",
+                "requestBody": json_body(json!({
+                    "type": "object",
+                    "required": ["accept_delegations"],
+                    "properties": { "accept_delegations": { "type": "boolean" } }
+                })),
+                "responses": with_errors(json_ok("The switch as it now stands", json!({
+                    "type": "object",
+                    "required": ["accept_delegations"],
+                    "properties": { "accept_delegations": { "type": "boolean" } }
+                })), &[("400", "invalid_request")])
+            }}),
+        ),
     ]
+}
+
+/// `responses` plus the named error statuses.
+fn with_errors(mut responses: Value, errors: &[(&str, &str)]) -> Value {
+    for (status, description) in errors {
+        responses[*status] = json!({ "description": description });
+    }
+    responses
+}
+
+/// A linked gateway as `/api/peers*` answers it: never its token.
+fn peer_view() -> Value {
+    json!({
+        "type": "object",
+        "required": ["peer_id", "name", "url", "reachable", "last_seen_ms"],
+        "properties": {
+            "peer_id": { "type": "string", "description": "The other gateway's server_id" },
+            "name": { "type": "string" },
+            "url": { "type": "string" },
+            "reachable": { "type": "boolean", "description": "It answered within the last 2 minutes" },
+            "last_seen_ms": { "type": ["integer", "null"] }
+        }
+    })
 }
 
 fn audio_asset_endpoint() -> Value {
@@ -1975,6 +2105,12 @@ mod history_contract_tests {
             ("/api/mcp/tokens", "post"),
             ("/api/mcp/tokens", "get"),
             ("/api/mcp/tokens/{id}", "delete"),
+            ("/api/pair/pending", "post"),
+            ("/api/peers", "get"),
+            ("/api/peers", "post"),
+            ("/api/peers/{id}", "patch"),
+            ("/api/peers/{id}", "delete"),
+            ("/api/fleet/settings", "put"),
         ] {
             assert!(spec["paths"][path][method].is_object(), "{method} {path}");
         }

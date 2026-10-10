@@ -1,4 +1,5 @@
-//! `GET /api/fleet/self`: this machine's manifest, for a paired device.
+//! `GET /api/fleet/self`: this machine's manifest, for a paired device or
+//! another of the owner's gateways.
 
 use axum::extract::State;
 use axum::http::HeaderMap;
@@ -6,7 +7,8 @@ use axum::routing::get;
 use axum::{Json, Router};
 
 use super::manifest::Manifest;
-use crate::{require_device, ApiResult, AppState};
+use crate::platform::http::require_device_or_peer;
+use crate::{ApiResult, AppState};
 
 pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
     router.route("/api/fleet/self", get(fleet_self))
@@ -16,7 +18,8 @@ async fn fleet_self(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Manifest>> {
-    require_device(&state, &headers)?;
+    // Read-only, and what another computer's `fleet.describe` shows of this one.
+    require_device_or_peer(&state, &headers)?;
     Ok(Json(state.fleet.manifest(&state).await))
 }
 

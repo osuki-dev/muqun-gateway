@@ -52,12 +52,14 @@ pub(crate) fn test_config(token: &str) -> Config {
         t3: agents::T3Config::default(),
         store: crate::platform::config::StoreConfig::default(),
         mcp: crate::platform::config::McpConfig::default(),
+        fleet: Default::default(),
     }
 }
 
 pub(crate) fn test_device(id: &str, token: &str) -> DeviceRecord {
     DeviceRecord {
         id: id.into(),
+        kind: DeviceKind::App,
         name: format!("device {id}"),
         token_hash: hash_token(token),
         transport_key: None,
@@ -66,6 +68,49 @@ pub(crate) fn test_device(id: &str, token: &str) -> DeviceRecord {
         last_seen_unix_ms: now_unix_ms(),
         install_id: None,
     }
+}
+
+/// A device record for another of the owner's gateways.
+pub(crate) fn test_peer_device(id: &str, token: &str) -> DeviceRecord {
+    DeviceRecord {
+        kind: DeviceKind::Gateway,
+        name: format!("gateway {id}"),
+        ..test_device(id, token)
+    }
+}
+
+/// `state` as the computer `id` named `label`.
+pub(crate) fn named(mut state: AppState, id: &str, label: &str) -> AppState {
+    state.config.server_id = id.into();
+    state.config.label = label.into();
+    state
+}
+
+/// The routes one gateway calls on another, behind the transport middleware
+/// the gateway runs.
+pub(crate) fn peer_router(state: AppState) -> Router {
+    let app = crate::platform::routes::mount(Router::new());
+    let app = crate::connectivity::routes::mount(app);
+    let app = crate::agents::ws_routes::mount(app);
+    let app = crate::fleet::routes::mount(app);
+    let app = crate::fleet::peer_routes::mount(app);
+    crate::tasks::routes::mount(app)
+        .layer(axum::middleware::from_fn(
+            crate::platform::server::envelope_compression_gate,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::platform::server::encrypted_transport,
+        ))
+        .with_state(state)
+}
+
+/// `router` on a loopback port; its base URL.
+pub(crate) async fn serve(router: Router) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    format!("http://{addr}")
 }
 
 pub(crate) fn test_state(admin_token: &str, devices: Vec<DeviceRecord>) -> AppState {
@@ -82,6 +127,13 @@ pub(crate) fn test_state(admin_token: &str, devices: Vec<DeviceRecord>) -> AppSt
         Arc::new(crate::tasks::store_sqlite::SqliteTaskStore::new(db.clone())),
         task_events.clone(),
         config.server_id.clone(),
+    ));
+    let presence = Arc::new(crate::fleet::peers::PeerPresence::default());
+    let peers = Arc::new(crate::fleet::peers::PeerService::new(
+        Arc::new(crate::fleet::peers_sqlite::SqlitePeerStore::new(db.clone())),
+        &crate::platform::config::FleetConfig::default(),
+        None,
+        presence,
     ));
     AppState {
         config,
@@ -104,6 +156,7 @@ pub(crate) fn test_state(admin_token: &str, devices: Vec<DeviceRecord>) -> AppSt
         message_images: Arc::default(),
         mcp_tokens: Arc::new(crate::mcp::tokens_sqlite::SqliteTokenStore::new(db.clone())),
         fleet: Arc::default(),
+        peers,
         tasks,
         task_events,
         db,
@@ -183,6 +236,7 @@ pub(crate) fn error_body(refusal: &(StatusCode, Json<Value>)) -> Value {
 pub(crate) fn device_fixture(id: &str) -> DeviceRecord {
     DeviceRecord {
         id: id.into(),
+        kind: DeviceKind::App,
         name: id.into(),
         token_hash: authority::hash_token(id),
         transport_key: None,
@@ -196,6 +250,7 @@ pub(crate) fn test_pending_pairing(created_unix_ms: u128) -> Option<PendingPairi
     let code = "2345-6789".to_owned();
     Some(PendingPairing {
         request_id: "request-1".into(),
+        kind: Default::default(),
         device_name: "Muqun test".into(),
         install_id: None,
         code_hash: hash_token(&code),

@@ -142,6 +142,7 @@ pub(crate) fn setup(
             t3: agents::T3Config::default(),
             store: crate::platform::config::StoreConfig::default(),
             mcp: crate::platform::config::McpConfig::default(),
+            fleet: Default::default(),
         },
     };
     config.listen = listen;

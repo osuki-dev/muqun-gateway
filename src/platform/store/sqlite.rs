@@ -21,6 +21,7 @@ pub(crate) struct Migration {
 pub(crate) const ALL_MIGRATIONS: &[Migration] = &[
     crate::tasks::store_sqlite::MIGRATION,
     crate::mcp::tokens::MIGRATION,
+    crate::fleet::peers::MIGRATION,
     crate::terminal::history_sqlite::MIGRATION,
 ];
 

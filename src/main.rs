@@ -40,7 +40,7 @@ pub(crate) use terminal::{
     supervision,
 };
 
-use authority::{hash_token, identify_device, DeviceRecord, PendingPairing};
+use authority::{hash_token, identify_device, DeviceKind, DeviceRecord, PendingPairing};
 use backend::{
     BackendError, CreateTab as BackendCreateTab, CreateWorkspace as BackendCreateWorkspace,
     OutputFormat as BackendOutputFormat, OutputSource as BackendOutputSource, Pane, PaneEnvVia,
@@ -102,6 +102,8 @@ pub(crate) struct AppState {
     pub(crate) mcp_tokens: Arc<dyn mcp::tokens::AssistantTokenStore>,
     /// This machine's manifest and its cached toolchain probes. See `fleet`.
     pub(crate) fleet: Arc<fleet::FleetService>,
+    /// The owner's other gateways and the accept switch. See `fleet::peers`.
+    pub(crate) peers: Arc<fleet::peers::PeerService>,
     /// Tasks: delegated agent work and `exec.run` commands. See `tasks::service`.
     pub(crate) tasks: Arc<tasks::service::TaskService>,
     /// Every task change the service records, for the event socket.

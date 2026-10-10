@@ -1777,7 +1777,7 @@ fn manage_lines(
                             format!(
                                 "{} {}  (paired {})",
                                 if index == ui.selected { ">" } else { " " },
-                                device.name,
+                                device.listed_name(),
                                 relative_since(device.paired_unix_ms)
                             ),
                             if index == ui.selected {
@@ -2327,6 +2327,7 @@ fn pending_from_answer(status: u16, value: &Value) -> anyhow::Result<Option<Pend
             .and_then(Value::as_str)
             .unwrap_or("Muqun app")
             .into(),
+        kind: Default::default(),
         install_id: value
             .get("install_id")
             .and_then(Value::as_str)

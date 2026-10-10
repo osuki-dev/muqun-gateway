@@ -39,10 +39,12 @@ use tokio::sync::{broadcast, oneshot};
 
 use super::domain::AgentDomainEvent;
 use super::routes::agent_event_record;
+use crate::connectivity::authority::DeviceKind;
+use crate::platform::http::require_device_or_peer;
 use crate::tasks::domain::{PrincipalKind, TaskPrincipal, TaskState};
 use crate::tasks::events::TaskDomainEvent;
 use crate::{
-    api_error, require_device, still_paired, transport, AppState, EncryptedStreamContext,
+    api_error, still_paired, transport, AppState, EncryptedStreamContext,
     STREAM_DEVICE_RECHECK_INTERVAL,
 };
 
@@ -106,6 +108,9 @@ pub(crate) enum FrameError {
     FrameTooLarge,
     /// A newer socket from the same device took this one's place.
     Superseded,
+    /// Another computer's socket asked for agent sessions; it may follow
+    /// tasks (`subscribe_tasks`) and nothing else.
+    PeerForbidden,
 }
 
 impl FrameError {
@@ -118,6 +123,7 @@ impl FrameError {
             Self::TooManySubscriptions => "too_many_subscriptions",
             Self::FrameTooLarge => "frame_too_large",
             Self::Superseded => "superseded",
+            Self::PeerForbidden => "peer_forbidden",
         }
     }
 }
@@ -584,10 +590,19 @@ async fn open_event_socket(
     headers: HeaderMap,
     upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Response {
-    let device_id = match require_device(&state, &headers) {
-        Ok(device_id) => device_id,
+    let caller = match require_device_or_peer(&state, &headers) {
+        Ok(caller) => caller,
         Err(error) => return error.into_response(),
     };
+    // Another computer follows its tasks as itself, a `Gateway` principal.
+    let device = TaskPrincipal {
+        kind: match caller.kind {
+            DeviceKind::App => PrincipalKind::Device,
+            DeviceKind::Gateway => PrincipalKind::Gateway,
+        },
+        id: caller.device_id,
+    };
+    let device_id = device.id.clone();
     let Ok(upgrade) = upgrade else {
         return api_error(
             StatusCode::BAD_REQUEST,
@@ -633,7 +648,7 @@ async fn open_event_socket(
                 timings: state.ws_connections.timings,
             };
             connection
-                .run(state, device_id, connection_id, events, tasks, slot)
+                .run(state, device, connection_id, events, tasks, slot)
                 .await;
         })
 }
@@ -705,7 +720,7 @@ impl Connection {
     async fn run(
         mut self,
         state: AppState,
-        device_id: String,
+        device: TaskPrincipal,
         connection_id: String,
         mut events: broadcast::Receiver<AgentDomainEvent>,
         mut tasks: broadcast::Receiver<TaskDomainEvent>,
@@ -731,10 +746,8 @@ impl Connection {
         );
         recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut unanswered_pings = 0_u8;
-        let device = TaskPrincipal {
-            kind: PrincipalKind::Device,
-            id: device_id.clone(),
-        };
+        let device_id = device.id.clone();
+        let peer = device.kind == PrincipalKind::Gateway;
         // The `defaults` frame last sent, once one was.
         let mut defaults_sent: Option<Option<String>> = None;
 
@@ -791,6 +804,17 @@ impl Connection {
                         .decode(text.as_str())
                         .and_then(|plaintext| ClientFrame::parse(&plaintext));
                     let tasks_now = matches!(frame, Ok(ClientFrame::SubscribeTasks));
+                    // Another computer follows tasks only, never an agent session.
+                    let frame = frame.and_then(|frame| match frame {
+                        ClientFrame::Subscribe(_)
+                        | ClientFrame::Unsubscribe(_)
+                        | ClientFrame::SubscribeAll
+                            if peer =>
+                        {
+                            Err(FrameError::PeerForbidden)
+                        }
+                        frame => Ok(frame),
+                    });
                     match frame.and_then(|frame| subscriptions.apply(&frame)) {
                         Ok(Some(reply)) => {
                             if self.send(&reply).await.is_err() {

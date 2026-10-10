@@ -1,7 +1,7 @@
 //! Connectivity HTTP routes: device pairing, registered device management, and push notifications.
 
 use axum::{
-    extract::{Path, State},
+    extract::{rejection::JsonRejection, Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -10,10 +10,13 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::authority::{self, hash_token, DeviceRecord, PairingCodeError, PendingPairing};
+use super::authority::{
+    self, hash_token, DeviceKind, DeviceRecord, PairingCodeError, PendingPairing,
+};
 use super::transport;
 use crate::{
     api_error, generate_pairing_code, generate_token, lock_devices, now_unix_ms,
+    platform::http::{peer_forbidden, require_device_or_peer},
     platform::i18n::{self, Locale},
     read_pairing_file, require_admin, require_device, require_pairing_manager,
     rotate_pairing_transport_key, send_expo_push_notifications, valid_device_name,
@@ -32,6 +35,10 @@ pub(crate) struct PairRequestBody {
     /// device does not leave a duplicate record behind.
     #[serde(default)]
     pub(crate) install_id: Option<String>,
+    /// `gateway` when another of the owner's gateways is pairing itself
+    /// (`muqun-gateway peers link`); absent for the app.
+    #[serde(default)]
+    pub(crate) kind: Option<DeviceKind>,
 }
 
 #[derive(Deserialize)]
@@ -78,7 +85,10 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
     router
         .route("/api/pair/request", post(pair_request))
         .route("/api/pair/claim", post(pair_claim))
-        .route("/api/pair/pending", get(pair_pending))
+        .route(
+            "/api/pair/pending",
+            get(pair_pending).post(mint_pairing_code),
+        )
         .route("/api/pairings", get(list_paired_devices))
         .route(
             "/api/pairings/{device_id}",
@@ -160,6 +170,7 @@ pub(crate) async fn pair_request(
         request_id: body.request_id.clone(),
         device_name,
         install_id,
+        kind: body.kind.unwrap_or_default(),
         code: code.clone(),
         code_hash: hash_token(&code),
         created_unix_ms: now,
@@ -208,7 +219,7 @@ pub(crate) async fn pair_claim(
         transport::Direction::PairingRequest,
     )?;
     require_pairing_transport(state.config.transport_encryption, request_nonce.is_some())?;
-    let (device_name, install_id, code) = {
+    let (device_name, install_id, kind, code) = {
         let mut pending = state.pending_pairing.lock().map_err(|_| {
             api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -221,6 +232,7 @@ pub(crate) async fn pair_claim(
             .map(|value| value.device_name.clone())
             .unwrap_or_else(|| "Muqun app".into());
         let install_id = pending.as_ref().and_then(|value| value.install_id.clone());
+        let kind = pending.as_ref().map(|value| value.kind).unwrap_or_default();
         let code = body.code.trim().to_ascii_uppercase();
         authority::consume_pairing_code(
             &mut pending,
@@ -247,7 +259,7 @@ pub(crate) async fn pair_claim(
                 "invalid pairing code",
             ),
         })?;
-        (device_name, install_id, code)
+        (device_name, install_id, kind, code)
     };
 
     // Each device gets its own token so it can be revoked without disturbing
@@ -264,6 +276,7 @@ pub(crate) async fn pair_claim(
         paired_unix_ms: now_unix_ms(),
         last_seen_unix_ms: now_unix_ms(),
         install_id: install_id.clone(),
+        kind,
     };
     let device_id = record.id.clone();
     {
@@ -601,6 +614,77 @@ pub(crate) async fn pair_pending(
     Ok(Json(json!({ "pending": false })))
 }
 
+#[derive(Deserialize)]
+pub(crate) struct MintCodeBody {
+    pub(crate) device_name: String,
+    #[serde(default)]
+    pub(crate) kind: DeviceKind,
+}
+
+/// `POST /api/pair/pending`: a pending pairing made on the owner's behalf,
+/// for a device that is not in front of this computer's screen -- another
+/// gateway the phone (or `muqun-gateway peers link`) is linking. The answer
+/// carries what `/api/pair/claim` takes. The owner's phone holds no admin
+/// token, so an app device may ask too; another gateway may not.
+pub(crate) async fn mint_pairing_code(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<MintCodeBody>, JsonRejection>,
+) -> ApiResult<Json<Value>> {
+    require_pairing_manager(&state, &headers)?;
+    let Json(body) = body.map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "invalid request",
+        )
+    })?;
+    let device_name = body.device_name.trim().to_owned();
+    if device_name.is_empty() || !valid_device_name(&device_name) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_device_name",
+            "device_name must be at most 80 characters and contain no control characters",
+        ));
+    }
+    let now = now_unix_ms();
+    let mut pending = state.pending_pairing.lock().map_err(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "pairing_lock_failed",
+            "failed to lock pending pairing state",
+        )
+    })?;
+    if pending
+        .as_ref()
+        .is_some_and(|value| !authority::pairing_code_expired(value, now, PAIRING_CODE_TTL_MS))
+    {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "pairing_in_progress",
+            "another pairing request is awaiting confirmation",
+        ));
+    }
+    record_pairing_request(&state, now)?;
+    let code = generate_pairing_code();
+    let request_id = format!("mint-{}", uuid::Uuid::new_v4());
+    *pending = Some(PendingPairing {
+        request_id: request_id.clone(),
+        device_name,
+        install_id: None,
+        kind: body.kind,
+        code: code.clone(),
+        code_hash: hash_token(&code),
+        created_unix_ms: now,
+        failed_attempts: 0,
+    });
+    Ok(Json(json!({
+        "request_id": request_id,
+        "code": code,
+        "expires_in_ms": PAIRING_CODE_TTL_MS,
+    })))
+}
+
 pub(crate) async fn register_push_token(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -756,6 +840,7 @@ pub(crate) async fn list_paired_devices(
                 "name": device.name,
                 "paired_unix_ms": device.paired_unix_ms,
                 "last_seen_unix_ms": device.last_seen_unix_ms,
+                "kind": device.kind,
                 "current": device.id == current_id
             })
         })
@@ -771,7 +856,13 @@ pub(crate) async fn revoke_paired_device(
     // Paired devices can manage pairings through the app; the local Manager
     // pane uses its admin token for the same narrow operation. The admin token
     // still cannot access terminal/workspace control routes.
-    require_pairing_manager(&state, &headers)?;
+    if require_admin(&state.config, &headers).is_err() {
+        let caller = require_device_or_peer(&state, &headers)?;
+        // Another computer may take back only its own link (`DELETE /api/peers` on its side).
+        if caller.kind == DeviceKind::Gateway && caller.device_id != device_id {
+            return Err(peer_forbidden());
+        }
+    }
     let mut devices = lock_devices(&state)?;
     let previous_len = devices.len();
     devices.retain(|device| device.id != device_id);
@@ -1082,6 +1173,7 @@ mod tests {
             request_id: "manual-4".into(),
             device_name: "Phone".into(),
             install_id: None,
+            kind: Default::default(),
             code_hash: hash_token(&code),
             code,
             created_unix_ms: 0,
