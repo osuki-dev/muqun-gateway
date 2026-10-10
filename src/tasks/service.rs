@@ -270,8 +270,8 @@ pub(crate) struct TaskView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_ref: Option<String>,
     /// A terminal delegation's model and effort: those its launch passed,
-    /// else what its agent's banner showed, else `default` (the agent's
-    /// own). Absent on every other task.
+    /// else (Codex) its own config's, else `default` (the agent's own).
+    /// Absent on every other task.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1307,7 +1307,7 @@ impl TaskService {
                     .0
             }
         };
-        let (_, model, variant) = pane_agent::launch_model(
+        let (model_args, model, variant) = pane_agent::launch_model(
             state,
             &kind,
             request.model.as_deref(),
@@ -1398,16 +1398,18 @@ impl TaskService {
         };
         let view = self.present(&task).await;
         let state = state.clone();
-        let cwd = request.cwd.clone();
-        let goal = request.goal.clone();
+        let start = TerminalStart {
+            cwd: request.cwd.clone(),
+            goal: request.goal.clone(),
+            model_args,
+        };
         tokio::spawn(async move {
             let start = tokio::spawn(start_terminal_agent(
                 state.clone(),
                 session,
                 kind,
-                cwd,
                 placed,
-                goal,
+                start,
                 task.clone(),
             ));
             // A start that panicked must not leave the task dispatching.
@@ -1437,6 +1439,14 @@ pub(crate) async fn runs_in_pane(state: &AppState, kind: &str) -> bool {
         && pane_agent::is_terminal_agent(state, kind)
 }
 
+/// What [`start_terminal_agent`] starts the agent with: where, the goal, and
+/// the launch arguments for the model and effort the request named.
+pub(crate) struct TerminalStart {
+    pub cwd: Option<String>,
+    pub goal: String,
+    pub model_args: Vec<String>,
+}
+
 /// The background half of [`TaskService::delegate_to_pane`]: start the agent
 /// in its placed pane with the goal alone (on its command line where it
 /// takes one, otherwise typed) unless the task ended meanwhile -- a cancel, or a
@@ -1446,11 +1456,15 @@ pub(crate) async fn start_terminal_agent(
     state: AppState,
     session: crate::SessionConfig,
     kind: String,
-    cwd: Option<String>,
     placed: crate::agents::session_routes::PlacedAgent,
-    goal: String,
+    start: TerminalStart,
     task: Task,
 ) {
+    let TerminalStart {
+        cwd,
+        goal,
+        model_args,
+    } = start;
     use crate::agents::session_routes::{start_agent_in_place, type_agent_prompt, TaskLaunch};
     let tasks = &state.tasks;
     // A cancel (or a follower that gave up) while the pane was made or the
@@ -1466,16 +1480,6 @@ pub(crate) async fn start_terminal_agent(
         tracing::debug!(task = %task.id.0, "terminal task ended before its agent started");
         return;
     }
-    // The model and effort the binding records as passed, as arguments.
-    let model_args = match &task.binding {
-        TaskBinding::Pane { model, variant, .. } => {
-            pane_agent::launch_model(&state, &kind, model.as_deref(), variant.as_deref())
-                .await
-                .map(|(args, _, _)| args)
-                .unwrap_or_default()
-        }
-        _ => Vec::new(),
-    };
     let pane_id = placed.place.pane_id.clone();
     let mut goal = goal;
     // What ran before the launch command was typed is never its job.
@@ -1553,8 +1557,6 @@ pub(crate) async fn start_terminal_agent(
     if let TaskBinding::Pane {
         shell_pid,
         agent_job,
-        model,
-        variant,
         ..
     } = &mut binding
     {
@@ -1569,12 +1571,6 @@ pub(crate) async fn start_terminal_agent(
                 task = %task.id.0,
                 "terminal task: no launched job recorded; its pane will not be typed to"
             );
-        }
-        // No model named: what the agent's banner says it runs.
-        if model.is_none() {
-            if let Some((ran, effort)) = pane_agent::ran_model(&session, &pane_id).await {
-                (*model, *variant) = (Some(ran), effort);
-            }
         }
     }
     if binding != task.binding {

@@ -184,9 +184,11 @@ pub(crate) async fn exited_to_shell(session: &SessionConfig, pane_id: &str, kind
 }
 
 /// What a pane delegation to `kind` launches with for the model and effort
-/// the request named ([`agent_kinds::model_args`]): the arguments, and the
-/// model and effort they set. A model or effort that is no plain word is
-/// refused; Claude Code is asked once which flags it takes.
+/// the request named ([`agent_kinds::model_args`]), and the model and effort
+/// it then runs: those passed, else -- for Codex -- its own config's, the
+/// same source `GET /api/tasks/defaults` answers from, so the two agree.
+/// `None`: the agent's own default, not known. A model or effort that is
+/// no plain word is refused; Claude Code is asked which flags it takes.
 pub(crate) async fn launch_model(
     state: &AppState,
     kind: &str,
@@ -202,76 +204,108 @@ pub(crate) async fn launch_model(
     }
     let flags = if kind == "claude" && model.is_some() {
         let command = agent_kinds::agent_command(kind, &state.config.agent_commands);
-        claude_model_flags(state, &command).await
+        let flags = claude_model_flags(state, &command).await;
+        if !flags.model || (variant.is_some() && !flags.effort) {
+            tracing::info!(
+                model = flags.model,
+                effort = flags.effort,
+                "Claude Code does not take every flag asked for; it runs without them"
+            );
+        }
+        flags
     } else {
         agent_kinds::ModelFlags::default()
     };
-    Ok(agent_kinds::model_args(kind, model, variant, flags))
+    let (args, mut ran, mut effort) = agent_kinds::model_args(kind, model, variant, flags);
+    if kind == "codex" && (ran.is_none() || effort.is_none()) {
+        if let Some((own, own_effort)) =
+            crate::mcp::inject::codex_default_model(&state.config).await
+        {
+            ran = ran.or(Some(own));
+            effort = effort.or(own_effort);
+        }
+    }
+    Ok((args, ran, effort))
 }
 
-/// Claude Code's model flags, from `<command> --help`: asked once per
-/// command and kept; an ask that fails (not found, no answer in 10 s) gives
-/// none and is asked again next time.
+/// Claude Code's model flags, from its `--help`, for the binary a pane's
+/// shell runs as `command`: resolved by the user's login shell, interactive
+/// as a pane's is, with `agent_env`, and kept by that file's path, size and
+/// modification time -- an upgrade is asked again. One that cannot be
+/// resolved or does not answer in time gives none, and is asked again next
+/// time.
 async fn claude_model_flags(state: &AppState, command: &str) -> agent_kinds::ModelFlags {
-    static SEEN: std::sync::OnceLock<std::sync::Mutex<HashMap<String, agent_kinds::ModelFlags>>> =
+    type Key = (std::path::PathBuf, u64, Option<std::time::SystemTime>);
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<HashMap<Key, agent_kinds::ModelFlags>>> =
         std::sync::OnceLock::new();
+    let Some(program) = pane_program(state, command).await else {
+        return agent_kinds::ModelFlags::default();
+    };
+    let Ok(meta) = std::fs::metadata(&program) else {
+        return agent_kinds::ModelFlags::default();
+    };
+    let key: Key = (program.clone(), meta.len(), meta.modified().ok());
     let seen = SEEN.get_or_init(Default::default);
-    if let Some(flags) = seen.lock().ok().and_then(|seen| seen.get(command).copied()) {
+    if let Some(flags) = seen.lock().ok().and_then(|seen| seen.get(&key).copied()) {
         return flags;
     }
-    let program = if command.contains('/') {
-        Some(std::path::PathBuf::from(command))
-    } else {
-        agent_kinds::find_on_path(command)
-    };
-    let Some(program) = program else {
+    let quoted = format!("'{}'", program.to_string_lossy().replace('\'', "'\\''"));
+    let Some(help) = in_pane_shell(state, &format!("{quoted} --help 2>&1")).await else {
         return agent_kinds::ModelFlags::default();
     };
-    let mut probe = tokio::process::Command::new(program);
-    probe
-        .arg("--help")
-        .envs(state.config.agent_env.usable())
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true);
-    let Ok(Ok(out)) = tokio::time::timeout(Duration::from_secs(10), probe.output()).await else {
-        return agent_kinds::ModelFlags::default();
-    };
-    let help = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
     let flags = agent_kinds::ModelFlags::from_help(&help);
     if let Ok(mut seen) = seen.lock() {
-        seen.insert(command.to_owned(), flags);
+        seen.insert(key, flags);
     }
     flags
 }
 
-/// The model and effort a started agent's banner shows -- Codex's
-/// `model: gpt-6 high   /model to change` -- for a delegation that named
-/// none. `None` when the pane shows no such line.
-pub(crate) async fn ran_model(
-    session: &SessionConfig,
-    pane_id: &str,
-) -> Option<(String, Option<String>)> {
-    banner_model(&read_pane_visible_text(session, pane_id).await.ok()?)
+/// The file a pane's shell runs for `command` (`command -v`, resolved
+/// through links); a path is taken as written. `None` for an alias or a
+/// function, or a command that is no plain word.
+async fn pane_program(state: &AppState, command: &str) -> Option<std::path::PathBuf> {
+    if command.contains('/') {
+        return std::fs::canonicalize(command).ok();
+    }
+    if !command
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+    {
+        return None;
+    }
+    let out = in_pane_shell(
+        state,
+        &format!("printf '\\n{FOUND}%s\\n' \"$(command -v {command})\""),
+    )
+    .await?;
+    let found = out
+        .lines()
+        .find_map(|line| line.strip_prefix(FOUND))?
+        .trim();
+    found
+        .starts_with('/')
+        .then(|| std::fs::canonicalize(found).ok())
+        .flatten()
 }
 
-fn banner_model(screen: &str) -> Option<(String, Option<String>)> {
-    screen.lines().find_map(|line| {
-        let (_, rest) = line.split_once("model:")?;
-        let mut words = rest
-            .split_whitespace()
-            .take_while(|word| !word.starts_with('/') && !word.starts_with('\u{2502}'));
-        let model = words
-            .next()
-            .filter(|word| agent_kinds::valid_model_word(word))?;
-        let variant = words
-            .next()
-            .filter(|word| agent_kinds::valid_model_word(word));
-        Some((model.to_owned(), variant.map(str::to_owned)))
-    })
+/// The fence [`pane_program`] reads its answer after: profiles print things.
+const FOUND: &str = "__muqun_found__";
+
+/// `script`'s output, run by the user's login shell as a pane's runs
+/// (`-lic`) with `agent_env`, stdin empty, within 10 s.
+async fn in_pane_shell(state: &AppState, script: &str) -> Option<String> {
+    let mut shell = tokio::process::Command::new(crate::terminal::login_env::user_shell());
+    shell
+        .args(["-lic", script])
+        .envs(state.config.agent_env.usable())
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let out = tokio::time::timeout(Duration::from_secs(10), shell.output())
+        .await
+        .ok()?
+        .ok()?;
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// The job a delegation launched in a pane: the pane's shell, and the job
@@ -1563,29 +1597,6 @@ mod tests {
         // `/proc/<pid>/stat`, a command name holding a parenthesis and spaces.
         let stat = "200 (a) b (c) S 100 200 200 34819 200 4194560 1 0 0 0 5 1 0 0 20 0 1 0 987654 1000 100";
         assert_eq!(start_ticks(stat), Some(987_654));
-    }
-
-    /// What a started agent's banner says it runs, when the task named no
-    /// model.
-    #[test]
-    fn the_banner_tells_which_model_runs() {
-        for (screen, ran) in [
-            (
-                "│ >_ OpenAI Codex (v0.161.0) │\n│ model: gpt-6-sol medium   /model to change │\n",
-                Some(("gpt-6-sol", Some("medium"))),
-            ),
-            (
-                "│ model: gpt-6-sol   /model to change │\n",
-                Some(("gpt-6-sol", None)),
-            ),
-            ("$ codex\n", None),
-        ] {
-            let got = banner_model(screen);
-            let got = got
-                .as_ref()
-                .map(|(model, variant)| (model.as_str(), variant.as_deref()));
-            assert_eq!(got, ran, "{screen:?}");
-        }
     }
 
     /// The job recorded at launch is the one the launch started: never a

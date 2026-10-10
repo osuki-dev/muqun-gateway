@@ -829,7 +829,7 @@ fn task_view_schema() -> Value {
             "created_ms": { "type": "integer" },
             "updated_ms": { "type": "integer" },
             "client_ref": { "type": "string", "description": "The requester's own reference for the task (POST /api/tasks client_ref), when it gave one" },
-            "model": { "type": "string", "description": "A terminal delegation only: the model its launch passed, else what its agent's banner showed, else \"default\" (the agent's own)" },
+            "model": { "type": "string", "description": "A terminal delegation only: the model its launch passed, else (codex) its own config's -- what GET /api/tasks/defaults answers -- else \"default\" (the agent's own)" },
             "variant": { "type": "string", "description": "A terminal delegation only: the effort that goes with model, when known" },
             "parent_task_id": { "type": ["string", "null"], "description": "The open task this one was started from, when the gateway could tell" },
             "origin": { "type": "string", "enum": ["device", "agent", "mcp", "peer"], "description": "device: POST /api/tasks; peer: POST /api/tasks by another of the owner's computers (fleet_peers); agent: started by work the gateway tracks (its agent service, or the pane of an open task); mcp: any other MCP host. Tasks stored before origins existed are mcp" },

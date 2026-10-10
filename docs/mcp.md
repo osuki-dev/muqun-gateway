@@ -480,17 +480,19 @@ other `POST /api/tasks` directory is. `mode` does not apply and is ignored.
 `model` and `variant` are passed to the agent's launch, for this run only
 (the user's own config is never touched): Codex gets `-c model="<model>"`
 and `-c model_reasoning_effort="<variant>"`; Claude Code gets `--model
-<model>` and `--effort <variant>`, each only when its `--help` (asked once)
-lists the flag. As for a session agent, `variant` applies only together
+<model>` and `--effort <variant>`, each only when its `--help` lists the
+flag -- asked of the binary the user's interactive login shell runs for
+`claude` (with `agent_env`), as a pane's shell would, and kept until that
+file changes; a flag it lacks is left out (logged), and the task shows what
+did run. As for a session agent, `variant` applies only together
 with `model`. Each must be 1 to 128 of `A-Z a-z 0-9 . _ : / @ + -`, not
 starting with `-` (else `400 unknown_model`). The binding and the task view
-carry the `model` and `variant` the launch passed; with none passed, what
-the agent's banner showed once it started (Codex's `model: <id> <effort>`
-line), else `model: "default"`, the agent's own. `GET
-/api/tasks/defaults?agent_id=<kind>[&model=..&variant=..]` answers the same
-for a task not yet made: the named ones where the launch can pass them,
-else Codex's own config (`model`, `model_reasoning_effort`), else
-`default`. `session_id` (`tasks.delegate`: `terminal`) chooses the terminal
+carry the `model` and `variant` the launch passed; for what was not
+passed, Codex's own config (`model`, `model_reasoning_effort`); else
+`model: "default"`, the agent's own. `GET
+/api/tasks/defaults?agent_id=<kind>[&model=..&variant=..]` answers from the
+same resolution for a task not yet made, so the dock and the task row
+agree. `session_id` (`tasks.delegate`: `terminal`) chooses the terminal
 session by its id in `config.json` -- a tmux session or Herdr -- instead of
 the first that answers; an id this computer has no session for is `400
 terminal_unknown` (`invalid_arguments` from `tasks.delegate`), one that does

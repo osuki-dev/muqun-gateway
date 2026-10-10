@@ -99,8 +99,9 @@ pub(crate) enum TaskBinding {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_job: Option<AgentJob>,
         /// The model a delegation's agent runs: the one the request named
-        /// and the launch passed, else what the agent's own banner showed
-        /// once it started. `None`: its own default, not known.
+        /// and the launch passed, else (Codex) its own config's -- what
+        /// `GET /api/tasks/defaults` answers. `None`: its own default, not
+        /// known.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
         /// The reasoning effort that goes with `model`, likewise.

@@ -139,7 +139,7 @@ async fn defaults(
     let mut answer = json!({ "default_cwd": state.tasks.default_cwd(&by).await });
     if let Some(kind) = query.get("agent_id") {
         if super::service::runs_in_pane(&state, kind).await {
-            let named = super::pane_agent::launch_model(
+            let (_, model, variant) = super::pane_agent::launch_model(
                 &state,
                 kind,
                 query.get("model").map(String::as_str),
@@ -147,13 +147,7 @@ async fn defaults(
             )
             .await
             .map_err(|_| invalid_request())?;
-            let (model, variant) = match named {
-                (_, Some(model), variant) => (model, variant),
-                _ if kind == "codex" => crate::mcp::inject::codex_default_model(&state.config)
-                    .await
-                    .unwrap_or_else(|| ("default".to_owned(), None)),
-                _ => ("default".to_owned(), None),
-            };
+            let model = model.unwrap_or_else(|| "default".to_owned());
             answer["model"] = json!(model);
             answer["variant"] = json!(variant);
         }
@@ -1071,9 +1065,12 @@ mod tests {
             state.clone(),
             session,
             "codex".into(),
-            None,
             placed,
-            "late".into(),
+            crate::tasks::service::TerminalStart {
+                cwd: None,
+                goal: "late".into(),
+                model_args: Vec::new(),
+            },
             cancelled,
         )
         .await;
