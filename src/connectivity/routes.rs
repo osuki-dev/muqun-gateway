@@ -951,6 +951,9 @@ pub(crate) async fn list_paired_devices(
                 "paired_unix_ms": device.paired_unix_ms,
                 "last_seen_unix_ms": device.last_seen_unix_ms,
                 "kind": device.kind,
+                // Another computer's own id (kind gateway), when it gave
+                // one: how its login is matched when it is unlinked.
+                "server_id": device.server_id,
                 "current": device.id == current_id
             })
         })

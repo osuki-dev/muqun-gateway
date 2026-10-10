@@ -156,7 +156,26 @@ pub fn openapi_spec() -> Value {
                     "responses": ok_response()
                 }
             },
-            "/api/pairings": { "get": simple_endpoint("List devices holding a gateway token") },
+            "/api/pairings": { "get": {
+                "summary": "List devices holding a gateway token",
+                "responses": json_ok("The paired devices", json!({
+                    "type": "object",
+                    "required": ["devices"],
+                    "properties": { "devices": { "type": "array", "items": {
+                        "type": "object",
+                        "required": ["id", "name", "paired_unix_ms", "last_seen_unix_ms", "kind", "current"],
+                        "properties": {
+                            "id": { "type": "string" },
+                            "name": { "type": "string" },
+                            "paired_unix_ms": { "type": "integer" },
+                            "last_seen_unix_ms": { "type": "integer" },
+                            "kind": { "type": "string", "enum": ["app", "gateway"] },
+                            "server_id": { "type": ["string", "null"], "description": "kind gateway: the id that computer gave for itself when it paired here, when known (null otherwise); matches its peer_server_id" },
+                            "current": { "type": "boolean", "description": "The device whose token made this request" }
+                        }
+                    } } }
+                }))
+            } },
             "/api/pairings/{deviceId}": {
                 "delete": {
                     "summary": "Revoke one device's gateway token",

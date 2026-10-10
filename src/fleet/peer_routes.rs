@@ -807,6 +807,14 @@ mod tests {
                     server_id: Some(server_id.into()),
                     ..test_peer_device("nas-login", "nas-login")
                 });
+                // The phone's list carries it, to match the login by.
+                let (_, listed) = call(&coding, "GET", "/api/pairings", "token", None).await;
+                let login = listed["devices"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|d| d["id"] == "nas-login");
+                assert_eq!(login.unwrap()["server_id"], server_id, "{listed}");
             }
             let (status, unlinked) = call(
                 &coding,
