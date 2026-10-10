@@ -158,15 +158,24 @@ impl OpencodeClient {
         Ok(true)
     }
 
+    /// Removing an entry that is not there (404) is done too.
     pub async fn remove_session_instruction(
         &self,
         session_id: &str,
         key: &str,
-    ) -> Result<Value, AgentError> {
-        self.delete(&format!(
-            "/api/experimental/session/{session_id}/instructions/entries/{key}"
-        ))
-        .await
+    ) -> Result<(), AgentError> {
+        let path = format!("/api/experimental/session/{session_id}/instructions/entries/{key}");
+        let url = format!("{}{path}", self.endpoint.url);
+        let resp = self
+            .authed_req(self.http.delete(&url))
+            .send()
+            .await
+            .map_err(|e| AgentError::Network(e.to_string()))?;
+        if resp.status() == StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+        self.handle_resp(resp, "DELETE", &path).await?;
+        Ok(())
     }
 
     /// `PUT /api/experimental/mcp/{name}`: add (or replace) an MCP server

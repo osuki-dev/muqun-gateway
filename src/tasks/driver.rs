@@ -81,40 +81,71 @@ pub(crate) fn spawn(state: AppState) {
     });
 }
 
-/// When a session task whose session carries the task's instruction ends,
-/// remove the entry, so a session reused later is not told it runs a task.
+/// How many recently ended tasks a sweep looks at.
+const INSTRUCTION_SWEEP: usize = 50;
+
+/// When a session task ends, remove its session's task instruction
+/// (`mcp::inject::SESSION_INSTRUCTION_KEY`), so a session reused later is not
+/// told it runs a task. Read from the ledger, not from memory: a task open
+/// across a gateway restart is covered, removal is idempotent, and the
+/// recently ended tasks are swept at startup and whenever this falls behind
+/// the task events.
 pub(crate) fn spawn_instruction_cleanup(state: AppState) {
     let mut events = state.task_events.subscribe();
     tokio::spawn(async move {
         use tokio::sync::broadcast::error::RecvError;
+        sweep_task_instructions(&state).await;
         loop {
-            let task = match events.recv().await {
-                Ok(super::events::TaskDomainEvent::Updated { task, .. }) => task,
-                Err(RecvError::Lagged(_)) => continue,
+            match events.recv().await {
+                Ok(super::events::TaskDomainEvent::Updated { task, .. }) => {
+                    if task.state.is_terminal() {
+                        drop_task_instruction(&state, &task.binding).await;
+                    }
+                }
+                Err(RecvError::Lagged(_)) => sweep_task_instructions(&state).await,
                 Err(RecvError::Closed) => return,
-            };
-            if !task.state.is_terminal()
-                || !state
-                    .tasks
-                    .take_instructed(&super::domain::TaskId(task.task_id.clone()))
-            {
-                continue;
-            }
-            let TaskBinding::AgentSession { agent_id, asid } = &task.binding else {
-                continue;
-            };
-            let Some(manager) = state.agent_runtime.manager_for_agent(agent_id).await else {
-                continue;
-            };
-            if let Err(error) = manager
-                .agent()
-                .remove_session_instruction(asid, crate::mcp::inject::SESSION_INSTRUCTION_KEY)
-                .await
-            {
-                tracing::debug!(%error, "the task's session instruction stays");
             }
         }
     });
+}
+
+/// Remove the task instruction from the session an ended task was bound to,
+/// where its agent keeps such instructions.
+pub(crate) async fn drop_task_instruction(state: &AppState, binding: &TaskBinding) {
+    let TaskBinding::AgentSession { agent_id, asid } = binding else {
+        return;
+    };
+    let Some(manager) = state.agent_runtime.manager_for_agent(agent_id).await else {
+        return;
+    };
+    if !manager.agent().adds_mcp_servers() {
+        return;
+    }
+    if let Err(error) = manager
+        .agent()
+        .remove_session_instruction(asid, crate::mcp::inject::SESSION_INSTRUCTION_KEY)
+        .await
+    {
+        tracing::debug!(%error, "the task's session instruction stays");
+    }
+}
+
+async fn sweep_task_instructions(state: &AppState) {
+    let filter = TaskFilter {
+        states: Some(vec![
+            TaskState::Done,
+            TaskState::Failed,
+            TaskState::Cancelled,
+        ]),
+        limit: INSTRUCTION_SWEEP,
+        ..Default::default()
+    };
+    let Ok(ended) = state.tasks.open_tasks(filter).await else {
+        return;
+    };
+    for task in ended {
+        drop_task_instruction(state, &task.binding).await;
+    }
 }
 
 /// Follow the agents' events for the life of the gateway, settling the
@@ -328,6 +359,32 @@ mod tests {
     use crate::tasks::domain::{now_ms, PrincipalKind, TaskId, TaskKind, TaskPrincipal};
     use crate::test_support::{fake_session, test_state, FakeAgent, FakePaneListHerdr};
     use serde_json::json;
+
+    #[tokio::test]
+    async fn an_ended_task_s_session_loses_its_instruction_from_the_ledger_alone() {
+        // No memory of having set it: the binding says which session, and
+        // an agent without such instructions is not asked.
+        for (keeps_instructions, removed) in [(true, true), (false, false)] {
+            let state = test_state("admin", Vec::new());
+            let mut agent = FakeAgent::new("opencode");
+            if keeps_instructions {
+                agent.mcp = Some(Default::default());
+            }
+            let calls = agent.calls.clone();
+            state.agent_runtime.attach_for_test(agent.manager()).await;
+            let binding = TaskBinding::AgentSession {
+                agent_id: "opencode".into(),
+                asid: "ses_1".into(),
+            };
+            drop_task_instruction(&state, &binding).await;
+            let asked = calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| call == "remove_instruction ses_1 muqun-task");
+            assert_eq!(asked, removed, "{keeps_instructions}");
+        }
+    }
 
     fn task(binding: TaskBinding, kind: TaskKind) -> Task {
         let now = now_ms();

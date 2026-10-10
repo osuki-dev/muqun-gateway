@@ -544,8 +544,7 @@ impl AgentPort for OpencodeDriver {
         Box::pin(async move {
             self.client
                 .remove_session_instruction(session_id, key)
-                .await?;
-            Ok(())
+                .await
         })
     }
 

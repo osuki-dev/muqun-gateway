@@ -160,8 +160,6 @@ struct Live {
     /// ([`TaskService::is_task_session`]); a delegation's session is marked
     /// when it is bound, before its first prompt.
     task_sessions: HashMap<String, bool>,
-    /// Session tasks whose session carries the task's instruction entry.
-    instructed: HashSet<TaskId>,
     /// The agent sessions running a turn now (their last status was busy):
     /// their last line may still be being written ([`super::transcript`]).
     busy: HashSet<String>,
@@ -705,19 +703,6 @@ impl TaskService {
         }
     }
 
-    fn mark_instructed(&self, id: &TaskId) {
-        if let Ok(mut live) = self.live.lock() {
-            live.instructed.insert(id.clone());
-        }
-    }
-
-    /// Whether ended task `id` had a session instruction to remove; forgets it.
-    pub(crate) fn take_instructed(&self, id: &TaskId) -> bool {
-        self.live
-            .lock()
-            .is_ok_and(|mut live| live.instructed.remove(id))
-    }
-
     /// Whether agent session `asid` is running a turn, as the follower last
     /// saw its status.
     pub(crate) fn is_busy(&self, asid: &str) -> bool {
@@ -946,11 +931,11 @@ impl TaskService {
                 )
                 .await
             {
-                Ok(true) => self.mark_instructed(&task.id),
+                Ok(true) => {}
                 Ok(false) => {
                     unannounced = Some(
-                        "this agent takes no per-session instructions; it is not told to \
-                         report the task's end"
+                        "the agent took no per-session instruction for this session; it is \
+                         not told to report the task's end"
                             .to_owned(),
                     )
                 }

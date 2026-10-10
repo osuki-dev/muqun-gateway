@@ -956,6 +956,15 @@ impl agents::ports::agent::AgentPort for FakeAgent {
         Box::pin(async move { Ok(connected) })
     }
 
+    fn remove_session_instruction<'a>(
+        &'a self,
+        session_id: &'a str,
+        key: &'a str,
+    ) -> agents::ports::agent::AgentFuture<'a, ()> {
+        self.record(&format!("remove_instruction {session_id} {key}"));
+        Box::pin(async { Ok(()) })
+    }
+
     fn add_mcp_server<'a>(
         &'a self,
         _name: &'a str,
