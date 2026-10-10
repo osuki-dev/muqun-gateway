@@ -880,8 +880,17 @@ impl PaneBuffer {
             .map(|row| frame[row])
             .collect();
         let known = head.iter().filter(|row| nearby.contains(row)).count() * 2 >= head.len();
+        // Every text row of the head already held somewhere above the run:
+        // the prompt Codex pins to the top row while it streams, on the first
+        // read that shows it pinned -- the prompt was sent well above, so it
+        // is not "nearby", and the frame before had the transcript's own top
+        // there. Rows the screen moving down brings into view are rows the
+        // buffer never had, so this never takes them.
+        let above: HashSet<u64> = held[..found.held_start].iter().copied().collect();
+        let repeated = !head.is_empty() && head.iter().all(|row| above.contains(row));
         let pinned = !carries[..found.read_start].contains(&true)
             || known
+            || repeated
             || (found.read_start <= self.last_frame.len()
                 && frame[..found.read_start] == self.last_frame[..found.read_start]);
         let skip = if pinned { found.read_start } else { 0 };
@@ -2669,6 +2678,47 @@ mod tests {
         assert!(lines
             .iter()
             .any(|line| line.starts_with("line 319 of round 7")));
+    }
+
+    /// Codex pins the prompt it was sent to the top row while the answer
+    /// streams under it. The first read that shows it pinned must not write
+    /// the prompt into the history a second time, mid-answer.
+    #[test]
+    fn a_prompt_pinned_to_the_top_row_is_held_once() {
+        let mut store = ScrollbackStore::default();
+        let out =
+            |from: usize, to: usize| (from..=to).map(|n| format!("out {n}")).collect::<Vec<_>>();
+        let frame = |head: &[&str], body: Vec<String>| {
+            head.iter()
+                .map(|row| (*row).to_owned())
+                .chain(body)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        store.record(
+            "pane",
+            &frame(&["banner 1", "banner 2", "", "› do it", ""], out(1, 10)),
+            false,
+        );
+        store.record("pane", &frame(&["› do it", ""], out(6, 25)), false);
+        store.record("pane", &frame(&["› do it", ""], out(21, 40)), false);
+        let held = store.window("pane", 5_000).unwrap();
+        let lines: Vec<&str> = held.lines().collect();
+        assert_eq!(
+            lines.iter().filter(|line| **line == "› do it").count(),
+            1,
+            "{held}"
+        );
+        let answer: Vec<&str> = lines
+            .iter()
+            .copied()
+            .filter(|line| line.starts_with("out "))
+            .collect();
+        assert_eq!(
+            answer,
+            out(1, 40).iter().map(String::as_str).collect::<Vec<_>>(),
+            "{held}"
+        );
     }
 
     use serde_json::json;
