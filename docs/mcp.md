@@ -723,9 +723,10 @@ peer_server_id, remote_task_id, peer_name}`.
   after 2 minutes.
 - If the computer is unlinked here, or turns out to no longer know this
   one's token (unlinked or revoked there: it answers `401`/`403`), its open
-  mirrors fail with a summary starting `peer_unlinked:` -- the task there can
-  never be read again, since a new link is a new login -- and the computer is
-  forgotten (`unauthorized` on the next delegation).
+  mirrors fail (view `reason: "peer_unlinked"`, a plain summary) -- the task
+  there can never be read again, since a new link is a new login -- and the
+  computer is forgotten (`unauthorized` on the next delegation). A mirror's
+  `reason` field is described in [agent-api.md](agent-api.md#linked-gateways-fleet_peers).
 
 ### States
 

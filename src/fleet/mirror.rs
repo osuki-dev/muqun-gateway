@@ -20,8 +20,21 @@ use crate::tasks::service::{DelegateRequest, TaskError, TaskView, OPEN_STATES, S
 use crate::AppState;
 
 const SOURCE: &str = "peer";
-/// How a mirror whose link is gone (unlinked on either side) begins its line.
-const PEER_UNLINKED: &str = "peer_unlinked";
+/// How a failed mirror's summary ends after its computer's name (the one in
+/// its binding), and the `reason` its view carries for it: the summary stays
+/// prose, and the phone words the reason itself.
+const UNLINKED_THERE: &str = " no longer accepts this computer";
+const UNLINKED_HERE: &str = " was unlinked";
+const NO_LONGER_LINKED: &str = " is no longer linked";
+const LOST_THERE: &str = " no longer has this task";
+const NOT_CONFIRMED: &str = " did not confirm the task";
+const ENDINGS: [(&str, &str); 5] = [
+    (UNLINKED_THERE, "peer_unlinked"),
+    (UNLINKED_HERE, "peer_unlinked"),
+    (NO_LONGER_LINKED, "peer_unlinked"),
+    (LOST_THERE, "peer_lost_task"),
+    (NOT_CONFIRMED, "peer_not_confirmed"),
+];
 /// How often a quiet socket re-checks whether any mirror of its peer is
 /// still open, and looks for the task of a mirror whose create got no answer.
 const IDLE_CHECK: Duration = if cfg!(test) {
@@ -386,8 +399,10 @@ async fn refresh(
         match client.read_task(remote_id(mirror)).await {
             Ok(remote) => Ok(apply(state, mirror, &remote).await),
             Err(PeerError::Refused { status: 404, .. }) => {
-                let lost = failed(&format!("lost: {} no longer has this task", peer.name));
-                state.tasks.record_failure(mirror, lost).await;
+                state
+                    .tasks
+                    .record_failure(mirror, ended(mirror, LOST_THERE))
+                    .await;
                 Ok(true)
             }
             Err(error) => Err(error),
@@ -430,8 +445,10 @@ async fn adopt(
         if now_ms().saturating_sub(mirror.created_ms) < ADOPT_WITHIN.as_millis() as u64 {
             return Ok(false);
         }
-        let never = failed(&format!("{} did not confirm the task", peer.name));
-        state.tasks.record_failure(mirror, never).await;
+        state
+            .tasks
+            .record_failure(mirror, ended(mirror, NOT_CONFIRMED))
+            .await;
         return Ok(true);
     };
     // Bound with its first move; one still starting is found again next time.
@@ -443,21 +460,15 @@ async fn adopt(
 }
 
 /// The peer answered 401/403: it was unlinked there, or this computer's
-/// login revoked. Its open mirrors fail (`peer_unlinked`): the task over
+/// login revoked. Its open mirrors fail (reason `peer_unlinked`): the task over
 /// there can never be read again, since a new link is a new login. Then the
 /// peer is forgotten (§10.10) -- last, since this may run in its follower,
 /// which forgetting ends. Every path that finds a link gone comes here.
 pub(crate) async fn forget(state: &AppState, peer_id: &str) {
     tracing::info!(peer = %peer_id, "a peer no longer knows this gateway; forgetting it");
     state.peers.presence.gone(peer_id);
-    let name = match state.peers.get(peer_id).await {
-        Some(peer) => peer.name,
-        None => peer_id.to_owned(),
-    };
     for mirror in open_mirrors(state, peer_id).await {
-        let why = failed(&format!(
-            "{PEER_UNLINKED}: {name} no longer accepts this computer"
-        ));
+        let why = ended(&mirror, UNLINKED_THERE);
         state.tasks.record_failure(&mirror, why).await;
     }
     state.peers.forget(peer_id).await;
@@ -501,10 +512,7 @@ pub(crate) async fn converge(state: &AppState, mirror: &Task) -> bool {
     let Some(peer) = state.peers.get(peer_id).await else {
         // Forgotten (a restart between the forget and its mirrors' end):
         // nothing can read its task again.
-        let TaskBinding::Peer { peer_name, .. } = &mirror.binding else {
-            return false;
-        };
-        let why = failed(&format!("{PEER_UNLINKED}: {peer_name} is no longer linked"));
+        let why = ended(mirror, NO_LONGER_LINKED);
         state.tasks.record_failure(mirror, why).await;
         return true;
     };
@@ -555,12 +563,39 @@ pub(crate) async fn forward_cancel(state: &AppState, mirror: &Task) {
     }
 }
 
-/// `peer_id` was unlinked here: its open mirrors fail (`peer_unlinked`).
-pub(crate) async fn lose(state: &AppState, peer_id: &str, name: &str) {
+/// `peer_id` was unlinked here: its open mirrors fail (reason `peer_unlinked`).
+pub(crate) async fn lose(state: &AppState, peer_id: &str) {
     for mirror in open_mirrors(state, peer_id).await {
-        let lost = failed(&format!("{PEER_UNLINKED}: {name} was unlinked"));
+        let lost = ended(&mirror, UNLINKED_HERE);
         state.tasks.record_failure(&mirror, lost).await;
     }
+}
+
+/// `mirror` fails with its computer's name and `ending` as its summary.
+fn ended(mirror: &Task, ending: &str) -> TaskChange {
+    let name = match &mirror.binding {
+        TaskBinding::Peer { peer_name, .. } => peer_name.as_str(),
+        _ => "",
+    };
+    failed(&format!("{name}{ending}"))
+}
+
+/// Why a mirror failed, or why an open one is stuck, for its view: one of
+/// the summaries [`ended`] writes (matched whole, so a summary copied from
+/// the task over there never counts), or `peer_unreachable` while its
+/// computer has not answered lately. `None` for any other task.
+pub(crate) fn reason(task: &Task, reachable: Option<bool>) -> Option<&'static str> {
+    let TaskBinding::Peer { peer_name, .. } = &task.binding else {
+        return None;
+    };
+    if task.state == TaskState::Failed {
+        let rest = task.summary.as_deref()?.strip_prefix(peer_name.as_str())?;
+        return ENDINGS
+            .iter()
+            .find(|(ending, _)| *ending == rest)
+            .map(|(_, reason)| *reason);
+    }
+    (!task.state.is_terminal() && reachable == Some(false)).then_some("peer_unreachable")
 }
 
 fn failed(why: &str) -> TaskChange {
@@ -842,10 +877,9 @@ mod tests {
         assert!(unlinked.forgotten);
         let lost = coding.tasks.get_for_test(&mirror_id).await;
         assert_eq!(lost.state, TaskState::Failed);
-        assert_eq!(
-            lost.summary.as_deref(),
-            Some("peer_unlinked: mini was unlinked")
-        );
+        assert_eq!(lost.summary.as_deref(), Some("mini was unlinked"));
+        let view = coding.tasks.present(&lost).await;
+        assert_eq!(view.reason, Some("peer_unlinked"), "the phone words it");
     }
 
     /// What the calling agent is told when the computer it names cannot take the work.
@@ -921,7 +955,7 @@ mod tests {
             (stranded.state, stranded.summary.as_deref()),
             (
                 TaskState::Failed,
-                Some("peer_unlinked: old no longer accepts this computer")
+                Some("old no longer accepts this computer")
             )
         );
         assert!(
@@ -994,6 +1028,8 @@ mod tests {
                 (Some(reachable), seen),
                 "{seen:?}"
             );
+            let stuck = (!reachable).then_some("peer_unreachable");
+            assert_eq!(view.reason, stuck, "{seen:?}");
             assert_eq!(view.progress, None, "no gateway-made progress line");
         }
     }

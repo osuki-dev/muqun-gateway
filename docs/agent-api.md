@@ -2092,8 +2092,8 @@ checks it, so it never replaces or evicts a device; its only use is that
 `DELETE /api/peers/{id}` also revokes the gateway devices here whose
 `server_id` is that peer's (its login into this computer), so one call
 unlinks both directions. A peer forgotten after a `401`/`403` keeps its login
-here; its open mirrors fail (`peer_unlinked: <name> no longer accepts this
-computer`), as they do on `DELETE /api/peers/{id}`.
+here; its open mirrors fail (`reason: "peer_unlinked"`), as they do on
+`DELETE /api/peers/{id}`.
 `DELETE /api/peers/{id}` (the admin token or an app device only) answers
 `{"remote_revoked", "counterpart_found", "counterpart_revoked"}`: whether the
 peer confirmed it revoked this gateway's token, whether a login of the peer's
@@ -2108,7 +2108,17 @@ is the id that computer gave for itself, which the phone knows it by, and
 `remote_task_id` is empty while a create that got no answer has not found its
 task there yet (`tasks.delegate` then carries a `note` saying so). The create
 carries a `client_ref`, which the task over there keeps and shows in its view
-(with `created_ms`), and that is how it is found. A task
+(with `created_ms`), and that is how it is found.
+
+A mirror's view also carries `reason`, made when the view is (nothing
+stored), for the app to word in its own copy; the `summary` stays a plain
+line. On a `failed` mirror: `peer_unlinked` (unlinked here, or the other
+computer no longer takes this one's token), `peer_lost_task` (the other
+computer no longer has the task), `peer_not_confirmed` (a create that got no
+answer never turned up there). On an open mirror: `peer_unreachable` while
+its computer has not answered in the last 2 minutes. Absent otherwise, and on
+every task that is not a mirror. (`delegation_loop` is never a view reason:
+that delegation creates nothing; it is the MCP error code.) A task
 another computer opened here (`origin: "peer"`) can be confirmed from the phone
 like a device's; its `requested_by` is `{kind: "gateway", id, name, server_id?}`,
 where `server_id` is the id that computer gave for itself when it paired here,

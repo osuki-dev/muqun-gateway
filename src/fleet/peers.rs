@@ -671,7 +671,7 @@ impl PeerService {
         let peer = self.get(peer_id).await?;
         let remote_revoked = revoke(&peer).await;
         let (counterpart_found, counterpart_revoked) = revoke_login(state, &peer.server_id);
-        super::mirror::lose(state, peer_id, &peer.name).await;
+        super::mirror::lose(state, peer_id).await;
         let forgotten = match self.store.remove(peer_id).await {
             Ok(_) => true,
             Err(error) => {

@@ -786,6 +786,7 @@ fn task_view_schema() -> Value {
             "exit_code": { "type": ["integer", "null"] },
             "peer_reachable": { "type": "boolean", "description": "A mirror only (binding peer): its computer answered within the last 2 minutes" },
             "peer_last_seen_ms": { "type": "integer", "description": "A mirror only: when its computer last answered; absent if it never did" },
+            "reason": { "type": "string", "enum": ["peer_unlinked", "peer_lost_task", "peer_not_confirmed", "peer_unreachable"], "description": "A mirror only, made when the view is: why a failed mirror failed (peer_unlinked, peer_lost_task, peer_not_confirmed) or why an open one is stuck (peer_unreachable); the app words it, the summary stays plain prose" },
             "binding": {
                 "type": "object",
                 "description": "What the task runs in. `kind` is `none`, `agent_session` (with agent_id, asid), `pane` (with session_id, pane_id, tab_id; plus agent_id, the terminal agent kind, for a delegation to a terminal agent -- absent for a command), or `peer` (fleet_peers: a mirror of task remote_task_id on linked computer peer_id, whose own server id is peer_server_id; peer_name is that computer's name when the mirror was made, a display fallback; remote_task_id is empty while a create that got no answer has not found its task there yet)",

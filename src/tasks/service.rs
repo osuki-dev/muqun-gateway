@@ -251,6 +251,11 @@ pub(crate) struct TaskView {
     /// The requester's reference for it, when it gave one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_ref: Option<String>,
+    /// A mirror's why, for the phone to word (its summary is prose):
+    /// `peer_unlinked`, `peer_lost_task` or `peer_not_confirmed` on a failed
+    /// one, `peer_unreachable` on an open one. Made when the view is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
 }
 
 /// How the agent working on a task says it ended (`tasks.complete`).
@@ -1803,6 +1808,7 @@ impl TaskService {
             title: self.title_of(task).unwrap_or(view.title),
             peer_reachable,
             peer_last_seen_ms,
+            reason: crate::fleet::mirror::reason(task, peer_reachable),
             ..view
         }
     }
@@ -1848,6 +1854,7 @@ impl TaskService {
             peer_last_seen_ms: None,
             mentions: task.mentions.clone(),
             client_ref: task.client_ref.clone(),
+            reason: None,
         }
     }
 
