@@ -805,6 +805,15 @@ const CHROME_START: [&str; 2] = ["Update available", "Tip:"];
 /// hint, and with at least three letters or digits. A box's right edge is
 /// cut off.
 fn meaningful(line: &str) -> Option<&str> {
+    // A marker is how the agent told the gateway, never a hint or progress:
+    // only the agent's words before it on the line count.
+    let line = [DONE_MARKER, BLOCKED_MARKER]
+        .iter()
+        .filter_map(|marker| line.find(marker))
+        .min()
+        .map_or(line, |at| {
+            line[..at].trim_end_matches(['`', '"', '\'', '*', ' '])
+        });
     let trimmed = line.trim();
     if trimmed.starts_with(['❯', '›']) || CHROME.iter().any(|c| trimmed.contains(c)) {
         return None;
@@ -1702,6 +1711,16 @@ mod tests {
             ("Pro Tip: run it twice\n", Some("Pro Tip: run it twice")),
             ("$ cargo test\n", Some("$ cargo test")),
             ("> make check\n› \n", Some("> make check")),
+            // A marker never becomes the hint: an old blocked line left on
+            // screen gives way to the prose above it.
+            (
+                "The config file is missing here.\n⏺ MUQUN_TASK_BLOCKED: notes.md does not exist\n",
+                Some("The config file is missing here."),
+            ),
+            (
+                "⏺ Built it, all good. MUQUN_TASK_DONE: built\n",
+                Some("Built it, all good."),
+            ),
         ] {
             assert_eq!(
                 screen_summary(Some("some-agent"), screen).as_deref(),
