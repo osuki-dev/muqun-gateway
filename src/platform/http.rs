@@ -91,24 +91,42 @@ pub(crate) fn require_device(state: &AppState, headers: &HeaderMap) -> ApiResult
     Ok(caller.device_id)
 }
 
-/// A paired device of either kind: the routes another gateway may use (the
-/// task routes, the event socket, the read-only manifest, its own
-/// revocation) take this, and look at `Caller::kind` themselves.
-pub(crate) fn require_device_or_peer(state: &AppState, headers: &HeaderMap) -> ApiResult<Caller> {
-    let device_id = authenticated_device(state, headers)?;
-    let devices = lock_devices(state)?;
-    let record = devices.iter().find(|device| device.id == device_id);
+/// The caller a matched token belongs to, read under the same lock that
+/// matched it. A record that is not there (revoked between the match and
+/// this read cannot happen under one guard, but fail closed regardless) is
+/// an invalid token, never an app.
+fn matched_caller(devices: &[DeviceRecord], device_id: String) -> ApiResult<Caller> {
+    let Some(record) = devices.iter().find(|device| device.id == device_id) else {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "invalid_token",
+            "invalid token",
+        ));
+    };
     Ok(Caller {
-        kind: record.map_or(DeviceKind::App, |device| device.kind),
-        name: record.map_or_else(|| device_id.clone(), |device| device.name.clone()),
+        kind: record.kind,
+        name: record.name.clone(),
         device_id,
     })
 }
 
-/// Control routes are for paired devices only. The admin token deliberately
-/// does not authorise these: it sits in plaintext on disk for the manage UI,
-/// and these routes can run commands on the host.
-fn authenticated_device(state: &AppState, headers: &HeaderMap) -> ApiResult<String> {
+/// A caller that is not a paired device: the admin token in cleartext mode,
+/// or `dev_unauthenticated`. Both act as the owner's app.
+fn synthetic_caller(device_id: &str) -> Caller {
+    Caller {
+        device_id: device_id.to_owned(),
+        kind: DeviceKind::App,
+        name: device_id.to_owned(),
+    }
+}
+
+/// A paired device of either kind: the routes another gateway may use (the
+/// task routes, the event socket, the read-only manifest, its own
+/// revocation) take this, and look at `Caller::kind` themselves. Control
+/// routes are for paired devices only. The admin token deliberately does
+/// not authorise them (outside cleartext mode): it sits in plaintext on
+/// disk for the manage UI, and these routes can run commands on the host.
+pub(crate) fn require_device_or_peer(state: &AppState, headers: &HeaderMap) -> ApiResult<Caller> {
     if state.config.transport_encryption == TransportEncryptionMode::Disabled {
         // Cleartext mode drops the envelope and the per-device transport
         // proof; it does not drop authentication. A device paired while
@@ -125,14 +143,14 @@ fn authenticated_device(state: &AppState, headers: &HeaderMap) -> ApiResult<Stri
                     now_unix_ms(),
                     DEVICE_LAST_SEEN_FLUSH_MS,
                 );
-                return Ok(device_id);
+                return matched_caller(&devices, device_id);
             }
             if authority::authenticates_admin(&state.config.token_hash, token) {
-                return Ok("admin".to_string());
+                return Ok(synthetic_caller("admin"));
             }
         }
         if state.config.dev_unauthenticated {
-            return Ok(DEV_UNAUTHENTICATED_DEVICE.to_string());
+            return Ok(synthetic_caller(DEV_UNAUTHENTICATED_DEVICE));
         }
         // Absent or malformed is 401 and a wrong token is 403, exactly as in
         // the encrypted mode: the two answers must not diverge by mode.
@@ -181,7 +199,7 @@ fn authenticated_device(state: &AppState, headers: &HeaderMap) -> ApiResult<Stri
             tracing::warn!("failed to persist device last-seen: {err:#}");
         }
     }
-    Ok(device_id)
+    matched_caller(&devices, device_id)
 }
 
 /// Whether a device authorised earlier is still authorised now.

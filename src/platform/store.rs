@@ -850,6 +850,26 @@ pub(crate) fn hostname_label() -> String {
 /// Persist a new display label into the config (and the pairing payload), so a
 /// name set from the app shows up in push notifications. Mirrors
 /// `update_public_url`.
+/// Read the config file at `path`, change it, and write it back, one writer
+/// at a time: a running gateway changes its label (`PATCH /api/meta`) and its
+/// accept switch (`PUT /api/fleet/settings`) this way, and neither may lose
+/// the other's write. Written through `Config`, so the file keeps its order.
+pub(crate) fn edit_config(
+    path: &std::path::Path,
+    edit: impl FnOnce(&mut Config),
+) -> anyhow::Result<()> {
+    static WRITER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _writer = WRITER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let bytes =
+        std::fs::read(path).with_context(|| format!("failed to read config {}", path.display()))?;
+    let mut config: Config = serde_json::from_slice(&bytes)?;
+    edit(&mut config);
+    write_secret_file(path, &serde_json::to_vec_pretty(&config)?)
+        .with_context(|| format!("failed to write config {}", path.display()))
+}
+
 pub(crate) fn update_server_label(label: &str) -> anyhow::Result<String> {
     let label = label.trim();
     anyhow::ensure!(
@@ -858,11 +878,9 @@ pub(crate) fn update_server_label(label: &str) -> anyhow::Result<String> {
             && !label.chars().any(char::is_control),
         "label must be non-empty, at most {MAX_DEVICE_NAME_CHARS} characters, and free of control characters"
     );
-    let config_path = config_dir()?.join(CONFIG_FILE);
-    let mut config = load_config(None)?;
-    config.label = label.to_string();
-    write_secret_file(&config_path, &serde_json::to_vec_pretty(&config)?)
-        .with_context(|| format!("failed to write config {}", config_path.display()))?;
+    edit_config(&config_dir()?.join(CONFIG_FILE), |config| {
+        config.label = label.to_string();
+    })?;
 
     if let Ok(mut pairing) = read_pairing_file() {
         pairing.payload.label = label.to_string();

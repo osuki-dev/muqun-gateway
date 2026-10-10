@@ -1723,10 +1723,16 @@ fn manage_lines(
                         body.push(ScreenLine::text(&badge, Tone::Badge));
                         body.push(ScreenLine::plain(""));
                         body.push(ScreenLine::text(
-                            format!(
-                                "Waiting for the phone… {} is asking for this code.",
-                                pending.device_name
-                            ),
+                            match pending.kind {
+                                crate::connectivity::authority::DeviceKind::App => format!(
+                                    "Waiting for the phone… {} is asking for this code.",
+                                    pending.device_name
+                                ),
+                                crate::connectivity::authority::DeviceKind::Gateway => format!(
+                                    "Waiting for the computer… {} (gateway) is asking for this code to link with this one.",
+                                    pending.device_name
+                                ),
+                            },
                             Tone::Accent,
                         ));
                         body.extend(wrapped_rows("Address", &config.public_url, inner));
@@ -1799,8 +1805,13 @@ fn manage_lines(
                 if let Some(pending) = data.pending {
                     body.push(ScreenLine::text(
                         format!(
-                            "{} is waiting for its pairing code: press p to show it.",
-                            pending.device_name
+                            "{}{} is waiting for its pairing code: press p to show it.",
+                            pending.device_name,
+                            if pending.kind == crate::connectivity::authority::DeviceKind::Gateway {
+                                " (gateway)"
+                            } else {
+                                ""
+                            }
                         ),
                         Tone::Warning,
                     ));
@@ -2327,7 +2338,7 @@ fn pending_from_answer(status: u16, value: &Value) -> anyhow::Result<Option<Pend
             .and_then(Value::as_str)
             .unwrap_or("Muqun app")
             .into(),
-        kind: Default::default(),
+        kind: serde_json::from_value(value["kind"].clone()).unwrap_or_default(),
         install_id: value
             .get("install_id")
             .and_then(Value::as_str)

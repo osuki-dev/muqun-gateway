@@ -129,32 +129,39 @@ running and where it listens, whether Herdr and the agent service answer,
 and how many devices are paired. While Gateway runs, the links refresh
 every few seconds; a stopped Gateway is not asked.
 
-The manager has four views, and the Overview footer lists them as
-"1 Overview · 2 Terminals · 3 Devices · 4 Settings". `1`–`4`, Tab/Shift-Tab,
-or Left/Right switches views; Up/Down or `j`/`k` selects a row and Enter
-performs the visible primary action, except on Overview, where Enter does
-nothing. PageUp/PageDown scrolls. Esc always goes one level back: from the
-pairing flow to the device list, from a view to Overview, from a dialog to
-its view; at Overview, Esc closes the manager. `q` closes from any main view
-without stopping Gateway. Confirmations default to **cancel**: arrows/Tab
-choose, Enter accepts the selected answer. The footer lists every key of the
-view with full words, one key per action, then the navigation keys; the
-status line under them belongs to the current view and resets when you
-switch views. Long lists keep the selected item visible after a resize.
+The manager has four views: 1 Overview, 2 Terminals, 3 Devices, 4 Settings.
+`1`–`4`, Tab/Shift-Tab, or Left/Right switches views; Up/Down or `j`/`k`
+selects a row, and **Enter is the only verb on a row**: it toggles a switch,
+opens a chooser for a choice, or edits a text. On Overview Enter does nothing;
+starting and stopping Gateway always take `s` and `t`. Esc always goes one
+level back (pairing flow → device list, dialog → its view, view → Overview,
+Overview → closed); `q` closes from any main view without stopping Gateway.
+Confirmations default to **cancel**.
 
-| view | keys |
-| --- | --- |
-| Overview (`1`) | `s` start, `t` stop, `r` restart the gateway |
-| Terminals (`2`) | `h` / `m` add Herdr / tmux; `f` make the selected backend default; `d` remove it; `b` toggle its backend autostart |
-| Devices (`3`) | `p` show pairing QR (or pair another device after one finishes); `x` revoke the selected device after confirmation; `r` return to the device list |
-| Settings (`4`) | `u` edit URL; `a` detect URL; `e` toggle transport encryption; `g` enable/disable gateway autostart; `c` check stable updates; `i` install an update after confirmation |
+The footer is one line of the same shape on every view,
+`↑↓ select · Enter change · Tab next view · q quit`, plus the view's own keys
+for actions that are not a row:
 
-Enter makes the selected terminal backend the default in Terminals, pairs the
-first device or reviews revocation in Devices, and changes the selected
-setting in Settings; starting and stopping Gateway always take `s` and `t`. The `>` selection marker
-is separate from the explicit `[default]` backend label. Empty lists explain
-the next step. Gateway stop, backend removal, and device revocation explain
-their scope before you confirm; none closes terminal tasks.
+| view | rows (Enter) | own keys |
+| --- | --- | --- |
+| Overview (`1`) | — | `s` start, `t` stop, `r` restart the gateway |
+| Terminals (`2`) | a backend's actions: make default, start with Gateway on/off, remove | `h` / `m` add Herdr / tmux |
+| Devices (`3`) | the device's kind, pairing and last-seen times; `x` there revokes it | `p` pair a device; `x` revoke the selected one |
+| Settings (`4`) | change the selected setting | `r` restart the gateway |
+
+Settings lists every setting as one row with its current value, a one-line
+explanation of the feature it switches, and, in grey, where it lives
+(`config.json › history.storage`), grouped as: *Gateway* (login autostart,
+address, detect address, transport encryption, updates), *Storage* (history
+checkpoints memory/SQLite, store encryption, read-only), *Agents started from
+the phone* (skipping the agents' own approval prompts, trusting the task
+folder, the environment passed to agents, values never shown), and
+*Assistant access* (the MCP server, loopback only). A change that applies only
+after a restart says `restart needed` on its row, and the header shows
+`Restart needed` until `r` restarts Gateway. Rows longer than the terminal end
+in `…` rather than a clipped word. Empty lists explain the next step. Gateway
+stop, backend removal, and device revocation explain their scope before you
+confirm; none closes terminal tasks.
 
 Runtime/connectivity/backend panels use the terminal's default background,
 with bold/reversed active tabs and rows, restrained status accents, and a
@@ -231,8 +238,8 @@ muqun-gateway update           # explicitly download, verify and install a newer
 muqun-gateway --version        # side-effect-free installed binary version
 ```
 
-Settings (`4`) in `manage` has the same update/check use case. `c` checks;
-`i` checks and asks for confirmation before downloading or downtime. Nothing
+Settings (`4`) in `manage` has the same update/check use case: Enter on
+Updates checks, and asks for confirmation before downloading or downtime. Nothing
 checks or installs updates in the background. Stable `vX.Y.Z` versions only;
 development/prerelease builds and downgrades are not supported.
 
@@ -351,7 +358,7 @@ without asking. To keep the prompts, set the launch arguments per kind in
 ```
 
 The gateway logs the launch arguments in effect at startup, and `manage` shows
-them under Settings. Details: [Agent API](docs/agent-api.md#terminal-agents-launched-for-remote-dispatch).
+and switches them under Settings › Agents started from the phone. Details: [Agent API](docs/agent-api.md#terminal-agents-launched-for-remote-dispatch).
 
 ### The OpenCode agent
 

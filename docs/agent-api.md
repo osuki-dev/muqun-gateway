@@ -2046,6 +2046,23 @@ answers. `custom` means a value outside `options` is allowed.
 
 ---
 
+## Linked gateways (`fleet_peers`)
+
+Another of the owner's computers is a paired device of `kind: "gateway"`
+(`GET /api/pairings` shows the kind). Its token reaches only the task routes
+(`GET /api/tasks` without `root`, `GET /api/tasks/{id}`,
+`POST /api/tasks/{id}/cancel`), `subscribe_tasks` on `/api/ws`,
+`GET /api/fleet/self` and `DELETE /api/pairings/{its own id}`; everything
+else answers `403 peer_forbidden`.
+
+**Operator note:** a gateway build older than this one does not know
+`kind` and reads a gateway device as an ordinary app device, with full
+device access. After rolling a gateway back below this version, revoke its
+gateway devices (`muqun-gateway revoke <device id>`, or `manage`'s Devices
+view, where they show as `name (gateway)`).
+
+---
+
 ## Limits
 
 The mirror is a cache in front of OpenCode, not a store; anything it drops can

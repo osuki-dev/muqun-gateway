@@ -52,10 +52,19 @@ pub(crate) struct Claimed {
     pub transport_key: Option<String>,
 }
 
+/// The most a peer's answer may weigh. A sealed page of 200 task views is
+/// well under it; anything larger is not a gateway answering.
+const MAX_ANSWER_BYTES: usize = 4 << 20;
+/// The longest error code kept from a peer's refusal.
+const MAX_CODE_LEN: usize = 64;
+
+/// A gateway never redirects, and the sealed envelope header would follow
+/// a redirect anywhere, so none is followed.
 fn http() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("a plain reqwest client builds")
 }
@@ -71,9 +80,23 @@ fn string(value: &Value) -> Result<String, PeerError> {
         .ok_or_else(|| PeerError::Unreachable("not a gateway".into()))
 }
 
-/// The JSON of a response, `null` for an empty one (`204`).
-async fn body_of(response: reqwest::Response) -> Result<Value, PeerError> {
-    let bytes = response.bytes().await.map_err(unreachable)?;
+/// The JSON of a response, `null` for an empty one (`204`); at most
+/// [`MAX_ANSWER_BYTES`] of it is read.
+async fn body_of(mut response: reqwest::Response) -> Result<Value, PeerError> {
+    let too_large = || PeerError::Unreachable("answer too large".into());
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_ANSWER_BYTES as u64)
+    {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(unreachable)? {
+        if bytes.len() + chunk.len() > MAX_ANSWER_BYTES {
+            return Err(too_large());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
     if bytes.is_empty() {
         return Ok(Value::Null);
     }
@@ -82,14 +105,22 @@ async fn body_of(response: reqwest::Response) -> Result<Value, PeerError> {
 
 /// `POST {url}/api/pair/request` as a gateway device: B shows the code its
 /// owner then reads off `muqun-gateway manage`. Answers B's label.
+/// `install_id` is this gateway's `server_id`: linking again replaces the
+/// device it enrolls rather than adding another.
 pub(crate) async fn request_pairing(
     url: &str,
     request_id: &str,
     device_name: &str,
+    install_id: &str,
 ) -> Result<String, PeerError> {
     let response = http()
         .post(format!("{url}/api/pair/request"))
-        .json(&json!({ "request_id": request_id, "device_name": device_name, "kind": "gateway" }))
+        .json(&json!({
+            "request_id": request_id,
+            "device_name": device_name,
+            "install_id": install_id,
+            "kind": "gateway",
+        }))
         .send()
         .await
         .map_err(unreachable)?;
@@ -304,10 +335,19 @@ impl PeerClient {
 }
 
 /// 401, or 403 for a token or proof this peer no longer knows, is the link
-/// being gone; any other refusal names its code.
+/// being gone; any other refusal names its code, kept only when it looks
+/// like one (`[a-z0-9_]`, at most 64) since whatever answered at the URL
+/// chose it.
 fn refused(status: u16, body: &Value) -> PeerError {
     let code = body["error"]["code"]
         .as_str()
+        .filter(|code| {
+            !code.is_empty()
+                && code.len() <= MAX_CODE_LEN
+                && code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        })
         .unwrap_or("refused")
         .to_owned();
     match (status, code.as_str()) {
@@ -315,5 +355,64 @@ fn refused(status: u16, body: &Value) -> PeerError {
         | (403, "invalid_token" | "device_proof_required")
         | (426, "device_repair_required") => PeerError::Unauthorized,
         _ => PeerError::Refused { status, code },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{refused, PeerError};
+
+    #[test]
+    fn a_refusal_keeps_only_a_code_shaped_code() {
+        let long = "a".repeat(65);
+        for (status, code, expected) in [
+            (401, json!("anything"), PeerError::Unauthorized),
+            (403, json!("invalid_token"), PeerError::Unauthorized),
+            (
+                426,
+                json!("device_repair_required"),
+                PeerError::Unauthorized,
+            ),
+            (
+                410,
+                json!("pairing_code_expired"),
+                PeerError::Refused {
+                    status: 410,
+                    code: "pairing_code_expired".into(),
+                },
+            ),
+            (
+                409,
+                json!("<b>hi</b> there"),
+                PeerError::Refused {
+                    status: 409,
+                    code: "refused".into(),
+                },
+            ),
+            (
+                409,
+                json!(long),
+                PeerError::Refused {
+                    status: 409,
+                    code: "refused".into(),
+                },
+            ),
+            (
+                500,
+                json!(null),
+                PeerError::Refused {
+                    status: 500,
+                    code: "refused".into(),
+                },
+            ),
+        ] {
+            assert_eq!(
+                refused(status, &json!({ "error": { "code": code } })),
+                expected,
+                "{status} {code}"
+            );
+        }
     }
 }

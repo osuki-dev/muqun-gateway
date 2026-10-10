@@ -58,6 +58,18 @@ fn peer_not_found() -> (StatusCode, Json<Value>) {
     api_error(StatusCode::NOT_FOUND, "peer_not_found", "peer not found")
 }
 
+/// Why the other computer refused, as one of the few reasons a client acts
+/// on; anything else it said is `refused`.
+fn refusal_reason(code: &str) -> &'static str {
+    match code {
+        "pairing_code_expired" => "pairing_code_expired",
+        "invalid_pairing_code" => "invalid_pairing_code",
+        "pairing_not_requested" => "pairing_not_requested",
+        "invalid_token" => "invalid_token",
+        _ => "refused",
+    }
+}
+
 fn valid_name(name: &str) -> bool {
     let name = name.trim();
     !name.is_empty() && valid_device_name(name)
@@ -71,7 +83,8 @@ async fn list(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Js
     let peers =
         futures::future::join_all(peers.into_iter().map(|peer| state.peers.checked(peer))).await;
     let now = now_ms();
-    let views: Vec<_> = peers.iter().map(|peer| peer.view(now)).collect();
+    // A peer that no longer knows this gateway was just forgotten.
+    let views: Vec<_> = peers.iter().flatten().map(|peer| peer.view(now)).collect();
     Ok(Json(json!({
         "accept_delegations": state.peers.accepts_delegations(),
         "peers": views,
@@ -123,10 +136,19 @@ async fn link(
                 "peer_unreachable",
                 "the other computer did not answer",
             ),
-            LinkError::Refused(code) => api_error(
+            LinkError::Refused(code) => {
+                let (status, Json(mut body)) = api_error(
+                    StatusCode::CONFLICT,
+                    "peer_refused",
+                    "the other computer refused the link",
+                );
+                body["error"]["reason"] = json!(refusal_reason(&code));
+                (status, Json(body))
+            }
+            LinkError::NameTaken => api_error(
                 StatusCode::CONFLICT,
-                "peer_refused",
-                &format!("the other computer refused the link ({code})"),
+                "peer_name_taken",
+                "another computer already has that name",
             ),
             LinkError::IsSelf => api_error(
                 StatusCode::BAD_REQUEST,
@@ -263,42 +285,60 @@ mod tests {
         let mini = named(output_state(&herdr), "srv-mini", "mini");
         let url = serve(peer_router(mini.clone())).await;
         let coding = named(output_state(&herdr), "srv-coding", "coding");
+        let other = named(output_state(&herdr), "srv-other", "other");
+        let other_url = serve(peer_router(other.clone())).await;
+        let gateways = |state: &AppState| -> Vec<String> {
+            let devices = state.devices.lock().unwrap();
+            devices
+                .iter()
+                .filter(|device| device.kind == DeviceKind::Gateway)
+                .map(|device| device.name.clone())
+                .collect()
+        };
 
-        let (status, minted) = call(
-            &mini,
-            "POST",
-            "/api/pair/pending",
-            "token",
-            Some(json!({ "device_name": "coding", "kind": "gateway" })),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{minted}");
-        let (status, peer) = call(
-            &coding,
-            "POST",
-            "/api/peers",
-            "token",
-            Some(json!({
-                "url": url, "name": "mini",
-                "request_id": minted["request_id"], "code": minted["code"],
-            })),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{peer}");
-        assert_eq!(peer["peer_id"], "srv-mini");
+        // Linked twice (the reconciler ran again): the second link replaces
+        // coding's device on mini. A second computer under a name a peer
+        // already holds is refused and keeps no device of coding's.
+        for (target, at, name, expected) in [
+            (&mini, &url, "mini", StatusCode::OK),
+            (&mini, &url, "mini", StatusCode::OK),
+            (&other, &other_url, "MINI", StatusCode::CONFLICT),
+        ] {
+            let (status, minted) = call(
+                target,
+                "POST",
+                "/api/pair/pending",
+                "token",
+                Some(json!({ "device_name": "coding", "kind": "gateway", "install_id": "srv-coding" })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{minted}");
+            let (status, peer) = call(
+                &coding,
+                "POST",
+                "/api/peers",
+                "token",
+                Some(json!({
+                    "url": at, "name": name,
+                    "request_id": minted["request_id"], "code": minted["code"],
+                })),
+            )
+            .await;
+            assert_eq!(status, expected, "{name}: {peer}");
+            assert!(
+                peer.get("token").is_none(),
+                "the token never leaves the gateway"
+            );
+        }
+        assert_eq!(gateways(&mini), ["coding"]);
         assert!(
-            peer.get("token").is_none(),
-            "the token never leaves the gateway"
+            gateways(&other).is_empty(),
+            "a refused link revokes what it enrolled"
         );
-        let enrolled: Vec<_> = mini
-            .devices
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|device| device.kind == DeviceKind::Gateway)
-            .map(|device| device.name.clone())
-            .collect();
-        assert_eq!(enrolled, ["coding"]);
+        assert_eq!(
+            coding.peers.get("srv-mini").await.map(|peer| peer.name),
+            Some("mini".into())
+        );
 
         for (body, accept) in [
             (json!({ "accept_delegations": false }), false),
@@ -373,6 +413,8 @@ mod tests {
         for (method, path, status) in [
             ("GET", "/api/tasks", StatusCode::OK),
             ("GET", "/api/tasks/t_missing", StatusCode::NOT_FOUND),
+            ("GET", "/api/tasks?root=t_missing", StatusCode::FORBIDDEN),
+            ("GET", "/api/tasks/defaults", StatusCode::FORBIDDEN),
             ("GET", "/api/pairings", StatusCode::FORBIDDEN),
             ("GET", "/health", StatusCode::FORBIDDEN),
             ("PATCH", "/api/peers/srv-x", StatusCode::FORBIDDEN),

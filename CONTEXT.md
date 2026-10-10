@@ -120,6 +120,12 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
   routes but `POST`/`complete`, `subscribe_tasks`, `GET /api/fleet/self`,
   its own `DELETE /api/pairings/{id}`); `require_device` refuses it with
   `peer_forbidden`. `fleet.accept_delegations` is the accept switch.
+  A gateway enrolment carries `install_id` `gateway-<its server_id>`, so
+  linking the same computer again replaces its device on the other side; a
+  link that fails after the claim revokes what it enrolled. A name another
+  peer holds is refused (`409 peer_name_taken`), never silently replaced.
+  After rolling a gateway back below the build that added device kinds,
+  revoke its gateway devices: an older build reads them as app devices.
 - `src/mcp/`: the gateway as an MCP server for local agents: `/mcp` on the
   existing listener (loopback, proxy-header refusal, assistant token in
   `auth.rs`), the eight tools in `tools.rs` (which file what they start under

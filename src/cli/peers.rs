@@ -7,7 +7,7 @@ use anyhow::Context as _;
 use clap::Subcommand;
 use serde_json::{json, Value};
 
-use super::local_api::{admin_request, admin_request_with_timeouts};
+use super::local_api::admin_request_with_timeouts;
 use crate::fleet::peer_client;
 
 /// Linking claims a code over there (Argon2id on both sides) and makes a
@@ -38,7 +38,16 @@ fn refusal(status: u16, value: &Value) -> String {
 }
 
 fn listed(config: &crate::Config) -> anyhow::Result<Vec<Value>> {
-    let (status, value) = admin_request(config, "GET", "/api/peers", None)?;
+    // `GET /api/peers` pings every stale peer first (3 s each, at once), so
+    // an unreachable one takes longer than a local request's two seconds.
+    let (status, value) = admin_request_with_timeouts(
+        config,
+        "GET",
+        "/api/peers",
+        None,
+        Duration::from_secs(1),
+        LINK_TIMEOUT,
+    )?;
     anyhow::ensure!(status == 200, refusal(status, &value));
     Ok(value["peers"].as_array().cloned().unwrap_or_default())
 }
@@ -49,11 +58,12 @@ pub(crate) async fn run(command: PeersCommand) -> anyhow::Result<()> {
         PeersCommand::Link { url, name } => {
             let url = url.trim().trim_end_matches('/').to_owned();
             let request_id = format!("peer-{}", uuid::Uuid::new_v4());
-            let label = peer_client::request_pairing(&url, &request_id, &config.label)
-                .await
-                .map_err(|error| {
-                    anyhow::anyhow!("{url} did not take the pairing request: {error}")
-                })?;
+            let label =
+                peer_client::request_pairing(&url, &request_id, &config.label, &config.server_id)
+                    .await
+                    .map_err(|error| {
+                        anyhow::anyhow!("{url} did not take the pairing request: {error}")
+                    })?;
             println!("Enter the code shown by \"muqun-gateway manage\" on {label}:");
             let mut code = String::new();
             std::io::stdin()

@@ -27,12 +27,7 @@ impl PeerStore for SqlitePeerStore {
         Box::pin(self.db.call(move |c| {
             let capabilities = serde_json::to_string(&peer.capabilities)?;
             let manifest = peer.manifest.as_ref().map(Value::to_string);
-            let tx = c.transaction()?;
-            tx.execute(
-                "DELETE FROM peers WHERE name = ?1 COLLATE NOCASE AND peer_id <> ?2",
-                params![peer.name, peer.peer_id],
-            )?;
-            tx.execute(
+            c.execute(
                 &format!(
                     "INSERT INTO peers({COLUMNS}) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                      ON CONFLICT(peer_id) DO UPDATE SET name = excluded.name, url = excluded.url,
@@ -54,7 +49,6 @@ impl PeerStore for SqlitePeerStore {
                     manifest,
                 ],
             )?;
-            tx.commit()?;
             Ok(())
         }))
     }

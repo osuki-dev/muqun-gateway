@@ -161,16 +161,13 @@ pub(crate) async fn pair_request(
     record_pairing_request(&state, now)?;
 
     let code = generate_pairing_code();
-    let install_id = body
-        .install_id
-        .as_deref()
-        .filter(|value| valid_install_id(value))
-        .map(str::to_owned);
+    let kind = body.kind.unwrap_or_default();
+    let install_id = enrolment_identity(kind, body.install_id.as_deref(), &device_name);
     let pending = PendingPairing {
         request_id: body.request_id.clone(),
         device_name,
         install_id,
-        kind: body.kind.unwrap_or_default(),
+        kind,
         code: code.clone(),
         code_hash: hash_token(&code),
         created_unix_ms: now,
@@ -182,6 +179,32 @@ pub(crate) async fn pair_request(
         b"POST /api/pair/request",
         request_nonce.as_deref(),
     )
+}
+
+/// What `enroll_device` replaces an earlier device by. An app's own install
+/// id, when it sent a valid one. Another gateway always has one, in a space
+/// of its own (`gateway-`): its `server_id` when the request named it,
+/// else its name, so linking the same computer again replaces its device
+/// rather than piling up records toward the device cap.
+fn enrolment_identity(
+    kind: DeviceKind,
+    install_id: Option<&str>,
+    device_name: &str,
+) -> Option<String> {
+    let given = install_id.filter(|value| valid_install_id(value));
+    match kind {
+        DeviceKind::App => given.map(str::to_owned),
+        DeviceKind::Gateway => Some(
+            given
+                .map(|id| format!("gateway-{id}"))
+                .filter(|id| valid_install_id(id))
+                .unwrap_or_else(|| {
+                    use sha2::{Digest as _, Sha256};
+                    let digest = Sha256::digest(device_name.to_lowercase().as_bytes());
+                    format!("gateway-name-{}", crate::platform::http::hex(&digest[..16]))
+                }),
+        ),
+    }
 }
 
 pub(crate) fn record_pairing_request(state: &AppState, now_unix_ms: u128) -> ApiResult<()> {
@@ -605,6 +628,7 @@ pub(crate) async fn pair_pending(
             "pending": true,
             "request_id": pending.request_id,
             "device_name": pending.device_name,
+            "kind": pending.kind,
             "code": pending.code,
             "created_unix_ms": pending.created_unix_ms,
             "expires_unix_ms": pending.created_unix_ms + PAIRING_CODE_TTL_MS,
@@ -619,6 +643,9 @@ pub(crate) struct MintCodeBody {
     pub(crate) device_name: String,
     #[serde(default)]
     pub(crate) kind: DeviceKind,
+    /// For a gateway: its `server_id`, so a later link replaces this device.
+    #[serde(default)]
+    pub(crate) install_id: Option<String>,
 }
 
 /// `POST /api/pair/pending`: a pending pairing made on the owner's behalf,
@@ -670,8 +697,8 @@ pub(crate) async fn mint_pairing_code(
     let request_id = format!("mint-{}", uuid::Uuid::new_v4());
     *pending = Some(PendingPairing {
         request_id: request_id.clone(),
+        install_id: enrolment_identity(body.kind, body.install_id.as_deref(), &device_name),
         device_name,
-        install_id: None,
         kind: body.kind,
         code: code.clone(),
         code_hash: hash_token(&code),

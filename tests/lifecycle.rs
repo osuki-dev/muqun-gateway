@@ -622,7 +622,7 @@ fn manager_pty_navigates_scrolls_resizes_and_keeps_start_failures_in_the_ui() {
     )
     .unwrap();
     let mut manager = ManagerPty::open(&install);
-    let output = manager.until("s Start gateway");
+    let output = manager.until("s start · t stop · r restart");
     assert!(output.contains("Runtime"));
     assert!(output.contains("Connectivity"));
     assert!(
@@ -630,17 +630,22 @@ fn manager_pty_navigates_scrolls_resizes_and_keeps_start_failures_in_the_ui() {
         "active tab is not reversed: {output:?}"
     );
     manager.send(b"2\x1b[F");
-    let output = manager.until_all(&["> qa-39", "终端 e\u{301} 39"]);
+    let output = manager.until_all(&["▌ qa-39", "终端 e\u{301} 39"]);
     assert!(
         output.contains("终端 e\u{301} 39"),
         "wide selected label missing: {output:?}"
     );
+    // Enter opens the backend's actions; its first is "Make default".
+    manager.send(b"\r");
+    manager.until("Make default");
     manager.send(b"\r");
     manager.until("default is now qa-39");
     let changed: serde_json::Value =
         serde_json::from_slice(&fs::read(install.config.join("config.json")).unwrap()).unwrap();
     assert_eq!(changed["sessions"][0]["id"], "qa-39");
-    manager.send(b"d");
+    manager.send(b"\r");
+    manager.until("Remove backend");
+    manager.send(b"\x1b[B\x1b[B\r");
     manager.until("Remove terminal backend?");
     manager.send(b"\x1b");
     manager.until("backend unchanged");
@@ -717,8 +722,12 @@ fn manager_enter_targets_the_selected_device_and_esc_only_cancels_revocation() {
     ])).unwrap();
     fs::write(&file, &records).unwrap();
     let mut manager = ManagerPty::open(&install);
-    manager.until("s Start gateway");
+    manager.until("s start · t stop · r restart");
+    // Enter shows the device; x there reviews its revocation.
     manager.send(b"3\x1b[B\r");
+    let output = manager.until("x revoke · Esc back");
+    assert!(output.contains("First phone 中文 e\u{301}"));
+    manager.send(b"x");
     let output = manager.until("Enter Confirm selection");
     assert!(output.contains("Selected: First phone 中文 e\u{301}"));
     assert!(output.contains("loses Gateway access immediately"));
@@ -744,7 +753,7 @@ fn manager_compact_pairing_keeps_the_full_address_reachable_without_resizing() {
     )
     .unwrap();
     let mut manager = ManagerPty::open(&install);
-    manager.until("s Start gateway");
+    manager.until("s start · t stop · r restart");
     let size = libc::winsize {
         ws_row: 8,
         ws_col: 40,
@@ -758,7 +767,7 @@ fn manager_compact_pairing_keeps_the_full_address_reachable_without_resizing() {
     );
     // Wait for the resized Overview frame before starting pairing, so PTY
     // resize delivery cannot overlap the navigation input being asserted.
-    manager.until("Tab Views");
+    manager.until("↑↓ select · Enter");
     manager.send(b"3\r");
     let output = manager.until(&address[..30]);
     assert!(output.contains("Resize for the full QR"));

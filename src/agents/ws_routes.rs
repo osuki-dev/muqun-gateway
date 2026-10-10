@@ -701,6 +701,11 @@ impl Connection {
         sent: &mut Option<Option<String>>,
         always: bool,
     ) -> Result<(), Gone> {
+        // Another computer gets no defaults, as `GET /api/tasks/defaults`
+        // refuses it.
+        if device.kind == PrincipalKind::Gateway {
+            return Ok(());
+        }
         let now = state.tasks.default_cwd(device).await;
         if !always && sent.as_ref() == Some(&now) {
             return Ok(());

@@ -1099,7 +1099,8 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
                     "required": ["device_name"],
                     "properties": {
                         "device_name": { "type": "string", "description": "At most 80 characters, no control characters" },
-                        "kind": { "type": "string", "enum": ["app", "gateway"], "description": "Default app" }
+                        "kind": { "type": "string", "enum": ["app", "gateway"], "description": "Default app" },
+                        "install_id": { "type": "string", "description": "For a gateway: its server_id, so linking it again replaces its device instead of adding one" }
                     }
                 })),
                 "responses": with_errors(json_ok("What POST /api/pair/claim takes", json!({
@@ -1145,7 +1146,7 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
                     })),
                     "responses": with_errors(json_ok("The new peer", peer_view()), &[
                         ("400", "invalid_request; peer_is_self: the url is this gateway"),
-                        ("409", "peer_refused: the other gateway refused the code (expired or invalid)"),
+                        ("409", "peer_refused: the other gateway refused the code; error.reason is pairing_code_expired, invalid_pairing_code, pairing_not_requested, invalid_token or refused. peer_name_taken: another peer has that name"),
                         ("502", "peer_unreachable: nothing answered at url"),
                     ])
                 }

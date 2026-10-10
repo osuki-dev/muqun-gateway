@@ -10,7 +10,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use anyhow::Context as _;
 use reqwest::Method;
 use serde::Serialize;
 use serde_json::Value;
@@ -96,8 +95,8 @@ pub(crate) struct PeerView {
 }
 
 pub(crate) trait PeerStore: Send + Sync {
-    /// Insert or replace by `peer_id`; a row of another id with the same name
-    /// (the computer was reinstalled) is replaced too.
+    /// Insert or replace by `peer_id`. Another row's name is an error (the
+    /// service refuses it first: `LinkError::NameTaken`).
     fn put<'a>(&'a self, peer: &'a Peer) -> TaskFuture<'a, ()>;
     fn list<'a>(&'a self) -> TaskFuture<'a, Vec<Peer>>;
     fn remove<'a>(&'a self, peer_id: &'a str) -> TaskFuture<'a, bool>;
@@ -158,6 +157,8 @@ pub(crate) enum LinkError {
     Refused(String),
     /// The URL is this gateway's own.
     IsSelf,
+    /// Another peer already holds that name.
+    NameTaken,
     Store(anyhow::Error),
 }
 
@@ -167,6 +168,18 @@ pub(crate) enum RenameError {
     /// Another peer already holds that name.
     Taken,
     Store(anyhow::Error),
+}
+
+/// Ask `peer` to revoke the device this gateway holds over there, with that
+/// device's own token. Best effort: the answer only goes to the log.
+async fn revoke(peer: &Peer) {
+    let Ok(client) = PeerClient::for_peer(peer) else {
+        return;
+    };
+    let path = format!("/api/pairings/{}", peer.device_id);
+    if let Err(error) = client.json(Method::DELETE, &path, None).await {
+        tracing::info!(peer = %peer.peer_id, "the peer did not confirm the revoke: {error}");
+    }
 }
 
 /// The peers registry and the accept switch (`AppState.peers`).
@@ -235,17 +248,18 @@ impl PeerService {
     }
 
     /// `peer`, pinged first when its last answer is older than [`CHECK_EVERY`].
-    /// A peer that no longer knows this gateway's token is forgotten (§10.10).
-    pub(crate) async fn checked(&self, peer: Peer) -> Peer {
+    /// A peer that no longer knows this gateway's token is forgotten (§10.10)
+    /// and answered as `None`.
+    pub(crate) async fn checked(&self, peer: Peer) -> Option<Peer> {
         let now = now_ms();
         if peer
             .last_seen_ms
             .is_some_and(|seen| now.saturating_sub(seen) < CHECK_EVERY.as_millis() as u64)
         {
-            return peer;
+            return Some(peer);
         }
         let Ok(client) = PeerClient::for_peer(&peer) else {
-            return peer;
+            return Some(peer);
         };
         match tokio::time::timeout(PING_TIMEOUT, client.ping()).await {
             Ok(Ok(())) => {
@@ -262,24 +276,26 @@ impl PeerService {
                     tracing::warn!(peer = %peer.peer_id, "failed to record a peer's answer: {error:#}");
                 }
                 self.presence.seen(&peer.peer_id, Some(now));
-                Peer {
+                Some(Peer {
                     last_seen_ms: Some(now),
                     capabilities: capabilities.unwrap_or(peer.capabilities),
                     ..peer
-                }
+                })
             }
             Ok(Err(PeerError::Unauthorized)) => {
                 tracing::info!(peer = %peer.peer_id, "a peer no longer knows this gateway; forgetting it");
                 self.forget(&peer.peer_id).await;
-                peer
+                None
             }
-            Ok(Err(_)) | Err(_) => peer,
+            Ok(Err(_)) | Err(_) => Some(peer),
         }
     }
 
     /// Pair with the gateway at `request.url` through the pending pairing
     /// `request.request_id`/`request.code`, prove the new credentials, and
-    /// keep them. `own_id` is this gateway's `server_id`.
+    /// keep them. `own_id` is this gateway's `server_id`. Once the claim
+    /// succeeded, every failure takes the device it enrolled over there back
+    /// out (best effort), so a failed link leaves nothing behind on either side.
     pub(crate) async fn link(&self, own_id: &str, request: LinkRequest) -> Result<Peer, LinkError> {
         let url = request.url.trim_end_matches('/').to_owned();
         let claimed = peer_client::claim(&url, &request.request_id, &request.code)
@@ -290,7 +306,7 @@ impl PeerService {
                 PeerError::Refused { code, .. } => LinkError::Refused(code),
             })?;
         let now = now_ms();
-        let mut peer = Peer {
+        let peer = Peer {
             peer_id: claimed.server_id,
             name: request.name.trim().to_owned(),
             url,
@@ -302,16 +318,33 @@ impl PeerService {
             capabilities: Vec::new(),
             manifest: None,
         };
-        let client = PeerClient::for_peer(&peer).map_err(LinkError::Store)?;
+        match self.keep(own_id, peer.clone()).await {
+            Ok(peer) => Ok(peer),
+            Err(error) => {
+                revoke(&peer).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// The rest of [`link`](Self::link) after the claim.
+    async fn keep(&self, own_id: &str, mut peer: Peer) -> Result<Peer, LinkError> {
         if peer.peer_id == own_id {
-            // Paired with itself: take the device it just enrolled back out.
-            let path = format!("/api/pairings/{}", peer.device_id);
-            let _ = client.json(Method::DELETE, &path, None).await;
             return Err(LinkError::IsSelf);
         }
+        let peers = self.store.list().await.map_err(LinkError::Store)?;
+        if peers.iter().any(|other| {
+            other.peer_id != peer.peer_id && other.name.eq_ignore_ascii_case(&peer.name)
+        }) {
+            return Err(LinkError::NameTaken);
+        }
+        let previous = peers
+            .into_iter()
+            .find(|other| other.peer_id == peer.peer_id);
         // The first authenticated call proves the new credentials (and, sealed,
         // the transport key) before they are kept; the public capability list
         // fills the cache.
+        let client = PeerClient::for_peer(&peer).map_err(LinkError::Store)?;
         client.ping().await.map_err(|error| match error {
             PeerError::Unreachable(_) => LinkError::Unreachable,
             PeerError::Unauthorized => LinkError::Refused("invalid_token".into()),
@@ -322,6 +355,12 @@ impl PeerService {
         self.store.put(&peer).await.map_err(LinkError::Store)?;
         self.presence.seen(&peer.peer_id, peer.last_seen_ms);
         self.refresh_names().await;
+        // A re-link replaced the credentials this gateway held for that peer;
+        // the device they belonged to goes (the peer usually replaced it
+        // already, by the enrolment's install id).
+        if let Some(previous) = previous.filter(|previous| previous.device_id != peer.device_id) {
+            revoke(&previous).await;
+        }
         Ok(peer)
     }
 
@@ -331,12 +370,7 @@ impl PeerService {
         let Some(peer) = self.get(peer_id).await else {
             return Ok(false);
         };
-        if let Ok(client) = PeerClient::for_peer(&peer) {
-            let path = format!("/api/pairings/{}", peer.device_id);
-            if let Err(error) = client.json(Method::DELETE, &path, None).await {
-                tracing::info!(peer = %peer.peer_id, "the peer did not confirm the unlink: {error}");
-            }
-        }
+        revoke(&peer).await;
         let removed = self.store.remove(peer_id).await?;
         self.presence.gone(peer_id);
         self.refresh_names().await;
@@ -401,27 +435,13 @@ impl PeerService {
         self.accept.load(Ordering::SeqCst)
     }
 
-    /// Flip the switch and write it to `config.json`, touching only
-    /// `fleet.accept_delegations` in what is on disk now, so a concurrent
-    /// edit of anything else is never overwritten with stale values.
+    /// Flip the switch and write it to `config.json`, changing only
+    /// `fleet.accept_delegations` in what is on disk now (`edit_config`).
     pub(crate) fn set_accepts_delegations(&self, on: bool) -> anyhow::Result<()> {
         if let Some(path) = &self.config_path {
-            let bytes = std::fs::read(path)
-                .with_context(|| format!("failed to read config {}", path.display()))?;
-            let mut config: Value = serde_json::from_slice(&bytes)?;
-            let object = config
-                .as_object_mut()
-                .context("config.json is not an object")?;
-            if on {
-                object.remove("fleet");
-            } else {
-                object.insert(
-                    "fleet".into(),
-                    serde_json::json!({ "accept_delegations": false }),
-                );
-            }
-            crate::write_secret_file(path, &serde_json::to_vec_pretty(&config)?)
-                .with_context(|| format!("failed to write config {}", path.display()))?;
+            crate::platform::store::edit_config(path, |config| {
+                config.fleet.accept_delegations = on;
+            })?;
         }
         self.accept.store(on, Ordering::SeqCst);
         Ok(())
