@@ -328,7 +328,7 @@ async fn settled(state: &AppState, task: &Task, to: TaskChange) -> bool {
 
 /// A session the agent says it does not have. OpenCode answers a deleted
 /// session with a plain HTTP 404 rather than `SessionNotFound`.
-fn session_gone(error: &AgentError) -> bool {
+pub(crate) fn session_gone(error: &AgentError) -> bool {
     match error {
         AgentError::SessionNotFound(_) => true,
         AgentError::RequestFailed(message) => message.starts_with("HTTP 404"),

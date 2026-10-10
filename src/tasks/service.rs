@@ -849,7 +849,7 @@ impl TaskService {
         &self,
         session_id: &str,
         pane_id: &str,
-    ) -> Option<(bool, Option<String>)> {
+    ) -> Option<(TaskState, Option<String>)> {
         let filter = TaskFilter {
             pane: Some((session_id.to_owned(), pane_id.to_owned())),
             limit: 1,
@@ -859,8 +859,7 @@ impl TaskService {
         let TaskBinding::Pane { agent_id, .. } = &task.binding else {
             return None;
         };
-        let stopped = matches!(task.state, TaskState::IdleUnconfirmed | TaskState::Done);
-        (task.kind == TaskKind::Delegation).then(|| (stopped, agent_id.clone()))
+        (task.kind == TaskKind::Delegation).then(|| (task.state, agent_id.clone()))
     }
 
     /// The agent sessions running a turn now, as the follower last saw them.

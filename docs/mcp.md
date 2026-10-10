@@ -692,7 +692,11 @@ and tabs turned into spaces, capped after that, and it always begins with
 the computer's name or the task's title, never with `/`, `!` or `:`. Each move into a reported state is told once -- a second question after the
 first was answered is told again -- recorded in the task
 store (`task_notices`), so a restart does not tell it twice; a state not told
-within a day is dropped. When the calling session cannot be told apart (none
+within a day is dropped. A child whose parent task has ended (the owner
+cancelled it, say), whose parent session is gone, or whose pane's delegation
+ended other than done is not told; that row is resolved at once, and newer
+results are looked at first, so one that cannot be told yet never holds back
+another. When the calling session cannot be told apart (none
 or several fit), nothing is recorded and the caller learns the result from
 `tasks.wait` alone.
 

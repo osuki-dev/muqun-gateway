@@ -34,7 +34,7 @@ pub(crate) trait TaskStore: Send + Sync {
         Box::pin(async { Ok(()) })
     }
     /// Tasks with a notice target, updated since `since_ms`, in a reported
-    /// state that has not been told yet: oldest change first, at most `limit`.
+    /// state that has not been told yet: newest change first, at most `limit`.
     fn pending_notices<'a>(
         &'a self,
         _since_ms: u64,

@@ -18,8 +18,10 @@ use crate::AppState;
 
 /// How far back an untold state is still worth telling.
 const LOOKBACK: Duration = Duration::from_secs(24 * 60 * 60);
-/// Untold states looked at per pass.
-const BATCH: usize = 20;
+/// Untold states looked at per pass, newest first: one a parent cannot take
+/// yet never keeps a newer one waiting, and one it never will is resolved
+/// at once.
+const BATCH: usize = 50;
 /// A pass also runs this often: a pane agent going idle sends no event.
 const SWEEP: Duration = Duration::from_secs(30);
 /// The longest result a line carries.
@@ -69,7 +71,11 @@ pub(crate) async fn deliver(state: &AppState) -> usize {
     };
     let mut told = 0;
     for (child, target) in pending {
-        match ready(state, &target).await {
+        let readiness = match parent_ended(state, &child).await {
+            Some(why) => Ready::Never(why),
+            None => ready(state, &target).await,
+        };
+        match readiness {
             Ready::NotYet => continue,
             // The record is the Home row and the parent's own summary.
             Ready::Never(why) => {
@@ -103,6 +109,17 @@ enum Sent {
     Withdrawn(&'static str),
 }
 
+/// Why a child's parent task will never take its result: it ended (the
+/// owner cancelled it, say) -- telling it would start a turn nobody wants.
+async fn parent_ended(state: &AppState, child: &Task) -> Option<&'static str> {
+    let parent = child.parent.as_ref()?;
+    let parent = state.tasks.task(parent).await.ok()??;
+    parent
+        .state
+        .is_terminal()
+        .then_some("the parent task has ended")
+}
+
 /// Whether a target can be told now.
 enum Ready {
     Now,
@@ -124,31 +141,34 @@ async fn ready(state: &AppState, target: &NoticeTarget) -> Ready {
             let Some(manager) = state.agent_runtime.manager_for_agent(agent_id).await else {
                 return Ready::NotYet;
             };
-            let idle = manager
-                .sessions()
-                .get_session(asid)
-                .await
-                .is_ok_and(|session| {
-                    !matches!(
+            match manager.sessions().get_session(asid).await {
+                Ok(session)
+                    if !matches!(
                         session.status,
                         AgentSessionStatus::Busy | AgentSessionStatus::Retry
-                    )
-                });
-            if idle {
-                Ready::Now
-            } else {
-                Ready::NotYet
+                    ) =>
+                {
+                    Ready::Now
+                }
+                Err(error) if super::driver::session_gone(&error) => {
+                    Ready::Never("the parent session is gone")
+                }
+                _ => Ready::NotYet,
             }
         }
         NoticeTarget::Pane {
             session_id,
             pane_id,
         } => {
-            let Some((stopped, kind)) = state.tasks.pane_task(session_id, pane_id).await else {
+            let Some((pane_state, kind)) = state.tasks.pane_task(session_id, pane_id).await else {
                 return Ready::Never("no delegation runs in that pane");
             };
-            if !stopped {
-                return Ready::NotYet;
+            match pane_state {
+                TaskState::IdleUnconfirmed | TaskState::Done => {}
+                TaskState::Cancelled | TaskState::Failed => {
+                    return Ready::Never("the pane's delegation has ended")
+                }
+                _ => return Ready::NotYet,
             }
             let Some(kind) = kind else {
                 return Ready::Never("the pane runs no known agent");
@@ -450,6 +470,40 @@ mod tests {
                 assert!(app.tasks.pending_notices(0, 10).await.unwrap().is_empty());
             }
         }
+    }
+
+    /// A parent that ended (the owner cancelled it) or a session that is gone
+    /// is never told -- and the row is resolved, not left to block newer ones.
+    #[tokio::test]
+    async fn an_ended_parent_or_a_gone_session_is_not_told_and_does_not_wait() {
+        let app = test_state("admin", vec![test_device("d1", "token")]);
+        let agent = FakeAgent::new("opencode").with_sessions(&[("ses_parent", 1)]);
+        let prompts = agent.prompts.clone();
+        app.agent_runtime.attach_for_test(agent.manager()).await;
+        let cancelled = app
+            .tasks
+            .insert_for_test(&child(TaskState::Cancelled, None))
+            .await;
+        for (parent, asid) in [(Some(cancelled), "ses_parent"), (None, "ses_gone")] {
+            let id = app
+                .tasks
+                .insert_for_test(&Task {
+                    parent,
+                    ..child(TaskState::Done, Some("built"))
+                })
+                .await;
+            let target = NoticeTarget::Session {
+                agent_id: "opencode".into(),
+                asid: asid.into(),
+            };
+            app.tasks.notify(&id, &target).await;
+        }
+        deliver(&app).await;
+        assert!(prompts.lock().unwrap().is_empty());
+        assert!(
+            app.tasks.pending_notices(0, 10).await.unwrap().is_empty(),
+            "resolved"
+        );
     }
 
     /// A second question after the first was answered is told too: what was

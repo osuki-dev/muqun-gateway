@@ -355,7 +355,7 @@ impl TaskStore for SqliteTaskStore {
                 "SELECT {TASK_COLUMNS}, target FROM tasks JOIN task_notices ON task_id = id \
                  WHERE state IN ({reported}) AND updated_ms >= ?1 \
                  AND (told_seq IS NULL OR told_seq != seq) \
-                 ORDER BY updated_ms LIMIT ?2"
+                 ORDER BY updated_ms DESC LIMIT ?2"
             ))?;
             let rows = stmt.query_map(params![since_ms as i64, limit as i64], |r| {
                 Ok((read_row(r)?, r.get::<_, String>(20)?))
