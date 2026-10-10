@@ -189,7 +189,8 @@ An agent gets the muqun server one of two ways:
    them in the conversation: an OpenCode session created for a task carries
    the sentence below as a per-session instruction entry
    (`PUT /api/experimental/session/{id}/instructions/entries/muqun-task`,
-   set before the goal, removed when the task ends; the "instructions
+   set before the goal, removed when the task ends -- read from the task's
+   binding, so a gateway restart in between does not leave it; the "instructions
    updated" notice it leaves is not served; an OpenCode without the route
    leaves a note on the task's dispatch event and the session gets only the
    conditional server instructions); any host that reads them gets the
