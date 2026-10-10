@@ -1374,6 +1374,9 @@ impl ScrollbackStore {
             // Do not stitch another generation's cache under a stale response.
             return backend_text.to_owned();
         }
+        // The line `exec.run` makes a pane print is never kept: stored rows,
+        // and so every history page and checkpoint, never carry it.
+        let backend_text = &*super::exit_marker::strip_exit_markers(backend_text);
         let owns_screen = self.owns_screen(session_id, pane_id);
         trace_read(
             session_id,
@@ -1411,6 +1414,7 @@ impl ScrollbackStore {
         if output.is_empty() || !self.accepts_capture(session_id, pane_id, fence) {
             return;
         }
+        let output = &*super::exit_marker::strip_exit_markers(output);
         let owns_screen = self.owns_screen(session_id, pane_id);
         trace_read(
             session_id,
@@ -3175,6 +3179,40 @@ mod tests {
 
         assert_eq!(served, "a\nb\n界界界界界界界界界界\nz");
         assert_eq!(split_lines(&served).len(), 4);
+    }
+
+    #[test]
+    fn exec_run_s_exit_marker_is_never_kept() {
+        let mut store = ScrollbackStore::default();
+        store.observe(
+            "s",
+            &json!({
+                "pane_id": "p",
+                "scroll": { "max_offset_from_bottom": 0, "viewport_rows": 3 }
+            }),
+        );
+        let served = store.serve_read(
+            "s",
+            "p",
+            "recent_unwrapped",
+            "text",
+            "out\n\u{1f}muqun-exit:t_1:0\u{1f}\n$ ",
+            10,
+        );
+        store.record_frame(
+            "s",
+            "p",
+            "recent_unwrapped",
+            "text",
+            "out\nmuqun-exit:t_1:0\n$ ",
+        );
+        let held = store
+            .window(&read_key("s", "p", "recent_unwrapped", "text"), 10)
+            .unwrap();
+        assert!(
+            !served.contains("muqun-exit") && !held.contains("muqun-exit"),
+            "{held}"
+        );
     }
 
     #[test]
