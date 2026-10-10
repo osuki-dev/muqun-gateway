@@ -63,16 +63,37 @@ pub(crate) struct Launchctl {
 }
 
 impl Launchctl {
-    /// The real agent: `gui/<uid>/dev.osuki.muqun-gateway`.
+    /// The real agent: `gui/<uid>/dev.osuki.muqun-gateway`, or the same
+    /// label in `user/<uid>` when that is where launchd has it (a gateway
+    /// installed from an SSH session, with no GUI login).
     #[cfg(target_os = "macos")]
     pub(crate) fn system() -> Result<Self> {
-        Ok(Self {
+        // `unsafe` only because getuid is FFI; it cannot fail.
+        let uid = unsafe { libc::getuid() };
+        let mut launchctl = Self {
             program: PathBuf::from("launchctl"),
-            // `unsafe` only because getuid is FFI; it cannot fail.
-            domain: format!("gui/{}", unsafe { libc::getuid() }),
+            domain: format!("gui/{uid}"),
             plist: super::service::unit_path()?,
             timing: Timing::LAUNCHD,
-        })
+        };
+        launchctl.domain = launchctl.loaded_domain(uid);
+        Ok(launchctl)
+    }
+
+    /// The domain the job is loaded in: `gui/<uid>` when it is there or
+    /// nowhere, `user/<uid>` when only there.
+    pub(crate) fn loaded_domain(&self, uid: u32) -> String {
+        let gui = format!("gui/{uid}");
+        let user = format!("user/{uid}");
+        let loaded_in = |domain: &str| {
+            self.run(&["print", &format!("{domain}/{SERVICE_LABEL}")])
+                .is_ok_and(|output| output.status.success())
+        };
+        if !loaded_in(&gui) && loaded_in(&user) {
+            user
+        } else {
+            gui
+        }
     }
 
     pub(crate) fn target(&self) -> String {
@@ -277,6 +298,9 @@ next() {
 case "$1" in
   print)
     [ -f "$dir/loaded" ] || { echo 'Could not find service' >&2; exit 113; }
+    if [ -s "$dir/domain" ]; then
+      case "$2" in "$(cat "$dir/domain")"/*) ;; *) echo 'Could not find service' >&2; exit 113 ;; esac
+    fi
     printf '%s = {\n\tstate = running\n\tprogram = %s\n' "$2" "$(cat "$dir/program" 2>/dev/null)"
     [ -s "$dir/pid" ] && printf '\tpid = %s\n' "$(cat "$dir/pid")"
     echo '}' ;;
@@ -469,6 +493,21 @@ mod tests {
         fake.launchctl().control(ServiceAction::Start).unwrap();
         assert_eq!(fake.calls(), ["kickstart"]);
         fake.launchctl().control(ServiceAction::Stop).unwrap();
+        assert!(!fake.loaded());
+    }
+
+    /// A gateway installed with no GUI login has its job in `user/<uid>`:
+    /// that is the one stopped, not a silent no-op on an empty `gui/<uid>`.
+    #[test]
+    fn the_job_is_found_in_whichever_domain_launchd_has_it() {
+        let fake = Fake::new();
+        fake.load();
+        assert_eq!(fake.launchctl().loaded_domain(501), "gui/501");
+        fake.set("domain", "user/501");
+        let mut launchctl = fake.launchctl();
+        launchctl.domain = launchctl.loaded_domain(501);
+        assert_eq!(launchctl.domain, "user/501");
+        launchctl.control(ServiceAction::Stop).unwrap();
         assert!(!fake.loaded());
     }
 

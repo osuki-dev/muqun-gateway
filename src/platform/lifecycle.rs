@@ -106,8 +106,10 @@ pub(crate) fn summary() -> anyhow::Result<String> {
 
 pub(crate) fn control(action: Action, verbose: bool) -> anyhow::Result<()> {
     let controller = Controller::acquire(action)?;
+    let before = running_pid()?;
     controller.control(action)?;
     if verbose {
+        println!("{}", controller.did(action, before));
         println!("gateway: {}", summary()?);
         println!("config: {}", config_dir()?.join(CONFIG_FILE).display());
     }
@@ -180,6 +182,22 @@ impl Controller {
         &self.paths.exe
     }
 
+    /// What `action` did, in one line: through which owner, on which pid.
+    pub(crate) fn did(&self, action: Action, before: Option<u32>) -> String {
+        did(&self.owner_name(), action, before)
+    }
+
+    fn owner_name(&self) -> String {
+        match &self.owner {
+            #[cfg(target_os = "macos")]
+            Owner::Installed => format!("the LaunchAgent {}", service::SERVICE_LABEL),
+            #[cfg(not(target_os = "macos"))]
+            Owner::Installed => format!("the user service {}.service", service::SERVICE_LABEL),
+            Owner::External(unit) => format!("the user service {unit}"),
+            Owner::Detached => String::from("this command"),
+        }
+    }
+
     pub(crate) fn control(&self, action: Action) -> anyhow::Result<()> {
         match &self.owner {
             Owner::Installed => service::control(action)?,
@@ -219,6 +237,17 @@ impl Controller {
     }
 }
 
+/// One line saying what a lifecycle command did and through whom.
+fn did(owner: &str, action: Action, before: Option<u32>) -> String {
+    match (action, before) {
+        (Action::Stop, None) => String::from("The gateway was not running."),
+        (Action::Stop, Some(pid)) => format!("Stopped the gateway (pid {pid}) through {owner}."),
+        (Action::Start, Some(pid)) => format!("The gateway was already running (pid {pid})."),
+        (Action::Start, None) => format!("Started the gateway through {owner}."),
+        (Action::Restart, _) => format!("Restarted the gateway through {owner}."),
+    }
+}
+
 pub(crate) fn wait_for(
     limit: Duration,
     mut ready: impl FnMut() -> anyhow::Result<bool>,
@@ -245,6 +274,36 @@ pub(crate) fn wait_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_lifecycle_command_says_what_it_did() {
+        let owner = "the LaunchAgent dev.osuki.muqun-gateway";
+        for (action, before, said) in [
+            (
+                Action::Stop,
+                Some(1991),
+                "Stopped the gateway (pid 1991) through the LaunchAgent dev.osuki.muqun-gateway.",
+            ),
+            (Action::Stop, None, "The gateway was not running."),
+            (
+                Action::Start,
+                None,
+                "Started the gateway through the LaunchAgent dev.osuki.muqun-gateway.",
+            ),
+            (
+                Action::Start,
+                Some(7),
+                "The gateway was already running (pid 7).",
+            ),
+            (
+                Action::Restart,
+                Some(7),
+                "Restarted the gateway through the LaunchAgent dev.osuki.muqun-gateway.",
+            ),
+        ] {
+            assert_eq!(did(owner, action, before), said);
+        }
+    }
 
     #[test]
     fn an_owner_ps_cannot_name_yet_is_waited_out_before_it_is_called_foreign() {
