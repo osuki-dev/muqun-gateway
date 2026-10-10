@@ -1117,7 +1117,7 @@ pub(crate) fn screen_summary(agent: Option<&str>, visible: &str) -> Option<Strin
 /// Banners, tips and the footer hints agents draw around their input, not
 /// their work. Specific phrases, not words: prose may well mention `ctrl+c`
 /// or auto mode.
-const CHROME: [&str; 12] = [
+const CHROME: [&str; 17] = [
     "mise upgrade",
     "? for shortcuts",
     "esc to interrupt",
@@ -1130,10 +1130,16 @@ const CHROME: [&str; 12] = [
     "\u{23ce} send",
     ">_ OpenAI Codex",
     "/model to change",
+    // Claude Code's plan banners: the owner's usage never reaches a task row.
+    "of your weekly limit",
+    "of your session limit",
+    "usage limit",
+    "/usage-credits",
+    "\u{b7} resets",
 ];
 
 /// Banner and tip lines, by how they start once their decoration is cut.
-const CHROME_START: [&str; 2] = ["Update available", "Tip:"];
+const CHROME_START: [&str; 4] = ["Update available", "Tip:", "You've used", "Approaching"];
 
 /// `line`'s text when it says something: not box drawing or a rule, not
 /// the agent's input prompt (`❯`, `›`), not a spinner, banner or footer
@@ -2164,6 +2170,11 @@ mod tests {
             ),
             ("  ⎿  Tip: Use /memory to edit memory\n", None),
             ("Tip: Press Enter to submit your prompt\n", None),
+            (
+                "You've used 92% of your weekly limit \u{b7} resets Oct 15, 6pm \u{b7} /usage-credits to keep using Claude Code\n",
+                None,
+            ),
+            ("Approaching usage limit \u{b7} resets at 6pm\n", None),
             ("⏺ Read file.rs\n", Some("Read file.rs")),
             ("✶\n", None),
             (
