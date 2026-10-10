@@ -1267,7 +1267,7 @@ fn peer_view() -> Value {
             "server_id": { "type": "string", "description": "The id the other gateway gave for itself; display data, never a key" },
             "name": { "type": "string" },
             "url": { "type": "string" },
-            "reachable": { "type": "boolean", "description": "It answered within the last 2 minutes" },
+            "reachable": { "type": "boolean", "description": "It answered within the last 2 minutes, and no call since failed to reach it (a closed task socket or a failed call reads unreachable at once)" },
             "last_seen_ms": { "type": ["integer", "null"] },
             "unauthorized": { "type": "boolean", "description": "Present (true) when it no longer takes this gateway's token: link it again; a link for the same computer or name replaces it" }
         }

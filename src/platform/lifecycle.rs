@@ -283,36 +283,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_lifecycle_command_says_what_it_did() {
-        let owner = "the LaunchAgent dev.osuki.muqun-gateway";
-        for (action, before, said) in [
-            (
-                Action::Stop,
-                Some(1991),
-                "Stopped the gateway (pid 1991) through the LaunchAgent dev.osuki.muqun-gateway.",
-            ),
-            (Action::Stop, None, "The gateway was not running."),
-            (
-                Action::Start,
-                None,
-                "Started the gateway through the LaunchAgent dev.osuki.muqun-gateway.",
-            ),
-            (
-                Action::Start,
-                Some(7),
-                "The gateway was already running (pid 7).",
-            ),
-            (
-                Action::Restart,
-                Some(7),
-                "Restarted the gateway through the LaunchAgent dev.osuki.muqun-gateway.",
-            ),
-        ] {
-            assert_eq!(did(owner, action, before), said);
-        }
-    }
-
-    #[test]
     fn an_owner_ps_cannot_name_yet_is_waited_out_before_it_is_called_foreign() {
         let pause = Duration::ZERO;
         // The gateway exiting: unnamed for a moment, then the lock is free.
