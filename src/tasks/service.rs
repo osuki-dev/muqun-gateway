@@ -1888,8 +1888,11 @@ impl TaskService {
 
     /// Agent session `asid` is named `title` now: remembered, when an open
     /// task works in it, for that task's title, and the task re-published
-    /// when that changes it. An adapter leaves a session the provider has
-    /// not named untitled (empty).
+    /// when that changes it. A session the provider has not named carries
+    /// its adapter's placeholder (OpenCode's id, DeepSeek's
+    /// "DeepSeek Agent Session", T3's "New thread"; see
+    /// `untitled_placeholder`), which never names a task, as an empty title
+    /// does not.
     pub(crate) async fn session_named(&self, asid: &str, title: &str) {
         let title = title.trim();
         if title.is_empty() || untitled_placeholder(asid, title) {
