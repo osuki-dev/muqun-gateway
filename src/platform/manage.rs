@@ -1250,8 +1250,9 @@ fn setting_value(setting: Setting, config: &crate::Config, autostart: &str) -> S
 }
 
 /// `text` broken at spaces into lines of at most `width` cells; a word wider
-/// than that is cut with `…` on its own line.
+/// than that (an address) is broken across lines rather than lost.
 fn word_wrap(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
     let mut lines = Vec::new();
     let mut line = String::new();
     for word in text.split_whitespace() {
@@ -1261,12 +1262,28 @@ fn word_wrap(text: &str, width: usize) -> Vec<String> {
         if !line.is_empty() {
             line.push(' ');
         }
-        line.push_str(word);
+        let mut rest = word;
+        while display_width(&line) + display_width(rest) > width {
+            let mut head = clip_cells(rest, width.saturating_sub(display_width(&line)));
+            if head.is_empty() && !line.is_empty() {
+                lines.push(std::mem::take(&mut line));
+                continue;
+            }
+            if head.is_empty() {
+                // A character wider than the whole line goes on its own.
+                let first = rest.chars().next().map_or(0, char::len_utf8);
+                head = &rest[..first];
+            }
+            line.push_str(head);
+            lines.push(std::mem::take(&mut line));
+            rest = &rest[head.len()..];
+        }
+        line.push_str(rest);
     }
     if !line.is_empty() {
         lines.push(line);
     }
-    lines.into_iter().map(|line| fit(&line, width)).collect()
+    lines
 }
 
 /// `text` in at most `cells` cells, cut with `…` when it does not fit.
@@ -1457,7 +1474,7 @@ fn choose(
             + 4;
         let mut rows = Vec::new();
         for line in about {
-            rows.extend(wrapped_rows("", line, inner));
+            rows.extend(word_wrap(line, inner).into_iter().map(ScreenLine::plain));
         }
         rows.push(ScreenLine::plain(""));
         for (index, (label, detail)) in options.iter().enumerate() {
@@ -1477,7 +1494,7 @@ fn choose(
         }
         if let Some(note) = note {
             rows.push(ScreenLine::plain(""));
-            rows.extend(wrapped_rows("", note, inner));
+            rows.extend(word_wrap(note, inner).into_iter().map(ScreenLine::plain));
         }
         let mut lines = Vec::new();
         panel(&mut lines, title, rows, budget, framed);
@@ -1897,13 +1914,9 @@ fn panel(
             Tone::Accent,
         ));
         for mut row in rows {
+            // Cut only the content, with `…`, before adding the borders.
+            fit_line(&mut row, width.saturating_sub(4));
             row.spans.insert(0, ("│ ".into(), Tone::Accent));
-            // Clip only the content before appending the right border.
-            let mut budget = width.saturating_sub(4);
-            for (text, _) in row.spans.iter_mut().skip(1) {
-                *text = clip_cells(text, budget).to_owned();
-                budget = budget.saturating_sub(display_width(text));
-            }
             let padding = width.saturating_sub(2 + row.width());
             row.spans
                 .push((format!("{} │", " ".repeat(padding)), Tone::Accent));
@@ -2256,6 +2269,8 @@ fn manage_lines(
                 // Columns: name, then kind, paired and last seen while they fit.
                 let columns: &[(&str, usize)] = if content >= 64 {
                     &[("kind", 10), ("paired", 14), ("last seen", 12)]
+                } else if content >= 50 {
+                    &[("kind", 8), ("paired", 9), ("seen", 9)]
                 } else if content >= 40 {
                     &[("kind", 10)]
                 } else {
@@ -2580,7 +2595,7 @@ fn write_dialog(title: &str, details: &[String], choices: ScreenLine) -> anyhow:
     };
     let mut rows = Vec::new();
     for line in details {
-        rows.extend(wrapped_rows("", line, inner));
+        rows.extend(word_wrap(line, inner).into_iter().map(ScreenLine::plain));
     }
     let mut lines = Vec::new();
     panel(&mut lines, title, rows, budget, framed);
@@ -3140,6 +3155,18 @@ mod tests {
             for line in footer_lines(&shape, 56) {
                 assert!(line.width() <= 56, "{section:?}: {}", line.render(200));
             }
+        }
+        // Notes break at spaces; an address longer than the line is kept whole.
+        for (text, width, lines) in [
+            ("one two three", 7, vec!["one two", "three"]),
+            (
+                "see https://example.test/abc",
+                12,
+                vec!["see", "https://exam", "ple.test/abc"],
+            ),
+            ("中文", 1, vec!["中", "文"]),
+        ] {
+            assert_eq!(super::word_wrap(text, width), lines, "{text}");
         }
     }
 
