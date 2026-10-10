@@ -250,7 +250,11 @@ async fn claude_model_flags(state: &AppState, command: &str) -> agent_kinds::Mod
         return flags;
     }
     let quoted = format!("'{}'", program.to_string_lossy().replace('\'', "'\\''"));
-    let Some(help) = in_pane_shell(state, &format!("{quoted} --help 2>&1")).await else {
+    // To a file, then read: Claude Code (Node) exits before a pipe drains,
+    // and its help piped stops at 8192 bytes -- before `--model`.
+    let script =
+        format!("f=$(mktemp) || exit 1; {quoted} --help >\"$f\" 2>&1; cat \"$f\"; rm -f \"$f\"");
+    let Some(help) = in_pane_shell(state, &script).await else {
         return agent_kinds::ModelFlags::default();
     };
     let flags = agent_kinds::ModelFlags::from_help(&help);
