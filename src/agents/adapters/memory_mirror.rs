@@ -1092,6 +1092,14 @@ impl SessionMirrorPort for MemoryMirror {
             {
                 merged.status = live_status;
             }
+            // Nor does a read that says the session failed know why; the
+            // reason the failure event carried is kept.
+            if merged.status == AgentSessionStatus::Failed
+                && merged.error.is_none()
+                && state.info.status == AgentSessionStatus::Failed
+            {
+                merged.error = state.info.error.clone();
+            }
             merged.time_idle = merged.time_idle.max(state.info.time_idle);
             merged.time_viewed = merged.time_viewed.max(state.info.time_viewed);
             state.info = merged.clone();
@@ -1302,6 +1310,21 @@ mod tests {
             .mark_viewed(&AgentSessionId("missing".into()), idle)
             .await
             .is_none());
+        // A read that says the session failed keeps the reason the failure
+        // event gave.
+        let error = AgentErrorInfo {
+            name: "provider.auth".into(),
+            message: "Key limit exceeded".into(),
+            status: Some(403),
+        };
+        mirror
+            .update_status(&asid, AgentSessionStatus::Failed, Some(error.clone()))
+            .await;
+        let mut failed = info(&asid, "Read test");
+        failed.status = AgentSessionStatus::Failed;
+        mirror.update_session(failed).await;
+        let snap = mirror.get_snapshot(&asid).await.unwrap();
+        assert_eq!(snap.info.error, Some(error));
     }
 
     #[tokio::test]

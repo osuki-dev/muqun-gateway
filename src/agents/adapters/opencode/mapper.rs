@@ -31,7 +31,10 @@ pub fn map_model_ref(val: &Value) -> Option<ModelRef> {
     })
 }
 
-/// `Session.StructuredError {type, message, status?}`.
+/// `Session.StructuredError {type, message, status?}` -- the v2 shape of a
+/// failed message or `session.execution.failed`. An error that nests its
+/// line (`{name, data: {message}}`, a provider's `{..., cause: {message}}`)
+/// is read there too, so a failure is never served without its reason.
 pub fn map_error(val: &Value) -> Option<AgentErrorInfo> {
     let obj = val.as_object()?;
     let name = obj
@@ -40,9 +43,10 @@ pub fn map_error(val: &Value) -> Option<AgentErrorInfo> {
         .and_then(Value::as_str)
         .unwrap_or("error")
         .to_string();
-    let message = obj
-        .get("message")
-        .and_then(Value::as_str)
+    let message = ["/message", "/data/message", "/data/error", "/cause/message"]
+        .iter()
+        .filter_map(|at| val.pointer(at).and_then(Value::as_str))
+        .find(|message| !message.trim().is_empty())
         .unwrap_or_default()
         .to_string();
     if message.is_empty() && name == "error" {
@@ -53,9 +57,21 @@ pub fn map_error(val: &Value) -> Option<AgentErrorInfo> {
         message,
         status: obj
             .get("status")
+            .or_else(|| val.pointer("/data/statusCode"))
             .and_then(Value::as_u64)
             .and_then(|s| u16::try_from(s).ok()),
     })
+}
+
+/// The error of the newest assistant message in `messages` (oldest first)
+/// that failed: what a read of a session whose last outcome is `failed`
+/// says it failed with, since `Session.Info` carries no error.
+pub fn last_failure(messages: &[Value]) -> Option<AgentErrorInfo> {
+    messages
+        .iter()
+        .rev()
+        .filter(|msg| msg.get("type").and_then(Value::as_str) == Some("assistant"))
+        .find_map(|msg| msg.get("error").and_then(map_error))
 }
 
 fn map_tokens(val: &Value) -> TokensUsage {
@@ -1436,6 +1452,53 @@ fn config_model_ref(val: &Value) -> Option<ModelRef> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_failure_is_read_with_its_reason_whatever_its_shape() {
+        // A failed message as OpenCode stores it (a provider's key limit;
+        // the key link redacted).
+        let failed = json!({
+            "id": "msg_2", "type": "assistant", "finish": "error", "content": [],
+            "error": { "type": "provider.auth", "status": 403,
+                "message": "Key limit exceeded (total limit). Manage it using <link>" }
+        });
+        let reason = "Key limit exceeded (total limit). Manage it using <link>";
+        for (shape, error, expected) in [
+            (
+                "v2",
+                failed["error"].clone(),
+                Some(("provider.auth", reason, Some(403))),
+            ),
+            (
+                "nested in data",
+                json!({ "name": "ProviderAuthError", "data": { "providerID": "p", "message": reason } }),
+                Some(("ProviderAuthError", reason, None)),
+            ),
+            (
+                "an error string in data",
+                json!({ "name": "APIError", "data": { "error": "rate limited", "statusCode": 429 } }),
+                Some(("APIError", "rate limited", Some(429))),
+            ),
+            (
+                "in its cause",
+                json!({ "name": "UnknownError", "cause": { "message": "socket hang up" } }),
+                Some(("UnknownError", "socket hang up", None)),
+            ),
+            ("nothing", json!({}), None),
+        ] {
+            let got = map_error(&error);
+            let got = got
+                .as_ref()
+                .map(|e| (e.name.as_str(), e.message.as_str(), e.status));
+            assert_eq!(got, expected, "{shape}");
+        }
+        // A read of a failed session takes the newest failed message's reason.
+        let messages = [
+            json!({ "id": "msg_1", "type": "user", "text": "hello" }),
+            failed,
+        ];
+        assert_eq!(last_failure(&messages).unwrap().message, reason);
+    }
 
     #[test]
     fn test_map_session() {

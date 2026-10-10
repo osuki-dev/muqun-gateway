@@ -484,8 +484,17 @@ impl AgentPort for OpencodeDriver {
     fn get_session<'a>(&'a self, session_id: &'a str) -> AgentFuture<'a, AgentSessionInfo> {
         Box::pin(async move {
             let raw = self.client.get_session(session_id).await?;
-            mapper::map_session(&raw)
-                .ok_or_else(|| AgentError::SessionNotFound(session_id.to_string()))
+            let mut info = mapper::map_session(&raw)
+                .ok_or_else(|| AgentError::SessionNotFound(session_id.to_string()))?;
+            // A failed session's reason is on its failed message only.
+            if info.status == crate::agents::domain::AgentSessionStatus::Failed
+                && info.error.is_none()
+            {
+                if let Ok(messages) = self.client.get_messages(session_id, 5).await {
+                    info.error = mapper::last_failure(&messages);
+                }
+            }
+            Ok(info)
         })
     }
 
