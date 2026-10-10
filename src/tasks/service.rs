@@ -194,6 +194,8 @@ pub(crate) struct DelegateRequest {
     pub label: Option<String>,
     /// The computers the user named for it (see [`Task::mentions`]).
     pub mentions: Vec<String>,
+    /// See [`Task::client_ref`].
+    pub client_ref: Option<String>,
 }
 
 /// Who asked for a task, as a task view shows it.
@@ -214,6 +216,7 @@ pub(crate) struct TaskView {
     pub summary: Option<String>,
     pub exit_code: Option<i32>,
     pub binding: TaskBinding,
+    pub created_ms: u64,
     pub updated_ms: u64,
     /// The open task this one was started from, if any.
     pub parent_task_id: Option<String>,
@@ -243,6 +246,9 @@ pub(crate) struct TaskView {
     /// The computers the user named for it; absent when none.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub mentions: Vec<String>,
+    /// The requester's reference for it, when it gave one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_ref: Option<String>,
 }
 
 /// How the agent working on a task says it ended (`tasks.complete`).
@@ -893,6 +899,7 @@ impl TaskService {
                 requester_name: by.name,
                 session_title: None,
                 mentions: request.mentions.clone(),
+                client_ref: request.client_ref.clone(),
             })
             .await?;
         let created = manager
@@ -1057,6 +1064,7 @@ impl TaskService {
                 requester_name: by.name,
                 session_title: None,
                 mentions: request.mentions.clone(),
+                client_ref: request.client_ref.clone(),
             })
             .await?;
         let cwd = request.cwd.as_deref();
@@ -1788,6 +1796,7 @@ impl TaskService {
             summary: task.summary.clone(),
             exit_code: task.exit_code,
             binding: task.binding.clone(),
+            created_ms: task.created_ms,
             updated_ms: task.updated_ms,
             parent_task_id: task.parent.as_ref().map(|id| id.0.clone()),
             origin: task.origin,
@@ -1799,6 +1808,7 @@ impl TaskService {
             peer_reachable: None,
             peer_last_seen_ms: None,
             mentions: task.mentions.clone(),
+            client_ref: task.client_ref.clone(),
         }
     }
 
@@ -2764,6 +2774,7 @@ mod tests {
             machine: machine.map(str::to_owned),
             label: None,
             mentions: Vec::new(),
+            client_ref: None,
         }
     }
 
@@ -3521,6 +3532,7 @@ mod tests {
                 requester_name: None,
                 session_title: None,
                 mentions: Vec::new(),
+                client_ref: None,
             })
             .await;
         state

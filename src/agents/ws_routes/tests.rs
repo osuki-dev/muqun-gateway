@@ -603,6 +603,7 @@ fn task_update(seq: u64) -> TaskDomainEvent {
             summary: None,
             exit_code: None,
             binding: crate::tasks::domain::TaskBinding::None,
+            created_ms: 5,
             updated_ms: 5,
             parent_task_id: None,
             origin: Default::default(),
@@ -614,6 +615,7 @@ fn task_update(seq: u64) -> TaskDomainEvent {
             peer_reachable: None,
             peer_last_seen_ms: None,
             mentions: Vec::new(),
+            client_ref: None,
         },
         seq,
     }
@@ -701,7 +703,7 @@ async fn a_subscribe_all_socket_gets_task_updates_and_a_session_socket_does_not(
     tasks.send(task_update(3)).unwrap();
     assert_eq!(
         next_text(&mut all).await.unwrap(),
-        r#"{"t":"event","asid":null,"seq":3,"event":"task.updated","data":{"task_id":"task-1","state":"working","kind":"command","goal":"make test","summary":null,"exit_code":null,"binding":{"kind":"none"},"updated_ms":5,"parent_task_id":null,"origin":"mcp","label":null,"title":"t","requested_by":null,"children":{"total":0,"active":0,"waiting":0,"failed":0}}}"#
+        r#"{"t":"event","asid":null,"seq":3,"event":"task.updated","data":{"task_id":"task-1","state":"working","kind":"command","goal":"make test","summary":null,"exit_code":null,"binding":{"kind":"none"},"created_ms":5,"updated_ms":5,"parent_task_id":null,"origin":"mcp","label":null,"title":"t","requested_by":null,"children":{"total":0,"active":0,"waiting":0,"failed":0}}}"#
     );
 
     // The session socket's next frame is the agent event, not the task one.

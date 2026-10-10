@@ -151,6 +151,9 @@ struct CreateBody {
     /// The computers the user `@`-named: linked peers' names (any case) or `self`.
     #[serde(default)]
     mentions: Vec<String>,
+    /// The requester's own reference for the task, echoed in its view.
+    #[serde(default)]
+    client_ref: Option<String>,
 }
 
 fn refused(code: &str, message: &str) -> (StatusCode, Json<Value>) {
@@ -239,6 +242,16 @@ impl CreateBody {
             ));
         }
         let mentions = known_mentions(self.mentions, linked)?;
+        if self
+            .client_ref
+            .as_deref()
+            .is_some_and(|reference| !crate::valid_install_id(reference))
+        {
+            return Err(refused(
+                "invalid_request",
+                "client_ref must be 1 to 128 of A-Z, a-z, 0-9, - and _",
+            ));
+        }
         // A remembered directory that has since gone away is no error: the
         // task opens at home, as if nothing were remembered. Only a directory
         // the device asked for by name is refused when it is missing.
@@ -253,6 +266,7 @@ impl CreateBody {
             machine: None,
             label,
             mentions,
+            client_ref: self.client_ref,
         })
     }
 }
@@ -451,6 +465,7 @@ mod tests {
                 requester_name: None,
                 session_title: None,
                 mentions: Vec::new(),
+                client_ref: None,
             })
             .await
             .unwrap();
@@ -619,6 +634,7 @@ mod tests {
                 requester_name: Some("phone".into()),
                 session_title: None,
                 mentions: Vec::new(),
+                client_ref: None,
             }
         };
         let mut ids = Vec::new();
@@ -810,6 +826,7 @@ mod tests {
                         requester_name: None,
                         session_title: None,
                         mentions: Vec::new(),
+                        client_ref: None,
                     })
                     .await
                     .unwrap();

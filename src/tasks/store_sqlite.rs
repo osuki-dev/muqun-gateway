@@ -38,11 +38,13 @@ CREATE INDEX tasks_device_cwd ON tasks(created_by, origin, created_ms DESC) WHER
 ALTER TABLE tasks ADD COLUMN session_title TEXT;
 ", "
 ALTER TABLE tasks ADD COLUMN mentions TEXT;
+", "
+ALTER TABLE tasks ADD COLUMN client_ref TEXT;
 "],
 };
 
 const DEFAULT_LIST_LIMIT: usize = 100;
-const TASK_COLUMNS: &str = "id, kind, goal, cwd, binding, state, summary, exit_code, created_by, created_ms, updated_ms, seq, parent_task_id, origin, label, requester_name, session_title, mentions";
+const TASK_COLUMNS: &str = "id, kind, goal, cwd, binding, state, summary, exit_code, created_by, created_ms, updated_ms, seq, parent_task_id, origin, label, requester_name, session_title, mentions, client_ref";
 
 pub(crate) struct SqliteTaskStore {
     db: Arc<SqliteStore>,
@@ -63,7 +65,7 @@ impl TaskStore for SqliteTaskStore {
             let mut task = task;
             task.seq = seq;
             tx.execute(
-                &format!("INSERT INTO tasks({TASK_COLUMNS}) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)"),
+                &format!("INSERT INTO tasks({TASK_COLUMNS}) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)"),
                 params![
                     task.id.0,
                     enum_text(&task.kind)?,
@@ -83,6 +85,7 @@ impl TaskStore for SqliteTaskStore {
                     task.requester_name,
                     task.session_title,
                     mentions_text(&task.mentions)?,
+                    task.client_ref,
                 ],
             )?;
             append_event(&tx, &task.id, seq, None, task.state, "created", None)?;
@@ -397,6 +400,7 @@ fn read_row(r: &Row<'_>) -> rusqlite::Result<anyhow::Result<Task>> {
     let requester_name: Option<String> = r.get(15)?;
     let session_title: Option<String> = r.get(16)?;
     let mentions: Option<String> = r.get(17)?;
+    let client_ref: Option<String> = r.get(18)?;
     // Only this gateway writes the column; a value it cannot read costs the
     // task its mentions, never the whole row.
     let mentions: Vec<String> = mentions
@@ -427,6 +431,7 @@ fn read_row(r: &Row<'_>) -> rusqlite::Result<anyhow::Result<Task>> {
             requester_name,
             session_title,
             mentions,
+            client_ref,
         })
     })())
 }
@@ -495,6 +500,7 @@ mod tests {
             requester_name: None,
             session_title: None,
             mentions: Vec::new(),
+            client_ref: None,
         }
     }
 

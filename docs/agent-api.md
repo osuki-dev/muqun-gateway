@@ -2075,7 +2075,7 @@ on all of these:
 | `GET /api/peers` | none | `{accept_delegations, peers: [{peer_id, server_id, name, url, reachable, last_seen_ms}]}`; a peer not heard from for a minute is pinged first (3 s), and one that no longer knows this gateway is forgotten and left out. |
 | `POST /api/peers` | `{url, name, request_id, code}` (`name` may not be `self`, in any case) | The new peer. `502 peer_unreachable`; `409 peer_refused` (`error.reason`: `pairing_code_expired`, `invalid_pairing_code`, `pairing_not_requested`, `invalid_token` or `refused`), `peer_conflict`, `peer_name_taken`; `400 peer_is_self`, `invalid_request`. |
 | `PATCH /api/peers/{peer_id}` | `{name}` (not `self`) | The renamed peer; `400 invalid_request`, `409 peer_name_taken`, `404 peer_not_found`. |
-| `DELETE /api/peers/{peer_id}` | none | `{remote_revoked, counterpart_revoked}`; this gateway forgets the peer, asks it to revoke this gateway's device, and revokes the peer's own login here (below). `404 peer_not_found`. |
+| `DELETE /api/peers/{peer_id}` | none | `{remote_revoked, counterpart_found, counterpart_revoked}`; this gateway forgets the peer, asks it to revoke this gateway's device, and revokes the peer's own login here (below). `404 peer_not_found`. |
 | `PUT /api/fleet/settings` | `{accept_delegations}` | `{accept_delegations}`, written to `config.json` (`fleet.accept_delegations`). |
 
 A peer's name is what `fleet.describe`/`fleet.list` show and what
@@ -2092,15 +2092,20 @@ checks it, so it never replaces or evicts a device; its only use is that
 `server_id` is that peer's (its login into this computer), so one call
 unlinks both directions. A peer forgotten after a `401` keeps its login here.
 `DELETE /api/peers/{id}` (the admin token or an app device only) answers
-`{"remote_revoked", "counterpart_revoked"}`: whether the peer confirmed it
-revoked this gateway's token, and whether a login of the peer's was found and
-revoked here. Each runs whatever the other did; the peer is forgotten either way.
+`{"remote_revoked", "counterpart_found", "counterpart_revoked"}`: whether the
+peer confirmed it revoked this gateway's token, whether a login of the peer's
+was here, and whether it is revoked (found but not revoked: the device list
+could not be written). Each runs whatever the other did; the peer is forgotten
+either way, and if its row cannot be removed the `500 peer_store_failed`
+still carries the three fields.
 
 A delegation to a linked computer is a mirror here with `binding: {kind:
 "peer", peer_id, peer_server_id, remote_task_id, peer_name}`: `peer_server_id`
 is the id that computer gave for itself, which the phone knows it by, and
 `remote_task_id` is empty while a create that got no answer has not found its
-task there yet (`tasks.delegate` then carries a `note` saying so). A task
+task there yet (`tasks.delegate` then carries a `note` saying so). The create
+carries a `client_ref`, which the task over there keeps and shows in its view
+(with `created_ms`), and that is how it is found. A task
 another computer opened here (`origin: "peer"`) can be confirmed from the phone
 like a device's.
 

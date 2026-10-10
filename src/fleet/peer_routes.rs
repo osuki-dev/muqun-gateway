@@ -210,8 +210,19 @@ async fn unlink(
         .peers
         .unlink(&state, &peer_id)
         .await
-        .map_err(store_failed)?
         .ok_or_else(peer_not_found)?;
+    if !unlinked.forgotten {
+        // The revokes ran; say how, though the row could not go.
+        let (status, Json(mut body)) = api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "peer_store_failed",
+            "the peer could not be forgotten",
+        );
+        body.as_object_mut()
+            .expect("an error body is an object")
+            .extend(json!(unlinked).as_object().cloned().unwrap_or_default());
+        return Ok((status, Json(body)).into_response());
+    }
     Ok(Json(json!(unlinked)).into_response())
 }
 
@@ -487,7 +498,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{unlinked}");
         assert_eq!(
             unlinked,
-            json!({ "remote_revoked": true, "counterpart_revoked": true })
+            json!({ "remote_revoked": true, "counterpart_found": true, "counterpart_revoked": true })
         );
         let left: Vec<String> = coding
             .devices
@@ -519,12 +530,12 @@ mod tests {
             (
                 "srv-nas",
                 true,
-                json!({ "remote_revoked": false, "counterpart_revoked": true }),
+                json!({ "remote_revoked": false, "counterpart_found": true, "counterpart_revoked": true }),
             ),
             (
                 "srv-gone",
                 false,
-                json!({ "remote_revoked": false, "counterpart_revoked": false }),
+                json!({ "remote_revoked": false, "counterpart_found": false, "counterpart_revoked": false }),
             ),
         ] {
             coding

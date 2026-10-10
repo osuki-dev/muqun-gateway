@@ -353,6 +353,7 @@ mod tests {
             requester_name: None,
             session_title: None,
             mentions: Vec::new(),
+            client_ref: None,
         }
     }
 

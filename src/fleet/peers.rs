@@ -288,14 +288,15 @@ impl PeerSockets {
 
 /// Revoke the gateway devices here that `server_id` paired as: the peer's
 /// own login into this computer. Best effort, like the revoke over there.
-/// Whether a login was found and revoked; the list changes only once it is
-/// written, so memory and disk never disagree.
-fn revoke_login(state: &AppState, server_id: &str) -> bool {
+/// `(found, revoked)`: whether a login was there, and whether it is gone.
+/// The list changes only once it is written, so memory and disk never
+/// disagree.
+fn revoke_login(state: &AppState, server_id: &str) -> (bool, bool) {
     if server_id.is_empty() {
-        return false;
+        return (false, false);
     }
     let Ok(mut devices) = state.devices.lock() else {
-        return false;
+        return (false, false);
     };
     let kept: Vec<_> = devices
         .iter()
@@ -303,16 +304,16 @@ fn revoke_login(state: &AppState, server_id: &str) -> bool {
         .cloned()
         .collect();
     if kept.len() == devices.len() {
-        return false;
+        return (false, false);
     }
     match crate::platform::store::write_devices(&kept) {
         Ok(()) => {
             *devices = kept;
-            true
+            (true, true)
         }
         Err(error) => {
             tracing::warn!("failed to revoke a peer's login here: {error:#}");
-            false
+            (true, false)
         }
     }
 }
@@ -328,8 +329,14 @@ fn is_login_of(device: &DeviceRecord, server_id: &str) -> bool {
 pub(crate) struct Unlinked {
     /// The peer confirmed it revoked this gateway's token over there.
     pub remote_revoked: bool,
-    /// The peer's own login here was found and revoked.
+    /// A login of the peer's was here.
+    pub counterpart_found: bool,
+    /// ... and is revoked (false with `counterpart_found`: it could not be
+    /// written).
     pub counterpart_revoked: bool,
+    /// The peer's row is gone here.
+    #[serde(skip)]
+    pub forgotten: bool,
 }
 
 /// The peers registry and the accept switch (`AppState.peers`).
@@ -647,25 +654,28 @@ impl PeerService {
     /// effort; take back its own login here too, so one call ends both
     /// directions. The link is over either way, and its open mirrors end as
     /// lost. `false`: no such peer.
-    pub(crate) async fn unlink(
-        &self,
-        state: &AppState,
-        peer_id: &str,
-    ) -> anyhow::Result<Option<Unlinked>> {
-        let Some(peer) = self.get(peer_id).await else {
-            return Ok(None);
-        };
-        let unlinked = Unlinked {
-            remote_revoked: revoke(&peer).await,
-            counterpart_revoked: revoke_login(state, &peer.server_id),
-        };
+    pub(crate) async fn unlink(&self, state: &AppState, peer_id: &str) -> Option<Unlinked> {
+        let peer = self.get(peer_id).await?;
+        let remote_revoked = revoke(&peer).await;
+        let (counterpart_found, counterpart_revoked) = revoke_login(state, &peer.server_id);
         super::mirror::lose(state, peer_id, &peer.name).await;
-        let removed = self.store.remove(peer_id).await;
+        let forgotten = match self.store.remove(peer_id).await {
+            Ok(_) => true,
+            Err(error) => {
+                tracing::warn!(peer = %peer_id, "failed to forget an unlinked peer: {error:#}");
+                false
+            }
+        };
         self.presence.gone(peer_id);
         self.drop_memory(peer_id);
         self.refresh_names().await;
         self.sockets.stop(peer_id);
-        Ok(removed?.then_some(unlinked))
+        Some(Unlinked {
+            remote_revoked,
+            counterpart_found,
+            counterpart_revoked,
+            forgotten,
+        })
     }
 
     /// Call `peer_id` `name` here (§10.16). `None`: no such peer.

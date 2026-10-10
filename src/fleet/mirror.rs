@@ -20,15 +20,23 @@ use crate::tasks::service::{DelegateRequest, TaskError, TaskView, OPEN_STATES, S
 use crate::AppState;
 
 const SOURCE: &str = "peer";
-/// How often a quiet socket re-checks whether any mirror of its peer is still open.
-const IDLE_CHECK: Duration = Duration::from_secs(30);
+/// How often a quiet socket re-checks whether any mirror of its peer is
+/// still open, and looks for the task of a mirror whose create got no answer.
+const IDLE_CHECK: Duration = if cfg!(test) {
+    Duration::from_millis(200)
+} else {
+    Duration::from_secs(30)
+};
 /// The first wait before a socket is opened again, doubling up to the last.
 /// A socket that lived less than [`IDLE_CHECK`] counts as a failed one.
 const RETRY_FIRST: Duration = Duration::from_secs(1);
 const RETRY_MOST: Duration = Duration::from_secs(60);
 /// How long a mirror whose create got no answer looks for its task over
-/// there before it fails as never started.
+/// there before it fails as not confirmed.
 const ADOPT_WITHIN: Duration = Duration::from_secs(120);
+/// How far apart two computers' clocks may be when a task over there is
+/// matched by when it was made (a peer that keeps no `client_ref`).
+const CLOCK_SKEW: Duration = Duration::from_secs(5);
 
 /// Open `request` on `peer` and keep a mirror of it here, under the caller's
 /// task. A peer that cannot take it leaves a failed mirror (or none, when it
@@ -50,6 +58,9 @@ pub(crate) async fn delegate(
         return Err(TaskError::MachineUnreachable(name));
     }
     let now = now_ms();
+    // Sent with the create and kept on the mirror: how the task over there is
+    // found when the create gets no answer.
+    let client_ref = uuid::Uuid::new_v4().simple().to_string();
     let mirror = state
         .tasks
         .record(&Task {
@@ -71,9 +82,10 @@ pub(crate) async fn delegate(
             requester_name: by.name,
             session_title: None,
             mentions: request.mentions.clone(),
+            client_ref: Some(client_ref.clone()),
         })
         .await?;
-    let mut body = json!({ "goal": request.goal });
+    let mut body = json!({ "goal": request.goal, "client_ref": client_ref });
     for (key, value) in [
         ("label", &request.label),
         ("cwd", &request.cwd),
@@ -123,6 +135,14 @@ pub(crate) async fn delegate(
         .await?;
     if let Some(remote) = &remote {
         apply(state, &mirror, remote).await;
+        // A frame sent before the binding above found no mirror: read once.
+        if let Ok(client) = PeerClient::for_peer(&peer) {
+            if let Ok(now) = client.read_task(&remote.task_id).await {
+                if let Some(mirror) = state.tasks.task(&mirror.id).await? {
+                    apply(state, &mirror, &now).await;
+                }
+            }
+        }
     }
     watch(state, &peer.peer_id);
     let now = state
@@ -302,11 +322,19 @@ async fn follow_feed(
         let item = tokio::time::timeout(IDLE_CHECK, feed.next()).await;
         open = open_mirrors(state, &peer.peer_id).await;
         match item {
-            // Quiet: seen only if B's own pings still arrive.
-            Err(_) if feed.heard().elapsed() < IDLE_CHECK => {
-                state.peers.mark_seen(&peer.peer_id).await
+            // Quiet: seen only if B's own pings still arrive; and a mirror
+            // whose create got no answer looks for its task (no frame may
+            // ever name it).
+            Err(_) => {
+                if feed.heard().elapsed() < IDLE_CHECK {
+                    state.peers.mark_seen(&peer.peer_id).await;
+                }
+                if open.iter().any(|mirror| remote_id(mirror).is_empty())
+                    && !read_all(state, client, peer).await
+                {
+                    return Ended::Forgotten;
+                }
             }
-            Err(_) => {}
             Ok(None) => return Ended::Socket,
             Ok(Some(FeedItem::Task(remote))) => {
                 state.peers.mark_seen(&peer.peer_id).await;
@@ -385,9 +413,11 @@ async fn refresh(
 }
 
 /// Find the task over there that `mirror`'s unanswered create opened: the
-/// newest of this gateway's tasks there with the same goal that no mirror
-/// follows yet. Bound to it once it has started; failed as never started
-/// when none appears within [`ADOPT_WITHIN`].
+/// one carrying the `client_ref` it sent; from a peer that keeps none, the
+/// oldest of this gateway's tasks there with the same goal made since the
+/// mirror (never an older run) that no mirror follows yet. Bound to it once
+/// it has started; failed as not confirmed when none appears within
+/// [`ADOPT_WITHIN`].
 async fn adopt(
     state: &AppState,
     client: &PeerClient,
@@ -404,17 +434,31 @@ async fn adopt(
         })
         .await
         .unwrap_or_default();
-    let found = theirs.into_iter().find(|task| {
-        task.goal == mirror.goal
-            && !followed
-                .iter()
-                .any(|other| remote_id(other) == task.task_id)
-    });
+    let since = mirror
+        .created_ms
+        .saturating_sub(CLOCK_SKEW.as_millis() as u64);
+    let found = match theirs
+        .iter()
+        .find(|task| task.client_ref.is_some() && task.client_ref == mirror.client_ref)
+    {
+        Some(task) => Some(task.clone()),
+        None => theirs
+            .into_iter()
+            .filter(|task| {
+                task.client_ref.is_none()
+                    && task.goal == mirror.goal
+                    && task.created_ms.is_some_and(|at| at >= since)
+                    && !followed
+                        .iter()
+                        .any(|other| remote_id(other) == task.task_id)
+            })
+            .min_by_key(|task| task.created_ms),
+    };
     let Some(remote) = found else {
         if now_ms().saturating_sub(mirror.created_ms) < ADOPT_WITHIN.as_millis() as u64 {
             return Ok(false);
         }
-        let never = failed(&format!("{} did not start the task", peer.name));
+        let never = failed(&format!("{} did not confirm the task", peer.name));
         state.tasks.record_failure(mirror, never).await;
         return Ok(true);
     };
@@ -460,10 +504,18 @@ fn remote_id(task: &Task) -> &str {
 /// The driver's pass for a mirror no socket follows: read it from its peer,
 /// then follow the peer again. Whether the mirror moved.
 pub(crate) async fn converge(state: &AppState, mirror: &Task) -> bool {
-    let TaskBinding::Peer { peer_id, .. } = &mirror.binding else {
+    let TaskBinding::Peer {
+        peer_id,
+        remote_task_id,
+        ..
+    } = &mirror.binding
+    else {
         return false;
     };
-    if state.peers.sockets.is_live(peer_id) {
+    // A live socket follows a bound mirror; one whose create got no answer
+    // is looked for here as well, so its deadline holds whatever the socket does.
+    let live = state.peers.sockets.is_live(peer_id);
+    if live && !remote_task_id.is_empty() {
         return false;
     }
     let Some(peer) = state.peers.get(peer_id).await else {
@@ -477,7 +529,9 @@ pub(crate) async fn converge(state: &AppState, mirror: &Task) -> bool {
     let Some(moved) = refresh(state, &client, &peer, mirror).await else {
         return false;
     };
-    watch(state, peer_id);
+    if !live {
+        watch(state, peer_id);
+    }
     moved
 }
 
@@ -562,6 +616,7 @@ mod tests {
             requester_name: None,
             session_title: None,
             mentions: Vec::new(),
+            client_ref: None,
         }
     }
 
@@ -569,6 +624,8 @@ mod tests {
         RemoteTask {
             task_id: "t_r".into(),
             goal: "g".into(),
+            client_ref: None,
+            created_ms: None,
             state,
             summary: summary.map(Into::into),
             exit_code: None,
@@ -787,7 +844,7 @@ mod tests {
         let view = delegate_as(&coding, "mini", "fourth goal").await.unwrap();
         let (mirror_id, _) = ids(&view);
         let unlinked = coding.peers.unlink(&coding, "srv-mini").await.unwrap();
-        assert!(unlinked.is_some());
+        assert!(unlinked.forgotten);
         let lost = coding.tasks.get_for_test(&mirror_id).await;
         assert_eq!(lost.state, TaskState::Failed);
         assert_eq!(lost.summary.as_deref(), Some("lost: mini was unlinked"));
@@ -903,8 +960,10 @@ mod tests {
         }
     }
 
-    /// A create that got no answer: the mirror finds its task over there by
-    /// its goal, or fails as never started once it has looked long enough.
+    /// A create that got no answer, through a live follower: the mirror finds
+    /// its task over there by the `client_ref` it sent, or (a peer that keeps
+    /// none) by its goal among tasks made since, never an older run; one not
+    /// found fails as not confirmed once the deadline passes, socket or not.
     #[tokio::test]
     async fn a_mirror_whose_create_got_no_answer_finds_its_task_there() {
         let herdr = FakeHerdr::start(vec!["$ "], None);
@@ -914,9 +973,14 @@ mod tests {
             .unwrap()
             .push(test_peer_device("coding-1", "peer-token"));
         let url = serve(peer_router(mini.clone())).await;
-        let started = mini
-            .tasks
-            .insert_for_test(&Task {
+        let now = now_ms();
+        let mut there = Vec::new();
+        for (goal, client_ref, created_ms) in [
+            ("same goal", Some("ref-1"), now),
+            ("no ref", None, now),
+            ("older run", None, now - 10 * 60_000),
+        ] {
+            let task = Task {
                 state: TaskState::Working,
                 binding: TaskBinding::None,
                 created_by: TaskPrincipal {
@@ -924,30 +988,37 @@ mod tests {
                     id: "coding-1".into(),
                 },
                 origin: TaskOrigin::Peer,
-                goal: "started there".into(),
+                goal: goal.into(),
+                created_ms,
+                client_ref: client_ref.map(Into::into),
                 ..mirror(TaskState::Working, None)
-            })
-            .await;
+            };
+            there.push(mini.tasks.insert_for_test(&task).await.0);
+        }
         let coding = named(output_state(&herdr), "srv-coding", "coding");
-        let mini_peer = peer("srv-mini", "mini", &url, Some(now_ms()));
-        coding.peers.store_for_test(mini_peer.clone()).await;
-        let client = PeerClient::for_peer(&mini_peer).unwrap();
-        let old = now_ms() - 5 * 60_000;
-        for (goal, created_ms, state, bound) in [
+        coding
+            .peers
+            .store_for_test(peer("srv-mini", "mini", &url, Some(now)))
+            .await;
+        let almost_due = now - ADOPT_WITHIN.as_millis() as u64 + 600;
+        let mut rows = Vec::new();
+        for (goal, client_ref, created_ms, state, bound) in [
             (
-                "started there",
-                now_ms(),
+                "same goal",
+                "ref-1",
+                now,
                 TaskState::Working,
-                Some(started.0.clone()),
+                Some(&there[0]),
             ),
-            ("not there yet", now_ms(), TaskState::Dispatching, None),
-            ("never started", old, TaskState::Failed, None),
+            ("no ref", "ref-2", now, TaskState::Working, Some(&there[1])),
+            ("older run", "ref-3", almost_due, TaskState::Failed, None),
         ] {
             let id = coding
                 .tasks
                 .insert_for_test(&Task {
                     goal: goal.into(),
                     created_ms,
+                    client_ref: Some(client_ref.into()),
                     binding: TaskBinding::Peer {
                         peer_id: "srv-mini".into(),
                         peer_server_id: "srv-mini".into(),
@@ -957,16 +1028,32 @@ mod tests {
                     ..mirror(TaskState::Dispatching, None)
                 })
                 .await;
-            let unresolved = coding.tasks.get_for_test(&id).await;
-            assert!(refresh(&coding, &client, &mini_peer, &unresolved)
-                .await
-                .is_some());
-            let now = coding.tasks.get_for_test(&id).await;
+            rows.push((goal, id, state, bound));
+        }
+        watch(&coding, "srv-mini");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        for (goal, id, state, bound) in rows {
+            let now = loop {
+                let now = coding.tasks.get_for_test(&id).await;
+                if now.state == state || tokio::time::Instant::now() > deadline {
+                    break now;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            };
             assert_eq!(now.state, state, "{goal}");
-            if let Some(bound) = bound {
-                assert_eq!(remote_id(&now), bound, "{goal}");
+            match bound {
+                Some(bound) => assert_eq!(remote_id(&now), bound.as_str(), "{goal}"),
+                None => assert_eq!(
+                    now.summary.as_deref(),
+                    Some("mini did not confirm the task"),
+                    "{goal}"
+                ),
             }
         }
+        assert!(
+            coding.peers.sockets.is_live("srv-mini"),
+            "found through the live follower"
+        );
     }
 
     fn ids(view: &Value) -> (TaskId, TaskId) {

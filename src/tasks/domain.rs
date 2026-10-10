@@ -185,6 +185,11 @@ pub(crate) struct Task {
     /// linked peers' names as this gateway calls them, or `self`.
     #[serde(default)]
     pub mentions: Vec<String>,
+    /// The requester's own reference for it (`POST /api/tasks`
+    /// `client_ref`): how another computer whose create got no answer finds
+    /// the task. On a mirror, the reference it sent.
+    #[serde(default)]
+    pub client_ref: Option<String>,
 }
 
 /// A task's direct children by state, computed when the task is read.

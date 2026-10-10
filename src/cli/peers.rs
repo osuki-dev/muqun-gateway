@@ -132,10 +132,14 @@ pub(crate) async fn run(command: PeersCommand) -> anyhow::Result<()> {
                     "{name} did not confirm it revoked this computer; revoke it in its manage view"
                 );
             }
-            if value["counterpart_revoked"] != true {
-                println!(
+            match (&value["counterpart_found"], &value["counterpart_revoked"]) {
+                (_, Value::Bool(true)) => {}
+                (Value::Bool(true), _) => println!(
+                    "{name}'s login here could not be revoked; revoke it in manage > Devices"
+                ),
+                _ => println!(
                     "{name} holds no login here that it was paired as; check manage > Devices"
-                );
+                ),
             }
         }
     }

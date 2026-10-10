@@ -336,6 +336,7 @@ impl DelegateArgs {
             machine: self.machine,
             label: None,
             mentions: Vec::new(),
+            client_ref: None,
         })
     }
 }
@@ -1223,6 +1224,7 @@ mod tests {
             requester_name: Some("phone".into()),
             session_title: None,
             mentions: vec!["mini".into()],
+            client_ref: None,
         };
         let id = state.tasks.insert_for_test(&task).await;
         for (pane, task_id, expected) in [

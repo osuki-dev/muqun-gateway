@@ -793,7 +793,9 @@ fn task_view_schema() -> Value {
                 "properties": { "kind": { "type": "string", "enum": ["none", "agent_session", "pane", "peer"] } },
                 "additionalProperties": true
             },
+            "created_ms": { "type": "integer" },
             "updated_ms": { "type": "integer" },
+            "client_ref": { "type": "string", "description": "The requester's own reference for the task (POST /api/tasks client_ref), when it gave one" },
             "parent_task_id": { "type": ["string", "null"], "description": "The open task this one was started from, when the gateway could tell" },
             "origin": { "type": "string", "enum": ["device", "agent", "mcp", "peer"], "description": "device: POST /api/tasks; peer: POST /api/tasks by another of the owner's computers (fleet_peers); agent: started by work the gateway tracks (its agent service, or the pane of an open task); mcp: any other MCP host. Tasks stored before origins existed are mcp" },
             "label": { "type": ["string", "null"], "description": "A short title the requester gave" },
@@ -974,6 +976,7 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
                         "model": { "type": "string", "description": "A model id from the agent's catalog, or provider_id/model_id. Ignored for a terminal agent, as is variant" },
                         "variant": { "type": "string", "description": "The model's variant (reasoning effort), applied when the session is created so the first turn uses it. Applied only together with model (ignored otherwise); must be one of the model's catalog variants when it lists any" },
                         "label": { "type": "string", "description": "A short title, at most 200 characters" },
+                        "client_ref": { "type": "string", "description": "The requester's own reference, 1 to 128 of A-Z, a-z, 0-9, - and _, echoed in the task's view: how another computer whose create got no answer finds the task" },
                         "mentions": { "type": "array", "items": { "type": "string" }, "maxItems": 8, "description": "The computers the user named: linked computers' names (any case) or self; more than 8, or a name that is neither, is 400 invalid_mentions. Kept on the task, never added to the goal" }
                     }
                 })),
@@ -1180,9 +1183,10 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
                     "responses": {
                         "200": { "description": "Unlinked", "content": { "application/json": { "schema": {
                             "type": "object",
-                            "required": ["remote_revoked", "counterpart_revoked"],
+                            "required": ["remote_revoked", "counterpart_found", "counterpart_revoked"],
                             "properties": {
                                 "remote_revoked": { "type": "boolean", "description": "The peer confirmed it revoked this gateway's token" },
+                                "counterpart_found": { "type": "boolean", "description": "A gateway device here paired as the peer's server_id" },
                                 "counterpart_revoked": { "type": "boolean", "description": "A gateway device here that paired as the peer's server_id was found and revoked" }
                             }
                         } } } },

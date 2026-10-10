@@ -82,6 +82,17 @@ fn http() -> reqwest::Client {
         .expect("a plain reqwest client builds")
 }
 
+/// A 2xx whose answer could not be read: the request was taken, so what it
+/// did is unknown.
+fn unread(status: u16, error: PeerError) -> PeerError {
+    match error {
+        PeerError::Unreachable(reason) if (200..300).contains(&status) => {
+            PeerError::NoAnswer(reason)
+        }
+        error => error,
+    }
+}
+
 /// Not even connected: nothing reached the peer. Anything later (a
 /// timeout, a cut body) may have.
 fn unreachable(error: reqwest::Error) -> PeerError {
@@ -243,7 +254,9 @@ impl PeerClient {
         }
         let response = request.send().await.map_err(unreachable)?;
         let status = response.status().as_u16();
-        let body = body_of(response).await?;
+        let body = body_of(response)
+            .await
+            .map_err(|error| unread(status, error))?;
         if (200..300).contains(&status) {
             Ok(body)
         } else {
@@ -288,7 +301,8 @@ impl PeerClient {
         };
         let response = request.send().await.map_err(unreachable)?;
         let outer_status = response.status().as_u16();
-        let outer = body_of(response).await?;
+        let unknown = |error| unread(outer_status, error);
+        let outer = body_of(response).await.map_err(unknown)?;
         let Ok(sealed) = serde_json::from_value::<transport::Envelope>(outer.clone()) else {
             // A refusal before the device was known (401/403) comes back unsealed.
             return Err(refused(outer_status, &outer));
@@ -300,15 +314,15 @@ impl PeerClient {
             &sealed,
             now_unix_ms(),
         )
-        .map_err(|_| PeerError::Unreachable("answer did not open".into()))?;
+        .map_err(|_| unknown(PeerError::Unreachable("answer did not open".into())))?;
         let answer: Value = serde_json::from_slice(&plaintext)
-            .map_err(|_| PeerError::Unreachable("answer".into()))?;
+            .map_err(|_| unknown(PeerError::Unreachable("answer".into())))?;
         // No `x-muqun-envelope-accept` is sent, so a compressed body is not ours.
         if answer
             .get("content_encoding")
             .is_some_and(|value| !value.is_null())
         {
-            return Err(PeerError::Unreachable("compressed".into()));
+            return Err(unknown(PeerError::Unreachable("compressed".into())));
         }
         let status = answer["status"].as_u64().unwrap_or(500) as u16;
         let bytes = URL_SAFE_NO_PAD
@@ -353,8 +367,11 @@ impl PeerClient {
     }
 
     /// `POST /api/tasks`: B opens `body` as its own task.
+    /// An answer that is not a task counts as no answer: the peer took the
+    /// request, and may have started it.
     pub(crate) async fn create_task(&self, body: &Value) -> Result<RemoteTask, PeerError> {
-        remote(self.json(Method::POST, "/api/tasks", Some(body)).await?)
+        let answer = self.json(Method::POST, "/api/tasks", Some(body)).await?;
+        remote(answer).map_err(|_| PeerError::NoAnswer("not a task".into()))
     }
 
     /// `GET /api/tasks`: the tasks this gateway opened there, newest first
@@ -550,9 +567,14 @@ fn remote(value: Value) -> Result<RemoteTask, PeerError> {
 pub(crate) struct RemoteTask {
     pub task_id: String,
     pub state: TaskState,
-    /// What it was asked: how a create that got no answer finds its task.
+    /// What it was asked, the reference this gateway sent with it, and when
+    /// it was made over there: how a create that got no answer finds its task.
     #[serde(default)]
     pub goal: String,
+    #[serde(default)]
+    pub client_ref: Option<String>,
+    #[serde(default)]
+    pub created_ms: Option<u64>,
     #[serde(default)]
     pub summary: Option<String>,
     #[serde(default)]
@@ -812,6 +834,7 @@ mod tests {
                 requester_name: None,
                 session_title: None,
                 mentions: Vec::new(),
+                client_ref: None,
             })
             .await
     }

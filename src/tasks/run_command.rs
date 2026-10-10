@@ -144,6 +144,7 @@ async fn launch(
                 requester_name: by.name,
                 session_title: None,
                 mentions: Vec::new(),
+                client_ref: None,
             })
             .await?;
         store
