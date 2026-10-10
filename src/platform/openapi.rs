@@ -893,7 +893,7 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
             }]
         }),
     );
-    create_responses["400"] = json!({ "description": "invalid_request (empty or oversized goal, oversized label, empty name), invalid_directory, directory_not_found, not_a_directory, unknown_model" });
+    create_responses["400"] = json!({ "description": "invalid_request (empty or oversized goal, oversized label, empty name), invalid_directory, directory_not_found, not_a_directory, unknown_model, invalid_mentions (too many mentions, or one naming no linked computer)" });
     create_responses["502"] = json!({ "description": "agent_error: the agent could not start the session or take the prompt, or no pane could be made for a terminal agent" });
     create_responses["403"] = json!({ "description": "delegations_disabled: another of the owner's computers (fleet_peers) asked while this computer takes no work from other computers (fleet.accept_delegations); checked before the body. Its task otherwise opens as a device's does, with origin peer and requested_by named from its device record" });
     create_responses["503"] = json!({ "description": "agent_unavailable: the agent is not attached (a session agent is never started in a pane) or a terminal agent is not on PATH; no_terminal: no terminal session answers" });
@@ -974,7 +974,7 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
                         "model": { "type": "string", "description": "A model id from the agent's catalog, or provider_id/model_id. Ignored for a terminal agent, as is variant" },
                         "variant": { "type": "string", "description": "The model's variant (reasoning effort), applied when the session is created so the first turn uses it. Applied only together with model (ignored otherwise); must be one of the model's catalog variants when it lists any" },
                         "label": { "type": "string", "description": "A short title, at most 200 characters" },
-                        "mentions": { "type": "array", "items": { "type": "string" }, "maxItems": 8, "description": "The computers the user named: linked computers' names (any case) or self; anything else is invalid_request. Kept on the task, never added to the goal" }
+                        "mentions": { "type": "array", "items": { "type": "string" }, "maxItems": 8, "description": "The computers the user named: linked computers' names (any case) or self; more than 8, or a name that is neither, is 400 invalid_mentions. Kept on the task, never added to the goal" }
                     }
                 })),
                 "responses": create_responses

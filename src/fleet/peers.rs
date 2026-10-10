@@ -338,8 +338,8 @@ pub(crate) struct PeerService {
     accept: AtomicBool,
     config_path: Option<PathBuf>,
     names: RwLock<Vec<String>>,
-    /// When each peer's cached manifest was fetched; in memory, so the first
-    /// look after a restart fetches it again.
+    /// When each peer's manifest was last asked for, answered or not; in
+    /// memory, so the first look after a restart asks again.
     manifests_at: Mutex<HashMap<String, u64>>,
     /// When each peer was last pinged, answered or not.
     pinged_at: Mutex<HashMap<String, u64>>,
@@ -423,13 +423,24 @@ impl PeerService {
         within(pinged, now, CHECK_EVERY).then(|| peer.reachable(now))
     }
 
+    /// Whether `peer`'s manifest was asked for in the last [`CHECK_EVERY`]:
+    /// what came of it (the cached one, or none) stands until then.
     fn manifest_fresh(&self, peer: &Peer, now: u64) -> bool {
-        let fetched = self
+        let asked = self
             .manifests_at
             .lock()
             .ok()
             .and_then(|at| at.get(&peer.peer_id).copied());
-        peer.manifest.is_some() && within(fetched, now, CHECK_EVERY)
+        within(asked, now, CHECK_EVERY)
+    }
+
+    /// Forget what is known in memory of `peer_id`.
+    fn drop_memory(&self, peer_id: &str) {
+        for map in [&self.manifests_at, &self.pinged_at] {
+            if let Ok(mut map) = map.lock() {
+                map.remove(peer_id);
+            }
+        }
     }
 
     /// Bring what is known of `peer` up to date in the background, unless it
@@ -521,12 +532,15 @@ impl PeerService {
     }
 
     /// `peer`'s manifest as `fleet.describe` shows it (its `GET /api/fleet/self`,
-    /// compacted): the cached one while it is under [`CHECK_EVERY`] old,
-    /// otherwise fetched and cached -- or, when the fetch fails, the cached one
-    /// however old. `None`: none was ever fetched and this fetch failed.
+    /// compacted): asked for at most once per [`CHECK_EVERY`], answered or
+    /// not, and cached; between asks, and when an ask fails, the cached one
+    /// however old. `None`: none was ever fetched.
     pub(crate) async fn manifest_of(&self, peer: &Peer) -> Option<Value> {
         if self.manifest_fresh(peer, now_ms()) {
             return peer.manifest.clone();
+        }
+        if let Ok(mut at) = self.manifests_at.lock() {
+            at.insert(peer.peer_id.clone(), now_ms());
         }
         let client = PeerClient::for_peer(peer).ok()?;
         let fetch = client.json(Method::GET, "/api/fleet/self", None);
@@ -543,9 +557,6 @@ impl PeerService {
             tracing::warn!(peer = %peer.peer_id, "failed to keep a peer's manifest: {error:#}");
         }
         self.presence.seen(&peer.peer_id, Some(now));
-        if let Ok(mut at) = self.manifests_at.lock() {
-            at.insert(peer.peer_id.clone(), now);
-        }
         Some(manifest)
     }
 
@@ -651,6 +662,7 @@ impl PeerService {
         super::mirror::lose(state, peer_id, &peer.name).await;
         let removed = self.store.remove(peer_id).await;
         self.presence.gone(peer_id);
+        self.drop_memory(peer_id);
         self.refresh_names().await;
         self.sockets.stop(peer_id);
         Ok(removed?.then_some(unlinked))
@@ -689,6 +701,7 @@ impl PeerService {
             tracing::warn!(peer = %peer_id, "failed to forget a peer: {error:#}");
         }
         self.presence.gone(peer_id);
+        self.drop_memory(peer_id);
         self.refresh_names().await;
         // Last: the caller may be the follower itself.
         self.sockets.stop(peer_id);

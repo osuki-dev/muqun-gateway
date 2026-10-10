@@ -2080,7 +2080,10 @@ on all of these:
 
 A peer's name is what `fleet.describe`/`fleet.list` show and what
 `POST /api/tasks` `mentions` must use (see
-[mcp.md](mcp.md#opening-a-task-from-the-device)).
+[mcp.md](mcp.md#opening-a-task-from-the-device)). More than 8 names, or a
+name that is neither a linked computer's nor `self`, is `400
+invalid_mentions` and nothing is created; the app sends the task again,
+once, without `mentions`.
 
 `POST /api/pair/request` and `POST /api/pair/pending` take an optional
 `server_id`, the claiming gateway's own, kept on its device record. Nothing

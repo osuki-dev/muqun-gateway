@@ -1057,15 +1057,43 @@ mod tests {
             "tasks": { "active": 2, "waiting": 0 },
             "agents": [{ "id": "opencode", "kind": "opencode", "status": "connected", "modes": [], "modelCount": 3 }],
         });
+        // old answers a ping but has no manifest to give (an older gateway);
+        // slow takes connections and never answers.
+        let old = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let old_url = format!("http://{}", old.local_addr().unwrap());
+        let router = axum::Router::new()
+            .route(
+                "/api/tasks",
+                axum::routing::get(|| async { axum::Json(json!({ "tasks": [] })) }),
+            )
+            .route(
+                "/api/capabilities",
+                axum::routing::get(|| async { axum::Json(json!({ "capabilities": [] })) }),
+            );
+        tokio::spawn(async move { axum::serve(old, router).await });
+        let slow = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let slow_url = format!("http://{}", slow.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = slow.accept().await {
+                held.push(socket);
+            }
+        });
         // nas never answered: nothing is known of it yet; pinged, 127.0.0.1:9 refuses at once.
-        for (id, name, seen) in [("srv-mini", "mini", Some(now)), ("srv-nas", "nas", None)] {
+        let refused = "http://127.0.0.1:9".to_owned();
+        for (id, name, seen, url) in [
+            ("srv-mini", "mini", Some(now), &refused),
+            ("srv-nas", "nas", None, &refused),
+            ("srv-old", "old", None, &old_url),
+            ("srv-slow", "slow", None, &slow_url),
+        ] {
             state
                 .peers
                 .store_for_test(Peer {
                     peer_id: format!("peer-{name}"),
                     server_id: id.into(),
                     name: name.into(),
-                    url: "http://127.0.0.1:9".into(),
+                    url: url.clone(),
                     token: "t".into(),
                     device_id: "d".into(),
                     transport_key: None,
@@ -1107,6 +1135,8 @@ mod tests {
             [
                 (json!("mini"), json!(true), json!(["ios-build"])),
                 (json!("nas"), Value::Null, json!([])),
+                (json!("old"), Value::Null, json!([])),
+                (json!("slow"), Value::Null, json!([])),
             ]
         );
         assert_eq!(body["peers"][0]["agents"][0]["id"], "opencode");
@@ -1116,6 +1146,7 @@ mod tests {
             ("srv-mini", Ok("srv-mini")),
             ("nas", Err("machine_unreachable")),
             ("printer", Err("machine_unknown")),
+            ("old", Err("manifest_unavailable")),
         ] {
             let (error, _, body) = describe(Some(machine)).await;
             match expected {
@@ -1132,7 +1163,14 @@ mod tests {
             }
         }
 
+        // slow's check runs in the background (3 s): it holds up nothing.
+        let started = std::time::Instant::now();
         let (_, _, listed) = answer(mcp.fleet_list().await);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
         let machines: Vec<_> = listed["machines"]
             .as_array()
             .unwrap()
@@ -1149,7 +1187,9 @@ mod tests {
             machines[1..],
             [
                 (json!("mini"), json!(true), json!(2)),
-                (json!("nas"), json!(false), json!(0))
+                (json!("nas"), json!(false), json!(0)),
+                (json!("old"), json!(true), json!(0)),
+                (json!("slow"), Value::Null, json!(0)),
             ]
         );
 

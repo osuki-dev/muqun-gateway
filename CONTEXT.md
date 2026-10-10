@@ -255,7 +255,9 @@ peer on a timer: `PeerService::checked` pings one whose last answer is over
 60 s old when something needs it (`GET /api/peers`, `fleet.*`), and it is
 reachable while that answer is under 2 minutes old; a 401 forgets it. Its
 compact manifest is cached in its row for 60 s (`manifest_of`). `fleet.*`
-never waits on a peer except `fleet.describe(machine: <peer>)`. The
+never waits on a peer except `fleet.describe(machine: <peer>)` on a peer
+not checked lately or without a manifest; a manifest is asked for at most
+once a minute, answered or not. The
 computers the user `@`-named when opening a task (`POST /api/tasks`
 `mentions`, checked against the peer names) are stored on the task
 (`Task::mentions`) and reach the agent only through `tasks.read` of its own

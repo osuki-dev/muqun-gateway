@@ -163,7 +163,7 @@ fn refused(code: &str, message: &str) -> (StatusCode, Json<Value>) {
 fn known_mentions(mentions: Vec<String>, linked: &[String]) -> ApiResult<Vec<String>> {
     let refusal = || {
         refused(
-            "invalid_request",
+            "invalid_mentions",
             "mentions must be at most 8 names of linked computers (or self)",
         )
     };
@@ -1002,11 +1002,11 @@ mod tests {
             ),
             (
                 json!({ "goal": "x", "mentions": vec!["mini"; 9] }),
-                "invalid_request",
+                "invalid_mentions",
             ),
             (
                 json!({ "goal": "x", "mentions": ["mini", "printer"] }),
-                "invalid_request",
+                "invalid_mentions",
             ),
         ] {
             let (status, answer) =

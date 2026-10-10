@@ -118,10 +118,22 @@ impl Manifest {
 
 /// The most items of a list a peer's compact manifest keeps.
 const PEER_LIST_CAP: usize = 64;
+/// The longest string a peer's compact manifest keeps, in characters.
+const PEER_TEXT_CAP: usize = 256;
+
+/// A string (clipped to [`PEER_TEXT_CAP`]), number or bool; anything else is null.
+fn scalar(value: &Value) -> Value {
+    match value {
+        Value::String(text) => Value::String(text.chars().take(PEER_TEXT_CAP).collect()),
+        Value::Number(_) | Value::Bool(_) => value.clone(),
+        _ => Value::Null,
+    }
+}
 
 /// [`Manifest::compact`] over another computer's `GET /api/fleet/self`
 /// answer: the [`CompactManifest`] keys only, field by field (so a peer on
-/// another gateway version still reads), each list cut at [`PEER_LIST_CAP`].
+/// another gateway version still reads), each a [`scalar`], each list cut
+/// at [`PEER_LIST_CAP`].
 pub(crate) fn compact_json(full: Value) -> Value {
     let list = |value: &Value| -> Vec<Value> {
         let items = value.as_array().map(Vec::as_slice).unwrap_or_default();
@@ -129,7 +141,7 @@ pub(crate) fn compact_json(full: Value) -> Value {
     };
     let pick = |item: &Value, keys: &[&str]| -> Value {
         keys.iter()
-            .map(|key| (key.to_string(), item[*key].clone()))
+            .map(|key| (key.to_string(), scalar(&item[*key])))
             .collect::<serde_json::Map<_, _>>()
             .into()
     };
@@ -139,7 +151,7 @@ pub(crate) fn compact_json(full: Value) -> Value {
             let mut compact = pick(agent, &["id", "kind", "status", "version"]);
             let modes = list(&agent["modes"])
                 .iter()
-                .map(|mode| mode["id"].clone())
+                .map(|mode| scalar(&mode["id"]))
                 .collect::<Vec<_>>();
             compact["modes"] = modes.into();
             let models = agent["models"].as_array().map_or(0, Vec::len);
@@ -176,8 +188,9 @@ pub(crate) fn compact_json(full: Value) -> Value {
     compact["toolchains"] = toolchains.into();
     compact["tasks"] = pick(&full["tasks"], &["active", "waiting"]);
     compact["suitableFor"] = list(&full["suitableFor"])
-        .into_iter()
-        .filter(Value::is_string)
+        .iter()
+        .filter(|tag| tag.is_string())
+        .map(scalar)
         .collect::<Vec<_>>()
         .into();
     compact
@@ -447,6 +460,14 @@ impl FleetService {
         let wanted = machine.unwrap_or_default();
         let unknown = || DescribeError::Unknown(state.peers.names());
         let peer = state.peers.resolve(wanted).await.ok_or_else(unknown)?;
+        // Known to answer, with a manifest: that, at once; any refresh it
+        // needs runs in the background, shared with every other caller.
+        if state.peers.reachability(&peer, now_ms()) == Some(true) {
+            if let Some(manifest) = peer.manifest.clone() {
+                state.peers.refresh_later(peer);
+                return Ok(manifest);
+            }
+        }
         let peer = state.peers.checked(peer).await.ok_or_else(unknown)?;
         if !peer.reachable(now_ms()) {
             return Err(DescribeError::Unreachable(peer.name));
@@ -503,7 +524,8 @@ mod tests {
     #[test]
     fn a_peer_manifest_keeps_only_the_compact_keys() {
         let full = serde_json::json!({
-            "machineId": "srv-mini", "os": "macos", "secret": "x", "suitableFor": ["web", 1],
+            "machineId": "srv-mini", "os": "m".repeat(1000), "label": { "big": [1, 2] },
+            "secret": "x", "suitableFor": ["web", 1],
             "agents": [{ "id": "opencode", "models": [{}, {}], "modes": [{ "id": "build", "name": "Build" }], "env": "x" }],
             "toolchains": (0..100).map(|i| serde_json::json!({ "id": format!("t{i}") })).collect::<Vec<_>>(),
         });
@@ -517,6 +539,8 @@ mod tests {
             PEER_LIST_CAP
         );
         assert_eq!(compact["suitableFor"], serde_json::json!(["web"]));
+        assert_eq!(compact["os"].as_str().map(str::len), Some(PEER_TEXT_CAP));
+        assert_eq!(compact["label"], Value::Null, "an object is no label");
     }
 
     #[test]
