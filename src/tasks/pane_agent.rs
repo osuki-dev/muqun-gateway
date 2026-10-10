@@ -8,12 +8,17 @@
 //! `done`: the goal is given with [`completion_request`] (on the agent's
 //! command line where it takes one, else typed), and the agent
 //! printing a [`DONE_MARKER`] line (or calling `tasks.complete` from the
-//! pane's own token) is that signal. Session delegations follow the same
-//! rule (`service::turn_end`).
+//! pane's own token) is that signal. An agent that stops because it needs
+//! the user says so the same way: a [`BLOCKED_MARKER`] line, or
+//! `tasks.complete` with outcome `blocked`. Session delegations follow the
+//! same rules (`service::turn_end`, `TaskService::settle`).
 //!
 //! | The pane | The task |
 //! |---|---|
 //! | a `MUQUN_TASK_DONE: <summary>` line below the echoed request, the agent not busy | `done`, with that summary |
+//! | a new `MUQUN_TASK_BLOCKED: <reason>` line below the echoed request, the agent not busy | `waiting` (*blocked*), with that reason |
+//! | *blocked*: agent idle, or still busy before it was seen idle on two polls | stays `waiting` |
+//! | *blocked*: agent starting / working after it was seen idle on two polls (the user answered) | `working` |
 //! | agent starting / working | `working` (from `dispatching`, or back from `waiting` or `idle_unconfirmed`) |
 //! | agent blocked on a menu (approval, question) | `waiting` |
 //! | agent idle on two polls, after it was seen working (or its state sequence moved), or for [`UNCONFIRMED_AFTER`] | `idle_unconfirmed` |
@@ -22,9 +27,15 @@
 //!
 //! The marker is looked for in the pane's recent output (not only its screen)
 //! on every poll, so the first poll after a gateway restart settles a task
-//! whose agent finished meanwhile. A task that is `idle_unconfirmed` is polled
-//! every [`PAUSED_POLL`] instead of every [`POLL`], backing off to
-//! [`MAX_PAUSED_POLL`] while nothing changes ([`paused_poll`]).
+//! whose agent finished meanwhile. A task is *blocked* while it is `waiting`
+//! because its agent said so -- the marker, or a `tasks.complete` call with
+//! outcome `blocked` (read off the task's last event when someone else moved
+//! it) -- and stops being blocked once it moves on. A blocked marker already
+//! acted on does not block again: an answered task that pauses with the
+//! same old line still on screen is `idle_unconfirmed`. A task that is
+//! `idle_unconfirmed` or blocked is polled every [`PAUSED_POLL`] instead of
+//! every [`POLL`], backing off to [`MAX_PAUSED_POLL`] while nothing changes
+//! ([`paused_poll`]).
 
 use std::time::Duration;
 
@@ -51,8 +62,8 @@ const PAUSED_POLL: Duration = Duration::from_secs(12);
 const MAX_PAUSED_POLL: Duration = Duration::from_secs(60);
 /// Lines of recent output searched for the marker.
 const MARKER_LINES: u32 = 200;
-/// A tab and pane title's length, from the goal.
-const TITLE_CHARS: usize = 40;
+/// A task title's length, from the goal.
+const TITLE_CHARS: usize = 60;
 /// How long an agent may sit idle, never seen working, before its task is
 /// `idle_unconfirmed`: a reply quicker than [`POLL`] on a backend without a
 /// state sequence (tmux) is never seen busy.
@@ -69,17 +80,24 @@ pub(crate) const PANE_CLOSED: &str = "the pane closed";
 pub(crate) const AGENT_EXITED: &str = "the agent exited before it finished";
 /// The line a terminal agent prints when the delegated goal is finished.
 pub(crate) const DONE_MARKER: &str = "MUQUN_TASK_DONE:";
+/// The line it prints when it stopped because it needs the user.
+pub(crate) const BLOCKED_MARKER: &str = "MUQUN_TASK_BLOCKED:";
 const SUMMARY_PLACEHOLDER: &str = "<one-line summary>";
+const REASON_PLACEHOLDER: &str = "<one-line reason>";
 /// Words of the typed request that can only come from its echo; a marker
 /// counts only below the last line holding one. Several, since a narrow
 /// pane wraps the echo anywhere.
-const ECHO_WORDS: [&str; 4] = [
+const ECHO_WORDS: [&str; 6] = [
     "exactly in this form",
     "<one-line",
     "one-line summary>",
     "summary>",
+    "one-line reason>",
+    "reason>",
 ];
 const SOURCE: &str = "pane_follower";
+/// The source of a move to `waiting` on a blocked marker (pane or session).
+pub(crate) const MARKER_BLOCKED: &str = "marker_blocked";
 
 /// Whether `agent_id` is a terminal agent kind the agent catalog lists.
 pub(crate) fn is_terminal_agent(state: &AppState, agent_id: &str) -> bool {
@@ -93,21 +111,30 @@ pub(crate) fn is_available(state: &AppState, agent_id: &str) -> bool {
 }
 
 /// The first prompt of every delegation to an agent (a terminal agent's
-/// pane or an agent session): the goal, then the request to say when it is
-/// finished -- the `tasks.complete` tool, or else the completion marker.
+/// pane or an agent session): the goal, then the request to say how it
+/// ended -- the `tasks.complete` tool, or else a marker line.
 pub(crate) fn completion_request(goal: &str) -> String {
     format!(
         "{goal}\n\nWhen the whole task is finished, call the muqun tool tasks.complete with a \
-         one-line summary; if you cannot call it, print one line exactly in this form: \
-         {DONE_MARKER} {SUMMARY_PLACEHOLDER}"
+         one-line summary, or with outcome \"blocked\" and the reason if you stopped because \
+         you need the user (a missing file, an unclear request, a permission you cannot get); \
+         if you cannot call it, print one line exactly in this form: \
+         {DONE_MARKER} {SUMMARY_PLACEHOLDER} -- or, blocked, {BLOCKED_MARKER} {REASON_PLACEHOLDER}"
     )
 }
 
-/// The summary of the last completion marker line in `output`. A marker
-/// counts only at the start of a line (after any bullet the agent draws),
-/// below the request echoed in the prompt, and with a summary that is not
-/// the placeholder or a piece of it.
-pub(crate) fn done_marker(output: &str) -> Option<String> {
+/// How an agent said its task ended, with its one line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Marker {
+    Done(String),
+    Blocked(String),
+}
+
+/// The last marker line in `output`, done or blocked. A marker counts only
+/// at the start of a line (after any bullet the agent draws), below the
+/// request echoed in the prompt, and with a line that is not a placeholder
+/// or a piece of one.
+pub(crate) fn marker(output: &str) -> Option<Marker> {
     let lines: Vec<&str> = output.lines().collect();
     let below_echo = lines
         .iter()
@@ -115,11 +142,17 @@ pub(crate) fn done_marker(output: &str) -> Option<String> {
         .map_or(0, |echo| echo + 1);
     lines[below_echo..].iter().rev().find_map(|line| {
         let line = line.trim_start_matches(|c: char| !c.is_alphanumeric());
-        let summary = line.strip_prefix(DONE_MARKER)?.trim();
-        let placeholder = summary.starts_with('<')
-            || SUMMARY_PLACEHOLDER.starts_with(summary)
-            || summary.trim_matches(|c| c == '.' || c == '…').is_empty();
-        (!placeholder).then(|| one_line(summary, SUMMARY_CHARS))
+        let (text, placeholder, marker): (_, _, fn(String) -> Marker) =
+            if let Some(text) = line.strip_prefix(DONE_MARKER) {
+                (text.trim(), SUMMARY_PLACEHOLDER, Marker::Done)
+            } else {
+                let text = line.strip_prefix(BLOCKED_MARKER)?;
+                (text.trim(), REASON_PLACEHOLDER, Marker::Blocked)
+            };
+        let stand_in = text.starts_with('<')
+            || placeholder.starts_with(text)
+            || text.trim_matches(|c| c == '.' || c == '…').is_empty();
+        (!stand_in).then(|| marker(one_line(text, SUMMARY_CHARS)))
     })
 }
 
@@ -179,10 +212,41 @@ pub(crate) async fn goal_accepted(session: &SessionConfig, pane_id: &str, prompt
     false
 }
 
-/// A terminal task's tab and pane title: its label, else the start of its
-/// goal.
-pub(crate) fn pane_title(label: Option<&str>, goal: &str) -> String {
-    one_line(label.unwrap_or(goal), TITLE_CHARS)
+/// A task's title (and a terminal task's tab and pane title): its label,
+/// else the name its agent session gave itself, else its goal's first
+/// sentence -- up to the first `.` or `?`/`!` followed by a space, a
+/// `。`/`？`/`！`, or a line end -- cut at a word to [`TITLE_CHARS`].
+pub(crate) fn title(label: Option<&str>, session_title: Option<&str>, goal: &str) -> String {
+    if let Some(label) = label.or(session_title) {
+        return one_line(label, TITLE_CHARS);
+    }
+    let goal = goal.trim();
+    let mut chars = goal.char_indices().peekable();
+    let mut end = goal.len();
+    while let Some((at, c)) = chars.next() {
+        let spaced = chars.peek().is_none_or(|(_, next)| next.is_whitespace());
+        let cut = match c {
+            '\n' | '。' | '.' if c != '.' || spaced => Some(at),
+            '？' | '！' => Some(at + c.len_utf8()),
+            '?' | '!' if spaced => Some(at + c.len_utf8()),
+            _ => None,
+        };
+        if let Some(cut) = cut {
+            end = cut;
+            break;
+        }
+    }
+    let sentence = one_line(&goal[..end], usize::MAX);
+    let line = one_line(&sentence, TITLE_CHARS);
+    let Some(cut) = line.strip_suffix('…') else {
+        return line;
+    };
+    // Cut mid-word unless a space came next: back to the last whole word.
+    let whole = sentence[cut.len()..].starts_with(' ');
+    match cut.rsplit_once(' ') {
+        Some((words, _)) if !whole && !words.is_empty() => format!("{words}…"),
+        _ => line,
+    }
 }
 
 /// The pane agent as one poll found it.
@@ -206,6 +270,33 @@ pub(crate) struct Progress {
     baseline: Option<Option<u64>>,
     absent: u32,
     idle: u32,
+    /// Whether the task is blocked (see the module docs).
+    held: Held,
+    /// The blocked marker last acted on.
+    blocked_by: Option<String>,
+}
+
+/// A blocked task's agent, as the follower has seen it since the block.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Held {
+    #[default]
+    No,
+    /// Blocked; the agent may still be finishing the turn that said so.
+    Reported,
+    /// Blocked, and the agent was seen idle since: work now is an answer.
+    Idle,
+}
+
+impl Progress {
+    /// Whether the task is blocked, as its stored history says: kept when
+    /// it is, and the follower's own view is kept while it still is.
+    pub(crate) fn blocked(&mut self, blocked: bool) {
+        self.held = match (blocked, self.held) {
+            (false, _) => Held::No,
+            (true, Held::No) => Held::Reported,
+            (true, held) => held,
+        };
+    }
 }
 
 /// Where a poll moves the task.
@@ -217,20 +308,25 @@ pub(crate) enum Verdict {
     Unconfirmed,
     /// The agent printed the marker; its summary.
     Done(String),
+    /// The agent printed the blocked marker; its reason.
+    Blocked(String),
     Failed(&'static str),
 }
 
-/// The mapping in the module docs. `marker` is the summary of a completion
-/// marker on screen; `elapsed` is how long the task has been followed.
+/// The mapping in the module docs. `marker` is the last marker on screen;
+/// `elapsed` is how long the task has been followed.
 pub(crate) fn judge(
     task: TaskState,
     seen: Seen,
-    marker: Option<&str>,
+    marker: Option<&Marker>,
     progress: &mut Progress,
     elapsed: Duration,
 ) -> Verdict {
     if task.is_terminal() {
         return Verdict::Stay;
+    }
+    if task != TaskState::Waiting {
+        progress.held = Held::No;
     }
     // A marker counts once the agent has stopped: one mentioned mid-stream
     // is not the end, and a real one is followed by the idle prompt.
@@ -241,16 +337,28 @@ pub(crate) fn judge(
         )
     };
     let (status, seq) = match (seen, marker) {
-        (Seen::Agent { status, .. }, Some(summary)) if !busy(status) => {
-            return Verdict::Done(summary.to_owned())
+        (Seen::Agent { status, .. }, Some(Marker::Done(summary))) if !busy(status) => {
+            return Verdict::Done(summary.clone())
         }
-        (Seen::Gone | Seen::NoAgent, Some(summary)) => return Verdict::Done(summary.to_owned()),
-        (Seen::Gone, None) => return Verdict::Failed(PANE_CLOSED),
+        (Seen::Agent { status, .. }, Some(Marker::Blocked(reason)))
+            if !busy(status) && progress.blocked_by.as_ref() != Some(reason) =>
+        {
+            progress.blocked_by = Some(reason.clone());
+            progress.held = Held::Idle;
+            if task == TaskState::Waiting {
+                return Verdict::Stay;
+            }
+            return Verdict::Blocked(reason.clone());
+        }
+        (Seen::Gone | Seen::NoAgent, Some(Marker::Done(summary))) => {
+            return Verdict::Done(summary.clone())
+        }
+        (Seen::Gone, _) => return Verdict::Failed(PANE_CLOSED),
         // Not started yet, not exited.
-        (Seen::NoAgent, None) if task == TaskState::Dispatching && elapsed < START_GRACE => {
+        (Seen::NoAgent, _) if task == TaskState::Dispatching && elapsed < START_GRACE => {
             return Verdict::Stay
         }
-        (Seen::NoAgent, None) => {
+        (Seen::NoAgent, _) => {
             progress.absent += 1;
             if progress.absent >= IN_A_ROW {
                 return Verdict::Failed(AGENT_EXITED);
@@ -267,6 +375,21 @@ pub(crate) fn judge(
     }
     let baseline = *progress.baseline.get_or_insert(seq);
     let moved = matches!((seq, baseline), (Some(now), Some(first)) if now > first);
+    if progress.held != Held::No {
+        // Blocked: only work after the agent was seen stopped is an answer.
+        return match status {
+            AgentStatus::Starting | AgentStatus::Working if progress.held == Held::Idle => {
+                progress.held = Held::No;
+                progress.busy = true;
+                Verdict::Working
+            }
+            AgentStatus::Idle | AgentStatus::Completed if progress.idle >= IN_A_ROW => {
+                progress.held = Held::Idle;
+                Verdict::Stay
+            }
+            _ => Verdict::Stay,
+        };
+    }
     match status {
         // An agent coming up has not taken its goal yet.
         AgentStatus::Starting if task == TaskState::Dispatching => Verdict::Stay,
@@ -421,7 +544,7 @@ fn bound<'a>(state: &'a AppState, task: &'a Task) -> Option<Bound<'a>> {
 struct Observed {
     seen: Seen,
     screen: Option<String>,
-    marker: Option<String>,
+    marker: Option<Marker>,
 }
 
 /// One read of the pane, its agent, its screen and its recent output; `None`
@@ -441,7 +564,7 @@ async fn observe(at: &Bound<'_>, rows: &mut Option<usize>) -> Option<Observed> {
             })
             .await
             .ok()
-            .and_then(|output| done_marker(&output.text)),
+            .and_then(|output| marker(&output.text)),
     };
     Some(Observed {
         seen,
@@ -504,9 +627,14 @@ fn change_for(
     agent_id: Option<&str>,
     screen: Option<&str>,
 ) -> Option<TaskChange> {
+    let mut source = SOURCE;
     let (to, summary, note) = match verdict {
         Verdict::Stay => return None,
         Verdict::Working => (TaskState::Working, None, None),
+        Verdict::Blocked(reason) => {
+            source = MARKER_BLOCKED;
+            (TaskState::Waiting, Some(reason), None)
+        }
         Verdict::Waiting => (TaskState::Waiting, None, None),
         Verdict::Unconfirmed => (
             TaskState::IdleUnconfirmed,
@@ -522,7 +650,7 @@ fn change_for(
     };
     Some(TaskChange {
         to,
-        source: SOURCE.into(),
+        source: source.into(),
         note,
         summary,
         ..Default::default()
@@ -549,7 +677,7 @@ async fn run(state: &AppState, id: &TaskId) {
     let mut progress = Progress::default();
     // The marker last read: a pane closed right after its agent printed it
     // still finished its task.
-    let mut last_marker: Option<String> = None;
+    let mut last_marker: Option<Marker> = None;
     // The screen last read: a closed pane's failure still says what was on it.
     let mut last_screen: Option<String> = None;
     let mut rows: Option<usize> = None;
@@ -557,6 +685,9 @@ async fn run(state: &AppState, id: &TaskId) {
     // polls in a row have found a paused task just so.
     let mut last: Option<(u64, Option<Seen>)> = None;
     let mut quiet = 0;
+    // The task's seq as the follower last saw or left it: any other means
+    // someone else moved it, and whether it is blocked is read again.
+    let mut known_seq = None;
     loop {
         let task = match state.tasks.task(id).await {
             Ok(Some(task)) if !task.state.is_terminal() => task,
@@ -570,6 +701,9 @@ async fn run(state: &AppState, id: &TaskId) {
         let Some(at) = bound(state, &task) else {
             return;
         };
+        if known_seq != Some(task.seq) {
+            progress.blocked(state.tasks.blocked_at(&task.id).await.is_some());
+        }
         let (mut now, mut seq, mut seen) = (task.state, task.seq, None);
         if let Some(observed) = observe(&at, &mut rows).await {
             seen = Some(observed.seen);
@@ -580,7 +714,7 @@ async fn run(state: &AppState, id: &TaskId) {
             let verdict = judge(
                 task.state,
                 observed.seen,
-                marker.as_deref(),
+                marker.as_ref(),
                 &mut progress,
                 started.elapsed(),
             );
@@ -602,23 +736,25 @@ async fn run(state: &AppState, id: &TaskId) {
             }
             last_screen = screen;
         }
+        known_seq = Some(seq);
         let unchanged = last == Some((seq, seen));
         last = Some((seq, seen));
-        let (next, pause) = paused_poll(quiet, now, unchanged);
+        let paused = now == TaskState::IdleUnconfirmed || progress.held != Held::No;
+        let (next, pause) = paused_poll(quiet, paused, unchanged);
         quiet = next;
         tokio::time::sleep(pause).await;
     }
 }
 
 /// The quiet count and the wait before the next read, given `quiet` polls
-/// in a row that found a paused (`idle_unconfirmed`) task unchanged before
-/// this one, the task's state `now`, and whether this poll found it
-/// `unchanged`. A paused task waits [`PAUSED_POLL`], doubling with each
-/// unchanged poll up to [`MAX_PAUSED_POLL`]; any change -- the task moved,
-/// the agent's state or state sequence -- starts again from the shortest.
-/// Any other state is read every [`POLL`].
-fn paused_poll(quiet: u32, now: TaskState, unchanged: bool) -> (u32, Duration) {
-    if now != TaskState::IdleUnconfirmed {
+/// in a row that found a paused (`idle_unconfirmed` or blocked) task
+/// unchanged before this one, whether the task is `paused` now, and whether
+/// this poll found it `unchanged`. A paused task waits [`PAUSED_POLL`],
+/// doubling with each unchanged poll up to [`MAX_PAUSED_POLL`]; any change
+/// -- the task moved, the agent's state or state sequence -- starts again
+/// from the shortest. Any other task is read every [`POLL`].
+fn paused_poll(quiet: u32, paused: bool, unchanged: bool) -> (u32, Duration) {
+    if !paused {
         return (0, POLL);
     }
     let quiet = if unchanged { quiet + 1 } else { 0 };
@@ -652,23 +788,24 @@ mod tests {
 
     #[test]
     fn a_paused_task_is_read_less_often_while_nothing_changes() {
-        use TaskState::{IdleUnconfirmed as Paused, Working};
+        let (paused, working) = (true, false);
         let s = Duration::from_secs;
-        // Successive polls of one follower: (task state, unchanged since the
-        // last poll) and the wait before the next read.
+        // Successive polls of one follower: (paused -- idle_unconfirmed or
+        // blocked, unchanged since the last poll) and the wait before the
+        // next read.
         let mut quiet = 0;
         for (step, (now, unchanged, wait)) in [
-            (Paused, false, s(12)),
-            (Paused, true, s(24)),
-            (Paused, true, s(48)),
-            (Paused, true, s(60)),
-            (Paused, true, s(60)),
+            (paused, false, s(12)),
+            (paused, true, s(24)),
+            (paused, true, s(48)),
+            (paused, true, s(60)),
+            (paused, true, s(60)),
             // A change starts the curve again.
-            (Paused, false, s(12)),
-            (Paused, true, s(24)),
+            (paused, false, s(12)),
+            (paused, true, s(24)),
             // Not paused: the ordinary poll, and the count is gone.
-            (Working, true, POLL),
-            (Paused, true, s(24)),
+            (working, true, POLL),
+            (paused, true, s(24)),
         ]
         .into_iter()
         .enumerate()
@@ -687,9 +824,11 @@ mod tests {
         let soon = Duration::from_secs(1);
         let late = UNCONFIRMED_AFTER;
         let done = || Verdict::Done("all green".into());
+        let green = Some(Marker::Done("all green".into()));
+        let stuck = Some(Marker::Blocked("no such file".into()));
         // Each row: the polls one follower sees, in order (task state, pane,
-        // marker summary on screen, time followed), and the verdict of the last.
-        type Poll = (T, Seen, Option<&'static str>, Duration);
+        // last marker on screen, time followed), and the verdict of the last.
+        type Poll = (T, Seen, Option<Marker>, Duration);
         let cases: Vec<(&str, Vec<Poll>, Verdict)> = vec![
             (
                 "starting is work",
@@ -698,22 +837,22 @@ mod tests {
             ),
             (
                 "the marker is done",
-                vec![(T::Working, agent(Idle, None), Some("all green"), soon)],
+                vec![(T::Working, agent(Idle, None), green.clone(), soon)],
                 done(),
             ),
             (
                 "the marker found after a restart is done, whatever the agent does now",
-                vec![(T::IdleUnconfirmed, Seen::NoAgent, Some("all green"), soon)],
+                vec![(T::IdleUnconfirmed, Seen::NoAgent, green.clone(), soon)],
                 done(),
             ),
             (
                 "a marker while the agent still works is not the end yet",
-                vec![(T::Working, agent(Working, None), Some("all green"), soon)],
+                vec![(T::Working, agent(Working, None), green.clone(), soon)],
                 Verdict::Stay,
             ),
             (
                 "a marker read before the pane closed is done",
-                vec![(T::Working, Seen::Gone, Some("all green"), soon)],
+                vec![(T::Working, Seen::Gone, green.clone(), soon)],
                 done(),
             ),
             (
@@ -823,6 +962,43 @@ mod tests {
                 Verdict::Failed(AGENT_EXITED),
             ),
             (
+                "the blocked marker waits with its reason",
+                vec![(T::Working, agent(Idle, None), stuck.clone(), soon)],
+                Verdict::Blocked("no such file".into()),
+            ),
+            (
+                "a blocked task stays waiting while its agent sits idle",
+                vec![
+                    (T::Working, agent(Idle, None), stuck.clone(), soon),
+                    (T::Waiting, agent(Idle, None), stuck.clone(), late),
+                    (T::Waiting, agent(Idle, None), stuck.clone(), late),
+                ],
+                Verdict::Stay,
+            ),
+            (
+                "an answered block works, and its old line does not block again",
+                vec![
+                    (T::Working, agent(Idle, None), stuck.clone(), soon),
+                    (T::Waiting, agent(Working, None), stuck.clone(), soon),
+                    (T::Working, agent(Idle, None), stuck.clone(), soon),
+                    (T::Working, agent(Idle, None), stuck.clone(), soon),
+                ],
+                Verdict::Unconfirmed,
+            ),
+            (
+                "a blocked task is done on the done marker",
+                vec![
+                    (T::Working, agent(Idle, None), stuck.clone(), soon),
+                    (T::Waiting, agent(Idle, None), green.clone(), soon),
+                ],
+                done(),
+            ),
+            (
+                "the marker of a blocked agent still busy is not read yet",
+                vec![(T::Working, agent(Working, None), stuck.clone(), soon)],
+                Verdict::Stay,
+            ),
+            (
                 "a finished task stays",
                 vec![(T::Done, Seen::Gone, None, soon)],
                 Verdict::Stay,
@@ -832,9 +1008,23 @@ mod tests {
             let mut progress = Progress::default();
             let mut verdict = Verdict::Stay;
             for (task, seen, marker, elapsed) in polls {
-                verdict = judge(task, seen, marker, &mut progress, elapsed);
+                verdict = judge(task, seen, marker.as_ref(), &mut progress, elapsed);
             }
             assert_eq!(verdict, expected, "{name}");
+        }
+        // Blocked by tasks.complete (the task's history says so): the rest
+        // of the agent's turn is not an answer; work after it stopped is.
+        let mut progress = Progress::default();
+        progress.blocked(true);
+        let polls = [
+            (agent(Working, None), Verdict::Stay),
+            (agent(Idle, None), Verdict::Stay),
+            (agent(Idle, None), Verdict::Stay),
+            (agent(Working, None), Verdict::Working),
+        ];
+        for (step, (seen, expected)) in polls.into_iter().enumerate() {
+            let verdict = judge(T::Waiting, seen, None, &mut progress, late);
+            assert_eq!(verdict, expected, "blocked by the tool, poll {step}");
         }
     }
 
@@ -843,11 +1033,16 @@ mod tests {
         // The request echoed in the prompt is not the marker; the agent's line is.
         let goal = completion_request("fix the build");
         let echoed = format!("> {}\n", goal.replace('\n', "\n  "));
-        assert_eq!(done_marker(&echoed), None);
+        assert_eq!(marker(&echoed), None);
         let finished = format!("{echoed}⏺ MUQUN_TASK_DONE: build fixed,   12 tests pass\n\n❯ \n");
         assert_eq!(
-            done_marker(&finished).as_deref(),
-            Some("build fixed, 12 tests pass")
+            marker(&finished),
+            Some(Marker::Done("build fixed, 12 tests pass".into()))
+        );
+        let blocked = format!("{echoed}⏺ MUQUN_TASK_BLOCKED: notes.md does not exist\n");
+        assert_eq!(
+            marker(&blocked),
+            Some(Marker::Blocked("notes.md does not exist".into()))
         );
         // A narrow pane wraps the echo so the marker starts a line, and an
         // agent restating the request writes a placeholder of its own.
@@ -856,16 +1051,41 @@ mod tests {
             "> ... print one line exactly in this\n  form:\n  MUQUN_TASK_DONE: <one-\n  line summary>\n",
             "⏺ I will end with\n  MUQUN_TASK_DONE: <summary>\n",
             "⏺ I will end with\n  MUQUN_TASK_DONE: …\n",
+            "> ... -- or, blocked, MUQUN_TASK_BLOCKED:\n  <one-line reason>\n",
+            "⏺ Otherwise\n  MUQUN_TASK_BLOCKED: <one-\n",
         ] {
-            assert_eq!(done_marker(not_yet), None, "{not_yet}");
+            assert_eq!(marker(not_yet), None, "{not_yet}");
         }
-        assert_eq!(
-            pane_title(None, &"fix the build ".repeat(9))
-                .chars()
-                .count(),
-            40
-        );
-        assert_eq!(pane_title(Some("build"), "fix the build"), "build");
+
+        // A title: the label, the session's name, else the goal's first
+        // sentence cut at a word.
+        let long = "fix the build ".repeat(9);
+        for (label, session, goal, expected) in [
+            (Some("build"), Some("Fix CI"), "fix the build", "build"),
+            (None, Some("Fix CI"), "fix the build", "Fix CI"),
+            (
+                None,
+                None,
+                "Fix src/main.rs. Then run the tests",
+                "Fix src/main.rs",
+            ),
+            (
+                None,
+                None,
+                "Why does it fail? Look at the log",
+                "Why does it fail?",
+            ),
+            (None, None, "整理笔记。然后提交", "整理笔记"),
+            (None, None, "first line\nsecond line", "first line"),
+            (
+                None,
+                None,
+                long.as_str(),
+                "fix the build fix the build fix the build fix the build fix…",
+            ),
+        ] {
+            assert_eq!(title(label, session, goal), expected, "{goal}");
+        }
 
         let claude =
             "⏺ Bash(cargo test)\n  ⎿  ok\n\n⏺ All 12 tests pass.\n\n❯ \n  ? for shortcuts\n";

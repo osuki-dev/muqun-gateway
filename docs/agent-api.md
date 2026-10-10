@@ -1477,6 +1477,7 @@ Server → client:
 | `{"t":"subscribed","asid":"ses_1"}` · `{"t":"subscribed","all":true}` · `{"t":"subscribed","tasks":true}` | The subscription is in effect: matching events published from here on reach this socket. Start catch-up after this, not before. |
 | `{"t":"event","asid":"ses_1","seq":12,"event":"agent.timeline.upsert","data":{…}}` | One domain event. `event` is the SSE `event:` name and `data` is the SSE `data:` payload **byte for byte**, embedded as JSON rather than as a string. `asid` and `seq` repeat the event's own (`asid` is `""` and `seq` 0 for `agent.worktree.changed` and `agent.resync`). |
 | `{"t":"task","asid":null,"seq":12,"event":"task.updated","data":{…}}` | One full `TaskView` on a `subscribe_tasks` socket. |
+| `{"t":"defaults","default_cwd":"/home/user/project"}` | On a `subscribe_tasks` socket: the directory a task this device opens without `cwd` runs in (`"~"`, the home directory, when it has no usable previous one; `null` when unknown). See **Task updates** below. |
 | `{"t":"resync","asid":"ses_1"}` | This socket fell behind the gateway's event backlog; refetch that session. `asid` `""` means every session. One per subscribed session, or a single `""` under `subscribe_all`. With `"tasks":true` it is about task updates instead: refetch `GET /api/tasks`. |
 | `{"t":"pong"}` | Answer to `ping`. |
 | `{"t":"error","code":"…"}` | Sent immediately before the gateway closes the socket (close code 1008). |
@@ -1529,6 +1530,32 @@ task views with `"t":"task"`, and no
 agent-session or pane traffic. It still receives the initial `hello` and a
 `{"t":"subscribed","tasks":true}` acknowledgement. Task lag uses the same
 task resync frame.
+
+A `subscribe_tasks` socket is also told where a task this device opens
+without `cwd` (`POST /api/tasks`) will run, so the app can show it before
+the user sends: one `{"t":"defaults","default_cwd":…}` frame right after the
+`subscribed` acknowledgement, another after each task resync frame, and a
+new one whenever a task the device opens changes the answer. `default_cwd`
+is the directory of the device's newest task while that is still a
+directory, else `"~"` (the home directory); `null` only when the task store
+cannot be read. `GET /api/tasks/defaults` answers `{"default_cwd": …}` by the
+same rule for a client without the socket.
+
+**Task fields and outcomes** (full contract in `docs/mcp.md`):
+
+- `TaskView.title` (always a string): the task's `label`; else, for a session
+  delegation, the name the agent session gave itself (not its placeholder,
+  not the goal restated); else the goal's first sentence -- cut to 60
+  characters at a word with `…`. Computed for each view, so it follows the
+  session's name; show it instead of the raw `goal`.
+- `tasks.complete` takes `outcome`: `done` (default) or `blocked`. A blocked
+  agent -- a missing file, an unclear request, a permission it cannot get --
+  may instead print `MUQUN_TASK_BLOCKED: <one-line reason>`, beside
+  `MUQUN_TASK_DONE: <one-line summary>`. Either moves the task to `waiting`
+  with the reason as `summary` (events carry source `tasks_complete_blocked` or
+  `marker_blocked`). It stays open: the user answers in the session or pane
+  and the agent goes on, or the device confirms or cancels it. Going idle
+  does not turn a blocked task into `idle_unconfirmed`.
 
 **Catch-up is unchanged.** The socket delivers live events only. After a
 (re)connect, re-subscribe, wait for `subscribed`, then catch up each session

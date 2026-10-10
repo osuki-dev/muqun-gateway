@@ -136,7 +136,7 @@ says `"truncated": true` when it left older ones out. `tasks.wait` and
 | `tasks.wait` | `task_id`; `timeout_s?`: 1..=45, default 30 | The task view, plus `stdout_tail` for a command, and `answer` for a session delegation that is done or `idle_unconfirmed`: the agent's last message in full (`summary` holds only its first 240 characters, on one line). Returns once the task is done, failed, cancelled, `waiting` or `idle_unconfirmed` (its agent stopped without saying it is finished), or when the time is up. Wait up to timeout_s (max 45) for a task to reach done/failed/waiting, or idle_unconfirmed (its agent stopped without completing). Returns the current state and summary; call again while it says working. |
 | `tasks.read` | `task_id`; `what`: `summary` or `timeline`; `cursor?` (timeline only) | `summary`: the task view. `timeline`: `{task_id, items, cursor}`, the most recent agent items after `cursor`; pass the returned `cursor` to read on. Read a task you created: its summary or recent timeline. A command has no timeline. |
 | `tasks.cancel` | `task_id` | The task view after the cancel. Interrupt a task you created. |
-| `tasks.complete` | `summary`: what was done, one line (non-empty, at most 32 KiB; stored cut to 240 characters); `task_id?`: default, the task the calling session works on | The task view, now `done` with that summary. Say that the task you were given is finished. Only the session working on the task may complete it (see [Finishing a delegation](#finishing-a-delegation)); any other task, none found, or a task that has already ended is `task_not_found`, whose message tells the agent to print the `MUQUN_TASK_DONE: <one-line summary>` line instead. |
+| `tasks.complete` | `summary`: what was done -- or, blocked, why the agent stopped -- one line (non-empty, at most 32 KiB; stored cut to 240 characters); `outcome?`: `done` (default) or `blocked`; `task_id?`: default, the task the calling session works on | The task view: `done` with that summary, or, for `outcome: "blocked"`, `waiting` with the reason as its `summary` (see [Blocked](#blocked)). Say how the task you were given ended: finished, or stopped because you need the user (a missing file, an unclear request, a permission you cannot get). Only the session working on the task may complete it (see [Finishing a delegation](#finishing-a-delegation)); any other task, none found, or a task that has already ended is `task_not_found`, whose message tells the agent to print the `MUQUN_TASK_DONE: <one-line summary>` (or `MUQUN_TASK_BLOCKED: <one-line reason>`) line instead. A task already `waiting` that is blocked again is answered as it stands. |
 
 Error codes:
 
@@ -177,9 +177,10 @@ device sees all of them. Announced as the `task_ledger` capability;
 
 A delegation follows its agent session as the agent reports it: when the
 session finishes a turn (idle after it was busy) the task is `done` if the
-agent's last message carries the completion marker, and `idle_unconfirmed`
-otherwise (see [Finishing a delegation](#finishing-a-delegation)); a paused
-task whose session runs again is `working`. The paused task's `summary` is
+agent's last message carries the completion marker, `waiting` if it carries
+the blocked marker, and `idle_unconfirmed` otherwise (see [Finishing a
+delegation](#finishing-a-delegation)); a paused task whose session runs
+again is `working` (a [blocked](#blocked) one only on a later turn). The paused task's `summary` is
 the last assistant message as a hint, on one line and cut to 240
 characters, whichever agent it is (the agent's own timeline read first; when
 that holds no answer written since the task began -- DeepSeek announces the
@@ -198,9 +199,11 @@ delegation whose agent no longer has the session fails with `session gone: <the 
 a delegation whose session failed fails with its error line as `summary`;
 a delegation whose session went idle after the task was created is `done`
 when the agent's last message carries the completion marker (read first, so
-a turn that ended while the gateway was down is settled by it) and
-`idle_unconfirmed` with the last assistant text as a hint otherwise; a paused
-delegation whose session runs again is `working`; a task still bound to nothing
+a turn that ended while the gateway was down is settled by it), `waiting` when
+it carries the blocked marker, and `idle_unconfirmed` with the last assistant
+text as a hint otherwise (a [blocked](#blocked) task stays `waiting`); a
+paused delegation whose session runs again is `working` (a blocked one, on a
+turn after the one that said so); a task still bound to nothing
 10 minutes after it was created (the gateway stopped before dispatching it)
 fails with `never dispatched`. A task whose terminal backend
 or agent cannot be reached is left as it is.
@@ -213,6 +216,7 @@ unknown id is `404 task_not_found`; any other failure is `500 task_failed`.
 | `GET /api/tasks?state=a,b&limit=50` | `{"tasks": [TaskView]}`, newest update first. `state` is a comma list of the states below; an unknown name is `400 invalid_request`. `limit` defaults to 50 and is capped at 200. |
 | `GET /api/tasks?root=<task_id>` | The same list, of that task and every task below it (its children, theirs, and so on); `state` and `limit` apply too. An unknown id lists nothing; an empty `root` is `400 invalid_request`. |
 | `POST /api/tasks` | Opens a delegation from the device; see below. |
+| `GET /api/tasks/defaults` | `{"default_cwd": string \| null}` for the calling device: the directory a delegation it opens without `cwd` runs in -- its newest task's directory while that is still a directory, else its home directory, as `~` (`null` only when the task store cannot be read). Any query string is ignored. The task WebSocket subscription carries the same answer as a `defaults` frame (see [Agent API](agent-api.md)). |
 | `GET /api/tasks/{id}` | `{"task": TaskView, "events": [TaskEvent]}`; `events` is the task's state history, oldest first. |
 | `POST /api/tasks/{id}/cancel` | The `TaskView` after the cancel. Interrupts the agent or sends Ctrl-C to the command. Cancelling a finished task changes nothing. |
 | `POST /api/tasks/{id}/complete` | The `TaskView`, now `done`. The user confirms that a delegation opened on a device (`origin: device`; any paired device may confirm it, as any may cancel it) that is `idle_unconfirmed` or `waiting` is finished. Body `{"summary"?: string}`, optional (the body may be left out): the new `summary`, one line, cut to 240 characters; without it the task keeps the hint it had. Published as `task.updated`. A task already `done` is answered as it stands; any other state or origin is `409 task_not_confirmable`; a body that is not that JSON object is `400 invalid_request`. |
@@ -227,6 +231,17 @@ unknown id is `404 task_not_found`; any other failure is `500 task_failed`.
   assistant in the pane of an open task) or `mcp` (any other MCP host). Tasks
   stored before origins existed read as `mcp`.
 - `label`: the short title the requester gave, or `null`.
+- `title`: what to call the task, never empty: its `label`; else, for a
+  session delegation, the name its agent session gave itself (ignored while
+  it is empty, the provider's placeholder -- `New session - <date>`, `New
+  thread` -- or the goal restated); else the goal's first sentence (up to the
+  first `.`, `?` or `!` followed by a space, a `。`, `？` or `！`, or a line
+  end). At most 60 characters, cut at a word with `…`. Made each time the
+  view is, so it follows the session's name as the agent renames it (a
+  rename re-publishes the task); the session's name is kept in memory, so
+  after a gateway restart an ended task's title is its goal's sentence until
+  its session is renamed again. A terminal agent's tab and pane are named
+  the same way.
 - `requested_by`: `{"kind": "device", "id": "<device id>", "name": "<device
   name>"}` for a device's task; `null` otherwise.
 - `progress` (present only while the task is open and something is known;
@@ -314,7 +329,7 @@ error line as `summary`, or `done` -- since the task and its session exist.
 `503 agent_unavailable`, never started in a pane). Then, for `POST /api/tasks`
 and `tasks.delegate` alike, the gateway opens a new tab in `cwd` in the first
 reachable terminal session, names the tab and pane after the task (its
-`label`, else the first 40 characters of the goal), starts the agent in it
+`title`, see [Tasks API](#tasks-api)), starts the agent in it
 exactly as `POST /api/sessions/{id}/agents/spawn` does (its bypass launch
 arguments, `agent_env`, folder trust for `cwd`) and gives it the goal as its
 first prompt. Claude Code and Codex on a tmux session get it on their command
@@ -373,7 +388,7 @@ finishes the task. The goal is given with one more paragraph:
 ```
 <goal>
 
-When the whole task is finished, call the muqun tool tasks.complete with a one-line summary; if you cannot call it, print one line exactly in this form: MUQUN_TASK_DONE: <one-line summary>
+When the whole task is finished, call the muqun tool tasks.complete with a one-line summary, or with outcome "blocked" and the reason if you stopped because you need the user (a missing file, an unclear request, a permission you cannot get); if you cannot call it, print one line exactly in this form: MUQUN_TASK_DONE: <one-line summary> -- or, blocked, MUQUN_TASK_BLOCKED: <one-line reason>
 ```
 
 (the stored `goal` is the goal as given). The marker is looked for in the
@@ -384,18 +399,24 @@ line of the echoed request (a narrow pane can wrap the echo so that the marker
 starts a line), carries a summary that is not the placeholder or a piece of
 it (`<…`, `…`), and the agent is not working, starting or blocked at that
 poll. The task is then `done` with that summary (one line, at most 240
-characters).
+characters). The blocked marker, `MUQUN_TASK_BLOCKED: <reason>`, is read by
+the same rules (the last marker line of either kind counts) and makes the
+task [blocked](#blocked).
 
 The task follows the pane as the terminal backend reports it (Herdr's own
 agent state; on tmux, the state read off the screen), polled every 2 s (every
-12 s while it is `idle_unconfirmed`, backing off to every 60 s while
-nothing changes), recorded with source `pane_follower` and
+12 s while it is `idle_unconfirmed` or blocked, backing off to every 60 s
+while nothing changes), recorded with source `pane_follower` (a blocked
+marker: `marker_blocked`) and
 published as `task.updated` like every change. The marker is checked first on
 every poll:
 
 | The pane | The task |
 |---|---|
 | the marker, as above | `done`, `summary` = the marker's summary |
+| a blocked marker not acted on before, the agent not busy | `waiting`, `summary` = the reason |
+| blocked: the agent idle, or still busy before it was seen idle on two polls | stays `waiting` |
+| blocked: the agent working after it was seen idle on two polls (the user answered) | `working` |
 | the agent working | `working` (from `dispatching`, or back from `waiting` or `idle_unconfirmed`); an agent still starting, or idle, while its task is `dispatching` (within the start grace) leaves it there. Claude Code counts as working only with its `esc to interrupt` footer on screen or a new `⏺` row since the poll before |
 | the agent blocked on a menu: an approval or a question | `waiting` |
 | the agent idle on two polls in a row, after it was seen working (or after its Herdr state sequence moved), or 30 s after the start | `idle_unconfirmed`, `summary` = a hint: the agent's last prose block when the gateway has a transcript dictionary for it (Claude Code, Codex, ...), else the screen's last line with any letter or digit in it |
@@ -442,16 +463,16 @@ signals:
 2. **The marker line** `MUQUN_TASK_DONE: <one-line summary>` at the start of
    a line of the agent's final message (a session) or of its pane's output (a
    terminal agent), not the placeholder or a piece of it. The summary is the
-   marker's text.
+   marker's text. Recorded with the follower's source.
 3. **The device**, `POST /api/tasks/{id}/complete`, for a task it opened that
    is `idle_unconfirmed` or `waiting` ("确认完成" on the phone). Recorded with
    source `device_confirm`.
 
 The first prompt of every delegation is the goal followed by one closing
-paragraph (the stored `goal` is the goal alone):
+paragraph that names both outcomes (the stored `goal` is the goal alone):
 
 ```text
-When the whole task is finished, call the muqun tool tasks.complete with a one-line summary; if you cannot call it, print one line exactly in this form: MUQUN_TASK_DONE: <one-line summary>
+When the whole task is finished, call the muqun tool tasks.complete with a one-line summary, or with outcome "blocked" and the reason if you stopped because you need the user (a missing file, an unclear request, a permission you cannot get); if you cannot call it, print one line exactly in this form: MUQUN_TASK_DONE: <one-line summary> -- or, blocked, MUQUN_TASK_BLOCKED: <one-line reason>
 ```
 
 A session delegation moves like this (moves pass the states between, so a
@@ -460,15 +481,42 @@ A session delegation moves like this (moves pass the states between, so a
 | The session | The task |
 |---|---|
 | the turn ends (idle after busy), the last message carries the marker | `done`, `summary` = the marker's summary |
-| the turn ends without the marker | `idle_unconfirmed`, `summary` = the last message as a hint |
+| the turn ends, the last message carries the blocked marker | `waiting` ([blocked](#blocked)), `summary` = the reason |
+| the turn ends without the marker | `idle_unconfirmed`, `summary` = the last message as a hint; a blocked task stays `waiting` |
 | a permission request or question form is pending | `waiting` (back to `working` when answered) |
-| busy again after a pause | `working` |
+| busy again after a pause | `working`; a blocked task, only on a turn that starts after the one that reported the block |
 | the session failed / was interrupted | `failed` with the error line / `cancelled` |
 
 A question the agent asks in plain text, without a form the gateway can see,
 cannot be told from a pause: it is `idle_unconfirmed`, and the question is
-its hint. `exec.run` command tasks are not delegations: their exit code
-finishes them, as before.
+its hint -- unless the agent says it is blocked. `exec.run` command tasks are
+not delegations: their exit code finishes them, as before.
+
+### Blocked
+
+An agent that stops because it needs the user -- a file that does not exist,
+a request it cannot make sense of, a permission it cannot get -- says so
+instead of finishing: `tasks.complete` with `outcome: "blocked"` and the
+reason as `summary` (recorded with source `tasks_complete_blocked`), or the
+line `MUQUN_TASK_BLOCKED: <one-line reason>`, read like the done marker
+(source `marker_blocked`). The task moves to `waiting` with the reason as
+its `summary`, so the phone never shows a finished task over a failure.
+
+Blocked is not an end. The task stays open while the user answers in the
+session or pane; a gateway restart keeps it (the task's last event says it
+is blocked). While it is blocked:
+
+- the agent going idle, or a turn ending without the done marker, leaves it
+  `waiting` -- it is never `idle_unconfirmed` for that;
+- the rest of the turn that reported the block is not an answer: a session
+  delegation goes back to `working` only on a turn that starts after that one
+  ended, a terminal agent's only once it was seen idle on two polls and then
+  works again;
+- the done marker or `tasks.complete` (outcome `done`) makes it `done`, and
+  the device can still confirm (`POST /api/tasks/{id}/complete`) or cancel it.
+
+A terminal agent's blocked line stays in the pane's output; once the task
+has moved on, the same line does not block it again (a new reason does).
 
 ### Task tree
 

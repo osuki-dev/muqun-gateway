@@ -9,9 +9,11 @@
 //! - A delegation whose session the agent no longer has fails ("session
 //!   gone"); one whose session failed fails with the error line as its
 //!   summary; one whose session went idle after the task was created is
-//!   done when the agent's last message carries the completion marker and
-//!   `idle_unconfirmed` (the last message's line as a hint) otherwise; a
-//!   paused one whose session runs again is working.
+//!   done when the agent's last message carries the completion marker,
+//!   `waiting` when it carries the blocked marker, and `idle_unconfirmed`
+//!   (the last message's line as a hint) otherwise -- except a blocked task,
+//!   which stays `waiting`; a paused one whose session runs again is
+//!   working (a blocked one, on a turn after the one that said so).
 //!
 //! - A terminal agent's delegation (bound to a pane, with `agent_id`) gets
 //!   its pane follower started if none runs (after a restart, say), which
@@ -41,7 +43,7 @@ use std::time::Duration;
 use super::domain::one_line;
 use super::domain::{now_ms, Task, TaskBinding, TaskChange, TaskFilter, TaskKind, TaskState};
 use super::service::{
-    finished_since, is_running, session_failure, summary_timeline, turn_end, OPEN_STATES,
+    finished_since, is_running, session_failure, sourced, summary_timeline, turn_end, OPEN_STATES,
     SUMMARY_CHARS,
 };
 use super::{pane_agent, same_pane};
@@ -198,13 +200,18 @@ async fn settle_delegation(state: &AppState, task: &Task, agent_id: &str, asid: 
             return false;
         }
     };
+    state.tasks.session_named(asid, &session.title).await;
     if session.status == AgentSessionStatus::Failed {
         let error = session.error.as_ref();
         let why = session_failure(Some(&manager), error, asid, task.created_ms).await;
         return fail(state, task, &why).await;
     }
-    if is_running(session.status) && task.state == TaskState::IdleUnconfirmed {
-        return moved(state, task, change(TaskState::Working)).await;
+    // A paused task whose session runs again works; a blocked one only on a
+    // turn after the one that reported it (`TaskService::settle`).
+    let blocked =
+        task.state == TaskState::Waiting && state.tasks.blocked_at(&task.id).await.is_some();
+    if is_running(session.status) && (task.state == TaskState::IdleUnconfirmed || blocked) {
+        return settled(state, task, change(TaskState::Working)).await;
     }
     if !finished_since(&session, task.created_ms) {
         // Left dispatching by a stop between binding the session and sending
@@ -220,11 +227,18 @@ async fn settle_delegation(state: &AppState, task: &Task, agent_id: &str, asid: 
     if ended.to == task.state {
         return false;
     }
-    let ended = TaskChange {
-        source: SOURCE.into(),
-        ..ended
-    };
-    moved(state, task, ended).await
+    settled(state, task, sourced(ended, SOURCE)).await
+}
+
+/// [`moved`] for a session delegation, which a blocked task may refuse.
+async fn settled(state: &AppState, task: &Task, to: TaskChange) -> bool {
+    match state.tasks.settle(state, task, to).await {
+        Ok(now) => now.seq != task.seq,
+        Err(error) => {
+            tracing::debug!(task = %task.id.0, %error, "task driver: move refused");
+            false
+        }
+    }
 }
 
 /// A session the agent says it does not have. OpenCode answers a deleted

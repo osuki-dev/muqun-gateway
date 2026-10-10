@@ -27,6 +27,7 @@ const MAX_LABEL_CHARS: usize = 200;
 pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
     router
         .route("/api/tasks", get(list).post(create))
+        .route("/api/tasks/defaults", get(defaults))
         .route("/api/tasks/{id}", get(read))
         .route("/api/tasks/{id}/cancel", post(cancel))
         .route("/api/tasks/{id}/complete", post(complete))
@@ -96,6 +97,17 @@ async fn list(
     };
     let tasks = tasks.map_err(|error| failed(error.into()))?;
     Ok(Json(json!({ "tasks": tasks })))
+}
+
+/// `GET /api/tasks/defaults`: what a task the device opens without `cwd`
+/// runs in (see [`TaskService::default_cwd`]); `null` when unknown.
+///
+/// [`TaskService::default_cwd`]: super::service::TaskService::default_cwd
+async fn defaults(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
+    let by = principal(require_device(&state, &headers)?);
+    Ok(Json(
+        json!({ "default_cwd": state.tasks.default_cwd(&by).await }),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -720,6 +732,16 @@ mod tests {
                     })
                     .await
                     .unwrap();
+            }
+            // What the device is told before it asks: the same answer, home as `~`.
+            if cwd.is_none() {
+                let (_, defaults) = send(&state, "GET", "/api/tasks/defaults", None, true).await;
+                let reported = if expected == home {
+                    "~"
+                } else {
+                    expected.to_str().unwrap()
+                };
+                assert_eq!(defaults, json!({ "default_cwd": reported }), "{name}");
             }
             let mut body = json!({ "goal": name, "agent_id": "opencode" });
             if let Some(cwd) = cwd {

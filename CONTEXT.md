@@ -82,12 +82,18 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
   (`binding.kind == "pane"` with `agent_id`); `pane_agent.rs` maps that pane
   agent's backend state onto the task. A delegation of either kind is `done`
   only on an explicit signal -- the agent's `tasks.complete` MCP call, the
-  `MUQUN_TASK_DONE` marker (`pane_agent::done_marker`, read off the pane or
+  `MUQUN_TASK_DONE` marker (`pane_agent::marker`, read off the pane or
   the session's last message by `service::turn_end`), or the device's
   `POST /api/tasks/{id}/complete`; a stop without one is `idle_unconfirmed`.
-  An open task's `progress` line (what it is doing now) lives in
-  `TaskService` memory only, fed by timeline upserts and pane polls and
-  published at most every 2 s per task.
+  An agent that needs the user says it is blocked (`tasks.complete` with
+  `outcome: blocked`, or `MUQUN_TASK_BLOCKED`): the task is `waiting`, and
+  stays so through idles until the agent works on a later turn or finishes
+  (`TaskService::blocked_at`/`settle`, `pane_agent::judge`).
+  An open task's `progress` line (what it is doing now) and the agent
+  session names behind `TaskView.title` live in `TaskService` memory only,
+  fed by agent events and pane polls; progress is published at most every
+  2 s per task. A device's default task folder (`default_cwd`) is served by
+  `GET /api/tasks/defaults` and a `defaults` frame on `subscribe_tasks`.
   Every task carries `parent_task_id` and `origin`; `children` counts are
   computed when a view is made, never stored. The driver's pass deletes
   tasks that ended over 30 days ago (`TASK_RETENTION`) with their events;
@@ -193,8 +199,10 @@ on two polls after it was seen busy (or after 30 s) is `idle_unconfirmed`
 (polled every 12 s, backing off to 60 s while nothing changes), and a pane
 that closed or lost its agent is `failed`.
 `done` needs an explicit signal: a `MUQUN_TASK_DONE: <summary>` line below the
-echoed request in the pane's recent output (`done_marker`), or the agent's
-`tasks.complete` call; an idle agent is never finished. Pane, launch and prompt
+echoed request in the pane's recent output (`marker`), or the agent's
+`tasks.complete` call; an idle agent is never finished. A
+`MUQUN_TASK_BLOCKED: <reason>` line (or `tasks.complete` with outcome
+`blocked`) makes it `waiting` until the user's answer sets it working. Pane, launch and prompt
 delivery live in `src/agents/session_routes.rs`; the prompt wording, the marker
 and the `judge` table in `src/tasks/pane_agent.rs`.
 

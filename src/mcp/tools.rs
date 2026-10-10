@@ -19,7 +19,8 @@ use crate::fleet::manifest::FleetService;
 use crate::tasks::domain::{clip, TaskBinding, TaskId, TaskPrincipal};
 use crate::tasks::run_command::{RunHandle, RunRequest};
 use crate::tasks::service::{
-    summary_line, task_directory, valid_goal, valid_name, DelegateRequest, ReadWhat, TaskError,
+    summary_line, task_directory, valid_goal, valid_name, DelegateRequest, Outcome, ReadWhat,
+    TaskError,
 };
 use crate::AppState;
 
@@ -350,8 +351,23 @@ pub(crate) struct CompleteArgs {
     /// The task you are working on; default: the one this session was given.
     #[serde(default)]
     pub task_id: Option<String>,
-    /// What was done, in one line (cut to 240 characters).
+    /// What was done -- or, blocked, why you stopped -- in one line (cut to
+    /// 240 characters).
     pub summary: String,
+    /// `done` (the default) when the task is finished; `blocked` when you
+    /// stopped because you need the user: a missing file, an unclear
+    /// request, a permission you cannot get. The user answers in this
+    /// session and you go on; call tasks.complete again when it is done.
+    #[serde(default)]
+    pub outcome: CompleteOutcome,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CompleteOutcome {
+    #[default]
+    Done,
+    Blocked,
 }
 
 #[derive(Clone)]
@@ -477,7 +493,7 @@ impl MuqunMcp {
 
     #[tool(
         name = "tasks.complete",
-        description = "Say that the task you were given is finished, with a one-line summary. Only the session (or terminal pane) working on the task can complete it; stopping or going idle does not."
+        description = "Say how the task you were given ended, in one line: finished (outcome done, the default), or blocked because you need the user (outcome blocked, with the reason: a missing file, an unclear request, a permission you cannot get). Only the session (or terminal pane) working on the task can complete it; stopping or going idle does not, and a blocked task stays open until you call this again with done."
     )]
     async fn tasks_complete(
         &self,
@@ -499,10 +515,15 @@ impl MuqunMcp {
             return Ok(fail(
                 "task_not_found",
                 "No open task of this session was found. If you finished it, print the line \
-                 MUQUN_TASK_DONE: <one-line summary> instead.",
+                 MUQUN_TASK_DONE: <one-line summary> instead (or, blocked, \
+                 MUQUN_TASK_BLOCKED: <one-line reason>).",
             ));
         };
-        reply(self.state.tasks.complete(&id, &args.summary).await)
+        let outcome = match args.outcome {
+            CompleteOutcome::Done => Outcome::Done,
+            CompleteOutcome::Blocked => Outcome::Blocked,
+        };
+        reply(self.state.tasks.complete(&id, &args.summary, outcome).await)
     }
 
     #[tool(name = "tasks.cancel", description = "Interrupt a task you created.")]
@@ -527,7 +548,8 @@ impl ServerHandler for MuqunMcp {
                 "Muqun Gateway on this computer. fleet.describe says what it has, exec.run \
                  runs short commands, tasks.delegate + tasks.wait hand work to a coding agent. \
                  Waits are capped at 45 s; call tasks.wait again while it says working. \
-                 When you finish a task you were given, call tasks.complete.",
+                 When you finish a task you were given, call tasks.complete; when you \
+                 stop because you need the user, call it with outcome blocked.",
             )
     }
 }

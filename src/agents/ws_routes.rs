@@ -39,6 +39,7 @@ use tokio::sync::{broadcast, oneshot};
 
 use super::domain::AgentDomainEvent;
 use super::routes::agent_event_record;
+use crate::tasks::domain::{PrincipalKind, TaskPrincipal, TaskState};
 use crate::tasks::events::TaskDomainEvent;
 use crate::{
     api_error, require_device, still_paired, transport, AppState, EncryptedStreamContext,
@@ -248,6 +249,17 @@ pub(crate) fn subscribed_frame(asid: Option<&str>, tasks_ended: bool) -> String 
         ),
         None => format!(r#"{{"t":"subscribed","all":true{tasks}}}"#),
     }
+}
+
+/// What a task the device opens without `cwd` runs in (`default_cwd`, see
+/// `TaskService::default_cwd`), for a task subscription: sent after its
+/// `subscribed`, after a task resync, and when a task the device opens
+/// changes it.
+pub(crate) fn defaults_frame(default_cwd: Option<&str>) -> String {
+    format!(
+        r#"{{"t":"defaults","default_cwd":{}}}"#,
+        default_cwd.map_or_else(|| "null".to_owned(), json_string)
+    )
 }
 
 pub(crate) fn subscribed_tasks_frame() -> String {
@@ -665,6 +677,24 @@ impl Connection {
             .await;
     }
 
+    /// Send the device's `defaults` frame when `always`, or when it differs
+    /// from the one last sent (`sent`).
+    async fn send_defaults(
+        &mut self,
+        state: &AppState,
+        device: &TaskPrincipal,
+        sent: &mut Option<Option<String>>,
+        always: bool,
+    ) -> Result<(), Gone> {
+        let now = state.tasks.default_cwd(device).await;
+        if !always && sent.as_ref() == Some(&now) {
+            return Ok(());
+        }
+        let frame = defaults_frame(now.as_deref());
+        *sent = Some(now);
+        self.send(&frame).await
+    }
+
     /// Say why, then close.
     async fn fail(&mut self, error: FrameError) {
         if self.send(&error_frame(error)).await.is_ok() {
@@ -701,6 +731,12 @@ impl Connection {
         );
         recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut unanswered_pings = 0_u8;
+        let device = TaskPrincipal {
+            kind: PrincipalKind::Device,
+            id: device_id.clone(),
+        };
+        // The `defaults` frame last sent, once one was.
+        let mut defaults_sent: Option<Option<String>> = None;
 
         loop {
             tokio::select! {
@@ -750,14 +786,22 @@ impl Connection {
                     };
                     // Any frame from the client is proof it is alive.
                     unanswered_pings = 0;
-                    let reply = self
+                    let frame = self
                         .codec
                         .decode(text.as_str())
-                        .and_then(|plaintext| ClientFrame::parse(&plaintext))
-                        .and_then(|frame| subscriptions.apply(&frame));
-                    match reply {
+                        .and_then(|plaintext| ClientFrame::parse(&plaintext));
+                    let tasks_now = matches!(frame, Ok(ClientFrame::SubscribeTasks));
+                    match frame.and_then(|frame| subscriptions.apply(&frame)) {
                         Ok(Some(reply)) => {
                             if self.send(&reply).await.is_err() {
+                                return;
+                            }
+                            if tasks_now
+                                && self
+                                    .send_defaults(&state, &device, &mut defaults_sent, true)
+                                    .await
+                                    .is_err()
+                            {
                                 return;
                             }
                         }
@@ -804,6 +848,20 @@ impl Connection {
                             if self.send(&frame).await.is_err() {
                                 return;
                             }
+                            // Only a task the device just opened can change
+                            // where its next one runs.
+                            let TaskDomainEvent::Updated { task, .. } = &task;
+                            let opened = task.requested_by.as_ref().is_some_and(|by| by.id == device.id)
+                                && matches!(task.state, TaskState::Queued | TaskState::Dispatching);
+                            if subscriptions.tasks_only()
+                                && opened
+                                && self
+                                    .send_defaults(&state, &device, &mut defaults_sent, false)
+                                    .await
+                                    .is_err()
+                            {
+                                return;
+                            }
                         }
                     }
                     // Fell behind the task broadcast: a task that changed in
@@ -814,6 +872,14 @@ impl Connection {
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         if subscriptions.wants_tasks()
                             && self.send(&task_resync_frame()).await.is_err()
+                        {
+                            return;
+                        }
+                        if subscriptions.tasks_only()
+                            && self
+                                .send_defaults(&state, &device, &mut defaults_sent, true)
+                                .await
+                                .is_err()
                         {
                             return;
                         }

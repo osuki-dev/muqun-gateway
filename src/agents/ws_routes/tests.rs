@@ -607,6 +607,7 @@ fn task_update(seq: u64) -> TaskDomainEvent {
             parent_task_id: None,
             origin: Default::default(),
             label: None,
+            title: "t".into(),
             requested_by: None,
             children: Default::default(),
             progress: None,
@@ -627,6 +628,11 @@ async fn subscribe_tasks_delivers_task_views_without_session_events() {
     assert_eq!(
         next_json(&mut client).await,
         json!({ "t": "subscribed", "tasks": true })
+    );
+    // Where a task the device opens without `cwd` runs: no task yet, home.
+    assert_eq!(
+        next_json(&mut client).await,
+        json!({ "t": "defaults", "default_cwd": "~" })
     );
 
     runtime.publish_for_test(status_event("ses_1", 1));
@@ -668,6 +674,7 @@ async fn subscribe_tasks_delivers_task_views_without_session_events() {
     ] {
         send_text(&mut client, r#"{"t":"subscribe_tasks"}"#).await;
         next_json(&mut client).await;
+        assert_eq!(next_json(&mut client).await["t"], "defaults");
         send_text(&mut client, subscribe).await;
         assert_eq!(next_json(&mut client).await, expected);
     }
@@ -691,7 +698,7 @@ async fn a_subscribe_all_socket_gets_task_updates_and_a_session_socket_does_not(
     tasks.send(task_update(3)).unwrap();
     assert_eq!(
         next_text(&mut all).await.unwrap(),
-        r#"{"t":"event","asid":null,"seq":3,"event":"task.updated","data":{"task_id":"task-1","state":"working","kind":"command","goal":"make test","summary":null,"exit_code":null,"binding":{"kind":"none"},"updated_ms":5,"parent_task_id":null,"origin":"mcp","label":null,"requested_by":null,"children":{"total":0,"active":0,"waiting":0,"failed":0}}}"#
+        r#"{"t":"event","asid":null,"seq":3,"event":"task.updated","data":{"task_id":"task-1","state":"working","kind":"command","goal":"make test","summary":null,"exit_code":null,"binding":{"kind":"none"},"updated_ms":5,"parent_task_id":null,"origin":"mcp","label":null,"title":"t","requested_by":null,"children":{"total":0,"active":0,"waiting":0,"failed":0}}}"#
     );
 
     // The session socket's next frame is the agent event, not the task one.
@@ -710,6 +717,10 @@ async fn a_socket_that_falls_behind_the_task_events_is_told_to_refetch_them() {
         next_json(&mut client).await;
         send_text(&mut client, &format!(r#"{{"t":"{subscribe}"}}"#)).await;
         assert_eq!(next_json(&mut client).await["t"], "subscribed");
+        let tasks_only = subscribe == "subscribe_tasks";
+        if tasks_only {
+            assert_eq!(next_json(&mut client).await["t"], "defaults");
+        }
 
         // Sent without yielding, so the socket's receiver overflows before it
         // reads anything.
@@ -722,6 +733,10 @@ async fn a_socket_that_falls_behind_the_task_events_is_told_to_refetch_them() {
             json!({ "t": "resync", "asid": "", "tasks": true }),
             "{subscribe}"
         );
+        // A task-only socket is told its defaults again with the refetch.
+        if tasks_only {
+            assert_eq!(next_json(&mut client).await["t"], "defaults");
+        }
         // What is still buffered follows, oldest first.
         let next = next_json(&mut client).await;
         assert_eq!(next["t"], frame, "{subscribe}");
