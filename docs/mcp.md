@@ -490,7 +490,10 @@ and `-c model_reasoning_effort="<variant>"`; Claude Code gets `--model
 flag -- asked of the binary the user's interactive login shell runs for
 `claude` (with `agent_env`), as a pane's shell would -- a version
 manager's shim is run as found, never resolved through -- and kept until its
-`--version` changes; a flag it lacks is left out (logged), and the task shows what
+`--version` changes. It is asked in the background, at start and whenever a
+launch finds another program or version; a launch never waits for it and
+uses what is known then (no flag before the first answer). One that fails is
+not asked again for 10 minutes and is warned about once; a flag it lacks is left out (logged), and the task shows what
 did run. As for a session agent, `variant` applies only together
 with `model`. Each must be 1 to 128 of `A-Z a-z 0-9 . _ : / @ + -`, not
 starting with `-` (else `400 unknown_model`). The binding and the task view

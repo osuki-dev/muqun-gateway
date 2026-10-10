@@ -145,6 +145,12 @@ fn probe_login_shell() -> Option<LoginEnvironment> {
     Some(parse_probe(&stdout))
 }
 
+/// The user's login shell as the probes run it: `$SHELL` when it is a
+/// POSIX shell, else `/bin/sh`.
+pub(crate) fn user_shell() -> String {
+    probe_shell_for(std::env::var("SHELL").ok().as_deref())
+}
+
 /// Which shell to ask.
 ///
 /// `$SHELL` when it speaks POSIX, because that is where the user's own profile
@@ -152,12 +158,6 @@ fn probe_login_shell() -> Option<LoginEnvironment> {
 /// a syntax error to fish, which would answer with nothing and cost a fish user
 /// the whole repair -- and `/bin/sh -l` still reads `/etc/profile`, which on
 /// macOS runs the same `path_helper` that puts Homebrew on the path.
-/// The user's login shell as the probes run it: `$SHELL` when it is a
-/// POSIX shell, else `/bin/sh`.
-pub(crate) fn user_shell() -> String {
-    probe_shell_for(std::env::var("SHELL").ok().as_deref())
-}
-
 fn probe_shell_for(shell: Option<&str>) -> String {
     const POSIX_SHELLS: &[&str] = &["sh", "bash", "zsh", "ksh", "mksh", "dash", "ash"];
     match shell {

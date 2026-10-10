@@ -204,7 +204,7 @@ pub(crate) async fn launch_model(
     }
     let flags = if kind == "claude" && model.is_some() {
         let command = agent_kinds::agent_command(kind, &state.config.agent_commands);
-        let flags = claude_model_flags(state, &command).await;
+        let flags = claude_model_flags(state, &command);
         if !flags.model || (variant.is_some() && !flags.effort) {
             tracing::info!(
                 model = flags.model,
@@ -228,73 +228,159 @@ pub(crate) async fn launch_model(
     Ok((args, ran, effort))
 }
 
-/// Claude Code's model flags, from its `--help`, for the program a pane's
-/// shell runs as `command`: found by the user's login shell, interactive as
-/// a pane's is, with `agent_env`, and run as found -- a version manager's
-/// shim (mise, asdf) picks the real program by its own name, so it is never
-/// resolved through. Kept by that path and its `--version` line, so an
-/// upgrade is asked again even behind a shim. One that cannot be found or
-/// does not answer in time gives none, and is asked again next time.
-async fn claude_model_flags(state: &AppState, command: &str) -> agent_kinds::ModelFlags {
-    type Key = (String, String);
-    static SEEN: std::sync::OnceLock<std::sync::Mutex<HashMap<Key, agent_kinds::ModelFlags>>> =
+/// How long a probe that failed is not tried again.
+const PROBE_FAILURE_TTL: Duration = Duration::from_secs(600);
+
+/// What is known of one command's Claude Code flags.
+#[derive(Default)]
+struct ClaudeProbe {
+    /// The program as the pane's shell finds it, and its `--version` line,
+    /// that `flags` were read from.
+    key: Option<(String, String)>,
+    flags: agent_kinds::ModelFlags,
+    running: bool,
+    failed_at: Option<std::time::Instant>,
+    /// A failure was warned about since the last success.
+    warned: bool,
+}
+
+fn claude_probes() -> &'static std::sync::Mutex<HashMap<String, ClaudeProbe>> {
+    static PROBES: std::sync::OnceLock<std::sync::Mutex<HashMap<String, ClaudeProbe>>> =
         std::sync::OnceLock::new();
-    let Some(key) = pane_program(state, command).await else {
-        return agent_kinds::ModelFlags::default();
-    };
-    let seen = SEEN.get_or_init(Default::default);
-    if let Some(flags) = seen.lock().ok().and_then(|seen| seen.get(&key).copied()) {
-        return flags;
+    PROBES.get_or_init(Default::default)
+}
+
+/// Claude Code's model flags for `command`, as last read: never waits. A
+/// launch takes whatever is known now (nothing before the first probe ends)
+/// and has the probe checked again in the background.
+fn claude_model_flags(state: &AppState, command: &str) -> agent_kinds::ModelFlags {
+    refresh_claude_probe(state, command);
+    claude_probes()
+        .lock()
+        .ok()
+        .and_then(|probes| probes.get(command).map(|probe| probe.flags))
+        .unwrap_or_default()
+}
+
+/// Warm the probe for the configured Claude Code at gateway start.
+pub(crate) fn warm_claude_probe(state: &AppState) {
+    if is_available(state, "claude") {
+        let command = agent_kinds::agent_command("claude", &state.config.agent_commands);
+        refresh_claude_probe(state, &command);
     }
-    // To a file, then read: Claude Code (Node) exits before a pipe drains,
-    // and its help piped stops at 8192 bytes -- before `--model`.
+}
+
+/// Probe `command` in the background unless a probe is running or one failed
+/// within [`PROBE_FAILURE_TTL`]: find the program as a pane's shell does and
+/// read its `--version`; only when that differs from what the flags were
+/// read from, read its `--help` too. A failure keeps the flags known so far
+/// and is warned about once.
+fn refresh_claude_probe(state: &AppState, command: &str) {
+    {
+        let Ok(mut probes) = claude_probes().lock() else {
+            return;
+        };
+        let probe = probes.entry(command.to_owned()).or_default();
+        if probe.running
+            || probe
+                .failed_at
+                .is_some_and(|at| at.elapsed() < PROBE_FAILURE_TTL)
+        {
+            return;
+        }
+        probe.running = true;
+    }
+    let (state, command) = (state.clone(), command.to_owned());
+    tokio::spawn(async move {
+        let known = claude_probes()
+            .lock()
+            .ok()
+            .and_then(|probes| probes.get(&command).and_then(|probe| probe.key.clone()));
+        let found = match pane_program(&state, &command).await {
+            Some(key) if Some(&key) == known.as_ref() => Ok(None),
+            Some(key) => match claude_help(&state, &key.0).await {
+                Some(help) => Ok(Some((key, agent_kinds::ModelFlags::from_help(&help)))),
+                None => Err(()),
+            },
+            None => Err(()),
+        };
+        let Ok(mut probes) = claude_probes().lock() else {
+            return;
+        };
+        let probe = probes.entry(command.clone()).or_default();
+        probe.running = false;
+        match found {
+            Ok(fresh) => {
+                if let Some((key, flags)) = fresh {
+                    (probe.key, probe.flags) = (Some(key), flags);
+                }
+                (probe.failed_at, probe.warned) = (None, false);
+            }
+            Err(()) => {
+                probe.failed_at = Some(std::time::Instant::now());
+                if !probe.warned {
+                    probe.warned = true;
+                    tracing::warn!(
+                        command,
+                        "could not ask Claude Code which flags it takes; tasks launch with what is known"
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// `program --help`, written to a file the gateway owns and read back:
+/// Claude Code (Node) exits before a pipe drains, and its help piped stops at
+/// 8192 bytes -- before `--model`.
+async fn claude_help(state: &AppState, program: &str) -> Option<String> {
+    let file = std::env::temp_dir().join(format!("muqun-claude-help-{}", uuid::Uuid::new_v4()));
     let script = format!(
-        "f=$(mktemp) || exit 1; {} --help >\"$f\" 2>&1; cat \"$f\"; rm -f \"$f\"",
-        shell_quoted(&key.0)
+        "{} --help >{} 2>&1",
+        shell_quoted(program),
+        shell_quoted(&file.to_string_lossy())
     );
-    let Some(help) = in_pane_shell(state, &script).await else {
-        return agent_kinds::ModelFlags::default();
-    };
-    let flags = agent_kinds::ModelFlags::from_help(&help);
-    if let Ok(mut seen) = seen.lock() {
-        seen.insert(key, flags);
-    }
-    flags
+    let ran = in_pane_shell(state, &script).await;
+    let help = std::fs::read_to_string(&file).ok();
+    let _ = std::fs::remove_file(&file);
+    ran.and(help).filter(|help| !help.is_empty())
 }
 
 /// The program a pane's shell runs for `command` (`command -v`; a path is
-/// taken as written) and its `--version` line, from one shell. `None` for an
-/// alias or a function, a command that is no plain word, or a version that
-/// cannot be read.
+/// taken as written) and its `--version` line. `None` for an alias or a
+/// function, a command that is no plain word, or a version that cannot be
+/// read.
 async fn pane_program(state: &AppState, command: &str) -> Option<(String, String)> {
     let find = if command.contains('/') {
         format!("p={}", shell_quoted(command))
-    } else if command
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+    } else if !command.starts_with('-')
+        && command
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
     {
-        format!("p=$(command -v {command}) || exit 1")
+        format!("p=$(command -v -- {}) || exit 1", shell_quoted(command))
     } else {
         return None;
     };
+    let file = std::env::temp_dir().join(format!("muqun-claude-version-{}", uuid::Uuid::new_v4()));
     let script = format!(
-        "{find}; f=$(mktemp) || exit 1; \"$p\" --version >\"$f\" 2>&1; \
-         printf '\\n{FOUND}%s\\n{VERSION}' \"$p\"; head -n 1 \"$f\"; rm -f \"$f\""
+        "{find}; \"$p\" --version >{} 2>&1; printf '\\n{FOUND}%s\\n' \"$p\"",
+        shell_quoted(&file.to_string_lossy())
     );
-    let out = in_pane_shell(state, &script).await?;
-    let fenced = |fence: &str| {
-        out.lines()
-            .find_map(|line| line.strip_prefix(fence))
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty())
-    };
-    let program = fenced(FOUND).filter(|path| path.starts_with('/'))?;
-    Some((program, fenced(VERSION)?))
+    let out = in_pane_shell(state, &script).await;
+    let version = std::fs::read_to_string(&file).ok();
+    let _ = std::fs::remove_file(&file);
+    let program = out?
+        .lines()
+        .find_map(|line| line.strip_prefix(FOUND))
+        .map(|path| path.trim().to_owned())
+        .filter(|path| path.starts_with('/'))?;
+    let version = version?.lines().next()?.trim().to_owned();
+    (!version.is_empty()).then_some((program, version))
 }
 
-/// The fences [`pane_program`] reads its answers after: profiles print things.
+/// The fence [`pane_program`] reads its answer after: profiles print things.
 const FOUND: &str = "__muqun_found__";
-const VERSION: &str = "__muqun_version__";
 
 /// `text` as one single-quoted shell word.
 fn shell_quoted(text: &str) -> String {
@@ -302,20 +388,35 @@ fn shell_quoted(text: &str) -> String {
 }
 
 /// `script`'s output, run by the user's login shell as a pane's runs
-/// (`-lic`) with `agent_env`, stdin empty, within 10 s.
+/// (`-lic`) with `agent_env`, stdin empty, within 10 s. It runs in a
+/// process group of its own, killed whole when time runs out, so nothing it
+/// started is left behind.
 async fn in_pane_shell(state: &AppState, script: &str) -> Option<String> {
     let mut shell = tokio::process::Command::new(crate::terminal::login_env::user_shell());
     shell
         .args(["-lic", script])
         .envs(state.config.agent_env.usable())
         .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
-    let out = tokio::time::timeout(Duration::from_secs(10), shell.output())
-        .await
-        .ok()?
-        .ok()?;
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    #[cfg(unix)]
+    shell.process_group(0);
+    let child = shell.spawn().ok()?;
+    let group = child.id();
+    match tokio::time::timeout(Duration::from_secs(10), child.wait_with_output()).await {
+        Ok(out) => Some(String::from_utf8_lossy(&out.ok()?.stdout).into_owned()),
+        Err(_) => {
+            #[cfg(unix)]
+            if let Some(group) = group.and_then(|pid| i32::try_from(pid).ok()) {
+                // SAFETY: signals the process group this spawn created.
+                unsafe {
+                    libc::killpg(group, libc::SIGKILL);
+                }
+            }
+            None
+        }
+    }
 }
 
 /// The job a delegation launched in a pane: the pane's shell, and the job
