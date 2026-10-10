@@ -821,18 +821,24 @@ impl TaskService {
         if child.state != state {
             return;
         }
-        if let Err(error) = self.store.mark_told(&child, now_ms()).await {
-            tracing::warn!(task = %id.0, %error, "could not record that the parent was told");
+        self.told_task(&child).await;
+    }
+
+    /// `child`, as it was when its line was sent (captured before the send),
+    /// has been told: a move it made meanwhile is still to be told.
+    pub(crate) async fn told_task(&self, child: &Task) {
+        if let Err(error) = self.store.mark_told(child, now_ms()).await {
+            tracing::warn!(task = %child.id.0, %error, "could not record that the parent was told");
         }
         // Its parent waits no more: the progress line goes.
-        let Some(parent) = child.parent else {
+        let Some(parent) = child.parent.clone() else {
             return;
         };
         let cleared = self.live.lock().is_ok_and(|mut live| {
             let ours = live
                 .waiting_on
                 .get(&parent)
-                .is_some_and(|waiting| waiting.child == *id);
+                .is_some_and(|waiting| waiting.child == child.id);
             ours && live.waiting_on.remove(&parent).is_some()
         });
         if cleared {

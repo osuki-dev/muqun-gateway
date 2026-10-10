@@ -84,7 +84,7 @@ pub(crate) async fn deliver(state: &AppState) -> usize {
             // The record is the Home row and the parent's own summary.
             Ready::Never(why) => {
                 tracing::info!(task = %child.id.0, why, "notices: the parent is not told");
-                state.tasks.told(&child.id, child.state).await;
+                state.tasks.told_task(&child).await;
                 continue;
             }
             Ready::Now => {}
@@ -92,7 +92,7 @@ pub(crate) async fn deliver(state: &AppState) -> usize {
         let line = message(state, &child).await;
         match send(state, &target, &line).await {
             Ok(Sent::Delivered) => {
-                state.tasks.told(&child.id, child.state).await;
+                state.tasks.told_task(&child).await;
                 told += 1;
             }
             // Not in front right now: tried again on a later pass, for a while.
@@ -101,7 +101,7 @@ pub(crate) async fn deliver(state: &AppState) -> usize {
             }
             Ok(Sent::Withdrawn(why)) => {
                 tracing::info!(task = %child.id.0, why, "notices: the parent is not told");
-                state.tasks.told(&child.id, child.state).await;
+                state.tasks.told_task(&child).await;
             }
             Err(error) => tracing::debug!(task = %child.id.0, %error, "notices: not told yet"),
         }

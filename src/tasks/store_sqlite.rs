@@ -47,6 +47,9 @@ CREATE TABLE task_notices(task_id TEXT PRIMARY KEY, target TEXT NOT NULL,
   told_state TEXT, delivered_to_parent_ms INTEGER);
 ", "
 ALTER TABLE task_notices ADD COLUMN told_seq INTEGER;
+UPDATE task_notices SET told_seq = (SELECT seq FROM tasks WHERE tasks.id = task_notices.task_id)
+  WHERE told_state IS NOT NULL
+    AND told_state = (SELECT state FROM tasks WHERE tasks.id = task_notices.task_id);
 "],
 };
 
@@ -688,6 +691,35 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not found"), "{err}");
+    }
+
+    /// A notice told before steps were recorded is not told again on upgrade.
+    #[tokio::test]
+    async fn an_upgrade_re_tells_nothing() {
+        let path =
+            crate::test_state_dir().join(format!("tasks-v8-{}.sqlite3", uuid::Uuid::new_v4()));
+        let v8 = Migration {
+            namespace: "tasks",
+            steps: &MIGRATION.steps[..8],
+        };
+        {
+            let old = SqliteStore::open(&path, None, &[v8]).unwrap();
+            old.call(|c| {
+                c.execute(
+                    "INSERT INTO tasks(id, kind, goal, cwd, binding, state, summary, exit_code, created_by, created_ms, updated_ms, seq, origin) VALUES('t_told', 'delegation', 'g', NULL, '{\"kind\":\"none\"}', 'done', 'ok', NULL, '{\"kind\":\"assistant\",\"id\":\"a\"}', 1, ?1, 7, 'agent')",
+                    [now_ms() as i64],
+                )?;
+                c.execute(
+                    "INSERT INTO task_notices(task_id, target, told_state, delivered_to_parent_ms) VALUES('t_told', '{\"kind\":\"session\",\"agent_id\":\"opencode\",\"asid\":\"s\"}', 'done', 1)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }
+        let store = SqliteTaskStore::new(SqliteStore::open(&path, None, &[MIGRATION]).unwrap());
+        assert!(store.pending_notices(0, 10).await.unwrap().is_empty());
     }
 
     #[tokio::test]
