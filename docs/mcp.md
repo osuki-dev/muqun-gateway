@@ -253,11 +253,12 @@ unknown id is `404 task_not_found`; any other failure is `500 task_failed`.
 - `progress` (present only while the task is open and something is known;
   `task_ledger_complete`): what it is doing now, one line of at most 120
   characters -- for a session delegation the agent's current tool call in
-  words (`<tool>` and the file in backticks when it names a file, a
-  patch's files included; else the provider's title as written; else
-  `<tool>` and its command, pattern or url in backticks -- every argument
-  is inline code, since the app reads the line as markdown and a path like
-  `src/__tests__/a.ts` must not turn bold; a
+  words (its title as the provider wrote it when that says more than its
+  argument; else `<tool>` and the argument it acts on -- a file, a patch's
+  files included, else a command's first line, a pattern, a query or a url
+  -- as inline code, since the app reads the line as markdown and a path
+  like `src/__tests__/a.ts` must not turn bold; a title that only restates
+  the argument, as OpenCode's adapter derives them, counts as the argument; a
   failed call with its error; never a bare tool name -- a call whose
   arguments name nothing readable, or have not streamed in yet, leaves the
   line before) or

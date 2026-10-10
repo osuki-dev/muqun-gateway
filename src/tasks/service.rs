@@ -1893,10 +1893,11 @@ fn progress_line(item: &TimelineItem) -> Option<String> {
     }
 }
 
-/// A tool call in words, its arguments as inline code: `<tool> <file>`
-/// when it names a file (a provider
-/// title that is only that file's name says less), else its title, else
-/// `<tool> <command, pattern or url>`; never its bare name -- a call whose
+/// A tool call in words: its title when that says more than its argument,
+/// else `<tool>` and the argument it acts on -- a file (a patch's too), else
+/// a command's first line, a pattern, a query or a url -- as inline code.
+/// A title that only restates that argument (OpenCode's adapter derives
+/// titles from them) is the argument. Never a bare name: a call whose
 /// arguments name nothing readable (or have not streamed in yet) has no
 /// line, and the line before stands.
 fn tool_line(call: &ToolCall) -> Option<String> {
@@ -1915,24 +1916,19 @@ fn tool_line(call: &ToolCall) -> Option<String> {
                 .map(str::trim)
         })
     };
-    let file = arg(&["filePath", "file_path", "path"]).or_else(patched);
+    let target = arg(&["filePath", "file_path", "path"])
+        .or_else(patched)
+        .or_else(|| arg(&["command", "pattern", "query", "url"]))
+        .map(|target| target.lines().next().unwrap_or(target).trim());
     let title = call
         .title
         .as_deref()
         .map(str::trim)
         .filter(|title| !title.is_empty() && *title != call.name);
-    let line = match (file, title) {
-        (Some(file), Some(title)) if !file.ends_with(title) => title.to_owned(),
-        (Some(file), _) => format!("{} {}", call.name, code(file)),
-        (None, Some(title)) => title.to_owned(),
-        (None, None) => {
-            let target = arg(&["command", "pattern", "query", "url"])?;
-            format!(
-                "{} {}",
-                call.name,
-                code(target.lines().next().unwrap_or(target))
-            )
-        }
+    let line = match (target, title) {
+        (Some(target), Some(title)) if !target.ends_with(title) => title.to_owned(),
+        (Some(target), _) => format!("{} {}", call.name, code(target)),
+        (None, title) => title?.to_owned(),
     };
     Some(line)
 }
@@ -3570,7 +3566,7 @@ mod tests {
             state.tasks.present(&task).await.progress
         };
         state.tasks.follow(&state, &upsert).await;
-        assert_eq!(progress().await.as_deref(), Some("cargo test"));
+        assert_eq!(progress().await.as_deref(), Some("bash `cargo test`"));
         // The next line, within the throttle: kept at once, published once
         // the 2 s are up.
         let text = AgentDomainEvent::TimelineUpsert {
@@ -3585,7 +3581,10 @@ mod tests {
                 .map(|TaskDomainEvent::Updated { task, .. }| task.progress)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(published(&mut updates), [Some("cargo test".to_owned())]);
+        assert_eq!(
+            published(&mut updates),
+            [Some("bash `cargo test`".to_owned())]
+        );
         tokio::time::sleep(PROGRESS_EVERY + Duration::from_millis(300)).await;
         assert_eq!(
             published(&mut updates),
@@ -3689,7 +3688,11 @@ mod tests {
                 Some("patch `release-notes/v3.1.0.md`"),
             ),
             (
-                call("bash", None, json!({ "command": "cargo test\ncargo fmt" })),
+                call(
+                    "bash",
+                    Some("cargo test"),
+                    json!({ "command": "cargo test\ncargo fmt" }),
+                ),
                 Some("bash `cargo test`"),
             ),
             (
@@ -3701,8 +3704,8 @@ mod tests {
                 Some("bash `bun test src/lib/__tests__/cards.test.ts`"),
             ),
             (
-                call("grep", None, json!({ "pattern": "a`b" })),
-                Some("grep ``a`b``"),
+                call("glob", Some("a`b"), json!({ "pattern": "a`b" })),
+                Some("glob ``a`b``"),
             ),
             (call("todowrite", None, json!({ "todos": [] })), None),
             (call("execute", None, json!({})), None),
