@@ -522,12 +522,35 @@ impl AgentPort for OpencodeDriver {
         instruction: &'a str,
     ) -> AgentFuture<'a, ()> {
         Box::pin(async move {
-            if let Err(error) = self.client.send_synthetic(session_id, instruction).await {
-                tracing::debug!(%error, "task instruction sent with the goal instead");
-                let text = format!("{goal}\n\n{instruction}");
-                return self.send_prompt(session_id, &text, &[], None).await;
+            let admitted = match self.client.send_synthetic(session_id, instruction).await {
+                Ok(admitted) => admitted,
+                Err(error) => {
+                    tracing::debug!(%error, "task instruction sent with the goal instead");
+                    let text = format!("{goal}\n\n{instruction}");
+                    return self.send_prompt(session_id, &text, &[], None).await;
+                }
+            };
+            // Tried twice: the admitted instruction would otherwise ride on
+            // whatever prompt the session gets next, so it is withdrawn when
+            // the goal cannot be sent.
+            let mut sent = self.client.send_prompt(session_id, goal, &[], None).await;
+            if sent.is_err() {
+                sent = self.client.send_prompt(session_id, goal, &[], None).await;
             }
-            self.client.send_prompt(session_id, goal, &[], None).await?;
+            if let Err(error) = sent {
+                let id = admitted.pointer("/data/id").or_else(|| admitted.get("id"));
+                let withdrawn = match id.and_then(Value::as_str) {
+                    Some(id) => self.client.cancel_inbox_item(session_id, id).await.is_ok(),
+                    None => false,
+                };
+                if !withdrawn {
+                    tracing::warn!(
+                        session_id,
+                        "task instruction left admitted: the goal was not sent"
+                    );
+                }
+                return Err(error);
+            }
             Ok(())
         })
     }

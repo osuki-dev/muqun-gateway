@@ -1357,22 +1357,24 @@ tail it cannot place.
 
 ### Task plumbing in the transcript
 
-A session working on a delegated task ([docs/mcp.md](mcp.md#finishing-a-delegation))
+A session a task is (or was) bound to ([docs/mcp.md](mcp.md#finishing-a-delegation))
 is served without the gateway's task plumbing -- on the snapshot, the
-timeline, the event replay, the SSE stream and `/api/ws`:
+timeline, the event replay, the SSE stream, `/api/ws` and `GET …/inbox`.
+Every other session is served as it is:
 
 - A user `text` row (or a `synthetic` row) that ends with the completion
   instruction is served with the instruction cut, and is left out when it was
   only the instruction. Any wording the gateway has sent is recognised, by the
   instruction's fixed opening (`When the whole task is finished, `) and its
   closing placeholder line, never by the goal.
-- An assistant `text` row is served without its marker lines: a line that
-  starts, after bullets and markup, with `MUQUN_TASK_DONE:` or
-  `MUQUN_TASK_BLOCKED:`. A row left with nothing else is left out. While the
-  row streams, a last line that can only be the start of a marker is held back
-  too, so the marker never shows mid-turn. `seq` keeps counting, so a client
-  may see a gap where a row was left out.
-
+- An assistant `text` or `reasoning` row is served without its marker lines: a
+  line outside a code fence that starts, after bullets and markup, with
+  `MUQUN_TASK_DONE:` or `MUQUN_TASK_BLOCKED:`. A row left with nothing else is
+  left out. While the row streams, a last line that can only be the start of a
+  marker (or is bare list or emphasis markup, such as `- `) is held back too,
+  so the marker never shows mid-turn. An `agent.timeline.upsert` whose rows
+  are all left with nothing arrives as `agent.timeline.removed` for them.
+  `seq` keeps counting, so a client may see a gap where a row was left out.
 - An inbox item (`GET …/inbox`, the snapshot's `inbox`,
   `agent.inbox.changed`) is cut the same way as a user row: OpenCode holds
   the instruction there for a moment before the turn runs.

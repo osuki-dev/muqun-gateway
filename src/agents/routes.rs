@@ -18,7 +18,7 @@ use super::message_images;
 use super::ports::mirror::SessionMirrorPort;
 use crate::platform::git;
 use crate::platform::vcs_routes::{self, VcsDiscardBody, VcsFileQuery};
-use crate::tasks::transcript::{hide_in_event, hide_in_inbox, hide_in_items};
+use crate::tasks::transcript::{for_session, hide_in_event, hide_in_inbox, hide_in_items};
 use crate::terminal::routes::git_error;
 use crate::{
     api_error, content_envelope, require_device, still_paired, stream_event, validate_text,
@@ -729,8 +729,10 @@ async fn do_get_agent_session(
         .await
         .map_err(|e| api_error(StatusCode::NOT_FOUND, "session_not_found", &e.to_string()))?;
     let directory = snapshot.info.directory.clone();
-    hide_in_items(&mut snapshot.timeline);
-    hide_in_inbox(&mut snapshot.inbox);
+    if for_session(state, asid).await {
+        hide_in_items(&mut snapshot.timeline);
+        hide_in_inbox(&mut snapshot.inbox);
+    }
     message_images::attach_to_items(state, asid, directory.as_deref(), &mut snapshot.timeline)
         .await;
 
@@ -758,8 +760,11 @@ async fn do_get_agent_session_events(
         .await
     {
         Some(mut events) => {
+            let plumbing = for_session(state, asid).await;
             for event in &mut events {
-                hide_in_event(event);
+                if plumbing {
+                    hide_in_event(event);
+                }
                 message_images::attach_to_event(state, event).await;
             }
             Ok(Json(content_envelope(json!(events))))
@@ -786,7 +791,9 @@ async fn do_get_agent_session_timeline(
         .mirror()
         .get_timeline_delta(&AgentSessionId(asid.to_string()), after_seq)
         .await;
-    hide_in_items(&mut items);
+    if for_session(state, asid).await {
+        hide_in_items(&mut items);
+    }
     message_images::attach_to_items(state, asid, None, &mut items).await;
 
     let payload = json!({
@@ -1383,7 +1390,9 @@ async fn do_stream_agent_session(
                     if !ev.asid().0.is_empty() && ev.asid() != &target_asid {
                         continue;
                     }
-                    hide_in_event(&mut ev);
+                    if for_session(&devices, &target_asid.0).await {
+                        hide_in_event(&mut ev);
+                    }
                     message_images::attach_to_event(&devices, &mut ev).await;
                     let (ev_name, payload) = agent_event_record(&ev);
                     // `None` means the record could not be sealed. It is
@@ -2518,9 +2527,11 @@ async fn get_agent_inbox(
     // Refresh the mirror so a later snapshot and the stream agree.
     manager
         .mirror()
-        .set_inbox(&AgentSessionId(asid), items.clone())
+        .set_inbox(&AgentSessionId(asid.clone()), items.clone())
         .await;
-    hide_in_inbox(&mut items);
+    if for_session(&state, &asid).await {
+        hide_in_inbox(&mut items);
+    }
     Ok(Json(content_envelope(json!({ "items": items }))))
 }
 

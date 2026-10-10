@@ -7,7 +7,7 @@
 //! a tool, a long build) and comes back -- so only an explicit signal is
 //! `done`: the goal is given with [`completion_instruction`] (out of band
 //! where the agent takes it -- Claude Code's appended system prompt, with
-//! one typed retry if it will not start that way -- else after the goal,
+//! one typed retry if it exits at once that way -- else after the goal,
 //! [`completion_request`];
 //! the goal on the agent's command line where it takes one, else typed),
 //! and the agent
@@ -127,9 +127,10 @@ pub(crate) fn is_available(state: &AppState, agent_id: &str) -> bool {
 /// synthetic OpenCode message; Claude Code's appended system prompt, unless
 /// its configured launch arguments append one of their own) and is cut from
 /// the served transcript otherwise ([`super::transcript`]). A Claude Code
-/// that does not start with `--append-system-prompt-file` is started once
-/// more with the instruction typed after its goal, rather than failing the
-/// task. Codex and other terminal agents get it typed: a terminal shows what
+/// seen to start with `--append-system-prompt-file` and gone again within
+/// [`SETTLE`], its pane back at a shell ([`exited_to_shell`]), is started
+/// once more with the instruction typed after its goal, rather than failing
+/// the task; a start that times out is never retried. Codex and other terminal agents get it typed: a terminal shows what
 /// was typed. It opens with [`REQUEST_OPENING`].
 pub(crate) fn completion_instruction() -> String {
     format!(
@@ -154,16 +155,59 @@ pub(crate) fn completion_request(goal: &str) -> String {
 /// (Claude Code's `--append-system-prompt-file`), so the launch line typed
 /// into the pane carries a path rather than the instruction. `None` when it
 /// cannot be written.
-pub(crate) fn completion_instruction_file() -> Option<std::path::PathBuf> {
+pub(crate) async fn completion_instruction_file() -> Option<std::path::PathBuf> {
     let path = crate::state_dir().ok()?.join("task-instruction.md");
     let text = completion_instruction();
-    if std::fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
-        if let Err(error) = std::fs::write(&path, &text) {
-            tracing::debug!(%error, "task instruction file not written");
-            return None;
-        }
+    if tokio::fs::read_to_string(&path).await.ok().as_deref() == Some(text.as_str()) {
+        return Some(path);
+    }
+    // Written beside it and renamed over it, so a Claude Code started by a
+    // concurrent delegation never reads half a file.
+    let partial = path.with_extension(format!("md.{}", uuid::Uuid::new_v4().simple()));
+    let written = async {
+        tokio::fs::write(&partial, &text).await?;
+        tokio::fs::rename(&partial, &path).await
+    };
+    if let Err(error) = written.await {
+        tracing::debug!(%error, "task instruction file not written");
+        let _ = tokio::fs::remove_file(&partial).await;
+        return None;
     }
     Some(path)
+}
+
+/// How long an agent started with its instruction out of band is given to
+/// show it stays up: one that refuses the flag exits at once.
+const SETTLE: Duration = Duration::from_secs(3);
+/// The shells a pane goes back to when its agent exits.
+const SHELLS: [&str; 13] = [
+    "sh", "bash", "zsh", "fish", "ksh", "mksh", "dash", "ash", "tcsh", "csh", "nu", "xonsh",
+    "elvish",
+];
+
+/// Whether the `kind` agent just started in `pane_id` exited again within
+/// [`SETTLE`]: the pane no longer runs it and its foreground is a shell.
+/// A pane that cannot be read, or runs anything else, says no.
+pub(crate) async fn exited_to_shell(session: &SessionConfig, pane_id: &str, kind: &str) -> bool {
+    tokio::time::sleep(SETTLE).await;
+    terminal_backend(session)
+        .get_pane(&PaneId::new(pane_id))
+        .await
+        .is_ok_and(|pane| {
+            at_shell(
+                pane.agent.as_deref(),
+                pane.foreground_command.as_deref(),
+                kind,
+            )
+        })
+}
+
+fn at_shell(agent: Option<&str>, foreground: Option<&str>, kind: &str) -> bool {
+    let shell = foreground.is_some_and(|command| {
+        let name = command.rsplit('/').next().unwrap_or(command);
+        SHELLS.contains(&name.trim_start_matches('-'))
+    });
+    agent != Some(kind) && shell
 }
 
 /// How an agent said its task ended, with its one line.
@@ -1248,6 +1292,22 @@ mod tests {
             "⏺ Otherwise\n  MUQUN_TASK_BLOCKED: <one-\n",
         ] {
             assert_eq!(marker(not_yet), None, "{not_yet}");
+        }
+
+        // An agent started with its instruction out of band that refused it
+        // is gone and its pane back at a shell; a slow or running one is not.
+        for (agent, foreground, back) in [
+            (None, Some("-zsh"), true),
+            (None, Some("/usr/bin/bash"), true),
+            (Some("claude"), Some("claude"), false),
+            (None, Some("node"), false),
+            (None, None, false),
+        ] {
+            assert_eq!(
+                at_shell(agent, foreground, "claude"),
+                back,
+                "{foreground:?}"
+            );
         }
 
         // A title: the label, the session's name, else the goal's first

@@ -5,57 +5,94 @@
 //! marker line ([`pane_agent::DONE_MARKER`], [`pane_agent::BLOCKED_MARKER`]).
 //! Both are how the gateway learns the task's end; the reader only needs the
 //! goal and the answer. So on the way out (snapshot, timeline, event replay,
-//! the SSE stream and `/api/ws`, like `message_images`) a transcript -- and
-//! the session's inbox -- is served with:
+//! the SSE stream and `/api/ws`, like `message_images`) the transcript -- and
+//! the inbox -- of a session a task is bound to ([`for_session`]) is served
+//! with:
 //!
 //! - a user text (or a synthetic message) that ends with a completion
 //!   instruction -- any wording this gateway has sent, found by its fixed
 //!   opening and its closing placeholder line, not by the goal -- cut back to
 //!   what came before it, and dropped when nothing did;
-//! - an assistant text without its marker lines (a line that starts, after
-//!   bullets and markup, with a marker), and dropped when nothing else is left.
-//!   A streamed text is served as snapshots of the whole text so far, so a
-//!   last line still being written that could only be the start of a marker
-//!   is held back too: the marker never flashes before its turn ends.
+//! - an assistant text or reasoning without its marker lines (a line outside
+//!   a code fence that starts, after bullets and markup, with a marker), and
+//!   dropped when nothing else is left. A streamed text is served as
+//!   snapshots of the whole text so far, so a last line still being written
+//!   that could only be the start of a marker (bare markup such as `- `
+//!   included) is held back too: the marker never flashes before its turn
+//!   ends. A streamed row left with nothing is removed
+//!   (`agent.timeline.removed`) rather than left out, so a client never keeps
+//!   an older version of it.
 //!
-//! The mirror, the agent's own reads and the task follower keep the raw text:
-//! detection (`pane_agent::marker`, `service::turn_end`) reads what the agent
-//! wrote.
+//! Sessions no task is bound to are served as they are. The mirror, the
+//! agent's own reads and the task follower keep the raw text: detection
+//! (`pane_agent::marker`, `service::turn_end`) reads what the agent wrote.
 
 use super::pane_agent::{
     BLOCKED_MARKER, DONE_MARKER, REASON_PLACEHOLDER, REQUEST_OPENING, SUMMARY_PLACEHOLDER,
 };
 use crate::agents::domain::{AgentDomainEvent, AgentPart, TimelineItem, TimelineRole};
+use crate::AppState;
+
+/// Whether session `asid`'s transcript is served without the plumbing: a
+/// task is (or was) bound to it.
+pub(crate) async fn for_session(state: &AppState, asid: &str) -> bool {
+    state.tasks.is_task_session(asid).await
+}
 
 /// `items` as the reader sees them.
 pub(crate) fn hide_in_items(items: &mut Vec<TimelineItem>) {
-    items.retain_mut(|item| {
-        let (text, served) = match (item.role, &mut item.part) {
-            (TimelineRole::User, AgentPart::Text { text })
-            | (_, AgentPart::Synthetic { text, .. }) => {
-                let served = without_request(text);
-                (text, served)
-            }
-            (TimelineRole::Assistant, AgentPart::Text { text }) => {
-                let served = without_markers(text);
-                (text, served)
-            }
-            _ => return true,
-        };
-        match served {
-            Some(served) => {
-                *text = served;
-                !text.trim().is_empty()
-            }
-            None => true,
-        }
-    });
+    items.retain_mut(|item| hide_in_item(item) != Served::Emptied);
 }
 
-/// `event` as the reader sees it.
+#[derive(PartialEq)]
+enum Served {
+    Kept,
+    Emptied,
+}
+
+fn hide_in_item(item: &mut TimelineItem) -> Served {
+    let (text, served) = match (item.role, &mut item.part) {
+        (TimelineRole::User, AgentPart::Text { text }) | (_, AgentPart::Synthetic { text, .. }) => {
+            let served = without_request(text);
+            (text, served)
+        }
+        (TimelineRole::Assistant, AgentPart::Text { text })
+        | (TimelineRole::Assistant, AgentPart::Reasoning { text, .. }) => {
+            let served = without_markers(text);
+            (text, served)
+        }
+        _ => return Served::Kept,
+    };
+    if let Some(served) = served {
+        *text = served;
+        if text.trim().is_empty() {
+            return Served::Emptied;
+        }
+    }
+    Served::Kept
+}
+
+/// `event` as the reader sees it. An upsert whose every row is left with
+/// nothing becomes the removal of those rows.
 pub(crate) fn hide_in_event(event: &mut AgentDomainEvent) {
     match event {
-        AgentDomainEvent::TimelineUpsert { items, .. } => hide_in_items(items),
+        AgentDomainEvent::TimelineUpsert { asid, items, seq } => {
+            let mut emptied = Vec::new();
+            items.retain_mut(|item| {
+                let kept = hide_in_item(item) == Served::Kept;
+                if !kept {
+                    emptied.push(item.id.clone());
+                }
+                kept
+            });
+            if items.is_empty() && !emptied.is_empty() {
+                *event = AgentDomainEvent::TimelineRemoved {
+                    asid: asid.clone(),
+                    ids: emptied,
+                    seq: *seq,
+                };
+            }
+        }
         AgentDomainEvent::InboxChanged { items, .. } => hide_in_inbox(items),
         _ => {}
     }
@@ -96,24 +133,47 @@ fn without_request(text: &str) -> Option<String> {
 }
 
 /// `text` without its marker lines, if it has any (or ends in what may be
-/// the start of one).
-fn without_markers(text: &str) -> Option<String> {
+/// the start of one). Lines inside a code fence are the agent quoting, and
+/// stay.
+pub(crate) fn without_markers(text: &str) -> Option<String> {
     let lines: Vec<&str> = text.split('\n').collect();
     let last = lines.len() - 1;
-    let kept: Vec<&str> = lines
-        .iter()
-        .enumerate()
-        .filter(|&(at, line)| {
-            let body = line.trim_start_matches(|c: char| !c.is_alphanumeric());
-            let marker = [DONE_MARKER, BLOCKED_MARKER].iter().any(|marker| {
-                body.starts_with(marker)
-                    || (at == last && !body.is_empty() && marker.starts_with(body))
-            });
-            !marker
-        })
-        .map(|(_, line)| *line)
-        .collect();
+    let mut fenced = false;
+    let mut kept: Vec<&str> = Vec::with_capacity(lines.len());
+    for (at, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            fenced = !fenced;
+        }
+        if fenced || !is_marker_line(line, at == last) {
+            kept.push(line);
+        }
+    }
     (kept.len() < lines.len()).then(|| kept.join("\n").trim_end().to_owned())
+}
+
+/// Whether `line` is a marker line -- or, as the `last` line still being
+/// written, could become one: a marker's start, or bare list or emphasis
+/// markup (not a `---` rule).
+fn is_marker_line(line: &str, last: bool) -> bool {
+    let body = line.trim_start_matches(|c: char| !c.is_alphanumeric());
+    let markers = [DONE_MARKER, BLOCKED_MARKER];
+    if markers.iter().any(|marker| body.starts_with(marker)) {
+        return true;
+    }
+    if !last {
+        return false;
+    }
+    if !body.is_empty() {
+        return markers.iter().any(|marker| marker.starts_with(body));
+    }
+    let markup = line.trim();
+    let mut chars = markup.chars();
+    let rule = markup.chars().count() >= 3 && chars.next().is_some_and(|c| chars.all(|d| d == c));
+    !markup.is_empty()
+        && markup.chars().count() <= 4
+        && markup.chars().all(|c| "-*+•⏺`>_ ".contains(c))
+        && !rule
 }
 
 #[cfg(test)]
@@ -213,6 +273,24 @@ mod tests {
                 text("MUQUN_TASK_DONE: x"),
                 Some("MUQUN_TASK_DONE: x"),
             ),
+            (
+                "a marker quoted in a code fence",
+                Assistant,
+                text("The line:\n```\nMUQUN_TASK_DONE: x\n```"),
+                Some("The line:\n```\nMUQUN_TASK_DONE: x\n```"),
+            ),
+            (
+                "bare bullet still streaming",
+                Assistant,
+                text("All green.\n- "),
+                Some("All green."),
+            ),
+            (
+                "a closing rule",
+                Assistant,
+                text("All green.\n---"),
+                Some("All green.\n---"),
+            ),
         ] {
             let mut items = vec![item(role, part)];
             hide_in_items(&mut items);
@@ -231,5 +309,16 @@ mod tests {
         hide_in_inbox(&mut inbox);
         let texts: Vec<_> = inbox.iter().map(|item| &item["payload"]["text"]).collect();
         assert_eq!(texts, ["fix the build", "and the tests"]);
+        // A streamed row left with nothing is removed, not left stale.
+        let mut event = AgentDomainEvent::TimelineUpsert {
+            asid: crate::agents::domain::AgentSessionId("s".into()),
+            items: vec![item(Assistant, text("- **MUQUN"))],
+            seq: 7,
+        };
+        hide_in_event(&mut event);
+        assert!(
+            matches!(&event, AgentDomainEvent::TimelineRemoved { ids, seq: 7, .. } if ids == &["i"]),
+            "{event:?}"
+        );
     }
 }

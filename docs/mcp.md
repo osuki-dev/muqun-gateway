@@ -406,8 +406,10 @@ starts with `--append-system-prompt-file <state dir>/task-instruction.md`
 (the text itself with `--append-system-prompt` when the file cannot be
 written) after its launch arguments, on tmux and Herdr alike -- unless
 `agent_launch_args.claude` already appends a system prompt, which wins. A
-Claude Code that does not start that way is started once more with the
-instruction typed. Any other agent, Codex included (its
+Claude Code seen to start that way and gone again within 3 s, its pane back
+at a shell (it refused the flag), is started once more with the instruction
+typed; a start that times out is a failed launch as before, never retried, so
+a slow agent is never started twice. Any other agent, Codex included (its
 `developer_instructions` would replace the user's own), gets the instruction
 as a paragraph typed after its goal (the stored `goal` is the goal as
 given). The marker line the agent prints

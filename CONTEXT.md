@@ -89,7 +89,7 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
   reader: the instruction goes out of band where the agent takes it
   (`AgentPort::send_task_prompt`; Claude Code's appended system prompt,
   `agents::tasks::instruction_args`), and
-  `transcript.rs` cuts both from every served transcript.
+  `transcript.rs` cuts both from the served transcript of a task's session.
   An agent that needs the user says it is blocked (`tasks.complete` with
   `outcome: blocked`, or `MUQUN_TASK_BLOCKED`): the task is `waiting`, and
   stays so through idles until the agent works on a later turn or finishes

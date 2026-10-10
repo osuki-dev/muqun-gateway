@@ -147,9 +147,15 @@ struct Live {
     /// as last seen (see [`TaskService::session_named`]); kept on the task
     /// when it ends.
     titles: HashMap<TaskId, String>,
-    /// When the follower last saw each open session delegation's session go
-    /// idle: a turn that ended after a `tasks.complete` block ([`TaskService::holds`]).
-    idled: HashMap<TaskId, u64>,
+    /// The open session delegations whose session the follower saw go idle
+    /// since their last `tasks.complete` block (cleared by the block): the
+    /// reporting turn ended ([`TaskService::holds`]). Presence, not a time,
+    /// so a block and an idle in the same millisecond are still ordered.
+    idled: HashSet<TaskId>,
+    /// Whether a task is bound to each agent session asked about
+    /// ([`TaskService::is_task_session`]); a delegation's session is marked
+    /// when it is bound, before its first prompt.
+    task_sessions: HashMap<String, bool>,
 }
 
 /// One open task's progress.
@@ -636,7 +642,37 @@ impl TaskService {
         if let Ok(mut live) = self.live.lock() {
             live.sessions
                 .insert(asid.to_owned(), (Some(id.clone()), Instant::now()));
+            live.task_sessions.insert(asid.to_owned(), true);
         }
+    }
+
+    /// Whether any task, open or ended, is bound to agent session `asid`:
+    /// its transcript is served without the task plumbing
+    /// ([`super::transcript`]). Read from the store once per session, then
+    /// remembered.
+    pub(crate) async fn is_task_session(&self, asid: &str) -> bool {
+        let known = self
+            .live
+            .lock()
+            .ok()
+            .and_then(|live| live.task_sessions.get(asid).copied());
+        if let Some(known) = known {
+            return known;
+        }
+        let filter = TaskFilter {
+            asid: Some(asid.to_owned()),
+            limit: 1,
+            ..Default::default()
+        };
+        let Ok(bound) = self.store.list(filter).await.map(|tasks| !tasks.is_empty()) else {
+            return false;
+        };
+        if let Ok(mut live) = self.live.lock() {
+            // A bind meanwhile wins over the read.
+            let entry = live.task_sessions.entry(asid.to_owned()).or_insert(bound);
+            return *entry;
+        }
+        bound
     }
 
     /// A session's timeline changed: the open task bound to it is doing
@@ -1012,9 +1048,10 @@ pub(crate) async fn start_terminal_agent(
     let instruction = pane_agent::completion_instruction();
     let configured =
         crate::agents::tasks::agent_launch_args(&kind, &[], &state.config.agent_launch_args);
-    let file = (kind == "claude")
-        .then(pane_agent::completion_instruction_file)
-        .flatten();
+    let file = match kind.as_str() {
+        "claude" => pane_agent::completion_instruction_file().await,
+        _ => None,
+    };
     let extra =
         crate::agents::tasks::instruction_args(&kind, &configured, &instruction, file.as_deref());
     let typed_form = pane_agent::completion_request(&goal);
@@ -1040,10 +1077,16 @@ pub(crate) async fn start_terminal_agent(
         }
     };
     let (mut launched, mut to_type) = start(placed.clone(), prompt.clone(), extra.clone()).await;
-    // An agent that would not start with the instruction out of band (a
-    // Claude Code without `--append-system-prompt-file`) is started once
-    // more with it typed after the goal.
-    if extra.is_some() && agent_failed(&launched.steps.value()) && !ended().await {
+    // An agent seen to start with the instruction out of band that is gone
+    // again, its pane back at the shell (a Claude Code that refuses
+    // `--append-system-prompt-file`), is started once more with the
+    // instruction typed. A start that timed out is a normal launch's
+    // failure: a slow agent may still come up, and must not start twice.
+    if extra.is_some()
+        && failed_step(&launched.steps.value()).is_none()
+        && pane_agent::exited_to_shell(&session, &pane_id, &kind).await
+        && !ended().await
+    {
         tracing::info!(task = %task.id.0, "terminal task: started again with the instruction typed");
         prompt = typed_form;
         (launched, to_type) = start(placed, prompt.clone(), None).await;
@@ -1762,6 +1805,12 @@ impl TaskService {
             source: source.into(),
             ..change(to)
         };
+        if outcome == Outcome::Blocked {
+            // The reporting turn has not been seen to end yet.
+            if let Ok(mut live) = self.live.lock() {
+                live.idled.remove(id);
+            }
+        }
         self.finish(id, to).await
     }
 
@@ -1826,15 +1875,14 @@ impl TaskService {
                 .live
                 .lock()
                 .ok()
-                .and_then(|live| live.idled.get(&task.id).copied())
-                .is_some_and(|idle| idle > blocked.at_ms);
+                .is_some_and(|live| live.idled.contains(&task.id));
         !ended
     }
 
     /// The follower saw `task`'s session go idle now.
     fn idle_seen(&self, task: &Task) {
         if let Ok(mut live) = self.live.lock() {
-            live.idled.insert(task.id.clone(), now_ms());
+            live.idled.insert(task.id.clone());
         }
     }
 
@@ -1919,11 +1967,15 @@ fn progress_line(item: &TimelineItem) -> Option<String> {
                 None => what,
             })
         }
-        AgentPart::Text { text } if item.role == TimelineRole::Assistant => text
-            .lines()
-            .map(str::trim)
-            .find(|line| !line.is_empty())
-            .map(str::to_owned),
+        // The marker line is the end, said to the gateway, not progress.
+        AgentPart::Text { text } if item.role == TimelineRole::Assistant => {
+            super::transcript::without_markers(text)
+                .unwrap_or_else(|| text.clone())
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .map(str::to_owned)
+        }
         _ => None,
     }
 }
@@ -2205,16 +2257,6 @@ async fn full_answer(state: &AppState, asid: &str, since_ms: u64) -> Option<Stri
 }
 
 /// `"<step>: <message>"` for the first failed step of a launch.
-/// Whether the agent itself did not start (its start step failed).
-fn agent_failed(steps: &Value) -> bool {
-    steps.as_array().is_some_and(|steps| {
-        steps.iter().any(|step| {
-            step.get("step").and_then(Value::as_str) == Some("agent")
-                && step.get("status").and_then(Value::as_str) == Some("failed")
-        })
-    })
-}
-
 fn failed_step(steps: &Value) -> Option<String> {
     let step = steps
         .as_array()?
