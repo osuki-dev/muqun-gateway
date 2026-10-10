@@ -787,6 +787,15 @@ fn refused(status: u16, body: &Value) -> PeerError {
         (401, _)
         | (403, "invalid_token" | "device_proof_required")
         | (426, "device_repair_required") => PeerError::Unauthorized,
+        // A sealed call carries its time; the peer refuses one more than 5
+        // minutes off its own clock, which reads like a plain refusal.
+        (_, "invalid_envelope") => {
+            tracing::warn!(
+                "a linked computer refused a sealed call (invalid_envelope): its clock and this \
+                 computer's may be more than 5 minutes apart"
+            );
+            PeerError::Refused { status, code }
+        }
         _ => PeerError::Refused { status, code },
     }
 }
