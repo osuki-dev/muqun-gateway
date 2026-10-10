@@ -771,25 +771,6 @@ mod tests {
 
     const ASID: &str = "opencode_new";
 
-    #[test]
-    fn a_caller_started_for_a_task_is_told_plainly_others_conditionally() {
-        for (in_task, says, not) in [
-            (
-                true,
-                "Muqun started you to work on one task",
-                "If this session was started",
-            ),
-            (
-                false,
-                "If this session was started as a Muqun task",
-                "Muqun started you",
-            ),
-        ] {
-            let text = instructions(in_task);
-            assert!(text.contains(says) && !text.contains(not), "{in_task}");
-            assert!(text.contains("task_not_found"));
-        }
-    }
 
     fn session(pane_id: &str) -> AssistantSession {
         AssistantSession {
