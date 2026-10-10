@@ -58,6 +58,14 @@ pub(crate) async fn run(command: PeersCommand) -> anyhow::Result<()> {
     match command {
         PeersCommand::Link { url, name } => {
             let url = url.trim().trim_end_matches('/').to_owned();
+            // This computer's own name would make `machine` ambiguous to the
+            // agent: refused before anything is asked of the other computer.
+            if let Some(name) = &name {
+                anyhow::ensure!(
+                    !same_name(name, &config.label),
+                    "{name} is this computer's own name; pass another --name"
+                );
+            }
             let request_id = format!("peer-{}", uuid::Uuid::new_v4());
             let label =
                 peer_client::request_pairing(&url, &request_id, &config.label, &config.server_id)
@@ -65,16 +73,28 @@ pub(crate) async fn run(command: PeersCommand) -> anyhow::Result<()> {
                     .map_err(|error| {
                         anyhow::anyhow!("{url} did not take the pairing request: {error}")
                     })?;
+            // Its own label is this computer's too: another name is asked for
+            // here, before the code, so the same pending pairing is claimed.
+            let mut name = name.unwrap_or_else(|| label.clone());
+            while same_name(&name, &config.label) {
+                println!(
+                    "{label} is also this computer's name. What should this computer call it?"
+                );
+                let mut other = String::new();
+                std::io::stdin()
+                    .read_line(&mut other)
+                    .context("failed to read the name")?;
+                anyhow::ensure!(
+                    !other.trim().is_empty(),
+                    "no name given; nothing was linked"
+                );
+                name = other.trim().to_owned();
+            }
             println!("Enter the code shown by \"muqun-gateway manage\" on {label}:");
             let mut code = String::new();
             std::io::stdin()
                 .read_line(&mut code)
                 .context("failed to read the code")?;
-            let name = name.unwrap_or(label);
-            anyhow::ensure!(
-                !same_name(&name, &config.label),
-                "{name} is this computer's own name too; link again with --name <another name>"
-            );
             let body = json!({
                 "url": url,
                 "name": name,
