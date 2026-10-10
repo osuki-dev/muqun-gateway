@@ -168,6 +168,7 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     crate::tasks::driver::spawn(state.clone());
     crate::tasks::driver::spawn_follower(state.clone());
     crate::tasks::driver::spawn_instruction_cleanup(state.clone());
+    crate::tasks::notices::spawn(state.clone());
 
     let app = Router::new();
     let app = platform::routes::mount(app);

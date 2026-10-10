@@ -412,3 +412,23 @@ mod tests {
         );
     }
 }
+
+/// The session a delegation was asked from, where its result is told once
+/// it ends (`tasks::notices`): an agent service's session, or the pane a
+/// terminal agent runs in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum NoticeTarget {
+    Session { agent_id: String, asid: String },
+    Pane { session_id: String, pane_id: String },
+}
+
+/// The states a parent is told about: the child ended, or stopped and needs
+/// someone.
+pub(crate) const REPORTED_STATES: [TaskState; 5] = [
+    TaskState::Done,
+    TaskState::Failed,
+    TaskState::Cancelled,
+    TaskState::Waiting,
+    TaskState::IdleUnconfirmed,
+];

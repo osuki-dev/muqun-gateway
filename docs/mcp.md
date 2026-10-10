@@ -637,6 +637,33 @@ as it). A restarted follower takes the lines the task's history already
 acted on as read. A pane that closes, or an agent that exits, right after a
 blocked line fails with that reason: `the pane closed: <reason>`.
 
+### Being told how a delegation ended
+
+An agent need not poll a long delegation. `tasks.delegate` records the
+session it was called from: a pane token's pane, or -- for the agent service's
+shared token -- the one session of that agent running this very call right
+now (found as for the [task tree](#task-tree), among all its sessions in a
+turn, not only task sessions, since a person's own session delegates too).
+When the child reaches `done`, `failed`, `cancelled`, `waiting` or
+`idle_unconfirmed` and that session's turn is over, the gateway sends it one
+plain line, as a user message would be:
+
+- `mini finished: <summary>` (a session delegation on this computer: its
+  last message, up to 4000 characters; `The task "<title>"` names a local
+  child);
+- `mini could not finish: <reason>` (failed, or `it was cancelled.`);
+- `mini needs an answer: <question>` (`waiting`);
+- `mini stopped without saying it is finished: <its last message>`.
+
+A session still in its turn -- inside a `tasks.wait`, say -- is sent nothing:
+the wait answers it, and a state a wait returned is never sent again. A pane
+is told when its own delegation's follower saw the agent stop
+(`idle_unconfirmed` or `done`). Each state is told once, recorded in the task
+store (`task_notices`), so a restart does not tell it twice; a state not told
+within a day is dropped. When the calling session cannot be told apart (none
+or several fit), nothing is recorded and the caller learns the result from
+`tasks.wait` alone.
+
 ### Task tree
 
 A task started through `exec.run` or `tasks.delegate` is filed under the

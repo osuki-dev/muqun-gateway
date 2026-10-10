@@ -4,7 +4,8 @@ use std::future::Future;
 use std::pin::Pin;
 
 use super::domain::{
-    ChildCounts, Task, TaskChange, TaskEvent, TaskFilter, TaskId, TaskPrincipal, TaskState,
+    ChildCounts, NoticeTarget, Task, TaskChange, TaskEvent, TaskFilter, TaskId, TaskPrincipal,
+    TaskState,
 };
 
 pub(crate) type TaskFuture<'a, T> = Pin<Box<dyn Future<Output = anyhow::Result<T>> + Send + 'a>>;
@@ -28,6 +29,28 @@ pub(crate) trait TaskStore: Send + Sync {
     /// Delete the tasks that ended before `before_ms` (none of whose
     /// children is still open), with their events. How many went.
     fn purge_ended<'a>(&'a self, before_ms: u64) -> TaskFuture<'a, usize>;
+    /// Tell `target` how task `id` ends (see `tasks::notices`).
+    fn set_notice<'a>(&'a self, _id: &'a TaskId, _target: &'a NoticeTarget) -> TaskFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+    /// Tasks with a notice target, updated since `since_ms`, in a reported
+    /// state that has not been told yet: oldest change first, at most `limit`.
+    fn pending_notices<'a>(
+        &'a self,
+        _since_ms: u64,
+        _limit: usize,
+    ) -> TaskFuture<'a, Vec<(Task, NoticeTarget)>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+    /// Task `id`'s `state` has been told (delivered, or returned by a wait).
+    fn mark_told<'a>(
+        &'a self,
+        _id: &'a TaskId,
+        _state: TaskState,
+        _at_ms: u64,
+    ) -> TaskFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 #[derive(Debug)]

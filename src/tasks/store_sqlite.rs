@@ -6,8 +6,8 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use super::domain::{
-    now_ms, ChildCounts, Task, TaskBinding, TaskChange, TaskEvent, TaskFilter, TaskId,
-    TaskPrincipal, TaskState,
+    now_ms, ChildCounts, NoticeTarget, Task, TaskBinding, TaskChange, TaskEvent, TaskFilter,
+    TaskId, TaskPrincipal, TaskState, REPORTED_STATES,
 };
 use super::ports::{TaskFuture, TaskStore, TaskStoreError};
 use crate::platform::store::sqlite::{Migration, SqliteStore};
@@ -42,6 +42,9 @@ ALTER TABLE tasks ADD COLUMN mentions TEXT;
 ALTER TABLE tasks ADD COLUMN client_ref TEXT;
 ", "
 ALTER TABLE tasks ADD COLUMN requester_server_id TEXT;
+", "
+CREATE TABLE task_notices(task_id TEXT PRIMARY KEY, target TEXT NOT NULL,
+  told_state TEXT, delivered_to_parent_ms INTEGER);
 "],
 };
 
@@ -309,8 +312,69 @@ impl TaskStore for SqliteTaskStore {
                 [before],
             )?;
             let purged = tx.execute(&format!("DELETE FROM tasks WHERE {ENDED}"), [before])?;
+            tx.execute(
+                "DELETE FROM task_notices WHERE task_id NOT IN (SELECT id FROM tasks)",
+                [],
+            )?;
             tx.commit()?;
             Ok(purged)
+        }))
+    }
+
+    fn set_notice<'a>(&'a self, id: &'a TaskId, target: &'a NoticeTarget) -> TaskFuture<'a, ()> {
+        let (id, target) = (id.0.clone(), json_text(target));
+        Box::pin(async move {
+            let target = target?;
+            self.db
+                .call(move |c| {
+                    c.execute(
+                        "INSERT INTO task_notices(task_id, target) VALUES(?1, ?2) \
+                         ON CONFLICT(task_id) DO UPDATE SET target=excluded.target",
+                        params![id, target],
+                    )?;
+                    Ok(())
+                })
+                .await
+        })
+    }
+
+    fn pending_notices<'a>(
+        &'a self,
+        since_ms: u64,
+        limit: usize,
+    ) -> TaskFuture<'a, Vec<(Task, NoticeTarget)>> {
+        Box::pin(self.db.call(move |c| {
+            let reported = REPORTED_STATES
+                .iter()
+                .map(|state| enum_text(state).map(|text| format!("'{text}'")))
+                .collect::<anyhow::Result<Vec<_>>>()?
+                .join(", ");
+            let mut stmt = c.prepare(&format!(
+                "SELECT {TASK_COLUMNS}, target FROM tasks JOIN task_notices ON task_id = id \
+                 WHERE state IN ({reported}) AND updated_ms >= ?1 \
+                 AND (told_state IS NULL OR told_state != state) \
+                 ORDER BY updated_ms LIMIT ?2"
+            ))?;
+            let rows = stmt.query_map(params![since_ms as i64, limit as i64], |r| {
+                Ok((read_row(r)?, r.get::<_, String>(20)?))
+            })?;
+            let mut pending = Vec::new();
+            for row in rows {
+                let (task, target) = row?;
+                pending.push((task?, serde_json::from_str(&target)?));
+            }
+            Ok(pending)
+        }))
+    }
+
+    fn mark_told<'a>(&'a self, id: &'a TaskId, state: TaskState, at_ms: u64) -> TaskFuture<'a, ()> {
+        let id = id.0.clone();
+        Box::pin(self.db.call(move |c| {
+            c.execute(
+                "UPDATE task_notices SET told_state = ?2, delivered_to_parent_ms = ?3 WHERE task_id = ?1",
+                params![id, enum_text(&state)?, at_ms as i64],
+            )?;
+            Ok(())
         }))
     }
 

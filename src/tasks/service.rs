@@ -16,8 +16,9 @@ use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::time::Instant;
 
 use super::domain::{
-    clip, now_ms, one_line, ChildCounts, PrincipalKind, Requested, Task, TaskBinding, TaskChange,
-    TaskEvent, TaskFilter, TaskId, TaskKind, TaskOrigin, TaskPrincipal, TaskState,
+    clip, now_ms, one_line, ChildCounts, NoticeTarget, PrincipalKind, Requested, Task, TaskBinding,
+    TaskChange, TaskEvent, TaskFilter, TaskId, TaskKind, TaskOrigin, TaskPrincipal, TaskState,
+    REPORTED_STATES,
 };
 use super::events::TaskDomainEvent;
 use super::pane_agent;
@@ -718,6 +719,57 @@ impl TaskService {
         if let Ok(mut live) = self.live.lock() {
             live.task_sessions.insert(asid.to_owned(), true);
         }
+    }
+
+    /// Tell `target` how task `id` ends (`tasks::notices`).
+    pub(crate) async fn notify(&self, id: &TaskId, target: &NoticeTarget) {
+        if let Err(error) = self.store.set_notice(id, target).await {
+            tracing::warn!(task = %id.0, %error, "the parent will not be told how this task ends");
+        }
+    }
+
+    /// Untold reported states of tasks with a notice target (`tasks::notices`).
+    pub(crate) async fn pending_notices(
+        &self,
+        since_ms: u64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(Task, NoticeTarget)>> {
+        self.store.pending_notices(since_ms, limit).await
+    }
+
+    /// Task `id`'s `state` has reached its parent: delivered, or answered by
+    /// a wait. It is not told again.
+    pub(crate) async fn told(&self, id: &TaskId, state: TaskState) {
+        if !REPORTED_STATES.contains(&state) {
+            return;
+        }
+        if let Err(error) = self.store.mark_told(id, state, now_ms()).await {
+            tracing::warn!(task = %id.0, %error, "could not record that the parent was told");
+        }
+    }
+
+    /// Whether the delegation running in pane `pane_id` has stopped: its
+    /// follower saw its agent go idle (or it reported done). `None`: no
+    /// delegation is bound to that pane.
+    pub(crate) async fn pane_task_stopped(&self, session_id: &str, pane_id: &str) -> Option<bool> {
+        let filter = TaskFilter {
+            pane: Some((session_id.to_owned(), pane_id.to_owned())),
+            limit: 1,
+            ..Default::default()
+        };
+        let task = self.store.list(filter).await.ok()?.into_iter().next()?;
+        (task.kind == TaskKind::Delegation).then_some(matches!(
+            task.state,
+            TaskState::IdleUnconfirmed | TaskState::Done
+        ))
+    }
+
+    /// The agent sessions running a turn now, as the follower last saw them.
+    pub(crate) fn busy_sessions(&self) -> Vec<String> {
+        self.live
+            .lock()
+            .map(|live| live.busy.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Whether agent session `asid` is running a turn, as the follower last
@@ -2538,7 +2590,7 @@ fn newest_answer(items: &[TimelineItem], since_ms: u64) -> Option<u64> {
 }
 
 /// The last assistant message of `asid`, in full; `None` when it cannot be read.
-async fn full_answer(state: &AppState, asid: &str, since_ms: u64) -> Option<String> {
+pub(crate) async fn full_answer(state: &AppState, asid: &str, since_ms: u64) -> Option<String> {
     let manager = state.agent_runtime.manager_for_session(asid).await?;
     // Never the child's marker: a parent quoting it would complete itself.
     last_assistant_text(&summary_timeline(&manager, asid, since_ms).await)

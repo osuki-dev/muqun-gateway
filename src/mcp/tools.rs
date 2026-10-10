@@ -535,10 +535,15 @@ impl MuqunMcp {
             args: vec![("goal", &goal)],
         };
         let by = lineage::requested(&self.state, &self.session, &call).await;
+        let caller = lineage::caller_session(&self.state, &self.session, &call).await;
         let view = match self.state.tasks.delegate(&self.state, by, request).await {
             Ok(view) => view,
             Err(error) => return Ok(task_error(error)),
         };
+        if let Some(caller) = caller {
+            let id = TaskId(view.task_id.clone());
+            self.state.tasks.notify(&id, &caller).await;
+        }
         let mut body = json!(view);
         // The create went out and got no answer: whether it started is unknown.
         if let TaskBinding::Peer {
@@ -568,7 +573,12 @@ impl MuqunMcp {
     ) -> Result<CallToolResult, ErrorData> {
         let (id, slice) = (TaskId(args.task_id), wait_slice(args.timeout_s));
         let tasks = &self.state.tasks;
-        reply(tasks.wait(&self.state, &self.by(), &id, slice).await)
+        let waited = tasks.wait(&self.state, &self.by(), &id, slice).await;
+        // What a wait answers is not told again into the caller's session.
+        if let Ok(waited) = &waited {
+            tasks.told(&id, waited.task.state).await;
+        }
+        reply(waited)
     }
 
     #[tool(

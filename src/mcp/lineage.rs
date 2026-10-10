@@ -26,7 +26,7 @@ use crate::agents::domain::{AgentPart, AgentSessionId, TimelineItem, ToolCallSta
 use crate::agents::manager::AgentManager;
 use crate::agents::ports::mirror::SessionMirrorPort;
 use crate::tasks::domain::{
-    Requested, Task, TaskBinding, TaskFilter, TaskId, TaskKind, TaskOrigin,
+    NoticeTarget, Requested, Task, TaskBinding, TaskFilter, TaskId, TaskKind, TaskOrigin,
 };
 use crate::tasks::service::OPEN_STATES;
 use crate::AppState;
@@ -61,6 +61,65 @@ pub(crate) async fn requested(
         parent,
         name: None,
         server_id: None,
+    }
+}
+
+/// The session making `call`, where its result is told (`tasks::notices`):
+/// a pane token's pane; for an agent token, the one session of that agent
+/// running this very call among those running a turn now -- task or not,
+/// since a person's own session delegates too. `None` when none or several
+/// fit: the caller then learns the result from `tasks.wait` only.
+pub(crate) async fn caller_session(
+    state: &AppState,
+    session: &AssistantSession,
+    call: &Call<'_>,
+) -> Option<NoticeTarget> {
+    let agent_id = match &session.binding {
+        TokenBinding::Pane {
+            session_id,
+            pane_id,
+        } => {
+            return Some(NoticeTarget::Pane {
+                session_id: session_id.clone(),
+                pane_id: pane_id.clone(),
+            })
+        }
+        TokenBinding::Agent { agent_id } => agent_id,
+    };
+    let manager = state.agent_runtime.manager_for_agent(agent_id).await?;
+    let mut busy = state.tasks.busy_sessions();
+    busy.truncate(MAX_CANDIDATES);
+    let probes = busy.iter().map(|asid| async {
+        session_items(&manager, asid)
+            .await
+            .iter()
+            .any(|item| runs(item, call))
+    });
+    let running = join_all(probes).await;
+    let mut fits = busy
+        .into_iter()
+        .zip(running)
+        .filter_map(|(asid, running)| running.then_some(asid));
+    match (fits.next(), fits.next()) {
+        (Some(asid), None) => Some(NoticeTarget::Session {
+            agent_id: agent_id.clone(),
+            asid,
+        }),
+        _ => None,
+    }
+}
+
+/// Whether `item` is `call` running right now.
+fn runs(item: &TimelineItem, call: &Call<'_>) -> bool {
+    match &item.part {
+        AgentPart::Tool(part) => {
+            part.state == ToolCallStatus::Running
+                && names_tool(&part.name, call.tool)
+                && call.args.iter().all(|(key, value)| {
+                    part.input.get(*key).and_then(|v| v.as_str()) == Some(*value)
+                })
+        }
+        _ => false,
     }
 }
 
@@ -149,16 +208,7 @@ async fn calling(
         session_items(&manager, asid)
             .await
             .iter()
-            .any(|item| match &item.part {
-                AgentPart::Tool(part) => {
-                    part.state == ToolCallStatus::Running
-                        && names_tool(&part.name, call.tool)
-                        && call.args.iter().all(|(key, value)| {
-                            part.input.get(*key).and_then(|v| v.as_str()) == Some(*value)
-                        })
-                }
-                _ => false,
-            })
+            .any(|item| runs(item, call))
     });
     let calling = join_all(probes).await;
     candidates
@@ -425,6 +475,22 @@ mod tests {
             assert_eq!(asked.parent, expected, "{name}");
             assert_eq!(asked.origin, TaskOrigin::Agent, "{name}");
             assert_eq!(asked.by.id, "agent:opencode");
+            // The same session, task or not, is where its result is told.
+            for (asid, _) in &sessions {
+                let busy = crate::agents::domain::AgentDomainEvent::StatusChanged {
+                    asid: crate::agents::domain::AgentSessionId(asid.to_string()),
+                    status: crate::agents::domain::AgentSessionStatus::Busy,
+                    error: None,
+                    seq: 1,
+                };
+                state.tasks.follow(&state, &busy).await;
+            }
+            let told = caller_session(&state, &agent_token(), &call).await;
+            let expected = has_parent.then(|| NoticeTarget::Session {
+                agent_id: "opencode".into(),
+                asid: "ses_parent".into(),
+            });
+            assert_eq!(told, expected, "{name}");
         }
     }
 
