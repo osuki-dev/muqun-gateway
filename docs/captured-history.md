@@ -301,7 +301,11 @@ re-identified, or the projection emptied; those are handled at once. An emptied
 projection deletes its stored row only when the pane was reset; otherwise the
 stored row stays. Each pass takes at most one 2 MiB projection under a short lock --
 its rows are shared, so that is one reference count per row, never a copy of the
-text -- encodes it without the lock and writes it in one transaction; an unchanged projection opens none. Late recovery
+text -- encodes it without the lock and writes it in one transaction (a
+projection over the bounds, such as one row past 256 KiB, is that pane's
+outcome rather than a storage failure: its stored row is removed, one warning
+is logged, it is not tried again until it changes, and the other panes go on
+being written); an unchanged projection opens none. Late recovery
 rechecks the observation identity, fence and policy, and that no fresh
 historical prefix has appeared meanwhile; a frame that changed only the screen
 does not stop it. Write acknowledgements recheck the exact revision; reset work

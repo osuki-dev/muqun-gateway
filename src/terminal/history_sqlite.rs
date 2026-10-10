@@ -323,6 +323,9 @@ struct SeenProjection {
     content: Option<[u8; 32]>,
     /// When this scope last changed the database.
     written: Instant,
+    /// This revision was over the bounds (a row past 256 KiB, say): not
+    /// stored, not tried again until the projection changes, said once.
+    oversized: bool,
 }
 
 impl Checkpoints {
@@ -631,19 +634,40 @@ impl Checkpoints {
                 }
                 // Shared rows only: the copy and the encoding happen below,
                 // without the lock every read and frame waits on.
-                store
-                    .live_projection_rows(&stamp.scope())
-                    .map_err(|_| anyhow::anyhow!("capture projection exceeds bounds"))?
+                store.live_projection_rows(&stamp.scope())
             };
-            let encoded = capture
-                .filter(|rows| !rows.is_empty())
-                .map(|rows| encode_rows(&rows));
-            if let Some(encoded) = &encoded {
-                anyhow::ensure!(
-                    encoded.len() <= MAX_ENCODED_BYTES,
-                    "encoded projection exceeds bounds"
+            let encoded = capture.map(|rows| {
+                rows.filter(|rows| !rows.is_empty())
+                    .map(|rows| encode_rows(&rows))
+            });
+            // Over the bounds: this pane's outcome, not a storage failure.
+            // The others are still written and the store stays healthy.
+            let Some(encoded) = encoded.ok().filter(|encoded| {
+                encoded
+                    .as_ref()
+                    .is_none_or(|e| e.len() <= MAX_ENCODED_BYTES)
+            }) else {
+                if !seen.is_some_and(|seen| seen.oversized && seen.key == key) {
+                    tracing::warn!(
+                        pane = %stamp.pane,
+                        format = %stamp.format,
+                        "captured history: a projection is over the checkpoint bounds; not stored until it changes"
+                    );
+                }
+                connection.execute("DELETE FROM history_captures WHERE identity=?1", [&key])?;
+                writer.next_scope = Some(scope_key.clone());
+                writer.seen.insert(
+                    scope_key,
+                    SeenProjection {
+                        stamp,
+                        key,
+                        content: None,
+                        written: Instant::now(),
+                        oversized: true,
+                    },
                 );
-            }
+                continue;
+            };
             let content: Option<[u8; 32]> = encoded
                 .as_ref()
                 .map(|encoded| Sha256::digest(encoded).into());
@@ -703,6 +727,7 @@ impl Checkpoints {
                     key,
                     content,
                     written: written.unwrap_or_else(Instant::now),
+                    oversized: false,
                 },
             );
             idle = false;

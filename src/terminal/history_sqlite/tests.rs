@@ -1263,3 +1263,33 @@ async fn quotas_evict_closed_panes_before_open_ones() {
         "the oldest closed one goes"
     );
 }
+
+#[tokio::test]
+async fn an_oversized_projection_is_skipped_and_the_others_are_still_written() {
+    let fixture = Fixture::new();
+    let fold = captures(Some("A"), false);
+    {
+        let mut store = fold.lock().unwrap();
+        // One text row past a page's bound scrolls into history.
+        let big = "x".repeat(300 * 1024);
+        store.record_frame(
+            "default",
+            "p",
+            "recent_unwrapped",
+            "text",
+            &format!("{big}\na\nb\nc"),
+        );
+        store.record_frame("default", "p", "recent_unwrapped", "text", "a\nb\nc\nd");
+        feed_ansi(&mut store);
+    }
+    let checkpoints = fixture.checkpoints(fold).await;
+    for _ in 0..4 {
+        checkpoints.flush_at(now_seconds()).await.unwrap();
+    }
+    assert!(checkpoints.healthy.load(Ordering::Acquire));
+    assert_eq!(
+        record_count(&checkpoints).await,
+        1,
+        "the ANSI shape is stored"
+    );
+}
