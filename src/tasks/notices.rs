@@ -14,7 +14,6 @@ use std::time::Duration;
 use super::domain::{now_ms, NoticeTarget, Task, TaskBinding, TaskState, REPORTED_STATES};
 use super::events::TaskDomainEvent;
 use crate::agents::domain::{AgentDomainEvent, AgentSessionStatus};
-use crate::terminal::backend::{PaneId, SendTextMode};
 use crate::AppState;
 
 /// How far back an untold state is still worth telling.
@@ -70,8 +69,15 @@ pub(crate) async fn deliver(state: &AppState) -> usize {
     };
     let mut told = 0;
     for (child, target) in pending {
-        if !idle(state, &target).await {
-            continue;
+        match ready(state, &target).await {
+            Ready::NotYet => continue,
+            // The record is the Home row and the parent's own summary.
+            Ready::Never(why) => {
+                tracing::info!(task = %child.id.0, why, "notices: the parent is not told");
+                state.tasks.told(&child.id, child.state).await;
+                continue;
+            }
+            Ready::Now => {}
         }
         let line = message(state, &child).await;
         match send(state, &target, &line).await {
@@ -85,18 +91,28 @@ pub(crate) async fn deliver(state: &AppState) -> usize {
     told
 }
 
-/// Whether `target` has ended its turn: a session not running one, or a pane
-/// whose own task its follower saw stop.
-async fn idle(state: &AppState, target: &NoticeTarget) -> bool {
+/// Whether a target can be told now.
+enum Ready {
+    Now,
+    /// Its turn is not over yet.
+    NotYet,
+    /// It never will be: a pane whose agent is gone (typing there would
+    /// reach a shell).
+    Never(&'static str),
+}
+
+/// A session not running a turn; a pane whose own delegation's follower saw
+/// its agent stop, with that agent still alive in it.
+async fn ready(state: &AppState, target: &NoticeTarget) -> Ready {
     match target {
         NoticeTarget::Session { agent_id, asid } => {
             if state.tasks.is_busy(asid) {
-                return false;
+                return Ready::NotYet;
             }
             let Some(manager) = state.agent_runtime.manager_for_agent(agent_id).await else {
-                return false;
+                return Ready::NotYet;
             };
-            manager
+            let idle = manager
                 .sessions()
                 .get_session(asid)
                 .await
@@ -105,17 +121,47 @@ async fn idle(state: &AppState, target: &NoticeTarget) -> bool {
                         session.status,
                         AgentSessionStatus::Busy | AgentSessionStatus::Retry
                     )
-                })
+                });
+            if idle {
+                Ready::Now
+            } else {
+                Ready::NotYet
+            }
         }
         NoticeTarget::Pane {
             session_id,
             pane_id,
-        } => state
-            .tasks
-            .pane_task_stopped(session_id, pane_id)
-            .await
-            .unwrap_or(false),
+        } => {
+            let Some((stopped, kind)) = state.tasks.pane_task(session_id, pane_id).await else {
+                return Ready::Never("no delegation runs in that pane");
+            };
+            if !stopped {
+                return Ready::NotYet;
+            }
+            let Some(kind) = kind else {
+                return Ready::Never("the pane runs no known agent");
+            };
+            let Some(session) = terminal_session(state, session_id) else {
+                return Ready::Never("the terminal session is gone");
+            };
+            if super::pane_agent::agent_lives_in(session, pane_id, &kind).await {
+                Ready::Now
+            } else {
+                Ready::Never("the pane's agent has exited")
+            }
+        }
     }
+}
+
+fn terminal_session<'a>(
+    state: &'a AppState,
+    session_id: &str,
+) -> Option<&'a crate::platform::config::SessionConfig> {
+    state
+        .config
+        .sessions
+        .iter()
+        .find(|session| session.id == session_id)
 }
 
 async fn send(state: &AppState, target: &NoticeTarget, line: &str) -> anyhow::Result<()> {
@@ -140,36 +186,83 @@ async fn send(state: &AppState, target: &NoticeTarget, line: &str) -> anyhow::Re
             session_id,
             pane_id,
         } => {
-            let session = state
-                .config
-                .sessions
-                .iter()
-                .find(|session| session.id == *session_id)
+            let session = terminal_session(state, session_id)
                 .ok_or_else(|| anyhow::anyhow!("no terminal session {session_id}"))?;
-            let backend = crate::terminal_backend(session);
-            let pane = PaneId::new(pane_id.as_str());
-            backend.send_text(&pane, line, SendTextMode::Paste).await?;
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            backend.send_keys(&pane, &["Enter".to_owned()]).await?;
-            super::pane_agent::goal_accepted(session, pane_id, line).await;
+            // As the goal is sent: the agent's own prompt call (a bracketed
+            // paste on tmux), then Enter once the paste has settled.
+            crate::agents::session_routes::submit_agent_prompt(session, pane_id, line)
+                .await
+                .map_err(|error| anyhow::anyhow!(error.message()))?;
+            crate::agents::session_routes::schedule_submit_keypress(
+                session.clone(),
+                pane_id.clone(),
+            );
         }
     }
     Ok(())
 }
 
+/// `text` as one line of plain prose: escape sequences (CSI, OSC and other
+/// `ESC` forms) and control characters gone, line breaks and tabs turned
+/// into single spaces, at most `max` characters.
+pub(crate) fn one_plain_line(text: &str, max: usize) -> String {
+    let mut plain = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => match chars.next() {
+                // CSI: parameters, then one final byte.
+                Some('[') => {
+                    for c in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                // OSC, DCS, SOS, PM, APC: up to BEL or ST.
+                Some(']' | 'P' | 'X' | '^' | '_') => {
+                    while let Some(c) = chars.next() {
+                        if c == '\u{7}' || (c == '\u{1b}' && chars.next_if_eq(&'\\').is_some()) {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            '\r' | '\n' | '\t' => plain.push(' '),
+            c if c.is_control() => {}
+            c => plain.push(c),
+        }
+    }
+    plain
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(max)
+        .collect()
+}
+
 /// The line a parent is told: who, how it ended, and what it said.
 pub(crate) async fn message(state: &AppState, child: &Task) -> String {
     let who = match &child.binding {
-        TaskBinding::Peer { peer_name, .. } => peer_name.clone(),
+        TaskBinding::Peer { peer_name, .. } => one_plain_line(peer_name, 80),
         _ => format!(
             "The task \"{}\"",
-            super::pane_agent::title(
-                child.label.as_deref(),
-                child.session_title.as_deref(),
-                &child.goal
+            one_plain_line(
+                &super::pane_agent::title(
+                    child.label.as_deref(),
+                    child.session_title.as_deref(),
+                    &child.goal
+                ),
+                120
             )
         ),
     };
+    // The line starts with `who`: never a slash command, a shell escape or
+    // a vim-style command.
+    let who = who.trim_start_matches(['/', '!', ':', ' ']);
+    let who = if who.is_empty() { "A sub-task" } else { who };
     // A session delegation's last message in full; else the summary line.
     let answer = match &child.binding {
         TaskBinding::AgentSession { asid, .. }
@@ -179,13 +272,10 @@ pub(crate) async fn message(state: &AppState, child: &Task) -> String {
         }
         _ => None,
     };
-    let result: String = answer
-        .or_else(|| child.summary.clone())
-        .unwrap_or_default()
-        .trim()
-        .chars()
-        .take(MAX_RESULT_CHARS)
-        .collect();
+    let result = one_plain_line(
+        &answer.or_else(|| child.summary.clone()).unwrap_or_default(),
+        MAX_RESULT_CHARS,
+    );
     let (how, fallback) = match child.state {
         TaskState::Done => ("finished", "it is done."),
         TaskState::Waiting => ("needs an answer", "it is waiting for you."),
@@ -344,5 +434,71 @@ mod tests {
         );
         app.tasks.told(&id, TaskState::Done).await;
         assert_eq!(progress(app.clone(), parent).await, None);
+    }
+
+    /// Text the child wrote reaches the parent as one plain line that
+    /// starts with who is speaking; a pane whose agent is gone is never
+    /// typed into, and that delivery is given up, not retried.
+    #[tokio::test]
+    async fn what_a_parent_is_told_is_one_plain_line_and_never_reaches_a_shell() {
+        let app = test_state("admin", vec![test_device("d1", "token")]);
+        let agent = FakeAgent::new("opencode").with_sessions(&[("ses_parent", 1)]);
+        let prompts = agent.prompts.clone();
+        app.agent_runtime.attach_for_test(agent.manager()).await;
+        let hostile = Task {
+            binding: TaskBinding::Peer {
+                peer_id: "peer-x".into(),
+                peer_server_id: "srv-x".into(),
+                remote_task_id: "t_r".into(),
+                peer_name: "/evil".into(),
+            },
+            ..child(
+                TaskState::Done,
+                Some("ok\r\n/exit\u{1b}[2J\u{1b}]0;title\u{7}\ttouch pwned\u{9b}"),
+            )
+        };
+        let id = app.tasks.insert_for_test(&hostile).await;
+        let parent = NoticeTarget::Session {
+            agent_id: "opencode".into(),
+            asid: "ses_parent".into(),
+        };
+        app.tasks.notify(&id, &parent).await;
+        deliver(&app).await;
+        assert_eq!(
+            prompts.lock().unwrap().clone(),
+            ["evil finished: ok /exit touch pwned"]
+        );
+
+        // A pane delegation whose agent cannot be found in its pane.
+        let pane = app
+            .tasks
+            .insert_for_test(&Task {
+                binding: TaskBinding::Pane {
+                    session_id: "default".into(),
+                    pane_id: "%9".into(),
+                    tab_id: None,
+                    shell_pid: None,
+                    agent_id: Some("claude".into()),
+                },
+                ..child(TaskState::IdleUnconfirmed, None)
+            })
+            .await;
+        let id = app
+            .tasks
+            .insert_for_test(&Task {
+                parent: Some(pane),
+                ..child(TaskState::Done, Some("built"))
+            })
+            .await;
+        let target = NoticeTarget::Pane {
+            session_id: "default".into(),
+            pane_id: "%9".into(),
+        };
+        app.tasks.notify(&id, &target).await;
+        assert_eq!(deliver(&app).await, 0);
+        assert!(
+            app.tasks.pending_notices(0, 10).await.unwrap().is_empty(),
+            "given up, not retried"
+        );
     }
 }

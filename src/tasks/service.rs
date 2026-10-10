@@ -834,20 +834,25 @@ impl TaskService {
         }
     }
 
-    /// Whether the delegation running in pane `pane_id` has stopped: its
-    /// follower saw its agent go idle (or it reported done). `None`: no
-    /// delegation is bound to that pane.
-    pub(crate) async fn pane_task_stopped(&self, session_id: &str, pane_id: &str) -> Option<bool> {
+    /// The delegation last bound to pane `pane_id`: whether its follower saw
+    /// its agent stop (idle, or it reported done), and which agent kind it
+    /// runs. `None`: no delegation is bound to that pane.
+    pub(crate) async fn pane_task(
+        &self,
+        session_id: &str,
+        pane_id: &str,
+    ) -> Option<(bool, Option<String>)> {
         let filter = TaskFilter {
             pane: Some((session_id.to_owned(), pane_id.to_owned())),
             limit: 1,
             ..Default::default()
         };
         let task = self.store.list(filter).await.ok()?.into_iter().next()?;
-        (task.kind == TaskKind::Delegation).then_some(matches!(
-            task.state,
-            TaskState::IdleUnconfirmed | TaskState::Done
-        ))
+        let TaskBinding::Pane { agent_id, .. } = &task.binding else {
+            return None;
+        };
+        let stopped = matches!(task.state, TaskState::IdleUnconfirmed | TaskState::Done);
+        (task.kind == TaskKind::Delegation).then(|| (stopped, agent_id.clone()))
     }
 
     /// The agent sessions running a turn now, as the follower last saw them.

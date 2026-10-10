@@ -182,6 +182,33 @@ pub(crate) async fn exited_to_shell(session: &SessionConfig, pane_id: &str, kind
     }
 }
 
+/// Whether a `kind` agent lives in `pane_id` now: the backend names it the
+/// pane's agent, it is the pane's foreground program, or it runs somewhere
+/// under the pane's shell. Anything that cannot be read says no -- the
+/// caller is about to type into the pane, and a shell must never receive it.
+pub(crate) async fn agent_lives_in(session: &SessionConfig, pane_id: &str, kind: &str) -> bool {
+    let Ok(pane) = terminal_backend(session)
+        .get_pane(&PaneId::new(pane_id))
+        .await
+    else {
+        return false;
+    };
+    if pane.agent.as_deref() == Some(kind)
+        || pane
+            .foreground_command
+            .as_deref()
+            .is_some_and(|command| command_name(command) == kind)
+    {
+        return true;
+    }
+    match pane.shell_pid {
+        Some(shell) => process_table()
+            .await
+            .is_some_and(|table| runs_under(&table, shell, kind)),
+        None => false,
+    }
+}
+
 fn at_shell(agent: Option<&str>, foreground: Option<&str>, kind: &str) -> bool {
     let shell = foreground.is_some_and(|command| SHELLS.contains(&command_name(command)));
     agent != Some(kind) && shell
