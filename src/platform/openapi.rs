@@ -829,6 +829,8 @@ fn task_view_schema() -> Value {
             "created_ms": { "type": "integer" },
             "updated_ms": { "type": "integer" },
             "client_ref": { "type": "string", "description": "The requester's own reference for the task (POST /api/tasks client_ref), when it gave one" },
+            "model": { "type": "string", "description": "A terminal delegation only: the model its launch passed, else what its agent's banner showed, else \"default\" (the agent's own)" },
+            "variant": { "type": "string", "description": "A terminal delegation only: the effort that goes with model, when known" },
             "parent_task_id": { "type": ["string", "null"], "description": "The open task this one was started from, when the gateway could tell" },
             "origin": { "type": "string", "enum": ["device", "agent", "mcp", "peer"], "description": "device: POST /api/tasks; peer: POST /api/tasks by another of the owner's computers (fleet_peers); agent: started by work the gateway tracks (its agent service, or the pane of an open task); mcp: any other MCP host. Tasks stored before origins existed are mcp" },
             "label": { "type": ["string", "null"], "description": "A short title the requester gave" },
@@ -929,7 +931,7 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
             }]
         }),
     );
-    create_responses["400"] = json!({ "description": "invalid_request (empty or oversized goal, oversized label, empty name), invalid_directory, directory_not_found, not_a_directory, unknown_model, invalid_mentions (too many mentions, or one naming no linked computer)" });
+    create_responses["400"] = json!({ "description": "invalid_request (empty or oversized goal, oversized label, empty name), invalid_directory, directory_not_found, not_a_directory, unknown_model, invalid_mentions (too many mentions, or one naming no linked computer), terminal_unknown (session_id names no terminal session here)" });
     create_responses["502"] = json!({ "description": "agent_error: the agent could not start the session or take the prompt, or no pane could be made for a terminal agent" });
     create_responses["403"] = json!({ "description": "delegations_disabled: another of the owner's computers (fleet_peers) asked while this computer takes no work from other computers (fleet.accept_delegations); checked before the body. Its task otherwise opens as a device's does, with origin peer and requested_by named from its device record" });
     create_responses["503"] = json!({ "description": "agent_unavailable: the agent is not attached (a session agent is never started in a pane) or a terminal agent is not on PATH; no_terminal: no terminal session answers" });
@@ -1007,14 +1009,34 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
                         "agent_id": { "type": "string", "description": "An attached agent (opencode, ...) or a terminal agent kind from GET /api/agents/catalog (codex, claude, ...). Default: the primary agent" },
                         "cwd": { "type": "string", "description": "Absolute directory (~ expands); default: the home directory" },
                         "mode": { "type": "string", "description": "Ignored for a terminal agent" },
-                        "model": { "type": "string", "description": "A model id from the agent's catalog, or provider_id/model_id. Ignored for a terminal agent, as is variant" },
-                        "variant": { "type": "string", "description": "The model's variant (reasoning effort), applied when the session is created so the first turn uses it. Applied only together with model (ignored otherwise); must be one of the model's catalog variants when it lists any" },
+                        "model": { "type": "string", "description": "A model id from the agent's catalog, or provider_id/model_id. For a terminal agent, passed to its launch for this run only (codex: -c model; claude: --model where its --help lists it); 1 to 128 of A-Z a-z 0-9 . _ : / @ + -, not starting with -" },
+                        "variant": { "type": "string", "description": "The model's variant (reasoning effort), applied when the session is created so the first turn uses it. Applied only together with model (ignored otherwise); must be one of the model's catalog variants when it lists any. For a terminal agent, passed to its launch (codex: -c model_reasoning_effort; claude: --effort where listed)" },
+                        "session_id": { "type": "string", "description": "For a terminal agent: the terminal session to start it in, by its config id (a tmux session or Herdr). Default: the first that answers. One this computer has no session for is 400 terminal_unknown" },
                         "label": { "type": "string", "description": "A short title, at most 200 characters" },
                         "client_ref": { "type": "string", "description": "The requester's own reference, 1 to 128 of A-Z, a-z, 0-9, - and _, echoed in the task's view: how another computer whose create got no answer finds the task" },
                         "mentions": { "type": "array", "items": { "type": "string" }, "maxItems": 8, "description": "The computers the user named: linked computers' names (any case) or self; more than 8, or a name that is neither, is 400 invalid_mentions. Kept on the task, never added to the goal" }
                     }
                 })),
                 "responses": create_responses
+            }}),
+        ),
+        (
+            "/api/tasks/defaults",
+            json!({ "get": {
+                "summary": "What a task the device opens would run with: default_cwd (the device's most recent task directory, null when unknown); with agent_id naming an agent that runs in a terminal pane, also model and variant -- the model/variant query values where its launch can pass them, else the agent's own (Codex's config), else model \"default\"",
+                "parameters": [
+                    query_param("agent_id", "An agent kind; a terminal agent adds model and variant to the answer"),
+                    query_param("model", "The model the task would name"),
+                    query_param("variant", "The effort the task would name")
+                ],
+                "responses": json_ok("Defaults", json!({
+                    "type": "object",
+                    "properties": {
+                        "default_cwd": { "type": ["string", "null"] },
+                        "model": { "type": "string" },
+                        "variant": { "type": ["string", "null"] }
+                    }
+                }))
             }}),
         ),
         (
