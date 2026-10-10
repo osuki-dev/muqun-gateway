@@ -1376,6 +1376,10 @@ Every other session is served as it is:
   its marker lines. An `agent.timeline.upsert` whose rows
   are all left with nothing arrives as `agent.timeline.removed` for them.
   `seq` keeps counting, so a client may see a gap where a row was left out.
+- OpenCode's Code Mode plumbing is left out: an `execute` tool row whose code
+  is only `search({query: …})` for a muqun tool (a query starting `muqun`, or
+  naming `tasks.`, `fleet.` or `exec.run`), and the "Code Mode tool catalog
+  has changed" notice.
 - An inbox item (`GET …/inbox`, the snapshot's `inbox`,
   `agent.inbox.changed`) is cut the same way as a user row: OpenCode holds
   the instruction there for a moment before the turn runs.

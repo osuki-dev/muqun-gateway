@@ -62,6 +62,14 @@ enum Served {
 
 fn hide_in_item(item: &mut TimelineItem, streaming: Streaming) -> Served {
     let (text, served) = match (item.role, &mut item.part) {
+        (_, AgentPart::System { text, .. }) | (_, AgentPart::Synthetic { text, .. })
+            if text
+                .trim_start()
+                .trim_start_matches("The ")
+                .starts_with(CATALOG_NOTICE) =>
+        {
+            return Served::Emptied;
+        }
         (TimelineRole::User, AgentPart::Text { text }) | (_, AgentPart::Synthetic { text, .. }) => {
             let served = without_request(text);
             (text, served)
@@ -70,6 +78,16 @@ fn hide_in_item(item: &mut TimelineItem, streaming: Streaming) -> Served {
         | (TimelineRole::Assistant, AgentPart::Reasoning { text, .. }) => {
             let served = without_markers(text, streaming);
             (text, served)
+        }
+        (_, AgentPart::Tool(call)) => {
+            let code = call.input.get("code").and_then(|code| code.as_str());
+            let lookup =
+                call.name == "execute" && code.is_some_and(|c| muqun_lookup(c, streaming.0));
+            return if lookup {
+                Served::Emptied
+            } else {
+                Served::Kept
+            };
         }
         _ => return Served::Kept,
     };
@@ -123,6 +141,67 @@ pub(crate) fn hide_in_inbox(items: &mut Vec<serde_json::Value>) {
         *text = served.into();
         keep
     });
+}
+
+/// The opening of OpenCode's notice that its Code Mode tool catalog changed
+/// (after an optional "The "): the muqun tools joining it, not the reader's
+/// business.
+const CATALOG_NOTICE: &str = "Code Mode tool catalog has changed";
+
+/// Whether `code` (an OpenCode Code Mode `execute` call) only looks up a
+/// muqun tool in the catalog -- `[return] search({query: "<muqun …|tasks.…|
+/// fleet.…|exec.run>", …})[;]` and nothing else: the agent finding the tool
+/// its hidden instruction names. While `streaming`, code that may still
+/// become one (none yet, or such a call not yet closed) counts too.
+fn muqun_lookup(code: &str, streaming: bool) -> bool {
+    let code = code.trim();
+    let call = code.strip_prefix("return ").map_or(code, str::trim_start);
+    let call = call.strip_suffix(';').unwrap_or(call).trim_end();
+    if call.contains([';', '\n']) {
+        return false;
+    }
+    let Some(args) = call.strip_prefix("search(") else {
+        return streaming
+            && ["return search(", "search("]
+                .iter()
+                .any(|form| form.starts_with(code));
+    };
+    if args.contains("search(") {
+        return false;
+    }
+    let closed_call = args.ends_with(')');
+    let ours = |query: &str| {
+        let query = query.trim().to_ascii_lowercase();
+        query.starts_with("muqun")
+            || ["tasks.", "fleet.", "exec.run"]
+                .iter()
+                .any(|id| query.contains(id))
+    };
+    match query_of(args) {
+        Some((query, true)) => ours(query) && (closed_call || streaming),
+        Some((query, false)) => {
+            streaming
+                && ("muqun".starts_with(query.trim().to_ascii_lowercase().as_str()) || ours(query))
+        }
+        None => streaming && !closed_call,
+    }
+}
+
+/// The `query` string in `search(` arguments, and whether its closing quote
+/// has been written.
+fn query_of(args: &str) -> Option<(&str, bool)> {
+    let rest = &args[args.find("query")? + "query".len()..];
+    let rest = rest.trim_start_matches(['"', '\'']).trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    let quote = rest
+        .chars()
+        .next()
+        .filter(|c| matches!(c, '"' | '\'' | '`'))?;
+    let text = &rest[1..];
+    Some(match text.find(quote) {
+        Some(end) => (&text[..end], true),
+        None => (text, false),
+    })
 }
 
 /// `text` without the completion instruction it ends with, if it ends with
@@ -209,6 +288,14 @@ mod tests {
         AgentPart::Text { text: text.into() }
     }
 
+    /// An OpenCode Code Mode `execute` call running `code`.
+    fn execute(code: &str) -> AgentPart {
+        AgentPart::Tool(crate::agents::adapters::opencode::mapper::map_tool_call(
+            &serde_json::json!({ "type": "tool", "id": "c", "name": "execute",
+                "state": { "status": "completed", "input": { "code": code } } }),
+        ))
+    }
+
     #[test]
     fn the_reader_gets_the_goal_and_the_answer_without_the_plumbing() {
         use TimelineRole::{Assistant, System, User};
@@ -289,11 +376,48 @@ mod tests {
                 text("All green.\n---"),
                 Some("All green.\n---"),
             ),
+            (
+                "a catalog lookup for a muqun tool",
+                Assistant,
+                execute("return search({query:'muqun tasks complete',limit:1});"),
+                None,
+            ),
+            (
+                "a lookup by tool id",
+                Assistant,
+                execute(r#"search({ "query": "tasks.complete" })"#),
+                None,
+            ),
+            (
+                "a script that also looks one up",
+                Assistant,
+                execute("const t = search({query:'muqun'});\nreturn t;"),
+                Some("const t = search({query:'muqun'});\nreturn t;"),
+            ),
+            (
+                "a lookup of another tool",
+                Assistant,
+                execute("return search({query:'browser tabs'});"),
+                Some("return search({query:'browser tabs'});"),
+            ),
+            (
+                "the catalog notice",
+                System,
+                AgentPart::System {
+                    text: "The Code Mode tool catalog has changed. This catalog supersedes it."
+                        .into(),
+                    description: None,
+                },
+                None,
+            ),
         ] {
             let mut items = vec![item(role, part)];
             hide_in_items(&mut items, Streaming(false));
             let got = items.first().map(|item| match &item.part {
-                AgentPart::Text { text } | AgentPart::Synthetic { text, .. } => text.as_str(),
+                AgentPart::Text { text }
+                | AgentPart::Synthetic { text, .. }
+                | AgentPart::System { text, .. } => text.as_str(),
+                AgentPart::Tool(call) => call.input["code"].as_str().unwrap(),
                 _ => unreachable!(),
             });
             assert_eq!(got, served, "{name}");
