@@ -685,7 +685,12 @@ impl MuqunMcp {
         Parameters(args): Parameters<CancelArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let id = TaskId(args.task_id);
-        reply(self.state.tasks.cancel(&self.state, &self.by(), &id).await)
+        let cancelled = self.state.tasks.cancel(&self.state, &self.by(), &id).await;
+        // The caller cancelled it: that end is not told back to it.
+        if let Ok(view) = &cancelled {
+            self.state.tasks.told(&id, view.state).await;
+        }
+        reply(cancelled)
     }
 }
 
@@ -917,6 +922,15 @@ mod tests {
         let (error, _, cancelled) = answer(mcp.tasks_cancel(Parameters(args)).await);
         assert!(!error, "{cancelled}");
         assert_eq!(cancelled["state"], "cancelled");
+        assert!(
+            mcp.state
+                .tasks
+                .pending_notices(0, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the caller's own cancel is not told back to it"
+        );
         let key = crate::terminal::shortcuts::interrupt_key(Some("claude"), None);
         assert!(
             herdr.calls.lock().unwrap().iter().any(|call| {
