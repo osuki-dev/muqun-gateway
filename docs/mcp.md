@@ -422,13 +422,14 @@ the task view plus the session to open:
 
 | Error | When |
 |---|---|
-| `400 invalid_request` | An empty or oversized `goal`, a `label` over 200 characters, an empty or oversized (256 bytes) `agent_id`/`mode`/`model`/`variant`, or `mentions` that is not a list of strings. Nothing is created. |
+| `400 invalid_request` | An empty or oversized `goal`, a `label` over 200 characters, an empty or oversized (256 bytes) `agent_id`/`mode`/`model`/`variant`/`session_id`, or `mentions` that is not a list of strings. Nothing is created. |
 | `400 invalid_mentions` | `mentions` holds more than 8 names, or names a computer that is neither linked nor `self` (it may have been unlinked since the phone offered it). Nothing is created; the same body without `mentions` would be taken. |
 | `400 invalid_directory`, `directory_not_found`, `not_a_directory` | `cwd` is relative, missing, or not a directory. Nothing is created. |
 | `400 unknown_model` | `model` is not in the agent's catalog for `cwd`. Nothing is created. |
 | `400 unknown_variant` | `variant` is not one of the resolved model's catalog variants (a variant without a `model` is ignored). Nothing is created. |
 | `503 agent_unavailable` | That agent (or, without `agent_id`, any agent) is not attached. |
-| `503 no_terminal` | A terminal agent was named and no terminal session answers. Nothing is created. |
+| `503 no_terminal` | A terminal agent was named and no terminal session answers (or the one `session_id` names does not). Nothing is created. |
+| `400 terminal_unknown` | `session_id` names no terminal session of this computer. Nothing is created. |
 | `400 invalid_request` (body) | The body is not a JSON object of the shape above. Authentication is checked first, so without a valid device token this is `401`/`403` whatever the body. |
 | `502 agent_error` | The agent could not create the session or take the prompt; the task is recorded as `failed`, with the error as its `summary`. |
 
@@ -443,7 +444,7 @@ error line as `summary`, or `done` -- since the task and its session exist.
 (`opencode`, `deepseek` and `t3` are session agents: unattached, they are
 `503 agent_unavailable`, never started in a pane). Then, for `POST /api/tasks`
 and `tasks.delegate` alike, the gateway opens a new tab in `cwd` in the first
-reachable terminal session, names the tab and pane after the task (its
+reachable terminal session (or the one `session_id` names, see below), names the tab and pane after the task (its
 `title`, see [Tasks API](#tasks-api)), starts the agent in it
 exactly as `POST /api/sessions/{id}/agents/spawn` does (its bypass launch
 arguments, `agent_env`, folder trust for `cwd`) and gives it the goal as its
@@ -467,8 +468,27 @@ file cannot be read. Neither agent's folder trust is set with
 task directory for that device (or home if it has none) for `POST /api/tasks`,
 and to wherever the backend opens the tab for `tasks.delegate`; it is not held
 to the spawn route's "a directory the session already has open" fence, as no
-other `POST /api/tasks` directory is. `mode`, `model` and `variant` do not
-apply and are ignored.
+other `POST /api/tasks` directory is. `mode` does not apply and is ignored.
+
+`model` and `variant` are passed to the agent's launch, for this run only
+(the user's own config is never touched): Codex gets `-c model="<model>"`
+and `-c model_reasoning_effort="<variant>"`; Claude Code gets `--model
+<model>` and `--effort <variant>`, each only when its `--help` (asked once)
+lists the flag. As for a session agent, `variant` applies only together
+with `model`. Each must be 1 to 128 of `A-Z a-z 0-9 . _ : / @ + -`, not
+starting with `-` (else `400 unknown_model`). The binding and the task view
+carry the `model` and `variant` the launch passed; with none passed, what
+the agent's banner showed once it started (Codex's `model: <id> <effort>`
+line), else `model: "default"`, the agent's own. `GET
+/api/tasks/defaults?agent_id=<kind>[&model=..&variant=..]` answers the same
+for a task not yet made: the named ones where the launch can pass them,
+else Codex's own config (`model`, `model_reasoning_effort`), else
+`default`. `session_id` (`tasks.delegate`: `terminal`) chooses the terminal
+session by its id in `config.json` -- a tmux session or Herdr -- instead of
+the first that answers; an id this computer has no session for is `400
+terminal_unknown` (`invalid_arguments` from `tasks.delegate`), one that does
+not answer `503 no_terminal`. Nothing is created in either case. A delegation
+to a linked computer passes all three on, checked there.
 
 The task is a `delegation`, bound to the pane:
 
