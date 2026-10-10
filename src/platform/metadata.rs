@@ -378,8 +378,15 @@ pub(crate) static SESSION_METADATA_CACHE: std::sync::OnceLock<
 
 pub(crate) async fn session_metadata(session: &SessionConfig) -> (Value, Value) {
     let cache = SESSION_METADATA_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    // Keyed by where the session's server is too: a session id reused for
+    // another socket (a config reload, or another gateway in the same
+    // process, as tests run) must not be answered for the old one.
+    let key = format!(
+        "{}\n{:?}\n{}",
+        session.id, session.backend, session.socket_path
+    );
     if let Ok(cache) = cache.lock() {
-        if let Some((seen, answer)) = cache.get(&session.id) {
+        if let Some((seen, answer)) = cache.get(&key) {
             if seen.elapsed() < SESSION_LIVENESS_TTL {
                 return answer.clone();
             }
@@ -390,10 +397,7 @@ pub(crate) async fn session_metadata(session: &SessionConfig) -> (Value, Value) 
         // Bounded by the configured sessions, which is a handful; the sweep is
         // only here so a config reload cannot leave an entry behind for ever.
         cache.retain(|_, (seen, _)| seen.elapsed() < SESSION_LIVENESS_TTL);
-        cache.insert(
-            session.id.clone(),
-            (std::time::Instant::now(), answer.clone()),
-        );
+        cache.insert(key, (std::time::Instant::now(), answer.clone()));
     }
     answer
 }

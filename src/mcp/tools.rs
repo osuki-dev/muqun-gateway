@@ -183,6 +183,15 @@ fn task_error(error: TaskError) -> CallToolResult {
                 "{name} no longer accepts this computer's link; it is linked again from the owner's phone."
             ),
         ),
+        // An argument the computer there refused is the same mistake as here.
+        TaskError::PeerRefused { machine, code }
+            if matches!(
+                code.as_str(),
+                "invalid_request" | "unknown_model" | "unknown_variant"
+            ) =>
+        {
+            invalid(&format!("{machine} refused the arguments ({code})."))
+        }
         // The code is the peer's own, already bounded to `[a-z0-9_]{1,64}`.
         TaskError::PeerRefused { machine, code } => {
             fail(&code, &format!("{machine} refused the task ({code})."))
@@ -496,7 +505,27 @@ impl MuqunMcp {
             args: vec![("goal", &goal)],
         };
         let by = lineage::requested(&self.state, &self.session, &call).await;
-        reply(self.state.tasks.delegate(&self.state, by, request).await)
+        let view = match self.state.tasks.delegate(&self.state, by, request).await {
+            Ok(view) => view,
+            Err(error) => return Ok(task_error(error)),
+        };
+        let mut body = json!(view);
+        // The create went out and got no answer: whether it started is unknown.
+        if let TaskBinding::Peer {
+            remote_task_id,
+            peer_name,
+            ..
+        } = &view.binding
+        {
+            if remote_task_id.is_empty() {
+                body["note"] = json!(format!(
+                    "Unknown: {peer_name} did not answer in time, so the task may have started there. \
+                     Wait on this task_id: it follows that task once {peer_name} answers, or fails if it never started. \
+                     Do not delegate it again."
+                ));
+            }
+        }
+        Ok(ok(body))
     }
 
     #[tool(

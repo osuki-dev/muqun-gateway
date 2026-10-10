@@ -587,6 +587,8 @@ mod tests {
             (TaskOrigin::Device, TaskState::Waiting),
             (TaskOrigin::Device, TaskState::Working),
             (TaskOrigin::Mcp, TaskState::IdleUnconfirmed),
+            // Another of the owner's computers opened it: the phone owns both.
+            (TaskOrigin::Peer, TaskState::IdleUnconfirmed),
         ] {
             let id = state.tasks.insert_for_test(&opened(origin)).await;
             let to = crate::tasks::domain::TaskChange {
@@ -615,6 +617,13 @@ mod tests {
         assert_eq!(
             (&body["state"], &body["summary"]),
             (&json!("done"), &json!("pushed and tagged"))
+        );
+
+        let (status, body) = call(&state, "POST", &path(&ids[4])).await;
+        assert_eq!(
+            (status, &body["state"]),
+            (StatusCode::OK, &json!("done")),
+            "{body}"
         );
 
         for (id, why) in [

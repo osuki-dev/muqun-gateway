@@ -35,6 +35,9 @@ const CLAIM_AAD: &[u8] = b"POST /api/pair/claim";
 pub(crate) enum PeerError {
     /// Nothing (or not a gateway) answered; a short reason for the log.
     Unreachable(String),
+    /// The request went out but no answer came (a timeout, a cut body):
+    /// whether it took effect over there is unknown.
+    NoAnswer(String),
     /// The peer no longer knows this gateway's token: the link is gone.
     Unauthorized,
     /// It answered with a refusal.
@@ -45,6 +48,7 @@ impl std::fmt::Display for PeerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unreachable(reason) => write!(f, "unreachable: {reason}"),
+            Self::NoAnswer(reason) => write!(f, "no answer: {reason}"),
             Self::Unauthorized => f.write_str("unauthorized"),
             Self::Refused { status, code } => write!(f, "refused {status} {code}"),
         }
@@ -78,8 +82,16 @@ fn http() -> reqwest::Client {
         .expect("a plain reqwest client builds")
 }
 
+/// Not even connected: nothing reached the peer. Anything later (a
+/// timeout, a cut body) may have.
 fn unreachable(error: reqwest::Error) -> PeerError {
-    PeerError::Unreachable(error.without_url().to_string())
+    let reason = error.is_connect();
+    let text = error.without_url().to_string();
+    if reason {
+        PeerError::Unreachable(text)
+    } else {
+        PeerError::NoAnswer(text)
+    }
 }
 
 fn string(value: &Value) -> Result<String, PeerError> {
@@ -345,6 +357,21 @@ impl PeerClient {
         remote(self.json(Method::POST, "/api/tasks", Some(body)).await?)
     }
 
+    /// `GET /api/tasks`: the tasks this gateway opened there, newest first
+    /// (a peer sees only its own).
+    pub(crate) async fn own_tasks(&self) -> Result<Vec<RemoteTask>, PeerError> {
+        let answer = self.json(Method::GET, "/api/tasks?limit=200", None).await?;
+        Ok(answer["tasks"]
+            .as_array()
+            .map(|tasks| {
+                tasks
+                    .iter()
+                    .filter_map(|task| remote(task.clone()).ok())
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     /// `GET /api/tasks/{id}`.
     pub(crate) async fn read_task(&self, id: &str) -> Result<RemoteTask, PeerError> {
         let path = format!("/api/tasks/{}", path_segment(id)?);
@@ -487,15 +514,19 @@ fn upgrade_refused(error: tungstenite::Error) -> PeerError {
     }
 }
 
-/// `id` as one path segment. A task id is `t_` plus URL-safe base64, so
-/// anything else names no task over there.
-fn path_segment(id: &str) -> Result<&str, PeerError> {
-    if !id.is_empty()
+/// Whether `id` can be a task id: `t_` plus URL-safe base64, so at most 64
+/// of `[A-Za-z0-9_-]`. Anything else names no task over there.
+pub(crate) fn is_task_id(id: &str) -> bool {
+    !id.is_empty()
         && id.len() <= 64
         && id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-    {
+}
+
+/// `id` as one path segment ([`is_task_id`]).
+fn path_segment(id: &str) -> Result<&str, PeerError> {
+    if is_task_id(id) {
         Ok(id)
     } else {
         Err(PeerError::Refused {
@@ -505,8 +536,13 @@ fn path_segment(id: &str) -> Result<&str, PeerError> {
     }
 }
 
+/// A task view from the peer, refused unless its id is task-shaped: the id
+/// is stored here and later put in a path.
 fn remote(value: Value) -> Result<RemoteTask, PeerError> {
-    serde_json::from_value(value).map_err(|_| PeerError::Unreachable("not a task".into()))
+    serde_json::from_value::<RemoteTask>(value)
+        .ok()
+        .filter(|task| is_task_id(&task.task_id))
+        .ok_or_else(|| PeerError::Unreachable("not a task".into()))
 }
 
 /// B's task view, as much of it as a mirror copies.
@@ -514,6 +550,9 @@ fn remote(value: Value) -> Result<RemoteTask, PeerError> {
 pub(crate) struct RemoteTask {
     pub task_id: String,
     pub state: TaskState,
+    /// What it was asked: how a create that got no answer finds its task.
+    #[serde(default)]
+    pub goal: String,
     #[serde(default)]
     pub summary: Option<String>,
     #[serde(default)]
@@ -557,6 +596,11 @@ pub(crate) struct TaskFeed {
 }
 
 impl TaskFeed {
+    /// When anything last arrived on the socket.
+    pub(crate) fn heard(&self) -> Instant {
+        self.heard
+    }
+
     /// The next task change, a `Resync` first. `None`: the socket ended
     /// (closed, silent past a ping, a frame that did not open, or an `error`
     /// frame); open a new one. Cancel-safe between frames.
@@ -567,7 +611,7 @@ impl TaskFeed {
         loop {
             let frame = self.next_plaintext().await?;
             match frame["t"].as_str() {
-                Some("task") => match serde_json::from_value(frame["data"].clone()) {
+                Some("task") => match remote(frame["data"].clone()) {
                     Ok(task) => return Some(FeedItem::Task(task)),
                     // A view this side cannot read: the follower's poll
                     // fetches it.

@@ -2071,6 +2071,18 @@ checks it, so it never replaces or evicts a device; its only use is that
 `DELETE /api/peers/{id}` also revokes the gateway devices here whose
 `server_id` is that peer's (its login into this computer), so one call
 unlinks both directions. A peer forgotten after a `401` keeps its login here.
+`DELETE /api/peers/{id}` (the admin token or an app device only) answers
+`{"remote_revoked", "counterpart_revoked"}`: whether the peer confirmed it
+revoked this gateway's token, and whether a login of the peer's was found and
+revoked here. Each runs whatever the other did; the peer is forgotten either way.
+
+A delegation to a linked computer is a mirror here with `binding: {kind:
+"peer", peer_id, peer_server_id, remote_task_id, peer_name}`: `peer_server_id`
+is the id that computer gave for itself, which the phone knows it by, and
+`remote_task_id` is empty while a create that got no answer has not found its
+task there yet (`tasks.delegate` then carries a `note` saying so). A task
+another computer opened here (`origin: "peer"`) can be confirmed from the phone
+like a device's.
 
 At the device limit, a gateway's `POST /api/pair/claim` makes room only by
 dropping the oldest gateway device, never one of the owner's apps; with no

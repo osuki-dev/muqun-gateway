@@ -87,8 +87,13 @@ pub(crate) enum TaskBinding {
     /// its mirror here, kept in step with task `remote_task_id` on peer
     /// `peer_id` (`fleet::mirror`). `peer_name` is the peer's name when the
     /// mirror was made: a display fallback for a phone that does not know it.
+    /// `peer_server_id` is the id that computer gave for itself, which the
+    /// phone knows it by. `remote_task_id` is empty while the create got no
+    /// answer and the task over there is not found yet.
     Peer {
         peer_id: String,
+        #[serde(default)]
+        peer_server_id: String,
         remote_task_id: String,
         peer_name: String,
     },

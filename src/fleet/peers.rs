@@ -15,7 +15,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::peer_client::{self, PeerClient, PeerError};
-use crate::connectivity::authority::DeviceKind;
+use crate::connectivity::authority::{DeviceKind, DeviceRecord};
 use crate::platform::config::FleetConfig;
 use crate::platform::store::sqlite::Migration;
 use crate::tasks::domain::now_ms;
@@ -188,14 +188,18 @@ pub(crate) enum RenameError {
 }
 
 /// Ask `peer` to revoke the device this gateway holds over there, with that
-/// device's own token. Best effort: the answer only goes to the log.
-async fn revoke(peer: &Peer) {
+/// device's own token. Best effort: whether the peer confirmed it.
+async fn revoke(peer: &Peer) -> bool {
     let Ok(client) = PeerClient::for_peer(peer) else {
-        return;
+        return false;
     };
     let path = format!("/api/pairings/{}", peer.device_id);
-    if let Err(error) = client.json(Method::DELETE, &path, None).await {
-        tracing::info!(peer = %peer.peer_id, "the peer did not confirm the revoke: {error}");
+    match client.json(Method::DELETE, &path, None).await {
+        Ok(_) => true,
+        Err(error) => {
+            tracing::info!(peer = %peer.peer_id, "the peer did not confirm the revoke: {error}");
+            false
+        }
     }
 }
 
@@ -236,6 +240,21 @@ impl PeerSockets {
             .unwrap_or(false)
     }
 
+    /// The calling follower of `peer_id` is about to end: its entry goes
+    /// now, so a mirror bound from here on starts a new one (`ensure`).
+    pub(crate) fn leave(&self, peer_id: &str) {
+        let Ok(mut running) = self.running.lock() else {
+            return;
+        };
+        let me = tokio::task::try_id();
+        if running
+            .get(peer_id)
+            .is_some_and(|handle| Some(handle.id()) == me)
+        {
+            running.remove(peer_id);
+        }
+    }
+
     /// End `peer_id`'s follower, if one runs. The follower may be the
     /// caller (it forgets a peer that no longer knows this gateway), so
     /// callers do this last: nothing after it in the same task would run.
@@ -253,19 +272,48 @@ impl PeerSockets {
 
 /// Revoke the gateway devices here that `server_id` paired as: the peer's
 /// own login into this computer. Best effort, like the revoke over there.
-fn revoke_login(state: &AppState, server_id: &str) {
+/// Whether a login was found and revoked; the list changes only once it is
+/// written, so memory and disk never disagree.
+fn revoke_login(state: &AppState, server_id: &str) -> bool {
+    if server_id.is_empty() {
+        return false;
+    }
     let Ok(mut devices) = state.devices.lock() else {
-        return;
+        return false;
     };
-    let before = devices.len();
-    devices.retain(|device| {
-        device.kind != DeviceKind::Gateway || device.server_id.as_deref() != Some(server_id)
-    });
-    if devices.len() != before {
-        if let Err(error) = crate::platform::store::write_devices(&devices) {
+    let kept: Vec<_> = devices
+        .iter()
+        .filter(|device| !is_login_of(device, server_id))
+        .cloned()
+        .collect();
+    if kept.len() == devices.len() {
+        return false;
+    }
+    match crate::platform::store::write_devices(&kept) {
+        Ok(()) => {
+            *devices = kept;
+            true
+        }
+        Err(error) => {
             tracing::warn!("failed to revoke a peer's login here: {error:#}");
+            false
         }
     }
+}
+
+/// A gateway device (never an app's) that paired as exactly `server_id`.
+fn is_login_of(device: &DeviceRecord, server_id: &str) -> bool {
+    device.kind == DeviceKind::Gateway && device.server_id.as_deref() == Some(server_id)
+}
+
+/// What an unlink did besides forgetting the peer: each step runs whatever
+/// the other did, and says how it went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct Unlinked {
+    /// The peer confirmed it revoked this gateway's token over there.
+    pub remote_revoked: bool,
+    /// The peer's own login here was found and revoked.
+    pub counterpart_revoked: bool,
 }
 
 /// The peers registry and the accept switch (`AppState.peers`).
@@ -388,7 +436,7 @@ impl PeerService {
         let claimed = peer_client::claim(&url, &request.request_id, &request.code)
             .await
             .map_err(|error| match error {
-                PeerError::Unreachable(_) => LinkError::Unreachable,
+                PeerError::Unreachable(_) | PeerError::NoAnswer(_) => LinkError::Unreachable,
                 PeerError::Unauthorized => LinkError::Refused("invalid_pairing_code".into()),
                 PeerError::Refused { code, .. } => LinkError::Refused(code),
             })?;
@@ -437,7 +485,7 @@ impl PeerService {
         // fills the cache.
         let client = PeerClient::for_peer(&peer).map_err(LinkError::Store)?;
         client.ping().await.map_err(|error| match error {
-            PeerError::Unreachable(_) => LinkError::Unreachable,
+            PeerError::Unreachable(_) | PeerError::NoAnswer(_) => LinkError::Unreachable,
             PeerError::Unauthorized => LinkError::Refused("invalid_token".into()),
             PeerError::Refused { code, .. } => LinkError::Refused(code),
         })?;
@@ -453,18 +501,24 @@ impl PeerService {
     /// effort; take back its own login here too, so one call ends both
     /// directions. The link is over either way, and its open mirrors end as
     /// lost. `false`: no such peer.
-    pub(crate) async fn unlink(&self, state: &AppState, peer_id: &str) -> anyhow::Result<bool> {
+    pub(crate) async fn unlink(
+        &self,
+        state: &AppState,
+        peer_id: &str,
+    ) -> anyhow::Result<Option<Unlinked>> {
         let Some(peer) = self.get(peer_id).await else {
-            return Ok(false);
+            return Ok(None);
         };
-        revoke(&peer).await;
-        revoke_login(state, &peer.server_id);
+        let unlinked = Unlinked {
+            remote_revoked: revoke(&peer).await,
+            counterpart_revoked: revoke_login(state, &peer.server_id),
+        };
         super::mirror::lose(state, peer_id, &peer.name).await;
-        let removed = self.store.remove(peer_id).await?;
+        let removed = self.store.remove(peer_id).await;
         self.presence.gone(peer_id);
         self.refresh_names().await;
         self.sockets.stop(peer_id);
-        Ok(removed)
+        Ok(removed?.then_some(unlinked))
     }
 
     /// Call `peer_id` `name` here (§10.16). `None`: no such peer.

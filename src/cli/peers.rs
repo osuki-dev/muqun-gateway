@@ -124,8 +124,19 @@ pub(crate) async fn run(command: PeersCommand) -> anyhow::Result<()> {
                 Duration::from_secs(1),
                 LINK_TIMEOUT,
             )?;
-            anyhow::ensure!(status == 204, refusal(status, &value));
-            println!("unlinked {}", peer["name"].as_str().unwrap_or(&name));
+            anyhow::ensure!(status == 200, refusal(status, &value));
+            let name = peer["name"].as_str().unwrap_or(&name);
+            println!("unlinked {name}");
+            if value["remote_revoked"] != true {
+                println!(
+                    "{name} did not confirm it revoked this computer; revoke it in its manage view"
+                );
+            }
+            if value["counterpart_revoked"] != true {
+                println!(
+                    "{name} holds no login here that it was paired as; check manage > Devices"
+                );
+            }
         }
     }
     Ok(())

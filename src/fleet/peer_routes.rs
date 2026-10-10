@@ -197,22 +197,22 @@ async fn rename(
     Ok(Json(json!(peer.view(now_ms()))))
 }
 
-/// `DELETE /api/peers/{peer_id}`: forget it, and ask it to forget this one.
+/// `DELETE /api/peers/{peer_id}`: forget it, ask it to forget this one, and
+/// revoke its own login here; says which of the two revokes took.
 async fn unlink(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(peer_id): Path<String>,
 ) -> ApiResult<Response> {
+    // The owner only: the admin token or an app device, never a peer's token.
     owner(&state, &headers)?;
-    if !state
+    let unlinked = state
         .peers
         .unlink(&state, &peer_id)
         .await
         .map_err(store_failed)?
-    {
-        return Err(peer_not_found());
-    }
-    Ok(StatusCode::NO_CONTENT.into_response())
+        .ok_or_else(peer_not_found)?;
+    Ok(Json(json!(unlinked)).into_response())
 }
 
 #[derive(Deserialize)]
@@ -247,6 +247,7 @@ mod tests {
     use tower::ServiceExt as _;
 
     use crate::connectivity::authority::{DeviceKind, DeviceRecord};
+    use crate::fleet::peers::Peer;
     use crate::test_support::{
         named, output_state, peer_router, serve, test_peer_device, FakeHerdr,
     };
@@ -438,15 +439,34 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
 
-        // Mini's own login here, and another computer's: unlinking mini takes
-        // back both directions, and only mini's.
-        for (id, server_id) in [("mini-login", "srv-mini"), ("other-login", "srv-other")] {
+        // Mini's own login here, and records that only look like it: unlinking
+        // mini takes back both directions, and only a gateway device that
+        // paired as exactly mini's id.
+        for (id, server_id, kind) in [
+            ("mini-login", "srv-mini", DeviceKind::Gateway),
+            ("other-login", "srv-other", DeviceKind::Gateway),
+            ("near-login", "srv-mini-2", DeviceKind::Gateway),
+            ("phone", "srv-mini", DeviceKind::App),
+        ] {
             coding.devices.lock().unwrap().push(DeviceRecord {
                 server_id: Some(server_id.into()),
+                kind,
                 ..test_peer_device(id, id)
             });
         }
-        let (status, _) = call(
+        // Neither a stranger nor mini's own login can unlink it.
+        for token in ["nobody", "mini-login"] {
+            let (status, _) = call(
+                &coding,
+                "DELETE",
+                &format!("/api/peers/{mini_id}"),
+                token,
+                None,
+            )
+            .await;
+            assert!(status.is_client_error(), "{token}: {status}");
+        }
+        let (status, unlinked) = call(
             &coding,
             "DELETE",
             &format!("/api/peers/{mini_id}"),
@@ -454,14 +474,26 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(status, StatusCode::OK, "{unlinked}");
         assert_eq!(
-            gateways(&coding)
-                .into_iter()
-                .map(|(id, _)| id)
-                .collect::<Vec<_>>(),
-            ["other-login"]
+            unlinked,
+            json!({ "remote_revoked": true, "counterpart_revoked": true })
         );
+        let left: Vec<String> = coding
+            .devices
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|device| device.id.clone())
+            .collect();
+        for (id, kept) in [
+            ("mini-login", false),
+            ("other-login", true),
+            ("near-login", true),
+            ("phone", true),
+        ] {
+            assert_eq!(left.iter().any(|left| left == id), kept, "{id}");
+        }
         assert!(mini
             .devices
             .lock()
@@ -470,6 +502,58 @@ mod tests {
             .all(|device| device.kind != DeviceKind::Gateway));
         let (_, listed) = call(&coding, "GET", "/api/peers", "token", None).await;
         assert_eq!(listed["peers"], json!([]));
+
+        // Each step is told apart, and none waits on another: a peer that does
+        // not answer is still forgotten, and its login here still revoked.
+        for (server_id, login, expected) in [
+            (
+                "srv-nas",
+                true,
+                json!({ "remote_revoked": false, "counterpart_revoked": true }),
+            ),
+            (
+                "srv-gone",
+                false,
+                json!({ "remote_revoked": false, "counterpart_revoked": false }),
+            ),
+        ] {
+            coding
+                .peers
+                .store_for_test(Peer {
+                    peer_id: format!("p-{server_id}"),
+                    server_id: server_id.into(),
+                    name: server_id.into(),
+                    url: "http://127.0.0.1:9".into(),
+                    token: "t".into(),
+                    device_id: "d".into(),
+                    transport_key: None,
+                    added_ms: 0,
+                    last_seen_ms: None,
+                    capabilities: vec![],
+                    manifest: None,
+                })
+                .await;
+            if login {
+                coding.devices.lock().unwrap().push(DeviceRecord {
+                    server_id: Some(server_id.into()),
+                    ..test_peer_device("nas-login", "nas-login")
+                });
+            }
+            let (status, unlinked) = call(
+                &coding,
+                "DELETE",
+                &format!("/api/peers/p-{server_id}"),
+                "token",
+                None,
+            )
+            .await;
+            assert_eq!(
+                (status, unlinked),
+                (StatusCode::OK, expected),
+                "{server_id}"
+            );
+            assert!(coding.peers.get(&format!("p-{server_id}")).await.is_none());
+        }
     }
 
     /// What a peer's token may do on the computer that enrolled it: its
@@ -493,6 +577,7 @@ mod tests {
             ("GET", "/api/pairings", StatusCode::FORBIDDEN),
             ("GET", "/health", StatusCode::FORBIDDEN),
             ("PATCH", "/api/peers/srv-x", StatusCode::FORBIDDEN),
+            ("DELETE", "/api/peers/srv-x", StatusCode::FORBIDDEN),
             ("POST", "/api/pair/pending", StatusCode::FORBIDDEN),
             ("GET", "/api/peers", StatusCode::FORBIDDEN),
             ("PUT", "/api/fleet/settings", StatusCode::FORBIDDEN),

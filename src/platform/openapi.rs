@@ -788,7 +788,7 @@ fn task_view_schema() -> Value {
             "peer_last_seen_ms": { "type": "integer", "description": "A mirror only: when its computer last answered; absent if it never did" },
             "binding": {
                 "type": "object",
-                "description": "What the task runs in. `kind` is `none`, `agent_session` (with agent_id, asid) `pane` (with session_id, pane_id, tab_id; plus agent_id, the terminal agent kind, for a delegation to a terminal agent -- absent for a command), or `peer` (fleet_peers: a mirror of task remote_task_id on linked computer peer_id; peer_name is that computer's name when the mirror was made, a display fallback)",
+                "description": "What the task runs in. `kind` is `none`, `agent_session` (with agent_id, asid), `pane` (with session_id, pane_id, tab_id; plus agent_id, the terminal agent kind, for a delegation to a terminal agent -- absent for a command), or `peer` (fleet_peers: a mirror of task remote_task_id on linked computer peer_id, whose own server id is peer_server_id; peer_name is that computer's name when the mirror was made, a display fallback; remote_task_id is empty while a create that got no answer has not found its task there yet)",
                 "required": ["kind"],
                 "properties": { "kind": { "type": "string", "enum": ["none", "agent_session", "pane", "peer"] } },
                 "additionalProperties": true
@@ -1173,10 +1173,17 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
                     ])
                 },
                 "delete": {
-                    "summary": "Unlink a gateway: forget it here and ask it to revoke this gateway's token (best effort)",
+                    "summary": "Unlink a gateway: forget it here, ask it to revoke this gateway's token, and revoke the gateway devices here that paired as its server_id. Each revoke is best effort and runs whatever the other did. The admin token or an app device only",
                     "parameters": [path_param("id")],
                     "responses": {
-                        "204": { "description": "Unlinked" },
+                        "200": { "description": "Unlinked", "content": { "application/json": { "schema": {
+                            "type": "object",
+                            "required": ["remote_revoked", "counterpart_revoked"],
+                            "properties": {
+                                "remote_revoked": { "type": "boolean", "description": "The peer confirmed it revoked this gateway's token" },
+                                "counterpart_revoked": { "type": "boolean", "description": "A gateway device here that paired as the peer's server_id was found and revoked" }
+                            }
+                        } } } },
                         "401": { "description": "Missing or invalid authorization" },
                         "403": { "description": "Invalid token, or peer_forbidden" },
                         "404": { "description": "peer_not_found" }

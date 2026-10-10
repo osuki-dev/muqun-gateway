@@ -2092,12 +2092,14 @@ impl TaskService {
         // A mirror is settled here in any open state (its computer may be
         // quiet, §10.11); the task over there is left as it is.
         let mirror = matches!(task.binding, TaskBinding::Peer { .. });
-        if task.state == TaskState::Done && (task.origin == TaskOrigin::Device || mirror) {
+        // Opened by a device, or by another of the owner's computers: the
+        // phone owns both, and confirms either.
+        let opened_by_owner = matches!(task.origin, TaskOrigin::Device | TaskOrigin::Peer);
+        if task.state == TaskState::Done && (opened_by_owner || mirror) {
             return Ok(self.present(&task).await);
         }
         let confirmable = task.kind == TaskKind::Delegation
-            && ((task.origin == TaskOrigin::Device && paused(task.state))
-                || (mirror && !task.state.is_terminal()));
+            && ((opened_by_owner && paused(task.state)) || (mirror && !task.state.is_terminal()));
         if !confirmable {
             return Err(TaskError::NotConfirmable);
         }
