@@ -177,12 +177,26 @@ fn hide_in_item(item: &mut TimelineItem, streaming: Streaming) -> Served {
         {
             return Served::Emptied;
         }
+        // The notice the task's per-session instruction leaves.
+        (_, AgentPart::System { text, description })
+        | (_, AgentPart::Synthetic { text, description })
+            if is_task_instruction_notice(text, description.as_deref()) =>
+        {
+            return Served::Emptied;
+        }
         (TimelineRole::User, AgentPart::Text { text }) | (_, AgentPart::Synthetic { text, .. }) => {
             let served = without_request(text);
             (text, served)
         }
         // Its marker line was cut before ([`strip_consumed_markers`]).
         (TimelineRole::Assistant, AgentPart::Text { text }) if text.trim().is_empty() => {
+            return Served::Emptied;
+        }
+        // The agent reporting the task's end is how the ledger hears it, not
+        // the reader's business: `tasks.complete` under any host's prefix.
+        (_, AgentPart::Tool(call))
+            if call.name.ends_with("tasks.complete") || call.name.ends_with("tasks_complete") =>
+        {
             return Served::Emptied;
         }
         (_, AgentPart::Tool(call)) if call.name == "execute" => {
@@ -264,6 +278,16 @@ const CATALOG_NOTICE: [&str; 2] = [
     "The Code Mode tool catalog has changed.",
     "The Code Mode tool catalog has changed. This catalog supersedes the previous Code Mode tool catalog.",
 ];
+
+/// Whether a system or synthetic row is the notice of the task's
+/// per-session instruction (`mcp::inject::SESSION_INSTRUCTION_KEY`): its
+/// description names the key, or its text is the instruction.
+fn is_task_instruction_notice(text: &str, description: Option<&str>) -> bool {
+    let key = crate::mcp::inject::SESSION_INSTRUCTION_KEY;
+    description.is_some_and(|description| {
+        description.starts_with("Instructions updated") && description.contains(key)
+    }) || text.trim() == crate::mcp::inject::TASK_SENTENCE
+}
 
 /// Whether `text` is exactly that notice: its first line, then nothing or
 /// the catalog listing.
@@ -626,6 +650,21 @@ mod tests {
                            Code Mode tool catalog.\n\n# Code Mode\n\nUse the `execute` tool."
                         .into(),
                     description: None,
+                },
+                None,
+            ),
+            (
+                "the agent reporting the task's end",
+                Assistant,
+                tool("muqun_tasks_complete", "completed", serde_json::Value::Null),
+                None,
+            ),
+            (
+                "the task's per-session instruction notice",
+                System,
+                AgentPart::System {
+                    text: crate::mcp::inject::TASK_SENTENCE.into(),
+                    description: Some("Instructions updated: muqun-task".into()),
                 },
                 None,
             ),

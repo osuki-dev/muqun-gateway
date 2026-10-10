@@ -157,6 +157,27 @@ pub trait AgentPort: Send + Sync {
         })
     }
 
+    /// Attach (or replace) a durable instruction `text` under `key` to
+    /// session `session_id`, outside its conversation. `Ok(false)` when the
+    /// agent has no such thing.
+    fn set_session_instruction<'a>(
+        &'a self,
+        _session_id: &'a str,
+        _key: &'a str,
+        _text: &'a str,
+    ) -> AgentFuture<'a, bool> {
+        Box::pin(async { Ok(false) })
+    }
+
+    /// Remove the instruction under `key` from session `session_id`.
+    fn remove_session_instruction<'a>(
+        &'a self,
+        _session_id: &'a str,
+        _key: &'a str,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// Revert session to a previous message and roll back file changes
     fn revert_session<'a>(
         &'a self,

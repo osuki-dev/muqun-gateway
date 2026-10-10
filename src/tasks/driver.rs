@@ -81,6 +81,42 @@ pub(crate) fn spawn(state: AppState) {
     });
 }
 
+/// When a session task whose session carries the task's instruction ends,
+/// remove the entry, so a session reused later is not told it runs a task.
+pub(crate) fn spawn_instruction_cleanup(state: AppState) {
+    let mut events = state.task_events.subscribe();
+    tokio::spawn(async move {
+        use tokio::sync::broadcast::error::RecvError;
+        loop {
+            let task = match events.recv().await {
+                Ok(super::events::TaskDomainEvent::Updated { task, .. }) => task,
+                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Closed) => return,
+            };
+            if !task.state.is_terminal()
+                || !state
+                    .tasks
+                    .take_instructed(&super::domain::TaskId(task.task_id.clone()))
+            {
+                continue;
+            }
+            let TaskBinding::AgentSession { agent_id, asid } = &task.binding else {
+                continue;
+            };
+            let Some(manager) = state.agent_runtime.manager_for_agent(agent_id).await else {
+                continue;
+            };
+            if let Err(error) = manager
+                .agent()
+                .remove_session_instruction(asid, crate::mcp::inject::SESSION_INSTRUCTION_KEY)
+                .await
+            {
+                tracing::debug!(%error, "the task's session instruction stays");
+            }
+        }
+    });
+}
+
 /// Follow the agents' events for the life of the gateway, settling the
 /// delegation each one is about.
 pub(crate) fn spawn_follower(state: AppState) {

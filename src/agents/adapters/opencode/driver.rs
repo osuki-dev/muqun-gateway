@@ -523,6 +523,32 @@ impl AgentPort for OpencodeDriver {
         true
     }
 
+    fn set_session_instruction<'a>(
+        &'a self,
+        session_id: &'a str,
+        key: &'a str,
+        text: &'a str,
+    ) -> AgentFuture<'a, bool> {
+        Box::pin(async move {
+            self.client
+                .set_session_instruction(session_id, key, text)
+                .await
+        })
+    }
+
+    fn remove_session_instruction<'a>(
+        &'a self,
+        session_id: &'a str,
+        key: &'a str,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            self.client
+                .remove_session_instruction(session_id, key)
+                .await?;
+            Ok(())
+        })
+    }
+
     fn mcp_server_connected<'a>(
         &'a self,
         name: &'a str,

@@ -181,9 +181,14 @@ An agent gets the muqun server one of two ways:
      `idle_unconfirmed`, or on a marker.
 
    How a task's agent learns to report its end comes three ways, none of
-   them in the conversation: OpenCode and any host that reads them get the
-   server's `initialize` instructions (written plainly for a caller started
-   for a task); Claude Code and Codex, which do not act on those, are given
+   them in the conversation: an OpenCode session created for a task carries
+   the sentence below as a per-session instruction entry
+   (`PUT /api/experimental/session/{id}/instructions/entries/muqun-task`,
+   set before the goal, removed when the task ends; the "instructions
+   updated" notice it leaves is not served; an OpenCode without the route
+   leaves a note on the task's dispatch event and the session gets only the
+   conditional server instructions); any host that reads them gets the
+   server's `initialize` instructions; Claude Code and Codex, which do not act on those, are given
    one sentence out of band at launch -- "You were started for a Muqun task:
    when it is finished call the muqun tool tasks.complete (outcome blocked if
    you need the user)." -- Claude Code through

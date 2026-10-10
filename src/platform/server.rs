@@ -166,6 +166,7 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     // Regardless of `mcp.enabled`: the phone's task list needs it too.
     crate::tasks::driver::spawn(state.clone());
     crate::tasks::driver::spawn_follower(state.clone());
+    crate::tasks::driver::spawn_instruction_cleanup(state.clone());
 
     let app = Router::new();
     let app = platform::routes::mount(app);

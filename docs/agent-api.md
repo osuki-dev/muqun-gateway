@@ -1385,6 +1385,9 @@ Every other session is served as it is:
   marker never shows mid-turn. An `agent.timeline.upsert` whose rows are all
   left with nothing arrives as `agent.timeline.removed` for them. `seq` keeps
   counting, so a client may see a gap where a row was left out.
+- The agent's own `tasks.complete` call (under any host prefix, such as
+  `muqun_tasks_complete`) and the notice OpenCode leaves for the task's
+  per-session instruction (`Instructions updated: …muqun-task`) are left out.
 - OpenCode's Code Mode plumbing is left out: an `execute` tool row (held while
   its code is not known yet and the turn runs) whose whole code is
   `[return] search({query: '<string>'[, limit: <integer>]})[;]` for a muqun

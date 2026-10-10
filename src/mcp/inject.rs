@@ -34,6 +34,10 @@ use crate::mcp::tokens::{AssistantTokenStore, TokenBinding, NO_EXPIRY};
 pub(crate) const TASK_SENTENCE: &str = "You were started for a Muqun task: when it is \
      finished call the muqun tool tasks.complete (outcome blocked if you need the user).";
 
+/// The key of the per-session instruction a session agent's task session
+/// carries ([`TASK_SENTENCE`]) while its task is open.
+pub(crate) const SESSION_INSTRUCTION_KEY: &str = "muqun-task";
+
 /// The label of the tokens minted for OpenCode's runtime registration; an
 /// earlier one is revoked when a new one is in use.
 pub(crate) const RUNTIME_LABEL: &str = "opencode (started tasks)";
