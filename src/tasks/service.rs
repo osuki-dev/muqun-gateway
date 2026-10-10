@@ -1760,18 +1760,20 @@ impl TaskService {
         let TaskBinding::AgentSession { agent_id, asid } = &task.binding else {
             return false;
         };
+        // `working` is only ever proposed on a sign of a running turn (a busy
+        // event, a running session); a session read need not agree yet --
+        // OpenCode's says idle -- so only the turn's age is checked.
         if to == TaskState::IdleUnconfirmed {
             return true;
+        }
+        if blocked.by_marker {
+            return false;
         }
         let Some(manager) = state.agent_runtime.manager_for_agent(agent_id).await else {
             return true;
         };
         match manager.sessions().get_session(asid).await {
-            Ok(session) => {
-                let later =
-                    blocked.by_marker || session.time_idle.is_some_and(|idle| idle > blocked.at_ms);
-                !(is_running(session.status) && later)
-            }
+            Ok(session) => !session.time_idle.is_some_and(|idle| idle > blocked.at_ms),
             Err(_) => true,
         }
     }
@@ -3299,7 +3301,9 @@ mod tests {
         let idle = || Event(Box::new(status(AgentSessionStatus::Idle)));
         let busy = || Event(Box::new(status(AgentSessionStatus::Busy)));
         let blocked = || Complete("notes.md does not exist", Outcome::Blocked);
-        let running_since = |offset| Session(AgentSessionStatus::Busy, offset);
+        // The session read reports idle even while a turn runs (OpenCode's
+        // does): the busy event is what says it runs.
+        let idle_since = |offset| Session(AgentSessionStatus::Idle, offset);
         let form = || {
             Event(Box::new(AgentDomainEvent::FormPending {
                 asid: AgentSessionId(ASID.into()),
@@ -3420,7 +3424,7 @@ mod tests {
                 "tasks.complete blocked: the rest of its own turn is no answer",
                 Working,
                 "",
-                vec![running_since(-60_000), blocked(), busy()],
+                vec![idle_since(-60_000), blocked(), busy()],
                 Waiting,
                 None,
             ),
@@ -3428,7 +3432,7 @@ mod tests {
                 "tasks.complete blocked: a turn after it (the user answered) works",
                 Working,
                 "",
-                vec![running_since(60_000), blocked(), busy()],
+                vec![idle_since(60_000), blocked(), busy()],
                 Working,
                 None,
             ),
@@ -3437,7 +3441,7 @@ mod tests {
                 Working,
                 "",
                 vec![
-                    running_since(-60_000),
+                    idle_since(-60_000),
                     Marked("notes.md does not exist"),
                     busy(),
                 ],
