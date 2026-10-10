@@ -415,14 +415,14 @@ pub(crate) fn one_plain_line(text: &str, max: usize) -> String {
         .collect()
 }
 
-/// `line` for an agent's typed input box: a word that starts with `@` and
-/// looks like a path (`@src/main.rs`, `@.env`) would attach that file
-/// there, so its `@` becomes `＠`. Other words (`@alice`, an email) are left
-/// alone, and the session API path never gets this: it attaches nothing.
+/// `line` for an agent's typed input box: any word that starts with `@`
+/// could attach a file there (`@Makefile` as much as `@src/main.rs`), so its
+/// `@` becomes `＠`. An `@` inside a word (an email) is left alone, and the
+/// session API path never gets this: it attaches nothing.
 fn without_file_mentions(line: &str) -> String {
     line.split(' ')
         .map(|word| match word.strip_prefix('@') {
-            Some(rest) if rest.contains('/') || rest.contains('.') => format!("＠{rest}"),
+            Some(rest) => format!("＠{rest}"),
             _ => word.to_owned(),
         })
         .collect::<Vec<_>>()
@@ -824,12 +824,12 @@ mod tests {
     }
 
     #[test]
-    fn a_path_mention_is_defused_for_a_typed_pane_only() {
+    fn a_word_initial_at_is_defused_for_a_typed_pane() {
         assert_eq!(
             without_file_mentions(
                 "mini finished: see @src/main.rs and @.env, ask @alice or bob@x.org"
             ),
-            "mini finished: see ＠src/main.rs and ＠.env, ask @alice or bob@x.org"
+            "mini finished: see ＠src/main.rs and ＠.env, ask ＠alice or bob@x.org"
         );
     }
 }
