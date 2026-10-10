@@ -177,6 +177,12 @@ fn task_error(error: TaskError) -> CallToolResult {
             "delegations_disabled",
             &format!("{name} does not take work from other computers (its owner switched it off)."),
         ),
+        TaskError::DelegationLoop(name) => fail(
+            "delegation_loop",
+            &format!(
+                "Your task was handed to this computer by another one, so it cannot hand work on to {name}: one hop only. Do it here, or finish with tasks.complete (outcome blocked) and say what needs {name}."
+            ),
+        ),
         TaskError::PeerUnauthorized(name) => fail(
             "unauthorized",
             &format!(
@@ -511,7 +517,7 @@ impl MuqunMcp {
 
     #[tool(
         name = "tasks.delegate",
-        description = "Start a sub-task on an agent, on this computer or (machine) on a linked one: a new session in cwd with your goal as the first prompt (for a terminal agent such as codex or claude, a new terminal pane running it). Returns task_id; poll with tasks.wait."
+        description = "Start a sub-task on an agent, on this computer or (machine) on a linked one: a new session in cwd with your goal as the first prompt (for a terminal agent such as codex or claude, a new terminal pane running it). Returns task_id; poll with tasks.wait. One hop only: a task another computer handed here cannot hand work to a linked computer (delegation_loop)."
     )]
     async fn tasks_delegate(
         &self,

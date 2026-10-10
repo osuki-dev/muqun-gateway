@@ -313,6 +313,9 @@ pub(crate) enum TaskError {
     DelegationsDisabled(String),
     /// The linked computer of that name no longer knows this one's token.
     PeerUnauthorized(String),
+    /// The caller's task came from another computer: it may not hand work
+    /// to one in turn (one hop only). The computer it named.
+    DelegationLoop(String),
     /// The linked computer refused the task with its own error code.
     PeerRefused {
         machine: String,
@@ -353,6 +356,9 @@ impl std::fmt::Display for TaskError {
                 write!(f, "{name} takes no work from other computers")
             }
             Self::PeerUnauthorized(name) => write!(f, "{name} no longer accepts this link"),
+            Self::DelegationLoop(name) => {
+                write!(f, "a task from another computer cannot hand work to {name}")
+            }
             Self::PeerRefused { machine, code } => write!(f, "{machine} refused the task ({code})"),
             Self::AgentUnavailable(agent) => write!(f, "agent '{agent}' is not available"),
             Self::UnknownModel(model) => write!(f, "unknown model '{model}'"),
@@ -808,6 +814,28 @@ impl TaskService {
         }
     }
 
+    /// Whether `by` works for a task another computer opened here, itself or
+    /// through its ancestors: such a task stays on this computer, so two
+    /// computers can never hand one goal back and forth.
+    async fn handed_by_a_peer(&self, by: &Requested) -> bool {
+        if by.origin == TaskOrigin::Peer {
+            return true;
+        }
+        let mut next = by.parent.clone();
+        // A tree is never this deep; the bound only guards a broken store.
+        for _ in 0..64 {
+            let Some(id) = next else {
+                return false;
+            };
+            match self.store.get(&id).await {
+                Ok(Some(task)) if task.origin == TaskOrigin::Peer => return true,
+                Ok(Some(task)) => next = task.parent,
+                _ => return false,
+            }
+        }
+        false
+    }
+
     /// The task `id` as stored.
     pub(crate) async fn task(&self, id: &TaskId) -> anyhow::Result<Option<Task>> {
         self.store.get(id).await
@@ -846,6 +874,9 @@ impl TaskService {
                 let known = state.peers.names();
                 return Err(TaskError::UnknownMachine { wanted, known });
             };
+            if self.handed_by_a_peer(&by).await {
+                return Err(TaskError::DelegationLoop(peer.name));
+            }
             return crate::fleet::mirror::delegate(state, by, peer, request).await;
         }
         if let Some(kind) = request.agent_id.as_deref() {

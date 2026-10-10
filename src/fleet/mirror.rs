@@ -934,6 +934,25 @@ mod tests {
             open.is_empty(),
             "a refused delegation leaves a failed mirror, never an open one"
         );
+
+        // One hop only: an agent working on a task mini handed here cannot
+        // hand work to a linked computer in turn.
+        coding
+            .tasks
+            .insert_for_test(&Task {
+                origin: TaskOrigin::Peer,
+                binding: TaskBinding::Pane {
+                    session_id: "default".into(),
+                    pane_id: "%1".into(),
+                    tab_id: None,
+                    shell_pid: None,
+                    agent_id: None,
+                },
+                ..mirror(TaskState::Working, None)
+            })
+            .await;
+        let error = delegate_as(&coding, "mini", "goal").await.unwrap_err();
+        assert_eq!(error["error"], "delegation_loop", "{error}");
     }
 
     /// What a mirror says about its computer (§10.12): structured fields,
