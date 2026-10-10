@@ -1201,15 +1201,16 @@ pub(crate) async fn start_terminal_agent(
     // A Claude Code seen to start with the sentence out of band and gone
     // again, its pane back at a shell with no Claude Code left under it (it
     // refused the flag), is started once more with the sentence typed after
-    // the goal. A start that timed out is a failed launch: a slow agent may
-    // still come up, and must not start twice.
+    // the goal -- whether the backend saw it start (tmux) or reported it
+    // exiting before it was ready (Herdr). A start that timed out is a failed
+    // launch: a slow agent may still come up, and must not start twice.
     let out_of_band = kind == "claude"
         && crate::mcp::inject::enabled(&state.config)
         && !crate::mcp::inject::terminal_task_args(&state.config, &kind)
             .await
             .is_empty();
     if out_of_band
-        && failed_step(&launched.steps.value()).is_none()
+        && may_retry_typed(&launched.steps.value())
         && pane_agent::exited_to_shell(&session, &pane_id, &kind).await
         && !ended().await
     {
@@ -2486,6 +2487,23 @@ async fn full_answer(state: &AppState, asid: &str, since_ms: u64) -> Option<Stri
 }
 
 /// `"<step>: <message>"` for the first failed step of a launch.
+/// Whether a launch's steps leave room for starting the agent again with
+/// its sentence typed, once it is shown to have exited: the agent step
+/// succeeded (tmux saw it start), or failed because the agent exited before
+/// it was ready (Herdr's `agent_start_failed`). Never after a timeout or
+/// any other failure.
+fn may_retry_typed(steps: &Value) -> bool {
+    let Some(failed) = steps.as_array().and_then(|steps| {
+        steps
+            .iter()
+            .find(|step| step.get("status").and_then(Value::as_str) == Some("failed"))
+    }) else {
+        return true;
+    };
+    failed.get("step").and_then(Value::as_str) == Some("agent")
+        && failed.pointer("/error/code").and_then(Value::as_str) == Some("agent_start_failed")
+}
+
 fn failed_step(steps: &Value) -> Option<String> {
     let step = steps
         .as_array()?
@@ -2835,6 +2853,26 @@ mod tests {
     /// A state with an OpenCode fake whose new session exists (idle, unless
     /// the fake already lists its sessions), and a task delegated to it by
     /// `assistant("a")`.
+    #[test]
+    fn a_claude_that_refused_its_flag_is_retried_only_after_a_real_failure() {
+        let failed = |code: &str| {
+            json!([{ "step": "pane", "status": "ok" },
+                   { "step": "agent", "status": "failed", "error": { "code": code, "message": "x" } }])
+        };
+        for (steps, retry) in [
+            (json!([{ "step": "agent", "status": "ok" }]), true),
+            (failed("agent_start_failed"), true),
+            (failed("agent_start_timeout"), false),
+            (failed("agent_not_found"), false),
+            (
+                json!([{ "step": "pane", "status": "failed", "error": { "code": "agent_start_failed" } }]),
+                false,
+            ),
+        ] {
+            assert_eq!(may_retry_typed(&steps), retry, "{steps}");
+        }
+    }
+
     async fn delegated(agent: FakeAgent) -> (AppState, TaskId) {
         let state = test_state("admin", vec![test_device("d1", "token")]);
         let agent = if agent.sessions.is_empty() {
