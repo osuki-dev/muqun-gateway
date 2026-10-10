@@ -621,7 +621,7 @@ mod tests {
         assert_eq!(task.state, TaskState::Failed);
         assert_eq!(
             task.summary.as_deref(),
-            Some("ProviderError: quota exceeded")
+            Some("OpenCode's model provider refused the request")
         );
     }
 

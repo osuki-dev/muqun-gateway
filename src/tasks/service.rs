@@ -2665,7 +2665,10 @@ pub(crate) async fn session_failure(
     since_ms: u64,
 ) -> String {
     if let Some(error) = error {
-        return one_line(&format!("{}: {}", error.name, error.message), SUMMARY_CHARS);
+        let agent = manager.map_or("the agent", |manager| agent_name(manager.agent().kind()));
+        return provider_failure(agent, error).unwrap_or_else(|| {
+            one_line(&format!("{}: {}", error.name, error.message), SUMMARY_CHARS)
+        });
     }
     let Some(manager) = manager else {
         return SESSION_FAILED.to_owned();
@@ -2681,6 +2684,52 @@ pub(crate) async fn session_failure(
         Some(detail) => one_line(&format!("{SESSION_FAILED}: {detail}"), SUMMARY_CHARS),
         None => SESSION_FAILED.to_owned(),
     }
+}
+
+/// An agent kind as a person names it.
+fn agent_name(kind: &str) -> &str {
+    match kind {
+        "opencode" => "OpenCode",
+        "deepseek" => "DeepSeek",
+        "t3" => "T3 Code",
+        "claude" => "Claude Code",
+        "codex" => "Codex",
+        other => other,
+    }
+}
+
+/// A model provider's refusal (`provider.auth …`, `ProviderAuthError`,
+/// `provider.*`) in words for a person, never the raw error:
+/// `OpenCode could not reach its model provider (HTTP 403)`, or `OpenCode's
+/// model provider refused the request (429)`. `None`: not a provider error.
+fn provider_failure(agent: &str, error: &AgentErrorInfo) -> Option<String> {
+    let name = error.name.to_ascii_lowercase();
+    if !name.starts_with("provider") {
+        return None;
+    }
+    let status = error.status.or_else(|| {
+        error
+            .message
+            .split(|c: char| !c.is_ascii_digit())
+            .find(|digits| digits.len() == 3)
+            .and_then(|digits| digits.parse().ok())
+    });
+    let mut capital = agent.chars();
+    let agent = match capital.next() {
+        Some(first) => first.to_uppercase().chain(capital).collect::<String>(),
+        None => String::new(),
+    };
+    Some(if name.contains("auth") {
+        let status = status
+            .map(|status| format!(" (HTTP {status})"))
+            .unwrap_or_default();
+        format!("{agent} could not reach its model provider{status}")
+    } else {
+        let status = status
+            .map(|status| format!(" ({status})"))
+            .unwrap_or_default();
+        format!("{agent}'s model provider refused the request{status}")
+    })
 }
 
 /// The timeline a finished delegation's summary is read from.
@@ -3107,6 +3156,38 @@ mod tests {
             asid: AgentSessionId(ASID.into()),
             request_id: "perm1".into(),
             seq: 0,
+        }
+    }
+
+    /// A model provider's refusal reads as a sentence; any other error keeps
+    /// its own words.
+    #[test]
+    fn a_provider_failure_is_worded_for_a_person() {
+        let error = |name: &str, message: &str, status: Option<u16>| AgentErrorInfo {
+            name: name.into(),
+            message: message.into(),
+            status,
+        };
+        for (error, worded) in [
+            (
+                error("provider.auth", "Request failed: 403", None),
+                Some("OpenCode could not reach its model provider (HTTP 403)"),
+            ),
+            (
+                error("ProviderAuthError", "bad key", Some(401)),
+                Some("OpenCode could not reach its model provider (HTTP 401)"),
+            ),
+            (
+                error("provider.rate_limit", "Request failed: 429", None),
+                Some("OpenCode's model provider refused the request (429)"),
+            ),
+            (error("UnknownError", "boom", None), None),
+        ] {
+            assert_eq!(
+                provider_failure("OpenCode", &error).as_deref(),
+                worded,
+                "{error:?}"
+            );
         }
     }
 
@@ -4462,7 +4543,7 @@ mod tests {
                 Failed,
                 Some(error),
                 "",
-                Some("ProviderError: rate limited: try again later"),
+                Some("OpenCode's model provider refused the request (429)"),
             ),
             (
                 "no error: what the session last said",
