@@ -24,7 +24,7 @@ use super::ports::{TaskFuture, TaskStore, TaskStoreError};
 use super::run_command::{self, RunHandle, RunRequest};
 use crate::agents::domain::{
     AgentDomainEvent, AgentErrorInfo, AgentPart, AgentSessionId, AgentSessionInfo,
-    AgentSessionStatus, ModelInfo, ModelRef, TimelineItem, TimelineRole,
+    AgentSessionStatus, ModelInfo, ModelRef, TimelineItem, TimelineRole, ToolCall,
 };
 use crate::agents::manager::AgentManager;
 use crate::agents::ports::agent::AgentError;
@@ -1793,20 +1793,13 @@ impl TaskService {
 }
 
 /// What a timeline item says an agent is doing, as a progress line: a tool
-/// call (its title, else its name and command or file; a failed call with
-/// its error), or the start of an assistant message. Nothing for the rest.
+/// call (see [`tool_line`]; a failed call with its error), or the start of
+/// an assistant message. Nothing for the rest, or for a call that says
+/// nothing more than its tool's name (the line before stands).
 fn progress_line(item: &TimelineItem) -> Option<String> {
     match &item.part {
         AgentPart::Tool(call) => {
-            let what = call.title.clone().unwrap_or_else(|| {
-                let target = ["command", "filePath", "file_path", "path", "pattern", "url"]
-                    .iter()
-                    .find_map(|key| call.input.get(*key).and_then(Value::as_str));
-                match target {
-                    Some(target) => format!("{} {target}", call.name),
-                    None => call.name.clone(),
-                }
-            });
+            let what = tool_line(call)?;
             Some(match &call.error {
                 Some(error) => format!("{what} failed: {}: {}", error.name, error.message),
                 None => what,
@@ -1819,6 +1812,47 @@ fn progress_line(item: &TimelineItem) -> Option<String> {
             .map(str::to_owned),
         _ => None,
     }
+}
+
+/// A tool call in words: `<tool> <file>` when it names a file (a provider
+/// title that is only that file's name says less), else its title, else
+/// `<tool> <command, pattern or url>`; its bare name only when it has no
+/// arguments at all, and nothing when its arguments name nothing readable.
+fn tool_line(call: &ToolCall) -> Option<String> {
+    let arg = |keys: &[&str]| {
+        keys.iter()
+            .find_map(|key| call.input.get(*key).and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    // A patch names its files inside its text (`*** Update File: <path>`).
+    let patched = || {
+        arg(&["patchText", "patch"])?.lines().find_map(|line| {
+            ["*** Update File:", "*** Add File:", "*** Delete File:"]
+                .iter()
+                .find_map(|head| line.strip_prefix(head))
+                .map(str::trim)
+        })
+    };
+    let file = arg(&["filePath", "file_path", "path"]).or_else(patched);
+    let title = call
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty() && *title != call.name);
+    let line = match (file, title) {
+        (Some(file), Some(title)) if !file.ends_with(title) => title.to_owned(),
+        (Some(file), _) => format!("{} {file}", call.name),
+        (None, Some(title)) => title.to_owned(),
+        (None, None) => match arg(&["command", "pattern", "query", "url"]) {
+            Some(target) => format!("{} {}", call.name, target.lines().next().unwrap_or(target)),
+            None if call.input.as_object().is_none_or(|input| input.is_empty()) => {
+                call.name.clone()
+            }
+            None => return None,
+        },
+    };
+    Some(line)
 }
 
 /// Stopped short of an end: waiting on the user, or paused without saying
@@ -3407,6 +3441,50 @@ mod tests {
             titles.contains(&"Fix the CI build".to_owned()),
             "{titles:?}"
         );
+    }
+
+    #[test]
+    fn a_tool_call_reads_as_what_the_agent_is_doing() {
+        let call = |name: &str, title: Option<&str>, input: Value| ToolCall {
+            name: name.into(),
+            title: title.map(str::to_owned),
+            ..serde_json::from_value(json!({
+                "id": "c1", "name": name, "input": input,
+                "state": "running", "status": "running"
+            }))
+            .unwrap()
+        };
+        let patch = "*** Begin Patch\n*** Update File: release-notes/v3.1.0.md\n@@\n-a\n+b";
+        for (tool, expected) in [
+            (
+                call(
+                    "edit",
+                    Some("Editing the notes"),
+                    json!({ "filePath": "notes.md" }),
+                ),
+                Some("Editing the notes"),
+            ),
+            (
+                call(
+                    "read",
+                    Some("README.md"),
+                    json!({ "filePath": "docs/README.md" }),
+                ),
+                Some("read docs/README.md"),
+            ),
+            (
+                call("patch", None, json!({ "patchText": patch })),
+                Some("patch release-notes/v3.1.0.md"),
+            ),
+            (
+                call("bash", None, json!({ "command": "cargo test\ncargo fmt" })),
+                Some("bash cargo test"),
+            ),
+            (call("todowrite", None, json!({ "todos": [] })), None),
+            (call("lsp_status", None, json!({})), Some("lsp_status")),
+        ] {
+            assert_eq!(tool_line(&tool).as_deref(), expected, "{}", tool.name);
+        }
     }
 
     #[tokio::test]

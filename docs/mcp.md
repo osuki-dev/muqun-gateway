@@ -246,8 +246,11 @@ unknown id is `404 task_not_found`; any other failure is `500 task_failed`.
   name>"}` for a device's task; `null` otherwise.
 - `progress` (present only while the task is open and something is known;
   `task_ledger_complete`): what it is doing now, one line of at most 120
-  characters -- for a session delegation the agent's current tool call (its
-  title, else its name and command or file; a failed call with its error) or
+  characters -- for a session delegation the agent's current tool call in
+  words (`<tool> <file>` when it names a file, a patch's files included;
+  else the provider's title; else `<tool> <command, pattern or url>`; a
+  failed call with its error; never the bare tool name of a call that has
+  arguments -- one that names nothing readable leaves the line before) or
   the start of its latest message, for a terminal agent the pane's last prose
   line that is not decoration (rules, box drawing, the input prompt,
   spinners, footer hints such as "bypass permissions on"). Every line is kept
