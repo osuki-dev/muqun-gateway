@@ -567,14 +567,10 @@ fn remote(value: Value) -> Result<RemoteTask, PeerError> {
 pub(crate) struct RemoteTask {
     pub task_id: String,
     pub state: TaskState,
-    /// What it was asked, the reference this gateway sent with it, and when
-    /// it was made over there: how a create that got no answer finds its task.
-    #[serde(default)]
-    pub goal: String,
+    /// The reference this gateway sent with it: how a create that got no
+    /// answer finds its task.
     #[serde(default)]
     pub client_ref: Option<String>,
-    #[serde(default)]
-    pub created_ms: Option<u64>,
     #[serde(default)]
     pub summary: Option<String>,
     #[serde(default)]

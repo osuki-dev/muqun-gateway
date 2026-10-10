@@ -453,7 +453,7 @@ impl PeerService {
     /// Bring what is known of `peer` up to date in the background, unless it
     /// is current or a refresh of it already runs: a ping when its
     /// reachability is unknown, then its manifest when that is stale.
-    pub(crate) fn refresh_later(self: &Arc<Self>, peer: Peer) {
+    pub(crate) fn refresh_later(&self, state: &AppState, peer: Peer) {
         let now = now_ms();
         let current = match self.reachability(&peer, now) {
             None => false,
@@ -477,10 +477,11 @@ impl PeerService {
                 }
             }
         }
-        let running = Running(self.clone(), peer.peer_id.clone());
+        let running = Running(state.peers.clone(), peer.peer_id.clone());
+        let state = state.clone();
         tokio::spawn(async move {
             let service = running.0.clone();
-            if let Some(peer) = service.checked(peer).await {
+            if let Some(peer) = service.checked(&state, peer).await {
                 if peer.reachable(now_ms()) {
                     service.manifest_of(&peer).await;
                 }
@@ -490,9 +491,9 @@ impl PeerService {
     }
 
     /// `peer`, pinged first when its last answer is older than [`CHECK_EVERY`].
-    /// A peer that no longer knows this gateway's token is forgotten (§10.10)
-    /// and answered as `None`.
-    pub(crate) async fn checked(&self, peer: Peer) -> Option<Peer> {
+    /// A peer that no longer knows this gateway's token is forgotten (§10.10),
+    /// its open mirrors failed, and answered as `None`.
+    pub(crate) async fn checked(&self, state: &AppState, peer: Peer) -> Option<Peer> {
         let now = now_ms();
         if peer
             .last_seen_ms
@@ -530,8 +531,7 @@ impl PeerService {
                 })
             }
             Ok(Err(PeerError::Unauthorized)) => {
-                tracing::info!(peer = %peer.peer_id, "a peer no longer knows this gateway; forgetting it");
-                self.forget(&peer.peer_id).await;
+                super::mirror::forget(state, &peer.peer_id).await;
                 None
             }
             Ok(Err(_)) | Err(_) => Some(peer),
@@ -704,9 +704,11 @@ impl PeerService {
         Ok(Some(peer))
     }
 
-    /// Drop the row only (the peer answered 401: it no longer knows us). Its
-    /// login here stays: it may still be linked to this computer.
-    pub(crate) async fn forget(&self, peer_id: &str) {
+    /// Drop the row only (the peer answered 401/403: it no longer knows us).
+    /// Its login here stays: it may still be linked to this computer. Called
+    /// through [`mirror::forget`](super::mirror::forget), which ends its
+    /// open mirrors first.
+    pub(super) async fn forget(&self, peer_id: &str) {
         if let Err(error) = self.store.remove(peer_id).await {
             tracing::warn!(peer = %peer_id, "failed to forget a peer: {error:#}");
         }

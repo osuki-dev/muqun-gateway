@@ -20,6 +20,8 @@ use crate::tasks::service::{DelegateRequest, TaskError, TaskView, OPEN_STATES, S
 use crate::AppState;
 
 const SOURCE: &str = "peer";
+/// How a mirror whose link is gone (unlinked on either side) begins its line.
+const PEER_UNLINKED: &str = "peer_unlinked";
 /// How often a quiet socket re-checks whether any mirror of its peer is
 /// still open, and looks for the task of a mirror whose create got no answer.
 const IDLE_CHECK: Duration = if cfg!(test) {
@@ -34,9 +36,6 @@ const RETRY_MOST: Duration = Duration::from_secs(60);
 /// How long a mirror whose create got no answer looks for its task over
 /// there before it fails as not confirmed.
 const ADOPT_WITHIN: Duration = Duration::from_secs(120);
-/// How far apart two computers' clocks may be when a task over there is
-/// matched by when it was made (a peer that keeps no `client_ref`).
-const CLOCK_SKEW: Duration = Duration::from_secs(5);
 
 /// Open `request` on `peer` and keep a mirror of it here, under the caller's
 /// task. A peer that cannot take it leaves a failed mirror (or none, when it
@@ -51,7 +50,7 @@ pub(crate) async fn delegate(
     request: DelegateRequest,
 ) -> Result<TaskView, TaskError> {
     let name = peer.name.clone();
-    let Some(peer) = state.peers.checked(peer).await else {
+    let Some(peer) = state.peers.checked(state, peer).await else {
         return Err(TaskError::PeerUnauthorized(name));
     };
     if !peer.reachable(now_ms()) {
@@ -172,7 +171,7 @@ async fn refusal(state: &AppState, peer: &Peer, error: PeerError) -> TaskError {
             TaskError::MachineUnreachable(machine)
         }
         PeerError::Unauthorized => {
-            state.peers.forget(&peer.peer_id).await;
+            forget(state, &peer.peer_id).await;
             TaskError::PeerUnauthorized(machine)
         }
         PeerError::Refused { code, .. } if code == "delegations_disabled" => {
@@ -414,9 +413,7 @@ async fn refresh(
 }
 
 /// Find the task over there that `mirror`'s unanswered create opened: the
-/// one carrying the `client_ref` it sent; from a peer that keeps none, the
-/// oldest of this gateway's tasks there with the same goal made since the
-/// mirror (never an older run) that no mirror follows yet. Bound to it once
+/// one carrying the `client_ref` it sent. Bound to it once
 /// it has started; failed as not confirmed when none appears within
 /// [`ADOPT_WITHIN`].
 async fn adopt(
@@ -426,35 +423,9 @@ async fn adopt(
     mirror: &Task,
 ) -> Result<bool, PeerError> {
     let theirs = client.own_tasks().await?;
-    let followed = state
-        .tasks
-        .open_tasks(TaskFilter {
-            peer: Some(peer.peer_id.clone()),
-            limit: 1000,
-            ..Default::default()
-        })
-        .await
-        .unwrap_or_default();
-    let since = mirror
-        .created_ms
-        .saturating_sub(CLOCK_SKEW.as_millis() as u64);
-    let found = match theirs
-        .iter()
-        .find(|task| task.client_ref.is_some() && task.client_ref == mirror.client_ref)
-    {
-        Some(task) => Some(task.clone()),
-        None => theirs
-            .into_iter()
-            .filter(|task| {
-                task.client_ref.is_none()
-                    && task.goal == mirror.goal
-                    && task.created_ms.is_some_and(|at| at >= since)
-                    && !followed
-                        .iter()
-                        .any(|other| remote_id(other) == task.task_id)
-            })
-            .min_by_key(|task| task.created_ms),
-    };
+    let found = theirs
+        .into_iter()
+        .find(|task| task.client_ref.is_some() && task.client_ref == mirror.client_ref);
     let Some(remote) = found else {
         if now_ms().saturating_sub(mirror.created_ms) < ADOPT_WITHIN.as_millis() as u64 {
             return Ok(false);
@@ -471,15 +442,23 @@ async fn adopt(
     Ok(moved(state, mirror, change).await)
 }
 
-/// The peer answered 401: say so on its mirrors, which keep their state
-/// until the user cancels or marks them done, and forget it (§10.10) --
-/// last, since this may run in its follower, which forgetting ends.
-async fn forget(state: &AppState, peer_id: &str) {
-    let open = open_mirrors(state, peer_id).await;
+/// The peer answered 401/403: it was unlinked there, or this computer's
+/// login revoked. Its open mirrors fail (`peer_unlinked`): the task over
+/// there can never be read again, since a new link is a new login. Then the
+/// peer is forgotten (§10.10) -- last, since this may run in its follower,
+/// which forgetting ends. Every path that finds a link gone comes here.
+pub(crate) async fn forget(state: &AppState, peer_id: &str) {
     tracing::info!(peer = %peer_id, "a peer no longer knows this gateway; forgetting it");
     state.peers.presence.gone(peer_id);
-    for mirror in &open {
-        state.tasks.republish(mirror).await;
+    let name = match state.peers.get(peer_id).await {
+        Some(peer) => peer.name,
+        None => peer_id.to_owned(),
+    };
+    for mirror in open_mirrors(state, peer_id).await {
+        let why = failed(&format!(
+            "{PEER_UNLINKED}: {name} no longer accepts this computer"
+        ));
+        state.tasks.record_failure(&mirror, why).await;
     }
     state.peers.forget(peer_id).await;
 }
@@ -520,9 +499,14 @@ pub(crate) async fn converge(state: &AppState, mirror: &Task) -> bool {
         return false;
     }
     let Some(peer) = state.peers.get(peer_id).await else {
-        // Forgotten: its view says unreachable now; so does the phone's row.
-        state.tasks.republish(mirror).await;
-        return false;
+        // Forgotten (a restart between the forget and its mirrors' end):
+        // nothing can read its task again.
+        let TaskBinding::Peer { peer_name, .. } = &mirror.binding else {
+            return false;
+        };
+        let why = failed(&format!("{PEER_UNLINKED}: {peer_name} is no longer linked"));
+        state.tasks.record_failure(mirror, why).await;
+        return true;
     };
     let Ok(client) = PeerClient::for_peer(&peer) else {
         return false;
@@ -560,10 +544,10 @@ pub(crate) async fn forward_cancel(state: &AppState, mirror: &Task) {
     }
 }
 
-/// `peer_id` was unlinked: its open mirrors end as lost.
+/// `peer_id` was unlinked here: its open mirrors fail (`peer_unlinked`).
 pub(crate) async fn lose(state: &AppState, peer_id: &str, name: &str) {
     for mirror in open_mirrors(state, peer_id).await {
-        let lost = failed(&format!("lost: {name} was unlinked"));
+        let lost = failed(&format!("{PEER_UNLINKED}: {name} was unlinked"));
         state.tasks.record_failure(&mirror, lost).await;
     }
 }
@@ -625,9 +609,7 @@ mod tests {
     fn remote(state: TaskState, summary: Option<&str>) -> RemoteTask {
         RemoteTask {
             task_id: "t_r".into(),
-            goal: "g".into(),
             client_ref: None,
-            created_ms: None,
             state,
             summary: summary.map(Into::into),
             exit_code: None,
@@ -849,7 +831,10 @@ mod tests {
         assert!(unlinked.forgotten);
         let lost = coding.tasks.get_for_test(&mirror_id).await;
         assert_eq!(lost.state, TaskState::Failed);
-        assert_eq!(lost.summary.as_deref(), Some("lost: mini was unlinked"));
+        assert_eq!(
+            lost.summary.as_deref(),
+            Some("peer_unlinked: mini was unlinked")
+        );
     }
 
     /// What the calling agent is told when the computer it names cannot take the work.
@@ -878,6 +863,19 @@ mod tests {
             ..peer("srv-old", "old", &url, Some(now_ms()))
         };
         coding.peers.store_for_test(old).await;
+        // A mirror still open there when it turns out revoked fails at once.
+        let stranded = coding
+            .tasks
+            .insert_for_test(&Task {
+                binding: TaskBinding::Peer {
+                    peer_id: "srv-old".into(),
+                    peer_server_id: "srv-old".into(),
+                    remote_task_id: "task-there".into(),
+                    peer_name: "old".into(),
+                },
+                ..mirror(TaskState::Working, None)
+            })
+            .await;
         // Its own login here may still be good: forgetting leaves it.
         coding
             .devices
@@ -906,6 +904,14 @@ mod tests {
         assert!(
             coding.peers.get("srv-old").await.is_none(),
             "a revoked link is forgotten"
+        );
+        let stranded = coding.tasks.get_for_test(&stranded).await;
+        assert_eq!(
+            (stranded.state, stranded.summary.as_deref()),
+            (
+                TaskState::Failed,
+                Some("peer_unlinked: old no longer accepts this computer")
+            )
         );
         assert!(
             coding
@@ -963,9 +969,9 @@ mod tests {
     }
 
     /// A create that got no answer, through a live follower: the mirror finds
-    /// its task over there by the `client_ref` it sent, or (a peer that keeps
-    /// none) by its goal among tasks made since, never an older run; one not
-    /// found fails as not confirmed once the deadline passes, socket or not.
+    /// its task over there by the `client_ref` it sent, never by its goal;
+    /// one not found fails as not confirmed once the deadline passes, socket
+    /// or not.
     #[tokio::test]
     async fn a_mirror_whose_create_got_no_answer_finds_its_task_there() {
         let herdr = FakeHerdr::start(vec!["$ "], None);
@@ -979,7 +985,6 @@ mod tests {
         let mut there = Vec::new();
         for (goal, client_ref, created_ms) in [
             ("same goal", Some("ref-1"), now),
-            ("no ref", None, now),
             ("older run", None, now - 10 * 60_000),
         ] {
             let task = Task {
@@ -1012,7 +1017,6 @@ mod tests {
                 TaskState::Working,
                 Some(&there[0]),
             ),
-            ("no ref", "ref-2", now, TaskState::Working, Some(&there[1])),
             ("older run", "ref-3", almost_due, TaskState::Failed, None),
         ] {
             let id = coding

@@ -296,7 +296,7 @@ async fn heard(state: &AppState) -> Vec<Heard> {
     peers
         .into_iter()
         .map(|peer| {
-            state.peers.refresh_later(peer.clone());
+            state.peers.refresh_later(state, peer.clone());
             Heard {
                 reachable: state.peers.reachability(&peer, now),
                 peer,
@@ -464,11 +464,11 @@ impl FleetService {
         // needs runs in the background, shared with every other caller.
         if state.peers.reachability(&peer, now_ms()) == Some(true) {
             if let Some(manifest) = peer.manifest.clone() {
-                state.peers.refresh_later(peer);
+                state.peers.refresh_later(state, peer);
                 return Ok(manifest);
             }
         }
-        let peer = state.peers.checked(peer).await.ok_or_else(unknown)?;
+        let peer = state.peers.checked(state, peer).await.ok_or_else(unknown)?;
         if !peer.reachable(now_ms()) {
             return Err(DescribeError::Unreachable(peer.name));
         }

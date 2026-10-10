@@ -80,8 +80,12 @@ fn valid_name(name: &str) -> bool {
 async fn list(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     owner(&state, &headers)?;
     let peers = state.peers.list().await.map_err(store_failed)?;
-    let peers =
-        futures::future::join_all(peers.into_iter().map(|peer| state.peers.checked(peer))).await;
+    let peers = futures::future::join_all(
+        peers
+            .into_iter()
+            .map(|peer| state.peers.checked(&state, peer)),
+    )
+    .await;
     let now = now_ms();
     // A peer that no longer knows this gateway was just forgotten.
     let views: Vec<_> = peers.iter().flatten().map(|peer| peer.view(now)).collect();
