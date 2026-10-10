@@ -45,6 +45,7 @@ use crate::agents::domain::{
     AgentDomainEvent, AgentPart, TimelineItem, TimelineRole, ToolCallStatus,
 };
 use crate::AppState;
+use serde_json::Value;
 
 /// How session `asid`'s transcript is served: `None` as it is, no task
 /// being (or having been) bound to it; else without the plumbing, holding
@@ -192,14 +193,17 @@ fn hide_in_item(item: &mut TimelineItem, streaming: Streaming) -> Served {
         (TimelineRole::Assistant, AgentPart::Text { text }) if text.trim().is_empty() => {
             return Served::Emptied;
         }
-        // The agent reporting the task's end is how the ledger hears it, not
-        // the reader's business: muqun's own `tasks.complete`, done without
-        // an error. A report that failed stays, so the reader sees why the
-        // task is still open; another server's tool of that name stays.
+        // The task protocol is how the ledger hears the agent, not the
+        // reader's business: muqun's own `tasks.complete`, and `tasks.read`
+        // asking whether this session has a task -- hidden while they run and
+        // once they succeed. One that failed (an error status, or a tool
+        // result that is an error) stays, so the reader sees why the task is
+        // still open. Real work (`tasks.delegate`, `fleet.*`) stays.
         (_, AgentPart::Tool(call))
-            if is_muqun_tasks_complete(&call.name)
-                && call.status == ToolCallStatus::Completed
-                && call.error.is_none() =>
+            if is_muqun_protocol_call(&call.name, &call.input)
+                && call.status != ToolCallStatus::Failed
+                && call.error.is_none()
+                && !answered_an_error(call) =>
         {
             return Served::Emptied;
         }
@@ -275,15 +279,38 @@ pub(crate) fn hide_in_inbox(items: &mut Vec<serde_json::Value>) {
     });
 }
 
-/// Whether a tool row's `name` is muqun's `tasks.complete`: bare, or under
-/// the prefix a host gives the muqun server's tools (`muqun_`, `muqun.`,
-/// `mcp__muqun__`).
-fn is_muqun_tasks_complete(name: &str) -> bool {
+/// Whether a tool row is muqun's task protocol: `tasks.complete`, or
+/// `tasks.read` without a `task_id`, bare or under the prefix a host gives
+/// the muqun server's tools (`muqun_`, `muqun.`, `mcp__muqun__`). A bare
+/// name is taken as muqun's (a host may list a server's tools unprefixed);
+/// another server's prefixed tool of that name is not.
+fn is_muqun_protocol_call(name: &str, input: &Value) -> bool {
     let bare = ["mcp__muqun__", "muqun__", "muqun_", "muqun."]
         .iter()
         .find_map(|prefix| name.strip_prefix(prefix))
         .unwrap_or(name);
-    matches!(bare, "tasks.complete" | "tasks_complete")
+    match bare {
+        "tasks.complete" | "tasks_complete" => true,
+        "tasks.read" | "tasks_read" => input.get("task_id").is_none_or(Value::is_null),
+        _ => false,
+    }
+}
+
+/// Whether a tool call's result is an error the tool answered (MCP
+/// `isError`, muqun's `{"error": …}`), which a host may still mark completed.
+fn answered_an_error(call: &crate::agents::domain::ToolCall) -> bool {
+    [call.output.as_ref(), call.content.as_ref()]
+        .into_iter()
+        .flatten()
+        .any(|value| {
+            let text = match value {
+                Value::String(text) => text.clone(),
+                other => other.to_string(),
+            };
+            text.contains("\"isError\":true")
+                || text.contains("\"error\":\"")
+                || text.contains("\\\"error\\\":\\\"")
+        })
 }
 
 /// The first line of OpenCode's notice that its Code Mode tool catalog
@@ -545,6 +572,15 @@ mod tests {
         ))
     }
 
+    /// A finished muqun tool call `name` whose result was `output`.
+    fn answered(name: &str, output: &str) -> AgentPart {
+        AgentPart::Tool(crate::agents::adapters::opencode::mapper::map_tool_call(
+            &serde_json::json!({ "type": "tool", "id": "c", "name": name,
+                "state": { "status": "completed", "input": {},
+                    "content": [{ "type": "text", "text": output }] } }),
+        ))
+    }
+
     /// A finished Code Mode `execute` call running `code`.
     fn execute(code: &str) -> AgentPart {
         tool("execute", "completed", code.into())
@@ -688,6 +724,24 @@ mod tests {
                 Assistant,
                 tool("muqun_tasks_complete", "error", serde_json::Value::Null),
                 Some("<code>"),
+            ),
+            (
+                "a report the tool answered with an error",
+                Assistant,
+                answered("muqun_tasks_complete", r#"{"error":"task_not_found","message":"x"}"#),
+                Some("<code>"),
+            ),
+            (
+                "a report still running",
+                Assistant,
+                tool("muqun_tasks_complete", "running", serde_json::Value::Null),
+                None,
+            ),
+            (
+                "asking whether this session has a task",
+                Assistant,
+                tool("muqun_tasks_read", "completed", serde_json::Value::Null),
+                None,
             ),
             (
                 "another server's tool of that name",
