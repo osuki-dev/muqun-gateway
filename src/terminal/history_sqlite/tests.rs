@@ -530,7 +530,11 @@ async fn sqlite_retention_and_quota_eviction_do_not_resurrect_unchanged_polled_p
             .collect();
         let now = if expire {
             let expired = base + RETENTION_SECONDS + 1;
-            worker.db.call(move |c| prune(c, expired)).await.unwrap();
+            worker
+                .db
+                .call(move |c| prune(c, expired, &[]))
+                .await
+                .unwrap();
             expired
         } else {
             worker
@@ -548,7 +552,7 @@ async fn sqlite_retention_and_quota_eviction_do_not_resurrect_unchanged_polled_p
                             ],
                         )?;
                     }
-                    prune(c, base + 1)
+                    prune(c, base + 1, &[])
                 })
                 .await
                 .unwrap();
@@ -990,7 +994,7 @@ async fn retention_and_logical_quotas_keep_the_newest_updates_and_reads_do_not_r
                         params![format!("fixture-{n:02}"), encode_rows(&["x"]), bytes, at],
                     )?;
                 }
-                prune(c, now_seconds())
+                prune(c, now_seconds(), &[])
             })
             .await
             .unwrap();
@@ -1032,7 +1036,7 @@ async fn retention_and_logical_quotas_keep_the_newest_updates_and_reads_do_not_r
             .db
             .call(move |c| {
                 c.execute("UPDATE history_captures SET updated=?1", [expired])?;
-                prune(c, now_seconds())
+                prune(c, now_seconds(), &[])
             })
             .await
             .unwrap();
@@ -1197,4 +1201,38 @@ async fn history_writes_skip_the_fsync_and_an_idle_prune_folds_the_wal_back() {
         .unwrap();
     assert_eq!(wal().await.unwrap(), 0, "an idle prune truncates the WAL");
     assert_eq!(record_count(&checkpoints).await, 1, "nothing was lost");
+}
+
+#[tokio::test]
+async fn quotas_evict_closed_panes_before_open_ones() {
+    let fixture = Fixture::new();
+    let checkpoints = fixture.checkpoints(captures(None, false)).await;
+    let left = checkpoints
+        .db
+        .call(|c| {
+            let transaction = c.transaction()?;
+            // An open pane's checkpoint older than every closed pane's.
+            for (identity, updated) in std::iter::once(("open".to_owned(), 1))
+                .chain((0..MAX_RECORDS).map(|n| (format!("closed-{n:02}"), 100 + n)))
+            {
+                transaction.execute(
+                    "INSERT INTO history_captures VALUES (?1,'p',x'00',1,?2)",
+                    params![identity, updated],
+                )?;
+            }
+            enforce_quotas(&transaction, &["open".to_owned()])?;
+            let left: Vec<String> = transaction
+                .prepare("SELECT identity FROM history_captures ORDER BY identity")?
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<_, _>>()?;
+            Ok(left)
+        })
+        .await
+        .unwrap();
+    assert_eq!(left.len() as i64, MAX_RECORDS);
+    assert!(left.contains(&"open".to_owned()), "the open pane stays");
+    assert!(
+        !left.contains(&"closed-00".to_owned()),
+        "the oldest closed one goes"
+    );
 }

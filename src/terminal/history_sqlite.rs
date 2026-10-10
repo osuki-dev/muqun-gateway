@@ -286,7 +286,7 @@ impl Checkpoints {
         let namespaces = db
             .call(move |connection| {
                 let namespaces = reconcile_backends(connection, &config)?;
-                prune(connection, now_seconds())?;
+                prune(connection, now_seconds(), &[])?;
                 Ok(namespaces)
             })
             .await?;
@@ -378,11 +378,14 @@ impl Checkpoints {
                 // other domains' FULL durability is restored before any of
                 // their jobs runs on this one connection.
                 connection.pragma_update(None, "synchronous", "NORMAL")?;
+                // The panes the last complete listings still show: quotas evict
+                // the rest first.
+                let live: Vec<String> = stamps.iter().filter_map(|stamp| this.key(stamp)).collect();
                 let passed = this
-                    .write_pass(connection, now, stamps, debounce)
+                    .write_pass(connection, now, stamps, debounce, &live)
                     .and_then(|idle| {
                         if prune_due {
-                            prune(connection, now)?;
+                            prune(connection, now, &live)?;
                         }
                         this.fold_wal(connection, prune_due)?;
                         Ok(idle)
@@ -497,6 +500,7 @@ impl Checkpoints {
         now: i64,
         mut stamps: Vec<ProjectionStamp>,
         debounce: Duration,
+        open_keys: &[String],
     ) -> anyhow::Result<bool> {
         let mut writer = self
             .writer
@@ -607,7 +611,7 @@ impl Checkpoints {
                 }
                 if let Some(encoded) = encoded {
                     transaction.execute("INSERT INTO history_captures VALUES (?1,?2,?3,?4,?5) ON CONFLICT(identity) DO UPDATE SET policy=excluded.policy, rows=excluded.rows, bytes=excluded.bytes, updated=excluded.updated WHERE history_captures.rows != excluded.rows OR history_captures.policy != excluded.policy", params![key, stamp.policy, encoded, encoded.len() as i64, now])?;
-                    enforce_quotas(&transaction)?;
+                    enforce_quotas(&transaction, open_keys)?;
                 } else if stamp.reset {
                     transaction
                         .execute("DELETE FROM history_captures WHERE identity=?1", [&key])?;
@@ -703,24 +707,42 @@ fn reconcile_backends(
 
 /// Age out records unchanged for the retention period, then apply the logical
 /// quotas.
-fn prune(connection: &mut Connection, now: i64) -> anyhow::Result<()> {
+fn prune(connection: &mut Connection, now: i64, live: &[String]) -> anyhow::Result<()> {
     let transaction = connection.transaction()?;
     transaction.execute(
         "DELETE FROM history_captures WHERE updated < ?1",
         [now - RETENTION_SECONDS],
     )?;
-    enforce_quotas(&transaction)?;
+    enforce_quotas(&transaction, live)?;
     transaction.commit()?;
     Ok(())
 }
 
 /// Keep the newest actual updates that fit both the record and the payload
-/// quota; evict the rest in one statement over the covering index.
-fn enforce_quotas(transaction: &Transaction<'_>) -> anyhow::Result<()> {
-    transaction.execute(
-        "DELETE FROM history_captures WHERE identity IN (SELECT identity FROM (SELECT identity, row_number() OVER w n, sum(bytes) OVER w t FROM history_captures WINDOW w AS (ORDER BY updated DESC, identity DESC)) WHERE n > ?1 OR t > ?2)",
-        params![MAX_RECORDS, MAX_PAYLOAD_BYTES],
-    )?;
+/// quota, the `live` panes' (those the last complete listings still show)
+/// ranked before every other; evict the rest over the covering index. A live
+/// pane's checkpoint evicted for quota is logged: that is history a user may
+/// still page through.
+fn enforce_quotas(transaction: &Transaction<'_>, live: &[String]) -> anyhow::Result<()> {
+    let live_json = serde_json::to_string(live)?;
+    let evicted: Vec<(String, bool)> = transaction
+        .prepare(
+            "SELECT identity, live FROM (SELECT identity, live, row_number() OVER w n, sum(bytes) OVER w t FROM (SELECT identity, bytes, updated, identity IN (SELECT value FROM json_each(?3)) live FROM history_captures) WINDOW w AS (ORDER BY live DESC, updated DESC, identity DESC)) WHERE n > ?1 OR t > ?2",
+        )?
+        .query_map(params![MAX_RECORDS, MAX_PAYLOAD_BYTES, live_json], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<Result<_, _>>()?;
+    for (identity, _) in &evicted {
+        transaction.execute("DELETE FROM history_captures WHERE identity=?1", [identity])?;
+    }
+    let live_evicted = evicted.iter().filter(|(_, live)| *live).count();
+    if live_evicted > 0 {
+        tracing::warn!(
+            panes = live_evicted,
+            "captured history quota evicted the checkpoint of a pane that is still open"
+        );
+    }
     Ok(())
 }
 

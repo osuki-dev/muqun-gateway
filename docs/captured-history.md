@@ -258,8 +258,10 @@ Durable payload retention is at most **48 captures / 24 MiB**, **5,000 rows / 2 
 of row text per shape**, for **7 days since the last actual projection change**,
 not the last read. Reads and unchanged polling do not extend age. Age pruning
 runs at startup and every 60 seconds; logical quotas also run after each written
-projection. The newest actual updates that fit both quotas are kept and the
-older ones evicted. Recovered checkpoints share the existing
+projection. Checkpoints of panes the last complete listings still show rank
+before every other; within each group the newest actual updates that fit both
+quotas are kept and the older ones evicted. Evicting an open pane's checkpoint
+for quota logs one warning line. Recovered checkpoints share the existing
 48-buffer/24-MiB live-memory budget; snapshots keep their separate 8-MiB budget.
 The bounded four-byte-per-row encoding overhead counts toward the payload quota,
 and recovered row/vector allocations count toward the total live-memory budget,
