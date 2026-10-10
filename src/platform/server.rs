@@ -134,7 +134,7 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     };
     // A registration handed to a session agent's service outlives a switch
     // turned off; its token does not.
-    crate::mcp::inject::revoke_when_off(&state.config, state.mcp_tokens.as_ref()).await;
+    crate::mcp::inject::startup_cleanup(&state.config, state.mcp_tokens.as_ref()).await;
     // After the token store exists, so the first OpenCode start already gets
     // its MCP environment.
     if state.config.mcp.enabled {

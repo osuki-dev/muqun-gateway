@@ -92,9 +92,25 @@ const INSTRUCTION_SWEEP: usize = 50;
 /// the task events.
 pub(crate) fn spawn_instruction_cleanup(state: AppState) {
     let mut events = state.task_events.subscribe();
+    let early = state.clone();
+    tokio::spawn(async move {
+        // The agent managers attach on their own task: the startup sweep
+        // waits (up to a minute) for one, else it would find none to ask.
+        for _ in 0..30 {
+            if early
+                .agent_runtime
+                .manager_for_agent("opencode")
+                .await
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        sweep_task_instructions(&early).await;
+    });
     tokio::spawn(async move {
         use tokio::sync::broadcast::error::RecvError;
-        sweep_task_instructions(&state).await;
         loop {
             match events.recv().await {
                 Ok(super::events::TaskDomainEvent::Updated { task, .. }) => {
@@ -361,7 +377,7 @@ mod tests {
     use serde_json::json;
 
     #[tokio::test]
-    async fn an_ended_task_s_session_loses_its_instruction_from_the_ledger_alone() {
+    async fn an_ended_task_s_binding_names_the_session_that_loses_its_instruction() {
         // No memory of having set it: the binding says which session, and
         // an agent without such instructions is not asked.
         for (keeps_instructions, removed) in [(true, true), (false, false)] {

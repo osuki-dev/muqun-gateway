@@ -31,6 +31,10 @@
 //!   runs, and the
 //!   "Code Mode tool catalog has changed" notice when it is exactly that.
 //!
+//! An event carries only the rows it updates, so the live stream reads its
+//! message as the turn's last: a marker in an earlier message of the turn
+//! is cut live but stays in the snapshot, which sees the whole turn.
+//!
 //! A streamed row left with nothing is removed (`agent.timeline.removed`)
 //! rather than left out, so a client never keeps an older version of it.
 //!
@@ -211,10 +215,11 @@ fn hide_in_item(item: &mut TimelineItem, streaming: Streaming) -> Served {
             // Held until its code is known, then shown unless it is only a
             // muqun lookup that did not fail.
             let code = call.input.get("code").and_then(|code| code.as_str());
-            let unknown = matches!(
-                call.status,
-                ToolCallStatus::Pending | ToolCallStatus::Streaming
-            );
+            let unknown = code.is_none()
+                && matches!(
+                    call.status,
+                    ToolCallStatus::Pending | ToolCallStatus::Streaming
+                );
             let failed = call.status == ToolCallStatus::Failed || call.error.is_some();
             let lookup = !failed && code.is_some_and(muqun_lookup);
             // Once the turn is over, a call that never got its code is shown.

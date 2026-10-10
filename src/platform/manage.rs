@@ -1447,6 +1447,13 @@ fn set_config_keys(
                 object.shift_remove(*last);
             }
         }
+        // A one-level object the removal left empty goes too, as if it had
+        // never been written (`"agent_launch_args": {}` reads as noise).
+        if let ([parent], None, Ordered::Object(top)) = (parents, value, &mut doc) {
+            if matches!(top.get(*parent), Some(Ordered::Object(left)) if left.is_empty()) {
+                top.shift_remove(*parent);
+            }
+        }
     }
     let rendered = serde_json::to_vec_pretty(&doc)?;
     let config: crate::Config =

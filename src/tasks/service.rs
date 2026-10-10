@@ -2500,7 +2500,6 @@ async fn full_answer(state: &AppState, asid: &str, since_ms: u64) -> Option<Stri
         .map(|text| super::transcript::without_any_marker(&text))
 }
 
-/// `"<step>: <message>"` for the first failed step of a launch.
 /// Whether a launch's steps leave room for starting the agent again with
 /// its sentence typed, once it is shown to have exited: the agent step
 /// succeeded (tmux saw it start), or failed because the agent exited before
@@ -2518,6 +2517,7 @@ fn may_retry_typed(steps: &Value) -> bool {
         && failed.pointer("/error/code").and_then(Value::as_str) == Some("agent_start_failed")
 }
 
+/// `"<step>: <message>"` for the first failed step of a launch.
 fn failed_step(steps: &Value) -> Option<String> {
     let step = steps
         .as_array()?
@@ -2866,9 +2866,6 @@ mod tests {
         }
     }
 
-    /// A state with an OpenCode fake whose new session exists (idle, unless
-    /// the fake already lists its sessions), and a task delegated to it by
-    /// `assistant("a")`.
     #[test]
     fn a_claude_that_refused_its_flag_is_retried_only_after_a_real_failure() {
         let failed = |code: &str| {
@@ -2889,6 +2886,9 @@ mod tests {
         }
     }
 
+    /// A state with an OpenCode fake whose new session exists (idle, unless
+    /// the fake already lists its sessions), and a task delegated to it by
+    /// `assistant("a")`.
     async fn delegated(agent: FakeAgent) -> (AppState, TaskId) {
         let state = test_state("admin", vec![test_device("d1", "token")]);
         let agent = if agent.sessions.is_empty() {
@@ -4065,6 +4065,7 @@ mod tests {
         ] {
             assert_eq!(home_relative(&dir, Some(&home)), named, "{dir}");
         }
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

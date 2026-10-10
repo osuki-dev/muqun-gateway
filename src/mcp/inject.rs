@@ -26,13 +26,18 @@ use serde_json::{json, Value};
 
 use super::hosts::{self, Host, SERVER_NAME};
 use crate::agents::ports::agent::AgentPort;
-use crate::mcp::tokens::{AssistantTokenStore, TokenBinding, NO_EXPIRY};
+use crate::mcp::tokens::{AssistantTokenStore, TokenBinding};
 
 /// The one sentence a terminal agent started for a task is given out of
 /// band, since Claude Code and Codex do not act on a server's instructions:
 /// Claude Code's appended system prompt, Codex's `developer_instructions`.
 pub(crate) const TASK_SENTENCE: &str = "You were started for a Muqun task: when it is \
      finished call the muqun tool tasks.complete (outcome blocked if you need the user).";
+
+/// How long a token handed to a session agent's service lives: a service
+/// that outlives it answers not connected, and the next delegation there
+/// registers a fresh one.
+const RUNTIME_TOKEN_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
 /// The key of the per-session instruction a session agent's task session
 /// carries ([`TASK_SENTENCE`]) while its task is open.
@@ -221,8 +226,9 @@ async fn codex_developer_instructions(config: &crate::Config) -> Option<String> 
             .get("developer_instructions")
             .and_then(toml::Value::as_str)
             .map(str::to_owned),
-        Err(error) => {
-            tracing::warn!(%error, "Codex's config did not parse; its task gets the sentence alone");
+        // The parse error quotes the file; only the fact is logged.
+        Err(_) => {
+            tracing::warn!("Codex's config did not parse; its task gets the sentence alone");
             None
         }
     }
@@ -289,7 +295,7 @@ pub(crate) async fn ensure_session_agent(
             .collect(),
         Err(_) => Vec::new(),
     };
-    let issued = match tokens.issue(binding, label, NO_EXPIRY).await {
+    let issued = match tokens.issue(binding, label, RUNTIME_TOKEN_TTL_MS).await {
         Ok(issued) => issued,
         Err(error) => {
             tracing::warn!(%error, "could not mint the agent's MCP token");
@@ -352,7 +358,7 @@ fn redact_bearer(text: &str) -> String {
 /// At startup with injection off: the tokens earlier registrations handed a
 /// session agent's service are revoked, so a registration that outlived the
 /// switch answers 401.
-pub(crate) async fn revoke_when_off(config: &crate::Config, tokens: &dyn AssistantTokenStore) {
+pub(crate) async fn startup_cleanup(config: &crate::Config, tokens: &dyn AssistantTokenStore) {
     let on = enabled(config);
     if let Ok(rows) = tokens.list().await {
         // With injection on, only the token minted before tokens were per
