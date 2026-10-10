@@ -796,7 +796,7 @@ mod tests {
             TaskState::Working
         );
         // In the asked directory, named for the task, started the spawn
-        // route's way: bypass flags, the instruction, then the goal as its prompt.
+        // route's way: bypass flags, then the goal as its prompt.
         let calls = herdr.calls.lock().unwrap().clone();
         let tab = calls.iter().find(|c| c["method"] == "tab.create").unwrap();
         assert_eq!(tab["params"]["cwd"], json!(dir));
@@ -813,15 +813,12 @@ mod tests {
             .iter()
             .find(|c| c["method"] == "agent.prompt")
             .unwrap();
-        // The goal alone is typed; the request for the completion marker
-        // that alone makes it done went on the launch line.
-        assert_eq!(prompt["params"]["text"], "fix the build");
-        let instruction = format!(
-            "developer_instructions={}",
-            crate::tasks::pane_agent::completion_instruction()
+        // The goal, asking for the completion marker that alone makes it done
+        // (Codex takes no instruction out of band).
+        assert_eq!(
+            prompt["params"]["text"],
+            crate::tasks::pane_agent::completion_request("fix the build")
         );
-        let args = start["params"]["args"].as_array().unwrap();
-        assert_eq!(args[args.len() - 2..], [json!("-c"), json!(instruction)]);
         assert_eq!(task["goal"], "fix the build");
 
         // A task cancelled before its agent starts gets no agent and no goal.

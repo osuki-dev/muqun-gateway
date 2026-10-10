@@ -6,7 +6,9 @@
 //! An idle agent is not a finished one -- a terminal agent pauses (thinking,
 //! a tool, a long build) and comes back -- so only an explicit signal is
 //! `done`: the goal is given with [`completion_instruction`] (out of band
-//! where the agent takes it, else after the goal -- [`completion_request`];
+//! where the agent takes it -- Claude Code's appended system prompt, with
+//! one typed retry if it will not start that way -- else after the goal,
+//! [`completion_request`];
 //! the goal on the agent's command line where it takes one, else typed),
 //! and the agent
 //! printing a [`DONE_MARKER`] line (or calling `tasks.complete` from the
@@ -122,9 +124,13 @@ pub(crate) fn is_available(state: &AppState, agent_id: &str) -> bool {
 /// session) asks besides its goal: to say how it ended -- the
 /// `tasks.complete` tool, or else a marker line. It is plumbing, never shown
 /// to the reader: it goes out of band where the agent takes that (a
-/// synthetic OpenCode message, Claude Code's appended system prompt, Codex's
-/// `developer_instructions`) and is cut from the transcript otherwise
-/// ([`super::transcript`]). It opens with [`REQUEST_OPENING`].
+/// synthetic OpenCode message; Claude Code's appended system prompt, unless
+/// its configured launch arguments append one of their own) and is cut from
+/// the served transcript otherwise ([`super::transcript`]). A Claude Code
+/// that does not start with `--append-system-prompt-file` is started once
+/// more with the instruction typed after its goal, rather than failing the
+/// task. Codex and other terminal agents get it typed: a terminal shows what
+/// was typed. It opens with [`REQUEST_OPENING`].
 pub(crate) fn completion_instruction() -> String {
     format!(
         "{REQUEST_OPENING}call the muqun tool tasks.complete with a \

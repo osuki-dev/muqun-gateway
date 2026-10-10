@@ -203,29 +203,34 @@ pub fn agent_launch_args(
 }
 
 /// The arguments that give a delegated agent the gateway's completion
-/// `instruction` out of band, so only the goal is its prompt: Claude Code
-/// appends it to its system prompt (read from `file` when there is one, so
-/// the launch line typed into the pane carries a path, not the text), Codex
-/// takes it as `developer_instructions` (a `-c` value that is not TOML is
-/// taken as a literal string, so no quoting is added). `None` for an agent
-/// with no such way in: it is given the instruction with its goal. Added
-/// after [`agent_launch_args`], whatever config says those are.
-pub fn instruction_args(kind: &str, instruction: &str, file: Option<&Path>) -> Option<Vec<String>> {
-    match (kind, file) {
-        ("claude", Some(file)) => Some(vec![
+/// `instruction` out of band, so only the goal is its prompt. Only Claude
+/// Code takes them: appended to its system prompt, read from `file` when
+/// there is one (so the launch line typed into the pane carries a path, not
+/// the text). `None` -- the instruction is typed with the goal -- for any
+/// other agent (Codex's `developer_instructions` would replace the user's
+/// own), and for a Claude Code whose configured launch arguments
+/// (`configured`) already append a system prompt: the user's wins. Added
+/// after [`agent_launch_args`].
+pub fn instruction_args(
+    kind: &str,
+    configured: &[String],
+    instruction: &str,
+    file: Option<&Path>,
+) -> Option<Vec<String>> {
+    let appends = configured.iter().any(|arg| {
+        let flag = arg.split('=').next().unwrap_or(arg);
+        flag == "--append-system-prompt" || flag == "--append-system-prompt-file"
+    });
+    if kind != "claude" || appends {
+        return None;
+    }
+    Some(match file {
+        Some(file) => vec![
             "--append-system-prompt-file".to_owned(),
             file.to_string_lossy().into_owned(),
-        ]),
-        ("claude", None) => Some(vec![
-            "--append-system-prompt".to_owned(),
-            instruction.to_owned(),
-        ]),
-        ("codex", _) => Some(vec![
-            "-c".to_owned(),
-            format!("developer_instructions={instruction}"),
-        ]),
-        _ => None,
-    }
+        ],
+        None => vec!["--append-system-prompt".to_owned(), instruction.to_owned()],
+    })
 }
 
 /// What the kinds with built-in defaults start with under this config, one
@@ -1013,9 +1018,12 @@ mod tests {
         // A delegation's completion instruction goes out of band where the
         // agent takes one, whatever its launch arguments are configured as.
         let file = Path::new("/state/task-instruction.md");
-        for (kind, file, args) in [
+        let own = ["--append-system-prompt=be brief".to_owned()];
+        let own_file = ["--append-system-prompt-file".to_owned(), "/x".to_owned()];
+        for (kind, configured, file, args) in [
             (
                 "claude",
+                &[][..],
                 Some(file),
                 Some(vec![
                     "--append-system-prompt-file",
@@ -1024,20 +1032,19 @@ mod tests {
             ),
             (
                 "claude",
+                &[][..],
                 None,
                 Some(vec!["--append-system-prompt", "say \"done\""]),
             ),
-            (
-                "codex",
-                Some(file),
-                Some(vec!["-c", "developer_instructions=say \"done\""]),
-            ),
-            ("gemini", Some(file), None),
+            ("claude", &own[..], Some(file), None),
+            ("claude", &own_file[..], None, None),
+            ("codex", &[][..], Some(file), None),
+            ("gemini", &[][..], Some(file), None),
         ] {
             assert_eq!(
-                instruction_args(kind, "say \"done\"", file),
+                instruction_args(kind, configured, "say \"done\"", file),
                 args.map(|args| args.into_iter().map(str::to_owned).collect()),
-                "{kind}"
+                "{kind} {configured:?}"
             );
         }
     }

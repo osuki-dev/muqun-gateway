@@ -404,10 +404,13 @@ finishes the task. The agent is given the completion instruction quoted in
 agent takes instructions out of band, only the goal is its prompt: `claude`
 starts with `--append-system-prompt-file <state dir>/task-instruction.md`
 (the text itself with `--append-system-prompt` when the file cannot be
-written), `codex` with `-c developer_instructions=<instruction>`, both after
-the launch arguments whatever `agent_launch_args` says, on tmux and Herdr
-alike. Any other agent gets the instruction as a paragraph after its goal
-(the stored `goal` is the goal as given). The marker line the agent prints
+written) after its launch arguments, on tmux and Herdr alike -- unless
+`agent_launch_args.claude` already appends a system prompt, which wins. A
+Claude Code that does not start that way is started once more with the
+instruction typed. Any other agent, Codex included (its
+`developer_instructions` would replace the user's own), gets the instruction
+as a paragraph typed after its goal (the stored `goal` is the goal as
+given). The marker line the agent prints
 stays in its pane: a terminal shows what was written. The marker is looked for in the
 pane's recent output (its last 200 lines, unwrapped), not only on its screen,
 so one that scrolled off still counts. It counts when the line starts with

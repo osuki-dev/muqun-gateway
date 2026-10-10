@@ -1010,24 +1010,44 @@ pub(crate) async fn start_terminal_agent(
     }
     let pane_id = placed.place.pane_id.clone();
     let instruction = pane_agent::completion_instruction();
+    let configured =
+        crate::agents::tasks::agent_launch_args(&kind, &[], &state.config.agent_launch_args);
     let file = (kind == "claude")
         .then(pane_agent::completion_instruction_file)
         .flatten();
-    let extra = crate::agents::tasks::instruction_args(&kind, &instruction, file.as_deref());
-    let prompt = match extra {
-        Some(_) => goal,
-        None => pane_agent::completion_request(&goal),
+    let extra =
+        crate::agents::tasks::instruction_args(&kind, &configured, &instruction, file.as_deref());
+    let typed_form = pane_agent::completion_request(&goal);
+    let mut prompt = if extra.is_some() {
+        goal
+    } else {
+        typed_form.clone()
     };
-    let (mut launched, to_type) = start_agent_in_place(
-        &state,
-        &session,
-        &kind,
-        cwd.as_deref(),
-        placed,
-        Some(&prompt),
-        extra.as_deref().unwrap_or_default(),
-    )
-    .await;
+    let start = |placed, prompt: String, extra: Option<Vec<String>>| {
+        let (state, session, kind, cwd) = (&state, &session, &kind, &cwd);
+        async move {
+            let extra = extra.unwrap_or_default();
+            start_agent_in_place(
+                state,
+                session,
+                kind,
+                cwd.as_deref(),
+                placed,
+                Some(&prompt),
+                &extra,
+            )
+            .await
+        }
+    };
+    let (mut launched, mut to_type) = start(placed.clone(), prompt.clone(), extra.clone()).await;
+    // An agent that would not start with the instruction out of band (a
+    // Claude Code without `--append-system-prompt-file`) is started once
+    // more with it typed after the goal.
+    if extra.is_some() && agent_failed(&launched.steps.value()) && !ended().await {
+        tracing::info!(task = %task.id.0, "terminal task: started again with the instruction typed");
+        prompt = typed_form;
+        (launched, to_type) = start(placed, prompt.clone(), None).await;
+    }
     let typed = to_type.is_some();
     if let Some(started) = to_type {
         if ended().await {
@@ -2185,6 +2205,16 @@ async fn full_answer(state: &AppState, asid: &str, since_ms: u64) -> Option<Stri
 }
 
 /// `"<step>: <message>"` for the first failed step of a launch.
+/// Whether the agent itself did not start (its start step failed).
+fn agent_failed(steps: &Value) -> bool {
+    steps.as_array().is_some_and(|steps| {
+        steps.iter().any(|step| {
+            step.get("step").and_then(Value::as_str) == Some("agent")
+                && step.get("status").and_then(Value::as_str) == Some("failed")
+        })
+    })
+}
+
 fn failed_step(steps: &Value) -> Option<String> {
     let step = steps
         .as_array()?
