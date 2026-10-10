@@ -40,7 +40,17 @@ pub(crate) fn non_default_dir(
 /// `/mcp` address the host is given, which it checks before any token goes
 /// there.
 pub(crate) fn helper_for_url(url: &str) -> String {
-    format!("{} --url {}", helper_for_this_gateway(), quoted(url))
+    let state = match (
+        crate::platform::store::state_dir(),
+        crate::platform::store::standalone_state_dir(),
+    ) {
+        (Ok(resolved), Ok(default)) => non_default_dir(resolved, &default),
+        _ => None,
+    };
+    let state = state
+        .map(|dir| format!(" --state-dir {}", quoted(&dir.to_string_lossy())))
+        .unwrap_or_default();
+    format!("{}{state} --url {}", helper_for_this_gateway(), quoted(url))
 }
 
 /// The helper command for this gateway's config directory.

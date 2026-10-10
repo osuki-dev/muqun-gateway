@@ -126,16 +126,21 @@ configured address keeps refusing `/mcp` (`403 mcp_loopback_only`).
 Identity comes before credentials. At startup the gateway mints a random
 secret identity and writes it to `<state>/mcp-identity` (0600, removed when it
 stops); the secret is never served. `POST /mcp/identity {challenge}` answers
-`{proof}`, `HMAC-SHA256(secret, challenge)` in hex, to a loopback caller with
-no proxy headers only, at most 20 a second. Every helper command the gateway
-hands out (and `mcp enable` writes) carries the exact `/mcp` address the host
-was given (`mcp token-helper --url <url>`); before printing a token, the
-helper reads the identity file itself, sends that address a fresh random
-challenge with no credential, and checks the proof in constant time. No
-identity file means no gateway running: no token. Anything else answering
-there -- a process that took a stale port -- cannot prove the secret and gets
-nothing: the helper prints `another process answers
-on 127.0.0.1:<port>; not sending the token` and exits 1. `mcp enable` writes
+`{proof}`, `HMAC-SHA256(secret, <its own /mcp address> "\n" challenge)` in hex,
+to a loopback caller with no proxy headers only (no rate limit: it is
+loopback-only, one HMAC per call, and a limit could only be used to make the
+helper refuse). Every helper command the gateway hands out (and `mcp enable`
+writes) carries the exact `/mcp` address the host was given (`mcp
+token-helper --url <url>`, plus `--state-dir` when the state directory is not
+the default); before printing a token, the helper reads the identity file
+itself, sends that address a fresh random challenge with no credential, and
+checks the proof for that address in constant time. A process on a stale port
+that relays the challenge to the real gateway gets a proof for the real
+address, which does not match its own. No identity file means no gateway
+running: no token. An entry without `--url` (written by an older gateway) is
+refused with "run `muqun-gateway mcp enable` again". Anything else answering
+there gets nothing: the helper prints `another process answers on
+127.0.0.1:<port>; not sending the token` and exits 1. `mcp enable` writes
 the configured port's address, never an ephemeral fallback.
 
 `muqun-gateway mcp revoke --all` or `--id <token-id>` revokes tokens from the

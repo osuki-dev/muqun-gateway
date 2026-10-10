@@ -28,6 +28,10 @@ pub(crate) enum McpCommand {
         /// before a token is printed.
         #[arg(long, value_name = "URL")]
         url: Option<String>,
+        /// The gateway's state directory, when it is not the default: where
+        /// its identity file is.
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
     },
     /// Revoke assistant tokens. A running gateway sees it on the next call.
     #[command(group(clap::ArgGroup::new("which").required(true).args(["all", "id"])))]
@@ -161,6 +165,7 @@ fn token_helper(
     bearer: bool,
     config_dir: Option<PathBuf>,
     url: Option<String>,
+    state_dir: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let fail = |code: i32, message: String| -> ! {
         eprintln!("{message}");
@@ -180,8 +185,20 @@ fn token_helper(
     // it was given at launch, so that address must be this gateway -- it
     // knows the secret identity this gateway wrote -- not a process that
     // took over a stale port.
-    let url = url.unwrap_or_else(|| crate::mcp::recorded_url(&config.listen));
-    let expected = crate::mcp::identity_file()
+    // An entry written before the address was baked in: it cannot be checked.
+    let Some(url) = url else {
+        fail(
+            1,
+            String::from(
+                "muqun: this MCP entry is from an older gateway; run `muqun-gateway mcp enable` again",
+            ),
+        );
+    };
+    let file = match state_dir {
+        Some(dir) => Ok(crate::mcp::identity_file_in(&dir)),
+        None => crate::mcp::identity_file(),
+    };
+    let expected = file
         .ok()
         .and_then(|file| std::fs::read_to_string(file).ok())
         .unwrap_or_default();
@@ -242,7 +259,8 @@ pub(crate) async fn run_mcp_command(command: McpCommand) -> anyhow::Result<()> {
             bearer,
             config_dir,
             url,
-        } => token_helper(bearer, config_dir, url)?,
+            state_dir,
+        } => token_helper(bearer, config_dir, url, state_dir)?,
         McpCommand::Revoke { all, id } => revoke(all, id).await?,
         McpCommand::Enable { host, project, url } => {
             let url = url.unwrap_or_else(default_url);
@@ -388,6 +406,7 @@ mod tests {
                     bearer,
                     config_dir,
                     url,
+                    ..
                 },
         } = cli.command
         else {

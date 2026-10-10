@@ -212,7 +212,13 @@ pub(crate) fn loopback_router(state: AppState) -> Router {
 static IDENTITY: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
 
 pub(crate) fn identity_file() -> anyhow::Result<std::path::PathBuf> {
-    Ok(crate::platform::store::state_dir()?.join("mcp-identity"))
+    Ok(identity_file_in(&crate::platform::store::state_dir()?))
+}
+
+/// [`identity_file`] in the state directory `state` (the helper's
+/// `--state-dir`, when the gateway's is not the default).
+pub(crate) fn identity_file_in(state: &std::path::Path) -> std::path::PathBuf {
+    state.join("mcp-identity")
 }
 
 /// Mint this process's identity and write it where the token helper reads
@@ -228,32 +234,18 @@ pub(crate) fn mint_identity() -> anyhow::Result<FileRecord> {
     Ok(FileRecord(file))
 }
 
-/// `HMAC-SHA256(secret, challenge)`, hex.
-pub(crate) fn identity_proof(secret: &str, challenge: &str) -> String {
+/// The identity MAC: `HMAC-SHA256(secret, url "\n" challenge)`. `url` is the
+/// `/mcp` address the gateway serves its agents -- its own knowledge, never
+/// what the caller says -- so a relay on another port that forwards the
+/// challenge gets a proof for the real address, not its own.
+fn identity_mac(secret: &str, url: &str, challenge: &str) -> hmac::Hmac<sha2::Sha256> {
     use hmac::{KeyInit as _, Mac as _};
     let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes())
         .expect("HMAC takes a key of any length");
+    mac.update(url.as_bytes());
+    mac.update(b"\n");
     mac.update(challenge.as_bytes());
-    hex::encode(mac.finalize().into_bytes())
-}
-
-/// At most this many identity proofs a second: the check is cheap, but
-/// there is no reason to serve thousands.
-const IDENTITY_PROOFS_PER_SECOND: u32 = 20;
-static IDENTITY_RATE: std::sync::Mutex<Option<(std::time::Instant, u32)>> =
-    std::sync::Mutex::new(None);
-
-fn identity_rate_allows() -> bool {
-    let Ok(mut rate) = IDENTITY_RATE.lock() else {
-        return false;
-    };
-    let now = std::time::Instant::now();
-    let (since, count) = rate.get_or_insert((now, 0));
-    if now.duration_since(*since) >= std::time::Duration::from_secs(1) {
-        (*since, *count) = (now, 0);
-    }
-    *count += 1;
-    *count <= IDENTITY_PROOFS_PER_SECOND
+    mac
 }
 
 #[derive(serde::Deserialize)]
@@ -264,17 +256,19 @@ struct Challenge {
 /// `POST /mcp/identity {challenge}`: `{proof}`, this gateway's identity
 /// applied to the caller's fresh challenge. Loopback callers without proxy
 /// headers only; the secret itself never leaves the process.
+///
+/// Not rate-limited: loopback only, one HMAC per call, and a limit any local
+/// process could exhaust would only make the helper refuse.
 async fn identity(
+    State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: axum::http::HeaderMap,
     body: Result<axum::Json<Challenge>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     use axum::http::StatusCode;
+    use hmac::Mac as _;
     if !auth::is_loopback(Some(peer)) || auth::refuse_for_proxy(&headers) {
         return StatusCode::FORBIDDEN.into_response();
-    }
-    if !identity_rate_allows() {
-        return StatusCode::TOO_MANY_REQUESTS.into_response();
     }
     let Ok(axum::Json(Challenge { challenge })) = body else {
         return StatusCode::BAD_REQUEST.into_response();
@@ -285,8 +279,11 @@ async fn identity(
     let secret = IDENTITY.read().ok().and_then(|identity| identity.clone());
     match secret {
         Some(secret) => {
-            axum::Json(serde_json::json!({ "proof": identity_proof(&secret, &challenge) }))
-                .into_response()
+            let url = local_url(&state.config.listen);
+            let proof = identity_mac(&secret, &url, &challenge)
+                .finalize()
+                .into_bytes();
+            axum::Json(serde_json::json!({ "proof": hex::encode(proof) })).into_response()
         }
         None => StatusCode::NOT_FOUND.into_response(),
     }
@@ -317,7 +314,7 @@ pub(crate) fn verify_identity(url: &str, secret: &str) -> Result<(), String> {
     let challenge =
         uuid::Uuid::new_v4().simple().to_string() + &uuid::Uuid::new_v4().simple().to_string();
     match crate::cli::local_api::identity_proof_at(address, &challenge) {
-        Ok(Some(proof)) if proves(secret, &challenge, &proof) => Ok(()),
+        Ok(Some(proof)) if proves(secret, url, &challenge, &proof) => Ok(()),
         Ok(_) => Err(format!(
             "muqun: another process answers on {at}; not sending the token"
         )),
@@ -327,16 +324,16 @@ pub(crate) fn verify_identity(url: &str, secret: &str) -> Result<(), String> {
     }
 }
 
-/// Whether `proof` is `secret` applied to `challenge`, compared in constant time.
-fn proves(secret: &str, challenge: &str, proof: &str) -> bool {
-    use hmac::{KeyInit as _, Mac as _};
+/// Whether `proof` is the gateway's MAC of `url` and `challenge` under
+/// `secret`, compared in constant time.
+fn proves(secret: &str, url: &str, challenge: &str, proof: &str) -> bool {
+    use hmac::Mac as _;
     let Ok(proof) = hex::decode(proof) else {
         return false;
     };
-    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes())
-        .expect("HMAC takes a key of any length");
-    mac.update(challenge.as_bytes());
-    mac.verify_slice(&proof).is_ok()
+    identity_mac(secret, url, challenge)
+        .verify_slice(&proof)
+        .is_ok()
 }
 
 pub(crate) fn local_url(listen: &str) -> String {
@@ -739,9 +736,11 @@ mod tests {
     /// credential, before it hands over a token.
     #[tokio::test]
     async fn a_token_goes_only_to_this_gateway() {
-        let state = crate::test_state("admin", Vec::new());
+        let mut state = crate::test_state("admin", Vec::new());
         let ours = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let ours_at = ours.local_addr().unwrap();
+        // The gateway signs the address it serves its agents.
+        state.config.listen = ours_at.to_string();
         let app = loopback_router(state.clone());
         tokio::spawn(async move {
             axum::serve(
@@ -752,10 +751,23 @@ mod tests {
         });
         let squatter = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let squatter_at = squatter.local_addr().unwrap();
-        // It may even have read an old answer; it cannot prove a fresh one.
+        // It relays the challenge to the real gateway and hands back its
+        // proof: a proof for the real address, not this one.
         let imposter = Router::new().route(
             "/mcp/identity",
-            axum::routing::post(|| async { axum::Json(json!({ "proof": "00".repeat(32) })) }),
+            axum::routing::post(move |body: String| async move {
+                let answer = reqwest::Client::new()
+                    .post(format!("http://{ours_at}/mcp/identity"))
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .send()
+                    .await
+                    .unwrap()
+                    .text()
+                    .await
+                    .unwrap();
+                ([("content-type", "application/json")], answer)
+            }),
         );
         tokio::spawn(async move { axum::serve(squatter, imposter).await });
         let record = mint_identity().unwrap();
