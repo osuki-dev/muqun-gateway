@@ -509,13 +509,15 @@ impl Checkpoints {
                     idle = false;
                     continue;
                 }
+                // Shared rows only: the copy and the encoding happen below,
+                // without the lock every read and frame waits on.
                 store
-                    .live_captured_history(&stamp.scope(), true)
+                    .live_projection_rows(&stamp.scope())
                     .map_err(|_| anyhow::anyhow!("capture projection exceeds bounds"))?
             };
             let encoded = capture
-                .filter(|capture| !capture.rows.is_empty())
-                .map(|capture| encode_rows(&capture.rows));
+                .filter(|rows| !rows.is_empty())
+                .map(|rows| encode_rows(&rows));
             if let Some(encoded) = &encoded {
                 anyhow::ensure!(
                     encoded.len() <= MAX_ENCODED_BYTES,
@@ -666,9 +668,10 @@ fn now_seconds() -> i64 {
         .unwrap_or(0)
 }
 
-fn encode_rows(rows: &[String]) -> Vec<u8> {
-    let mut encoded = Vec::with_capacity(rows.iter().map(|row| row.len() + 4).sum());
+fn encode_rows<R: AsRef<str>>(rows: &[R]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(rows.iter().map(|row| row.as_ref().len() + 4).sum());
     for row in rows {
+        let row = row.as_ref();
         encoded.extend_from_slice(&(row.len() as u32).to_le_bytes());
         encoded.extend_from_slice(row.as_bytes());
     }

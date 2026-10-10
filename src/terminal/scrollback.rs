@@ -621,6 +621,10 @@ fn common_suffix(previous: &[u64], current: &[u64], carries: &[bool]) -> usize {
     best
 }
 
+/// One held row. Shared, not copied: the checkpoint writer takes a pane's
+/// rows under the store lock by bumping these counts, and encodes them after.
+pub(crate) type Row = std::sync::Arc<str>;
+
 #[derive(Debug, Default)]
 struct PaneBuffer {
     /// Identity for pagination only; legacy tail folding does not use it.
@@ -631,7 +635,7 @@ struct PaneBuffer {
     /// does not change `epoch`; this is how a cursor tells whether the rows it
     /// points at are still held.
     trimmed: u64,
-    lines: VecDeque<String>,
+    lines: VecDeque<Row>,
     hashes: VecDeque<u64>,
     bytes: usize,
     /// When this buffer was last fed, on the store's own clock.
@@ -653,7 +657,7 @@ struct PaneBuffer {
     /// read says whether the screen came back down past them (they go back)
     /// or nothing agrees with them any more (they go back too, under the new
     /// screen: they were shown, and are history). See `fold`.
-    set_aside: Vec<String>,
+    set_aside: Vec<Row>,
     /// The screen as it was before a read that agreed with nothing went on
     /// top of it -- see `Covered` and `fold`.
     covered: Option<Covered>,
@@ -681,7 +685,7 @@ struct PaneBuffer {
 #[derive(Debug)]
 struct Covered {
     start: usize,
-    rows: Vec<String>,
+    rows: Vec<Row>,
     screen: usize,
     last_frame: Vec<u64>,
     last_shapes: Vec<u64>,
@@ -898,7 +902,7 @@ impl PaneBuffer {
 
     fn keep(&mut self, incoming: Vec<String>, skip: usize, frame: Vec<u64>, shapes: Vec<u64>) {
         for line in incoming.into_iter().skip(skip) {
-            self.push(line);
+            self.push(Row::from(line));
         }
         self.trim();
         self.screen = self.screen.min(self.lines.len());
@@ -906,7 +910,7 @@ impl PaneBuffer {
         self.last_shapes = shapes;
     }
 
-    fn push(&mut self, line: String) {
+    fn push(&mut self, line: Row) {
         self.bytes += line.len();
         self.hashes.push_back(line_hash(&line));
         self.lines.push_back(line);
@@ -1350,8 +1354,8 @@ impl ScrollbackStore {
                 .lines
                 .iter()
                 .skip(start)
-                .cloned()
-                .collect::<Vec<String>>()
+                .map(|row| &**row)
+                .collect::<Vec<&str>>()
                 .join("\n"),
         )
     }
@@ -1668,26 +1672,9 @@ impl ScrollbackStore {
         };
         let count = buffer.lines.len().saturating_sub(buffer.screen);
         let rows = if include_rows {
-            // Row text only, the same measure the live cap holds the buffer
-            // to: a pane at its cap is exactly the pane with history worth
-            // paging. Per-row allocation overhead is the snapshot store's to
-            // count, once, against its own budget.
-            let bytes = buffer
-                .lines
-                .iter()
-                .take(count)
-                .map(String::len)
-                .sum::<usize>();
-            if bytes > MAX_PANE_BYTES
-                || buffer
-                    .lines
-                    .iter()
-                    .take(count)
-                    .any(|row| row.len() + 1 > super::history::MAX_PAGE_BYTES)
-            {
-                return Err(super::history::HistoryError::TooLarge);
-            }
-            buffer.lines.iter().take(count).cloned().collect()
+            Self::historical(buffer)?
+                .map(|row| row.to_string())
+                .collect()
         } else {
             Vec::new()
         };
@@ -1697,6 +1684,36 @@ impl ScrollbackStore {
             len: count,
             rows,
         }))
+    }
+
+    /// The historical rows of the live fold for `scope`, shared rather than
+    /// copied: what the checkpoint writer takes under the lock (a count bump
+    /// per row) before it encodes them without it.
+    pub(crate) fn live_projection_rows(
+        &self,
+        scope: &super::history::HistoryScope,
+    ) -> Result<Option<Vec<Row>>, super::history::HistoryError> {
+        self.captured_buffer(scope)
+            .map(|buffer| Ok(Self::historical(buffer)?.cloned().collect()))
+            .transpose()
+    }
+
+    /// A buffer's rows above its screen, refused whole when they exceed the
+    /// bounds: row text only, the same measure the live cap holds the buffer
+    /// to (a pane at its cap is exactly the pane with history worth paging).
+    /// Per-row allocation overhead is the snapshot store's to count, once,
+    /// against its own budget.
+    fn historical(
+        buffer: &PaneBuffer,
+    ) -> Result<impl Iterator<Item = &Row>, super::history::HistoryError> {
+        let count = buffer.lines.len().saturating_sub(buffer.screen);
+        let rows = || buffer.lines.iter().take(count);
+        if rows().map(|row| row.len()).sum::<usize>() > MAX_PANE_BYTES
+            || rows().any(|row| row.len() + 1 > super::history::MAX_PAGE_BYTES)
+        {
+            return Err(super::history::HistoryError::TooLarge);
+        }
+        Ok(rows())
     }
 
     /// Called with neutral native entities before compatibility serialization.

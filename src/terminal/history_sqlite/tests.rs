@@ -537,7 +537,7 @@ async fn sqlite_retention_and_quota_eviction_do_not_resurrect_unchanged_polled_p
                 .db
                 .call(move |c| {
                     for n in 0..MAX_RECORDS {
-                        let encoded = encode_rows(&["quota fixture".into()]);
+                        let encoded = encode_rows(&["quota fixture"]);
                         c.execute(
                             "INSERT INTO history_captures VALUES (?1,'quota',?2,?3,?4)",
                             params![
@@ -963,12 +963,7 @@ async fn retention_and_logical_quotas_keep_the_newest_updates_and_reads_do_not_r
                     let at = if n == 59 { aged + 1 } else { aged - 59 + n };
                     c.execute(
                         "INSERT INTO history_captures VALUES (?1,'policy',?2,?3,?4)",
-                        params![
-                            format!("fixture-{n:02}"),
-                            encode_rows(&["x".into()]),
-                            bytes,
-                            at
-                        ],
+                        params![format!("fixture-{n:02}"), encode_rows(&["x"]), bytes, at],
                     )?;
                 }
                 prune(c, now_seconds())
