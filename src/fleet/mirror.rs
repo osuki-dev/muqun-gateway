@@ -83,6 +83,7 @@ pub(crate) async fn delegate(
             session_title: None,
             mentions: request.mentions.clone(),
             client_ref: Some(client_ref.clone()),
+            requester_server_id: None,
         })
         .await?;
     let mut body = json!({ "goal": request.goal, "client_ref": client_ref });
@@ -617,6 +618,7 @@ mod tests {
             session_title: None,
             mentions: Vec::new(),
             client_ref: None,
+            requester_server_id: None,
         }
     }
 

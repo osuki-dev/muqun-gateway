@@ -835,6 +835,7 @@ mod tests {
                 session_title: None,
                 mentions: Vec::new(),
                 client_ref: None,
+                requester_server_id: None,
             })
             .await
     }

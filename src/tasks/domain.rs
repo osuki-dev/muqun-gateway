@@ -143,6 +143,8 @@ pub(crate) struct Requested {
     pub parent: Option<TaskId>,
     /// The requester's display name (a device's name), when it has one.
     pub name: Option<String>,
+    /// Another computer's own id, as its device record here has it.
+    pub server_id: Option<String>,
 }
 
 impl Requested {
@@ -154,6 +156,7 @@ impl Requested {
             origin: TaskOrigin::Mcp,
             parent: None,
             name: None,
+            server_id: None,
         }
     }
 }
@@ -190,6 +193,10 @@ pub(crate) struct Task {
     /// the task. On a mirror, the reference it sent.
     #[serde(default)]
     pub client_ref: Option<String>,
+    /// The id the requesting computer gave for itself when it paired here
+    /// (its device record's `server_id`), when another computer opened it.
+    #[serde(default)]
+    pub requester_server_id: Option<String>,
 }
 
 /// A task's direct children by state, computed when the task is read.

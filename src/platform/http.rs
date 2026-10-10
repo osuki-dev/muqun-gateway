@@ -69,6 +69,8 @@ pub(crate) struct Caller {
     pub(crate) device_id: String,
     pub(crate) kind: DeviceKind,
     pub(crate) name: String,
+    /// Another computer's own id, as it paired (`DeviceRecord::server_id`).
+    pub(crate) server_id: Option<String>,
 }
 
 pub(crate) fn peer_forbidden() -> (StatusCode, Json<Value>) {
@@ -106,6 +108,7 @@ fn matched_caller(devices: &[DeviceRecord], device_id: String) -> ApiResult<Call
     Ok(Caller {
         kind: record.kind,
         name: record.name.clone(),
+        server_id: record.server_id.clone(),
         device_id,
     })
 }
@@ -117,6 +120,7 @@ fn synthetic_caller(device_id: &str) -> Caller {
         device_id: device_id.to_owned(),
         kind: DeviceKind::App,
         name: device_id.to_owned(),
+        server_id: None,
     }
 }
 

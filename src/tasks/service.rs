@@ -204,6 +204,10 @@ pub(crate) struct RequestedBy {
     pub kind: PrincipalKind,
     pub id: String,
     pub name: String,
+    /// Another computer's own id, as it paired here: how the phone tells
+    /// which of its computers asked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -900,6 +904,7 @@ impl TaskService {
                 session_title: None,
                 mentions: request.mentions.clone(),
                 client_ref: request.client_ref.clone(),
+                requester_server_id: by.server_id.clone(),
             })
             .await?;
         let created = manager
@@ -1065,6 +1070,7 @@ impl TaskService {
                 session_title: None,
                 mentions: request.mentions.clone(),
                 client_ref: request.client_ref.clone(),
+                requester_server_id: by.server_id.clone(),
             })
             .await?;
         let cwd = request.cwd.as_deref();
@@ -1785,6 +1791,7 @@ impl TaskService {
                 kind: task.created_by.kind,
                 id: task.created_by.id.clone(),
                 name: name.clone(),
+                server_id: task.requester_server_id.clone(),
             }),
             _ => None,
         };
@@ -3533,6 +3540,7 @@ mod tests {
                 session_title: None,
                 mentions: Vec::new(),
                 client_ref: None,
+                requester_server_id: None,
             })
             .await;
         state
@@ -4088,6 +4096,7 @@ mod tests {
             origin: TaskOrigin::Agent,
             parent: Some(parent.clone()),
             name: None,
+            server_id: None,
         };
         let mut second = request(None);
         second.label = Some("sub".into());

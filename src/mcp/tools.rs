@@ -1010,6 +1010,7 @@ mod tests {
             origin: crate::tasks::domain::TaskOrigin::Device,
             parent: None,
             name: Some("phone".into()),
+            server_id: None,
         };
         let goal = DelegateArgs {
             goal: "parent goal".into(),
@@ -1225,6 +1226,7 @@ mod tests {
             session_title: None,
             mentions: vec!["mini".into()],
             client_ref: None,
+            requester_server_id: None,
         };
         let id = state.tasks.insert_for_test(&task).await;
         for (pane, task_id, expected) in [

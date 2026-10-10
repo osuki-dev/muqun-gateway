@@ -2107,7 +2107,9 @@ task there yet (`tasks.delegate` then carries a `note` saying so). The create
 carries a `client_ref`, which the task over there keeps and shows in its view
 (with `created_ms`), and that is how it is found. A task
 another computer opened here (`origin: "peer"`) can be confirmed from the phone
-like a device's.
+like a device's; its `requested_by` is `{kind: "gateway", id, name, server_id?}`,
+where `server_id` is the id that computer gave for itself when it paired here,
+when its device record has one.
 
 At the device limit, a gateway's `POST /api/pair/claim` makes room only by
 dropping the oldest gateway device, never one of the owner's apps; with no

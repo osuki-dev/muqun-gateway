@@ -312,6 +312,7 @@ async fn create(
         },
         parent: None,
         name: Some(caller.name),
+        server_id: caller.server_id.clone(),
     };
     let task = state
         .tasks
@@ -466,6 +467,7 @@ mod tests {
                 session_title: None,
                 mentions: Vec::new(),
                 client_ref: None,
+                requester_server_id: None,
             })
             .await
             .unwrap();
@@ -635,6 +637,7 @@ mod tests {
                 session_title: None,
                 mentions: Vec::new(),
                 client_ref: None,
+                requester_server_id: None,
             }
         };
         let mut ids = Vec::new();
@@ -827,6 +830,7 @@ mod tests {
                         session_title: None,
                         mentions: Vec::new(),
                         client_ref: None,
+                        requester_server_id: None,
                     })
                     .await
                     .unwrap();
@@ -1167,15 +1171,15 @@ mod tests {
             .devices
             .lock()
             .unwrap()
-            .push(crate::test_support::test_peer_device(
-                "coding-1",
-                "peer-token",
-            ));
+            .push(crate::connectivity::authority::DeviceRecord {
+                server_id: Some("srv-coding".into()),
+                ..crate::test_support::test_peer_device("coding-1", "peer-token")
+            });
         for (accept, status, check) in [
             (
                 true,
                 StatusCode::OK,
-                json!({ "origin": "peer", "requested_by": { "kind": "gateway", "id": "coding-1", "name": "gateway coding-1" } }),
+                json!({ "origin": "peer", "requested_by": { "kind": "gateway", "id": "coding-1", "name": "gateway coding-1", "server_id": "srv-coding" } }),
             ),
             (
                 false,

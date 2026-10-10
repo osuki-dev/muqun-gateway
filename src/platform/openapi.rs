@@ -810,7 +810,8 @@ fn task_view_schema() -> Value {
                         "properties": {
                             "kind": { "type": "string", "enum": ["device", "gateway"] },
                             "id": { "type": "string" },
-                            "name": { "type": "string" }
+                            "name": { "type": "string" },
+                            "server_id": { "type": "string", "description": "kind gateway: the id that computer gave for itself when it paired here, when known" }
                         }
                     }
                 ]

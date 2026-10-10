@@ -60,6 +60,7 @@ pub(crate) async fn requested(
         origin,
         parent,
         name: None,
+        server_id: None,
     }
 }
 
@@ -244,6 +245,7 @@ mod tests {
             session_title: None,
             mentions: Vec::new(),
             client_ref: None,
+            requester_server_id: None,
         }
     }
 
