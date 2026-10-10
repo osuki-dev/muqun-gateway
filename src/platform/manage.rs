@@ -1414,28 +1414,38 @@ fn set_config_key(
     path: &[&str],
     value: Option<Value>,
 ) -> anyhow::Result<crate::Config> {
+    set_config_keys(file, &[(path, value)])
+}
+
+/// [`set_config_key`] for several keys, in one replacement of the file.
+fn set_config_keys(
+    file: &std::path::Path,
+    edits: &[(&[&str], Option<Value>)],
+) -> anyhow::Result<crate::Config> {
     let text = std::fs::read_to_string(file)?;
     // Read in written order at every depth (serde_json's own maps sort).
     let mut doc: Ordered = serde_json::from_str(&text)?;
-    let (last, parents) = path.split_last().context("an empty config key")?;
-    let mut at = &mut doc;
-    for key in parents {
+    for (path, value) in edits {
+        let (last, parents) = path.split_last().context("an empty config key")?;
+        let mut at = &mut doc;
+        for key in parents {
+            let Ordered::Object(object) = at else {
+                anyhow::bail!("config key is not an object");
+            };
+            at = object
+                .entry((*key).to_owned())
+                .or_insert_with(|| Ordered::Object(indexmap::IndexMap::new()));
+        }
         let Ordered::Object(object) = at else {
             anyhow::bail!("config key is not an object");
         };
-        at = object
-            .entry((*key).to_owned())
-            .or_insert_with(|| Ordered::Object(indexmap::IndexMap::new()));
-    }
-    let Ordered::Object(object) = at else {
-        anyhow::bail!("config key is not an object");
-    };
-    match value {
-        Some(value) => {
-            object.insert((*last).to_owned(), serde_json::from_value(value)?);
-        }
-        None => {
-            object.shift_remove(*last);
+        match value {
+            Some(value) => {
+                object.insert((*last).to_owned(), serde_json::from_value(value.clone())?);
+            }
+            None => {
+                object.shift_remove(*last);
+            }
         }
     }
     let rendered = serde_json::to_vec_pretty(&doc)?;
@@ -1471,11 +1481,7 @@ fn toggle_agent_bypass() -> anyhow::Result<String> {
         ));
     }
     if states.iter().all(|(_, state)| *state == "On") {
-        write_launch_args(|args| {
-            for kind in ["codex", "claude"] {
-                args.insert(kind.to_owned(), Vec::new());
-            }
-        })?;
+        write_launch_args(Some(Vec::new()))?;
         return Ok(String::from(
             "Approval prompts on; press r to restart Gateway and apply. A task may then wait for you.",
         ));
@@ -1490,26 +1496,23 @@ fn toggle_agent_bypass() -> anyhow::Result<String> {
     )? {
         return Ok(String::from("Approval prompts unchanged."));
     }
-    write_launch_args(|args| {
-        for kind in ["codex", "claude"] {
-            args.remove(kind);
-        }
-    })?;
+    write_launch_args(None)?;
     Ok(String::from(
         "Approval prompts skipped; press r to restart Gateway and apply.",
     ))
 }
 
-/// `agent_launch_args` changed by `change`, written in one replacement.
-fn write_launch_args(
-    change: impl FnOnce(&mut std::collections::BTreeMap<String, Vec<String>>),
-) -> anyhow::Result<()> {
-    let mut args = load_config(None)?.agent_launch_args;
-    change(&mut args);
-    let value = (!args.is_empty())
-        .then(|| serde_json::to_value(&args))
-        .transpose()?;
-    write_config_key(&["agent_launch_args"], value)?;
+/// `agent_launch_args` for codex and claude set to `args` (`None` removes
+/// them), in one replacement that keeps every other key, and the order of
+/// the kinds, as written.
+fn write_launch_args(args: Option<Vec<String>>) -> anyhow::Result<()> {
+    let value = args.map(Value::from);
+    let codex: &[&str] = &["agent_launch_args", "codex"];
+    let claude: &[&str] = &["agent_launch_args", "claude"];
+    set_config_keys(
+        &config_dir()?.join(CONFIG_FILE),
+        &[(codex, value.clone()), (claude, value)],
+    )?;
     Ok(())
 }
 
