@@ -3008,6 +3008,7 @@ fn pending_from_answer(status: u16, value: &Value) -> anyhow::Result<Option<Pend
             .get("install_id")
             .and_then(Value::as_str)
             .map(str::to_owned),
+        server_id: None,
         code: value
             .get("code")
             .and_then(Value::as_str)

@@ -118,6 +118,7 @@ pub(crate) async fn request_pairing(
     url: &str,
     request_id: &str,
     device_name: &str,
+    server_id: &str,
 ) -> Result<String, PeerError> {
     let response = http()
         .post(format!("{url}/api/pair/request"))
@@ -125,6 +126,7 @@ pub(crate) async fn request_pairing(
             "request_id": request_id,
             "device_name": device_name,
             "kind": "gateway",
+            "server_id": server_id,
         }))
         .send()
         .await

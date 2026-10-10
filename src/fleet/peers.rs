@@ -15,6 +15,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::peer_client::{self, PeerClient, PeerError};
+use crate::connectivity::authority::DeviceKind;
 use crate::platform::config::FleetConfig;
 use crate::platform::store::sqlite::Migration;
 use crate::tasks::domain::now_ms;
@@ -250,6 +251,23 @@ impl PeerSockets {
     }
 }
 
+/// Revoke the gateway devices here that `server_id` paired as: the peer's
+/// own login into this computer. Best effort, like the revoke over there.
+fn revoke_login(state: &AppState, server_id: &str) {
+    let Ok(mut devices) = state.devices.lock() else {
+        return;
+    };
+    let before = devices.len();
+    devices.retain(|device| {
+        device.kind != DeviceKind::Gateway || device.server_id.as_deref() != Some(server_id)
+    });
+    if devices.len() != before {
+        if let Err(error) = crate::platform::store::write_devices(&devices) {
+            tracing::warn!("failed to revoke a peer's login here: {error:#}");
+        }
+    }
+}
+
 /// The peers registry and the accept switch (`AppState.peers`).
 pub(crate) struct PeerService {
     store: Arc<dyn PeerStore>,
@@ -432,13 +450,15 @@ impl PeerService {
     }
 
     /// Forget `peer_id` and ask it to revoke this gateway's token, best
-    /// effort: the link is over either way, and its open mirrors end as
+    /// effort; take back its own login here too, so one call ends both
+    /// directions. The link is over either way, and its open mirrors end as
     /// lost. `false`: no such peer.
     pub(crate) async fn unlink(&self, state: &AppState, peer_id: &str) -> anyhow::Result<bool> {
         let Some(peer) = self.get(peer_id).await else {
             return Ok(false);
         };
         revoke(&peer).await;
+        revoke_login(state, &peer.server_id);
         super::mirror::lose(state, peer_id, &peer.name).await;
         let removed = self.store.remove(peer_id).await?;
         self.presence.gone(peer_id);
@@ -473,7 +493,8 @@ impl PeerService {
         Ok(Some(peer))
     }
 
-    /// Drop the row only (the peer answered 401: it no longer knows us).
+    /// Drop the row only (the peer answered 401: it no longer knows us). Its
+    /// login here stays: it may still be linked to this computer.
     pub(crate) async fn forget(&self, peer_id: &str) {
         if let Err(error) = self.store.remove(peer_id).await {
             tracing::warn!(peer = %peer_id, "failed to forget a peer: {error:#}");

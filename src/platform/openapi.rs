@@ -1102,7 +1102,8 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
                     "required": ["device_name"],
                     "properties": {
                         "device_name": { "type": "string", "description": "At most 80 characters, no control characters" },
-                        "kind": { "type": "string", "enum": ["app", "gateway"], "description": "Default app" }
+                        "kind": { "type": "string", "enum": ["app", "gateway"], "description": "Default app" },
+                        "server_id": { "type": "string", "description": "kind gateway: the claiming gateway's own server id, kept on its device record so DELETE /api/peers/{id} on this computer can revoke it; never used to replace or evict a device" }
                     }
                 })),
                 "responses": with_errors(json_ok("What POST /api/pair/claim takes", json!({

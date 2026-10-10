@@ -2060,10 +2060,17 @@ answers. `custom` means a value outside `options` is allowed.
 
 Another of the owner's computers is a paired device of `kind: "gateway"`
 (`GET /api/pairings` shows the kind). Its token reaches only the task routes
-(`GET /api/tasks` without `root`, `GET /api/tasks/{id}`,
+(`POST /api/tasks`, `GET /api/tasks` without `root`, `GET /api/tasks/{id}`,
 `POST /api/tasks/{id}/cancel`), `subscribe_tasks` on `/api/ws`,
 `GET /api/fleet/self` and `DELETE /api/pairings/{its own id}`; everything
 else answers `403 peer_forbidden`.
+
+`POST /api/pair/request` and `POST /api/pair/pending` take an optional
+`server_id`, the claiming gateway's own, kept on its device record. Nothing
+checks it, so it never replaces or evicts a device; its only use is that
+`DELETE /api/peers/{id}` also revokes the gateway devices here whose
+`server_id` is that peer's (its login into this computer), so one call
+unlinks both directions. A peer forgotten after a `401` keeps its login here.
 
 At the device limit, a gateway's `POST /api/pair/claim` makes room only by
 dropping the oldest gateway device, never one of the owner's apps; with no

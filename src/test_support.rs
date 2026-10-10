@@ -67,6 +67,7 @@ pub(crate) fn test_device(id: &str, token: &str) -> DeviceRecord {
         // Fresh enough that require_device will not flush to disk.
         last_seen_unix_ms: now_unix_ms(),
         install_id: None,
+        server_id: None,
     }
 }
 
@@ -244,6 +245,7 @@ pub(crate) fn device_fixture(id: &str) -> DeviceRecord {
         paired_unix_ms: 1,
         last_seen_unix_ms: 1,
         install_id: None,
+        server_id: None,
     }
 }
 
@@ -254,6 +256,7 @@ pub(crate) fn test_pending_pairing(created_unix_ms: u128) -> Option<PendingPairi
         kind: Default::default(),
         device_name: "Muqun test".into(),
         install_id: None,
+        server_id: None,
         code_hash: hash_token(&code),
         code,
         created_unix_ms,

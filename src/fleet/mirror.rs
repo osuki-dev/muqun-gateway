@@ -655,6 +655,15 @@ mod tests {
             ..peer("srv-old", "old", &url, Some(now_ms()))
         };
         coding.peers.store_for_test(old).await;
+        // Its own login here may still be good: forgetting leaves it.
+        coding
+            .devices
+            .lock()
+            .unwrap()
+            .push(crate::connectivity::authority::DeviceRecord {
+                server_id: Some("srv-old".into()),
+                ..test_peer_device("old-login", "old-token")
+            });
         for (machine, code) in [
             ("printer", "machine_unknown"),
             ("nas", "machine_unreachable"),
@@ -674,6 +683,15 @@ mod tests {
         assert!(
             coding.peers.get("srv-old").await.is_none(),
             "a revoked link is forgotten"
+        );
+        assert!(
+            coding
+                .devices
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|d| d.id == "old-login"),
+            "a forgotten peer keeps its login here"
         );
         let open = coding
             .tasks

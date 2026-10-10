@@ -246,7 +246,7 @@ mod tests {
     use serde_json::{json, Value};
     use tower::ServiceExt as _;
 
-    use crate::connectivity::authority::DeviceKind;
+    use crate::connectivity::authority::{DeviceKind, DeviceRecord};
     use crate::test_support::{
         named, output_state, peer_router, serve, test_peer_device, FakeHerdr,
     };
@@ -335,7 +335,7 @@ mod tests {
                 "POST",
                 "/api/pair/pending",
                 "token",
-                Some(json!({ "device_name": "coding", "kind": "gateway" })),
+                Some(json!({ "device_name": "coding", "kind": "gateway", "server_id": "srv-coding" })),
             )
             .await;
             assert_eq!(status, StatusCode::OK, "{minted}");
@@ -377,6 +377,14 @@ mod tests {
             gateways(&mini),
             first,
             "the first device stays, the second went"
+        );
+        assert!(
+            mini.devices
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|device| device.server_id.as_deref() == Some("srv-coding")),
+            "the phone said whose login it is"
         );
         assert!(
             gateways(&other).is_empty(),
@@ -430,6 +438,14 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
 
+        // Mini's own login here, and another computer's: unlinking mini takes
+        // back both directions, and only mini's.
+        for (id, server_id) in [("mini-login", "srv-mini"), ("other-login", "srv-other")] {
+            coding.devices.lock().unwrap().push(DeviceRecord {
+                server_id: Some(server_id.into()),
+                ..test_peer_device(id, id)
+            });
+        }
         let (status, _) = call(
             &coding,
             "DELETE",
@@ -439,6 +455,13 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            gateways(&coding)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            ["other-login"]
+        );
         assert!(mini
             .devices
             .lock()

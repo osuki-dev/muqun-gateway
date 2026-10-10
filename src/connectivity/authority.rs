@@ -18,6 +18,12 @@ pub struct PendingPairing {
     pub install_id: Option<String>,
     #[serde(default, skip_serializing_if = "DeviceKind::is_app")]
     pub kind: DeviceKind,
+    /// Another gateway's own server id, as it (or the owner's phone) said
+    /// when the pairing was made. Used only to take its login back when the
+    /// owner unlinks it here (`fleet::peers::unlink`); never to replace or
+    /// evict a device, since nothing checks it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_id: Option<String>,
     pub code: String,
     pub code_hash: String,
     pub created_unix_ms: u128,
@@ -68,6 +74,12 @@ pub struct DeviceRecord {
     pub install_id: Option<String>,
     #[serde(default, skip_serializing_if = "DeviceKind::is_app")]
     pub kind: DeviceKind,
+    /// Another gateway's own server id, as it (or the owner's phone) said
+    /// when the pairing was made. Used only to take its login back when the
+    /// owner unlinks it here (`fleet::peers::unlink`); never to replace or
+    /// evict a device, since nothing checks it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_id: Option<String>,
 }
 
 impl DeviceRecord {
@@ -227,6 +239,7 @@ mod tests {
             paired_unix_ms: 1,
             last_seen_unix_ms: 1,
             install_id: install_id.map(str::to_owned),
+            server_id: None,
         }
     }
 

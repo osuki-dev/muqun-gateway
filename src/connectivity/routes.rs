@@ -39,6 +39,9 @@ pub(crate) struct PairRequestBody {
     /// (`muqun-gateway peers link`); absent for the app.
     #[serde(default)]
     pub(crate) kind: Option<DeviceKind>,
+    /// A gateway's own server id (`DeviceRecord::server_id`).
+    #[serde(default)]
+    pub(crate) server_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -167,6 +170,7 @@ pub(crate) async fn pair_request(
         request_id: body.request_id.clone(),
         device_name,
         install_id,
+        server_id: gateway_server_id(kind, body.server_id.as_deref()),
         kind,
         code: code.clone(),
         code_hash: hash_token(&code),
@@ -192,6 +196,16 @@ fn enrolment_identity(kind: DeviceKind, install_id: Option<&str>) -> Option<Stri
             .filter(|value| valid_install_id(value))
             .map(str::to_owned),
         DeviceKind::Gateway => None,
+    }
+}
+
+/// A gateway's server id as given, kept when it looks like one; an app has none.
+fn gateway_server_id(kind: DeviceKind, server_id: Option<&str>) -> Option<String> {
+    match kind {
+        DeviceKind::Gateway => server_id
+            .filter(|value| valid_install_id(value))
+            .map(str::to_owned),
+        DeviceKind::App => None,
     }
 }
 
@@ -230,7 +244,7 @@ pub(crate) async fn pair_claim(
         transport::Direction::PairingRequest,
     )?;
     require_pairing_transport(state.config.transport_encryption, request_nonce.is_some())?;
-    let (device_name, install_id, kind, code) = {
+    let (device_name, install_id, server_id, kind, code) = {
         let mut pending = state.pending_pairing.lock().map_err(|_| {
             api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -243,6 +257,7 @@ pub(crate) async fn pair_claim(
             .map(|value| value.device_name.clone())
             .unwrap_or_else(|| "Muqun app".into());
         let install_id = pending.as_ref().and_then(|value| value.install_id.clone());
+        let server_id = pending.as_ref().and_then(|value| value.server_id.clone());
         let kind = pending.as_ref().map(|value| value.kind).unwrap_or_default();
         let code = body.code.trim().to_ascii_uppercase();
         authority::consume_pairing_code(
@@ -270,7 +285,7 @@ pub(crate) async fn pair_claim(
                 "invalid pairing code",
             ),
         })?;
-        (device_name, install_id, kind, code)
+        (device_name, install_id, server_id, kind, code)
     };
 
     // Each device gets its own token so it can be revoked without disturbing
@@ -287,6 +302,7 @@ pub(crate) async fn pair_claim(
         paired_unix_ms: now_unix_ms(),
         last_seen_unix_ms: now_unix_ms(),
         install_id: install_id.clone(),
+        server_id,
         kind,
     };
     let device_id = record.id.clone();
@@ -638,6 +654,10 @@ pub(crate) struct MintCodeBody {
     pub(crate) device_name: String,
     #[serde(default)]
     pub(crate) kind: DeviceKind,
+    /// The claiming gateway's own server id, from the owner's phone
+    /// (`DeviceRecord::server_id`).
+    #[serde(default)]
+    pub(crate) server_id: Option<String>,
 }
 
 /// `POST /api/pair/pending`: a pending pairing made on the owner's behalf,
@@ -690,6 +710,7 @@ pub(crate) async fn mint_pairing_code(
     *pending = Some(PendingPairing {
         request_id: request_id.clone(),
         install_id: None,
+        server_id: gateway_server_id(body.kind, body.server_id.as_deref()),
         device_name,
         kind: body.kind,
         code: code.clone(),
@@ -1192,6 +1213,7 @@ mod tests {
             request_id: "manual-4".into(),
             device_name: "Phone".into(),
             install_id: None,
+            server_id: None,
             kind: Default::default(),
             code_hash: hash_token(&code),
             code,
