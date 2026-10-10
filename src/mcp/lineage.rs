@@ -241,6 +241,7 @@ mod tests {
             origin: TaskOrigin::Device,
             label: None,
             requester_name: None,
+            session_title: None,
         }
     }
 

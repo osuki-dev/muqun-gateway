@@ -126,6 +126,16 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "task_ledger_complete",
     // `subscribe_tasks` on `/api/ws`: task views without session events.
     "task_ws_subscription",
+    // The task view of P1's Home card: `tasks.complete` takes `outcome`
+    // (`blocked` moves a delegation to `waiting`, as the MUQUN_TASK_BLOCKED
+    // marker does); a `waiting` task's `summary` is what the user is asked;
+    // `title` is always set (label, the session's own name, or the goal's
+    // first sentence); `progress` names a tool call in words.
+    "task_outcome",
+    // Where a task the device opens without `cwd` runs: `GET
+    // /api/tasks/defaults` and the `defaults` frame on `subscribe_tasks`
+    // (`default_cwd`, named from `~`).
+    "task_defaults",
 ];
 
 /// Handing a task to an agent the app did not start, and following it home.

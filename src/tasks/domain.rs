@@ -44,12 +44,14 @@ impl TaskState {
     /// Once it works, a task moves freely among working, waiting and
     /// idle_unconfirmed, and can end from any of them: a confirm of a waiting
     /// task, or a pane closing under a paused one, is a direct move, never a
-    /// walk through a `working` that did not happen.
+    /// walk through a `working` that did not happen. A waiting task may move
+    /// to `waiting` again: it is asked something new (a new blocked reason).
     pub(crate) fn can_move_to(self, to: TaskState) -> bool {
         use TaskState::*;
         match self {
             Queued => matches!(to, Dispatching | Cancelled),
             Dispatching => matches!(to, Working | Failed | Cancelled),
+            Waiting if to == Waiting => true,
             Working | Waiting | IdleUnconfirmed => {
                 to != self && !matches!(to, Queued | Dispatching)
             }
@@ -156,6 +158,9 @@ pub(crate) struct Task {
     pub label: Option<String>,
     /// The requester's display name (a device's name), if it had one.
     pub requester_name: Option<String>,
+    /// The name its agent session last had, kept when a session delegation
+    /// ends (an open task's comes live from the session).
+    pub session_title: Option<String>,
 }
 
 /// A task's direct children by state, computed when the task is read.
@@ -200,6 +205,7 @@ pub(crate) struct TaskChange {
     pub summary: Option<String>,
     pub exit_code: Option<i32>,
     pub binding: Option<TaskBinding>,
+    pub session_title: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -345,6 +351,8 @@ mod tests {
             (Waiting, Failed),
             (IdleUnconfirmed, Failed),
             (IdleUnconfirmed, Waiting),
+            // A new question while waiting.
+            (Waiting, Waiting),
         ] {
             assert!(a.can_move_to(b), "{a:?}->{b:?}");
         }

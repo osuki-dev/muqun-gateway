@@ -1531,23 +1531,34 @@ agent-session or pane traffic. It still receives the initial `hello` and a
 `{"t":"subscribed","tasks":true}` acknowledgement. Task lag uses the same
 task resync frame.
 
-A `subscribe_tasks` socket is also told where a task this device opens
-without `cwd` (`POST /api/tasks`) will run, so the app can show it before
-the user sends: one `{"t":"defaults","default_cwd":…}` frame right after the
-`subscribed` acknowledgement, another after each task resync frame, and a
-new one whenever a task the device opens changes the answer. `default_cwd`
-is the directory of the device's newest task while that is still a
-directory, else `"~"` (the home directory); `null` only when the task store
-cannot be read. `GET /api/tasks/defaults` answers `{"default_cwd": …}` by the
-same rule for a client without the socket.
+When `task_defaults` is advertised, a `subscribe_tasks` socket is also told
+where a task this device opens without `cwd` (`POST /api/tasks`) will run,
+so the app can show it before the user sends: one
+`{"t":"defaults","default_cwd":…}` frame right after the `subscribed`
+acknowledgement, another after each task resync frame, and a new one
+whenever a task the device opens changes the answer. `default_cwd` is the
+directory of the device's newest task while that is still a directory, else
+the home directory -- always named from `~` when it is under home (`"~"`,
+`"~/src/app"`), so no user name is shown; `POST /api/tasks` expands `~` in
+`cwd`. `null` only when the task store cannot be read. `GET
+/api/tasks/defaults` answers `{"default_cwd": …}` by the same rule for a
+client without the socket.
 
-**Task fields and outcomes** (full contract in `docs/mcp.md`):
+**Task fields and outcomes** (capability `task_outcome`; full contract in
+`docs/mcp.md`):
 
 - `TaskView.title` (always a string): the task's `label`; else, for a session
-  delegation, the name the agent session gave itself (not its placeholder,
-  not the goal restated); else the goal's first sentence -- cut to 60
-  characters at a word with `…`. Computed for each view, so it follows the
-  session's name; show it instead of the raw `goal`.
+  delegation, the first sentence of the name the agent session gave itself
+  (an untitled session has an empty `title` -- adapters no longer make one
+  up -- and a name that is the asid, or the goal restated or cut short, is
+  not used); else the goal's first sentence -- cut to 60 characters at a
+  word with `…`. An open task's follows the session's name as it changes;
+  an ended one keeps the name it had when it ended. Show it instead of the
+  raw `goal`.
+- Agent sessions (`GET /api/agent-sessions`, …) carry an empty `title` until
+  the provider names them; OpenCode's adapter no longer fills in the asid,
+  DeepSeek's no longer `DeepSeek Agent Session`, T3's no longer reports the
+  `New thread` it creates threads with.
 - `tasks.complete` takes `outcome`: `done` (default) or `blocked`. A blocked
   agent -- a missing file, an unclear request, a permission it cannot get --
   may instead print `MUQUN_TASK_BLOCKED: <one-line reason>`, beside
@@ -1555,13 +1566,16 @@ same rule for a client without the socket.
   with the reason as `summary` (events carry source `tasks_complete_blocked` or
   `marker_blocked`). It stays open: the user answers in the session or pane
   and the agent goes on, or the device confirms or cancels it. Going idle
-  does not turn a blocked task into `idle_unconfirmed`.
+  does not turn a blocked task into `idle_unconfirmed`; a new reason
+  replaces the old one.
 - The second line of a task card: `progress` while the task works, `summary`
   once it pauses or ends (`progress` is absent then). For a `waiting` task
   `summary` is what the user is asked -- "Needs you · <summary>": a blocked
-  agent's reason; for a pending permission or question form, the last line
-  of the agent's last message since the task began, else the request's own
-  text; for a terminal agent on a menu, the screen's last meaningful line.
+  agent's reason; for a pending permission request, its prompt; for a
+  question form, the last line of the agent's last message when that came
+  after the turn's last tool call (the agent asked in its own words), else
+  the form's title; for a terminal agent on a menu, the screen's last
+  meaningful line.
 
 **Catch-up is unchanged.** The socket delivers live events only. After a
 (re)connect, re-subscribe, wait for `subscribed`, then catch up each session

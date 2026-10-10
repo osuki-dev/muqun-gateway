@@ -16,7 +16,7 @@
 //! | The pane | The task |
 //! |---|---|
 //! | a `MUQUN_TASK_DONE: <summary>` line below the echoed request, the agent not busy | `done`, with that summary |
-//! | a new `MUQUN_TASK_BLOCKED: <reason>` line below the echoed request, the agent not busy | `waiting` (*blocked*), with that reason |
+//! | a new `MUQUN_TASK_BLOCKED: <reason>` line below the echoed request, the agent not busy | `waiting` (*blocked*), with that reason (replacing an earlier one) |
 //! | *blocked*: agent idle, or still busy before it was seen idle on two polls | stays `waiting` |
 //! | *blocked*: agent starting / working after it was seen idle on two polls (the user answered) | `working` |
 //! | agent starting / working | `working` (from `dispatching`, or back from `waiting` or `idle_unconfirmed`) |
@@ -30,9 +30,12 @@
 //! whose agent finished meanwhile. A task is *blocked* while it is `waiting`
 //! because its agent said so -- the marker, or a `tasks.complete` call with
 //! outcome `blocked` (read off the task's last event when someone else moved
-//! it) -- and stops being blocked once it moves on. A blocked marker already
+//! it) -- and stops being blocked once it moves on. A blocked line already
 //! acted on does not block again: an answered task that pauses with the
-//! same old line still on screen is `idle_unconfirmed`. A task that is
+//! same old line still on screen is `idle_unconfirmed`. "That line" is an
+//! occurrence, not a text: the same reason printed once more blocks again
+//! ([`Marker::Blocked`] counts them), and a restarted follower takes the
+//! reasons in the task's `marker_blocked` events as read ([`Progress::seed`]). A task that is
 //! `idle_unconfirmed` or blocked is polled every [`PAUSED_POLL`] instead of
 //! every [`POLL`], backing off to [`MAX_PAUSED_POLL`] while nothing changes
 //! ([`paused_poll`]).
@@ -127,7 +130,12 @@ pub(crate) fn completion_request(goal: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Marker {
     Done(String),
-    Blocked(String),
+    /// `count`: how many lines in the output read as this very marker, so
+    /// the same reason printed again (after the user answered) is new.
+    Blocked {
+        reason: String,
+        count: usize,
+    },
 }
 
 /// The last marker line in `output`, done or blocked. A marker counts only
@@ -140,19 +148,44 @@ pub(crate) fn marker(output: &str) -> Option<Marker> {
         .iter()
         .rposition(|line| ECHO_WORDS.iter().any(|word| line.contains(word)))
         .map_or(0, |echo| echo + 1);
-    lines[below_echo..].iter().rev().find_map(|line| {
-        let line = line.trim_start_matches(|c: char| !c.is_alphanumeric());
-        let (text, placeholder, marker): (_, _, fn(String) -> Marker) =
-            if let Some(text) = line.strip_prefix(DONE_MARKER) {
-                (text.trim(), SUMMARY_PLACEHOLDER, Marker::Done)
-            } else {
-                let text = line.strip_prefix(BLOCKED_MARKER)?;
-                (text.trim(), REASON_PLACEHOLDER, Marker::Blocked)
-            };
-        let stand_in = text.starts_with('<')
-            || placeholder.starts_with(text)
-            || text.trim_matches(|c| c == '.' || c == '…').is_empty();
-        (!stand_in).then(|| marker(one_line(text, SUMMARY_CHARS)))
+    let found: Vec<Marker> = lines[below_echo..]
+        .iter()
+        .filter_map(|line| marker_line(line))
+        .collect();
+    match found.last()? {
+        Marker::Blocked { reason, .. } => {
+            let same = |m: &&Marker| matches!(m, Marker::Blocked { reason: r, .. } if r == reason);
+            Some(Marker::Blocked {
+                reason: reason.clone(),
+                count: found.iter().filter(same).count(),
+            })
+        }
+        done => Some(done.clone()),
+    }
+}
+
+fn marker_line(line: &str) -> Option<Marker> {
+    let line = line.trim_start_matches(|c: char| !c.is_alphanumeric());
+    let (text, placeholder, done) = if let Some(text) = line.strip_prefix(DONE_MARKER) {
+        (text.trim(), SUMMARY_PLACEHOLDER, true)
+    } else {
+        let text = line.strip_prefix(BLOCKED_MARKER)?;
+        (text.trim(), REASON_PLACEHOLDER, false)
+    };
+    let stand_in = text.starts_with('<')
+        || placeholder.starts_with(text)
+        || text.trim_matches(|c| c == '.' || c == '…').is_empty();
+    if stand_in {
+        return None;
+    }
+    let line = one_line(text, SUMMARY_CHARS);
+    Some(if done {
+        Marker::Done(line)
+    } else {
+        Marker::Blocked {
+            reason: line,
+            count: 1,
+        }
     })
 }
 
@@ -213,13 +246,14 @@ pub(crate) async fn goal_accepted(session: &SessionConfig, pane_id: &str, prompt
 }
 
 /// A task's title (and a terminal task's tab and pane title): its label,
-/// else the name its agent session gave itself, else its goal's first
-/// sentence -- up to the first `.` or `?`/`!` followed by a space, a
-/// `。`/`？`/`！`, or a line end -- each cut at a word to [`TITLE_CHARS`].
+/// else the first sentence of the name its agent session gave itself, else
+/// its goal's first sentence ([`first_sentence`]) -- cut at a word to
+/// [`TITLE_CHARS`].
 pub(crate) fn title(label: Option<&str>, session_title: Option<&str>, goal: &str) -> String {
-    let text = match label.or(session_title) {
-        Some(name) => name,
-        None => first_sentence(goal),
+    let text = match (label, session_title) {
+        (Some(label), _) => label,
+        (None, Some(name)) => first_sentence(name),
+        (None, None) => first_sentence(goal),
     };
     let text = one_line(text, usize::MAX);
     let line = one_line(&text, TITLE_CHARS);
@@ -234,13 +268,34 @@ pub(crate) fn title(label: Option<&str>, session_title: Option<&str>, goal: &str
     }
 }
 
+/// `text` up to the first `.` or `?`/`!` followed by a space or the end
+/// (`.` itself left out; a `.` inside a word, as in `main.rs`, does not end
+/// it, but one running a sentence into the next, as in `done.Next`, does),
+/// a `。`/`？`/`！`, or a line end. A text that starts with a stop has
+/// its first line instead, so a title is never empty.
 fn first_sentence(text: &str) -> &str {
     let text = text.trim();
+    let sentence = sentence_of(text);
+    if sentence
+        .trim_matches(|c: char| c.is_whitespace() || c.is_ascii_punctuation() || c == '…')
+        .is_empty()
+    {
+        return text.lines().next().unwrap_or(text);
+    }
+    sentence
+}
+
+fn sentence_of(text: &str) -> &str {
     let mut chars = text.char_indices().peekable();
+    let mut before = ' ';
     while let Some((at, c)) = chars.next() {
-        let spaced = chars.peek().is_none_or(|(_, next)| next.is_whitespace());
+        let next = chars.peek().map(|(_, next)| *next);
+        let spaced = next.is_none_or(char::is_whitespace);
+        // `exists.File`: a sentence run into the next one.
+        let run_on = before.is_lowercase() && next.is_some_and(char::is_uppercase);
+        before = c;
         let cut = match c {
-            '\n' | '。' | '.' if c != '.' || spaced => Some(at),
+            '\n' | '。' | '.' if c != '.' || spaced || run_on => Some(at),
             '？' | '！' => Some(at + c.len_utf8()),
             '?' | '!' if spaced => Some(at + c.len_utf8()),
             _ => None,
@@ -275,8 +330,9 @@ pub(crate) struct Progress {
     idle: u32,
     /// Whether the task is blocked (see the module docs).
     held: Held,
-    /// The blocked marker last acted on.
-    blocked_by: Option<String>,
+    /// The blocked marker last acted on: its reason, and how many lines
+    /// read as it then ([`Marker::Blocked`]).
+    blocked_by: Option<(String, usize)>,
 }
 
 /// A blocked task's agent, as the follower has seen it since the block.
@@ -291,6 +347,17 @@ enum Held {
 }
 
 impl Progress {
+    /// A new follower's view of the blocked marker on screen: one whose
+    /// reason the task's history (`acted`, the reasons of its earlier
+    /// `marker_blocked` moves) already holds was acted on before a restart.
+    pub(crate) fn seed(&mut self, marker: Option<&Marker>, acted: &[String]) {
+        if let Some(Marker::Blocked { reason, count }) = marker {
+            if acted.contains(reason) {
+                self.blocked_by = Some((reason.clone(), *count));
+            }
+        }
+    }
+
     /// Whether the task is blocked, as its stored history says: kept when
     /// it is, and the follower's own view is kept while it still is.
     pub(crate) fn blocked(&mut self, blocked: bool) {
@@ -343,14 +410,16 @@ pub(crate) fn judge(
         (Seen::Agent { status, .. }, Some(Marker::Done(summary))) if !busy(status) => {
             return Verdict::Done(summary.clone())
         }
-        (Seen::Agent { status, .. }, Some(Marker::Blocked(reason)))
-            if !busy(status) && progress.blocked_by.as_ref() != Some(reason) =>
+        (Seen::Agent { status, .. }, Some(Marker::Blocked { reason, count }))
+            if !busy(status)
+                && progress
+                    .blocked_by
+                    .as_ref()
+                    .is_none_or(|(acted, seen)| acted != reason || count > seen) =>
         {
-            progress.blocked_by = Some(reason.clone());
+            progress.blocked_by = Some((reason.clone(), *count));
             progress.held = Held::Idle;
-            if task == TaskState::Waiting {
-                return Verdict::Stay;
-            }
+            // While waiting too: a new reason replaces the old one.
             return Verdict::Blocked(reason.clone());
         }
         (Seen::Gone | Seen::NoAgent, Some(Marker::Done(summary))) => {
@@ -625,18 +694,23 @@ async fn observe_agent(at: &Bound<'_>, rows: &mut Option<usize>) -> Option<(Seen
 }
 
 /// The change a verdict records.
+/// The change a verdict records. `marker` is the last marker read: a pane
+/// that fails right after a blocked one still says why the agent stopped.
 fn change_for(
     verdict: Verdict,
     agent_id: Option<&str>,
     screen: Option<&str>,
+    marker: Option<&Marker>,
 ) -> Option<TaskChange> {
     let mut source = SOURCE;
     let (to, summary, note) = match verdict {
         Verdict::Stay => return None,
         Verdict::Working => (TaskState::Working, None, None),
+        // The reason is also the event's note: a restarted follower reads
+        // which blocked lines were acted on from it ([`Progress::seed`]).
         Verdict::Blocked(reason) => {
             source = MARKER_BLOCKED;
-            (TaskState::Waiting, Some(reason), None)
+            (TaskState::Waiting, Some(reason.clone()), Some(reason))
         }
         Verdict::Waiting => (
             TaskState::Waiting,
@@ -649,11 +723,15 @@ fn change_for(
             None,
         ),
         Verdict::Done(summary) => (TaskState::Done, Some(summary), None),
-        Verdict::Failed(why) => (
-            TaskState::Failed,
-            Some(failure_line(why, screen)),
-            Some(why.to_owned()),
-        ),
+        Verdict::Failed(why) => {
+            let line = match marker {
+                Some(Marker::Blocked { reason, .. }) => {
+                    one_line(&format!("{why}: {reason}"), SUMMARY_CHARS)
+                }
+                _ => failure_line(why, screen),
+            };
+            (TaskState::Failed, Some(line), Some(why.to_owned()))
+        }
     };
     Some(TaskChange {
         to,
@@ -695,6 +773,8 @@ async fn run(state: &AppState, id: &TaskId) {
     // The task's seq as the follower last saw or left it: any other means
     // someone else moved it, and whether it is blocked is read again.
     let mut known_seq = None;
+    // The blocked reasons acted on before this follower, read once.
+    let mut acted: Option<Vec<String>> = None;
     loop {
         let task = match state.tasks.task(id).await {
             Ok(Some(task)) if !task.state.is_terminal() => task,
@@ -718,6 +798,11 @@ async fn run(state: &AppState, id: &TaskId) {
                 Seen::Gone => last_marker.take(),
                 _ => observed.marker,
             };
+            if acted.is_none() {
+                let reasons = state.tasks.marker_reasons(id).await;
+                progress.seed(marker.as_ref(), &reasons);
+                acted = Some(reasons);
+            }
             let verdict = judge(
                 task.state,
                 observed.seen,
@@ -725,7 +810,6 @@ async fn run(state: &AppState, id: &TaskId) {
                 &mut progress,
                 started.elapsed(),
             );
-            last_marker = marker;
             let screen = observed.screen.or_else(|| last_screen.take());
             if let Some(line) = screen
                 .as_deref()
@@ -733,7 +817,9 @@ async fn run(state: &AppState, id: &TaskId) {
             {
                 state.tasks.note_progress(state, id, &line).await;
             }
-            if let Some(change) = change_for(verdict, at.agent_id, screen.as_deref()) {
+            let change = change_for(verdict, at.agent_id, screen.as_deref(), marker.as_ref());
+            last_marker = marker;
+            if let Some(change) = change {
                 match state.tasks.move_to(id, change).await {
                     Ok(moved) => (now, seq) = (moved.state, moved.seq),
                     Err(error) => {
@@ -832,7 +918,13 @@ mod tests {
         let late = UNCONFIRMED_AFTER;
         let done = || Verdict::Done("all green".into());
         let green = Some(Marker::Done("all green".into()));
-        let stuck = Some(Marker::Blocked("no such file".into()));
+        let blocked = |count| {
+            Some(Marker::Blocked {
+                reason: "no such file".into(),
+                count,
+            })
+        };
+        let stuck = blocked(1);
         // Each row: the polls one follower sees, in order (task state, pane,
         // last marker on screen, time followed), and the verdict of the last.
         type Poll = (T, Seen, Option<Marker>, Duration);
@@ -993,6 +1085,22 @@ mod tests {
                 Verdict::Unconfirmed,
             ),
             (
+                "a new reason while blocked replaces the old one",
+                vec![
+                    (T::Working, agent(Idle, None), stuck.clone(), soon),
+                    (
+                        T::Waiting,
+                        agent(Idle, None),
+                        Some(Marker::Blocked {
+                            reason: "the config is missing too".into(),
+                            count: 1,
+                        }),
+                        soon,
+                    ),
+                ],
+                Verdict::Blocked("the config is missing too".into()),
+            ),
+            (
                 "a blocked task is done on the done marker",
                 vec![
                     (T::Working, agent(Idle, None), stuck.clone(), soon),
@@ -1001,9 +1109,13 @@ mod tests {
                 done(),
             ),
             (
-                "the marker of a blocked agent still busy is not read yet",
-                vec![(T::Working, agent(Working, None), stuck.clone(), soon)],
-                Verdict::Stay,
+                "the same reason printed again after an answer blocks again",
+                vec![
+                    (T::Working, agent(Idle, None), stuck.clone(), soon),
+                    (T::Waiting, agent(Working, None), stuck.clone(), soon),
+                    (T::Working, agent(Idle, None), blocked(2), soon),
+                ],
+                Verdict::Blocked("no such file".into()),
             ),
             (
                 "a finished task stays",
@@ -1033,6 +1145,18 @@ mod tests {
             let verdict = judge(T::Waiting, seen, None, &mut progress, late);
             assert_eq!(verdict, expected, "blocked by the tool, poll {step}");
         }
+        // After a restart: a blocked line the history already acted on, on a
+        // task answered since, does not block it again.
+        let mut progress = Progress::default();
+        progress.seed(stuck.as_ref(), &["no such file".to_owned()]);
+        let verdict = judge(
+            T::Working,
+            agent(Idle, None),
+            stuck.as_ref(),
+            &mut progress,
+            soon,
+        );
+        assert_eq!(verdict, Verdict::Stay, "seeded from history");
     }
 
     #[test]
@@ -1049,7 +1173,10 @@ mod tests {
         let blocked = format!("{echoed}⏺ MUQUN_TASK_BLOCKED: notes.md does not exist\n");
         assert_eq!(
             marker(&blocked),
-            Some(Marker::Blocked("notes.md does not exist".into()))
+            Some(Marker::Blocked {
+                reason: "notes.md does not exist".into(),
+                count: 1
+            })
         );
         // A narrow pane wraps the echo so the marker starts a line, and an
         // agent restating the request writes a placeholder of its own.
@@ -1072,10 +1199,12 @@ mod tests {
             (None, Some("Fix CI"), "fix the build", "Fix CI"),
             (
                 None,
-                Some("Creating the requested file and verifying it exists. And more"),
+                Some("Creating the requested file and verifying it exists.File creation…"),
                 "make a file",
-                "Creating the requested file and verifying it exists. And…",
+                "Creating the requested file and verifying it exists",
             ),
+            (None, None, ". fix it", ". fix it"),
+            (None, None, "... fix it", "... fix it"),
             (
                 None,
                 None,
@@ -1108,8 +1237,23 @@ mod tests {
         );
         // A task waiting on a menu says what the screen asks.
         let menu = "⏺ Bash(cargo clean)\n\n Do you want to proceed?\n";
-        let waiting = change_for(Verdict::Waiting, Some("codex"), Some(menu)).unwrap();
+        let waiting = change_for(Verdict::Waiting, Some("codex"), Some(menu), None).unwrap();
         assert_eq!(waiting.summary.as_deref(), Some("Do you want to proceed?"));
+        // A pane that closes right after a blocked line still says why.
+        let reason = Marker::Blocked {
+            reason: "notes.md does not exist".into(),
+            count: 1,
+        };
+        let closed = change_for(
+            Verdict::Failed(PANE_CLOSED),
+            None,
+            Some(menu),
+            Some(&reason),
+        );
+        assert_eq!(
+            closed.unwrap().summary.as_deref(),
+            Some("the pane closed: notes.md does not exist")
+        );
         let plain = "build ok\n   done:   3 files  \n\n───\n";
         assert_eq!(
             screen_summary(Some("some-agent"), plain).as_deref(),

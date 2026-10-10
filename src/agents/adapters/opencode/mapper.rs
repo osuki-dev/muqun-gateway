@@ -105,10 +105,11 @@ fn map_fork(val: &Value) -> Option<SessionForkInfo> {
 pub fn map_session(val: &Value) -> Option<AgentSessionInfo> {
     let item = val.get("data").unwrap_or(val);
     let id = item.get("id").and_then(Value::as_str)?;
+    // Untitled (empty) when OpenCode gave none, never its id.
     let title = item
         .get("title")
         .and_then(Value::as_str)
-        .unwrap_or(id)
+        .unwrap_or_default()
         .to_string();
 
     let mode = item

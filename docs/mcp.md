@@ -6,8 +6,11 @@ Capabilities: `mcp_server` (the `/mcp` endpoint; present only while
 as `agent_id`, bound to its pane), `task_ledger_complete` (a delegation is
 `done` only on an explicit signal: `tasks.complete`, the `MUQUN_TASK_DONE`
 marker, or the device's `POST /api/tasks/{id}/complete`; see
-[Finishing a delegation](#finishing-a-delegation)) and `task_ws_subscription` (`subscribe_tasks`
-on `/api/ws`). Discovery also announces
+[Finishing a delegation](#finishing-a-delegation)), `task_ws_subscription` (`subscribe_tasks`
+on `/api/ws`), `task_outcome` (`tasks.complete`'s `outcome` and the
+[blocked](#blocked) state, a `waiting` task's question as `summary`, the
+task view's `title`, `progress` in words) and `task_defaults` (`GET
+/api/tasks/defaults` and the `defaults` frame). Discovery also announces
 `transports.mcp`. (`tasks` is a different, older capability: `POST
 /api/sessions/{id}/tasks`.)
 
@@ -216,7 +219,7 @@ unknown id is `404 task_not_found`; any other failure is `500 task_failed`.
 | `GET /api/tasks?state=a,b&limit=50` | `{"tasks": [TaskView]}`, newest update first. `state` is a comma list of the states below; an unknown name is `400 invalid_request`. `limit` defaults to 50 and is capped at 200. |
 | `GET /api/tasks?root=<task_id>` | The same list, of that task and every task below it (its children, theirs, and so on); `state` and `limit` apply too. An unknown id lists nothing; an empty `root` is `400 invalid_request`. |
 | `POST /api/tasks` | Opens a delegation from the device; see below. |
-| `GET /api/tasks/defaults` | `{"default_cwd": string \| null}` for the calling device: the directory a delegation it opens without `cwd` runs in -- its newest task's directory while that is still a directory, else its home directory, as `~` (`null` only when the task store cannot be read). Any query string is ignored. The task WebSocket subscription carries the same answer as a `defaults` frame (see [Agent API](agent-api.md)). |
+| `GET /api/tasks/defaults` | `task_defaults`. `{"default_cwd": string \| null}` for the calling device: the directory a delegation it opens without `cwd` runs in -- its newest task's directory while that is still a directory, else the home directory -- named from `~` when under home (`~`, `~/<path>`; `null` only when the task store cannot be read). Any query string is ignored. The task WebSocket subscription carries the same answer as a `defaults` frame (see [Agent API](agent-api.md)). |
 | `GET /api/tasks/{id}` | `{"task": TaskView, "events": [TaskEvent]}`; `events` is the task's state history, oldest first. |
 | `POST /api/tasks/{id}/cancel` | The `TaskView` after the cancel. Interrupts the agent or sends Ctrl-C to the command. Cancelling a finished task changes nothing. |
 | `POST /api/tasks/{id}/complete` | The `TaskView`, now `done`. The user confirms that a delegation opened on a device (`origin: device`; any paired device may confirm it, as any may cancel it) that is `idle_unconfirmed` or `waiting` is finished. Body `{"summary"?: string}`, optional (the body may be left out): the new `summary`, one line, cut to 240 characters; without it the task keeps the hint it had. Published as `task.updated`. A task already `done` is answered as it stands; any other state or origin is `409 task_not_confirmable`; a body that is not that JSON object is `400 invalid_request`. |
@@ -231,17 +234,19 @@ unknown id is `404 task_not_found`; any other failure is `500 task_failed`.
   assistant in the pane of an open task) or `mcp` (any other MCP host). Tasks
   stored before origins existed read as `mcp`.
 - `label`: the short title the requester gave, or `null`.
-- `title`: what to call the task, never empty: its `label`; else, for a
-  session delegation, the name its agent session gave itself (ignored while
-  it is empty, the provider's placeholder -- `New session - <date>`, `New
-  thread` -- or the goal restated); else the goal's first sentence (up to the
-  first `.`, `?` or `!` followed by a space, a `。`, `？` or `！`, or a line
-  end). At most 60 characters, cut at a word with `…`. Made each time the
-  view is, so it follows the session's name as the agent renames it (a
-  rename re-publishes the task); the session's name is kept in memory, so
-  after a gateway restart an ended task's title is its goal's sentence until
-  its session is renamed again. A terminal agent's tab and pane are named
-  the same way.
+- `title` (`task_outcome`): what to call the task, never empty: its
+  `label`; else, for a session delegation, the first sentence of the name its
+  agent session gave itself (not used while the session is untitled -- empty
+  -- nor when it is the asid, or the goal restated or cut short); else the
+  goal's first sentence (up to the first `.`, `?` or `!` followed by a space,
+  a `.` running one sentence into the next as in `done.Next`, a `。`, `？` or
+  `！`, or a line end; a goal that starts with a stop gives its first line).
+  At most 60 characters, cut at a word with `…`. An open task's follows the
+  session's name as the agent renames it (a rename re-publishes the task;
+  the name is held in memory, and the 60 s reconcile reads it again after a
+  restart); when a session delegation ends, the name it had is stored with
+  the task, which keeps it. A terminal agent's tab and pane are named the
+  same way.
 - `requested_by`: `{"kind": "device", "id": "<device id>", "name": "<device
   name>"}` for a device's task; `null` otherwise.
 - `progress` (present only while the task is open and something is known;
@@ -487,8 +492,9 @@ A session delegation moves like this (moves pass the states between, so a
 | the turn ends (idle after busy), the last message carries the marker | `done`, `summary` = the marker's summary |
 | the turn ends, the last message carries the blocked marker | `waiting` ([blocked](#blocked)), `summary` = the reason |
 | the turn ends without the marker | `idle_unconfirmed`, `summary` = the last message as a hint; a blocked task stays `waiting` |
-| a permission request or question form is pending | `waiting` (back to `working` when answered), `summary` = what the user is asked: the last line of the agent's last message since the task began, else the request's own text (the permission prompt, the form title) |
-| busy again after a pause | `working`; a blocked task, only on a turn that starts after the one that reported the block |
+| a permission request or question form is pending | `waiting` (back to `working` when answered), `summary` = what the user is asked: a permission request's prompt; for a question form, the last line of the agent's last message when that came after the turn's last tool call, else the form's title |
+| busy again after a pause | `working`; a task blocked by `tasks.complete`, only on a turn that runs after the one that called it went idle; one blocked by the marker (read once its turn had ended), whenever the session runs again |
+| the turn ends with the blocked marker while blocked | stays `waiting`, `summary` = the new reason |
 | the session failed / was interrupted | `failed` with the error line / `cancelled` |
 
 A question the agent asks in plain text, without a form the gateway can see,
@@ -508,19 +514,28 @@ its `summary`, so the phone never shows a finished task over a failure.
 
 Blocked is not an end. The task stays open while the user answers in the
 session or pane; a gateway restart keeps it (the task's last event says it
-is blocked). While it is blocked:
+is blocked; a marker's event carries the reason as its note). While it is
+blocked:
 
 - the agent going idle, or a turn ending without the done marker, leaves it
   `waiting` -- it is never `idle_unconfirmed` for that;
 - the rest of the turn that reported the block is not an answer: a session
-  delegation goes back to `working` only on a turn that starts after that one
-  ended, a terminal agent's only once it was seen idle on two polls and then
-  works again;
+  delegation blocked by `tasks.complete` goes back to `working` only on a
+  turn that runs after that one went idle; one blocked by the marker (read
+  only once that turn had ended) as soon as its session runs again; a
+  terminal agent's only once it was seen idle on two polls and then works
+  again;
+- a new reason (another blocked marker or `tasks.complete` call) replaces the
+  old one;
 - the done marker or `tasks.complete` (outcome `done`) makes it `done`, and
   the device can still confirm (`POST /api/tasks/{id}/complete`) or cancel it.
 
 A terminal agent's blocked line stays in the pane's output; once the task
-has moved on, the same line does not block it again (a new reason does).
+has moved on, that line does not block it again -- a new reason does, and so
+does the same reason printed again (the follower counts how many lines read
+as it). A restarted follower takes the lines the task's history already
+acted on as read. A pane that closes, or an agent that exits, right after a
+blocked line fails with that reason: `the pane closed: <reason>`.
 
 ### Task tree
 

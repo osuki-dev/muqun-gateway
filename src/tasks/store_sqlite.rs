@@ -34,11 +34,13 @@ CREATE INDEX tasks_by_parent ON tasks(parent_task_id, state);
 CREATE INDEX tasks_by_asid ON tasks(json_extract(binding, '$.asid'));
 ", "
 CREATE INDEX tasks_device_cwd ON tasks(created_by, origin, created_ms DESC) WHERE cwd IS NOT NULL;
+", "
+ALTER TABLE tasks ADD COLUMN session_title TEXT;
 "],
 };
 
 const DEFAULT_LIST_LIMIT: usize = 100;
-const TASK_COLUMNS: &str = "id, kind, goal, cwd, binding, state, summary, exit_code, created_by, created_ms, updated_ms, seq, parent_task_id, origin, label, requester_name";
+const TASK_COLUMNS: &str = "id, kind, goal, cwd, binding, state, summary, exit_code, created_by, created_ms, updated_ms, seq, parent_task_id, origin, label, requester_name, session_title";
 
 pub(crate) struct SqliteTaskStore {
     db: Arc<SqliteStore>,
@@ -59,7 +61,7 @@ impl TaskStore for SqliteTaskStore {
             let mut task = task;
             task.seq = seq;
             tx.execute(
-                &format!("INSERT INTO tasks({TASK_COLUMNS}) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)"),
+                &format!("INSERT INTO tasks({TASK_COLUMNS}) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"),
                 params![
                     task.id.0,
                     enum_text(&task.kind)?,
@@ -77,6 +79,7 @@ impl TaskStore for SqliteTaskStore {
                     enum_text(&task.origin)?,
                     task.label,
                     task.requester_name,
+                    task.session_title,
                 ],
             )?;
             append_event(&tx, &task.id, seq, None, task.state, "created", None)?;
@@ -212,10 +215,13 @@ impl TaskStore for SqliteTaskStore {
             if let Some(binding) = change.binding {
                 task.binding = binding;
             }
+            if let Some(title) = change.session_title {
+                task.session_title = Some(title);
+            }
             task.updated_ms = now_ms();
             task.seq = seq;
             tx.execute(
-                "UPDATE tasks SET state=?2, summary=?3, exit_code=?4, binding=?5, updated_ms=?6, seq=?7 WHERE id=?1",
+                "UPDATE tasks SET state=?2, summary=?3, exit_code=?4, binding=?5, updated_ms=?6, seq=?7, session_title=?8 WHERE id=?1",
                 params![
                     task.id.0,
                     enum_text(&task.state)?,
@@ -224,6 +230,7 @@ impl TaskStore for SqliteTaskStore {
                     json_text(&task.binding)?,
                     task.updated_ms as i64,
                     task.seq as i64,
+                    task.session_title,
                 ],
             )?;
             append_event(
@@ -377,6 +384,7 @@ fn read_row(r: &Row<'_>) -> rusqlite::Result<anyhow::Result<Task>> {
     let origin: String = r.get(13)?;
     let label: Option<String> = r.get(14)?;
     let requester_name: Option<String> = r.get(15)?;
+    let session_title: Option<String> = r.get(16)?;
     Ok((|| {
         Ok(Task {
             id: TaskId(id),
@@ -395,6 +403,7 @@ fn read_row(r: &Row<'_>) -> rusqlite::Result<anyhow::Result<Task>> {
             origin: parse_enum(&origin)?,
             label,
             requester_name,
+            session_title,
         })
     })())
 }
@@ -453,6 +462,7 @@ mod tests {
             origin: TaskOrigin::Mcp,
             label: None,
             requester_name: None,
+            session_title: None,
         }
     }
 

@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use serde::Serialize;
+use rmcp::schemars::{self, JsonSchema};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::time::Instant;
@@ -140,9 +141,10 @@ struct Live {
     /// for a session no open task is bound to (a chat), asked again after
     /// [`UNBOUND_RECHECK`].
     sessions: HashMap<String, (Option<TaskId>, Instant)>,
-    /// The name each agent session an open task worked in gave itself, as
-    /// last seen (see [`TaskService::session_named`]).
-    titles: HashMap<String, String>,
+    /// The name each open session delegation's agent session gave itself,
+    /// as last seen (see [`TaskService::session_named`]); kept on the task
+    /// when it ends.
+    titles: HashMap<TaskId, String>,
 }
 
 /// One open task's progress.
@@ -212,13 +214,25 @@ pub(crate) struct TaskView {
 }
 
 /// How the agent working on a task says it ended (`tasks.complete`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum Outcome {
     /// Finished: the task is `done`.
     #[default]
     Done,
-    /// Stopped because it needs the user: the task is `waiting`.
+    /// Stopped because it needs the user (a missing file, an unclear
+    /// request, a permission it cannot get): the task is `waiting`.
     Blocked,
+}
+
+/// Why a task is blocked ([`TaskService::blocked_at`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Blocked {
+    /// When it was recorded.
+    pub at_ms: u64,
+    /// By the blocked marker (read once the reporting turn had ended), not
+    /// by `tasks.complete` (called while it still ran).
+    pub by_marker: bool,
 }
 
 /// A task as [`TaskService::wait`] leaves it, with a command's
@@ -370,9 +384,18 @@ impl TaskStore for Publishing<'_> {
         self.0.store.list(filter)
     }
 
-    fn transition<'a>(&'a self, id: &'a TaskId, change: TaskChange) -> TaskFuture<'a, Task> {
+    fn transition<'a>(&'a self, id: &'a TaskId, mut change: TaskChange) -> TaskFuture<'a, Task> {
         Box::pin(async move {
+            // An ending task keeps its session's last name.
+            if change.to.is_terminal() && change.session_title.is_none() {
+                change.session_title = self.0.live_title(id);
+            }
             let task = self.0.store.transition(id, change).await?;
+            if task.state.is_terminal() {
+                if let Ok(mut live) = self.0.live.lock() {
+                    live.titles.remove(id);
+                }
+            }
             self.publish(&task).await;
             Ok(task)
         })
@@ -428,6 +451,8 @@ enum Step {
     Idle,
     /// The session failed, with the agent's error if it gave one.
     Failed(Option<AgentErrorInfo>),
+    /// A question form is pending, with its title ([`form_waiting`]).
+    Form(String),
     Move(TaskChange),
 }
 
@@ -457,7 +482,7 @@ fn step(event: &AgentDomainEvent, asid: &str) -> Step {
         } if ours(id) => Step::Move(asking(&request.prompt)),
         AgentDomainEvent::FormPending {
             asid: id, request, ..
-        } if ours(id) => Step::Move(asking(&request.title)),
+        } if ours(id) => Step::Form(request.title.clone()),
         AgentDomainEvent::PermissionResolved { asid: id, .. }
         | AgentDomainEvent::FormResolved { asid: id, .. }
             if ours(id) =>
@@ -732,6 +757,7 @@ impl TaskService {
                 origin: by.origin,
                 label: request.label.clone(),
                 requester_name: by.name,
+                session_title: None,
             })
             .await?;
         let created = manager
@@ -856,6 +882,7 @@ impl TaskService {
                 origin: by.origin,
                 label: request.label.clone(),
                 requester_name: by.name,
+                session_title: None,
             })
             .await?;
         let cwd = request.cwd.as_deref();
@@ -1149,6 +1176,7 @@ impl TaskService {
                 Step::Idle if !seen_busy => continue,
                 Step::Idle => turn_end(&summary_timeline(&manager, asid, task.created_ms).await),
                 Step::Failed(error) => failed_change(&manager, &task, error.as_ref()).await,
+                Step::Form(title) => form_waiting(&manager, &task, &title).await,
                 Step::Move(to) => to,
             };
             if to.to == task.state {
@@ -1219,12 +1247,6 @@ impl TaskService {
                 .get(&task.id)
                 .await?
                 .unwrap_or_else(|| task.clone()));
-        }
-        let mut to = to;
-        if to.to == TaskState::Waiting && to.source != pane_agent::MARKER_BLOCKED {
-            if let Some(question) = question(state, task).await {
-                to.summary = Some(question);
-            }
         }
         self.move_to(&task.id, to).await
     }
@@ -1509,6 +1531,8 @@ impl TaskService {
 
     /// `task`'s title with its session's name, when the session has one
     /// that says more than its goal.
+    /// The live name for an open task, the one kept when it ended for the
+    /// rest; never its asid, nor its goal restated or cut short.
     fn title_of(&self, task: &Task) -> Option<String> {
         let TaskBinding::AgentSession { asid, .. } = &task.binding else {
             return None;
@@ -1516,25 +1540,28 @@ impl TaskService {
         if task.label.is_some() {
             return None;
         }
-        let live = self.live.lock().ok()?;
-        let name = live.titles.get(asid)?;
+        let name = match task.state.is_terminal() {
+            true => task.session_title.clone()?,
+            false => self.live_title(&task.id)?,
+        };
+        let name = one_line(&name, usize::MAX);
+        let short = name.trim_end_matches(['…', '.']).trim_end();
         let goal = one_line(&task.goal, usize::MAX);
-        (one_line(name, usize::MAX) != goal)
-            .then(|| pane_agent::title(None, Some(name), &task.goal))
+        let says_more = !short.is_empty() && name != *asid && !goal.starts_with(short);
+        says_more.then(|| pane_agent::title(None, Some(&name), &task.goal))
+    }
+
+    fn live_title(&self, id: &TaskId) -> Option<String> {
+        self.live.lock().ok()?.titles.get(id).cloned()
     }
 
     /// Agent session `asid` is named `title` now: remembered, when an open
     /// task works in it, for that task's title, and the task re-published
-    /// when that changes it. Names that are a provider's placeholder (`New
-    /// session - <date>`) are not names.
+    /// when that changes it. An adapter leaves a session the provider has
+    /// not named untitled (empty).
     pub(crate) async fn session_named(&self, asid: &str, title: &str) {
         let title = title.trim();
-        let placeholder = title.is_empty()
-            || PLACEHOLDER_TITLES.contains(&title)
-            || PLACEHOLDER_TITLE_STARTS
-                .iter()
-                .any(|start| title.starts_with(start));
-        if placeholder {
+        if title.is_empty() {
             return;
         }
         let Some(id) = self.task_for_session(asid).await else {
@@ -1542,10 +1569,7 @@ impl TaskService {
         };
         let changed = match self.live.lock() {
             Ok(mut live) => {
-                live.titles
-                    .insert(asid.to_owned(), title.to_owned())
-                    .as_deref()
-                    != Some(title)
+                live.titles.insert(id.clone(), title.to_owned()).as_deref() != Some(title)
             }
             Err(_) => return,
         };
@@ -1609,6 +1633,12 @@ impl TaskService {
             {
                 change(TaskState::Working)
             }
+            Step::Form(title) if task.state != TaskState::Waiting => {
+                match state.agent_runtime.manager_for_session(&asid.0).await {
+                    Some(manager) => form_waiting(&manager, &task, &title).await,
+                    None => asking(&title),
+                }
+            }
             Step::Failed(error) => match state.agent_runtime.manager_for_session(&asid.0).await {
                 Some(manager) => failed_change(&manager, &task, error.as_ref()).await,
                 None => failed(
@@ -1662,7 +1692,7 @@ impl TaskService {
             return None;
         }
         let to = turn_end(&summary_timeline(&manager, asid, task.created_ms).await);
-        (to.to != task.state).then_some(to)
+        moves(task, &to).then_some(to)
     }
 
     /// The agent working on `id` says how it ended (`tasks.complete`; the
@@ -1687,27 +1717,44 @@ impl TaskService {
         self.finish(id, to).await
     }
 
-    /// When the task `id` was moved to `waiting` because its agent said it
-    /// is blocked (`tasks.complete` with outcome `blocked`, or the blocked
-    /// marker), if that is where it still stands: its last event says so.
-    pub(crate) async fn blocked_at(&self, id: &TaskId) -> Option<u64> {
+    /// Whether the task `id` is `waiting` because its agent said it is
+    /// blocked (`tasks.complete` with outcome `blocked`, or the blocked
+    /// marker), and how: its last event says so.
+    pub(crate) async fn blocked_at(&self, id: &TaskId) -> Option<Blocked> {
         let events = self.store.events(id).await.ok()?;
         let last = events.last()?;
-        let blocked = last.to == TaskState::Waiting
-            && [COMPLETE_BLOCKED, pane_agent::MARKER_BLOCKED].contains(&last.source.as_str());
-        blocked.then_some(last.at_ms)
+        let by_marker = last.source == pane_agent::MARKER_BLOCKED;
+        let blocked =
+            last.to == TaskState::Waiting && (by_marker || last.source == COMPLETE_BLOCKED);
+        blocked.then_some(Blocked {
+            at_ms: last.at_ms,
+            by_marker,
+        })
+    }
+
+    /// The reasons of the blocked markers task `id` was moved to `waiting`
+    /// on (each such event's note).
+    pub(crate) async fn marker_reasons(&self, id: &TaskId) -> Vec<String> {
+        let events = self.store.events(id).await.unwrap_or_default();
+        events
+            .into_iter()
+            .filter(|event| event.source == pane_agent::MARKER_BLOCKED)
+            .filter_map(|event| event.note)
+            .collect()
     }
 
     /// Whether a blocked task stays `waiting` instead of moving `to`: a
     /// turn that ends without the done marker does not pause it, and only a
-    /// turn of its session that starts after the one that reported the
-    /// block (the user answered) is work again. A pane task's follower
+    /// turn of its session after the one that reported the block (the user
+    /// answered) is work again -- for a marker, any turn that runs, as the
+    /// reporting one had ended when it was read; for `tasks.complete`, one
+    /// that ran after the reporting one went idle. A pane task's follower
     /// keeps the same rule itself ([`pane_agent::judge`]).
     async fn holds(&self, state: &AppState, task: &Task, to: TaskState) -> bool {
         if !matches!(to, TaskState::Working | TaskState::IdleUnconfirmed) {
             return false;
         }
-        let Some(at) = self.blocked_at(&task.id).await else {
+        let Some(blocked) = self.blocked_at(&task.id).await else {
             return false;
         };
         let TaskBinding::AgentSession { agent_id, asid } = &task.binding else {
@@ -1721,18 +1768,21 @@ impl TaskService {
         };
         match manager.sessions().get_session(asid).await {
             Ok(session) => {
-                !(is_running(session.status) && session.time_idle.is_some_and(|idle| idle > at))
+                let later =
+                    blocked.by_marker || session.time_idle.is_some_and(|idle| idle > blocked.at_ms);
+                !(is_running(session.status) && later)
             }
             Err(_) => true,
         }
     }
 
     /// What `default_cwd` is for `device`: the folder its newest task ran
-    /// in while that is still a directory, else the home directory, `~`.
-    /// `None` when the task store cannot be read.
+    /// in while that is still a directory, else the home directory -- named
+    /// from `~` (`~`, `~/<path>`), so no user name is shown. `None` when the
+    /// task store cannot be read.
     pub(crate) async fn default_cwd(&self, device: &TaskPrincipal) -> Option<String> {
         match self.store.latest_device_cwd(device).await {
-            Ok(Some(dir)) if Path::new(&dir).is_dir() => Some(dir),
+            Ok(Some(dir)) if Path::new(&dir).is_dir() => Some(home_relative(&dir)),
             Ok(_) => Some("~".to_owned()),
             Err(error) => {
                 tracing::debug!(%error, "default folder not read");
@@ -1875,8 +1925,9 @@ pub(crate) fn turn_end(items: &[TimelineItem]) -> TaskChange {
             summary: Some(summary),
             ..change(TaskState::Done)
         },
-        Some(pane_agent::Marker::Blocked(reason)) => TaskChange {
-            summary: Some(reason),
+        Some(pane_agent::Marker::Blocked { reason, .. }) => TaskChange {
+            summary: Some(reason.clone()),
+            note: Some(reason),
             source: pane_agent::MARKER_BLOCKED.into(),
             ..change(TaskState::Waiting)
         },
@@ -1887,17 +1938,53 @@ pub(crate) fn turn_end(items: &[TimelineItem]) -> TaskChange {
     }
 }
 
-/// What a session task waiting on the user is asked, for its `summary`:
-/// the last line of the agent's last message since the task began, when
-/// there is one.
-async fn question(state: &AppState, task: &Task) -> Option<String> {
-    let TaskBinding::AgentSession { agent_id, asid } = &task.binding else {
-        return None;
+/// A session task's move to `waiting` on a question form titled `title`:
+/// its `summary` is the agent's own question -- the last line of its last
+/// message, when that came after the turn's last tool call -- else the
+/// form's title. (A permission request's line is its prompt, [`asking`].)
+async fn form_waiting(manager: &AgentManager, task: &Task, title: &str) -> TaskChange {
+    let TaskBinding::AgentSession { asid, .. } = &task.binding else {
+        return asking(title);
     };
-    let manager = state.agent_runtime.manager_for_agent(agent_id).await?;
-    let text = last_assistant_text(&summary_timeline(&manager, asid, task.created_ms).await)?;
-    let line = text.lines().rev().find(|line| !line.trim().is_empty())?;
-    Some(one_line(line, SUMMARY_CHARS))
+    let items = summary_timeline(manager, asid, task.created_ms).await;
+    let last_tool = items
+        .iter()
+        .rposition(|item| matches!(item.part, AgentPart::Tool(_)));
+    let last_text = items.iter().rposition(|item| {
+        item.role == TimelineRole::Assistant
+            && matches!(&item.part, AgentPart::Text { text } if !text.trim().is_empty())
+    });
+    let asked = match (last_text, last_tool) {
+        (Some(text), tool) if tool.is_none_or(|tool| text > tool) => last_assistant_text(&items)
+            .and_then(|text| {
+                text.lines()
+                    .rev()
+                    .find(|line| !line.trim().is_empty())
+                    .map(str::to_owned)
+            }),
+        _ => None,
+    };
+    asking(asked.as_deref().unwrap_or(title))
+}
+
+/// Whether `to` moves `task`: a change of state, or a waiting task asked
+/// something new (another blocked reason).
+pub(crate) fn moves(task: &Task, to: &TaskChange) -> bool {
+    to.to != task.state
+        || (to.to == TaskState::Waiting && to.summary.is_some() && to.summary != task.summary)
+}
+
+/// `dir` named from the home directory: `~` itself, `~/<rest>` below it,
+/// else as it is.
+fn home_relative(dir: &str) -> String {
+    let Some(home) = dirs::home_dir() else {
+        return dir.to_owned();
+    };
+    match Path::new(dir).strip_prefix(&home) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => dir.to_owned(),
+    }
 }
 
 /// `task`'s session failed (`error`, if the agent gave one).
@@ -1934,9 +2021,6 @@ const FOLLOWER: &str = "task_follower";
 /// The source of a move to `waiting` by `tasks.complete` with outcome
 /// `blocked`.
 pub(crate) const COMPLETE_BLOCKED: &str = "tasks_complete_blocked";
-/// Session names that are a provider's stand-in, not a name.
-const PLACEHOLDER_TITLES: [&str; 2] = ["New thread", "Untitled"];
-const PLACEHOLDER_TITLE_STARTS: [&str; 2] = ["New session - ", "Child session - "];
 
 /// `to` recorded as from `source`, unless it is a blocked marker's move,
 /// which keeps saying so ([`TaskService::blocked_at`] reads it).
@@ -3088,6 +3172,7 @@ mod tests {
                 origin: TaskOrigin::Mcp,
                 label: None,
                 requester_name: None,
+                session_title: None,
             })
             .await;
         state
@@ -3200,12 +3285,31 @@ mod tests {
         enum Input {
             Event(Box<AgentDomainEvent>),
             Complete(&'static str, Outcome),
+            /// Blocked by the marker of a turn that has ended.
+            Marked(&'static str),
+            /// The session as the agent reports it throughout: its status and
+            /// `time_idle` relative to the row's start (default: idle, a
+            /// minute on -- its turn ended after everything before it).
+            Session(AgentSessionStatus, i64),
+            /// A tool call after the agent's last message.
+            ToolAfter,
         }
         use Input::*;
         use TaskState::*;
         let idle = || Event(Box::new(status(AgentSessionStatus::Idle)));
         let busy = || Event(Box::new(status(AgentSessionStatus::Busy)));
         let blocked = || Complete("notes.md does not exist", Outcome::Blocked);
+        let running_since = |offset| Session(AgentSessionStatus::Busy, offset);
+        let form = || {
+            Event(Box::new(AgentDomainEvent::FormPending {
+                asid: AgentSessionId(ASID.into()),
+                request: serde_json::from_value(json!({
+                    "id": "form1", "asid": ASID, "title": "Pick a branch", "fields": []
+                }))
+                .unwrap(),
+                seq: 0,
+            }))
+        };
         let marked = "Done.\n\nMUQUN_TASK_DONE: the build is green";
         let rows = [
             (
@@ -3233,20 +3337,28 @@ mod tests {
                 None,
             ),
             (
-                "a question the gateway sees: its own words",
+                "a permission request: its prompt, whatever the agent said before",
                 Working,
-                "",
+                "Let me clean the build dir.",
                 vec![Event(Box::new(permission(ASID)))],
                 Waiting,
                 Some("run it?"),
             ),
             (
-                "a question the gateway sees: the agent's last line",
+                "a question form: the agent's own question",
                 Working,
-                "The build dir is stale.\nShall I delete it?",
-                vec![Event(Box::new(permission(ASID)))],
+                "I need one detail.\nWhich branch should I use?",
+                vec![form()],
                 Waiting,
-                Some("Shall I delete it?"),
+                Some("Which branch should I use?"),
+            ),
+            (
+                "a question form after a tool call: its title",
+                Working,
+                "Let me look at the branches.",
+                vec![ToolAfter, form()],
+                Waiting,
+                Some("Pick a branch"),
             ),
             (
                 "a new turn after a pause",
@@ -3308,9 +3420,37 @@ mod tests {
                 "tasks.complete blocked: the rest of its own turn is no answer",
                 Working,
                 "",
-                vec![blocked(), busy()],
+                vec![running_since(-60_000), blocked(), busy()],
                 Waiting,
                 None,
+            ),
+            (
+                "tasks.complete blocked: a turn after it (the user answered) works",
+                Working,
+                "",
+                vec![running_since(60_000), blocked(), busy()],
+                Working,
+                None,
+            ),
+            (
+                "marker blocked: the session running again (the user answered) works",
+                Working,
+                "",
+                vec![
+                    running_since(-60_000),
+                    Marked("notes.md does not exist"),
+                    busy(),
+                ],
+                Working,
+                None,
+            ),
+            (
+                "marker blocked, then blocked for a new reason",
+                Working,
+                "MUQUN_TASK_BLOCKED: the config is missing too",
+                vec![Marked("notes.md does not exist"), idle()],
+                Waiting,
+                Some("the config is missing too"),
             ),
             (
                 "tasks.complete blocked, then done",
@@ -3322,12 +3462,30 @@ mod tests {
             ),
         ];
         for (name, from, last, inputs, to, summary) in rows {
-            let timeline = if last.is_empty() {
+            let mut timeline = if last.is_empty() {
                 Vec::new()
             } else {
                 vec![reply("m1", last)]
             };
-            let (state, id) = tracked(finished_agent(timeline)).await;
+            if inputs.iter().any(|input| matches!(input, ToolAfter)) {
+                let mut call = reply("m2", "");
+                call.part = AgentPart::Tool(
+                    serde_json::from_value(json!({
+                        "id": "c1", "name": "bash", "input": { "command": "git branch" },
+                        "state": "completed", "status": "completed"
+                    }))
+                    .unwrap(),
+                );
+                timeline.push(call);
+            }
+            let mut agent = finished_agent(timeline);
+            for input in &inputs {
+                if let Session(status, offset) = input {
+                    agent.sessions[0].status = *status;
+                    agent.sessions[0].time_idle = Some(now_ms().saturating_add_signed(*offset));
+                }
+            }
+            let (state, id) = tracked(agent).await;
             if from != Working {
                 state.tasks.move_to(&id, change(from)).await.unwrap();
             }
@@ -3339,6 +3497,16 @@ mod tests {
                     Complete(text, outcome) => {
                         state.tasks.complete(&id, text, outcome).await.unwrap();
                     }
+                    Marked(reason) => {
+                        let block = TaskChange {
+                            summary: Some(reason.into()),
+                            note: Some(reason.into()),
+                            source: pane_agent::MARKER_BLOCKED.into(),
+                            ..change(Waiting)
+                        };
+                        state.tasks.move_to(&id, block).await.unwrap();
+                    }
+                    Session(..) | ToolAfter => {}
                 }
             }
             let task = state.tasks.get_for_test(&id).await;
@@ -3347,21 +3515,6 @@ mod tests {
                 assert_eq!(task.summary.as_deref(), summary, "{name}");
             }
         }
-
-        // A new turn of a blocked task's session (the user answered) works.
-        let mut agent = finished_agent(Vec::new());
-        agent.sessions[0].status = AgentSessionStatus::Busy;
-        let (state, id) = tracked(agent).await;
-        state
-            .tasks
-            .complete(&id, "notes.md does not exist", Outcome::Blocked)
-            .await
-            .unwrap();
-        state
-            .tasks
-            .follow(&state, &status(AgentSessionStatus::Busy))
-            .await;
-        assert_eq!(state.tasks.get_for_test(&id).await.state, Working);
 
         // While it works, the view says what it is doing: the running tool.
         let (state, id) = tracked(finished_agent(Vec::new())).await;
@@ -3413,14 +3566,17 @@ mod tests {
             .unwrap();
         assert_eq!(progress().await, None);
 
-        // The title follows the session's own name, but not a placeholder
-        // or the goal restated; a renamed session re-publishes its task.
+        // The title follows the session's own name -- not an untitled
+        // session's (DeepSeek's before it is named: empty), its asid, or the
+        // goal restated or cut short; a renamed session re-publishes its task.
         let title = || async {
             let task = state.tasks.get_for_test(&id).await;
             state.tasks.present(&task).await.title
         };
         for (name, expected) in [
-            ("New session - 2026-10-10T08:00:00.000Z", "fix the build"),
+            ("", "fix the build"),
+            (ASID, "fix the build"),
+            ("fix the…", "fix the build"),
             ("fix the build", "fix the build"),
             ("Fix the CI build", "Fix the CI build"),
         ] {
@@ -3441,6 +3597,16 @@ mod tests {
             titles.contains(&"Fix the CI build".to_owned()),
             "{titles:?}"
         );
+        // An ended task keeps the name it had, stored, not held in memory.
+        state
+            .tasks
+            .move_to(&id, change(TaskState::Done))
+            .await
+            .unwrap();
+        let ended = state.tasks.get_for_test(&id).await;
+        assert_eq!(ended.session_title.as_deref(), Some("Fix the CI build"));
+        assert_eq!(state.tasks.live_title(&id), None);
+        assert_eq!(title().await, "Fix the CI build");
     }
 
     #[test]

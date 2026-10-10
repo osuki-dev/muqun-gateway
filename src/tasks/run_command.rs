@@ -142,6 +142,7 @@ async fn launch(
                 origin: by.origin,
                 label: None,
                 requester_name: by.name,
+                session_title: None,
             })
             .await?;
         store

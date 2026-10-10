@@ -76,13 +76,14 @@ pub fn map_session(raw: &Value) -> Option<AgentSessionInfo> {
             }
         });
 
-    // Derive a clean title
+    // Untitled (empty) until DeepSeek names it: a made-up name would read
+    // as the session's own.
     let title = raw
         .get("title")
         .or_else(|| projections_values.and_then(|v| v.get("title")))
         .and_then(Value::as_str)
         .filter(|t| !t.trim().is_empty())
-        .unwrap_or("DeepSeek Agent Session")
+        .unwrap_or_default()
         .to_string();
 
     let status = if running {

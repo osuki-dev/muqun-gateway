@@ -90,10 +90,14 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
   stays so through idles until the agent works on a later turn or finishes
   (`TaskService::blocked_at`/`settle`, `pane_agent::judge`).
   An open task's `progress` line (what it is doing now) and the agent
-  session names behind `TaskView.title` live in `TaskService` memory only,
-  fed by agent events and pane polls; progress is published at most every
-  2 s per task. A device's default task folder (`default_cwd`) is served by
-  `GET /api/tasks/defaults` and a `defaults` frame on `subscribe_tasks`.
+  session names behind an open task's `TaskView.title` live in
+  `TaskService` memory only, fed by agent events and pane polls; progress is
+  published at most every 2 s per task. An ended session delegation stores
+  its session's last name (`session_title`). A device's default task folder
+  (`default_cwd`, named from `~`) is served by `GET /api/tasks/defaults` and
+  a `defaults` frame on `subscribe_tasks` (capability `task_defaults`); the
+  blocked outcome, the waiting line, `title` and the worded `progress` are
+  `task_outcome`.
   Every task carries `parent_task_id` and `origin`; `children` counts are
   computed when a view is made, never stored. The driver's pass deletes
   tasks that ended over 30 days ago (`TASK_RETENTION`) with their events;

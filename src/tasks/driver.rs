@@ -43,8 +43,8 @@ use std::time::Duration;
 use super::domain::one_line;
 use super::domain::{now_ms, Task, TaskBinding, TaskChange, TaskFilter, TaskKind, TaskState};
 use super::service::{
-    finished_since, is_running, session_failure, sourced, summary_timeline, turn_end, OPEN_STATES,
-    SUMMARY_CHARS,
+    finished_since, is_running, moves, session_failure, sourced, summary_timeline, turn_end,
+    OPEN_STATES, SUMMARY_CHARS,
 };
 use super::{pane_agent, same_pane};
 use crate::agents::domain::AgentSessionStatus;
@@ -224,7 +224,7 @@ async fn settle_delegation(state: &AppState, task: &Task, agent_id: &str, asid: 
     // Marker first: a turn that ended while the gateway was down is done
     // only if the agent said so.
     let ended = turn_end(&summary_timeline(&manager, asid, task.created_ms).await);
-    if ended.to == task.state {
+    if !moves(task, &ended) {
         return false;
     }
     settled(state, task, sourced(ended, SOURCE)).await
@@ -313,6 +313,7 @@ mod tests {
             origin: Default::default(),
             label: None,
             requester_name: None,
+            session_title: None,
         }
     }
 

@@ -359,15 +359,7 @@ pub(crate) struct CompleteArgs {
     /// request, a permission you cannot get. The user answers in this
     /// session and you go on; call tasks.complete again when it is done.
     #[serde(default)]
-    pub outcome: CompleteOutcome,
-}
-
-#[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum CompleteOutcome {
-    #[default]
-    Done,
-    Blocked,
+    pub outcome: Outcome,
 }
 
 #[derive(Clone)]
@@ -519,11 +511,12 @@ impl MuqunMcp {
                  MUQUN_TASK_BLOCKED: <one-line reason>).",
             ));
         };
-        let outcome = match args.outcome {
-            CompleteOutcome::Done => Outcome::Done,
-            CompleteOutcome::Blocked => Outcome::Blocked,
-        };
-        reply(self.state.tasks.complete(&id, &args.summary, outcome).await)
+        reply(
+            self.state
+                .tasks
+                .complete(&id, &args.summary, args.outcome)
+                .await,
+        )
     }
 
     #[tool(name = "tasks.cancel", description = "Interrupt a task you created.")]

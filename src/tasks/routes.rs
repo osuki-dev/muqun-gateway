@@ -383,6 +383,7 @@ mod tests {
                 origin: Default::default(),
                 label: None,
                 requester_name: None,
+                session_title: None,
             })
             .await
             .unwrap();
@@ -549,6 +550,7 @@ mod tests {
                 origin,
                 label: None,
                 requester_name: Some("phone".into()),
+                session_title: None,
             }
         };
         let mut ids = Vec::new();
@@ -729,6 +731,7 @@ mod tests {
                         origin: TaskOrigin::Device,
                         label: None,
                         requester_name: None,
+                        session_title: None,
                     })
                     .await
                     .unwrap();
@@ -736,10 +739,11 @@ mod tests {
             // What the device is told before it asks: the same answer, home as `~`.
             if cwd.is_none() {
                 let (_, defaults) = send(&state, "GET", "/api/tasks/defaults", None, true).await;
-                let reported = if expected == home {
-                    "~"
-                } else {
-                    expected.to_str().unwrap()
+                // Named from home, so no user name shows.
+                let reported = match expected.strip_prefix(&home) {
+                    Ok(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+                    Ok(rest) => format!("~/{}", rest.display()),
+                    Err(_) => expected.display().to_string(),
                 };
                 assert_eq!(defaults, json!({ "default_cwd": reported }), "{name}");
             }
