@@ -115,10 +115,20 @@ bound to one non-loopback address (a tailnet IP, say) therefore also listens
 on `127.0.0.1` and `::1` for `/mcp` alone -- the configured port when it is
 free there, else any free port -- and that is the URL every agent it starts
 is given (Claude Code's `--mcp-config`, Codex's overrides, OpenCode's
-registration). The running gateway records it in `<state>/mcp-endpoint`,
-which `mcp enable` reads, and `manage` shows it on the overview as `MCP:
-127.0.0.1:<port>`. The configured address keeps refusing `/mcp`
-(`403 mcp_loopback_only`).
+registration), resolved by the running gateway at each launch. On the
+configured port nothing is recorded: every reader derives it. Only when
+that port is taken on loopback does the gateway record the other one in
+`<state>/mcp-endpoint` (written atomically, 0600), and it removes the file
+when it stops (SIGTERM/SIGINT or a normal exit). `mcp enable` reads it, and
+`manage` shows the address on the overview as `MCP: 127.0.0.1:<port>`. The
+configured address keeps refusing `/mcp` (`403 mcp_loopback_only`).
+
+Identity comes before credentials: `muqun-gateway mcp token-helper` first
+asks the loopback address for the public `GET /api/capabilities`, with no
+credential, and compares its `serverId` with this gateway's own. Anything
+else answering there -- a process that took a stale port -- gets nothing:
+the helper prints `another process answers on 127.0.0.1:<port>; not sending
+the token` and exits 1, so the host never sends a token there.
 
 `muqun-gateway mcp revoke --all` or `--id <token-id>` revokes tokens from the
 CLI; a running gateway sees it on the next call. Paired devices can also

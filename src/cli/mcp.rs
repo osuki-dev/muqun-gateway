@@ -166,6 +166,14 @@ fn token_helper(bearer: bool, config_dir: Option<PathBuf>) -> anyhow::Result<()>
         tracing::debug!("token-helper: {error:#}");
         fail(1, HELPER_FAILED.into())
     });
+    // Identity before credentials: the host sends this token to the loopback
+    // MCP address, so that address must be this gateway, not a process that
+    // took over a stale port.
+    let url = crate::mcp::recorded_url(&config.listen);
+    if let Err(refused) = crate::mcp::verify_identity(&url, &config.server_id) {
+        tracing::warn!("{refused}");
+        fail(1, refused);
+    }
     let pids = ancestor_chain(std::process::id(), MAX_ANCESTORS, parent_pid);
     let body = json!({ "ancestor_pids": pids });
     let (status, value) = match admin_request(&config, "POST", "/api/mcp/tokens", Some(&body)) {

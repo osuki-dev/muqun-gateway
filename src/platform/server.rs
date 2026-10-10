@@ -71,28 +71,18 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     } else {
         None
     };
-    if let Ok(file) = crate::mcp::endpoint_file() {
-        match mcp_listeners
-            .as_ref()
-            .and_then(|listeners| listeners.first())
-        {
-            Some(listener) => {
-                let url = format!(
-                    "http://127.0.0.1:{}{}",
-                    listener.local_addr()?.port(),
-                    crate::mcp::MCP_PATH
-                );
-                if let Err(error) = std::fs::write(&file, &url) {
-                    tracing::warn!(%error, "could not record the loopback MCP address");
-                }
-                tracing::info!("MCP for this computer's agents on {url}");
-                crate::mcp::use_loopback_url(url);
+    let _endpoint_record = match mcp_listeners
+        .as_ref()
+        .and_then(|listeners| listeners.first())
+    {
+        Some(listener) => crate::mcp::announce_loopback(listener.local_addr()?.port(), addr.port()),
+        None => {
+            if let Ok(file) = crate::mcp::endpoint_file() {
+                let _ = std::fs::remove_file(file);
             }
-            None => {
-                let _ = std::fs::remove_file(&file);
-            }
+            None
         }
-    }
+    };
     // One background attempt per opted-in backend; no restart/logging loop.
     backend_startup::spawn(&config);
 

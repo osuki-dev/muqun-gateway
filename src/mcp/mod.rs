@@ -87,28 +87,126 @@ pub(crate) async fn bind_loopback(
     Ok(Some(listeners))
 }
 
-/// Record `url` as this process's loopback `/mcp` address.
-pub(crate) fn use_loopback_url(url: String) {
-    let _ = LOOPBACK_URL.set(url);
+/// Use the loopback listener on `port` for `/mcp` from now on. On the
+/// configured port (`configured`) it needs no record: every reader derives
+/// it. On any other port, the address is written to [`endpoint_file`]
+/// (0600, atomically) and the returned record removes it again -- when it is
+/// dropped, or on SIGTERM/SIGINT, so no stale address outlives the gateway.
+pub(crate) fn announce_loopback(port: u16, configured: u16) -> Option<EndpointRecord> {
+    let url = format!("http://127.0.0.1:{port}{MCP_PATH}");
+    tracing::info!("MCP for this computer's agents on {url}");
+    let _ = LOOPBACK_URL.set(url.clone());
+    let file = endpoint_file().ok()?;
+    if port == configured {
+        let _ = std::fs::remove_file(&file);
+        return None;
+    }
+    let record = record_endpoint(file, &url)?;
+    remove_on_stop(record.0.clone());
+    Some(record)
+}
+
+/// Write `url` to `file` and hold it there until the record is dropped or
+/// the process is told to stop.
+fn record_endpoint(file: std::path::PathBuf, url: &str) -> Option<EndpointRecord> {
+    if let Err(error) = crate::platform::store::write_secret_file(&file, url.as_bytes()) {
+        tracing::warn!(%error, "could not record the loopback MCP address");
+        return None;
+    }
+    Some(EndpointRecord(file))
+}
+
+/// On SIGTERM or SIGINT, remove `file`, then exit: a gateway stopped by its
+/// service manager leaves no stale address behind.
+fn remove_on_stop(file: std::path::PathBuf) {
+    #[cfg(unix)]
+    {
+        let on_stop = file;
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                use tokio::signal::unix::{signal, SignalKind};
+                let (Ok(mut term), Ok(mut int)) = (
+                    signal(SignalKind::terminate()),
+                    signal(SignalKind::interrupt()),
+                ) else {
+                    return;
+                };
+                tokio::select! {
+                    _ = term.recv() => {}
+                    _ = int.recv() => {}
+                }
+                let _ = std::fs::remove_file(&on_stop);
+                std::process::exit(0);
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = file;
+}
+
+/// The recorded loopback address, removed when this is dropped.
+pub(crate) struct EndpointRecord(std::path::PathBuf);
+
+impl Drop for EndpointRecord {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /// The address `/mcp` is served at on this computer's loopback, from the
 /// running gateway's record when it has one (see [`bind_loopback`]), else
 /// from the listen address ([`local_url`]).
 pub(crate) fn recorded_url(listen: &str) -> String {
-    endpoint_file()
-        .ok()
-        .and_then(|file| std::fs::read_to_string(file).ok())
-        .map(|url| url.trim().to_owned())
-        .filter(|url| url.starts_with("http://127.0.0.1:"))
-        .unwrap_or_else(|| local_url(listen))
+    if let Some(url) = LOOPBACK_URL.get() {
+        return url.clone();
+    }
+    // A gateway on a non-loopback address serves `/mcp` at 127.0.0.1 on its
+    // configured port, unless it had to take another, which it records.
+    if loopback_warning(listen).is_some() {
+        let port = listen.parse::<SocketAddr>().map_or(0, |addr| addr.port());
+        return endpoint_file()
+            .ok()
+            .and_then(|file| std::fs::read_to_string(file).ok())
+            .map(|url| url.trim().to_owned())
+            .filter(|url| url.starts_with("http://127.0.0.1:"))
+            .unwrap_or_else(|| format!("http://127.0.0.1:{port}{MCP_PATH}"));
+    }
+    local_url(listen)
 }
 
-/// `/mcp` alone, for the loopback listener: none of the device routes.
+/// `/mcp` alone, for the loopback listener -- none of the device routes --
+/// and the public capability list, whose `serverId` lets a client check it
+/// is talking to this gateway before it sends a token ([`verify_identity`]).
 pub(crate) fn loopback_router(state: AppState) -> Router {
     mount(Router::new())
+        .route(
+            "/api/capabilities",
+            axum::routing::get(crate::platform::routes::api_capabilities),
+        )
         .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
+}
+
+/// Whether what answers at `url` (an `http://<host:port>/mcp` address on
+/// this computer) is the gateway `server_id`: asked with no credential, so a
+/// process squatting a stale address never sees a token. `Err` says why not.
+pub(crate) fn verify_identity(url: &str, server_id: &str) -> Result<(), String> {
+    let at = url
+        .trim_start_matches("http://")
+        .trim_end_matches(MCP_PATH)
+        .to_owned();
+    let address: SocketAddr = at
+        .parse()
+        .map_err(|_| format!("muqun: {url} is not an address on this computer"))?;
+    match crate::cli::local_api::identity_at(address) {
+        Ok(Some(answered)) if answered == server_id => Ok(()),
+        Ok(_) => Err(format!(
+            "muqun: another process answers on {at}; not sending the token"
+        )),
+        Err(_) => Err(format!(
+            "muqun: nothing answers on {at}; not sending the token"
+        )),
+    }
 }
 
 pub(crate) fn local_url(listen: &str) -> String {
@@ -475,6 +573,72 @@ mod tests {
         for served in ["127.0.0.1:0", "0.0.0.0:0", "[::]:0"] {
             assert!(bind_loopback(served).await.unwrap().is_none(), "{served}");
         }
+    }
+
+    /// The configured port taken on loopback: the listener takes another, and
+    /// its address is recorded 0600 only as long as the record lives.
+    #[tokio::test]
+    async fn a_busy_port_moves_mcp_to_a_recorded_ephemeral_one() {
+        let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = busy.local_addr().unwrap().port();
+        let listeners = bind_loopback(&format!("100.64.0.7:{port}"))
+            .await
+            .unwrap()
+            .unwrap();
+        let taken = listeners[0].local_addr().unwrap().port();
+        assert_ne!(taken, port);
+        let file = crate::test_state_dir().join(format!("mcp-endpoint-{}", uuid::Uuid::new_v4()));
+        let url = format!("http://127.0.0.1:{taken}{MCP_PATH}");
+        let record = record_endpoint(file.clone(), &url).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), url);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        drop(record);
+        assert!(!file.exists(), "removed with the gateway");
+    }
+
+    /// A client of the loopback address asks who answers, with no
+    /// credential, before it hands over a token.
+    #[tokio::test]
+    async fn a_token_goes_only_to_this_gateway() {
+        let state = crate::test_state("admin", Vec::new());
+        let ours = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ours_at = ours.local_addr().unwrap();
+        let app = loopback_router(state.clone());
+        tokio::spawn(async move {
+            axum::serve(
+                ours,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+        });
+        let squatter = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let squatter_at = squatter.local_addr().unwrap();
+        let imposter = Router::new().route(
+            "/api/capabilities",
+            axum::routing::get(|| async { axum::Json(json!({ "serverId": "someone-else" })) }),
+        );
+        tokio::spawn(async move { axum::serve(squatter, imposter).await });
+        let own = state.config.server_id.clone();
+        let checks = tokio::task::spawn_blocking(move || {
+            (
+                verify_identity(&format!("http://{ours_at}{MCP_PATH}"), &own),
+                verify_identity(&format!("http://{squatter_at}{MCP_PATH}"), &own),
+            )
+        })
+        .await
+        .unwrap();
+        assert_eq!(checks.0, Ok(()));
+        assert_eq!(
+            checks.1,
+            Err(format!(
+                "muqun: another process answers on {squatter_at}; not sending the token"
+            ))
+        );
     }
 
     #[test]
