@@ -353,17 +353,31 @@ fn redact_bearer(text: &str) -> String {
 /// session agent's service are revoked, so a registration that outlived the
 /// switch answers 401.
 pub(crate) async fn revoke_when_off(config: &crate::Config, tokens: &dyn AssistantTokenStore) {
-    if enabled(config) {
-        return;
+    let on = enabled(config);
+    if let Ok(rows) = tokens.list().await {
+        // With injection on, only the token minted before tokens were per
+        // directory (its label bare) goes; off, every one does.
+        let doomed = rows.into_iter().filter(|row| {
+            row.label == RUNTIME_LABEL || (!on && row.label.starts_with(RUNTIME_LABEL))
+        });
+        for row in doomed {
+            let _ = tokens.revoke(&row.id).await;
+        }
     }
-    let Ok(rows) = tokens.list().await else {
-        return;
-    };
-    for row in rows
-        .into_iter()
-        .filter(|row| row.label.starts_with(RUNTIME_LABEL))
-    {
-        let _ = tokens.revoke(&row.id).await;
+    // Off, the launch files go too; on, they are rewritten when used.
+    if !on {
+        if let Ok(state) = crate::state_dir() {
+            for name in ["mcp-claude.json", "task-instruction.md"] {
+                let _ = remove_if_there(&state.join(name)).await;
+            }
+        }
+    }
+}
+
+async fn remove_if_there(path: &Path) -> std::io::Result<()> {
+    match tokio::fs::remove_file(path).await {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
     }
 }
 
@@ -371,6 +385,14 @@ pub(crate) async fn revoke_when_off(config: &crate::Config, tokens: &dyn Assista
 mod tests {
     use super::*;
     use crate::test_support::{test_state, FakeAgent, FakeMcp};
+
+    #[test]
+    fn a_refusal_that_echoes_the_request_does_not_log_the_token() {
+        assert_eq!(
+            redact_bearer("bad config {\"Authorization\":\"Bearer abc.DEF-123\"}"),
+            "bad config {\"Authorization\":\"Bearer …\"}"
+        );
+    }
 
     #[tokio::test]
     async fn a_session_agent_is_given_the_server_once_per_directory() {
@@ -418,11 +440,6 @@ mod tests {
         mcp.lock().unwrap().refuse = false;
         ensure_session_agent(&off, tokens, &agent, Some("/d")).await;
         assert_eq!(live(runtime_label(Some("/d"))).await, 0);
-        // A refusal that echoes the request does not log the token.
-        assert_eq!(
-            redact_bearer("bad config {\"Authorization\":\"Bearer abc.DEF-123\"}"),
-            "bad config {\"Authorization\":\"Bearer …\"}"
-        );
     }
 
     #[test]
