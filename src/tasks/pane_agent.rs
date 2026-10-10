@@ -291,21 +291,13 @@ pub(crate) enum Marker {
 
 /// The last marker line in `output`, done or blocked. A marker counts only
 /// at the start of a line (after any bullet the agent draws), below the
-/// request echoed in the prompt, and with a line that is not a placeholder
-/// or a piece of one.
+/// request echoed in the prompt, outside a code fence (the agent quoting
+/// one), and with a line that is not a placeholder or a piece of one.
 pub(crate) fn marker(output: &str) -> Option<Marker> {
-    let lines: Vec<&str> = output.lines().collect();
-    let below_echo = lines
-        .iter()
-        .rposition(|line| ECHO_WORDS.iter().any(|word| line.contains(word)))
-        .map_or(0, |echo| echo + 1);
-    let found: Vec<Marker> = lines[below_echo..]
-        .iter()
-        .filter_map(|line| marker_line(line))
-        .collect();
-    match found.last()? {
+    let found = marker_lines(output);
+    match &found.last()?.1 {
         Marker::Blocked { reason, .. } => {
-            let same = |m: &&Marker| matches!(m, Marker::Blocked { reason: r, .. } if r == reason);
+            let same = |(_, m): &&(usize, Marker)| matches!(m, Marker::Blocked { reason: r, .. } if r == reason);
             Some(Marker::Blocked {
                 reason: reason.clone(),
                 count: found.iter().filter(same).count(),
@@ -313,6 +305,40 @@ pub(crate) fn marker(output: &str) -> Option<Marker> {
         }
         done => Some(done.clone()),
     }
+}
+
+/// The line of `output` (its index in `output.lines()`) that [`marker`]
+/// reads the task's end from: the one line the served transcript leaves
+/// out ([`super::transcript`]), so a line the ledger ignores stays in view.
+pub(crate) fn consumed_marker_line(output: &str) -> Option<usize> {
+    marker_lines(output).last().map(|(at, _)| *at)
+}
+
+/// Every marker line of `output` that counts, with its index.
+fn marker_lines(output: &str) -> Vec<(usize, Marker)> {
+    let lines: Vec<&str> = output.lines().collect();
+    let below_echo = lines
+        .iter()
+        .rposition(|line| ECHO_WORDS.iter().any(|word| line.contains(word)))
+        .map_or(0, |echo| echo + 1);
+    let mut fenced = false;
+    let mut found = Vec::new();
+    for (at, line) in lines.iter().enumerate() {
+        if is_fence(line) {
+            fenced = !fenced;
+        } else if !fenced && at >= below_echo {
+            if let Some(marker) = marker_line(line) {
+                found.push((at, marker));
+            }
+        }
+    }
+    found
+}
+
+/// Whether `line` opens or closes a markdown code fence.
+pub(crate) fn is_fence(line: &str) -> bool {
+    let line = line.trim();
+    line.starts_with("```") || line.starts_with("~~~")
 }
 
 fn marker_line(line: &str) -> Option<Marker> {

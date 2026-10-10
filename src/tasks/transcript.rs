@@ -13,24 +13,32 @@
 //!   instruction -- any wording this gateway has sent, found by its fixed
 //!   opening and its closing placeholder line, not by the goal -- cut back to
 //!   what came before it, and dropped when nothing did;
-//! - an assistant text or reasoning without its marker lines (a line outside
-//!   a code fence that starts, after bullets and markup, with a marker), and
-//!   dropped when nothing else is left. A streamed text is served as
-//!   snapshots of the whole text so far, so while the session runs a turn
-//!   a last line that could only be the start of a marker (bare markup such
-//!   as `- ` included) is held back too: the marker never flashes before
-//!   its turn ends, and a finished message is never cut but for markers. A streamed row left with nothing is removed
-//!   (`agent.timeline.removed`) rather than left out, so a client never keeps
-//!   an older version of it.
+//! - an assistant text or reasoning without the one marker line the ledger
+//!   reads its end from ([`pane_agent::consumed_marker_line`], shared with
+//!   detection: an earlier marker line, one in a code fence or one the
+//!   ledger ignores stays in view), and dropped when nothing else is left.
+//!   A streamed text is served as snapshots of the whole text so far, so
+//!   while the session runs a turn a last line that could only be the start
+//!   of a marker (bare markup such as `- ` included) is held back too: the
+//!   marker never flashes before its turn ends;
+//! - OpenCode's Code Mode plumbing: an `execute` call whose whole code is a
+//!   catalog lookup of a muqun tool ([`muqun_lookup`], parsed strictly; one
+//!   that failed stays), held while its code is not known yet, and the
+//!   "Code Mode tool catalog has changed" notice when it is exactly that.
+//!
+//! A streamed row left with nothing is removed (`agent.timeline.removed`)
+//! rather than left out, so a client never keeps an older version of it.
 //!
 //! Sessions no task is bound to are served as they are. The mirror, the
 //! agent's own reads and the task follower keep the raw text: detection
 //! (`pane_agent::marker`, `service::turn_end`) reads what the agent wrote.
 
 use super::pane_agent::{
-    BLOCKED_MARKER, DONE_MARKER, REASON_PLACEHOLDER, REQUEST_OPENING, SUMMARY_PLACEHOLDER,
+    self, BLOCKED_MARKER, DONE_MARKER, REASON_PLACEHOLDER, REQUEST_OPENING, SUMMARY_PLACEHOLDER,
 };
-use crate::agents::domain::{AgentDomainEvent, AgentPart, TimelineItem, TimelineRole};
+use crate::agents::domain::{
+    AgentDomainEvent, AgentPart, TimelineItem, TimelineRole, ToolCallStatus,
+};
 use crate::AppState;
 
 /// How session `asid`'s transcript is served: `None` as it is, no task
@@ -63,10 +71,7 @@ enum Served {
 fn hide_in_item(item: &mut TimelineItem, streaming: Streaming) -> Served {
     let (text, served) = match (item.role, &mut item.part) {
         (_, AgentPart::System { text, .. }) | (_, AgentPart::Synthetic { text, .. })
-            if text
-                .trim_start()
-                .trim_start_matches("The ")
-                .starts_with(CATALOG_NOTICE) =>
+            if is_catalog_notice(text) =>
         {
             return Served::Emptied;
         }
@@ -79,11 +84,17 @@ fn hide_in_item(item: &mut TimelineItem, streaming: Streaming) -> Served {
             let served = without_markers(text, streaming);
             (text, served)
         }
-        (_, AgentPart::Tool(call)) => {
+        (_, AgentPart::Tool(call)) if call.name == "execute" => {
+            // Held until its code is known, then shown unless it is only a
+            // muqun lookup that did not fail.
             let code = call.input.get("code").and_then(|code| code.as_str());
-            let lookup =
-                call.name == "execute" && code.is_some_and(|c| muqun_lookup(c, streaming.0));
-            return if lookup {
+            let unknown = matches!(
+                call.status,
+                ToolCallStatus::Pending | ToolCallStatus::Streaming
+            );
+            let failed = call.status == ToolCallStatus::Failed || call.error.is_some();
+            let lookup = !failed && code.is_some_and(muqun_lookup);
+            return if unknown || lookup {
                 Served::Emptied
             } else {
                 Served::Kept
@@ -143,33 +154,62 @@ pub(crate) fn hide_in_inbox(items: &mut Vec<serde_json::Value>) {
     });
 }
 
-/// The opening of OpenCode's notice that its Code Mode tool catalog changed
-/// (after an optional "The "): the muqun tools joining it, not the reader's
-/// business.
-const CATALOG_NOTICE: &str = "Code Mode tool catalog has changed";
+/// The first line of OpenCode's notice that its Code Mode tool catalog
+/// changed (the muqun tools joining it); the catalog listing follows it
+/// under a `# Code Mode` heading.
+const CATALOG_NOTICE: [&str; 2] = [
+    "The Code Mode tool catalog has changed.",
+    "The Code Mode tool catalog has changed. This catalog supersedes the previous Code Mode tool catalog.",
+];
 
-/// Whether `code` (an OpenCode Code Mode `execute` call) only looks up a
-/// muqun tool in the catalog -- `[return] search({query: "<muqun …|tasks.…|
-/// fleet.…|exec.run>", …})[;]` and nothing else: the agent finding the tool
-/// its hidden instruction names. While `streaming`, code that may still
-/// become one (none yet, or such a call not yet closed) counts too.
-fn muqun_lookup(code: &str, streaming: bool) -> bool {
-    let code = code.trim();
-    let call = code.strip_prefix("return ").map_or(code, str::trim_start);
-    let call = call.strip_suffix(';').unwrap_or(call).trim_end();
-    if call.contains([';', '\n']) {
+/// Whether `text` is exactly that notice: its first line, then nothing or
+/// the catalog listing.
+fn is_catalog_notice(text: &str) -> bool {
+    let text = text.trim();
+    let (first, rest) = text.split_once('\n').unwrap_or((text, ""));
+    let rest = rest.trim_start();
+    CATALOG_NOTICE.contains(&first.trim()) && (rest.is_empty() || rest.starts_with("# Code Mode\n"))
+}
+
+/// Whether `code` (an OpenCode Code Mode `execute` call) is only a catalog
+/// lookup of a muqun tool, read strictly as the whole code:
+/// `[return] search({query: <string>[, limit: <integer>]})[;]`, keys in any
+/// order, each once, the query a plain quoted string (no escapes, no
+/// template) that starts with `muqun` or names `tasks.`, `fleet.` or
+/// `exec.run`. Anything else -- another statement, a chained call, an
+/// operator, another key -- is the agent's own work and is shown.
+fn muqun_lookup(code: &str) -> bool {
+    let mut at = Cursor(code.trim());
+    if at.word("return") && !at.0.starts_with(char::is_whitespace) {
         return false;
     }
-    let Some(args) = call.strip_prefix("search(") else {
-        return streaming
-            && ["return search(", "search("]
-                .iter()
-                .any(|form| form.starts_with(code));
-    };
-    if args.contains("search(") {
-        return false;
-    }
-    let closed_call = args.ends_with(')');
+    let (mut query, mut limit) = (None, false);
+    let parsed = at.eat("search")
+        && at.eat("(")
+        && at.eat("{")
+        && loop {
+            let key = at.key();
+            if !at.eat(":") {
+                break false;
+            }
+            match key {
+                Some("query") if query.is_none() => match at.string() {
+                    Some(text) => query = Some(text),
+                    None => break false,
+                },
+                Some("limit") if !limit && at.integer() => limit = true,
+                _ => break false,
+            }
+            let comma = at.eat(",");
+            if at.eat("}") {
+                break true;
+            }
+            if !comma {
+                break false;
+            }
+        }
+        && at.eat(")");
+    at.eat(";");
     let ours = |query: &str| {
         let query = query.trim().to_ascii_lowercase();
         query.starts_with("muqun")
@@ -177,31 +217,79 @@ fn muqun_lookup(code: &str, streaming: bool) -> bool {
                 .iter()
                 .any(|id| query.contains(id))
     };
-    match query_of(args) {
-        Some((query, true)) => ours(query) && (closed_call || streaming),
-        Some((query, false)) => {
-            streaming
-                && ("muqun".starts_with(query.trim().to_ascii_lowercase().as_str()) || ours(query))
-        }
-        None => streaming && !closed_call,
-    }
+    parsed && at.0.trim().is_empty() && query.is_some_and(ours)
 }
 
-/// The `query` string in `search(` arguments, and whether its closing quote
-/// has been written.
-fn query_of(args: &str) -> Option<(&str, bool)> {
-    let rest = &args[args.find("query")? + "query".len()..];
-    let rest = rest.trim_start_matches(['"', '\'']).trim_start();
-    let rest = rest.strip_prefix(':')?.trim_start();
-    let quote = rest
-        .chars()
-        .next()
-        .filter(|c| matches!(c, '"' | '\'' | '`'))?;
-    let text = &rest[1..];
-    Some(match text.find(quote) {
-        Some(end) => (&text[..end], true),
-        None => (text, false),
-    })
+/// A tiny reader over the rest of a code text, skipping whitespace before
+/// each token.
+struct Cursor<'a>(&'a str);
+
+impl<'a> Cursor<'a> {
+    /// Takes `token` if the rest starts with it.
+    fn eat(&mut self, token: &str) -> bool {
+        let rest = self.0.trim_start();
+        match rest.strip_prefix(token) {
+            Some(rest) => {
+                self.0 = rest;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Takes `word` if it is a whole word at the start.
+    fn word(&mut self, word: &str) -> bool {
+        let rest = self.0.trim_start();
+        let whole = rest
+            .strip_prefix(word)
+            .is_some_and(|after| !after.starts_with(|c: char| c.is_alphanumeric() || c == '_'));
+        if whole {
+            self.0 = &rest[word.len()..];
+        }
+        whole
+    }
+
+    /// An object key: a name, or one in plain quotes.
+    fn key(&mut self) -> Option<&'a str> {
+        let rest = self.0.trim_start();
+        if rest.starts_with(['"', '\'']) {
+            return self.string();
+        }
+        let end = rest
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        (end > 0).then(|| {
+            self.0 = &rest[end..];
+            &rest[..end]
+        })
+    }
+
+    /// A string literal in `'` or `"` without escapes.
+    fn string(&mut self) -> Option<&'a str> {
+        let rest = self.0.trim_start();
+        let quote = rest.chars().next().filter(|c| matches!(c, '"' | '\''))?;
+        let body = &rest[1..];
+        let end = body.find(quote)?;
+        let text = &body[..end];
+        if text.contains(['\\', '\n']) {
+            return None;
+        }
+        self.0 = &body[end + 1..];
+        Some(text)
+    }
+
+    /// An integer literal.
+    fn integer(&mut self) -> bool {
+        let rest = self.0.trim_start();
+        let end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        if end == 0 {
+            return false;
+        }
+        self.0 = &rest[end..];
+        true
+    }
 }
 
 /// `text` without the completion instruction it ends with, if it ends with
@@ -221,40 +309,40 @@ fn without_request(text: &str) -> Option<String> {
         .then(|| before.trim_end().to_owned())
 }
 
-/// `text` without its marker lines, if it has any (or, `streaming`, ends in
-/// what may be the start of one). Lines inside a code fence are the agent
-/// quoting, and stay.
+/// `text` without the marker line the ledger reads its end from
+/// ([`pane_agent::consumed_marker_line`], the same rule detection uses: so
+/// an earlier marker line, one in a code fence, or one the ledger ignores
+/// stays in view) -- and, `streaming`, without a last line that may still
+/// become a marker.
 pub(crate) fn without_markers(text: &str, streaming: Streaming) -> Option<String> {
+    let consumed = pane_agent::consumed_marker_line(text);
     let lines: Vec<&str> = text.split('\n').collect();
     let last = lines.len() - 1;
-    let mut fenced = false;
-    let mut kept: Vec<&str> = Vec::with_capacity(lines.len());
-    for (at, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            fenced = !fenced;
-        }
-        if fenced || !is_marker_line(line, streaming.0 && at == last) {
-            kept.push(line);
-        }
-    }
+    let fenced_at_last = lines[..last]
+        .iter()
+        .filter(|line| pane_agent::is_fence(line))
+        .count()
+        % 2
+        == 1;
+    let held = streaming.0 && !fenced_at_last && may_become_marker(lines[last]);
+    let kept: Vec<&str> = lines
+        .iter()
+        .enumerate()
+        .filter(|&(at, _)| Some(at) != consumed && !(held && at == last))
+        .map(|(_, line)| *line)
+        .collect();
     (kept.len() < lines.len()).then(|| kept.join("\n").trim_end().to_owned())
 }
 
-/// Whether `line` is a marker line -- or, as the last line still being
-/// `written`, could become one: a marker's start, or bare list or emphasis
-/// markup (not a `---` rule).
-fn is_marker_line(line: &str, written: bool) -> bool {
+/// Whether `line`, the last line still being written, may become a marker
+/// line: a marker or its start, or bare list or emphasis markup (not a
+/// `---` rule).
+fn may_become_marker(line: &str) -> bool {
     let body = line.trim_start_matches(|c: char| !c.is_alphanumeric());
-    let markers = [DONE_MARKER, BLOCKED_MARKER];
-    if markers.iter().any(|marker| body.starts_with(marker)) {
-        return true;
-    }
-    if !written {
-        return false;
-    }
     if !body.is_empty() {
-        return markers.iter().any(|marker| marker.starts_with(body));
+        return [DONE_MARKER, BLOCKED_MARKER]
+            .iter()
+            .any(|marker| body.starts_with(marker) || marker.starts_with(body));
     }
     let markup = line.trim();
     let mut chars = markup.chars();
@@ -288,12 +376,17 @@ mod tests {
         AgentPart::Text { text: text.into() }
     }
 
-    /// An OpenCode Code Mode `execute` call running `code`.
-    fn execute(code: &str) -> AgentPart {
+    /// An OpenCode tool call `name`, `status`, with `code` as its input.
+    fn tool(name: &str, status: &str, code: serde_json::Value) -> AgentPart {
         AgentPart::Tool(crate::agents::adapters::opencode::mapper::map_tool_call(
-            &serde_json::json!({ "type": "tool", "id": "c", "name": "execute",
-                "state": { "status": "completed", "input": { "code": code } } }),
+            &serde_json::json!({ "type": "tool", "id": "c", "name": name,
+                "state": { "status": status, "input": { "code": code } } }),
         ))
+    }
+
+    /// A finished Code Mode `execute` call running `code`.
+    fn execute(code: &str) -> AgentPart {
+        tool("execute", "completed", code.into())
     }
 
     #[test]
@@ -404,10 +497,33 @@ mod tests {
                 "the catalog notice",
                 System,
                 AgentPart::System {
-                    text: "The Code Mode tool catalog has changed. This catalog supersedes it."
+                    text: "The Code Mode tool catalog has changed. This catalog supersedes the previous \
+                           Code Mode tool catalog.\n\n# Code Mode\n\nUse the `execute` tool."
                         .into(),
                     description: None,
                 },
+                None,
+            ),
+            (
+                "a catalog notice with more after it",
+                System,
+                AgentPart::System {
+                    text: "The Code Mode tool catalog has changed.\nAlso: run the migration."
+                        .into(),
+                    description: None,
+                },
+                Some("The Code Mode tool catalog has changed.\nAlso: run the migration."),
+            ),
+            (
+                "a fleet lookup",
+                Assistant,
+                execute("return search({ limit: 3, query: \"fleet.self\" })"),
+                None,
+            ),
+            (
+                "an exec.run lookup",
+                Assistant,
+                execute("search({'query':'exec.run'});"),
                 None,
             ),
         ] {
@@ -417,10 +533,101 @@ mod tests {
                 AgentPart::Text { text }
                 | AgentPart::Synthetic { text, .. }
                 | AgentPart::System { text, .. } => text.as_str(),
-                AgentPart::Tool(call) => call.input["code"].as_str().unwrap(),
+                AgentPart::Tool(call) => call.input["code"].as_str().unwrap_or("<code>"),
                 _ => unreachable!(),
             });
             assert_eq!(got, served, "{name}");
+        }
+        // Real work shaped like a lookup is shown; a lookup still being
+        // written is held until its code is known.
+        for (name, part, hidden) in [
+            (
+                "chained",
+                execute("search({query:'muqun'}).then(r => tools.fleet.exec({}))"),
+                false,
+            ),
+            (
+                "and-ed",
+                execute("search({query:'muqun'}) && await tools.bash.run('x')"),
+                false,
+            ),
+            (
+                "work before the query",
+                execute("search({limit: await tools.x(), query:'muqun'})"),
+                false,
+            ),
+            (
+                "a template query",
+                execute("search({query: `muqun${await run()}`})"),
+                false,
+            ),
+            (
+                "a built query",
+                execute("search({query:'muqun'+await run()})"),
+                false,
+            ),
+            (
+                "an extra key",
+                execute("search({query:'muqun', all: true})"),
+                false,
+            ),
+            (
+                "search in a string",
+                execute("log('search({query:\\'muqun\\'})')"),
+                false,
+            ),
+            (
+                "another statement",
+                execute("search({query:'muqun'}); rm()"),
+                false,
+            ),
+            (
+                "return without semicolon",
+                execute("return search({query:'muqun tasks'})"),
+                true,
+            ),
+            (
+                "another tool",
+                tool("bash", "completed", "search({query:'muqun'})".into()),
+                false,
+            ),
+            (
+                "code not a string",
+                tool("execute", "completed", serde_json::json!(1)),
+                false,
+            ),
+            (
+                "a failed lookup",
+                tool("execute", "error", "search({query:'muqun'})".into()),
+                false,
+            ),
+            (
+                "still streaming",
+                tool("execute", "streaming", serde_json::Value::Null),
+                true,
+            ),
+        ] {
+            let mut items = vec![item(Assistant, part)];
+            hide_in_items(&mut items, Streaming(true));
+            assert_eq!(items.is_empty(), hidden, "{name}");
+        }
+        // Only the marker line the ledger reads goes; others stay in view.
+        for (written, served) in [
+            (
+                "MUQUN_TASK_BLOCKED: a\nok\nMUQUN_TASK_DONE: b",
+                "MUQUN_TASK_BLOCKED: a\nok",
+            ),
+            (
+                "I will end with\nMUQUN_TASK_DONE: <summary>",
+                "I will end with\nMUQUN_TASK_DONE: <summary>",
+            ),
+        ] {
+            let mut items = vec![item(Assistant, text(written))];
+            hide_in_items(&mut items, Streaming(false));
+            assert!(
+                matches!(&items[0].part, AgentPart::Text { text } if text == served),
+                "{written}"
+            );
         }
         // A last line that may become a marker is held back only while the
         // turn runs; a finished message keeps it.
