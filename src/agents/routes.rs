@@ -18,7 +18,7 @@ use super::message_images;
 use super::ports::mirror::SessionMirrorPort;
 use crate::platform::git;
 use crate::platform::vcs_routes::{self, VcsDiscardBody, VcsFileQuery};
-use crate::tasks::transcript::{hide_in_event, hide_in_items};
+use crate::tasks::transcript::{hide_in_event, hide_in_inbox, hide_in_items};
 use crate::terminal::routes::git_error;
 use crate::{
     api_error, content_envelope, require_device, still_paired, stream_event, validate_text,
@@ -730,6 +730,7 @@ async fn do_get_agent_session(
         .map_err(|e| api_error(StatusCode::NOT_FOUND, "session_not_found", &e.to_string()))?;
     let directory = snapshot.info.directory.clone();
     hide_in_items(&mut snapshot.timeline);
+    hide_in_inbox(&mut snapshot.inbox);
     message_images::attach_to_items(state, asid, directory.as_deref(), &mut snapshot.timeline)
         .await;
 
@@ -2509,7 +2510,7 @@ async fn get_agent_inbox(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     let manager = session_manager_or_err!(&state, &headers, &asid);
-    let items = manager
+    let mut items = manager
         .agent()
         .get_inbox(&asid)
         .await
@@ -2519,6 +2520,7 @@ async fn get_agent_inbox(
         .mirror()
         .set_inbox(&AgentSessionId(asid), items.clone())
         .await;
+    hide_in_inbox(&mut items);
     Ok(Json(content_envelope(json!({ "items": items }))))
 }
 

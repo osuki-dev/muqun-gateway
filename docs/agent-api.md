@@ -1373,6 +1373,10 @@ timeline, the event replay, the SSE stream and `/api/ws`:
   too, so the marker never shows mid-turn. `seq` keeps counting, so a client
   may see a gap where a row was left out.
 
+- An inbox item (`GET …/inbox`, the snapshot's `inbox`,
+  `agent.inbox.changed`) is cut the same way as a user row: OpenCode holds
+  the instruction there for a moment before the turn runs.
+
 The agent's own transcript, the mirror and the task follower keep the raw text
 (the marker is read from it); the task's `summary` is still the marker's line.
 

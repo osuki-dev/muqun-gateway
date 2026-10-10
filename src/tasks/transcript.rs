@@ -5,8 +5,8 @@
 //! marker line ([`pane_agent::DONE_MARKER`], [`pane_agent::BLOCKED_MARKER`]).
 //! Both are how the gateway learns the task's end; the reader only needs the
 //! goal and the answer. So on the way out (snapshot, timeline, event replay,
-//! the SSE stream and `/api/ws`, like `message_images`) a transcript is served
-//! with:
+//! the SSE stream and `/api/ws`, like `message_images`) a transcript -- and
+//! the session's inbox -- is served with:
 //!
 //! - a user text (or a synthetic message) that ends with a completion
 //!   instruction -- any wording this gateway has sent, found by its fixed
@@ -54,9 +54,28 @@ pub(crate) fn hide_in_items(items: &mut Vec<TimelineItem>) {
 
 /// `event` as the reader sees it.
 pub(crate) fn hide_in_event(event: &mut AgentDomainEvent) {
-    if let AgentDomainEvent::TimelineUpsert { items, .. } = event {
-        hide_in_items(items);
+    match event {
+        AgentDomainEvent::TimelineUpsert { items, .. } => hide_in_items(items),
+        AgentDomainEvent::InboxChanged { items, .. } => hide_in_inbox(items),
+        _ => {}
     }
+}
+
+/// A session's inbox (OpenCode's `{type, payload: {text}, ...}` items, the
+/// input admitted but not yet run) as the reader sees it: the instruction
+/// waits there beside the goal for a moment.
+pub(crate) fn hide_in_inbox(items: &mut Vec<serde_json::Value>) {
+    items.retain_mut(|item| {
+        let Some(text) = item.pointer_mut("/payload/text") else {
+            return true;
+        };
+        let Some(served) = text.as_str().and_then(without_request) else {
+            return true;
+        };
+        let keep = !served.trim().is_empty();
+        *text = served.into();
+        keep
+    });
 }
 
 /// `text` without the completion instruction it ends with, if it ends with
@@ -203,5 +222,14 @@ mod tests {
             });
             assert_eq!(got, served, "{name}");
         }
+        // The inbox holds the instruction for a moment before the turn runs.
+        let mut inbox = vec![
+            serde_json::json!({ "type": "synthetic", "payload": { "text": instruction_only } }),
+            serde_json::json!({ "type": "user", "payload": { "text": current } }),
+            serde_json::json!({ "type": "user", "payload": { "text": "and the tests" } }),
+        ];
+        hide_in_inbox(&mut inbox);
+        let texts: Vec<_> = inbox.iter().map(|item| &item["payload"]["text"]).collect();
+        assert_eq!(texts, ["fix the build", "and the tests"]);
     }
 }
