@@ -452,6 +452,46 @@ mod tests {
         }
     }
 
+    /// A second question after the first was answered is told too: what was
+    /// told is the child's move, not just its state.
+    #[tokio::test]
+    async fn a_second_question_is_told_again() {
+        let app = test_state("admin", vec![test_device("d1", "token")]);
+        let agent = FakeAgent::new("opencode").with_sessions(&[("ses_parent", 1)]);
+        let prompts = agent.prompts.clone();
+        app.agent_runtime.attach_for_test(agent.manager()).await;
+        let id = app
+            .tasks
+            .insert_for_test(&child(TaskState::Waiting, Some("which branch?")))
+            .await;
+        let parent = NoticeTarget::Session {
+            agent_id: "opencode".into(),
+            asid: "ses_parent".into(),
+        };
+        app.tasks.notify(&id, &parent).await;
+        deliver(&app).await;
+        for (to, summary) in [
+            (TaskState::Working, None),
+            (TaskState::Waiting, Some("which remote?")),
+        ] {
+            let change = crate::tasks::domain::TaskChange {
+                to,
+                source: "test".into(),
+                summary: summary.map(Into::into),
+                ..Default::default()
+            };
+            app.tasks.move_to(&id, change).await.unwrap();
+        }
+        deliver(&app).await;
+        assert_eq!(
+            prompts.lock().unwrap().clone(),
+            [
+                "mini needs an answer: which branch?",
+                "mini needs an answer: which remote?"
+            ]
+        );
+    }
+
     /// While a child works, its waiting parent's progress says so; once
     /// the child's end is told, the line goes.
     #[tokio::test]
@@ -486,6 +526,12 @@ mod tests {
             progress(app.clone(), parent.clone()).await.as_deref(),
             Some("Waiting for mini · under a minute")
         );
+        let done = crate::tasks::domain::TaskChange {
+            to: TaskState::Done,
+            source: "test".into(),
+            ..Default::default()
+        };
+        app.tasks.move_to(&id, done).await.unwrap();
         app.tasks.told(&id, TaskState::Done).await;
         assert_eq!(progress(app.clone(), parent).await, None);
     }

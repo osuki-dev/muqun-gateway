@@ -45,6 +45,8 @@ ALTER TABLE tasks ADD COLUMN requester_server_id TEXT;
 ", "
 CREATE TABLE task_notices(task_id TEXT PRIMARY KEY, target TEXT NOT NULL,
   told_state TEXT, delivered_to_parent_ms INTEGER);
+", "
+ALTER TABLE task_notices ADD COLUMN told_seq INTEGER;
 "],
 };
 
@@ -352,7 +354,7 @@ impl TaskStore for SqliteTaskStore {
             let mut stmt = c.prepare(&format!(
                 "SELECT {TASK_COLUMNS}, target FROM tasks JOIN task_notices ON task_id = id \
                  WHERE state IN ({reported}) AND updated_ms >= ?1 \
-                 AND (told_state IS NULL OR told_state != state) \
+                 AND (told_seq IS NULL OR told_seq != seq) \
                  ORDER BY updated_ms LIMIT ?2"
             ))?;
             let rows = stmt.query_map(params![since_ms as i64, limit as i64], |r| {
@@ -367,12 +369,12 @@ impl TaskStore for SqliteTaskStore {
         }))
     }
 
-    fn mark_told<'a>(&'a self, id: &'a TaskId, state: TaskState, at_ms: u64) -> TaskFuture<'a, ()> {
-        let id = id.0.clone();
+    fn mark_told<'a>(&'a self, task: &'a Task, at_ms: u64) -> TaskFuture<'a, ()> {
+        let (id, state, seq) = (task.id.0.clone(), task.state, task.seq);
         Box::pin(self.db.call(move |c| {
             c.execute(
-                "UPDATE task_notices SET told_state = ?2, delivered_to_parent_ms = ?3 WHERE task_id = ?1",
-                params![id, enum_text(&state)?, at_ms as i64],
+                "UPDATE task_notices SET told_state = ?2, told_seq = ?3, delivered_to_parent_ms = ?4 WHERE task_id = ?1",
+                params![id, enum_text(&state)?, seq as i64, at_ms as i64],
             )?;
             Ok(())
         }))

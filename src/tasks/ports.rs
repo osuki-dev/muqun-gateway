@@ -42,13 +42,9 @@ pub(crate) trait TaskStore: Send + Sync {
     ) -> TaskFuture<'a, Vec<(Task, NoticeTarget)>> {
         Box::pin(async { Ok(Vec::new()) })
     }
-    /// Task `id`'s `state` has been told (delivered, or returned by a wait).
-    fn mark_told<'a>(
-        &'a self,
-        _id: &'a TaskId,
-        _state: TaskState,
-        _at_ms: u64,
-    ) -> TaskFuture<'a, ()> {
+    /// `task` as it is now (its state, at its `seq`) has been told: a later
+    /// move into a reported state, even the same one again, is told anew.
+    fn mark_told<'a>(&'a self, _task: &'a Task, _at_ms: u64) -> TaskFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }
 }

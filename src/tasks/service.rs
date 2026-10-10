@@ -814,13 +814,17 @@ impl TaskService {
         if !REPORTED_STATES.contains(&state) {
             return;
         }
-        if let Err(error) = self.store.mark_told(id, state, now_ms()).await {
-            tracing::warn!(task = %id.0, %error, "could not record that the parent was told");
-        }
-        // Its parent waits no more: the progress line goes.
         let Ok(Some(child)) = self.store.get(id).await else {
             return;
         };
+        // Moved on since: that newer state is still to be told.
+        if child.state != state {
+            return;
+        }
+        if let Err(error) = self.store.mark_told(&child, now_ms()).await {
+            tracing::warn!(task = %id.0, %error, "could not record that the parent was told");
+        }
+        // Its parent waits no more: the progress line goes.
         let Some(parent) = child.parent else {
             return;
         };
