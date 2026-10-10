@@ -309,7 +309,12 @@ pub(crate) struct DelegateArgs {
 impl DelegateArgs {
     /// `machine_id`/`label`: this computer's, so `cwd` is checked here only
     /// when the task runs here; another computer checks its own (`~` too).
-    fn request(self, machine_id: &str, label: &str) -> Result<DelegateRequest, CallToolResult> {
+    fn request(
+        self,
+        machine_id: &str,
+        label: &str,
+        peers: &[String],
+    ) -> Result<DelegateRequest, CallToolResult> {
         if !valid_goal(&self.goal) {
             return Err(invalid("goal must be non-empty and at most 32 KiB"));
         }
@@ -319,7 +324,7 @@ impl DelegateArgs {
                 "agent_id, mode, model and variant must be non-empty and at most 256 bytes",
             ));
         }
-        let here = is_self(self.machine.as_deref(), machine_id, label);
+        let here = is_self(self.machine.as_deref(), machine_id, label, peers);
         let cwd = match self.cwd {
             Some(cwd) if here => Some(directory(&cwd)?.to_string_lossy().into_owned()),
             Some(cwd) if !cwd.is_empty() && cwd.len() <= 4096 => Some(cwd),
@@ -514,7 +519,8 @@ impl MuqunMcp {
     ) -> Result<CallToolResult, ErrorData> {
         let goal = args.goal.clone();
         let config = &self.state.config;
-        let request = match args.request(&config.server_id, &config.label) {
+        let peers = self.state.peers.names();
+        let request = match args.request(&config.server_id, &config.label, &peers) {
             Ok(request) => request,
             Err(refused) => return Ok(refused),
         };
@@ -771,7 +777,6 @@ mod tests {
 
     const ASID: &str = "opencode_new";
 
-
     fn session(pane_id: &str) -> AssistantSession {
         AssistantSession {
             token_id: format!("tok-{pane_id}"),
@@ -1002,7 +1007,7 @@ mod tests {
             variant: None,
             machine: None,
         }
-        .request("srv-coding", "coding")
+        .request("srv-coding", "coding", &[])
         .unwrap();
         let parent = state.tasks.delegate(&state, device, goal).await.unwrap();
 
@@ -1348,7 +1353,7 @@ mod tests {
             ),
         ] {
             let parsed: DelegateArgs = serde_json::from_value(args.clone()).unwrap();
-            let request = parsed.request("srv-coding", "coding").ok();
+            let request = parsed.request("srv-coding", "coding", &[]).ok();
             assert_eq!(
                 request.map(|request| request.variant),
                 variant.map(|variant| variant.map(str::to_owned)),

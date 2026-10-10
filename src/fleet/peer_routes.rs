@@ -54,6 +54,19 @@ fn store_failed(error: anyhow::Error) -> (StatusCode, Json<Value>) {
     )
 }
 
+/// `name` is this computer's own: a peer called so would make `machine`
+/// ambiguous to the agent, and the phone shows both under one name.
+fn own_name(state: &AppState, name: &str) -> ApiResult<()> {
+    if super::peers::same_name(name.trim(), &state.config.label) {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "name_conflict",
+            "that is this computer's own name; give the other computer another one",
+        ));
+    }
+    Ok(())
+}
+
 fn peer_not_found() -> (StatusCode, Json<Value>) {
     api_error(StatusCode::NOT_FOUND, "peer_not_found", "peer not found")
 }
@@ -124,6 +137,8 @@ async fn link(
     {
         return Err(invalid_request());
     }
+    // Before the claim: the code stays good for a link under another name.
+    own_name(&state, &body.name)?;
     let request = LinkRequest {
         url: url.to_owned(),
         name: body.name,
@@ -184,6 +199,7 @@ async fn rename(
 ) -> ApiResult<Json<Value>> {
     owner(&state, &headers)?;
     let Json(body) = body.map_err(|_| invalid_request())?;
+    own_name(&state, &body.name)?;
     let peer = state
         .peers
         .rename(&peer_id, &body.name)
@@ -443,6 +459,19 @@ mod tests {
                 .await
                 .map(|peer| peer.server_id),
             Some("srv-mini".to_owned())
+        );
+        // Nor this computer's own name: the agent could not tell them apart.
+        let (status, refused) = call(
+            &coding,
+            "PATCH",
+            &format!("/api/peers/{mini_id}"),
+            "token",
+            Some(json!({ "name": "CODING" })),
+        )
+        .await;
+        assert_eq!(
+            (status, &refused["error"]["code"]),
+            (StatusCode::CONFLICT, &json!("name_conflict"))
         );
         // `self` always means the computer asked, so no peer may take it.
         let (status, _) = call(

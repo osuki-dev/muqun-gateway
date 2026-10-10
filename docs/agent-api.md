@@ -2073,8 +2073,8 @@ on all of these:
 |---|---|---|
 | `POST /api/pair/pending` (on the computer to be linked) | `{device_name, kind?: "app" \| "gateway", server_id?}` | `{request_id, code, expires_in_ms}` for `POST /api/peers` on the other side; `409 pairing_in_progress` while another code is pending, `429 pairing_rate_limited`. |
 | `GET /api/peers` | none | `{accept_delegations, peers: [{peer_id, server_id, name, url, reachable, last_seen_ms}]}`; a peer not heard from for a minute is pinged first (3 s), and one that no longer knows this gateway is forgotten and left out. |
-| `POST /api/peers` | `{url, name, request_id, code}` (`name` may not be `self`, in any case) | The new peer. `502 peer_unreachable`; `409 peer_refused` (`error.reason`: `pairing_code_expired`, `invalid_pairing_code`, `pairing_not_requested`, `invalid_token` or `refused`), `peer_conflict`, `peer_name_taken`; `400 peer_is_self`, `invalid_request`. |
-| `PATCH /api/peers/{peer_id}` | `{name}` (not `self`) | The renamed peer; `400 invalid_request`, `409 peer_name_taken`, `404 peer_not_found`. |
+| `POST /api/peers` | `{url, name, request_id, code}` (`name` may not be `self`, in any case) | The new peer. `502 peer_unreachable`; `409 name_conflict` (`name` is this computer's own label, any case; checked before the claim, so the code stays good), `409 peer_refused` (`error.reason`: `pairing_code_expired`, `invalid_pairing_code`, `pairing_not_requested`, `invalid_token` or `refused`), `peer_conflict`, `peer_name_taken`; `400 peer_is_self`, `invalid_request`. |
+| `PATCH /api/peers/{peer_id}` | `{name}` (not `self`) | The renamed peer; `400 invalid_request`, `409 peer_name_taken`, `409 name_conflict` (this computer's own label), `404 peer_not_found`. |
 | `DELETE /api/peers/{peer_id}` | none | `{remote_revoked, counterpart_found, counterpart_revoked}`; this gateway forgets the peer, asks it to revoke this gateway's device, and revokes the peer's own login here (below). `404 peer_not_found`. |
 | `PUT /api/fleet/settings` | `{accept_delegations}` | `{accept_delegations}`, written to `config.json` (`fleet.accept_delegations`). |
 
@@ -2090,7 +2090,9 @@ once, without `mentions`.
 checks it, so it never replaces or evicts a device; its only use is that
 `DELETE /api/peers/{id}` also revokes the gateway devices here whose
 `server_id` is that peer's (its login into this computer), so one call
-unlinks both directions. A peer forgotten after a `401` keeps its login here.
+unlinks both directions. A peer forgotten after a `401`/`403` keeps its login
+here; its open mirrors fail (`peer_unlinked: <name> no longer accepts this
+computer`), as they do on `DELETE /api/peers/{id}`.
 `DELETE /api/peers/{id}` (the admin token or an app device only) answers
 `{"remote_revoked", "counterpart_found", "counterpart_revoked"}`: whether the
 peer confirmed it revoked this gateway's token, whether a login of the peer's

@@ -839,6 +839,7 @@ impl TaskService {
             request.machine.as_deref(),
             &self.machine_id,
             &state.config.label,
+            &state.peers.names(),
         ) {
             let wanted = request.machine.clone().unwrap_or_default();
             let Some(peer) = state.peers.resolve(&wanted).await else {

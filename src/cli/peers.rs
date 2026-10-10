@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 
 use super::local_api::admin_request_with_timeouts;
 use crate::fleet::peer_client;
+use crate::fleet::peers::same_name;
 
 /// Linking claims a code over there (Argon2id on both sides) and makes a
 /// first call; give it more than a local request's two seconds.
@@ -70,6 +71,10 @@ pub(crate) async fn run(command: PeersCommand) -> anyhow::Result<()> {
                 .read_line(&mut code)
                 .context("failed to read the code")?;
             let name = name.unwrap_or(label);
+            anyhow::ensure!(
+                !same_name(&name, &config.label),
+                "{name} is this computer's own name too; link again with --name <another name>"
+            );
             let body = json!({
                 "url": url,
                 "name": name,
@@ -112,7 +117,7 @@ pub(crate) async fn run(command: PeersCommand) -> anyhow::Result<()> {
                 .find(|peer| {
                     peer["name"]
                         .as_str()
-                        .is_some_and(|known| known.eq_ignore_ascii_case(name.trim()))
+                        .is_some_and(|known| same_name(known, &name))
                 })
                 .with_context(|| format!("no linked computer is called {name}"))?;
             let peer_id = peer["peer_id"].as_str().unwrap_or_default();

@@ -1155,7 +1155,7 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
                     })),
                     "responses": with_errors(json_ok("The new peer", peer_view()), &[
                         ("400", "invalid_request; peer_is_self: the url is this gateway"),
-                        ("409", "peer_refused: the other gateway refused the code; error.reason is pairing_code_expired, invalid_pairing_code, pairing_not_requested, invalid_token or refused. peer_name_taken: another peer has that name. peer_conflict: a peer giving the same id is already linked (remove it first)"),
+                        ("409", "name_conflict: name is this computer's own (checked before the claim, so the code stays good). peer_refused: the other gateway refused the code; error.reason is pairing_code_expired, invalid_pairing_code, pairing_not_requested, invalid_token or refused. peer_name_taken: another peer has that name. peer_conflict: a peer giving the same id is already linked (remove it first)"),
                         ("502", "peer_unreachable: nothing answered at url"),
                     ])
                 }

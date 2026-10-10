@@ -334,12 +334,21 @@ pub(crate) struct MachineSummary {
 
 /// Whether `machine` names this computer: unnamed, `"self"` (any case), its
 /// id, or its own label (any case; the agent knows it by the name the phone
-/// shows).
-pub(crate) fn is_self(machine: Option<&str>, machine_id: &str, label: &str) -> bool {
+/// shows) unless a linked computer of `peers` is called that: a peer's name
+/// wins, and `self` stays the explicit way to say this one.
+pub(crate) fn is_self(
+    machine: Option<&str>,
+    machine_id: &str,
+    label: &str,
+    peers: &[String],
+) -> bool {
     machine.is_none_or(|machine| {
         super::peers::reserved_name(machine)
             || machine == machine_id
-            || super::peers::same_name(machine, label)
+            || (super::peers::same_name(machine, label)
+                && !peers
+                    .iter()
+                    .any(|peer| super::peers::same_name(peer, machine)))
     })
 }
 
@@ -451,7 +460,8 @@ impl FleetService {
         state: &AppState,
         machine: Option<&str>,
     ) -> Result<Value, DescribeError> {
-        if is_self(machine, &state.config.server_id, &state.config.label) {
+        let (id, label) = (&state.config.server_id, &state.config.label);
+        if is_self(machine, id, label, &state.peers.names()) {
             let (manifest, peers) = tokio::join!(self.manifest(state), heard(state));
             let mut answer = json!(manifest.compact());
             answer["peers"] = json!(peers.iter().map(Heard::entry).collect::<Vec<_>>());
@@ -508,15 +518,23 @@ mod tests {
 
     #[test]
     fn only_this_computer_is_self() {
-        for (machine, expected) in [
-            (None, true),
-            (Some("self"), true),
-            (Some("SELF"), true),
-            (Some("srv-1"), true),
-            (Some("CODING"), true),
-            (Some("mini"), false),
+        for (machine, peers, expected) in [
+            (None, &[][..], true),
+            (Some("self"), &[], true),
+            (Some("SELF"), &["self-ish"], true),
+            (Some("srv-1"), &[], true),
+            (Some("CODING"), &[], true),
+            (Some("mini"), &["mini"], false),
+            // A linked computer that shares this one's label wins it.
+            (Some("Coding"), &["coding"], false),
+            (Some("self"), &["coding"], true),
         ] {
-            assert_eq!(is_self(machine, "srv-1", "coding"), expected, "{machine:?}");
+            let peers: Vec<String> = peers.iter().map(|name| name.to_string()).collect();
+            assert_eq!(
+                is_self(machine, "srv-1", "coding", &peers),
+                expected,
+                "{machine:?}"
+            );
         }
     }
 
