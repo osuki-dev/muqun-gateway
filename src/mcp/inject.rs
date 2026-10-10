@@ -30,7 +30,7 @@ use crate::mcp::tokens::{AssistantTokenStore, TokenBinding, NO_EXPIRY};
 
 /// The label of the tokens minted for OpenCode's runtime registration; an
 /// earlier one is revoked when a new one is in use.
-const RUNTIME_LABEL: &str = "opencode (started tasks)";
+pub(crate) const RUNTIME_LABEL: &str = "opencode (started tasks)";
 
 /// Whether agents the gateway starts get the muqun server: MCP on, the
 /// switch on, and `/mcp` reachable on this computer's loopback.

@@ -367,6 +367,9 @@ pub(crate) struct MuqunMcp {
     state: AppState,
     /// Who is calling; work is attributed to it.
     session: AssistantSession,
+    /// Whether the caller was started for a task ([`started_for_task`]):
+    /// its instructions then say so plainly.
+    in_task: bool,
     tool_router: ToolRouter<Self>,
 }
 
@@ -376,8 +379,15 @@ impl MuqunMcp {
         Self {
             state,
             session,
+            in_task: false,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// The handler for a caller that [`started_for_task`] says is a task.
+    pub(crate) fn in_task(mut self, in_task: bool) -> Self {
+        self.in_task = in_task;
+        self
     }
 
     fn by(&self) -> TaskPrincipal {
@@ -485,7 +495,7 @@ impl MuqunMcp {
 
     #[tool(
         name = "tasks.complete",
-        description = "If this session was started as a Muqun task, call this when that task is finished, with a one-line summary (outcome done, the default) -- or when you stop because you need the user, with outcome blocked and the reason (a missing file, an unclear request, a permission you cannot get). Only the session (or terminal pane) working on the task can complete it; stopping or going idle does not, and a blocked task stays open until you call this again with done."
+        description = "Call this when the task you were given is finished, with a one-line summary (outcome done, the default) -- or when you stop because you need the user, with outcome blocked and the reason (a missing file, an unclear request, a permission you cannot get). Only the session (or terminal pane) working on the task can complete it; stopping or going idle does not, and a blocked task stays open until you call this again with done. If it answers task_not_found, you are not working on a Muqun task: do not call it again."
     )]
     async fn tasks_complete(
         &self,
@@ -537,17 +547,45 @@ impl ServerHandler for MuqunMcp {
                 "muqun-gateway",
                 env!("CARGO_PKG_VERSION"),
             ))
-            .with_instructions(
-                "Muqun Gateway on this computer. fleet.describe says what it has, exec.run \
+            .with_instructions(instructions(self.in_task))
+    }
+}
+
+/// What the server tells a caller about itself and about finishing a task:
+/// plainly to one started for a task (`in_task`), conditionally to anyone
+/// else, who may never have been given one.
+pub(crate) fn instructions(in_task: bool) -> String {
+    let about = "Muqun Gateway on this computer. fleet.describe says what it has, exec.run \
                  runs short commands, tasks.delegate + tasks.wait hand work to a coding agent \
-                 (waits are capped at 45 s; call tasks.wait again while it says working). \
-                 If this session was started as a Muqun task: when the whole task is \
-                 finished, call tasks.complete with a one-line summary; when you stop \
-                 because you need the user, call it with outcome \"blocked\" and the reason; \
-                 if you cannot call it, end with the line MUQUN_TASK_DONE: <summary> (or \
-                 MUQUN_TASK_BLOCKED: <reason>). If tasks.complete answers task_not_found, \
-                 this session is not a Muqun task: do not call it again and print no marker.",
-            )
+                 (waits are capped at 45 s; call tasks.wait again while it says working).";
+    let finish = "call tasks.complete with a one-line summary; when you stop because you \
+                  need the user, call it with outcome \"blocked\" and the reason; if you \
+                  cannot call it, end with the line MUQUN_TASK_DONE: <summary> (or \
+                  MUQUN_TASK_BLOCKED: <reason>). If tasks.complete answers task_not_found, \
+                  this session is not a Muqun task: do not call it again and print no marker.";
+    if in_task {
+        format!(
+            "{about} Muqun started you to work on a task: its goal is your first prompt. \
+             When that whole task is finished, {finish}"
+        )
+    } else {
+        format!("{about} If this session was started as a Muqun task: when the whole task is finished, {finish}")
+    }
+}
+
+/// Whether the caller of `/mcp` was started for a task: a pane-bound token
+/// whose pane holds an open task, or the token the gateway handed a
+/// session agent's service for the tasks it delegates there
+/// ([`super::inject`]).
+pub(crate) async fn started_for_task(state: &AppState, session: &AssistantSession) -> bool {
+    match &session.binding {
+        crate::mcp::tokens::TokenBinding::Pane {
+            session_id,
+            pane_id,
+        } => state.tasks.open_task_in_pane(session_id, pane_id).await,
+        crate::mcp::tokens::TokenBinding::Agent { .. } => {
+            session.label == super::inject::RUNTIME_LABEL
+        }
     }
 }
 
@@ -559,6 +597,26 @@ mod tests {
     use crate::test_support::{output_state, test_state, FakeAgent, FakeHerdr};
 
     const ASID: &str = "opencode_new";
+
+    #[test]
+    fn a_caller_started_for_a_task_is_told_plainly_others_conditionally() {
+        for (in_task, says, not) in [
+            (
+                true,
+                "Muqun started you to work on a task",
+                "If this session was started",
+            ),
+            (
+                false,
+                "If this session was started as a Muqun task",
+                "Muqun started you",
+            ),
+        ] {
+            let text = instructions(in_task);
+            assert!(text.contains(says) && !text.contains(not), "{in_task}");
+            assert!(text.contains("task_not_found"));
+        }
+    }
 
     fn session(pane_id: &str) -> AssistantSession {
         AssistantSession {

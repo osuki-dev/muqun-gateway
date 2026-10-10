@@ -514,12 +514,19 @@ signals:
 
 Every delegation is given its goal alone. How to say it ended is
 declaration-level knowledge, never conversation text: the MCP server's
-`initialize` answer carries `instructions` ("You may be running inside a
-Muqun task: when the whole task you were given is finished, call
-tasks.complete with a one-line summary; when you stop because you need the
-user, call it with outcome "blocked" and the reason. If you cannot call it,
-end with the line MUQUN_TASK_DONE: <summary> (or MUQUN_TASK_BLOCKED:
-<reason>)."), and the `tasks.complete` description says the same. An agent
+`initialize` answer carries `instructions`, written for the caller: to one
+started for a task -- a pane-bound token whose pane holds an open task, or
+the token the gateway hands a session agent's service (see
+[Host setup](#host-setup)) -- "Muqun started you to work on a task: its goal
+is your first prompt. When that whole task is finished, call tasks.complete
+with a one-line summary; when you stop because you need the user, call it
+with outcome "blocked" and the reason; if you cannot call it, end with the
+line MUQUN_TASK_DONE: <summary> (or MUQUN_TASK_BLOCKED: <reason>). If
+tasks.complete answers task_not_found, this session is not a Muqun task: do
+not call it again and print no marker."; to anyone else the same, opening
+"If this session was started as a Muqun task". The `tasks.complete`
+description says when to call it, and that `task_not_found` means not to
+call it again. An agent
 without the muqun tools (T3 Code, DeepSeek) is told nothing: its task ends
 `idle_unconfirmed` for the device to confirm, unless it prints a marker of
 its own accord. The machines a task mentions will not be written into its

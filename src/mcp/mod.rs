@@ -86,8 +86,9 @@ async fn serve(
             Ok(session) => session,
             Err(refusal) => return refusal.into_response(),
         };
+    let in_task = tools::started_for_task(&state, &session).await;
     let service = StreamableHttpService::new(
-        move || Ok(tools::MuqunMcp::new(state.clone(), session.clone())),
+        move || Ok(tools::MuqunMcp::new(state.clone(), session.clone()).in_task(in_task)),
         Arc::new(NeverSessionManager::default()),
         config(),
     );

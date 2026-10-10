@@ -659,6 +659,21 @@ impl TaskService {
         self.live.lock().is_ok_and(|live| live.busy.contains(asid))
     }
 
+    /// Whether an open task is bound to pane `pane_id` of terminal session
+    /// `session_id`: its agent was started for that task.
+    pub(crate) async fn open_task_in_pane(&self, session_id: &str, pane_id: &str) -> bool {
+        let filter = TaskFilter {
+            pane: Some((session_id.to_owned(), pane_id.to_owned())),
+            states: Some(OPEN_STATES.to_vec()),
+            limit: 1,
+            ..Default::default()
+        };
+        self.store
+            .list(filter)
+            .await
+            .is_ok_and(|tasks| !tasks.is_empty())
+    }
+
     /// Whether any task, open or ended, is bound to agent session `asid`:
     /// its transcript is served without the task plumbing
     /// ([`super::transcript`]). Read from the store once per session, then
