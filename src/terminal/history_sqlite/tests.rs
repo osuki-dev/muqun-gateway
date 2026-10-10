@@ -1185,7 +1185,13 @@ async fn an_idle_fold_does_not_wake_the_writer() {
     let count = || checkpoints.wakes.load(Ordering::Relaxed);
     tokio::time::sleep(Duration::from_millis(300)).await;
     let settled = count();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // The approval watcher's listing, unchanged, every 1.5 s in production.
+    for _ in 0..5 {
+        fold.lock()
+            .unwrap()
+            .observe_native_listing("default", &[pane(Some("A"))]);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     assert_eq!(count(), settled, "no wake while nothing changes");
     fold.lock().unwrap().record_frame(
         "default",

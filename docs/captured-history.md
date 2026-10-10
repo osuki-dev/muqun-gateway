@@ -286,8 +286,10 @@ encryption is separate and does not cover the database.
 
 The shared store's single worker thread owns the one SQLite connection; no
 SQLite operation runs on the Tokio executor, and no fold mutex is held while a
-job waits for that worker. A Tokio task sleeps until the fold changes (every
-change signals it) or pruning is due, so an idle Gateway does not wake it. It
+job waits for that worker. A Tokio task sleeps until the fold changes (a
+recorded frame, or a listing that changed a projection's identity, policy,
+fences or which buffers exist; the approval watcher's unchanged listing every
+1.5 s is not one) or pruning is due, so an idle Gateway does not wake it. It
 then submits one write pass to the worker, and while a pass leaves work behind
 (a debounced scope waiting, more projections to write) it follows up every
 100 ms (a debounced pass only checks metadata and copies no rows); at most 16

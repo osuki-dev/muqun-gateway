@@ -1089,7 +1089,11 @@ impl ScrollbackStore {
     /// is the question this store actually needs answered and the one
     /// `alternate_on` answers directly.
     pub fn observe(&mut self, session_id: &str, value: &Value) {
-        self.touch();
+        self.touching_if_changed(|store| store.observe_panes(session_id, value));
+    }
+
+    /// [`Self::observe`] without telling the checkpoint writer.
+    fn observe_panes(&mut self, session_id: &str, value: &Value) {
         let mut passed_through = Vec::new();
         visit_panes(value, &mut |pane_id, pane| {
             let key = pane_key(session_id, pane_id);
@@ -1171,9 +1175,14 @@ impl ScrollbackStore {
     /// where an absent pane means nothing. A complete listing is the one
     /// caller that can tell "gone" from "not mentioned", so it is the one that
     /// prunes. The approval watcher calls it every 1500ms with exactly that.
+    #[cfg(test)]
     pub fn observe_listing(&mut self, session_id: &str, value: &Value) {
-        self.touch();
-        self.observe(session_id, value);
+        self.touching_if_changed(|store| store.observe_listed(session_id, value));
+    }
+
+    /// [`Self::observe_listing`] without telling the checkpoint writer.
+    fn observe_listed(&mut self, session_id: &str, value: &Value) {
+        self.observe_panes(session_id, value);
         let mut live = HashSet::new();
         visit_panes(value, &mut |pane_id, _| {
             live.insert(pane_key(session_id, pane_id));
@@ -1722,7 +1731,11 @@ impl ScrollbackStore {
     /// Called with neutral native entities before compatibility serialization.
     /// No private process identity is ever inserted into a public JSON envelope.
     pub(crate) fn observe_native_listing(&mut self, session: &str, panes: &[super::backend::Pane]) {
-        self.touch();
+        self.touching_if_changed(|store| store.observe_native(session, panes));
+    }
+
+    /// [`Self::observe_native_listing`] without telling the checkpoint writer.
+    fn observe_native(&mut self, session: &str, panes: &[super::backend::Pane]) {
         // An existing unknown observation is not evidence for the newly verified
         // process. Discard its rows and outstanding fences in either direction.
         // A first-ever verified observation has no prior capture to quarantine
@@ -1737,7 +1750,7 @@ impl ScrollbackStore {
                 self.forget_pane(session, pane.id.as_str());
             }
         }
-        self.observe_listing(session, &super::backend::compat::pane_list(panes.to_vec()));
+        self.observe_listed(session, &super::backend::compat::pane_list(panes.to_vec()));
         for pane in panes {
             let key = pane_key(session, pane.id.as_str());
             if let Some(observed) = self.identities.get_mut(&key) {
@@ -1788,6 +1801,27 @@ impl ScrollbackStore {
     fn touch(&mut self) {
         self.version += 1;
         self.changed.notify_one();
+    }
+
+    /// Run `observe`, and tell the checkpoint writer only when what it reads
+    /// of the fold moved: a listing that changed nothing -- the approval
+    /// watcher sends one every 1.5 s per session -- leaves it asleep.
+    fn touching_if_changed(&mut self, observe: impl FnOnce(&mut Self)) {
+        let before = self.writer_view();
+        observe(self);
+        if self.writer_view() != before {
+            self.touch();
+        }
+    }
+
+    /// What the checkpoint writer reads of the fold: every projection's
+    /// stamp, in a fixed order, and how many buffers and checkpoints exist.
+    fn writer_view(&self) -> (Vec<ProjectionStamp>, usize) {
+        let mut stamps = self.projection_stamps();
+        stamps.sort_by(|a, b| {
+            (&a.session, &a.pane, &a.format).cmp(&(&b.session, &b.pane, &b.format))
+        });
+        (stamps, self.buffers.len() + self.checkpoints.len())
     }
 
     pub(crate) fn projection_stamps(&self) -> Vec<ProjectionStamp> {
