@@ -51,7 +51,70 @@ pub(crate) fn loopback_warning(listen: &str) -> Option<String> {
     })
 }
 
+/// The `/mcp` URL this gateway's own loopback listener serves, set once at
+/// startup when the configured address is not loopback ([`bind_loopback`]).
+static LOOPBACK_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Where the running gateway's loopback MCP address is recorded, for the
+/// CLI (another process) and `manage`.
+pub(crate) fn endpoint_file() -> anyhow::Result<std::path::PathBuf> {
+    Ok(crate::platform::store::state_dir()?.join("mcp-endpoint"))
+}
+
+/// A gateway that listens on one non-loopback address (a tailnet IP, say)
+/// cannot be called on `/mcp` by its own agents, which `/mcp` requires to
+/// be loopback callers: it also listens on `127.0.0.1` (and `::1`) for
+/// `/mcp` alone -- the configured port when free, else any. The URL is what
+/// agents are handed from then on ([`local_url`]) and is recorded in
+/// [`endpoint_file`]. `None`: the configured address already serves loopback.
+pub(crate) async fn bind_loopback(
+    listen: &str,
+) -> anyhow::Result<Option<Vec<tokio::net::TcpListener>>> {
+    if loopback_warning(listen).is_none() {
+        return Ok(None);
+    }
+    let port = listen.parse::<SocketAddr>().map_or(0, |addr| addr.port());
+    let v4 = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+        Ok(listener) => listener,
+        Err(_) => tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?,
+    };
+    let port = v4.local_addr()?.port();
+    let mut listeners = vec![v4];
+    // Best effort: a machine without IPv6 loopback still has 127.0.0.1.
+    if let Ok(v6) = tokio::net::TcpListener::bind(("::1", port)).await {
+        listeners.push(v6);
+    }
+    Ok(Some(listeners))
+}
+
+/// Record `url` as this process's loopback `/mcp` address.
+pub(crate) fn use_loopback_url(url: String) {
+    let _ = LOOPBACK_URL.set(url);
+}
+
+/// The address `/mcp` is served at on this computer's loopback, from the
+/// running gateway's record when it has one (see [`bind_loopback`]), else
+/// from the listen address ([`local_url`]).
+pub(crate) fn recorded_url(listen: &str) -> String {
+    endpoint_file()
+        .ok()
+        .and_then(|file| std::fs::read_to_string(file).ok())
+        .map(|url| url.trim().to_owned())
+        .filter(|url| url.starts_with("http://127.0.0.1:"))
+        .unwrap_or_else(|| local_url(listen))
+}
+
+/// `/mcp` alone, for the loopback listener: none of the device routes.
+pub(crate) fn loopback_router(state: AppState) -> Router {
+    mount(Router::new())
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+        .with_state(state)
+}
+
 pub(crate) fn local_url(listen: &str) -> String {
+    if let Some(url) = LOOPBACK_URL.get() {
+        return url.clone();
+    }
     let addr = match listen.parse::<SocketAddr>() {
         Ok(addr) if !addr.ip().is_unspecified() => addr,
         Ok(addr) => SocketAddr::from(([127, 0, 0, 1], addr.port())),
@@ -368,6 +431,50 @@ mod tests {
             StatusCode::UNAUTHORIZED,
             "token_expired",
         );
+    }
+
+    /// A gateway that listens on a tailnet address only still serves its own
+    /// agents' `/mcp` -- on a loopback listener of its own; a loopback or
+    /// wildcard gateway needs none. (The public address keeps refusing it:
+    /// `a_proxied_or_remote_request_is_refused_even_with_a_live_token`.)
+    #[tokio::test]
+    async fn a_tailnet_only_gateway_serves_mcp_on_its_own_loopback() {
+        let state = crate::test_state("admin", Vec::new());
+        let token = issue(&state).await;
+        let listeners = bind_loopback("100.64.0.7:0").await.unwrap().unwrap();
+        let address = listeners[0].local_addr().unwrap();
+        assert!(address.ip().is_loopback());
+        for listener in listeners {
+            let app = loopback_router(state.clone());
+            tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .await
+            });
+        }
+        let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientInfo": { "name": "test", "version": "0" },
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }
+        } });
+        let answer = reqwest::Client::new()
+            .post(format!("http://{address}{MCP_PATH}"))
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "tools/list")
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(answer.status(), 200, "{}", answer.text().await.unwrap());
+        for served in ["127.0.0.1:0", "0.0.0.0:0", "[::]:0"] {
+            assert!(bind_loopback(served).await.unwrap().is_none(), "{served}");
+        }
     }
 
     #[test]

@@ -48,11 +48,13 @@ pub(crate) const SESSION_INSTRUCTION_KEY: &str = "muqun-task";
 pub(crate) const RUNTIME_LABEL: &str = "opencode (started tasks)";
 
 /// Whether agents the gateway starts get the muqun server: MCP on, the
-/// switch on, and `/mcp` reachable on this computer's loopback.
+/// switch on, and `/mcp` reachable on this computer's loopback -- the listen
+/// address itself, or the loopback listener started beside it.
 pub(crate) fn enabled(config: &crate::Config) -> bool {
     config.mcp.enabled
         && config.mcp.inject_into_agents
-        && super::loopback_warning(&config.listen).is_none()
+        && (super::loopback_warning(&config.listen).is_none()
+            || super::local_url(&config.listen).starts_with("http://127.0.0.1:"))
 }
 
 /// The launch arguments that give the `kind` agent the server at `url`,

@@ -64,6 +64,35 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
 
     // Bind successfully before starting anything on the user's behalf.
     let listener = gateway_listener::bind(addr).await?;
+    // A non-loopback listen address: `/mcp` gets its own loopback listener,
+    // whose URL every agent registration uses from here on.
+    let mcp_listeners = if config.mcp.enabled {
+        crate::mcp::bind_loopback(&config.listen).await?
+    } else {
+        None
+    };
+    if let Ok(file) = crate::mcp::endpoint_file() {
+        match mcp_listeners
+            .as_ref()
+            .and_then(|listeners| listeners.first())
+        {
+            Some(listener) => {
+                let url = format!(
+                    "http://127.0.0.1:{}{}",
+                    listener.local_addr()?.port(),
+                    crate::mcp::MCP_PATH
+                );
+                if let Err(error) = std::fs::write(&file, &url) {
+                    tracing::warn!(%error, "could not record the loopback MCP address");
+                }
+                tracing::info!("MCP for this computer's agents on {url}");
+                crate::mcp::use_loopback_url(url);
+            }
+            None => {
+                let _ = std::fs::remove_file(&file);
+            }
+        }
+    }
     // One background attempt per opted-in backend; no restart/logging loop.
     backend_startup::spawn(&config);
 
@@ -138,14 +167,24 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     // After the token store exists, so the first OpenCode start already gets
     // its MCP environment.
     if state.config.mcp.enabled {
-        match crate::mcp::loopback_warning(&state.config.listen) {
-            // An unusable URL is not handed to OpenCode.
-            Some(warning) => tracing::warn!("{warning}"),
-            None => state.agent_runtime.enable_mcp(
-                state.mcp_tokens.clone(),
-                crate::mcp::local_url(&state.config.listen),
-            ),
-        }
+        // The listen address, or the loopback listener bound beside it.
+        state.agent_runtime.enable_mcp(
+            state.mcp_tokens.clone(),
+            crate::mcp::local_url(&state.config.listen),
+        );
+    }
+    for listener in mcp_listeners.into_iter().flatten() {
+        let app = crate::mcp::loopback_router(state.clone());
+        tokio::spawn(async move {
+            if let Err(error) = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            {
+                tracing::error!(%error, "the loopback MCP listener stopped");
+            }
+        });
     }
     tracing::info!(
         "agents started from a phone or an MCP caller launch with: {}",

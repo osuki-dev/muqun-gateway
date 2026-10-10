@@ -2276,6 +2276,15 @@ fn manage_lines(
             panel(&mut body, "Runtime", rows, content, framed);
             let mut rows = wrapped_rows("Address", &config.public_url, inner);
             rows.push(ScreenLine::plain(format!("Listener: {}", config.listen)));
+            if config.mcp.enabled {
+                // Where this computer's agents reach /mcp: the loopback
+                // listener a non-loopback gateway runs beside its own.
+                let url = crate::mcp::recorded_url(&config.listen);
+                let at = url
+                    .trim_start_matches("http://")
+                    .trim_end_matches(crate::mcp::MCP_PATH);
+                rows.push(ScreenLine::plain(format!("MCP: {at}")));
+            }
             let gateways = data
                 .devices
                 .iter()

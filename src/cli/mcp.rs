@@ -57,7 +57,7 @@ pub(crate) enum McpCommand {
 
 fn default_url() -> String {
     match crate::load_config(None) {
-        Ok(config) => crate::mcp::local_url(&config.listen),
+        Ok(config) => crate::mcp::recorded_url(&config.listen),
         Err(_) => crate::mcp::local_url(""),
     }
 }
@@ -78,9 +78,15 @@ fn enable_in_project(host: Host, path: &Path, url: &str, helper: &str) -> anyhow
     }
 }
 
-/// The loopback warning for the configured listen address, if it needs one.
+/// The loopback warning for the configured listen address, if it needs one:
+/// not when the running gateway serves `/mcp` on its own loopback listener.
 fn listen_warning_for_this_gateway() -> Option<String> {
     let config = crate::load_config(None).ok()?;
+    let recorded =
+        crate::mcp::recorded_url(&config.listen) != crate::mcp::local_url(&config.listen);
+    if recorded {
+        return None;
+    }
     crate::mcp::loopback_warning(&config.listen)
 }
 

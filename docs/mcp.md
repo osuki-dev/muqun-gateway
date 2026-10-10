@@ -110,10 +110,15 @@ When a token expires, `/mcp` answers 401 so the host fetches a new one:
 
 `MUQUN_MCP_URL` and the default URL `mcp enable` uses are
 `http://<listen host>:<port>/mcp`, with `127.0.0.1` for a wildcard listen
-address (`0.0.0.0`, `[::]`). `/mcp` still answers loopback peers only, so on
-a gateway bound to a non-loopback address a local caller is refused: `mcp
-enable` prints a warning, and the gateway logs one and gives OpenCode no
-`MUQUN_MCP_*` environment.
+address (`0.0.0.0`, `[::]`). `/mcp` answers loopback peers only. A gateway
+bound to one non-loopback address (a tailnet IP, say) therefore also listens
+on `127.0.0.1` and `::1` for `/mcp` alone -- the configured port when it is
+free there, else any free port -- and that is the URL every agent it starts
+is given (Claude Code's `--mcp-config`, Codex's overrides, OpenCode's
+registration). The running gateway records it in `<state>/mcp-endpoint`,
+which `mcp enable` reads, and `manage` shows it on the overview as `MCP:
+127.0.0.1:<port>`. The configured address keeps refusing `/mcp`
+(`403 mcp_loopback_only`).
 
 `muqun-gateway mcp revoke --all` or `--id <token-id>` revokes tokens from the
 CLI; a running gateway sees it on the next call. Paired devices can also
