@@ -37,7 +37,9 @@ pub(crate) fn spawn(state: AppState) {
         sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
-                _ = sweep.tick() => {}
+                _ = sweep.tick() => {
+                    state.tasks.republish_waiting_parents().await;
+                }
                 event = tasks.recv() => match event {
                     Ok(TaskDomainEvent::Updated { task, .. }) if REPORTED_STATES.contains(&task.state) => {}
                     Ok(_) => continue,
@@ -304,5 +306,43 @@ mod tests {
                 assert!(app.tasks.pending_notices(0, 10).await.unwrap().is_empty());
             }
         }
+    }
+
+    /// While a child works, its waiting parent's progress says so; once
+    /// the child's end is told, the line goes.
+    #[tokio::test]
+    async fn a_waiting_parent_shows_whom_it_waits_for_until_it_is_told() {
+        let app = test_state("admin", vec![test_device("d1", "token")]);
+        let agent = FakeAgent::new("opencode").with_sessions(&[("ses_parent", 1)]);
+        app.agent_runtime.attach_for_test(agent.manager()).await;
+        let parent = app
+            .tasks
+            .insert_for_test(&Task {
+                binding: TaskBinding::AgentSession {
+                    agent_id: "opencode".into(),
+                    asid: "ses_parent".into(),
+                },
+                ..child(TaskState::IdleUnconfirmed, None)
+            })
+            .await;
+        let id = app
+            .tasks
+            .insert_for_test(&Task {
+                parent: Some(parent.clone()),
+                ..child(TaskState::Working, None)
+            })
+            .await;
+        let progress = |app: AppState, id: TaskId| async move {
+            let task = app.tasks.task(&id).await.unwrap().unwrap();
+            app.tasks.present(&task).await.progress
+        };
+        let working = app.tasks.task(&id).await.unwrap().unwrap();
+        app.tasks.waits_on(&parent, &working).await;
+        assert_eq!(
+            progress(app.clone(), parent.clone()).await.as_deref(),
+            Some("Waiting for mini · under a minute")
+        );
+        app.tasks.told(&id, TaskState::Done).await;
+        assert_eq!(progress(app.clone(), parent).await, None);
     }
 }

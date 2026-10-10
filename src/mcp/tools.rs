@@ -540,9 +540,16 @@ impl MuqunMcp {
             Ok(view) => view,
             Err(error) => return Ok(task_error(error)),
         };
+        let id = TaskId(view.task_id.clone());
         if let Some(caller) = caller {
-            let id = TaskId(view.task_id.clone());
             self.state.tasks.notify(&id, &caller).await;
+        }
+        if let (Some(parent), Ok(Some(child))) = (
+            view.parent_task_id.as_ref(),
+            self.state.tasks.task(&id).await,
+        ) {
+            let parent = TaskId(parent.clone());
+            self.state.tasks.waits_on(&parent, &child).await;
         }
         let mut body = json!(view);
         // The create went out and got no answer: whether it started is unknown.

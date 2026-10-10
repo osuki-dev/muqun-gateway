@@ -164,6 +164,16 @@ struct Live {
     /// The agent sessions running a turn now (their last status was busy):
     /// their last line may still be being written ([`super::transcript`]).
     busy: HashSet<String>,
+    /// The child each open parent last delegated and has not been told the
+    /// end of yet: its `progress` while it waits ([`TaskService::progress_of`]).
+    waiting_on: HashMap<TaskId, WaitingOn>,
+}
+
+/// A parent's untold delegation: which, to whom, and since when.
+struct WaitingOn {
+    child: TaskId,
+    who: String,
+    since_ms: u64,
 }
 
 /// One open task's progress.
@@ -681,11 +691,68 @@ impl TaskService {
     }
 
     fn progress_of(&self, task: &Task) -> Option<String> {
-        if task.state.is_terminal() || paused(task.state) {
+        if task.state.is_terminal() {
             return None;
         }
         let live = self.live.lock().ok()?;
-        live.lines.get(&task.id).map(|entry| entry.line.clone())
+        let line = (!paused(task.state))
+            .then(|| live.lines.get(&task.id).map(|entry| entry.line.clone()))
+            .flatten();
+        // Its own turn is over (or quiet) while a child it delegated works.
+        line.or_else(|| {
+            live.waiting_on.get(&task.id).map(|waiting| {
+                waiting_line(&waiting.who, now_ms().saturating_sub(waiting.since_ms))
+            })
+        })
+    }
+
+    /// `parent` now waits on `child`: until the child's end is told, the
+    /// parent's progress reads `Waiting for <who> · <elapsed>`.
+    pub(crate) async fn waits_on(&self, parent: &TaskId, child: &Task) {
+        let who = match &child.binding {
+            TaskBinding::Peer { peer_name, .. } => peer_name.clone(),
+            TaskBinding::AgentSession { agent_id, .. } => agent_id.clone(),
+            TaskBinding::Pane {
+                agent_id: Some(agent_id),
+                ..
+            } => agent_id.clone(),
+            _ => String::from("a sub-task"),
+        };
+        if let Ok(mut live) = self.live.lock() {
+            live.waiting_on.insert(
+                parent.clone(),
+                WaitingOn {
+                    child: child.id.clone(),
+                    who,
+                    since_ms: child.created_ms,
+                },
+            );
+        }
+        if let Ok(Some(parent)) = self.store.get(parent).await {
+            self.store().publish(&parent).await;
+        }
+    }
+
+    /// Publish every parent still waiting on a child, so its elapsed time
+    /// moves on the phone.
+    pub(crate) async fn republish_waiting_parents(&self) {
+        let parents: Vec<TaskId> = self
+            .live
+            .lock()
+            .map(|live| live.waiting_on.keys().cloned().collect())
+            .unwrap_or_default();
+        for id in parents {
+            match self.store.get(&id).await {
+                Ok(Some(parent)) if !parent.state.is_terminal() => {
+                    self.store().publish(&parent).await
+                }
+                _ => {
+                    if let Ok(mut live) = self.live.lock() {
+                        live.waiting_on.remove(&id);
+                    }
+                }
+            }
+        }
     }
 
     fn forget_line(&self, id: &TaskId) {
@@ -745,6 +812,25 @@ impl TaskService {
         }
         if let Err(error) = self.store.mark_told(id, state, now_ms()).await {
             tracing::warn!(task = %id.0, %error, "could not record that the parent was told");
+        }
+        // Its parent waits no more: the progress line goes.
+        let Ok(Some(child)) = self.store.get(id).await else {
+            return;
+        };
+        let Some(parent) = child.parent else {
+            return;
+        };
+        let cleared = self.live.lock().is_ok_and(|mut live| {
+            let ours = live
+                .waiting_on
+                .get(&parent)
+                .is_some_and(|waiting| waiting.child == *id);
+            ours && live.waiting_on.remove(&parent).is_some()
+        });
+        if cleared {
+            if let Ok(Some(parent)) = self.store.get(&parent).await {
+                self.store().publish(&parent).await;
+            }
         }
     }
 
@@ -2381,6 +2467,17 @@ fn untitled_placeholder(asid: &str, title: &str) -> bool {
 
 /// Stopped short of an end: waiting on the user, or paused without saying
 /// it is finished.
+/// A parent's progress while a child works: `Waiting for mini · 3 min`.
+fn waiting_line(who: &str, elapsed_ms: u64) -> String {
+    let minutes = elapsed_ms / 60_000;
+    let elapsed = match minutes {
+        0 => String::from("under a minute"),
+        1..=59 => format!("{minutes} min"),
+        _ => format!("{} h {} min", minutes / 60, minutes % 60),
+    };
+    format!("Waiting for {who} · {elapsed}")
+}
+
 fn paused(state: TaskState) -> bool {
     matches!(state, TaskState::Waiting | TaskState::IdleUnconfirmed)
 }
