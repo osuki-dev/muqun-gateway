@@ -1551,8 +1551,8 @@ client without the socket.
   delegation, the first sentence of the name the agent session gave itself
   (an untitled session has an empty `title` -- adapters no longer make one
   up -- and a name that is the asid, or the goal restated or cut short, is
-  not used); else the goal's first sentence -- cut to 60 characters at a
-  word with `…`. An open task's follows the session's name as it changes;
+  not used); else the goal's first sentence -- cut to 60 characters with
+  `…`, back to a word boundary when that keeps at least 30 characters. An open task's follows the session's name as it changes;
   an ended one keeps the name it had when it ended. Show it instead of the
   raw `goal`.
 - Agent sessions (`GET /api/agent-sessions`, …) carry an empty `title` until

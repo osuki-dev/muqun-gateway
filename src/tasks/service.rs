@@ -127,6 +127,8 @@ pub(crate) struct TaskService {
     store: Arc<dyn TaskStore>,
     events: broadcast::Sender<TaskDomainEvent>,
     machine_id: String,
+    /// When this gateway started ([`TaskService::holds`]).
+    started_ms: u64,
     /// Pane delegations a follower is running for (see [`pane_agent::follow`]).
     following: Mutex<HashSet<TaskId>>,
     /// What each open task is doing now (see [`TaskService::note_progress`]).
@@ -145,6 +147,9 @@ struct Live {
     /// as last seen (see [`TaskService::session_named`]); kept on the task
     /// when it ends.
     titles: HashMap<TaskId, String>,
+    /// When the follower last saw each open session delegation's session go
+    /// idle: a turn that ended after a `tasks.complete` block ([`TaskService::holds`]).
+    idled: HashMap<TaskId, u64>,
 }
 
 /// One open task's progress.
@@ -394,6 +399,7 @@ impl TaskStore for Publishing<'_> {
             if task.state.is_terminal() {
                 if let Ok(mut live) = self.0.live.lock() {
                     live.titles.remove(id);
+                    live.idled.remove(id);
                 }
             }
             self.publish(&task).await;
@@ -476,7 +482,8 @@ fn step(event: &AgentDomainEvent, asid: &str) -> Step {
             AgentSessionStatus::Interrupted => Step::Move(change(TaskState::Cancelled)),
             AgentSessionStatus::Unknown => Step::Stay,
         },
-        // The request's own words, until the agent's are read ([`TaskService::settle`]).
+        // A permission request's line is its own prompt; a form's, the
+        // agent's question when it asked one ([`form_waiting`]).
         AgentDomainEvent::PermissionPending {
             asid: id, request, ..
         } if ours(id) => Step::Move(asking(&request.prompt)),
@@ -503,6 +510,7 @@ impl TaskService {
             store,
             events,
             machine_id,
+            started_ms: now_ms(),
             following: Mutex::new(HashSet::new()),
             live: Mutex::default(),
         }
@@ -1064,7 +1072,7 @@ impl TaskService {
         let Some(done) = self.finished_change(state, &task).await else {
             return task;
         };
-        match self.settle(state, &task, done).await {
+        match self.settle(&task, done).await {
             Ok(done) => done,
             Err(error) => {
                 tracing::debug!(task = %task.id.0, %error, "a finished task was not settled");
@@ -1193,7 +1201,7 @@ impl TaskService {
                 }
                 task = now;
             }
-            task = match self.settle(state, &task, to).await {
+            task = match self.settle(&task, to).await {
                 Ok(task) => task,
                 // Moved meanwhile (another waiter, a cancel): that is the answer.
                 Err(error) if is_illegal_transition(&error) => {
@@ -1235,13 +1243,8 @@ impl TaskService {
     /// on the user that finishes passes Working; so does an unconfirmed idle
     /// one that fails) -- unless it is blocked and stays ([`Self::holds`]):
     /// then it is answered as it stands.
-    pub(crate) async fn settle(
-        &self,
-        state: &AppState,
-        task: &Task,
-        to: TaskChange,
-    ) -> Result<Task, TaskError> {
-        if self.holds(state, task, to.to).await {
+    pub(crate) async fn settle(&self, task: &Task, to: TaskChange) -> Result<Task, TaskError> {
+        if self.holds(task, to.to).await {
             return Ok(self
                 .store
                 .get(&task.id)
@@ -1529,9 +1532,7 @@ impl TaskService {
         }
     }
 
-    /// `task`'s title with its session's name, when the session has one
-    /// that says more than its goal.
-    /// The live name for an open task, the one kept when it ended for the
+    /// `task`'s title from its session's name: the live name for an open task, the one kept when it ended for the
     /// rest; never its asid, nor its goal restated or cut short.
     fn title_of(&self, task: &Task) -> Option<String> {
         let TaskBinding::AgentSession { asid, .. } = &task.binding else {
@@ -1620,10 +1621,13 @@ impl TaskService {
             return false;
         };
         let to = match step(event, &asid.0) {
-            Step::Idle => match self.finished_change(state, &task).await {
-                Some(done) => done,
-                None => return false,
-            },
+            Step::Idle => {
+                self.idle_seen(&task);
+                match self.finished_change(state, &task).await {
+                    Some(done) => done,
+                    None => return false,
+                }
+            }
             // A new turn after a pause: the user (or the agent) went on. A
             // blocked task's own turn may still be running ([`Self::settle`]).
             Step::Busy if task.state == TaskState::IdleUnconfirmed => change(TaskState::Working),
@@ -1649,7 +1653,7 @@ impl TaskService {
             Step::Move(to) if to.to != task.state => to,
             _ => return false,
         };
-        match self.settle(state, &task, sourced(to, FOLLOWER)).await {
+        match self.settle(&task, sourced(to, FOLLOWER)).await {
             Ok(now) => now.seq != task.seq,
             Err(error) => {
                 // Moved meanwhile by a waiter or the driver: nothing to do.
@@ -1692,7 +1696,19 @@ impl TaskService {
             return None;
         }
         let to = turn_end(&summary_timeline(&manager, asid, task.created_ms).await);
-        moves(task, &to).then_some(to)
+        self.moves(task, &to).await.then_some(to)
+    }
+
+    /// Whether `to` moves `task`: a change of state, or a task blocked by
+    /// its agent blocked again for a new reason (which replaces the old).
+    pub(crate) async fn moves(&self, task: &Task, to: &TaskChange) -> bool {
+        if to.to != task.state {
+            return true;
+        }
+        to.to == TaskState::Waiting
+            && to.summary.is_some()
+            && to.summary != task.summary
+            && self.blocked_at(&task.id).await.is_some()
     }
 
     /// The agent working on `id` says how it ended (`tasks.complete`; the
@@ -1750,31 +1766,42 @@ impl TaskService {
     /// reporting one had ended when it was read; for `tasks.complete`, one
     /// that ran after the reporting one went idle. A pane task's follower
     /// keeps the same rule itself ([`pane_agent::judge`]).
-    async fn holds(&self, state: &AppState, task: &Task, to: TaskState) -> bool {
+    async fn holds(&self, task: &Task, to: TaskState) -> bool {
         if !matches!(to, TaskState::Working | TaskState::IdleUnconfirmed) {
             return false;
         }
         let Some(blocked) = self.blocked_at(&task.id).await else {
             return false;
         };
-        let TaskBinding::AgentSession { agent_id, asid } = &task.binding else {
+        if !matches!(task.binding, TaskBinding::AgentSession { .. }) {
             return false;
-        };
+        }
         // `working` is only ever proposed on a sign of a running turn (a busy
-        // event, a running session); a session read need not agree yet --
-        // OpenCode's says idle -- so only the turn's age is checked.
+        // event, a running session); a session read need not agree -- an
+        // OpenCode v2 read always says idle -- so only the order of events
+        // decides which turn it is. One after a marker block is a new turn:
+        // the marker was read on its turn's idle. One after a `tasks.complete`
+        // block is, once its session was seen idle since; a gateway started
+        // after the block never saw the reporting turn run, so takes the next
+        // turn it sees as the answer.
         if to == TaskState::IdleUnconfirmed {
             return true;
         }
-        if blocked.by_marker {
-            return false;
-        }
-        let Some(manager) = state.agent_runtime.manager_for_agent(agent_id).await else {
-            return true;
-        };
-        match manager.sessions().get_session(asid).await {
-            Ok(session) => !session.time_idle.is_some_and(|idle| idle > blocked.at_ms),
-            Err(_) => true,
+        let ended = blocked.by_marker
+            || self.started_ms > blocked.at_ms
+            || self
+                .live
+                .lock()
+                .ok()
+                .and_then(|live| live.idled.get(&task.id).copied())
+                .is_some_and(|idle| idle > blocked.at_ms);
+        !ended
+    }
+
+    /// The follower saw `task`'s session go idle now.
+    fn idle_seen(&self, task: &Task) {
+        if let Ok(mut live) = self.live.lock() {
+            live.idled.insert(task.id.clone(), now_ms());
         }
     }
 
@@ -1866,7 +1893,8 @@ fn progress_line(item: &TimelineItem) -> Option<String> {
     }
 }
 
-/// A tool call in words: `<tool> <file>` when it names a file (a provider
+/// A tool call in words, its arguments as inline code: `<tool> <file>`
+/// when it names a file (a provider
 /// title that is only that file's name says less), else its title, else
 /// `<tool> <command, pattern or url>`; never its bare name -- a call whose
 /// arguments name nothing readable (or have not streamed in yet) has no
@@ -1895,14 +1923,32 @@ fn tool_line(call: &ToolCall) -> Option<String> {
         .filter(|title| !title.is_empty() && *title != call.name);
     let line = match (file, title) {
         (Some(file), Some(title)) if !file.ends_with(title) => title.to_owned(),
-        (Some(file), _) => format!("{} {file}", call.name),
+        (Some(file), _) => format!("{} {}", call.name, code(file)),
         (None, Some(title)) => title.to_owned(),
         (None, None) => {
             let target = arg(&["command", "pattern", "query", "url"])?;
-            format!("{} {}", call.name, target.lines().next().unwrap_or(target))
+            format!(
+                "{} {}",
+                call.name,
+                code(target.lines().next().unwrap_or(target))
+            )
         }
     };
     Some(line)
+}
+
+/// `text` as inline code: the app reads progress as markdown, and a path
+/// like `src/__tests__/a.ts` must not turn bold. The fence is one backtick
+/// longer than any run inside.
+fn code(text: &str) -> String {
+    let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest + 1);
+    let pad = if text.starts_with('`') || text.ends_with('`') {
+        " "
+    } else {
+        ""
+    };
+    format!("{fence}{pad}{text}{pad}{fence}")
 }
 
 /// Stopped short of an end: waiting on the user, or paused without saying
@@ -1967,20 +2013,15 @@ async fn form_waiting(manager: &AgentManager, task: &Task, title: &str) -> TaskC
     asking(asked.as_deref().unwrap_or(title))
 }
 
-/// Whether `to` moves `task`: a change of state, or a waiting task asked
-/// something new (another blocked reason).
-pub(crate) fn moves(task: &Task, to: &TaskChange) -> bool {
-    to.to != task.state
-        || (to.to == TaskState::Waiting && to.summary.is_some() && to.summary != task.summary)
-}
-
 /// `dir` named from the home directory: `~` itself, `~/<rest>` below it,
-/// else as it is.
+/// else as it is. Both are canonicalized first, so a home reached through a
+/// symlink still reads `~`.
 fn home_relative(dir: &str) -> String {
     let Some(home) = dirs::home_dir() else {
         return dir.to_owned();
     };
-    match Path::new(dir).strip_prefix(&home) {
+    let real = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_owned());
+    match real(Path::new(dir)).strip_prefix(real(&home)) {
         Ok(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
         Ok(rest) => format!("~/{}", rest.display()),
         Err(_) => dir.to_owned(),
@@ -3287,10 +3328,6 @@ mod tests {
             Complete(&'static str, Outcome),
             /// Blocked by the marker of a turn that has ended.
             Marked(&'static str),
-            /// The session as the agent reports it throughout: its status and
-            /// `time_idle` relative to the row's start (default: idle, a
-            /// minute on -- its turn ended after everything before it).
-            Session(AgentSessionStatus, i64),
             /// A tool call after the agent's last message.
             ToolAfter,
         }
@@ -3299,9 +3336,6 @@ mod tests {
         let idle = || Event(Box::new(status(AgentSessionStatus::Idle)));
         let busy = || Event(Box::new(status(AgentSessionStatus::Busy)));
         let blocked = || Complete("notes.md does not exist", Outcome::Blocked);
-        // The session read reports idle even while a turn runs (OpenCode's
-        // does): the busy event is what says it runs.
-        let idle_since = |offset| Session(AgentSessionStatus::Idle, offset);
         let form = || {
             Event(Box::new(AgentDomainEvent::FormPending {
                 asid: AgentSessionId(ASID.into()),
@@ -3422,15 +3456,15 @@ mod tests {
                 "tasks.complete blocked: the rest of its own turn is no answer",
                 Working,
                 "",
-                vec![idle_since(-60_000), blocked(), busy()],
+                vec![blocked(), busy()],
                 Waiting,
                 None,
             ),
             (
-                "tasks.complete blocked: a turn after it (the user answered) works",
+                "tasks.complete blocked: a turn after it ended (the user answered) works",
                 Working,
                 "",
-                vec![idle_since(60_000), blocked(), busy()],
+                vec![blocked(), idle(), busy()],
                 Working,
                 None,
             ),
@@ -3438,13 +3472,17 @@ mod tests {
                 "marker blocked: the session running again (the user answered) works",
                 Working,
                 "",
-                vec![
-                    idle_since(-60_000),
-                    Marked("notes.md does not exist"),
-                    busy(),
-                ],
+                vec![Marked("notes.md does not exist"), busy()],
                 Working,
                 None,
+            ),
+            (
+                "waiting on a permission: an old blocked line does not re-block it",
+                Working,
+                "MUQUN_TASK_BLOCKED: notes.md does not exist",
+                vec![Event(Box::new(permission(ASID))), idle()],
+                Waiting,
+                Some("run it?"),
             ),
             (
                 "marker blocked, then blocked for a new reason",
@@ -3480,14 +3518,7 @@ mod tests {
                 );
                 timeline.push(call);
             }
-            let mut agent = finished_agent(timeline);
-            for input in &inputs {
-                if let Session(status, offset) = input {
-                    agent.sessions[0].status = *status;
-                    agent.sessions[0].time_idle = Some(now_ms().saturating_add_signed(*offset));
-                }
-            }
-            let (state, id) = tracked(agent).await;
+            let (state, id) = tracked(finished_agent(timeline)).await;
             if from != Working {
                 state.tasks.move_to(&id, change(from)).await.unwrap();
             }
@@ -3508,7 +3539,7 @@ mod tests {
                         };
                         state.tasks.move_to(&id, block).await.unwrap();
                     }
-                    Session(..) | ToolAfter => {}
+                    ToolAfter => {}
                 }
             }
             let task = state.tasks.get_for_test(&id).await;
@@ -3612,6 +3643,19 @@ mod tests {
     }
 
     #[test]
+    fn a_folder_is_named_from_home() {
+        let home = dirs::home_dir().unwrap();
+        let home = home.to_str().unwrap();
+        for (dir, named) in [
+            (home.to_owned(), "~"),
+            (format!("{home}/src/app"), "~/src/app"),
+            ("/opt/elsewhere".to_owned(), "/opt/elsewhere"),
+        ] {
+            assert_eq!(home_relative(&dir), named, "{dir}");
+        }
+    }
+
+    #[test]
     fn a_tool_call_reads_as_what_the_agent_is_doing() {
         let call = |name: &str, title: Option<&str>, input: Value| ToolCall {
             name: name.into(),
@@ -3638,15 +3682,27 @@ mod tests {
                     Some("README.md"),
                     json!({ "filePath": "docs/README.md" }),
                 ),
-                Some("read docs/README.md"),
+                Some("read `docs/README.md`"),
             ),
             (
                 call("patch", None, json!({ "patchText": patch })),
-                Some("patch release-notes/v3.1.0.md"),
+                Some("patch `release-notes/v3.1.0.md`"),
             ),
             (
                 call("bash", None, json!({ "command": "cargo test\ncargo fmt" })),
-                Some("bash cargo test"),
+                Some("bash `cargo test`"),
+            ),
+            (
+                call(
+                    "bash",
+                    None,
+                    json!({ "command": "bun test src/lib/__tests__/cards.test.ts" }),
+                ),
+                Some("bash `bun test src/lib/__tests__/cards.test.ts`"),
+            ),
+            (
+                call("grep", None, json!({ "pattern": "a`b" })),
+                Some("grep ``a`b``"),
             ),
             (call("todowrite", None, json!({ "todos": [] })), None),
             (call("execute", None, json!({})), None),

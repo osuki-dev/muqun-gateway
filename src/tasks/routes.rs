@@ -736,16 +736,11 @@ mod tests {
                     .await
                     .unwrap();
             }
-            // What the device is told before it asks: the same answer, home as `~`.
-            if cwd.is_none() {
+            // What the device is told before it asks: home as `~`, no user
+            // name (folders below home: `service::home_relative`'s table).
+            if expected == home {
                 let (_, defaults) = send(&state, "GET", "/api/tasks/defaults", None, true).await;
-                // Named from home, so no user name shows.
-                let reported = match expected.strip_prefix(&home) {
-                    Ok(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
-                    Ok(rest) => format!("~/{}", rest.display()),
-                    Err(_) => expected.display().to_string(),
-                };
-                assert_eq!(defaults, json!({ "default_cwd": reported }), "{name}");
+                assert_eq!(defaults, json!({ "default_cwd": "~" }), "{name}");
             }
             let mut body = json!({ "goal": name, "agent_id": "opencode" });
             if let Some(cwd) = cwd {

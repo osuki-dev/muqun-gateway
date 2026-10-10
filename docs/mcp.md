@@ -241,7 +241,8 @@ unknown id is `404 task_not_found`; any other failure is `500 task_failed`.
   goal's first sentence (up to the first `.`, `?` or `!` followed by a space,
   a `.` running one sentence into the next as in `done.Next`, a `。`, `？` or
   `！`, or a line end; a goal that starts with a stop gives its first line).
-  At most 60 characters, cut at a word with `…`. An open task's follows the
+  At most 60 characters, ending in `…` when cut: cut back to a word
+  boundary when that keeps at least 30 characters, else cut hard at 60. An open task's follows the
   session's name as the agent renames it (a rename re-publishes the task;
   the name is held in memory, and the 60 s reconcile reads it again after a
   restart); when a session delegation ends, the name it had is stored with
@@ -252,8 +253,11 @@ unknown id is `404 task_not_found`; any other failure is `500 task_failed`.
 - `progress` (present only while the task is open and something is known;
   `task_ledger_complete`): what it is doing now, one line of at most 120
   characters -- for a session delegation the agent's current tool call in
-  words (`<tool> <file>` when it names a file, a patch's files included;
-  else the provider's title; else `<tool> <command, pattern or url>`; a
+  words (`<tool>` and the file in backticks when it names a file, a
+  patch's files included; else the provider's title as written; else
+  `<tool>` and its command, pattern or url in backticks -- every argument
+  is inline code, since the app reads the line as markdown and a path like
+  `src/__tests__/a.ts` must not turn bold; a
   failed call with its error; never a bare tool name -- a call whose
   arguments name nothing readable, or have not streamed in yet, leaves the
   line before) or
@@ -494,7 +498,7 @@ A session delegation moves like this (moves pass the states between, so a
 | the turn ends, the last message carries the blocked marker | `waiting` ([blocked](#blocked)), `summary` = the reason |
 | the turn ends without the marker | `idle_unconfirmed`, `summary` = the last message as a hint; a blocked task stays `waiting` |
 | a permission request or question form is pending | `waiting` (back to `working` when answered), `summary` = what the user is asked: a permission request's prompt; for a question form, the last line of the agent's last message when that came after the turn's last tool call, else the form's title |
-| busy again after a pause | `working`; a task blocked by `tasks.complete`, only on a turn that runs after the one that called it went idle; one blocked by the marker (read once its turn had ended), whenever the session runs again |
+| busy again after a pause | `working`; a task blocked by `tasks.complete`, only once the gateway has seen its session go idle since the call (or when the gateway started after it, so never saw that turn); one blocked by the marker (read once its turn had ended), whenever the session runs again |
 | the turn ends with the blocked marker while blocked | stays `waiting`, `summary` = the new reason |
 | the session failed / was interrupted | `failed` with the error line / `cancelled` |
 
@@ -522,7 +526,9 @@ blocked:
   `waiting` -- it is never `idle_unconfirmed` for that;
 - the rest of the turn that reported the block is not an answer: a session
   delegation blocked by `tasks.complete` goes back to `working` only on a
-  turn that runs after that one went idle; one blocked by the marker (read
+  turn after the gateway saw that one go idle (by the order of the agent's
+  events, not its idle time stamp, which some agents never give; a gateway
+  started after the block takes the next turn as the answer); one blocked by the marker (read
   only once that turn had ended) as soon as its session runs again; a
   terminal agent's only once it was seen idle on two polls and then works
   again;

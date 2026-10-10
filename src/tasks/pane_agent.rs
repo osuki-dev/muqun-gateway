@@ -67,6 +67,9 @@ const MAX_PAUSED_POLL: Duration = Duration::from_secs(60);
 const MARKER_LINES: u32 = 200;
 /// A task title's length, from the goal.
 const TITLE_CHARS: usize = 60;
+/// The shortest a title cut back to a word boundary may be: a goal whose
+/// first word is a long path is cut hard instead (the app clips the same).
+const MIN_TITLE_CUT: usize = 30;
 /// How long an agent may sit idle, never seen working, before its task is
 /// `idle_unconfirmed`: a reply quicker than [`POLL`] on a backend without a
 /// state sequence (tmux) is never seen busy.
@@ -260,10 +263,13 @@ pub(crate) fn title(label: Option<&str>, session_title: Option<&str>, goal: &str
     let Some(cut) = line.strip_suffix('…') else {
         return line;
     };
-    // Cut mid-word unless a space came next: back to the last whole word.
+    // Cut mid-word unless a space came next: back to the last whole word,
+    // when that keeps at least MIN_TITLE_CUT characters; else a hard cut.
     let whole = text[cut.len()..].starts_with(' ');
     match cut.rsplit_once(' ') {
-        Some((words, _)) if !whole && !words.is_empty() => format!("{words}…"),
+        Some((words, _)) if !whole && words.chars().count() >= MIN_TITLE_CUT => {
+            format!("{words}…")
+        }
         _ => line,
     }
 }
@@ -356,6 +362,20 @@ impl Progress {
                 self.blocked_by = Some((reason.clone(), *count));
             }
         }
+    }
+
+    /// The blocked line a failure may name: one not acted on yet (printed
+    /// just before the pane went), or the one the task is still blocked by
+    /// -- never an old one the user has answered since.
+    fn failure_reason<'a>(&self, marker: Option<&'a Marker>) -> Option<&'a Marker> {
+        let Some(Marker::Blocked { reason, count }) = marker else {
+            return None;
+        };
+        let acted = self
+            .blocked_by
+            .as_ref()
+            .is_some_and(|(acted, seen)| acted == reason && seen >= count);
+        (!acted || self.held != Held::No).then_some(marker?)
     }
 
     /// Whether the task is blocked, as its stored history says: kept when
@@ -693,9 +713,9 @@ async fn observe_agent(at: &Bound<'_>, rows: &mut Option<usize>) -> Option<(Seen
     Some((seen, screen))
 }
 
-/// The change a verdict records.
-/// The change a verdict records. `marker` is the last marker read: a pane
-/// that fails right after a blocked one still says why the agent stopped.
+/// The change a verdict records. `marker` is the blocked line a failure
+/// names ([`Progress::failure_reason`]): a pane that fails right after one
+/// still says why the agent stopped.
 fn change_for(
     verdict: Verdict,
     agent_id: Option<&str>,
@@ -817,7 +837,8 @@ async fn run(state: &AppState, id: &TaskId) {
             {
                 state.tasks.note_progress(state, id, &line).await;
             }
-            let change = change_for(verdict, at.agent_id, screen.as_deref(), marker.as_ref());
+            let blocked = progress.failure_reason(marker.as_ref());
+            let change = change_for(verdict, at.agent_id, screen.as_deref(), blocked);
             last_marker = marker;
             if let Some(change) = change {
                 match state.tasks.move_to(id, change).await {
@@ -1204,6 +1225,12 @@ mod tests {
                 "Creating the requested file and verifying it exists",
             ),
             (None, None, ". fix it", ". fix it"),
+            (
+                None,
+                None,
+                "In /very/long/path/to/some/deeply/nested/project/directory/of/the/app run the tests",
+                "In /very/long/path/to/some/deeply/nested/project/directory/…",
+            ),
             (None, None, "... fix it", "... fix it"),
             (
                 None,
@@ -1244,16 +1271,20 @@ mod tests {
             reason: "notes.md does not exist".into(),
             count: 1,
         };
+        let mut progress = Progress::default();
         let closed = change_for(
             Verdict::Failed(PANE_CLOSED),
             None,
             Some(menu),
-            Some(&reason),
+            progress.failure_reason(Some(&reason)),
         );
         assert_eq!(
             closed.unwrap().summary.as_deref(),
             Some("the pane closed: notes.md does not exist")
         );
+        // ... but not one acted on and answered since: the task works again.
+        progress.blocked_by = Some(("notes.md does not exist".into(), 1));
+        assert_eq!(progress.failure_reason(Some(&reason)), None);
         let plain = "build ok\n   done:   3 files  \n\n───\n";
         assert_eq!(
             screen_summary(Some("some-agent"), plain).as_deref(),
