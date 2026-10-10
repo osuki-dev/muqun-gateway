@@ -967,6 +967,22 @@ mod tests {
             }),
             "the pane agent was interrupted with {key}"
         );
+
+        // A terminal session this computer does not have: refused, as an
+        // argument error, and nothing is made.
+        let args = DelegateArgs {
+            goal: "review the diff".into(),
+            cwd: None,
+            agent_id: Some("claude".into()),
+            mode: None,
+            model: None,
+            variant: None,
+            machine: None,
+            terminal: Some("nope".into()),
+        };
+        let (error, text, _) = answer(mcp.tasks_delegate(Parameters(args)).await);
+        assert!(error, "{text}");
+        assert!(text.contains("No terminal session 'nope'"), "{text}");
     }
 
     #[tokio::test]

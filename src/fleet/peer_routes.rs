@@ -844,6 +844,11 @@ mod tests {
             .lock()
             .unwrap()
             .push(test_peer_device("peer-1", "peer-token"));
+        // Files are a device's uploads here: another computer has none.
+        let body = json!({ "goal": "g", "attachments": ["/tmp/x.png"] });
+        let (got, answer) = call(&state, "POST", "/api/tasks", "peer-token", Some(body)).await;
+        assert_eq!(got, StatusCode::BAD_REQUEST, "{answer}");
+        assert_eq!(answer["error"]["code"], "attachments_unsupported");
         for (method, path, status) in [
             ("GET", "/api/tasks", StatusCode::OK),
             ("GET", "/api/tasks/t_missing", StatusCode::NOT_FOUND),

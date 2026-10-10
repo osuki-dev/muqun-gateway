@@ -22,7 +22,7 @@ impl PromptService {
         attachments: &[String],
         delivery: Option<&str>,
     ) -> Result<(), AgentError> {
-        if attachments.is_empty() || self.agent.attachment_mode() == AttachmentMode::Native {
+        if attachments.is_empty() {
             return self
                 .agent
                 .send_prompt(&asid.0, text, attachments, delivery)
@@ -30,7 +30,15 @@ impl PromptService {
         }
         let uploads = crate::uploads_dir()
             .map_err(|_| AgentError::InvalidRequest("no upload directory".to_string()))?;
-        let text = prompt_with_attachment_paths(text, attachments, &uploads)?;
+        let mode = self.agent.attachment_mode();
+        let checked = checked_attachments(mode, attachments, &uploads)?;
+        if mode == AttachmentMode::Native {
+            return self
+                .agent
+                .send_prompt(&asid.0, text, &checked, delivery)
+                .await;
+        }
+        let text = append_attachment_paths(text, &checked);
         self.agent.send_prompt(&asid.0, &text, &[], delivery).await
     }
 
@@ -40,40 +48,63 @@ impl PromptService {
 }
 
 /// `text` with the attachments listed as host paths, for an agent that reads
-/// files itself. Every path must be an absolute path to a regular file inside
-/// `uploads` once symlinks and `..` are resolved, so a client can only point
-/// the agent at files it uploaded through `POST /api/uploads`.
+/// files itself ([`checked_attachments`]).
 pub(crate) fn prompt_with_attachment_paths(
     text: &str,
     attachments: &[String],
     uploads: &Path,
 ) -> Result<String, AgentError> {
-    if attachments.is_empty() {
-        return Ok(text.to_string());
-    }
+    let paths = checked_attachments(AttachmentMode::ByPath, attachments, uploads)?;
+    Ok(append_attachment_paths(text, &paths))
+}
+
+/// The attachments as an agent of `mode` is given them. A file reference --
+/// a path, or for an agent that takes files itself a `file://` URI -- must be
+/// an absolute path to a regular file inside `uploads` once symlinks and `..`
+/// are resolved, and is given as that canonical path, so a client can only
+/// point the agent at files it uploaded through `POST /api/uploads`. An agent
+/// that takes files itself also takes `http(s)://` and `data:` references as
+/// they are.
+pub(crate) fn checked_attachments(
+    mode: AttachmentMode,
+    attachments: &[String],
+    uploads: &Path,
+) -> Result<Vec<String>, AgentError> {
     let refuse = |path: &str| {
         AgentError::InvalidRequest(format!(
             "attachment is not a file uploaded to this gateway: {path}"
         ))
     };
-    let root = uploads
-        .canonicalize()
-        .map_err(|_| refuse(&attachments[0]))?;
-    let paths = attachments
+    let mut root = None;
+    attachments
         .iter()
         .map(|raw| {
-            let path = Path::new(raw);
+            let native = mode == AttachmentMode::Native;
+            if native
+                && ["http://", "https://", "data:"]
+                    .iter()
+                    .any(|scheme| raw.starts_with(scheme))
+            {
+                return Ok(raw.clone());
+            }
+            let path = Path::new(if native {
+                raw.strip_prefix("file://").unwrap_or(raw)
+            } else {
+                raw
+            });
             if !path.is_absolute() {
                 return Err(refuse(raw));
             }
+            if root.is_none() {
+                root = Some(uploads.canonicalize().map_err(|_| refuse(raw))?);
+            }
             let resolved = path.canonicalize().map_err(|_| refuse(raw))?;
-            if !resolved.starts_with(&root) || !resolved.is_file() {
+            if root.as_ref().is_none_or(|root| !resolved.starts_with(root)) || !resolved.is_file() {
                 return Err(refuse(raw));
             }
             Ok(resolved.to_string_lossy().into_owned())
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(append_attachment_paths(text, &paths))
+        .collect()
 }
 
 #[cfg(test)]
@@ -144,6 +175,33 @@ mod tests {
             let err = prompt_with_attachment_paths("look", std::slice::from_ref(&bad), &dir)
                 .expect_err(&bad);
             assert!(matches!(err, AgentError::InvalidRequest(_)), "{bad}");
+        }
+    }
+
+    /// An agent that takes files itself gets uploaded files as canonical
+    /// paths; a `file://` or path outside the uploads is refused like any
+    /// other, and a web or data reference goes as it is.
+    #[test]
+    fn a_native_agent_gets_only_uploaded_files() {
+        let (_scratch, uploads) = uploads_with(&["shot.png"]);
+        let shot = path_in(&uploads, "shot.png");
+        for (raw, kept) in [
+            (shot.clone(), Some(shot.clone())),
+            (format!("file://{shot}"), Some(shot.clone())),
+            ("file:///etc/hosts".to_owned(), None),
+            ("/etc/hosts".to_owned(), None),
+            (
+                "https://example.com/a.png".to_owned(),
+                Some("https://example.com/a.png".to_owned()),
+            ),
+            (
+                "data:text/plain,hi".to_owned(),
+                Some("data:text/plain,hi".to_owned()),
+            ),
+        ] {
+            let got =
+                checked_attachments(AttachmentMode::Native, std::slice::from_ref(&raw), &uploads);
+            assert_eq!(got.ok(), kept.map(|kept| vec![kept]), "{raw}");
         }
     }
 }

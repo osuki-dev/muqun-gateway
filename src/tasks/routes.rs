@@ -343,6 +343,14 @@ async fn create(
         ));
     }
     let Json(body) = body.map_err(|_| invalid_request())?;
+    // References are files on this computer, uploaded from a device: another
+    // computer has none to send.
+    if caller.kind == DeviceKind::Gateway && !body.attachments.is_empty() {
+        return Err(refused(
+            "attachments_unsupported",
+            "Attachments go only to a session agent on this computer",
+        ));
+    }
     let by_caller = caller_principal(&caller);
     let previous_cwd = if body.cwd.is_none() {
         state
@@ -393,6 +401,10 @@ fn create_failed(error: TaskError) -> (StatusCode, Json<Value>) {
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_unavailable",
             "That agent is not available",
+        ),
+        TaskError::InvalidAttachment(_) => refused(
+            "invalid_attachment",
+            "An attachment is not a file uploaded to this computer",
         ),
         TaskError::AttachmentsUnsupported => refused(
             "attachments_unsupported",
@@ -775,16 +787,45 @@ mod tests {
         let state = state();
         let agent =
             crate::test_support::FakeAgent::new("opencode").with_sessions(&[("opencode_new", 1)]);
-        let (prompts, attached) = (agent.prompts.clone(), agent.attached.clone());
+        let (prompts, attached, calls) = (
+            agent.prompts.clone(),
+            agent.attached.clone(),
+            agent.calls.clone(),
+        );
         state.agent_runtime.attach_for_test(agent.manager()).await;
         let dir = std::env::temp_dir().canonicalize().unwrap();
+        // Two files uploaded through the gateway, as the dock sends them.
+        let uploads = crate::ensure_uploads_dir().unwrap();
+        let files: Vec<String> = ["shot.png", "notes.txt"]
+            .iter()
+            .map(|name| {
+                let path = uploads.join(format!("{}-{name}", uuid::Uuid::new_v4()));
+                std::fs::write(&path, b"x").unwrap();
+                path.canonicalize().unwrap().to_string_lossy().into_owned()
+            })
+            .collect();
+        // A file that was never uploaded is refused before anything is made:
+        // no task, no session.
+        let body = json!({ "goal": "g", "cwd": dir, "agent_id": "opencode",
+                           "attachments": [files[0], "/etc/hosts"] });
+        let (status, refusal) = send(&state, "POST", "/api/tasks", Some(body), true).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{refusal}");
+        assert_eq!(refusal["error"]["code"], "invalid_attachment");
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "{:?}",
+            calls.lock().unwrap()
+        );
+        let (_, listed) = call(&state, "GET", "/api/tasks").await;
+        assert_eq!(listed["tasks"], json!([]));
+
         let body = json!({
             "goal": "fix the build",
             "cwd": dir,
             "label": "  build  ",
             "agent_id": "opencode",
             "mode": "build",
-            "attachments": ["asset_shot", "/home/u/notes.txt"]
+            "attachments": files
         });
         let (status, task) = send(&state, "POST", "/api/tasks", Some(body), true).await;
         assert_eq!(status, StatusCode::OK, "{task}");
@@ -816,13 +857,7 @@ mod tests {
 
         // The goal and both attachments, as the session prompt sends them.
         assert_eq!(*prompts.lock().unwrap(), ["fix the build"]);
-        assert_eq!(
-            *attached.lock().unwrap(),
-            [vec![
-                "asset_shot".to_owned(),
-                "/home/u/notes.txt".to_owned()
-            ]]
-        );
+        assert_eq!(*attached.lock().unwrap(), [files]);
 
         let (_, listed) = call(&state, "GET", "/api/tasks").await;
         assert_eq!(listed["tasks"][0]["origin"], "device");
@@ -1021,20 +1056,76 @@ mod tests {
         let mut other = state.config.sessions[0].clone();
         other.id = "hd".into();
         state.config.sessions.push(other);
-        for (session_id, status, answer) in [
-            ("hd", StatusCode::OK, json!("hd")),
-            ("nope", StatusCode::BAD_REQUEST, json!("terminal_unknown")),
+        // Files cannot go to a terminal agent. Refusals make nothing.
+        for (name, extra, status, answer) in [
+            (
+                "session hd",
+                json!({ "session_id": "hd" }),
+                StatusCode::OK,
+                json!("hd"),
+            ),
+            (
+                "session nope",
+                json!({ "session_id": "nope" }),
+                StatusCode::BAD_REQUEST,
+                json!("terminal_unknown"),
+            ),
+            (
+                "attachments",
+                json!({ "attachments": ["/tmp/x.png"] }),
+                StatusCode::BAD_REQUEST,
+                json!("attachments_unsupported"),
+            ),
         ] {
-            let body = json!({ "goal": "g", "cwd": dir, "agent_id": "codex",
-                               "session_id": session_id });
+            let (_, before) = call(&state, "GET", "/api/tasks").await;
+            let mut body = json!({ "goal": "g", "cwd": dir, "agent_id": "codex" });
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
             let (status_got, view) = send(&state, "POST", "/api/tasks", Some(body), true).await;
-            assert_eq!(status_got, status, "{session_id}: {view}");
-            let got = if status == StatusCode::OK {
-                &view["binding"]["session_id"]
+            assert_eq!(status_got, status, "{name}: {view}");
+            let (_, after) = call(&state, "GET", "/api/tasks").await;
+            let made = after["tasks"].as_array().unwrap().len()
+                - before["tasks"].as_array().unwrap().len();
+            if status == StatusCode::OK {
+                assert_eq!(view["binding"]["session_id"], answer, "{name}: {view}");
+                assert_eq!(made, 1, "{name}");
             } else {
-                &view["error"]["code"]
-            };
-            assert_eq!(got, &answer, "{session_id}: {view}");
+                assert_eq!(view["error"]["code"], answer, "{name}: {view}");
+                assert_eq!(made, 0, "{name}");
+            }
+        }
+
+        // What such a task would run, before it is made: the named model and
+        // effort where the launch passes them; no plain word is refused.
+        for (query, status, model) in [
+            (
+                "agent_id=codex&model=gpt-6-sol&variant=low",
+                StatusCode::OK,
+                json!("gpt-6-sol"),
+            ),
+            (
+                "agent_id=codex&model=-x",
+                StatusCode::BAD_REQUEST,
+                Value::Null,
+            ),
+        ] {
+            let (got, defaults) = send(
+                &state,
+                "GET",
+                &format!("/api/tasks/defaults?{query}"),
+                None,
+                true,
+            )
+            .await;
+            assert_eq!(got, status, "{query}: {defaults}");
+            if status == StatusCode::OK {
+                assert_eq!(
+                    (&defaults["model"], &defaults["variant"]),
+                    (&model, &json!("low")),
+                    "{query}"
+                );
+            }
         }
 
         // A task cancelled before its agent starts gets no agent and no goal.

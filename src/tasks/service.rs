@@ -367,6 +367,8 @@ pub(crate) enum TaskError {
     /// Attachments sent where they cannot go along: a terminal agent, or
     /// another computer (they are references on this one).
     AttachmentsUnsupported,
+    /// An attachment that is no file uploaded to this computer.
+    InvalidAttachment(String),
     /// A timeline was asked of a task that has none (a command).
     NoTimeline,
     /// The device confirmed a task that is not its own paused or waiting
@@ -412,6 +414,7 @@ impl std::fmt::Display for TaskError {
             Self::AttachmentsUnsupported => {
                 write!(f, "attachments go only to a session agent on this computer")
             }
+            Self::InvalidAttachment(why) => write!(f, "{why}"),
             Self::NoTimeline => write!(f, "only a delegated task has a timeline"),
             Self::InvalidSummary => write!(f, "summary must be non-empty and at most 32 KiB"),
             Self::NotConfirmable => write!(
@@ -1100,6 +1103,18 @@ impl TaskService {
         }
         let manager = agent_for(state, request.agent_id.as_deref()).await?;
         let agent_id = manager.agent().kind();
+        // Checked before anything is made: a reference the prompt would
+        // refuse is a refusal here, never a failed task and a stray session.
+        if !request.attachments.is_empty() {
+            let uploads = crate::uploads_dir()
+                .map_err(|_| TaskError::InvalidAttachment("no upload directory".into()))?;
+            crate::agents::use_cases::prompt_service::checked_attachments(
+                manager.agent().attachment_mode(),
+                &request.attachments,
+                &uploads,
+            )
+            .map_err(|error| TaskError::InvalidAttachment(error.to_string()))?;
+        }
         let variant = request.variant.as_deref();
         let model = match request.model.as_deref() {
             Some(id) => {

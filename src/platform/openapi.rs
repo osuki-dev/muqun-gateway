@@ -931,10 +931,10 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
             }]
         }),
     );
-    create_responses["400"] = json!({ "description": "invalid_request (empty or oversized goal, oversized label, empty name), invalid_directory, directory_not_found, not_a_directory, unknown_model, invalid_mentions (too many mentions, or one naming no linked computer), terminal_unknown (session_id names no terminal session here), attachments_unsupported (attachments with a terminal agent or another computer)" });
+    create_responses["400"] = json!({ "description": "invalid_request (empty or oversized goal, oversized label, empty name), invalid_directory, directory_not_found, not_a_directory, unknown_model, invalid_mentions (too many mentions, or one naming no linked computer), terminal_unknown (session_id names no terminal session here), attachments_unsupported (attachments with a terminal agent, for another computer, or from one), invalid_attachment (a reference that is no file uploaded here; checked before anything is made)" });
     create_responses["502"] = json!({ "description": "agent_error: the agent could not start the session or take the prompt, or no pane could be made for a terminal agent" });
     create_responses["403"] = json!({ "description": "delegations_disabled: another of the owner's computers (fleet_peers) asked while this computer takes no work from other computers (fleet.accept_delegations); checked before the body. Its task otherwise opens as a device's does, with origin peer and requested_by named from its device record" });
-    create_responses["503"] = json!({ "description": "agent_unavailable: the agent is not attached (a session agent is never started in a pane) or a terminal agent is not on PATH; no_terminal: no terminal session answers" });
+    create_responses["503"] = json!({ "description": "agent_unavailable: the agent is not attached (a session agent is never started in a pane) or a terminal agent is not on PATH; no_terminal: no terminal session answers (or the one session_id names does not)" });
     let read_responses = not_found(
         json_ok(
             "The task and its state history, oldest first",

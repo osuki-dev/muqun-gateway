@@ -410,9 +410,14 @@ view's `mentions`; the goal is sent as it is, and the agent finds them with
 with the goal, the same references `POST /api/agent-sessions/{asid}/prompt`
 takes (uploaded asset references, file paths on this computer); they go to
 the agent with the goal, its first prompt, exactly as that route sends them,
-and the task is recorded like any other. They go only to a session agent on
-this computer: with a terminal agent, or for another computer, the create is
-`400 attachments_unsupported` and nothing is made.
+and the task is recorded like any other. Each must be a file uploaded to this
+computer (`POST /api/uploads`): its path, or for an agent that takes files
+itself (OpenCode) a `file://` URI of it, inside the uploads folder once links
+are resolved -- or, for such an agent, an `http(s)://` or `data:` reference.
+Anything else is `400 invalid_attachment`, checked before anything is made:
+no task row, no session. They go only to a session agent on this computer:
+with a terminal agent, for another computer, or sent by another computer,
+the create is `400 attachments_unsupported` and nothing is made.
 Fields the gateway does not know are ignored. The answer is
 the task view plus the session to open:
 
@@ -428,7 +433,7 @@ the task view plus the session to open:
 
 | Error | When |
 |---|---|
-| `400 invalid_request` | An empty or oversized `goal`, a `label` over 200 characters, an empty or oversized (256 bytes) `agent_id`/`mode`/`model`/`variant`/`session_id`, or `mentions` that is not a list of strings. Nothing is created. |
+| `400 invalid_request` | An empty or oversized `goal`, a `label` over 200 characters, an empty or oversized (256 bytes) `agent_id`/`mode`/`model`/`variant`/`session_id`, more than 16 `attachments` or one empty or over 4096 bytes, or `mentions` that is not a list of strings. Nothing is created. |
 | `400 invalid_mentions` | `mentions` holds more than 8 names, or names a computer that is neither linked nor `self` (it may have been unlinked since the phone offered it). Nothing is created; the same body without `mentions` would be taken. |
 | `400 invalid_directory`, `directory_not_found`, `not_a_directory` | `cwd` is relative, missing, or not a directory. Nothing is created. |
 | `400 unknown_model` | `model` is not in the agent's catalog for `cwd`. Nothing is created. |
@@ -436,7 +441,8 @@ the task view plus the session to open:
 | `503 agent_unavailable` | That agent (or, without `agent_id`, any agent) is not attached. |
 | `503 no_terminal` | A terminal agent was named and no terminal session answers (or the one `session_id` names does not). Nothing is created. |
 | `400 terminal_unknown` | `session_id` names no terminal session of this computer. Nothing is created. |
-| `400 attachments_unsupported` | `attachments` were sent with a terminal agent or for another computer. Nothing is created. |
+| `400 attachments_unsupported` | `attachments` were sent with a terminal agent, for another computer, or by another computer. Nothing is created. |
+| `400 invalid_attachment` | An attachment is not a file uploaded to this computer. Nothing is created. |
 | `400 invalid_request` (body) | The body is not a JSON object of the shape above. Authentication is checked first, so without a valid device token this is `401`/`403` whatever the body. |
 | `502 agent_error` | The agent could not create the session or take the prompt; the task is recorded as `failed`, with the error as its `summary`. |
 
