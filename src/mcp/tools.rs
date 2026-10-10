@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use super::lineage;
 use super::tokens::AssistantSession;
 use crate::fleet::manifest::{is_self, DescribeError};
-use crate::tasks::domain::{clip, TaskBinding, TaskId, TaskPrincipal};
+use crate::tasks::domain::{clip, TaskBinding, TaskId, TaskPrincipal, REPORTED_STATES};
 use crate::tasks::run_command::{RunHandle, RunRequest};
 use crate::tasks::service::{
     summary_line, task_directory, valid_goal, valid_name, DelegateRequest, Outcome, ReadWhat,
@@ -227,6 +227,32 @@ fn task_error(error: TaskError) -> CallToolResult {
             fail("internal", "The call failed.")
         }
     }
+}
+
+/// The reminder a delegating agent reads with its child's result.
+pub(crate) const CHILD_REMINDER: &str =
+    "If this result finishes your own task, call tasks.complete with a one-line summary.";
+
+/// `answer` about `child` (a `tasks.read` or `tasks.wait`) with
+/// [`CHILD_REMINDER`] as `when_finished`, when the child has a result and was
+/// delegated by a task still open. The line typed into a parent's pane stays
+/// plain prose; the reminder rides on what the agent reads.
+pub(crate) async fn with_reminder(state: &AppState, mut answer: Value, child: &TaskId) -> Value {
+    let Ok(Some(task)) = state.tasks.task(child).await else {
+        return answer;
+    };
+    if !REPORTED_STATES.contains(&task.state) {
+        return answer;
+    }
+    let Some(parent) = task.parent.as_ref() else {
+        return answer;
+    };
+    if let Ok(Some(parent)) = state.tasks.task(parent).await {
+        if !parent.state.is_terminal() && answer.is_object() {
+            answer["when_finished"] = json!(CHILD_REMINDER);
+        }
+    }
+    answer
 }
 
 fn reply<T: Serialize>(result: Result<T, TaskError>) -> Result<CallToolResult, ErrorData> {
@@ -604,7 +630,10 @@ impl MuqunMcp {
         if let Ok(waited) = &waited {
             tasks.told(&id, waited.task.state).await;
         }
-        reply(waited)
+        Ok(match waited {
+            Ok(waited) => ok(with_reminder(&self.state, json!(waited), &id).await),
+            Err(error) => task_error(error),
+        })
     }
 
     #[tool(
@@ -641,6 +670,7 @@ impl MuqunMcp {
             .await
         {
             Err(TaskError::NotYours) => {}
+            Ok(read) => return Ok(ok(with_reminder(state, read, &id).await)),
             read => return reply(read),
         }
         // Not one it created: the task this session works on, if it is that.

@@ -535,6 +535,56 @@ mod tests {
         }
     }
 
+    /// The line typed into a parent stays plain prose; the reminder to finish
+    /// its own task rides on what it reads of the child (`tasks.read`,
+    /// `tasks.wait`): only for a child with a result whose parent is open.
+    #[tokio::test]
+    async fn a_parent_reading_its_child_s_result_is_reminded_to_finish() {
+        let app = test_state("admin", vec![test_device("d1", "token")]);
+        for (name, parent_state, child_state, reminded) in [
+            (
+                "an open parent, a finished child",
+                TaskState::Working,
+                TaskState::Done,
+                true,
+            ),
+            (
+                "an ended parent",
+                TaskState::Cancelled,
+                TaskState::Done,
+                false,
+            ),
+            (
+                "a child still working",
+                TaskState::Working,
+                TaskState::Working,
+                false,
+            ),
+        ] {
+            let parent = app.tasks.insert_for_test(&child(parent_state, None)).await;
+            let id = app
+                .tasks
+                .insert_for_test(&Task {
+                    parent: Some(parent),
+                    ..child(child_state, Some("built"))
+                })
+                .await;
+            let answer =
+                crate::mcp::tools::with_reminder(&app, serde_json::json!({ "task_id": id.0 }), &id)
+                    .await;
+            assert_eq!(
+                answer.get("when_finished").is_some(),
+                reminded,
+                "{name}: {answer}"
+            );
+        }
+        let line = message(&app, &child(TaskState::Done, Some("built"))).await;
+        assert!(
+            !line.contains("t_") && !line.contains("tasks.complete"),
+            "{line}"
+        );
+    }
+
     /// A child reaching each reported state, its parent session idle or in
     /// its turn: what the parent is told, once.
     #[tokio::test]

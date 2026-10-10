@@ -753,7 +753,7 @@ group has the terminal by then, the pasted line is cleared (Ctrl-U) and Enter is
 never pressed. What the child wrote is untrusted, so the line is one line of
 plain text: escape sequences and control characters removed, line breaks
 and tabs turned into spaces, capped after that, and it always begins with
-the computer's name or the task's title, never with `/`, `!` or `:`. Each move into a reported state is told once -- a second question after the
+the computer's name or the task's title, never with `/`, `!` or `:`. The line carries no ids and no instructions; what the parent reads of the child (`tasks.read`, `tasks.wait`) carries its `task_id` and, while the parent's own task is open, `when_finished`: "If this result finishes your own task, call tasks.complete with a one-line summary." Each move into a reported state is told once -- a second question after the
 first was answered is told again -- recorded in the task
 store (`task_notices`), so a restart does not tell it twice; a state not told
 within a day is dropped. A child whose parent task has ended (the owner
