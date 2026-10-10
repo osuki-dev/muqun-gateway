@@ -933,6 +933,9 @@ mod tests {
                 None,
             ),
             ("  ⎿  Tip: Use /memory to edit memory\n", None),
+            ("Tip: Press Enter to submit your prompt\n", None),
+            ("⏺ Read file.rs\n", Some("Read file.rs")),
+            ("✶\n", None),
             (
                 "│ >_ OpenAI Codex (v0.161.0) │\n│ model: gpt-6 high  /model to change │\n",
                 None,
@@ -947,6 +950,10 @@ mod tests {
             (
                 "• Press ctrl+c to stop the server; auto mode and accept edits stay on.\n",
                 Some("Press ctrl+c to stop the server; auto mode and accept edits stay on."),
+            ),
+            (
+                "The process exits when I press ctrl+c.\n",
+                Some("The process exits when I press ctrl+c."),
             ),
             ("Pro Tip: run it twice\n", Some("Pro Tip: run it twice")),
             ("$ cargo test\n", Some("$ cargo test")),
