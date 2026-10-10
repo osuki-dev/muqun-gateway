@@ -230,6 +230,47 @@ off) cannot be detected from the final config alone. It must not be used as an
 implicit purge; stop Gateway and clear the `history` records (see below) if
 that is the intent. A changed native server/root process still denies adoption independently.
 
+### Which panes are captured, and what a restart keeps
+
+In plain words:
+
+- **Captured:** panes whose program draws on the alternate screen and keeps no
+  scrollback of its own there -- Codex, Claude Code, OpenCode and other agent
+  TUIs -- and any pane the backend reports with no native backlog. For these
+  the terminal itself forgets what scrolled off, so Gateway keeps what it saw.
+- **Not captured:** an ordinary shell pane with native scrollback (tmux or
+  Herdr already keeps its history, and `/output` pages it natively); it
+  answers `not_captured`. A full-screen editor (nvim, vim, lazygit and the
+  like) repaints its screen in place, so it has no history to keep: its
+  answer is `captured` with no rows.
+- **Only what Gateway saw:** rows are captured while something reads the pane
+  -- the App's `/output` reads or its pane stream. Output that
+  scrolled past while nothing was reading is not there.
+
+After `muqun-gateway restart` with `history.storage: sqlite`, the first
+`/history` page of a pane comes back with the rows checkpointed before the
+restart, and `next_before` pages through them as before, when all of these
+hold:
+
+1. **The pane is the same process.** The tmux or Herdr server and the pane's
+   root process are the ones that were running before (checked by process
+   start time and boot id, not by pane id or PID alone). A pane whose server
+   or program was restarted starts empty.
+2. **The checkpoint was written.** Writes are sampled: changes from the last
+   ~3 seconds before the stop may not have reached the store.
+3. **The pane has no new history yet.** Recovery happens on the first
+   `/history` read while the restarted Gateway holds no historical rows of its
+   own for that pane (only its current screen). Once new output scrolls off,
+   the new capture replaces the checkpoint; they are never joined.
+4. **The checkpoint is fresh enough.** It was last changed within 7 days and
+   survived the 48-checkpoint / 24 MiB quota.
+
+Each format is recovered on its own: the ANSI rows come back only if the pane
+was read in ANSI before the restart (the App reads ANSI). A cursor from before
+the restart always answers `410 history_cursor_gone`; start again without
+`before` and the recovered rows are a new snapshot with a new
+`capture_epoch`.
+
 ### Privacy, failure and retention bounds
 
 Checkpoints live in the Gateway's shared store, `<state>/store/gateway.sqlite3`,

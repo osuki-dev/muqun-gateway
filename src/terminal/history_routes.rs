@@ -718,6 +718,20 @@ mod tests {
                     .lines()
                     .any(|row| row.trim() == format!("row {}", top + 6))
                 {
+                    let _ansi = pane_output(
+                        State(state.clone()),
+                        Path(("s".into(), pane.id.to_string())),
+                        Query(OutputQuery {
+                            source: Some("recent-unwrapped".into()),
+                            lines: Some(200),
+                            format: Some("ansi".into()),
+                            start: None,
+                            end: None,
+                        }),
+                        bearer_headers("token"),
+                    )
+                    .await
+                    .unwrap();
                     break;
                 }
                 assert!(
@@ -777,6 +791,30 @@ mod tests {
         let recovered = get(app(), &uri, Some("token")).await;
         assert_eq!(recovered.0, StatusCode::OK);
         assert_eq!(recovered.1["data"]["rows"], first.1["data"]["rows"]);
+        assert_eq!(recovered.1["data"]["row_count"], 2);
+        assert_eq!(recovered.1["data"]["has_more"], true);
+        // The recovered checkpoint pages like a live capture.
+        let older = recovered.1["data"]["next_before"].as_str().unwrap();
+        let second = get(app(), &format!("{uri}&before={older}"), Some("token")).await;
+        assert_eq!(second.0, StatusCode::OK);
+        assert_eq!(second.1["data"]["rows"], json!(["row 3", "row 4"]));
+        // So does the ANSI shape the app reads, page for page.
+        let ansi = format!("{uri}&format=ansi");
+        let colored = get(app(), &ansi, Some("token")).await;
+        assert_eq!(colored.0, StatusCode::OK);
+        let rows = colored.1["data"]["rows"].as_array().unwrap();
+        assert_eq!(colored.1["data"]["row_count"], rows.len());
+        assert!(
+            rows.len() == 2
+                && rows
+                    .iter()
+                    .all(|row| row.as_str().unwrap().contains("row ")),
+            "{rows:?}"
+        );
+        let older = colored.1["data"]["next_before"].as_str().unwrap();
+        let colored = get(app(), &format!("{ansi}&before={older}"), Some("token")).await;
+        assert_eq!(colored.0, StatusCode::OK);
+        assert_eq!(colored.1["data"]["row_count"], 2);
         assert_eq!(
             state
                 .scrollback
