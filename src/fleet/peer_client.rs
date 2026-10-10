@@ -13,6 +13,7 @@ use futures::{SinkExt as _, StreamExt as _};
 use reqwest::Method;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{self, Message};
@@ -360,6 +361,7 @@ impl PeerClient {
 
     /// `GET /api/ws`, then `{"t":"subscribe_tasks"}`: answers once B has
     /// confirmed the subscription, so no change after this returns is missed.
+    /// What changed before it is the feed's first item, a `Resync`.
     #[allow(dead_code)] // the mirrors of Task G3
     pub(crate) async fn subscribe_tasks(&self) -> Result<TaskFeed, PeerError> {
         tokio::time::timeout(REQUEST_TIMEOUT, self.open_task_socket())
@@ -413,7 +415,9 @@ impl PeerClient {
         let mut feed = TaskFeed {
             socket,
             codec: None,
+            heard: Instant::now(),
             pinged: false,
+            resync: true,
         };
         let first = feed
             .next_frame()
@@ -439,7 +443,12 @@ impl PeerClient {
                 .ok_or_else(|| PeerError::Unreachable("socket closed".into()))?;
             match frame["t"].as_str() {
                 Some("subscribed") if frame["tasks"] == true => return Ok(feed),
-                Some("error") => return Err(refused(403, &json!({ "error": frame }))),
+                // Refused for what this token is; any other error (another
+                // socket of this device took the slot) is a socket that ended.
+                Some("error") if frame["code"] == "peer_forbidden" => {
+                    return Err(refused(403, &json!({ "error": frame })))
+                }
+                Some("error") => return Err(PeerError::Unreachable("socket".into())),
                 _ => continue,
             }
         }
@@ -541,16 +550,25 @@ pub(crate) struct TaskFeed {
     socket: Socket,
     /// `Some` when the socket is sealed.
     codec: Option<ClientCodec>,
+    /// When anything last arrived: the half-open bound runs from it, across
+    /// however many `next` calls the caller cancels.
+    heard: Instant,
     /// A ping went out and nothing has come back since.
     pinged: bool,
+    /// The first item is a `Resync`: what changed before the subscription
+    /// came through no frame.
+    resync: bool,
 }
 
 impl TaskFeed {
-    /// The next task change. `None`: the socket ended (closed, silent past
-    /// a ping, a frame that did not open, or an `error` frame); open a new
-    /// one. Cancel-safe between frames.
+    /// The next task change, a `Resync` first. `None`: the socket ended
+    /// (closed, silent past a ping, a frame that did not open, or an `error`
+    /// frame); open a new one. Cancel-safe between frames.
     #[allow(dead_code)] // the mirrors of Task G3
     pub(crate) async fn next(&mut self) -> Option<FeedItem> {
+        if std::mem::take(&mut self.resync) {
+            return Some(FeedItem::Resync);
+        }
         loop {
             let frame = self.next_plaintext().await?;
             match frame["t"].as_str() {
@@ -581,15 +599,24 @@ impl TaskFeed {
     /// The next text frame as JSON, as it arrived.
     async fn next_frame(&mut self) -> Option<Value> {
         loop {
-            let message = match tokio::time::timeout(PING_AFTER, self.socket.next()).await {
+            let quiet_for = if self.pinged {
+                2 * PING_AFTER
+            } else {
+                PING_AFTER
+            };
+            let deadline = self.heard + quiet_for;
+            let message = match tokio::time::timeout_at(deadline, self.socket.next()).await {
                 Ok(message) => message?.ok()?,
                 Err(_) if self.pinged => return None,
                 Err(_) => {
-                    self.send(r#"{"t":"ping"}"#).await.ok()?;
+                    // Marked first: a cancelled send still counts, and B's
+                    // own pings keep a live socket talking anyway.
                     self.pinged = true;
+                    self.send(r#"{"t":"ping"}"#).await.ok()?;
                     continue;
                 }
             };
+            self.heard = Instant::now();
             self.pinged = false;
             match message {
                 Message::Text(text) => return serde_json::from_str(text.as_str()).ok(),
@@ -601,7 +628,7 @@ impl TaskFeed {
     }
 
     async fn send(&mut self, plaintext: &str) -> Result<(), PeerError> {
-        let wire = match &mut self.codec {
+        let wire = match &self.codec {
             Some(codec) => codec
                 .seal(plaintext)
                 .map_err(|_| PeerError::Unreachable("seal".into()))?,
@@ -610,7 +637,13 @@ impl TaskFeed {
         self.socket
             .send(Message::Text(wire.into()))
             .await
-            .map_err(|_| PeerError::Unreachable("socket closed".into()))
+            .map_err(|_| PeerError::Unreachable("socket closed".into()))?;
+        // Counted once sent: a send the caller cancelled leaves no gap in
+        // the sequence B checks.
+        if let Some(codec) = &mut self.codec {
+            codec.send_seq += 1;
+        }
+        Ok(())
     }
 }
 
@@ -663,7 +696,9 @@ impl ClientCodec {
         Ok(String::from_utf8(plaintext)?)
     }
 
-    fn seal(&mut self, plaintext: &str) -> anyhow::Result<String> {
+    /// The frame for `plaintext` at the next sequence number; the caller
+    /// counts it once it is sent.
+    fn seal(&self, plaintext: &str) -> anyhow::Result<String> {
         let seq = self.send_seq;
         let c = transport::seal_stream_event(
             &self.client_key,
@@ -671,7 +706,6 @@ impl ClientCodec {
             self.aad(seq).as_bytes(),
             plaintext.as_bytes(),
         )?;
-        self.send_seq += 1;
         Ok(format!(r#"{{"seq":{seq},"c":"{c}"}}"#))
     }
 }
@@ -777,6 +811,10 @@ mod tests {
                 .subscribe_tasks()
                 .await
                 .unwrap_or_else(|error| panic!("sealed={sealed}: no socket: {error}"));
+            assert!(
+                matches!(feed.next().await, Some(FeedItem::Resync)),
+                "sealed={sealed}: a fresh feed starts with a resync"
+            );
             let id = peer_task(&mini, "coding-1").await;
             mini.tasks
                 .move_to(
