@@ -1363,10 +1363,20 @@ tail it cannot place.
 
 ### Task plumbing in the transcript
 
+Every session is served without the muqun MCP server's tool rows -- on the
+snapshot, the timeline, the event replay, the SSE stream and `/api/ws`: a
+tool row named for that server under any host's prefix (`muqun_tasks_wait`,
+`mcp__muqun__exec.run`, `muqun.fleet.list`, …), any tool it has or will
+have, in every state (pending, running, completed, failed). They are
+internal; what a person sees of a delegation is its row on Home, the
+parent's `progress` (`Waiting for mini · 3 min`) and the result line the
+gateway tells the parent session ([mcp.md](mcp.md#being-told-how-a-delegation-ended)).
+A tool of the same name with no server prefix, or another server's, stays.
+The agent's own prose is untouched.
+
 A session a task is (or was) bound to ([docs/mcp.md](mcp.md#finishing-a-delegation))
-is served without the gateway's task plumbing -- on the snapshot, the
-timeline, the event replay, the SSE stream, `/api/ws` and `GET …/inbox`.
-Every other session is served as it is:
+is also served without the rest of the gateway's task plumbing, there and
+on `GET …/inbox`:
 
 - A user `text` row (or a `synthetic` row) that ends with the completion
   instruction an older gateway sent with a goal (goals now go alone) is served
@@ -1385,9 +1395,8 @@ Every other session is served as it is:
   marker never shows mid-turn. An `agent.timeline.upsert` whose rows are all
   left with nothing arrives as `agent.timeline.removed` for them. `seq` keeps
   counting, so a client may see a gap where a row was left out.
-- The agent's own `tasks.complete` call (under any host prefix, such as
-  `muqun_tasks_complete`) and the notice OpenCode leaves for the task's
-  per-session instruction (`Instructions updated: …muqun-task`) are left out.
+- The notice OpenCode leaves for the task's per-session instruction
+  (`Instructions updated: …muqun-task`) is left out.
 - OpenCode's Code Mode plumbing is left out: an `execute` tool row (held while
   its code is not known yet and the turn runs) whose whole code is
   `[return] search({query: '<string>'[, limit: <integer>]})[;]` for a muqun

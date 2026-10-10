@@ -845,11 +845,9 @@ impl Connection {
                     Ok(mut event) => {
                         if subscriptions.wants(&event.asid().0) {
                             let asid = event.asid().0.clone();
-                            if let Some(streaming) =
-                                crate::tasks::transcript::for_session(&state, &asid).await
-                            {
-                                crate::tasks::transcript::hide_in_event(&mut event, streaming);
-                            }
+                            let plumbing =
+                                crate::tasks::transcript::for_session(&state, &asid).await;
+                            crate::tasks::transcript::hide_in_event(&mut event, plumbing);
                             super::message_images::attach_to_event(&state, &mut event).await;
                             if self.send(&event_frame(&event)).await.is_err() {
                                 return;

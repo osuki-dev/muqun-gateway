@@ -729,8 +729,9 @@ async fn do_get_agent_session(
         .await
         .map_err(|e| api_error(StatusCode::NOT_FOUND, "session_not_found", &e.to_string()))?;
     let directory = snapshot.info.directory.clone();
-    if let Some(streaming) = for_session(state, asid).await {
-        hide_in_items(&mut snapshot.timeline, streaming);
+    let plumbing = for_session(state, asid).await;
+    hide_in_items(&mut snapshot.timeline, plumbing);
+    if plumbing.task {
         hide_in_inbox(&mut snapshot.inbox);
     }
     message_images::attach_to_items(state, asid, directory.as_deref(), &mut snapshot.timeline)
@@ -762,9 +763,7 @@ async fn do_get_agent_session_events(
         Some(mut events) => {
             let plumbing = for_session(state, asid).await;
             for event in &mut events {
-                if let Some(streaming) = plumbing {
-                    hide_in_event(event, streaming);
-                }
+                hide_in_event(event, plumbing);
                 message_images::attach_to_event(state, event).await;
             }
             Ok(Json(content_envelope(json!(events))))
@@ -791,9 +790,7 @@ async fn do_get_agent_session_timeline(
         .mirror()
         .get_timeline_delta(&AgentSessionId(asid.to_string()), after_seq)
         .await;
-    if let Some(streaming) = for_session(state, asid).await {
-        hide_in_items(&mut items, streaming);
-    }
+    hide_in_items(&mut items, for_session(state, asid).await);
     message_images::attach_to_items(state, asid, None, &mut items).await;
 
     let payload = json!({
@@ -1390,9 +1387,7 @@ async fn do_stream_agent_session(
                     if !ev.asid().0.is_empty() && ev.asid() != &target_asid {
                         continue;
                     }
-                    if let Some(streaming) = for_session(&devices, &target_asid.0).await {
-                        hide_in_event(&mut ev, streaming);
-                    }
+                    hide_in_event(&mut ev, for_session(&devices, &target_asid.0).await);
                     message_images::attach_to_event(&devices, &mut ev).await;
                     let (ev_name, payload) = agent_event_record(&ev);
                     // `None` means the record could not be sealed. It is
@@ -2529,7 +2524,7 @@ async fn get_agent_inbox(
         .mirror()
         .set_inbox(&AgentSessionId(asid.clone()), items.clone())
         .await;
-    if for_session(&state, &asid).await.is_some() {
+    if for_session(&state, &asid).await.task {
         hide_in_inbox(&mut items);
     }
     Ok(Json(content_envelope(json!({ "items": items }))))
