@@ -406,7 +406,13 @@ computer's name (any case) or `self`. They are stored on the task as this
 gateway names them at that moment (a later rename of a computer does not
 change the tasks that named it), once each in the order given, and shown as the task
 view's `mentions`; the goal is sent as it is, and the agent finds them with
-`tasks.read` of its own task.
+`tasks.read` of its own task. `attachments` (at most 16) are the files sent
+with the goal, the same references `POST /api/agent-sessions/{asid}/prompt`
+takes (uploaded asset references, file paths on this computer); they go to
+the agent with the goal, its first prompt, exactly as that route sends them,
+and the task is recorded like any other. They go only to a session agent on
+this computer: with a terminal agent, or for another computer, the create is
+`400 attachments_unsupported` and nothing is made.
 Fields the gateway does not know are ignored. The answer is
 the task view plus the session to open:
 
@@ -430,6 +436,7 @@ the task view plus the session to open:
 | `503 agent_unavailable` | That agent (or, without `agent_id`, any agent) is not attached. |
 | `503 no_terminal` | A terminal agent was named and no terminal session answers (or the one `session_id` names does not). Nothing is created. |
 | `400 terminal_unknown` | `session_id` names no terminal session of this computer. Nothing is created. |
+| `400 attachments_unsupported` | `attachments` were sent with a terminal agent or for another computer. Nothing is created. |
 | `400 invalid_request` (body) | The body is not a JSON object of the shape above. Authentication is checked first, so without a valid device token this is `401`/`403` whatever the body. |
 | `502 agent_error` | The agent could not create the session or take the prompt; the task is recorded as `failed`, with the error as its `summary`. |
 
