@@ -202,37 +202,6 @@ pub fn agent_launch_args(
     }
 }
 
-/// The arguments that give a delegated agent the gateway's completion
-/// `instruction` out of band, so only the goal is its prompt. Only Claude
-/// Code takes them: appended to its system prompt, read from `file` when
-/// there is one (so the launch line typed into the pane carries a path, not
-/// the text). `None` -- the instruction is typed with the goal -- for any
-/// other agent (Codex's `developer_instructions` would replace the user's
-/// own), and for a Claude Code whose configured launch arguments
-/// (`configured`) already append a system prompt: the user's wins. Added
-/// after [`agent_launch_args`].
-pub fn instruction_args(
-    kind: &str,
-    configured: &[String],
-    instruction: &str,
-    file: Option<&Path>,
-) -> Option<Vec<String>> {
-    let appends = configured.iter().any(|arg| {
-        let flag = arg.split('=').next().unwrap_or(arg);
-        flag == "--append-system-prompt" || flag == "--append-system-prompt-file"
-    });
-    if kind != "claude" || appends {
-        return None;
-    }
-    Some(match file {
-        Some(file) => vec![
-            "--append-system-prompt-file".to_owned(),
-            file.to_string_lossy().into_owned(),
-        ],
-        None => vec!["--append-system-prompt".to_owned(), instruction.to_owned()],
-    })
-}
-
 /// What the kinds with built-in defaults start with under this config, one
 /// line each (`codex: --dangerously-… ; folder trust on`), for the startup
 /// log and `manage`'s Settings view: the owner should not have to read the
@@ -1012,39 +981,6 @@ mod tests {
                 launch_prompt_args(kind, prompt),
                 args.map(|args| args.map(str::to_owned)),
                 "{kind}"
-            );
-        }
-
-        // A delegation's completion instruction goes out of band where the
-        // agent takes one, whatever its launch arguments are configured as.
-        let file = Path::new("/state/task-instruction.md");
-        let own = ["--append-system-prompt=be brief".to_owned()];
-        let own_file = ["--append-system-prompt-file".to_owned(), "/x".to_owned()];
-        for (kind, configured, file, args) in [
-            (
-                "claude",
-                &[][..],
-                Some(file),
-                Some(vec![
-                    "--append-system-prompt-file",
-                    "/state/task-instruction.md",
-                ]),
-            ),
-            (
-                "claude",
-                &[][..],
-                None,
-                Some(vec!["--append-system-prompt", "say \"done\""]),
-            ),
-            ("claude", &own[..], Some(file), None),
-            ("claude", &own_file[..], None, None),
-            ("codex", &[][..], Some(file), None),
-            ("gemini", &[][..], Some(file), None),
-        ] {
-            assert_eq!(
-                instruction_args(kind, configured, "say \"done\"", file),
-                args.map(|args| args.into_iter().map(str::to_owned).collect()),
-                "{kind} {configured:?}"
             );
         }
     }

@@ -849,11 +849,10 @@ impl TaskService {
             };
             self.store().transition(&task.id, dispatching).await?;
             self.bind_session(&asid.0, &task.id);
-            // Asked for an explicit end: a turn that stops is only a pause.
-            let instruction = pane_agent::completion_instruction();
+            // The goal alone: how to say it ended is the MCP server's.
             manager
-                .agent()
-                .send_task_prompt(&asid.0, &request.goal, &instruction)
+                .prompts()
+                .send_prompt(&asid, &request.goal, &[], None)
                 .await?;
             let task = self
                 .store()
@@ -1027,10 +1026,8 @@ impl TaskService {
 }
 
 /// The background half of [`TaskService::delegate_to_pane`]: start the agent
-/// in its placed pane with the goal (on its command line where it takes one,
-/// otherwise typed) -- and the completion instruction out of band where the
-/// agent takes one ([`crate::agents::tasks::instruction_args`]), else after
-/// the goal -- unless the task ended meanwhile -- a cancel, or a
+/// in its placed pane with the goal alone (on its command line where it
+/// takes one, otherwise typed) unless the task ended meanwhile -- a cancel, or a
 /// follower that gave up on it -- then move the task to working and follow
 /// it -- or fail it naming the step.
 pub(crate) async fn start_terminal_agent(
@@ -1058,52 +1055,16 @@ pub(crate) async fn start_terminal_agent(
         return;
     }
     let pane_id = placed.place.pane_id.clone();
-    let instruction = pane_agent::completion_instruction();
-    let configured =
-        crate::agents::tasks::agent_launch_args(&kind, &[], &state.config.agent_launch_args);
-    let file = match kind.as_str() {
-        "claude" => pane_agent::completion_instruction_file().await,
-        _ => None,
-    };
-    let extra =
-        crate::agents::tasks::instruction_args(&kind, &configured, &instruction, file.as_deref());
-    let typed_form = pane_agent::completion_request(&goal);
-    let mut prompt = if extra.is_some() {
-        goal
-    } else {
-        typed_form.clone()
-    };
-    let start = |placed, prompt: String, extra: Option<Vec<String>>| {
-        let (state, session, kind, cwd) = (&state, &session, &kind, &cwd);
-        async move {
-            let extra = extra.unwrap_or_default();
-            start_agent_in_place(
-                state,
-                session,
-                kind,
-                cwd.as_deref(),
-                placed,
-                Some(&prompt),
-                &extra,
-            )
-            .await
-        }
-    };
-    let (mut launched, mut to_type) = start(placed.clone(), prompt.clone(), extra.clone()).await;
-    // An agent seen to start with the instruction out of band that is gone
-    // again, its pane back at the shell (a Claude Code that refuses
-    // `--append-system-prompt-file`), is started once more with the
-    // instruction typed. A start that timed out is a normal launch's
-    // failure: a slow agent may still come up, and must not start twice.
-    if extra.is_some()
-        && failed_step(&launched.steps.value()).is_none()
-        && pane_agent::exited_to_shell(&session, &pane_id, &kind).await
-        && !ended().await
-    {
-        tracing::info!(task = %task.id.0, "terminal task: started again with the instruction typed");
-        prompt = typed_form;
-        (launched, to_type) = start(placed, prompt.clone(), None).await;
-    }
+    let prompt = goal;
+    let (mut launched, to_type) = start_agent_in_place(
+        &state,
+        &session,
+        &kind,
+        cwd.as_deref(),
+        placed,
+        Some(&prompt),
+    )
+    .await;
     let typed = to_type.is_some();
     if let Some(started) = to_type {
         if ended().await {
@@ -2675,7 +2636,7 @@ mod tests {
         let (state, id) = delegated(agent).await;
         assert_eq!(*calls.lock().unwrap(), ["create_session", "send_prompt"]);
         // Asked for an explicit end; the goal is stored as given.
-        let sent = [pane_agent::completion_request("fix the build")];
+        let sent = ["fix the build"];
         assert_eq!(*prompts.lock().unwrap(), sent);
         let view = state
             .tasks

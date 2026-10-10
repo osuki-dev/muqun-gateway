@@ -1363,8 +1363,8 @@ timeline, the event replay, the SSE stream, `/api/ws` and `GET …/inbox`.
 Every other session is served as it is:
 
 - A user `text` row (or a `synthetic` row) that ends with the completion
-  instruction is served with the instruction cut, and is left out when it was
-  only the instruction. Any wording the gateway has sent is recognised, by the
+  instruction an older gateway sent with a goal (goals now go alone) is served
+  with the instruction cut, and is left out when it was only the instruction. Any wording the gateway has sent is recognised, by the
   instruction's fixed opening (`When the whole task is finished, `) and its
   closing placeholder line, never by the goal.
 - Each turn's last assistant message is served without the one marker the

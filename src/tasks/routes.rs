@@ -833,12 +833,8 @@ mod tests {
             .iter()
             .find(|c| c["method"] == "agent.prompt")
             .unwrap();
-        // The goal, asking for the completion marker that alone makes it done
-        // (Codex takes no instruction out of band).
-        assert_eq!(
-            prompt["params"]["text"],
-            crate::tasks::pane_agent::completion_request("fix the build")
-        );
+        // The goal alone: how to finish is the MCP server's to say.
+        assert_eq!(prompt["params"]["text"], "fix the build");
         assert_eq!(task["goal"], "fix the build");
 
         // A task cancelled before its agent starts gets no agent and no goal.

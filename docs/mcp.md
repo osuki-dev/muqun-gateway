@@ -399,21 +399,10 @@ could not be made is `502 agent_error`, the task recorded `failed`.
 
 An idle terminal agent is not a finished one -- it pauses to think, run a
 tool or wait on a long build, and comes back -- so only an explicit signal
-finishes the task. The agent is given the completion instruction quoted in
-[Finishing a delegation](#finishing-a-delegation) beside its goal. Where the
-agent takes instructions out of band, only the goal is its prompt: `claude`
-starts with `--append-system-prompt-file <state dir>/task-instruction.md`
-(the text itself with `--append-system-prompt` when the file cannot be
-written) after its launch arguments, on tmux and Herdr alike -- unless
-`agent_launch_args.claude` already appends a system prompt, which wins. A
-Claude Code seen to start that way and gone again before its prompt is up
-(at most 3 s), its pane back at a shell with no Claude Code process left
-under it (it refused the flag), is started once more with the instruction
-typed; a start that times out is a failed launch as before, never retried, so
-a slow agent is never started twice. Any other agent, Codex included (its
-`developer_instructions` would replace the user's own), gets the instruction
-as a paragraph typed after its goal (the stored `goal` is the goal as
-given). The marker line the agent prints
+finishes the task. The agent is given its goal alone (the stored `goal`
+is the goal as given); how to finish is declared by the MCP server, not
+written into the conversation (see [Finishing a delegation](#finishing-a-delegation)).
+A marker line the agent prints
 stays in its pane: a terminal shows what was written. The marker is looked for in the
 pane's recent output (its last 200 lines, unwrapped), not only on its screen,
 so one that scrolled off still counts. It counts when `MUQUN_TASK_DONE:`
@@ -497,20 +486,22 @@ signals:
    is `idle_unconfirmed` or `waiting` ("确认完成" on the phone). Recorded with
    source `device_confirm`.
 
-Every delegation is given its goal and one instruction that names both
-outcomes (the stored `goal` is the goal alone):
+Every delegation is given its goal alone. How to say it ended is
+declaration-level knowledge, never conversation text: the MCP server's
+`initialize` answer carries `instructions` ("You may be running inside a
+Muqun task: when the whole task you were given is finished, call
+tasks.complete with a one-line summary; when you stop because you need the
+user, call it with outcome "blocked" and the reason. If you cannot call it,
+end with the line MUQUN_TASK_DONE: <summary> (or MUQUN_TASK_BLOCKED:
+<reason>)."), and the `tasks.complete` description says the same. An agent
+without the muqun tools (T3 Code, DeepSeek) is told nothing: its task ends
+`idle_unconfirmed` for the device to confirm, unless it prints a marker of
+its own accord. The machines a task mentions are not written into its goal
+either: the `tasks.read` of the agent's own task lists them (`mentions`).
 
-```text
-When the whole task is finished, call the muqun tool tasks.complete with a one-line summary, or with outcome "blocked" and the reason if you stopped because you need the user (a missing file, an unclear request, a permission you cannot get); if you cannot call it, print one line exactly in this form: MUQUN_TASK_DONE: <one-line summary> -- or, blocked, MUQUN_TASK_BLOCKED: <one-line reason>
-```
-
-The instruction and the marker lines are how the gateway learns the end; the
-reader is never shown them. An OpenCode session gets the instruction as a
-synthetic message admitted just before the goal (`POST
-/api/session/{id}/synthetic`, `resume: false`), so the user's message is the
-goal alone; DeepSeek and T3 Code take one text, so the instruction follows
-the goal there. Either way the served transcript cuts it and the agent's
-marker lines ([transcript rules](agent-api.md#task-plumbing-in-the-transcript)).
+Sessions from before goals went alone still hold the completion
+instruction this gateway used to send; the served transcript cuts it and the
+consumed marker ([transcript rules](agent-api.md#task-plumbing-in-the-transcript)).
 
 A session delegation moves like this (moves pass the states between, so a
 `waiting` task that is completed passes `working`):

@@ -1,8 +1,9 @@
 //! The task plumbing a session transcript is served without.
 //!
-//! A delegation asks its agent to say how it ended
-//! ([`pane_agent::completion_instruction`]), and the agent may answer with a
-//! marker line ([`pane_agent::DONE_MARKER`], [`pane_agent::BLOCKED_MARKER`]).
+//! A delegated agent says how it ended with `tasks.complete` or, without
+//! the tool, a marker line ([`pane_agent::DONE_MARKER`],
+//! [`pane_agent::BLOCKED_MARKER`]); sessions from before goals went alone
+//! also hold the completion instruction this gateway used to send.
 //! Both are how the gateway learns the task's end; the reader only needs the
 //! goal and the answer. So on the way out (snapshot, timeline, event replay,
 //! the SSE stream and `/api/ws`, like `message_images`) the transcript -- and
@@ -444,7 +445,7 @@ fn may_become_marker(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tasks::pane_agent::completion_request;
+    use crate::tasks::pane_agent::LAST_REQUEST;
 
     fn item(role: TimelineRole, part: AgentPart) -> TimelineItem {
         TimelineItem {
@@ -480,7 +481,7 @@ mod tests {
     #[test]
     fn the_reader_gets_the_goal_and_the_answer_without_the_plumbing() {
         use TimelineRole::{Assistant, System, User};
-        let current = completion_request("fix the build");
+        let current = format!("fix the build\n\n{LAST_REQUEST}");
         // Every wording this gateway has sent.
         let first = "fix the build\n\nWhen the whole task is finished, print one line exactly \
                      in this form: MUQUN_TASK_DONE: <one-line summary>";

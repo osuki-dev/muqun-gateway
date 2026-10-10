@@ -485,7 +485,7 @@ impl MuqunMcp {
 
     #[tool(
         name = "tasks.complete",
-        description = "Say how the task you were given ended, in one line: finished (outcome done, the default), or blocked because you need the user (outcome blocked, with the reason: a missing file, an unclear request, a permission you cannot get). Only the session (or terminal pane) working on the task can complete it; stopping or going idle does not, and a blocked task stays open until you call this again with done."
+        description = "Call this when the task you were given is finished, with a one-line summary (outcome done, the default) -- or when you stop because you need the user, with outcome blocked and the reason (a missing file, an unclear request, a permission you cannot get). Only the session (or terminal pane) working on the task can complete it; stopping or going idle does not, and a blocked task stays open until you call this again with done."
     )]
     async fn tasks_complete(
         &self,
@@ -539,10 +539,13 @@ impl ServerHandler for MuqunMcp {
             ))
             .with_instructions(
                 "Muqun Gateway on this computer. fleet.describe says what it has, exec.run \
-                 runs short commands, tasks.delegate + tasks.wait hand work to a coding agent. \
-                 Waits are capped at 45 s; call tasks.wait again while it says working. \
-                 When you finish a task you were given, call tasks.complete; when you \
-                 stop because you need the user, call it with outcome blocked.",
+                 runs short commands, tasks.delegate + tasks.wait hand work to a coding agent \
+                 (waits are capped at 45 s; call tasks.wait again while it says working). \
+                 You may be running inside a Muqun task: when the whole task you were given \
+                 is finished, call tasks.complete with a one-line summary; when you stop \
+                 because you need the user, call it with outcome \"blocked\" and the reason. \
+                 If you cannot call it, end with the line MUQUN_TASK_DONE: <summary> (or \
+                 MUQUN_TASK_BLOCKED: <reason>).",
             )
     }
 }

@@ -85,11 +85,10 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
   `MUQUN_TASK_DONE` marker (`pane_agent::marker`, read off the pane or
   the session's last message by `service::turn_end`), or the device's
   `POST /api/tasks/{id}/complete`; a stop without one is `idle_unconfirmed`.
-  The completion instruction and the marker lines are never shown to the
-  reader: the instruction goes out of band where the agent takes it
-  (`AgentPort::send_task_prompt`; Claude Code's appended system prompt,
-  `agents::tasks::instruction_args`), and
-  `transcript.rs` cuts both from the served transcript of a task's session.
+  The goal goes to the agent alone: how to finish is the MCP server's
+  `instructions` and the `tasks.complete` description, never conversation
+  text. `transcript.rs` cuts the consumed marker (and the instruction older
+  gateways sent) from the served transcript of a task's session.
   An agent that needs the user says it is blocked (`tasks.complete` with
   `outcome: blocked`, or `MUQUN_TASK_BLOCKED`): the task is `waiting`, and
   stays so through idles until the agent works on a later turn or finishes
@@ -220,8 +219,8 @@ A delegation to a terminal agent (`claude`, `codex`, ...) opened by `POST
 makes the pane through the spawn route's `place_agent`, binds it (`binding.kind
 == "pane"` with `agent_id` and `shell_pid`) and answers at once as `dispatching`.
 `start_terminal_agent` then starts the agent with its launch arguments and, once
-it is ready, types the goal wrapped by `pane_agent::completion_request`
-(`type_agent_prompt`); `goal_accepted` presses Enter again if the goal sits
+it is ready, types the goal (`type_agent_prompt`) where it could not go on
+the command line; `goal_accepted` presses Enter again if the goal sits
 unsent in the input box, and fails the task if it never leaves. `pane_agent::follow`
 (resumed by `driver.rs` after a restart) reads the pane every 2 s: an agent
 starting or working is `working`, one blocked on a menu is `waiting`, one idle

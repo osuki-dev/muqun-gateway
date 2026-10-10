@@ -519,51 +519,6 @@ impl AgentPort for OpencodeDriver {
         })
     }
 
-    /// The instruction is a synthetic message admitted without running,
-    /// then the goal is the user's prompt that starts the turn: the model
-    /// reads both, the transcript shows the instruction as a synthetic row
-    /// (which the served transcript drops). An OpenCode that refuses the
-    /// synthetic message gets them as one prompt.
-    fn send_task_prompt<'a>(
-        &'a self,
-        session_id: &'a str,
-        goal: &'a str,
-        instruction: &'a str,
-    ) -> AgentFuture<'a, ()> {
-        Box::pin(async move {
-            let admitted = match self.client.send_synthetic(session_id, instruction).await {
-                Ok(admitted) => admitted,
-                Err(error) => {
-                    tracing::debug!(%error, "task instruction sent with the goal instead");
-                    let text = format!("{goal}\n\n{instruction}");
-                    return self.send_prompt(session_id, &text, &[], None).await;
-                }
-            };
-            // Tried twice: the admitted instruction would otherwise ride on
-            // whatever prompt the session gets next, so it is withdrawn when
-            // the goal cannot be sent.
-            let mut sent = self.client.send_prompt(session_id, goal, &[], None).await;
-            if sent.is_err() {
-                sent = self.client.send_prompt(session_id, goal, &[], None).await;
-            }
-            if let Err(error) = sent {
-                let id = admitted.pointer("/data/id").or_else(|| admitted.get("id"));
-                let withdrawn = match id.and_then(Value::as_str) {
-                    Some(id) => self.client.cancel_inbox_item(session_id, id).await.is_ok(),
-                    None => false,
-                };
-                if !withdrawn {
-                    tracing::warn!(
-                        session_id,
-                        "task instruction left admitted: the goal was not sent"
-                    );
-                }
-                return Err(error);
-            }
-            Ok(())
-        })
-    }
-
     fn revert_session<'a>(
         &'a self,
         session_id: &'a str,

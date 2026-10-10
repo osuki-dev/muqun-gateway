@@ -5,17 +5,15 @@
 //!
 //! An idle agent is not a finished one -- a terminal agent pauses (thinking,
 //! a tool, a long build) and comes back -- so only an explicit signal is
-//! `done`: the goal is given with [`completion_instruction`] (out of band
-//! where the agent takes it -- Claude Code's appended system prompt, with
-//! one typed retry if it exits at once that way -- else after the goal,
-//! [`completion_request`];
-//! the goal on the agent's command line where it takes one, else typed),
-//! and the agent
-//! printing a [`DONE_MARKER`] line (or calling `tasks.complete` from the
-//! pane's own token) is that signal. An agent that stops because it needs
-//! the user says so the same way: a [`BLOCKED_MARKER`] line, or
-//! `tasks.complete` with outcome `blocked`. Session delegations follow the
-//! same rules (`service::turn_end`, `TaskService::settle`).
+//! `done`. The goal goes to the agent alone (on its command line where it
+//! takes one, else typed); how to say it finished is declared once, not in
+//! the conversation: the MCP server's `instructions` and the
+//! `tasks.complete` tool's description tell an agent with the muqun tools to
+//! call `tasks.complete` (outcome `blocked` when it needs the user), or else
+//! to print a [`DONE_MARKER`] / [`BLOCKED_MARKER`] line. Either is the
+//! signal; an agent with neither ends `idle_unconfirmed` for the device to
+//! confirm. Session delegations follow the same rules (`service::turn_end`,
+//! `TaskService::settle`).
 //!
 //! | The pane | The task |
 //! |---|---|
@@ -120,162 +118,20 @@ pub(crate) fn is_available(state: &AppState, agent_id: &str) -> bool {
     agent_kinds::find_on_path(&command).is_some()
 }
 
-/// What every delegation to an agent (a terminal agent's pane or an agent
-/// session) asks besides its goal: to say how it ended -- the
-/// `tasks.complete` tool, or else a marker line. It is plumbing, never shown
-/// to the reader: it goes out of band where the agent takes that (a
-/// synthetic OpenCode message; Claude Code's appended system prompt, unless
-/// its configured launch arguments append one of their own) and is cut from
-/// the served transcript otherwise ([`super::transcript`]). A Claude Code
-/// seen to start with `--append-system-prompt-file` and gone again within
-/// [`SETTLE`] -- its pane back at a shell with no Claude Code process left
-/// under it ([`exited_to_shell`]) -- is started once more with the
-/// instruction typed after its goal, rather than failing the task; a start
-/// that times out is never retried. Codex and other terminal agents get it
-/// typed: a terminal shows what was typed. It opens with
-/// [`REQUEST_OPENING`].
-pub(crate) fn completion_instruction() -> String {
-    format!(
-        "{REQUEST_OPENING}call the muqun tool tasks.complete with a \
-         one-line summary, or with outcome \"blocked\" and the reason if you stopped because \
-         you need the user (a missing file, an unclear request, a permission you cannot get); \
-         if you cannot call it, print one line exactly in this form: \
-         {DONE_MARKER} {SUMMARY_PLACEHOLDER} -- or, blocked, {BLOCKED_MARKER} {REASON_PLACEHOLDER}"
-    )
-}
-
-/// The opening of every completion instruction this gateway has sent.
+/// The opening of the completion instruction this gateway once sent with
+/// a delegated goal (every wording began with it). Goals now go alone -- the
+/// agent learns how to finish from the MCP server's instructions and the
+/// `tasks.complete` tool -- but sessions from before still hold it, and the
+/// served transcript cuts it ([`super::transcript`]).
 pub(crate) const REQUEST_OPENING: &str = "When the whole task is finished, ";
 
-/// The goal followed by [`completion_instruction`], for an agent that can
-/// only be given one text.
-pub(crate) fn completion_request(goal: &str) -> String {
-    format!("{goal}\n\n{}", completion_instruction())
-}
-
-/// [`completion_instruction`] in a file for an agent that reads it from one
-/// (Claude Code's `--append-system-prompt-file`), so the launch line typed
-/// into the pane carries a path rather than the instruction. `None` when it
-/// cannot be written.
-pub(crate) async fn completion_instruction_file() -> Option<std::path::PathBuf> {
-    let path = crate::state_dir().ok()?.join("task-instruction.md");
-    let text = completion_instruction();
-    if tokio::fs::read_to_string(&path).await.ok().as_deref() == Some(text.as_str()) {
-        return Some(path);
-    }
-    // Written beside it and renamed over it, so a Claude Code started by a
-    // concurrent delegation never reads half a file.
-    let partial = path.with_extension(format!("md.{}", uuid::Uuid::new_v4().simple()));
-    let written = async {
-        tokio::fs::write(&partial, &text).await?;
-        tokio::fs::rename(&partial, &path).await
-    };
-    if let Err(error) = written.await {
-        tracing::debug!(%error, "task instruction file not written");
-        let _ = tokio::fs::remove_file(&partial).await;
-        return None;
-    }
-    Some(path)
-}
-
-/// How long an agent started with its instruction out of band is watched
-/// for an exit: one that refuses the flag exits at once. The watch ends as
-/// soon as the agent's prompt is up.
-const SETTLE: Duration = Duration::from_secs(3);
-const SETTLE_POLL: Duration = Duration::from_millis(200);
-/// The shells a pane goes back to when its agent exits.
-const SHELLS: [&str; 13] = [
-    "sh", "bash", "zsh", "fish", "ksh", "mksh", "dash", "ash", "tcsh", "csh", "nu", "xonsh",
-    "elvish",
-];
-
-/// Whether the `kind` agent just started in `pane_id` exited again within
-/// [`SETTLE`]: the pane no longer runs it, its foreground is a shell, and no
-/// `kind` process is left anywhere under the pane's shell (a launcher script
-/// can put a shell in the foreground of a running agent). Watched until
-/// the agent's prompt is up (Herdr reports its state; on tmux, its input
-/// box is drawn), at most [`SETTLE`]. A pane or process table that cannot be
-/// read says no: a launch that cannot be shown to have failed is never
-/// started twice.
-pub(crate) async fn exited_to_shell(session: &SessionConfig, pane_id: &str, kind: &str) -> bool {
-    let backend = terminal_backend(session);
-    let deadline = tokio::time::Instant::now() + SETTLE;
-    loop {
-        tokio::time::sleep(SETTLE_POLL).await;
-        let Ok(pane) = backend.get_pane(&PaneId::new(pane_id)).await else {
-            return false;
-        };
-        let foreground = pane.foreground_command.as_deref();
-        if at_shell(pane.agent.as_deref(), foreground, kind) {
-            return match pane.shell_pid {
-                Some(shell) => process_table()
-                    .await
-                    .is_some_and(|table| !runs_under(&table, shell, kind)),
-                None => false,
-            };
-        }
-        let ready = pane.agent.as_deref() == Some(kind)
-            && (matches!(
-                pane.agent_status,
-                AgentStatus::Idle | AgentStatus::Working | AgentStatus::Blocked
-            ) || read_pane_visible_text(session, pane_id)
-                .await
-                .is_ok_and(|screen| input_box(&screen).is_some()));
-        if ready || tokio::time::Instant::now() >= deadline {
-            return false;
-        }
-    }
-}
-
-fn at_shell(agent: Option<&str>, foreground: Option<&str>, kind: &str) -> bool {
-    let shell = foreground.is_some_and(|command| SHELLS.contains(&command_name(command)));
-    agent != Some(kind) && shell
-}
-
-/// A command's name: its path's last part, without a login shell's `-`.
-fn command_name(command: &str) -> &str {
-    let name = command.rsplit('/').next().unwrap_or(command);
-    name.trim_start_matches('-')
-}
-
-/// `ps -A -o pid=,ppid=,comm=`: every process's pid, parent and command.
-async fn process_table() -> Option<String> {
-    let out = tokio::process::Command::new("ps")
-        .args(["-A", "-o", "pid=,ppid=,comm="])
-        .output()
-        .await
-        .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-/// Whether a process named `name` is `root` or below it in `table` (the
-/// output of [`process_table`]).
-fn runs_under(table: &str, root: u32, name: &str) -> bool {
-    let rows: Vec<(u32, u32, &str)> = table
-        .lines()
-        .filter_map(|line| {
-            let (pid, rest) = line.trim_start().split_once(char::is_whitespace)?;
-            let (ppid, command) = rest.trim_start().split_once(char::is_whitespace)?;
-            Some((pid.parse().ok()?, ppid.parse().ok()?, command.trim()))
-        })
-        .collect();
-    let mut tree = vec![root];
-    let mut at = 0;
-    while at < tree.len() {
-        let parent = tree[at];
-        tree.extend(
-            rows.iter()
-                .filter(|(pid, ppid, _)| *ppid == parent && !tree.contains(pid))
-                .map(|(pid, _, _)| *pid)
-                .collect::<Vec<_>>(),
-        );
-        at += 1;
-    }
-    rows.iter()
-        .any(|(pid, _, command)| tree.contains(pid) && command_name(command) == name)
-}
+/// The last wording of that instruction, for the tests of what reads it.
+#[cfg(test)]
+pub(crate) const LAST_REQUEST: &str = "When the whole task is finished, call the muqun tool \
+    tasks.complete with a one-line summary, or with outcome \"blocked\" and the reason if you \
+    stopped because you need the user (a missing file, an unclear request, a permission you \
+    cannot get); if you cannot call it, print one line exactly in this form: \
+    MUQUN_TASK_DONE: <one-line summary> -- or, blocked, MUQUN_TASK_BLOCKED: <one-line reason>";
 
 /// How an agent said its task ended, with its one line.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1392,7 +1248,7 @@ mod tests {
     #[test]
     fn the_marker_hint_and_failure_lines_are_read_off_the_screen() {
         // The request echoed in the prompt is not the marker; the agent's line is.
-        let goal = completion_request("fix the build");
+        let goal = format!("fix the build\n\n{LAST_REQUEST}");
         let echoed = format!("> {}\n", goal.replace('\n', "\n  "));
         assert_eq!(marker(&echoed), None);
         let finished = format!("{echoed}⏺ MUQUN_TASK_DONE: build fixed,   12 tests pass\n\n❯ \n");
@@ -1440,34 +1296,6 @@ mod tests {
             "⏺ Otherwise\n  MUQUN_TASK_BLOCKED: <one-\n",
         ] {
             assert_eq!(marker(not_yet), None, "{not_yet}");
-        }
-
-        // An agent started with its instruction out of band that refused it
-        // is gone and its pane back at a shell; a slow or running one is not.
-        for (agent, foreground, back) in [
-            (None, Some("-zsh"), true),
-            (None, Some("/usr/bin/bash"), true),
-            (Some("claude"), Some("claude"), false),
-            (None, Some("node"), false),
-            (None, None, false),
-        ] {
-            assert_eq!(
-                at_shell(agent, foreground, "claude"),
-                back,
-                "{foreground:?}"
-            );
-        }
-        // ... and only once no such process is left under the pane's shell.
-        let table = "  1     0 init\n 40     1 -zsh\n 41    40 /usr/local/bin/claude-shim\n \
-                     42    41 sh\n 43    42 claude\n 50     1 claude\n";
-        for (root, gone) in [
-            (40, false),
-            (42, false),
-            (41, false),
-            (50, false),
-            (7, true),
-        ] {
-            assert_eq!(!runs_under(table, root, "claude"), gone, "{root}");
         }
 
         // A title: the label, the session's name, else the goal's first

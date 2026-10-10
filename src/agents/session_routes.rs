@@ -670,7 +670,7 @@ pub(crate) async fn start_placed_agent(
     prompt: Option<&str>,
 ) -> AgentLaunch {
     let (mut launch, started) =
-        start_agent_in_place(state, session, agent, cwd, placed, prompt, &[]).await;
+        start_agent_in_place(state, session, agent, cwd, placed, prompt).await;
     if let Some(started) = started {
         type_agent_prompt(session, &started, prompt, &mut launch).await;
     }
@@ -683,8 +683,7 @@ pub(crate) struct StartedAgent {
     prompt_target: String,
 }
 
-/// Start the agent in the placed pane, with `extra_args` after its launch
-/// arguments. Claude Code and Codex get `prompt`
+/// Start the agent in the placed pane. Claude Code and Codex get `prompt`
 /// as their command line's last argument (`-- <prompt>`) on a backend that
 /// takes one: a goal typed into a TUI's input box can sit there unsent. Any
 /// other agent, or backend, is handed back to have it typed
@@ -700,7 +699,6 @@ pub(crate) async fn start_agent_in_place(
     cwd: Option<&str>,
     placed: PlacedAgent,
     prompt: Option<&str>,
-    extra_args: &[String],
 ) -> (AgentLaunch, Option<StartedAgent>) {
     let PlacedAgent {
         place,
@@ -718,7 +716,6 @@ pub(crate) async fn start_agent_in_place(
         &trusted_folders(state, agent_cwd.as_deref()),
         &state.config.agent_launch_args,
     );
-    agent_args.extend(extra_args.iter().cloned());
     let launch_prompt = prompt
         .filter(|_| terminal_backend(session).takes_launch_prompt())
         .and_then(|prompt| Some((prompt, tasks::launch_prompt_args(agent, prompt)?)));

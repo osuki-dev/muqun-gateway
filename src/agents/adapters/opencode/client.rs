@@ -276,15 +276,6 @@ impl OpencodeClient {
             .await
     }
 
-    /// `POST /api/session/{id}/synthetic` with `resume: false`: input the
-    /// model reads with the next prompt, kept apart from the user's own
-    /// messages and not run on its own.
-    pub async fn send_synthetic(&self, session_id: &str, text: &str) -> Result<Value, AgentError> {
-        let body = json!({ "text": text, "resume": false });
-        self.post(&format!("/api/session/{session_id}/synthetic"), &body)
-            .await
-    }
-
     /// Stage and commit in one call. Kept for the one-shot `POST …/revert`
     /// the app has always had; the two halves below are the separate steps.
     pub async fn revert_session(
