@@ -214,6 +214,7 @@ fn task_error(error: TaskError) -> CallToolResult {
         ),
         TaskError::NoTimeline => invalid("Only a delegated task has a timeline."),
         TaskError::InvalidSummary => invalid("summary must be non-empty and at most 32 KiB"),
+        TaskError::ChildrenOpen(which) => fail("children_open", &which),
         TaskError::NoTerminal => fail(
             "no_terminal",
             "No terminal session is reachable on this computer.",

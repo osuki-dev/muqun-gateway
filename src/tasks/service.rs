@@ -353,6 +353,9 @@ pub(crate) enum TaskError {
     /// The device confirmed a task that is not its own paused or waiting
     /// delegation.
     NotConfirmable,
+    /// `tasks.complete` (done) on a task whose sub-tasks are not all over:
+    /// a plain sentence naming them.
+    ChildrenOpen(String),
     /// A completion summary that is empty (where one is required) or larger
     /// than [`MAX_SUMMARY_BYTES`].
     InvalidSummary,
@@ -364,6 +367,7 @@ pub(crate) enum TaskError {
 impl std::fmt::Display for TaskError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ChildrenOpen(which) => write!(f, "{which}"),
             Self::NotFound => write!(f, "task not found"),
             Self::NotYours => write!(f, "task belongs to someone else"),
             Self::UnknownMachine { wanted, .. } => write!(f, "unknown machine '{wanted}'"),
@@ -2220,8 +2224,49 @@ impl TaskService {
             if let Ok(mut live) = self.live.lock() {
                 live.idled.remove(id);
             }
+        } else if let Some(open) = self.open_children(id).await {
+            // Done means the whole of it: a child still out (working,
+            // paused, waiting) is finished or cancelled first.
+            return Err(TaskError::ChildrenOpen(open));
         }
         self.finish(id, to).await
+    }
+
+    /// A sentence naming task `id`'s sub-tasks that have not ended, if any:
+    /// `mini is still on 'Checking Xcode version'; wait for it or cancel it.`
+    async fn open_children(&self, id: &TaskId) -> Option<String> {
+        let filter = TaskFilter {
+            root: Some(id.clone()),
+            states: Some(OPEN_STATES.to_vec()),
+            limit: 20,
+            ..Default::default()
+        };
+        let open: Vec<String> = self
+            .store
+            .list(filter)
+            .await
+            .ok()?
+            .into_iter()
+            .filter(|task| task.id != *id)
+            .map(|child| {
+                let who = match &child.binding {
+                    TaskBinding::Peer { peer_name, .. } => peer_name.clone(),
+                    _ => String::from("A sub-task"),
+                };
+                let title = self.title_of(&child).unwrap_or_else(|| {
+                    pane_agent::title(
+                        child.label.as_deref(),
+                        child.session_title.as_deref(),
+                        &child.goal,
+                    )
+                });
+                format!("{who} is still on '{title}'")
+            })
+            .collect();
+        (!open.is_empty()).then(|| {
+            let it = if open.len() == 1 { "it" } else { "them" };
+            format!("{}; wait for {it} or cancel {it}.", open.join("; "))
+        })
     }
 
     /// Whether the task `id` is `waiting` because its agent said it is

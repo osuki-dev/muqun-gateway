@@ -164,6 +164,7 @@ Error codes:
 | `task_not_found` | No task with that `task_id`, or it belongs to another assistant. |
 | `machine_unknown` | `machine` names neither this computer nor a linked one; the message lists the names that work. |
 | `machine_unreachable` | `fleet.describe` or `tasks.delegate` named a linked computer that does not answer now; nothing was started there. |
+| `children_open` | `tasks.complete` (done) on a task with a sub-task that has not ended -- working, paused (`idle_unconfirmed`) or `waiting`: the message names each ("mini is still on 'Checking Xcode version'; wait for it or cancel it."). `outcome: "blocked"` is still taken. |
 | `delegation_loop` | `tasks.delegate(machine)` named a linked computer from a task another computer handed here (itself or an ancestor `origin: "peer"`): one hop only, so two computers never hand a goal back and forth; nothing is created. |
 | `delegations_disabled` | `tasks.delegate` named a linked computer whose owner switched off work from other computers. |
 | `unauthorized` | `tasks.delegate` or `fleet.describe` named a linked computer that no longer takes this one's token ("mini no longer accepts this computer; link again from your phone"); the link is kept, marked `unauthorized`, until the owner's phone links it again. |

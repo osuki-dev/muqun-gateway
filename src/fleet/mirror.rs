@@ -1020,6 +1020,48 @@ mod tests {
         assert_eq!(error["error"], "delegation_loop", "{error}");
     }
 
+    /// A task is not done while a child it delegated is still out -- working,
+    /// paused or waiting: `tasks.complete` names it; blocked still goes.
+    #[tokio::test]
+    async fn a_parent_is_not_done_while_its_child_is_still_out() {
+        let state = crate::test_support::test_state("admin", vec![]);
+        let parent = state
+            .tasks
+            .insert_for_test(&Task {
+                binding: TaskBinding::None,
+                ..mirror(TaskState::Working, None)
+            })
+            .await;
+        let child = state
+            .tasks
+            .insert_for_test(&Task {
+                parent: Some(parent.clone()),
+                goal: "Check the Xcode version".into(),
+                ..mirror(TaskState::IdleUnconfirmed, None)
+            })
+            .await;
+        let refused = state
+            .tasks
+            .complete(&parent, "all done", Outcome::Done)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            "mini is still on 'Check the Xcode version'; wait for it or cancel it."
+        );
+        let by = owner(&state, &child).await;
+        state.tasks.cancel(&state, &by, &child).await.unwrap();
+        assert_eq!(
+            state
+                .tasks
+                .complete(&parent, "all done", Outcome::Done)
+                .await
+                .unwrap()
+                .state,
+            TaskState::Done
+        );
+    }
+
     /// What a mirror says about its computer (§10.12): structured fields,
     /// never a gateway-made line; the phone words them.
     #[tokio::test]
