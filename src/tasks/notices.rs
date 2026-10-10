@@ -242,7 +242,7 @@ async fn send(state: &AppState, target: &NoticeTarget, line: &str) -> anyhow::Re
                 .await
                 .and_then(|(_, kind)| kind)
                 .ok_or_else(|| anyhow::anyhow!("no agent runs in that pane"))?;
-            return send_to_pane(session, pane_id, &kind, line).await;
+            return send_to_pane(session, pane_id, &kind, &without_file_mentions(line)).await;
         }
     }
     Ok(Sent::Delivered)
@@ -406,18 +406,27 @@ pub(crate) fn one_plain_line(text: &str, max: usize) -> String {
             c => plain.push(c),
         }
     }
-    // A word starting `@` would attach that file in Claude Code's input.
     plain
         .split_whitespace()
-        .map(|word| match word.strip_prefix('@') {
-            Some(rest) => format!("＠{rest}"),
-            None => word.to_owned(),
-        })
         .collect::<Vec<_>>()
         .join(" ")
         .chars()
         .take(max)
         .collect()
+}
+
+/// `line` for an agent's typed input box: a word that starts with `@` and
+/// looks like a path (`@src/main.rs`, `@.env`) would attach that file
+/// there, so its `@` becomes `＠`. Other words (`@alice`, an email) are left
+/// alone, and the session API path never gets this: it attaches nothing.
+fn without_file_mentions(line: &str) -> String {
+    line.split(' ')
+        .map(|word| match word.strip_prefix('@') {
+            Some(rest) if rest.contains('/') || rest.contains('.') => format!("＠{rest}"),
+            _ => word.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The line a parent is told: who, how it ended, and what it said.
@@ -812,5 +821,15 @@ mod tests {
             assert_eq!(matches!(sent, Sent::Delivered), delivered);
             assert_eq!(*typist.steps.lock().unwrap(), steps);
         }
+    }
+
+    #[test]
+    fn a_path_mention_is_defused_for_a_typed_pane_only() {
+        assert_eq!(
+            without_file_mentions(
+                "mini finished: see @src/main.rs and @.env, ask @alice or bob@x.org"
+            ),
+            "mini finished: see ＠src/main.rs and ＠.env, ask @alice or bob@x.org"
+        );
     }
 }
