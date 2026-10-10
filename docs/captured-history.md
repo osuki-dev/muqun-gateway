@@ -234,17 +234,20 @@ encryption is separate and does not cover the database.
 
 The shared store's single worker thread owns the one SQLite connection; no
 SQLite operation runs on the Tokio executor, and no fold mutex is held while a
-job waits for that worker. Every 100 ms a Tokio task compares the fold's change
-counter with the last idle pass and submits one write pass to the worker when
-it moved, when pruning is due, or on every tick while a debounced scope is
-waiting (such a pass only checks metadata and copies no rows); at most 16
-checkpoint reads may wait on it, and one more is refused rather than queued.
+job waits for that worker. A Tokio task sleeps until the fold changes (every
+change signals it) or pruning is due, so an idle Gateway does not wake it. It
+then submits one write pass to the worker, and while a pass leaves work behind
+(a debounced scope waiting, more projections to write) it follows up every
+100 ms (a debounced pass only checks metadata and copies no rows); at most 16
+checkpoint reads may wait on the worker, and one more is refused rather than
+queued.
 Dirty revisions remain coalesced in the bounded live fold. A projection written
 in the last 3 seconds waits out that debounce unless its pane was reset or
 re-identified, or the projection emptied; those are handled at once. An emptied
 projection deletes its stored row only when the pane was reset; otherwise the
-stored row stays. Each pass copies at most one 2 MiB projection under a short lock and
-writes it in one transaction; an unchanged projection opens none. Late recovery
+stored row stays. Each pass takes at most one 2 MiB projection under a short lock --
+its rows are shared, so that is one reference count per row, never a copy of the
+text -- encodes it without the lock and writes it in one transaction; an unchanged projection opens none. Late recovery
 rechecks the observation identity, fence and policy, and that no fresh
 historical prefix has appeared meanwhile; a frame that changed only the screen
 does not stop it. Write acknowledgements recheck the exact revision; reset work

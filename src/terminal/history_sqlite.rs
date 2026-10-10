@@ -1,8 +1,8 @@
 //! Optional captured-history checkpoints, kept in the shared store under the
-//! `history` namespace. The live fold coalesces revisions; on a tick where the
-//! fold's version moved, a Tokio task hands the store worker one pass that
-//! copies at most one bounded projection under the fold lock and writes it
-//! without that lock.
+//! `history` namespace. The live fold coalesces revisions; when the fold's
+//! version moves, a Tokio task hands the store worker one pass that takes at
+//! most one bounded projection's shared rows under the fold lock and encodes
+//! and writes it without that lock. An idle fold wakes it only to prune.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -47,6 +47,8 @@ const MAX_PAYLOAD_BYTES: i64 = 24 * 1024 * 1024;
 // Length prefixes have their own bounded overhead, counted in payload quotas.
 const MAX_ENCODED_BYTES: usize = MAX_PANE_BYTES + 4 * MAX_PANE_LINES;
 const RETENTION_SECONDS: i64 = 7 * 24 * 60 * 60;
+/// How soon a pass that left work (a debounced scope, a projection still to
+/// write) is followed by the next.
 const FLUSH_TICK: Duration = Duration::from_millis(100);
 const PRUNE_EVERY: Duration = Duration::from_secs(60);
 /// A written scope waits this long before its next ordinary write; a reset,
@@ -233,6 +235,8 @@ struct Checkpoints {
     debounce: Duration,
     healthy: AtomicBool,
     writer: Mutex<Writer>,
+    /// How often the write loop has woken: an idle fold leaves it asleep.
+    wakes: std::sync::atomic::AtomicU64,
 }
 
 /// `(session, pane, format)`.
@@ -287,19 +291,29 @@ impl Checkpoints {
                 seen: HashMap::new(),
                 next_scope: None,
             }),
+            wakes: std::sync::atomic::AtomicU64::new(0),
         }))
     }
 
     async fn flush_forever(self: Arc<Self>) {
-        let mut tick = tokio::time::interval(FLUSH_TICK);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let Ok(changes) = self.captures.lock().map(|captures| captures.changes()) else {
+            return;
+        };
         // The fold's version as of the last pass that found nothing left to
         // do. While the fold still has exactly that version a pass would be a
-        // no-op, so idle ticks leave the shared worker alone until pruning is due.
+        // no-op, so the loop sleeps until the fold changes or pruning is due.
         let mut settled: Option<u64> = None;
         let mut pruned = Instant::now();
         while self.healthy.load(Ordering::Acquire) {
-            tick.tick().await;
+            if settled.is_some() {
+                tokio::select! {
+                    () = changes.notified() => {}
+                    () = tokio::time::sleep_until((pruned + PRUNE_EVERY).into()) => {}
+                }
+            } else {
+                tokio::time::sleep(FLUSH_TICK).await;
+            }
+            self.wakes.fetch_add(1, Ordering::Relaxed);
             let prune_due = pruned.elapsed() >= PRUNE_EVERY;
             let snapshot = match self.captures.lock() {
                 Ok(captures) => (prune_due || settled != Some(captures.version()))

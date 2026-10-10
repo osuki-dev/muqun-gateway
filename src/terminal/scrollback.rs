@@ -986,6 +986,9 @@ pub struct ScrollbackStore {
     /// Bumped by every mutating entry point, so a durable writer can tell an
     /// untouched fold from one it must look at again with one comparison.
     version: u64,
+    /// Signalled with every bump of `version`: what the checkpoint writer
+    /// sleeps on, so an idle gateway does not wake it.
+    changed: std::sync::Arc<tokio::sync::Notify>,
 }
 
 #[derive(Debug)]
@@ -1086,7 +1089,7 @@ impl ScrollbackStore {
     /// is the question this store actually needs answered and the one
     /// `alternate_on` answers directly.
     pub fn observe(&mut self, session_id: &str, value: &Value) {
-        self.version += 1;
+        self.touch();
         let mut passed_through = Vec::new();
         visit_panes(value, &mut |pane_id, pane| {
             let key = pane_key(session_id, pane_id);
@@ -1169,7 +1172,7 @@ impl ScrollbackStore {
     /// caller that can tell "gone" from "not mentioned", so it is the one that
     /// prunes. The approval watcher calls it every 1500ms with exactly that.
     pub fn observe_listing(&mut self, session_id: &str, value: &Value) {
-        self.version += 1;
+        self.touch();
         self.observe(session_id, value);
         let mut live = HashSet::new();
         visit_panes(value, &mut |pane_id, _| {
@@ -1373,7 +1376,7 @@ impl ScrollbackStore {
         rows: usize,
         fence: Option<CaptureFence>,
     ) -> String {
-        self.version += 1;
+        self.touch();
         if !self.accepts_capture(session_id, pane_id, fence) {
             // Do not stitch another generation's cache under a stale response.
             return backend_text.to_owned();
@@ -1414,7 +1417,7 @@ impl ScrollbackStore {
         output: &str,
         fence: Option<CaptureFence>,
     ) {
-        self.version += 1;
+        self.touch();
         if output.is_empty() || !self.accepts_capture(session_id, pane_id, fence) {
             return;
         }
@@ -1719,7 +1722,7 @@ impl ScrollbackStore {
     /// Called with neutral native entities before compatibility serialization.
     /// No private process identity is ever inserted into a public JSON envelope.
     pub(crate) fn observe_native_listing(&mut self, session: &str, panes: &[super::backend::Pane]) {
-        self.version += 1;
+        self.touch();
         // An existing unknown observation is not evidence for the newly verified
         // process. Discard its rows and outstanding fences in either direction.
         // A first-ever verified observation has no prior capture to quarantine
@@ -1775,6 +1778,16 @@ impl ScrollbackStore {
     /// See the `version` field.
     pub(crate) fn version(&self) -> u64 {
         self.version
+    }
+
+    /// Signalled whenever `version` moves.
+    pub(crate) fn changes(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        self.changed.clone()
+    }
+
+    fn touch(&mut self) {
+        self.version += 1;
+        self.changed.notify_one();
     }
 
     pub(crate) fn projection_stamps(&self) -> Vec<ProjectionStamp> {
@@ -1852,7 +1865,7 @@ impl ScrollbackStore {
         rows: Vec<String>,
         expires: std::time::Instant,
     ) -> bool {
-        self.version += 1;
+        self.touch();
         let scope = stamp.scope();
         // Identity, fence and policy, not revision: a frame folded during the
         // checkpoint read moves the revision without making the checkpoint

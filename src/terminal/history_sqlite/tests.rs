@@ -1125,3 +1125,33 @@ async fn default_memory_does_not_touch_the_history_tables() {
         0
     );
 }
+
+#[tokio::test]
+async fn an_idle_fold_does_not_wake_the_writer() {
+    let fixture = Fixture::new();
+    let fold = captures(Some("A"), true);
+    let repository = fixture.open(fold.clone()).await;
+    persisted(&repository).await;
+    let checkpoints = repository.checkpoints.clone().unwrap();
+    let count = || checkpoints.wakes.load(Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let settled = count();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(count(), settled, "no wake while nothing changes");
+    fold.lock().unwrap().record_frame(
+        "default",
+        "p",
+        "recent_unwrapped",
+        "text",
+        "row 8\nrow 9\nrow 10\nrow 11",
+    );
+    for _ in 0..100 {
+        if count() > settled {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(count() > settled, "a change wakes it");
+    drop(checkpoints);
+    repository.close().await;
+}
