@@ -853,21 +853,21 @@ impl TaskService {
         }
     }
 
-    /// The delegation last bound to pane `pane_id`: whether its follower saw
-    /// its agent stop (idle, or it reported done), and which agent kind it
-    /// runs. `None`: no delegation is bound to that pane.
+    /// Delegation `parent`, when it is bound to pane `pane_id`: whether its
+    /// follower saw its agent stop (idle, or it reported done), and the job
+    /// its launch recorded there. Never another delegation that pane id
+    /// holds now (a restarted tmux reuses ids). `None`: `parent` is no
+    /// delegation bound to that pane.
     pub(crate) async fn pane_task(
         &self,
+        parent: &TaskId,
         session_id: &str,
         pane_id: &str,
     ) -> Option<(TaskState, Option<pane_agent::PaneJob>)> {
-        let filter = TaskFilter {
-            pane: Some((session_id.to_owned(), pane_id.to_owned())),
-            limit: 1,
-            ..Default::default()
-        };
-        let task = self.store.list(filter).await.ok()?.into_iter().next()?;
+        let task = self.store.get(parent).await.ok()??;
         let TaskBinding::Pane {
+            session_id: bound_session,
+            pane_id: bound_pane,
             shell_pid,
             agent_job,
             ..
@@ -875,6 +875,9 @@ impl TaskService {
         else {
             return None;
         };
+        if bound_session != session_id || bound_pane != pane_id {
+            return None;
+        }
         let job = shell_pid
             .zip(agent_job.clone())
             .map(|(shell_pid, job)| pane_agent::PaneJob { shell_pid, job });

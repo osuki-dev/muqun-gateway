@@ -695,7 +695,10 @@ process group, that was not there before the command was typed and has run
 no longer than since then -- the oldest such, and only while it holds the
 terminal, looked for for at most ten seconds once the launch is confirmed.
 A job already in front before the launch, or one started after it, is never
-taken. Its process group, and its leader's pid and start time, are kept;
+taken. Its process group, and its leader's pid and start time (on Linux in
+clock ticks since boot, which a stepped clock never moves), are kept on that
+delegation -- the job used is always the child's own parent's, never
+whatever delegation the pane id holds now;
 how the agent was installed, and what its executable or arguments are,
 never matter. With no job recorded (an older task, or none found) nothing
 is ever typed to that pane -- there is no guess at what holds it. A line is
@@ -708,8 +711,8 @@ again on later passes for an hour (the agent may come back with `fg`, the
 same group), then given up. A job that is gone -- the agent exited, or its
 pid or group now belongs to another process (a different start time), as
 after a restart -- is given up at once, recorded
-as skipped. The
-line is sent the way a goal is (the agent's prompt call, a bracketed paste on
+as skipped. A send that fails is retried within the same hour, no longer.
+The line is sent the way a goal is (the agent's prompt call, a bracketed paste on
 tmux), and the foreground is looked at again before each Enter: if another
 group has the terminal by then, the pasted line is cleared (Ctrl-U) and Enter is
 never pressed. What the child wrote is untrusted, so the line is one line of

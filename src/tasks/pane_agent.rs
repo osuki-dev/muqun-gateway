@@ -296,7 +296,27 @@ async fn job_table() -> Option<Vec<Proc>> {
     if !out.status.success() {
         return None;
     }
-    process_rows(&String::from_utf8_lossy(&out.stdout))
+    let mut rows = process_rows(&String::from_utf8_lossy(&out.stdout))?;
+    // Linux's `lstart` is derived from the boot time, which moves when the
+    // wall clock is stepped (NTP, a resume): the start time since boot, in
+    // clock ticks, never does. A process on no terminal is never a job.
+    if cfg!(target_os = "linux") {
+        for row in rows.iter_mut().filter(|row| on_terminal(&row.tty)) {
+            row.started = std::fs::read_to_string(format!("/proc/{}/stat", row.pid))
+                .ok()
+                .and_then(|stat| start_ticks(&stat))
+                .map_or_else(String::new, |ticks| format!("ticks:{ticks}"));
+        }
+    }
+    Some(rows)
+}
+
+/// The start time, in clock ticks since boot, in a `/proc/<pid>/stat` line:
+/// field 22, counted after the command name's closing parenthesis (the name
+/// may hold spaces and parentheses itself).
+fn start_ticks(stat: &str) -> Option<u64> {
+    let (_, rest) = stat.rsplit_once(')')?;
+    rest.split_whitespace().nth(19)?.parse().ok()
 }
 
 /// One `ps -o pid=,ppid=,pgid=,tpgid=,tty=,etime=,lstart=` row.
@@ -1443,6 +1463,9 @@ mod tests {
             elapsed_seconds("2-03:04:05"),
             Some(2 * 86_400 + 3 * 3600 + 4 * 60 + 5)
         );
+        // `/proc/<pid>/stat`, a command name holding a parenthesis and spaces.
+        let stat = "200 (a) b (c) S 100 200 200 34819 200 4194560 1 0 0 0 5 1 0 0 20 0 1 0 987654 1000 100";
+        assert_eq!(start_ticks(stat), Some(987_654));
     }
 
     /// The job recorded at launch is the one the launch started: never a

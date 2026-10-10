@@ -91,7 +91,7 @@ pub(crate) async fn deliver(state: &AppState) -> usize {
             Ready::Now => {}
         }
         let line = message(state, &child).await;
-        match send(state, &target, &line).await {
+        match send(state, &child, &target, &line).await {
             Ok(Sent::Delivered) => {
                 state.tasks.told_task(&child).await;
                 told += 1;
@@ -104,7 +104,14 @@ pub(crate) async fn deliver(state: &AppState) -> usize {
                 tracing::info!(task = %child.id.0, why, "notices: the parent is not told");
                 state.tasks.told_task(&child).await;
             }
-            Err(error) => tracing::debug!(task = %child.id.0, %error, "notices: not told yet"),
+            // A send that failed is tried again within the same hour, no longer.
+            Err(error) if recent(&child) => {
+                tracing::debug!(task = %child.id.0, %error, "notices: not told yet")
+            }
+            Err(error) => {
+                tracing::info!(task = %child.id.0, %error, "notices: the parent is not told");
+                state.tasks.told_task(&child).await;
+            }
         }
     }
     told
@@ -175,7 +182,11 @@ async fn ready(state: &AppState, child: &Task, target: &NoticeTarget) -> Ready {
             session_id,
             pane_id,
         } => {
-            let Some((pane_state, job)) = state.tasks.pane_task(session_id, pane_id).await else {
+            let Some(parent) = child.parent.as_ref() else {
+                return Ready::Never("no delegation runs in that pane");
+            };
+            let Some((pane_state, job)) = state.tasks.pane_task(parent, session_id, pane_id).await
+            else {
                 return Ready::Never("no delegation runs in that pane");
             };
             match pane_state {
@@ -214,7 +225,12 @@ fn terminal_session<'a>(
         .find(|session| session.id == session_id)
 }
 
-async fn send(state: &AppState, target: &NoticeTarget, line: &str) -> anyhow::Result<Sent> {
+async fn send(
+    state: &AppState,
+    child: &Task,
+    target: &NoticeTarget,
+    line: &str,
+) -> anyhow::Result<Sent> {
     match target {
         NoticeTarget::Session { agent_id, asid } => {
             let manager = state
@@ -238,9 +254,13 @@ async fn send(state: &AppState, target: &NoticeTarget, line: &str) -> anyhow::Re
         } => {
             let session = terminal_session(state, session_id)
                 .ok_or_else(|| anyhow::anyhow!("no terminal session {session_id}"))?;
+            let parent = child
+                .parent
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("no parent delegation"))?;
             let job = state
                 .tasks
-                .pane_task(session_id, pane_id)
+                .pane_task(parent, session_id, pane_id)
                 .await
                 .and_then(|(_, job)| job)
                 .ok_or_else(|| anyhow::anyhow!("no launched agent job in that pane"))?;
