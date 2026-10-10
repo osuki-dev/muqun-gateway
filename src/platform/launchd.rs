@@ -60,6 +60,9 @@ pub(crate) struct Launchctl {
     pub domain: String,
     pub plist: PathBuf,
     pub timing: Timing,
+    /// Where a stop writes the domain it found the job in, for the next
+    /// start: an unloaded job is in no domain to find it by.
+    pub domain_record: Option<PathBuf>,
 }
 
 impl Launchctl {
@@ -75,13 +78,17 @@ impl Launchctl {
             domain: format!("gui/{uid}"),
             plist: super::service::unit_path()?,
             timing: Timing::LAUNCHD,
+            domain_record: crate::state_dir()
+                .ok()
+                .map(|state| state.join("launchd-domain")),
         };
         launchctl.domain = launchctl.loaded_domain(uid);
         Ok(launchctl)
     }
 
-    /// The domain the job is loaded in: `gui/<uid>` when it is there or
-    /// nowhere, `user/<uid>` when only there.
+    /// The domain the job is loaded in. Loaded nowhere (stopped): the one
+    /// the last stop found it in; else `gui/<uid>` when that domain exists
+    /// (a console login), else `user/<uid>`.
     pub(crate) fn loaded_domain(&self, uid: u32) -> String {
         let gui = format!("gui/{uid}");
         let user = format!("user/{uid}");
@@ -89,10 +96,28 @@ impl Launchctl {
             self.run(&["print", &format!("{domain}/{SERVICE_LABEL}")])
                 .is_ok_and(|output| output.status.success())
         };
-        if !loaded_in(&gui) && loaded_in(&user) {
-            user
-        } else {
+        if loaded_in(&gui) {
+            return gui;
+        }
+        if loaded_in(&user) {
+            return user;
+        }
+        let recorded = self
+            .domain_record
+            .as_ref()
+            .and_then(|file| std::fs::read_to_string(file).ok())
+            .map(|domain| domain.trim().to_owned())
+            .filter(|domain| *domain == gui || *domain == user);
+        if let Some(domain) = recorded {
+            return domain;
+        }
+        let gui_exists = self
+            .run(&["print", &gui])
+            .is_ok_and(|output| output.status.success());
+        if gui_exists {
             gui
+        } else {
+            user
         }
     }
 
@@ -202,6 +227,9 @@ impl Launchctl {
         if action == ServiceAction::Stop {
             if self.loaded() {
                 anyhow::ensure!(self.bootout()?, "launchd has not stopped the gateway yet");
+                if let Some(file) = &self.domain_record {
+                    let _ = std::fs::write(file, &self.domain);
+                }
             }
             return Ok(());
         }
@@ -354,6 +382,7 @@ esac
                 program: self.dir.join("launchctl"),
                 domain: String::from("gui/501"),
                 plist: self.dir.join("agent.plist"),
+                domain_record: Some(self.dir.join("launchd-domain")),
                 timing: Timing {
                     bootout_wait: Duration::from_millis(50),
                     poll: Duration::from_millis(5),
@@ -509,6 +538,8 @@ mod tests {
         assert_eq!(launchctl.domain, "user/501");
         launchctl.control(ServiceAction::Stop).unwrap();
         assert!(!fake.loaded());
+        // Stopped, it is in no domain: start goes back where stop found it.
+        assert_eq!(fake.launchctl().loaded_domain(501), "user/501");
     }
 
     #[test]

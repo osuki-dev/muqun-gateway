@@ -190,7 +190,14 @@ impl Controller {
     fn owner_name(&self) -> String {
         match &self.owner {
             #[cfg(target_os = "macos")]
-            Owner::Installed => format!("the LaunchAgent {}", service::SERVICE_LABEL),
+            Owner::Installed => match super::launchd::Launchctl::system() {
+                Ok(launchctl) => format!(
+                    "the LaunchAgent {} in {}",
+                    service::SERVICE_LABEL,
+                    launchctl.domain
+                ),
+                Err(_) => format!("the LaunchAgent {}", service::SERVICE_LABEL),
+            },
             #[cfg(not(target_os = "macos"))]
             Owner::Installed => format!("the user service {}.service", service::SERVICE_LABEL),
             Owner::External(unit) => format!("the user service {unit}"),
