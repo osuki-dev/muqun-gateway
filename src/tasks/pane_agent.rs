@@ -291,8 +291,9 @@ pub(crate) enum Marker {
 
 /// The last marker line in `output`, done or blocked. A marker counts only
 /// at the start of a line (after any bullet the agent draws), below the
-/// request echoed in the prompt, outside a code fence (the agent quoting
-/// one), and with a line that is not a placeholder or a piece of one.
+/// request echoed in the prompt, and with a line that is not a placeholder
+/// or a piece of one. Code fences are not looked at: a pane's window of
+/// output can start inside one.
 pub(crate) fn marker(output: &str) -> Option<Marker> {
     let found = marker_lines(output);
     match &found.last()?.1 {
@@ -321,21 +322,16 @@ fn marker_lines(output: &str) -> Vec<(usize, Marker)> {
         .iter()
         .rposition(|line| ECHO_WORDS.iter().any(|word| line.contains(word)))
         .map_or(0, |echo| echo + 1);
-    let mut fenced = false;
-    let mut found = Vec::new();
-    for (at, line) in lines.iter().enumerate() {
-        if is_fence(line) {
-            fenced = !fenced;
-        } else if !fenced && at >= below_echo {
-            if let Some(marker) = marker_line(line) {
-                found.push((at, marker));
-            }
-        }
-    }
-    found
+    lines
+        .iter()
+        .enumerate()
+        .skip(below_echo)
+        .filter_map(|(at, line)| Some((at, marker_line(line)?)))
+        .collect()
 }
 
-/// Whether `line` opens or closes a markdown code fence.
+/// Whether `line` opens or closes a markdown code fence (for display:
+/// detection does not look at fences).
 pub(crate) fn is_fence(line: &str) -> bool {
     let line = line.trim();
     line.starts_with("```") || line.starts_with("~~~")
@@ -1383,6 +1379,10 @@ mod tests {
                 count: 1
             })
         );
+        // A window of output that starts inside a code fence still finds
+        // the agent's marker after the fence closes.
+        let mid_fence = "  let x = 1;\n```\n\u{23fa} MUQUN_TASK_DONE: built\n";
+        assert_eq!(marker(mid_fence), Some(Marker::Done("built".into())));
         // A narrow pane wraps the echo so the marker starts a line, and an
         // agent restating the request writes a placeholder of its own.
         for not_yet in [

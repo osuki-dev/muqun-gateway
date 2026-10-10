@@ -13,17 +13,19 @@
 //!   instruction -- any wording this gateway has sent, found by its fixed
 //!   opening and its closing placeholder line, not by the goal -- cut back to
 //!   what came before it, and dropped when nothing did;
-//! - an assistant text or reasoning without the one marker line the ledger
-//!   reads its end from ([`pane_agent::consumed_marker_line`], shared with
-//!   detection: an earlier marker line, one in a code fence or one the
-//!   ledger ignores stays in view), and dropped when nothing else is left.
-//!   A streamed text is served as snapshots of the whole text so far, so
-//!   while the session runs a turn a last line that could only be the start
-//!   of a marker (bare markup such as `- ` included) is held back too: the
-//!   marker never flashes before its turn ends;
+//! - each turn's last assistant message without the one marker line the
+//!   ledger read the turn's end from ([`pane_agent::consumed_marker_line`]
+//!   over its text rows joined, as `service::turn_end` reads them), unless
+//!   the reader sees that line inside a code fence; every other marker line
+//!   stays in view, and a row left with nothing is dropped. A streamed text
+//!   is served as snapshots of the whole text so far, so while the session
+//!   runs a turn a last line that could only be the start of a marker (bare
+//!   markup such as `- ` included) is held back too: the marker never
+//!   flashes before its turn ends;
 //! - OpenCode's Code Mode plumbing: an `execute` call whose whole code is a
 //!   catalog lookup of a muqun tool ([`muqun_lookup`], parsed strictly; one
-//!   that failed stays), held while its code is not known yet, and the
+//!   that failed stays), held while its code is not known yet and the turn
+//!   runs, and the
 //!   "Code Mode tool catalog has changed" notice when it is exactly that.
 //!
 //! A streamed row left with nothing is removed (`agent.timeline.removed`)
@@ -59,7 +61,83 @@ pub(crate) struct Streaming(pub(crate) bool);
 
 /// `items` as the reader sees them.
 pub(crate) fn hide_in_items(items: &mut Vec<TimelineItem>, streaming: Streaming) {
+    strip_consumed_markers(items, streaming);
     items.retain_mut(|item| hide_in_item(item, streaming) != Served::Emptied);
+}
+
+/// Cut from `items` the marker line the ledger read each turn's end from:
+/// [`pane_agent::consumed_marker_line`] over the text of the turn's last
+/// assistant message, its text rows joined as `service::turn_end` joins
+/// them -- unless, as the reader sees that row, it sits in a code fence.
+/// While `streaming`, each such message's last row also loses a last line
+/// that may still become a marker. Every other marker line stays in view.
+fn strip_consumed_markers(items: &mut [TimelineItem], streaming: Streaming) {
+    let text_of = |item: &TimelineItem| match (&item.role, &item.part) {
+        (TimelineRole::Assistant, AgentPart::Text { text }) => Some(text.clone()),
+        _ => None,
+    };
+    // The last assistant message with text before each user row, and at the end.
+    let mut last_messages: Vec<String> = Vec::new();
+    let mut current: Option<String> = None;
+    for item in items.iter() {
+        if item.role == TimelineRole::User {
+            last_messages.extend(current.take());
+        } else if text_of(item).is_some_and(|text| !text.trim().is_empty()) {
+            current = Some(item.message_id.clone());
+        }
+    }
+    last_messages.extend(current);
+    for message in last_messages {
+        let rows: Vec<usize> = (0..items.len())
+            .filter(|&at| items[at].message_id == message && text_of(&items[at]).is_some())
+            .collect();
+        let texts: Vec<String> = rows.iter().filter_map(|&at| text_of(&items[at])).collect();
+        let consumed = pane_agent::consumed_marker_line(&texts.join("\n"));
+        let mut first_line = 0;
+        for (n, (&at, text)) in rows.iter().zip(&texts).enumerate() {
+            let count = text.split('\n').count();
+            let here = consumed
+                .filter(|line| (first_line..first_line + count).contains(line))
+                .map(|line| line - first_line);
+            let last_row = n + 1 == rows.len();
+            if let Some(served) = without_marker_line(text, here, streaming.0 && last_row) {
+                if let AgentPart::Text { text } = &mut items[at].part {
+                    *text = served;
+                }
+            }
+            first_line += count;
+        }
+    }
+}
+
+/// `text` without the marker line the ledger consumed from it, if one
+/// (outside a code fence, as the reader sees it) -- and, while `streaming`,
+/// without a last line that may still become a marker. Also the progress
+/// line's reading of a finished text.
+pub(crate) fn without_markers(text: &str, streaming: Streaming) -> Option<String> {
+    without_marker_line(text, pane_agent::consumed_marker_line(text), streaming.0)
+}
+
+fn without_marker_line(text: &str, consumed: Option<usize>, streaming: bool) -> Option<String> {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let last = lines.len() - 1;
+    let fenced = |at: usize| {
+        lines[..at]
+            .iter()
+            .filter(|line| pane_agent::is_fence(line))
+            .count()
+            % 2
+            == 1
+    };
+    let consumed = consumed.filter(|&at| at <= last && !fenced(at));
+    let held = streaming && !fenced(last) && may_become_marker(lines[last]);
+    let kept: Vec<&str> = lines
+        .iter()
+        .enumerate()
+        .filter(|&(at, _)| Some(at) != consumed && !(held && at == last))
+        .map(|(_, line)| *line)
+        .collect();
+    (kept.len() < lines.len()).then(|| kept.join("\n").trim_end().to_owned())
 }
 
 #[derive(PartialEq)]
@@ -79,10 +157,9 @@ fn hide_in_item(item: &mut TimelineItem, streaming: Streaming) -> Served {
             let served = without_request(text);
             (text, served)
         }
-        (TimelineRole::Assistant, AgentPart::Text { text })
-        | (TimelineRole::Assistant, AgentPart::Reasoning { text, .. }) => {
-            let served = without_markers(text, streaming);
-            (text, served)
+        // Its marker line was cut before ([`strip_consumed_markers`]).
+        (TimelineRole::Assistant, AgentPart::Text { text }) if text.trim().is_empty() => {
+            return Served::Emptied;
         }
         (_, AgentPart::Tool(call)) if call.name == "execute" => {
             // Held until its code is known, then shown unless it is only a
@@ -94,7 +171,8 @@ fn hide_in_item(item: &mut TimelineItem, streaming: Streaming) -> Served {
             );
             let failed = call.status == ToolCallStatus::Failed || call.error.is_some();
             let lookup = !failed && code.is_some_and(muqun_lookup);
-            return if unknown || lookup {
+            // Once the turn is over, a call that never got its code is shown.
+            return if (unknown && streaming.0) || lookup {
                 Served::Emptied
             } else {
                 Served::Kept
@@ -116,6 +194,7 @@ fn hide_in_item(item: &mut TimelineItem, streaming: Streaming) -> Served {
 pub(crate) fn hide_in_event(event: &mut AgentDomainEvent, streaming: Streaming) {
     match event {
         AgentDomainEvent::TimelineUpsert { asid, items, seq } => {
+            strip_consumed_markers(items, streaming);
             let mut emptied = Vec::new();
             items.retain_mut(|item| {
                 let kept = hide_in_item(item, streaming) == Served::Kept;
@@ -307,31 +386,6 @@ fn without_request(text: &str) -> Option<String> {
     let before = &trimmed[..at];
     (before.is_empty() || before.ends_with(char::is_whitespace))
         .then(|| before.trim_end().to_owned())
-}
-
-/// `text` without the marker line the ledger reads its end from
-/// ([`pane_agent::consumed_marker_line`], the same rule detection uses: so
-/// an earlier marker line, one in a code fence, or one the ledger ignores
-/// stays in view) -- and, `streaming`, without a last line that may still
-/// become a marker.
-pub(crate) fn without_markers(text: &str, streaming: Streaming) -> Option<String> {
-    let consumed = pane_agent::consumed_marker_line(text);
-    let lines: Vec<&str> = text.split('\n').collect();
-    let last = lines.len() - 1;
-    let fenced_at_last = lines[..last]
-        .iter()
-        .filter(|line| pane_agent::is_fence(line))
-        .count()
-        % 2
-        == 1;
-    let held = streaming.0 && !fenced_at_last && may_become_marker(lines[last]);
-    let kept: Vec<&str> = lines
-        .iter()
-        .enumerate()
-        .filter(|&(at, _)| Some(at) != consumed && !(held && at == last))
-        .map(|(_, line)| *line)
-        .collect();
-    (kept.len() < lines.len()).then(|| kept.join("\n").trim_end().to_owned())
 }
 
 /// Whether `line`, the last line still being written, may become a marker
@@ -611,6 +665,13 @@ mod tests {
             hide_in_items(&mut items, Streaming(true));
             assert_eq!(items.is_empty(), hidden, "{name}");
         }
+        // A call that never got its code is shown once the turn is over.
+        let mut items = vec![item(
+            Assistant,
+            tool("execute", "pending", serde_json::Value::Null),
+        )];
+        hide_in_items(&mut items, Streaming(false));
+        assert_eq!(items.len(), 1, "pending after the turn");
         // Only the marker line the ledger reads goes; others stay in view.
         for (written, served) in [
             (
@@ -629,6 +690,35 @@ mod tests {
                 "{written}"
             );
         }
+        // Only in the turn's last message, read across its text rows as the
+        // ledger reads them: an earlier message's marker, and an earlier
+        // row's, stay.
+        let row = |id: &str, message: &str, written: &str| TimelineItem {
+            id: id.into(),
+            message_id: message.into(),
+            ..item(Assistant, text(written))
+        };
+        let mut items = vec![
+            row("a", "m1", "MUQUN_TASK_DONE: early"),
+            row("b", "m2", "first\nMUQUN_TASK_DONE: one"),
+            row("c", "m2", "second\nMUQUN_TASK_DONE: two"),
+        ];
+        hide_in_items(&mut items, Streaming(false));
+        let texts: Vec<_> = items
+            .iter()
+            .map(|item| match &item.part {
+                AgentPart::Text { text } => text.as_str(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "MUQUN_TASK_DONE: early",
+                "first\nMUQUN_TASK_DONE: one",
+                "second"
+            ]
+        );
         // A last line that may become a marker is held back only while the
         // turn runs; a finished message keeps it.
         for (last, streaming, served) in [
@@ -653,6 +743,20 @@ mod tests {
         hide_in_inbox(&mut inbox);
         let texts: Vec<_> = inbox.iter().map(|item| &item["payload"]["text"]).collect();
         assert_eq!(texts, ["fix the build", "and the tests"]);
+        // A streaming `execute` arrives as a removal until its code is known.
+        let mut event = AgentDomainEvent::TimelineUpsert {
+            asid: crate::agents::domain::AgentSessionId("s".into()),
+            items: vec![item(
+                Assistant,
+                tool("execute", "streaming", serde_json::Value::Null),
+            )],
+            seq: 6,
+        };
+        hide_in_event(&mut event, Streaming(true));
+        assert!(
+            matches!(&event, AgentDomainEvent::TimelineRemoved { seq: 6, .. }),
+            "{event:?}"
+        );
         // A streamed row left with nothing is removed, not left stale.
         let mut event = AgentDomainEvent::TimelineUpsert {
             asid: crate::agents::domain::AgentSessionId("s".into()),
