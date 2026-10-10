@@ -521,7 +521,8 @@ pub(crate) async fn converge(state: &AppState, mirror: &Task) -> bool {
 }
 
 /// Ask the peer to cancel the task `mirror` mirrors, best effort: the mirror
-/// is cancelled here either way.
+/// is cancelled here either way. One whose create got no answer is looked
+/// up by its `client_ref` first, so a task that did start there stops too.
 pub(crate) async fn forward_cancel(state: &AppState, mirror: &Task) {
     let TaskBinding::Peer {
         peer_id,
@@ -531,14 +532,24 @@ pub(crate) async fn forward_cancel(state: &AppState, mirror: &Task) {
     else {
         return;
     };
-    if remote_task_id.is_empty() {
-        return;
-    }
     let Some(peer) = state.peers.get(peer_id).await else {
         return;
     };
     if let Ok(client) = PeerClient::for_peer(&peer) {
-        if let Err(error) = client.cancel_task(remote_task_id).await {
+        let remote_task_id = match remote_task_id.as_str() {
+            "" => {
+                let theirs = client.own_tasks().await.unwrap_or_default();
+                let started = theirs
+                    .into_iter()
+                    .find(|task| task.client_ref.is_some() && task.client_ref == mirror.client_ref);
+                match started {
+                    Some(task) => task.task_id,
+                    None => return,
+                }
+            }
+            known => known.to_owned(),
+        };
+        if let Err(error) = client.cancel_task(&remote_task_id).await {
             tracing::warn!(task = %mirror.id.0, peer = %peer.peer_id, %error, "the cancel did not reach the peer");
         }
     }
@@ -1005,6 +1016,7 @@ mod tests {
         for (goal, client_ref, created_ms) in [
             ("same goal", Some("ref-1"), now),
             ("older run", None, now - 10 * 60_000),
+            ("cancelled early", Some("ref-4"), now),
         ] {
             let task = Task {
                 state: TaskState::Working,
@@ -1078,6 +1090,27 @@ mod tests {
         assert!(
             coding.peers.sockets.is_live("srv-mini"),
             "found through the live follower"
+        );
+
+        // Cancelled before its task was found: the task it did start there stops too.
+        let unresolved = Task {
+            goal: "cancelled early".into(),
+            client_ref: Some("ref-4".into()),
+            binding: TaskBinding::Peer {
+                peer_id: "srv-mini".into(),
+                peer_server_id: "srv-mini".into(),
+                remote_task_id: String::new(),
+                peer_name: "mini".into(),
+            },
+            ..mirror(TaskState::Dispatching, None)
+        };
+        forward_cancel(&coding, &unresolved).await;
+        assert_eq!(
+            mini.tasks
+                .get_for_test(&TaskId(there[2].clone()))
+                .await
+                .state,
+            TaskState::Cancelled
         );
     }
 
