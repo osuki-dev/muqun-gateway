@@ -332,9 +332,11 @@ checkpoints (already lost to the debounce) but never corrupts the file. The
 setting is switched back to `FULL` on the one shared connection before any
 other job runs, so tasks and tokens keep full durability. The WAL is folded
 back into the database (`wal_checkpoint(TRUNCATE)`, on the store worker, never
-on a request) after a pass that grew it past 4 MiB, and on the 60-second prune
+on a request) after a pass that grew it past 1 MiB, and on the 60-second prune
 pass once nothing has been written for a minute, so an idle store's WAL file is
-empty.
+empty (SQLite's own autocheckpoint folds pages back at about 4 MiB but never
+shrinks the file). A TRUNCATE takes the shared worker for a moment, so a task
+or token request arriving then waits that long; none runs on a request.
 The write loop retains a bounded last-processed content fingerprint independently of
 the database row. An unchanged poll cannot recreate an age-pruned or quota-evicted
 projection; a genuine change in that exact format can be persisted again.

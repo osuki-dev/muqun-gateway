@@ -58,8 +58,9 @@ const WRITE_DEBOUNCE: Duration = Duration::from_secs(3);
 /// Checkpoint reads waiting on the shared store; one more is a 503.
 const MAX_PENDING_READS: usize = 16;
 /// A WAL past this is folded back into the database after the pass that
-/// grew it.
-const WAL_CHECKPOINT_BYTES: u64 = 4 * 1024 * 1024;
+/// grew it -- below SQLite's own autocheckpoint (1,000 pages, about 4 MiB),
+/// which folds pages back but never shrinks the file; TRUNCATE does.
+const WAL_CHECKPOINT_BYTES: u64 = 1024 * 1024;
 /// A writer that has written nothing for this long folds the WAL back on its
 /// next prune pass, so an idle store's WAL file is empty.
 const IDLE_CHECKPOINT: Duration = if cfg!(test) {
@@ -434,11 +435,14 @@ impl Checkpoints {
                 // other domains' FULL durability is restored before any of
                 // their jobs runs on this one connection.
                 connection.pragma_update(None, "synchronous", "NORMAL")?;
+                // FULL comes back however the job ends, a panic included:
+                // the store catches it and the connection serves every domain.
+                let mut durable_again = DurableAgain(connection);
+                let connection = &mut *durable_again;
                 // The panes the last complete listings still show: quotas evict
                 // the rest first.
                 let live: Vec<String> = stamps.iter().filter_map(|stamp| this.key(stamp)).collect();
-                let passed = this
-                    .write_pass(connection, now, stamps, debounce, &live)
+                this.write_pass(connection, now, stamps, debounce, &live)
                     .and_then(|idle| {
                         if prune_due {
                             prune(connection, now, &live)?;
@@ -448,9 +452,7 @@ impl Checkpoints {
                             .store(stored_count(connection)?, Ordering::Relaxed);
                         this.wal.store(wal_bytes(connection), Ordering::Relaxed);
                         Ok(idle)
-                    });
-                connection.pragma_update(None, "synchronous", "FULL")?;
-                passed
+                    })
             })
             .await
     }
@@ -825,6 +827,30 @@ fn enforce_quotas(transaction: &Transaction<'_>, live: &[String]) -> anyhow::Res
         );
     }
     Ok(())
+}
+
+/// The shared connection, set back to `synchronous=FULL` when dropped.
+struct DurableAgain<'a>(&'a mut Connection);
+
+impl std::ops::Deref for DurableAgain<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.0
+    }
+}
+
+impl std::ops::DerefMut for DurableAgain<'_> {
+    fn deref_mut(&mut self) -> &mut Connection {
+        self.0
+    }
+}
+
+impl Drop for DurableAgain<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.0.pragma_update(None, "synchronous", "FULL") {
+            tracing::error!(%error, "the shared store could not go back to synchronous=FULL");
+        }
+    }
 }
 
 /// How many checkpoints are stored, over the covering index.

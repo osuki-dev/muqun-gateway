@@ -694,6 +694,13 @@ async fn real_worker_close_reopen_recovers_checkpoint_not_viewport_and_old_curso
         .unwrap();
     assert_eq!(checkpoint["rows"], json!(["row 5", "row 6"]));
     assert_ne!(checkpoint["capture_epoch"], first["capture_epoch"]);
+    let older = checkpoint["next_before"].as_str().unwrap();
+    assert_eq!(
+        read_page(&repository, restarted.clone(), Some(older))
+            .await
+            .unwrap()["rows"],
+        json!(["row 3", "row 4"])
+    );
     assert_eq!(fold.lock().unwrap().depth("default", "p"), 0);
     fold.lock().unwrap().record_frame(
         "default",
@@ -917,7 +924,9 @@ async fn storage_failures_spare_memory_and_heal_on_the_next_working_pass() {
     let checkpoints = repository.checkpoints().unwrap();
     checkpoints
         .db
-        .call(|c| Ok(c.execute_batch("DROP TABLE history_captures")?))
+        .call(|c| {
+            Ok(c.execute_batch("ALTER TABLE history_captures RENAME TO history_captures_away")?)
+        })
         .await
         .unwrap();
     fold.lock().unwrap().record_frame(
@@ -942,7 +951,9 @@ async fn storage_failures_spare_memory_and_heal_on_the_next_working_pass() {
     );
     checkpoints
         .db
-        .call(|c| Ok(c.execute_batch("CREATE TABLE history_captures(identity TEXT PRIMARY KEY, policy TEXT NOT NULL, rows BLOB NOT NULL, bytes INTEGER NOT NULL, updated INTEGER NOT NULL); CREATE INDEX history_capture_quota ON history_captures(updated, identity, bytes);")?))
+        .call(|c| {
+            Ok(c.execute_batch("ALTER TABLE history_captures_away RENAME TO history_captures")?)
+        })
         .await
         .unwrap();
     for _ in 0..400 {
@@ -1212,7 +1223,7 @@ async fn an_idle_fold_does_not_wake_the_writer() {
 }
 
 #[tokio::test]
-async fn history_writes_skip_the_fsync_and_an_idle_prune_folds_the_wal_back() {
+async fn a_history_pass_leaves_full_durability_and_an_idle_prune_folds_the_wal_back() {
     let fixture = Fixture::new();
     let checkpoints = fixture.checkpoints(captures(Some("A"), true)).await;
     passes(&checkpoints, now_seconds()).await;
