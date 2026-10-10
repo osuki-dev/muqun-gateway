@@ -2056,6 +2056,10 @@ Another of the owner's computers is a paired device of `kind: "gateway"`
 `GET /api/fleet/self` and `DELETE /api/pairings/{its own id}`; everything
 else answers `403 peer_forbidden`.
 
+At the device limit, a gateway's `POST /api/pair/claim` makes room only by
+dropping the oldest gateway device, never one of the owner's apps; with no
+gateway device to drop it answers `409 device_cap`.
+
 **Operator note:** a gateway build older than this one does not know
 `kind` and reads a gateway device as an ordinary app device, with full
 device access. After rolling a gateway back below this version, revoke its

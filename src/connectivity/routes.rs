@@ -292,7 +292,14 @@ pub(crate) async fn pair_claim(
     let device_id = record.id.clone();
     {
         let mut devices = lock_devices(&state)?;
-        authority::enroll_device(&mut devices, record, MAX_DEVICES);
+        // Bounded and generic; the code is spent either way.
+        authority::enroll_device(&mut devices, record, MAX_DEVICES).map_err(|_| {
+            api_error(
+                StatusCode::CONFLICT,
+                "device_cap",
+                "this gateway has no room for another computer; revoke a device first",
+            )
+        })?;
         write_devices(&devices).map_err(|err| {
             tracing::warn!("failed to write device tokens: {err:#}");
             api_error(

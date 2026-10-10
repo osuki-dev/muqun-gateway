@@ -122,11 +122,32 @@ pub fn touch_device(
     stale
 }
 
+/// The device list is full and a gateway enrolment may not make room.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceCapReached;
+
 /// Replace an existing install, retain insertion order, and enforce the device
-/// ceiling. Persistence remains the caller's responsibility.
-pub fn enroll_device(devices: &mut Vec<DeviceRecord>, record: DeviceRecord, maximum: usize) {
+/// ceiling. An app at the ceiling evicts the oldest device; another gateway
+/// evicts only the oldest gateway device and never one of the owner's apps,
+/// and with none to evict it is refused. Persistence remains the caller's
+/// responsibility.
+pub fn enroll_device(
+    devices: &mut Vec<DeviceRecord>,
+    record: DeviceRecord,
+    maximum: usize,
+) -> Result<(), DeviceCapReached> {
     if let Some(install_id) = record.install_id.as_deref() {
         devices.retain(|device| device.install_id.as_deref() != Some(install_id));
+    }
+    devices.sort_by_key(|item| item.paired_unix_ms);
+    if record.kind == DeviceKind::Gateway {
+        while devices.len() >= maximum {
+            let oldest = devices
+                .iter()
+                .position(|device| device.kind == DeviceKind::Gateway)
+                .ok_or(DeviceCapReached)?;
+            devices.remove(oldest);
+        }
     }
     devices.push(record);
     devices.sort_by_key(|item| item.paired_unix_ms);
@@ -134,6 +155,7 @@ pub fn enroll_device(devices: &mut Vec<DeviceRecord>, record: DeviceRecord, maxi
         let excess = devices.len() - maximum;
         devices.drain(..excess);
     }
+    Ok(())
 }
 
 pub fn consume_pairing_code(
@@ -233,10 +255,55 @@ mod tests {
             &mut devices,
             device("new", "new-token", Some("install")),
             16,
-        );
+        )
+        .unwrap();
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].id, "new");
         assert_eq!(identify_device(&devices, "old-token"), None);
+    }
+
+    /// At the ceiling (two here) a phone makes room as it always did, and
+    /// another computer only ever at another computer's expense.
+    #[test]
+    fn a_full_device_list_never_drops_a_phone_for_a_computer() {
+        let at = |id: &str, kind: DeviceKind, paired: u128| DeviceRecord {
+            kind,
+            paired_unix_ms: paired,
+            ..device(id, id, None)
+        };
+        let (app, gateway) = (DeviceKind::App, DeviceKind::Gateway);
+        for (existing, newcomer, expected) in [
+            // A phone evicts the oldest device, whatever it is.
+            (
+                vec![at("p1", app, 1), at("g1", gateway, 2)],
+                at("p2", app, 3),
+                Ok(vec!["g1", "p2"]),
+            ),
+            // A computer evicts the oldest computer, not the older phone.
+            (
+                vec![at("p1", app, 1), at("g1", gateway, 2)],
+                at("g2", gateway, 3),
+                Ok(vec!["p1", "g2"]),
+            ),
+            // A computer with only phones to evict is refused; nothing changes.
+            (
+                vec![at("p1", app, 1), at("p2", app, 2)],
+                at("g1", gateway, 3),
+                Err(DeviceCapReached),
+            ),
+        ] {
+            let mut devices = existing.clone();
+            let outcome = enroll_device(&mut devices, newcomer.clone(), 2).map(|()| {
+                devices
+                    .iter()
+                    .map(|device| device.id.as_str())
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(outcome, expected, "{} joining", newcomer.id);
+            if outcome.is_err() {
+                assert_eq!(devices, existing, "a refusal leaves the list alone");
+            }
+        }
     }
     #[test]
     fn token_hash_is_stable_and_not_plaintext() {

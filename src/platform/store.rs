@@ -847,9 +847,6 @@ pub(crate) fn hostname_label() -> String {
     "Server".into()
 }
 
-/// Persist a new display label into the config (and the pairing payload), so a
-/// name set from the app shows up in push notifications. Mirrors
-/// `update_public_url`.
 /// Read the config file at `path`, change it, and write it back, one writer
 /// at a time: a running gateway changes its label (`PATCH /api/meta`) and its
 /// accept switch (`PUT /api/fleet/settings`) this way, and neither may lose
@@ -870,6 +867,9 @@ pub(crate) fn edit_config(
         .with_context(|| format!("failed to write config {}", path.display()))
 }
 
+/// Persist a new display label into the config (and the pairing payload), so a
+/// name set from the app shows up in push notifications. Mirrors
+/// `update_public_url`.
 pub(crate) fn update_server_label(label: &str) -> anyhow::Result<String> {
     let label = label.trim();
     anyhow::ensure!(
