@@ -799,6 +799,11 @@ impl TaskService {
         }
     }
 
+    /// Where task `id`'s end is told, if anywhere.
+    pub(crate) async fn notice_of(&self, id: &TaskId) -> Option<NoticeTarget> {
+        self.store.notice_of(id).await.ok().flatten()
+    }
+
     /// Untold reported states of tasks with a notice target (`tasks::notices`).
     pub(crate) async fn pending_notices(
         &self,

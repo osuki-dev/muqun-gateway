@@ -684,11 +684,21 @@ impl MuqunMcp {
         &self,
         Parameters(args): Parameters<CancelArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        let task_id = args.task_id.clone();
         let id = TaskId(args.task_id);
+        let call = lineage::Call {
+            tool: "tasks.cancel",
+            args: vec![("task_id", &task_id)],
+        };
+        // Judged before the cancel ends the call: the session making it.
+        let caller = lineage::caller_session(&self.state, &self.session, &call).await;
         let cancelled = self.state.tasks.cancel(&self.state, &self.by(), &id).await;
-        // The caller cancelled it: that end is not told back to it.
-        if let Ok(view) = &cancelled {
-            self.state.tasks.told(&id, view.state).await;
+        // The session that would be told cancelled it itself: not told back.
+        // Another session under the same token is not that parent.
+        if let (Ok(view), Some(caller)) = (&cancelled, caller) {
+            if self.state.tasks.notice_of(&id).await.as_ref() == Some(&caller) {
+                self.state.tasks.told(&id, view.state).await;
+            }
         }
         reply(cancelled)
     }
@@ -1451,6 +1461,99 @@ mod tests {
                 "tasks.read",
                 "tasks.wait"
             ]
+        );
+    }
+
+    /// Another session under the same agent token cancelling a child is not
+    /// its parent: the parent session is still told.
+    #[tokio::test]
+    async fn a_cancel_from_another_session_is_still_told_to_the_parent() {
+        use crate::agents::domain::{AgentPart, TimelineItem, TimelineRole};
+        use crate::tasks::domain::{NoticeTarget, Task, TaskKind, TaskOrigin, TaskState};
+        let state = test_state("admin", Vec::new());
+        let child = Task {
+            id: TaskId::new(),
+            kind: TaskKind::Delegation,
+            goal: "g".into(),
+            cwd: None,
+            binding: TaskBinding::None,
+            state: TaskState::Working,
+            summary: None,
+            exit_code: None,
+            created_by: crate::tasks::domain::TaskPrincipal {
+                kind: crate::tasks::domain::PrincipalKind::Assistant,
+                id: TokenBinding::Agent {
+                    agent_id: "opencode".into(),
+                }
+                .owner_key(),
+            },
+            created_ms: crate::tasks::domain::now_ms(),
+            updated_ms: crate::tasks::domain::now_ms(),
+            seq: 0,
+            parent: None,
+            origin: TaskOrigin::Agent,
+            label: None,
+            requester_name: None,
+            session_title: None,
+            mentions: Vec::new(),
+            client_ref: None,
+            requester_server_id: None,
+        };
+        let id = state.tasks.insert_for_test(&child).await;
+        let running: crate::agents::domain::ToolCall = serde_json::from_value(serde_json::json!({
+            "id": "c1", "name": "muqun_tasks_cancel", "input": { "task_id": id.0 },
+            "state": "running", "status": "running"
+        }))
+        .unwrap();
+        let mut agent =
+            FakeAgent::new("opencode").with_sessions(&[("ses_parent", 1), ("ses_other", 1)]);
+        agent.session_timelines.insert(
+            "ses_other".into(),
+            vec![TimelineItem {
+                id: "p1".into(),
+                message_id: "m1".into(),
+                role: TimelineRole::Assistant,
+                part: AgentPart::Tool(running),
+                seq: 1,
+                updated_ms: 0,
+                ordinal: 0,
+                attachments: None,
+                image_assets: None,
+            }],
+        );
+        state.agent_runtime.attach_for_test(agent.manager()).await;
+        let busy = crate::agents::domain::AgentDomainEvent::StatusChanged {
+            asid: crate::agents::domain::AgentSessionId("ses_other".into()),
+            status: crate::agents::domain::AgentSessionStatus::Busy,
+            error: None,
+            seq: 1,
+        };
+        state.tasks.follow(&state, &busy).await;
+        let parent = NoticeTarget::Session {
+            agent_id: "opencode".into(),
+            asid: "ses_parent".into(),
+        };
+        state.tasks.notify(&id, &parent).await;
+        let session = AssistantSession {
+            token_id: "tok".into(),
+            binding: TokenBinding::Agent {
+                agent_id: "opencode".into(),
+            },
+            label: "opencode".into(),
+            expires_ms: None,
+        };
+        let mcp = MuqunMcp::new(state.clone(), session);
+        let (error, _, cancelled) = answer(
+            mcp.tasks_cancel(Parameters(CancelArgs {
+                task_id: id.0.clone(),
+            }))
+            .await,
+        );
+        assert!(!error, "{cancelled}");
+        assert_eq!(
+            state.tasks.pending_notices(0, 10).await.unwrap().len(),
+            1,
+            "the parent session is still told"
         );
     }
 }

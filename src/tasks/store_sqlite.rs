@@ -343,6 +343,20 @@ impl TaskStore for SqliteTaskStore {
         })
     }
 
+    fn notice_of<'a>(&'a self, id: &'a TaskId) -> TaskFuture<'a, Option<NoticeTarget>> {
+        let id = id.0.clone();
+        Box::pin(self.db.call(move |c| {
+            let target: Option<String> = c
+                .query_row(
+                    "SELECT target FROM task_notices WHERE task_id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(target.and_then(|target| serde_json::from_str(&target).ok()))
+        }))
+    }
+
     fn pending_notices<'a>(
         &'a self,
         since_ms: u64,

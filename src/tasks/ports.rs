@@ -29,6 +29,10 @@ pub(crate) trait TaskStore: Send + Sync {
     /// Delete the tasks that ended before `before_ms` (none of whose
     /// children is still open), with their events. How many went.
     fn purge_ended<'a>(&'a self, before_ms: u64) -> TaskFuture<'a, usize>;
+    /// Where task `id`'s end is told, if anywhere.
+    fn notice_of<'a>(&'a self, _id: &'a TaskId) -> TaskFuture<'a, Option<NoticeTarget>> {
+        Box::pin(async { Ok(None) })
+    }
     /// Tell `target` how task `id` ends (see `tasks::notices`).
     fn set_notice<'a>(&'a self, _id: &'a TaskId, _target: &'a NoticeTarget) -> TaskFuture<'a, ()> {
         Box::pin(async { Ok(()) })
