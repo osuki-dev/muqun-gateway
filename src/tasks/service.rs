@@ -2468,7 +2468,9 @@ fn newest_answer(items: &[TimelineItem], since_ms: u64) -> Option<u64> {
 /// The last assistant message of `asid`, in full; `None` when it cannot be read.
 async fn full_answer(state: &AppState, asid: &str, since_ms: u64) -> Option<String> {
     let manager = state.agent_runtime.manager_for_session(asid).await?;
+    // Never the child's marker: a parent quoting it would complete itself.
     last_assistant_text(&summary_timeline(&manager, asid, since_ms).await)
+        .map(|text| super::transcript::without_any_marker(&text))
 }
 
 /// `"<step>: <message>"` for the first failed step of a launch.
@@ -2712,6 +2714,8 @@ pub(crate) fn compact_item(item: &TimelineItem) -> Value {
         AgentPart::Status { text } => ("status", text.clone()),
         _ => ("other", String::new()),
     };
+    // Never a marker: a parent agent reading it would quote it.
+    let text = super::transcript::without_any_marker(&text);
     json!({ "role": role, "type": kind, "text": clip(&text, 2000) })
 }
 
@@ -3458,6 +3462,11 @@ mod tests {
         assert_eq!(
             compact_item(&items[1]),
             json!({"role": "assistant", "type": "text", "text": "first"})
+        );
+        // A child's marker never reaches the agent reading it.
+        assert_eq!(
+            compact_item(&reply("a3", "Built.\nMUQUN_TASK_DONE: built")),
+            json!({"role": "assistant", "type": "text", "text": "Built."})
         );
     }
 

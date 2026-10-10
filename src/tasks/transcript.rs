@@ -456,6 +456,9 @@ fn without_request(text: &str) -> Option<String> {
 /// starts to the end of its line, with the quote or backtick before it;
 /// a line left with no words is dropped. A hint never carries marker text.
 pub(crate) fn without_any_marker(text: &str) -> String {
+    if !text.contains(DONE_MARKER) && !text.contains(BLOCKED_MARKER) {
+        return text.to_owned();
+    }
     text.lines()
         .filter_map(|line| {
             let start = [DONE_MARKER, BLOCKED_MARKER]
