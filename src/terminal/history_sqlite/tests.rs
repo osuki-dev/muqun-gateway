@@ -1179,3 +1179,22 @@ async fn an_idle_fold_does_not_wake_the_writer() {
     drop(checkpoints);
     repository.close().await;
 }
+
+#[tokio::test]
+async fn history_writes_skip_the_fsync_and_an_idle_prune_folds_the_wal_back() {
+    let fixture = Fixture::new();
+    let checkpoints = fixture.checkpoints(captures(Some("A"), true)).await;
+    passes(&checkpoints, now_seconds()).await;
+    assert_eq!(record_count(&checkpoints).await, 1);
+    let wal = || checkpoints.db.call(|c| Ok(wal_bytes(c)));
+    assert!(wal().await.unwrap() > 0, "the write went to the WAL");
+    // The connection the other domains share keeps FULL durability.
+    assert_eq!(sql_i64(&checkpoints.db, "PRAGMA synchronous").await, 2);
+    let stamps = checkpoints.captures.lock().unwrap().projection_stamps();
+    checkpoints
+        .pass(now_seconds(), true, stamps, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(wal().await.unwrap(), 0, "an idle prune truncates the WAL");
+    assert_eq!(record_count(&checkpoints).await, 1, "nothing was lost");
+}

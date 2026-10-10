@@ -266,6 +266,15 @@ and recovered row/vector allocations count toward the total live-memory budget,
 not a second per-shape row-text cap. Front trims slide a live capture's row base
 without changing its epoch; checkpoints contain only retained rows, never trimmed
 rows or old cursor coordinates.
+Checkpoint writes commit with `synchronous=NORMAL`: in WAL mode that skips the
+fsync of each history commit, so a power cut can lose the last few seconds of
+checkpoints (already lost to the debounce) but never corrupts the file. The
+setting is switched back to `FULL` on the one shared connection before any
+other job runs, so tasks and tokens keep full durability. The WAL is folded
+back into the database (`wal_checkpoint(TRUNCATE)`, on the store worker, never
+on a request) after a pass that grew it past 4 MiB, and on the 60-second prune
+pass once nothing has been written for a minute, so an idle store's WAL file is
+empty.
 The write loop retains a bounded last-processed content fingerprint independently of
 the database row. An unchanged poll cannot recreate an age-pruned or quota-evicted
 projection; a genuine change in that exact format can be persisted again.

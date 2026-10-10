@@ -56,6 +56,17 @@ const PRUNE_EVERY: Duration = Duration::from_secs(60);
 const WRITE_DEBOUNCE: Duration = Duration::from_secs(3);
 /// Checkpoint reads waiting on the shared store; one more is a 503.
 const MAX_PENDING_READS: usize = 16;
+/// A WAL past this is folded back into the database after the pass that
+/// grew it.
+const WAL_CHECKPOINT_BYTES: u64 = 4 * 1024 * 1024;
+/// A writer that has written nothing for this long folds the WAL back on its
+/// next prune pass, so an idle store's WAL file is empty.
+const IDLE_CHECKPOINT: Duration = if cfg!(test) {
+    Duration::ZERO
+} else {
+    Duration::from_secs(60)
+};
+
 /// How long the write loop waits after a failed pass before it tries again:
 /// each failure moves one step on, and a pass that works starts over.
 const RETRY_AFTER: [Duration; 3] = [
@@ -233,6 +244,8 @@ struct Checkpoints {
     writer: Mutex<Writer>,
     /// How often the write loop has woken: an idle fold leaves it asleep.
     wakes: std::sync::atomic::AtomicU64,
+    /// When a pass last committed a change, for the idle WAL checkpoint.
+    last_write: Mutex<Instant>,
 }
 
 /// `(session, pane, format)`.
@@ -288,6 +301,7 @@ impl Checkpoints {
                 next_scope: None,
             }),
             wakes: std::sync::atomic::AtomicU64::new(0),
+            last_write: Mutex::new(Instant::now()),
         }))
     }
 
@@ -359,13 +373,41 @@ impl Checkpoints {
         let this = self.clone();
         self.db
             .call(move |connection| {
-                let idle = this.write_pass(connection, now, stamps, debounce)?;
-                if prune_due {
-                    prune(connection, now)?;
-                }
-                Ok(idle)
+                // Checkpoints are sampled and may lose their last seconds
+                // (see WRITE_DEBOUNCE), so their commits skip the fsync; the
+                // other domains' FULL durability is restored before any of
+                // their jobs runs on this one connection.
+                connection.pragma_update(None, "synchronous", "NORMAL")?;
+                let passed = this
+                    .write_pass(connection, now, stamps, debounce)
+                    .and_then(|idle| {
+                        if prune_due {
+                            prune(connection, now)?;
+                        }
+                        this.fold_wal(connection, prune_due)?;
+                        Ok(idle)
+                    });
+                connection.pragma_update(None, "synchronous", "FULL")?;
+                passed
             })
             .await
+    }
+
+    /// Fold the WAL back into the database when it has grown past
+    /// [`WAL_CHECKPOINT_BYTES`], or on a prune pass once nothing has been
+    /// written for [`IDLE_CHECKPOINT`]. Runs on the store worker, never on a
+    /// request.
+    fn fold_wal(&self, connection: &Connection, prune_due: bool) -> anyhow::Result<()> {
+        let wal = wal_bytes(connection);
+        let idle = self
+            .last_write
+            .lock()
+            .map(|at| at.elapsed() >= IDLE_CHECKPOINT)
+            .unwrap_or(false);
+        if wal > WAL_CHECKPOINT_BYTES || (prune_due && idle && wal > 0) {
+            connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+        }
+        Ok(())
     }
 
     /// A pass over the fold as it is now, without pruning.
@@ -572,6 +614,9 @@ impl Checkpoints {
                 }
                 transaction.commit()?;
                 written = Some(Instant::now());
+                if let Ok(mut at) = self.last_write.lock() {
+                    *at = Instant::now();
+                }
             }
             let still_current = self
                 .captures
@@ -677,6 +722,15 @@ fn enforce_quotas(transaction: &Transaction<'_>) -> anyhow::Result<()> {
         params![MAX_RECORDS, MAX_PAYLOAD_BYTES],
     )?;
     Ok(())
+}
+
+/// The size of the store's WAL file; 0 when it has none.
+fn wal_bytes(connection: &Connection) -> u64 {
+    connection
+        .path()
+        .filter(|path| !path.is_empty())
+        .and_then(|path| std::fs::metadata(format!("{path}-wal")).ok())
+        .map_or(0, |wal| wal.len())
 }
 
 fn now_seconds() -> i64 {
