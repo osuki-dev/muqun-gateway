@@ -839,3 +839,41 @@ async fn an_oversized_client_frame_is_refused_and_ends_the_socket() {
     );
     assert!(closes(&mut client).await);
 }
+
+/// Another computer's token follows tasks and nothing else (spec §10.3): a
+/// session subscription ends its socket with `peer_forbidden`.
+#[tokio::test]
+async fn a_peer_socket_may_follow_tasks_and_ping_only() {
+    let state = test_state(
+        "admin",
+        vec![crate::test_support::test_peer_device("coding-1", TOKEN)],
+    );
+    let addr = serve(state).await;
+    let forbidden = json!({ "t": "error", "code": "peer_forbidden" });
+    for (frame, answer) in [
+        (r#"{"t":"ping"}"#, json!({ "t": "pong" })),
+        (
+            r#"{"t":"subscribe_tasks"}"#,
+            json!({ "t": "subscribed", "tasks": true }),
+        ),
+        (r#"{"t":"subscribe","asid":"ses_1"}"#, forbidden.clone()),
+        (r#"{"t":"unsubscribe","asid":"ses_1"}"#, forbidden.clone()),
+        (r#"{"t":"subscribe_all"}"#, forbidden.clone()),
+    ] {
+        let (mut client, _) = connect(addr, &bearer()).await.unwrap();
+        assert_eq!(next_json(&mut client).await["t"], "hello");
+        send_text(&mut client, frame).await;
+        assert_eq!(next_json(&mut client).await, answer, "{frame}");
+        if answer == forbidden {
+            assert!(closes(&mut client).await, "{frame}");
+        } else {
+            // Still open, and no `defaults` frame: a peer gets none.
+            send_text(&mut client, r#"{"t":"ping"}"#).await;
+            assert_eq!(
+                next_json(&mut client).await,
+                json!({ "t": "pong" }),
+                "{frame}"
+            );
+        }
+    }
+}

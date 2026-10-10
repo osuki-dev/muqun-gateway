@@ -1,20 +1,28 @@
 //! The owner's other gateway, spoken to exactly as the phone speaks to it:
 //! its device API, with the device token it issued this gateway, sealed with
 //! the transport key it issued when it runs `transport_encryption: required`.
-//! One-shot JSON calls; the task socket comes with Task G2.
+//! One-shot JSON calls for its tasks, and the `subscribe_tasks` socket that
+//! follows them (`TaskFeed`), framed exactly as the phone's.
 
 use std::time::Duration;
 
+use anyhow::Context as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
+use futures::{SinkExt as _, StreamExt as _};
 use reqwest::Method;
+use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::tungstenite::{self, Message};
 
 use super::peers::Peer;
 use crate::connectivity::routes::code_pairing_material;
 use crate::platform::server::{
     EncryptedRequestPayload, TRANSPORT_DEVICE_HEADER, TRANSPORT_ENVELOPE_HEADER, TRANSPORT_HEADER,
 };
+use crate::tasks::domain::TaskState;
 use crate::{now_unix_ms, transport};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -328,6 +336,344 @@ impl PeerClient {
             })
             .unwrap_or_default())
     }
+
+    /// `POST /api/tasks`: B opens `body` as its own task.
+    #[allow(dead_code)] // the mirrors of Task G3
+    pub(crate) async fn create_task(&self, body: &Value) -> Result<RemoteTask, PeerError> {
+        remote(self.json(Method::POST, "/api/tasks", Some(body)).await?)
+    }
+
+    /// `GET /api/tasks/{id}`.
+    #[allow(dead_code)] // the mirrors of Task G3
+    pub(crate) async fn read_task(&self, id: &str) -> Result<RemoteTask, PeerError> {
+        let path = format!("/api/tasks/{}", path_segment(id)?);
+        let answer = self.json(Method::GET, &path, None).await?;
+        remote(answer["task"].clone())
+    }
+
+    /// `POST /api/tasks/{id}/cancel`: the task as the cancel left it.
+    #[allow(dead_code)] // the mirrors of Task G3
+    pub(crate) async fn cancel_task(&self, id: &str) -> Result<RemoteTask, PeerError> {
+        let path = format!("/api/tasks/{}/cancel", path_segment(id)?);
+        remote(self.json(Method::POST, &path, Some(&json!({}))).await?)
+    }
+
+    /// `GET /api/ws`, then `{"t":"subscribe_tasks"}`: answers once B has
+    /// confirmed the subscription, so no change after this returns is missed.
+    #[allow(dead_code)] // the mirrors of Task G3
+    pub(crate) async fn subscribe_tasks(&self) -> Result<TaskFeed, PeerError> {
+        tokio::time::timeout(REQUEST_TIMEOUT, self.open_task_socket())
+            .await
+            .unwrap_or_else(|_| Err(PeerError::Unreachable("socket timed out".into())))
+    }
+
+    async fn open_task_socket(&self) -> Result<TaskFeed, PeerError> {
+        let mut request = ws_url(&self.base)?
+            .into_client_request()
+            .map_err(|_| PeerError::Unreachable("not a socket url".into()))?;
+        let headers = request.headers_mut();
+        let mut nonce = None;
+        if let Some(material) = &self.material {
+            // The phone's sealed upgrade: the token inside an envelope over
+            // `GET /api/ws`, whose nonce the frame keys derive from.
+            let payload = EncryptedRequestPayload {
+                token: self.token.clone(),
+                content_type: None,
+                body: String::new(),
+            };
+            let envelope = transport::seal(
+                material,
+                transport::Direction::Request,
+                WS_AAD.as_bytes(),
+                &serde_json::to_vec(&payload).expect("payload serializes"),
+                now_unix_ms(),
+            )
+            .map_err(|_| PeerError::Unreachable("seal".into()))?;
+            let sealed = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&envelope).expect("envelope"));
+            for (name, value) in [
+                (TRANSPORT_HEADER, "1"),
+                (TRANSPORT_DEVICE_HEADER, self.device_id.as_str()),
+                (TRANSPORT_ENVELOPE_HEADER, sealed.as_str()),
+            ] {
+                headers.insert(name, header_value(value)?);
+            }
+            nonce = Some(envelope.nonce);
+        } else {
+            headers.insert(
+                "authorization",
+                header_value(&format!("Bearer {}", self.token))?,
+            );
+        }
+        let config = WebSocketConfig::default()
+            .max_message_size(Some(MAX_ANSWER_BYTES))
+            .max_frame_size(Some(MAX_ANSWER_BYTES));
+        let (socket, _) = tokio_tungstenite::connect_async_with_config(request, Some(config), true)
+            .await
+            .map_err(upgrade_refused)?;
+        let mut feed = TaskFeed {
+            socket,
+            codec: None,
+            pinged: false,
+        };
+        let first = feed
+            .next_frame()
+            .await
+            .ok_or_else(|| PeerError::Unreachable("no hello".into()))?;
+        let hello = match (&self.material, nonce) {
+            (Some(material), Some(nonce)) => {
+                let (codec, hello) = ClientCodec::open_first(&first, material, &nonce)
+                    .map_err(|_| PeerError::Unreachable("hello did not open".into()))?;
+                feed.codec = Some(codec);
+                serde_json::from_str(&hello).unwrap_or(Value::Null)
+            }
+            _ => first,
+        };
+        if hello["t"] != "hello" {
+            return Err(PeerError::Unreachable("no hello".into()));
+        }
+        feed.send(r#"{"t":"subscribe_tasks"}"#).await?;
+        loop {
+            let frame = feed
+                .next_plaintext()
+                .await
+                .ok_or_else(|| PeerError::Unreachable("socket closed".into()))?;
+            match frame["t"].as_str() {
+                Some("subscribed") if frame["tasks"] == true => return Ok(feed),
+                Some("error") => return Err(refused(403, &json!({ "error": frame }))),
+                _ => continue,
+            }
+        }
+    }
+}
+
+/// The `/api/ws` URL under a peer's base URL.
+fn ws_url(base: &str) -> Result<String, PeerError> {
+    if let Some(rest) = base.strip_prefix("http://") {
+        Ok(format!("ws://{rest}{WS_PATH}"))
+    } else if let Some(rest) = base.strip_prefix("https://") {
+        Ok(format!("wss://{rest}{WS_PATH}"))
+    } else {
+        Err(PeerError::Unreachable("not a socket url".into()))
+    }
+}
+
+fn header_value(value: &str) -> Result<tungstenite::http::HeaderValue, PeerError> {
+    value
+        .parse()
+        .map_err(|_| PeerError::Unreachable("header".into()))
+}
+
+/// A refused upgrade is read as a refused call; anything else never reached
+/// a gateway.
+fn upgrade_refused(error: tungstenite::Error) -> PeerError {
+    match error {
+        tungstenite::Error::Http(response) => {
+            let body = response
+                .body()
+                .as_deref()
+                .and_then(|bytes| serde_json::from_slice(bytes).ok())
+                .unwrap_or(Value::Null);
+            refused(response.status().as_u16(), &body)
+        }
+        tungstenite::Error::Io(error) => PeerError::Unreachable(error.kind().to_string()),
+        _ => PeerError::Unreachable("socket".into()),
+    }
+}
+
+/// `id` as one path segment. A task id is `t_` plus URL-safe base64, so
+/// anything else names no task over there.
+fn path_segment(id: &str) -> Result<&str, PeerError> {
+    if !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        Ok(id)
+    } else {
+        Err(PeerError::Refused {
+            status: 404,
+            code: "task_not_found".into(),
+        })
+    }
+}
+
+fn remote(value: Value) -> Result<RemoteTask, PeerError> {
+    serde_json::from_value(value).map_err(|_| PeerError::Unreachable("not a task".into()))
+}
+
+/// B's task view, as much of it as a mirror copies.
+#[allow(dead_code)] // the mirrors of Task G3
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct RemoteTask {
+    pub task_id: String,
+    pub state: TaskState,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub progress: Option<String>,
+}
+
+/// What a peer's task socket says.
+#[allow(dead_code)] // the mirrors of Task G3
+#[derive(Debug)]
+pub(crate) enum FeedItem {
+    /// One of B's tasks changed; this is it now.
+    Task(RemoteTask),
+    /// B dropped task frames for this socket: read the mirrored tasks again.
+    Resync,
+}
+
+const WS_PATH: &str = "/api/ws";
+const WS_AAD: &str = "GET /api/ws";
+/// Quiet this long, the feed pings; quiet as long again, it is over. A live
+/// gateway pings its sockets every 25 s and answers a ping at once, so only
+/// a half-open connection trips it.
+const PING_AFTER: Duration = Duration::from_secs(25);
+
+type Socket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// B's `subscribe_tasks` socket, subscribed. Dropping it closes the socket.
+pub(crate) struct TaskFeed {
+    socket: Socket,
+    /// `Some` when the socket is sealed.
+    codec: Option<ClientCodec>,
+    /// A ping went out and nothing has come back since.
+    pinged: bool,
+}
+
+impl TaskFeed {
+    /// The next task change. `None`: the socket ended (closed, silent past
+    /// a ping, a frame that did not open, or an `error` frame); open a new
+    /// one. Cancel-safe between frames.
+    #[allow(dead_code)] // the mirrors of Task G3
+    pub(crate) async fn next(&mut self) -> Option<FeedItem> {
+        loop {
+            let frame = self.next_plaintext().await?;
+            match frame["t"].as_str() {
+                Some("task") => match serde_json::from_value(frame["data"].clone()) {
+                    Ok(task) => return Some(FeedItem::Task(task)),
+                    // A view this side cannot read: the follower's poll
+                    // fetches it.
+                    Err(_) => return Some(FeedItem::Resync),
+                },
+                Some("resync") if frame["tasks"] == true => return Some(FeedItem::Resync),
+                Some("error") => return None,
+                // hello, subscribed, defaults, pong, a session resync.
+                _ => continue,
+            }
+        }
+    }
+
+    /// The next frame's plaintext JSON.
+    async fn next_plaintext(&mut self) -> Option<Value> {
+        let frame = self.next_frame().await?;
+        let Some(codec) = &mut self.codec else {
+            return Some(frame);
+        };
+        let plaintext = codec.open(&frame).ok()?;
+        serde_json::from_str(&plaintext).ok()
+    }
+
+    /// The next text frame as JSON, as it arrived.
+    async fn next_frame(&mut self) -> Option<Value> {
+        loop {
+            let message = match tokio::time::timeout(PING_AFTER, self.socket.next()).await {
+                Ok(message) => message?.ok()?,
+                Err(_) if self.pinged => return None,
+                Err(_) => {
+                    self.send(r#"{"t":"ping"}"#).await.ok()?;
+                    self.pinged = true;
+                    continue;
+                }
+            };
+            self.pinged = false;
+            match message {
+                Message::Text(text) => return serde_json::from_str(text.as_str()).ok(),
+                Message::Binary(_) | Message::Close(_) => return None,
+                // Pings are answered by the socket itself.
+                _ => continue,
+            }
+        }
+    }
+
+    async fn send(&mut self, plaintext: &str) -> Result<(), PeerError> {
+        let wire = match &mut self.codec {
+            Some(codec) => codec
+                .seal(plaintext)
+                .map_err(|_| PeerError::Unreachable("seal".into()))?,
+            None => plaintext.to_owned(),
+        };
+        self.socket
+            .send(Message::Text(wire.into()))
+            .await
+            .map_err(|_| PeerError::Unreachable("socket closed".into()))
+    }
+}
+
+/// The client half of a sealed `/api/ws` (see `ws_routes::FrameCodec`): the
+/// first server frame names the connection, both keys derive from it and the
+/// upgrade's nonce, and each direction counts its own frames from zero.
+struct ClientCodec {
+    server_key: [u8; 32],
+    client_key: [u8; 32],
+    connection_id: String,
+    recv_seq: u64,
+    send_seq: u64,
+}
+
+impl ClientCodec {
+    fn open_first(
+        first: &Value,
+        material: &[u8],
+        request_nonce: &str,
+    ) -> anyhow::Result<(Self, String)> {
+        let connection_id = first["cid"]
+            .as_str()
+            .context("no connection id")?
+            .to_owned();
+        let mut codec = Self {
+            server_key: transport::derive_ws_server_key(material, &connection_id, request_nonce)?,
+            client_key: transport::derive_ws_client_key(material, &connection_id, request_nonce)?,
+            connection_id,
+            recv_seq: 0,
+            send_seq: 0,
+        };
+        let hello = codec.open(first)?;
+        Ok((codec, hello))
+    }
+
+    fn aad(&self, seq: u64) -> String {
+        format!("{WS_AAD}\n{}\n{seq}", self.connection_id)
+    }
+
+    fn open(&mut self, frame: &Value) -> anyhow::Result<String> {
+        let seq = frame["seq"].as_u64().context("no seq")?;
+        anyhow::ensure!(seq == self.recv_seq, "frame out of order");
+        let plaintext = transport::open_stream_event(
+            &self.server_key,
+            seq,
+            self.aad(seq).as_bytes(),
+            frame["c"].as_str().context("no ciphertext")?,
+        )?;
+        self.recv_seq += 1;
+        Ok(String::from_utf8(plaintext)?)
+    }
+
+    fn seal(&mut self, plaintext: &str) -> anyhow::Result<String> {
+        let seq = self.send_seq;
+        let c = transport::seal_stream_event(
+            &self.client_key,
+            seq,
+            self.aad(seq).as_bytes(),
+            plaintext.as_bytes(),
+        )?;
+        self.send_seq += 1;
+        Ok(format!(r#"{{"seq":{seq},"c":"{c}"}}"#))
+    }
 }
 
 /// 401, or 403 for a token or proof this peer no longer knows, is the link
@@ -356,9 +702,140 @@ fn refused(status: u16, body: &Value) -> PeerError {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use super::*;
+    use crate::tasks::domain::{
+        now_ms, PrincipalKind, Task, TaskBinding, TaskChange, TaskId, TaskKind, TaskOrigin,
+        TaskPrincipal,
+    };
+    use crate::test_support::{
+        named, output_state, peer_router, serve, test_peer_device, FakeHerdr,
+    };
+    use crate::{generate_token, AppState, TransportEncryptionMode};
 
-    use super::{refused, PeerError};
+    /// A task the peer opened on `state`, as if through `POST /api/tasks`.
+    async fn peer_task(state: &AppState, device_id: &str) -> TaskId {
+        let now = now_ms();
+        state
+            .tasks
+            .insert_for_test(&Task {
+                id: TaskId::new(),
+                kind: TaskKind::Delegation,
+                goal: "screenshot Home".into(),
+                cwd: None,
+                binding: TaskBinding::None,
+                state: TaskState::Queued,
+                summary: None,
+                exit_code: None,
+                created_by: TaskPrincipal {
+                    kind: PrincipalKind::Gateway,
+                    id: device_id.into(),
+                },
+                created_ms: now,
+                updated_ms: now,
+                seq: 0,
+                parent: None,
+                origin: TaskOrigin::Agent,
+                label: None,
+                requester_name: None,
+                session_title: None,
+            })
+            .await
+    }
+
+    /// Reads, cancels and follows a task on another gateway, in both of the
+    /// transports a gateway can run: sealed with the key it issued at
+    /// pairing, and plain.
+    #[tokio::test]
+    async fn a_peer_reads_cancels_and_follows_its_tasks_in_either_transport() {
+        for sealed in [true, false] {
+            let herdr = FakeHerdr::start(vec!["$ "], None);
+            let mut mini = named(output_state(&herdr), "srv-mini", "mini");
+            let mut device = test_peer_device("coding-1", "peer-token");
+            if sealed {
+                device.transport_key = Some(generate_token());
+            } else {
+                mini.config.transport_encryption = TransportEncryptionMode::Disabled;
+            }
+            mini.devices.lock().unwrap().push(device.clone());
+            let url = serve(peer_router(mini.clone())).await;
+            let client = PeerClient::for_peer(&Peer {
+                peer_id: "p-mini".into(),
+                server_id: "srv-mini".into(),
+                name: "mini".into(),
+                url,
+                token: "peer-token".into(),
+                device_id: "coding-1".into(),
+                transport_key: device.transport_key.clone(),
+                added_ms: 0,
+                last_seen_ms: None,
+                capabilities: vec![],
+                manifest: None,
+            })
+            .unwrap();
+
+            let mut feed = client
+                .subscribe_tasks()
+                .await
+                .unwrap_or_else(|error| panic!("sealed={sealed}: no socket: {error}"));
+            let id = peer_task(&mini, "coding-1").await;
+            mini.tasks
+                .move_to(
+                    &id,
+                    TaskChange {
+                        to: TaskState::Working,
+                        source: "test".into(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let followed = loop {
+                match tokio::time::timeout(Duration::from_secs(5), feed.next())
+                    .await
+                    .expect("a frame")
+                {
+                    Some(FeedItem::Task(task))
+                        if task.task_id == id.0 && task.state == TaskState::Working =>
+                    {
+                        break task
+                    }
+                    Some(_) => continue,
+                    None => panic!("sealed={sealed}: the socket closed"),
+                }
+            };
+            assert_eq!(followed.state, TaskState::Working);
+
+            assert_eq!(
+                client.read_task(&id.0).await.unwrap().state,
+                TaskState::Working,
+                "sealed={sealed}"
+            );
+            assert_eq!(
+                client.cancel_task(&id.0).await.unwrap().state,
+                TaskState::Cancelled,
+                "sealed={sealed}"
+            );
+            for missing in ["t_missing", "../health", ""] {
+                assert!(
+                    matches!(
+                        client.read_task(missing).await,
+                        Err(PeerError::Refused { status: 404, .. })
+                    ),
+                    "sealed={sealed}: {missing:?}"
+                );
+            }
+
+            mini.devices.lock().unwrap().retain(|d| d.id != "coding-1");
+            assert!(
+                matches!(client.read_task(&id.0).await, Err(PeerError::Unauthorized)),
+                "sealed={sealed}: a revoked link"
+            );
+            assert!(
+                matches!(client.subscribe_tasks().await, Err(PeerError::Unauthorized)),
+                "sealed={sealed}: a revoked link's socket"
+            );
+        }
+    }
 
     #[test]
     fn a_refusal_keeps_only_a_code_shaped_code() {

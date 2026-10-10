@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use reqwest::Method;
@@ -198,6 +198,55 @@ async fn revoke(peer: &Peer) {
     }
 }
 
+/// The one task socket per peer (`fleet::mirror::watch`): started when a
+/// mirror of that peer opens, ended by its follower when none is open.
+#[derive(Default)]
+pub(crate) struct PeerSockets {
+    running: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+}
+
+impl PeerSockets {
+    /// Start `follow` for `peer_id` unless one is running.
+    #[allow(dead_code)] // the mirrors of Task G3
+    pub(crate) fn ensure(
+        &self,
+        peer_id: &str,
+        follow: impl FnOnce() -> tokio::task::JoinHandle<()>,
+    ) {
+        let Ok(mut running) = self.running.lock() else {
+            return;
+        };
+        if running
+            .get(peer_id)
+            .is_some_and(|handle| !handle.is_finished())
+        {
+            return;
+        }
+        running.insert(peer_id.to_owned(), follow());
+    }
+
+    #[allow(dead_code)] // the mirrors of Task G3
+    pub(crate) fn is_live(&self, peer_id: &str) -> bool {
+        self.running
+            .lock()
+            .ok()
+            .and_then(|running| running.get(peer_id).map(|handle| !handle.is_finished()))
+            .unwrap_or(false)
+    }
+
+    /// End `peer_id`'s follower, if one runs.
+    pub(crate) fn stop(&self, peer_id: &str) {
+        let handle = self
+            .running
+            .lock()
+            .ok()
+            .and_then(|mut running| running.remove(peer_id));
+        if let Some(handle) = handle {
+            handle.abort();
+        }
+    }
+}
+
 /// The peers registry and the accept switch (`AppState.peers`).
 pub(crate) struct PeerService {
     store: Arc<dyn PeerStore>,
@@ -206,6 +255,7 @@ pub(crate) struct PeerService {
     names: RwLock<Vec<String>>,
     /// Shared with the task service (G3).
     pub(crate) presence: Arc<PeerPresence>,
+    pub(crate) sockets: PeerSockets,
 }
 
 impl PeerService {
@@ -223,6 +273,7 @@ impl PeerService {
             config_path,
             names: RwLock::default(),
             presence,
+            sockets: PeerSockets::default(),
         }
     }
 
@@ -384,6 +435,7 @@ impl PeerService {
         let Some(peer) = self.get(peer_id).await else {
             return Ok(false);
         };
+        self.sockets.stop(peer_id);
         revoke(&peer).await;
         let removed = self.store.remove(peer_id).await?;
         self.presence.gone(peer_id);
@@ -419,6 +471,7 @@ impl PeerService {
 
     /// Drop the row only (the peer answered 401: it no longer knows us).
     pub(crate) async fn forget(&self, peer_id: &str) {
+        self.sockets.stop(peer_id);
         if let Err(error) = self.store.remove(peer_id).await {
             tracing::warn!(peer = %peer_id, "failed to forget a peer: {error:#}");
         }

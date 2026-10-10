@@ -46,7 +46,10 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", default-features = false, features = ["ansi", "env-filter", "fmt", "smallvec", "std", "tracing-log"] }
 uuid = { version = "1.24.0", features = ["v4"] }
 argon2 = { version = "0.6.0", default-features = false, features = ["alloc"] }
-tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake"] }
+# `rustls-tls-webpki-roots`: a linked peer at an `https://` URL is followed
+# over `wss://` (`fleet::peer_client::TaskFeed`), with the same rustls and
+# webpki roots reqwest already uses.
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 # `CancellationToken` for the T3 Code RPC connection actor: one token stops
 # the socket task, its ping timer and every subscription together. Already in
 # the tree through reqwest, so this adds no compiled crate.
