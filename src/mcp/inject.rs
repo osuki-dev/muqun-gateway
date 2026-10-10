@@ -203,11 +203,35 @@ fn configured_developer_instructions(configured: &[String]) -> Option<String> {
     found
 }
 
-/// The user's own Codex `developer_instructions`, if their config sets one,
-/// from `CODEX_HOME` as the agent will see it (`agent_env` first). Read
-/// only; a file that cannot be read or parsed gives nothing, logged, and the
-/// launch carries the sentence alone.
+/// The user's own Codex `developer_instructions`, if their config sets one.
+/// A config that cannot be read gives nothing, and the launch carries the
+/// sentence alone.
 async fn codex_developer_instructions(config: &crate::Config) -> Option<String> {
+    codex_config(config)
+        .await?
+        .get("developer_instructions")
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned)
+}
+
+/// The model and reasoning effort the user's Codex config runs with, when
+/// it names a model: what a pane delegation that names none will run.
+pub(crate) async fn codex_default_model(
+    config: &crate::Config,
+) -> Option<(String, Option<String>)> {
+    let table = codex_config(config).await?;
+    let model = table.get("model")?.as_str()?.to_owned();
+    let effort = table
+        .get("model_reasoning_effort")
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned);
+    Some((model, effort))
+}
+
+/// The user's Codex config, from `CODEX_HOME` as the agent will see it
+/// (`agent_env` first). Read only; a file that cannot be read or parsed
+/// gives nothing, logged.
+async fn codex_config(config: &crate::Config) -> Option<toml::Table> {
     let home = config
         .agent_env
         .usable()
@@ -219,18 +243,15 @@ async fn codex_developer_instructions(config: &crate::Config) -> Option<String> 
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
         Err(error) => {
-            tracing::warn!(%error, "Codex's config was not read; its task gets the sentence alone");
+            tracing::warn!(%error, "Codex's config was not read");
             return None;
         }
     };
     match toml::from_str::<toml::Table>(&text) {
-        Ok(table) => table
-            .get("developer_instructions")
-            .and_then(toml::Value::as_str)
-            .map(str::to_owned),
+        Ok(table) => Some(table),
         // The parse error quotes the file; only the fact is logged.
         Err(_) => {
-            tracing::warn!("Codex's config did not parse; its task gets the sentence alone");
+            tracing::warn!("Codex's config did not parse");
             None
         }
     }

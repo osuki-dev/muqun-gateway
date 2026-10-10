@@ -42,13 +42,13 @@
 //! every [`POLL`], backing off to [`MAX_PAUSED_POLL`] while nothing changes
 //! ([`paused_poll`]).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use serde_json::Value;
 
 use super::domain::{one_line, AgentJob, Task, TaskBinding, TaskChange, TaskId, TaskState};
-use super::service::SUMMARY_CHARS;
+use super::service::{TaskError, SUMMARY_CHARS};
 use super::{may_touch, same_pane};
 use crate::agents::tasks as agent_kinds;
 use crate::backend::{AgentStatus, OutputFormat, OutputSource, PaneId, ReadPane};
@@ -181,6 +181,97 @@ pub(crate) async fn exited_to_shell(session: &SessionConfig, pane_id: &str, kind
             return false;
         }
     }
+}
+
+/// What a pane delegation to `kind` launches with for the model and effort
+/// the request named ([`agent_kinds::model_args`]): the arguments, and the
+/// model and effort they set. A model or effort that is no plain word is
+/// refused; Claude Code is asked once which flags it takes.
+pub(crate) async fn launch_model(
+    state: &AppState,
+    kind: &str,
+    model: Option<&str>,
+    variant: Option<&str>,
+) -> Result<(Vec<String>, Option<String>, Option<String>), TaskError> {
+    if let Some(word) = [model, variant]
+        .into_iter()
+        .flatten()
+        .find(|word| !agent_kinds::valid_model_word(word))
+    {
+        return Err(TaskError::UnknownModel(word.to_owned()));
+    }
+    let flags = if kind == "claude" && model.is_some() {
+        let command = agent_kinds::agent_command(kind, &state.config.agent_commands);
+        claude_model_flags(state, &command).await
+    } else {
+        agent_kinds::ModelFlags::default()
+    };
+    Ok(agent_kinds::model_args(kind, model, variant, flags))
+}
+
+/// Claude Code's model flags, from `<command> --help`: asked once per
+/// command and kept; an ask that fails (not found, no answer in 10 s) gives
+/// none and is asked again next time.
+async fn claude_model_flags(state: &AppState, command: &str) -> agent_kinds::ModelFlags {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<HashMap<String, agent_kinds::ModelFlags>>> =
+        std::sync::OnceLock::new();
+    let seen = SEEN.get_or_init(Default::default);
+    if let Some(flags) = seen.lock().ok().and_then(|seen| seen.get(command).copied()) {
+        return flags;
+    }
+    let program = if command.contains('/') {
+        Some(std::path::PathBuf::from(command))
+    } else {
+        agent_kinds::find_on_path(command)
+    };
+    let Some(program) = program else {
+        return agent_kinds::ModelFlags::default();
+    };
+    let mut probe = tokio::process::Command::new(program);
+    probe
+        .arg("--help")
+        .envs(state.config.agent_env.usable())
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let Ok(Ok(out)) = tokio::time::timeout(Duration::from_secs(10), probe.output()).await else {
+        return agent_kinds::ModelFlags::default();
+    };
+    let help = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let flags = agent_kinds::ModelFlags::from_help(&help);
+    if let Ok(mut seen) = seen.lock() {
+        seen.insert(command.to_owned(), flags);
+    }
+    flags
+}
+
+/// The model and effort a started agent's banner shows -- Codex's
+/// `model: gpt-6 high   /model to change` -- for a delegation that named
+/// none. `None` when the pane shows no such line.
+pub(crate) async fn ran_model(
+    session: &SessionConfig,
+    pane_id: &str,
+) -> Option<(String, Option<String>)> {
+    banner_model(&read_pane_visible_text(session, pane_id).await.ok()?)
+}
+
+fn banner_model(screen: &str) -> Option<(String, Option<String>)> {
+    screen.lines().find_map(|line| {
+        let (_, rest) = line.split_once("model:")?;
+        let mut words = rest
+            .split_whitespace()
+            .take_while(|word| !word.starts_with('/') && !word.starts_with('\u{2502}'));
+        let model = words
+            .next()
+            .filter(|word| agent_kinds::valid_model_word(word))?;
+        let variant = words
+            .next()
+            .filter(|word| agent_kinds::valid_model_word(word));
+        Some((model.to_owned(), variant.map(str::to_owned)))
+    })
 }
 
 /// The job a delegation launched in a pane: the pane's shell, and the job
@@ -1466,6 +1557,29 @@ mod tests {
         // `/proc/<pid>/stat`, a command name holding a parenthesis and spaces.
         let stat = "200 (a) b (c) S 100 200 200 34819 200 4194560 1 0 0 0 5 1 0 0 20 0 1 0 987654 1000 100";
         assert_eq!(start_ticks(stat), Some(987_654));
+    }
+
+    /// What a started agent's banner says it runs, when the task named no
+    /// model.
+    #[test]
+    fn the_banner_tells_which_model_runs() {
+        for (screen, ran) in [
+            (
+                "│ >_ OpenAI Codex (v0.161.0) │\n│ model: gpt-6-sol medium   /model to change │\n",
+                Some(("gpt-6-sol", Some("medium"))),
+            ),
+            (
+                "│ model: gpt-6-sol   /model to change │\n",
+                Some(("gpt-6-sol", None)),
+            ),
+            ("$ codex\n", None),
+        ] {
+            let got = banner_model(screen);
+            let got = got
+                .as_ref()
+                .map(|(model, variant)| (model.as_str(), variant.as_deref()));
+            assert_eq!(got, ran, "{screen:?}");
+        }
     }
 
     /// The job recorded at launch is the one the launch started: never a

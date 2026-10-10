@@ -765,6 +765,8 @@ mod tests {
                     shell_pid: None,
                     agent_id: Some("claude".into()),
                     agent_job: None,
+                    model: None,
+                    variant: None,
                 },
                 ..child(TaskState::IdleUnconfirmed, None)
             })

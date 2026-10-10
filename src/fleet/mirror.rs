@@ -106,6 +106,7 @@ pub(crate) async fn delegate(
         ("mode", &request.mode),
         ("model", &request.model),
         ("variant", &request.variant),
+        ("session_id", &request.session_id),
     ] {
         if let Some(value) = value {
             body[key] = json!(value);
@@ -1021,6 +1022,8 @@ mod tests {
                     shell_pid: None,
                     agent_id: None,
                     agent_job: None,
+                    model: None,
+                    variant: None,
                 },
                 ..mirror(TaskState::Working, None)
             })

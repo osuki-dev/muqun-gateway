@@ -123,14 +123,42 @@ async fn list(
 }
 
 /// `GET /api/tasks/defaults`: what a task the device opens without `cwd`
-/// runs in (see [`TaskService::default_cwd`]); `null` when unknown.
+/// runs in (see [`TaskService::default_cwd`]); `null` when unknown. With
+/// `agent_id` naming an agent that runs in a terminal pane (and optionally
+/// `model`, `variant`), also the `model` and `variant` such a task would
+/// run: the ones named where its launch can pass them, else the agent's
+/// own (Codex's config), else `default`.
 ///
 /// [`TaskService::default_cwd`]: super::service::TaskService::default_cwd
-async fn defaults(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
+async fn defaults(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> ApiResult<Json<Value>> {
     let by = principal(require_device(&state, &headers)?);
-    Ok(Json(
-        json!({ "default_cwd": state.tasks.default_cwd(&by).await }),
-    ))
+    let mut answer = json!({ "default_cwd": state.tasks.default_cwd(&by).await });
+    if let Some(kind) = query.get("agent_id") {
+        if super::service::runs_in_pane(&state, kind).await {
+            let named = super::pane_agent::launch_model(
+                &state,
+                kind,
+                query.get("model").map(String::as_str),
+                query.get("variant").map(String::as_str),
+            )
+            .await
+            .map_err(|_| invalid_request())?;
+            let (model, variant) = match named {
+                (_, Some(model), variant) => (model, variant),
+                _ if kind == "codex" => crate::mcp::inject::codex_default_model(&state.config)
+                    .await
+                    .unwrap_or_else(|| ("default".to_owned(), None)),
+                _ => ("default".to_owned(), None),
+            };
+            answer["model"] = json!(model);
+            answer["variant"] = json!(variant);
+        }
+    }
+    Ok(Json(answer))
 }
 
 #[derive(Debug, Deserialize)]
@@ -154,6 +182,10 @@ struct CreateBody {
     /// The requester's own reference for the task, echoed in its view.
     #[serde(default)]
     client_ref: Option<String>,
+    /// The terminal session a terminal agent starts in, by its config id;
+    /// absent: the first that answers.
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 fn refused(code: &str, message: &str) -> (StatusCode, Json<Value>) {
@@ -220,7 +252,13 @@ impl CreateBody {
                 "goal must be non-empty and at most 32 KiB",
             ));
         }
-        let names = [&self.agent_id, &self.mode, &self.model, &self.variant];
+        let names = [
+            &self.agent_id,
+            &self.mode,
+            &self.model,
+            &self.variant,
+            &self.session_id,
+        ];
         if names
             .iter()
             .filter_map(|name| name.as_deref())
@@ -267,6 +305,7 @@ impl CreateBody {
             label,
             mentions,
             client_ref: self.client_ref,
+            session_id: self.session_id,
         })
     }
 }
@@ -341,6 +380,10 @@ fn create_failed(error: TaskError) -> (StatusCode, Json<Value>) {
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_unavailable",
             "That agent is not available",
+        ),
+        TaskError::TerminalUnknown(_) => refused(
+            "terminal_unknown",
+            "No terminal session of that id on this computer",
         ),
         TaskError::UnknownModel(_) => refused(
             "unknown_model",
@@ -870,7 +913,7 @@ mod tests {
             .insert("codex".into(), "sh".into());
         let dir = std::env::temp_dir().canonicalize().unwrap();
         let body = json!({ "goal": "fix the build", "cwd": dir, "agent_id": "codex",
-                           "model": "ignored", "label": "build" });
+                           "model": "gpt-6-sol", "variant": "low", "label": "build" });
         let (status, task) = send(&state, "POST", "/api/tasks", Some(body), true).await;
         assert_eq!(status, StatusCode::OK, "{task}");
         // Answered once the pane exists; the agent starts in the background.
@@ -881,7 +924,12 @@ mod tests {
         assert_eq!(
             task["binding"],
             json!({ "kind": "pane", "session_id": "default", "pane_id": "w1:p9",
-                    "tab_id": "w1:t9", "shell_pid": 4242, "agent_id": "codex" })
+                    "tab_id": "w1:t9", "shell_pid": 4242, "agent_id": "codex",
+                    "model": "gpt-6-sol", "variant": "low" })
+        );
+        assert_eq!(
+            (&task["model"], &task["variant"]),
+            (&json!("gpt-6-sol"), &json!("low"))
         );
         let id = TaskId(task["task_id"].as_str().unwrap().into());
         for _ in 0..400 {
@@ -908,6 +956,26 @@ mod tests {
             start["params"]["args"][0],
             crate::agents::tasks::CODEX_BYPASS_FLAG
         );
+        // The model and effort asked for, for this run only, before the goal.
+        let args: Vec<&str> = start["params"]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        let at = args
+            .iter()
+            .position(|arg| *arg == "model=\"gpt-6-sol\"")
+            .unwrap();
+        assert_eq!(
+            &args[at - 1..at + 3],
+            [
+                "-c",
+                "model=\"gpt-6-sol\"",
+                "-c",
+                "model_reasoning_effort=\"low\""
+            ]
+        );
         let prompt = calls
             .iter()
             .find(|c| c["method"] == "agent.prompt")
@@ -915,6 +983,27 @@ mod tests {
         // The goal alone: how to finish is the MCP server's to say.
         assert_eq!(prompt["params"]["text"], "fix the build");
         assert_eq!(task["goal"], "fix the build");
+
+        // The terminal session the request names, not the first that
+        // answers; one this computer does not have is refused.
+        let mut other = state.config.sessions[0].clone();
+        other.id = "hd".into();
+        state.config.sessions.push(other);
+        for (session_id, status, answer) in [
+            ("hd", StatusCode::OK, json!("hd")),
+            ("nope", StatusCode::BAD_REQUEST, json!("terminal_unknown")),
+        ] {
+            let body = json!({ "goal": "g", "cwd": dir, "agent_id": "codex",
+                               "session_id": session_id });
+            let (status_got, view) = send(&state, "POST", "/api/tasks", Some(body), true).await;
+            assert_eq!(status_got, status, "{session_id}: {view}");
+            let got = if status == StatusCode::OK {
+                &view["binding"]["session_id"]
+            } else {
+                &view["error"]["code"]
+            };
+            assert_eq!(got, &answer, "{session_id}: {view}");
+        }
 
         // A task cancelled before its agent starts gets no agent and no goal.
         let session = state.config.sessions[0].clone();

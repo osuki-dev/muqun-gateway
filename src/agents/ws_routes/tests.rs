@@ -616,6 +616,8 @@ fn task_update(seq: u64) -> TaskDomainEvent {
             peer_last_seen_ms: None,
             mentions: Vec::new(),
             client_ref: None,
+            model: None,
+            variant: None,
             reason: None,
         },
         seq,

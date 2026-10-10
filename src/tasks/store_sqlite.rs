@@ -887,6 +887,8 @@ mod tests {
                 shell_pid: Some(9),
                 agent_id: None,
                 agent_job: None,
+                model: None,
+                variant: None,
             }))
             .await
             .unwrap();

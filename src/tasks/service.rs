@@ -205,6 +205,9 @@ pub(crate) struct DelegateRequest {
     pub mentions: Vec<String>,
     /// See [`Task::client_ref`].
     pub client_ref: Option<String>,
+    /// The terminal session a terminal agent starts in (a tmux session or
+    /// Herdr, by its id in the config); `None`: the first that answers.
+    pub session_id: Option<String>,
 }
 
 /// Who asked for a task, as a task view shows it.
@@ -262,6 +265,13 @@ pub(crate) struct TaskView {
     /// The requester's reference for it, when it gave one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_ref: Option<String>,
+    /// A terminal delegation's model and effort: those its launch passed,
+    /// else what its agent's banner showed, else `default` (the agent's
+    /// own). Absent on every other task.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variant: Option<String>,
     /// A mirror's why, for the phone to word (its summary is prose):
     /// `peer_unlinked`, `peer_lost_task` or `peer_not_confirmed` on a failed
     /// one, `peer_unreachable` on an open one. Made when the view is.
@@ -348,6 +358,8 @@ pub(crate) enum TaskError {
     },
     /// No configured terminal session answers, so a command has nowhere to run.
     NoTerminal,
+    /// The request named a terminal session this computer has no such id for.
+    TerminalUnknown(String),
     /// A timeline was asked of a task that has none (a command).
     NoTimeline,
     /// The device confirmed a task that is not its own paused or waiting
@@ -389,6 +401,7 @@ impl std::fmt::Display for TaskError {
                 )
             }
             Self::NoTerminal => write!(f, "{}", run_command::NO_TERMINAL),
+            Self::TerminalUnknown(id) => write!(f, "no terminal session '{id}'"),
             Self::NoTimeline => write!(f, "only a delegated task has a timeline"),
             Self::InvalidSummary => write!(f, "summary must be non-empty and at most 32 KiB"),
             Self::NotConfirmable => write!(
@@ -546,7 +559,7 @@ enum Step {
     Failed(Option<AgentErrorInfo>),
     /// A question form is pending, with its title ([`form_waiting`]).
     Form(String),
-    Move(TaskChange),
+    Move(Box<TaskChange>),
 }
 
 /// Whether a session is running a turn.
@@ -566,14 +579,14 @@ fn step(event: &AgentDomainEvent, asid: &str) -> Step {
             AgentSessionStatus::Busy | AgentSessionStatus::Retry => Step::Busy,
             AgentSessionStatus::Idle => Step::Idle,
             AgentSessionStatus::Failed => Step::Failed(error.clone()),
-            AgentSessionStatus::Interrupted => Step::Move(change(TaskState::Cancelled)),
+            AgentSessionStatus::Interrupted => Step::Move(Box::new(change(TaskState::Cancelled))),
             AgentSessionStatus::Unknown => Step::Stay,
         },
         // A permission request's line is its own prompt; a form's, the
         // agent's question when it asked one ([`form_waiting`]).
         AgentDomainEvent::PermissionPending {
             asid: id, request, ..
-        } if ours(id) => Step::Move(asking(&request.prompt)),
+        } if ours(id) => Step::Move(Box::new(asking(&request.prompt))),
         AgentDomainEvent::FormPending {
             asid: id, request, ..
         } if ours(id) => Step::Form(request.title.clone()),
@@ -581,7 +594,7 @@ fn step(event: &AgentDomainEvent, asid: &str) -> Step {
         | AgentDomainEvent::FormResolved { asid: id, .. }
             if ours(id) =>
         {
-            Step::Move(change(TaskState::Working))
+            Step::Move(Box::new(change(TaskState::Working)))
         }
         _ => Step::Stay,
     }
@@ -1059,13 +1072,13 @@ impl TaskService {
             }
             return crate::fleet::mirror::delegate(state, by, peer, request).await;
         }
+        if let Some(id) = request.session_id.as_deref() {
+            if !state.config.sessions.iter().any(|session| session.id == id) {
+                return Err(TaskError::TerminalUnknown(id.to_owned()));
+            }
+        }
         if let Some(kind) = request.agent_id.as_deref() {
-            // A session agent (OpenCode, DeepSeek, T3) is never started in a
-            // pane: unattached, it is unavailable.
-            if !AGENT_PREFERENCE.contains(&kind)
-                && state.agent_runtime.manager_for_agent(kind).await.is_none()
-                && pane_agent::is_terminal_agent(state, kind)
-            {
+            if runs_in_pane(state, kind).await {
                 return self.delegate_to_pane(state, by, request).await;
             }
         }
@@ -1254,10 +1267,37 @@ impl TaskService {
         if !pane_agent::is_available(state, &kind) {
             return Err(TaskError::AgentUnavailable(kind));
         }
-        let session = run_command::reachable_session(state)
-            .await
-            .ok_or(TaskError::NoTerminal)?
-            .0;
+        let session = match request.session_id.as_deref() {
+            Some(id) => {
+                let session = state
+                    .config
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == id)
+                    .cloned()
+                    .ok_or_else(|| TaskError::TerminalUnknown(id.to_owned()))?;
+                if !matches!(
+                    crate::terminal_backend(&session).probe_reachable().await,
+                    Ok(true)
+                ) {
+                    return Err(TaskError::NoTerminal);
+                }
+                session
+            }
+            None => {
+                run_command::reachable_session(state)
+                    .await
+                    .ok_or(TaskError::NoTerminal)?
+                    .0
+            }
+        };
+        let (_, model, variant) = pane_agent::launch_model(
+            state,
+            &kind,
+            request.model.as_deref(),
+            request.variant.as_deref(),
+        )
+        .await?;
         let now = now_ms();
         let task = self
             .store()
@@ -1326,6 +1366,8 @@ impl TaskService {
             shell_pid,
             agent_id: Some(kind.clone()),
             agent_job: None,
+            model,
+            variant,
         };
         let dispatching = TaskChange {
             binding: Some(binding),
@@ -1369,6 +1411,16 @@ impl TaskService {
     }
 }
 
+/// Whether a delegation to agent `kind` starts it in a terminal pane: a
+/// terminal agent from the catalog that no session runtime serves. A
+/// session agent (OpenCode, DeepSeek, T3) never is: unattached, it is
+/// unavailable.
+pub(crate) async fn runs_in_pane(state: &AppState, kind: &str) -> bool {
+    !AGENT_PREFERENCE.contains(&kind)
+        && state.agent_runtime.manager_for_agent(kind).await.is_none()
+        && pane_agent::is_terminal_agent(state, kind)
+}
+
 /// The background half of [`TaskService::delegate_to_pane`]: start the agent
 /// in its placed pane with the goal alone (on its command line where it
 /// takes one, otherwise typed) unless the task ended meanwhile -- a cancel, or a
@@ -1383,7 +1435,7 @@ pub(crate) async fn start_terminal_agent(
     goal: String,
     task: Task,
 ) {
-    use crate::agents::session_routes::{start_agent_in_place, type_agent_prompt};
+    use crate::agents::session_routes::{start_agent_in_place, type_agent_prompt, TaskLaunch};
     let tasks = &state.tasks;
     // A cancel (or a follower that gave up) while the pane was made or the
     // agent started: nothing more is started or typed.
@@ -1398,6 +1450,16 @@ pub(crate) async fn start_terminal_agent(
         tracing::debug!(task = %task.id.0, "terminal task ended before its agent started");
         return;
     }
+    // The model and effort the binding records as passed, as arguments.
+    let model_args = match &task.binding {
+        TaskBinding::Pane { model, variant, .. } => {
+            pane_agent::launch_model(&state, &kind, model.as_deref(), variant.as_deref())
+                .await
+                .map(|(args, _, _)| args)
+                .unwrap_or_default()
+        }
+        _ => Vec::new(),
+    };
     let pane_id = placed.place.pane_id.clone();
     let mut goal = goal;
     // What ran before the launch command was typed is never its job.
@@ -1409,7 +1471,10 @@ pub(crate) async fn start_terminal_agent(
         cwd.as_deref(),
         placed.clone(),
         Some(&goal),
-        true,
+        Some(TaskLaunch {
+            out_of_band: true,
+            model_args: &model_args,
+        }),
     )
     .await;
     // A Claude Code seen to start with the sentence out of band and gone
@@ -1438,7 +1503,10 @@ pub(crate) async fn start_terminal_agent(
             cwd.as_deref(),
             placed,
             Some(&goal),
-            false,
+            Some(TaskLaunch {
+                out_of_band: false,
+                model_args: &model_args,
+            }),
         )
         .await;
     }
@@ -1465,28 +1533,36 @@ pub(crate) async fn start_terminal_agent(
         return;
     }
     let mut to = change(TaskState::Working);
-    // The job the launch started: the only one a told result is ever typed
-    // to (`tasks::notices`). Without one, nothing ever is.
-    let shell_pid = match &task.binding {
-        TaskBinding::Pane { shell_pid, .. } => *shell_pid,
-        _ => None,
-    };
-    let job = match (shell_pid, &before) {
-        (Some(shell_pid), Some(before)) => pane_agent::launched_job(shell_pid, before).await,
-        _ => None,
-    };
-    match job {
-        Some(job) => {
-            let mut binding = task.binding.clone();
-            if let TaskBinding::Pane { agent_job, .. } = &mut binding {
-                *agent_job = Some(job);
-            }
-            to.binding = Some(binding);
+    let mut binding = task.binding.clone();
+    if let TaskBinding::Pane {
+        shell_pid,
+        agent_job,
+        model,
+        variant,
+        ..
+    } = &mut binding
+    {
+        // The job the launch started: the only one a told result is ever
+        // typed to (`tasks::notices`). Without one, nothing ever is.
+        *agent_job = match (*shell_pid, &before) {
+            (Some(shell_pid), Some(before)) => pane_agent::launched_job(shell_pid, before).await,
+            _ => None,
+        };
+        if agent_job.is_none() {
+            tracing::warn!(
+                task = %task.id.0,
+                "terminal task: no launched job recorded; its pane will not be typed to"
+            );
         }
-        None => tracing::warn!(
-            task = %task.id.0,
-            "terminal task: no launched job recorded; its pane will not be typed to"
-        ),
+        // No model named: what the agent's banner says it runs.
+        if model.is_none() {
+            if let Some((ran, effort)) = pane_agent::ran_model(&session, &pane_id).await {
+                (*model, *variant) = (Some(ran), effort);
+            }
+        }
+    }
+    if binding != task.binding {
+        to.binding = Some(binding);
     }
     // A follower or a cancel may have moved it meanwhile; follow whatever is
     // still open.
@@ -1664,7 +1740,7 @@ impl TaskService {
                 Step::Idle => turn_end(&summary_timeline(&manager, asid, task.created_ms).await),
                 Step::Failed(error) => failed_change(&manager, &task, error.as_ref()).await,
                 Step::Form(title) => form_waiting(&manager, &task, &title).await,
-                Step::Move(to) => to,
+                Step::Move(to) => *to,
             };
             if to.to == task.state {
                 // The follower may have moved it since it was read (a paused
@@ -2035,6 +2111,18 @@ impl TaskService {
             }),
             _ => None,
         };
+        let (model, variant) = match &task.binding {
+            TaskBinding::Pane {
+                agent_id: Some(_),
+                model,
+                variant,
+                ..
+            } => (
+                Some(model.clone().unwrap_or_else(|| "default".to_owned())),
+                variant.clone(),
+            ),
+            _ => (None, None),
+        };
         TaskView {
             task_id: task.id.0.clone(),
             state: task.state,
@@ -2056,6 +2144,8 @@ impl TaskService {
             peer_last_seen_ms: None,
             mentions: task.mentions.clone(),
             client_ref: task.client_ref.clone(),
+            model,
+            variant,
             reason: None,
         }
     }
@@ -2211,7 +2301,7 @@ impl TaskService {
                     error,
                 ),
             },
-            Step::Move(to) if to.to != task.state => to,
+            Step::Move(to) if to.to != task.state => *to,
             _ => return false,
         };
         match self.settle(&task, sourced(to, FOLLOWER)).await {
@@ -3188,6 +3278,7 @@ mod tests {
             label: None,
             mentions: Vec::new(),
             client_ref: None,
+            session_id: None,
         }
     }
 

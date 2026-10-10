@@ -670,7 +670,7 @@ pub(crate) async fn start_placed_agent(
     prompt: Option<&str>,
 ) -> AgentLaunch {
     let (mut launch, started) =
-        start_agent_in_place(state, session, agent, cwd, placed, prompt, false).await;
+        start_agent_in_place(state, session, agent, cwd, placed, prompt, None).await;
     if let Some(started) = started {
         type_agent_prompt(session, &started, prompt, &mut launch).await;
     }
@@ -681,6 +681,15 @@ pub(crate) async fn start_placed_agent(
 pub(crate) struct StartedAgent {
     pane_id: String,
     prompt_target: String,
+}
+
+/// How a delegation starts its agent ([`start_agent_in_place`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TaskLaunch<'a> {
+    /// Told how to report the task's end on its command line.
+    pub out_of_band: bool,
+    /// The model and effort the task named, as launch arguments.
+    pub model_args: &'a [String],
 }
 
 /// Start the agent in the placed pane. Claude Code and Codex get `prompt`
@@ -699,7 +708,7 @@ pub(crate) async fn start_agent_in_place(
     cwd: Option<&str>,
     placed: PlacedAgent,
     prompt: Option<&str>,
-    for_task: bool,
+    task: Option<TaskLaunch<'_>>,
 ) -> (AgentLaunch, Option<StartedAgent>) {
     let PlacedAgent {
         place,
@@ -719,9 +728,14 @@ pub(crate) async fn start_agent_in_place(
     );
     // The muqun server for the agent's own process, never its config.
     agent_args.extend(crate::mcp::inject::terminal_args(&state.config, agent).await);
-    // A task's agent is told, out of band, how to report the task's end.
-    if for_task {
-        agent_args.extend(crate::mcp::inject::terminal_task_args(&state.config, agent).await);
+    if let Some(task) = task {
+        // A task's agent is told, out of band, how to report the task's end.
+        if task.out_of_band {
+            agent_args.extend(crate::mcp::inject::terminal_task_args(&state.config, agent).await);
+        }
+        // The model and effort the task named, after the configured
+        // arguments (a later `-c` wins) and before the prompt.
+        agent_args.extend(task.model_args.iter().cloned());
     }
     let launch_prompt = prompt
         .filter(|_| terminal_backend(session).takes_launch_prompt())

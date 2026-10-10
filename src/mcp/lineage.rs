@@ -505,6 +505,8 @@ mod tests {
                 shell_pid: None,
                 agent_id: None,
                 agent_job: None,
+                model: None,
+                variant: None,
             },
         )
         .await;
@@ -583,6 +585,8 @@ mod tests {
             shell_pid: None,
             agent_id: Some("claude".into()),
             agent_job: None,
+            model: None,
+            variant: None,
         };
         let in_pane = working(&state, pane("%4")).await;
         assert_eq!(

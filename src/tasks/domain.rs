@@ -98,6 +98,14 @@ pub(crate) enum TaskBinding {
         /// none was recorded -- then nothing is.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_job: Option<AgentJob>,
+        /// The model a delegation's agent runs: the one the request named
+        /// and the launch passed, else what the agent's own banner showed
+        /// once it started. `None`: its own default, not known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// The reasoning effort that goes with `model`, likewise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        variant: Option<String>,
     },
     /// A delegation running on another of the owner's computers: this task is
     /// its mirror here, kept in step with task `remote_task_id` on peer
@@ -365,6 +373,8 @@ mod tests {
                 shell_pid: None,
                 agent_id: None,
                 agent_job: None,
+                model: None,
+                variant: None,
             }
         );
         assert_eq!(serde_json::to_string(&binding).unwrap(), stored);
@@ -375,6 +385,8 @@ mod tests {
             shell_pid: Some(42),
             agent_id: None,
             agent_job: None,
+            model: None,
+            variant: None,
         };
         let json = serde_json::to_string(&pinned).unwrap();
         assert_eq!(serde_json::from_str::<TaskBinding>(&json).unwrap(), pinned);

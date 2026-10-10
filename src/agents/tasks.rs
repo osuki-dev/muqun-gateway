@@ -329,6 +329,76 @@ pub fn launch_prompt_args(kind: &str, prompt: &str) -> Option<[String; 2]> {
     (plain && matches!(kind, "claude" | "codex")).then(|| ["--".to_owned(), prompt.to_owned()])
 }
 
+/// Which of Claude Code's model flags the installed version takes, as its
+/// `--help` lists them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ModelFlags {
+    pub model: bool,
+    pub effort: bool,
+}
+
+impl ModelFlags {
+    pub fn from_help(help: &str) -> Self {
+        Self {
+            model: help.contains("--model"),
+            effort: help.contains("--effort"),
+        }
+    }
+}
+
+/// A model id or effort a launch may carry as an argument: 1 to 128 of
+/// `A-Z a-z 0-9 . _ : / @ + -`, not starting with `-` (never a flag).
+pub fn valid_model_word(word: &str) -> bool {
+    (1..=128).contains(&word.len())
+        && !word.starts_with('-')
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._:/@+-".contains(c))
+}
+
+/// The launch arguments that run terminal agent `kind` with the model and
+/// effort a task named, and the model and effort they set. Codex takes
+/// both as `-c` overrides of its config for this run only (the user's file
+/// is never touched); Claude Code takes `--model` and `--effort` where the
+/// installed version has them (`claude`). The effort applies only with a
+/// model, as for a session agent; another agent takes neither. Nothing
+/// named: no arguments, the agent's own default.
+pub fn model_args(
+    kind: &str,
+    model: Option<&str>,
+    variant: Option<&str>,
+    claude: ModelFlags,
+) -> (Vec<String>, Option<String>, Option<String>) {
+    let Some(model) = model else {
+        return (Vec::new(), None, None);
+    };
+    let toml = |value: &str| toml::Value::String(value.to_owned()).to_string();
+    let (mut args, mut applied) = (Vec::new(), (None, None));
+    match kind {
+        "codex" => {
+            args.extend(["-c".to_owned(), format!("model={}", toml(model))]);
+            applied.0 = Some(model.to_owned());
+            if let Some(variant) = variant {
+                args.extend([
+                    "-c".to_owned(),
+                    format!("model_reasoning_effort={}", toml(variant)),
+                ]);
+                applied.1 = Some(variant.to_owned());
+            }
+        }
+        "claude" if claude.model => {
+            args.extend(["--model".to_owned(), model.to_owned()]);
+            applied.0 = Some(model.to_owned());
+            if let Some(variant) = variant.filter(|_| claude.effort) {
+                args.extend(["--effort".to_owned(), variant.to_owned()]);
+                applied.1 = Some(variant.to_owned());
+            }
+        }
+        _ => {}
+    }
+    (args, applied.0, applied.1)
+}
+
 /// Claude Code's user config: `$CLAUDE_CONFIG_DIR/.claude.json` when that is
 /// set (`config_dir`), else `~/.claude.json`.
 pub fn claude_config_file(config_dir: Option<&str>, home: &Path) -> PathBuf {
@@ -1334,5 +1404,117 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// What a pane delegation's launch carries for the model and effort it
+    /// asked for, and what it then reports as running.
+    #[test]
+    fn a_terminal_agent_runs_the_model_and_effort_a_task_names() {
+        let both = ModelFlags {
+            model: true,
+            effort: true,
+        };
+        let none = ModelFlags::default();
+        let model_only = ModelFlags {
+            model: true,
+            effort: false,
+        };
+        for (name, kind, model, variant, flags, args, applied) in [
+            (
+                "codex, both",
+                "codex",
+                Some("gpt-6-sol"),
+                Some("low"),
+                none,
+                vec![
+                    "-c",
+                    "model=\"gpt-6-sol\"",
+                    "-c",
+                    "model_reasoning_effort=\"low\"",
+                ],
+                (Some("gpt-6-sol"), Some("low")),
+            ),
+            (
+                "codex, model only",
+                "codex",
+                Some("gpt-6-sol"),
+                None,
+                none,
+                vec!["-c", "model=\"gpt-6-sol\""],
+                (Some("gpt-6-sol"), None),
+            ),
+            (
+                "codex, effort without a model",
+                "codex",
+                None,
+                Some("low"),
+                none,
+                vec![],
+                (None, None),
+            ),
+            (
+                "codex, nothing named",
+                "codex",
+                None,
+                None,
+                none,
+                vec![],
+                (None, None),
+            ),
+            (
+                "claude, both flags",
+                "claude",
+                Some("haiku"),
+                Some("low"),
+                both,
+                vec!["--model", "haiku", "--effort", "low"],
+                (Some("haiku"), Some("low")),
+            ),
+            (
+                "claude, no --effort",
+                "claude",
+                Some("haiku"),
+                Some("low"),
+                model_only,
+                vec!["--model", "haiku"],
+                (Some("haiku"), None),
+            ),
+            (
+                "claude, neither flag",
+                "claude",
+                Some("haiku"),
+                Some("low"),
+                none,
+                vec![],
+                (None, None),
+            ),
+            (
+                "another agent",
+                "gemini",
+                Some("m"),
+                Some("low"),
+                both,
+                vec![],
+                (None, None),
+            ),
+        ] {
+            let (got, model, variant) = model_args(kind, model, variant, flags);
+            assert_eq!(got, args, "{name}");
+            assert_eq!((model.as_deref(), variant.as_deref()), applied, "{name}");
+        }
+        assert_eq!(
+            ModelFlags::from_help("  --model <model>  Model for the session\n  --effort <level>"),
+            both
+        );
+        for (word, ok) in [
+            ("gpt-6-sol", true),
+            ("openai/gpt-6.1-sol", true),
+            ("-x", false),
+            ("a b", false),
+            ("a\"b", false),
+            ("", false),
+        ] {
+            assert_eq!(valid_model_word(word), ok, "{word:?}");
+        }
     }
 }

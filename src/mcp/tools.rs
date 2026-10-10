@@ -193,7 +193,7 @@ fn task_error(error: TaskError) -> CallToolResult {
         TaskError::PeerRefused { machine, code }
             if matches!(
                 code.as_str(),
-                "invalid_request" | "unknown_model" | "unknown_variant"
+                "invalid_request" | "unknown_model" | "unknown_variant" | "terminal_unknown"
             ) =>
         {
             invalid(&format!("{machine} refused the arguments ({code})."))
@@ -219,6 +219,9 @@ fn task_error(error: TaskError) -> CallToolResult {
             "no_terminal",
             "No terminal session is reachable on this computer.",
         ),
+        TaskError::TerminalUnknown(id) => invalid(&format!(
+            "No terminal session '{id}' on this computer; leave terminal out to use the first that answers."
+        )),
         error => {
             tracing::warn!("MCP task call failed: {error}");
             fail("internal", "The call failed.")
@@ -296,7 +299,7 @@ pub(crate) struct DelegateArgs {
     /// Absolute project directory on this computer (any existing one; for a terminal agent, where its pane opens).
     #[serde(default)]
     pub cwd: Option<String>,
-    /// Agent to use: a structured agent, e.g. "opencode", or a terminal agent from the agent catalog, e.g. "codex" or "claude" (started in a new terminal pane; mode, model and variant do not apply). Default: the primary agent.
+    /// Agent to use: a structured agent, e.g. "opencode", or a terminal agent from the agent catalog, e.g. "codex" or "claude" (started in a new terminal pane; model and variant are passed to its launch, mode does not apply). Default: the primary agent.
     #[serde(default)]
     pub agent_id: Option<String>,
     /// Agent mode, e.g. "build" or "plan".
@@ -311,6 +314,9 @@ pub(crate) struct DelegateArgs {
     /// The computer to run on: "self" (default), or the name of a linked computer from fleet.describe (e.g. "mini"); cwd is then a directory on that computer.
     #[serde(default)]
     pub machine: Option<String>,
+    /// For a terminal agent: the terminal session to start it in, by its id on that computer (e.g. "default" for tmux, or a Herdr session's id). Default: the first that answers.
+    #[serde(default)]
+    pub terminal: Option<String>,
 }
 
 impl DelegateArgs {
@@ -325,10 +331,16 @@ impl DelegateArgs {
         if !valid_goal(&self.goal) {
             return Err(invalid("goal must be non-empty and at most 32 KiB"));
         }
-        let names = [&self.agent_id, &self.mode, &self.model, &self.variant];
+        let names = [
+            &self.agent_id,
+            &self.mode,
+            &self.model,
+            &self.variant,
+            &self.terminal,
+        ];
         if !names.iter().filter_map(|n| n.as_deref()).all(valid_name) {
             return Err(invalid(
-                "agent_id, mode, model and variant must be non-empty and at most 256 bytes",
+                "agent_id, mode, model, variant and terminal must be non-empty and at most 256 bytes",
             ));
         }
         let here = is_self(self.machine.as_deref(), machine_id, label, peers);
@@ -349,6 +361,7 @@ impl DelegateArgs {
             label: None,
             mentions: Vec::new(),
             client_ref: None,
+            session_id: self.terminal,
         })
     }
 }
@@ -797,6 +810,7 @@ pub(crate) mod tests_support {
             model: None,
             variant: None,
             machine: Some(machine.into()),
+            terminal: None,
         };
         let result = MuqunMcp::new(state.clone(), session)
             .tasks_delegate(Parameters(args))
@@ -872,6 +886,7 @@ mod tests {
             model: None,
             variant: None,
             machine: None,
+            terminal: None,
         };
         let (error, _, body) = answer(mcp.tasks_delegate(Parameters(args)).await);
         assert!(!error, "{body}");
@@ -918,6 +933,7 @@ mod tests {
             model: None,
             variant: None,
             machine: None,
+            terminal: None,
         };
         let (error, _, task) = answer(mcp.tasks_delegate(Parameters(args)).await);
         assert!(!error, "{task}");
@@ -1059,6 +1075,7 @@ mod tests {
             model: None,
             variant: None,
             machine: None,
+            terminal: None,
         }
         .request("srv-coding", "coding", &[])
         .unwrap();
@@ -1073,6 +1090,7 @@ mod tests {
             model: None,
             variant: None,
             machine: None,
+            terminal: None,
         };
         let (error, _, body) = answer(mcp.tasks_delegate(Parameters(args)).await);
         assert!(!error, "{body}");
@@ -1249,6 +1267,8 @@ mod tests {
                 shell_pid: None,
                 agent_id: Some("claude".into()),
                 agent_job: None,
+                model: None,
+                variant: None,
             },
             state: TaskState::Working,
             summary: None,
