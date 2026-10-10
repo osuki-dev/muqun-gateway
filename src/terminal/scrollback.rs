@@ -880,23 +880,61 @@ impl PaneBuffer {
             .map(|row| frame[row])
             .collect();
         let known = head.iter().filter(|row| nearby.contains(row)).count() * 2 >= head.len();
-        // Every text row of the head already held somewhere above the run:
-        // the prompt Codex pins to the top row while it streams, on the first
-        // read that shows it pinned -- the prompt was sent well above, so it
-        // is not "nearby", and the frame before had the transcript's own top
-        // there. Rows the screen moving down brings into view are rows the
-        // buffer never had, so this never takes them.
-        let above: HashSet<u64> = held[..found.held_start].iter().copied().collect();
-        let repeated = !head.is_empty() && head.iter().all(|row| above.contains(row));
+        // The prompt Codex pins to the top row while it streams, on the first
+        // read that shows it pinned: the prompt was sent well above, so it is
+        // not "nearby", and the frame before had the transcript's own top
+        // there. Only a head of that one row, a prompt, that is the latest
+        // prompt held above the run.
         let pinned = !carries[..found.read_start].contains(&true)
             || known
-            || repeated
             || (found.read_start <= self.last_frame.len()
-                && frame[..found.read_start] == self.last_frame[..found.read_start]);
+                && frame[..found.read_start] == self.last_frame[..found.read_start])
+            || self.latest_prompt_again(
+                &incoming[..found.read_start],
+                &held,
+                start,
+                end,
+                found.held_start,
+            );
         let skip = if pinned { found.read_start } else { 0 };
         self.drop_back(held.len() - found.held_start);
         self.screen = frame.len() - skip;
         self.keep(incoming, skip, frame, shapes);
+    }
+
+    /// Whether a read's `head` (its rows above the placed run) is a single
+    /// prompt row -- `›` or `❯` -- equal to the latest prompt row held above
+    /// the run (`held[..held_start]`, the buffer's `start..end` followed by
+    /// the rows set aside). Searched back from the run, stopping at the first
+    /// prompt row: never any older row that happens to read the same.
+    fn latest_prompt_again(
+        &self,
+        head: &[String],
+        held: &[u64],
+        start: usize,
+        end: usize,
+        held_start: usize,
+    ) -> bool {
+        let is_prompt = |row: &str| row.trim_start().starts_with(['›', '❯']);
+        let mut text = head.iter().filter(|row| !row.trim().is_empty());
+        let (Some(row), None) = (text.next(), text.next()) else {
+            return false;
+        };
+        if !is_prompt(row) {
+            return false;
+        }
+        let held_row = |at: usize| -> Option<&str> {
+            if start + at < end {
+                self.lines.get(start + at).map(|row| &**row)
+            } else {
+                self.set_aside.get(start + at - end).map(|row| &**row)
+            }
+        };
+        (0..held_start.min(held.len()))
+            .rev()
+            .filter_map(held_row)
+            .find(|held| is_prompt(held))
+            .is_some_and(|latest| line_hash(latest) == line_hash(row))
     }
 
     /// Put the rows an older screen covered back on the end, in place of the
@@ -2719,6 +2757,23 @@ mod tests {
             out(1, 40).iter().map(String::as_str).collect::<Vec<_>>(),
             "{held}"
         );
+        // Not a prompt, or not the latest one: a head the screen brings into
+        // view stays, even when an older row reads the same.
+        for head in ["PASS", "› older"] {
+            let mut store = ScrollbackStore::default();
+            store.record(
+                "pane",
+                &frame(&["› older", "PASS", "› do it", ""], out(1, 10)),
+                false,
+            );
+            store.record("pane", &frame(&[head, ""], out(6, 25)), false);
+            let held = store.window("pane", 5_000).unwrap();
+            assert_eq!(
+                held.lines().filter(|line| *line == head).count(),
+                2,
+                "{head}: {held}"
+            );
+        }
     }
 
     use serde_json::json;
