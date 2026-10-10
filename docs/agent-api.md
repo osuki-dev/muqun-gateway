@@ -1367,12 +1367,13 @@ Every other session is served as it is:
   only the instruction. Any wording the gateway has sent is recognised, by the
   instruction's fixed opening (`When the whole task is finished, `) and its
   closing placeholder line, never by the goal.
-- Each turn's last assistant message is served without the one marker line
-  the task ledger read the turn's end from: over the message's `text` rows
-  joined, the last line below any restated instruction that starts (after
-  bullets and markup) with `MUQUN_TASK_DONE:` or `MUQUN_TASK_BLOCKED:` and is
-  not a placeholder -- unless it sits in a code fence as rendered. Any other
-  marker line stays. A row left with nothing else is left out. While the
+- Each turn's last assistant message is served without the one marker the
+  task ledger read the turn's end from: over the message's `text` rows
+  joined, the last `MUQUN_TASK_DONE:` or `MUQUN_TASK_BLOCKED:` below any
+  restated instruction that starts a line (after bullets and markup) or
+  follows the agent's words on it, and is not a placeholder -- cut from the
+  marker to its line's end, the words before it kept -- unless it sits in a
+  code fence as rendered. Any other marker stays. A row left with nothing else is left out. While the
   session runs a turn, a last line that can only be the start of a marker (or
   is bare list or emphasis markup, such as `- `) is held back too, so the
   marker never shows mid-turn. An `agent.timeline.upsert` whose rows are all

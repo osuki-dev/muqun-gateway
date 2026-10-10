@@ -13,11 +13,13 @@
 //!   instruction -- any wording this gateway has sent, found by its fixed
 //!   opening and its closing placeholder line, not by the goal -- cut back to
 //!   what came before it, and dropped when nothing did;
-//! - each turn's last assistant message without the one marker line the
-//!   ledger read the turn's end from ([`pane_agent::consumed_marker_line`]
-//!   over its text rows joined, as `service::turn_end` reads them), unless
-//!   the reader sees that line inside a code fence; every other marker line
-//!   stays in view, and a row left with nothing is dropped. A streamed text
+//! - each turn's last assistant message without the one marker the ledger
+//!   read the turn's end from ([`pane_agent::consumed_marker`] over its
+//!   text rows joined, as `service::turn_end` reads them): cut from where it
+//!   starts -- a line's start, or after the agent's words on it -- to the
+//!   line's end, the words before it kept, unless the reader sees that line
+//!   inside a code fence; every other marker stays in view, and a row left
+//!   with nothing is dropped. A streamed text
 //!   is served as snapshots of the whole text so far, so while the session
 //!   runs a turn a last line that could only be the start of a marker (bare
 //!   markup such as `- ` included) is held back too: the marker never
@@ -66,7 +68,7 @@ pub(crate) fn hide_in_items(items: &mut Vec<TimelineItem>, streaming: Streaming)
 }
 
 /// Cut from `items` the marker line the ledger read each turn's end from:
-/// [`pane_agent::consumed_marker_line`] over the text of the turn's last
+/// [`pane_agent::consumed_marker`] over the text of the turn's last
 /// assistant message, its text rows joined as `service::turn_end` joins
 /// them -- unless, as the reader sees that row, it sits in a code fence.
 /// While `streaming`, each such message's last row also loses a last line
@@ -92,13 +94,13 @@ fn strip_consumed_markers(items: &mut [TimelineItem], streaming: Streaming) {
             .filter(|&at| items[at].message_id == message && text_of(&items[at]).is_some())
             .collect();
         let texts: Vec<String> = rows.iter().filter_map(|&at| text_of(&items[at])).collect();
-        let consumed = pane_agent::consumed_marker_line(&texts.join("\n"));
+        let consumed = pane_agent::consumed_marker(&texts.join("\n"));
         let mut first_line = 0;
         for (n, (&at, text)) in rows.iter().zip(&texts).enumerate() {
             let count = text.split('\n').count();
             let here = consumed
-                .filter(|line| (first_line..first_line + count).contains(line))
-                .map(|line| line - first_line);
+                .filter(|(line, _)| (first_line..first_line + count).contains(line))
+                .map(|(line, start)| (line - first_line, start));
             let last_row = n + 1 == rows.len();
             if let Some(served) = without_marker_line(text, here, streaming.0 && last_row) {
                 if let AgentPart::Text { text } = &mut items[at].part {
@@ -110,15 +112,15 @@ fn strip_consumed_markers(items: &mut [TimelineItem], streaming: Streaming) {
     }
 }
 
-/// `text` without the marker line the ledger consumed from it, if one
-/// (outside a code fence, as the reader sees it) -- and, while `streaming`,
-/// without a last line that may still become a marker. Also the progress
-/// line's reading of a finished text.
-pub(crate) fn without_markers(text: &str, streaming: Streaming) -> Option<String> {
-    without_marker_line(text, pane_agent::consumed_marker_line(text), streaming.0)
-}
-
-fn without_marker_line(text: &str, consumed: Option<usize>, streaming: bool) -> Option<String> {
+/// `text` without the marker the ledger consumed from it, if one (outside
+/// a code fence, as the reader sees it): from where it starts to its line's
+/// end, the agent's words before it kept -- and, while `streaming`, without
+/// a last line that may still become a marker.
+fn without_marker_line(
+    text: &str,
+    consumed: Option<(usize, usize)>,
+    streaming: bool,
+) -> Option<String> {
     let lines: Vec<&str> = text.split('\n').collect();
     let last = lines.len() - 1;
     let fenced = |at: usize| {
@@ -129,15 +131,26 @@ fn without_marker_line(text: &str, consumed: Option<usize>, streaming: bool) -> 
             % 2
             == 1
     };
-    let consumed = consumed.filter(|&at| at <= last && !fenced(at));
+    let consumed = consumed.filter(|&(at, _)| at <= last && !fenced(at));
     let held = streaming && !fenced(last) && may_become_marker(lines[last]);
+    if consumed.is_none() && !held {
+        return None;
+    }
+    // The marker runs from where it starts to the line's end; the agent's
+    // words before it on that line stay, bare bullets or markup do not.
     let kept: Vec<&str> = lines
         .iter()
         .enumerate()
-        .filter(|&(at, _)| Some(at) != consumed && !(held && at == last))
-        .map(|(_, line)| *line)
+        .filter(|&(at, _)| !(held && at == last))
+        .filter_map(|(at, line)| match consumed {
+            Some((line_at, start)) if line_at == at => {
+                let before = line.get(..start).unwrap_or("").trim_end();
+                before.chars().any(char::is_alphanumeric).then_some(before)
+            }
+            _ => Some(*line),
+        })
         .collect();
-    (kept.len() < lines.len()).then(|| kept.join("\n").trim_end().to_owned())
+    Some(kept.join("\n").trim_end().to_owned())
 }
 
 #[derive(PartialEq)]
@@ -388,6 +401,27 @@ fn without_request(text: &str) -> Option<String> {
         .then(|| before.trim_end().to_owned())
 }
 
+/// `text` for a line the ledger shows of its own (an idle task's hint, a
+/// question, `progress`): every marker, valid or not, cut from where it
+/// starts to the end of its line, with the quote or backtick before it;
+/// a line left with no words is dropped. A hint never carries marker text.
+pub(crate) fn without_any_marker(text: &str) -> String {
+    text.lines()
+        .filter_map(|line| {
+            let start = [DONE_MARKER, BLOCKED_MARKER]
+                .iter()
+                .filter_map(|marker| line.find(marker))
+                .min();
+            let Some(start) = start else {
+                return Some(line);
+            };
+            let before = line[..start].trim_end_matches(['`', '"', '\'', '“', '‘', '*', ' ']);
+            before.chars().any(char::is_alphanumeric).then_some(before)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Whether `line`, the last line still being written, may become a marker
 /// line: a marker or its start, or bare list or emphasis markup (not a
 /// `---` rule).
@@ -492,6 +526,12 @@ mod tests {
                 Assistant,
                 text("MUQUN_TASK_DONE: done"),
                 None,
+            ),
+            (
+                "a marker after the agent's words on its line",
+                Assistant,
+                text("Hello. How can I help?MUQUN_TASK_DONE: Greeted the user"),
+                Some("Hello. How can I help?"),
             ),
             (
                 "a marker mid-text",
@@ -719,6 +759,27 @@ mod tests {
                 "second"
             ]
         );
+        // The line the ledger read is cut unless the reader sees it in a code
+        // fence; while streaming, only the message's last row holds back a
+        // line that may still become a marker.
+        let mut items = vec![
+            row("a", "m", "Example:\n```\nMUQUN_TASK_DONE: x"),
+            row("b", "m", "- "),
+        ];
+        hide_in_items(&mut items, Streaming(false));
+        assert!(
+            matches!(&items[0].part, AgentPart::Text { text } if text.ends_with("MUQUN_TASK_DONE: x"))
+        );
+        let mut items = vec![row("a", "m", "first\n- "), row("b", "m", "second\n- ")];
+        hide_in_items(&mut items, Streaming(true));
+        let texts: Vec<_> = items
+            .iter()
+            .map(|item| match &item.part {
+                AgentPart::Text { text } => text.as_str(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(texts, ["first\n- ", "second"]);
         // A last line that may become a marker is held back only while the
         // turn runs; a finished message keeps it.
         for (last, streaming, served) in [

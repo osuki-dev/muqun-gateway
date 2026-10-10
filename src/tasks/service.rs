@@ -1992,8 +1992,7 @@ fn progress_line(item: &TimelineItem) -> Option<String> {
         }
         // The marker line is the end, said to the gateway, not progress.
         AgentPart::Text { text } if item.role == TimelineRole::Assistant => {
-            super::transcript::without_markers(text, super::transcript::Streaming(false))
-                .unwrap_or_else(|| text.clone())
+            super::transcript::without_any_marker(text)
                 .lines()
                 .map(str::trim)
                 .find(|line| !line.is_empty())
@@ -2092,8 +2091,10 @@ pub(crate) fn turn_end(items: &[TimelineItem]) -> TaskChange {
             source: pane_agent::MARKER_BLOCKED.into(),
             ..change(TaskState::Waiting)
         },
+        // The hint is what the reader sees: never a marker's text.
         None => TaskChange {
-            summary: last.map(|text| one_line(&text, SUMMARY_CHARS)),
+            summary: last
+                .map(|text| one_line(&super::transcript::without_any_marker(&text), SUMMARY_CHARS)),
             ..change(TaskState::IdleUnconfirmed)
         },
     }
@@ -2117,6 +2118,7 @@ async fn form_waiting(manager: &AgentManager, task: &Task, title: &str) -> TaskC
     });
     let asked = match (last_text, last_tool) {
         (Some(text), tool) if tool.is_none_or(|tool| text > tool) => last_assistant_text(&items)
+            .map(|text| super::transcript::without_any_marker(&text))
             .and_then(|text| {
                 text.lines()
                     .rev()
@@ -3478,6 +3480,22 @@ mod tests {
                 vec![idle()],
                 Done,
                 Some("the build is green"),
+            ),
+            (
+                "the marker after the agent's words on its line",
+                Working,
+                "Hello. How can I help?MUQUN_TASK_DONE: Greeted the user",
+                vec![idle()],
+                Done,
+                Some("Greeted the user"),
+            ),
+            (
+                "a hint never carries marker text",
+                Working,
+                "Shall I go on? `MUQUN_TASK_DONE: <one-line summary>`",
+                vec![idle()],
+                IdleUnconfirmed,
+                Some("Shall I go on?"),
             ),
             (
                 "the marker's placeholder",

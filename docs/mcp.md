@@ -416,8 +416,11 @@ as a paragraph typed after its goal (the stored `goal` is the goal as
 given). The marker line the agent prints
 stays in its pane: a terminal shows what was written. The marker is looked for in the
 pane's recent output (its last 200 lines, unwrapped), not only on its screen,
-so one that scrolled off still counts. It counts when the line starts with
-`MUQUN_TASK_DONE:` (after any bullet the agent draws), lies below the last
+so one that scrolled off still counts. It counts when `MUQUN_TASK_DONE:`
+starts a line (after any bullet or markup the agent draws) or follows the
+agent's own words on it (`Done.MUQUN_TASK_DONE: …`; not inside a word, not
+quoted after a backtick or quote mid-sentence), runs to the line's end
+(that rest is the summary), lies below the last
 line of the echoed request (a narrow pane can wrap the echo so that the marker
 starts a line), carries a summary that is not the placeholder or a piece of
 it (`<…`, `…`), and the agent is not working, starting or blocked at that
@@ -483,10 +486,13 @@ signals:
    same arguments -- the rule [Task tree](#task-tree) uses for parents. A
    `task_id` narrows the choice and must name that task. Anything else is
    `task_not_found`. Recorded with source `tasks_complete`.
-2. **The marker line** `MUQUN_TASK_DONE: <one-line summary>` at the start of
-   a line of the agent's final message (a session) or of its pane's output (a
-   terminal agent), not the placeholder or a piece of it. The summary is the
-   marker's text. Recorded with the follower's source.
+2. **The marker** `MUQUN_TASK_DONE: <one-line summary>` on a line of the
+   agent's final message (a session) or of its pane's output (a terminal
+   agent) -- at the line's start or right after the agent's words on it, not
+   inside a word or quoted mid-sentence -- and not the placeholder or a piece
+   of it. The summary is what follows the marker to the line's end. The
+   lines the ledger shows of its own (an idle task's hint, a question,
+   `progress`) never carry marker text. Recorded with the follower's source.
 3. **The device**, `POST /api/tasks/{id}/complete`, for a task it opened that
    is `idle_unconfirmed` or `waiting` ("确认完成" on the phone). Recorded with
    source `device_confirm`.

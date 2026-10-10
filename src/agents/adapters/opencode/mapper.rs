@@ -63,15 +63,17 @@ pub fn map_error(val: &Value) -> Option<AgentErrorInfo> {
     })
 }
 
-/// The error of the newest assistant message in `messages` (oldest first)
-/// that failed: what a read of a session whose last outcome is `failed`
-/// says it failed with, since `Session.Info` carries no error.
+/// The error of the newest assistant message in `messages` (oldest first),
+/// if it failed: what a read of a session whose last outcome is `failed`
+/// says it failed with, since `Session.Info` carries no error. An older
+/// message's error is never the current failure's reason.
 pub fn last_failure(messages: &[Value]) -> Option<AgentErrorInfo> {
     messages
         .iter()
         .rev()
-        .filter(|msg| msg.get("type").and_then(Value::as_str) == Some("assistant"))
-        .find_map(|msg| msg.get("error").and_then(map_error))
+        .find(|msg| msg.get("type").and_then(Value::as_str) == Some("assistant"))?
+        .get("error")
+        .and_then(map_error)
 }
 
 fn map_tokens(val: &Value) -> TokensUsage {
@@ -1495,9 +1497,12 @@ mod tests {
         // A read of a failed session takes the newest failed message's reason.
         let messages = [
             json!({ "id": "msg_1", "type": "user", "text": "hello" }),
-            failed,
+            failed.clone(),
         ];
         assert_eq!(last_failure(&messages).unwrap().message, reason);
+        // ... and never an older message's, when the newest did not fail.
+        let newer = json!({ "id": "msg_3", "type": "assistant", "content": [] });
+        assert_eq!(last_failure(&[failed, newer]), None);
     }
 
     #[test]

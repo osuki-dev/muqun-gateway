@@ -19,7 +19,7 @@
 //!
 //! | The pane | The task |
 //! |---|---|
-//! | a `MUQUN_TASK_DONE: <summary>` line below the echoed request, the agent not busy | `done`, with that summary |
+//! | a `MUQUN_TASK_DONE: <summary>` below the echoed request (at a line's start or after the agent's words on it), the agent not busy | `done`, with that summary |
 //! | a new `MUQUN_TASK_BLOCKED: <reason>` line below the echoed request, the agent not busy | `waiting` (*blocked*), with that reason (replacing an earlier one) |
 //! | *blocked*: agent idle, or still busy before it was seen idle on two polls | stays `waiting` |
 //! | *blocked*: agent starting / working after it was seen idle on two polls (the user answered) | `working` |
@@ -289,16 +289,14 @@ pub(crate) enum Marker {
     },
 }
 
-/// The last marker line in `output`, done or blocked. A marker counts only
-/// at the start of a line (after any bullet the agent draws), below the
-/// request echoed in the prompt, and with a line that is not a placeholder
-/// or a piece of one. Code fences are not looked at: a pane's window of
-/// output can start inside one.
+/// The last marker in `output`, done or blocked, read as [`marker_line`]
+/// reads one, below the request echoed in the prompt. Code fences are not
+/// looked at: a pane's window of output can start inside one.
 pub(crate) fn marker(output: &str) -> Option<Marker> {
     let found = marker_lines(output);
-    match &found.last()?.1 {
+    match &found.last()?.2 {
         Marker::Blocked { reason, .. } => {
-            let same = |(_, m): &&(usize, Marker)| matches!(m, Marker::Blocked { reason: r, .. } if r == reason);
+            let same = |(_, _, m): &&(usize, usize, Marker)| matches!(m, Marker::Blocked { reason: r, .. } if r == reason);
             Some(Marker::Blocked {
                 reason: reason.clone(),
                 count: found.iter().filter(same).count(),
@@ -308,15 +306,20 @@ pub(crate) fn marker(output: &str) -> Option<Marker> {
     }
 }
 
-/// The line of `output` (its index in `output.lines()`) that [`marker`]
-/// reads the task's end from: the one line the served transcript leaves
-/// out ([`super::transcript`]), so a line the ledger ignores stays in view.
-pub(crate) fn consumed_marker_line(output: &str) -> Option<usize> {
-    marker_lines(output).last().map(|(at, _)| *at)
+/// Where in `output` [`marker`] reads the task's end from: the index of
+/// the line in `output.lines()` and the byte where the marker starts in it
+/// (the marker runs to the line's end). The one span the served transcript
+/// leaves out ([`super::transcript`]), so a marker the ledger ignores stays
+/// in view.
+pub(crate) fn consumed_marker(output: &str) -> Option<(usize, usize)> {
+    marker_lines(output)
+        .last()
+        .map(|(line, start, _)| (*line, *start))
 }
 
-/// Every marker line of `output` that counts, with its index.
-fn marker_lines(output: &str) -> Vec<(usize, Marker)> {
+/// Every marker that counts in `output`: its line, where it starts on it,
+/// and what it says.
+fn marker_lines(output: &str) -> Vec<(usize, usize, Marker)> {
     let lines: Vec<&str> = output.lines().collect();
     let below_echo = lines
         .iter()
@@ -326,7 +329,10 @@ fn marker_lines(output: &str) -> Vec<(usize, Marker)> {
         .iter()
         .enumerate()
         .skip(below_echo)
-        .filter_map(|(at, line)| Some((at, marker_line(line)?)))
+        .filter_map(|(at, line)| {
+            let (start, marker) = marker_line(line)?;
+            Some((at, start, marker))
+        })
         .collect()
 }
 
@@ -337,28 +343,51 @@ pub(crate) fn is_fence(line: &str) -> bool {
     line.starts_with("```") || line.starts_with("~~~")
 }
 
-fn marker_line(line: &str) -> Option<Marker> {
-    let line = line.trim_start_matches(|c: char| !c.is_alphanumeric());
-    let (text, placeholder, done) = if let Some(text) = line.strip_prefix(DONE_MARKER) {
-        (text.trim(), SUMMARY_PLACEHOLDER, true)
-    } else {
-        let text = line.strip_prefix(BLOCKED_MARKER)?;
-        (text.trim(), REASON_PLACEHOLDER, false)
-    };
-    let stand_in = text.starts_with('<')
-        || placeholder.starts_with(text)
-        || text.trim_matches(|c| c == '.' || c == '…').is_empty();
-    if stand_in {
-        return None;
-    }
-    let line = one_line(text, SUMMARY_CHARS);
-    Some(if done {
-        Marker::Done(line)
-    } else {
-        Marker::Blocked {
-            reason: line,
-            count: 1,
+/// The first marker on `line` that counts, and the byte it starts at: one
+/// at the line's start (after any bullet or markup the agent draws) or
+/// right after the agent's own words on it ("Done.MUQUN_TASK_DONE: …"), but
+/// not inside a word, nor quoted mid-sentence (after a backtick or quote),
+/// and with a line that is not a placeholder or a piece of one. The marker
+/// runs to the line's end; what follows it is the summary or reason.
+fn marker_line(line: &str) -> Option<(usize, Marker)> {
+    let mut found: Vec<(usize, bool)> = [(DONE_MARKER, true), (BLOCKED_MARKER, false)]
+        .iter()
+        .flat_map(|(token, done)| line.match_indices(token).map(move |(at, _)| (at, *done)))
+        .filter(|(at, _)| {
+            let before = &line[..*at];
+            let at_start = !before.chars().any(char::is_alphanumeric);
+            let previous = before.chars().next_back();
+            let in_word = previous.is_some_and(|c| c.is_alphanumeric() || c == '_');
+            let quoted = previous.is_some_and(|c| matches!(c, '`' | '"' | '\'' | '“' | '‘'));
+            at_start || !(in_word || quoted)
+        })
+        .collect();
+    found.sort_unstable();
+    found.into_iter().find_map(|(at, done)| {
+        let (token, placeholder) = if done {
+            (DONE_MARKER, SUMMARY_PLACEHOLDER)
+        } else {
+            (BLOCKED_MARKER, REASON_PLACEHOLDER)
+        };
+        let text = line[at + token.len()..].trim();
+        let stand_in = text.starts_with('<')
+            || placeholder.starts_with(text)
+            || text.trim_matches(|c| c == '.' || c == '…').is_empty();
+        if stand_in {
+            return None;
         }
+        let text = one_line(text, SUMMARY_CHARS);
+        Some((
+            at,
+            if done {
+                Marker::Done(text)
+            } else {
+                Marker::Blocked {
+                    reason: text,
+                    count: 1,
+                }
+            },
+        ))
     })
 }
 
@@ -1378,6 +1407,23 @@ mod tests {
                 reason: "notes.md does not exist".into(),
                 count: 1
             })
+        );
+        // A marker after the agent's own words on the same line counts; one
+        // inside a word does not.
+        assert_eq!(
+            marker("Hello. How can I help?MUQUN_TASK_DONE: Greeted the user"),
+            Some(Marker::Done("Greeted the user".into()))
+        );
+        for mention in [
+            "XMUQUN_TASK_DONE: no",
+            "I print `MUQUN_TASK_DONE: x` at the end",
+            "the line \"MUQUN_TASK_BLOCKED: why\" is for later",
+        ] {
+            assert_eq!(marker(mention), None, "{mention}");
+        }
+        assert_eq!(
+            marker("`MUQUN_TASK_DONE: fixed`"),
+            Some(Marker::Done("fixed`".into()))
         );
         // A window of output that starts inside a code fence still finds
         // the agent's marker after the fence closes.
