@@ -611,6 +611,8 @@ fn task_update(seq: u64) -> TaskDomainEvent {
             requested_by: None,
             children: Default::default(),
             progress: None,
+            peer_reachable: None,
+            peer_last_seen_ms: None,
         },
         seq,
     }

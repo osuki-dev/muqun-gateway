@@ -339,13 +339,11 @@ impl PeerClient {
     }
 
     /// `POST /api/tasks`: B opens `body` as its own task.
-    #[allow(dead_code)] // the mirrors of Task G3
     pub(crate) async fn create_task(&self, body: &Value) -> Result<RemoteTask, PeerError> {
         remote(self.json(Method::POST, "/api/tasks", Some(body)).await?)
     }
 
     /// `GET /api/tasks/{id}`.
-    #[allow(dead_code)] // the mirrors of Task G3
     pub(crate) async fn read_task(&self, id: &str) -> Result<RemoteTask, PeerError> {
         let path = format!("/api/tasks/{}", path_segment(id)?);
         let answer = self.json(Method::GET, &path, None).await?;
@@ -353,7 +351,6 @@ impl PeerClient {
     }
 
     /// `POST /api/tasks/{id}/cancel`: the task as the cancel left it.
-    #[allow(dead_code)] // the mirrors of Task G3
     pub(crate) async fn cancel_task(&self, id: &str) -> Result<RemoteTask, PeerError> {
         let path = format!("/api/tasks/{}/cancel", path_segment(id)?);
         remote(self.json(Method::POST, &path, Some(&json!({}))).await?)
@@ -362,7 +359,6 @@ impl PeerClient {
     /// `GET /api/ws`, then `{"t":"subscribe_tasks"}`: answers once B has
     /// confirmed the subscription, so no change after this returns is missed.
     /// What changed before it is the feed's first item, a `Resync`.
-    #[allow(dead_code)] // the mirrors of Task G3
     pub(crate) async fn subscribe_tasks(&self) -> Result<TaskFeed, PeerError> {
         tokio::time::timeout(REQUEST_TIMEOUT, self.open_task_socket())
             .await
@@ -512,7 +508,6 @@ fn remote(value: Value) -> Result<RemoteTask, PeerError> {
 }
 
 /// B's task view, as much of it as a mirror copies.
-#[allow(dead_code)] // the mirrors of Task G3
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct RemoteTask {
     pub task_id: String,
@@ -526,7 +521,6 @@ pub(crate) struct RemoteTask {
 }
 
 /// What a peer's task socket says.
-#[allow(dead_code)] // the mirrors of Task G3
 #[derive(Debug)]
 pub(crate) enum FeedItem {
     /// One of B's tasks changed; this is it now.
@@ -564,7 +558,6 @@ impl TaskFeed {
     /// The next task change, a `Resync` first. `None`: the socket ended
     /// (closed, silent past a ping, a frame that did not open, or an `error`
     /// frame); open a new one. Cancel-safe between frames.
-    #[allow(dead_code)] // the mirrors of Task G3
     pub(crate) async fn next(&mut self) -> Option<FeedItem> {
         if std::mem::take(&mut self.resync) {
             return Some(FeedItem::Resync);

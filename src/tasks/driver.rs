@@ -177,6 +177,8 @@ pub(crate) async fn reconcile(state: &AppState) -> usize {
             TaskBinding::AgentSession { agent_id, asid } => {
                 settle_delegation(state, &task, agent_id, asid).await
             }
+            // Read from its computer when no socket follows it.
+            TaskBinding::Peer { .. } => crate::fleet::mirror::converge(state, &task).await,
             TaskBinding::None => {
                 older_than(task.created_ms, NEVER_DISPATCHED_AFTER)
                     && fail(state, &task, NEVER_DISPATCHED).await

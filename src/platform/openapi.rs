@@ -784,26 +784,28 @@ fn task_view_schema() -> Value {
             "summary": { "type": ["string", "null"], "description": "A delegation's result as one line of at most 240 characters: the agent's own summary when done, a hint (its last message) when idle_unconfirmed, and when failed the error the agent, provider or backend gave (never a bare word); a command's exit code and output tail" },
             "progress": { "type": "string", "description": "Only while the task is working (not paused, waiting or ended), and once something is known (task_ledger_complete): what it is doing now, one line of at most 120 characters -- a session agent's current tool call or the start of its latest message, a terminal agent's last prose line. Updates are published as task.updated at most every 2 s per task, a held-back line when the 2 s are up; kept in memory, so absent after a gateway restart until the agent moves again" },
             "exit_code": { "type": ["integer", "null"] },
+            "peer_reachable": { "type": "boolean", "description": "A mirror only (binding peer): its computer answered within the last 2 minutes" },
+            "peer_last_seen_ms": { "type": "integer", "description": "A mirror only: when its computer last answered; absent if it never did" },
             "binding": {
                 "type": "object",
-                "description": "What the task runs in. `kind` is `none`, `agent_session` (with agent_id, asid) or `pane` (with session_id, pane_id, tab_id; plus agent_id, the terminal agent kind, for a delegation to a terminal agent -- absent for a command)",
+                "description": "What the task runs in. `kind` is `none`, `agent_session` (with agent_id, asid) `pane` (with session_id, pane_id, tab_id; plus agent_id, the terminal agent kind, for a delegation to a terminal agent -- absent for a command), or `peer` (fleet_peers: a mirror of task remote_task_id on linked computer peer_id; peer_name is that computer's name when the mirror was made, a display fallback)",
                 "required": ["kind"],
-                "properties": { "kind": { "type": "string", "enum": ["none", "agent_session", "pane"] } },
+                "properties": { "kind": { "type": "string", "enum": ["none", "agent_session", "pane", "peer"] } },
                 "additionalProperties": true
             },
             "updated_ms": { "type": "integer" },
             "parent_task_id": { "type": ["string", "null"], "description": "The open task this one was started from, when the gateway could tell" },
-            "origin": { "type": "string", "enum": ["device", "agent", "mcp"], "description": "device: POST /api/tasks; agent: started by work the gateway tracks (its agent service, or the pane of an open task); mcp: any other MCP host. Tasks stored before origins existed are mcp" },
+            "origin": { "type": "string", "enum": ["device", "agent", "mcp", "peer"], "description": "device: POST /api/tasks; peer: POST /api/tasks by another of the owner's computers (fleet_peers); agent: started by work the gateway tracks (its agent service, or the pane of an open task); mcp: any other MCP host. Tasks stored before origins existed are mcp" },
             "label": { "type": ["string", "null"], "description": "A short title the requester gave" },
             "requested_by": {
-                "description": "The device that opened the task (origin device); otherwise null",
+                "description": "The device that opened the task (origin device), or the computer (origin peer, kind gateway, named from its device record); otherwise null",
                 "oneOf": [
                     { "type": "null" },
                     {
                         "type": "object",
                         "required": ["kind", "id", "name"],
                         "properties": {
-                            "kind": { "type": "string", "enum": ["device"] },
+                            "kind": { "type": "string", "enum": ["device", "gateway"] },
                             "id": { "type": "string" },
                             "name": { "type": "string" }
                         }
@@ -892,6 +894,7 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
     );
     create_responses["400"] = json!({ "description": "invalid_request (empty or oversized goal, oversized label, empty name), invalid_directory, directory_not_found, not_a_directory, unknown_model" });
     create_responses["502"] = json!({ "description": "agent_error: the agent could not start the session or take the prompt, or no pane could be made for a terminal agent" });
+    create_responses["403"] = json!({ "description": "delegations_disabled: another of the owner's computers (fleet_peers) asked while this computer takes no work from other computers (fleet.accept_delegations); checked before the body. Its task otherwise opens as a device's does, with origin peer and requested_by named from its device record" });
     create_responses["503"] = json!({ "description": "agent_unavailable: the agent is not attached (a session agent is never started in a pane) or a terminal agent is not on PATH; no_terminal: no terminal session answers" });
     let read_responses = not_found(
         json_ok(
@@ -958,7 +961,7 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
                 ],
                 "responses": list_responses
             }, "post": {
-                "summary": "Open a delegation from the device: a new agent session with the goal as its first prompt, or, for a terminal agent from the agent catalog (codex, claude, ...), a new pane running it with the goal as its first prompt (on the command line for codex and claude on tmux, else typed in). Requires the task_ledger_create capability and a device token; a terminal agent needs task_ledger_pane",
+                "summary": "Open a delegation from the device: a new agent session with the goal as its first prompt, or, for a terminal agent from the agent catalog (codex, claude, ...), a new pane running it with the goal as its first prompt (on the command line for codex and claude on tmux, else typed in). Requires the task_ledger_create capability and a device token (or, fleet_peers, another computer's gateway token); a terminal agent needs task_ledger_pane",
                 "requestBody": json_body(json!({
                     "type": "object",
                     "required": ["goal"],

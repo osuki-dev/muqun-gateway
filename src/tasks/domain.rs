@@ -83,6 +83,15 @@ pub(crate) enum TaskBinding {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_id: Option<String>,
     },
+    /// A delegation running on another of the owner's computers: this task is
+    /// its mirror here, kept in step with task `remote_task_id` on peer
+    /// `peer_id` (`fleet::mirror`). `peer_name` is the peer's name when the
+    /// mirror was made: a display fallback for a phone that does not know it.
+    Peer {
+        peer_id: String,
+        remote_task_id: String,
+        peer_name: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +123,9 @@ pub(crate) enum TaskOrigin {
     /// stored before origins existed read as this.
     #[default]
     Mcp,
+    /// Another of the owner's gateways opened it: `POST /api/tasks` with its
+    /// device token.
+    Peer,
 }
 
 /// Who asks for a new task, on whose behalf, and under which task.
@@ -225,6 +237,8 @@ pub(crate) struct TaskFilter {
     pub asid: Option<String>,
     /// Only tasks bound to this pane: `(session_id, pane_id)`.
     pub pane: Option<(String, String)>,
+    /// Only mirrors of tasks on this peer (`TaskBinding::Peer`).
+    pub peer: Option<String>,
 }
 
 /// `text` cut to at most `max` bytes on a char boundary, keeping the end.

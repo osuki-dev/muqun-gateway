@@ -91,12 +91,13 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         crate::platform::config::StoreEncryption::Off => err,
     })?;
     let task_events = tokio::sync::broadcast::channel(crate::tasks::events::TASK_EVENT_CAPACITY).0;
+    let presence = Arc::new(crate::fleet::peers::PeerPresence::default());
     let tasks = Arc::new(crate::tasks::service::TaskService::new(
         Arc::new(crate::tasks::store_sqlite::SqliteTaskStore::new(db.clone())),
         task_events.clone(),
         config.server_id.clone(),
+        presence.clone(),
     ));
-    let presence = Arc::new(crate::fleet::peers::PeerPresence::default());
     let peers = Arc::new(crate::fleet::peers::PeerService::new(
         Arc::new(crate::fleet::peers_sqlite::SqlitePeerStore::new(db.clone())),
         &config.fleet,

@@ -21,7 +21,7 @@ use super::service::{
 use crate::agents::directories::expand_directory_param;
 use crate::connectivity::authority::DeviceKind;
 use crate::platform::http::{peer_forbidden, require_device_or_peer, Caller};
-use crate::{api_error, lock_devices, require_device, ApiResult, AppState};
+use crate::{api_error, require_device, ApiResult, AppState};
 
 const DEFAULT_LIMIT: usize = 50;
 const MAX_LIMIT: usize = 200;
@@ -229,29 +229,37 @@ async fn create(
     body: Result<Json<CreateBody>, JsonRejection>,
 ) -> ApiResult<Json<Value>> {
     // Who is asking comes first: a stranger learns nothing about the body.
-    let device_id = require_device(&state, &headers)?;
+    let caller = require_device_or_peer(&state, &headers)?;
+    // Another of the owner's computers, while the owner switched that off.
+    if caller.kind == DeviceKind::Gateway && !state.peers.accepts_delegations() {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "delegations_disabled",
+            "This computer does not take work from other computers",
+        ));
+    }
     let Json(body) = body.map_err(|_| invalid_request())?;
-    let by_device = principal(device_id.clone());
+    let by_caller = caller_principal(&caller);
     let previous_cwd = if body.cwd.is_none() {
         state
             .tasks
-            .latest_device_cwd(&by_device)
+            .latest_device_cwd(&by_caller)
             .await
             .map_err(|error| failed(error.into()))?
     } else {
         None
     };
     let request = body.request(previous_cwd.as_deref())?;
-    let name = lock_devices(&state)?
-        .iter()
-        .find(|device| device.id == device_id)
-        .map(|device| device.name.clone())
-        .unwrap_or_else(|| device_id.clone());
+    // Named from the device record the token belongs to, never from the
+    // body: another computer cannot pass itself off as a third (§10.5).
     let by = Requested {
-        by: by_device,
-        origin: TaskOrigin::Device,
+        by: by_caller,
+        origin: match caller.kind {
+            DeviceKind::App => TaskOrigin::Device,
+            DeviceKind::Gateway => TaskOrigin::Peer,
+        },
         parent: None,
-        name: Some(name),
+        name: Some(caller.name),
     };
     let task = state
         .tasks
@@ -1038,5 +1046,61 @@ mod tests {
         let (status, task) = send(&state, "POST", "/api/tasks", Some(body), true).await;
         assert_eq!(status, StatusCode::OK, "a variant alone is dropped: {task}");
         assert_eq!(created.lock().unwrap()[1], None);
+    }
+
+    /// Another of the owner's computers opens a task here like a phone, is
+    /// named on it as a gateway, and is refused while the switch is off.
+    #[tokio::test]
+    async fn another_computer_opens_a_task_unless_the_switch_is_off() {
+        let state = with_agent().await;
+        state
+            .devices
+            .lock()
+            .unwrap()
+            .push(crate::test_support::test_peer_device(
+                "coding-1",
+                "peer-token",
+            ));
+        for (accept, status, check) in [
+            (
+                true,
+                StatusCode::OK,
+                json!({ "origin": "peer", "requested_by": { "kind": "gateway", "id": "coding-1", "name": "gateway coding-1" } }),
+            ),
+            (
+                false,
+                StatusCode::FORBIDDEN,
+                json!({ "error": { "code": "delegations_disabled" } }),
+            ),
+        ] {
+            state.peers.set_accepts_delegations(accept).unwrap();
+            let response = mount(Router::new())
+                .with_state(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/tasks")
+                        .header("authorization", "Bearer peer-token")
+                        .header("content-type", "application/json")
+                        .body(Body::from(json!({ "goal": "screenshot Home" }).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "accept={accept}");
+            let body: Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 1 << 20)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            for (key, expected) in check.as_object().unwrap() {
+                if key == "error" {
+                    assert_eq!(body["error"]["code"], expected["code"], "accept={accept}");
+                } else {
+                    assert_eq!(&body[key], expected, "accept={accept}: {key}");
+                }
+            }
+        }
     }
 }

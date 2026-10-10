@@ -19,6 +19,7 @@ use crate::platform::config::FleetConfig;
 use crate::platform::store::sqlite::Migration;
 use crate::tasks::domain::now_ms;
 use crate::tasks::ports::TaskFuture;
+use crate::AppState;
 
 pub(crate) const MIGRATION: Migration = Migration {
     namespace: "fleet",
@@ -144,7 +145,6 @@ impl PeerPresence {
     }
 
     /// `(reachable, last_seen_ms)`; an unknown peer (unlinked, forgotten) is unreachable, never seen.
-    #[allow(dead_code)] // read by the task service from Task G3
     pub(crate) fn of(&self, peer_id: &str, now_ms: u64) -> (bool, Option<u64>) {
         let seen = self
             .0
@@ -198,6 +198,9 @@ async fn revoke(peer: &Peer) {
     }
 }
 
+/// How often [`PeerService::mark_seen`] writes to the store.
+const SEEN_WRITE_EVERY: Duration = Duration::from_secs(10);
+
 /// The one task socket per peer (`fleet::mirror::watch`): started when a
 /// mirror of that peer opens, ended by its follower when none is open.
 #[derive(Default)]
@@ -207,7 +210,6 @@ pub(crate) struct PeerSockets {
 
 impl PeerSockets {
     /// Start `follow` for `peer_id` unless one is running.
-    #[allow(dead_code)] // the mirrors of Task G3
     pub(crate) fn ensure(
         &self,
         peer_id: &str,
@@ -225,7 +227,6 @@ impl PeerSockets {
         running.insert(peer_id.to_owned(), follow());
     }
 
-    #[allow(dead_code)] // the mirrors of Task G3
     pub(crate) fn is_live(&self, peer_id: &str) -> bool {
         self.running
             .lock()
@@ -234,7 +235,9 @@ impl PeerSockets {
             .unwrap_or(false)
     }
 
-    /// End `peer_id`'s follower, if one runs.
+    /// End `peer_id`'s follower, if one runs. The follower may be the
+    /// caller (it forgets a peer that no longer knows this gateway), so
+    /// callers do this last: nothing after it in the same task would run.
     pub(crate) fn stop(&self, peer_id: &str) {
         let handle = self
             .running
@@ -306,7 +309,6 @@ impl PeerService {
     }
 
     /// A peer by its name (any case) or its id.
-    #[cfg_attr(not(test), allow(dead_code))] // `tasks.delegate(machine)` from Task G3
     pub(crate) async fn resolve(&self, machine: &str) -> Option<Peer> {
         let peers = self.store.list().await.ok()?;
         peers
@@ -430,16 +432,18 @@ impl PeerService {
     }
 
     /// Forget `peer_id` and ask it to revoke this gateway's token, best
-    /// effort: the link is over either way. `false`: no such peer.
-    pub(crate) async fn unlink(&self, peer_id: &str) -> anyhow::Result<bool> {
+    /// effort: the link is over either way, and its open mirrors end as
+    /// lost. `false`: no such peer.
+    pub(crate) async fn unlink(&self, state: &AppState, peer_id: &str) -> anyhow::Result<bool> {
         let Some(peer) = self.get(peer_id).await else {
             return Ok(false);
         };
-        self.sockets.stop(peer_id);
         revoke(&peer).await;
+        super::mirror::lose(state, peer_id, &peer.name).await;
         let removed = self.store.remove(peer_id).await?;
         self.presence.gone(peer_id);
         self.refresh_names().await;
+        self.sockets.stop(peer_id);
         Ok(removed)
     }
 
@@ -471,31 +475,45 @@ impl PeerService {
 
     /// Drop the row only (the peer answered 401: it no longer knows us).
     pub(crate) async fn forget(&self, peer_id: &str) {
-        self.sockets.stop(peer_id);
         if let Err(error) = self.store.remove(peer_id).await {
             tracing::warn!(peer = %peer_id, "failed to forget a peer: {error:#}");
         }
         self.presence.gone(peer_id);
         self.refresh_names().await;
+        // Last: the caller may be the follower itself.
+        self.sockets.stop(peer_id);
     }
 
-    /// It answered just now.
-    #[allow(dead_code)] // the peer socket from Task G2
+    /// It answered just now. Kept in the store at most every
+    /// [`SEEN_WRITE_EVERY`]: a socket's frames come far more often.
     pub(crate) async fn mark_seen(&self, peer_id: &str) {
         let now = now_ms();
+        if let (_, Some(seen)) = self.presence.of(peer_id, now) {
+            if now.saturating_sub(seen) < SEEN_WRITE_EVERY.as_millis() as u64 {
+                return;
+            }
+        }
         if let Err(error) = self.store.seen(peer_id, now, None, None).await {
             tracing::warn!(peer = %peer_id, "failed to record a peer's answer: {error:#}");
         }
         self.presence.seen(peer_id, Some(now));
     }
 
-    /// The peers' names, for the `mentions` a task's `tasks.read` will list (G5).
-    #[allow(dead_code)] // read by `tasks.read` `mentions` from Task G5
+    /// The peers' names: `machine_unknown`'s list, and the `mentions` a
+    /// task's `tasks.read` lists (G5).
     pub(crate) fn names(&self) -> Vec<String> {
         self.names
             .read()
             .map(|names| names.clone())
             .unwrap_or_default()
+    }
+
+    /// Keep `peer` as if it had just been linked, without the link.
+    #[cfg(test)]
+    pub(crate) async fn store_for_test(&self, peer: Peer) {
+        self.store.put(&peer).await.unwrap();
+        self.presence.seen(&peer.peer_id, peer.last_seen_ms);
+        self.refresh_names().await;
     }
 
     pub(crate) fn accepts_delegations(&self) -> bool {

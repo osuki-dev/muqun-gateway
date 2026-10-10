@@ -162,6 +162,14 @@ impl TaskStore for SqliteTaskStore {
                     args.len()
                 ));
             }
+            if let Some(peer_id) = &filter.peer {
+                args.push(peer_id.clone());
+                sql.push_str(&format!(
+                    " AND json_extract(binding, '$.kind') = 'peer' \
+                     AND json_extract(binding, '$.peer_id') = ?{}",
+                    args.len()
+                ));
+            }
             if let Some((session_id, pane_id)) = &filter.pane {
                 args.push(session_id.clone());
                 args.push(pane_id.clone());

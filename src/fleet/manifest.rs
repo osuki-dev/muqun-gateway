@@ -140,10 +140,12 @@ pub(crate) struct MachineSummary {
     pub tasks_active: usize,
 }
 
-/// Whether `machine` names this computer: unnamed, `"self"`, or its id.
-/// Only this computer is reachable for now.
-pub(crate) fn is_self(machine: Option<&str>, machine_id: &str) -> bool {
-    machine.is_none_or(|machine| machine == "self" || machine == machine_id)
+/// Whether `machine` names this computer: unnamed, `"self"`, its id, or its
+/// own label in any case (the agent knows it by the name the phone shows).
+pub(crate) fn is_self(machine: Option<&str>, machine_id: &str, label: &str) -> bool {
+    machine.is_none_or(|machine| {
+        machine == "self" || machine == machine_id || machine.eq_ignore_ascii_case(label)
+    })
 }
 
 /// Simple, explainable rules over the stable layer.
@@ -251,7 +253,7 @@ impl FleetService {
         state: &AppState,
         machine: Option<&str>,
     ) -> Option<CompactManifest> {
-        if !is_self(machine, &state.config.server_id) {
+        if !is_self(machine, &state.config.server_id, &state.config.label) {
             return None;
         }
         Some(self.manifest(state).await.compact())
@@ -285,10 +287,15 @@ mod tests {
 
     #[test]
     fn only_this_computer_is_self() {
-        for machine in [None, Some("self"), Some("srv-1")] {
-            assert!(is_self(machine, "srv-1"), "{machine:?}");
+        for (machine, expected) in [
+            (None, true),
+            (Some("self"), true),
+            (Some("srv-1"), true),
+            (Some("CODING"), true),
+            (Some("mini"), false),
+        ] {
+            assert_eq!(is_self(machine, "srv-1", "coding"), expected, "{machine:?}");
         }
-        assert!(!is_self(Some("mac"), "srv-1"));
     }
 
     #[test]

@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 
 use super::lineage;
 use super::tokens::AssistantSession;
-use crate::fleet::manifest::FleetService;
+use crate::fleet::manifest::{is_self, FleetService};
 use crate::tasks::domain::{clip, TaskBinding, TaskId, TaskPrincipal};
 use crate::tasks::run_command::{RunHandle, RunRequest};
 use crate::tasks::service::{
@@ -162,10 +162,31 @@ fn task_error(error: TaskError) -> CallToolResult {
         TaskError::NotFound | TaskError::NotYours => {
             fail("task_not_found", "No task with that task_id.")
         }
-        TaskError::UnknownMachine(_) => fail(
-            "machine_unknown",
-            "Unknown machine. Only this computer is available.",
+        TaskError::UnknownMachine { known, .. } => {
+            let known: Vec<String> = std::iter::once("self".to_owned()).chain(known).collect();
+            fail(
+                "machine_unknown",
+                &format!("Unknown machine. Known: {}.", known.join(", ")),
+            )
+        }
+        TaskError::MachineUnreachable(name) => fail(
+            "machine_unreachable",
+            &format!("{name} has not answered in the last 2 minutes; nothing was started there."),
         ),
+        TaskError::DelegationsDisabled(name) => fail(
+            "delegations_disabled",
+            &format!("{name} does not take work from other computers (its owner switched it off)."),
+        ),
+        TaskError::PeerUnauthorized(name) => fail(
+            "unauthorized",
+            &format!(
+                "{name} no longer accepts this computer's link; it is linked again from the owner's phone."
+            ),
+        ),
+        // The code is the peer's own, already bounded to `[a-z0-9_]{1,64}`.
+        TaskError::PeerRefused { machine, code } => {
+            fail(&code, &format!("{machine} refused the task ({code})."))
+        }
         TaskError::AgentUnavailable(_) => fail(
             "agent_unavailable",
             "That agent is not available on this computer.",
@@ -271,13 +292,15 @@ pub(crate) struct DelegateArgs {
     /// Model variant (reasoning effort) from the model's catalog entry, e.g. "high". Applied only together with `model`; ignored otherwise.
     #[serde(default)]
     pub variant: Option<String>,
-    /// The computer to run on: "self" (default) or its machineId.
+    /// The computer to run on: "self" (default), or the name of a linked computer from fleet.describe (e.g. "mini"); cwd is then a directory on that computer.
     #[serde(default)]
     pub machine: Option<String>,
 }
 
 impl DelegateArgs {
-    fn request(self) -> Result<DelegateRequest, CallToolResult> {
+    /// `machine_id`/`label`: this computer's, so `cwd` is checked here only
+    /// when the task runs here; another computer checks its own (`~` too).
+    fn request(self, machine_id: &str, label: &str) -> Result<DelegateRequest, CallToolResult> {
         if !valid_goal(&self.goal) {
             return Err(invalid("goal must be non-empty and at most 32 KiB"));
         }
@@ -287,8 +310,11 @@ impl DelegateArgs {
                 "agent_id, mode, model and variant must be non-empty and at most 256 bytes",
             ));
         }
+        let here = is_self(self.machine.as_deref(), machine_id, label);
         let cwd = match self.cwd {
-            Some(cwd) => Some(directory(&cwd)?.to_string_lossy().into_owned()),
+            Some(cwd) if here => Some(directory(&cwd)?.to_string_lossy().into_owned()),
+            Some(cwd) if !cwd.is_empty() && cwd.len() <= 4096 => Some(cwd),
+            Some(_) => return Err(invalid("cwd must be a directory path")),
             None => None,
         };
         Ok(DelegateRequest {
@@ -422,7 +448,10 @@ impl MuqunMcp {
     ) -> Result<CallToolResult, ErrorData> {
         let fleet = &self.state.fleet;
         let manifest = fleet.describe(&self.state, args.machine.as_deref()).await;
-        let unknown = TaskError::UnknownMachine(args.machine.unwrap_or_default());
+        let unknown = TaskError::UnknownMachine {
+            wanted: args.machine.unwrap_or_default(),
+            known: self.state.peers.names(),
+        };
         reply(manifest.ok_or(unknown))
     }
 
@@ -450,14 +479,15 @@ impl MuqunMcp {
 
     #[tool(
         name = "tasks.delegate",
-        description = "Start a sub-task on an agent on this computer: a new session in cwd with your goal as the first prompt (for a terminal agent such as codex or claude, a new terminal pane running it). Returns task_id; poll with tasks.wait."
+        description = "Start a sub-task on an agent, on this computer or (machine) on a linked one: a new session in cwd with your goal as the first prompt (for a terminal agent such as codex or claude, a new terminal pane running it). Returns task_id; poll with tasks.wait."
     )]
     async fn tasks_delegate(
         &self,
         Parameters(args): Parameters<DelegateArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let goal = args.goal.clone();
-        let request = match args.request() {
+        let config = &self.state.config;
+        let request = match args.request(&config.server_id, &config.label) {
             Ok(request) => request,
             Err(refused) => return Ok(refused),
         };
@@ -620,6 +650,50 @@ pub(crate) async fn started_for_task(state: &AppState, session: &AssistantSessio
             pane_id,
         } => state.tasks.open_task_in_pane(session_id, pane_id).await,
         crate::mcp::tokens::TokenBinding::Agent { .. } => false,
+    }
+}
+
+/// `tasks.delegate` as an agent in a pane would call it, for other modules' tests.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use super::*;
+    use crate::mcp::tokens::TokenBinding;
+
+    /// The body `tasks.delegate(machine, goal)` answers: `Ok` unless it is an error.
+    pub(crate) async fn delegate_as(
+        state: &AppState,
+        machine: &str,
+        goal: &str,
+    ) -> Result<Value, Value> {
+        let session = AssistantSession {
+            token_id: "tok-%1".into(),
+            binding: TokenBinding::Pane {
+                session_id: "default".into(),
+                pane_id: "%1".into(),
+            },
+            label: "test".into(),
+            expires_ms: None,
+        };
+        let args = DelegateArgs {
+            goal: goal.into(),
+            cwd: None,
+            agent_id: None,
+            mode: None,
+            model: None,
+            variant: None,
+            machine: Some(machine.into()),
+        };
+        let result = MuqunMcp::new(state.clone(), session)
+            .tasks_delegate(Parameters(args))
+            .await
+            .unwrap();
+        let result = serde_json::to_value(result).unwrap();
+        let body = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        if result["isError"] == true {
+            Err(body)
+        } else {
+            Ok(body)
+        }
     }
 }
 
@@ -881,7 +955,7 @@ mod tests {
             variant: None,
             machine: None,
         }
-        .request()
+        .request("srv-coding", "coding")
         .unwrap();
         let parent = state.tasks.delegate(&state, device, goal).await.unwrap();
 
@@ -1005,9 +1079,19 @@ mod tests {
             (json!({ "goal": "g", "model": "m", "variant": long }), None),
             (json!({ "goal": "g", "agent_id": "" }), None),
             (json!({ "goal": "g", "mode": long }), None),
+            // A directory is checked on the computer that runs the task.
+            (json!({ "goal": "g", "cwd": "~/src" }), None),
+            (
+                json!({ "goal": "g", "cwd": "~/src", "machine": "Coding" }),
+                None,
+            ),
+            (
+                json!({ "goal": "g", "cwd": "~/src", "machine": "mini" }),
+                Some(None),
+            ),
         ] {
             let parsed: DelegateArgs = serde_json::from_value(args.clone()).unwrap();
-            let request = parsed.request().ok();
+            let request = parsed.request("srv-coding", "coding").ok();
             assert_eq!(
                 request.map(|request| request.variant),
                 variant.map(|variant| variant.map(str::to_owned)),

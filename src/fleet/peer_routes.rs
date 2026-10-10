@@ -204,7 +204,12 @@ async fn unlink(
     Path(peer_id): Path<String>,
 ) -> ApiResult<Response> {
     owner(&state, &headers)?;
-    if !state.peers.unlink(&peer_id).await.map_err(store_failed)? {
+    if !state
+        .peers
+        .unlink(&state, &peer_id)
+        .await
+        .map_err(store_failed)?
+    {
         return Err(peer_not_found());
     }
     Ok(StatusCode::NO_CONTENT.into_response())
@@ -460,8 +465,8 @@ mod tests {
             ("GET", "/api/tasks/t_missing", StatusCode::NOT_FOUND),
             ("GET", "/api/tasks?root=t_missing", StatusCode::FORBIDDEN),
             ("GET", "/api/tasks/defaults", StatusCode::FORBIDDEN),
-            // Not until G3; then `requested_by` comes from this record, not the body.
-            ("POST", "/api/tasks", StatusCode::FORBIDDEN),
+            // Opens a task as a phone does (this body has no goal).
+            ("POST", "/api/tasks", StatusCode::BAD_REQUEST),
             ("GET", "/api/pairings", StatusCode::FORBIDDEN),
             ("GET", "/health", StatusCode::FORBIDDEN),
             ("PATCH", "/api/peers/srv-x", StatusCode::FORBIDDEN),

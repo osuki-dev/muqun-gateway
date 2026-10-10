@@ -33,6 +33,7 @@ use crate::agents::ports::mirror::SessionMirrorPort;
 use crate::agents::runtime::AGENT_PREFERENCE;
 use crate::backend::{PaneId, TabId};
 use crate::fleet::manifest::is_self;
+use crate::fleet::peers::PeerPresence;
 use crate::AppState;
 
 /// The longest a `wait` blocks, and the shortest.
@@ -127,6 +128,9 @@ pub(crate) struct TaskService {
     store: Arc<dyn TaskStore>,
     events: broadcast::Sender<TaskDomainEvent>,
     machine_id: String,
+    /// When each linked computer last answered: a mirror's view says
+    /// whether its computer answers (`peer_reachable`, §10.12).
+    presence: Arc<PeerPresence>,
     /// When this gateway started ([`TaskService::holds`]).
     started_ms: u64,
     /// Pane delegations a follower is running for (see [`pane_agent::follow`]).
@@ -227,6 +231,13 @@ pub(crate) struct TaskView {
     /// and once the task has ended.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub progress: Option<String>,
+    /// A mirror's computer answered within the last two minutes; absent on
+    /// every task that is not a mirror (§10.12).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer_reachable: Option<bool>,
+    /// When a mirror's computer last answered, if it ever did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer_last_seen_ms: Option<u64>,
 }
 
 /// How the agent working on a task says it ended (`tasks.complete`).
@@ -277,7 +288,23 @@ pub(crate) enum TaskError {
     /// Someone else's task. Callers outside the gateway are told
     /// [`TaskError::NotFound`]'s answer, so ids cannot be probed.
     NotYours,
-    UnknownMachine(String),
+    /// `machine` names neither this computer nor a linked one: what was
+    /// asked for, and the linked computers' names.
+    UnknownMachine {
+        wanted: String,
+        known: Vec<String>,
+    },
+    /// The linked computer of that name has not answered lately.
+    MachineUnreachable(String),
+    /// The linked computer of that name takes no work from other computers.
+    DelegationsDisabled(String),
+    /// The linked computer of that name no longer knows this one's token.
+    PeerUnauthorized(String),
+    /// The linked computer refused the task with its own error code.
+    PeerRefused {
+        machine: String,
+        code: String,
+    },
     AgentUnavailable(String),
     /// `model` names nothing in the agent's catalog for that directory.
     UnknownModel(String),
@@ -307,7 +334,13 @@ impl std::fmt::Display for TaskError {
         match self {
             Self::NotFound => write!(f, "task not found"),
             Self::NotYours => write!(f, "task belongs to someone else"),
-            Self::UnknownMachine(machine) => write!(f, "unknown machine '{machine}'"),
+            Self::UnknownMachine { wanted, .. } => write!(f, "unknown machine '{wanted}'"),
+            Self::MachineUnreachable(name) => write!(f, "{name} is not reachable"),
+            Self::DelegationsDisabled(name) => {
+                write!(f, "{name} takes no work from other computers")
+            }
+            Self::PeerUnauthorized(name) => write!(f, "{name} no longer accepts this link"),
+            Self::PeerRefused { machine, code } => write!(f, "{machine} refused the task ({code})"),
             Self::AgentUnavailable(agent) => write!(f, "agent '{agent}' is not available"),
             Self::UnknownModel(model) => write!(f, "unknown model '{model}'"),
             Self::UnknownVariant { wanted, offered } => {
@@ -520,11 +553,13 @@ impl TaskService {
         store: Arc<dyn TaskStore>,
         events: broadcast::Sender<TaskDomainEvent>,
         machine_id: String,
+        presence: Arc<PeerPresence>,
     ) -> Self {
         Self {
             store,
             events,
             machine_id,
+            presence,
             started_ms: now_ms(),
             following: Mutex::new(HashSet::new()),
             live: Mutex::default(),
@@ -789,10 +824,17 @@ impl TaskService {
         by: Requested,
         request: DelegateRequest,
     ) -> Result<TaskView, TaskError> {
-        if !is_self(request.machine.as_deref(), &self.machine_id) {
-            return Err(TaskError::UnknownMachine(
-                request.machine.unwrap_or_default(),
-            ));
+        if !is_self(
+            request.machine.as_deref(),
+            &self.machine_id,
+            &state.config.label,
+        ) {
+            let wanted = request.machine.clone().unwrap_or_default();
+            let Some(peer) = state.peers.resolve(&wanted).await else {
+                let known = state.peers.names();
+                return Err(TaskError::UnknownMachine { wanted, known });
+            };
+            return crate::fleet::mirror::delegate(state, by, peer, request).await;
         }
         if let Some(kind) = request.agent_id.as_deref() {
             // A session agent (OpenCode, DeepSeek, T3) is never started in a
@@ -1233,9 +1275,35 @@ impl TaskService {
         }
     }
 
+    /// Store a new task as it is given, and publish it.
+    pub(crate) async fn record(&self, task: &Task) -> Result<Task, TaskError> {
+        Ok(self.store().insert(task).await?)
+    }
+
+    /// One `task.updated` with `task`'s current view, though nothing about
+    /// it moved: what its view derives (a mirror's `peer_reachable`) did.
+    pub(crate) async fn republish(&self, task: &Task) {
+        let task = match self.store.get(&task.id).await {
+            Ok(Some(now)) => now,
+            _ => task.clone(),
+        };
+        let _ = self.events.send(TaskDomainEvent::Updated {
+            task: self.present(&task).await,
+            seq: task.seq,
+        });
+    }
+
+    /// Whether `task` mirrors a task on a computer that has not answered lately.
+    fn peer_quiet(&self, task: &Task) -> bool {
+        match &task.binding {
+            TaskBinding::Peer { peer_id, .. } => !self.presence.of(peer_id, now_ms()).0,
+            _ => false,
+        }
+    }
+
     /// [`Self::move_to`], logging instead of failing: the caller is already
     /// reporting an error. The failure's note is its summary, unless it has one.
-    async fn record_failure(&self, task: &Task, mut failed: TaskChange) {
+    pub(crate) async fn record_failure(&self, task: &Task, mut failed: TaskChange) {
         if failed.summary.is_none() {
             failed.summary = failed
                 .note
@@ -1266,6 +1334,10 @@ impl TaskService {
             TaskBinding::Pane { .. } if task.kind == TaskKind::Delegation => {
                 self.wait_published(&task.id, deadline).await?
             }
+            // A mirror whose computer is quiet is answered at once, saying
+            // so (`peer_reachable: false`); the agent decides (§10.14).
+            TaskBinding::Peer { .. } if self.peer_quiet(&task) => self.present(&task).await,
+            TaskBinding::Peer { .. } => self.wait_published(&task.id, deadline).await?,
             TaskBinding::Pane { .. } => {
                 let handle = self.poll_command(state, &task, deadline).await?;
                 return Ok(Waited {
@@ -1364,10 +1436,11 @@ impl TaskService {
     }
 
     /// Wait for the task to be recorded as finished, waiting on the user or
-    /// paused (by whoever moves it), or for `deadline`; the task as it then
-    /// stands.
+    /// paused (by whoever moves it), or -- a mirror -- for its computer to go
+    /// quiet, or for `deadline`; the task as it then stands.
     async fn wait_published(&self, id: &TaskId, deadline: Instant) -> Result<TaskView, TaskError> {
-        let settled = |task: &Task| task.state.is_terminal() || paused(task.state);
+        let settled =
+            |task: &Task| task.state.is_terminal() || paused(task.state) || self.peer_quiet(task);
         // Subscribe before reading, so nothing falls between.
         let mut events = self.events.subscribe();
         loop {
@@ -1477,6 +1550,7 @@ impl TaskService {
                     tracing::warn!(task = %task.id.0, %error, "could not interrupt the agent session");
                 }
             }
+            TaskBinding::Peer { .. } => crate::fleet::mirror::forward_cancel(state, &task).await,
             TaskBinding::None => {}
         }
         let task = match self
@@ -1633,10 +1707,25 @@ impl TaskService {
                 ChildCounts::default()
             }
         };
-        let view = Self::view(task, counts);
+        self.presented(task, counts)
+    }
+
+    /// [`Self::view`] with what only the service knows: the live progress
+    /// line and title, and a mirror's computer's presence.
+    fn presented(&self, task: &Task, children: ChildCounts) -> TaskView {
+        let view = Self::view(task, children);
+        let (peer_reachable, peer_last_seen_ms) = match &task.binding {
+            TaskBinding::Peer { peer_id, .. } => {
+                let (reachable, seen) = self.presence.of(peer_id, now_ms());
+                (Some(reachable), seen)
+            }
+            _ => (None, None),
+        };
         TaskView {
             progress: self.progress_of(task),
             title: self.title_of(task).unwrap_or(view.title),
+            peer_reachable,
+            peer_last_seen_ms,
             ..view
         }
     }
@@ -1647,20 +1736,13 @@ impl TaskService {
         let counts = self.store.child_counts(ids).await?;
         Ok(tasks
             .iter()
-            .map(|task| {
-                let view = Self::view(task, counts.get(&task.id).copied().unwrap_or_default());
-                TaskView {
-                    progress: self.progress_of(task),
-                    title: self.title_of(task).unwrap_or(view.title),
-                    ..view
-                }
-            })
+            .map(|task| self.presented(task, counts.get(&task.id).copied().unwrap_or_default()))
             .collect())
     }
 
     pub(crate) fn view(task: &Task, children: ChildCounts) -> TaskView {
         let requested_by = match (&task.origin, &task.requester_name) {
-            (TaskOrigin::Device, Some(name)) => Some(RequestedBy {
+            (TaskOrigin::Device | TaskOrigin::Peer, Some(name)) => Some(RequestedBy {
                 kind: task.created_by.kind,
                 id: task.created_by.id.clone(),
                 name: name.clone(),
@@ -1683,6 +1765,8 @@ impl TaskService {
             requested_by,
             children,
             progress: None,
+            peer_reachable: None,
+            peer_last_seen_ms: None,
         }
     }
 
@@ -2005,12 +2089,15 @@ impl TaskService {
             summary_line(summary)?;
         }
         let task = self.store.get(id).await?.ok_or(TaskError::NotFound)?;
-        if task.state == TaskState::Done && task.origin == TaskOrigin::Device {
+        // A mirror is settled here in any open state (its computer may be
+        // quiet, §10.11); the task over there is left as it is.
+        let mirror = matches!(task.binding, TaskBinding::Peer { .. });
+        if task.state == TaskState::Done && (task.origin == TaskOrigin::Device || mirror) {
             return Ok(self.present(&task).await);
         }
         let confirmable = task.kind == TaskKind::Delegation
-            && task.origin == TaskOrigin::Device
-            && paused(task.state);
+            && ((task.origin == TaskOrigin::Device && paused(task.state))
+                || (mirror && !task.state.is_terminal()));
         if !confirmable {
             return Err(TaskError::NotConfirmable);
         }
@@ -3072,7 +3159,7 @@ mod tests {
             .delegate(&state, Requested::mcp(assistant("a")), request(Some("mac")))
             .await;
         assert!(
-            matches!(&refused, Err(TaskError::UnknownMachine(m)) if m == "mac"),
+            matches!(&refused, Err(TaskError::UnknownMachine { wanted, .. }) if wanted == "mac"),
             "{refused:?}"
         );
         for machine in ["self", "server-1"] {
@@ -3146,6 +3233,7 @@ mod tests {
             }),
             state.task_events.clone(),
             state.config.server_id.clone(),
+            state.peers.presence.clone(),
         ));
         let agent = FakeAgent::new("opencode").with_sessions(&[(ASID, 1)]);
         let calls = agent.calls.clone();
@@ -3486,6 +3574,7 @@ mod tests {
             Arc::new(Racing { inner }),
             state.task_events.clone(),
             state.config.server_id.clone(),
+            state.peers.presence.clone(),
         ));
         let agent = FakeAgent::new("opencode").with_sessions(&[(ASID, 1)]);
         let calls = agent.calls.clone();
