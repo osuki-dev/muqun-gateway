@@ -19,7 +19,7 @@ impl SqlitePeerStore {
     }
 }
 
-const COLUMNS: &str = "peer_id, name, url, token, device_id, transport_key, added_ms, last_seen_ms, capabilities, manifest";
+const COLUMNS: &str = "peer_id, name, url, token, device_id, transport_key, added_ms, last_seen_ms, capabilities, manifest, server_id";
 
 impl PeerStore for SqlitePeerStore {
     fn put<'a>(&'a self, peer: &'a Peer) -> TaskFuture<'a, ()> {
@@ -29,12 +29,12 @@ impl PeerStore for SqlitePeerStore {
             let manifest = peer.manifest.as_ref().map(Value::to_string);
             c.execute(
                 &format!(
-                    "INSERT INTO peers({COLUMNS}) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                    "INSERT INTO peers({COLUMNS}) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                      ON CONFLICT(peer_id) DO UPDATE SET name = excluded.name, url = excluded.url,
                        token = excluded.token, device_id = excluded.device_id,
                        transport_key = excluded.transport_key, added_ms = excluded.added_ms,
                        last_seen_ms = excluded.last_seen_ms, capabilities = excluded.capabilities,
-                       manifest = excluded.manifest"
+                       manifest = excluded.manifest, server_id = excluded.server_id"
                 ),
                 params![
                     peer.peer_id,
@@ -47,6 +47,7 @@ impl PeerStore for SqlitePeerStore {
                     peer.last_seen_ms.map(|ms| ms as i64),
                     capabilities,
                     manifest,
+                    peer.server_id,
                 ],
             )?;
             Ok(())
@@ -106,6 +107,7 @@ fn read_row(row: &Row<'_>) -> rusqlite::Result<anyhow::Result<Peer>> {
     let last_seen_ms: Option<i64> = row.get(7)?;
     let capabilities: String = row.get(8)?;
     let manifest: Option<String> = row.get(9)?;
+    let server_id: String = row.get(10)?;
     let (peer_id, name, url, token, device_id, transport_key) = (
         row.get(0)?,
         row.get(1)?,
@@ -117,6 +119,7 @@ fn read_row(row: &Row<'_>) -> rusqlite::Result<anyhow::Result<Peer>> {
     Ok((|| {
         Ok(Peer {
             peer_id,
+            server_id,
             name,
             url,
             token,

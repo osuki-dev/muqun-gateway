@@ -1099,8 +1099,7 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
                     "required": ["device_name"],
                     "properties": {
                         "device_name": { "type": "string", "description": "At most 80 characters, no control characters" },
-                        "kind": { "type": "string", "enum": ["app", "gateway"], "description": "Default app" },
-                        "install_id": { "type": "string", "description": "For a gateway: its server_id, so linking it again replaces its device instead of adding one" }
+                        "kind": { "type": "string", "enum": ["app", "gateway"], "description": "Default app" }
                     }
                 })),
                 "responses": with_errors(json_ok("What POST /api/pair/claim takes", json!({
@@ -1146,7 +1145,7 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
                     })),
                     "responses": with_errors(json_ok("The new peer", peer_view()), &[
                         ("400", "invalid_request; peer_is_self: the url is this gateway"),
-                        ("409", "peer_refused: the other gateway refused the code; error.reason is pairing_code_expired, invalid_pairing_code, pairing_not_requested, invalid_token or refused. peer_name_taken: another peer has that name"),
+                        ("409", "peer_refused: the other gateway refused the code; error.reason is pairing_code_expired, invalid_pairing_code, pairing_not_requested, invalid_token or refused. peer_name_taken: another peer has that name. peer_conflict: a peer giving the same id is already linked (remove it first)"),
                         ("502", "peer_unreachable: nothing answered at url"),
                     ])
                 }
@@ -1212,9 +1211,10 @@ fn with_errors(mut responses: Value, errors: &[(&str, &str)]) -> Value {
 fn peer_view() -> Value {
     json!({
         "type": "object",
-        "required": ["peer_id", "name", "url", "reachable", "last_seen_ms"],
+        "required": ["peer_id", "server_id", "name", "url", "reachable", "last_seen_ms"],
         "properties": {
-            "peer_id": { "type": "string", "description": "The other gateway's server_id" },
+            "peer_id": { "type": "string", "description": "This gateway's own id for the link" },
+            "server_id": { "type": "string", "description": "The id the other gateway gave for itself; display data, never a key" },
             "name": { "type": "string" },
             "url": { "type": "string" },
             "reachable": { "type": "boolean", "description": "It answered within the last 2 minutes" },

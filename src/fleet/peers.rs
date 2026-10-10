@@ -22,14 +22,21 @@ use crate::tasks::ports::TaskFuture;
 
 pub(crate) const MIGRATION: Migration = Migration {
     namespace: "fleet",
-    steps: &["
+    steps: &[
+        "
 CREATE TABLE peers(
   peer_id TEXT PRIMARY KEY, name TEXT NOT NULL, url TEXT NOT NULL,
   token TEXT NOT NULL, device_id TEXT NOT NULL, transport_key TEXT,
   added_ms INTEGER NOT NULL, last_seen_ms INTEGER,
   capabilities TEXT NOT NULL DEFAULT '[]', manifest TEXT);
 CREATE UNIQUE INDEX peers_by_name ON peers(name COLLATE NOCASE);
-"],
+",
+        "
+ALTER TABLE peers ADD COLUMN server_id TEXT;
+UPDATE peers SET server_id = peer_id;
+CREATE UNIQUE INDEX peers_by_server ON peers(server_id);
+",
+    ],
 };
 
 /// A peer is reachable while its last successful call is this recent.
@@ -40,7 +47,11 @@ const PING_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, PartialEq)]
 pub(crate) struct Peer {
+    /// This gateway's own id for the link, minted when it was made.
     pub peer_id: String,
+    /// The id the peer gave for itself in its claim answer: display data,
+    /// never a key. Two links asserting one id are a conflict, not a merge.
+    pub server_id: String,
     pub name: String,
     pub url: String,
     pub token: String,
@@ -57,6 +68,7 @@ impl std::fmt::Debug for Peer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Peer")
             .field("peer_id", &self.peer_id)
+            .field("server_id", &self.server_id)
             .field("name", &self.name)
             .field("url", &self.url)
             .field("last_seen_ms", &self.last_seen_ms)
@@ -76,6 +88,7 @@ impl Peer {
     pub(crate) fn view(&self, now_ms: u64) -> PeerView {
         PeerView {
             peer_id: self.peer_id.clone(),
+            server_id: self.server_id.clone(),
             name: self.name.clone(),
             url: self.url.clone(),
             reachable: self.reachable(now_ms),
@@ -88,6 +101,7 @@ impl Peer {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct PeerView {
     pub peer_id: String,
+    pub server_id: String,
     pub name: String,
     pub url: String,
     pub reachable: bool,
@@ -95,8 +109,8 @@ pub(crate) struct PeerView {
 }
 
 pub(crate) trait PeerStore: Send + Sync {
-    /// Insert or replace by `peer_id`. Another row's name is an error (the
-    /// service refuses it first: `LinkError::NameTaken`).
+    /// Insert or replace by `peer_id`. Another row's name or `server_id` is
+    /// an error (the service refuses both first).
     fn put<'a>(&'a self, peer: &'a Peer) -> TaskFuture<'a, ()>;
     fn list<'a>(&'a self) -> TaskFuture<'a, Vec<Peer>>;
     fn remove<'a>(&'a self, peer_id: &'a str) -> TaskFuture<'a, bool>;
@@ -159,6 +173,8 @@ pub(crate) enum LinkError {
     IsSelf,
     /// Another peer already holds that name.
     NameTaken,
+    /// A peer asserting the same id is already linked.
+    Conflict,
     Store(anyhow::Error),
 }
 
@@ -307,7 +323,8 @@ impl PeerService {
             })?;
         let now = now_ms();
         let peer = Peer {
-            peer_id: claimed.server_id,
+            peer_id: format!("peer-{}", uuid::Uuid::new_v4()),
+            server_id: claimed.server_id,
             name: request.name.trim().to_owned(),
             url,
             token: claimed.token,
@@ -329,18 +346,21 @@ impl PeerService {
 
     /// The rest of [`link`](Self::link) after the claim.
     async fn keep(&self, own_id: &str, mut peer: Peer) -> Result<Peer, LinkError> {
-        if peer.peer_id == own_id {
+        if peer.server_id == own_id {
             return Err(LinkError::IsSelf);
         }
         let peers = self.store.list().await.map_err(LinkError::Store)?;
-        if peers.iter().any(|other| {
-            other.peer_id != peer.peer_id && other.name.eq_ignore_ascii_case(&peer.name)
-        }) {
+        if peers.iter().any(|other| other.server_id == peer.server_id) {
+            // Already linked under that id: a second link is never merged into
+            // it (the id is only what the claimant said); remove the first.
+            return Err(LinkError::Conflict);
+        }
+        if peers
+            .iter()
+            .any(|other| other.name.eq_ignore_ascii_case(&peer.name))
+        {
             return Err(LinkError::NameTaken);
         }
-        let previous = peers
-            .into_iter()
-            .find(|other| other.peer_id == peer.peer_id);
         // The first authenticated call proves the new credentials (and, sealed,
         // the transport key) before they are kept; the public capability list
         // fills the cache.
@@ -355,12 +375,6 @@ impl PeerService {
         self.store.put(&peer).await.map_err(LinkError::Store)?;
         self.presence.seen(&peer.peer_id, peer.last_seen_ms);
         self.refresh_names().await;
-        // A re-link replaced the credentials this gateway held for that peer;
-        // the device they belonged to goes (the peer usually replaced it
-        // already, by the enrolment's install id).
-        if let Some(previous) = previous.filter(|previous| previous.device_id != peer.device_id) {
-            revoke(&previous).await;
-        }
         Ok(peer)
     }
 

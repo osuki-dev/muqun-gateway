@@ -105,20 +105,16 @@ async fn body_of(mut response: reqwest::Response) -> Result<Value, PeerError> {
 
 /// `POST {url}/api/pair/request` as a gateway device: B shows the code its
 /// owner then reads off `muqun-gateway manage`. Answers B's label.
-/// `install_id` is this gateway's `server_id`: linking again replaces the
-/// device it enrolls rather than adding another.
 pub(crate) async fn request_pairing(
     url: &str,
     request_id: &str,
     device_name: &str,
-    install_id: &str,
 ) -> Result<String, PeerError> {
     let response = http()
         .post(format!("{url}/api/pair/request"))
         .json(&json!({
             "request_id": request_id,
             "device_name": device_name,
-            "install_id": install_id,
             "kind": "gateway",
         }))
         .send()

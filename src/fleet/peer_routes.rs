@@ -145,6 +145,11 @@ async fn link(
                 body["error"]["reason"] = json!(refusal_reason(&code));
                 (status, Json(body))
             }
+            LinkError::Conflict => api_error(
+                StatusCode::CONFLICT,
+                "peer_conflict",
+                "a computer with that id is already linked; remove it first",
+            ),
             LinkError::NameTaken => api_error(
                 StatusCode::CONFLICT,
                 "peer_name_taken",
@@ -287,29 +292,45 @@ mod tests {
         let coding = named(output_state(&herdr), "srv-coding", "coding");
         let other = named(output_state(&herdr), "srv-other", "other");
         let other_url = serve(peer_router(other.clone())).await;
-        let gateways = |state: &AppState| -> Vec<String> {
+        let gateways = |state: &AppState| -> Vec<(String, String)> {
             let devices = state.devices.lock().unwrap();
             devices
                 .iter()
                 .filter(|device| device.kind == DeviceKind::Gateway)
-                .map(|device| device.name.clone())
+                .map(|device| (device.id.clone(), device.name.clone()))
                 .collect()
         };
 
-        // Linked twice (the reconciler ran again): the second link replaces
-        // coding's device on mini. A second computer under a name a peer
-        // already holds is refused and keeps no device of coding's.
-        for (target, at, name, expected) in [
-            (&mini, &url, "mini", StatusCode::OK),
-            (&mini, &url, "mini", StatusCode::OK),
-            (&other, &other_url, "MINI", StatusCode::CONFLICT),
+        // Linked, then linked again (the reconciler ran twice): the id mini
+        // gave is display data, so the second link is a conflict, never a
+        // merge, and it takes back the device it enrolled -- mini keeps the
+        // first device, which a claim could not replace. A second computer
+        // under a name a peer holds is refused and keeps nothing either.
+        let mut first = Vec::new();
+        let mut mini_id = String::new();
+        for (target, at, name, expected, code) in [
+            (&mini, &url, "mini", StatusCode::OK, Value::Null),
+            (
+                &mini,
+                &url,
+                "mini 2",
+                StatusCode::CONFLICT,
+                json!("peer_conflict"),
+            ),
+            (
+                &other,
+                &other_url,
+                "MINI",
+                StatusCode::CONFLICT,
+                json!("peer_name_taken"),
+            ),
         ] {
             let (status, minted) = call(
                 target,
                 "POST",
                 "/api/pair/pending",
                 "token",
-                Some(json!({ "device_name": "coding", "kind": "gateway", "install_id": "srv-coding" })),
+                Some(json!({ "device_name": "coding", "kind": "gateway" })),
             )
             .await;
             assert_eq!(status, StatusCode::OK, "{minted}");
@@ -324,20 +345,37 @@ mod tests {
                 })),
             )
             .await;
-            assert_eq!(status, expected, "{name}: {peer}");
+            assert_eq!(
+                (status, &peer["error"]["code"]),
+                (expected, &code),
+                "{name}: {peer}"
+            );
             assert!(
                 peer.get("token").is_none(),
                 "the token never leaves the gateway"
             );
+            if status == StatusCode::OK {
+                assert_eq!(peer["server_id"], "srv-mini");
+                assert_ne!(peer["peer_id"], "srv-mini", "keyed by coding's own id");
+                mini_id = peer["peer_id"].as_str().unwrap().to_owned();
+                first = gateways(&mini);
+            }
         }
-        assert_eq!(gateways(&mini), ["coding"]);
+        assert_eq!(
+            first
+                .iter()
+                .map(|(_, name)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["coding"]
+        );
+        assert_eq!(
+            gateways(&mini),
+            first,
+            "the first device stays, the second went"
+        );
         assert!(
             gateways(&other).is_empty(),
             "a refused link revokes what it enrolled"
-        );
-        assert_eq!(
-            coding.peers.get("srv-mini").await.map(|peer| peer.name),
-            Some("mini".into())
         );
 
         for (body, accept) in [
@@ -360,7 +398,7 @@ mod tests {
         let (status, renamed) = call(
             &coding,
             "PATCH",
-            "/api/peers/srv-mini",
+            &format!("/api/peers/{mini_id}"),
             "token",
             Some(json!({ "name": "mac mini" })),
         )
@@ -374,7 +412,7 @@ mod tests {
                 .peers
                 .resolve("MAC MINI")
                 .await
-                .map(|peer| peer.peer_id),
+                .map(|peer| peer.server_id),
             Some("srv-mini".to_owned())
         );
         let (status, _) = call(
@@ -387,7 +425,14 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
 
-        let (status, _) = call(&coding, "DELETE", "/api/peers/srv-mini", "token", None).await;
+        let (status, _) = call(
+            &coding,
+            "DELETE",
+            &format!("/api/peers/{mini_id}"),
+            "token",
+            None,
+        )
+        .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
         assert!(mini
             .devices
@@ -415,6 +460,8 @@ mod tests {
             ("GET", "/api/tasks/t_missing", StatusCode::NOT_FOUND),
             ("GET", "/api/tasks?root=t_missing", StatusCode::FORBIDDEN),
             ("GET", "/api/tasks/defaults", StatusCode::FORBIDDEN),
+            // Not until G3; then `requested_by` comes from this record, not the body.
+            ("POST", "/api/tasks", StatusCode::FORBIDDEN),
             ("GET", "/api/pairings", StatusCode::FORBIDDEN),
             ("GET", "/health", StatusCode::FORBIDDEN),
             ("PATCH", "/api/peers/srv-x", StatusCode::FORBIDDEN),

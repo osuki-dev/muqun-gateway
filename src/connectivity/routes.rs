@@ -162,7 +162,7 @@ pub(crate) async fn pair_request(
 
     let code = generate_pairing_code();
     let kind = body.kind.unwrap_or_default();
-    let install_id = enrolment_identity(kind, body.install_id.as_deref(), &device_name);
+    let install_id = enrolment_identity(kind, body.install_id.as_deref());
     let pending = PendingPairing {
         request_id: body.request_id.clone(),
         device_name,
@@ -181,29 +181,17 @@ pub(crate) async fn pair_request(
     )
 }
 
-/// What `enroll_device` replaces an earlier device by. An app's own install
-/// id, when it sent a valid one. Another gateway always has one, in a space
-/// of its own (`gateway-`): its `server_id` when the request named it,
-/// else its name, so linking the same computer again replaces its device
-/// rather than piling up records toward the device cap.
-fn enrolment_identity(
-    kind: DeviceKind,
-    install_id: Option<&str>,
-    device_name: &str,
-) -> Option<String> {
-    let given = install_id.filter(|value| valid_install_id(value));
+/// What `enroll_device` replaces an earlier device by: an app's own install
+/// id, when it sent a valid one. Another gateway never has one. Anything it
+/// sent is only its say-so, and an enrolment must not take another device's
+/// place on that: a gateway that links again revokes its old device itself,
+/// with the token it still holds (`fleet::peers`), or the owner does.
+fn enrolment_identity(kind: DeviceKind, install_id: Option<&str>) -> Option<String> {
     match kind {
-        DeviceKind::App => given.map(str::to_owned),
-        DeviceKind::Gateway => Some(
-            given
-                .map(|id| format!("gateway-{id}"))
-                .filter(|id| valid_install_id(id))
-                .unwrap_or_else(|| {
-                    use sha2::{Digest as _, Sha256};
-                    let digest = Sha256::digest(device_name.to_lowercase().as_bytes());
-                    format!("gateway-name-{}", crate::platform::http::hex(&digest[..16]))
-                }),
-        ),
+        DeviceKind::App => install_id
+            .filter(|value| valid_install_id(value))
+            .map(str::to_owned),
+        DeviceKind::Gateway => None,
     }
 }
 
@@ -643,9 +631,6 @@ pub(crate) struct MintCodeBody {
     pub(crate) device_name: String,
     #[serde(default)]
     pub(crate) kind: DeviceKind,
-    /// For a gateway: its `server_id`, so a later link replaces this device.
-    #[serde(default)]
-    pub(crate) install_id: Option<String>,
 }
 
 /// `POST /api/pair/pending`: a pending pairing made on the owner's behalf,
@@ -697,7 +682,7 @@ pub(crate) async fn mint_pairing_code(
     let request_id = format!("mint-{}", uuid::Uuid::new_v4());
     *pending = Some(PendingPairing {
         request_id: request_id.clone(),
-        install_id: enrolment_identity(body.kind, body.install_id.as_deref(), &device_name),
+        install_id: None,
         device_name,
         kind: body.kind,
         code: code.clone(),

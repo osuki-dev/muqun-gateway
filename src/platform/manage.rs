@@ -2313,8 +2313,13 @@ fn manage_lines(
                 if let Some(pending) = data.pending {
                     body.push(ScreenLine::text(
                         format!(
-                            "{} is waiting for its pairing code: press p to show it.",
-                            pending.device_name
+                            "{}{} is waiting for its pairing code: press p to show it.",
+                            pending.device_name,
+                            if pending.kind == crate::connectivity::authority::DeviceKind::Gateway {
+                                " (gateway)"
+                            } else {
+                                ""
+                            }
                         ),
                         Tone::Warning,
                     ));
