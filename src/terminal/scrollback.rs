@@ -1924,6 +1924,41 @@ fn trace_dir() -> Option<&'static std::path::Path> {
     .as_deref()
 }
 
+type TraceLine = (std::path::PathBuf, String);
+
+/// The trace file writer: its own thread, fed one line at a time, so no
+/// file I/O happens under the store lock the callers hold. A full queue
+/// drops the line (the trace is a developer's aid, never a reason to wait).
+fn trace_sender() -> Option<&'static std::sync::mpsc::SyncSender<TraceLine>> {
+    static SENDER: std::sync::OnceLock<Option<std::sync::mpsc::SyncSender<TraceLine>>> =
+        std::sync::OnceLock::new();
+    SENDER
+        .get_or_init(|| {
+            let dir = trace_dir()?.to_owned();
+            let (sender, lines) = std::sync::mpsc::sync_channel::<TraceLine>(1024);
+            std::thread::Builder::new()
+                .name("scrollback-trace".into())
+                .spawn(move || {
+                    for (path, line) in lines {
+                        let written = std::fs::create_dir_all(&dir).and_then(|()| {
+                            use std::io::Write;
+                            let mut file = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(&path)?;
+                            writeln!(file, "{line}")
+                        });
+                        if let Err(err) = written {
+                            tracing::debug!("scrollback trace to {} failed: {err}", path.display());
+                        }
+                    }
+                })
+                .ok()?;
+            Some(sender)
+        })
+        .as_ref()
+}
+
 fn trace_read(
     session_id: &str,
     pane_id: &str,
@@ -1933,7 +1968,7 @@ fn trace_read(
     owns_screen: bool,
     text: &str,
 ) {
-    let Some(dir) = trace_dir() else {
+    let (Some(dir), Some(sender)) = (trace_dir(), trace_sender()) else {
         return;
     };
     let safe = |part: &str| -> String {
@@ -1960,17 +1995,7 @@ fn trace_read(
         "rows": split_lines(text),
     });
     let path = dir.join(format!("{}_{}.jsonl", safe(session_id), safe(pane_id)));
-    let written = std::fs::create_dir_all(dir).and_then(|()| {
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
-        writeln!(file, "{line}")
-    });
-    if let Err(err) = written {
-        tracing::debug!("scrollback trace to {} failed: {err}", path.display());
-    }
+    let _ = sender.try_send((path, line.to_string()));
 }
 
 /// Every object in a Herdr body that names a pane and reports its scroll.
