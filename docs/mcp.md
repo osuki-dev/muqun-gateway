@@ -135,7 +135,7 @@ says `"truncated": true` when it left older ones out. `tasks.wait` and
 | `fleet.list` | none | `{"machines": [{machineId, label, os, online, suitableFor, tasksActive}]}`: this computer first, then every linked computer (`machineId` is the id it gave for itself, which `fleet.describe` takes; `label` is the name this gateway gives it; `online` whether it is reachable, `null` while it was not checked in the last minute; `os`, `suitableFor` and `tasksActive` come from its cached manifest, empty or 0 while none was fetched). Answered at once from what this gateway last heard (see [Linked computers](#linked-computers)). List the computers this gateway can hand work to: this one and every linked one, with OS, what each is suitable for, whether it is reachable and how busy it is. |
 | `fleet.describe` | `machine?`: `"self"` (default, any case), this computer's `machineId` or label, or a linked computer's name (any case) or `machineId` from `fleet.list` | A compact manifest of that computer: `GET /api/fleet/self`'s fields, but each agent is only `{id, kind, status, version, modes, modelCount}` (mode ids, no model catalog) and each terminal backend `{sessionId, label, kind, connected, version}`. For this computer it also carries `peers`: one `{name, reachable, lastSeen, capabilities, agents, suitableFor}` per linked computer, answered at once from what this gateway last heard (`reachable` is `null` while it was not checked in the last minute; see [Linked computers](#linked-computers)). Naming a linked computer answers its cached manifest at once when it is known to answer; only a computer not checked lately, or with no manifest yet, is waited on: one check and, when it answers, one manifest fetch. What a computer offers: its agents, terminal backends, toolchains with versions, task counts and what it is suitable for. Without machine, this computer plus a short entry per linked computer (peers). |
 | `exec.run` | `cwd`: absolute directory; `command`: shell command, run as `sh -c <command>` (at most 16 KiB); `timeout_s?`: 1..=45, default 30 | `{task_id, state, exit_code, stdout_tail, duration_ms, pane}`. Run a shell command in a visible terminal pane on this computer and return its exit code and output tail. Blocks up to timeout_s (max 45); if still running, returns a task_id for tasks.wait. `exit_code` is null while it runs; `pane` is `{session_id, pane_id}`. |
-| `tasks.delegate` | `goal` (at most 32 KiB); `cwd?`: absolute directory; `agent_id?` (default: the primary agent; a terminal agent kind such as `codex` or `claude` starts it in a new pane instead, see [Delegating to a terminal agent](#delegating-to-a-terminal-agent)); `mode?` (for example `build` or `plan`); `model?`: a model id from the agent's catalog for `cwd` (for example `claude-haiku-5-5`), or `<provider_id>/<model_id>` to pick one provider; default: the agent's default. An unknown id is `invalid_arguments` and nothing is created; `variant?`: the model's variant (reasoning effort, for example `high`), applied when the session is created so the first turn uses it; applied only together with `model` (ignored otherwise), and must be one of the model's catalog variants when it lists any (else `invalid_arguments`); `machine?` | A task view (see [Tasks API](#tasks-api)), filed under the caller's task when the gateway can tell which one it is (see [Task tree](#task-tree)). Start a sub-task on an agent on this computer: a new session in cwd with your goal as the first prompt (for a terminal agent such as codex or claude, a new terminal pane running it). Returns task_id; poll with tasks.wait. |
+| `tasks.delegate` | `goal` (at most 32 KiB); `cwd?`: absolute directory; `agent_id?` (default: the primary agent; a terminal agent kind such as `codex` or `claude` starts it in a new pane instead, see [Delegating to a terminal agent](#delegating-to-a-terminal-agent)); `mode?` (for example `build` or `plan`); `model?`: a model id from the agent's catalog for `cwd` (for example `claude-haiku-5-5`), or `<provider_id>/<model_id>` to pick one provider; default: the agent's default. An unknown id is `invalid_arguments` and nothing is created; `variant?`: the model's variant (reasoning effort, for example `high`), applied when the session is created so the first turn uses it; applied only together with `model` (ignored otherwise), and must be one of the model's catalog variants when it lists any (else `invalid_arguments`); `machine?`: `"self"` (default, any case), this computer's `machineId` or label, or a linked computer's name (any case) or `machineId`; `cwd`, `agent_id`, `model` and `variant` are then checked by that computer (`~` allowed in `cwd`) | A task view (see [Tasks API](#tasks-api)), filed under the caller's task when the gateway can tell which one it is (see [Task tree](#task-tree)); for a linked computer, a mirror of the task there (see [Delegating to another computer](#delegating-to-another-computer)), with a `note` when the request got no answer. Start a sub-task on an agent, on this computer or (machine) on a linked one: a new session in cwd with your goal as the first prompt (for a terminal agent such as codex or claude, a new terminal pane running it). Returns task_id; poll with tasks.wait. |
 | `tasks.wait` | `task_id`; `timeout_s?`: 1..=45, default 30 | The task view, plus `stdout_tail` for a command, and `answer` for a session delegation that is done or `idle_unconfirmed`: the agent's last message in full (`summary` holds only its first 240 characters, on one line). Returns once the task is done, failed, cancelled, `waiting` or `idle_unconfirmed` (its agent stopped without saying it is finished), or when the time is up. Wait up to timeout_s (max 45) for a task to reach done/failed/waiting, or idle_unconfirmed (its agent stopped without completing). Returns the current state and summary; call again while it says working. |
 | `tasks.read` | `task_id?`: default, the task the calling session works on; `what`: `summary` or `timeline`; `cursor?` (timeline only) | `summary`: the task view. `timeline`: `{task_id, items, cursor}`, the most recent agent items after `cursor`; pass the returned `cursor` to read on. Read a task you created, or (without task_id) the one this session was given: its summary or recent timeline. Your own task's summary lists the computers the user named for it (`mentions`). A command has no timeline. The session's own task is found as `tasks.complete` finds it (see [Finishing a delegation](#finishing-a-delegation)); none found is `task_not_found`. |
 | `tasks.cancel` | `task_id` | The task view after the cancel. Interrupt a task you created. |
@@ -148,7 +148,10 @@ Error codes:
 | `invalid_arguments` | A bad argument: an empty or oversized `command`, `goal` or `summary`, a `cwd` that is not an existing absolute directory, an unknown `model` for `tasks.delegate`, `tasks.read` timeline of a command. |
 | `task_not_found` | No task with that `task_id`, or it belongs to another assistant. |
 | `machine_unknown` | `machine` names neither this computer nor a linked one; the message lists the names that work. |
-| `machine_unreachable` | `fleet.describe` named a linked computer that does not answer now. |
+| `machine_unreachable` | `fleet.describe` or `tasks.delegate` named a linked computer that does not answer now; nothing was started there. |
+| `delegations_disabled` | `tasks.delegate` named a linked computer whose owner switched off work from other computers. |
+| `unauthorized` | `tasks.delegate` named a linked computer that no longer knows this one; the link is forgotten here, and the owner's phone links it again. |
+| *the computer's own code* | `tasks.delegate`: the linked computer refused the task (for example `directory_not_found`, `agent_unavailable`); an argument it refused (`invalid_request`, `unknown_model`, `unknown_variant`) is `invalid_arguments`. The message names the computer. |
 | `manifest_unavailable` | `fleet.describe` named a linked computer that answers but gave no manifest, and none is cached (for example an older gateway). |
 | `agent_unavailable` | The requested agent is not available on this computer. |
 | `no_terminal` | `exec.run` found no reachable terminal session. |
@@ -685,6 +688,36 @@ and kept in the peer row, so a computer that does not answer still
 shows its last agents and `suitableFor`. `lastSeen` is ms since the epoch,
 null if it never answered. Names match in any case (Unicode-aware); no
 linked computer may be called `self`.
+
+### Delegating to another computer
+
+`tasks.delegate(machine: "mini")` runs the goal on that linked computer as an
+ordinary task of its own (`origin: "peer"`, `requested_by.kind: "gateway"`,
+named from the device record its token belongs to); this computer keeps a
+mirror of it under the caller's task, `binding: {kind: "peer", peer_id,
+peer_server_id, remote_task_id, peer_name}`.
+
+- A computer not heard from in the last 2 minutes is checked first; if it
+  still does not answer, `machine_unreachable` and nothing is created.
+- The mirror follows the task there over one task socket per computer
+  (`subscribe_tasks`, the frames the phone reads), while any mirror of it is
+  open; when the socket is down, the driver's pass (every 60 s) reads the
+  task instead. State, summary (cut to one line), exit code and the progress
+  line are copied; nothing moves backwards.
+- `tasks.wait` on a mirror blocks as for a local delegation and wakes on
+  every move. While the computer does not answer it returns at once with
+  `peer_reachable: false` and `peer_last_seen_ms`: the mirror never fails
+  because its computer went quiet, and the agent decides how long to wait.
+- `tasks.cancel` on a mirror cancels the task there too (best effort) and
+  the mirror here either way. `tasks.read` gives the summary; a mirror has no
+  timeline here.
+- A create that went out but got no answer leaves the mirror `dispatching`
+  with an empty `remote_task_id`, and the answer carries a `note`: the task
+  may have started there, so do not delegate it again. The mirror finds that
+  task by the `client_ref` it sent with the create, or fails as not confirmed
+  after 2 minutes.
+- If the computer is unlinked, its open mirrors fail as lost; a computer that
+  no longer knows this one's token is forgotten (`unauthorized`).
 
 ### States
 
