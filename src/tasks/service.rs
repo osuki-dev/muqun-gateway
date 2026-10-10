@@ -801,10 +801,10 @@ impl TaskService {
             self.store().transition(&task.id, dispatching).await?;
             self.bind_session(&asid.0, &task.id);
             // Asked for an explicit end: a turn that stops is only a pause.
-            let prompt = pane_agent::completion_request(&request.goal);
+            let instruction = pane_agent::completion_instruction();
             manager
-                .prompts()
-                .send_prompt(&asid, &prompt, &[], None)
+                .agent()
+                .send_task_prompt(&asid.0, &request.goal, &instruction)
                 .await?;
             let task = self
                 .store()
@@ -949,7 +949,7 @@ impl TaskService {
         let view = self.present(&task).await;
         let state = state.clone();
         let cwd = request.cwd.clone();
-        let prompt = pane_agent::completion_request(&request.goal);
+        let goal = request.goal.clone();
         tokio::spawn(async move {
             let start = tokio::spawn(start_terminal_agent(
                 state.clone(),
@@ -957,7 +957,7 @@ impl TaskService {
                 kind,
                 cwd,
                 placed,
-                prompt,
+                goal,
                 task.clone(),
             ));
             // A start that panicked must not leave the task dispatching.
@@ -979,7 +979,9 @@ impl TaskService {
 
 /// The background half of [`TaskService::delegate_to_pane`]: start the agent
 /// in its placed pane with the goal (on its command line where it takes one,
-/// otherwise typed) unless the task ended meanwhile -- a cancel, or a
+/// otherwise typed) -- and the completion instruction out of band where the
+/// agent takes one ([`crate::agents::tasks::instruction_args`]), else after
+/// the goal -- unless the task ended meanwhile -- a cancel, or a
 /// follower that gave up on it -- then move the task to working and follow
 /// it -- or fail it naming the step.
 pub(crate) async fn start_terminal_agent(
@@ -988,7 +990,7 @@ pub(crate) async fn start_terminal_agent(
     kind: String,
     cwd: Option<String>,
     placed: crate::agents::session_routes::PlacedAgent,
-    prompt: String,
+    goal: String,
     task: Task,
 ) {
     use crate::agents::session_routes::{start_agent_in_place, type_agent_prompt};
@@ -1007,6 +1009,15 @@ pub(crate) async fn start_terminal_agent(
         return;
     }
     let pane_id = placed.place.pane_id.clone();
+    let instruction = pane_agent::completion_instruction();
+    let file = (kind == "claude")
+        .then(pane_agent::completion_instruction_file)
+        .flatten();
+    let extra = crate::agents::tasks::instruction_args(&kind, &instruction, file.as_deref());
+    let prompt = match extra {
+        Some(_) => goal,
+        None => pane_agent::completion_request(&goal),
+    };
     let (mut launched, to_type) = start_agent_in_place(
         &state,
         &session,
@@ -1014,6 +1025,7 @@ pub(crate) async fn start_terminal_agent(
         cwd.as_deref(),
         placed,
         Some(&prompt),
+        extra.as_deref().unwrap_or_default(),
     )
     .await;
     let typed = to_type.is_some();

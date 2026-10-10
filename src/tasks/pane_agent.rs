@@ -5,8 +5,10 @@
 //!
 //! An idle agent is not a finished one -- a terminal agent pauses (thinking,
 //! a tool, a long build) and comes back -- so only an explicit signal is
-//! `done`: the goal is given with [`completion_request`] (on the agent's
-//! command line where it takes one, else typed), and the agent
+//! `done`: the goal is given with [`completion_instruction`] (out of band
+//! where the agent takes it, else after the goal -- [`completion_request`];
+//! the goal on the agent's command line where it takes one, else typed),
+//! and the agent
 //! printing a [`DONE_MARKER`] line (or calling `tasks.complete` from the
 //! pane's own token) is that signal. An agent that stops because it needs
 //! the user says so the same way: a [`BLOCKED_MARKER`] line, or
@@ -88,8 +90,8 @@ pub(crate) const AGENT_EXITED: &str = "the agent exited before it finished";
 pub(crate) const DONE_MARKER: &str = "MUQUN_TASK_DONE:";
 /// The line it prints when it stopped because it needs the user.
 pub(crate) const BLOCKED_MARKER: &str = "MUQUN_TASK_BLOCKED:";
-const SUMMARY_PLACEHOLDER: &str = "<one-line summary>";
-const REASON_PLACEHOLDER: &str = "<one-line reason>";
+pub(crate) const SUMMARY_PLACEHOLDER: &str = "<one-line summary>";
+pub(crate) const REASON_PLACEHOLDER: &str = "<one-line reason>";
 /// Words of the typed request that can only come from its echo; a marker
 /// counts only below the last line holding one. Several, since a narrow
 /// pane wraps the echo anywhere.
@@ -116,17 +118,46 @@ pub(crate) fn is_available(state: &AppState, agent_id: &str) -> bool {
     agent_kinds::find_on_path(&command).is_some()
 }
 
-/// The first prompt of every delegation to an agent (a terminal agent's
-/// pane or an agent session): the goal, then the request to say how it
-/// ended -- the `tasks.complete` tool, or else a marker line.
-pub(crate) fn completion_request(goal: &str) -> String {
+/// What every delegation to an agent (a terminal agent's pane or an agent
+/// session) asks besides its goal: to say how it ended -- the
+/// `tasks.complete` tool, or else a marker line. It is plumbing, never shown
+/// to the reader: it goes out of band where the agent takes that (a
+/// synthetic OpenCode message, Claude Code's appended system prompt, Codex's
+/// `developer_instructions`) and is cut from the transcript otherwise
+/// ([`super::transcript`]). It opens with [`REQUEST_OPENING`].
+pub(crate) fn completion_instruction() -> String {
     format!(
-        "{goal}\n\nWhen the whole task is finished, call the muqun tool tasks.complete with a \
+        "{REQUEST_OPENING}call the muqun tool tasks.complete with a \
          one-line summary, or with outcome \"blocked\" and the reason if you stopped because \
          you need the user (a missing file, an unclear request, a permission you cannot get); \
          if you cannot call it, print one line exactly in this form: \
          {DONE_MARKER} {SUMMARY_PLACEHOLDER} -- or, blocked, {BLOCKED_MARKER} {REASON_PLACEHOLDER}"
     )
+}
+
+/// The opening of every completion instruction this gateway has sent.
+pub(crate) const REQUEST_OPENING: &str = "When the whole task is finished, ";
+
+/// The goal followed by [`completion_instruction`], for an agent that can
+/// only be given one text.
+pub(crate) fn completion_request(goal: &str) -> String {
+    format!("{goal}\n\n{}", completion_instruction())
+}
+
+/// [`completion_instruction`] in a file for an agent that reads it from one
+/// (Claude Code's `--append-system-prompt-file`), so the launch line typed
+/// into the pane carries a path rather than the instruction. `None` when it
+/// cannot be written.
+pub(crate) fn completion_instruction_file() -> Option<std::path::PathBuf> {
+    let path = crate::state_dir().ok()?.join("task-instruction.md");
+    let text = completion_instruction();
+    if std::fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
+        if let Err(error) = std::fs::write(&path, &text) {
+            tracing::debug!(%error, "task instruction file not written");
+            return None;
+        }
+    }
+    Some(path)
 }
 
 /// How an agent said its task ended, with its one line.

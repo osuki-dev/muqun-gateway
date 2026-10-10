@@ -399,15 +399,16 @@ could not be made is `502 agent_error`, the task recorded `failed`.
 
 An idle terminal agent is not a finished one -- it pauses to think, run a
 tool or wait on a long build, and comes back -- so only an explicit signal
-finishes the task. The goal is given with one more paragraph:
-
-```
-<goal>
-
-When the whole task is finished, call the muqun tool tasks.complete with a one-line summary, or with outcome "blocked" and the reason if you stopped because you need the user (a missing file, an unclear request, a permission you cannot get); if you cannot call it, print one line exactly in this form: MUQUN_TASK_DONE: <one-line summary> -- or, blocked, MUQUN_TASK_BLOCKED: <one-line reason>
-```
-
-(the stored `goal` is the goal as given). The marker is looked for in the
+finishes the task. The agent is given the completion instruction quoted in
+[Finishing a delegation](#finishing-a-delegation) beside its goal. Where the
+agent takes instructions out of band, only the goal is its prompt: `claude`
+starts with `--append-system-prompt-file <state dir>/task-instruction.md`
+(the text itself with `--append-system-prompt` when the file cannot be
+written), `codex` with `-c developer_instructions=<instruction>`, both after
+the launch arguments whatever `agent_launch_args` says, on tmux and Herdr
+alike. Any other agent gets the instruction as a paragraph after its goal
+(the stored `goal` is the goal as given). The marker line the agent prints
+stays in its pane: a terminal shows what was written. The marker is looked for in the
 pane's recent output (its last 200 lines, unwrapped), not only on its screen,
 so one that scrolled off still counts. It counts when the line starts with
 `MUQUN_TASK_DONE:` (after any bullet the agent draws), lies below the last
@@ -484,12 +485,20 @@ signals:
    is `idle_unconfirmed` or `waiting` ("确认完成" on the phone). Recorded with
    source `device_confirm`.
 
-The first prompt of every delegation is the goal followed by one closing
-paragraph that names both outcomes (the stored `goal` is the goal alone):
+Every delegation is given its goal and one instruction that names both
+outcomes (the stored `goal` is the goal alone):
 
 ```text
 When the whole task is finished, call the muqun tool tasks.complete with a one-line summary, or with outcome "blocked" and the reason if you stopped because you need the user (a missing file, an unclear request, a permission you cannot get); if you cannot call it, print one line exactly in this form: MUQUN_TASK_DONE: <one-line summary> -- or, blocked, MUQUN_TASK_BLOCKED: <one-line reason>
 ```
+
+The instruction and the marker lines are how the gateway learns the end; the
+reader is never shown them. An OpenCode session gets the instruction as a
+synthetic message admitted just before the goal (`POST
+/api/session/{id}/synthetic`, `resume: false`), so the user's message is the
+goal alone; DeepSeek and T3 Code take one text, so the instruction follows
+the goal there. Either way the served transcript cuts it and the agent's
+marker lines ([transcript rules](agent-api.md#task-plumbing-in-the-transcript)).
 
 A session delegation moves like this (moves pass the states between, so a
 `waiting` task that is completed passes `working`):

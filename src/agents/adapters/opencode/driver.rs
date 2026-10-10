@@ -510,6 +510,28 @@ impl AgentPort for OpencodeDriver {
         })
     }
 
+    /// The instruction is a synthetic message admitted without running,
+    /// then the goal is the user's prompt that starts the turn: the model
+    /// reads both, the transcript shows the instruction as a synthetic row
+    /// (which the served transcript drops). An OpenCode that refuses the
+    /// synthetic message gets them as one prompt.
+    fn send_task_prompt<'a>(
+        &'a self,
+        session_id: &'a str,
+        goal: &'a str,
+        instruction: &'a str,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            if let Err(error) = self.client.send_synthetic(session_id, instruction).await {
+                tracing::debug!(%error, "task instruction sent with the goal instead");
+                let text = format!("{goal}\n\n{instruction}");
+                return self.send_prompt(session_id, &text, &[], None).await;
+            }
+            self.client.send_prompt(session_id, goal, &[], None).await?;
+            Ok(())
+        })
+    }
+
     fn revert_session<'a>(
         &'a self,
         session_id: &'a str,

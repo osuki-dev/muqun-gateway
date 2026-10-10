@@ -10,6 +10,7 @@ pub(crate) mod routes;
 pub(crate) mod run_command;
 pub(crate) mod service;
 pub(crate) mod store_sqlite;
+pub(crate) mod transcript;
 
 use crate::backend::{Pane, PaneId, TerminalBackend};
 

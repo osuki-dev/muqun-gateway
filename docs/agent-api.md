@@ -1355,6 +1355,27 @@ tail it cannot place.
 
 `?after=<seq>` → `{"items": [...], "status": "busy", "resync": false, "latest_seq": 42}`.
 
+### Task plumbing in the transcript
+
+A session working on a delegated task ([docs/mcp.md](mcp.md#finishing-a-delegation))
+is served without the gateway's task plumbing -- on the snapshot, the
+timeline, the event replay, the SSE stream and `/api/ws`:
+
+- A user `text` row (or a `synthetic` row) that ends with the completion
+  instruction is served with the instruction cut, and is left out when it was
+  only the instruction. Any wording the gateway has sent is recognised, by the
+  instruction's fixed opening (`When the whole task is finished, `) and its
+  closing placeholder line, never by the goal.
+- An assistant `text` row is served without its marker lines: a line that
+  starts, after bullets and markup, with `MUQUN_TASK_DONE:` or
+  `MUQUN_TASK_BLOCKED:`. A row left with nothing else is left out. While the
+  row streams, a last line that can only be the start of a marker is held back
+  too, so the marker never shows mid-turn. `seq` keeps counting, so a client
+  may see a gap where a row was left out.
+
+The agent's own transcript, the mirror and the task follower keep the raw text
+(the marker is read from it); the task's `summary` is still the marker's line.
+
 ### WebSocket events: `GET /api/ws`
 
 One WebSocket per device carrying the agent events of **any number of

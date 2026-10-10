@@ -85,6 +85,10 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
   `MUQUN_TASK_DONE` marker (`pane_agent::marker`, read off the pane or
   the session's last message by `service::turn_end`), or the device's
   `POST /api/tasks/{id}/complete`; a stop without one is `idle_unconfirmed`.
+  The completion instruction and the marker lines are never shown to the
+  reader: the instruction goes out of band where the agent takes it
+  (`AgentPort::send_task_prompt`, `agents::tasks::instruction_args`), and
+  `transcript.rs` cuts both from every served transcript.
   An agent that needs the user says it is blocked (`tasks.complete` with
   `outcome: blocked`, or `MUQUN_TASK_BLOCKED`): the task is `waiting`, and
   stays so through idles until the agent works on a later turn or finishes

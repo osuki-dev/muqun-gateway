@@ -202,6 +202,32 @@ pub fn agent_launch_args(
     }
 }
 
+/// The arguments that give a delegated agent the gateway's completion
+/// `instruction` out of band, so only the goal is its prompt: Claude Code
+/// appends it to its system prompt (read from `file` when there is one, so
+/// the launch line typed into the pane carries a path, not the text), Codex
+/// takes it as `developer_instructions` (a `-c` value that is not TOML is
+/// taken as a literal string, so no quoting is added). `None` for an agent
+/// with no such way in: it is given the instruction with its goal. Added
+/// after [`agent_launch_args`], whatever config says those are.
+pub fn instruction_args(kind: &str, instruction: &str, file: Option<&Path>) -> Option<Vec<String>> {
+    match (kind, file) {
+        ("claude", Some(file)) => Some(vec![
+            "--append-system-prompt-file".to_owned(),
+            file.to_string_lossy().into_owned(),
+        ]),
+        ("claude", None) => Some(vec![
+            "--append-system-prompt".to_owned(),
+            instruction.to_owned(),
+        ]),
+        ("codex", _) => Some(vec![
+            "-c".to_owned(),
+            format!("developer_instructions={instruction}"),
+        ]),
+        _ => None,
+    }
+}
+
 /// What the kinds with built-in defaults start with under this config, one
 /// line each (`codex: --dangerously-… ; folder trust on`), for the startup
 /// log and `manage`'s Settings view: the owner should not have to read the
@@ -980,6 +1006,37 @@ mod tests {
             assert_eq!(
                 launch_prompt_args(kind, prompt),
                 args.map(|args| args.map(str::to_owned)),
+                "{kind}"
+            );
+        }
+
+        // A delegation's completion instruction goes out of band where the
+        // agent takes one, whatever its launch arguments are configured as.
+        let file = Path::new("/state/task-instruction.md");
+        for (kind, file, args) in [
+            (
+                "claude",
+                Some(file),
+                Some(vec![
+                    "--append-system-prompt-file",
+                    "/state/task-instruction.md",
+                ]),
+            ),
+            (
+                "claude",
+                None,
+                Some(vec!["--append-system-prompt", "say \"done\""]),
+            ),
+            (
+                "codex",
+                Some(file),
+                Some(vec!["-c", "developer_instructions=say \"done\""]),
+            ),
+            ("gemini", Some(file), None),
+        ] {
+            assert_eq!(
+                instruction_args(kind, "say \"done\"", file),
+                args.map(|args| args.into_iter().map(str::to_owned).collect()),
                 "{kind}"
             );
         }

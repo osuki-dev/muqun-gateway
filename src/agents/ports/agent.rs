@@ -126,6 +126,23 @@ pub trait AgentPort: Send + Sync {
         delivery: Option<&'a str>,
     ) -> AgentFuture<'a, ()>;
 
+    /// Submit a delegated goal with the gateway's completion `instruction`
+    /// (`tasks::pane_agent::completion_instruction`). An agent that takes
+    /// input the reader is not shown sends the instruction that way;
+    /// otherwise it follows the goal in one prompt, and the served
+    /// transcript cuts it (`tasks::transcript`).
+    fn send_task_prompt<'a>(
+        &'a self,
+        session_id: &'a str,
+        goal: &'a str,
+        instruction: &'a str,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            let text = format!("{goal}\n\n{instruction}");
+            self.send_prompt(session_id, &text, &[], None).await
+        })
+    }
+
     /// Revert session to a previous message and roll back file changes
     fn revert_session<'a>(
         &'a self,
