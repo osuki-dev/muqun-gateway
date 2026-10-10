@@ -1556,6 +1556,12 @@ same rule for a client without the socket.
   `marker_blocked`). It stays open: the user answers in the session or pane
   and the agent goes on, or the device confirms or cancels it. Going idle
   does not turn a blocked task into `idle_unconfirmed`.
+- The second line of a task card: `progress` while the task works, `summary`
+  once it pauses or ends (`progress` is absent then). For a `waiting` task
+  `summary` is what the user is asked -- "Needs you · <summary>": a blocked
+  agent's reason; for a pending permission or question form, the last line
+  of the agent's last message since the task began, else the request's own
+  text; for a terminal agent on a menu, the screen's last meaningful line.
 
 **Catch-up is unchanged.** The socket delivers live events only. After a
 (re)connect, re-subscribe, wait for `subscribed`, then catch up each session

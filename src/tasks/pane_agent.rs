@@ -20,7 +20,7 @@
 //! | *blocked*: agent idle, or still busy before it was seen idle on two polls | stays `waiting` |
 //! | *blocked*: agent starting / working after it was seen idle on two polls (the user answered) | `working` |
 //! | agent starting / working | `working` (from `dispatching`, or back from `waiting` or `idle_unconfirmed`) |
-//! | agent blocked on a menu (approval, question) | `waiting` |
+//! | agent blocked on a menu (approval, question) | `waiting`, with the screen's last meaningful line ([`screen_summary`]) |
 //! | agent idle on two polls, after it was seen working (or its state sequence moved), or for [`UNCONFIRMED_AFTER`] | `idle_unconfirmed` |
 //! | no agent in the pane (two polls running; for a `dispatching` task, only after [`START_GRACE`]) | `failed`: the agent exited |
 //! | the pane is gone | `failed`: the pane closed |
@@ -635,7 +635,11 @@ fn change_for(
             source = MARKER_BLOCKED;
             (TaskState::Waiting, Some(reason), None)
         }
-        Verdict::Waiting => (TaskState::Waiting, None, None),
+        Verdict::Waiting => (
+            TaskState::Waiting,
+            screen.and_then(|text| screen_summary(agent_id, text)),
+            None,
+        ),
         Verdict::Unconfirmed => (
             TaskState::IdleUnconfirmed,
             screen.and_then(|text| screen_summary(agent_id, text)),
@@ -1093,6 +1097,10 @@ mod tests {
             screen_summary(Some("claude"), claude).as_deref(),
             Some("All 12 tests pass.")
         );
+        // A task waiting on a menu says what the screen asks.
+        let menu = "⏺ Bash(cargo clean)\n\n Do you want to proceed?\n";
+        let waiting = change_for(Verdict::Waiting, Some("codex"), Some(menu)).unwrap();
+        assert_eq!(waiting.summary.as_deref(), Some("Do you want to proceed?"));
         let plain = "build ok\n   done:   3 files  \n\n───\n";
         assert_eq!(
             screen_summary(Some("some-agent"), plain).as_deref(),

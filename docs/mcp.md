@@ -256,7 +256,8 @@ unknown id is `404 task_not_found`; any other failure is `500 task_failed`.
   publishes it at once). It is kept in memory, so after a gateway restart it
   is absent until the agent moves again, and it is dropped when the task
   pauses (`idle_unconfirmed`, `waiting`) or ends: the `summary` then says
-  why.
+  why -- for a `waiting` task, what the user is asked (a pending request's
+  question, a terminal agent's menu line, or a blocked agent's reason).
 - A `failed` task's `summary` is the error as the agent, provider or backend
   gave it: `<name>: <message>` from the session, else the session's last
   failed tool call, status line or message (`the agent session failed:
@@ -418,7 +419,7 @@ every poll:
 | blocked: the agent idle, or still busy before it was seen idle on two polls | stays `waiting` |
 | blocked: the agent working after it was seen idle on two polls (the user answered) | `working` |
 | the agent working | `working` (from `dispatching`, or back from `waiting` or `idle_unconfirmed`); an agent still starting, or idle, while its task is `dispatching` (within the start grace) leaves it there. Claude Code counts as working only with its `esc to interrupt` footer on screen or a new `⏺` row since the poll before |
-| the agent blocked on a menu: an approval or a question | `waiting` |
+| the agent blocked on a menu: an approval or a question | `waiting`, `summary` = the screen's last meaningful line (as for a pause's hint) |
 | the agent idle on two polls in a row, after it was seen working (or after its Herdr state sequence moved), or 30 s after the start | `idle_unconfirmed`, `summary` = a hint: the agent's last prose block when the gateway has a transcript dictionary for it (Claude Code, Codex, ...), else the screen's last line with any letter or digit in it |
 | no agent running in the pane, on two polls in a row, and no marker (a `dispatching` task's agent is given its start timeout plus 15 s first) | `failed`, `summary` = `the agent exited before it finished: <last screen line>` |
 | the pane is gone (or another shell holds its id), and no marker was read before | `failed`, `summary` = `the pane closed: <the last screen line read>` |
@@ -483,7 +484,7 @@ A session delegation moves like this (moves pass the states between, so a
 | the turn ends (idle after busy), the last message carries the marker | `done`, `summary` = the marker's summary |
 | the turn ends, the last message carries the blocked marker | `waiting` ([blocked](#blocked)), `summary` = the reason |
 | the turn ends without the marker | `idle_unconfirmed`, `summary` = the last message as a hint; a blocked task stays `waiting` |
-| a permission request or question form is pending | `waiting` (back to `working` when answered) |
+| a permission request or question form is pending | `waiting` (back to `working` when answered), `summary` = what the user is asked: the last line of the agent's last message since the task began, else the request's own text (the permission prompt, the form title) |
 | busy again after a pause | `working`; a blocked task, only on a turn that starts after the one that reported the block |
 | the session failed / was interrupted | `failed` with the error line / `cancelled` |
 

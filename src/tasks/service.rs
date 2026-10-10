@@ -402,6 +402,15 @@ fn change(to: TaskState) -> TaskChange {
     }
 }
 
+/// A move to `waiting` on a pending request whose text is `text`.
+fn asking(text: &str) -> TaskChange {
+    let line = one_line(text, SUMMARY_CHARS);
+    TaskChange {
+        summary: (!line.is_empty()).then_some(line),
+        ..change(TaskState::Waiting)
+    }
+}
+
 fn noted(to: TaskState, note: impl Into<String>) -> TaskChange {
     TaskChange {
         note: Some(note.into()),
@@ -442,12 +451,13 @@ fn step(event: &AgentDomainEvent, asid: &str) -> Step {
             AgentSessionStatus::Interrupted => Step::Move(change(TaskState::Cancelled)),
             AgentSessionStatus::Unknown => Step::Stay,
         },
-        AgentDomainEvent::PermissionPending { asid: id, .. }
-        | AgentDomainEvent::FormPending { asid: id, .. }
-            if ours(id) =>
-        {
-            Step::Move(change(TaskState::Waiting))
-        }
+        // The request's own words, until the agent's are read ([`TaskService::settle`]).
+        AgentDomainEvent::PermissionPending {
+            asid: id, request, ..
+        } if ours(id) => Step::Move(asking(&request.prompt)),
+        AgentDomainEvent::FormPending {
+            asid: id, request, ..
+        } if ours(id) => Step::Move(asking(&request.title)),
         AgentDomainEvent::PermissionResolved { asid: id, .. }
         | AgentDomainEvent::FormResolved { asid: id, .. }
             if ours(id) =>
@@ -1210,6 +1220,12 @@ impl TaskService {
                 .await?
                 .unwrap_or_else(|| task.clone()));
         }
+        let mut to = to;
+        if to.to == TaskState::Waiting && to.source != pane_agent::MARKER_BLOCKED {
+            if let Some(question) = question(state, task).await {
+                to.summary = Some(question);
+            }
+        }
         self.move_to(&task.id, to).await
     }
 
@@ -1835,6 +1851,19 @@ pub(crate) fn turn_end(items: &[TimelineItem]) -> TaskChange {
             ..change(TaskState::IdleUnconfirmed)
         },
     }
+}
+
+/// What a session task waiting on the user is asked, for its `summary`:
+/// the last line of the agent's last message since the task began, when
+/// there is one.
+async fn question(state: &AppState, task: &Task) -> Option<String> {
+    let TaskBinding::AgentSession { agent_id, asid } = &task.binding else {
+        return None;
+    };
+    let manager = state.agent_runtime.manager_for_agent(agent_id).await?;
+    let text = last_assistant_text(&summary_timeline(&manager, asid, task.created_ms).await)?;
+    let line = text.lines().rev().find(|line| !line.trim().is_empty())?;
+    Some(one_line(line, SUMMARY_CHARS))
 }
 
 /// `task`'s session failed (`error`, if the agent gave one).
@@ -3170,12 +3199,20 @@ mod tests {
                 None,
             ),
             (
-                "a question the gateway sees",
+                "a question the gateway sees: its own words",
                 Working,
                 "",
                 vec![Event(Box::new(permission(ASID)))],
                 Waiting,
-                None,
+                Some("run it?"),
+            ),
+            (
+                "a question the gateway sees: the agent's last line",
+                Working,
+                "The build dir is stale.\nShall I delete it?",
+                vec![Event(Box::new(permission(ASID)))],
+                Waiting,
+                Some("Shall I delete it?"),
             ),
             (
                 "a new turn after a pause",
