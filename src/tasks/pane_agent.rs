@@ -183,11 +183,20 @@ pub(crate) async fn exited_to_shell(session: &SessionConfig, pane_id: &str, kind
 }
 
 /// Whether the `kind` agent itself holds `pane_id`'s terminal now -- what
-/// typed text reaches: an agent process under the pane's shell whose process
-/// group is its terminal's foreground group. Anything else in front (a
-/// shell, `ssh`, `sudo`, an editor, the agent suspended with Ctrl-Z or run
-/// with `&`) is a no; so is a pane or process table that cannot be read.
-/// The caller is about to type there.
+/// typed text reaches. All of these, on one `ps` snapshot:
+///
+/// - the pane's shell (its root process) is listed, on a terminal, and that
+///   terminal has a foreground process group;
+/// - a process descending from that shell sits on the same terminal, in that
+///   foreground group;
+/// - its executable, resolved by the system (`/proc/<pid>/exe` on Linux, the
+///   kernel's command name on macOS) and never read from its arguments, is
+///   the `kind` agent's.
+///
+/// Anything else in front (a shell, `ssh`, `sudo`, an editor, the agent
+/// suspended with Ctrl-Z or run with `&`, an agent in front on another
+/// terminal) is a no; so is anything that cannot be read or parsed. The
+/// caller is about to type there.
 pub(crate) async fn agent_in_foreground(
     session: &SessionConfig,
     pane_id: &str,
@@ -203,62 +212,122 @@ pub(crate) async fn agent_in_foreground(
         return false;
     };
     let Ok(out) = tokio::process::Command::new("ps")
-        .args(["-A", "-o", "pid=,ppid=,pgid=,tpgid=,args="])
+        .args(["-A", "-o", "pid=,ppid=,pgid=,tpgid=,tty=,comm="])
         .kill_on_drop(true)
         .output()
         .await
     else {
         return false;
     };
-    out.status.success() && agent_in_front(&String::from_utf8_lossy(&out.stdout), root, kind)
+    if !out.status.success() {
+        return false;
+    }
+    let Some(mut rows) = process_rows(&String::from_utf8_lossy(&out.stdout)) else {
+        return false;
+    };
+    for row in &mut rows {
+        row.exe = resolved_executable(row.pid, &row.exe);
+    }
+    holds_terminal(&rows, root, kind)
 }
 
-/// [`agent_in_foreground`] on a process table (`ps -o
-/// pid=,ppid=,pgid=,tpgid=,args=`): a `kind` process at or under `root`
-/// (its program, or the script a runtime runs, named `kind`) whose process
-/// group is the foreground group of its terminal.
-fn agent_in_front(table: &str, root: u32, kind: &str) -> bool {
-    let rows: Vec<(u32, u32, i64, i64, String)> = table
+/// One `ps -o pid=,ppid=,pgid=,tpgid=,tty=,comm=` row; `exe` is the command
+/// name until [`resolved_executable`] replaces it.
+#[derive(Debug, Clone)]
+struct Proc {
+    pid: u32,
+    ppid: u32,
+    pgid: i64,
+    tpgid: i64,
+    tty: String,
+    exe: String,
+}
+
+/// The rows of a process table, by fixed columns: four numbers, the
+/// terminal, the command name. `None` when any row does not parse -- the
+/// table is then not trusted at all.
+fn process_rows(table: &str) -> Option<Vec<Proc>> {
+    table
         .lines()
-        .filter_map(|line| {
-            // Four numeric columns, then the arguments as they are.
-            let field = |rest: &str| -> Option<(String, String)> {
-                let rest = rest.trim_start();
-                let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-                Some((rest[..end].to_owned(), rest[end..].to_owned()))
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let mut rest = line.trim_start();
+            let mut field = || -> Option<String> {
+                let end = rest.find(char::is_whitespace)?;
+                let value = rest[..end].to_owned();
+                rest = rest[end..].trim_start();
+                Some(value)
             };
-            let (pid, rest) = field(line)?;
-            let (ppid, rest) = field(&rest)?;
-            let (pgid, rest) = field(&rest)?;
-            let (tpgid, rest) = field(&rest)?;
-            Some((
-                pid.parse().ok()?,
-                ppid.parse().ok()?,
-                pgid.parse().ok()?,
-                tpgid.parse().ok()?,
-                rest.trim().to_owned(),
-            ))
+            let pid = field()?.parse().ok()?;
+            let ppid = field()?.parse().ok()?;
+            let pgid = field()?.parse().ok()?;
+            let tpgid = field()?.parse().ok()?;
+            let tty = field()?;
+            let exe = rest.trim().to_owned();
+            (!exe.is_empty()).then_some(Proc {
+                pid,
+                ppid,
+                pgid,
+                tpgid,
+                tty,
+                exe,
+            })
         })
-        .collect();
-    let names_kind = |args: &str| {
-        args.split_whitespace().take(2).any(|word| {
-            let name = command_name(word).to_ascii_lowercase();
-            name == kind || name.starts_with(&format!("{kind}-"))
-        })
+        .collect()
+}
+
+/// `pid`'s executable as the system resolved it: `/proc/<pid>/exe` on
+/// Linux (the command name there is whatever the process set), the
+/// kernel's command name (`comm`) elsewhere. Unreadable: empty, which
+/// matches no agent.
+fn resolved_executable(pid: u32, comm: &str) -> String {
+    if cfg!(target_os = "linux") {
+        std::fs::read_link(format!("/proc/{pid}/exe"))
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    } else {
+        comm.to_owned()
+    }
+}
+
+/// Whether executable `exe` is the `kind` agent: a binary named `kind`
+/// (or `kind-<target>`, as Codex ships), or for Claude Code its versioned
+/// binary under `…/claude/versions/`. A runtime (`node`, `bun`) or a shell
+/// never is, whatever script it runs.
+fn agent_executable(exe: &str, kind: &str) -> bool {
+    let name = command_name(exe).to_ascii_lowercase();
+    name == kind
+        || name.starts_with(&format!("{kind}-"))
+        || exe.contains(&format!("/{kind}/versions/"))
+}
+
+/// [`agent_in_foreground`] on a resolved process table.
+fn holds_terminal(rows: &[Proc], root: u32, kind: &str) -> bool {
+    let Some(shell) = rows.iter().find(|row| row.pid == root) else {
+        return false;
     };
+    let on_terminal = |tty: &str| !matches!(tty, "?" | "??" | "-" | "");
+    if !on_terminal(&shell.tty) || shell.tpgid <= 0 {
+        return false;
+    }
+    let (pane_tty, foreground) = (&shell.tty, shell.tpgid);
     let mut tree = vec![root];
     let mut at = 0;
     while at < tree.len() && tree.len() < 512 {
         let parent = tree[at];
-        for (pid, ppid, ..) in &rows {
-            if *ppid == parent && !tree.contains(pid) {
-                tree.push(*pid);
+        for row in rows {
+            if row.ppid == parent && !tree.contains(&row.pid) {
+                tree.push(row.pid);
             }
         }
         at += 1;
     }
-    rows.iter().any(|(pid, _, pgid, tpgid, args)| {
-        tree.contains(pid) && *tpgid > 0 && pgid == tpgid && names_kind(args)
+    rows.iter().any(|row| {
+        row.pid != root
+            && tree.contains(&row.pid)
+            && row.tty == *pane_tty
+            && row.pgid == foreground
+            && agent_executable(&row.exe, kind)
     })
 }
 
@@ -1227,37 +1296,77 @@ pub(crate) async fn interrupt(state: &AppState, task: &Task) {
 #[cfg(test)]
 mod tests {
 
-    /// Only the agent that holds the pane's terminal is typed to: anything
-    /// in front of a suspended or backgrounded agent gets nothing.
+    /// Only the agent itself, on the pane's terminal and in its foreground
+    /// group, is typed to.
     #[test]
-    fn only_the_agent_holding_the_terminal_is_typed_to() {
-        // pid ppid pgid tpgid args; the pane's shell is 100.
-        let table = |rows: &[&str]| rows.join("\n");
-        let claude_front = table(&[
-            "100 1 100 200 -zsh",
-            "200 100 200 200 /usr/local/bin/claude --resume",
-        ]);
-        let renamed = table(&["100 1 100 200 -zsh", "200 100 200 200 node /opt/bin/claude"]);
-        let suspended_ssh = table(&[
-            "100 1 100 300 -zsh",
-            "200 100 200 300 claude",
-            "300 100 300 300 ssh prod",
-        ]);
-        let suspended_shell = table(&["100 1 100 100 -zsh", "200 100 200 100 claude"]);
-        let other_pane = table(&["100 1 100 100 -zsh", "900 1 900 900 claude"]);
-        for (name, rows, typed) in [
-            ("the agent in front", &claude_front, true),
-            ("a runtime running the agent's script", &renamed, true),
+    fn only_the_agent_holding_the_pane_terminal_is_typed_to() {
+        // pid ppid pgid tpgid tty exe; the pane's shell is 100 on pts/3.
+        let rows = |lines: &[&str]| process_rows(&lines.join("\n")).unwrap();
+        let shell = "100 1 100 200 pts/3 /usr/bin/zsh";
+        for (name, table, typed) in [
             (
-                "(claude, ssh): ssh in front of a suspended agent",
-                &suspended_ssh,
+                "the real agent in front",
+                rows(&[
+                    shell,
+                    "200 100 200 200 pts/3 /home/u/.local/share/claude/versions/2.1.239",
+                ]),
+                true,
+            ),
+            (
+                "another agent (codex) in front",
+                rows(&[
+                    "100 1 100 200 pts/3 /usr/bin/zsh",
+                    "200 100 200 200 pts/3 /usr/bin/node",
+                    "201 200 200 200 pts/3 /opt/codex/codex-x86_64-unknown-linux-musl",
+                ]),
                 false,
             ),
-            ("a shell in front", &suspended_shell, false),
-            ("an agent in another pane", &other_pane, false),
+            (
+                "(claude, ssh): ssh in front of a suspended agent",
+                rows(&[
+                    "100 1 100 300 pts/3 /usr/bin/zsh",
+                    "200 100 200 300 pts/3 /usr/bin/claude",
+                    "300 100 300 300 pts/3 /usr/bin/ssh",
+                ]),
+                false,
+            ),
+            (
+                "an agent in front on another terminal",
+                rows(&[
+                    "100 1 100 100 pts/3 /usr/bin/zsh",
+                    "200 100 200 200 pts/7 /usr/bin/claude",
+                ]),
+                false,
+            ),
+            (
+                "argv says claude, the executable is sh",
+                rows(&[shell, "200 100 200 200 pts/3 /bin/sh"]),
+                false,
+            ),
+            (
+                "an agent run by a runtime",
+                rows(&[shell, "200 100 200 200 pts/3 /usr/bin/node"]),
+                false,
+            ),
         ] {
-            assert_eq!(agent_in_front(rows, 100, "claude"), typed, "{name}");
+            assert_eq!(holds_terminal(&table, 100, "claude"), typed, "{name}");
         }
+        assert!(
+            holds_terminal(
+                &rows(&[
+                    "100 1 100 200 pts/3 /usr/bin/zsh",
+                    "200 100 200 200 pts/3 /usr/bin/node",
+                    "201 200 200 200 pts/3 /opt/codex/codex-x86_64-unknown-linux-musl"
+                ]),
+                100,
+                "codex"
+            ),
+            "Codex in front"
+        );
+        assert!(
+            process_rows("100 1 x 200 pts/3 zsh").is_none(),
+            "unparsable: not trusted"
+        );
     }
     use super::*;
 

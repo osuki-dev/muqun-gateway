@@ -688,8 +688,13 @@ A session still in its turn -- inside a `tasks.wait`, say -- is sent nothing:
 the wait answers it, and a state a wait returned is never sent again. A pane
 is told when its own delegation's follower saw the agent stop
 (`idle_unconfirmed` or `done`) and the agent itself holds the pane's
-terminal: an agent process under the pane's shell whose process group is the
-terminal's foreground group. Anything else in front -- a shell, `ssh`, `sudo`,
+terminal: a process descending from the pane's shell, on the pane's own
+terminal, in that terminal's foreground process group, whose executable --
+resolved by the system (`/proc/<pid>/exe` on Linux, the kernel's command
+name on macOS), never read from its arguments -- is the agent's (a binary
+named for it, Codex's `codex-<target>`, or Claude Code's
+`…/claude/versions/<version>`; an agent run through `node` or `bun` does not
+count, so such a pane is never typed into). Anything else in front -- a shell, `ssh`, `sudo`,
 an editor, the agent suspended with Ctrl-Z or run with `&` -- means nothing is
 typed, since that program would receive the text; the result is tried again
 on later passes for an hour (the agent may come back with `fg`), then given
