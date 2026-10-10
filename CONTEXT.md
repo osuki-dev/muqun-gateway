@@ -148,8 +148,10 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
   - `setup.rs`: setup, backend configuration, Herdr plugin import, and the
     service/background lifecycle.
   - `manage.rs`: crossterm management views (overview, terminals, devices,
-    settings), structured styled rows, Enter primary actions, default-cancel
-    scope confirmations, selected-row scrolling and cell-safe resize handling.
+    settings). Settings is one row per setting (`Setting`: value, one-line
+    explanation, config key; Enter toggles, opens a chooser or edits), the
+    footer one navigation line plus the view's own keys; default-cancel scope
+    confirmations, selected-row scrolling and cell-safe, `…`-cut rows.
   - `lifecycle.rs`: shared CLI/TUI start/stop/restart/status ownership and
     transition checks; serializes commands separately from the runtime state lock.
   - `update.rs`: explicit stable-only official GitHub release checks and self-update;

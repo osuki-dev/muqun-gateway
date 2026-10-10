@@ -173,7 +173,7 @@ pub(crate) fn manage() -> anyhow::Result<()> {
         let item_count = match ui.section {
             Section::Terminals => load_config(None)?.sessions.len(),
             Section::Devices if !pairing.open => devices.len(),
-            Section::Settings => 4,
+            Section::Settings => Setting::ALL.len(),
             _ => 0,
         };
         if event.code == KeyCode::Esc {
@@ -216,11 +216,9 @@ pub(crate) fn manage() -> anyhow::Result<()> {
         }
         let input = match event.code {
             KeyCode::Char(ch) => ch.to_string(),
-            KeyCode::Enter => {
-                primary_action(ui.section, ui.selected, item_count == 0, pairing.open)
-                    .map(|ch| ch.to_string())
-                    .unwrap_or_default()
-            }
+            KeyCode::Enter => enter_action(ui.section, item_count == 0, pairing.open)
+                .unwrap_or_default()
+                .to_owned(),
             _ => String::new(),
         };
         if input == "q" {
@@ -257,8 +255,9 @@ pub(crate) fn manage() -> anyhow::Result<()> {
                     stop_background_inner(false)?;
                     message = String::from("Gateway stopped. Terminal tasks are still running.");
                 }
-                (Section::Overview, "r") => {
+                (Section::Overview | Section::Settings, "r") => {
                     crate::restart_gateway(false)?;
+                    ui.restart.clear();
                     message = String::from("gateway restarted");
                 }
                 (Section::Devices, "p") => {
@@ -267,10 +266,14 @@ pub(crate) fn manage() -> anyhow::Result<()> {
                     ui.scroll = 0;
                     message = String::from("scan to pair another device");
                 }
-                (Section::Devices, "x") if !pairing.open => {
+                (Section::Devices, "x" | "enter") if !pairing.open => {
                     if devices.is_empty() {
                         message = String::from("no paired devices to revoke");
                     } else if let Some(device) = devices.iter().rev().nth(ui.selected).cloned() {
+                        if input == "enter" && !show_device(&device)? {
+                            message = String::from(IDLE_STATUS);
+                            return Ok(());
+                        }
                         if !confirm_revoke_device(&device)? {
                             message = String::from("revoke cancelled");
                             return Ok(());
@@ -303,99 +306,77 @@ pub(crate) fn manage() -> anyhow::Result<()> {
                     ui.scroll = 0;
                     message = String::from("Pairing view closed; paired devices are unchanged.");
                 }
-                (Section::Settings, "u") => match prompt_public_url()? {
-                    Some(url) => {
-                        let listen = listen_for_explicit_public_url(&url, configured_port());
-                        update_public_url(&url, &listen)?;
-                        message = format!("url updated: {}", truncate(&url, 36));
-                    }
-                    None => {
-                        message = String::from("url unchanged");
-                    }
-                },
-                (Section::Settings, "a") => {
-                    let port = configured_port();
-                    let selection = auto_public_url(port);
-                    update_public_url(
-                        &selection.url,
-                        &format!("{}:{port}", selection.listen_host),
-                    )?;
-                    message = format!("auto url: {}", truncate(&selection.url, 36));
-                }
-                (Section::Settings, "e") => {
-                    message = toggle_transport_encryption()?;
-                }
                 (Section::Terminals, "h") => {
                     message = enable_managed_backend(BackendKind::Herdr)?;
                 }
                 (Section::Terminals, "m") => {
                     message = enable_managed_backend(BackendKind::Tmux)?;
                 }
-                (Section::Terminals, "d") => {
-                    if let Some(session) = load_config(None)?.sessions.get(ui.selected) {
-                        if confirm_remove_backend(session)? {
-                            message = remove_managed_backend(&session.id)?;
-                        } else {
-                            message = String::from("backend unchanged");
-                        }
-                    }
-                }
-                (Section::Terminals, "f") => {
-                    if let Some(session) = load_config(None)?.sessions.get(ui.selected) {
-                        message = set_managed_default_backend(&session.id)?;
+                (Section::Terminals, "enter") => {
+                    message = backend_actions(ui.selected)?;
+                    if message.starts_with("default is now") {
                         ui.selected = 0;
                         ui.scroll = 0;
                     }
                 }
-                (Section::Terminals, "b") => {
-                    if let Some(session) = load_config(None)?.sessions.get(ui.selected) {
-                        message = toggle_backend_autostart(&session.id)?;
-                    }
-                }
-                (Section::Settings, "g") => match autostart_toggle(service::state()) {
-                    AutostartToggle::Refuse(reason) => message = reason,
-                    toggle => {
-                        let enable = toggle == AutostartToggle::Install;
-                        if confirm_gateway_autostart(enable)? {
-                            crate::run_service_command(if enable {
-                                crate::ServiceCommand::Install
-                            } else {
-                                crate::ServiceCommand::Uninstall
-                            })?;
-                            message =
-                                format!("gateway autostart {}", if enable { "on" } else { "off" });
-                        } else {
-                            message = String::from("gateway autostart unchanged");
+                (Section::Settings, "enter") => {
+                    let setting = Setting::ALL[ui.selected.min(Setting::ALL.len() - 1)];
+                    let before = load_config(None)?;
+                    match setting {
+                        Setting::Autostart => match autostart_toggle(service::state()) {
+                            AutostartToggle::Refuse(reason) => message = reason,
+                            toggle => {
+                                let enable = toggle == AutostartToggle::Install;
+                                if confirm_gateway_autostart(enable)? {
+                                    crate::run_service_command(if enable {
+                                        crate::ServiceCommand::Install
+                                    } else {
+                                        crate::ServiceCommand::Uninstall
+                                    })?;
+                                    message = format!(
+                                        "gateway autostart {}",
+                                        if enable { "on" } else { "off" }
+                                    );
+                                } else {
+                                    message = String::from("gateway autostart unchanged");
+                                }
+                            }
+                        },
+                        Setting::Address => match prompt_public_url()? {
+                            Some(url) => {
+                                let listen =
+                                    listen_for_explicit_public_url(&url, configured_port());
+                                update_public_url(&url, &listen)?;
+                                message = format!("url updated: {}", truncate(&url, 36));
+                            }
+                            None => {
+                                message = String::from("url unchanged");
+                            }
+                        },
+                        Setting::DetectAddress => {
+                            let port = configured_port();
+                            let selection = auto_public_url(port);
+                            update_public_url(
+                                &selection.url,
+                                &format!("{}:{port}", selection.listen_host),
+                            )?;
+                            message = format!("auto url: {}", truncate(&selection.url, 36));
                         }
-                    }
-                },
-                (Section::Settings, "c") => {
-                    message =
-                        String::from("Checking official stable release (no background polling)...");
-                    print_manage_screen(
-                        &message,
-                        pending_pairing.as_ref(),
-                        &devices,
-                        &pairing,
-                        connectivity,
-                        &mut ui,
-                    )?;
-                    let plan = update::in_thread(update::check)?;
-                    message = plan.summary();
-                }
-                (Section::Settings, "i") => {
-                    message =
-                        String::from("Checking official stable release before confirmation...");
-                    print_manage_screen(
-                        &message,
-                        pending_pairing.as_ref(),
-                        &devices,
-                        &pairing,
-                        connectivity,
-                        &mut ui,
-                    )?;
-                    let plan = update::in_thread(update::check)?;
-                    if !plan.available() {
+                        Setting::TransportEncryption => message = toggle_transport_encryption()?,
+                        Setting::Updates => {
+                            message = String::from(
+                                "Checking official stable release before confirmation...",
+                            );
+                            print_manage_screen(
+                                &message,
+                                pending_pairing.as_ref(),
+                                &devices,
+                                &pairing,
+                                connectivity,
+                                &mut ui,
+                            )?;
+                            let plan = update::in_thread(update::check)?;
+                            if !plan.available() {
                         message = plan.summary();
                     } else if confirm_action("Install stable Gateway update?", &[
                         plan.summary(),
@@ -409,6 +390,24 @@ pub(crate) fn manage() -> anyhow::Result<()> {
                         message = update::in_thread(move || update::apply(plan))?;
                     } else {
                         message = String::from("Gateway update cancelled; no binary downloaded or restart.");
+                    }
+                        }
+                        Setting::HistoryStorage => match choose_history_storage()? {
+                            Some(changed) => message = changed,
+                            None => message = String::from("History checkpoints unchanged."),
+                        },
+                        Setting::AgentBypass => message = toggle_agent_bypass()?,
+                        Setting::AgentTrust => message = toggle_agent_trust()?,
+                        Setting::Mcp => message = toggle_mcp()?,
+                        Setting::StoreEncryption | Setting::AgentEnv | Setting::McpLoopback => {
+                            message = setting.read_only().unwrap_or(IDLE_STATUS).to_owned();
+                        }
+                    }
+                    // A change that needs a restart says so on its row.
+                    let after = load_config(None)?;
+                    let changed = serde_json::to_value(&before)? != serde_json::to_value(&after)?;
+                    if changed && setting.needs_restart() && !ui.restart.contains(&setting) {
+                        ui.restart.push(setting);
                     }
                 }
                 _ => {}
@@ -958,7 +957,7 @@ fn spawn_link_poller() -> std::sync::mpsc::Receiver<Connectivity> {
     receiver
 }
 
-/// What the footer's hints depend on besides the view.
+/// What the footer depends on besides the view.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct FooterContext {
     no_backends: bool,
@@ -967,89 +966,616 @@ struct FooterContext {
     pairing: Option<PairingStage>,
 }
 
-/// The footer's hint rows: the view's actions, then navigation.
-struct FooterHints {
-    /// The view's own keys, one key per action, each followed by the full
-    /// words for what it does.
-    actions: String,
-    /// Switching views, selecting, and leaving: Esc is always one level back
-    /// and `q` always closes the manager.
+/// The footer: one navigation line, the same shape on every view, and at
+/// most one group of the view's own keys -- the actions that are not a row.
+/// Everything a row does is its Enter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Footer {
     navigation: String,
-    /// The navigation row a short terminal shows instead: the same views,
-    /// Tab, Esc and `q`, in fewer words and without the selection keys.
-    compact_navigation: String,
+    actions: Option<String>,
 }
 
-/// Hints are separated by " | " so narrow terminals can wrap them.
-fn footer_hints(section: Section, context: &FooterContext) -> FooterHints {
+fn footer(section: Section, context: &FooterContext) -> Footer {
+    let enter = match (section, context.pairing) {
+        (Section::Devices, Some(_)) => "Enter back",
+        (Section::Terminals, _) if context.no_backends => "Enter add tmux",
+        (Section::Terminals, _) => "Enter actions",
+        (Section::Devices, None) if context.no_devices => "Enter pair",
+        (Section::Devices, None) => "Enter details",
+        _ => "Enter change",
+    };
+    let navigation = format!("↑↓ select · {enter} · Tab next view · q quit");
     let actions = match (section, context.pairing) {
-        (Section::Overview, _) => {
-            String::from("s Start gateway | t Stop gateway | r Restart gateway")
-        }
-        (Section::Terminals, _) if context.no_backends => {
-            String::from("m Add tmux backend | h Add Herdr backend")
-        }
-        (Section::Terminals, _) => String::from(
-            "f Make selected default | b Toggle terminal-server startup | d Remove selected backend | h Add Herdr backend | m Add tmux backend",
-        ),
-        // Leaving the pairing flow is Esc's job, listed under navigation;
-        // `r` does the same and is not listed twice.
-        (Section::Devices, Some(PairingStage::Done)) => String::from("p Pair another device"),
-        (Section::Devices, Some(_)) => String::new(),
-        (Section::Devices, None) if context.no_devices => String::from("p Pair first device"),
-        (Section::Devices, None) => {
-            String::from("x Revoke selected device | p Pair new device")
-        }
-        (Section::Settings, _) => String::from(
-            "Enter Change selected setting | g Gateway login autostart | u Edit address | a Detect address | e Toggle encryption | c Check updates | i Install update",
-        ),
+        (Section::Overview, _) => Some("s start · t stop · r restart"),
+        (Section::Terminals, _) => Some("h add Herdr · m add tmux"),
+        (Section::Devices, Some(PairingStage::Done)) => Some("p pair another · Esc back"),
+        (Section::Devices, Some(_)) => Some("Esc back"),
+        (Section::Devices, None) if context.no_devices => Some("p pair a device"),
+        (Section::Devices, None) => Some("p pair a device · x revoke"),
+        (Section::Settings, _) => Some("PgUp/PgDn scroll · r restart"),
     };
-    let views = (section == Section::Overview)
-        .then_some("1 Overview · 2 Terminals · 3 Devices · 4 Settings");
-    let select = (section != Section::Overview && context.pairing.is_none())
-        .then_some("Up/Down Select | PageUp/PageDown Scroll");
-    let (back, compact_back) = match (section, context.pairing) {
-        (Section::Overview, _) => ("Esc or q Close manager", "Esc or q Close manager"),
-        (Section::Devices, Some(_)) => (
-            "Esc Back to device list | q Close manager",
-            "Esc Back | q Close manager",
-        ),
-        _ => (
-            "Esc Back to Overview | q Close manager",
-            "Esc Back | q Close manager",
-        ),
-    };
-    let join = |hints: &[Option<&str>]| {
-        hints
-            .iter()
-            .flatten()
-            .copied()
-            .collect::<Vec<_>>()
-            .join(" | ")
-    };
-    FooterHints {
-        actions,
-        navigation: join(&[views, Some("Tab Next view"), select, Some(back)]),
-        compact_navigation: join(&[views, Some("Tab Views"), Some(compact_back)]),
+    Footer {
+        navigation,
+        actions: actions.map(str::to_owned),
     }
 }
 
-/// The key Enter stands in for on a view. Overview has none: its actions
-/// start, stop and restart the gateway, and none of those belongs on the key
-/// an operator leans on to look around.
-fn primary_action(
-    section: Section,
-    selected: usize,
-    empty_items: bool,
-    pairing_open: bool,
-) -> Option<char> {
+/// The footer's lines in `width` cells: navigation and actions on one line
+/// when they fit, the actions right-aligned; else on two.
+fn footer_lines(footer: &Footer, width: usize) -> Vec<ScreenLine> {
+    let shorter;
+    let footer = if display_width(&footer.navigation) > width {
+        shorter = Footer {
+            navigation: footer.navigation.replace("Tab next view", "Tab view"),
+            actions: footer.actions.clone(),
+        };
+        &shorter
+    } else {
+        footer
+    };
+    let Some(actions) = &footer.actions else {
+        return vec![ScreenLine::text(&footer.navigation, Tone::Quiet)];
+    };
+    let used = display_width(&footer.navigation) + display_width(actions);
+    if used + 3 <= width {
+        return vec![ScreenLine {
+            spans: vec![
+                (footer.navigation.clone(), Tone::Quiet),
+                (" ".repeat(width - used), Tone::Normal),
+                (actions.clone(), Tone::Accent),
+            ],
+            qr: None,
+        }];
+    }
+    vec![
+        ScreenLine::text(&footer.navigation, Tone::Quiet),
+        ScreenLine::text(actions, Tone::Accent),
+    ]
+}
+
+/// What Enter does on a view, as the key or action it stands for: `None` on
+/// Overview, whose actions start, stop and restart the gateway -- none of
+/// them belongs on the key an operator leans on to look around.
+fn enter_action(section: Section, empty_items: bool, pairing_open: bool) -> Option<&'static str> {
     match section {
         Section::Overview => None,
-        Section::Terminals => Some(if empty_items { 'm' } else { 'f' }),
+        Section::Terminals if empty_items => Some("m"),
         // The pairing view (QR, code, or done) returns to the list on Enter.
-        Section::Devices if pairing_open => Some('r'),
-        Section::Devices => Some(if empty_items { 'p' } else { 'x' }),
-        Section::Settings => ['g', 'u', 'e', 'c'].get(selected).copied(),
+        Section::Devices if pairing_open => Some("r"),
+        Section::Devices if empty_items => Some("p"),
+        _ => Some("enter"),
+    }
+}
+
+/// One row of the Settings view, in the order shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Setting {
+    Autostart,
+    Address,
+    DetectAddress,
+    TransportEncryption,
+    Updates,
+    HistoryStorage,
+    StoreEncryption,
+    AgentBypass,
+    AgentTrust,
+    AgentEnv,
+    Mcp,
+    McpLoopback,
+}
+
+impl Setting {
+    const ALL: [Self; 12] = [
+        Self::Autostart,
+        Self::Address,
+        Self::DetectAddress,
+        Self::TransportEncryption,
+        Self::Updates,
+        Self::HistoryStorage,
+        Self::StoreEncryption,
+        Self::AgentBypass,
+        Self::AgentTrust,
+        Self::AgentEnv,
+        Self::Mcp,
+        Self::McpLoopback,
+    ];
+
+    fn group(self) -> &'static str {
+        match self {
+            Self::Autostart
+            | Self::Address
+            | Self::DetectAddress
+            | Self::TransportEncryption
+            | Self::Updates => "GATEWAY",
+            Self::HistoryStorage | Self::StoreEncryption => "STORAGE",
+            Self::AgentBypass | Self::AgentTrust | Self::AgentEnv => {
+                "AGENTS STARTED FROM THE PHONE"
+            }
+            Self::Mcp | Self::McpLoopback => "ASSISTANT ACCESS",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Autostart => "Login autostart",
+            Self::Address => "Gateway address",
+            Self::DetectAddress => "Detect address",
+            Self::TransportEncryption => "Transport encryption",
+            Self::Updates => "Updates",
+            Self::HistoryStorage => "History checkpoints",
+            Self::StoreEncryption => "Store encryption",
+            Self::AgentBypass => "Skip the agent's own approval prompts",
+            Self::AgentTrust => "Trust the task folder automatically",
+            Self::AgentEnv => "Environment passed to agents",
+            Self::Mcp => "MCP server",
+            Self::McpLoopback => "Loopback only",
+        }
+    }
+
+    /// The feature the row switches, in one line.
+    fn explanation(self) -> &'static str {
+        match self {
+            Self::Autostart => "Starts Gateway when you log in.",
+            Self::Address => "What the App dials. Enter edits it.",
+            Self::DetectAddress => {
+                "Finds this computer's LAN or tailnet address and uses it as the address."
+            }
+            Self::TransportEncryption => {
+                "Encrypts new pairings. Devices already paired keep what they have."
+            }
+            Self::Updates => "Enter checks for a stable release. Installing always asks first.",
+            Self::HistoryStorage => "Keeps agent panes' scrollback across restarts.",
+            Self::StoreEncryption => "How tokens and history are encrypted at rest.",
+            Self::AgentBypass => {
+                "Launches with the bypass flags so a task never stalls on a prompt."
+            }
+            Self::AgentTrust => {
+                "Pre-accepts the agent's folder trust dialog for the task's folder."
+            }
+            Self::AgentEnv => "Variables every agent the gateway starts receives.",
+            Self::Mcp => "Lets agents on this computer use the muqun tools (tasks, fleet).",
+            Self::McpLoopback => "The MCP endpoint answers this computer only.",
+        }
+    }
+
+    /// Where the setting lives, shown in grey beside its explanation.
+    fn source(self) -> Option<&'static str> {
+        match self {
+            Self::Autostart => Some("user service"),
+            Self::Address => Some("config.json › public_url"),
+            Self::TransportEncryption => Some("config.json › transport_encryption"),
+            Self::HistoryStorage => Some("config.json › history.storage"),
+            Self::StoreEncryption => Some("config.json › store.encryption"),
+            Self::AgentBypass => Some("agent_launch_args"),
+            Self::AgentTrust => Some("agent_trust_folders"),
+            Self::AgentEnv => Some("agent_env"),
+            Self::Mcp => Some("mcp.enabled"),
+            Self::DetectAddress | Self::Updates | Self::McpLoopback => None,
+        }
+    }
+
+    /// Whether a change takes effect only once Gateway restarts.
+    fn needs_restart(self) -> bool {
+        matches!(
+            self,
+            Self::Address
+                | Self::DetectAddress
+                | Self::TransportEncryption
+                | Self::HistoryStorage
+                | Self::Mcp
+        )
+    }
+
+    /// The status line Enter gives a row it cannot change.
+    fn read_only(self) -> Option<&'static str> {
+        match self {
+            Self::StoreEncryption => Some(
+                "Store encryption is chosen when the store is created; it is not changed here.",
+            ),
+            Self::AgentEnv => Some("Edit agent_env in config.json; values are never shown here."),
+            Self::McpLoopback => Some("The MCP endpoint always answers this computer only."),
+            _ => None,
+        }
+    }
+}
+
+/// Whether each built-in kind starts with its bypass flags: "On" with the
+/// defaults (or an override that keeps the flag), "Off" with an empty
+/// override, "custom" with any other.
+fn bypass_states(
+    overrides: &std::collections::BTreeMap<String, Vec<String>>,
+) -> [(&'static str, &'static str); 2] {
+    ["codex", "claude"].map(|kind| {
+        let state = match overrides.get(kind) {
+            None => "On",
+            Some(args) if args.is_empty() => "Off",
+            Some(args)
+                if args.iter().any(|arg| {
+                    arg == crate::agents::tasks::CODEX_BYPASS_FLAG
+                        || arg == crate::agents::tasks::CLAUDE_BYPASS_FLAG
+                }) =>
+            {
+                "On"
+            }
+            Some(_) => "custom",
+        };
+        (kind, state)
+    })
+}
+
+fn on_off(on: bool) -> &'static str {
+    if on {
+        "On"
+    } else {
+        "Off"
+    }
+}
+
+/// The value a Settings row shows.
+fn setting_value(setting: Setting, config: &crate::Config, autostart: &str) -> String {
+    match setting {
+        Setting::Autostart => autostart
+            .split_once(" - ")
+            .map_or(autostart, |(state, _)| state)
+            .to_owned(),
+        Setting::Address => config.public_url.clone(),
+        Setting::DetectAddress => String::from("Enter"),
+        Setting::TransportEncryption => {
+            on_off(config.transport_encryption == TransportEncryptionMode::Required).to_owned()
+        }
+        Setting::Updates => env!("CARGO_PKG_VERSION").to_owned(),
+        Setting::HistoryStorage => match config.history.storage {
+            crate::HistoryStorage::Memory => String::from("memory"),
+            crate::HistoryStorage::Sqlite => String::from("SQLite"),
+        },
+        Setting::StoreEncryption => match config.store.encryption {
+            crate::StoreEncryption::File => String::from("file key · read-only"),
+            crate::StoreEncryption::Off => String::from("off · read-only"),
+        },
+        Setting::AgentBypass => bypass_states(&config.agent_launch_args)
+            .map(|(kind, state)| format!("{kind} {state}"))
+            .join(" · "),
+        Setting::AgentTrust => on_off(config.agent_trust_folders).to_owned(),
+        Setting::AgentEnv => {
+            let keys: Vec<&str> = config.agent_env.0.keys().map(String::as_str).collect();
+            if keys.is_empty() {
+                String::from("none")
+            } else {
+                format!("{} · values hidden", keys.join(", "))
+            }
+        }
+        Setting::Mcp => on_off(config.mcp.enabled).to_owned(),
+        Setting::McpLoopback => String::from("On · read-only"),
+    }
+}
+
+/// `text` in at most `cells` cells, cut with `…` when it does not fit.
+fn fit(text: &str, cells: usize) -> String {
+    if display_width(text) <= cells {
+        return text.to_owned();
+    }
+    if cells == 0 {
+        return String::new();
+    }
+    format!("{}…", clip_cells(text, cells - 1))
+}
+
+/// A row with its label on the left and its value on the right, in `width`
+/// cells; the value is cut with `…` before the label is.
+fn value_row(label: &str, value: &str, selected: bool, width: usize) -> ScreenLine {
+    let left = safe_text(&format!("{}{label}", if selected { "▌ " } else { "  " }));
+    let room = width.saturating_sub(display_width(&left) + 2);
+    let value = fit(&safe_text(value), room);
+    let pad = width.saturating_sub(display_width(&left) + display_width(&value));
+    let (label_tone, value_tone) = if selected {
+        (Tone::Selected, Tone::Selected)
+    } else {
+        (Tone::Normal, Tone::Accent)
+    };
+    ScreenLine {
+        spans: vec![
+            (left, label_tone),
+            (" ".repeat(pad), label_tone),
+            (value, value_tone),
+        ],
+        qr: None,
+    }
+}
+
+/// A row's explanation, indented, with where it lives right-aligned in grey
+/// when both fit.
+fn help_row(explanation: &str, source: Option<&str>, width: usize) -> ScreenLine {
+    let text = format!("   {explanation}");
+    match source {
+        Some(source) if display_width(&text) + 2 + display_width(source) <= width => {
+            let pad = width - display_width(&text) - display_width(source);
+            ScreenLine {
+                spans: vec![
+                    (text, Tone::Quiet),
+                    (" ".repeat(pad), Tone::Quiet),
+                    (source.to_owned(), Tone::Quiet),
+                ],
+                qr: None,
+            }
+        }
+        _ => ScreenLine::text(text, Tone::Quiet),
+    }
+}
+
+fn write_config_with(change: impl FnOnce(&mut crate::Config)) -> anyhow::Result<crate::Config> {
+    let mut config = load_config(None)?;
+    change(&mut config);
+    write_config(&config_dir()?.join(CONFIG_FILE), &config)?;
+    Ok(config)
+}
+
+/// Enter on "Skip the agent's own approval prompts": off by an empty
+/// override for both kinds; on by removing those overrides, after a
+/// confirmation, since it lets the agents act without asking. Custom launch
+/// arguments are left for config.json.
+fn toggle_agent_bypass() -> anyhow::Result<String> {
+    let config = load_config(None)?;
+    let states = bypass_states(&config.agent_launch_args);
+    if states.iter().any(|(_, state)| *state == "custom") {
+        return Ok(String::from(
+            "Custom launch arguments are set; edit agent_launch_args in config.json.",
+        ));
+    }
+    if states.iter().all(|(_, state)| *state == "On") {
+        write_config_with(|config| {
+            for kind in ["codex", "claude"] {
+                config.agent_launch_args.insert(kind.to_owned(), Vec::new());
+            }
+        })?;
+        return Ok(String::from(
+            "Agents now start with their own approval prompts; a task may wait for you.",
+        ));
+    }
+    if !confirm_action(
+        "Skip the agents' own approval prompts?",
+        &[
+            String::from("Codex and Claude Code started from the phone run without asking."),
+            String::from("Only for agents the gateway starts; your own terminals are unchanged."),
+        ],
+        "skip prompts",
+    )? {
+        return Ok(String::from("Approval prompts unchanged."));
+    }
+    write_config_with(|config| {
+        for kind in ["codex", "claude"] {
+            config.agent_launch_args.remove(kind);
+        }
+    })?;
+    Ok(String::from(
+        "Agents started from the phone skip their own approval prompts.",
+    ))
+}
+
+fn toggle_agent_trust() -> anyhow::Result<String> {
+    let config = write_config_with(|config| {
+        config.agent_trust_folders = !config.agent_trust_folders;
+    })?;
+    Ok(format!(
+        "Trust the task folder automatically: {}; applies to the next agent started.",
+        on_off(config.agent_trust_folders)
+    ))
+}
+
+fn toggle_mcp() -> anyhow::Result<String> {
+    let config = write_config_with(|config| config.mcp.enabled = !config.mcp.enabled)?;
+    Ok(format!(
+        "MCP server: {}; press r to restart Gateway and apply.",
+        on_off(config.mcp.enabled)
+    ))
+}
+
+/// Enter on "History checkpoints": a chooser; the pick is written and needs
+/// a restart. `None` when nothing changed.
+fn choose_history_storage() -> anyhow::Result<Option<String>> {
+    let current = load_config(None)?.history.storage;
+    let options = [
+        (
+            crate::HistoryStorage::Memory,
+            "memory",
+            "only while Gateway runs",
+        ),
+        (
+            crate::HistoryStorage::Sqlite,
+            "SQLite",
+            "survives restarts · encrypted store",
+        ),
+    ];
+    let start = options
+        .iter()
+        .position(|(storage, _, _)| *storage == current)
+        .unwrap_or(0);
+    let Some(pick) = choose(
+        "History checkpoints",
+        &[String::from(
+            "Where captured scrollback of agent panes is kept.",
+        )],
+        &options.map(|(_, label, detail)| (label.to_owned(), detail.to_owned())),
+        start,
+        Some("Changing this needs a restart. Enter picks, then r restarts."),
+    )?
+    else {
+        return Ok(None);
+    };
+    let (storage, label, _) = options[pick];
+    if storage == current {
+        return Ok(None);
+    }
+    write_config_with(|config| config.history.storage = storage)?;
+    Ok(Some(format!(
+        "History checkpoints: {label}; press r to restart Gateway and apply."
+    )))
+}
+
+/// A small list to pick one entry from, Enter picks and Esc cancels.
+fn choose(
+    title: &str,
+    about: &[String],
+    options: &[(String, String)],
+    start: usize,
+    note: Option<&str>,
+) -> anyhow::Result<Option<usize>> {
+    let mut selected = start.min(options.len().saturating_sub(1));
+    loop {
+        let (width, height) = terminal_size().unwrap_or((100, 30));
+        let budget = (width.saturating_sub(1) as usize).min(92);
+        let framed = budget >= 48 && height >= 14;
+        let inner = if framed {
+            budget.saturating_sub(4)
+        } else {
+            budget
+        };
+        let label_width = options
+            .iter()
+            .map(|(label, _)| display_width(label))
+            .max()
+            .unwrap_or(0)
+            + 4;
+        let mut rows = Vec::new();
+        for line in about {
+            rows.extend(wrapped_rows("", line, inner));
+        }
+        rows.push(ScreenLine::plain(""));
+        for (index, (label, detail)) in options.iter().enumerate() {
+            let marker = if index == selected { "▌ " } else { "  " };
+            let pad = label_width.saturating_sub(display_width(label));
+            rows.push(ScreenLine::text(
+                fit(
+                    &format!("{marker}{label}{}{detail}", " ".repeat(pad)),
+                    inner,
+                ),
+                if index == selected {
+                    Tone::Selected
+                } else {
+                    Tone::Normal
+                },
+            ));
+        }
+        if let Some(note) = note {
+            rows.push(ScreenLine::plain(""));
+            rows.extend(wrapped_rows("", note, inner));
+        }
+        let mut lines = Vec::new();
+        panel(&mut lines, title, rows, budget, framed);
+        lines.truncate((height as usize).saturating_sub(1));
+        lines.push(ScreenLine::text(
+            fit("↑↓ choose · Enter pick · Esc cancel", budget),
+            Tone::Quiet,
+        ));
+        write_viewport(&lines, width, height)?;
+        if let TerminalEvent::Key(event) = read_event()? {
+            if event.kind != KeyEventKind::Press {
+                continue;
+            }
+            match event.code {
+                KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    selected = (selected + 1).min(options.len().saturating_sub(1))
+                }
+                KeyCode::Enter => return Ok(Some(selected)),
+                KeyCode::Esc | KeyCode::Char('q') => return Ok(None),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Enter on a terminal backend: its three actions in a chooser.
+fn backend_actions(index: usize) -> anyhow::Result<String> {
+    let config = load_config(None)?;
+    let Some(session) = config.sessions.get(index).cloned() else {
+        return Ok(String::from(IDLE_STATUS));
+    };
+    let starts = config.autostart_backends.contains(&session.id);
+    let options = [
+        (
+            String::from("Make default"),
+            String::from(if index == 0 {
+                "already the default"
+            } else {
+                "the App opens it first"
+            }),
+        ),
+        (
+            String::from("Start with Gateway"),
+            format!("{} → {}", on_off(starts), on_off(!starts)),
+        ),
+        (
+            String::from("Remove backend"),
+            String::from(if config.sessions.len() > 1 {
+                "asks first"
+            } else {
+                "the only backend stays"
+            }),
+        ),
+    ];
+    let pick = choose(
+        &format!("{} · {}", session.id, session.label),
+        &[String::from(
+            "Removing a backend never closes its terminals. Changes apply after a Gateway restart.",
+        )],
+        &options,
+        0,
+        None,
+    )?;
+    Ok(match pick {
+        None => String::from("backend unchanged"),
+        Some(0) if index == 0 => format!("{} is already the default", session.id),
+        Some(0) => set_managed_default_backend(&session.id)?,
+        Some(1) => toggle_backend_autostart(&session.id)?,
+        Some(_) if confirm_remove_backend(&session)? => remove_managed_backend(&session.id)?,
+        Some(_) => String::from("backend unchanged"),
+    })
+}
+
+fn device_kind(device: &DeviceRecord) -> &'static str {
+    match device.kind {
+        crate::authority::DeviceKind::App => "phone",
+        crate::authority::DeviceKind::Gateway => "gateway",
+    }
+}
+
+fn last_seen(device: &DeviceRecord) -> String {
+    if device.last_seen_unix_ms == 0 {
+        String::from("—")
+    } else {
+        relative_since(device.last_seen_unix_ms)
+    }
+}
+
+/// Enter on a paired device: what is known about it. Whether `x` was pressed
+/// there to revoke it.
+fn show_device(device: &DeviceRecord) -> anyhow::Result<bool> {
+    let details = [
+        format!("Kind: {}", device_kind(device)),
+        format!("Paired: {}", relative_since(device.paired_unix_ms)),
+        format!("Last seen: {}", last_seen(device)),
+        String::from(if device.kind == crate::authority::DeviceKind::Gateway {
+            "Another of your computers; revoking it stops that computer sending work here."
+        } else {
+            "Revoking it removes its access at once; it can pair again."
+        }),
+    ];
+    loop {
+        write_dialog(
+            &device.name,
+            &details,
+            ScreenLine::text("x revoke · Esc back", Tone::Quiet),
+        )?;
+        if let TerminalEvent::Key(event) = read_event()? {
+            if event.kind != KeyEventKind::Press {
+                continue;
+            }
+            match event.code {
+                KeyCode::Char('x') => return Ok(true),
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => return Ok(false),
+                _ => {}
+            }
+        }
     }
 }
 
@@ -1058,6 +1584,9 @@ struct ManageView {
     section: Section,
     selected: usize,
     scroll: usize,
+    /// Settings changed here that apply only after a restart; their rows say
+    /// so until Gateway restarts.
+    restart: Vec<Setting>,
 }
 
 impl ManageView {
@@ -1378,40 +1907,6 @@ fn wrapped_rows(label: &str, value: &str, width: usize) -> Vec<ScreenLine> {
     lines.into_iter().map(ScreenLine::plain).collect()
 }
 
-/// Hints wrap at " | "; a hint wider than the row on its own, such as the
-/// views list, wraps at " · " rather than being clipped mid-word.
-fn shortcut_rows(hints: &str, width: usize, tone: Tone) -> Vec<ScreenLine> {
-    let mut rows = Vec::new();
-    let mut line = String::new();
-    for hint in hints.split(" | ") {
-        if !line.is_empty() && display_width(&line) + 3 + display_width(hint) > width {
-            rows.push(ScreenLine::text(&line, tone));
-            line.clear();
-        }
-        if line.is_empty() && display_width(hint) > width && hint.contains(" · ") {
-            for part in hint.split(" · ") {
-                if !line.is_empty() && display_width(&line) + 3 + display_width(part) > width {
-                    rows.push(ScreenLine::text(&line, tone));
-                    line.clear();
-                }
-                if !line.is_empty() {
-                    line.push_str(" · ");
-                }
-                line.push_str(part);
-            }
-            continue;
-        }
-        if !line.is_empty() {
-            line.push_str(" | ");
-        }
-        line.push_str(hint);
-    }
-    if !line.is_empty() {
-        rows.push(ScreenLine::text(line, tone));
-    }
-    rows
-}
-
 fn manage_lines(
     data: &ManageData<'_>,
     ui: &mut ManageView,
@@ -1432,7 +1927,7 @@ fn manage_lines(
     ui.selected = ui.selected.min(match ui.section {
         Section::Terminals => config.sessions.len().saturating_sub(1),
         Section::Devices => data.devices.len().saturating_sub(1),
-        Section::Settings => 3,
+        Section::Settings => Setting::ALL.len() - 1,
         Section::Overview => 0,
     });
     let status = header_line(
@@ -1464,6 +1959,16 @@ fn manage_lines(
         ],
         qr: None,
     }];
+    if data.changed {
+        let badge = "Restart needed";
+        if header[0].width() + 3 + display_width(badge) <= content {
+            let pad = content - header[0].width() - display_width(badge);
+            header[0].spans.push((" ".repeat(pad), Tone::Normal));
+            header[0].spans.push((badge.into(), Tone::Warning));
+        } else {
+            header.push(ScreenLine::text(badge, Tone::Warning));
+        }
+    }
     let mut tabs = ScreenLine {
         spans: Vec::new(),
         qr: None,
@@ -1488,7 +1993,7 @@ fn manage_lines(
     }
     let pairing_stage = data.pairing.stage(data.pending.is_some());
     let show_pairing = data.pairing.open;
-    let hints = footer_hints(
+    let shape = footer(
         ui.section,
         &FooterContext {
             no_backends: config.sessions.is_empty(),
@@ -1496,8 +2001,11 @@ fn manage_lines(
             pairing: show_pairing.then_some(pairing_stage),
         },
     );
-    let mut footer = shortcut_rows(&hints.actions, content, Tone::Accent);
-    footer.extend(shortcut_rows(&hints.navigation, content, Tone::Quiet));
+    let mut footer = footer_lines(&shape, content);
+    // A short window keeps the navigation line and the status line only.
+    if height < 14 {
+        footer.truncate(1);
+    }
     footer.push(ScreenLine::text(
         format!(
             "{}{}",
@@ -1514,48 +2022,6 @@ fn manage_lines(
             Tone::Normal
         },
     ));
-    // Small windows keep one primary action and one status row, not a wall of shortcuts.
-    if height < 14 {
-        footer = hints
-            .actions
-            .split(" | ")
-            .next()
-            .filter(|hint| !hint.is_empty())
-            .map(|hint| vec![ScreenLine::text(hint, Tone::Accent)])
-            .unwrap_or_default();
-        footer.extend(shortcut_rows(
-            &hints.compact_navigation,
-            content,
-            Tone::Quiet,
-        ));
-        footer.push(ScreenLine::plain(format!("Status: {}", data.message)));
-    }
-    let pinned_backend =
-        ui.section == Section::Terminals && height >= 14 && config.sessions.len() + 12 >= height;
-    if pinned_backend {
-        if let Some(session) = config.sessions.get(ui.selected) {
-            let mut context = vec![
-                ScreenLine::text(
-                    format!("Selected: {} ({})", session.label, session.backend.as_str()),
-                    Tone::Title,
-                ),
-                ScreenLine::plain(format!(
-                    "Terminal-server startup: {} (on Gateway start)",
-                    if config.autostart_backends.contains(&session.id) {
-                        "On"
-                    } else {
-                        "Off"
-                    }
-                )),
-                ScreenLine::text(
-                    format!("Endpoint: {}", backend_endpoint(session)),
-                    Tone::Quiet,
-                ),
-            ];
-            context.extend(footer);
-            footer = context;
-        }
-    }
     let body_height = height.saturating_sub(header.len() + footer.len());
     let mut body = Vec::new();
     match ui.section {
@@ -1574,18 +2040,25 @@ fn manage_lines(
             if framed {
                 rows.insert(0, ScreenLine::text(&config.label, Tone::Title));
             }
-            if data.changed {
-                rows.push(ScreenLine::text(
-                    "Settings changed: restart Gateway to apply.",
-                    Tone::Warning,
-                ));
-            }
             panel(&mut body, "Runtime", rows, content, framed);
             let mut rows = wrapped_rows("Address", &config.public_url, inner);
             rows.push(ScreenLine::plain(format!("Listener: {}", config.listen)));
+            let gateways = data
+                .devices
+                .iter()
+                .filter(|device| device.kind == crate::authority::DeviceKind::Gateway)
+                .count();
             rows.push(ScreenLine::plain(format!(
-                "Devices: {} paired",
-                data.devices.len()
+                "Devices: {} paired{}",
+                data.devices.len(),
+                if gateways > 0 {
+                    format!(
+                        " · {gateways} gateway{}",
+                        if gateways == 1 { "" } else { "s" }
+                    )
+                } else {
+                    String::new()
+                }
             )));
             if data.pending.is_some() {
                 rows.push(ScreenLine::text(
@@ -1600,9 +2073,9 @@ fn manage_lines(
                 .enumerate()
                 .map(|(index, session)| {
                     ScreenLine::plain(format!(
-                        "{}{}: {}",
+                        "{}{} · {}",
                         session.id,
-                        if index == 0 { " [default]" } else { "" },
+                        if index == 0 { " default" } else { "" },
                         data.backend_states
                             .get(index)
                             .map(String::as_str)
@@ -1627,63 +2100,46 @@ fn manage_lines(
         }
         Section::Terminals => {
             ui.selected = ui.selected.min(config.sessions.len().saturating_sub(1));
-            let mut rows = config
-                .sessions
-                .iter()
-                .enumerate()
-                .map(|(index, session)| {
-                    ScreenLine::text(
-                        format!(
-                            "{} {}{}  {}",
-                            if index == ui.selected { ">" } else { " " },
-                            session.id,
-                            if index == 0 { " [default]" } else { "" },
-                            session.label
-                        ),
-                        if index == ui.selected {
-                            Tone::Selected
-                        } else {
-                            Tone::Normal
-                        },
-                    )
-                })
-                .collect::<Vec<_>>();
-            if rows.is_empty() {
-                rows.push(ScreenLine::plain(
-                    "No terminal backends. Enter Add tmux or h Add Herdr.",
+            body.push(ScreenLine::text("TERMINAL BACKENDS", Tone::Title));
+            for (index, session) in config.sessions.iter().enumerate() {
+                let starts = config.autostart_backends.contains(&session.id);
+                let value = match (index == 0, starts) {
+                    (true, true) => "default · starts with Gateway",
+                    (true, false) => "default · on demand",
+                    (false, true) => "starts with Gateway",
+                    (false, false) => "on demand",
+                };
+                let name = format!("{:<12} {}", session.id, session.label);
+                body.push(value_row(&name, value, index == ui.selected, content));
+                body.push(ScreenLine::text(
+                    format!(
+                        "   {}",
+                        data.backend_states
+                            .get(index)
+                            .filter(|state| !state.is_empty())
+                            .cloned()
+                            .unwrap_or_else(|| backend_endpoint(session))
+                    ),
+                    Tone::Quiet,
                 ));
             }
-            panel(
-                &mut body,
-                "Terminal backends - select with arrows",
-                rows,
-                content,
-                framed,
-            );
-            if let Some(session) = config.sessions.get(ui.selected).filter(|_| !pinned_backend) {
-                let mut details = vec![
-                    ScreenLine::plain(format!(
-                        "Selected: {} ({})",
-                        session.label,
-                        session.backend.as_str()
-                    )),
-                    ScreenLine::plain(format!(
-                        "Terminal-server startup: {} (on Gateway start)",
-                        if config.autostart_backends.contains(&session.id) {
-                            "On"
-                        } else {
-                            "Off"
-                        }
-                    )),
-                ];
-                details.extend(wrapped_rows("Endpoint", &backend_endpoint(session), inner));
-                panel(&mut body, "Selected backend", details, content, framed);
+            if config.sessions.is_empty() {
+                body.push(ScreenLine::plain(
+                    "No terminal backends. Enter adds tmux; h adds Herdr.",
+                ));
             }
-            body.push(ScreenLine::plain(
-                "Enter makes the selected backend the default for the App.",
-            ));
+            body.push(ScreenLine::plain(""));
+            body.extend(
+                wrapped_rows(
+                    "",
+                    "Enter opens the backend's actions. Removing a backend never closes its terminals.",
+                    content,
+                )
+                .into_iter()
+                .map(|line| ScreenLine::text(line.spans[0].0.trim_start(), Tone::Quiet)),
+            );
             body.push(ScreenLine::text(
-                "Removal never closes terminals. Restart Gateway after changes.",
+                "Changes apply after a Gateway restart.",
                 Tone::Quiet,
             ));
         }
@@ -1773,131 +2229,116 @@ fn manage_lines(
                 }
             } else {
                 ui.selected = ui.selected.min(data.devices.len().saturating_sub(1));
-                let mut rows = data
-                    .devices
-                    .iter()
-                    .rev()
-                    .enumerate()
-                    .map(|(index, device)| {
-                        ScreenLine::text(
-                            format!(
-                                "{} {}  (paired {})",
-                                if index == ui.selected { ">" } else { " " },
-                                device.listed_name(),
-                                relative_since(device.paired_unix_ms)
-                            ),
-                            if index == ui.selected {
-                                Tone::Selected
-                            } else {
-                                Tone::Normal
-                            },
+                // Columns: name, then kind, paired and last seen while they fit.
+                let columns: &[(&str, usize)] = if content >= 64 {
+                    &[("kind", 10), ("paired", 14), ("last seen", 12)]
+                } else if content >= 40 {
+                    &[("kind", 10)]
+                } else {
+                    &[]
+                };
+                let name_width =
+                    content.saturating_sub(columns.iter().map(|(_, w)| w).sum::<usize>());
+                let row = |name: String, cells: &[String], tone: Tone| {
+                    let mut text = format!(
+                        "{}{}",
+                        fit(&name, name_width),
+                        " ".repeat(
+                            name_width.saturating_sub(display_width(&fit(&name, name_width)))
                         )
-                    })
-                    .collect::<Vec<_>>();
-                if rows.is_empty() {
-                    rows.push(ScreenLine::plain("No devices paired yet."));
-                    rows.push(ScreenLine::text(
+                    );
+                    for ((_, width), cell) in columns.iter().zip(cells) {
+                        let cell = fit(cell, width - 1);
+                        text.push_str(&cell);
+                        text.push_str(&" ".repeat(width.saturating_sub(display_width(&cell))));
+                    }
+                    ScreenLine::text(text.trim_end(), tone)
+                };
+                body.push(row(
+                    String::from("PAIRED DEVICES"),
+                    &columns
+                        .iter()
+                        .map(|(title, _)| (*title).to_owned())
+                        .collect::<Vec<_>>(),
+                    Tone::Title,
+                ));
+                for (index, device) in data.devices.iter().rev().enumerate() {
+                    let selected = index == ui.selected;
+                    body.push(row(
+                        format!("{}{}", if selected { "▌ " } else { "  " }, device.name),
+                        &[
+                            device_kind(device).to_owned(),
+                            relative_since(device.paired_unix_ms),
+                            last_seen(device),
+                        ],
+                        if selected {
+                            Tone::Selected
+                        } else {
+                            Tone::Normal
+                        },
+                    ));
+                }
+                if data.devices.is_empty() {
+                    body.push(ScreenLine::plain("No devices paired yet."));
+                    body.push(ScreenLine::text(
                         "Press Enter to pair your first device with Muqun.",
                         Tone::Accent,
                     ));
                 }
-                panel(&mut body, "Paired devices", rows, content, framed);
+                body.push(ScreenLine::plain(""));
                 if let Some(pending) = data.pending {
                     body.push(ScreenLine::text(
                         format!(
-                            "{}{} is waiting for its pairing code: press p to show it.",
-                            pending.device_name,
-                            if pending.kind == crate::connectivity::authority::DeviceKind::Gateway {
-                                " (gateway)"
-                            } else {
-                                ""
-                            }
+                            "{} is waiting for its pairing code: press p to show it.",
+                            pending.device_name
                         ),
                         Tone::Warning,
                     ));
                 }
                 if !data.devices.is_empty() {
-                    body.push(ScreenLine::plain(
-                        "Enter reviews revocation; the selected device will lose access.",
-                    ));
+                    for text in [
+                        "Enter shows the device; x revokes it after a confirmation. A revoked device loses access at once.",
+                        "A gateway device is another of your computers; revoking it stops that computer sending work here.",
+                    ] {
+                        body.extend(
+                            wrapped_rows("", text, content)
+                                .into_iter()
+                                .map(|line| ScreenLine::text(line.spans[0].0.trim_start(), Tone::Quiet)),
+                        );
+                    }
                 }
             }
         }
         Section::Settings => {
-            ui.selected = ui.selected.min(3);
-            let settings = [
-                format!("Gateway login autostart: {}", data.autostart),
-                format!("Gateway address: {}", config.public_url),
-                format!(
-                    "Transport encryption: {}",
-                    config.transport_encryption.as_str()
-                ),
-                String::from("Stable Gateway updates: Enter checks; i installs with confirmation"),
-            ];
-            panel(
-                &mut body,
-                "Gateway settings - Enter changes selected",
-                settings
-                    .iter()
-                    .enumerate()
-                    .map(|(index, text)| {
-                        ScreenLine::text(
-                            format!("{} {text}", if index == ui.selected { ">" } else { " " }),
-                            if index == ui.selected {
-                                Tone::Selected
-                            } else {
-                                Tone::Normal
-                            },
-                        )
-                    })
-                    .collect(),
-                content,
-                framed,
-            );
-            let mut rows = vec![
-                ScreenLine::plain("Gateway login autostart starts Gateway when you log in."),
-                ScreenLine::plain("Terminal-server startup is separate: 2 Terminals, b."),
-                ScreenLine::plain("That starts opted-in terminal servers on Gateway start."),
-            ];
-            if config.transport_encryption == TransportEncryptionMode::Disabled {
-                rows.push(ScreenLine::text(
-                    "Warning: token-only mode. A leaked token can call the API.",
-                    Tone::Warning,
+            ui.selected = ui.selected.min(Setting::ALL.len() - 1);
+            let mut group = "";
+            for (index, setting) in Setting::ALL.iter().enumerate() {
+                if setting.group() != group {
+                    if !group.is_empty() {
+                        body.push(ScreenLine::plain(""));
+                    }
+                    group = setting.group();
+                    body.push(ScreenLine::text(group, Tone::Title));
+                }
+                let mut value = setting_value(*setting, config, data.autostart);
+                if data.changed && ui.restart.contains(setting) {
+                    value.push_str(" · restart needed");
+                }
+                body.push(value_row(
+                    setting.label(),
+                    &value,
+                    index == ui.selected,
+                    content,
                 ));
+                body.push(help_row(setting.explanation(), setting.source(), content));
             }
-            rows.push(ScreenLine::plain(
-                "Address/encryption edits need a Gateway restart.",
-            ));
-            rows.push(ScreenLine::text(
-                "Encryption edits affect new pairings, not existing devices.",
+            // Linking this computer with your others gets its own row here.
+            body.push(ScreenLine::plain(""));
+            body.push(ScreenLine::text("OTHER COMPUTERS", Tone::Title));
+            body.push(ScreenLine::text(
+                "  Linking between your computers appears here once it is available.",
                 Tone::Quiet,
             ));
-            rows.push(ScreenLine::plain(
-                "Updates are manual only; never background-installed or downgraded.",
-            ));
-            panel(&mut body, "What these settings do", rows, content, framed);
-            let mut agents: Vec<ScreenLine> = crate::agents::tasks::launch_defaults(
-                &config.agent_launch_args,
-                config.agent_trust_folders,
-            )
-            .into_iter()
-            .map(ScreenLine::plain)
-            .collect();
-            agents.push(ScreenLine::text(
-                "The default flags skip the agent's own approval prompts.",
-                Tone::Warning,
-            ));
-            agents.push(ScreenLine::text(
-                "Change: agent_launch_args, agent_trust_folders in config.json.",
-                Tone::Quiet,
-            ));
-            panel(
-                &mut body,
-                "Agents started from the phone",
-                agents,
-                content,
-                framed,
-            );
         }
     }
     let selected_line = body.iter().position(ScreenLine::selected);
@@ -1915,11 +2356,7 @@ fn manage_lines(
     lines.truncate(height);
     for line in &mut lines {
         if line.qr.is_none() {
-            let mut budget = content;
-            for (text, _) in &mut line.spans {
-                *text = clip_cells(text, budget).to_owned();
-                budget = budget.saturating_sub(display_width(text));
-            }
+            fit_line(line, content);
         }
     }
     if margin > 0 {
@@ -1932,6 +2369,28 @@ fn manage_lines(
         }
     }
     lines
+}
+
+/// `line` in at most `width` cells; one that is longer ends in `…`.
+fn fit_line(line: &mut ScreenLine, width: usize) {
+    if line.width() <= width {
+        return;
+    }
+    let mut budget = width.saturating_sub(1);
+    for (text, _) in &mut line.spans {
+        *text = clip_cells(text, budget).to_owned();
+        budget = budget.saturating_sub(display_width(text));
+    }
+    if width > 0 {
+        if let Some((text, _)) = line
+            .spans
+            .iter_mut()
+            .rev()
+            .find(|(text, _)| !text.is_empty())
+        {
+            text.push('…');
+        }
+    }
 }
 
 fn write_viewport(lines: &[ScreenLine], width: u16, height: u16) -> anyhow::Result<()> {
@@ -2481,7 +2940,7 @@ mod tests {
     }
 
     use super::{
-        clip_cells, manage_lines, primary_action, safe_text, viewport_start, Confirmation, KeyCode,
+        clip_cells, enter_action, manage_lines, safe_text, viewport_start, Confirmation, KeyCode,
         ManageData, ManageView, ScreenLine, Section, Tone,
     };
     use crate::*;
@@ -2592,19 +3051,15 @@ mod tests {
     }
 
     #[test]
-    fn footer_hints_name_every_action_and_always_offer_esc_and_q() {
-        use super::{footer_hints, FooterContext, PairingStage};
+    fn the_footer_is_one_navigation_line_and_the_views_own_keys() {
+        use super::{footer, footer_lines, FooterContext, PairingStage};
         let base = FooterContext::default();
-        let cases: [(Section, FooterContext, &[&str]); 6] = [
+        let cases = [
             (
                 Section::Overview,
                 base,
-                &[
-                    "s Start gateway",
-                    "t Stop gateway",
-                    "1 Overview · 2 Terminals · 3 Devices · 4 Settings",
-                    "Esc or q Close manager",
-                ],
+                "Enter change",
+                Some("s start · t stop · r restart"),
             ),
             (
                 Section::Terminals,
@@ -2612,30 +3067,20 @@ mod tests {
                     no_backends: true,
                     ..base
                 },
-                &[
-                    "m Add tmux backend",
-                    "h Add Herdr backend",
-                    "Esc Back to Overview",
-                    "q Close manager",
-                ],
+                "Enter add tmux",
+                Some("h add Herdr · m add tmux"),
             ),
             (
                 Section::Terminals,
                 base,
-                &[
-                    "f Make selected default",
-                    "d Remove selected backend",
-                    "Esc Back to Overview",
-                    "q Close manager",
-                ],
+                "Enter actions",
+                Some("h add Herdr · m add tmux"),
             ),
             (
                 Section::Devices,
-                FooterContext {
-                    pairing: Some(PairingStage::Scan),
-                    ..base
-                },
-                &["Esc Back to device list", "q Close manager"],
+                base,
+                "Enter details",
+                Some("p pair a device · x revoke"),
             ),
             (
                 Section::Devices,
@@ -2643,62 +3088,136 @@ mod tests {
                     pairing: Some(PairingStage::Done),
                     ..base
                 },
-                &[
-                    "p Pair another device",
-                    "Esc Back to device list",
-                    "q Close manager",
-                ],
+                "Enter back",
+                Some("p pair another · Esc back"),
             ),
             (
                 Section::Settings,
                 base,
-                &[
-                    "Enter Change selected setting",
-                    "i Install update",
-                    "Esc Back to Overview",
-                    "q Close manager",
-                ],
+                "Enter change",
+                Some("PgUp/PgDn scroll · r restart"),
             ),
         ];
-        for (section, context, expected) in cases {
-            let hints = footer_hints(section, &context);
-            let footer = format!("{} | {}", hints.actions, hints.navigation);
-            for text in expected {
-                assert!(
-                    footer.contains(text),
-                    "{section:?} {context:?}: missing {text:?} in {footer:?}"
-                );
-            }
-            if section == Section::Overview {
-                assert!(!footer.contains("Enter"), "Overview offers Enter");
-            }
-            // No action is listed under two keys.
-            let mut described: Vec<&str> = footer
-                .split(" | ")
-                .filter_map(|hint| hint.split_once(' ').map(|(_, what)| what))
-                .collect();
-            described.sort_unstable();
-            let before = described.len();
-            described.dedup();
+        for (section, context, enter, actions) in cases {
+            let shape = footer(section, &context);
             assert_eq!(
-                described.len(),
-                before,
-                "{section:?}: an action is listed twice"
+                shape.navigation,
+                format!("↑↓ select · {enter} · Tab next view · q quit"),
+                "{section:?}"
             );
-            for row in [&hints.navigation, &hints.compact_navigation] {
-                assert!(row.contains("Esc"), "{section:?}: Esc missing in {row:?}");
-                assert!(
-                    row.contains("q Close manager"),
-                    "{section:?}: q missing in {row:?}"
-                );
-                assert!(row.contains("Tab"), "{section:?}: Tab missing in {row:?}");
-                assert_eq!(
-                    row.contains("1 Overview · 2 Terminals · 3 Devices · 4 Settings"),
-                    section == Section::Overview,
-                    "{section:?}: views explainer in {row:?}"
-                );
+            assert_eq!(shape.actions.as_deref(), actions, "{section:?}");
+            // One line where it fits, two where it does not; never clipped.
+            assert_eq!(footer_lines(&shape, 110).len(), 1, "{section:?}");
+            for line in footer_lines(&shape, 56) {
+                assert!(line.width() <= 56, "{section:?}: {}", line.render(200));
             }
-            assert!(!hints.compact_navigation.contains("Select"));
+        }
+    }
+
+    #[test]
+    fn every_setting_is_a_row_with_its_value_explanation_and_source() {
+        use super::{setting_value, Setting};
+        let config = |change: serde_json::Value| {
+            let mut value = serde_json::to_value(layout_config()).unwrap();
+            for (key, field) in change.as_object().unwrap() {
+                value[key] = field.clone();
+            }
+            serde_json::from_value::<crate::Config>(value).unwrap()
+        };
+        let cases = [
+            (Setting::HistoryStorage, serde_json::json!({}), "memory"),
+            (
+                Setting::HistoryStorage,
+                serde_json::json!({ "history": { "storage": "sqlite" } }),
+                "SQLite",
+            ),
+            (
+                Setting::StoreEncryption,
+                serde_json::json!({}),
+                "file key · read-only",
+            ),
+            (
+                Setting::StoreEncryption,
+                serde_json::json!({ "store": { "encryption": "off" } }),
+                "off · read-only",
+            ),
+            (
+                Setting::AgentBypass,
+                serde_json::json!({}),
+                "codex On · claude On",
+            ),
+            (
+                Setting::AgentBypass,
+                serde_json::json!({ "agent_launch_args": { "codex": [], "claude": ["--model", "x"] } }),
+                "codex Off · claude custom",
+            ),
+            (
+                Setting::AgentTrust,
+                serde_json::json!({ "agent_trust_folders": false }),
+                "Off",
+            ),
+            (
+                Setting::AgentEnv,
+                serde_json::json!({ "agent_env": { "HTTPS_PROXY": "http://secret" } }),
+                "HTTPS_PROXY · values hidden",
+            ),
+            (
+                Setting::Mcp,
+                serde_json::json!({ "mcp": { "enabled": false } }),
+                "Off",
+            ),
+            (Setting::Autostart, serde_json::json!({}), "Off"),
+        ];
+        for (setting, change, value) in cases {
+            assert_eq!(
+                setting_value(setting, &config(change), "Off - start Gateway manually"),
+                value,
+                "{setting:?}"
+            );
+            assert!(!setting.explanation().is_empty());
+        }
+        // The view lists every row in order, each under its group, and fits
+        // a 60-column terminal, cutting with … rather than mid-word.
+        let config = config(serde_json::json!({}));
+        let data = ManageData {
+            config: &config,
+            message: "ready",
+            pending: None,
+            devices: &[],
+            runtime: "stopped",
+            running: false,
+            autostart: "Off - start Gateway manually",
+            backend_states: &[],
+            qr: None,
+            changed: false,
+            connectivity: super::Connectivity::default(),
+            pairing: &super::PairingView::default(),
+        };
+        for width in [110_u16, 61] {
+            let mut text = String::new();
+            for selected in [0, Setting::ALL.len() - 1] {
+                let mut ui = ManageView {
+                    section: Section::Settings,
+                    selected,
+                    ..Default::default()
+                };
+                for line in manage_lines(&data, &mut ui, width, 200) {
+                    assert!(line.width() <= width as usize, "{}", line.render(300));
+                    text.push_str(&line.render(300));
+                    text.push('\n');
+                }
+            }
+            let mut at = 0;
+            for setting in Setting::ALL {
+                let found = text[at..]
+                    .find(setting.label())
+                    .unwrap_or_else(|| panic!("{setting:?} missing at {width}: {text}"));
+                at += found;
+            }
+            assert!(text.contains("OTHER COMPUTERS"));
+            if width == 110 {
+                assert!(text.contains("config.json › history.storage"));
+            }
         }
     }
 
@@ -2716,13 +3235,6 @@ mod tests {
         ui.navigate(KeyCode::PageUp, 50);
         assert_eq!(ui.selected, 39);
         assert!(!ui.navigate(KeyCode::Char('g'), 50));
-        let context = super::FooterContext::default();
-        assert!(!super::footer_hints(Section::Terminals, &context)
-            .actions
-            .contains("Gateway login autostart"));
-        assert!(super::footer_hints(Section::Settings, &context)
-            .actions
-            .contains("Gateway login autostart"));
         ui.navigate(KeyCode::Tab, 50);
         assert_eq!(ui.selected, 0);
         assert_eq!(ui.scroll, 0);
@@ -2730,24 +3242,18 @@ mod tests {
 
     #[test]
     fn manager_enter_actions_and_confirmation_cancel_are_explicit() {
-        // Enter never starts or stops the gateway from the landing view.
-        assert_eq!(primary_action(Section::Overview, 0, true, false), None);
-        assert_eq!(
-            primary_action(Section::Terminals, 3, false, false),
-            Some('f')
-        );
-        assert_eq!(
-            primary_action(Section::Terminals, 0, true, false),
-            Some('m')
-        );
-        assert_eq!(primary_action(Section::Devices, 0, true, false), Some('p'));
-        assert_eq!(primary_action(Section::Devices, 1, false, false), Some('x'));
-        assert_eq!(primary_action(Section::Devices, 0, true, true), Some('r'));
-        for (index, action) in ['g', 'u', 'e'].iter().enumerate() {
-            assert_eq!(
-                primary_action(Section::Settings, index, true, false),
-                Some(*action)
-            );
+        // Enter never starts or stops the gateway from the landing view; on
+        // every other view it is the selected row's action.
+        for (section, empty, pairing, action) in [
+            (Section::Overview, true, false, None),
+            (Section::Terminals, false, false, Some("enter")),
+            (Section::Terminals, true, false, Some("m")),
+            (Section::Devices, true, false, Some("p")),
+            (Section::Devices, false, false, Some("enter")),
+            (Section::Devices, true, true, Some("r")),
+            (Section::Settings, false, false, Some("enter")),
+        ] {
+            assert_eq!(enter_action(section, empty, pairing), action, "{section:?}");
         }
         let mut confirmation = Confirmation::default();
         assert_eq!(confirmation.key(KeyCode::Enter), Some(false));
@@ -2786,7 +3292,7 @@ mod tests {
             let mut ui = ManageView {
                 section,
                 selected: if section == Section::Terminals { 39 } else { 0 },
-                scroll: 0,
+                ..Default::default()
             };
             for width in [0_u16, 1, 2, 8, 24, 40, 60, 80, 100, 200] {
                 for height in [0_u16, 1, 5, 8, 18, 30] {
@@ -2811,7 +3317,7 @@ mod tests {
                     if section == Section::Terminals && width >= 40 && height >= 8 {
                         assert!(lines
                             .iter()
-                            .any(|line| line.selected() && line.render(100).contains("> qa-39")));
+                            .any(|line| line.selected() && line.render(100).contains("▌ qa-39")));
                     }
                 }
             }
@@ -2843,7 +3349,7 @@ mod tests {
         let mut ui = ManageView {
             section: Section::Terminals,
             selected: 1,
-            scroll: 0,
+            ..Default::default()
         };
         let lines = manage_lines(&data(&config), &mut ui, 100, 30);
         let selected = lines
@@ -2851,17 +3357,18 @@ mod tests {
             .find(|line| line.selected() && line.render(100).contains("qa-01"))
             .unwrap()
             .render(100);
-        assert!(selected.contains("> qa-01"));
-        assert!(!selected.contains("[default]"));
-        assert!(lines
-            .iter()
-            .any(|line| line.render(100).contains("qa-00 [default]")));
+        assert!(selected.contains("▌ qa-01"));
+        assert!(!selected.contains("default"));
+        assert!(lines.iter().any(|line| {
+            let text = line.render(100);
+            text.contains("qa-00") && text.contains("default · on demand")
+        }));
         let mut empty_config = layout_config();
         empty_config.sessions.clear();
         let lines = manage_lines(&data(&empty_config), &mut ui, 100, 30);
         assert!(lines
             .iter()
-            .any(|line| line.render(100).contains("Enter Add tmux or h Add Herdr")));
+            .any(|line| line.render(100).contains("Enter adds tmux; h adds Herdr")));
         ui.section = Section::Devices;
         let lines = manage_lines(&data(&empty_config), &mut ui, 100, 30);
         assert!(lines
@@ -2869,7 +3376,7 @@ mod tests {
             .any(|line| line.render(100).contains("Enter to pair your first device")));
         assert!(lines
             .iter()
-            .any(|line| line.render(100).contains("p Pair first device")));
+            .any(|line| line.render(100).contains("p pair a device")));
     }
 
     #[test]
@@ -3008,6 +3515,7 @@ mod tests {
             section: Section::Devices,
             selected: 0,
             scroll: 99,
+            ..Default::default()
         };
         let lines = manage_lines(&data, &mut ui, 100, 50);
         assert_eq!(
