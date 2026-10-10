@@ -142,7 +142,7 @@ pub fn openapi_spec() -> Value {
             "/api/meta": { "get": simple_endpoint("Gateway API, backend, and legacy compatibility metadata") },
             "/api/pair/request": {
                 "post": {
-                    "summary": "Request pairing from Muqun app",
+                    "summary": "Request pairing from Muqun app. The code shown on this computer lives five minutes (expires_in_ms: 300000); a code minted with POST /api/pair/pending for another gateway lives one (60000)",
                     "security": [],
                     "requestBody": json_body(object_schema(&[("request_id", "string"), ("device_name", "string")], &["request_id"])),
                     "responses": ok_response()
@@ -1132,7 +1132,7 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
                     "properties": {
                         "request_id": { "type": "string" },
                         "code": { "type": "string" },
-                        "expires_in_ms": { "type": "integer" }
+                        "expires_in_ms": { "type": "integer", "description": "60000: a minted code lives one minute (a pairing a device asks for itself, POST /api/pair/request, lives five: 300000)" }
                     }
                 })), &[
                     ("400", "invalid_request, invalid_device_name"),
