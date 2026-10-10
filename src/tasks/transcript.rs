@@ -202,12 +202,14 @@ fn hide_in_item(item: &mut TimelineItem, streaming: Streaming) -> Served {
         // asking whether this session has a task -- hidden while they run and
         // once they succeed. One that failed (an error status, or a tool
         // result that is an error) stays, so the reader sees why the task is
-        // still open. Real work (`tasks.delegate`, `fleet.*`) stays.
+        // still open; so does one the turn ended without a result, as for
+        // `execute`. Real work (`tasks.delegate`, `fleet.*`) stays.
         (_, AgentPart::Tool(call))
             if is_muqun_protocol_call(&call.name, &call.input)
                 && call.status != ToolCallStatus::Failed
                 && call.error.is_none()
-                && !answered_an_error(call) =>
+                && !answered_an_error(call)
+                && (streaming.0 || call.status == ToolCallStatus::Completed) =>
         {
             return Served::Emptied;
         }
@@ -737,10 +739,10 @@ mod tests {
                 Some("<code>"),
             ),
             (
-                "a report still running",
+                "a report the turn left without a result",
                 Assistant,
                 tool("muqun_tasks_complete", "running", serde_json::Value::Null),
-                None,
+                Some("<code>"),
             ),
             (
                 "asking whether this session has a task",
@@ -869,6 +871,11 @@ mod tests {
             (
                 "still streaming",
                 tool("execute", "streaming", serde_json::Value::Null),
+                true,
+            ),
+            (
+                "a report still running",
+                tool("muqun_tasks_complete", "running", serde_json::Value::Null),
                 true,
             ),
         ] {
