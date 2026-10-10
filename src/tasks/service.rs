@@ -1868,8 +1868,9 @@ fn progress_line(item: &TimelineItem) -> Option<String> {
 
 /// A tool call in words: `<tool> <file>` when it names a file (a provider
 /// title that is only that file's name says less), else its title, else
-/// `<tool> <command, pattern or url>`; its bare name only when it has no
-/// arguments at all, and nothing when its arguments name nothing readable.
+/// `<tool> <command, pattern or url>`; never its bare name -- a call whose
+/// arguments name nothing readable (or have not streamed in yet) has no
+/// line, and the line before stands.
 fn tool_line(call: &ToolCall) -> Option<String> {
     let arg = |keys: &[&str]| {
         keys.iter()
@@ -1896,13 +1897,10 @@ fn tool_line(call: &ToolCall) -> Option<String> {
         (Some(file), Some(title)) if !file.ends_with(title) => title.to_owned(),
         (Some(file), _) => format!("{} {file}", call.name),
         (None, Some(title)) => title.to_owned(),
-        (None, None) => match arg(&["command", "pattern", "query", "url"]) {
-            Some(target) => format!("{} {}", call.name, target.lines().next().unwrap_or(target)),
-            None if call.input.as_object().is_none_or(|input| input.is_empty()) => {
-                call.name.clone()
-            }
-            None => return None,
-        },
+        (None, None) => {
+            let target = arg(&["command", "pattern", "query", "url"])?;
+            format!("{} {}", call.name, target.lines().next().unwrap_or(target))
+        }
     };
     Some(line)
 }
@@ -3651,7 +3649,7 @@ mod tests {
                 Some("bash cargo test"),
             ),
             (call("todowrite", None, json!({ "todos": [] })), None),
-            (call("lsp_status", None, json!({})), Some("lsp_status")),
+            (call("execute", None, json!({})), None),
         ] {
             assert_eq!(tool_line(&tool).as_deref(), expected, "{}", tool.name);
         }
