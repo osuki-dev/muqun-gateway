@@ -182,105 +182,70 @@ pub(crate) async fn exited_to_shell(session: &SessionConfig, pane_id: &str, kind
     }
 }
 
-/// Whether the `kind` agent itself holds `pane_id`'s terminal now -- what
-/// typed text reaches. All of these, on one `ps` snapshot:
-///
-/// - the pane's shell (its root process) is listed, on a terminal, and that
-///   terminal has a foreground process group;
-/// - a process descending from that shell sits on the same terminal, in that
-///   foreground group;
-/// - its executable, resolved by the system (`/proc/<pid>/exe` on Linux, the
-///   kernel's command name on macOS) and never read from its arguments, is
-///   the `kind` agent's.
-///
-/// Anything else in front (a shell, `ssh`, `sudo`, an editor, the agent
-/// suspended with Ctrl-Z or run with `&`, an agent in front on another
-/// terminal) is a no; so is anything that cannot be read or parsed. The
-/// caller is about to type there.
-pub(crate) async fn agent_in_foreground(
-    session: &SessionConfig,
-    pane_id: &str,
-    kind: &str,
-) -> bool {
-    let Ok(pane) = terminal_backend(session)
-        .get_pane(&PaneId::new(pane_id))
-        .await
-    else {
-        return false;
-    };
-    let Some(root) = pane.shell_pid else {
-        return false;
-    };
-    let Ok(out) = tokio::process::Command::new("ps")
-        .args(["-A", "-o", "pid=,ppid=,pgid=,tpgid=,tty=,comm="])
+/// The job a delegation launched in a pane: the pane's shell, and the
+/// process group the launch command started as (`TaskBinding::Pane`'s
+/// `shell_pid` and `agent_pgid`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PaneJob {
+    pub shell_pid: u32,
+    pub pgid: i64,
+}
+
+/// Where a pane's launched job stands now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Front {
+    /// It holds the pane's terminal: typed text reaches it.
+    Agent,
+    /// Something else does (a shell, `ssh`, `sudo`, an editor; the agent
+    /// suspended with Ctrl-Z or put in the background).
+    Other,
+    /// The job (or the pane's shell) is gone.
+    Gone,
+}
+
+/// The process group in front of `shell_pid`'s terminal, once something
+/// other than the shell holds it: what a launch command just typed there
+/// started as. Asked a few times while the command starts; `None` when the
+/// shell never gave the terminal up.
+pub(crate) async fn launched_job(shell_pid: u32) -> Option<i64> {
+    for _ in 0..20 {
+        if let Some(rows) = job_table().await {
+            if let Some(shell) = rows.iter().find(|row| row.pid == shell_pid) {
+                if shell.tpgid > 0 && shell.tpgid != shell.pgid {
+                    return Some(shell.tpgid);
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    None
+}
+
+/// Where `job` stands now ([`job_front`] on a fresh process table); a
+/// table that cannot be read or parsed answers `Other`, never `Agent`.
+pub(crate) async fn job_in_front(job: PaneJob) -> Front {
+    match job_table().await {
+        Some(rows) => job_front(&rows, job),
+        None => Front::Other,
+    }
+}
+
+/// `ps -o pid=,ppid=,pgid=,tpgid=,tty=` for every process; `None` when it
+/// cannot be run or any row does not parse.
+async fn job_table() -> Option<Vec<Proc>> {
+    let out = tokio::process::Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid=,pgid=,tpgid=,tty="])
         .kill_on_drop(true)
         .output()
         .await
-    else {
-        return false;
-    };
+        .ok()?;
     if !out.status.success() {
-        return false;
+        return None;
     }
-    let Some(mut rows) = process_rows(&String::from_utf8_lossy(&out.stdout)) else {
-        return false;
-    };
-    for row in &mut rows {
-        row.exe = resolved_executable(row.pid, &row.exe);
-        if is_runtime(&row.exe) {
-            row.script = runtime_script(row.pid).await;
-        }
-    }
-    holds_terminal(&rows, root, kind)
+    process_rows(&String::from_utf8_lossy(&out.stdout))
 }
 
-/// Whether `exe` is a JavaScript runtime an agent's CLI can run under.
-fn is_runtime(exe: &str) -> bool {
-    matches!(command_name(exe), "node" | "bun")
-}
-
-/// The script a runtime process `pid` runs: its first argument after the
-/// runtime that is not an option, canonicalised. `None` unless that path
-/// resolves to a real file -- the argument alone never counts.
-async fn runtime_script(pid: u32) -> Option<String> {
-    let args: Vec<String> = if cfg!(target_os = "linux") {
-        let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-        raw.split(|byte| *byte == 0)
-            .filter(|arg| !arg.is_empty())
-            .map(|arg| String::from_utf8_lossy(arg).into_owned())
-            .collect()
-    } else {
-        let out = tokio::process::Command::new("ps")
-            .args(["-o", "args=", "-p", &pid.to_string()])
-            .kill_on_drop(true)
-            .output()
-            .await
-            .ok()?;
-        String::from_utf8_lossy(&out.stdout)
-            .split_whitespace()
-            .map(str::to_owned)
-            .collect()
-    };
-    let script = args.iter().skip(1).find(|arg| !arg.starts_with('-'))?;
-    let path = std::fs::canonicalize(script).ok()?;
-    path.is_file().then(|| path.to_string_lossy().into_owned())
-}
-
-/// Whether a runtime's canonical `script` lies in the `kind` agent's own
-/// package: `@anthropic-ai/claude-code` (Claude Code), `@openai/codex`
-/// (Codex), an `opencode` package (OpenCode's CLI).
-fn agent_script(script: &str, kind: &str) -> bool {
-    let package = match kind {
-        "claude" => "/@anthropic-ai/claude-code/",
-        "codex" => "/@openai/codex/",
-        "opencode" => "/opencode",
-        _ => return false,
-    };
-    script.contains(package)
-}
-
-/// One `ps -o pid=,ppid=,pgid=,tpgid=,tty=,comm=` row; `exe` is the command
-/// name until [`resolved_executable`] replaces it.
+/// One `ps -o pid=,ppid=,pgid=,tpgid=,tty=` row.
 #[derive(Debug, Clone)]
 struct Proc {
     pid: u32,
@@ -288,82 +253,41 @@ struct Proc {
     pgid: i64,
     tpgid: i64,
     tty: String,
-    exe: String,
-    /// For a runtime (`node`, `bun`): the script it runs, canonicalised --
-    /// `None` unless that file really exists.
-    script: Option<String>,
 }
 
-/// The rows of a process table, by fixed columns: four numbers, the
-/// terminal, the command name. `None` when any row does not parse -- the
-/// table is then not trusted at all.
+/// The rows of a process table, by fixed columns: four numbers and the
+/// terminal. `None` when any row does not parse -- the table is then not
+/// trusted at all.
 fn process_rows(table: &str) -> Option<Vec<Proc>> {
     table
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| {
-            let mut rest = line.trim_start();
-            let mut field = || -> Option<String> {
-                let end = rest.find(char::is_whitespace)?;
-                let value = rest[..end].to_owned();
-                rest = rest[end..].trim_start();
-                Some(value)
+            let mut fields = line.split_whitespace();
+            let row = Proc {
+                pid: fields.next()?.parse().ok()?,
+                ppid: fields.next()?.parse().ok()?,
+                pgid: fields.next()?.parse().ok()?,
+                tpgid: fields.next()?.parse().ok()?,
+                tty: fields.next()?.to_owned(),
             };
-            let pid = field()?.parse().ok()?;
-            let ppid = field()?.parse().ok()?;
-            let pgid = field()?.parse().ok()?;
-            let tpgid = field()?.parse().ok()?;
-            let tty = field()?;
-            let exe = rest.trim().to_owned();
-            (!exe.is_empty()).then_some(Proc {
-                pid,
-                ppid,
-                pgid,
-                tpgid,
-                tty,
-                exe,
-                script: None,
-            })
+            fields.next().is_none().then_some(row)
         })
         .collect()
 }
 
-/// `pid`'s executable as the system resolved it: `/proc/<pid>/exe` on
-/// Linux (the command name there is whatever the process set), the
-/// kernel's command name (`comm`) elsewhere. Unreadable: empty, which
-/// matches no agent.
-fn resolved_executable(pid: u32, comm: &str) -> String {
-    if cfg!(target_os = "linux") {
-        std::fs::read_link(format!("/proc/{pid}/exe"))
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    } else {
-        comm.to_owned()
-    }
-}
-
-/// Whether executable `exe` is the `kind` agent: a binary named `kind`
-/// (or `kind-<target>`, as Codex ships), or for Claude Code its versioned
-/// binary under `…/claude/versions/`. A runtime (`node`, `bun`) counts only
-/// through the script it runs ([`agent_script`]); a shell never does.
-fn agent_executable(exe: &str, kind: &str) -> bool {
-    let name = command_name(exe).to_ascii_lowercase();
-    name == kind
-        || name.starts_with(&format!("{kind}-"))
-        || exe.contains(&format!("/{kind}/versions/"))
-}
-
-/// [`agent_in_foreground`] on a resolved process table.
-fn holds_terminal(rows: &[Proc], root: u32, kind: &str) -> bool {
-    let Some(shell) = rows.iter().find(|row| row.pid == root) else {
-        return false;
+/// [`job_in_front`] on a process table: the job is in front when the pane
+/// terminal's foreground group (as its shell reports it) is the job's own,
+/// and that group still has a process on that terminal descending from the
+/// shell. Gone when the shell or every such process is gone.
+fn job_front(rows: &[Proc], job: PaneJob) -> Front {
+    let Some(shell) = rows.iter().find(|row| row.pid == job.shell_pid) else {
+        return Front::Gone;
     };
-    let on_terminal = |tty: &str| !matches!(tty, "?" | "??" | "-" | "");
-    if !on_terminal(&shell.tty) || shell.tpgid <= 0 {
-        return false;
+    if matches!(shell.tty.as_str(), "?" | "??" | "-" | "") {
+        return Front::Gone;
     }
-    let (pane_tty, foreground) = (&shell.tty, shell.tpgid);
-    let mut tree = vec![root];
+    let mut tree = vec![shell.pid];
     let mut at = 0;
     while at < tree.len() && tree.len() < 512 {
         let parent = tree[at];
@@ -374,18 +298,17 @@ fn holds_terminal(rows: &[Proc], root: u32, kind: &str) -> bool {
         }
         at += 1;
     }
-    rows.iter().any(|row| {
-        row.pid != root
+    let alive = rows.iter().any(|row| {
+        row.pid != shell.pid
+            && row.pgid == job.pgid
+            && row.tty == shell.tty
             && tree.contains(&row.pid)
-            && row.tty == *pane_tty
-            && row.pgid == foreground
-            && (agent_executable(&row.exe, kind)
-                || (is_runtime(&row.exe)
-                    && row
-                        .script
-                        .as_deref()
-                        .is_some_and(|script| agent_script(script, kind))))
-    })
+    });
+    match (alive, shell.tpgid == job.pgid) {
+        (false, _) => Front::Gone,
+        (true, true) => Front::Agent,
+        (true, false) => Front::Other,
+    }
 }
 
 fn at_shell(agent: Option<&str>, foreground: Option<&str>, kind: &str) -> bool {
@@ -1353,96 +1276,57 @@ pub(crate) async fn interrupt(state: &AppState, task: &Task) {
 #[cfg(test)]
 mod tests {
 
-    /// Only the agent itself, on the pane's terminal and in its foreground
-    /// group, is typed to.
+    /// Only the job the delegation launched, holding the pane's terminal, is
+    /// typed to; whatever else holds it, nothing is, and a job that is gone
+    /// is given up.
     #[test]
-    fn only_the_agent_holding_the_pane_terminal_is_typed_to() {
-        // pid ppid pgid tpgid tty exe; the pane's shell is 100 on pts/3.
-        let rows = |lines: &[&str]| process_rows(&lines.join("\n")).unwrap();
-        // The canonical script of the runtime row, as the probe resolves it.
-        let script = |mut rows: Vec<Proc>, path: &str| {
-            rows[1].script = Some(path.to_owned());
-            rows
+    fn only_the_launched_job_holding_the_terminal_is_typed_to() {
+        // pid ppid pgid tpgid tty; the pane's shell is 100 on pts/3, the
+        // launched job's group is 200.
+        let job = PaneJob {
+            shell_pid: 100,
+            pgid: 200,
         };
-        let shell = "100 1 100 200 pts/3 /usr/bin/zsh";
-        for (name, table, typed) in [
+        let rows = |lines: &[&str]| process_rows(&lines.join("\n")).unwrap();
+        for (name, table, front) in [
             (
-                "the real agent in front",
+                "the recorded job in front",
                 rows(&[
-                    shell,
-                    "200 100 200 200 pts/3 /home/u/.local/share/claude/versions/2.1.239",
+                    "100 1 100 200 pts/3",
+                    "200 100 200 200 pts/3",
+                    "201 200 200 200 pts/3",
                 ]),
-                true,
+                Front::Agent,
             ),
             (
-                "another agent (codex) in front",
+                "the shell in front (Ctrl-Z)",
+                rows(&["100 1 100 100 pts/3", "200 100 200 100 pts/3"]),
+                Front::Other,
+            ),
+            (
+                "another job in front (ssh, sudo, an editor)",
                 rows(&[
-                    "100 1 100 200 pts/3 /usr/bin/zsh",
-                    "200 100 200 200 pts/3 /usr/bin/node",
-                    "201 200 200 200 pts/3 /opt/codex/codex-x86_64-unknown-linux-musl",
+                    "100 1 100 300 pts/3",
+                    "200 100 200 300 pts/3",
+                    "300 100 300 300 pts/3",
                 ]),
-                false,
+                Front::Other,
             ),
             (
-                "(claude, ssh): ssh in front of a suspended agent",
-                rows(&[
-                    "100 1 100 300 pts/3 /usr/bin/zsh",
-                    "200 100 200 300 pts/3 /usr/bin/claude",
-                    "300 100 300 300 pts/3 /usr/bin/ssh",
-                ]),
-                false,
+                "the group gone after a restart",
+                rows(&["100 1 100 100 pts/3"]),
+                Front::Gone,
             ),
             (
-                "an agent in front on another terminal",
-                rows(&[
-                    "100 1 100 100 pts/3 /usr/bin/zsh",
-                    "200 100 200 200 pts/7 /usr/bin/claude",
-                ]),
-                false,
-            ),
-            (
-                "argv says claude, the executable is sh",
-                rows(&[shell, "200 100 200 200 pts/3 /bin/sh"]),
-                false,
-            ),
-            (
-                "a runtime with no script that exists",
-                rows(&[shell, "200 100 200 200 pts/3 /usr/bin/node"]),
-                false,
-            ),
-            (
-                "node running the real Claude Code package",
-                script(
-                    rows(&[shell, "200 100 200 200 pts/3 /usr/bin/node"]),
-                    "/home/u/.local/share/mise/installs/node/24/lib/node_modules/@anthropic-ai/claude-code/cli.js",
-                ),
-                true,
-            ),
-            (
-                "node running a script elsewhere named claude",
-                script(
-                    rows(&[shell, "200 100 200 200 pts/3 /usr/bin/node"]),
-                    "/tmp/claude/claude.js",
-                ),
-                false,
+                "the group on another terminal",
+                rows(&["100 1 100 200 pts/3", "200 100 200 200 pts/7"]),
+                Front::Gone,
             ),
         ] {
-            assert_eq!(holds_terminal(&table, 100, "claude"), typed, "{name}");
+            assert_eq!(job_front(&table, job), front, "{name}");
         }
         assert!(
-            holds_terminal(
-                &rows(&[
-                    "100 1 100 200 pts/3 /usr/bin/zsh",
-                    "200 100 200 200 pts/3 /usr/bin/node",
-                    "201 200 200 200 pts/3 /opt/codex/codex-x86_64-unknown-linux-musl"
-                ]),
-                100,
-                "codex"
-            ),
-            "Codex in front"
-        );
-        assert!(
-            process_rows("100 1 x 200 pts/3 zsh").is_none(),
+            process_rows("100 1 x 200 pts/3").is_none(),
             "unparsable: not trusted"
         );
     }

@@ -82,6 +82,11 @@ pub(crate) enum TaskBinding {
         /// started in this pane; absent for a command task.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_id: Option<String>,
+        /// The process group of the agent this delegation launched, taken
+        /// from the pane terminal's foreground group once the launch command
+        /// had started: only that job is ever typed to (`tasks::notices`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_pgid: Option<i64>,
     },
     /// A delegation running on another of the owner's computers: this task is
     /// its mirror here, kept in step with task `remote_task_id` on peer
@@ -348,6 +353,7 @@ mod tests {
                 tab_id: None,
                 shell_pid: None,
                 agent_id: None,
+                agent_pgid: None,
             }
         );
         assert_eq!(serde_json::to_string(&binding).unwrap(), stored);
@@ -357,6 +363,7 @@ mod tests {
             tab_id: None,
             shell_pid: Some(42),
             agent_id: None,
+            agent_pgid: None,
         };
         let json = serde_json::to_string(&pinned).unwrap();
         assert_eq!(serde_json::from_str::<TaskBinding>(&json).unwrap(), pinned);

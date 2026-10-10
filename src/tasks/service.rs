@@ -860,17 +860,25 @@ impl TaskService {
         &self,
         session_id: &str,
         pane_id: &str,
-    ) -> Option<(TaskState, Option<String>)> {
+    ) -> Option<(TaskState, Option<pane_agent::PaneJob>)> {
         let filter = TaskFilter {
             pane: Some((session_id.to_owned(), pane_id.to_owned())),
             limit: 1,
             ..Default::default()
         };
         let task = self.store.list(filter).await.ok()?.into_iter().next()?;
-        let TaskBinding::Pane { agent_id, .. } = &task.binding else {
+        let TaskBinding::Pane {
+            shell_pid,
+            agent_pgid,
+            ..
+        } = &task.binding
+        else {
             return None;
         };
-        (task.kind == TaskKind::Delegation).then(|| (task.state, agent_id.clone()))
+        let job = shell_pid
+            .zip(*agent_pgid)
+            .map(|(shell_pid, pgid)| pane_agent::PaneJob { shell_pid, pgid });
+        (task.kind == TaskKind::Delegation).then_some((task.state, job))
     }
 
     /// The agent sessions running a turn now, as the follower last saw them.
@@ -1314,6 +1322,7 @@ impl TaskService {
             tab_id: placed.place.tab_id.clone(),
             shell_pid,
             agent_id: Some(kind.clone()),
+            agent_pgid: None,
         };
         let dispatching = TaskChange {
             binding: Some(binding),
@@ -1449,7 +1458,22 @@ pub(crate) async fn start_terminal_agent(
             .await;
         return;
     }
-    let to = change(TaskState::Working);
+    let mut to = change(TaskState::Working);
+    // The job the launch started: the only one a told result is ever typed
+    // to (`tasks::notices`).
+    if let TaskBinding::Pane {
+        shell_pid: Some(shell_pid),
+        ..
+    } = &task.binding
+    {
+        if let Some(pgid) = pane_agent::launched_job(*shell_pid).await {
+            let mut binding = task.binding.clone();
+            if let TaskBinding::Pane { agent_pgid, .. } = &mut binding {
+                *agent_pgid = Some(pgid);
+            }
+            to.binding = Some(binding);
+        }
+    }
     // A follower or a cancel may have moved it meanwhile; follow whatever is
     // still open.
     if let Err(error) = tasks.store().transition(&task.id, to).await {

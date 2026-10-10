@@ -130,6 +130,7 @@ async fn launch(
                     tab_id: Some(tab.id.as_str().to_owned()),
                     shell_pid,
                     agent_id: None,
+                    agent_pgid: None,
                 },
                 state: TaskState::Queued,
                 summary: None,

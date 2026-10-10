@@ -1248,6 +1248,7 @@ mod tests {
                 tab_id: None,
                 shell_pid: None,
                 agent_id: Some("claude".into()),
+                agent_pgid: None,
             },
             state: TaskState::Working,
             summary: None,

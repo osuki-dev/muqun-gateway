@@ -1020,6 +1020,7 @@ mod tests {
                     tab_id: None,
                     shell_pid: None,
                     agent_id: None,
+                    agent_pgid: None,
                 },
                 ..mirror(TaskState::Working, None)
             })

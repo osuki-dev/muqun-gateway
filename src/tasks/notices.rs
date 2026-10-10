@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use super::domain::{now_ms, NoticeTarget, Task, TaskBinding, TaskState, REPORTED_STATES};
 use super::events::TaskDomainEvent;
+use super::pane_agent::{Front, PaneJob};
 use crate::agents::domain::{AgentDomainEvent, AgentSessionStatus};
 use crate::AppState;
 
@@ -174,7 +175,7 @@ async fn ready(state: &AppState, child: &Task, target: &NoticeTarget) -> Ready {
             session_id,
             pane_id,
         } => {
-            let Some((pane_state, kind)) = state.tasks.pane_task(session_id, pane_id).await else {
+            let Some((pane_state, job)) = state.tasks.pane_task(session_id, pane_id).await else {
                 return Ready::Never("no delegation runs in that pane");
             };
             match pane_state {
@@ -184,18 +185,19 @@ async fn ready(state: &AppState, child: &Task, target: &NoticeTarget) -> Ready {
                 }
                 _ => return Ready::NotYet,
             }
-            let Some(kind) = kind else {
-                return Ready::Never("the pane runs no known agent");
+            let Some(job) = job else {
+                return Ready::Never("no launched agent job is recorded for that pane");
             };
-            let Some(session) = terminal_session(state, session_id) else {
+            if terminal_session(state, session_id).is_none() {
                 return Ready::Never("the terminal session is gone");
-            };
-            if super::pane_agent::agent_in_foreground(session, pane_id, &kind).await {
-                Ready::Now
-            } else if recent(child) {
-                Ready::NotYet
-            } else {
-                Ready::Never("the pane's agent has not been in its foreground for an hour")
+            }
+            match super::pane_agent::job_in_front(job).await {
+                Front::Agent => Ready::Now,
+                Front::Gone => Ready::Never("the launched agent job is gone"),
+                Front::Other if recent(child) => Ready::NotYet,
+                Front::Other => {
+                    Ready::Never("the launched agent job has not been in front for an hour")
+                }
             }
         }
     }
@@ -236,13 +238,13 @@ async fn send(state: &AppState, target: &NoticeTarget, line: &str) -> anyhow::Re
         } => {
             let session = terminal_session(state, session_id)
                 .ok_or_else(|| anyhow::anyhow!("no terminal session {session_id}"))?;
-            let kind = state
+            let job = state
                 .tasks
                 .pane_task(session_id, pane_id)
                 .await
-                .and_then(|(_, kind)| kind)
-                .ok_or_else(|| anyhow::anyhow!("no agent runs in that pane"))?;
-            return send_to_pane(session, pane_id, &kind, &without_file_mentions(line)).await;
+                .and_then(|(_, job)| job)
+                .ok_or_else(|| anyhow::anyhow!("no launched agent job in that pane"))?;
+            return send_to_pane(session, pane_id, job, &without_file_mentions(line)).await;
         }
     }
     Ok(Sent::Delivered)
@@ -252,13 +254,13 @@ async fn send(state: &AppState, target: &NoticeTarget, line: &str) -> anyhow::Re
 async fn send_to_pane(
     session: &crate::platform::config::SessionConfig,
     pane_id: &str,
-    kind: &str,
+    job: PaneJob,
     line: &str,
 ) -> anyhow::Result<Sent> {
     let typist = PaneTypist {
         session,
         pane: crate::terminal::backend::PaneId::new(pane_id),
-        kind,
+        job,
         line,
     };
     type_line(&typist).await
@@ -310,17 +312,14 @@ async fn type_line(typist: &impl Typist) -> anyhow::Result<Sent> {
 struct PaneTypist<'a> {
     session: &'a crate::platform::config::SessionConfig,
     pane: crate::terminal::backend::PaneId,
-    kind: &'a str,
+    job: PaneJob,
     line: &'a str,
 }
 
 impl Typist for PaneTypist<'_> {
     fn in_front(&self) -> BoxFuture<'_, bool> {
-        Box::pin(super::pane_agent::agent_in_foreground(
-            self.session,
-            self.pane.as_str(),
-            self.kind,
-        ))
+        let job = self.job;
+        Box::pin(async move { super::pane_agent::job_in_front(job).await == Front::Agent })
     }
     fn paste(&self) -> BoxFuture<'_, anyhow::Result<()>> {
         Box::pin(async move {
@@ -745,6 +744,7 @@ mod tests {
                     tab_id: None,
                     shell_pid: None,
                     agent_id: Some("claude".into()),
+                    agent_pgid: None,
                 },
                 ..child(TaskState::IdleUnconfirmed, None)
             })

@@ -468,6 +468,7 @@ mod tests {
             tab_id: None,
             shell_pid: None,
             agent_id: None,
+            agent_pgid: None,
         };
         let gone = working(&state, task(pane("w1:p7"), TaskKind::Command)).await;
         let unknown_session = TaskBinding::Pane {
@@ -476,6 +477,7 @@ mod tests {
             tab_id: None,
             shell_pid: None,
             agent_id: None,
+            agent_pgid: None,
         };
         let unknown = working(&state, task(unknown_session, TaskKind::Command)).await;
 
@@ -500,6 +502,7 @@ mod tests {
             tab_id: None,
             shell_pid,
             agent_id: None,
+            agent_pgid: None,
         };
         let reused = working(&state, task(pane(Some(100)), TaskKind::Command)).await;
         let same = working(&state, task(pane(Some(200)), TaskKind::Command)).await;

@@ -687,24 +687,23 @@ plain line, as a user message would be:
 A session still in its turn -- inside a `tasks.wait`, say -- is sent nothing:
 the wait answers it, and a state a wait returned is never sent again. A pane
 is told when its own delegation's follower saw the agent stop
-(`idle_unconfirmed` or `done`) and the agent itself holds the pane's
-terminal: a process descending from the pane's shell, on the pane's own
-terminal, in that terminal's foreground process group, whose executable --
-resolved by the system (`/proc/<pid>/exe` on Linux, the kernel's command
-name on macOS), never read from its arguments -- is the agent's (a binary
-named for it, Codex's `codex-<target>`, or Claude Code's
-`…/claude/versions/<version>`). A `node` or `bun` process counts only when the
-script it runs -- its first argument that is not an option, canonicalised,
-and a file that really exists -- lies in the agent's own package
-(`@anthropic-ai/claude-code`, `@openai/codex`, an `opencode` package); its
-arguments alone never do. Anything else in front -- a shell, `ssh`, `sudo`,
-an editor, the agent suspended with Ctrl-Z or run with `&` -- means nothing is
-typed, since that program would receive the text; the result is tried again
-on later passes for an hour (the agent may come back with `fg`), then given
-up. The
+(`idle_unconfirmed` or `done`) and the job that delegation launched holds
+the pane's terminal. The gateway typed the launch command itself, so once
+that command has started (the terminal's foreground process group is no
+longer the shell's) it records that group on the task (`agent_pgid`, for
+tmux and Herdr alike) -- how the agent was installed, and what its
+executable or arguments are, never matter. A line is typed only when the
+pane terminal's foreground group is that recorded group, and the group
+still has a process on that terminal descending from the pane's shell.
+Anything else in front -- the shell after Ctrl-Z, `ssh`, `sudo`, an editor,
+anything started afterwards -- is another group, so nothing is typed; the
+result is tried again on later passes for an hour (the agent may come back
+with `fg`, the same group), then given up. A group that is gone (the agent
+exited, or a restart found nothing left of it) is given up at once, recorded
+as skipped. The
 line is sent the way a goal is (the agent's prompt call, a bracketed paste on
-tmux), and the foreground is looked at again before each Enter: if a shell
-has the terminal by then, the pasted line is cleared (Ctrl-U) and Enter is
+tmux), and the foreground is looked at again before each Enter: if another
+group has the terminal by then, the pasted line is cleared (Ctrl-U) and Enter is
 never pressed. What the child wrote is untrusted, so the line is one line of
 plain text: escape sequences and control characters removed, line breaks
 and tabs turned into spaces, capped after that, and it always begins with
