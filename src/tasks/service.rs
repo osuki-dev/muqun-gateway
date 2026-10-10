@@ -1836,7 +1836,7 @@ impl TaskService {
     /// not named untitled (empty).
     pub(crate) async fn session_named(&self, asid: &str, title: &str) {
         let title = title.trim();
-        if title.is_empty() {
+        if title.is_empty() || untitled_placeholder(asid, title) {
             return;
         }
         let Some(id) = self.task_for_session(asid).await else {
@@ -2253,6 +2253,15 @@ fn code(text: &str, room: usize) -> String {
         ""
     };
     format!("{fence}{pad}{text}{pad}{fence}")
+}
+
+/// Whether `title` is what an adapter shows for a session that has not been
+/// named (its id, T3's "New thread", DeepSeek's placeholder): never a
+/// task's title.
+fn untitled_placeholder(asid: &str, title: &str) -> bool {
+    title == asid
+        || title == crate::agents::adapters::t3::driver::NEW_THREAD_TITLE
+        || title == crate::agents::adapters::deepseek::mapper::UNTITLED
 }
 
 /// Stopped short of an end: waiting on the user, or paused without saying
@@ -3979,7 +3988,7 @@ mod tests {
         assert_eq!(progress().await, None);
 
         // The title follows the session's own name -- not an untitled
-        // session's (DeepSeek's before it is named: empty), its asid, or the
+        // session's placeholder (its asid, "New thread", DeepSeek's), or the
         // goal restated or cut short; a renamed session re-publishes its task.
         let title = || async {
             let task = state.tasks.get_for_test(&id).await;
@@ -3988,6 +3997,8 @@ mod tests {
         for (name, expected) in [
             ("", "fix the build"),
             (ASID, "fix the build"),
+            ("New thread", "fix the build"),
+            ("DeepSeek Agent Session", "fix the build"),
             ("fix the…", "fix the build"),
             ("fix the build", "fix the build"),
             ("Fix the CI build", "Fix the CI build"),

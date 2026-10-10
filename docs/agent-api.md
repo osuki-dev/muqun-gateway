@@ -1596,16 +1596,16 @@ client without the socket.
 
 - `TaskView.title` (always a string): the task's `label`; else, for a session
   delegation, the first sentence of the name the agent session gave itself
-  (an untitled session has an empty `title` -- adapters no longer make one
-  up -- and a name that is the asid, or the goal restated or cut short, is
-  not used); else the goal's first sentence -- cut to 60 characters with
+  (an untitled session's placeholder -- its asid, `New thread`, `DeepSeek
+  Agent Session` -- or the goal restated or cut short is not used); else the goal's first sentence -- cut to 60 characters with
   `…`, back to a word boundary when that keeps at least 30 characters. An
   open task's follows the session's name as it changes; an ended one keeps
   the name it had when it ended. Show it instead of the raw `goal`.
-- Agent sessions (`GET /api/agent-sessions`, …) carry an empty `title` until
-  the provider names them; OpenCode's adapter no longer fills in the asid,
-  DeepSeek's no longer `DeepSeek Agent Session`, T3's no longer reports the
-  `New thread` it creates threads with.
+- Agent sessions (`GET /api/agent-sessions`, …) never carry an empty
+  `title`: until the provider names one it reads as before -- OpenCode's
+  asid, `DeepSeek Agent Session`, T3's `New thread`. A task's `title` never
+  takes such a placeholder; it keeps the goal's first sentence until the
+  session is really named.
 - `tasks.complete` takes `outcome`: `done` (default) or `blocked`. A blocked
   agent -- a missing file, an unclear request, a permission it cannot get --
   may instead print `MUQUN_TASK_BLOCKED: <one-line reason>`, beside

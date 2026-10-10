@@ -9,6 +9,9 @@ use crate::agents::domain::{
     ToolCallStatus, ToolTime,
 };
 
+/// The title of a DeepSeek session it has not named.
+pub(crate) const UNTITLED: &str = "DeepSeek Agent Session";
+
 /// Map a DeepSeek Harness `SessionSummary` JSON object into Gateway `AgentSessionInfo`.
 pub fn map_session(raw: &Value) -> Option<AgentSessionInfo> {
     let session_id = raw.get("sessionId").and_then(Value::as_str)?;
@@ -76,14 +79,14 @@ pub fn map_session(raw: &Value) -> Option<AgentSessionInfo> {
             }
         });
 
-    // Untitled (empty) until DeepSeek names it: a made-up name would read
-    // as the session's own.
+    // Untitled sessions keep the placeholder clients have always shown; a
+    // task's title ignores it (`untitled_placeholder`).
     let title = raw
         .get("title")
         .or_else(|| projections_values.and_then(|v| v.get("title")))
         .and_then(Value::as_str)
         .filter(|t| !t.trim().is_empty())
-        .unwrap_or_default()
+        .unwrap_or(UNTITLED)
         .to_string();
 
     let status = if running {
