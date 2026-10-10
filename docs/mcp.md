@@ -488,8 +488,9 @@ other `POST /api/tasks` directory is. `mode` does not apply and is ignored.
 and `-c model_reasoning_effort="<variant>"`; Claude Code gets `--model
 <model>` and `--effort <variant>`, each only when its `--help` lists the
 flag -- asked of the binary the user's interactive login shell runs for
-`claude` (with `agent_env`), as a pane's shell would, and kept until that
-file changes; a flag it lacks is left out (logged), and the task shows what
+`claude` (with `agent_env`), as a pane's shell would -- a version
+manager's shim is run as found, never resolved through -- and kept until its
+`--version` changes; a flag it lacks is left out (logged), and the task shows what
 did run. As for a session agent, `variant` applies only together
 with `model`. Each must be 1 to 128 of `A-Z a-z 0-9 . _ : / @ + -`, not
 starting with `-` (else `400 unknown_model`). The binding and the task view

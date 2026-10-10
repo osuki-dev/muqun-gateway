@@ -228,32 +228,30 @@ pub(crate) async fn launch_model(
     Ok((args, ran, effort))
 }
 
-/// Claude Code's model flags, from its `--help`, for the binary a pane's
-/// shell runs as `command`: resolved by the user's login shell, interactive
-/// as a pane's is, with `agent_env`, and kept by that file's path, size and
-/// modification time -- an upgrade is asked again. One that cannot be
-/// resolved or does not answer in time gives none, and is asked again next
-/// time.
+/// Claude Code's model flags, from its `--help`, for the program a pane's
+/// shell runs as `command`: found by the user's login shell, interactive as
+/// a pane's is, with `agent_env`, and run as found -- a version manager's
+/// shim (mise, asdf) picks the real program by its own name, so it is never
+/// resolved through. Kept by that path and its `--version` line, so an
+/// upgrade is asked again even behind a shim. One that cannot be found or
+/// does not answer in time gives none, and is asked again next time.
 async fn claude_model_flags(state: &AppState, command: &str) -> agent_kinds::ModelFlags {
-    type Key = (std::path::PathBuf, u64, Option<std::time::SystemTime>);
+    type Key = (String, String);
     static SEEN: std::sync::OnceLock<std::sync::Mutex<HashMap<Key, agent_kinds::ModelFlags>>> =
         std::sync::OnceLock::new();
-    let Some(program) = pane_program(state, command).await else {
+    let Some(key) = pane_program(state, command).await else {
         return agent_kinds::ModelFlags::default();
     };
-    let Ok(meta) = std::fs::metadata(&program) else {
-        return agent_kinds::ModelFlags::default();
-    };
-    let key: Key = (program.clone(), meta.len(), meta.modified().ok());
     let seen = SEEN.get_or_init(Default::default);
     if let Some(flags) = seen.lock().ok().and_then(|seen| seen.get(&key).copied()) {
         return flags;
     }
-    let quoted = format!("'{}'", program.to_string_lossy().replace('\'', "'\\''"));
     // To a file, then read: Claude Code (Node) exits before a pipe drains,
     // and its help piped stops at 8192 bytes -- before `--model`.
-    let script =
-        format!("f=$(mktemp) || exit 1; {quoted} --help >\"$f\" 2>&1; cat \"$f\"; rm -f \"$f\"");
+    let script = format!(
+        "f=$(mktemp) || exit 1; {} --help >\"$f\" 2>&1; cat \"$f\"; rm -f \"$f\"",
+        shell_quoted(&key.0)
+    );
     let Some(help) = in_pane_shell(state, &script).await else {
         return agent_kinds::ModelFlags::default();
     };
@@ -264,36 +262,44 @@ async fn claude_model_flags(state: &AppState, command: &str) -> agent_kinds::Mod
     flags
 }
 
-/// The file a pane's shell runs for `command` (`command -v`, resolved
-/// through links); a path is taken as written. `None` for an alias or a
-/// function, or a command that is no plain word.
-async fn pane_program(state: &AppState, command: &str) -> Option<std::path::PathBuf> {
-    if command.contains('/') {
-        return std::fs::canonicalize(command).ok();
-    }
-    if !command
+/// The program a pane's shell runs for `command` (`command -v`; a path is
+/// taken as written) and its `--version` line, from one shell. `None` for an
+/// alias or a function, a command that is no plain word, or a version that
+/// cannot be read.
+async fn pane_program(state: &AppState, command: &str) -> Option<(String, String)> {
+    let find = if command.contains('/') {
+        format!("p={}", shell_quoted(command))
+    } else if command
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
     {
+        format!("p=$(command -v {command}) || exit 1")
+    } else {
         return None;
-    }
-    let out = in_pane_shell(
-        state,
-        &format!("printf '\\n{FOUND}%s\\n' \"$(command -v {command})\""),
-    )
-    .await?;
-    let found = out
-        .lines()
-        .find_map(|line| line.strip_prefix(FOUND))?
-        .trim();
-    found
-        .starts_with('/')
-        .then(|| std::fs::canonicalize(found).ok())
-        .flatten()
+    };
+    let script = format!(
+        "{find}; f=$(mktemp) || exit 1; \"$p\" --version >\"$f\" 2>&1; \
+         printf '\\n{FOUND}%s\\n{VERSION}' \"$p\"; head -n 1 \"$f\"; rm -f \"$f\""
+    );
+    let out = in_pane_shell(state, &script).await?;
+    let fenced = |fence: &str| {
+        out.lines()
+            .find_map(|line| line.strip_prefix(fence))
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+    };
+    let program = fenced(FOUND).filter(|path| path.starts_with('/'))?;
+    Some((program, fenced(VERSION)?))
 }
 
-/// The fence [`pane_program`] reads its answer after: profiles print things.
+/// The fences [`pane_program`] reads its answers after: profiles print things.
 const FOUND: &str = "__muqun_found__";
+const VERSION: &str = "__muqun_version__";
+
+/// `text` as one single-quoted shell word.
+fn shell_quoted(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
 
 /// `script`'s output, run by the user's login shell as a pane's runs
 /// (`-lic`) with `agent_env`, stdin empty, within 10 s.
