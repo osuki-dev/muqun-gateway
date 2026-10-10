@@ -87,8 +87,7 @@ pub(crate) async fn caller_session(
         TokenBinding::Agent { agent_id } => agent_id,
     };
     let manager = state.agent_runtime.manager_for_agent(agent_id).await?;
-    let mut busy = state.tasks.busy_sessions();
-    busy.truncate(MAX_CANDIDATES);
+    let busy = state.tasks.busy_sessions();
     let probes = busy.iter().map(|asid| async {
         session_items(&manager, asid)
             .await

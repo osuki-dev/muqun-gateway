@@ -585,6 +585,8 @@ impl PeerService {
                 super::mirror::unauthorized(state, &peer.peer_id).await;
                 None
             }
+            // It answered, refusing: still reachable.
+            Ok(Err(PeerError::Refused { .. })) => Some(peer),
             // Unreachable at once, not after its last answer ages out.
             Ok(Err(_)) | Err(_) => {
                 self.presence.down(&peer.peer_id);

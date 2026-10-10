@@ -308,8 +308,13 @@ pub(crate) fn one_plain_line(text: &str, max: usize) -> String {
             c => plain.push(c),
         }
     }
+    // A word starting `@` would attach that file in Claude Code's input.
     plain
         .split_whitespace()
+        .map(|word| match word.strip_prefix('@') {
+            Some(rest) => format!("＠{rest}"),
+            None => word.to_owned(),
+        })
         .collect::<Vec<_>>()
         .join(" ")
         .chars()

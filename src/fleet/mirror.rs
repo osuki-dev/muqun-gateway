@@ -301,8 +301,9 @@ async fn follow(state: AppState, peer_id: String) {
                 }
             }
             Err(PeerError::Unauthorized) => return unauthorized(&state, &peer_id).await,
+            // A socket that cannot open is not the peer gone: the reads say
+            // (a proxy without WebSocket still answers them).
             Err(_) => {
-                state.peers.presence.down(&peer_id);
                 if !read_all(&state, &client, &peer).await {
                     return;
                 }
@@ -433,8 +434,10 @@ async fn refresh(
         // Quiet: the mirror keeps its state. Published anyway, so its view's
         // `peer_reachable`/`peer_last_seen_ms` (§10.12) reach the phone and
         // a blocked `tasks.wait` wakes to them.
-        Err(_) => {
-            state.peers.presence.down(&peer.peer_id);
+        Err(error) => {
+            if matches!(error, PeerError::Unreachable(_) | PeerError::NoAnswer(_)) {
+                state.peers.presence.down(&peer.peer_id);
+            }
             state.tasks.republish(mirror).await;
             Some(false)
         }

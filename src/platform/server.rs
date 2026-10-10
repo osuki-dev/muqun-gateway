@@ -76,7 +76,12 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     // A non-loopback listen address: `/mcp` gets its own loopback listener,
     // whose URL every agent registration uses from here on.
     let mcp_listeners = if config.mcp.enabled {
-        crate::mcp::bind_loopback(&config.listen).await?
+        crate::mcp::bind_loopback(&config.listen)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "no loopback listener for /mcp; agents started here get no muqun tools");
+                None
+            })
     } else {
         None
     };

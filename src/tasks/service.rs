@@ -2039,13 +2039,6 @@ impl TaskService {
         self.live.lock().ok()?.titles.get(id).cloned()
     }
 
-    /// Agent session `asid` is named `title` now: remembered, when an open
-    /// task works in it, for that task's title, and the task re-published
-    /// when that changes it. A session the provider has not named carries
-    /// its adapter's placeholder (OpenCode's id, DeepSeek's
-    /// "DeepSeek Agent Session", T3's "New thread"; see
-    /// `untitled_placeholder`), which never names a task, as an empty title
-    /// does not.
     /// Mirror `id`'s task over there shows `title`: the mirror shows it too,
     /// so one task reads the same on both computers' cards.
     pub(crate) async fn mirror_titled(&self, id: &TaskId, title: &str) {
@@ -2063,6 +2056,13 @@ impl TaskService {
         }
     }
 
+    /// Agent session `asid` is named `title` now: remembered, when an open
+    /// task works in it, for that task's title, and the task re-published
+    /// when that changes it. A session the provider has not named carries
+    /// its adapter's placeholder (OpenCode's id, DeepSeek's
+    /// "DeepSeek Agent Session", T3's "New thread"; see
+    /// `untitled_placeholder`), which never names a task, as an empty title
+    /// does not.
     pub(crate) async fn session_named(&self, asid: &str, title: &str) {
         let title = title.trim();
         if title.is_empty() || untitled_placeholder(asid, title) {
@@ -2538,8 +2538,6 @@ fn untitled_placeholder(asid: &str, title: &str) -> bool {
         || title == crate::agents::adapters::deepseek::mapper::UNTITLED
 }
 
-/// Stopped short of an end: waiting on the user, or paused without saying
-/// it is finished.
 /// A parent's progress while a child works: `Waiting for mini · 3 min`.
 fn waiting_line(who: &str, elapsed_ms: u64) -> String {
     let minutes = elapsed_ms / 60_000;
@@ -2551,6 +2549,8 @@ fn waiting_line(who: &str, elapsed_ms: u64) -> String {
     format!("Waiting for {who} · {elapsed}")
 }
 
+/// Stopped short of an end: waiting on the user, or paused without saying
+/// it is finished.
 fn paused(state: TaskState) -> bool {
     matches!(state, TaskState::Waiting | TaskState::IdleUnconfirmed)
 }
@@ -2727,15 +2727,22 @@ fn agent_name(kind: &str) -> &str {
 /// model provider refused the request (429)`. `None`: not a provider error.
 fn provider_failure(agent: &str, error: &AgentErrorInfo) -> Option<String> {
     let name = error.name.to_ascii_lowercase();
-    if !name.starts_with("provider") {
+    if !name.starts_with("provider") && name != "apierror" {
         return None;
     }
+    // An HTTP error status, never a port (`…:443`) that happens to have three digits.
     let status = error.status.or_else(|| {
-        error
-            .message
-            .split(|c: char| !c.is_ascii_digit())
-            .find(|digits| digits.len() == 3)
-            .and_then(|digits| digits.parse().ok())
+        let message = error.message.as_bytes();
+        (0..message.len().saturating_sub(2)).find_map(|at| {
+            let digits = &message[at..at + 3];
+            let whole = digits.iter().all(u8::is_ascii_digit)
+                && (at == 0 || !message[at - 1].is_ascii_digit() && message[at - 1] != b':')
+                && message
+                    .get(at + 3)
+                    .is_none_or(|next| !next.is_ascii_digit());
+            let code: u16 = std::str::from_utf8(digits).ok()?.parse().ok()?;
+            (whole && (400..600).contains(&code)).then_some(code)
+        })
     });
     let mut capital = agent.chars();
     let agent = match capital.next() {
@@ -3203,6 +3210,10 @@ mod tests {
             (
                 error("provider.rate_limit", "Request failed: 429", None),
                 Some("OpenCode's model provider refused the request (429)"),
+            ),
+            (
+                error("APIError", "https://api.example:443 answered 503", None),
+                Some("OpenCode's model provider refused the request (503)"),
             ),
             (error("UnknownError", "boom", None), None),
         ] {
