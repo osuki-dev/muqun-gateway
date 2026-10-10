@@ -64,7 +64,9 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
     without the second. Read at startup and written into the unit file.
 - `src/connectivity/`: pairing identity, transports, and push.
   - `authority.rs`: pure pairing-code and credential authority; owns hashed
-    device records, token verification, install replacement, and last-seen policy.
+    device records (with their `DeviceKind`: `app`, or `gateway` for another of
+    the owner's computers), token verification, install replacement, and
+    last-seen policy.
   - `transport.rs`, `gateway_listener.rs`: the AES-GCM envelope and the listener
     bind behind the Tailscale-friendly address policy.
   - `routes.rs`: pairing and push-token registration routes.
@@ -108,7 +110,9 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
   the MCP sweep deletes token rows revoked or expired over 7 days ago.
 - `src/fleet/`: this machine's capability manifest (agents, terminal backends,
   probed toolchains, task counts) behind `GET /api/fleet/self` and the
-  `fleet.*` MCP tools.
+  `fleet.*` MCP tools, which also list the linked computers from what this
+  gateway last heard (`FleetService::describe`/`list` over
+  `PeerService::checked` and `manifest_of`, each answer cached 60 s).
   The owner's other gateways (`peers.rs`, `peers_sqlite.rs`, `/api/peers*`
   and `PUT /api/fleet/settings` in `peer_routes.rs`, `muqun-gateway peers`):
   a peer is linked by pairing with it as a phone does, as a device of
@@ -240,6 +244,20 @@ echo of the goal in the pane's recent output (`marker_after`), or the agent's
 delivery live in `src/agents/session_routes.rs`; the prompt wording, the marker
 and the `judge` table in `src/tasks/pane_agent.rs`.
 
+### Linked computers
+
+A peer is a `gateway` device on the other side: this gateway paired with it
+as a phone would and holds an ordinary device token for it, which there
+reaches only the peer routes (`require_device_or_peer`). Nothing pings a
+peer on a timer: `PeerService::checked` pings one whose last answer is over
+60 s old when something needs it (`GET /api/peers`, `fleet.*`), and it is
+reachable while that answer is under 2 minutes old; a 401 forgets it. Its
+compact manifest is cached in its row for 60 s (`manifest_of`). The
+computers the user `@`-named when opening a task (`POST /api/tasks`
+`mentions`, checked against the peer names) are stored on the task
+(`Task::mentions`) and reach the agent only through `tasks.read` of its own
+task, never through its conversation.
+
 ## Engineering conventions
 
 - Keep backend branching in adapter construction or adapter modules, not route
@@ -322,6 +340,10 @@ so the goal is on that command line too, quoted by `shell_word` to read
 back unchanged in sh, bash, zsh and fish; a goal with a backslash or a
 control character other than a newline, other agents, and Herdr have it
 typed once the agent is up.
+
+`fleet.accept_delegations` (default `true`) is whether linked computers may
+open tasks here; the phone's switch writes it (`PUT /api/fleet/settings`),
+changing only that key in `config.json`.
 
 ## Verification
 

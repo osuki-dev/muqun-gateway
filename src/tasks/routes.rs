@@ -26,6 +26,8 @@ use crate::{api_error, require_device, ApiResult, AppState};
 const DEFAULT_LIMIT: usize = 50;
 const MAX_LIMIT: usize = 200;
 const MAX_LABEL_CHARS: usize = 200;
+/// The most computers one task may name (`mentions`).
+const MAX_MENTIONS: usize = 8;
 pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
     router
         .route("/api/tasks", get(list).post(create))
@@ -145,10 +147,42 @@ struct CreateBody {
     variant: Option<String>,
     #[serde(default)]
     label: Option<String>,
+    /// The computers the user `@`-named: linked peers' names (any case) or `self`.
+    #[serde(default)]
+    mentions: Vec<String>,
 }
 
 fn refused(code: &str, message: &str) -> (StatusCode, Json<Value>) {
     api_error(StatusCode::BAD_REQUEST, code, message)
+}
+
+/// `mentions` as stored: each the name this gateway gives a linked peer, or
+/// `self`, once each, in the order given. At most [`MAX_MENTIONS`]; a name no
+/// peer has is refused, so the agent is never told of a computer it cannot reach.
+fn known_mentions(mentions: Vec<String>, linked: &[String]) -> ApiResult<Vec<String>> {
+    let refusal = || {
+        refused(
+            "invalid_request",
+            "mentions must be at most 8 names of linked computers (or self)",
+        )
+    };
+    if mentions.len() > MAX_MENTIONS {
+        return Err(refusal());
+    }
+    let mut known: Vec<String> = Vec::new();
+    for wanted in mentions {
+        let wanted = wanted.trim();
+        let name = if wanted.eq_ignore_ascii_case("self") {
+            "self".to_owned()
+        } else {
+            let peer = linked.iter().find(|name| name.eq_ignore_ascii_case(wanted));
+            peer.ok_or_else(refusal)?.clone()
+        };
+        if !known.contains(&name) {
+            known.push(name);
+        }
+    }
+    Ok(known)
 }
 
 /// An absolute, existing directory, canonicalized; `~` expands. None uses
@@ -174,7 +208,8 @@ fn requested_directory(cwd: Option<&str>) -> ApiResult<Option<String>> {
 }
 
 impl CreateBody {
-    fn request(self, default_cwd: Option<&str>) -> ApiResult<DelegateRequest> {
+    /// `linked`: the linked computers' names, which `mentions` must be among.
+    fn request(self, default_cwd: Option<&str>, linked: &[String]) -> ApiResult<DelegateRequest> {
         if !valid_goal(&self.goal) {
             return Err(refused(
                 "invalid_request",
@@ -202,6 +237,7 @@ impl CreateBody {
                 "label must be at most 200 characters",
             ));
         }
+        let mentions = known_mentions(self.mentions, linked)?;
         // A remembered directory that has since gone away is no error: the
         // task opens at home, as if nothing were remembered. Only a directory
         // the device asked for by name is refused when it is missing.
@@ -215,6 +251,7 @@ impl CreateBody {
             variant: self.variant,
             machine: None,
             label,
+            mentions,
         })
     }
 }
@@ -249,7 +286,7 @@ async fn create(
     } else {
         None
     };
-    let request = body.request(previous_cwd.as_deref())?;
+    let request = body.request(previous_cwd.as_deref(), &state.peers.names())?;
     // Named from the device record the token belongs to, never from the
     // body: another computer cannot pass itself off as a third (§10.5).
     let by = Requested {
@@ -412,6 +449,7 @@ mod tests {
                 label: None,
                 requester_name: None,
                 session_title: None,
+                mentions: Vec::new(),
             })
             .await
             .unwrap();
@@ -579,6 +617,7 @@ mod tests {
                 label: None,
                 requester_name: Some("phone".into()),
                 session_title: None,
+                mentions: Vec::new(),
             }
         };
         let mut ids = Vec::new();
@@ -769,6 +808,7 @@ mod tests {
                         label: None,
                         requester_name: None,
                         session_title: None,
+                        mentions: Vec::new(),
                     })
                     .await
                     .unwrap();
@@ -904,6 +944,22 @@ mod tests {
     #[tokio::test]
     async fn opening_a_task_checks_auth_then_the_body() {
         let state = with_agent().await;
+        state
+            .peers
+            .store_for_test(crate::fleet::peers::Peer {
+                peer_id: "peer-mini".into(),
+                server_id: "srv-mini".into(),
+                name: "mini".into(),
+                url: "http://127.0.0.1:9".into(),
+                token: "t".into(),
+                device_id: "d".into(),
+                transport_key: None,
+                added_ms: 0,
+                last_seen_ms: None,
+                capabilities: Vec::new(),
+                manifest: None,
+            })
+            .await;
         let (status, _) = send(
             &state,
             "POST",
@@ -939,6 +995,18 @@ mod tests {
                 "invalid_request",
             ),
             (json!({ "goal": "x", "mode": "" }), "invalid_request"),
+            (
+                json!({ "goal": "x", "mentions": "mini" }),
+                "invalid_request",
+            ),
+            (
+                json!({ "goal": "x", "mentions": vec!["mini"; 9] }),
+                "invalid_request",
+            ),
+            (
+                json!({ "goal": "x", "mentions": ["mini", "printer"] }),
+                "invalid_request",
+            ),
         ] {
             let (status, answer) =
                 send(&state, "POST", "/api/tasks", Some(body.clone()), true).await;
@@ -971,6 +1039,21 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+
+        // Named in any case, once each, in the user's order; kept on the task.
+        let (status, answer) = send(
+            &state,
+            "POST",
+            "/api/tasks",
+            Some(json!({
+                "goal": "x", "cwd": std::env::temp_dir().canonicalize().unwrap(),
+                "mentions": ["MINI", "self", "mini"],
+            })),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert_eq!(answer["mentions"], json!(["mini", "self"]));
     }
 
     #[tokio::test]

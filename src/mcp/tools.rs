@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 
 use super::lineage;
 use super::tokens::AssistantSession;
-use crate::fleet::manifest::{is_self, FleetService};
+use crate::fleet::manifest::{is_self, DescribeError};
 use crate::tasks::domain::{clip, TaskBinding, TaskId, TaskPrincipal};
 use crate::tasks::run_command::{RunHandle, RunRequest};
 use crate::tasks::service::{
@@ -253,7 +253,7 @@ fn directory(cwd: &str) -> Result<PathBuf, CallToolResult> {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct DescribeArgs {
-    /// The computer to describe: "self" (default) or its machineId.
+    /// The computer to describe: "self" (default) or a linked computer's name (from `peers`).
     #[serde(default)]
     pub machine: Option<String>,
 }
@@ -335,6 +335,7 @@ impl DelegateArgs {
             variant: self.variant,
             machine: self.machine,
             label: None,
+            mentions: Vec::new(),
         })
     }
 }
@@ -358,7 +359,8 @@ pub(crate) enum What {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct ReadArgs {
     /// A task_id you created. Leave it out to ask whether this session is
-    /// working on a Muqun task, and which.
+    /// working on a Muqun task, and which (its summary lists the computers
+    /// the user named, `mentions`).
     #[serde(default)]
     pub task_id: Option<String>,
     /// "summary": the task as it stands. "timeline": its recent agent items.
@@ -438,30 +440,41 @@ impl MuqunMcp {
 
     #[tool(
         name = "fleet.list",
-        description = "List the computers this gateway knows (this one only for now): alias, OS, what each is suitable for, how busy it is."
+        description = "List the computers this gateway can hand work to: this one and every linked one, with OS, what each is suitable for, whether it is reachable and how busy it is."
     )]
     async fn fleet_list(&self) -> Result<CallToolResult, ErrorData> {
-        let manifest = self.state.fleet.manifest(&self.state).await;
-        Ok(ok(
-            json!({ "machines": [FleetService::summary(&manifest)] }),
-        ))
+        let machines = self.state.fleet.list(&self.state).await;
+        Ok(ok(json!({ "machines": machines })))
     }
 
     #[tool(
         name = "fleet.describe",
-        description = "What a computer offers: its agents (status, version, modes, model count), terminal backends, toolchains with versions, task counts and what it is suitable for."
+        description = "What a computer offers: its agents (status, version, modes, model count), terminal backends, toolchains with versions, task counts and what it is suitable for. Without machine, this computer plus a short entry per linked computer (peers)."
     )]
     async fn fleet_describe(
         &self,
         Parameters(args): Parameters<DescribeArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let fleet = &self.state.fleet;
-        let manifest = fleet.describe(&self.state, args.machine.as_deref()).await;
-        let unknown = TaskError::UnknownMachine {
-            wanted: args.machine.unwrap_or_default(),
-            known: self.state.peers.names(),
-        };
-        reply(manifest.ok_or(unknown))
+        Ok(
+            match fleet.describe(&self.state, args.machine.as_deref()).await {
+                Ok(manifest) => ok(manifest),
+                Err(DescribeError::Unknown(known)) => fail(
+                    "machine_unknown",
+                    &format!(
+                        "Unknown machine. Known: self{}.",
+                        known
+                            .iter()
+                            .map(|name| format!(", {name}"))
+                            .collect::<String>()
+                    ),
+                ),
+                Err(DescribeError::Unreachable(name)) => fail(
+                    "machine_unreachable",
+                    &format!("{name} cannot be reached right now."),
+                ),
+            },
+        )
     }
 
     #[tool(
@@ -543,21 +556,21 @@ impl MuqunMcp {
 
     #[tool(
         name = "tasks.read",
-        description = "Read a task you created: its summary or recent timeline. Without task_id: whether this session itself is working on a Muqun task, and that task."
+        description = "Read a task you created: its summary or recent timeline. Without task_id: whether this session itself is working on a Muqun task, and that task, whose summary lists the computers the user named for it (mentions)."
     )]
     async fn tasks_read(
         &self,
         Parameters(args): Parameters<ReadArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let what = args.what();
-        let Some(task_id) = args.task_id else {
+        let (state, what) = (&self.state, args.what());
+        let Some(task_id) = args.task_id.clone() else {
             let call = lineage::Call {
                 tool: "tasks.read",
                 args: Vec::new(),
             };
-            let own = lineage::own_task(&self.state, &self.session, &call, None).await;
+            let own = lineage::own_task(state, &self.session, &call, None).await;
             return Ok(match own {
-                Some(id) => match self.state.tasks.own_view(&id).await {
+                Some(id) => match state.tasks.own_view(&id).await {
                     Ok(task) => CallToolResult::structured(json!({
                         "your_task": task,
                         "when_finished": "call tasks.complete with a one-line summary \
@@ -569,12 +582,27 @@ impl MuqunMcp {
             });
         };
         let id = TaskId(task_id);
-        let tasks = &self.state.tasks;
-        reply(
-            tasks
-                .read(&self.state, &self.by(), &id, what, args.cursor)
-                .await,
-        )
+        match state
+            .tasks
+            .read(state, &self.by(), &id, what, args.cursor)
+            .await
+        {
+            Err(TaskError::NotYours) => {}
+            read => return reply(read),
+        }
+        // Not one it created: the task this session works on, if it is that.
+        let what_text = match args.what {
+            What::Summary => "summary",
+            What::Timeline => "timeline",
+        };
+        let call = lineage::Call {
+            tool: "tasks.read",
+            args: vec![("what", what_text), ("task_id", &id.0)],
+        };
+        match lineage::own_task(state, &self.session, &call, Some(&id)).await {
+            Some(own) => reply(state.tasks.read_own(state, &own, what, args.cursor).await),
+            None => Ok(task_error(TaskError::NotFound)),
+        }
     }
 
     #[tool(
@@ -638,9 +666,12 @@ impl ServerHandler for MuqunMcp {
 /// plainly to one started for a task (`in_task`), conditionally to anyone
 /// else, who may never have been given one.
 pub(crate) fn instructions(in_task: bool) -> String {
-    let about = "Muqun Gateway on this computer. fleet.describe says what it has, exec.run \
-                 runs short commands, tasks.delegate + tasks.wait hand work to a coding agent \
-                 (waits are capped at 45 s; call tasks.wait again while it says working).";
+    let about = "Muqun Gateway on this computer. fleet.describe says what it has and which \
+                 other computers are linked to it, exec.run runs short commands, \
+                 tasks.delegate + tasks.wait hand work to a coding agent (waits are capped at \
+                 45 s; call tasks.wait again while it says working); tasks.delegate(machine) \
+                 sends work to a linked computer, and your task's summary (tasks.read without \
+                 a task_id) lists the ones the user named (mentions).";
     let finish = "call tasks.complete with a one-line summary; when you stop because you \
                   need the user, call it with outcome \"blocked\" and the reason; if you \
                   cannot call it, end with the line MUQUN_TASK_DONE: <summary> (or \
@@ -1005,15 +1036,182 @@ mod tests {
         assert_eq!(body["requested_by"], Value::Null);
     }
 
+    /// An agent learns the linked computers from fleet.describe and
+    /// fleet.list, from what this gateway last heard -- no call goes out to
+    /// a peer while its answer is fresh -- and, from its own task, which of
+    /// them the user named.
     #[tokio::test]
-    async fn fleet_describe_of_mac_is_machine_unknown() {
-        let mcp = MuqunMcp::new(test_state("admin", Vec::new()), session("%1"));
-        let args = DescribeArgs {
-            machine: Some("mac".into()),
+    async fn an_agent_sees_the_linked_computers_and_the_ones_the_user_named() {
+        use crate::fleet::peers::Peer;
+        use crate::tasks::domain::{PrincipalKind, Task, TaskKind, TaskOrigin, TaskState};
+
+        let herdr = FakeHerdr::start(vec!["$ "], None);
+        let state = output_state(&herdr);
+        let now = crate::tasks::domain::now_ms();
+        let manifest = json!({
+            "machineId": "srv-mini", "label": "mini", "os": "macos", "suitableFor": ["ios-build"],
+            "tasks": { "active": 2, "waiting": 0 },
+            "agents": [{ "id": "opencode", "kind": "opencode", "status": "connected", "modes": [], "modelCount": 3 }],
+        });
+        // nas never answered: it is pinged, and 127.0.0.1:9 refuses at once.
+        for (id, name, seen) in [("srv-mini", "mini", Some(now)), ("srv-nas", "nas", None)] {
+            state
+                .peers
+                .store_for_test(Peer {
+                    peer_id: format!("peer-{name}"),
+                    server_id: id.into(),
+                    name: name.into(),
+                    url: "http://127.0.0.1:9".into(),
+                    token: "t".into(),
+                    device_id: "d".into(),
+                    transport_key: None,
+                    added_ms: 0,
+                    last_seen_ms: seen,
+                    capabilities: vec!["fleet_peers".into()],
+                    manifest: seen.map(|_| manifest.clone()),
+                })
+                .await;
+        }
+        let mcp = MuqunMcp::new(state.clone(), session("%1"));
+
+        let describe = |machine: Option<&str>| {
+            let machine = machine.map(str::to_owned);
+            let mcp = mcp.clone();
+            async move {
+                answer(
+                    mcp.fleet_describe(Parameters(DescribeArgs { machine }))
+                        .await,
+                )
+            }
         };
-        let (error, _, body) = answer(mcp.fleet_describe(Parameters(args)).await);
-        assert!(error);
-        assert_eq!(body["error"], "machine_unknown", "{body}");
+        let (error, _, body) = describe(None).await;
+        assert!(!error, "{body}");
+        let peers: Vec<_> = body["peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|peer| {
+                (
+                    peer["name"].clone(),
+                    peer["reachable"].clone(),
+                    peer["suitableFor"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            peers,
+            [
+                (json!("mini"), json!(true), json!(["ios-build"])),
+                (json!("nas"), json!(false), json!([])),
+            ]
+        );
+        assert_eq!(body["peers"][0]["agents"][0]["id"], "opencode");
+
+        for (machine, expected) in [
+            ("MINI", Ok("srv-mini")),
+            ("nas", Err("machine_unreachable")),
+            ("printer", Err("machine_unknown")),
+        ] {
+            let (error, _, body) = describe(Some(machine)).await;
+            match expected {
+                Ok(id) => assert_eq!(
+                    (error, body["machineId"].as_str()),
+                    (false, Some(id)),
+                    "{machine}: {body}"
+                ),
+                Err(code) => assert_eq!(
+                    (error, body["error"].as_str()),
+                    (true, Some(code)),
+                    "{machine}: {body}"
+                ),
+            }
+        }
+
+        let (_, _, listed) = answer(mcp.fleet_list().await);
+        let machines: Vec<_> = listed["machines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| {
+                (
+                    m["label"].clone(),
+                    m["online"].clone(),
+                    m["tasksActive"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            machines[1..],
+            [
+                (json!("mini"), json!(true), json!(2)),
+                (json!("nas"), json!(false), json!(0))
+            ]
+        );
+
+        // The phone opened a task naming mini; the agent in its pane reads it
+        // without knowing its id. Another pane's agent finds no task of its own.
+        let task = Task {
+            id: TaskId::new(),
+            kind: TaskKind::Delegation,
+            goal: "fix the build".into(),
+            cwd: None,
+            binding: TaskBinding::Pane {
+                session_id: "default".into(),
+                pane_id: "%1".into(),
+                tab_id: None,
+                shell_pid: None,
+                agent_id: Some("claude".into()),
+            },
+            state: TaskState::Working,
+            summary: None,
+            exit_code: None,
+            created_by: TaskPrincipal {
+                kind: PrincipalKind::Device,
+                id: "d1".into(),
+            },
+            created_ms: now,
+            updated_ms: now,
+            seq: 0,
+            parent: None,
+            origin: TaskOrigin::Device,
+            label: None,
+            requester_name: Some("phone".into()),
+            session_title: None,
+            mentions: vec!["mini".into()],
+        };
+        let id = state.tasks.insert_for_test(&task).await;
+        for (pane, task_id, expected) in [
+            ("%1", None, Ok(json!(["mini"]))),
+            ("%1", Some(id.0.clone()), Ok(json!(["mini"]))),
+            ("%2", Some(id.0.clone()), Err("task_not_found")),
+        ] {
+            let mcp = MuqunMcp::new(state.clone(), session(pane));
+            let args = ReadArgs {
+                task_id: task_id.clone(),
+                what: What::Summary,
+                cursor: None,
+            };
+            let (error, _, body) = answer(mcp.tasks_read(Parameters(args)).await);
+            match expected {
+                // Without a task_id the answer is `{your_task, when_finished}`.
+                Ok(mentions) => assert_eq!(
+                    (
+                        error,
+                        match task_id {
+                            None => &body["your_task"]["mentions"],
+                            Some(_) => &body["mentions"],
+                        }
+                    ),
+                    (false, &mentions),
+                    "{pane} {task_id:?}: {body}"
+                ),
+                Err(code) => assert_eq!(
+                    (error, body["error"].as_str()),
+                    (true, Some(code)),
+                    "{pane}: {body}"
+                ),
+            }
+        }
     }
 
     #[tokio::test]

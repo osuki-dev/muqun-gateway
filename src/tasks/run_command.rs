@@ -143,6 +143,7 @@ async fn launch(
                 label: None,
                 requester_name: by.name,
                 session_title: None,
+                mentions: Vec::new(),
             })
             .await?;
         store

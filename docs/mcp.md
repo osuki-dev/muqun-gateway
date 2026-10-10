@@ -132,12 +132,12 @@ says `"truncated": true` when it left older ones out. `tasks.wait` and
 
 | Tool | Arguments | Result |
 |---|---|---|
-| `fleet.list` | none | `{"machines": [{machineId, label, os, online, suitableFor, tasksActive}]}`. List the computers this gateway knows (this one only for now): alias, OS, what each is suitable for, how busy it is. |
-| `fleet.describe` | `machine?`: `"self"` (default) or a `machineId` | A compact manifest of that computer: `GET /api/fleet/self`'s fields, but each agent is only `{id, kind, status, version, modes, modelCount}` (mode ids, no model catalog) and each terminal backend `{sessionId, label, kind, connected, version}`. What a computer offers: its agents, terminal backends, toolchains with versions, task counts and what it is suitable for. |
+| `fleet.list` | none | `{"machines": [{machineId, label, os, online, suitableFor, tasksActive}]}`: this computer first, then every linked computer (`label` is the name this gateway gives it, `online` whether it is reachable; `os`, `suitableFor` and `tasksActive` come from its cached manifest, empty or 0 while none was fetched). List the computers this gateway can hand work to: this one and every linked one, with OS, what each is suitable for, whether it is reachable and how busy it is. |
+| `fleet.describe` | `machine?`: `"self"` (default), this computer's `machineId` or label, or a linked computer's name (any case) | A compact manifest of that computer: `GET /api/fleet/self`'s fields, but each agent is only `{id, kind, status, version, modes, modelCount}` (mode ids, no model catalog) and each terminal backend `{sessionId, label, kind, connected, version}`. For this computer it also carries `peers`: one `{name, reachable, lastSeen, capabilities, agents, suitableFor}` per linked computer (see [Linked computers](#linked-computers)). What a computer offers: its agents, terminal backends, toolchains with versions, task counts and what it is suitable for. Without machine, this computer plus a short entry per linked computer (peers). |
 | `exec.run` | `cwd`: absolute directory; `command`: shell command, run as `sh -c <command>` (at most 16 KiB); `timeout_s?`: 1..=45, default 30 | `{task_id, state, exit_code, stdout_tail, duration_ms, pane}`. Run a shell command in a visible terminal pane on this computer and return its exit code and output tail. Blocks up to timeout_s (max 45); if still running, returns a task_id for tasks.wait. `exit_code` is null while it runs; `pane` is `{session_id, pane_id}`. |
 | `tasks.delegate` | `goal` (at most 32 KiB); `cwd?`: absolute directory; `agent_id?` (default: the primary agent; a terminal agent kind such as `codex` or `claude` starts it in a new pane instead, see [Delegating to a terminal agent](#delegating-to-a-terminal-agent)); `mode?` (for example `build` or `plan`); `model?`: a model id from the agent's catalog for `cwd` (for example `claude-haiku-5-5`), or `<provider_id>/<model_id>` to pick one provider; default: the agent's default. An unknown id is `invalid_arguments` and nothing is created; `variant?`: the model's variant (reasoning effort, for example `high`), applied when the session is created so the first turn uses it; applied only together with `model` (ignored otherwise), and must be one of the model's catalog variants when it lists any (else `invalid_arguments`); `machine?` | A task view (see [Tasks API](#tasks-api)), filed under the caller's task when the gateway can tell which one it is (see [Task tree](#task-tree)). Start a sub-task on an agent on this computer: a new session in cwd with your goal as the first prompt (for a terminal agent such as codex or claude, a new terminal pane running it). Returns task_id; poll with tasks.wait. |
 | `tasks.wait` | `task_id`; `timeout_s?`: 1..=45, default 30 | The task view, plus `stdout_tail` for a command, and `answer` for a session delegation that is done or `idle_unconfirmed`: the agent's last message in full (`summary` holds only its first 240 characters, on one line). Returns once the task is done, failed, cancelled, `waiting` or `idle_unconfirmed` (its agent stopped without saying it is finished), or when the time is up. Wait up to timeout_s (max 45) for a task to reach done/failed/waiting, or idle_unconfirmed (its agent stopped without completing). Returns the current state and summary; call again while it says working. |
-| `tasks.read` | `task_id`; `what`: `summary` or `timeline`; `cursor?` (timeline only) | `summary`: the task view. `timeline`: `{task_id, items, cursor}`, the most recent agent items after `cursor`; pass the returned `cursor` to read on. Read a task you created: its summary or recent timeline. A command has no timeline. |
+| `tasks.read` | `task_id?`: default, the task the calling session works on; `what`: `summary` or `timeline`; `cursor?` (timeline only) | `summary`: the task view. `timeline`: `{task_id, items, cursor}`, the most recent agent items after `cursor`; pass the returned `cursor` to read on. Read a task you created, or (without task_id) the one this session was given: its summary or recent timeline. Your own task's summary lists the computers the user named for it (`mentions`). A command has no timeline. The session's own task is found as `tasks.complete` finds it (see [Finishing a delegation](#finishing-a-delegation)); none found is `task_not_found`. |
 | `tasks.cancel` | `task_id` | The task view after the cancel. Interrupt a task you created. |
 | `tasks.complete` | `summary`: what was done -- or, blocked, why the agent stopped -- one line (non-empty, at most 32 KiB; stored cut to 240 characters); `outcome?`: `done` (default) or `blocked`; `task_id?`: default, the task the calling session works on | The task view: `done` with that summary, or, for `outcome: "blocked"`, `waiting` with the reason as its `summary` (see [Blocked](#blocked)). Say how the task you were given ended: finished, or stopped because you need the user (a missing file, an unclear request, a permission you cannot get). Only the session working on the task may complete it (see [Finishing a delegation](#finishing-a-delegation)); any other task, none found, or a task that has already ended is `task_not_found`, whose message tells the agent to print the `MUQUN_TASK_DONE: <one-line summary>` (or `MUQUN_TASK_BLOCKED: <one-line reason>`) line instead. A task already `waiting` that is blocked again is answered as it stands. |
 
@@ -147,7 +147,8 @@ Error codes:
 |---|---|
 | `invalid_arguments` | A bad argument: an empty or oversized `command`, `goal` or `summary`, a `cwd` that is not an existing absolute directory, an unknown `model` for `tasks.delegate`, `tasks.read` timeline of a command. |
 | `task_not_found` | No task with that `task_id`, or it belongs to another assistant. |
-| `machine_unknown` | `machine` names a computer other than this one. |
+| `machine_unknown` | `machine` names neither this computer nor a linked one; the message lists the names that work. |
+| `machine_unreachable` | `fleet.describe` named a linked computer that does not answer now. |
 | `agent_unavailable` | The requested agent is not available on this computer. |
 | `no_terminal` | `exec.run` found no reachable terminal session. |
 | `internal` | Anything else; the details are in the gateway log. |
@@ -300,6 +301,10 @@ unknown id is `404 task_not_found`; any other failure is `500 task_failed`.
   same way.
 - `requested_by`: `{"kind": "device", "id": "<device id>", "name": "<device
   name>"}` for a device's task; `null` otherwise.
+- `mentions` (present only when there are any): the computers the user
+  `@`-named when opening the task (see [Opening a task from the
+  device](#opening-a-task-from-the-device)), as this gateway names them, or
+  `self`.
 - `progress` (present only while the task is open and something is known;
   `task_ledger_complete`): what it is doing now, one line of at most 120
   characters -- for a session delegation the agent's current tool call in
@@ -358,7 +363,12 @@ the same device, or the home directory if that device has no previous task.
 effort, for example `high`), applied when the session is created so the first
 turn already runs with it -- it is applied only together with `model` (ignored
 otherwise) and must be one of the model's catalog variants when the catalog
-lists any; `label` is at most 200 characters.
+lists any; `label` is at most 200 characters; `mentions` names the
+computers the user `@`-named in the goal: at most 8, each a linked
+computer's name (any case) or `self`. They are stored on the task as this
+gateway names them, once each in the order given, and shown as the task
+view's `mentions`; the goal is sent as it is, and the agent finds them with
+`tasks.read` of its own task.
 Fields the gateway does not know are ignored. The answer is
 the task view plus the session to open:
 
@@ -374,7 +384,7 @@ the task view plus the session to open:
 
 | Error | When |
 |---|---|
-| `400 invalid_request` | An empty or oversized `goal`, a `label` over 200 characters, an empty or oversized (256 bytes) `agent_id`/`mode`/`model`/`variant`. |
+| `400 invalid_request` | An empty or oversized `goal`, a `label` over 200 characters, an empty or oversized (256 bytes) `agent_id`/`mode`/`model`/`variant`, `mentions` that is not a list, holds more than 8 names, or names a computer that is neither linked nor `self`. Nothing is created. |
 | `400 invalid_directory`, `directory_not_found`, `not_a_directory` | `cwd` is relative, missing, or not a directory. Nothing is created. |
 | `400 unknown_model` | `model` is not in the agent's catalog for `cwd`. Nothing is created. |
 | `400 unknown_variant` | `variant` is not one of the resolved model's catalog variants (a variant without a `model` is ignored). Nothing is created. |
@@ -549,7 +559,9 @@ is told the same only on condition: if this session was started as a Muqun
 task, which `tasks.read` without a task_id answers (the session's task, or
 "this session has no Muqun task: ignore the task protocol"). `tasks.complete`
 from a session without a task answers `task_not_found`: not a task, do not
-call again, print no marker. An agent
+call again, print no marker. Both also say that `tasks.delegate(machine)`
+sends work to a linked computer and that the task's summary lists the ones
+the user named (`mentions`). An agent
 without the muqun tools (T3 Code, DeepSeek) is told nothing: its task ends
 `idle_unconfirmed` for the device to confirm, unless it prints a marker of
 its own accord. The machines a task mentions will not be written into its
@@ -652,6 +664,19 @@ computer's full manifest, model catalogs included; `fleet.describe` returns
 the compact form described under Tools. Manifest fields are camelCase, like
 discovery (the task API stays snake_case).
 
+### Linked computers
+
+Another of the owner's gateways that this one was paired with (capability
+`fleet_peers`; see [Linked gateways](agent-api.md#linked-gateways-fleet_peers)).
+There is no heartbeat: what `fleet.describe` and `fleet.list` show is what
+this gateway last heard. A computer whose last answer is over 60 s old is
+pinged when one of them is called (one that no longer knows this gateway's
+token is forgotten and left out); it is `reachable` while its last answer is
+under 2 minutes old. Its manifest (`GET /api/fleet/self` on it, compacted
+as above) is fetched again when it is over 60 s old and kept in the peer
+row, so an unreachable computer still shows its last agents and
+`suitableFor`. `lastSeen` is ms since the epoch, null if it never answered.
+
 ### States
 
 `queued`, `dispatching`, `working`, `waiting`, `idle_unconfirmed`, `done`,
@@ -724,10 +749,11 @@ because the phone uses them regardless.
   commands are stubs that may open the "install the command line developer
   tools" dialog.
 
-## What P2 adds
+## What is still out
 
-- Peers: other gateways as machines in `fleet.list`, with `machine` selecting one.
-- Grants and @mentions: which assistants may act on which computers, and
-  addressing an agent from a conversation.
-- Remote machines: delegating and running commands on another computer, with
-  the same tasks and the same phone view.
+- Relaying through the phone: a linked computer is reached at the URL the
+  phone used for it, or not at all.
+- Queueing for an offline computer: work for a computer that does not answer
+  is refused (`machine_unreachable`), never held until it is back.
+- Remote files: `cwd` and `@`-mentioned files are always on the computer the
+  task runs on; nothing is copied between computers.

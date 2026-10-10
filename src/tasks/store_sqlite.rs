@@ -36,11 +36,13 @@ CREATE INDEX tasks_by_asid ON tasks(json_extract(binding, '$.asid'));
 CREATE INDEX tasks_device_cwd ON tasks(created_by, origin, created_ms DESC) WHERE cwd IS NOT NULL;
 ", "
 ALTER TABLE tasks ADD COLUMN session_title TEXT;
+", "
+ALTER TABLE tasks ADD COLUMN mentions TEXT;
 "],
 };
 
 const DEFAULT_LIST_LIMIT: usize = 100;
-const TASK_COLUMNS: &str = "id, kind, goal, cwd, binding, state, summary, exit_code, created_by, created_ms, updated_ms, seq, parent_task_id, origin, label, requester_name, session_title";
+const TASK_COLUMNS: &str = "id, kind, goal, cwd, binding, state, summary, exit_code, created_by, created_ms, updated_ms, seq, parent_task_id, origin, label, requester_name, session_title, mentions";
 
 pub(crate) struct SqliteTaskStore {
     db: Arc<SqliteStore>,
@@ -61,7 +63,7 @@ impl TaskStore for SqliteTaskStore {
             let mut task = task;
             task.seq = seq;
             tx.execute(
-                &format!("INSERT INTO tasks({TASK_COLUMNS}) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"),
+                &format!("INSERT INTO tasks({TASK_COLUMNS}) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)"),
                 params![
                     task.id.0,
                     enum_text(&task.kind)?,
@@ -80,6 +82,7 @@ impl TaskStore for SqliteTaskStore {
                     task.label,
                     task.requester_name,
                     task.session_title,
+                    mentions_text(&task.mentions)?,
                 ],
             )?;
             append_event(&tx, &task.id, seq, None, task.state, "created", None)?;
@@ -393,6 +396,7 @@ fn read_row(r: &Row<'_>) -> rusqlite::Result<anyhow::Result<Task>> {
     let label: Option<String> = r.get(14)?;
     let requester_name: Option<String> = r.get(15)?;
     let session_title: Option<String> = r.get(16)?;
+    let mentions: Option<String> = r.get(17)?;
     Ok((|| {
         Ok(Task {
             id: TaskId(id),
@@ -412,8 +416,20 @@ fn read_row(r: &Row<'_>) -> rusqlite::Result<anyhow::Result<Task>> {
             label,
             requester_name,
             session_title,
+            mentions: match mentions {
+                Some(text) => serde_json::from_str(&text)?,
+                None => Vec::new(),
+            },
         })
     })())
+}
+
+/// `NULL` for none, as rows written before mentions existed.
+fn mentions_text(mentions: &[String]) -> anyhow::Result<Option<String>> {
+    Ok(match mentions {
+        [] => None,
+        names => Some(json_text(&names)?),
+    })
 }
 
 fn json_text<T: Serialize>(value: &T) -> anyhow::Result<String> {
@@ -471,6 +487,7 @@ mod tests {
             label: None,
             requester_name: None,
             session_title: None,
+            mentions: Vec::new(),
         }
     }
 

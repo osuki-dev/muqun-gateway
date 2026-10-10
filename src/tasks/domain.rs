@@ -181,6 +181,10 @@ pub(crate) struct Task {
     /// The name its agent session last had, kept when a session delegation
     /// ends (an open task's comes live from the session).
     pub session_title: Option<String>,
+    /// The computers the user named for it (`POST /api/tasks` `mentions`):
+    /// linked peers' names as this gateway calls them, or `self`.
+    #[serde(default)]
+    pub mentions: Vec<String>,
 }
 
 /// A task's direct children by state, computed when the task is read.

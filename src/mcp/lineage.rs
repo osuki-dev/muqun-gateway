@@ -242,6 +242,7 @@ mod tests {
             label: None,
             requester_name: None,
             session_title: None,
+            mentions: Vec::new(),
         }
     }
 

@@ -3,14 +3,17 @@
 
 use std::time::{Duration, Instant};
 
+use futures::future::join_all;
 use serde::Serialize;
+use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
+use super::peers::Peer;
 use super::probes;
 use crate::platform::discovery::{
     AgentAvailability, AgentDiscoveryInfo, TerminalBackendDiscoveryInfo,
 };
-use crate::tasks::domain::TaskState;
+use crate::tasks::domain::{now_ms, TaskState};
 use crate::AppState;
 
 const PROBE_TTL: Duration = Duration::from_secs(60);
@@ -114,6 +117,150 @@ impl Manifest {
     }
 }
 
+/// [`Manifest::compact`] over another computer's `GET /api/fleet/self`
+/// answer, field by field, so a peer on another gateway version still reads.
+pub(crate) fn compact_json(mut full: Value) -> Value {
+    let list = |value: &Value| value.as_array().cloned().unwrap_or_default();
+    let agents: Vec<Value> = list(&full["agents"])
+        .iter()
+        .map(|agent| {
+            json!({
+                "id": agent["id"],
+                "kind": agent["kind"],
+                "status": agent["status"],
+                "version": agent["version"],
+                "modes": list(&agent["modes"]).iter().map(|mode| mode["id"].clone()).collect::<Vec<_>>(),
+                "modelCount": list(&agent["models"]).len(),
+            })
+        })
+        .collect();
+    let terminal: Vec<Value> = list(&full["terminal"])
+        .iter()
+        .map(|backend| {
+            json!({
+                "sessionId": backend["sessionId"],
+                "label": backend["label"],
+                "kind": backend["kind"],
+                "connected": backend["connected"],
+                "version": backend["version"],
+            })
+        })
+        .collect();
+    if let Some(fields) = full.as_object_mut() {
+        fields.insert("agents".into(), agents.into());
+        fields.insert("terminal".into(), terminal.into());
+    }
+    full
+}
+
+/// A linked computer, as `fleet.describe` lists it beside this one: what
+/// this gateway last heard of it, never a call per field.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PeerEntry {
+    pub name: String,
+    pub reachable: bool,
+    /// When it last answered, ms since the epoch.
+    pub last_seen: Option<u64>,
+    pub capabilities: Vec<String>,
+    /// From its cached manifest (compact); empty while none was fetched.
+    pub agents: Vec<Value>,
+    pub suitable_for: Vec<String>,
+}
+
+/// Why `fleet.describe` has nothing for a machine.
+#[derive(Debug)]
+pub(crate) enum DescribeError {
+    /// Neither this computer nor a linked one; the names that are.
+    Unknown(Vec<String>),
+    /// A linked computer that does not answer now.
+    Unreachable(String),
+}
+
+/// A linked computer as last heard: checked when its answer is over a minute
+/// old, with its manifest (fetched again when that is over a minute old).
+struct Heard {
+    peer: Peer,
+    reachable: bool,
+    manifest: Option<Value>,
+}
+
+impl Heard {
+    fn strings(&self, field: &str) -> Vec<String> {
+        self.manifest.as_ref().map_or_else(Vec::new, |manifest| {
+            manifest[field]
+                .as_array()
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|item| item.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+    }
+
+    fn entry(&self) -> PeerEntry {
+        PeerEntry {
+            name: self.peer.name.clone(),
+            reachable: self.reachable,
+            last_seen: self.peer.last_seen_ms,
+            capabilities: self.peer.capabilities.clone(),
+            agents: self
+                .manifest
+                .as_ref()
+                .and_then(|manifest| manifest["agents"].as_array().cloned())
+                .unwrap_or_default(),
+            suitable_for: self.strings("suitableFor"),
+        }
+    }
+
+    fn summary(&self) -> MachineSummary {
+        let field = |name: &str| {
+            self.manifest
+                .as_ref()
+                .and_then(|manifest| manifest[name].as_str().map(str::to_owned))
+        };
+        MachineSummary {
+            machine_id: field("machineId").unwrap_or_else(|| self.peer.server_id.clone()),
+            label: self.peer.name.clone(),
+            os: field("os").unwrap_or_default(),
+            online: self.reachable,
+            suitable_for: self.strings("suitableFor"),
+            tasks_active: self
+                .manifest
+                .as_ref()
+                .and_then(|manifest| manifest["tasks"]["active"].as_u64())
+                .unwrap_or(0) as usize,
+        }
+    }
+}
+
+/// Every linked computer, checked concurrently; one that no longer knows
+/// this gateway is dropped (it was forgotten).
+async fn heard(state: &AppState) -> Vec<Heard> {
+    let peers = match state.peers.list().await {
+        Ok(peers) => peers,
+        Err(error) => {
+            tracing::warn!("fleet: the peers could not be listed: {error:#}");
+            return Vec::new();
+        }
+    };
+    let checks = peers.into_iter().map(|peer| async {
+        let peer = state.peers.checked(peer).await?;
+        let reachable = peer.reachable(now_ms());
+        let manifest = match reachable {
+            true => state.peers.manifest_of(&peer).await,
+            false => peer.manifest.clone(),
+        };
+        Some(Heard {
+            peer,
+            reachable,
+            manifest,
+        })
+    });
+    join_all(checks).await.into_iter().flatten().collect()
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Toolchain {
@@ -134,7 +281,7 @@ pub(crate) struct TaskCounts {
 pub(crate) struct MachineSummary {
     pub machine_id: String,
     pub label: String,
-    pub os: &'static str,
+    pub os: String,
     pub online: bool,
     pub suitable_for: Vec<String>,
     pub tasks_active: usize,
@@ -247,27 +394,44 @@ impl FleetService {
         }
     }
 
-    /// The compact manifest of `machine`, if it names this computer.
+    /// What `fleet.describe` answers for `machine`: this computer's compact
+    /// manifest plus an entry per linked computer (`peers`), or a linked
+    /// computer's own compact manifest (by name in any case, or peer id).
     pub(crate) async fn describe(
         &self,
         state: &AppState,
         machine: Option<&str>,
-    ) -> Option<CompactManifest> {
-        if !is_self(machine, &state.config.server_id, &state.config.label) {
-            return None;
+    ) -> Result<Value, DescribeError> {
+        if is_self(machine, &state.config.server_id, &state.config.label) {
+            let (manifest, peers) = tokio::join!(self.manifest(state), heard(state));
+            let mut answer = json!(manifest.compact());
+            answer["peers"] = json!(peers.iter().map(Heard::entry).collect::<Vec<_>>());
+            return Ok(answer);
         }
-        Some(self.manifest(state).await.compact())
+        let wanted = machine.unwrap_or_default();
+        let unknown = || DescribeError::Unknown(state.peers.names());
+        let peer = state.peers.resolve(wanted).await.ok_or_else(unknown)?;
+        let peer = state.peers.checked(peer).await.ok_or_else(unknown)?;
+        if !peer.reachable(now_ms()) {
+            return Err(DescribeError::Unreachable(peer.name));
+        }
+        let manifest = state.peers.manifest_of(&peer).await;
+        manifest.ok_or(DescribeError::Unreachable(peer.name))
     }
 
-    pub(crate) fn summary(m: &Manifest) -> MachineSummary {
-        MachineSummary {
-            machine_id: m.machine_id.clone(),
-            label: m.label.clone(),
-            os: m.os,
+    /// What `fleet.list` answers: this computer, then every linked one.
+    pub(crate) async fn list(&self, state: &AppState) -> Vec<MachineSummary> {
+        let (manifest, peers) = tokio::join!(self.manifest(state), heard(state));
+        let mut machines = vec![MachineSummary {
+            machine_id: manifest.machine_id.clone(),
+            label: manifest.label.clone(),
+            os: manifest.os.to_owned(),
             online: true,
-            suitable_for: m.suitable_for.clone(),
-            tasks_active: m.tasks.active,
-        }
+            suitable_for: manifest.suitable_for.clone(),
+            tasks_active: manifest.tasks.active,
+        }];
+        machines.extend(peers.iter().map(Heard::summary));
+        machines
     }
 }
 

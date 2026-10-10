@@ -613,6 +613,7 @@ fn task_update(seq: u64) -> TaskDomainEvent {
             progress: None,
             peer_reachable: None,
             peer_last_seen_ms: None,
+            mentions: Vec::new(),
         },
         seq,
     }

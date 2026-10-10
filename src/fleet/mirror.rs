@@ -70,6 +70,7 @@ pub(crate) async fn delegate(
             label: request.label.clone(),
             requester_name: by.name,
             session_title: None,
+            mentions: request.mentions.clone(),
         })
         .await?;
     let mut body = json!({ "goal": request.goal });
@@ -560,6 +561,7 @@ mod tests {
             label: None,
             requester_name: None,
             session_title: None,
+            mentions: Vec::new(),
         }
     }
 

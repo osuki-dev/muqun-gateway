@@ -46,6 +46,8 @@ pub(crate) const REACHABLE_FOR: Duration = Duration::from_secs(120);
 /// How long a ping's answer (reachability, capabilities) is good for.
 pub(crate) const CHECK_EVERY: Duration = Duration::from_secs(60);
 const PING_TIMEOUT: Duration = Duration::from_secs(3);
+/// A first manifest runs the peer's toolchain probes, which take a few seconds.
+const MANIFEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, PartialEq)]
 pub(crate) struct Peer {
@@ -322,6 +324,9 @@ pub(crate) struct PeerService {
     accept: AtomicBool,
     config_path: Option<PathBuf>,
     names: RwLock<Vec<String>>,
+    /// When each peer's cached manifest was fetched; in memory, so the first
+    /// look after a restart fetches it again.
+    manifests_at: Mutex<HashMap<String, u64>>,
     /// Shared with the task service (G3).
     pub(crate) presence: Arc<PeerPresence>,
     pub(crate) sockets: PeerSockets,
@@ -341,6 +346,7 @@ impl PeerService {
             accept: AtomicBool::new(config.accept_delegations),
             config_path,
             names: RwLock::default(),
+            manifests_at: Mutex::default(),
             presence,
             sockets: PeerSockets::default(),
         }
@@ -424,6 +430,57 @@ impl PeerService {
             }
             Ok(Err(_)) | Err(_) => Some(peer),
         }
+    }
+
+    /// `peer`'s manifest as `fleet.describe` shows it (its `GET /api/fleet/self`,
+    /// compacted): the cached one while it is under [`CHECK_EVERY`] old,
+    /// otherwise fetched and cached -- or, when the fetch fails, the cached one
+    /// however old. `None`: none was ever fetched and this fetch failed.
+    pub(crate) async fn manifest_of(&self, peer: &Peer) -> Option<Value> {
+        let fetched_at = self
+            .manifests_at
+            .lock()
+            .ok()
+            .and_then(|at| at.get(&peer.peer_id).copied());
+        let fresh = fetched_at
+            .is_some_and(|at| now_ms().saturating_sub(at) < CHECK_EVERY.as_millis() as u64);
+        if fresh && peer.manifest.is_some() {
+            return peer.manifest.clone();
+        }
+        let client = PeerClient::for_peer(peer).ok()?;
+        let fetch = client.json(Method::GET, "/api/fleet/self", None);
+        let Ok(Ok(full)) = tokio::time::timeout(MANIFEST_TIMEOUT, fetch).await else {
+            return peer.manifest.clone();
+        };
+        let manifest = super::manifest::compact_json(full);
+        let now = now_ms();
+        if let Err(error) = self
+            .store
+            .seen(&peer.peer_id, now, None, Some(manifest.clone()))
+            .await
+        {
+            tracing::warn!(peer = %peer.peer_id, "failed to keep a peer's manifest: {error:#}");
+        }
+        self.presence.seen(&peer.peer_id, Some(now));
+        if let Ok(mut at) = self.manifests_at.lock() {
+            at.insert(peer.peer_id.clone(), now);
+        }
+        Some(manifest)
+    }
+
+    /// Keep `peer` as if it had been linked; a manifest it carries counts as
+    /// fetched when it was last seen.
+    #[cfg(test)]
+    pub(crate) async fn store_for_test(&self, peer: Peer) {
+        if let (Some(_), Some(seen)) = (&peer.manifest, peer.last_seen_ms) {
+            self.manifests_at
+                .lock()
+                .unwrap()
+                .insert(peer.peer_id.clone(), seen);
+        }
+        self.presence.seen(&peer.peer_id, peer.last_seen_ms);
+        self.store.put(&peer).await.unwrap();
+        self.refresh_names().await;
     }
 
     /// Pair with the gateway at `request.url` through the pending pairing
@@ -581,14 +638,6 @@ impl PeerService {
             .read()
             .map(|names| names.clone())
             .unwrap_or_default()
-    }
-
-    /// Keep `peer` as if it had just been linked, without the link.
-    #[cfg(test)]
-    pub(crate) async fn store_for_test(&self, peer: Peer) {
-        self.store.put(&peer).await.unwrap();
-        self.presence.seen(&peer.peer_id, peer.last_seen_ms);
-        self.refresh_names().await;
     }
 
     pub(crate) fn accepts_delegations(&self) -> bool {

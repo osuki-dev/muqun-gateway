@@ -797,6 +797,7 @@ fn task_view_schema() -> Value {
             "parent_task_id": { "type": ["string", "null"], "description": "The open task this one was started from, when the gateway could tell" },
             "origin": { "type": "string", "enum": ["device", "agent", "mcp", "peer"], "description": "device: POST /api/tasks; peer: POST /api/tasks by another of the owner's computers (fleet_peers); agent: started by work the gateway tracks (its agent service, or the pane of an open task); mcp: any other MCP host. Tasks stored before origins existed are mcp" },
             "label": { "type": ["string", "null"], "description": "A short title the requester gave" },
+            "mentions": { "type": "array", "items": { "type": "string" }, "description": "Only when there are any: the computers the user named when opening the task, as this gateway names them, or self" },
             "requested_by": {
                 "description": "The device that opened the task (origin device), or the computer (origin peer, kind gateway, named from its device record); otherwise null",
                 "oneOf": [
@@ -972,7 +973,8 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
                         "mode": { "type": "string", "description": "Ignored for a terminal agent" },
                         "model": { "type": "string", "description": "A model id from the agent's catalog, or provider_id/model_id. Ignored for a terminal agent, as is variant" },
                         "variant": { "type": "string", "description": "The model's variant (reasoning effort), applied when the session is created so the first turn uses it. Applied only together with model (ignored otherwise); must be one of the model's catalog variants when it lists any" },
-                        "label": { "type": "string", "description": "A short title, at most 200 characters" }
+                        "label": { "type": "string", "description": "A short title, at most 200 characters" },
+                        "mentions": { "type": "array", "items": { "type": "string" }, "maxItems": 8, "description": "The computers the user named: linked computers' names (any case) or self; anything else is invalid_request. Kept on the task, never added to the goal" }
                     }
                 })),
                 "responses": create_responses

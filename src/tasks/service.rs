@@ -192,6 +192,8 @@ pub(crate) struct DelegateRequest {
     pub machine: Option<String>,
     /// A short title for the task.
     pub label: Option<String>,
+    /// The computers the user named for it (see [`Task::mentions`]).
+    pub mentions: Vec<String>,
 }
 
 /// Who asked for a task, as a task view shows it.
@@ -238,6 +240,9 @@ pub(crate) struct TaskView {
     /// When a mirror's computer last answered, if it ever did.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peer_last_seen_ms: Option<u64>,
+    /// The computers the user named for it; absent when none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<String>,
 }
 
 /// How the agent working on a task says it ended (`tasks.complete`).
@@ -887,6 +892,7 @@ impl TaskService {
                 label: request.label.clone(),
                 requester_name: by.name,
                 session_title: None,
+                mentions: request.mentions.clone(),
             })
             .await?;
         let created = manager
@@ -1050,6 +1056,7 @@ impl TaskService {
                 label: request.label.clone(),
                 requester_name: by.name,
                 session_title: None,
+                mentions: request.mentions.clone(),
             })
             .await?;
         let cwd = request.cwd.as_deref();
@@ -1486,6 +1493,30 @@ impl TaskService {
         cursor: Option<u64>,
     ) -> Result<Value, TaskError> {
         let task = self.owned(by, id).await?;
+        self.read_task(state, task, what, cursor).await
+    }
+
+    /// [`read`](Self::read) of the task the caller is working on, which it
+    /// did not create (a device did): the caller showed it is its own
+    /// (`mcp::lineage::own_task`).
+    pub(crate) async fn read_own(
+        &self,
+        state: &AppState,
+        id: &TaskId,
+        what: ReadWhat,
+        cursor: Option<u64>,
+    ) -> Result<Value, TaskError> {
+        let task = self.store.get(id).await?.ok_or(TaskError::NotFound)?;
+        self.read_task(state, task, what, cursor).await
+    }
+
+    async fn read_task(
+        &self,
+        state: &AppState,
+        task: Task,
+        what: ReadWhat,
+        cursor: Option<u64>,
+    ) -> Result<Value, TaskError> {
         if what == ReadWhat::Summary {
             return Ok(json!(self.present(&task).await));
         }
@@ -1767,6 +1798,7 @@ impl TaskService {
             progress: None,
             peer_reachable: None,
             peer_last_seen_ms: None,
+            mentions: task.mentions.clone(),
         }
     }
 
@@ -2731,6 +2763,7 @@ mod tests {
             variant: None,
             machine: machine.map(str::to_owned),
             label: None,
+            mentions: Vec::new(),
         }
     }
 
@@ -3487,6 +3520,7 @@ mod tests {
                 label: None,
                 requester_name: None,
                 session_title: None,
+                mentions: Vec::new(),
             })
             .await;
         state

@@ -2065,6 +2065,23 @@ Another of the owner's computers is a paired device of `kind: "gateway"`
 `GET /api/fleet/self` and `DELETE /api/pairings/{its own id}`; everything
 else answers `403 peer_forbidden`.
 
+The owner -- an app device, or the admin token (the `muqun-gateway peers`
+CLI) -- links and manages them; a gateway token gets `403 peer_forbidden`
+on all of these:
+
+| Route | Body | Answer |
+|---|---|---|
+| `POST /api/pair/pending` (on the computer to be linked) | `{device_name, kind?: "app" \| "gateway", server_id?}` | `{request_id, code, expires_in_ms}` for `POST /api/peers` on the other side; `409 pairing_in_progress` while another code is pending, `429 pairing_rate_limited`. |
+| `GET /api/peers` | none | `{accept_delegations, peers: [{peer_id, server_id, name, url, reachable, last_seen_ms}]}`; a peer not heard from for a minute is pinged first (3 s), and one that no longer knows this gateway is forgotten and left out. |
+| `POST /api/peers` | `{url, name, request_id, code}` | The new peer. `502 peer_unreachable`; `409 peer_refused` (`error.reason`: `pairing_code_expired`, `invalid_pairing_code`, `pairing_not_requested`, `invalid_token` or `refused`), `peer_conflict`, `peer_name_taken`; `400 peer_is_self`, `invalid_request`. |
+| `PATCH /api/peers/{peer_id}` | `{name}` | The renamed peer; `409 peer_name_taken`, `404 peer_not_found`. |
+| `DELETE /api/peers/{peer_id}` | none | `{remote_revoked, counterpart_revoked}`; this gateway forgets the peer, asks it to revoke this gateway's device, and revokes the peer's own login here (below). `404 peer_not_found`. |
+| `PUT /api/fleet/settings` | `{accept_delegations}` | `{accept_delegations}`, written to `config.json` (`fleet.accept_delegations`). |
+
+A peer's name is what `fleet.describe`/`fleet.list` show and what
+`POST /api/tasks` `mentions` must use (see
+[mcp.md](mcp.md#opening-a-task-from-the-device)).
+
 `POST /api/pair/request` and `POST /api/pair/pending` take an optional
 `server_id`, the claiming gateway's own, kept on its device record. Nothing
 checks it, so it never replaces or evicts a device; its only use is that
