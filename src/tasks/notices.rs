@@ -191,7 +191,7 @@ async fn ready(state: &AppState, child: &Task, target: &NoticeTarget) -> Ready {
             if terminal_session(state, session_id).is_none() {
                 return Ready::Never("the terminal session is gone");
             }
-            match super::pane_agent::job_in_front(job).await {
+            match super::pane_agent::job_in_front(&job).await {
                 Front::Agent => Ready::Now,
                 Front::Gone => Ready::Never("the launched agent job is gone"),
                 Front::Other if recent(child) => Ready::NotYet,
@@ -318,8 +318,7 @@ struct PaneTypist<'a> {
 
 impl Typist for PaneTypist<'_> {
     fn in_front(&self) -> BoxFuture<'_, bool> {
-        let job = self.job;
-        Box::pin(async move { super::pane_agent::job_in_front(job).await == Front::Agent })
+        Box::pin(async move { super::pane_agent::job_in_front(&self.job).await == Front::Agent })
     }
     fn paste(&self) -> BoxFuture<'_, anyhow::Result<()>> {
         Box::pin(async move {
@@ -734,7 +733,8 @@ mod tests {
             ["evil finished: ok /exit touch pwned"]
         );
 
-        // A pane delegation whose agent cannot be found in its pane.
+        // A pane delegation with no launched job recorded (an older binding,
+        // or a launch whose job was not found).
         let pane = app
             .tasks
             .insert_for_test(&Task {
@@ -744,7 +744,7 @@ mod tests {
                     tab_id: None,
                     shell_pid: None,
                     agent_id: Some("claude".into()),
-                    agent_pgid: None,
+                    agent_job: None,
                 },
                 ..child(TaskState::IdleUnconfirmed, None)
             })
@@ -753,9 +753,9 @@ mod tests {
             session_id: "default".into(),
             pane_id: "%9".into(),
         };
-        // Nothing typed; within the hour it waits for the agent to come back
-        // to the front (`fg`), after that it is given up.
-        for (age_ms, pending) in [(0, 1), (2 * 60 * 60 * 1000, 0)] {
+        // Nothing typed, ever: never a guess at what holds the pane, so it is
+        // given up at once, recent or not.
+        for (age_ms, pending) in [(0, 0), (2 * 60 * 60 * 1000, 0)] {
             let id = app
                 .tasks
                 .insert_for_test(&Task {

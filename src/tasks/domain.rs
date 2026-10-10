@@ -60,6 +60,17 @@ impl TaskState {
     }
 }
 
+/// The job a delegation's launch command started in its pane, as the
+/// terminal knew it then: its process group, and that group's leader by pid
+/// and start time -- a pid or group reused later by another process has
+/// another start time, so is never taken for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct AgentJob {
+    pub pgid: i64,
+    pub leader: u32,
+    pub started: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum TaskBinding {
@@ -82,11 +93,11 @@ pub(crate) enum TaskBinding {
         /// started in this pane; absent for a command task.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_id: Option<String>,
-        /// The process group of the agent this delegation launched, taken
-        /// from the pane terminal's foreground group once the launch command
-        /// had started: only that job is ever typed to (`tasks::notices`).
+        /// The job this delegation's launch command started in the pane:
+        /// only that job is ever typed to (`tasks::notices`). Absent when
+        /// none was recorded -- then nothing is.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        agent_pgid: Option<i64>,
+        agent_job: Option<AgentJob>,
     },
     /// A delegation running on another of the owner's computers: this task is
     /// its mirror here, kept in step with task `remote_task_id` on peer
@@ -353,7 +364,7 @@ mod tests {
                 tab_id: None,
                 shell_pid: None,
                 agent_id: None,
-                agent_pgid: None,
+                agent_job: None,
             }
         );
         assert_eq!(serde_json::to_string(&binding).unwrap(), stored);
@@ -363,7 +374,7 @@ mod tests {
             tab_id: None,
             shell_pid: Some(42),
             agent_id: None,
-            agent_pgid: None,
+            agent_job: None,
         };
         let json = serde_json::to_string(&pinned).unwrap();
         assert_eq!(serde_json::from_str::<TaskBinding>(&json).unwrap(), pinned);

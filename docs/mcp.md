@@ -688,18 +688,26 @@ A session still in its turn -- inside a `tasks.wait`, say -- is sent nothing:
 the wait answers it, and a state a wait returned is never sent again. A pane
 is told when its own delegation's follower saw the agent stop
 (`idle_unconfirmed` or `done`) and the job that delegation launched holds
-the pane's terminal. The gateway typed the launch command itself, so once
-that command has started (the terminal's foreground process group is no
-longer the shell's) it records that group on the task (`agent_pgid`, for
-tmux and Herdr alike) -- how the agent was installed, and what its
-executable or arguments are, never matter. A line is typed only when the
-pane terminal's foreground group is that recorded group, and the group
-still has a process on that terminal descending from the pane's shell.
-Anything else in front -- the shell after Ctrl-Z, `ssh`, `sudo`, an editor,
-anything started afterwards -- is another group, so nothing is typed; the
-result is tried again on later passes for an hour (the agent may come back
-with `fg`, the same group), then given up. A group that is gone (the agent
-exited, or a restart found nothing left of it) is given up at once, recorded
+the pane's terminal. The gateway typed the launch command itself, so it
+records the job that command started (`agent_job`, for tmux and Herdr
+alike): a child of the pane's shell, on its terminal, leading its own
+process group, that was not there before the command was typed and has run
+no longer than since then -- the oldest such, and only while it holds the
+terminal, looked for for at most ten seconds once the launch is confirmed.
+A job already in front before the launch, or one started after it, is never
+taken. Its process group, and its leader's pid and start time, are kept;
+how the agent was installed, and what its executable or arguments are,
+never matter. With no job recorded (an older task, or none found) nothing
+is ever typed to that pane -- there is no guess at what holds it. A line is
+typed only when the leader is still there with the same start time, still
+leads that group on the pane's terminal and descends from the pane's shell,
+and that group is the terminal's foreground group. Anything else in front
+-- the shell after Ctrl-Z, `ssh`, `sudo`, an editor, anything started
+afterwards -- is another group, so nothing is typed; the result is tried
+again on later passes for an hour (the agent may come back with `fg`, the
+same group), then given up. A job that is gone -- the agent exited, or its
+pid or group now belongs to another process (a different start time), as
+after a restart -- is given up at once, recorded
 as skipped. The
 line is sent the way a goal is (the agent's prompt call, a bracketed paste on
 tmux), and the foreground is looked at again before each Enter: if another

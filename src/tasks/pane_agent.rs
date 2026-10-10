@@ -42,11 +42,12 @@
 //! every [`POLL`], backing off to [`MAX_PAUSED_POLL`] while nothing changes
 //! ([`paused_poll`]).
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use serde_json::Value;
 
-use super::domain::{one_line, Task, TaskBinding, TaskChange, TaskId, TaskState};
+use super::domain::{one_line, AgentJob, Task, TaskBinding, TaskChange, TaskId, TaskState};
 use super::service::SUMMARY_CHARS;
 use super::{may_touch, same_pane};
 use crate::agents::tasks as agent_kinds;
@@ -182,13 +183,13 @@ pub(crate) async fn exited_to_shell(session: &SessionConfig, pane_id: &str, kind
     }
 }
 
-/// The job a delegation launched in a pane: the pane's shell, and the
-/// process group the launch command started as (`TaskBinding::Pane`'s
-/// `shell_pid` and `agent_pgid`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The job a delegation launched in a pane: the pane's shell, and the job
+/// its launch command started (`TaskBinding::Pane`'s `shell_pid` and
+/// `agent_job`).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PaneJob {
     pub shell_pid: u32,
-    pub pgid: i64,
+    pub job: AgentJob,
 }
 
 /// Where a pane's launched job stands now.
@@ -199,42 +200,95 @@ pub(crate) enum Front {
     /// Something else does (a shell, `ssh`, `sudo`, an editor; the agent
     /// suspended with Ctrl-Z or put in the background).
     Other,
-    /// The job (or the pane's shell) is gone.
+    /// The job (or the pane's shell) is gone, or its group is now another
+    /// process's.
     Gone,
 }
 
-/// The process group in front of `shell_pid`'s terminal, once something
-/// other than the shell holds it: what a launch command just typed there
-/// started as. Asked a few times while the command starts; `None` when the
-/// shell never gave the terminal up.
-pub(crate) async fn launched_job(shell_pid: u32) -> Option<i64> {
-    for _ in 0..20 {
-        if let Some(rows) = job_table().await {
-            if let Some(shell) = rows.iter().find(|row| row.pid == shell_pid) {
-                if shell.tpgid > 0 && shell.tpgid != shell.pgid {
-                    return Some(shell.tpgid);
-                }
-            }
+/// How long [`launched_job`] looks for the job once the launch is confirmed.
+const CAPTURE_WINDOW: Duration = Duration::from_secs(10);
+
+/// The processes there were just before a launch command was typed, and
+/// when: none of them is ever taken for the job the launch started.
+pub(crate) struct BeforeLaunch {
+    pids: HashSet<u32>,
+    at: std::time::Instant,
+}
+
+/// [`BeforeLaunch`] now; `None` when the process table cannot be read --
+/// then no job is recorded.
+pub(crate) async fn before_launch() -> Option<BeforeLaunch> {
+    let rows = job_table().await?;
+    Some(BeforeLaunch {
+        pids: rows.iter().map(|row| row.pid).collect(),
+        at: std::time::Instant::now(),
+    })
+}
+
+/// The job a launch command typed into `shell_pid`'s terminal started
+/// ([`new_job`]), looked for for at most [`CAPTURE_WINDOW`]; `None` when no
+/// process qualifies, the shell is not found, or the table cannot be read.
+pub(crate) async fn launched_job(shell_pid: u32, before: &BeforeLaunch) -> Option<AgentJob> {
+    let deadline = std::time::Instant::now() + CAPTURE_WINDOW;
+    loop {
+        let rows = job_table().await?;
+        rows.iter().find(|row| row.pid == shell_pid)?;
+        let since = before.at.elapsed().as_secs() + 1;
+        if let Some(job) = new_job(&rows, shell_pid, &before.pids, since) {
+            return Some(job);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    None
+}
+
+/// The job a launch started, on a process table: of the shell's children
+/// on its terminal that lead their own process group, were not there before
+/// the launch (`before`) and have run no longer than since then (`since`
+/// seconds, against a pid reused meanwhile), the oldest -- and only when it
+/// holds the terminal. A job already there, or one started after it, is
+/// never taken.
+fn new_job(rows: &[Proc], shell_pid: u32, before: &HashSet<u32>, since: u64) -> Option<AgentJob> {
+    let shell = rows.iter().find(|row| row.pid == shell_pid)?;
+    if !on_terminal(&shell.tty) {
+        return None;
+    }
+    let leader = rows
+        .iter()
+        .filter(|row| {
+            row.ppid == shell.pid
+                && i64::from(row.pid) == row.pgid
+                && row.tty == shell.tty
+                && !before.contains(&row.pid)
+                && row.etime <= since
+        })
+        .max_by_key(|row| row.etime)?;
+    (shell.tpgid == leader.pgid).then(|| AgentJob {
+        pgid: leader.pgid,
+        leader: leader.pid,
+        started: leader.started.clone(),
+    })
 }
 
 /// Where `job` stands now ([`job_front`] on a fresh process table); a
 /// table that cannot be read or parsed answers `Other`, never `Agent`.
-pub(crate) async fn job_in_front(job: PaneJob) -> Front {
+pub(crate) async fn job_in_front(job: &PaneJob) -> Front {
     match job_table().await {
         Some(rows) => job_front(&rows, job),
         None => Front::Other,
     }
 }
 
-/// `ps -o pid=,ppid=,pgid=,tpgid=,tty=` for every process; `None` when it
-/// cannot be run or any row does not parse.
+/// `ps -o pid=,ppid=,pgid=,tpgid=,tty=,etime=,lstart=` for every process,
+/// start times in UTC; `None` when it cannot be run or any row does not
+/// parse.
 async fn job_table() -> Option<Vec<Proc>> {
     let out = tokio::process::Command::new("ps")
-        .args(["-A", "-o", "pid=,ppid=,pgid=,tpgid=,tty="])
+        .args(["-A", "-o", "pid=,ppid=,pgid=,tpgid=,tty=,etime=,lstart="])
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC")
         .kill_on_drop(true)
         .output()
         .await
@@ -245,7 +299,7 @@ async fn job_table() -> Option<Vec<Proc>> {
     process_rows(&String::from_utf8_lossy(&out.stdout))
 }
 
-/// One `ps -o pid=,ppid=,pgid=,tpgid=,tty=` row.
+/// One `ps -o pid=,ppid=,pgid=,tpgid=,tty=,etime=,lstart=` row.
 #[derive(Debug, Clone)]
 struct Proc {
     pid: u32,
@@ -253,61 +307,102 @@ struct Proc {
     pgid: i64,
     tpgid: i64,
     tty: String,
+    /// Seconds it has run.
+    etime: u64,
+    /// When it started, as `ps` prints it: compared, never parsed.
+    started: String,
 }
 
-/// The rows of a process table, by fixed columns: four numbers and the
-/// terminal. `None` when any row does not parse -- the table is then not
-/// trusted at all.
+/// The rows of a process table, by fixed columns: four numbers, the
+/// terminal, the elapsed time and the rest of the line as the start time.
+/// `None` when any row does not parse -- the table is then not trusted at
+/// all.
 fn process_rows(table: &str) -> Option<Vec<Proc>> {
     table
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| {
             let mut fields = line.split_whitespace();
-            let row = Proc {
-                pid: fields.next()?.parse().ok()?,
-                ppid: fields.next()?.parse().ok()?,
-                pgid: fields.next()?.parse().ok()?,
-                tpgid: fields.next()?.parse().ok()?,
-                tty: fields.next()?.to_owned(),
-            };
-            fields.next().is_none().then_some(row)
+            let pid = fields.next()?.parse().ok()?;
+            let ppid = fields.next()?.parse().ok()?;
+            let pgid = fields.next()?.parse().ok()?;
+            let tpgid = fields.next()?.parse().ok()?;
+            let tty = fields.next()?.to_owned();
+            let etime = elapsed_seconds(fields.next()?)?;
+            let started = fields.collect::<Vec<_>>().join(" ");
+            (!started.is_empty()).then_some(Proc {
+                pid,
+                ppid,
+                pgid,
+                tpgid,
+                tty,
+                etime,
+                started,
+            })
         })
         .collect()
 }
 
-/// [`job_in_front`] on a process table: the job is in front when the pane
-/// terminal's foreground group (as its shell reports it) is the job's own,
-/// and that group still has a process on that terminal descending from the
-/// shell. Gone when the shell or every such process is gone.
-fn job_front(rows: &[Proc], job: PaneJob) -> Front {
-    let Some(shell) = rows.iter().find(|row| row.pid == job.shell_pid) else {
+/// `ps`'s `etime`, `[[dd-]hh:]mm:ss`, in seconds.
+fn elapsed_seconds(etime: &str) -> Option<u64> {
+    let (days, clock) = match etime.split_once('-') {
+        Some((days, clock)) => (days.parse::<u64>().ok()?, clock),
+        None => (0, etime),
+    };
+    let mut seconds = 0u64;
+    let parts: Vec<&str> = clock.split(':').collect();
+    if !(2..=3).contains(&parts.len()) {
+        return None;
+    }
+    for part in parts {
+        seconds = seconds * 60 + part.parse::<u64>().ok()?;
+    }
+    Some(days * 86_400 + seconds)
+}
+
+/// Whether `ps` names a terminal there.
+fn on_terminal(tty: &str) -> bool {
+    !matches!(tty, "?" | "??" | "-" | "")
+}
+
+/// [`job_in_front`] on a process table. The recorded job's leader must
+/// still be there with the start time it had, still lead the recorded
+/// group, sit on the shell's terminal and descend from the shell --
+/// otherwise the job is gone, whatever now holds its pid or group. It is in
+/// front when the terminal's foreground group (as the shell reports it) is
+/// that group.
+fn job_front(rows: &[Proc], pane: &PaneJob) -> Front {
+    let Some(shell) = rows.iter().find(|row| row.pid == pane.shell_pid) else {
         return Front::Gone;
     };
-    if matches!(shell.tty.as_str(), "?" | "??" | "-" | "") {
+    let Some(leader) = rows.iter().find(|row| row.pid == pane.job.leader) else {
         return Front::Gone;
-    }
-    let mut tree = vec![shell.pid];
-    let mut at = 0;
-    while at < tree.len() && tree.len() < 512 {
-        let parent = tree[at];
-        for row in rows {
-            if row.ppid == parent && !tree.contains(&row.pid) {
-                tree.push(row.pid);
+    };
+    let descends = || {
+        let mut at = leader.ppid;
+        for _ in 0..64 {
+            if at == shell.pid {
+                return true;
+            }
+            match rows.iter().find(|row| row.pid == at) {
+                Some(row) if row.ppid != at => at = row.ppid,
+                _ => return false,
             }
         }
-        at += 1;
+        false
+    };
+    if !on_terminal(&shell.tty)
+        || leader.started != pane.job.started
+        || leader.pgid != pane.job.pgid
+        || leader.tty != shell.tty
+        || !descends()
+    {
+        return Front::Gone;
     }
-    let alive = rows.iter().any(|row| {
-        row.pid != shell.pid
-            && row.pgid == job.pgid
-            && row.tty == shell.tty
-            && tree.contains(&row.pid)
-    });
-    match (alive, shell.tpgid == job.pgid) {
-        (false, _) => Front::Gone,
-        (true, true) => Front::Agent,
-        (true, false) => Front::Other,
+    if shell.tpgid == pane.job.pgid {
+        Front::Agent
+    } else {
+        Front::Other
     }
 }
 
@@ -1278,58 +1373,119 @@ mod tests {
 
     /// Only the job the delegation launched, holding the pane's terminal, is
     /// typed to; whatever else holds it, nothing is, and a job that is gone
-    /// is given up.
+    /// -- or whose pid or group another process now has -- is given up.
     #[test]
     fn only_the_launched_job_holding_the_terminal_is_typed_to() {
-        // pid ppid pgid tpgid tty; the pane's shell is 100 on pts/3, the
-        // launched job's group is 200.
-        let job = PaneJob {
+        // pid ppid pgid tpgid tty etime lstart; the pane's shell is 100 on
+        // pts/3, the launched job is group 200 led by 200.
+        const AT: &str = "Sun Oct 11 10:00:00 2026";
+        let pane = PaneJob {
             shell_pid: 100,
-            pgid: 200,
+            job: AgentJob {
+                pgid: 200,
+                leader: 200,
+                started: AT.into(),
+            },
         };
         let rows = |lines: &[&str]| process_rows(&lines.join("\n")).unwrap();
+        let shell =
+            |tpgid: u32| format!("100 1 100 {tpgid} pts/3 01:00:00 Sun Oct 11 09:00:00 2026");
         for (name, table, front) in [
             (
                 "the recorded job in front",
                 rows(&[
-                    "100 1 100 200 pts/3",
-                    "200 100 200 200 pts/3",
-                    "201 200 200 200 pts/3",
+                    &shell(200),
+                    &format!("200 100 200 200 pts/3 05:00 {AT}"),
+                    &format!("201 200 200 200 pts/3 04:00 {AT}"),
                 ]),
                 Front::Agent,
             ),
             (
                 "the shell in front (Ctrl-Z)",
-                rows(&["100 1 100 100 pts/3", "200 100 200 100 pts/3"]),
+                rows(&[&shell(100), &format!("200 100 200 100 pts/3 05:00 {AT}")]),
                 Front::Other,
             ),
             (
                 "another job in front (ssh, sudo, an editor)",
                 rows(&[
-                    "100 1 100 300 pts/3",
-                    "200 100 200 300 pts/3",
-                    "300 100 300 300 pts/3",
+                    &shell(300),
+                    &format!("200 100 200 300 pts/3 05:00 {AT}"),
+                    &format!("300 100 300 300 pts/3 00:10 {AT}"),
                 ]),
                 Front::Other,
             ),
             (
-                "the group gone after a restart",
-                rows(&["100 1 100 100 pts/3"]),
+                "the job gone after a restart",
+                rows(&[&shell(100)]),
                 Front::Gone,
             ),
             (
-                "the group on another terminal",
-                rows(&["100 1 100 200 pts/3", "200 100 200 200 pts/7"]),
+                "the same pid and group, started at another time",
+                rows(&[
+                    &shell(200),
+                    "200 100 200 200 pts/3 00:03 Sun Oct 11 11:00:00 2026",
+                ]),
+                Front::Gone,
+            ),
+            (
+                "the leader on another terminal",
+                rows(&[&shell(200), &format!("200 100 200 200 pts/7 05:00 {AT}")]),
                 Front::Gone,
             ),
         ] {
-            assert_eq!(job_front(&table, job), front, "{name}");
+            assert_eq!(job_front(&table, &pane), front, "{name}");
         }
         assert!(
-            process_rows("100 1 x 200 pts/3").is_none(),
+            process_rows("100 1 x 200 pts/3 00:01 {AT}").is_none(),
             "unparsable: not trusted"
         );
+        assert_eq!(
+            elapsed_seconds("2-03:04:05"),
+            Some(2 * 86_400 + 3 * 3600 + 4 * 60 + 5)
+        );
     }
+
+    /// The job recorded at launch is the one the launch started: never a
+    /// job already in front before it was typed, nor one started after it.
+    #[test]
+    fn the_launch_records_only_the_job_it_started() {
+        let before: HashSet<u32> = [1, 100, 150].into();
+        let shell =
+            |tpgid: u32| format!("100 1 100 {tpgid} pts/3 01:00:00 Sun Oct 11 09:00:00 2026");
+        let rows = |lines: &[&str]| process_rows(&lines.join("\n")).unwrap();
+        let old = "150 100 150 150 pts/3 10:00 Sun Oct 11 09:50:00 2026";
+        let agent = "200 100 200 200 pts/3 00:04 Sun Oct 11 10:00:00 2026";
+        let later = "300 100 300 300 pts/3 00:01 Sun Oct 11 10:00:03 2026";
+        for (name, table, recorded) in [
+            (
+                "the launched job in front",
+                rows(&[&shell(200), old, agent]),
+                Some(200),
+            ),
+            (
+                "a job there before the launch in front",
+                rows(&[&shell(150), old]),
+                None,
+            ),
+            (
+                "a job started after it in front",
+                rows(&[&shell(300), agent, later]),
+                None,
+            ),
+            (
+                "a reused pid older than the launch",
+                rows(&[
+                    &shell(200),
+                    "200 100 200 200 pts/3 09:00 Sun Oct 11 09:51:00 2026",
+                ]),
+                None,
+            ),
+        ] {
+            let job = new_job(&table, 100, &before, 6).map(|job| job.leader);
+            assert_eq!(job, recorded, "{name}");
+        }
+    }
+
     use super::*;
 
     #[test]

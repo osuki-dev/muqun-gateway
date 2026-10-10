@@ -869,15 +869,15 @@ impl TaskService {
         let task = self.store.list(filter).await.ok()?.into_iter().next()?;
         let TaskBinding::Pane {
             shell_pid,
-            agent_pgid,
+            agent_job,
             ..
         } = &task.binding
         else {
             return None;
         };
         let job = shell_pid
-            .zip(*agent_pgid)
-            .map(|(shell_pid, pgid)| pane_agent::PaneJob { shell_pid, pgid });
+            .zip(agent_job.clone())
+            .map(|(shell_pid, job)| pane_agent::PaneJob { shell_pid, job });
         (task.kind == TaskKind::Delegation).then_some((task.state, job))
     }
 
@@ -1322,7 +1322,7 @@ impl TaskService {
             tab_id: placed.place.tab_id.clone(),
             shell_pid,
             agent_id: Some(kind.clone()),
-            agent_pgid: None,
+            agent_job: None,
         };
         let dispatching = TaskChange {
             binding: Some(binding),
@@ -1397,6 +1397,8 @@ pub(crate) async fn start_terminal_agent(
     }
     let pane_id = placed.place.pane_id.clone();
     let mut goal = goal;
+    // What ran before the launch command was typed is never its job.
+    let mut before = pane_agent::before_launch().await;
     let (mut launched, mut to_type) = start_agent_in_place(
         &state,
         &session,
@@ -1425,6 +1427,7 @@ pub(crate) async fn start_terminal_agent(
     {
         tracing::info!(task = %task.id.0, "terminal task: started again with the sentence typed");
         goal = format!("{goal}\n\n{}", crate::mcp::inject::TASK_SENTENCE);
+        before = pane_agent::before_launch().await;
         (launched, to_type) = start_agent_in_place(
             &state,
             &session,
@@ -1460,19 +1463,27 @@ pub(crate) async fn start_terminal_agent(
     }
     let mut to = change(TaskState::Working);
     // The job the launch started: the only one a told result is ever typed
-    // to (`tasks::notices`).
-    if let TaskBinding::Pane {
-        shell_pid: Some(shell_pid),
-        ..
-    } = &task.binding
-    {
-        if let Some(pgid) = pane_agent::launched_job(*shell_pid).await {
+    // to (`tasks::notices`). Without one, nothing ever is.
+    let shell_pid = match &task.binding {
+        TaskBinding::Pane { shell_pid, .. } => *shell_pid,
+        _ => None,
+    };
+    let job = match (shell_pid, &before) {
+        (Some(shell_pid), Some(before)) => pane_agent::launched_job(shell_pid, before).await,
+        _ => None,
+    };
+    match job {
+        Some(job) => {
             let mut binding = task.binding.clone();
-            if let TaskBinding::Pane { agent_pgid, .. } = &mut binding {
-                *agent_pgid = Some(pgid);
+            if let TaskBinding::Pane { agent_job, .. } = &mut binding {
+                *agent_job = Some(job);
             }
             to.binding = Some(binding);
         }
+        None => tracing::warn!(
+            task = %task.id.0,
+            "terminal task: no launched job recorded; its pane will not be typed to"
+        ),
     }
     // A follower or a cancel may have moved it meanwhile; follow whatever is
     // still open.
