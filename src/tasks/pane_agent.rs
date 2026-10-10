@@ -1161,7 +1161,7 @@ pub(crate) fn screen_summary(agent: Option<&str>, visible: &str) -> Option<Strin
 /// Banners, tips and the footer hints agents draw around their input, not
 /// their work. Specific phrases, not words: prose may well mention `ctrl+c`
 /// or auto mode.
-const CHROME: [&str; 17] = [
+const CHROME: [&str; 12] = [
     "mise upgrade",
     "? for shortcuts",
     "esc to interrupt",
@@ -1174,16 +1174,28 @@ const CHROME: [&str; 17] = [
     "\u{23ce} send",
     ">_ OpenAI Codex",
     "/model to change",
-    // Claude Code's plan banners: the owner's usage never reaches a task row.
-    "of your weekly limit",
-    "of your session limit",
-    "usage limit",
-    "/usage-credits",
-    "\u{b7} resets",
 ];
 
 /// Banner and tip lines, by how they start once their decoration is cut.
-const CHROME_START: [&str; 4] = ["Update available", "Tip:", "You've used", "Approaching"];
+const CHROME_START: [&str; 2] = ["Update available", "Tip:"];
+
+/// Claude Code's plan-usage banners, by their exact shape -- `You've used
+/// 92% of your weekly limit ...` and `Approaching usage limit \u{b7} resets
+/// ...` -- so the owner's usage never reaches a task row, while prose that
+/// merely starts or speaks that way is kept.
+fn plan_banner(text: &str) -> bool {
+    if let Some(rest) = text.strip_prefix("You've used ") {
+        let digits = rest.chars().take_while(char::is_ascii_digit).count();
+        return digits > 0
+            && rest[digits..].starts_with("% of your ")
+            && rest.split_whitespace().take(6).any(|word| word == "limit");
+    }
+    if let Some(rest) = text.strip_prefix("Approaching ") {
+        return rest.split_whitespace().take(3).any(|word| word == "limit")
+            && rest.contains("\u{b7} resets");
+    }
+    false
+}
 
 /// `line`'s text when it says something: not box drawing or a rule, not
 /// the agent's input prompt (`❯`, `›`), not a spinner, banner or footer
@@ -1206,7 +1218,7 @@ fn meaningful(line: &str) -> Option<&str> {
     let text = trimmed
         .trim_start_matches(|c: char| !c.is_alphanumeric() && !"([{\"'`/~.>$".contains(c))
         .trim_end_matches(|c: char| c == '│' || c.is_whitespace());
-    if CHROME_START.iter().any(|start| text.starts_with(start)) {
+    if CHROME_START.iter().any(|start| text.starts_with(start)) || plan_banner(text) {
         return None;
     }
     let words = text.chars().filter(|c| c.is_alphanumeric()).count();
@@ -2196,6 +2208,14 @@ mod tests {
                 None,
             ),
             ("Approaching usage limit \u{b7} resets at 6pm\n", None),
+            (
+                "Approaching the bug differently this time\n",
+                Some("Approaching the bug differently this time"),
+            ),
+            (
+                "You've used the cache, so the build hit the API usage limit\n",
+                Some("You've used the cache, so the build hit the API usage limit"),
+            ),
             ("⏺ Read file.rs\n", Some("Read file.rs")),
             ("✶\n", None),
             (
