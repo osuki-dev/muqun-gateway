@@ -296,6 +296,10 @@ async fn pane_alive(
 
 /// One marker read of a command's pane. Whether the task moved.
 async fn poll_command(state: &AppState, task: &Task) -> bool {
+    if task.origin == super::domain::TaskOrigin::Peer {
+        super::run_command::follow_peer_command(state, task);
+        return false;
+    }
     match state.tasks.poll_once(state, task).await {
         Ok(handle) => handle.task.state != task.state,
         Err(error) => {

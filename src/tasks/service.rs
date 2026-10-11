@@ -2144,9 +2144,11 @@ impl TaskService {
         by: Requested,
         request: RunRequest,
     ) -> Result<RunHandle, TaskError> {
-        run_command::start(state, &self.store(), by, request)
+        let handle = run_command::start(state, &self.store(), by, request)
             .await
-            .map_err(command_error)
+            .map_err(command_error)?;
+        run_command::follow_peer_command(state, &handle.task);
+        Ok(handle)
     }
 
     /// Run `command` on the linked computer `machine` (`exec.run` with

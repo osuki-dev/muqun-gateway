@@ -12,7 +12,7 @@ use anyhow::{anyhow, Context as _};
 use tokio::time::Instant;
 
 use super::domain::{
-    now_ms, Requested, Task, TaskBinding, TaskChange, TaskId, TaskKind, TaskState,
+    now_ms, Requested, Task, TaskBinding, TaskChange, TaskId, TaskKind, TaskOrigin, TaskState,
 };
 use super::may_touch;
 use super::ports::TaskStore;
@@ -188,6 +188,38 @@ async fn launch(
         .transition(&task.id, change(TaskState::Working))
         .await?;
     poll(state, store, &task, deadline).await
+}
+
+/// A peer cannot poll this pane itself. Keep observing after its create
+/// request returned a handle so tasks.wait and the result notice receive the
+/// exit promptly, without waiting for the driver's sixty-second sweep.
+/// This only observes the command already running; it never dispatches again.
+pub(crate) fn follow_peer_command(state: &AppState, task: &Task) {
+    if task.kind != TaskKind::Command
+        || task.origin != TaskOrigin::Peer
+        || task.state.is_terminal()
+        || !state.tasks.claim_follow(&task.id)
+    {
+        return;
+    }
+    let (state, id) = (state.clone(), task.id.clone());
+    tokio::spawn(async move {
+        while let Ok(Some(task)) = state.tasks.task(&id).await {
+            if task.state.is_terminal() {
+                break;
+            }
+            match state.tasks.poll_once(&state, &task).await {
+                Ok(handle) if !handle.task.state.is_terminal() => {}
+                Ok(_) => break,
+                Err(error) => {
+                    tracing::debug!(task = %id.0, %error, "peer command observer stopped");
+                    break;
+                }
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+        state.tasks.release_follow(&id);
+    });
 }
 
 /// Close a tab nothing was typed into, so a failed start leaves none behind.
@@ -482,6 +514,42 @@ mod tests {
         let closed = methods(&herdr, "tab.close");
         assert_eq!(closed.len(), 1);
         assert_eq!(closed[0]["params"]["tab_id"], "w1:t9");
+    }
+
+    #[tokio::test]
+    async fn a_peer_command_finishes_after_create_returned_without_another_wait() {
+        let screens = screens("echo hi", "hi\n", 0);
+        let herdr = FakeHerdr::start(screens.iter().map(String::as_str).collect(), None);
+        let state = output_state(&herdr);
+        let store = SqliteTaskStore::new(state.db.clone());
+        let mut by = principal();
+        by.origin = TaskOrigin::Peer;
+        let handle = launch(
+            &state,
+            &store,
+            by,
+            request("echo hi", Duration::ZERO),
+            TaskId(ID.into()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(handle.task.state, TaskState::Working);
+        follow_peer_command(&state, &handle.task);
+        follow_peer_command(&state, &handle.task);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let task = state.tasks.task(&handle.task.id).await.unwrap().unwrap();
+                if task.state == TaskState::Done {
+                    assert_eq!(task.exit_code, Some(0));
+                    assert!(task.summary.as_deref().unwrap().contains("hi"));
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(herdr.enters().len(), 1, "the command is never sent twice");
     }
 
     #[tokio::test]

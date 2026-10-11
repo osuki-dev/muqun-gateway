@@ -129,6 +129,9 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
   short command on a peer without starting an agent. It retains a command
   mirror and returns bounded output through `tasks.wait`; the receiver
   restricts the working directory to its home and the sender enforces one hop.
+  A peer command keeps a single background observer after the create request
+  returns its handle, so its exit reaches waiters and result notices promptly;
+  the driver restores that observer after a restart without resending the command.
   A `peers` row is keyed by this gateway's own id; the `server_id` the
   peer gave is display data, and a second link giving one already held is
   `409 peer_conflict`, never a merge. On the other side a gateway enrolment
