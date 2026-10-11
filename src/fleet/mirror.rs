@@ -688,25 +688,25 @@ async fn open_mirrors(state: &AppState, peer_id: &str) -> Vec<Task> {
 
 /// Ended delegations stay subscribed so a new turn arrives as a normal frame.
 async fn watched_mirrors(state: &AppState, peer_id: &str) -> Vec<Task> {
-    state
+    // Recent history must not push an older, still-running mirror out of
+    // the socket's page. Reserve the existing full page for open work.
+    let mut watched = open_mirrors(state, peer_id).await;
+    let ended = state
         .tasks
         .open_tasks(TaskFilter {
             peer: Some(peer_id.to_owned()),
-            states: Some(
-                [
-                    OPEN_STATES.as_slice(),
-                    &[TaskState::Done, TaskState::Failed],
-                ]
-                .concat(),
-            ),
+            states: Some(vec![TaskState::Done, TaskState::Failed]),
             limit: 1000,
             ..Default::default()
         })
         .await
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|task| !task.state.is_terminal() || task.kind == TaskKind::Delegation)
-        .collect()
+        .unwrap_or_default();
+    watched.extend(
+        ended
+            .into_iter()
+            .filter(|task| task.kind == TaskKind::Delegation),
+    );
+    watched
 }
 
 fn remote_id(task: &Task) -> &str {
@@ -895,6 +895,26 @@ mod tests {
             progress: None,
             title: None,
         }
+    }
+
+    #[tokio::test]
+    async fn finished_history_does_not_displace_an_open_mirror() {
+        let state = crate::test_support::test_state("admin", vec![]);
+        let active = state
+            .tasks
+            .record(&mirror(TaskState::Working, None))
+            .await
+            .unwrap();
+        for _ in 0..1000 {
+            state
+                .tasks
+                .record(&mirror(TaskState::Done, Some("history")))
+                .await
+                .unwrap();
+        }
+        let watched = watched_mirrors(&state, "srv-mini").await;
+        assert_eq!(watched.len(), 1001);
+        assert!(watched.iter().any(|task| task.id == active.id));
     }
 
     #[tokio::test]
