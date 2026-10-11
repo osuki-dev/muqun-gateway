@@ -158,9 +158,20 @@ pub(crate) enum TaskOrigin {
     Peer,
 }
 
+/// An observed caller context, never a client-supplied authorization claim.
+/// Provider tokens are shared: resolution is workflow inference, not isolation
+/// between hostile sessions running as the same OS user.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ForwardingContext {
+    #[default]
+    Unknown,
+    Resolved,
+}
+
 /// Who asks for a new task, on whose behalf, and under which task.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Requested {
+    pub forwarding: ForwardingContext,
     /// Owns the task: only it (or a device) may read, wait for or cancel it.
     pub by: TaskPrincipal,
     pub origin: TaskOrigin,
@@ -177,6 +188,7 @@ impl Requested {
     #[cfg(test)]
     pub(crate) fn mcp(by: TaskPrincipal) -> Self {
         Self {
+            forwarding: ForwardingContext::Unknown,
             by,
             origin: TaskOrigin::Mcp,
             parent: None,

@@ -399,6 +399,7 @@ pub async fn build_discovery(state: &AppState, _sealed: bool, authenticated: boo
     .collect();
 
     json!({
+        "transport_versions": crate::connectivity::transport::SUPPORTED_VERSIONS,
         "ok": true,
         "gatewayVersion": env!("CARGO_PKG_VERSION"),
         "apiVersion": crate::GATEWAY_API_VERSION,

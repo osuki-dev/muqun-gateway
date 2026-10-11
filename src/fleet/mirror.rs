@@ -459,12 +459,22 @@ async fn follow(state: AppState, peer_id: String) {
         else {
             return;
         };
-        let Ok(client) = PeerClient::for_peer(&peer) else {
-            return;
-        };
         if watched_mirrors(&state, &peer_id).await.is_empty() {
             return leave(&state, &peer_id).await;
         }
+        // Restored mirrors negotiate and persist their transport pin before
+        // opening a socket, just as a new dispatch does before its request.
+        let Some(peer) = state.peers.checked(&state, peer).await else {
+            return;
+        };
+        if !state.peers.reachable(&peer, now_ms()) {
+            tokio::time::sleep(retry).await;
+            retry = (retry * 2).min(RETRY_MOST);
+            continue;
+        }
+        let Ok(client) = PeerClient::for_peer(&peer) else {
+            return;
+        };
         let opened = Instant::now();
         match client.subscribe_tasks().await {
             Ok(mut feed) => {
@@ -967,6 +977,7 @@ mod tests {
             token: "peer-token".into(),
             device_id: "coding-1".into(),
             transport_key: None,
+            transport_min_version: 1,
             added_ms: 0,
             last_seen_ms: seen,
             capabilities: vec![],

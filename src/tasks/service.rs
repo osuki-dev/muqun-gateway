@@ -348,6 +348,8 @@ pub(crate) enum TaskError {
     /// The caller's task came from another computer: it may not hand work
     /// to one in turn (one hop only). The computer it named.
     DelegationLoop(String),
+    /// The caller or an ancestor could not be established reliably.
+    LineageUnresolved,
     /// The linked computer refused the task with its own error code.
     PeerRefused {
         machine: String,
@@ -402,6 +404,10 @@ impl std::fmt::Display for TaskError {
             Self::DelegationLoop(name) => {
                 write!(f, "a task from another computer cannot hand work to {name}")
             }
+            Self::LineageUnresolved => write!(
+                f,
+                "caller lineage could not be resolved; nothing was forwarded"
+            ),
             Self::PeerRefused { machine, code } => write!(f, "{machine} refused the task ({code})"),
             Self::AgentUnavailable(agent) => write!(f, "agent '{agent}' is not available"),
             Self::UnknownModel(model) => write!(f, "unknown model '{model}'"),
@@ -1100,29 +1106,42 @@ impl TaskService {
         }
     }
 
-    /// Whether `by` works for a task another computer opened here, itself or
-    /// through its ancestors: such a task stays on this computer, so two
-    /// computers can never hand one goal back and forth. Best effort: a
-    /// caller whose task could not be told (`by.parent` is `None` when no
-    /// open task, or several, fit the call) passes, so a loop takes two
-    /// such misses in a row.
-    async fn handed_by_a_peer(&self, by: &Requested) -> bool {
-        if by.origin == TaskOrigin::Peer {
-            return true;
+    /// Refuse peer ancestry and any unresolved lineage before forwarding.
+    /// This is a workflow boundary, not a sandbox for same-user shell code.
+    async fn allow_forwarding(&self, by: &Requested, machine: &str) -> Result<(), TaskError> {
+        if by.origin == TaskOrigin::Peer || by.by.kind == PrincipalKind::Gateway {
+            return Err(TaskError::DelegationLoop(machine.to_owned()));
+        }
+        if by.by.kind == PrincipalKind::Assistant
+            && by.forwarding != crate::tasks::domain::ForwardingContext::Resolved
+        {
+            return Err(TaskError::LineageUnresolved);
         }
         let mut next = by.parent.clone();
-        // A tree is never this deep; the bound only guards a broken store.
+        let mut visited = std::collections::HashSet::new();
         for _ in 0..64 {
             let Some(id) = next else {
-                return false;
+                return Ok(());
             };
+            if !visited.insert(id.clone()) {
+                return Err(TaskError::LineageUnresolved);
+            }
             match self.store.get(&id).await {
-                Ok(Some(task)) if task.origin == TaskOrigin::Peer => return true,
+                Ok(Some(task)) if task.origin == TaskOrigin::Peer => {
+                    return Err(TaskError::DelegationLoop(machine.to_owned()));
+                }
+                Ok(Some(task))
+                    if task.parent.is_none()
+                        && task.created_by.kind == PrincipalKind::Assistant
+                        && matches!(task.origin, TaskOrigin::Agent | TaskOrigin::Mcp) =>
+                {
+                    return Err(TaskError::LineageUnresolved);
+                }
                 Ok(Some(task)) => next = task.parent,
-                _ => return false,
+                _ => return Err(TaskError::LineageUnresolved),
             }
         }
-        false
+        Err(TaskError::LineageUnresolved)
     }
 
     /// The task `id` as stored.
@@ -1166,9 +1185,7 @@ impl TaskService {
                 let known = state.peers.names();
                 return Err(TaskError::UnknownMachine { wanted, known });
             };
-            if self.handed_by_a_peer(&by).await {
-                return Err(TaskError::DelegationLoop(peer.name));
-            }
+            self.allow_forwarding(&by, &peer.name).await?;
             return crate::fleet::mirror::delegate(state, by, peer, request).await;
         }
         if let Some(id) = request.session_id.as_deref() {
@@ -2171,9 +2188,7 @@ impl TaskService {
                 known,
             });
         };
-        if self.handed_by_a_peer(&by).await {
-            return Err(TaskError::DelegationLoop(peer.name));
-        }
+        self.allow_forwarding(&by, &peer.name).await?;
         let owner = by.by.clone();
         let started = Instant::now();
         let mut run =
@@ -4064,6 +4079,67 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn forwarding_refuses_unknown_peer_and_broken_ancestry() {
+        use crate::tasks::domain::ForwardingContext;
+        let (state, id) = delegated(FakeAgent::new("opencode")).await;
+        let mut by = Requested::mcp(assistant("a"));
+        assert!(matches!(
+            state.tasks.allow_forwarding(&by, "mini").await,
+            Err(TaskError::LineageUnresolved)
+        ));
+        by.forwarding = ForwardingContext::Resolved;
+        assert!(state.tasks.allow_forwarding(&by, "mini").await.is_ok());
+        by.parent = Some(TaskId("missing".into()));
+        assert!(matches!(
+            state.tasks.allow_forwarding(&by, "mini").await,
+            Err(TaskError::LineageUnresolved)
+        ));
+        // A child created locally while its caller was unknown cannot wash
+        // that missing lineage into a known local root on its next call.
+        by.parent = Some(id.clone());
+        assert!(matches!(
+            state.tasks.allow_forwarding(&by, "mini").await,
+            Err(TaskError::LineageUnresolved)
+        ));
+        let mut root = state.tasks.get_for_test(&id).await;
+        root.id = TaskId::new();
+        root.origin = TaskOrigin::Device;
+        root.created_by = device();
+        let local = state.tasks.insert_for_test(&root).await;
+        by.parent = Some(local.clone());
+        assert!(state.tasks.allow_forwarding(&by, "mini").await.is_ok());
+        root.id = TaskId::new();
+        root.origin = TaskOrigin::Peer;
+        let peer = state.tasks.insert_for_test(&root).await;
+        by.parent = Some(peer);
+        assert!(matches!(
+            state.tasks.allow_forwarding(&by, "mini").await,
+            Err(TaskError::DelegationLoop(_))
+        ));
+        root.id = TaskId::new();
+        root.origin = TaskOrigin::Device;
+        root.parent = Some(root.id.clone());
+        by.parent = Some(state.tasks.insert_for_test(&root).await);
+        assert!(matches!(
+            state.tasks.allow_forwarding(&by, "mini").await,
+            Err(TaskError::LineageUnresolved)
+        ));
+        by.parent = Some(local);
+        state
+            .db
+            .call(|db| {
+                db.execute_batch("DROP TABLE tasks")?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            state.tasks.allow_forwarding(&by, "mini").await,
+            Err(TaskError::LineageUnresolved)
+        ));
+    }
+
     /// A store that refuses every move to `refuse`.
     struct Refusing {
         inner: Arc<dyn TaskStore>,
@@ -4937,6 +5013,7 @@ mod tests {
         let (state, parent) = delegated(FakeAgent::new("opencode")).await;
         let mut updates = state.task_events.subscribe();
         let by = Requested {
+            forwarding: crate::tasks::domain::ForwardingContext::Unknown,
             by: assistant("agent:opencode"),
             origin: TaskOrigin::Agent,
             parent: Some(parent.clone()),

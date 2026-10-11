@@ -391,3 +391,43 @@ Important quirks:
   automatically selects the first session and does not yet expose a picker.
 - The historical plugin ID (`herdr.gateway`) still identifies migration paths;
   legacy `herdr` response metadata remains unchanged for older Apps.
+
+### Encrypted transport revision 2 and durable request admission
+
+`transport_versions: [1, 2]` in authenticated health/discovery answers advertises
+revision 2. The transport header remains `1` (an encryption marker); paired keys
+and the HKDF key family do not change. Revision 2 authenticates
+`muqun-transport-v2\n<timestamp_ms>\n<existing AAD>`. Existing AAD is method plus
+path/query, with the initiating request nonce appended for replies. Responses
+use the authenticated request revision. SSE/WebSocket record keys and counters
+remain unchanged; their opening request uses the negotiated envelope.
+
+Clients verify an authenticated, nonce-bound v2 read before durably pinning v2
+and sending an application operation. A plain `transport_version_required`
+refusal may suggest a v2 read but cannot establish a trusted pin. Lost replies
+can be recovered with read-only negotiation; never retry an ambiguous mutation
+or downgrade a pin. `fleet::Peer.transport_min_version` persists outbound choice.
+
+`connectivity::replay_store` stores canonical nonce bytes and the minimum inbound
+revision per credential in SQLite, atomically before dispatch. A successfully
+authenticated v2 request pins its credential across restart. Expired v2 identities
+can be pruned because timestamps are authenticated. Accepted legacy v1 identities
+remain until upgrade; unauthenticated timestamps are never grounds for eviction.
+Admission refuses at 262,144 outstanding identities per credential instead of
+evicting protection. A full legacy ledger returns `transport_version_required`
+so a read-only v2 negotiation can release old history without re-pairing.
+
+Legacy v1 still works during migration, including pairing bootstrap. Durable
+identities prevent replay of requests this Gateway has accepted, but cannot
+authenticate an unseen v1 request's freshness or recover pre-upgrade history.
+Do not describe legacy v1 as equivalent to v2. Update App and Gateway peers and
+verify v2 before claiming remediation for that connection. Back up the store
+before installation: the new fleet migration means an older binary alone is
+not a valid rollback of the new database.
+
+Outbound MCP forwarding resolves context separately from best-effort local task
+filing. Missing, ambiguous, failed, timed-out or truncated evidence and broken
+ancestry return `lineage_unresolved` before remote work. Peer ancestry returns
+`delegation_loop`. Local operations retain their behavior. Shared provider
+credentials and same-user shell access are not a session sandbox; this is a
+conservative workflow boundary rather than hostile OS isolation.

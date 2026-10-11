@@ -3,5 +3,6 @@
 pub mod authority;
 pub mod gateway_listener;
 pub mod push;
+pub(crate) mod replay_store;
 pub mod routes;
 pub mod transport;

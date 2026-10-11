@@ -388,6 +388,7 @@ async fn create(
     // Named from the device record the token belongs to, never from the
     // body: another computer cannot pass itself off as a third (§10.5).
     let by = Requested {
+        forwarding: crate::tasks::domain::ForwardingContext::Unknown,
         by: by_caller,
         origin: match caller.kind {
             DeviceKind::App => TaskOrigin::Device,
@@ -457,6 +458,7 @@ async fn create_command(
         client_ref: body.client_ref,
     };
     let by = Requested {
+        forwarding: crate::tasks::domain::ForwardingContext::Unknown,
         by: caller_principal(&caller),
         origin: if peer {
             TaskOrigin::Peer
@@ -1292,6 +1294,7 @@ mod tests {
                 token: "t".into(),
                 device_id: "d".into(),
                 transport_key: None,
+                transport_min_version: 1,
                 added_ms: 0,
                 last_seen_ms: None,
                 capabilities: Vec::new(),

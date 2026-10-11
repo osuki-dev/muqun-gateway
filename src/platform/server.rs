@@ -176,7 +176,6 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         peers,
         tasks,
         task_events,
-        #[cfg(test)]
         db,
     };
     // A registration handed to a session agent's service outlives a switch
@@ -397,6 +396,7 @@ pub(crate) struct EncryptedStreamContext {
     pub(crate) material: Vec<u8>,
     pub(crate) request_aad: String,
     pub(crate) request_nonce: String,
+    pub(crate) transport_version: u8,
 }
 
 /// Decrypt an authenticated request before Axum extractors see it, then seal
@@ -430,6 +430,11 @@ pub(crate) async fn encrypted_transport(
     let websocket = is_websocket_upgrade(request.headers());
     match decrypt_transport_request(&state, request).await {
         Ok((request, material, aad, request_nonce)) => {
+            let version = request
+                .extensions()
+                .get::<EncryptedStreamContext>()
+                .expect("decrypted context")
+                .transport_version;
             let response = next.run(request).await;
             // A WebSocket upgrade has no body to seal: the 101 hands the
             // connection to the socket handler, which seals every frame under
@@ -463,7 +468,7 @@ pub(crate) async fn encrypted_transport(
                 );
                 return response;
             }
-            encrypt_transport_response(response, &material, &aad, &request_nonce).await
+            encrypt_transport_response(response, &material, &aad, &request_nonce, version).await
         }
         Err(error) => error.into_response(),
     }
@@ -577,7 +582,7 @@ pub(crate) async fn decrypt_transport_request(
     }
     // Only authenticated envelopes enter the replay cache. Otherwise anyone
     // who knows a device id could fill it with arbitrary nonces.
-    remember_transport_nonce(device_id, &envelope)?;
+    remember_transport_nonce(state, device_id, &token_hash, &transport_key, &envelope).await?;
     let body = transport::decode_key(&payload.body).map_err(|_| {
         api_error(
             StatusCode::BAD_REQUEST,
@@ -622,6 +627,7 @@ pub(crate) async fn decrypt_transport_request(
         material: material.clone(),
         request_aad: aad.clone(),
         request_nonce: envelope.nonce.clone(),
+        transport_version: envelope.version,
     });
     Ok((
         Request::from_parts(parts, Body::from(body)),
@@ -631,33 +637,63 @@ pub(crate) async fn decrypt_transport_request(
     ))
 }
 
-pub(crate) fn remember_transport_nonce(
+async fn remember_transport_nonce(
+    state: &AppState,
     device_id: &str,
+    token_hash: &str,
+    transport_key: &str,
     envelope: &transport::Envelope,
 ) -> ApiResult<()> {
-    use std::sync::OnceLock;
-    static SEEN: OnceLock<Mutex<HashMap<String, u128>>> = OnceLock::new();
-    let mut seen = SEEN
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .map_err(|_| {
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "replay_cache_failed",
-                "request failed",
-            )
-        })?;
-    let now = now_unix_ms();
-    seen.retain(|_, timestamp| now.abs_diff(*timestamp) <= transport::MAX_CLOCK_SKEW_MS);
-    let key = format!("{device_id}:{}", envelope.nonce);
-    if seen.insert(key, envelope.timestamp_ms).is_some() {
-        return Err(api_error(
+    use crate::connectivity::replay_store::{self, Acceptance};
+    let nonce = transport::nonce_bytes(&envelope.nonce).map_err(|_| {
+        api_error(
+            StatusCode::FORBIDDEN,
+            "invalid_envelope",
+            "invalid encrypted request",
+        )
+    })?;
+    let credential_hash = hash_token(&format!("{token_hash}\n{transport_key}"));
+    let accepted = replay_store::accept(
+        &state.db,
+        device_id.to_owned(),
+        credential_hash,
+        nonce,
+        envelope.version,
+        envelope.timestamp_ms,
+        now_unix_ms(),
+    )
+    .await
+    .map_err(|error| {
+        tracing::warn!(%error, "transport replay store unavailable");
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "replay_store_unavailable",
+            "encrypted request could not be safely recorded",
+        )
+    })?;
+    match accepted {
+        Acceptance::Accepted => Ok(()),
+        Acceptance::Replayed => Err(api_error(
             StatusCode::CONFLICT,
             "replayed_request",
             "request was already used",
-        ));
+        )),
+        Acceptance::VersionRequired => Err(api_error(
+            StatusCode::UPGRADE_REQUIRED,
+            "transport_version_required",
+            "This device requires encrypted transport version 2",
+        )),
+        Acceptance::Capacity if envelope.version == transport::VERSION => Err(api_error(
+            StatusCode::UPGRADE_REQUIRED,
+            "transport_version_required",
+            "Legacy request history is full; upgrade to encrypted transport version 2",
+        )),
+        Acceptance::Capacity => Err(api_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "transport_replay_capacity",
+            "Encrypted request history is full; wait for current requests to expire",
+        )),
     }
-    Ok(())
 }
 
 pub(crate) async fn encrypt_transport_response(
@@ -665,6 +701,7 @@ pub(crate) async fn encrypt_transport_response(
     material: &[u8],
     aad: &str,
     request_nonce: &str,
+    version: u8,
 ) -> Response {
     let (parts, body) = response.into_parts();
     // A response is buffered as plaintext and sealed afterwards, so the bound
@@ -717,7 +754,8 @@ pub(crate) async fn encrypt_transport_response(
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
     let response_aad = format!("{aad}\n{request_nonce}");
-    let envelope = match transport::seal(
+    let envelope = match transport::seal_version(
+        version,
         material,
         transport::Direction::Response,
         response_aad.as_bytes(),
@@ -1467,6 +1505,7 @@ mod tests {
             material: vec![0u8; 32],
             request_aad: "aad".to_string(),
             request_nonce: "nonce".to_string(),
+            transport_version: transport::VERSION,
         });
         let response = app.oneshot(request).await.unwrap();
         let body = axum::body::to_bytes(response.into_body(), 1024)
@@ -1516,6 +1555,7 @@ mod tests {
                 material: vec![0u8; 32],
                 request_aad: "aad".to_string(),
                 request_nonce: "nonce".to_string(),
+                transport_version: transport::VERSION,
             });
             request
         };
@@ -1790,5 +1830,134 @@ mod tests {
         // The rest of the blanket still applies either way.
         assert_eq!(specific.headers()["x-content-type-options"], "nosniff");
         assert_eq!(specific.headers()["pragma"], "no-cache");
+    }
+}
+
+#[cfg(test)]
+mod transport_v2_tests {
+    use super::*;
+    use axum::routing::get;
+    use serde_json::json;
+    use tower::ServiceExt as _;
+
+    #[tokio::test]
+    async fn full_legacy_history_can_upgrade_without_repairing() {
+        let key = [32; 32];
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key);
+        let credential = hash_token(&format!("{}\n{encoded}", hash_token("fixture-token")));
+        let mut device = crate::test_device("fixture-device", "fixture-token");
+        device.transport_key = Some(encoded);
+        let state = crate::test_state("fixture-admin", vec![device]);
+        // Populate only the isolated fixture database, directly and in one
+        // transaction. No Gateway requests or command handlers are exercised.
+        state.db.call(move |db| {
+            db.execute("WITH RECURSIVE entries(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM entries WHERE n < ?1) INSERT INTO transport_nonces(device_id,credential_hash,nonce,version,timestamp_ms) SELECT 'fixture-device',?2,CAST(printf('%012d',n) AS BLOB),1,1 FROM entries", rusqlite::params![crate::connectivity::replay_store::MAX_NONCES_PER_CREDENTIAL, credential])?;
+            Ok(())
+        }).await.unwrap();
+        let full = request(&state, &fixture(1, &key)).await;
+        assert_eq!(full.status(), StatusCode::UPGRADE_REQUIRED);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(full.into_body(), 8192).await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "transport_version_required");
+        assert_eq!(
+            request(&state, &fixture(2, &key)).await.status(),
+            StatusCode::OK
+        );
+        let legacy_count: i64 = state
+            .db
+            .call(|db| {
+                Ok(db.query_row(
+                    "SELECT COUNT(*) FROM transport_nonces WHERE version=1",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(legacy_count, 0);
+        assert_eq!(
+            request(&state, &fixture(1, &key)).await.status(),
+            StatusCode::UPGRADE_REQUIRED
+        );
+    }
+
+    fn fixture(version: u8, key: &[u8]) -> transport::Envelope {
+        transport::seal_version(
+            version,
+            key,
+            transport::Direction::Request,
+            b"GET /fixture",
+            br#"{"token":"fixture-token","body":""}"#,
+            now_unix_ms(),
+        )
+        .unwrap()
+    }
+
+    async fn request(state: &AppState, envelope: &transport::Envelope) -> Response {
+        let app = Router::new()
+            .route("/fixture", get(|| async { Json(json!({"ok":true})) }))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                encrypted_transport,
+            ))
+            .with_state(state.clone());
+        app.oneshot(
+            Request::get("/fixture")
+                .header(TRANSPORT_HEADER, "1")
+                .header(TRANSPORT_DEVICE_HEADER, "fixture-device")
+                .header(
+                    TRANSPORT_ENVELOPE_HEADER,
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .encode(serde_json::to_vec(envelope).unwrap()),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn authenticated_v2_pins_before_dispatch_and_answers_in_the_same_version() {
+        let key = [31; 32];
+        let mut device = crate::test_device("fixture-device", "fixture-token");
+        device.transport_key = Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key));
+        let state = crate::test_state("fixture-admin", vec![device]);
+        let mut invalid = fixture(2, &key);
+        invalid.timestamp_ms += 1;
+        assert_eq!(
+            request(&state, &invalid).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        // A failed v2 authentication neither advances the pin nor poisons a
+        // valid legacy request from the same paired credential.
+        let legacy = request(&state, &fixture(1, &key)).await;
+        let legacy: transport::Envelope =
+            serde_json::from_slice(&to_bytes(legacy.into_body(), 8192).await.unwrap()).unwrap();
+        assert_eq!(legacy.version, 1);
+        let envelope = fixture(2, &key);
+        let reply = request(&state, &envelope).await;
+        let reply: transport::Envelope =
+            serde_json::from_slice(&to_bytes(reply.into_body(), 8192).await.unwrap()).unwrap();
+        assert_eq!(reply.version, 2);
+        let plaintext = transport::open(
+            &key,
+            transport::Direction::Response,
+            format!("GET /fixture\n{}", envelope.nonce).as_bytes(),
+            &reply,
+            now_unix_ms(),
+        )
+        .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&plaintext).unwrap();
+        assert_eq!(body["status"], 200);
+        assert_eq!(
+            request(&state, &envelope).await.status(),
+            StatusCode::CONFLICT
+        );
+        let downgrade = request(&state, &fixture(1, &key)).await;
+        assert_eq!(downgrade.status(), StatusCode::UPGRADE_REQUIRED);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(downgrade.into_body(), 8192).await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "transport_version_required");
     }
 }

@@ -183,6 +183,10 @@ fn task_error(error: TaskError) -> CallToolResult {
                 "Your task was handed to this computer by another one, so it cannot hand work on to {name}: one hop only. Do it here, or finish with tasks.complete (outcome blocked) and say what needs {name}."
             ),
         ),
+        TaskError::LineageUnresolved => fail(
+            "lineage_unresolved",
+            "The calling session or its task ancestry could not be resolved. Nothing was forwarded. Continue locally or ask the user to start the work from their own session.",
+        ),
         TaskError::PeerUnauthorized(name) => fail(
             "unauthorized",
             &format!(
@@ -588,9 +592,16 @@ impl MuqunMcp {
         let machine = args.machine.clone().unwrap_or_default();
         let call = lineage::Call {
             tool: "exec.run",
-            args: vec![("command", &args.command), ("cwd", &args.cwd)],
+            args: vec![
+                ("command", &args.command),
+                ("cwd", &args.cwd),
+                ("machine", &machine),
+            ],
         };
-        let by = lineage::requested(&self.state, &self.session, &call).await;
+        let by = match lineage::requested_for_forwarding(&self.state, &self.session, &call).await {
+            Ok(by) => by,
+            Err(error) => return Ok(task_error(error)),
+        };
         let caller = lineage::caller_session(&self.state, &self.session, &call).await;
         let run = self
             .state
@@ -636,17 +647,29 @@ impl MuqunMcp {
         Parameters(args): Parameters<DelegateArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let goal = args.goal.clone();
+        let machine = args.machine.clone();
         let config = &self.state.config;
         let peers = self.state.peers.names();
         let request = match args.request(&config.server_id, &config.label, &peers) {
             Ok(request) => request,
             Err(refused) => return Ok(refused),
         };
-        let call = lineage::Call {
+        let mut call = lineage::Call {
             tool: "tasks.delegate",
             args: vec![("goal", &goal)],
         };
-        let by = lineage::requested(&self.state, &self.session, &call).await;
+        let remote = !is_self(machine.as_deref(), &config.server_id, &config.label, &peers);
+        let by = if remote {
+            if let Some(machine) = machine.as_deref() {
+                call.args.push(("machine", machine));
+            }
+            match lineage::requested_for_forwarding(&self.state, &self.session, &call).await {
+                Ok(by) => by,
+                Err(error) => return Ok(task_error(error)),
+            }
+        } else {
+            lineage::requested(&self.state, &self.session, &call).await
+        };
         let caller = lineage::caller_session(&self.state, &self.session, &call).await;
         let view = match self.state.tasks.delegate(&self.state, by, request).await {
             Ok(view) => view,
@@ -1212,6 +1235,7 @@ mod tests {
             expires_ms: None,
         };
         let device = crate::tasks::domain::Requested {
+            forwarding: crate::tasks::domain::ForwardingContext::Unknown,
             by: crate::tasks::domain::TaskPrincipal {
                 kind: crate::tasks::domain::PrincipalKind::Device,
                 id: "d1".into(),
@@ -1310,6 +1334,7 @@ mod tests {
                     token: "t".into(),
                     device_id: "d".into(),
                     transport_key: None,
+                    transport_min_version: 1,
                     added_ms: 0,
                     last_seen_ms: seen,
                     capabilities: vec!["fleet_peers".into()],

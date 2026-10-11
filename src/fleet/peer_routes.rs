@@ -795,6 +795,7 @@ mod tests {
                     token: "t".into(),
                     device_id: "d".into(),
                     transport_key: None,
+                    transport_min_version: 1,
                     added_ms: 0,
                     last_seen_ms: None,
                     capabilities: vec![],

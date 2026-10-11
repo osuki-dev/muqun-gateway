@@ -19,7 +19,7 @@ impl SqlitePeerStore {
     }
 }
 
-const COLUMNS: &str = "peer_id, name, url, token, device_id, transport_key, added_ms, last_seen_ms, capabilities, manifest, server_id, unauthorized";
+const COLUMNS: &str = "peer_id, name, url, token, device_id, transport_key, added_ms, last_seen_ms, capabilities, manifest, server_id, unauthorized, transport_min_version";
 
 impl PeerStore for SqlitePeerStore {
     fn put<'a>(&'a self, peer: &'a Peer) -> TaskFuture<'a, ()> {
@@ -29,12 +29,13 @@ impl PeerStore for SqlitePeerStore {
             let manifest = peer.manifest.as_ref().map(Value::to_string);
             c.execute(
                 &format!(
-                    "INSERT INTO peers({COLUMNS}) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                    "INSERT INTO peers({COLUMNS}) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                      ON CONFLICT(peer_id) DO UPDATE SET name = excluded.name, url = excluded.url,
                        token = excluded.token, device_id = excluded.device_id,
                        transport_key = excluded.transport_key, added_ms = excluded.added_ms,
                        last_seen_ms = excluded.last_seen_ms, capabilities = excluded.capabilities,
-                       manifest = excluded.manifest, server_id = excluded.server_id, unauthorized = excluded.unauthorized"
+                       manifest = excluded.manifest, server_id = excluded.server_id, unauthorized = excluded.unauthorized,
+                       transport_min_version = MAX(peers.transport_min_version, excluded.transport_min_version)"
                 ),
                 params![
                     peer.peer_id,
@@ -49,6 +50,7 @@ impl PeerStore for SqlitePeerStore {
                     manifest,
                     peer.server_id,
                     peer.unauthorized,
+                    peer.transport_min_version,
                 ],
             )?;
             Ok(())
@@ -87,6 +89,22 @@ impl PeerStore for SqlitePeerStore {
                  WHERE peer_id = ?1",
                 params![peer_id, name, url],
             )? > 0)
+        }))
+    }
+
+    fn pin_transport_version<'a>(&'a self, peer_id: &'a str, version: u8) -> TaskFuture<'a, u8> {
+        let peer_id = peer_id.to_owned();
+        Box::pin(self.db.call(move |c| {
+            anyhow::ensure!(
+                (1..=2).contains(&version),
+                "unsupported peer transport version"
+            );
+            Ok(c.query_row(
+                "UPDATE peers SET transport_min_version = MAX(transport_min_version, ?2)
+                 WHERE peer_id = ?1 RETURNING transport_min_version",
+                params![peer_id, version],
+                |row| row.get(0),
+            )?)
         }))
     }
 
@@ -137,6 +155,7 @@ fn read_row(row: &Row<'_>) -> rusqlite::Result<anyhow::Result<Peer>> {
     let manifest: Option<String> = row.get(9)?;
     let server_id: String = row.get(10)?;
     let unauthorized: bool = row.get(11)?;
+    let transport_min_version: u8 = row.get(12)?;
     let (peer_id, name, url, token, device_id, transport_key) = (
         row.get(0)?,
         row.get(1)?,
@@ -154,6 +173,7 @@ fn read_row(row: &Row<'_>) -> rusqlite::Result<anyhow::Result<Peer>> {
             token,
             device_id,
             transport_key,
+            transport_min_version,
             added_ms: added_ms as u64,
             last_seen_ms: last_seen_ms.map(|ms| ms as u64),
             capabilities: serde_json::from_str(&capabilities)?,
@@ -163,4 +183,58 @@ fn read_row(row: &Row<'_>) -> rusqlite::Result<anyhow::Result<Peer>> {
             unauthorized,
         })
     })())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn outbound_transport_pin_survives_stale_writes_and_restart() {
+        let path =
+            crate::test_state_dir().join(format!("peer-pin-{}.sqlite3", uuid::Uuid::new_v4()));
+        let db = SqliteStore::open(&path, None, &[super::super::peers::MIGRATION]).unwrap();
+        let store = SqlitePeerStore::new(db.clone());
+        let peer = Peer {
+            peer_id: "peer-test".into(),
+            server_id: "server-test".into(),
+            name: "test".into(),
+            url: "http://127.0.0.1:9".into(),
+            token: "test-token".into(),
+            device_id: "test-device".into(),
+            transport_key: Some(crate::generate_token()),
+            transport_min_version: 1,
+            added_ms: 0,
+            last_seen_ms: None,
+            capabilities: vec![],
+            manifest: None,
+            unauthorized: false,
+        };
+        store.put(&peer).await.unwrap();
+        assert_eq!(store.list().await.unwrap()[0].transport_min_version, 1);
+        assert_eq!(
+            store.pin_transport_version(&peer.peer_id, 2).await.unwrap(),
+            2
+        );
+        assert_eq!(
+            store.pin_transport_version(&peer.peer_id, 1).await.unwrap(),
+            2
+        );
+        store.put(&peer).await.unwrap();
+        store
+            .seen(&peer.peer_id, 1, Some(vec![]), None)
+            .await
+            .unwrap();
+        store
+            .edit(&peer.peer_id, Some("renamed".into()), None)
+            .await
+            .unwrap();
+        drop(store);
+        drop(db);
+        let db = SqliteStore::open(&path, None, &[super::super::peers::MIGRATION]).unwrap();
+        let reloaded = SqlitePeerStore::new(db).list().await.unwrap();
+        assert_eq!(reloaded[0].transport_min_version, 2);
+        assert_eq!(reloaded[0].name, "renamed");
+        assert!(reloaded[0].capabilities.is_empty());
+    }
 }

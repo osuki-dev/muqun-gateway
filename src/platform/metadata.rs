@@ -316,6 +316,7 @@ pub(crate) async fn gateway_metadata(
         "ok": true,
         "gatewayVersion": env!("CARGO_PKG_VERSION"),
         "apiVersion": GATEWAY_API_VERSION,
+        "transport_versions": crate::connectivity::transport::SUPPORTED_VERSIONS,
         "apiMajor": GATEWAY_API_MAJOR,
         "generation": &*state.generation,
         "minimumCompatibleApiVersion": "1.0.0",

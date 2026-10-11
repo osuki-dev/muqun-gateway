@@ -209,6 +209,12 @@ pub(crate) async fn claim(url: &str, request_id: &str, code: &str) -> Result<Cla
     })
 }
 
+/// Authenticated metadata and the minimum transport this peer can speak.
+pub(crate) struct PeerCapabilities {
+    pub names: Vec<String>,
+    pub transport_version: u8,
+}
+
 /// One linked peer's device API.
 pub(crate) struct PeerClient {
     http: reqwest::Client,
@@ -217,15 +223,25 @@ pub(crate) struct PeerClient {
     device_id: String,
     /// The decoded transport key; `None` speaks plain bearer.
     material: Option<Vec<u8>>,
+    transport_version: u8,
 }
 
 impl PeerClient {
     pub(crate) fn for_peer(peer: &Peer) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            (1..=2).contains(&peer.transport_min_version),
+            "unsupported peer transport version"
+        );
+        anyhow::ensure!(
+            peer.transport_min_version == 1 || peer.transport_key.is_some(),
+            "pinned peer transport requires a key"
+        );
         Ok(Self {
             http: http(),
             base: peer.url.trim_end_matches('/').to_owned(),
             token: peer.token.clone(),
             device_id: peer.device_id.clone(),
+            transport_version: peer.transport_min_version,
             material: peer
                 .transport_key
                 .as_deref()
@@ -277,7 +293,8 @@ impl PeerClient {
             content_type: body.map(|_| "application/json".to_owned()),
             body: URL_SAFE_NO_PAD.encode(body.map(Value::to_string).unwrap_or_default()),
         };
-        let envelope = transport::seal(
+        let envelope = transport::seal_version(
+            self.transport_version,
             material,
             transport::Direction::Request,
             aad.as_bytes(),
@@ -305,8 +322,17 @@ impl PeerClient {
         let outer = body_of(response).await.map_err(unknown)?;
         let Ok(sealed) = serde_json::from_value::<transport::Envelope>(outer.clone()) else {
             // A refusal before the device was known (401/403) comes back unsealed.
+            // An unsealed success cannot establish whether a mutation ran.
+            if (200..300).contains(&outer_status) {
+                return Err(PeerError::NoAnswer("unsealed answer".into()));
+            }
             return Err(refused(outer_status, &outer));
         };
+        if sealed.version != envelope.version {
+            return Err(unknown(PeerError::Unreachable(
+                "answer transport version changed".into(),
+            )));
+        }
         let plaintext = transport::open(
             material,
             transport::Direction::Response,
@@ -343,27 +369,67 @@ impl PeerClient {
             .map(|_| ())
     }
 
-    /// The public `GET /api/capabilities` list.
-    pub(crate) async fn capabilities(&self) -> Result<Vec<String>, PeerError> {
-        let response = self
-            .http
-            .get(format!("{}/api/capabilities", self.base))
-            .send()
-            .await
-            .map_err(unreachable)?;
-        let status = response.status().as_u16();
-        let body = body_of(response).await?;
-        if !(200..300).contains(&status) {
-            return Err(refused(status, &body));
-        }
-        Ok(body["capabilities"]
+    /// Discover through an authenticated envelope whenever the peer issued a
+    /// key. An unsigned capability list must never decide an encrypted upgrade.
+    pub(crate) async fn capabilities(&self) -> Result<PeerCapabilities, PeerError> {
+        let body = self.json(Method::GET, "/api/capabilities", None).await?;
+        let names = body["capabilities"]
             .as_array()
             .map(|list| {
                 list.iter()
                     .filter_map(|item| item.as_str().map(str::to_owned))
                     .collect()
             })
-            .unwrap_or_default())
+            .unwrap_or_default();
+        let supports_v2 = self.material.is_some()
+            && body["transport_versions"]
+                .as_array()
+                .is_some_and(|versions| versions.iter().any(|version| version.as_u64() == Some(2)));
+        Ok(PeerCapabilities {
+            names,
+            transport_version: if supports_v2 {
+                2
+            } else {
+                self.transport_version
+            },
+        })
+    }
+
+    /// Confirm v2 with a read-only v2 exchange before callers persist a pin.
+    /// An unsealed 426 is only a hint to probe, never proof of support. This
+    /// also recovers a lost probe response: the peer may already require v2.
+    pub(crate) async fn negotiate(&self) -> Result<PeerCapabilities, PeerError> {
+        match self.capabilities().await {
+            Ok(capabilities)
+                if self.material.is_none()
+                    || self.transport_version == 2
+                    || capabilities.transport_version == 1 =>
+            {
+                Ok(capabilities)
+            }
+            Ok(_) => self.probe_v2().await,
+            Err(PeerError::Refused { status: 426, code })
+                if self.material.is_some()
+                    && self.transport_version == 1
+                    && code == "transport_version_required" =>
+            {
+                self.probe_v2().await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn probe_v2(&self) -> Result<PeerCapabilities, PeerError> {
+        Self {
+            http: self.http.clone(),
+            base: self.base.clone(),
+            token: self.token.clone(),
+            device_id: self.device_id.clone(),
+            material: self.material.clone(),
+            transport_version: 2,
+        }
+        .capabilities()
+        .await
     }
 
     /// `POST /api/tasks`: B opens `body` as its own task.
@@ -436,7 +502,8 @@ impl PeerClient {
                 content_type: None,
                 body: String::new(),
             };
-            let envelope = transport::seal(
+            let envelope = transport::seal_version(
+                self.transport_version,
                 material,
                 transport::Direction::Request,
                 WS_AAD.as_bytes(),
@@ -871,7 +938,8 @@ mod tests {
     /// pairing, and plain.
     #[tokio::test]
     async fn a_peer_reads_cancels_and_follows_its_tasks_in_either_transport() {
-        for sealed in [true, false] {
+        for version in [Some(1), Some(2), None] {
+            let sealed = version.is_some();
             let herdr = FakeHerdr::start(vec!["$ "], None);
             let mut mini = named(output_state(&herdr), "srv-mini", "mini");
             let mut device = test_peer_device("coding-1", "peer-token");
@@ -890,6 +958,7 @@ mod tests {
                 token: "peer-token".into(),
                 device_id: "coding-1".into(),
                 transport_key: device.transport_key.clone(),
+                transport_min_version: version.unwrap_or(1),
                 added_ms: 0,
                 last_seen_ms: None,
                 capabilities: vec![],
@@ -978,6 +1047,14 @@ mod tests {
                 PeerError::Unauthorized,
             ),
             (
+                426,
+                json!("transport_version_required"),
+                PeerError::Refused {
+                    status: 426,
+                    code: "transport_version_required".into(),
+                },
+            ),
+            (
                 410,
                 json!("pairing_code_expired"),
                 PeerError::Refused {
@@ -1016,5 +1093,296 @@ mod tests {
                 "{status} {code}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_v2_peer_refuses_a_v1_answer_without_retrying_the_mutation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let material = transport::decode_key(&generate_token()).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let received = calls.clone();
+        let server_material = material.clone();
+        let router = axum::Router::new().route(
+            "/api/tasks",
+            axum::routing::post(
+                move |axum::Json(envelope): axum::Json<transport::Envelope>| {
+                    let received = received.clone();
+                    let material = server_material.clone();
+                    async move {
+                        received.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(envelope.version, 2);
+                        transport::open(
+                            &material,
+                            transport::Direction::Request,
+                            b"POST /api/tasks",
+                            &envelope,
+                            now_unix_ms(),
+                        )
+                        .unwrap();
+                        axum::Json(
+                            transport::seal_version(
+                                1,
+                                &material,
+                                transport::Direction::Response,
+                                format!("POST /api/tasks\n{}", envelope.nonce).as_bytes(),
+                                br#"{"status":200,"body":"e30"}"#,
+                                now_unix_ms(),
+                            )
+                            .unwrap(),
+                        )
+                    }
+                },
+            ),
+        );
+        let client = PeerClient::for_peer(&Peer {
+            peer_id: "peer-test".into(),
+            server_id: "server-test".into(),
+            name: "test".into(),
+            url: serve(router).await,
+            token: "test-token".into(),
+            device_id: "test-device".into(),
+            transport_key: Some(URL_SAFE_NO_PAD.encode(material)),
+            transport_min_version: 2,
+            added_ms: 0,
+            last_seen_ms: None,
+            capabilities: vec![],
+            manifest: None,
+            unauthorized: false,
+        })
+        .unwrap();
+        assert!(matches!(
+            client
+                .json(Method::POST, "/api/tasks", Some(&json!({})))
+                .await,
+            Err(PeerError::NoAnswer(_))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn authenticated_discovery_confirms_v2_before_pinning_and_recovers_a_lost_probe() {
+        check_discovery_upgrade(false).await;
+        check_discovery_upgrade(true).await;
+    }
+
+    async fn check_discovery_upgrade(lose_probe_response: bool) {
+        use axum::response::IntoResponse as _;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let herdr = FakeHerdr::start(vec!["$ "], None);
+        let coding = named(output_state(&herdr), "srv-coding", "coding");
+        let mini = named(output_state(&herdr), "srv-mini", "mini");
+        let mut device = test_peer_device("coding-1", "peer-token");
+        device.transport_key = Some(generate_token());
+        mini.devices.lock().unwrap().push(device.clone());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = requests.clone();
+        let registry = coding.peers.clone();
+        let lose_response = Arc::new(AtomicBool::new(lose_probe_response));
+        let router = peer_router(mini).layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let registry = registry.clone();
+                let captured = captured.clone();
+                let lose_response = lose_response.clone();
+                async move {
+                    let header = request.headers()[TRANSPORT_ENVELOPE_HEADER]
+                        .to_str()
+                        .unwrap();
+                    let envelope: transport::Envelope =
+                        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(header).unwrap()).unwrap();
+                    let persisted = registry.get("p-mini").await.unwrap().transport_min_version;
+                    captured.lock().unwrap().push((envelope.version, persisted));
+                    let response = next.run(request).await;
+                    if envelope.version == 2 && lose_response.swap(false, Ordering::SeqCst) {
+                        // The real server accepted and pinned the v2 probe,
+                        // but its answer never reached this client intact.
+                        axum::http::StatusCode::BAD_GATEWAY.into_response()
+                    } else {
+                        response
+                    }
+                }
+            },
+        ));
+        let peer = Peer {
+            peer_id: "p-mini".into(),
+            server_id: "srv-mini".into(),
+            name: "mini".into(),
+            url: serve(router).await,
+            token: "peer-token".into(),
+            device_id: "coding-1".into(),
+            transport_key: device.transport_key,
+            transport_min_version: 1,
+            added_ms: 0,
+            last_seen_ms: Some(now_ms()),
+            capabilities: vec![],
+            manifest: None,
+            unauthorized: false,
+        };
+        coding.peers.store_for_test(peer.clone()).await;
+        let first = coding.peers.checked(&coding, peer.clone()).await.unwrap();
+        let upgraded = if lose_probe_response {
+            assert_eq!(first.transport_min_version, 1);
+            assert_eq!(
+                coding
+                    .peers
+                    .get("p-mini")
+                    .await
+                    .unwrap()
+                    .transport_min_version,
+                1
+            );
+            assert!(!coding.peers.reachable(&first, now_ms()));
+            coding.peers.checked(&coding, peer.clone()).await.unwrap()
+        } else {
+            first
+        };
+        assert_eq!(upgraded.transport_min_version, 2);
+        let expected = if lose_probe_response {
+            vec![(1, 1), (2, 1), (1, 1), (2, 1), (2, 2)]
+        } else {
+            vec![(1, 1), (2, 1), (2, 2)]
+        };
+        assert_eq!(*requests.lock().unwrap(), expected);
+        // A caller retaining its old Peer snapshot uses the persisted pin.
+        assert_eq!(
+            coding
+                .peers
+                .checked(&coding, peer)
+                .await
+                .unwrap()
+                .transport_min_version,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn unsigned_discovery_cannot_upgrade_an_encrypted_or_plain_link() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let pings = Arc::new(AtomicUsize::new(0));
+        let received = pings.clone();
+        let router = axum::Router::new()
+            .route(
+                "/api/capabilities",
+                axum::routing::get(|| async {
+                    axum::Json(json!({"capabilities": [], "transport_versions": [1, 2]}))
+                }),
+            )
+            .route(
+                "/api/tasks",
+                axum::routing::get(move || {
+                    let received = received.clone();
+                    async move {
+                        received.fetch_add(1, Ordering::SeqCst);
+                        axum::Json(json!({"tasks": []}))
+                    }
+                }),
+            );
+        let mut peer = Peer {
+            peer_id: "peer-test".into(),
+            server_id: "server-test".into(),
+            name: "test".into(),
+            url: serve(router).await,
+            token: "test-token".into(),
+            device_id: "test-device".into(),
+            transport_key: Some(generate_token()),
+            transport_min_version: 1,
+            added_ms: 0,
+            last_seen_ms: None,
+            capabilities: vec![],
+            manifest: None,
+            unauthorized: false,
+        };
+        assert!(PeerClient::for_peer(&peer)
+            .unwrap()
+            .capabilities()
+            .await
+            .is_err());
+        let herdr = FakeHerdr::start(vec!["$ "], None);
+        let state = output_state(&herdr);
+        state.peers.store_for_test(peer.clone()).await;
+        let checked = state.peers.checked(&state, peer.clone()).await.unwrap();
+        assert!(!state.peers.reachable(&checked, now_ms()));
+        assert_eq!(
+            pings.load(Ordering::SeqCst),
+            0,
+            "no v1 fallback after failed discovery"
+        );
+        peer.transport_key = None;
+        assert_eq!(
+            PeerClient::for_peer(&peer)
+                .unwrap()
+                .capabilities()
+                .await
+                .unwrap()
+                .transport_version,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forged_upgrade_hint_with_a_failed_v2_probe_never_pins() {
+        use std::sync::{Arc, Mutex};
+
+        let versions = Arc::new(Mutex::new(Vec::new()));
+        let captured = versions.clone();
+        let router = axum::Router::new().route(
+            "/api/capabilities",
+            axum::routing::get(move |headers: axum::http::HeaderMap| {
+                let captured = captured.clone();
+                async move {
+                    let envelope: transport::Envelope = serde_json::from_slice(
+                        &URL_SAFE_NO_PAD
+                            .decode(headers[TRANSPORT_ENVELOPE_HEADER].as_bytes())
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    captured.lock().unwrap().push(envelope.version);
+                    let (status, code) = if envelope.version == 1 {
+                        (
+                            axum::http::StatusCode::UPGRADE_REQUIRED,
+                            "transport_version_required",
+                        )
+                    } else {
+                        (axum::http::StatusCode::BAD_GATEWAY, "unavailable")
+                    };
+                    (status, axum::Json(json!({"error": {"code": code}})))
+                }
+            }),
+        );
+        let peer = Peer {
+            peer_id: "peer-test".into(),
+            server_id: "server-test".into(),
+            name: "test".into(),
+            url: serve(router).await,
+            token: "test-token".into(),
+            device_id: "test-device".into(),
+            transport_key: Some(generate_token()),
+            transport_min_version: 1,
+            added_ms: 0,
+            last_seen_ms: None,
+            capabilities: vec![],
+            manifest: None,
+            unauthorized: false,
+        };
+        let herdr = FakeHerdr::start(vec!["$ "], None);
+        let state = output_state(&herdr);
+        state.peers.store_for_test(peer.clone()).await;
+        let checked = state.peers.checked(&state, peer).await.unwrap();
+        assert_eq!(*versions.lock().unwrap(), vec![1, 2]);
+        assert_eq!(
+            state
+                .peers
+                .get("peer-test")
+                .await
+                .unwrap()
+                .transport_min_version,
+            1
+        );
+        assert!(!state.peers.reachable(&checked, now_ms()));
     }
 }
