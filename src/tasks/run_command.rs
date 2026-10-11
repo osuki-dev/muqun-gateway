@@ -152,6 +152,8 @@ async fn launch(
                 mentions: Vec::new(),
                 client_ref: request.client_ref.clone(),
                 requester_server_id: by.server_id,
+                reopened_ms: None,
+                reopen_count: 0,
             })
             .await?;
         store

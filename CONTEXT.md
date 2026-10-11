@@ -250,6 +250,14 @@ echo of the goal in the pane's recent output (`marker_after`), or the agent's
 delivery live in `src/agents/session_routes.rs`; the prompt wording, the marker
 and the `judge` table in `src/tasks/pane_agent.rs`.
 
+A finished delegation follows its still-live binding into another turn. A new
+user timeline item reopens an agent session; a pane must show an idle-to-busy
+boundary and retain its recorded shell and foreground job identity. Reopening
+keeps the task ID and prior summary, increments `reopen_count`, and records
+`reopened_ms`. Old completion markers are excluded from the new turn. Cancelled
+tasks and missing or reused bindings stay finished. Peer mirrors follow the
+same generation, including when a whole turn finished between observations.
+
 ### Linked computers
 
 A peer is a `gateway` device on the other side: this gateway paired with it

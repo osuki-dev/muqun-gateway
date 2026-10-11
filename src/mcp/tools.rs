@@ -1442,6 +1442,8 @@ mod tests {
             mentions: vec!["mini".into()],
             client_ref: None,
             requester_server_id: None,
+            reopened_ms: None,
+            reopen_count: 0,
         };
         let id = state.tasks.insert_for_test(&task).await;
         for (pane, task_id, expected) in [
@@ -1673,6 +1675,8 @@ mod tests {
             mentions: Vec::new(),
             client_ref: None,
             requester_server_id: None,
+            reopened_ms: None,
+            reopen_count: 0,
         };
         let id = state.tasks.insert_for_test(&child).await;
         let running: crate::agents::domain::ToolCall = serde_json::from_value(serde_json::json!({

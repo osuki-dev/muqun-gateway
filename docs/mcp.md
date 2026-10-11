@@ -827,6 +827,17 @@ shows its last agents and `suitableFor`. `lastSeen` is ms since the epoch,
 null if it never answered. Names match in any case (Unicode-aware); no
 linked computer may be called `self`.
 
+### Continuing a finished assignment
+
+Finished delegations follow their original live session. A new user message
+after `done` or `failed` reopens the same task as `working`; a terminal
+delegation also requires its original shell and launched job identity and an
+idle-to-working boundary. Cancelled tasks, closed panes and deleted sessions
+do not reopen. Task views include `reopened_ms` and `reopen_count`, persisted
+with the state transition and delivered through ordinary `task.updated`
+frames, including peer mirrors. The previous summary stays until the new
+turn reports its result; a previous turn's marker does not complete it again.
+
 ### Commands on another computer
 
 `exec.run` with `machine` runs the command on that linked computer without

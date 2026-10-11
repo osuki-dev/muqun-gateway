@@ -295,6 +295,8 @@ mod tests {
             mentions: Vec::new(),
             client_ref: None,
             requester_server_id: None,
+            reopened_ms: None,
+            reopen_count: 0,
         }
     }
 

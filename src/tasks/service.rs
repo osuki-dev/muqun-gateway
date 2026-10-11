@@ -238,6 +238,8 @@ pub(crate) struct TaskView {
     pub binding: TaskBinding,
     pub created_ms: u64,
     pub updated_ms: u64,
+    pub reopened_ms: Option<u64>,
+    pub reopen_count: u64,
     /// The open task this one was started from, if any.
     pub parent_task_id: Option<String>,
     pub origin: TaskOrigin,
@@ -614,6 +616,87 @@ fn step(event: &AgentDomainEvent, asid: &str) -> Step {
 }
 
 impl TaskService {
+    /// Resume the same assignment only after its observer verified a new turn.
+    /// The sequence check prevents a delayed observer from reviving a cancelled
+    /// task or overwriting another completion.
+    pub(crate) async fn reopen(&self, task: &Task, at: u64) -> Result<Task, TaskError> {
+        self.reopen_with_note(task, None, Some(at)).await
+    }
+
+    pub(crate) async fn reopen_with_note(
+        &self,
+        task: &Task,
+        note: Option<String>,
+        reopened_ms: Option<u64>,
+    ) -> Result<Task, TaskError> {
+        let now = self
+            .store()
+            .transition(
+                &task.id,
+                TaskChange {
+                    to: TaskState::Working,
+                    source: "new_user_turn".into(),
+                    note,
+                    reopen: true,
+                    reopened_ms,
+                    expected_seq: Some(task.seq),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        if let Ok(mut live) = self.live.lock() {
+            live.idled.remove(&task.id);
+            if let TaskBinding::AgentSession { asid, .. } = &task.binding {
+                live.sessions.remove(asid);
+            }
+        }
+        Ok(now)
+    }
+
+    pub(crate) async fn reopen_note(&self, id: &TaskId) -> Option<String> {
+        self.store
+            .events(id)
+            .await
+            .ok()?
+            .into_iter()
+            .rev()
+            .find(|event| event.source == "new_user_turn")?
+            .note
+    }
+
+    pub(crate) async fn reopen_session(
+        &self,
+        state: &AppState,
+        task: &Task,
+        items: &[TimelineItem],
+    ) -> bool {
+        if task.kind != TaskKind::Delegation
+            || !matches!(task.state, TaskState::Done | TaskState::Failed)
+        {
+            return false;
+        }
+        let Some(started_ms) = items
+            .iter()
+            .filter(|item| item.role == TimelineRole::User && item.updated_ms > task.updated_ms)
+            .map(|item| item.updated_ms)
+            .min()
+        else {
+            return false;
+        };
+        let TaskBinding::AgentSession { agent_id, asid } = &task.binding else {
+            return false;
+        };
+        let Some(manager) = state.agent_runtime.manager_for_agent(agent_id).await else {
+            return false;
+        };
+        if manager.sessions().get_session(asid).await.is_err() {
+            return false;
+        }
+        // Reconciliation may discover a turn after its answer already arrived.
+        // Filtering from observation time would discard that turn's completion.
+        self.reopen(task, started_ms).await.is_ok()
+    }
+
     pub(crate) fn new(
         store: Arc<dyn TaskStore>,
         events: broadcast::Sender<TaskDomainEvent>,
@@ -1157,6 +1240,8 @@ impl TaskService {
                 mentions: request.mentions.clone(),
                 client_ref: request.client_ref.clone(),
                 requester_server_id: by.server_id.clone(),
+                reopened_ms: None,
+                reopen_count: 0,
             })
             .await?;
         let created = manager
@@ -1353,6 +1438,8 @@ impl TaskService {
                 mentions: request.mentions.clone(),
                 client_ref: request.client_ref.clone(),
                 requester_server_id: by.server_id.clone(),
+                reopened_ms: None,
+                reopen_count: 0,
             })
             .await?;
         let cwd = request.cwd.as_deref();
@@ -1604,6 +1691,11 @@ impl TaskService {
     /// (Queued passes Dispatching, Waiting passes Working), reading the
     /// task's current state first. The steps carry `to`'s source.
     pub(crate) async fn move_to(&self, task: &TaskId, to: TaskChange) -> Result<Task, TaskError> {
+        // A verified new generation is one atomic transition, including a
+        // peer that completed and reopened between two Working snapshots.
+        if to.reopen {
+            return Ok(self.store().transition(task, to).await?);
+        }
         let now = self.store.get(task).await?.ok_or(TaskError::NotFound)?;
         for step in steps_between(now.state, to.to) {
             let step = TaskChange {
@@ -1768,7 +1860,7 @@ impl TaskService {
         // Subscribe before reading the session, so nothing falls between.
         let mut events = state.agent_runtime.subscribe_events();
         let manager = session_manager(state, agent_id, asid).await?;
-        let since = task.created_ms;
+        let since = task.reopened_ms.unwrap_or(task.created_ms);
         let mut pending: VecDeque<_> = snapshot(&manager, asid, since, task.state).await?.into();
         let mut seen_busy = false;
         loop {
@@ -1791,7 +1883,7 @@ impl TaskService {
                     continue;
                 }
                 Step::Idle if !seen_busy => continue,
-                Step::Idle => turn_end(&summary_timeline(&manager, asid, task.created_ms).await),
+                Step::Idle => turn_end(&turn_timeline(&manager, asid, &task).await),
                 Step::Failed(error) => failed_change(&manager, &task, error.as_ref()).await,
                 Step::Form(title) => form_waiting(&manager, &task, &title).await,
                 Step::Move(to) => *to,
@@ -2227,6 +2319,8 @@ impl TaskService {
             binding: task.binding.clone(),
             created_ms: task.created_ms,
             updated_ms: task.updated_ms,
+            reopened_ms: task.reopened_ms,
+            reopen_count: task.reopen_count,
             parent_task_id: task.parent.as_ref().map(|id| id.0.clone()),
             origin: task.origin,
             label: task.label.clone(),
@@ -2336,8 +2430,21 @@ impl TaskService {
         }
         match event {
             AgentDomainEvent::TimelineUpsert { asid, items, .. } => {
+                let latest = self
+                    .store
+                    .list(TaskFilter {
+                        asid: Some(asid.0.clone()),
+                        limit: 1,
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap_or_default();
+                let mut reopened = false;
+                if let Some(task) = latest.first() {
+                    reopened = self.reopen_session(state, task, items).await;
+                }
                 self.follow_progress(state, &asid.0, items).await;
-                return false;
+                return reopened;
             }
             AgentDomainEvent::SessionUpdated { asid, info, .. } => {
                 self.session_named(&asid.0, &info.title).await;
@@ -2437,10 +2544,10 @@ impl TaskService {
         };
         let manager = state.agent_runtime.manager_for_agent(agent_id).await?;
         let session = manager.sessions().get_session(asid).await.ok()?;
-        if !finished_since(&session, task.created_ms) {
+        if !finished_since(&session, task.reopened_ms.unwrap_or(task.created_ms)) {
             return None;
         }
-        let to = turn_end(&summary_timeline(&manager, asid, task.created_ms).await);
+        let to = turn_end(&turn_timeline(&manager, asid, task).await);
         self.moves(task, &to).await.then_some(to)
     }
 
@@ -2825,7 +2932,7 @@ async fn form_waiting(manager: &AgentManager, task: &Task, title: &str) -> TaskC
     let TaskBinding::AgentSession { asid, .. } = &task.binding else {
         return asking(title);
     };
-    let items = summary_timeline(manager, asid, task.created_ms).await;
+    let items = turn_timeline(manager, asid, task).await;
     let last_tool = items
         .iter()
         .rposition(|item| matches!(item.part, AgentPart::Tool(_)));
@@ -3004,6 +3111,19 @@ fn provider_failure(agent: &str, error: &AgentErrorInfo) -> Option<String> {
 /// gateway's mirror of the session has the streamed rows by then, so when the
 /// agent's read lacks an assistant answer written since `since_ms` (the
 /// task's start), the mirror is read instead.
+pub(crate) async fn turn_timeline(
+    manager: &AgentManager,
+    asid: &str,
+    task: &Task,
+) -> Vec<TimelineItem> {
+    let since = task.reopened_ms.unwrap_or(task.created_ms);
+    summary_timeline(manager, asid, since)
+        .await
+        .into_iter()
+        .filter(|item| task.reopened_ms.is_none() || item.updated_ms >= since)
+        .collect()
+}
+
 pub(crate) async fn summary_timeline(
     manager: &AgentManager,
     asid: &str,
@@ -3520,6 +3640,71 @@ mod tests {
             state.agent_runtime.publish_for_test(event);
         }
         waiting.await.unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_new_user_turn_reopens_only_a_live_finished_session() {
+        for (ended, live, fresh, expected) in [
+            (TaskState::Done, true, true, true),
+            (TaskState::Failed, true, true, true),
+            (TaskState::Cancelled, true, true, false),
+            (TaskState::Done, false, true, false),
+            (TaskState::Done, true, false, false),
+        ] {
+            let agent = FakeAgent::new("opencode");
+            let (state, id) = if live {
+                delegated(agent).await
+            } else {
+                tracked(agent).await
+            };
+            let task = state
+                .tasks
+                .move_to(
+                    &id,
+                    TaskChange {
+                        to: ended,
+                        summary: Some("first result".into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let mut user = reply("follow-up", "Please continue");
+            user.role = TimelineRole::User;
+            user.updated_ms = task.updated_ms + u64::from(fresh);
+            assert_eq!(
+                state.tasks.reopen_session(&state, &task, &[user]).await,
+                expected
+            );
+            let now = state.tasks.task(&id).await.unwrap().unwrap();
+            assert_eq!(now.state, if expected { TaskState::Working } else { ended });
+            assert_eq!(now.summary.as_deref(), Some("first result"));
+            assert_eq!(now.reopen_count, u64::from(expected));
+            if expected {
+                assert_eq!(now.reopened_ms, Some(task.updated_ms + 1));
+                // A duplicate observer cannot reopen the same finish twice.
+                assert!(state
+                    .tasks
+                    .reopen(&task, task.updated_ms + 1)
+                    .await
+                    .is_err());
+                let done = state
+                    .tasks
+                    .move_to(
+                        &id,
+                        TaskChange {
+                            to: TaskState::Done,
+                            summary: Some("second result".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(done.id, task.id);
+                assert_eq!(done.summary.as_deref(), Some("second result"));
+                assert_eq!(done.reopen_count, 1);
+            }
+        }
     }
 
     #[tokio::test]
@@ -4194,6 +4379,8 @@ mod tests {
                 mentions: Vec::new(),
                 client_ref: None,
                 requester_server_id: None,
+                reopened_ms: None,
+                reopen_count: 0,
             })
             .await;
         state

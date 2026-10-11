@@ -1383,12 +1383,14 @@ struct Observed {
     seen: Seen,
     screen: Option<String>,
     marker: Option<Marker>,
+    done_count: usize,
 }
 
 /// One read of the pane, its agent, its screen and its recent output; `None`
 /// when the backend cannot say.
 async fn observe(at: &Bound<'_>, rows: &mut Option<usize>) -> Option<Observed> {
     let (seen, screen) = observe_agent(at, rows).await?;
+    let mut done_count = 0;
     let marker = match seen {
         Seen::Gone => None,
         _ => terminal_backend(at.session)
@@ -1402,13 +1404,72 @@ async fn observe(at: &Bound<'_>, rows: &mut Option<usize>) -> Option<Observed> {
             })
             .await
             .ok()
-            .and_then(|output| marker_after(&output.text, Some(at.goal))),
+            .and_then(|output| {
+                let marker = marker_after(&output.text, Some(at.goal));
+                if let Some(Marker::Done(summary)) = &marker {
+                    done_count = marker_lines(&output.text, Some(at.goal)).iter()
+                        .filter(|(_, _, marker)| matches!(marker, Marker::Done(text) if text == summary)).count();
+                }
+                marker
+            }),
     };
     Some(Observed {
         seen,
         screen,
         marker,
+        done_count,
     })
+}
+
+/// Reopening needs the launched job, not merely an agent-shaped screen in a
+/// reused pane. Older bindings without job identity remain finished.
+async fn same_live_job(task: &Task) -> bool {
+    let TaskBinding::Pane {
+        shell_pid: Some(shell_pid),
+        agent_job: Some(job),
+        ..
+    } = &task.binding
+    else {
+        return false;
+    };
+    job_in_front(&PaneJob {
+        shell_pid: *shell_pid,
+        job: job.clone(),
+    })
+    .await
+        == Front::Agent
+}
+
+#[derive(Default)]
+struct FinishedTurn {
+    seq: Option<u64>,
+    idle: bool,
+}
+
+impl FinishedTurn {
+    fn resumed(&mut self, state: TaskState, seq: u64, seen: Seen) -> bool {
+        if !matches!(state, TaskState::Done | TaskState::Failed) {
+            return false;
+        }
+        if self.seq != Some(seq) {
+            self.seq = Some(seq);
+            self.idle = false;
+        }
+        match seen {
+            Seen::Agent {
+                status: AgentStatus::Idle | AgentStatus::Completed,
+                ..
+            } => {
+                self.idle = true;
+                false
+            }
+            Seen::Agent {
+                status: AgentStatus::Working | AgentStatus::Starting,
+                ..
+            } => self.idle,
+            _ => false,
+        }
+    }
 }
 
 /// Claude Code's tool and message rows (`⏺`) on `screen`.
@@ -1508,9 +1569,9 @@ fn change_for(
     })
 }
 
-/// Follow `task`'s pane agent until the task ends, unless something already
-/// does. The driver calls this for every open pane delegation, which is how
-/// following resumes after a gateway restart.
+/// Follow the assignment while its launched job remains alive, including
+/// finished turns that can reopen. The driver restores followers after a
+/// gateway restart; a claimed task already has exactly one follower.
 pub(crate) fn follow(state: &AppState, task: &Task) {
     if !state.tasks.claim_follow(&task.id) {
         return;
@@ -1541,9 +1602,15 @@ async fn run(state: &AppState, id: &TaskId) {
     let mut known_seq = None;
     // The blocked reasons acted on before this follower, read once.
     let mut acted: Option<Vec<String>> = None;
+    let mut finished_turn = FinishedTurn::default();
+    let mut prior_done: Option<(String, usize)> = state
+        .tasks
+        .reopen_note(id)
+        .await
+        .and_then(|note| serde_json::from_str(&note).ok());
     loop {
         let task = match state.tasks.task(id).await {
-            Ok(Some(task)) if !task.state.is_terminal() => task,
+            Ok(Some(task)) if task.state != TaskState::Cancelled => task,
             Ok(_) => return,
             Err(error) => {
                 tracing::debug!(task = %id.0, %error, "pane follower: read failed");
@@ -1559,11 +1626,60 @@ async fn run(state: &AppState, id: &TaskId) {
         }
         let (mut now, mut seq, mut seen) = (task.state, task.seq, None);
         if let Some(observed) = observe(&at, &mut rows).await {
+            if task.state.is_terminal() {
+                if !same_live_job(&task).await {
+                    return;
+                }
+                if finished_turn.resumed(task.state, task.seq, observed.seen) {
+                    let baseline = match &observed.marker {
+                        Some(Marker::Done(text)) => Some((text.clone(), observed.done_count)),
+                        _ => None,
+                    };
+                    let note = baseline
+                        .as_ref()
+                        .and_then(|value| serde_json::to_string(value).ok());
+                    if state
+                        .tasks
+                        .reopen_with_note(&task, note, None)
+                        .await
+                        .is_ok()
+                    {
+                        prior_done = baseline;
+                        progress = Progress::default();
+                        progress.busy = true;
+                        last_marker = None;
+                        last_screen = None;
+                        known_seq = None;
+                    }
+                }
+                if matches!(observed.seen, Seen::Gone | Seen::NoAgent) {
+                    return;
+                }
+                let unchanged = last == Some((task.seq, Some(observed.seen)));
+                last = Some((task.seq, Some(observed.seen)));
+                // Catch the end of the reporting turn promptly, then let a
+                // finished idle pane back off like any paused assignment.
+                let (next, pause) = paused_poll(quiet, finished_turn.idle && quiet >= 2, unchanged);
+                quiet = if next == 0 && unchanged {
+                    quiet + 1
+                } else {
+                    next
+                };
+                tokio::time::sleep(pause).await;
+                continue;
+            }
             seen = Some(observed.seen);
-            let marker = match observed.seen {
+            let mut marker = match observed.seen {
                 Seen::Gone => last_marker.take(),
                 _ => observed.marker,
             };
+            // The previous turn's marker may still be in scrollback. It must
+            // not finish the new turn before a new result is reported.
+            if let (Some((old, count)), Some(Marker::Done(text))) = (&prior_done, &marker) {
+                if old == text && observed.done_count <= *count {
+                    marker = None;
+                }
+            }
             if acted.is_none() {
                 let reasons = state.tasks.marker_reasons(id).await;
                 progress.seed(marker.as_ref(), &reasons);
@@ -1644,6 +1760,24 @@ pub(crate) async fn interrupt(state: &AppState, task: &Task) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_finished_pane_requires_a_new_turn_not_the_remainder_of_its_old_turn() {
+        use super::*;
+        let seen = |status| Seen::Agent { status, seq: None };
+        for state in [TaskState::Done, TaskState::Failed] {
+            let mut turn = FinishedTurn::default();
+            assert!(!turn.resumed(state, 5, seen(AgentStatus::Working)));
+            assert!(!turn.resumed(state, 5, seen(AgentStatus::Idle)));
+            assert!(turn.resumed(state, 5, seen(AgentStatus::Working)));
+            // The next completion needs its own idle boundary.
+            assert!(!turn.resumed(state, 9, seen(AgentStatus::Working)));
+            assert!(!turn.resumed(state, 9, Seen::Gone));
+            assert!(!turn.resumed(state, 9, Seen::NoAgent));
+        }
+        let mut turn = FinishedTurn::default();
+        assert!(!turn.resumed(TaskState::Cancelled, 5, seen(AgentStatus::Idle)));
+        assert!(!turn.resumed(TaskState::Cancelled, 5, seen(AgentStatus::Working)));
+    }
 
     /// Only the job the delegation launched, holding the pane's terminal, is
     /// typed to; whatever else holds it, nothing is, and a job that is gone

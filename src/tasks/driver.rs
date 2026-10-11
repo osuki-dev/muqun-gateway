@@ -43,7 +43,7 @@ use std::time::Duration;
 use super::domain::one_line;
 use super::domain::{now_ms, Task, TaskBinding, TaskChange, TaskFilter, TaskKind, TaskState};
 use super::service::{
-    finished_since, is_running, session_failure, sourced, summary_timeline, turn_end, OPEN_STATES,
+    finished_since, is_running, session_failure, sourced, turn_end, turn_timeline, OPEN_STATES,
     SUMMARY_CHARS,
 };
 use super::{pane_agent, same_pane};
@@ -193,17 +193,53 @@ pub(crate) async fn reconcile(state: &AppState) -> usize {
         limit: PAGE,
         ..Default::default()
     };
-    let tasks = match state.tasks.open_tasks(filter).await {
+    let mut tasks = match state.tasks.open_tasks(filter).await {
         Ok(tasks) => tasks,
         Err(error) => {
             tracing::warn!(%error, "task driver: could not list tasks");
             return 0;
         }
     };
+    // Finished history must never crowd active tasks out of their driver page.
+    if let Ok(ended) = state
+        .tasks
+        .open_tasks(TaskFilter {
+            states: Some(vec![TaskState::Done, TaskState::Failed]),
+            limit: PAGE,
+            ..Default::default()
+        })
+        .await
+    {
+        tasks.extend(ended);
+    }
     // Each session's panes, listed once per pass; `None` when unreachable.
     let mut panes: PaneCache = HashMap::new();
     let mut moved = 0;
     for task in tasks {
+        if task.state.is_terminal() {
+            if task.kind != TaskKind::Delegation {
+                continue;
+            }
+            match &task.binding {
+                TaskBinding::AgentSession { agent_id, asid } => {
+                    if let Some(manager) = state.agent_runtime.manager_for_agent(agent_id).await {
+                        let items = manager
+                            .agent()
+                            .get_timeline(asid, super::service::SUMMARY_ITEMS)
+                            .await
+                            .unwrap_or_default();
+                        moved +=
+                            usize::from(state.tasks.reopen_session(state, &task, &items).await);
+                    }
+                }
+                TaskBinding::Pane { .. } => pane_agent::follow(state, &task),
+                TaskBinding::Peer { .. } => {
+                    moved += usize::from(crate::fleet::mirror::converge(state, &task).await);
+                }
+                TaskBinding::None => {}
+            }
+            continue;
+        }
         let outcome = match &task.binding {
             TaskBinding::Pane {
                 session_id,
@@ -298,7 +334,7 @@ async fn settle_delegation(state: &AppState, task: &Task, agent_id: &str, asid: 
     if is_running(session.status) && (task.state == TaskState::IdleUnconfirmed || blocked) {
         return settled(state, task, change(TaskState::Working)).await;
     }
-    if !finished_since(&session, task.created_ms) {
+    if !finished_since(&session, task.reopened_ms.unwrap_or(task.created_ms)) {
         // Left dispatching by a stop between binding the session and sending
         // its prompt: the session never ran it, and nothing else will move it.
         let never_sent = task.state == TaskState::Dispatching
@@ -308,7 +344,7 @@ async fn settle_delegation(state: &AppState, task: &Task, agent_id: &str, asid: 
     }
     // Marker first: a turn that ended while the gateway was down is done
     // only if the agent said so.
-    let ended = turn_end(&summary_timeline(&manager, asid, task.created_ms).await);
+    let ended = turn_end(&turn_timeline(&manager, asid, task).await);
     if !state.tasks.moves(task, &ended).await {
         return false;
     }
@@ -428,6 +464,8 @@ mod tests {
             mentions: Vec::new(),
             client_ref: None,
             requester_server_id: None,
+            reopened_ms: None,
+            reopen_count: 0,
         }
     }
 

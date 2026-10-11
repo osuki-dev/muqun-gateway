@@ -576,6 +576,10 @@ fn remote(value: Value) -> Result<RemoteTask, PeerError> {
 /// B's task view, as much of it as a mirror copies.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct RemoteTask {
+    #[serde(default)]
+    pub reopened_ms: Option<u64>,
+    #[serde(default)]
+    pub reopen_count: u64,
     pub task_id: String,
     pub state: TaskState,
     /// The reference this gateway sent with it: how a create that got no
@@ -856,6 +860,8 @@ mod tests {
                 mentions: Vec::new(),
                 client_ref: None,
                 requester_server_id: None,
+                reopened_ms: None,
+                reopen_count: 0,
             })
             .await
     }

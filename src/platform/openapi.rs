@@ -828,6 +828,8 @@ fn task_view_schema() -> Value {
             },
             "created_ms": { "type": "integer" },
             "updated_ms": { "type": "integer" },
+            "reopened_ms": { "type": ["integer", "null"], "description": "When the same live session or pane started another user turn after finishing" },
+            "reopen_count": { "type": "integer", "description": "Number of times this assignment resumed; acknowledgements apply to one finish only" },
             "client_ref": { "type": "string", "description": "The requester's own reference for the task (POST /api/tasks client_ref), when it gave one" },
             "model": { "type": "string", "description": "A terminal delegation only: the model its launch passed, else (codex) its own config's -- what GET /api/tasks/defaults answers -- else \"default\" (the agent's own)" },
             "variant": { "type": "string", "description": "A terminal delegation only: the effort that goes with model, when known" },

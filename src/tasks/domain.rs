@@ -222,6 +222,10 @@ pub(crate) struct Task {
     /// (its device record's `server_id`), when another computer opened it.
     #[serde(default)]
     pub requester_server_id: Option<String>,
+    #[serde(default)]
+    pub reopened_ms: Option<u64>,
+    #[serde(default)]
+    pub reopen_count: u64,
 }
 
 /// A task's direct children by state, computed when the task is read.
@@ -260,6 +264,11 @@ pub(crate) struct TaskEvent {
 /// A requested move. `Some` fields replace the task's value, `None` keeps it.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TaskChange {
+    /// A verified new turn on the same live binding; never a generic state move.
+    pub reopen: bool,
+    pub reopen_count: Option<u64>,
+    pub reopened_ms: Option<u64>,
+    pub expected_seq: Option<u64>,
     pub to: TaskState,
     pub source: String,
     pub note: Option<String>,
