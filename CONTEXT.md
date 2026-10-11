@@ -260,6 +260,10 @@ keeps the task ID and prior summary, increments `reopen_count`, and records
 `reopened_ms`. Old completion markers are excluded from the new turn. Cancelled
 tasks and missing or reused bindings stay finished. Peer mirrors follow the
 same generation, including when a whole turn finished between observations.
+A terminal agent's first tool call can precede that observation. Its still-live
+finished assignment remains the parent for a command it starts, so child history
+and the peer-origin one-hop restriction do not depend on polling timing. A tool
+call alone does not reopen the assignment.
 
 ### Linked computers
 

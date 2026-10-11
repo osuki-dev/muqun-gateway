@@ -1423,7 +1423,7 @@ async fn observe(at: &Bound<'_>, rows: &mut Option<usize>) -> Option<Observed> {
 
 /// Reopening needs the launched job, not merely an agent-shaped screen in a
 /// reused pane. Older bindings without job identity remain finished.
-async fn same_live_job(task: &Task) -> bool {
+pub(crate) async fn same_live_job(task: &Task) -> bool {
     let TaskBinding::Pane {
         shell_pid: Some(shell_pid),
         agent_job: Some(job),

@@ -125,8 +125,75 @@ fn runs(item: &TimelineItem, call: &Call<'_>) -> bool {
 async fn parent_of(state: &AppState, binding: &TokenBinding, call: &Call<'_>) -> Option<TaskId> {
     match <[Task; 1]>::try_from(fitting(state, binding, call).await) {
         Ok([task]) => Some(task.id),
+        Err(tasks) if tasks.is_empty() => finished_parent(state, binding, call).await,
         Err(_) => None,
     }
+}
+
+/// A tool call may reach MCP before the new-turn event or pane poll. The
+/// assignment still owns that session; finding its parent does not reopen it.
+async fn finished_parent(
+    state: &AppState,
+    binding: &TokenBinding,
+    call: &Call<'_>,
+) -> Option<TaskId> {
+    let TokenBinding::Agent { agent_id } = binding else {
+        return finished_pane_parent(state, binding).await;
+    };
+    let candidates = state
+        .tasks
+        .open_tasks(TaskFilter {
+            agent_id: Some(agent_id.clone()),
+            states: Some(vec![
+                crate::tasks::domain::TaskState::Done,
+                crate::tasks::domain::TaskState::Failed,
+            ]),
+            limit: MAX_CANDIDATES,
+            ..Default::default()
+        })
+        .await
+        .ok()?;
+    let [task] = <[Task; 1]>::try_from(calling(state, agent_id, candidates, call).await).ok()?;
+    let TaskBinding::AgentSession { asid, .. } = &task.binding else {
+        return None;
+    };
+    let manager = state.agent_runtime.manager_for_agent(agent_id).await?;
+    manager.sessions().get_session(asid).await.ok()?;
+    Some(task.id)
+}
+
+/// A terminal agent can make its first tool call before the pane observer
+/// sees the new turn. Keep that command under the same still-live assignment,
+/// including its peer-origin one-hop restriction, without treating the tool
+/// call itself as evidence that the assignment reopened.
+async fn finished_pane_parent(state: &AppState, binding: &TokenBinding) -> Option<TaskId> {
+    let TokenBinding::Pane {
+        session_id,
+        pane_id,
+    } = binding
+    else {
+        return None;
+    };
+    let tasks = state
+        .tasks
+        .open_tasks(TaskFilter {
+            pane: Some((session_id.clone(), pane_id.clone())),
+            limit: 1,
+            ..Default::default()
+        })
+        .await
+        .ok()?;
+    let task = tasks.first()?;
+    if task.kind != TaskKind::Delegation
+        || !matches!(
+            task.state,
+            crate::tasks::domain::TaskState::Done | crate::tasks::domain::TaskState::Failed
+        )
+        || !crate::tasks::pane_agent::same_live_job(task).await
+    {
+        return None;
+    }
+    Some(task.id.clone())
 }
 
 /// The open delegation `session` works on, for `tasks.complete` (`call`):
@@ -520,6 +587,73 @@ mod tests {
             (elsewhere.parent, elsewhere.origin),
             (None, TaskOrigin::Mcp)
         );
+    }
+
+    #[tokio::test]
+    async fn a_first_tool_call_keeps_its_finished_session_parent_without_reopening_it() {
+        let call = run("make", "/w");
+        let state = state_with(&[(
+            "ses_parent",
+            calling(
+                "muqun_exec_run",
+                "running",
+                json!({"command":"make", "cwd":"/w"}),
+            ),
+        )])
+        .await;
+        let id = working(&state, session_of("ses_parent")).await;
+        state
+            .tasks
+            .move_to(
+                &id,
+                TaskChange {
+                    to: TaskState::Done,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let asked = requested(&state, &agent_token(), &call).await;
+        assert_eq!(asked.parent, Some(id.clone()));
+        assert_eq!(
+            state.tasks.task(&id).await.unwrap().unwrap().state,
+            TaskState::Done
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finished_pane_without_its_recorded_job_is_not_a_parent() {
+        for ended in [TaskState::Done, TaskState::Failed, TaskState::Cancelled] {
+            let state = test_state("admin", Vec::new());
+            let id = working(
+                &state,
+                TaskBinding::Pane {
+                    session_id: "default".into(),
+                    pane_id: "%4".into(),
+                    tab_id: None,
+                    shell_pid: None,
+                    agent_id: Some("codex".into()),
+                    agent_job: None,
+                    model: None,
+                    variant: None,
+                },
+            )
+            .await;
+            state
+                .tasks
+                .move_to(
+                    &id,
+                    TaskChange {
+                        to: ended,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let asked = requested(&state, &pane_token("%4"), &run("make", "/w")).await;
+            assert_eq!(asked.parent, None);
+            assert_eq!(state.tasks.task(&id).await.unwrap().unwrap().state, ended);
+        }
     }
 
     /// `tasks.complete` reaches only the caller's own task: the session
