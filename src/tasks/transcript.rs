@@ -204,8 +204,10 @@ fn hide_in_item(item: &mut TimelineItem, plumbing: Plumbing) -> Served {
     // Every call of the muqun server's tools is internal, whatever its state
     // and in every session: the reader sees a delegation through the Home
     // rows, the parent's progress line and the result line it is told.
+    // So is an agent loading a skill (its name and path, no side effect):
+    // setup, not the work.
     if let AgentPart::Tool(call) = &item.part {
-        if is_muqun_tool(&call.name) {
+        if is_muqun_tool(&call.name) || call.name.eq_ignore_ascii_case("skill") {
             return Served::Emptied;
         }
     }
@@ -352,16 +354,32 @@ fn is_catalog_notice(text: &str) -> bool {
 
 /// Whether `code` (an OpenCode Code Mode `execute` call) is only a catalog
 /// lookup of a muqun tool, read strictly as the whole code:
-/// `[return] search({query: <string>[, limit: <integer>]})[;]`, keys in any
-/// order, each once, the query a plain quoted string (no escapes, no
-/// template) that starts with `muqun` or names `tasks.`, `fleet.` or
-/// `exec.run`. Anything else -- another statement, a chained call, an
-/// operator, another key -- is the agent's own work and is shown.
+/// `[return] [await] search({query: <string>[, limit: <integer>]})[;]`, or
+/// the same bound to a name and returned --
+/// `const|let|var <id> = [await] search({...})[;] [return <id>[;]]` --
+/// keys in any order, each once, the query a plain quoted string (no
+/// escapes, no template) that starts with `muqun` or names `tasks.`,
+/// `fleet.` or `exec.run`. Anything else -- another statement, a chained
+/// call, an operator, another key, returning something else -- is the
+/// agent's own work and is shown.
 fn muqun_lookup(code: &str) -> bool {
     let mut at = Cursor(code.trim());
-    if at.word("return") && !at.0.starts_with(char::is_whitespace) {
-        return false;
-    }
+    let bound = if at.word("const") || at.word("let") || at.word("var") {
+        let rest = at.0.trim_start();
+        if rest.starts_with(['"', '\'']) {
+            return false;
+        }
+        match at.key() {
+            Some(name) if at.eat("=") && !at.0.trim_start().starts_with('=') => Some(name),
+            _ => return false,
+        }
+    } else {
+        if at.word("return") && !at.0.starts_with(char::is_whitespace) {
+            return false;
+        }
+        None
+    };
+    at.word("await");
     let (mut query, mut limit) = (None, false);
     let parsed = at.eat("search")
         && at.eat("(")
@@ -389,6 +407,14 @@ fn muqun_lookup(code: &str) -> bool {
         }
         && at.eat(")");
     at.eat(";");
+    if let Some(name) = bound {
+        if at.word("return")
+            && !(at.word(name) && at.0.trim_start().trim_start_matches(';').trim().is_empty())
+        {
+            return false;
+        }
+        at.eat(";");
+    }
     let ours = |query: &str| {
         let query = query.trim().to_ascii_lowercase();
         query.starts_with("muqun")
@@ -695,10 +721,28 @@ mod tests {
                 None,
             ),
             (
-                "a script that also looks one up",
+                "a lookup bound to a name and returned",
                 Assistant,
                 execute("const t = search({query:'muqun'});\nreturn t;"),
-                Some("const t = search({query:'muqun'});\nreturn t;"),
+                None,
+            ),
+            (
+                "the owner's lookup",
+                Assistant,
+                execute(r#"const x = search({query:"muqun fleet.describe exec.run tasks.complete tasks.read",limit:10}); return x;"#),
+                None,
+            ),
+            (
+                "a lookup followed by another call",
+                Assistant,
+                execute("const t = search({query:'muqun'});\nreturn run(t);"),
+                Some("const t = search({query:'muqun'});\nreturn run(t);"),
+            ),
+            (
+                "an agent loading a skill",
+                Assistant,
+                tool("skill", "completed", serde_json::json!({ "name": "a-workflow" })),
+                None,
             ),
             (
                 "a lookup of another tool",
