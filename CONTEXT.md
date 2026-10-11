@@ -122,9 +122,13 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
   shared store's `peers` table. `peer_client.rs` speaks to it through its
   device API, sealed when it issued a transport key. On the receiving side a
   gateway token reaches only `require_device_or_peer` routes (the task
-  routes but `POST`/`complete`, `subscribe_tasks`, `GET /api/fleet/self`,
+  routes except `complete`, `subscribe_tasks`, `GET /api/fleet/self`,
   its own `DELETE /api/pairings/{id}`); `require_device` refuses it with
   `peer_forbidden`. `fleet.accept_delegations` is the accept switch.
+  `exec.run(machine)` uses `POST /api/tasks` with `kind: command` to run a
+  short command on a peer without starting an agent. It retains a command
+  mirror and returns bounded output through `tasks.wait`; the receiver
+  restricts the working directory to its home and the sender enforces one hop.
   A `peers` row is keyed by this gateway's own id; the `server_id` the
   peer gave is display data, and a second link giving one already held is
   `409 peer_conflict`, never a merge. On the other side a gateway enrolment

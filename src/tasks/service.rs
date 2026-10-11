@@ -1693,13 +1693,40 @@ impl TaskService {
         let deadline = Instant::now() + timeout.clamp(MIN_WAIT, MAX_WAIT);
         let task = self.owned(by, id).await?;
         let view = match &task.binding {
-            _ if task.state.is_terminal() => self.present(&task).await,
+            _ if task.state.is_terminal()
+                && !(task.kind == TaskKind::Command
+                    && matches!(task.binding, TaskBinding::Peer { .. })) =>
+            {
+                self.present(&task).await
+            }
             TaskBinding::Pane { .. } if task.kind == TaskKind::Delegation => {
                 self.wait_published(&task.id, deadline).await?
             }
             // A mirror whose computer is quiet is answered at once, saying
             // so (`peer_reachable: false`); the agent decides (§10.14).
             TaskBinding::Peer { .. } if self.peer_quiet(&task) => self.present(&task).await,
+            // A command on another computer: its tail and exit code come
+            // from there once it has ended.
+            TaskBinding::Peer { .. } if task.kind == TaskKind::Command => {
+                let view = self.wait_published(&task.id, deadline).await?;
+                let mut stdout_tail = None;
+                let mut view = view;
+                if view.state.is_terminal() {
+                    if let Some(now) = self.task(&task.id).await.ok().flatten() {
+                        if let Some((code, tail)) =
+                            crate::fleet::mirror::command_result(state, &now).await
+                        {
+                            stdout_tail = Some(tail);
+                            view.exit_code = view.exit_code.or(code);
+                        }
+                    }
+                }
+                return Ok(Waited {
+                    task: view,
+                    stdout_tail,
+                    answer: None,
+                });
+            }
             TaskBinding::Peer { .. } => self.wait_published(&task.id, deadline).await?,
             TaskBinding::Pane { .. } => {
                 let handle = self.poll_command(state, &task, deadline).await?;
@@ -2028,6 +2055,46 @@ impl TaskService {
         run_command::start(state, &self.store(), by, request)
             .await
             .map_err(command_error)
+    }
+
+    /// Run `command` on the linked computer `machine` (`exec.run` with
+    /// `machine`): a command task in that computer's ledger, mirrored here
+    /// under the caller's task, waited for up to `timeout` in all. One hop
+    /// only, as for a delegation.
+    pub(crate) async fn run_on(
+        &self,
+        state: &AppState,
+        by: Requested,
+        machine: &str,
+        command: String,
+        cwd: Option<String>,
+        timeout: Duration,
+    ) -> Result<crate::fleet::mirror::RemoteRun, TaskError> {
+        let Some(peer) = state.peers.resolve(machine).await else {
+            let known = state.peers.names();
+            return Err(TaskError::UnknownMachine {
+                wanted: machine.to_owned(),
+                known,
+            });
+        };
+        if self.handed_by_a_peer(&by).await {
+            return Err(TaskError::DelegationLoop(peer.name));
+        }
+        let owner = by.by.clone();
+        let started = Instant::now();
+        let mut run =
+            crate::fleet::mirror::run_command(state, by, peer, command, cwd, timeout).await?;
+        let left = timeout.saturating_sub(started.elapsed());
+        if !run.task.state.is_terminal() && left >= MIN_WAIT {
+            let id = TaskId(run.task.task_id.clone());
+            let waited = self.wait(state, &owner, &id, left).await?;
+            run.task = waited.task;
+            run.stdout_tail = waited.stdout_tail.or(run.stdout_tail);
+        }
+        if run.task.state.is_terminal() && run.exit_code.is_none() {
+            run.exit_code = run.task.exit_code;
+        }
+        Ok(run)
     }
 
     /// Open tasks for the driver, as stored.

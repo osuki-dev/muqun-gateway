@@ -369,6 +369,17 @@ impl PeerClient {
     /// `POST /api/tasks`: B opens `body` as its own task.
     /// An answer that is not a task counts as no answer: the peer took the
     /// request, and may have started it.
+    /// `POST /api/tasks` for a command: the task, and the whole answer (its
+    /// exit code and output tail when it ended within the wait).
+    pub(crate) async fn create_command(
+        &self,
+        body: &Value,
+    ) -> Result<(RemoteTask, Value), PeerError> {
+        let answer = self.json(Method::POST, "/api/tasks", Some(body)).await?;
+        let task = remote(answer.clone()).map_err(|_| PeerError::NoAnswer("not a task".into()))?;
+        Ok((task, answer))
+    }
+
     pub(crate) async fn create_task(&self, body: &Value) -> Result<RemoteTask, PeerError> {
         let answer = self.json(Method::POST, "/api/tasks", Some(body)).await?;
         remote(answer).map_err(|_| PeerError::NoAnswer("not a task".into()))

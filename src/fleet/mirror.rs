@@ -167,6 +167,154 @@ pub(crate) async fn delegate(
     Ok(state.tasks.present(&now).await)
 }
 
+/// How long another computer is asked to wait for a command before it
+/// answers: within the peer client's request timeout. The rest of the
+/// caller's wait is spent here, on the mirror.
+const PEER_COMMAND_WAIT_S: u64 = 5;
+
+/// A command run on another computer (`exec.run` with `machine`), as its
+/// create answered.
+pub(crate) struct RemoteRun {
+    pub task: TaskView,
+    pub exit_code: Option<i32>,
+    pub stdout_tail: Option<String>,
+}
+
+/// Run `command` on `peer` as a command task of its own ledger -- a
+/// visible pane there, no agent session -- and keep a command mirror of it
+/// here, under the caller's task, moved as a delegation's mirror is. A peer
+/// that cannot take it leaves a failed mirror and says why.
+pub(crate) async fn run_command(
+    state: &AppState,
+    by: Requested,
+    peer: Peer,
+    command: String,
+    cwd: Option<String>,
+    timeout: Duration,
+) -> Result<RemoteRun, TaskError> {
+    let name = peer.name.clone();
+    let Some(peer) = state.peers.checked(state, peer).await else {
+        return Err(TaskError::PeerUnauthorized(name));
+    };
+    if !state.peers.reachable(&peer, now_ms()) {
+        return Err(TaskError::MachineUnreachable(name));
+    }
+    let now = now_ms();
+    let client_ref = uuid::Uuid::new_v4().simple().to_string();
+    let mirror = state
+        .tasks
+        .record(&Task {
+            id: TaskId::new(),
+            kind: TaskKind::Command,
+            goal: command.clone(),
+            cwd: cwd.clone(),
+            binding: TaskBinding::None,
+            state: TaskState::Queued,
+            summary: None,
+            exit_code: None,
+            created_by: by.by,
+            created_ms: now,
+            updated_ms: now,
+            seq: 0,
+            parent: by.parent,
+            origin: by.origin,
+            label: None,
+            requester_name: by.name,
+            session_title: None,
+            mentions: Vec::new(),
+            client_ref: Some(client_ref.clone()),
+            requester_server_id: None,
+        })
+        .await?;
+    let mut body = json!({
+        "kind": "command",
+        "command": command,
+        "client_ref": client_ref,
+        "timeout_s": timeout.as_secs().clamp(1, PEER_COMMAND_WAIT_S),
+    });
+    if let Some(cwd) = &cwd {
+        body["cwd"] = json!(cwd);
+    }
+    let created = match PeerClient::for_peer(&peer) {
+        Ok(client) => client.create_command(&body).await,
+        Err(_) => Err(PeerError::Unreachable("client".into())),
+    };
+    let (remote, answer) = match created {
+        Ok((remote, answer)) => (Some(remote), Some(answer)),
+        Err(PeerError::NoAnswer(_)) => (None, None),
+        Err(error) => {
+            let error = refusal(state, &peer, error).await;
+            state
+                .tasks
+                .record_failure(&mirror, failed(&error.to_string()))
+                .await;
+            return Err(error);
+        }
+    };
+    if remote.is_some() {
+        state.peers.mark_seen(&peer.peer_id).await;
+    }
+    let remote_task_id = remote
+        .as_ref()
+        .map(|remote| remote.task_id.clone())
+        .unwrap_or_default();
+    let mirror = state
+        .tasks
+        .move_to(
+            &mirror.id,
+            TaskChange {
+                binding: Some(binding(&peer, remote_task_id)),
+                to: TaskState::Dispatching,
+                source: SOURCE.into(),
+                ..Default::default()
+            },
+        )
+        .await?;
+    if let Some(remote) = &remote {
+        apply(state, &mirror, remote).await;
+    }
+    watch(state, &peer.peer_id);
+    let now = state
+        .tasks
+        .task(&mirror.id)
+        .await?
+        .ok_or(TaskError::NotFound)?;
+    let field = |key: &str| answer.as_ref().and_then(|answer| answer.get(key).cloned());
+    Ok(RemoteRun {
+        task: state.tasks.present(&now).await,
+        exit_code: field("exit_code")
+            .and_then(|code| code.as_i64())
+            .and_then(|code| i32::try_from(code).ok()),
+        stdout_tail: field("stdout_tail").and_then(|tail| tail.as_str().map(str::to_owned)),
+    })
+}
+
+/// A finished command mirror's output tail and exit code, as the command
+/// task over there recorded them (`exit <code>` then the tail). `None` when
+/// that computer cannot be read.
+pub(crate) async fn command_result(state: &AppState, task: &Task) -> Option<(Option<i32>, String)> {
+    let TaskBinding::Peer {
+        peer_id,
+        remote_task_id,
+        ..
+    } = &task.binding
+    else {
+        return None;
+    };
+    let peer = state.peers.get(peer_id).await?;
+    let there = PeerClient::for_peer(&peer)
+        .ok()?
+        .read_task(remote_task_id)
+        .await
+        .ok()?;
+    let summary = there.summary.unwrap_or_default();
+    let tail = match summary.split_once('\n') {
+        Some((first, rest)) if first.starts_with("exit ") => rest.to_owned(),
+        _ => String::new(),
+    };
+    Some((there.exit_code, tail))
+}
+
 fn binding(peer: &Peer, remote_task_id: String) -> TaskBinding {
     TaskBinding::Peer {
         peer_id: peer.peer_id.clone(),
@@ -637,7 +785,7 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
-    use crate::mcp::tools::tests_support::delegate_as;
+    use crate::mcp::tools::tests_support::{delegate_as, run_as};
     use crate::tasks::domain::{PrincipalKind, TaskOrigin, TaskPrincipal};
     use crate::tasks::service::Outcome;
     use crate::test_support::{
@@ -965,6 +1113,12 @@ mod tests {
         ] {
             let error = delegate_as(&coding, machine, "goal").await.unwrap_err();
             assert_eq!(error["error"], code, "{machine}: {error}");
+            // A command there is refused the same way: the switch is that
+            // computer's for any work from another.
+            if machine != "old" {
+                let error = run_as(&coding, machine, "ls", 1).await.unwrap_err();
+                assert_eq!(error["error"], code, "exec.run on {machine}: {error}");
+            }
             if code == "machine_unknown" {
                 let message = error["message"].as_str().unwrap();
                 assert!(
@@ -1030,6 +1184,90 @@ mod tests {
             .await;
         let error = delegate_as(&coding, "mini", "goal").await.unwrap_err();
         assert_eq!(error["error"], "delegation_loop", "{error}");
+        let error = run_as(&coding, "mini", "ls", 1).await.unwrap_err();
+        assert_eq!(error["error"], "delegation_loop", "exec.run: {error}");
+    }
+
+    /// A command on another computer (`exec.run` with `machine`) runs there
+    /// as a command task of its own ledger -- a pane, no agent session --
+    /// with a command mirror here; its exit code and output tail come back.
+    #[tokio::test]
+    async fn a_command_on_another_computer_runs_there_without_an_agent() {
+        let herdr = FakeHerdr::start(vec!["$ "], None);
+        let mini = named(output_state(&herdr), "srv-mini", "mini");
+        mini.devices
+            .lock()
+            .unwrap()
+            .push(test_peer_device("coding-1", "peer-token"));
+        let url = serve(peer_router(mini.clone())).await;
+        let coding = named(output_state(&herdr), "srv-coding", "coding");
+        coding
+            .peers
+            .store_for_test(peer("srv-mini", "mini", &url, Some(now_ms())))
+            .await;
+
+        let ran = run_as(&coding, "mini", "ls ~/Desktop", 1).await.unwrap();
+        assert_eq!(ran["machine"], "mini", "{ran}");
+        let mirror_id = TaskId(ran["task_id"].as_str().unwrap().into());
+        let mirror = coding.tasks.get_for_test(&mirror_id).await;
+        assert_eq!(
+            (mirror.kind, &mirror.goal[..]),
+            (TaskKind::Command, "ls ~/Desktop")
+        );
+        let TaskBinding::Peer { remote_task_id, .. } = &mirror.binding else {
+            panic!("{:?}", mirror.binding);
+        };
+        let remote_id = TaskId(remote_task_id.clone());
+        let there = mini.tasks.get_for_test(&remote_id).await;
+        assert_eq!(
+            (there.kind, there.origin, &there.goal[..]),
+            (TaskKind::Command, TaskOrigin::Peer, "ls ~/Desktop")
+        );
+        assert!(
+            matches!(there.binding, TaskBinding::Pane { .. }),
+            "a pane there"
+        );
+        assert!(mini
+            .agent_runtime
+            .manager_for_agent("opencode")
+            .await
+            .is_none());
+
+        // It ends there: the wait here answers its exit code and tail.
+        mini.tasks
+            .move_to(
+                &remote_id,
+                TaskChange {
+                    to: TaskState::Done,
+                    summary: Some("exit 0\nDocuments\nNotes.txt\n".into()),
+                    exit_code: Some(0),
+                    source: "test".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let by = owner(&coding, &mirror_id).await;
+        let waited = coding
+            .tasks
+            .wait(&coding, &by, &mirror_id, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(waited.task.state, TaskState::Done);
+        assert_eq!(waited.task.exit_code, Some(0));
+        assert_eq!(
+            waited.stdout_tail.as_deref(),
+            Some("Documents\nNotes.txt\n")
+        );
+        // A caller may wait only after the result frame has already arrived.
+        // Finished mirrors must still return the command output on reread.
+        let reread = coding
+            .tasks
+            .wait(&coding, &by, &mirror_id, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(reread.task.exit_code, Some(0));
+        assert_eq!(reread.stdout_tail, waited.stdout_tail);
     }
 
     /// A mirror reads as the task over there does: its goal's sentence until

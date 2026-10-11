@@ -157,6 +157,8 @@ async fn defaults(
 
 #[derive(Debug, Deserialize)]
 struct CreateBody {
+    /// Required for a delegation (checked there); a command has `command`.
+    #[serde(default)]
     goal: String,
     #[serde(default)]
     agent_id: Option<String>,
@@ -184,6 +186,16 @@ struct CreateBody {
     /// takes them.
     #[serde(default)]
     attachments: Vec<String>,
+    /// `command`: run `command` as a command task (another computer's
+    /// `exec.run` with `machine`) instead of delegating `goal`.
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    command: Option<String>,
+    /// How long the create waits for the command before answering with its
+    /// handle (1..=45, default 30).
+    #[serde(default)]
+    timeout_s: Option<u64>,
 }
 
 /// How many attachments one task's goal may carry.
@@ -342,7 +354,18 @@ async fn create(
             "This computer does not take work from other computers",
         ));
     }
-    let Json(body) = body.map_err(|_| invalid_request())?;
+    let Json(mut body) = body.map_err(|_| invalid_request())?;
+    if body.kind.as_deref() == Some("command") {
+        return create_command(&state, caller, body).await;
+    }
+    if body
+        .kind
+        .as_deref()
+        .is_some_and(|kind| kind != "delegation")
+    {
+        return Err(invalid_request());
+    }
+    body.kind = None;
     // References are files on this computer, uploaded from a device: another
     // computer has none to send.
     if caller.kind == DeviceKind::Gateway && !body.attachments.is_empty() {
@@ -389,6 +412,78 @@ async fn create(
     }
     Ok(Json(answer))
 }
+
+/// `POST /api/tasks` with `kind: "command"`: run `command` in `cwd` (home
+/// when absent; `~` expands) as a command task, exactly as `exec.run` does
+/// here -- a visible pane, a row in this computer's ledger -- and answer
+/// with the task view, its exit code and output tail once it ended within
+/// `timeout_s`, else its handle. Another computer's command (`exec.run`
+/// with `machine`) runs only in a directory inside this computer's home.
+async fn create_command(
+    state: &AppState,
+    caller: Caller,
+    body: CreateBody,
+) -> ApiResult<Json<Value>> {
+    let command = body.command.unwrap_or_default();
+    if command.trim().is_empty() || command.len() > MAX_COMMAND_BYTES {
+        return Err(refused(
+            "invalid_request",
+            "command must be non-empty and at most 16 KiB",
+        ));
+    }
+    if body
+        .client_ref
+        .as_deref()
+        .is_some_and(|reference| !crate::valid_install_id(reference))
+    {
+        return Err(invalid_request());
+    }
+    let cwd = requested_directory(Some(body.cwd.as_deref().unwrap_or("~")))?
+        .ok_or_else(invalid_request)?;
+    let peer = caller.kind == DeviceKind::Gateway;
+    if peer {
+        let home = dirs::home_dir().and_then(|home| home.canonicalize().ok());
+        if !home.is_some_and(|home| std::path::Path::new(&cwd).starts_with(home)) {
+            return Err(refused(
+                "invalid_directory",
+                "Another computer's command runs only inside this computer's home",
+            ));
+        }
+    }
+    let request = crate::tasks::run_command::RunRequest {
+        cwd: cwd.into(),
+        command,
+        timeout: crate::mcp::tools::wait_slice(body.timeout_s),
+        client_ref: body.client_ref,
+    };
+    let by = Requested {
+        by: caller_principal(&caller),
+        origin: if peer {
+            TaskOrigin::Peer
+        } else {
+            TaskOrigin::Device
+        },
+        parent: None,
+        name: Some(caller.name),
+        server_id: caller.server_id.clone(),
+    };
+    let handle = state
+        .tasks
+        .run(state, by, request)
+        .await
+        .map_err(create_failed)?;
+    let mut answer = json!(state.tasks.present(&handle.task).await);
+    answer["exit_code"] = json!(handle.exit_code);
+    answer["stdout_tail"] = json!(handle.stdout_tail);
+    answer["duration_ms"] = json!(handle.duration_ms);
+    if let TaskBinding::Pane { pane_id, .. } = &handle.task.binding {
+        answer["pane_id"] = json!(pane_id);
+    }
+    Ok(Json(answer))
+}
+
+/// The longest command a create runs, as `exec.run` takes it.
+const MAX_COMMAND_BYTES: usize = 16 * 1024;
 
 fn create_failed(error: TaskError) -> (StatusCode, Json<Value>) {
     match error {

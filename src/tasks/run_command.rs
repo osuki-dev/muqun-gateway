@@ -41,6 +41,9 @@ pub(crate) struct RunRequest {
     pub command: String,
     /// At most [`MAX_WAIT`].
     pub timeout: Duration,
+    /// The requester's reference for it (another computer's create): how a
+    /// create that got no answer finds its task.
+    pub client_ref: Option<String>,
 }
 
 pub(crate) struct RunHandle {
@@ -147,8 +150,8 @@ async fn launch(
                 requester_name: by.name,
                 session_title: None,
                 mentions: Vec::new(),
-                client_ref: None,
-                requester_server_id: None,
+                client_ref: request.client_ref.clone(),
+                requester_server_id: by.server_id,
             })
             .await?;
         store
@@ -367,6 +370,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             command: command.into(),
             timeout,
+            client_ref: None,
         }
     }
 

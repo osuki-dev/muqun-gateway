@@ -296,13 +296,16 @@ pub(crate) struct DescribeArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct ExecRunArgs {
-    /// Absolute working directory on this computer.
+    /// Absolute working directory on this computer; with machine, a directory on that computer inside its home ("~" allowed).
     pub cwd: String,
     /// Shell command, run as `sh -c <command>`.
     pub command: String,
     /// Seconds to wait before returning a task handle (1..=45, default 30).
     #[serde(default)]
     pub timeout_s: Option<u64>,
+    /// The computer to run on: "self" (default), or the name of a linked computer from fleet.describe (e.g. "mini"). The command runs in a visible pane there; no agent is started.
+    #[serde(default)]
+    pub machine: Option<String>,
 }
 
 impl ExecRunArgs {
@@ -314,6 +317,7 @@ impl ExecRunArgs {
             cwd: directory(&self.cwd)?,
             command: self.command,
             timeout: wait_slice(self.timeout_s),
+            client_ref: None,
         })
     }
 }
@@ -540,13 +544,23 @@ impl MuqunMcp {
 
     #[tool(
         name = "exec.run",
-        description = "Run a shell command in a visible terminal pane on this computer and return its exit code and output tail. Blocks up to timeout_s (max 45); if still running, returns a task_id for tasks.wait."
+        description = "Run a shell command in a visible terminal pane on this computer, or (machine) on a linked computer, and return its exit code and output tail. Blocks up to timeout_s (max 45); if still running, returns a task_id for tasks.wait. For a command or a short script on another computer use this, not tasks.delegate: no agent is started there."
     )]
     async fn exec_run(
         &self,
         Parameters(args): Parameters<ExecRunArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let (command, cwd) = (args.command.clone(), args.cwd.clone());
+        let config = &self.state.config;
+        let peers = self.state.peers.names();
+        if !is_self(
+            args.machine.as_deref(),
+            &config.server_id,
+            &config.label,
+            &peers,
+        ) {
+            return self.exec_run_on(args).await;
+        }
         let request = match args.request() {
             Ok(request) => request,
             Err(refused) => return Ok(refused),
@@ -558,6 +572,59 @@ impl MuqunMcp {
         let by = lineage::requested(&self.state, &self.session, &call).await;
         let run = self.state.tasks.run(&self.state, by, request).await;
         reply(run.map(command_result))
+    }
+
+    /// `exec.run` with `machine`: a command task on that computer, mirrored
+    /// here; its exit code and output tail come back when it ends within the
+    /// wait, else a handle for `tasks.wait`, and the caller is told when it
+    /// ends.
+    async fn exec_run_on(&self, args: ExecRunArgs) -> Result<CallToolResult, ErrorData> {
+        if args.command.trim().is_empty() || args.command.len() > MAX_COMMAND_BYTES {
+            return Ok(invalid("command must be non-empty and at most 16 KiB"));
+        }
+        if args.cwd.is_empty() || args.cwd.len() > 4096 {
+            return Ok(invalid("cwd must be a directory path"));
+        }
+        let machine = args.machine.clone().unwrap_or_default();
+        let call = lineage::Call {
+            tool: "exec.run",
+            args: vec![("command", &args.command), ("cwd", &args.cwd)],
+        };
+        let by = lineage::requested(&self.state, &self.session, &call).await;
+        let caller = lineage::caller_session(&self.state, &self.session, &call).await;
+        let run = self
+            .state
+            .tasks
+            .run_on(
+                &self.state,
+                by,
+                &machine,
+                args.command,
+                Some(args.cwd),
+                wait_slice(args.timeout_s),
+            )
+            .await;
+        let run = match run {
+            Ok(run) => run,
+            Err(error) => return Ok(task_error(error)),
+        };
+        let id = TaskId(run.task.task_id.clone());
+        if !run.task.state.is_terminal() {
+            if let Some(caller) = caller {
+                self.state.tasks.notify(&id, &caller).await;
+            }
+        }
+        let machine = match &run.task.binding {
+            TaskBinding::Peer { peer_name, .. } => peer_name.clone(),
+            _ => machine,
+        };
+        Ok(ok(json!({
+            "task_id": run.task.task_id,
+            "state": run.task.state,
+            "exit_code": run.exit_code,
+            "stdout_tail": run.stdout_tail,
+            "machine": machine,
+        })))
     }
 
     #[tool(
@@ -770,7 +837,10 @@ pub(crate) fn instructions(in_task: bool) -> String {
                  end your turn after delegating; you will be told when it finishes. Use \
                  tasks.wait (at most 45 s) only for short jobs; tasks.delegate(machine) \
                  sends work to a linked computer, and your task's summary (tasks.read without \
-                 a task_id) lists the ones the user named (mentions).";
+                 a task_id) lists the ones the user named (mentions). For a command or a \
+                 short script on another computer, call exec.run with machine; delegate a goal \
+                 only when the other computer needs an agent of its own. Do not restate the \
+                 completion protocol in a delegated goal: the agent there already knows it.";
     let finish = "call tasks.complete with a one-line summary; when you stop because you \
                   need the user, call it with outcome \"blocked\" and the reason; if you \
                   cannot call it, end with the line MUQUN_TASK_DONE: <summary> (or \
@@ -817,6 +887,41 @@ pub(crate) async fn started_for_task(state: &AppState, session: &AssistantSessio
 pub(crate) mod tests_support {
     use super::*;
     use crate::mcp::tokens::TokenBinding;
+
+    /// The body `exec.run(machine, command)` answers: `Ok` unless it is an error.
+    pub(crate) async fn run_as(
+        state: &AppState,
+        machine: &str,
+        command: &str,
+        timeout_s: u64,
+    ) -> Result<Value, Value> {
+        let session = AssistantSession {
+            token_id: "tok-%1".into(),
+            binding: TokenBinding::Pane {
+                session_id: "default".into(),
+                pane_id: "%1".into(),
+            },
+            label: "test".into(),
+            expires_ms: None,
+        };
+        let args = ExecRunArgs {
+            cwd: "~".into(),
+            command: command.into(),
+            timeout_s: Some(timeout_s),
+            machine: Some(machine.into()),
+        };
+        let result = MuqunMcp::new(state.clone(), session)
+            .exec_run(Parameters(args))
+            .await
+            .unwrap();
+        let result = serde_json::to_value(result).unwrap();
+        let body = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        if result["isError"] == true {
+            Err(body)
+        } else {
+            Ok(body)
+        }
+    }
 
     /// The body `tasks.delegate(machine, goal)` answers: `Ok` unless it is an error.
     pub(crate) async fn delegate_as(
@@ -932,6 +1037,7 @@ mod tests {
             cwd: std::env::temp_dir().to_string_lossy().into_owned(),
             command: "sleep 60".into(),
             timeout_s: Some(1),
+            machine: None,
         };
         let (error, _, body) = answer(mcp.exec_run(Parameters(args)).await);
         assert!(!error, "{body}");
@@ -1023,6 +1129,7 @@ mod tests {
             cwd: std::env::temp_dir().to_string_lossy().into_owned(),
             command: "sleep 60".into(),
             timeout_s: Some(1),
+            machine: None,
         };
         let (_, _, run) = answer(mcp.exec_run(Parameters(args)).await);
         let args = ReadArgs {

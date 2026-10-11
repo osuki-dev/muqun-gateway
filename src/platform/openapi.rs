@@ -1003,14 +1003,16 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
                 "summary": "Open a delegation from the device: a new agent session with the goal as its first prompt, or, for a terminal agent from the agent catalog (codex, claude, ...), a new pane running it with the goal as its first prompt (on the command line for codex and claude on tmux, else typed in). Requires the task_ledger_create capability and a device token (or, fleet_peers, another computer's gateway token); a terminal agent needs task_ledger_pane",
                 "requestBody": json_body(json!({
                     "type": "object",
-                    "required": ["goal"],
                     "properties": {
-                        "goal": { "type": "string", "description": "At most 32 KiB" },
+                        "goal": { "type": "string", "description": "At most 32 KiB; required unless kind is command" },
                         "agent_id": { "type": "string", "description": "An attached agent (opencode, ...) or a terminal agent kind from GET /api/agents/catalog (codex, claude, ...). Default: the primary agent" },
                         "cwd": { "type": "string", "description": "Absolute directory (~ expands); default: the home directory" },
                         "mode": { "type": "string", "description": "Ignored for a terminal agent" },
                         "model": { "type": "string", "description": "A model id from the agent's catalog, or provider_id/model_id. For a terminal agent, passed to its launch for this run only (codex: -c model; claude: --model where its --help lists it); 1 to 128 of A-Z a-z 0-9 . _ : / @ + -, not starting with -" },
                         "variant": { "type": "string", "description": "The model's variant (reasoning effort), applied when the session is created so the first turn uses it. Applied only together with model (ignored otherwise); must be one of the model's catalog variants when it lists any. For a terminal agent, passed to its launch (codex: -c model_reasoning_effort; claude: --effort where listed)" },
+                        "kind": { "type": "string", "enum": ["delegation", "command"], "description": "command: run `command` as a command task (a visible pane, no agent) and answer with its exit_code, stdout_tail and pane_id once it ended within timeout_s; goal is then not needed. Another computer's command (exec.run with machine) runs only in a directory inside this computer's home" },
+                        "command": { "type": "string", "description": "kind command: the shell command, at most 16 KiB" },
+                        "timeout_s": { "type": "integer", "description": "kind command: how long the create waits for it, 1..=45 (default 30)" },
                         "attachments": { "type": "array", "items": { "type": "string" }, "maxItems": 16, "description": "Files sent with the goal, as POST /api/agent-sessions/{asid}/prompt takes them (uploaded asset references or file paths on this computer), handed to the agent with its first prompt. A session agent on this computer only: with a terminal agent or another computer it is 400 attachments_unsupported" },
                         "session_id": { "type": "string", "description": "For a terminal agent: the terminal session to start it in, by its config id (a tmux session or Herdr). Default: the first that answers. One this computer has no session for is 400 terminal_unknown" },
                         "label": { "type": "string", "description": "A short title, at most 200 characters" },
