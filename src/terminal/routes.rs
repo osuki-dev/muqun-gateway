@@ -1404,7 +1404,7 @@ async fn deliver_agent_form_notice(state: &AppState, asid: &str, request: &agent
 }
 
 pub(crate) async fn watch_agent_notifications(state: AppState, session: SessionConfig) {
-    let mut statuses = seed_agent_statuses(&session).await;
+    let (mut statuses, mut pending_inputs) = seed_agent_notifications(&session).await;
     let mut completions = CompletionGate::default();
     // One subscription to the session's shared hub, held for the life of the
     // process -- which is what lets a phone that is not connected still get a
@@ -1426,12 +1426,21 @@ pub(crate) async fn watch_agent_notifications(state: AppState, session: SessionC
                             .filter_map(|event| event.pointer("/data/pane_id").and_then(Value::as_str))
                             .map(str::to_owned)
                             .collect();
+                        pending_inputs.retain_present(&events);
                         for event in events {
                             if let Some(mut notification) = observe_agent_notification(
                                 &state, &session.id, &event, &mut statuses, &mut completions,
                             ) {
                                 enrich_blocked_notification(&state, &session, &mut notification).await;
                                 deliver_agent_notification(&state, notification).await;
+                            }
+                            if pending_inputs.observe(&event) {
+                                if let Some(notification) = native_input_notification(
+                                    &event, &state.config.server_id,
+                                    &current_server_label(&state.config.label), &session.id,
+                                ) {
+                                    deliver_agent_notification(&state, notification).await;
+                                }
                             }
                         }
                         for notification in completions.ready(&statuses, &present, Instant::now()) {
@@ -1614,22 +1623,117 @@ pub(crate) async fn deliver_agent_notification(state: &AppState, notice: AgentPu
     }
 }
 
-pub(crate) async fn seed_agent_statuses(session: &SessionConfig) -> HashMap<String, String> {
+async fn seed_agent_notifications(
+    session: &SessionConfig,
+) -> (HashMap<String, String>, PendingUserInputGate) {
     let Ok(value) = backend_agent_list(session).await else {
-        return HashMap::new();
+        return (HashMap::new(), PendingUserInputGate::default());
     };
-    value
+    let agents: Vec<Value> = value
         .pointer("/result/agents")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
+        .cloned()
+        .collect();
+    let statuses = agents
+        .iter()
         .filter_map(|agent| {
             Some((
                 agent.get("pane_id")?.as_str()?.to_owned(),
                 agent.get("agent_status")?.as_str()?.to_ascii_lowercase(),
             ))
         })
-        .collect()
+        .collect();
+    let mut pending_inputs = PendingUserInputGate::default();
+    for agent in agents {
+        pending_inputs.observe(&agent);
+    }
+    (statuses, pending_inputs)
+}
+
+/// One reminder per observed false-to-true native question boundary, never
+/// per work-state change. Herdr exposes no question ID, so this is not a
+/// promise of one reminder per individual question.
+#[derive(Default)]
+struct PendingUserInputGate {
+    pending: std::collections::HashSet<String>,
+}
+
+impl PendingUserInputGate {
+    fn observe(&mut self, event: &Value) -> bool {
+        let agent = event.get("data").unwrap_or(event);
+        let Some(instance) = agent
+            .get("instance_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        else {
+            return false;
+        };
+        let Some(pending) = agent.get("pending_user_input").and_then(Value::as_bool) else {
+            return false;
+        };
+        if pending {
+            let newly_pending = self.pending.insert(instance.to_owned());
+            newly_pending
+                && matches!(
+                    agent.get("agent_status").and_then(Value::as_str),
+                    Some("working" | "idle")
+                )
+        } else {
+            self.pending.remove(instance);
+            false
+        }
+    }
+
+    fn retain_present(&mut self, events: &[Value]) {
+        let present: std::collections::HashSet<&str> = events
+            .iter()
+            .filter_map(|event| {
+                event
+                    .get("data")
+                    .unwrap_or(event)
+                    .get("instance_id")
+                    .and_then(Value::as_str)
+            })
+            .collect();
+        self.pending
+            .retain(|instance| present.contains(instance.as_str()));
+    }
+}
+
+fn native_input_notification(
+    event: &Value,
+    server_id: &str,
+    server_label: &str,
+    session_id: &str,
+) -> Option<AgentPushNotice> {
+    let agent = event.get("data").unwrap_or(event);
+    let pane_id = agent.get("pane_id")?.as_str()?;
+    Some(AgentPushNotice {
+        notice: AgentNotice::AgentInputRequired,
+        server_label: server_label.to_owned(),
+        agent_name: ["display_agent", "agent"].into_iter().find_map(|key| {
+            agent
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        }),
+        data: [
+            ("type".into(), json!("agent.input_required")),
+            ("url".into(), json!(format!("/servers/{server_id}"))),
+            ("server_id".into(), json!(server_id)),
+            ("session_id".into(), json!(session_id)),
+            ("pane_id".into(), json!(pane_id)),
+            ("instance_id".into(), json!(agent.get("instance_id"))),
+        ]
+        .into_iter()
+        .collect(),
+        choices: Vec::new(),
+        detail: None,
+    })
 }
 
 pub(crate) async fn backend_agent_list(session: &SessionConfig) -> Result<Value, BackendError> {
@@ -3380,6 +3484,69 @@ pub(crate) struct ZoomPaneBody {
 
 #[cfg(test)]
 mod tests {
+    fn native_question_event(instance: &str, pending: Value, status: &str) -> Value {
+        json!({ "data": {
+            "instance_id": instance, "pane_id": "w1:p1", "display_agent": "Codex",
+            "pending_user_input": pending, "agent_status": status,
+        } })
+    }
+
+    #[test]
+    fn native_question_reminder_tracks_bool_boundaries_not_work_state() {
+        let mut gate = super::PendingUserInputGate::default();
+        let working = native_question_event("one", json!(true), "working");
+        assert!(gate.observe(&working));
+        assert!(!gate.observe(&working));
+        assert!(!gate.observe(&native_question_event("one", json!(true), "idle")));
+        // Opening answer controls or covering them with an approval does not
+        // end the pending ordinary question or create a second reminder.
+        assert!(!gate.observe(&native_question_event("one", json!(true), "blocked")));
+        assert!(!gate.observe(&native_question_event("one", json!(true), "unknown")));
+        assert!(!gate.observe(&native_question_event("one", Value::Null, "unknown")));
+        assert!(!gate.observe(&working));
+        assert!(!gate.observe(&native_question_event("one", json!(false), "working")));
+        assert!(gate.observe(&working));
+        assert!(gate.observe(&native_question_event("two", json!(true), "working")));
+        gate.retain_present(&[]);
+        assert!(gate.observe(&working));
+    }
+
+    #[test]
+    fn native_question_reminder_requires_identity_bool_and_ordinary_status() {
+        let mut gate = super::PendingUserInputGate::default();
+        for event in [
+            native_question_event("", json!(true), "working"),
+            native_question_event("one", json!("true"), "working"),
+            native_question_event("one", Value::Null, "working"),
+            native_question_event("one", json!(true), "blocked"),
+            native_question_event("one", json!(true), "unknown"),
+        ] {
+            assert!(!gate.observe(&event));
+        }
+        // Ineligible display states still retain the pending fact. Returning
+        // to the main composer cannot reinterpret it as a new question.
+        assert!(gate.pending.contains("one"));
+        let event = native_question_event("one", json!(true), "working");
+        // Startup remembers pending attention without delivering an old reminder.
+        gate.observe(&event);
+        assert!(!gate.observe(&event));
+    }
+
+    #[test]
+    fn native_question_reminder_has_no_approval_actions_or_question_content() {
+        let event = native_question_event("one", json!(true), "working");
+        let notice = super::native_input_notification(&event, "server", "Studio", "herdr").unwrap();
+        assert_eq!(notice.notice, AgentNotice::AgentInputRequired);
+        assert!(notice.choices.is_empty());
+        assert!(notice.detail.is_none());
+        let rendered = notice.render(crate::platform::i18n::Locale::En);
+        assert_eq!(rendered.title, "Needs your input · Studio");
+        assert_eq!(rendered.body, "Codex needs your input.");
+        assert_eq!(rendered.data["type"], "agent.input_required");
+        assert_eq!(rendered.data["pane_id"], "w1:p1");
+        assert_eq!(rendered.data["instance_id"], "one");
+        assert!(!rendered.data.contains_key("options"));
+    }
     use crate::agents::session_routes::native_approval_data;
     use crate::connectivity::routes::revoke_paired_device;
     use crate::*;

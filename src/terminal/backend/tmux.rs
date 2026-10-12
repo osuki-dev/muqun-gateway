@@ -1308,6 +1308,8 @@ fn agent_from_pane(pane: Pane) -> Option<Agent> {
         kind: Some(kind),
         status: pane.agent_status,
         state_change_seq: None,
+        pending_user_input: None,
+        shell_pid: pane.shell_pid,
     })
 }
 

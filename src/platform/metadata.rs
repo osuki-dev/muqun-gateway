@@ -68,6 +68,8 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "one_time_pairing_codes",
     "pane_context",
     "pane_approvals",
+    // Optional native ordinary-question attention; never inferred from status or text here.
+    "terminal_pending_user_input",
     "pane_composer",
     "pane_file_search",
     "pane_interrupt",

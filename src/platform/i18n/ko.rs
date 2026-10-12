@@ -18,6 +18,7 @@ pub(super) const KO: &[(&str, &str)] = &[
     // -- push notifications --------------------------------------------------
     ("Agent", "에이전트"),
     ("Approval needed", "승인 필요"),
+    ("Needs your input", "입력이 필요합니다"),
     ("Agent blocked", "에이전트 대기 중"),
     ("Agent done", "에이전트 완료"),
     ("{name} is waiting for your approval.", "{name}이(가) 승인을 기다리고 있습니다."),

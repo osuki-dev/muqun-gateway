@@ -46,11 +46,12 @@ pub(crate) struct AgentPushNotification {
     pub(crate) data: serde_json::Map<String, Value>,
 }
 
-/// What happened, in the only three ways this gateway ever raises a push.
+/// What happened, before a registered device chooses its language.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AgentNotice {
     ApprovalPending,
     AgentBlocked,
+    AgentInputRequired,
     AgentCompleted,
 }
 
@@ -138,6 +139,7 @@ impl AgentPushNotice {
                 ("Approval needed", "{name} is waiting for your approval.")
             }
             AgentNotice::AgentBlocked => ("Agent blocked", "{name} needs your input."),
+            AgentNotice::AgentInputRequired => ("Needs your input", "{name} needs your input."),
             AgentNotice::AgentCompleted => ("Agent done", "{name} finished running."),
         };
         // Title carries which server so a multi-server user knows where to

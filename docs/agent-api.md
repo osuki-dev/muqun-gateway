@@ -11,6 +11,31 @@ verbatim, so their keys stay camelCase.
 
 ## Conventions
 
+Terminal `/agents` and `/snapshot` responses advertise the optional
+`terminal_pending_user_input` capability when they can relay Herdr's native
+`pending_user_input` boolean. An exact `true` means an ordinary native question
+is pending; it can coexist with `working`, `idle`, or a focused input dialog.
+An approval overlay or temporarily unknown screen preserves previously known
+pending attention without permitting `agent.prompt`; it is independent of
+permission approval. Older Herdr versions omit the fact and are represented as
+unknown (`null`); this must not be confused with an observed `false`. Clients
+must not infer a question from `blocked`, titles, or versions.
+The fact identifies pending attention, not a question form or request ID.
+Sending an ordinary follow-up does not constitute answering the native question.
+The notification watcher remembers this boolean per opaque agent instance and
+raises `agent.input_required` on a newly observed pending boundary. Continued
+work-state changes or entering/leaving native answer/approval controls while
+pending do not repeat the reminder. Only an explicit false or disappearing
+instance clears the reminder boundary. Startup seeds
+already pending instances without replaying their old reminders. No request ID
+is available, so replacing one pending question with another without a false
+observation cannot be distinguished or announced separately.
+
+Native agent rows also relay optional `shell_pid`, observed with the agent, for
+correlating an existing pane task with its shell incarnation. Missing or invalid
+PIDs remain unknown. This field is not a substitute for opaque `instance_id`:
+another agent can start in the same shell, and the operating system can reuse PIDs.
+
 - **Auth.** Every route requires a paired device (`Authorization: Bearer
   <device token>`); a missing or malformed header is `401` and an unpaired or
   revoked device is `403`. This holds in every transport mode — a gateway with

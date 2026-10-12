@@ -21,6 +21,7 @@ pub(super) const JA: &[(&str, &str)] = &[
     // -- push notifications --------------------------------------------------
     ("Agent", "エージェント"),
     ("Approval needed", "承認が必要"),
+    ("Needs your input", "入力が必要です"),
     ("Agent blocked", "エージェントが待機中"),
     ("Agent done", "エージェントが完了"),
     ("{name} is waiting for your approval.", "{name} が承認を待っています。"),
