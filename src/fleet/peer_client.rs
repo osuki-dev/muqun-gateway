@@ -898,6 +898,89 @@ mod tests {
     };
     use crate::{generate_token, AppState, TransportEncryptionMode};
 
+    #[tokio::test]
+    async fn manual_pairing_accepts_an_http_hostname() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received = calls.clone();
+        let url = serve(axum::Router::new().fallback(axum::routing::post(
+            move |uri: axum::http::Uri,
+                  headers: axum::http::HeaderMap,
+                  axum::Json(body): axum::Json<Value>| {
+                let received = received.clone();
+                async move {
+                    assert!(!headers.contains_key("authorization"));
+                    assert!(!headers.contains_key("cookie"));
+                    received.lock().unwrap().push((uri.path().to_owned(), body));
+                    axum::Json(json!({
+                        "server_label": "fixture", "server_id": "fixture-peer",
+                        "label": "fixture", "token": "fixture-token",
+                        "device_id": "fixture-device",
+                    }))
+                }
+            },
+        )))
+        .await;
+        let named_http = url.replace("127.0.0.1", "localhost");
+        assert_ne!(url, named_http);
+        assert_eq!(
+            request_pairing(&named_http, "fixture-request", "fixture", "fixture-id")
+                .await
+                .unwrap(),
+            "fixture"
+        );
+        let claimed = claim(&named_http, "fixture-request", "2345-6789")
+            .await
+            .unwrap();
+        assert_eq!(claimed.device_id, "fixture-device");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                (
+                    "/api/pair/request".into(),
+                    json!({
+                        "request_id": "fixture-request", "device_name": "fixture",
+                        "kind": "gateway", "server_id": "fixture-id",
+                    }),
+                ),
+                (
+                    "/api/pair/claim".into(),
+                    json!({ "request_id": "fixture-request", "code": "2345-6789" }),
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_pairing_does_not_follow_redirects() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let received = calls.clone();
+        let destination = serve(axum::Router::new().fallback(axum::routing::any(move || {
+            received.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { axum::Json(json!({})) }
+        })))
+        .await;
+        let url = serve(axum::Router::new().fallback(axum::routing::post(move || {
+            let destination = destination.clone();
+            async move {
+                (
+                    axum::http::StatusCode::TEMPORARY_REDIRECT,
+                    [(axum::http::header::LOCATION, destination)],
+                    axum::Json(json!({})),
+                )
+            }
+        })))
+        .await;
+        assert!(matches!(
+            request_pairing(&url, "fixture-request", "fixture", "fixture-id").await,
+            Err(PeerError::Refused { status: 307, .. })
+        ));
+        assert!(matches!(
+            claim(&url, "fixture-request", "2345-6789").await,
+            Err(PeerError::Refused { status: 307, .. })
+        ));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
     /// A task the peer opened on `state`, as if through `POST /api/tasks`.
     async fn peer_task(state: &AppState, device_id: &str) -> TaskId {
         let now = now_ms();

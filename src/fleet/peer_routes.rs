@@ -364,7 +364,10 @@ mod tests {
     async fn a_gateway_links_to_another_through_a_pairing_code_and_unlinks() {
         let herdr = FakeHerdr::start(vec!["$ "], None);
         let mini = named(output_state(&herdr), "srv-mini", "mini");
-        let url = serve(peer_router(mini.clone())).await;
+        // Exercise new links and their sealed traffic over an HTTP hostname.
+        let url = serve(peer_router(mini.clone()))
+            .await
+            .replace("127.0.0.1", "localhost");
         let coding = named(output_state(&herdr), "srv-coding", "coding");
         let other = named(output_state(&herdr), "srv-other", "other");
         let other_url = serve(peer_router(other.clone())).await;

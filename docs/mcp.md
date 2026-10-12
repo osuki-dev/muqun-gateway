@@ -810,6 +810,8 @@ discovery (the task API stays snake_case).
 
 Another of the owner's gateways that this one was paired with (capability
 `fleet_peers`; see [Linked gateways](agent-api.md#linked-gateways-fleet_peers)).
+Manual links accept HTTP and HTTPS URLs, including LAN and Tailscale addresses.
+
 There is no heartbeat, and `fleet.describe` and `fleet.list` never wait on
 another computer: they answer with what this gateway last heard. A computer
 neither heard from nor pinged in the last 60 s is `reachable: null` (not
