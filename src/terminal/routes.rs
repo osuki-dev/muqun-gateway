@@ -1657,7 +1657,7 @@ async fn seed_agent_notifications(
 /// promise of one reminder per individual question.
 #[derive(Default)]
 struct PendingUserInputGate {
-    pending: std::collections::HashSet<String>,
+    pending: HashMap<String, String>,
 }
 
 impl PendingUserInputGate {
@@ -1674,7 +1674,13 @@ impl PendingUserInputGate {
             return false;
         };
         if pending {
-            let newly_pending = self.pending.insert(instance.to_owned());
+            let Some(pane) = agent.get("pane_id").and_then(Value::as_str) else {
+                return false;
+            };
+            let newly_pending = self
+                .pending
+                .insert(instance.to_owned(), pane.to_owned())
+                .is_none();
             newly_pending
                 && matches!(
                     agent.get("agent_status").and_then(Value::as_str),
@@ -1687,18 +1693,27 @@ impl PendingUserInputGate {
     }
 
     fn retain_present(&mut self, events: &[Value]) {
-        let present: std::collections::HashSet<&str> = events
+        let present: HashMap<&str, Option<&str>> = events
             .iter()
             .filter_map(|event| {
-                event
-                    .get("data")
-                    .unwrap_or(event)
-                    .get("instance_id")
-                    .and_then(Value::as_str)
+                let agent = event.get("data").unwrap_or(event);
+                Some((
+                    agent.get("pane_id")?.as_str()?,
+                    agent
+                        .get("instance_id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty()),
+                ))
             })
             .collect();
         self.pending
-            .retain(|instance| present.contains(instance.as_str()));
+            .retain(|instance, pane| match present.get(pane.as_str()) {
+                // A present agent with temporarily unavailable identity cannot
+                // prove that the remembered instance exited or was replaced.
+                Some(None) => true,
+                Some(Some(current)) => *current == instance.as_str(),
+                None => false,
+            });
     }
 }
 
@@ -3525,7 +3540,7 @@ mod tests {
         }
         // Ineligible display states still retain the pending fact. Returning
         // to the main composer cannot reinterpret it as a new question.
-        assert!(gate.pending.contains("one"));
+        assert!(gate.pending.contains_key("one"));
         let event = native_question_event("one", json!(true), "working");
         // Startup remembers pending attention without delivering an old reminder.
         gate.observe(&event);
@@ -3546,6 +3561,21 @@ mod tests {
         assert_eq!(rendered.data["pane_id"], "w1:p1");
         assert_eq!(rendered.data["instance_id"], "one");
         assert!(!rendered.data.contains_key("options"));
+    }
+
+    #[test]
+    fn native_question_reminder_retains_unknown_identity_until_confirmed_exit_or_replacement() {
+        let mut gate = super::PendingUserInputGate::default();
+        let original = native_question_event("one", json!(true), "working");
+        assert!(gate.observe(&original));
+        gate.retain_present(&[native_question_event("", Value::Null, "unknown")]);
+        assert!(!gate.observe(&original));
+        let replacement = native_question_event("two", json!(true), "working");
+        gate.retain_present(std::slice::from_ref(&replacement));
+        assert!(!gate.pending.contains_key("one"));
+        assert!(gate.observe(&replacement));
+        gate.retain_present(&[]);
+        assert!(gate.pending.is_empty());
     }
     use crate::agents::session_routes::native_approval_data;
     use crate::connectivity::routes::revoke_paired_device;
