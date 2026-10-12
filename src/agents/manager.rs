@@ -809,15 +809,12 @@ impl AgentManager {
                 let error = data.pointer("/status/error").and_then(mapper::map_error);
                 ctx.set_status(&asid, status, error).await;
             }
-            "session.step.ended" => {
-                // Not a status change. It does carry the running cost/token
-                // totals for the step, which are worth keeping.
-                let Some(asid) = session_id.map(str::to_string).map(AgentSessionId) else {
-                    return;
-                };
-                Self::apply_usage(ctx, &asid, data).await;
-            }
-            "session.step.started" | "session.step.streamed" | "session.step.failed" => {}
+            // Step usage is per request, not cumulative. OpenCode publishes
+            // session.usage.updated after adding it to the session totals.
+            "session.step.started"
+            | "session.step.streamed"
+            | "session.step.ended"
+            | "session.step.failed" => {}
             "session.usage.updated" => {
                 let Some(asid) = session_id.map(str::to_string).map(AgentSessionId) else {
                     return;

@@ -132,6 +132,63 @@ async fn a_rename_updates_the_title_in_place() {
 }
 
 #[tokio::test]
+async fn step_usage_never_replaces_cumulative_session_usage() {
+    let ctx = ctx();
+    replay(&ctx, "session-lifecycle.sse").await;
+    let asid = AgentSessionId("ses_f5112fddafferdTlgNjwonf8Au".to_string());
+    let mut rx = ctx.tx.subscribe();
+
+    let cumulative = serde_json::json!({
+        "sessionID": asid.0,
+        "cost": 2.5,
+        "tokens": {
+            "input": 1000, "output": 200, "reasoning": 100,
+            "cache": { "read": 9000, "write": 500 }
+        }
+    });
+    let dispatch = |event_type: &str, data: Value| OpencodeRawEvent {
+        id: None,
+        event_type: event_type.to_string(),
+        created: None,
+        location: None,
+        data,
+    };
+    AgentManager::handle_raw_event(dispatch("session.usage.updated", cumulative.clone()), &ctx)
+        .await;
+    let expected = ctx.mirror.session_info(&asid).await.unwrap();
+
+    let step = serde_json::json!({
+        "sessionID": asid.0,
+        "cost": 0.1,
+        "tokens": {
+            "input": 10, "output": 20, "reasoning": 5,
+            "cache": { "read": 90, "write": 0 }
+        }
+    });
+    for _ in 0..2 {
+        AgentManager::handle_raw_event(dispatch("session.step.ended", step.clone()), &ctx).await;
+        let info = ctx.mirror.session_info(&asid).await.unwrap();
+        assert_eq!(info.tokens, expected.tokens);
+        assert_eq!(info.cost, expected.cost);
+    }
+
+    // Cumulative snapshots can also be replayed; they replace rather than add.
+    AgentManager::handle_raw_event(dispatch("session.usage.updated", cumulative), &ctx).await;
+    let info = ctx.mirror.session_info(&asid).await.unwrap();
+    assert_eq!(info.tokens, expected.tokens);
+    assert_eq!(info.cost, expected.cost);
+    let mut updates = 0;
+    while let Ok(event) = rx.try_recv() {
+        if let AgentDomainEvent::SessionUpdated { info, .. } = event {
+            updates += 1;
+            assert_eq!(info.tokens, expected.tokens);
+            assert_eq!(info.cost, expected.cost);
+        }
+    }
+    assert_eq!(updates, 2, "only cumulative usage is published to the app");
+}
+
+#[tokio::test]
 async fn a_failed_run_carries_the_error_to_the_client() {
     let ctx = ctx();
     let mut rx = ctx.tx.subscribe();
