@@ -2974,7 +2974,7 @@ pub(crate) struct GitStatusQuery {
 
 /// A selected directory must be an exact canonical entry in this pane's Git
 /// inventory. Never accept arbitrary directories or resolve client aliases.
-async fn selected_git_worktree(
+pub(crate) async fn selected_git_worktree(
     checkout: Option<PathBuf>,
     selected: Option<&str>,
 ) -> ApiResult<Option<PathBuf>> {

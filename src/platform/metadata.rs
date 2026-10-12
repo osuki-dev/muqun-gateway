@@ -65,6 +65,7 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "git_diff",
     "git_worktrees",
     "pane_lazygit",
+    "pane_lazygit_worktree",
     "one_time_pairing_codes",
     "pane_context",
     "pane_approvals",

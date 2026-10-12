@@ -456,12 +456,19 @@ login startup; on Linux boot startup requires the user service and lingering.
 ### Lazygit
 
 Install `lazygit` on the Gateway host to offer it in a compatible App's Terminal
-Quick actions and Changes sheets. The Gateway advertises `pane_lazygit` and
+Git workspace. The Gateway advertises `pane_lazygit` and
 checks the installed executable and the source pane's Git checkout before the
-App shows an entry. No App-provided shell command or working directory is used.
+App shows an entry. No App-provided shell command or arbitrary working directory is used.
+
+`pane_lazygit_worktree` adds an optional `worktree` query parameter to the
+availability and launch routes. The App must select an exact canonical path
+from `git/worktrees`; the Gateway verifies it against the source repository's
+current linked-checkout inventory for every request. A removed or unrelated
+checkout is refused before creating a terminal. Omit the selector to retain
+the original source-checkout behavior on older Apps and Gateways.
 
 Launching creates a dedicated tab in the same workspace and starts lazygit in
-that checkout, leaving the source terminal's desktop focus unchanged. The App
+the selected checkout, leaving the source terminal's desktop focus unchanged. The App
 selects the new pane and exposes its virtual keyboard. Lazygit has its own key
 profile and full-screen output handling; it receives no Vim-specific commands.
 If startup cannot be confirmed, open the already-created terminal to inspect it

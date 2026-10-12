@@ -1957,7 +1957,7 @@ fn git_worktrees_path() -> Value {
     json!({
         "get": {
             "summary": "List available Git-linked checkouts of this pane's repository",
-            "description": "Paired-device read, announced as git_worktrees. Uses Git's authoritative worktree inventory and verifies canonical checkout/common-directory identity. Missing, bare, replaced and fenced-out checkouts are omitted. The content envelope data contains current (canonical pane checkout path or null) and worktrees (path, branch, head, detached). Outside a checkout the list is empty. Selecting a worktree on git/status or git/diff never checks out a branch or moves a pane. The existing vcs/discard and lazygit routes always target the pane's original checkout.",
+            "description": "Paired-device read, announced as git_worktrees. Uses Git's authoritative worktree inventory and verifies canonical checkout/common-directory identity. Missing, bare, replaced and fenced-out checkouts are omitted. The content envelope data contains current (canonical pane checkout path or null) and worktrees (path, branch, head, detached). Outside a checkout the list is empty. Selecting a worktree on git/status or git/diff never checks out a branch or moves a pane. The existing vcs/discard route always targets the pane's original checkout; lazygit can select a verified linked checkout when pane_lazygit_worktree is advertised.",
             "parameters": [path_param("sessionId"), path_param("paneId")],
             "responses": {
                 "200": { "description": "Versioned content envelope with current and worktrees" },
@@ -2199,14 +2199,14 @@ fn lazygit_endpoints() -> Value {
     json!({
         "get": {
             "summary": "Check whether lazygit can open for this pane",
-            "description": "Requires a paired device. Checks an executable lazygit on the Gateway host's PATH and the source pane's canonical Git checkout. No process is launched. Announced as pane_lazygit.",
-            "parameters": [path_param("sessionId"), path_param("paneId")],
+            "description": "Requires a paired device. Checks an executable lazygit on the Gateway host's PATH and the source pane's canonical Git checkout. No process is launched. Announced as pane_lazygit; optional worktree selection requires pane_lazygit_worktree and is revalidated against the source repository's canonical Git inventory.",
+            "parameters": [path_param("sessionId"), path_param("paneId"), query_param("worktree", "Optional exact canonical path from git/worktrees. Announced as pane_lazygit_worktree; unavailable or unrelated checkouts are refused with 403 invalid_worktree.")],
             "responses": ok_response()
         },
         "post": {
             "summary": "Open lazygit in a dedicated terminal tab",
-            "description": "No client command or cwd is accepted. Creates an unfocused tab in the source pane's workspace and checkout, starts the installed lazygit once, and returns data.target with session_id, workspace_id, tab_id and pane_id plus started. A false started means inspect the created target, not automatically repeat the launch. Desktop focus is preserved.",
-            "parameters": [path_param("sessionId"), path_param("paneId")],
+            "description": "No client command or arbitrary cwd is accepted. Optional worktree selection requires pane_lazygit_worktree and is revalidated before creating a terminal. Creates an unfocused tab in the source pane's workspace and verified selected checkout (the original checkout when omitted), starts the installed lazygit once, and returns data.target with session_id, workspace_id, tab_id and pane_id plus started. A false started means inspect the created target, not automatically repeat the launch. Desktop focus is preserved.",
+            "parameters": [path_param("sessionId"), path_param("paneId"), query_param("worktree", "Optional exact canonical path from git/worktrees. Announced as pane_lazygit_worktree; unavailable or unrelated checkouts are refused with 403 invalid_worktree.")],
             "responses": ok_response()
         }
     })
