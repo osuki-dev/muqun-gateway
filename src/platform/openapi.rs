@@ -775,6 +775,14 @@ pub fn openapi_spec() -> Value {
     });
     spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/history"] = captured_history_path();
     spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/git/worktrees"] = git_worktrees_path();
+    spec["paths"]["/api/agents/{agent_id}/sessions/{asid}"] = json!({
+        "delete": {
+            "summary": "Delete a session from its exact owning agent",
+            "description": "Announced as agent_session_delete_scoped. Verify the exact session belongs to the named attached agent and delete only there, without falling back to another agent. Older gateways return 404 for this distinct route; clients must never fall back to the legacy unscoped DELETE. 400 invalid_agent or invalid_session, 503 agent_unavailable, 404 session_not_found, 409 session_changed, 502 agent_error, 501 feature_unsupported. Provider deletion removes a conversation; it does not guarantee active processes have stopped.",
+            "parameters": [path_param("agent_id"), path_param("asid")],
+            "responses": ok_response()
+        }
+    });
     spec["paths"]["/api/history/storage"] = json!({ "get": {
         "summary": "Which captured-history storage this Gateway runs with (memory or sqlite, from config.json at startup) and, for sqlite, what it holds, from counters the write loop keeps. Requires the admin token or a device",
         "responses": json_ok("The storage", json!({

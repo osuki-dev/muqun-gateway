@@ -866,6 +866,7 @@ pub(crate) struct FakeAgent {
     /// Sessions answered the way OpenCode answers a deleted one: a plain
     /// HTTP 404 rather than `SessionNotFound`.
     pub http_404: Vec<String>,
+    pub session_deletion: bool,
     /// An agent whose service takes MCP servers at runtime.
     pub mcp: Option<Arc<Mutex<FakeMcp>>>,
 }
@@ -895,6 +896,7 @@ impl FakeAgent {
             prompts: Arc::default(),
             attached: Arc::default(),
             http_404: Vec::new(),
+            session_deletion: false,
             mcp: None,
         }
     }
@@ -913,6 +915,11 @@ impl FakeAgent {
             .iter()
             .map(|(asid, updated_ms)| fake_session(asid, *updated_ms))
             .collect();
+        self
+    }
+
+    pub fn with_session_deletion(mut self) -> Self {
+        self.session_deletion = true;
         self
     }
 
@@ -1061,6 +1068,21 @@ impl agents::ports::agent::AgentPort for FakeAgent {
                 .ok_or_else(|| agents::ports::agent::AgentError::SessionNotFound(session_id.into()))
         })
     }
+    fn delete_session<'a>(
+        &'a self,
+        session_id: &'a str,
+    ) -> agents::ports::agent::AgentFuture<'a, ()> {
+        Box::pin(async move {
+            if !self.session_deletion {
+                return Err(agents::ports::agent::AgentError::Unsupported(
+                    "delete_session".into(),
+                ));
+            }
+            self.record(&format!("delete_session {session_id}"));
+            Ok(())
+        })
+    }
+
     fn send_prompt<'a>(
         &'a self,
         _session_id: &'a str,

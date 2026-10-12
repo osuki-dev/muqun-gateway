@@ -415,6 +415,28 @@ parent filter; DeepSeek and T3 have no sub-agent sessions, so they list none.
 `{"deleted": true}`. OpenCode removes the session's children too, and announces
 each one on the stream.
 
+### `DELETE /api/agents/{agent_id}/sessions/{asid}`
+
+Gate provider-scoped deletion on `agent_session_delete_scoped`, then use the
+provider and session ID captured from the selected row. The gateway verifies
+that exact attached provider owns the session before deleting it, without
+consulting a cached owner or trying another provider. Unknown providers return
+`400 invalid_agent`; unavailable providers `503 agent_unavailable`; missing
+sessions `404 session_not_found`; a mismatched session response
+`409 session_changed`; a failed ownership read `502 agent_error`. The ID must
+be 1–128 ASCII letters, digits, `-`, `_`, `.`, or `:`, and cannot be `.` or `..`;
+unsafe IDs return `400 invalid_session`. No mutation occurs on these failures.
+
+The legacy route retains its original owner lookup. Older gateways return 404
+for this distinct scoped route, even when a client cached the capability before
+a downgrade. Clients must never fall back to the legacy route for scoped deletion
+or assume that an `agent_id` query on that route constrains its owner.
+
+OpenCode and T3 implement deletion; DeepSeek returns `501 feature_unsupported`.
+Provider deletion removes the conversation according to the provider's contract;
+the gateway does not promise that active work or child processes have stopped.
+It is separate from closing a terminal pane and from removing a local Home entry.
+
 ### `POST /api/agent-sessions/{asid}/rename`
 
 `{"title": "…"}` → `{"renamed": true, "title": "…"}`.

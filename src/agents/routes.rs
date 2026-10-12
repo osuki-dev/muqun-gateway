@@ -296,6 +296,10 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
             get(get_agent_session_global).delete(delete_agent_session_global),
         )
         .route(
+            "/api/agents/{agent_id}/sessions/{asid}",
+            delete(delete_agent_session_scoped),
+        )
+        .route(
             "/api/agent-sessions/{asid}/children",
             get(list_agent_session_children),
         )
@@ -2022,19 +2026,87 @@ async fn delete_agent_session_global(
     Path(asid): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    let manager = session_manager_or_err!(&state, &headers, &asid);
+    do_delete_agent_session(&state, &asid, None, &headers).await
+}
+
+async fn delete_agent_session_scoped(
+    State(state): State<AppState>,
+    Path((agent_id, asid)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    do_delete_agent_session(&state, &asid, Some(&agent_id), &headers).await
+}
+
+async fn do_delete_agent_session(
+    state: &AppState,
+    asid: &str,
+    agent_id: Option<&str>,
+    headers: &HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(state, headers)?;
+    let manager = if let Some(agent_id) = agent_id {
+        if asid.is_empty()
+            || asid.len() > 128
+            || matches!(asid, "." | "..")
+            || !asid.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
+            })
+        {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_session",
+                "Invalid session identifier",
+            ));
+        }
+        let manager = agent_manager_or_err(state, agent_id).await?;
+        let info = manager.agent().get_session(asid).await.map_err(|error| {
+            use super::ports::agent::AgentError;
+            let missing = matches!(&error, AgentError::SessionNotFound(_))
+                || matches!(&error, AgentError::RequestFailed(message) if message.starts_with("HTTP 404"));
+            if missing {
+                api_error(
+                    StatusCode::NOT_FOUND,
+                    "session_not_found",
+                    "The selected agent does not own this session",
+                )
+            } else {
+                api_error(
+                    StatusCode::BAD_GATEWAY,
+                    "agent_error",
+                    "The selected agent could not verify this session",
+                )
+            }
+        })?;
+        if info.asid.0 != asid {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "session_changed",
+                "The selected agent returned a different session",
+            ));
+        }
+        manager
+    } else {
+        session_manager_or_err(state, asid).await?
+    };
     manager
         .agent()
-        .delete_session(&asid)
+        .delete_session(asid)
         .await
         .map_err(agent_error)?;
     // OpenCode deletes the children too, but it also announces each one on the
     // stream, so the mirror only has to forget this session here.
     manager
         .mirror()
-        .remove_session(&AgentSessionId(asid.clone()))
+        .remove_session(&AgentSessionId(asid.to_owned()))
         .await;
-    state.agent_runtime.forget_session_route(&asid).await;
+    if let Some(agent_id) = agent_id {
+        state
+            .agent_runtime
+            .forget_session_route_for_agent(asid, agent_id)
+            .await;
+    } else {
+        state.agent_runtime.forget_session_route(asid).await;
+    }
     Ok(Json(content_envelope(json!({ "deleted": true }))))
 }
 
@@ -3192,6 +3264,303 @@ mod tests {
             .await
             .expect("body reads");
         serde_json::from_slice(&bytes).expect("body is json")
+    }
+
+    async fn delete_response(state: AppState, uri: &str, token: Option<&str>) -> Response {
+        use tower::ServiceExt;
+        let mut request = axum::http::Request::builder().method("DELETE").uri(uri);
+        if let Some(token) = token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        mount(Router::new())
+            .with_state(state)
+            .oneshot(request.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn scoped_session_delete_selects_the_named_owner_even_for_colliding_ids() {
+        let opencode = FakeAgent::new("opencode")
+            .with_sessions(&[("shared", 1)])
+            .with_session_deletion();
+        let t3 = FakeAgent::new("t3")
+            .with_sessions(&[("shared", 1)])
+            .with_session_deletion();
+        let oc_calls = opencode.calls.clone();
+        let t3_calls = t3.calls.clone();
+        let state = state_with(vec![opencode, t3]).await;
+        state
+            .agent_runtime
+            .record_session_route("shared", "t3")
+            .await;
+
+        let response = delete_response(
+            state.clone(),
+            "/api/agents/opencode/sessions/shared",
+            Some("device-token"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["data"]["deleted"], true);
+        assert_eq!(*oc_calls.lock().unwrap(), ["delete_session shared"]);
+        assert!(t3_calls.lock().unwrap().is_empty());
+        assert_eq!(
+            state
+                .agent_runtime
+                .manager_for_session("shared")
+                .await
+                .unwrap()
+                .agent()
+                .kind(),
+            "t3",
+            "scoped deletion must keep another provider's cached route"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_session_delete_never_falls_back_to_another_provider() {
+        let opencode = FakeAgent::new("opencode")
+            .with_sessions(&[("owned", 1)])
+            .with_session_deletion();
+        let oc_calls = opencode.calls.clone();
+        let t3 = FakeAgent::new("t3").with_session_deletion();
+        let t3_calls = t3.calls.clone();
+        let state = state_with(vec![opencode, t3]).await;
+        state
+            .agent_runtime
+            .record_session_route("owned", "opencode")
+            .await;
+        let response =
+            delete_response(state, "/api/agents/t3/sessions/owned", Some("device-token")).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            body_json(response).await["error"]["code"],
+            "session_not_found"
+        );
+        assert!(oc_calls.lock().unwrap().is_empty());
+        assert!(t3_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn scoped_session_delete_refuses_unknown_unavailable_and_untrusted_callers() {
+        let state = state_with(Vec::new()).await;
+        for (agent_id, token, status, code) in [
+            (
+                "unknown",
+                None,
+                StatusCode::UNAUTHORIZED,
+                "missing_authorization",
+            ),
+            (
+                "unknown",
+                Some("wrong"),
+                StatusCode::FORBIDDEN,
+                "invalid_token",
+            ),
+            (
+                "unknown",
+                Some("admin"),
+                StatusCode::FORBIDDEN,
+                "invalid_token",
+            ),
+            (
+                "unknown",
+                Some("device-token"),
+                StatusCode::BAD_REQUEST,
+                "invalid_agent",
+            ),
+            (
+                "t3",
+                Some("device-token"),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "agent_unavailable",
+            ),
+        ] {
+            let response = delete_response(
+                state.clone(),
+                &format!("/api/agents/{agent_id}/sessions/owned"),
+                token,
+            )
+            .await;
+            assert_eq!(response.status(), status);
+            assert_eq!(body_json(response).await["error"]["code"], code);
+        }
+        let peer_state = crate::test_support::test_state(
+            "admin",
+            vec![crate::test_support::test_peer_device("peer", "peer-token")],
+        );
+        let response = delete_response(
+            peer_state,
+            "/api/agents/unknown/sessions/owned",
+            Some("peer-token"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_json(response).await["error"]["code"], "peer_forbidden");
+    }
+
+    #[tokio::test]
+    async fn scoped_session_delete_propagates_unsupported_without_forgetting_the_session() {
+        let deepseek = FakeAgent::new("deepseek").with_sessions(&[("owned", 1)]);
+        let calls = deepseek.calls.clone();
+        let state = state_with(vec![deepseek]).await;
+        state
+            .agent_runtime
+            .record_session_route("owned", "deepseek")
+            .await;
+        let response = delete_response(
+            state.clone(),
+            "/api/agents/deepseek/sessions/owned",
+            Some("device-token"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            body_json(response).await["error"]["code"],
+            "feature_unsupported"
+        );
+        assert!(calls.lock().unwrap().is_empty());
+        assert_eq!(
+            state
+                .agent_runtime
+                .manager_for_session("owned")
+                .await
+                .unwrap()
+                .agent()
+                .kind(),
+            "deepseek"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_session_delete_refuses_the_providers_http_missing_session_response() {
+        let mut opencode = FakeAgent::new("opencode")
+            .with_sessions(&[("owned", 1)])
+            .with_session_deletion();
+        opencode.http_404.push("owned".into());
+        let calls = opencode.calls.clone();
+        let response = delete_response(
+            state_with(vec![opencode]).await,
+            "/api/agents/opencode/sessions/owned",
+            Some("device-token"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            body_json(response).await["error"]["code"],
+            "session_not_found"
+        );
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_session_delete_keeps_the_recorded_owner_lookup() {
+        let opencode = FakeAgent::new("opencode")
+            .with_sessions(&[("shared", 1)])
+            .with_session_deletion();
+        let t3 = FakeAgent::new("t3")
+            .with_sessions(&[("shared", 1)])
+            .with_session_deletion();
+        let oc_calls = opencode.calls.clone();
+        let t3_calls = t3.calls.clone();
+        let state = state_with(vec![opencode, t3]).await;
+        state
+            .agent_runtime
+            .record_session_route("shared", "t3")
+            .await;
+        let response =
+            delete_response(state, "/api/agent-sessions/shared", Some("device-token")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(oc_calls.lock().unwrap().is_empty());
+        assert_eq!(*t3_calls.lock().unwrap(), ["delete_session shared"]);
+    }
+
+    #[tokio::test]
+    async fn scoped_session_delete_rejects_ids_that_could_change_the_provider_request_path() {
+        let state = state_with(Vec::new()).await;
+        for id in [
+            "..",
+            "owned%2Fchild",
+            "owned%3Fquery",
+            "owned%23fragment",
+            "owned%252fchild",
+        ] {
+            let response = delete_response(
+                state.clone(),
+                &format!("/api/agents/opencode/sessions/{id}"),
+                Some("device-token"),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                body_json(response).await["error"]["code"],
+                "invalid_session"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_session_delete_binds_encrypted_provider_identity_and_refuses_replay() {
+        use base64::Engine as _;
+        use tower::ServiceExt;
+
+        let opencode = FakeAgent::new("opencode")
+            .with_sessions(&[("shared", 1)])
+            .with_session_deletion();
+        let t3 = FakeAgent::new("t3")
+            .with_sessions(&[("shared", 1)])
+            .with_session_deletion();
+        let oc_calls = opencode.calls.clone();
+        let t3_calls = t3.calls.clone();
+        let state = state_with(vec![opencode, t3]).await;
+        let key = [13; 32];
+        state.devices.lock().unwrap()[0].transport_key =
+            Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key));
+        let path = "/api/agents/opencode/sessions/shared";
+        let payload = json!({ "token": "device-token", "body": "" });
+        let envelope = crate::connectivity::transport::seal(
+            &key,
+            crate::connectivity::transport::Direction::Request,
+            format!("DELETE {path}").as_bytes(),
+            &serde_json::to_vec(&payload).unwrap(),
+            crate::now_unix_ms(),
+        )
+        .unwrap();
+        let bytes = serde_json::to_vec(&envelope).unwrap();
+        let request = |path: &str| {
+            axum::http::Request::builder()
+                .method("DELETE")
+                .uri(path)
+                .header("x-muqun-transport", "1")
+                .header("x-muqun-device", "phone-1")
+                .body(axum::body::Body::from(bytes.clone()))
+                .unwrap()
+        };
+        let app = mount(Router::new())
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::platform::server::encrypted_transport,
+            ))
+            .with_state(state);
+        let tampered = app
+            .clone()
+            .oneshot(request("/api/agents/t3/sessions/shared"))
+            .await
+            .unwrap();
+        assert_eq!(tampered.status(), StatusCode::FORBIDDEN);
+        assert!(oc_calls.lock().unwrap().is_empty());
+        assert!(t3_calls.lock().unwrap().is_empty());
+        assert_eq!(
+            app.clone().oneshot(request(path)).await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.oneshot(request(path)).await.unwrap().status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(*oc_calls.lock().unwrap(), ["delete_session shared"]);
+        assert!(t3_calls.lock().unwrap().is_empty());
     }
 
     fn ids(data: &Value) -> Vec<(String, String)> {

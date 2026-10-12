@@ -47,6 +47,7 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "agent_models",
     "agent_permissions",
     "agent_sessions",
+    "agent_session_delete_scoped",
     "capabilities_discovery",
     "agent_discovery",
     "agent_spawn",

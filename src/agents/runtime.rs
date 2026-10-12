@@ -439,6 +439,14 @@ impl AgentRuntime {
         self.session_routes.write().await.remove(asid);
     }
 
+    /// Forget a deleted session without clearing another agent's same-id route.
+    pub(crate) async fn forget_session_route_for_agent(&self, asid: &str, agent_id: &str) {
+        let mut routes = self.session_routes.write().await;
+        if routes.map.get(asid).is_some_and(|owner| owner == agent_id) {
+            routes.remove(asid);
+        }
+    }
+
     pub fn subscribe_events(&self) -> broadcast::Receiver<AgentDomainEvent> {
         self.events_tx.subscribe()
     }
