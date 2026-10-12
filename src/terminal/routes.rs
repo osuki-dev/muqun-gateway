@@ -136,6 +136,10 @@ pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
             get(pane_git_status),
         )
         .route(
+            "/api/sessions/{session_id}/panes/{pane_id}/git/worktrees",
+            get(pane_git_worktrees),
+        )
+        .route(
             "/api/sessions/{session_id}/panes/{pane_id}/git/diff",
             get(pane_git_diff),
         )
@@ -2813,6 +2817,7 @@ pub(crate) async fn pane_context(
 pub(crate) async fn pane_git_status(
     State(state): State<AppState>,
     Path((session_id, pane_id)): Path<(String, String)>,
+    Query(query): Query<GitStatusQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
@@ -2822,6 +2827,7 @@ pub(crate) async fn pane_git_status(
         Some(cwd) => checkout_of(&cwd).await,
         None => None,
     };
+    let checkout = selected_git_worktree(checkout, query.worktree.as_deref()).await?;
     let Some(toplevel) = checkout else {
         return Ok(Json(content_envelope(json!({
             "session_id": session_id,
@@ -2842,8 +2848,68 @@ pub(crate) async fn pane_git_status(
     }))))
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct GitStatusQuery {
+    pub(crate) worktree: Option<String>,
+}
+
+/// A selected directory must be an exact canonical entry in this pane's Git
+/// inventory. Never accept arbitrary directories or resolve client aliases.
+async fn selected_git_worktree(
+    checkout: Option<PathBuf>,
+    selected: Option<&str>,
+) -> ApiResult<Option<PathBuf>> {
+    let Some(selected) = selected else {
+        return Ok(checkout);
+    };
+    let Some(checkout) = checkout else {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            "no_repository",
+            "this pane is not inside a git checkout",
+        ));
+    };
+    let inventory = git::worktrees(&checkout).await.map_err(git_error)?;
+    inventory
+        .into_iter()
+        .find(|entry| {
+            entry.path.as_os_str() == std::ffi::OsStr::new(selected)
+                && is_scannable_root(&entry.path)
+        })
+        .map(|entry| Some(entry.path))
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::FORBIDDEN,
+                "invalid_worktree",
+                "The selected checkout is not an available worktree of this repository",
+            )
+        })
+}
+
+pub(crate) async fn pane_git_worktrees(
+    State(state): State<AppState>,
+    Path((session_id, pane_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let session = find_session(&state.config, &session_id)?.clone();
+    let checkout = match pane_fenced_cwd(&state, &session, &pane_id).await {
+        Some(cwd) => checkout_of(&cwd).await,
+        None => None,
+    };
+    let inventory = match checkout.as_ref() {
+        Some(checkout) => git::worktrees(checkout).await.map_err(git_error)?,
+        None => Vec::new(),
+    };
+    Ok(Json(content_envelope(json!({
+        "current": checkout,
+        "worktrees": inventory.iter().filter(|entry| is_scannable_root(&entry.path)).map(git::Worktree::to_json).collect::<Vec<_>>(),
+    }))))
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct GitDiffQuery {
+    pub(crate) worktree: Option<String>,
     pub(crate) path: Option<String>,
     /// The path before a rename or copy, so git sees both sides.
     pub(crate) old_path: Option<String>,
@@ -2901,6 +2967,7 @@ pub(crate) async fn pane_git_diff(
         Some(cwd) => checkout_of(&cwd).await,
         None => None,
     };
+    let checkout = selected_git_worktree(checkout, query.worktree.as_deref()).await?;
     let Some(toplevel) = checkout else {
         return Err(api_error(
             StatusCode::NOT_FOUND,

@@ -606,7 +606,9 @@ pub async fn repository_root(cwd: &Path) -> Result<Option<PathBuf>, GitError> {
     match run(cwd, &["rev-parse", "--show-toplevel"], &[0]).await {
         Ok(output) => {
             let text = String::from_utf8_lossy(&output.stdout);
-            let line = text.lines().next().unwrap_or("").trim();
+            // Git terminates this path with one newline; whitespace within
+            // the path belongs to the directory, including other newlines.
+            let line = text.strip_suffix('\n').unwrap_or(&text);
             if line.is_empty() {
                 return Ok(None);
             }
@@ -616,6 +618,101 @@ pub async fn repository_root(cwd: &Path) -> Result<Option<PathBuf>, GitError> {
         Err(GitError::Failed(_)) => Ok(None),
         Err(err) => Err(err),
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct Worktree {
+    pub path: PathBuf,
+    pub branch: Option<String>,
+    pub head: Option<String>,
+    pub detached: bool,
+}
+
+impl Worktree {
+    pub fn to_json(&self) -> Value {
+        json!({ "path": self.path, "branch": self.branch, "head": self.head, "detached": self.detached })
+    }
+}
+
+/// Git's authoritative inventory, NUL-delimited so unusual path names survive.
+/// Missing, bare or replaced checkouts are omitted. Every accepted checkout
+/// must still point at this repository's canonical common directory.
+pub async fn worktrees(toplevel: &Path) -> Result<Vec<Worktree>, GitError> {
+    tokio::time::timeout(GIT_TIMEOUT, read_worktrees(toplevel))
+        .await
+        .map_err(|_| GitError::Timeout)?
+}
+
+async fn read_worktrees(toplevel: &Path) -> Result<Vec<Worktree>, GitError> {
+    let common = common_directory(toplevel).await?;
+    let output = run(toplevel, &["worktree", "list", "--porcelain", "-z"], &[0]).await?;
+    if output.capped {
+        return Err(GitError::Failed(
+            "worktree inventory exceeded its output limit".into(),
+        ));
+    }
+    let mut entries = Vec::new();
+    let mut entry: Option<Worktree> = None;
+    let mut bare = false;
+    for field in output.stdout.split(|byte| *byte == 0) {
+        if field.is_empty() {
+            if let Some(mut candidate) = entry.take() {
+                if !bare {
+                    if let Ok(path) = std::fs::canonicalize(&candidate.path) {
+                        if path.is_dir()
+                            && common_directory(&path).await.ok().as_ref() == Some(&common)
+                            && repository_root(&path).await?.as_ref() == Some(&path)
+                        {
+                            candidate.path = path;
+                            entries.push(candidate);
+                        }
+                    }
+                }
+            }
+            bare = false;
+            continue;
+        }
+        let field = std::str::from_utf8(field)
+            .map_err(|_| GitError::Failed("worktree inventory is not UTF-8".into()))?;
+        if let Some(path) = field.strip_prefix("worktree ") {
+            if entries.len() >= 128 {
+                return Err(GitError::Failed(
+                    "worktree inventory exceeded its entry limit".into(),
+                ));
+            }
+            entry = Some(Worktree {
+                path: path.into(),
+                branch: None,
+                head: None,
+                detached: false,
+            });
+        } else if let Some(candidate) = entry.as_mut() {
+            if let Some(head) = field.strip_prefix("HEAD ") {
+                candidate.head = (!head.bytes().all(|byte| byte == b'0')).then(|| head.to_owned());
+            } else if let Some(branch) = field.strip_prefix("branch ") {
+                candidate.branch =
+                    Some(branch.strip_prefix("refs/heads/").unwrap_or(branch).into());
+            } else if field == "detached" {
+                candidate.detached = true;
+            } else if field == "bare" {
+                bare = true;
+            }
+        }
+    }
+    Ok(entries)
+}
+
+async fn common_directory(toplevel: &Path) -> Result<PathBuf, GitError> {
+    let output = run(
+        toplevel,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        &[0],
+    )
+    .await?;
+    let text = std::str::from_utf8(&output.stdout)
+        .map_err(|_| GitError::Failed("git common directory is not UTF-8".into()))?;
+    let path = text.strip_suffix('\n').unwrap_or(text);
+    std::fs::canonicalize(path).map_err(|err| GitError::Failed(err.to_string()))
 }
 
 /// What changed, for an agent session's checkout. Numstat only, so it stays
@@ -3067,6 +3164,166 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn paired_http_reads_only_git_linked_worktrees_of_the_panes_repository() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt as _;
+
+        let (root, repo) = git_test_repo("linked-worktrees");
+        let linked = root.join("linked checkout\nwith newline");
+        let detached = root.join("detached");
+        for (path, args) in [
+            (&linked, vec!["worktree", "add", "-q", "-b", "feature"]),
+            (&detached, vec!["worktree", "add", "-q", "--detach"]),
+        ] {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::fs::write(linked.join("linked.txt"), "only in the linked checkout\n").unwrap();
+        let state = unreachable_state();
+        remember_pane_root(&state, "wA:p1", repo.join("src"));
+        let app = crate::terminal::routes::mount(axum::Router::new()).with_state(state);
+        let prefix = "/api/sessions/default/panes/wA:p1/git";
+        let request = |uri: String, token: &str| {
+            Request::builder()
+                .uri(uri)
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        let refused = app
+            .clone()
+            .oneshot(request(format!("{prefix}/worktrees"), "wrong"))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        let listed = app
+            .clone()
+            .oneshot(request(format!("{prefix}/worktrees"), "token"))
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(listed.into_body(), MAX_OUTPUT_BYTES)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["data"]["current"], json!(repo));
+        let entries = body["data"]["worktrees"].as_array().unwrap();
+        assert_eq!(entries.len(), 3);
+        assert!(entries
+            .iter()
+            .any(|entry| entry["path"] == json!(linked) && entry["branch"] == "feature"));
+        assert!(entries
+            .iter()
+            .any(|entry| entry["path"] == json!(detached) && entry["detached"] == true));
+        let query = |path: &Path| {
+            let mut url = reqwest::Url::parse("http://localhost").unwrap();
+            url.query_pairs_mut()
+                .append_pair("worktree", path.to_str().unwrap());
+            url.query().unwrap().to_owned()
+        };
+        let response = app
+            .clone()
+            .oneshot(request(
+                format!("{prefix}/status?{}", query(&linked)),
+                "token",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), MAX_OUTPUT_BYTES)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["data"]["repo"]["branch"], "feature");
+        assert_eq!(body["data"]["files"].as_array().unwrap().len(), 1);
+        assert_eq!(body["data"]["files"][0]["path"], "linked.txt");
+        let response = app
+            .clone()
+            .oneshot(request(
+                format!("{prefix}/diff?path=linked.txt&{}", query(&linked)),
+                "token",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), MAX_OUTPUT_BYTES)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(body["data"]["patch"]
+            .as_str()
+            .unwrap()
+            .contains("+only in the linked checkout"));
+        // Neither browsing nor a patch read changes either checkout.
+        assert!(std::fs::read_to_string(repo.join("src/a.ts"))
+            .unwrap()
+            .contains("const B"));
+        assert!(linked.join("linked.txt").is_file());
+        for invalid in [
+            root.clone(),
+            linked.join("src"),
+            repo.join("../repo"),
+            root.join("missing"),
+            PathBuf::from("--help"),
+        ] {
+            for endpoint in ["status?", "diff?path=linked.txt&"] {
+                let response = app
+                    .clone()
+                    .oneshot(request(
+                        format!("{prefix}/{endpoint}{}", query(&invalid)),
+                        "token",
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::FORBIDDEN, "{invalid:?}");
+            }
+        }
+        let unknown = app
+            .clone()
+            .oneshot(request(
+                format!(
+                    "/api/sessions/default/panes/unknown/git/status?{}",
+                    query(&linked)
+                ),
+                "token",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        // A linked directory replaced by a symlink to another repository is
+        // no longer an inventory member, even though its old path is registered.
+        let (foreign_root, foreign_repo) = git_test_repo("foreign-worktree");
+        std::fs::remove_dir_all(&linked).unwrap();
+        std::os::unix::fs::symlink(&foreign_repo, &linked).unwrap();
+        let response = app
+            .oneshot(request(
+                format!("{prefix}/status?{}", query(&linked)),
+                "token",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(foreign_root).unwrap();
+    }
+
+    #[tokio::test]
     async fn git_status_lists_the_checkout_of_the_panes_fenced_directory() {
         let (root, repo) = git_test_repo("git-status");
         let state = unreachable_state();
@@ -3076,6 +3333,7 @@ mod tests {
         let answer = pane_git_status(
             State(state.clone()),
             ExtractPath(("default".into(), "wA:p1".into())),
+            Query(Default::default()),
             bearer_headers("token"),
         )
         .await
@@ -3106,6 +3364,7 @@ mod tests {
             pane_git_status(
                 State(state.clone()),
                 ExtractPath(("default".into(), "wA:p1".into())),
+                Query(Default::default()),
                 bearer_headers("not-a-token"),
             )
             .await
@@ -3118,6 +3377,7 @@ mod tests {
         let none = pane_git_status(
             State(state),
             ExtractPath(("default".into(), "wB:p9".into())),
+            Query(Default::default()),
             bearer_headers("token"),
         )
         .await
@@ -3136,6 +3396,7 @@ mod tests {
         remember_pane_root(&state, "wA:p1", repo.clone());
 
         let query = |path: &str| GitDiffQuery {
+            worktree: None,
             path: Some(path.into()),
             old_path: None,
             staged: None,

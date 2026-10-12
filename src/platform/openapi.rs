@@ -501,7 +501,7 @@ pub fn openapi_spec() -> Value {
                 "get": {
                     "summary": "What changed in the pane's checkout",
                     "description": "git status --porcelain=v2 plus git diff --numstat HEAD, run read-only (--no-optional-locks, so the agent working in the checkout never loses index.lock) inside the checkout the pane's fenced working directory belongs to. One entry per changed file -- staged, unstaged and untracked together, which is what 'what did the agent change' means -- with line totals; binary files carry null totals. The list stops at 2000 files and says so with truncated; repo.changed_files is still the full count. A pane outside any checkout answers repo: null and an empty list, not an error. Announced as git_diff.",
-                    "parameters": [path_param("sessionId"), path_param("paneId")],
+                    "parameters": [path_param("sessionId"), path_param("paneId"), query_param("worktree", "Optional exact canonical path from git/worktrees; unavailable or unrelated checkouts are refused with 403 invalid_worktree. Announced as git_worktrees.")],
                     "responses": git_status_responses()
                 }
             },
@@ -512,6 +512,7 @@ pub fn openapi_spec() -> Value {
                     "parameters": [
                         path_param("sessionId"),
                         path_param("paneId"),
+                        query_param("worktree", "Optional exact canonical path from git/worktrees; read-only and restricted to this pane's repository"),
                         query_param("path", "The file, relative to the checkout's top level"),
                         query_param("old_path", "For a renamed or copied file, the path before, so git renders the rename rather than a new file"),
                         query_param("staged", "Absent: working tree against HEAD. true: index against HEAD. false: working tree against index"),
@@ -773,6 +774,7 @@ pub fn openapi_spec() -> Value {
         }
     });
     spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/history"] = captured_history_path();
+    spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/git/worktrees"] = git_worktrees_path();
     spec["paths"]["/api/history/storage"] = json!({ "get": {
         "summary": "Which captured-history storage this Gateway runs with (memory or sqlite, from config.json at startup) and, for sqlite, what it holds, from counters the write loop keeps. Requires the admin token or a device",
         "responses": json_ok("The storage", json!({
@@ -1941,6 +1943,21 @@ fn pane_context_responses() -> Value {
     });
     responses["404"] = json!({ "description": "Unknown session" });
     responses
+}
+
+fn git_worktrees_path() -> Value {
+    json!({
+        "get": {
+            "summary": "List available Git-linked checkouts of this pane's repository",
+            "description": "Paired-device read, announced as git_worktrees. Uses Git's authoritative worktree inventory and verifies canonical checkout/common-directory identity. Missing, bare, replaced and fenced-out checkouts are omitted. The content envelope data contains current (canonical pane checkout path or null) and worktrees (path, branch, head, detached). Outside a checkout the list is empty. Selecting a worktree on git/status or git/diff never checks out a branch or moves a pane. The existing vcs/discard and lazygit routes always target the pane's original checkout.",
+            "parameters": [path_param("sessionId"), path_param("paneId")],
+            "responses": {
+                "200": { "description": "Versioned content envelope with current and worktrees" },
+                "403": { "description": "Paired device required" },
+                "504": { "description": "Git inventory timed out" }
+            }
+        }
+    })
 }
 
 fn git_status_responses() -> Value {
