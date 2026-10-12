@@ -23,6 +23,14 @@ revalidates it; directory aliases, subdirectories and unrelated repositories
 return `403 invalid_worktree`. A pane without an authorized repository cannot
 use a selected path to discover one. Authentication precedes filesystem access.
 
-These routes never check out a branch, move a pane or remove a worktree. Discard,
-Lazygit and agent-session VCS routes retain their existing pane/session scope.
+These read routes never check out a branch, move a pane or remove a worktree.
+Discard and agent-session VCS routes retain their existing pane/session scope.
 The App uses paged patches for alternate checkouts and suppresses mutation controls.
+
+`pane_lazygit_worktree` adds the same optional canonical selector to both
+`GET` and `POST` on the pane's `lazygit` route. The Gateway validates the path
+against the source repository's current Git inventory before creating a new,
+unfocused terminal tab. The selected directory is passed as the tab's native
+working directory, never interpolated into a shell command. Omitting the
+selector retains the original checkout behavior. The App disables alternate
+checkout launches with an explanation when this capability is absent.
