@@ -1231,7 +1231,30 @@ mod tests {
             }
         }
 
-        // A task cancelled before its agent starts gets no agent and no goal.
+        // Neither an unknown agent nor an unattached session agent (OpenCode
+        // is in the terminal catalog too) is started in a pane.
+        for agent_id in ["no-such-agent", "opencode"] {
+            let body = json!({ "goal": "x", "agent_id": agent_id });
+            let (status, body) = send(&state, "POST", "/api/tasks", Some(body), true).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{agent_id}");
+            assert_eq!(body["error"]["code"], "agent_unavailable");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_terminal_task_never_starts_an_agent_or_sends_its_goal() {
+        // No earlier successful task shares this backend: its background
+        // launch must not be counted as the cancelled task starting.
+        let herdr = crate::FakeHerdr::start(vec!["$ "], None);
+        herdr.set_panes(json!([
+            { "pane_id": "w1:p9", "workspace_id": "w1", "tab_id": "w1:t9", "shell_pid": 4242 }
+        ]));
+        let mut state = state();
+        state.config.sessions[0].socket_path = herdr.session().socket_path;
+        state
+            .config
+            .agent_commands
+            .insert("codex".into(), "sh".into());
         let session = state.config.sessions[0].clone();
         let placed =
             crate::agents::session_routes::place_agent(&state, &session, "codex", None, None)
@@ -1239,22 +1262,6 @@ mod tests {
                 .unwrap();
         let cancelled = insert(&state, "late", Some(TaskState::Cancelled)).await;
         let cancelled = state.tasks.get_for_test(&TaskId(cancelled)).await;
-        let prompts = || {
-            let calls = herdr.calls.lock().unwrap();
-            calls
-                .iter()
-                .filter(|c| c["method"] == "agent.prompt")
-                .count()
-        };
-        let before = prompts();
-        let starts = || {
-            let calls = herdr.calls.lock().unwrap();
-            calls
-                .iter()
-                .filter(|c| c["method"] == "agent.start")
-                .count()
-        };
-        let started = starts();
         crate::tasks::service::start_terminal_agent(
             state.clone(),
             session,
@@ -1268,16 +1275,13 @@ mod tests {
             cancelled,
         )
         .await;
-        assert_eq!(prompts(), before);
-        assert_eq!(starts(), started, "no agent started either");
-
-        // Neither an unknown agent nor an unattached session agent (OpenCode
-        // is in the terminal catalog too) is started in a pane.
-        for agent_id in ["no-such-agent", "opencode"] {
-            let body = json!({ "goal": "x", "agent_id": agent_id });
-            let (status, body) = send(&state, "POST", "/api/tasks", Some(body), true).await;
-            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{agent_id}");
-            assert_eq!(body["error"]["code"], "agent_unavailable");
+        let calls = herdr.calls.lock().unwrap();
+        for method in ["agent.start", "agent.prompt"] {
+            assert_eq!(
+                calls.iter().filter(|call| call["method"] == method).count(),
+                0,
+                "a cancelled task must not send {method}"
+            );
         }
     }
 
