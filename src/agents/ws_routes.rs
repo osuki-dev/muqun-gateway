@@ -41,7 +41,7 @@ use super::domain::AgentDomainEvent;
 use super::routes::agent_event_record;
 use crate::connectivity::authority::DeviceKind;
 use crate::platform::http::require_device_or_peer;
-use crate::tasks::domain::{PrincipalKind, TaskPrincipal, TaskState};
+use crate::tasks::domain::{PrincipalKind, TaskId, TaskPrincipal, TaskState};
 use crate::tasks::events::TaskDomainEvent;
 use crate::{
     api_error, still_paired, transport, AppState, EncryptedStreamContext,
@@ -873,6 +873,13 @@ impl Connection {
                 task = tasks.recv() => match task {
                     Ok(task) => {
                         if subscriptions.wants_tasks() {
+                            // Snapshots and resync reads use `/api/tasks`; live
+                            // and finished task frames need the same ownership
+                            // check against the store, not display metadata.
+                            let TaskDomainEvent::Updated { task: view, .. } = &task;
+                            if peer && state.tasks.owned(&device, &TaskId(view.task_id.clone())).await.is_err() {
+                                continue;
+                            }
                             let frame = if subscriptions.tasks_only() {
                                 task_only_frame(&task)
                             } else {

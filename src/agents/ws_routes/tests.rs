@@ -887,3 +887,146 @@ async fn a_peer_socket_may_follow_tasks_and_ping_only() {
         }
     }
 }
+
+#[tokio::test]
+async fn a_peer_receives_only_its_tasks_in_snapshots_updates_and_reconnected_history() {
+    use crate::tasks::domain::{Task, TaskBinding, TaskChange, TaskKind, TaskOrigin};
+
+    let state = test_state(
+        "admin",
+        vec![
+            test_device("phone", "phone-token"),
+            crate::test_support::test_peer_device("peer-a", TOKEN),
+            crate::test_support::test_peer_device("peer-b", "peer-b-token"),
+        ],
+    );
+    let mut tasks = Vec::new();
+    // The peer's own task is last, so receiving it also proves earlier
+    // unrelated updates were filtered, without depending on a quiet timeout.
+    for (kind, owner) in [
+        (PrincipalKind::Device, "phone"),
+        (PrincipalKind::Gateway, "peer-b"),
+        (PrincipalKind::Gateway, "peer-a"),
+    ] {
+        let task = Task {
+            id: TaskId::new(),
+            kind: TaskKind::Command,
+            goal: format!("private command for {owner}"),
+            cwd: None,
+            binding: TaskBinding::None,
+            state: TaskState::Working,
+            summary: None,
+            exit_code: None,
+            created_by: TaskPrincipal {
+                kind,
+                id: owner.into(),
+            },
+            created_ms: 1,
+            updated_ms: 1,
+            seq: 0,
+            parent: None,
+            origin: if kind == PrincipalKind::Gateway {
+                TaskOrigin::Peer
+            } else {
+                TaskOrigin::Device
+            },
+            label: None,
+            // Legacy records may have no display attribution. The stored
+            // principal still decides which peer can receive the task.
+            requester_name: None,
+            session_title: None,
+            mentions: Vec::new(),
+            client_ref: None,
+            requester_server_id: None,
+            reopened_ms: None,
+            reopen_count: 0,
+        };
+        tasks.push(state.tasks.record(&task).await.unwrap());
+    }
+    let base = crate::test_support::serve(crate::test_support::peer_router(state.clone())).await;
+    let addr = base.strip_prefix("http://").unwrap().parse().unwrap();
+    let http = reqwest::Client::new();
+    let (mut app, _) = connect(addr, &[("authorization", "Bearer phone-token".into())])
+        .await
+        .unwrap();
+    next_json(&mut app).await;
+    send_text(&mut app, r#"{"t":"subscribe_all"}"#).await;
+    assert_eq!(next_json(&mut app).await["t"], "subscribed");
+
+    for expected_state in ["working", "done"] {
+        let (mut peer, _) = connect(addr, &bearer()).await.unwrap();
+        assert_eq!(next_json(&mut peer).await["t"], "hello");
+        send_text(&mut peer, r#"{"t":"subscribe_tasks"}"#).await;
+        assert_eq!(
+            next_json(&mut peer).await,
+            json!({"t":"subscribed", "tasks":true})
+        );
+
+        // The snapshot/refetch after a subscribe, resync or reconnect is the
+        // authenticated HTTP list; history reads use the same ownership.
+        let snapshot: Value = http
+            .get(format!("{base}/api/tasks"))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(snapshot["tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["tasks"][0]["task_id"], tasks[2].id.0);
+        assert_eq!(snapshot["tasks"][0]["state"], expected_state);
+        let all: Value = http
+            .get(format!("{base}/api/tasks"))
+            .bearer_auth("phone-token")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(all["tasks"].as_array().unwrap().len(), 3);
+        for (index, task) in tasks.iter().enumerate() {
+            let history = http
+                .get(format!("{base}/api/tasks/{}", task.id.0))
+                .bearer_auth(TOKEN)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                history.status(),
+                if index == 2 {
+                    StatusCode::OK
+                } else {
+                    StatusCode::NOT_FOUND
+                }
+            );
+            state.tasks.republish(task).await;
+            assert_eq!(next_json(&mut app).await["data"]["task_id"], task.id.0);
+        }
+        let received = next_json(&mut peer).await;
+        assert_eq!(received["t"], "task");
+        assert_eq!(received["data"]["task_id"], tasks[2].id.0);
+        assert_eq!(received["data"]["state"], expected_state);
+        peer.close(None).await.unwrap();
+
+        if expected_state == "working" {
+            for task in &tasks {
+                state
+                    .tasks
+                    .move_to(
+                        &task.id,
+                        TaskChange {
+                            to: TaskState::Done,
+                            summary: Some("private completed output".into()),
+                            source: "test".into(),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(next_json(&mut app).await["data"]["state"], "done");
+            }
+        }
+    }
+}
