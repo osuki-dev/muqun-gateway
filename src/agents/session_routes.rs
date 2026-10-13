@@ -541,6 +541,14 @@ pub(crate) async fn spawn_agent(
 pub(crate) struct AgentLaunch {
     pub(crate) payload: Value,
     pub(crate) steps: tasks::StepLog,
+    pub(crate) prompt_delivery: PromptDelivery,
+}
+
+/// A submission attempt can have delivered the prompt even if its reply failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromptDelivery {
+    NotAttempted,
+    Attempted,
 }
 
 /// The first half of [`launch_agent`]: the pane exists, nothing runs in it
@@ -743,6 +751,12 @@ pub(crate) async fn start_agent_in_place(
     if let Some((_, args)) = &launch_prompt {
         agent_args.extend(args.iter().cloned());
     }
+    // Record before calling the backend: an error can follow execution of argv.
+    let prompt_delivery = if launch_prompt.is_some() {
+        PromptDelivery::Attempted
+    } else {
+        PromptDelivery::NotAttempted
+    };
     trust_claude_folder(state, agent, agent_cwd.as_deref()).await;
     match start_backend_agent(
         session,
@@ -787,19 +801,40 @@ pub(crate) async fn start_agent_in_place(
             steps.failed("agent", err.code(), &err.message());
             // The pane is real and the user can type in it, so this is a 207
             // rather than an error that implies nothing was created.
-            return (AgentLaunch { payload, steps }, None);
+            return (
+                AgentLaunch {
+                    payload,
+                    steps,
+                    prompt_delivery,
+                },
+                None,
+            );
         }
     }
     if let Some((prompt, _)) = launch_prompt {
         steps.ok("prompt", json!({ "bytes": prompt.len(), "via": "argv" }));
         payload["prompt_submitted"] = json!(true);
-        return (AgentLaunch { payload, steps }, None);
+        return (
+            AgentLaunch {
+                payload,
+                steps,
+                prompt_delivery,
+            },
+            None,
+        );
     }
     let started = StartedAgent {
         pane_id: place.pane_id,
         prompt_target,
     };
-    (AgentLaunch { payload, steps }, Some(started))
+    (
+        AgentLaunch {
+            payload,
+            steps,
+            prompt_delivery,
+        },
+        Some(started),
+    )
 }
 
 /// Type `prompt` into a started agent, retrying until it is ready, and
@@ -810,11 +845,16 @@ pub(crate) async fn type_agent_prompt(
     prompt: Option<&str>,
     launch: &mut AgentLaunch,
 ) {
-    let AgentLaunch { payload, steps } = launch;
+    let AgentLaunch {
+        payload,
+        steps,
+        prompt_delivery,
+    } = launch;
     let prompt_target = &started.prompt_target;
     match prompt {
         None => steps.skipped("prompt", "no prompt was given"),
         Some(prompt) => {
+            *prompt_delivery = PromptDelivery::Attempted;
             // An agent that has just been launched is not a named agent yet --
             // it is a program still deciding what it is, and Herdr only learns
             // its name once it has drawn its first prompt. Waiting for that is

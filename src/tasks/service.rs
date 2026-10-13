@@ -1616,19 +1616,16 @@ pub(crate) async fn start_terminal_agent(
         }),
     )
     .await;
-    // A Claude Code seen to start with the sentence out of band and gone
-    // again, its pane back at a shell with no Claude Code left under it (it
-    // refused the flag), is started once more with the sentence typed after
-    // the goal -- whether the backend saw it start (tmux) or reported it
-    // exiting before it was ready (Herdr). A start that timed out is a failed
-    // launch: a slow agent may still come up, and must not start twice.
+    // Retry an explicit startup failure only when no goal submission was
+    // attempted. An argv goal can already have taken effect before an exit
+    // or error; a shell foreground alone never proves a rejected goal.
     let out_of_band = kind == "claude"
         && crate::mcp::inject::enabled(&state.config)
         && !crate::mcp::inject::terminal_task_args(&state.config, &kind)
             .await
             .is_empty();
     if out_of_band
-        && may_retry_typed(&launched.steps.value())
+        && may_retry_typed(&launched)
         && pane_agent::exited_to_shell(&session, &pane_id, &kind).await
         && !ended().await
     {
@@ -3193,21 +3190,39 @@ pub(crate) async fn full_answer(state: &AppState, asid: &str, since_ms: u64) -> 
         .map(|text| super::transcript::without_any_marker(&text))
 }
 
-/// Whether a launch's steps leave room for starting the agent again with
-/// its sentence typed, once it is shown to have exited: the agent step
-/// succeeded (tmux saw it start), or failed because the agent exited before
-/// it was ready (Herdr's `agent_start_failed`). Never after a timeout or
-/// any other failure.
-fn may_retry_typed(steps: &Value) -> bool {
-    let Some(failed) = steps.as_array().and_then(|steps| {
-        steps
-            .iter()
-            .find(|step| step.get("status").and_then(Value::as_str) == Some("failed"))
-    }) else {
-        return true;
+/// Only an explicit exit before readiness, with no attempted goal delivery,
+/// permits the typed-sentence fallback. Missing or ambiguous evidence fails closed.
+fn may_retry_typed(launch: &crate::agents::session_routes::AgentLaunch) -> bool {
+    use crate::agents::session_routes::PromptDelivery;
+    if launch.prompt_delivery != PromptDelivery::NotAttempted
+        || launch.payload.get("agent_started") != Some(&json!(false))
+        || launch.payload.get("prompt_submitted") != Some(&json!(false))
+    {
+        return false;
+    }
+    let steps = launch.steps.value();
+    let Some(steps) = steps.as_array() else {
+        return false;
     };
-    failed.get("step").and_then(Value::as_str) == Some("agent")
-        && failed.pointer("/error/code").and_then(Value::as_str) == Some("agent_start_failed")
+    let mut failed_before_prompt = false;
+    for step in steps {
+        match (
+            step.get("step").and_then(Value::as_str),
+            step.get("status").and_then(Value::as_str),
+        ) {
+            (Some("agent"), Some("failed"))
+                if !failed_before_prompt
+                    && step.pointer("/error/code").and_then(Value::as_str)
+                        == Some("agent_start_failed") =>
+            {
+                failed_before_prompt = true;
+            }
+            (Some("agent" | "prompt"), _) | (_, Some("failed")) | (_, None) => return false,
+            (Some(_), Some("ok" | "skipped")) => {}
+            _ => return false,
+        }
+    }
+    failed_before_prompt
 }
 
 /// `"<step>: <message>"` for the first failed step of a launch.
@@ -3598,23 +3613,430 @@ mod tests {
     }
 
     #[test]
-    fn a_claude_that_refused_its_flag_is_retried_only_after_a_real_failure() {
-        let failed = |code: &str| {
-            json!([{ "step": "pane", "status": "ok" },
-                   { "step": "agent", "status": "failed", "error": { "code": code, "message": "x" } }])
-        };
-        for (steps, retry) in [
-            (json!([{ "step": "agent", "status": "ok" }]), true),
-            (failed("agent_start_failed"), true),
-            (failed("agent_start_timeout"), false),
-            (failed("agent_not_found"), false),
+    fn typed_fallback_requires_an_explicit_failure_and_no_delivery_attempt() {
+        use crate::agents::session_routes::{AgentLaunch, PromptDelivery};
+        for (step, code, delivery, retry) in [
             (
-                json!([{ "step": "pane", "status": "failed", "error": { "code": "agent_start_failed" } }]),
+                "agent",
+                "agent_start_failed",
+                PromptDelivery::NotAttempted,
+                true,
+            ),
+            (
+                "agent",
+                "agent_start_failed",
+                PromptDelivery::Attempted,
+                false,
+            ),
+            (
+                "agent",
+                "agent_start_timeout",
+                PromptDelivery::NotAttempted,
+                false,
+            ),
+            (
+                "agent",
+                "agent_not_found",
+                PromptDelivery::NotAttempted,
+                false,
+            ),
+            (
+                "agent",
+                "herdr_unavailable",
+                PromptDelivery::NotAttempted,
+                false,
+            ),
+            (
+                "agent",
+                "invalid_herdr_response",
+                PromptDelivery::NotAttempted,
+                false,
+            ),
+            (
+                "pane",
+                "agent_start_failed",
+                PromptDelivery::NotAttempted,
+                false,
+            ),
+            (
+                "prompt",
+                "agent_start_failed",
+                PromptDelivery::NotAttempted,
                 false,
             ),
         ] {
-            assert_eq!(may_retry_typed(&steps), retry, "{steps}");
+            let mut steps = crate::agents::tasks::StepLog::new();
+            steps.failed(step, code, "x");
+            let mut launch = AgentLaunch {
+                payload: json!({ "agent_started": false, "prompt_submitted": false }),
+                steps,
+                prompt_delivery: delivery,
+            };
+            assert_eq!(
+                may_retry_typed(&launch),
+                retry,
+                "{step}: {code}, {delivery:?}"
+            );
+            launch.payload = Value::Null;
+            assert!(!may_retry_typed(&launch), "missing metadata: {code}");
         }
+        for success in [false, true] {
+            let mut steps = crate::agents::tasks::StepLog::new();
+            if success {
+                steps.ok("agent", json!({}));
+                steps.ok("prompt", json!({ "via": "argv" }));
+            }
+            assert!(!may_retry_typed(&AgentLaunch {
+                payload: json!({ "agent_started": false, "prompt_submitted": false }),
+                steps,
+                prompt_delivery: PromptDelivery::NotAttempted,
+            }));
+        }
+    }
+
+    async fn terminal_task(state: &AppState, pane_id: &str, goal: &str) -> Task {
+        let now = now_ms();
+        let task = Task {
+            id: TaskId::new(),
+            kind: TaskKind::Delegation,
+            goal: goal.into(),
+            cwd: None,
+            binding: TaskBinding::Pane {
+                session_id: state.config.sessions[0].id.clone(),
+                pane_id: pane_id.into(),
+                tab_id: None,
+                shell_pid: None,
+                agent_id: Some("claude".into()),
+                agent_job: None,
+                model: None,
+                variant: None,
+            },
+            state: TaskState::Queued,
+            summary: None,
+            exit_code: None,
+            created_by: assistant("a"),
+            created_ms: now,
+            updated_ms: now,
+            seq: 0,
+            parent: None,
+            origin: TaskOrigin::Mcp,
+            label: None,
+            requester_name: None,
+            session_title: None,
+            mentions: Vec::new(),
+            client_ref: None,
+            requester_server_id: None,
+            reopened_ms: None,
+            reopen_count: 0,
+        };
+        state.tasks.insert_for_test(&task).await;
+        state
+            .tasks
+            .move_to(&task.id, change(TaskState::Dispatching))
+            .await
+            .unwrap()
+    }
+
+    struct TaskStartHerdr {
+        dir: std::path::PathBuf,
+        calls: Arc<std::sync::Mutex<Vec<Value>>>,
+        serving: tokio::task::JoinHandle<()>,
+    }
+
+    impl TaskStartHerdr {
+        fn start(first_error: Option<&'static str>) -> Self {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+            // Keep the Unix socket path below SUN_LEN even with a long TMPDIR.
+            let dir = crate::test_support::asset_test_dir("s");
+            let listener = tokio::net::UnixListener::bind(dir.join("h")).unwrap();
+            let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let recorded = calls.clone();
+            let serving = tokio::spawn(async move {
+                let mut starts = 0;
+                while let Ok((stream, _)) = listener.accept().await {
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        continue;
+                    }
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    recorded.lock().unwrap().push(request.clone());
+                    let method = request["method"].as_str().unwrap();
+                    let error = if method == "agent.start" {
+                        starts += 1;
+                        (starts == 1).then_some(first_error).flatten()
+                    } else {
+                        None
+                    };
+                    // A lost response cannot show whether the launch ran.
+                    if error == Some("disconnect") {
+                        continue;
+                    }
+                    let result = match method {
+                        "tab.create" => {
+                            json!({ "tab": { "tab_id": "w1:t1", "workspace_id": "w1", "active_pane_id": "w1:p1" } })
+                        }
+                        "pane.get" => {
+                            json!({ "pane": { "pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1" } })
+                        }
+                        "pane.list" => {
+                            json!({ "panes": [{ "pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1" }] })
+                        }
+                        "pane.process_info" => {
+                            json!({ "process_info": { "shell_pid": 4242, "foreground_processes": [{ "name": "sh", "argv0": "sh" }] } })
+                        }
+                        "pane.read" => json!({ "read": { "text": "$ ", "revision": 1 } }),
+                        "agent.list" => json!({ "agents": [] }),
+                        "ping" => json!({ "version": "0.9.0", "protocol": 17 }),
+                        _ => json!({ "ok": true }),
+                    };
+                    let response = match error {
+                        Some("malformed") => {
+                            json!({ "id": request["id"], "result": { "agent": { "terminal_id": "t" } } })
+                        }
+                        Some(code) => {
+                            json!({ "id": request["id"], "error": { "code": code, "message": "startup refused" } })
+                        }
+                        None => json!({ "id": request["id"], "result": result }),
+                    };
+                    let mut stream = reader.into_inner();
+                    stream
+                        .write_all(response.to_string().as_bytes())
+                        .await
+                        .unwrap();
+                    stream.write_all(b"\n").await.unwrap();
+                }
+            });
+            Self {
+                dir,
+                calls,
+                serving,
+            }
+        }
+    }
+
+    impl Drop for TaskStartHerdr {
+        fn drop(&mut self) {
+            self.serving.abort();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_start_retries_only_before_a_typed_goal_can_be_delivered() {
+        for (error, starts, prompts, end) in [
+            (Some("agent_start_failed"), 2, 1, TaskState::Working),
+            (Some("agent_pane_busy"), 2, 1, TaskState::Working),
+            (None, 1, 1, TaskState::Working),
+            (Some("agent_start_timeout"), 1, 0, TaskState::Failed),
+            (Some("agent_not_ready"), 1, 0, TaskState::Failed),
+            (Some("disconnect"), 1, 0, TaskState::Failed),
+            (Some("malformed"), 1, 0, TaskState::Failed),
+        ] {
+            let fake = TaskStartHerdr::start(error);
+            let mut state = test_state("admin", Vec::new());
+            state.config.agent_trust_folders = false;
+            state.config.sessions[0].socket_path =
+                fake.dir.join("h").to_string_lossy().into_owned();
+            let session = state.config.sessions[0].clone();
+            let placed =
+                crate::agents::session_routes::place_agent(&state, &session, "claude", None, None)
+                    .await
+                    .unwrap();
+            let goal = "apply the non-idempotent change once";
+            let task = terminal_task(&state, &placed.place.pane_id, goal).await;
+            start_terminal_agent(
+                state.clone(),
+                session,
+                "claude".into(),
+                placed,
+                TerminalStart {
+                    cwd: None,
+                    goal: goal.into(),
+                    model_args: Vec::new(),
+                },
+                task.clone(),
+            )
+            .await;
+            assert_eq!(
+                state.tasks.get_for_test(&task.id).await.state,
+                end,
+                "{error:?}"
+            );
+            let calls = fake.calls.lock().unwrap();
+            let launches: Vec<_> = calls
+                .iter()
+                .filter(|call| call["method"] == "agent.start")
+                .collect();
+            let deliveries: Vec<_> = calls
+                .iter()
+                .filter(|call| call["method"] == "agent.prompt")
+                .collect();
+            assert_eq!(launches.len(), starts, "{error:?}: {calls:?}");
+            assert_eq!(deliveries.len(), prompts, "{error:?}: {calls:?}");
+            assert!(launches.iter().all(|call| !call["params"]["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|arg| arg.as_str().is_some_and(|arg| arg.contains(goal)))));
+            if prompts > 0 {
+                let typed_fallback = error == Some("agent_start_failed");
+                let expected = if typed_fallback {
+                    format!("{goal}\n\n{}", crate::mcp::inject::TASK_SENTENCE)
+                } else {
+                    goal.to_owned()
+                };
+                assert_eq!(deliveries[0]["params"]["text"], expected, "{error:?}");
+                let args = launches.last().unwrap()["params"]["args"]
+                    .as_array()
+                    .unwrap();
+                assert_eq!(
+                    args.iter().any(|arg| arg
+                        .as_str()
+                        .is_some_and(|arg| arg.starts_with("--append-system-prompt"))),
+                    !typed_fallback
+                );
+            }
+        }
+    }
+
+    struct TaskTmux {
+        dir: std::path::PathBuf,
+        socket: std::path::PathBuf,
+    }
+
+    impl Drop for TaskTmux {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("tmux")
+                .arg("-S")
+                .arg(&self.socket)
+                .arg("kill-server")
+                .output();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated tmux server; runs only a fake shell agent"]
+    async fn an_argv_goal_is_not_relaunched_after_success_and_a_rapid_exit() {
+        let dir = crate::test_support::asset_test_dir("task-argv");
+        let fake = TaskTmux {
+            socket: dir.join("tmux.sock"),
+            dir,
+        };
+        let created = std::process::Command::new("tmux")
+            .arg("-S")
+            .arg(&fake.socket)
+            .args([
+                "-f",
+                "/dev/null",
+                "new-session",
+                "-d",
+                "-s",
+                "task-argv",
+                "/bin/sh",
+            ])
+            .output()
+            .unwrap();
+        assert!(created.status.success(), "{created:?}");
+        let mut state = test_state("admin", Vec::new());
+        state.config.agent_trust_folders = false;
+        state.config.sessions[0].backend = crate::backend::BackendKind::Tmux;
+        state.config.sessions[0].socket_path = fake.socket.to_string_lossy().into_owned();
+        state
+            .config
+            .agent_commands
+            .insert("claude".into(), "sh".into());
+        let effects = fake.dir.join("effects");
+        let argv = fake.dir.join("argv");
+        let release = fake.dir.join("release");
+        // A non-idempotent side effect, then an exit. No AI process is run.
+        let script = format!(
+            "printf 'effect\\n' >> {}; printf '%s\\n' \"$@\" >> {}; while [ ! -f {} ]; do :; done",
+            crate::terminal::shell_word::shell_word(&effects.to_string_lossy()),
+            crate::terminal::shell_word::shell_word(&argv.to_string_lossy()),
+            crate::terminal::shell_word::shell_word(&release.to_string_lossy()),
+        );
+        state
+            .config
+            .agent_launch_args
+            .insert("claude".into(), vec!["-c".into(), script]);
+        let session = state.config.sessions[0].clone();
+        let placed =
+            crate::agents::session_routes::place_agent(&state, &session, "claude", None, None)
+                .await
+                .unwrap();
+        let goal = "apply the non-idempotent change once";
+        let task = terminal_task(&state, &placed.place.pane_id, goal).await;
+        let exit = tokio::spawn({
+            let effects = effects.clone();
+            async move {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !effects.exists() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                std::fs::write(release, "exit").unwrap();
+            }
+        });
+        start_terminal_agent(
+            state.clone(),
+            session,
+            "claude".into(),
+            placed,
+            TerminalStart {
+                cwd: None,
+                goal: goal.into(),
+                model_args: Vec::new(),
+            },
+            task.clone(),
+        )
+        .await;
+        exit.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(std::fs::read_to_string(effects).unwrap(), "effect\n");
+        let argv = std::fs::read_to_string(argv).unwrap();
+        assert!(argv.contains("--append-system-prompt"), "{argv}");
+        assert_eq!(argv.lines().filter(|arg| *arg == goal).count(), 1, "{argv}");
+        assert_eq!(
+            state.tasks.get_for_test(&task.id).await.state,
+            TaskState::Working
+        );
+        // The argv delivery disposition must survive a backend error too;
+        // absence of a successful prompt step is not proof of non-delivery.
+        state
+            .config
+            .agent_commands
+            .insert("claude".into(), "muqun-nonexistent-task-test-agent".into());
+        let placed = crate::agents::session_routes::place_agent(
+            &state,
+            &state.config.sessions[0],
+            "claude",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let (failed, to_type) = crate::agents::session_routes::start_agent_in_place(
+            &state,
+            &state.config.sessions[0],
+            "claude",
+            None,
+            placed,
+            Some(goal),
+            None,
+        )
+        .await;
+        assert_eq!(
+            failed.prompt_delivery,
+            crate::agents::session_routes::PromptDelivery::Attempted
+        );
+        assert!(failed.steps.has_failure());
+        assert!(to_type.is_none());
+        assert!(!may_retry_typed(&failed));
     }
 
     /// A state with an OpenCode fake whose new session exists (idle, unless
