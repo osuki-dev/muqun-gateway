@@ -21,6 +21,11 @@ pub(crate) struct Prepared {
     binding: Option<RuntimeTerminal>,
     pub usage: Option<Value>,
 }
+impl Prepared {
+    pub(crate) fn external(&self) -> bool {
+        self.binding.is_some()
+    }
+}
 struct Entry {
     tail: Arc<Mutex<RolloutTail>>,
     binding: RuntimeTerminal,

@@ -151,6 +151,23 @@ impl CodexDriver {
         self.usage.lock().await.remove(id);
     }
 
+    async fn seed_usage(&self, id: &str, value: Option<&Value>, external: bool) {
+        let mut usage = self.usage.lock().await;
+        // An explicit external reread may select a reverted rollout. Its sample
+        // supersedes earlier persisted counts; no sample means unknown. Native
+        // live notifications remain stronger than a historical initial sample.
+        if external {
+            usage.remove(id);
+        }
+        if usage.len() < MAX_SESSIONS || usage.contains_key(id) {
+            if let Some(value) = value {
+                usage
+                    .entry(id.into())
+                    .or_insert_with(|| super::usage::Usage::from_wire(value));
+            }
+        }
+    }
+
     pub(crate) async fn cached_usage(&self, id: &str) -> Option<super::usage::Usage> {
         self.usage.lock().await.get(id).cloned()
     }
@@ -1219,14 +1236,8 @@ impl AgentPort for CodexDriver {
                 items.drain(..items.len() - limit);
             }
             if let Some(prepared) = prepared {
-                if let Some(value) = &prepared.usage {
-                    let mut usage = self.usage.lock().await;
-                    if usage.len() < MAX_SESSIONS || usage.contains_key(id) {
-                        usage
-                            .entry(id.into())
-                            .or_insert_with(|| super::usage::Usage::from_wire(value));
-                    }
-                }
+                self.seed_usage(id, prepared.usage.as_ref(), prepared.external())
+                    .await;
                 self.rollouts.install(id, prepared);
             }
             Ok(items)
@@ -1262,6 +1273,33 @@ mod model_page_tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn persisted_usage_refresh_replaces_external_counts_but_not_live_native_counts() {
+        let mut fixture =
+            Fixture::new(|_| panic!("usage seeding must not call the provider")).await;
+        fixture.ready().await;
+        let driver = CodexDriver::new(fixture.client.clone());
+        let count = |n| json!({"last":{"totalTokens":n},"modelContextWindow":1000});
+        driver.record_usage("thread", &count(20)).await.unwrap();
+        driver.seed_usage("thread", Some(&count(10)), false).await;
+        let mut info = mapper::session(&golden()["thread"]).unwrap();
+        driver
+            .cached_usage("thread")
+            .await
+            .unwrap()
+            .apply(&mut info);
+        assert_eq!(info.context_usage.as_ref().unwrap().total_tokens, 20);
+        driver.seed_usage("thread", Some(&count(10)), true).await;
+        driver
+            .cached_usage("thread")
+            .await
+            .unwrap()
+            .apply(&mut info);
+        assert_eq!(info.context_usage.as_ref().unwrap().total_tokens, 10);
+        driver.seed_usage("thread", None, true).await;
+        assert!(driver.cached_usage("thread").await.is_none());
+    }
 
     #[tokio::test]
     async fn codex_model_page_pending_selection_survives_failed_read_until_source_confirmation() {
