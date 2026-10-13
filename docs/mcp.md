@@ -94,10 +94,30 @@ issued it.
   `MUQUN_MCP_TOKEN` and `MUQUN_MCP_URL`. The next OpenCode start the gateway
   makes replaces it (the old one is revoked only after the start worked), and
   `mcp revoke` ends it.
+- **Task-bound** (Codex tasks using the shared daemon). The per-thread
+  `muqun-gateway mcp token-helper --task-id <id>` configuration selects one
+  immutable stored task instead of relying on the daemon's process ancestry.
+  The helper still verifies the Gateway identity and authenticates issuance
+  with the local admin credential. The task id alone, a paired-device token,
+  a peer token, or another assistant token cannot issue a token. The issuance
+  body accepts either `task_id` or `ancestor_pids`, never both.
+  Task tokens expire after seven days. A retained completed or failed Codex
+  delegation can renew its token for an explicit follow-up; completing it
+  again requires that exact task to have reopened. Reusing its pane never
+  transfers authority to a replacement assignment. Cancellation or deletion
+  denies subsequent MCP calls immediately and prevents renewal; the sweep
+  also revokes those rows. Revoking one token does not prevent an authorized
+  helper from obtaining another token for a retained task.
 - **OpenCode run by hand** is not pane-bound by itself: it reads
   `MUQUN_MCP_TOKEN` from its environment. From inside a pane the gateway
   manages, `export MUQUN_MCP_TOKEN=$(muqun-gateway mcp token-helper --bearer)`
   before starting it; the token is then bound to that pane.
+
+Existing pane and agent token records remain compatible. New task records use
+the existing token binding column with `kind: "task"`; older Gateway binaries
+cannot deserialize that binding. Before downgrading, use a compatible store
+backup or remove the task-token rows while still running compatible tooling.
+Revocation alone retains the rows and is not a storage rollback.
 
 When a token expires, `/mcp` answers 401 so the host fetches a new one:
 
@@ -773,10 +793,15 @@ or several fit), nothing is recorded and the caller learns the result from
 
 A task started through `exec.run` or `tasks.delegate` is filed under the
 open task it was started from, when the gateway can tell which one that is.
-A token names who is calling, not from which task, so the gateway looks:
+A task-bound token identifies its exact task. For other token kinds, the
+Gateway determines the calling task from the following evidence:
 
 - **Pane-bound token**: the open task bound to the caller's pane (an
   assistant running inside an `exec.run` pane).
+- **Task-bound token**: the exact retained task in its immutable binding,
+  including its parent ancestry after completion. No pane-id or timeline
+  inference can redirect it to a later task. Cancellation and deletion end
+  this authority.
 - **Agent-bound token** (every session of the agent service the gateway runs
   shares it): among the open delegations to that agent, the one whose session
   is running this very call -- its latest timeline shows a *running* call of
