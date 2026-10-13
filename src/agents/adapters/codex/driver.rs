@@ -1088,6 +1088,16 @@ impl AgentPort for CodexDriver {
         Box::pin(async move { Ok(self.runtime(id, false).await) })
     }
 
+    fn prepare_selected_session<'a>(&'a self, id: &'a str) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            if self.client.is_shared() && !self.client.is_subscribed(id) {
+                let thread = self.read_thread(id).await?;
+                self.rejoin_loaded(id, &thread, true).await?;
+            }
+            Ok(())
+        })
+    }
+
     fn get_session<'a>(&'a self, id: &'a str) -> AgentFuture<'a, AgentSessionInfo> {
         Box::pin(async move {
             let mut info = mapper::session(&self.read_thread(id).await?)?;

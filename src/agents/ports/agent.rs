@@ -144,6 +144,13 @@ pub trait AgentPort: Send + Sync {
     /// Get session metadata
     fn get_session<'a>(&'a self, session_id: &'a str) -> AgentFuture<'a, AgentSessionInfo>;
 
+    /// Prepare a user-selected snapshot, even when its retained mirror is warm.
+    /// Must not replace history or submit a prompt. Discovery and metadata-only
+    /// reads do not call this hook. Rejected ownership must remain an error.
+    fn prepare_selected_session<'a>(&'a self, _id: &'a str) -> AgentFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// Optional fresh runtime observation, without reading/replacing transcript history.
     fn session_runtime<'a>(
         &'a self,

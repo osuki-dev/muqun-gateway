@@ -346,6 +346,141 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn selected_native_recovery_runs_after_mark_viewed_seeds_the_mirror() {
+        use crate::agents::domain::AgentSessionId;
+        use crate::agents::manager::AgentManager;
+        const ID: &str = "00000000-0000-4000-8000-000000000018";
+        for mode in ["cached", "cold", "refresh"] {
+            let mut fixture = Fixture::new(|request| match request["method"].as_str().unwrap() {
+            "thread/read" => {
+                json!({"thread":{"id":ID,"historyMode":"paginated","status":{"type":"notLoaded"}}})
+            }
+            "thread/resume" => {
+                json!({"thread":{"id":ID,"historyMode":"paginated","status":{"type":"idle"}}})
+            }
+            "thread/items/list" | "thread/turns/list" => json!({"data":[],"nextCursor":null}),
+            other => panic!("selected recovery must not call {other}"),
+        })
+        .await;
+            let registry = native_registry(&fixture);
+            registry.record(&fixture._home.0, ID).await.unwrap();
+            let herdr = crate::test_support::FakeHerdr::start(vec![], None);
+            herdr.set_agents(json!([{"pane_id":"w1:p1","terminal_id":"fixture-terminal","agent":"codex","agent_status":"idle","shell_pid":42,"agent_session":{"kind":"id","agent":"codex","value":ID}}]));
+            let (tx, _events) = tokio::sync::broadcast::channel(64);
+            let manager = AgentManager::connect_codex_recoverable(
+                fixture.client.clone(),
+                std::mem::replace(&mut fixture.events, mpsc::channel(1).1),
+                tx,
+                Some(crate::agents::terminal_runtime::TerminalRuntime::new(&[
+                    herdr.session(),
+                ])),
+                Some(registry),
+            );
+            if mode != "cold" {
+                manager.view_session(ID, 1).await.unwrap();
+            }
+            assert_eq!(
+                manager
+                    .sessions()
+                    .get_session(ID)
+                    .await
+                    .unwrap()
+                    .runtime
+                    .unwrap()
+                    .source,
+                RuntimeSource::Terminal
+            );
+            assert!(!fixture.client.is_subscribed(ID));
+            let asid = AgentSessionId(ID.into());
+            let first = if mode == "refresh" {
+                manager.sessions().refresh_snapshot(&asid).await.unwrap()
+            } else {
+                manager.sessions().get_snapshot(&asid).await.unwrap()
+            };
+            assert_eq!(first.info.runtime.unwrap().source, RuntimeSource::Native);
+            let second = manager.sessions().get_snapshot(&asid).await.unwrap();
+            assert_eq!(second.info.runtime.unwrap().source, RuntimeSource::Native);
+            assert_eq!(
+                locked(&fixture.requests)
+                    .iter()
+                    .filter(|r| r["method"] == "thread/resume")
+                    .count(),
+                1
+            );
+            assert!(!locked(&fixture.requests)
+                .iter()
+                .any(|r| r["method"] == "turn/start"));
+            manager.shutdown();
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_native_recovery_refusal_preserves_cached_history_and_never_sends() {
+        use crate::agents::domain::AgentSessionId;
+        use crate::agents::manager::AgentManager;
+        use crate::agents::ports::mirror::SessionMirrorPort;
+        const ID: &str = "00000000-0000-4000-8000-000000000019";
+        let mut fixture = Fixture::with_outcomes(|request| match request["method"].as_str().unwrap() {
+            "thread/read" => Ok(json!({"thread":{"id":ID,"historyMode":"paginated","status":{"type":"notLoaded"}}})),
+            "thread/resume" => Err(json!({"code":-32600,"message":"thread already has an active writer"})),
+            other => panic!("refused selected recovery must not call {other}"),
+        }, None).await;
+        let registry = native_registry(&fixture);
+        registry.record(&fixture._home.0, ID).await.unwrap();
+        let (tx, _events) = tokio::sync::broadcast::channel(64);
+        let manager = AgentManager::connect_codex_recoverable(
+            fixture.client.clone(),
+            std::mem::replace(&mut fixture.events, mpsc::channel(1).1),
+            tx,
+            Some(crate::agents::terminal_runtime::TerminalRuntime::new(&[])),
+            Some(registry),
+        );
+        manager.view_session(ID, 1).await.unwrap();
+        let asid = AgentSessionId(ID.into());
+        let retained = crate::agents::adapters::codex::mapper::item(
+            ID,
+            "old-turn",
+            &json!({"type":"agentMessage","id":"old-message","text":"Retained history"}),
+            0,
+        );
+        assert!(!retained.is_empty());
+        manager
+            .mirror()
+            .upsert_timeline_items(&asid, retained)
+            .await;
+        let before = manager.mirror().get_snapshot(&asid).await.unwrap().timeline;
+        assert!(manager.sessions().get_snapshot(&asid).await.is_err());
+        assert_eq!(
+            manager.mirror().get_snapshot(&asid).await.unwrap().timeline,
+            before
+        );
+        assert!(!fixture.client.is_subscribed(ID));
+        assert_eq!(
+            locked(&fixture.requests)
+                .iter()
+                .filter(|r| r["method"] == "thread/resume")
+                .count(),
+            1
+        );
+        assert!(manager
+            .agent()
+            .send_prompt(ID, "Do not submit", &[], None)
+            .await
+            .is_err());
+        assert_eq!(
+            locked(&fixture.requests)
+                .iter()
+                .filter(|r| r["method"] == "thread/resume")
+                .count(),
+            2
+        );
+        assert!(!locked(&fixture.requests)
+            .iter()
+            .any(|r| r["method"] == "turn/start" || r["method"] == "thread/start"));
+        manager.shutdown();
+    }
+
+    #[tokio::test]
     async fn native_recovery_records_fork_and_explicit_send_but_not_loaded_rejoin() {
         const ID: &str = "00000000-0000-4000-8000-000000000016";
         const CHILD: &str = "00000000-0000-4000-8000-000000000017";

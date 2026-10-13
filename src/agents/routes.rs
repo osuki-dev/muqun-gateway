@@ -812,18 +812,19 @@ async fn do_read_agent_session(
     require_device(state, headers)?;
     let manager = session_manager_or_err(state, asid).await?;
     let id = AgentSessionId(asid.to_string());
-    let mut snapshot =
-        if refresh {
-            manager
-                .sessions()
-                .refresh_snapshot(&id)
-                .await
-                .map_err(agent_error)?
-        } else {
-            manager.sessions().get_snapshot(&id).await.map_err(|e| {
-                api_error(StatusCode::NOT_FOUND, "session_not_found", &e.to_string())
-            })?
-        };
+    let mut snapshot = if refresh {
+        manager
+            .sessions()
+            .refresh_snapshot(&id)
+            .await
+            .map_err(agent_error)?
+    } else {
+        manager
+            .sessions()
+            .get_snapshot(&id)
+            .await
+            .map_err(agent_error)?
+    };
     let directory = snapshot.info.directory.clone();
     let plumbing = for_session(state, asid).await;
     hide_in_items(&mut snapshot.timeline, plumbing);
@@ -2127,6 +2128,9 @@ fn agent_error(err: super::ports::agent::AgentError) -> (StatusCode, Json<Value>
     // as its own field so the app can offer to forget the session rather than
     // parse a sentence.
     match &err {
+        super::ports::agent::AgentError::SessionNotFound(_) => {
+            api_error(StatusCode::NOT_FOUND, "session_not_found", &err.to_string())
+        }
         super::ports::agent::AgentError::TerminalInteraction(runtime) => (
             StatusCode::CONFLICT,
             Json(
@@ -3166,6 +3170,19 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some(tag.as_str())
         );
+    }
+
+    #[test]
+    fn a_rejected_session_resume_is_not_a_missing_session() {
+        use super::super::ports::agent::AgentError;
+        let (status, Json(body)) = agent_error(AgentError::RequestFailed(
+            "thread already has an active writer".into(),
+        ));
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"]["code"], "agent_error");
+        let (status, Json(body)) = agent_error(AgentError::SessionNotFound("gone".into()));
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "session_not_found");
     }
 
     /// A folder that has been deleted is a 404 that names it, never a 502 --

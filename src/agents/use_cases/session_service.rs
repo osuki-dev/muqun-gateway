@@ -134,6 +134,10 @@ impl SessionService {
         &self,
         asid: &AgentSessionId,
     ) -> Result<AgentSessionSnapshot, AgentError> {
+        // Mark-viewed and metadata events may already have seeded the mirror.
+        // Ownership recovery belongs to selection, not a transcript cache miss.
+        // A rejected preparation leaves the retained snapshot untouched.
+        self.agent.prepare_selected_session(&asid.0).await?;
         // A session the mirror holds is served from the mirror, even when its
         // timeline is legitimately empty: treating "no rows" as a cache miss
         // re-hit OpenCode twice on every poll of a new session.
@@ -198,6 +202,7 @@ impl SessionService {
         &self,
         asid: &AgentSessionId,
     ) -> Result<AgentSessionSnapshot, AgentError> {
+        self.agent.prepare_selected_session(&asid.0).await?;
         let expected = self.mirror.get_snapshot(asid).await.map(|s| s.seq);
         let info = self.get_session(&asid.0).await?;
         let timeline = self.agent.get_timeline(&asid.0, 100).await?;

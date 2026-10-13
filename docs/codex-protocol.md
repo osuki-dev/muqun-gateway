@@ -129,6 +129,10 @@ fork or prompt submission for its exact thread ID and verified canonical Codex
 home. This evidence stores no prompt, credential or workspace path. Listing and
 metadata reads do not trigger recovery, and old unregistered sessions are not
 backfilled from terminal observations or transcript metadata.
+Selection prepares ownership before serving a retained snapshot, including when
+marking a session viewed has already populated its metadata cache. A cache hit
+must not skip recovery. A rejected preparation is returned as an error while
+the retained history remains untouched; it is not converted to native ownership.
 `thread/resume` carries only its exact ID and `excludeTurns: true`; it does not
 apply model, instructions or permission overrides. A one-turn metadata page
 (`itemsView: notLoaded`)
