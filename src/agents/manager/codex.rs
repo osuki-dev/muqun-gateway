@@ -553,14 +553,36 @@ impl Context {
                 // Do not duplicate it or depend on experimental settings events.
             }
             "turn/completed" => {
-                self.set_status(thread, mapper::status(&params["turn"]["status"]))
-                    .await;
+                // Canonical completed items remain useful history even when the
+                // completion is too old to mutate the live turn's lifecycle.
+                if let Some(turn) = params["turn"]["id"].as_str() {
+                    if let Some(items) = params["turn"]["items"].as_array() {
+                        for item in items {
+                            if let Ok(items) = self.driver.ordered_items(thread, turn, item, 0) {
+                                self.upsert(&asid, items).await;
+                            }
+                        }
+                    }
+                }
                 let ended_turn = params["turn"]["id"].as_str().filter(|_| {
                     matches!(
                         params["turn"]["status"].as_str(),
                         Some("completed" | "failed" | "interrupted")
                     )
                 });
+                // The reader may already be on a newer turn while this event
+                // waits in the queue. Unknown/disconnected completions cannot
+                // authorize clearing the thread's current callbacks or status.
+                let Some(ended_turn) = ended_turn.filter(|turn| {
+                    self.driver
+                        .client()
+                        .is_current_turn_completion(thread, turn)
+                }) else {
+                    return;
+                };
+                self.set_status(thread, mapper::status(&params["turn"]["status"]))
+                    .await;
+                let ended_turn = Some(ended_turn);
                 // A completion snapshot can carry the final committed user reply.
                 // Resolve it before expiring unanswered forms, even if its item
                 // notification was not observed separately.
@@ -580,15 +602,6 @@ impl Context {
                     }
                 }
                 self.clear_requests(thread, ended_turn).await;
-                if let Some(turn) = params["turn"]["id"].as_str() {
-                    if let Some(items) = params["turn"]["items"].as_array() {
-                        for item in items {
-                            if let Ok(items) = self.driver.ordered_items(thread, turn, item, 0) {
-                                self.upsert(&asid, items).await;
-                            }
-                        }
-                    }
-                }
             }
             "serverRequest/resolved" => {
                 if let Some(id) = self.driver.client().request_id(&params["requestId"]) {
@@ -1493,7 +1506,12 @@ mod tests {
                     _ => None,
                 })
                 .collect();
-            assert_eq!(replay_reasons, vec![expected], "replay {scenario}");
+            let stale = matches!(scenario, "wrong_turn" | "new_turn");
+            assert_eq!(
+                replay_reasons,
+                if stale { vec![] } else { vec![expected] },
+                "replay {scenario}"
+            );
             let mut live_reasons = vec![];
             while let Ok(event) = events.try_recv() {
                 if let AgentDomainEvent::FormResolved { reason, .. } = event {
@@ -1502,19 +1520,175 @@ mod tests {
             }
             assert_eq!(
                 live_reasons,
-                if scenario == "disconnected" {
+                if scenario == "disconnected" || stale {
                     vec![]
                 } else {
                     vec![expected]
                 },
                 "live {scenario}"
             );
-            assert!(mirror
-                .get_snapshot(&session.asid)
+            assert_eq!(
+                mirror
+                    .get_snapshot(&session.asid)
+                    .await
+                    .unwrap()
+                    .forms
+                    .is_empty(),
+                !stale
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_completion_preserves_new_turn_questions_permissions_and_busy_status() {
+        for scenario in [
+            "active",
+            "queued_completion",
+            "disconnected",
+            "missing_turn",
+            "unknown_turn",
+        ] {
+            let mut fixture = Fixture::new(|request| match request["method"].as_str().unwrap() {
+                "thread/start" | "thread/read" => json!({"thread":golden()["thread"]}),
+                "turn/start" => json!({"turn":{"id":"old-turn","status":"inProgress"}}),
+                other => panic!("unexpected RPC {other}"),
+            })
+            .await;
+            fixture.ready().await;
+            let driver = Arc::new(CodexDriver::new(fixture.client.clone()));
+            let session = driver.create_session(None, None, None).await.unwrap();
+            let thread = &session.asid.0;
+            driver
+                .send_prompt(thread, "Start", &[], None)
+                .await
+                .unwrap();
+            let mirror = Arc::new(MemoryMirror::for_agent("codex"));
+            mirror.update_session(session.clone()).await;
+            let (tx, _) = broadcast::channel(64);
+            let context = Context {
+                driver: driver.clone(),
+                mirror: mirror.clone(),
+                tx,
+                stopped: Arc::new(Mutex::new(false)),
+                threads: tokio::sync::Mutex::new(HashSet::new()),
+            };
+            fixture.send(json!({"method":"turn/started","params":{"threadId":thread,"turn":{"id":"next-turn","status":"inProgress"}}})).await;
+            loop {
+                let event = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    fixture.events.as_mut().unwrap().recv(),
+                )
                 .await
                 .unwrap()
-                .forms
-                .is_empty());
+                .unwrap();
+                let started = matches!(&event, CodexEvent::Notification { method, .. } if method == "turn/started");
+                context.event(event).await;
+                if started {
+                    break;
+                }
+            }
+            context.notification("item/completed", &json!({"threadId":thread,"turnId":"next-turn","item":{"type":"agentMessage","id":"new-question","questions":[{"title":"Keep this draft?"}]}})).await;
+            fixture.send(json!({"id":77,"method":"item/fileChange/requestApproval","params":{"threadId":thread,"turnId":"next-turn","itemId":"new-edit"}})).await;
+            loop {
+                let event = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    fixture.events.as_mut().unwrap().recv(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                let requested = matches!(&event, CodexEvent::Request { .. });
+                context.event(event).await;
+                if requested {
+                    break;
+                }
+            }
+            let before = mirror.get_snapshot(&session.asid).await.unwrap();
+            assert_eq!(before.info.status, AgentSessionStatus::Busy);
+            assert_eq!(before.forms.len(), 1);
+            assert_eq!(before.permissions.len(), 1);
+            let mut queued = None;
+            if scenario == "queued_completion" {
+                fixture.send(json!({"method":"turn/completed","params":{"threadId":thread,"turn":{"id":"next-turn","status":"completed"}}})).await;
+                queued = Some(
+                    tokio::time::timeout(
+                        Duration::from_secs(2),
+                        fixture.events.as_mut().unwrap().recv(),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                );
+                assert!(fixture
+                    .client
+                    .is_current_turn_completion(thread, "next-turn"));
+            }
+            if scenario == "disconnected" {
+                fixture.client.stop();
+            }
+            let stale = json!({"threadId":thread,"turn":{"id":if scenario=="missing_turn"{Value::Null}else if scenario=="unknown_turn"{json!("unknown")}else{json!("old-turn")},"status":"completed","items":[{"type":"agentMessage","id":"old-final","text":"Prior result"}]}});
+            if scenario == "disconnected" {
+                // A queued notification may be consumed after transport loss.
+                context.notification("turn/completed", &stale).await;
+            } else {
+                fixture
+                    .send(json!({"method":"turn/completed","params":stale}))
+                    .await;
+                let event = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    fixture.events.as_mut().unwrap().recv(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                context.event(event).await;
+            }
+            let after = mirror.get_snapshot(&session.asid).await.unwrap();
+            assert_eq!(after.info.status, AgentSessionStatus::Busy, "{scenario}");
+            assert_eq!(after.forms, before.forms, "{scenario}");
+            assert_eq!(after.permissions, before.permissions, "{scenario}");
+            if scenario != "missing_turn" {
+                assert!(after.timeline.iter().any(|item| matches!(&item.part, AgentPart::Text { text } if text == "Prior result")), "canonical history {scenario}");
+            }
+            assert!(
+                mirror
+                    .get_events_after(&session.asid, before.seq)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|event| !matches!(
+                        event,
+                        AgentDomainEvent::FormResolved { .. }
+                            | AgentDomainEvent::PermissionResolved { .. }
+                    )),
+                "{scenario}"
+            );
+            if scenario != "disconnected" && scenario != "queued_completion" {
+                assert_eq!(
+                    driver.get_pending_forms(thread).await.unwrap(),
+                    before.forms,
+                    "registry {scenario}"
+                );
+            }
+            if let Some(event) = queued {
+                assert!(
+                    fixture
+                        .client
+                        .is_current_turn_completion(thread, "next-turn"),
+                    "old completion must not replace the completed identity"
+                );
+                context.event(event).await;
+                let completed = mirror.get_snapshot(&session.asid).await.unwrap();
+                assert_eq!(completed.info.status, AgentSessionStatus::Idle);
+                assert!(completed.forms.is_empty());
+                assert!(completed.permissions.is_empty());
+            } else if scenario != "disconnected" {
+                assert_eq!(
+                    fixture.client.server_requests(thread).len(),
+                    1,
+                    "new callback {scenario}"
+                );
+            }
         }
     }
 

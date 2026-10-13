@@ -84,6 +84,8 @@ struct State {
     requests: Mutex<HashMap<String, ServerRequest>>,
     turns: Mutex<HashMap<String, String>>,
     completed_turns: Mutex<HashMap<String, String>>,
+    // Only completions of observed active turns authorize lifecycle cleanup.
+    lifecycle_completed_turns: Mutex<HashMap<String, String>>,
     next_id: AtomicU64,
     ready: AtomicBool,
     cancel: CancellationToken,
@@ -114,6 +116,7 @@ impl State {
         locked(&self.subscribed).clear();
         locked(&self.turns).clear();
         locked(&self.completed_turns).clear();
+        locked(&self.lifecycle_completed_turns).clear();
     }
 
     fn emit(&self, event: CodexEvent) -> Result<(), AgentError> {
@@ -235,6 +238,7 @@ impl CodexClient {
             requests: Mutex::new(HashMap::new()),
             turns: Mutex::new(HashMap::new()),
             completed_turns: Mutex::new(HashMap::new()),
+            lifecycle_completed_turns: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             ready: AtomicBool::new(false),
             cancel: CancellationToken::new(),
@@ -308,6 +312,21 @@ impl CodexClient {
     pub(crate) fn subscription_revision(&self, thread: &str) -> Option<u64> {
         let subscribed = locked(&self.state.subscribed);
         subscribed.get(thread).copied().filter(|_| self.is_ready())
+    }
+
+    /// The event consumer can lag behind the reader; a queued completion must
+    /// not finish a newer turn that the reader has already observed.
+    pub(crate) fn is_current_turn_completion(&self, thread: &str, turn: &str) -> bool {
+        if !self.is_ready() || (self.is_shared() && !self.is_subscribed(thread)) {
+            return false;
+        }
+        let active = locked(&self.state.turns);
+        match active.get(thread) {
+            Some(current) => current == turn,
+            None => locked(&self.state.lifecycle_completed_turns)
+                .get(thread)
+                .is_some_and(|completed| completed == turn),
+        }
     }
 
     pub(crate) fn observe_active_turn(&self, thread: &str, turn: &Value) {
@@ -745,10 +764,20 @@ fn route_frame(state: &State, value: Value, frame_bytes: usize) -> Result<(), Ag
             } else if method == "turn/completed" {
                 let turn = params["turn"]["id"].as_str();
                 let mut turns = locked(&state.turns);
-                if turns.get(thread).map(String::as_str) == turn {
+                let current = turn.is_some() && turns.get(thread).map(String::as_str) == turn;
+                if let Some(turn) = turn.filter(|_| current) {
+                    let mut completed = locked(&state.lifecycle_completed_turns);
+                    if completed.len() >= 4096 && !completed.contains_key(thread) {
+                        return Err(AgentError::Protocol(
+                            "Codex lifecycle completed-turn capacity exhausted".into(),
+                        ));
+                    }
+                    completed.insert(thread.into(), turn.into());
                     turns.remove(thread);
                 }
                 drop(turns);
+                // Keep the separate response fence even for an unobserved turn:
+                // completion can arrive before the turn/start acknowledgement.
                 if let Some(turn) = turn {
                     let mut completed = locked(&state.completed_turns);
                     if completed.len() >= 4096 && !completed.contains_key(thread) {
@@ -758,9 +787,11 @@ fn route_frame(state: &State, value: Value, frame_bytes: usize) -> Result<(), Ag
                     }
                     completed.insert(thread.into(), turn.into());
                 }
-                locked(&state.requests).retain(|_, r| {
-                    !(r.params["threadId"] == thread && r.params["turnId"].as_str() == turn)
-                });
+                if let Some(turn) = turn {
+                    locked(&state.requests).retain(|_, r| {
+                        !(r.params["threadId"] == thread && r.params["turnId"] == turn)
+                    });
+                }
             } else if method == "serverRequest/resolved" {
                 if let Some(key) = state.request_id(&params["requestId"]) {
                     let mut requests = locked(&state.requests);
@@ -777,6 +808,7 @@ fn route_frame(state: &State, value: Value, frame_bytes: usize) -> Result<(), Ag
                 locked(&state.subscribed).remove(thread);
                 locked(&state.turns).remove(thread);
                 locked(&state.completed_turns).remove(thread);
+                locked(&state.lifecycle_completed_turns).remove(thread);
                 locked(&state.requests).retain(|_, r| r.params["threadId"] != thread);
             }
             state.emit(CodexEvent::Notification {
@@ -884,6 +916,52 @@ fn route_frame(state: &State, value: Value, frame_bytes: usize) -> Result<(), Ag
 mod tests {
     use super::*;
     use tokio::io::{AsyncBufReadExt, BufReader};
+
+    #[tokio::test]
+    async fn unobserved_completion_fences_resurrection_without_authorizing_lifecycle_cleanup() {
+        let mut fixture = crate::agents::adapters::codex::tests::Fixture::new(|request| {
+            assert_eq!(request["method"], "thread/start");
+            json!({"thread":{"id":"thread"}})
+        })
+        .await;
+        fixture.ready().await;
+        fixture
+            .client
+            .call("thread/start", json!({}))
+            .await
+            .unwrap();
+        let client = &fixture.client;
+        // Exercise the metadata-rejoin fence with an accepted subscription.
+        locked(&client.state.subscribed).insert("thread".into(), 1);
+        let complete = |turn: &str| json!({"method":"turn/completed","params":{"threadId":"thread","turn":{"id":turn,"status":"completed"}}});
+        route_frame(&client.state, json!({"id":77,"method":"item/fileChange/requestApproval","params":{"threadId":"thread"}}), 0).unwrap();
+        route_frame(&client.state, json!({"method":"turn/completed","params":{"threadId":"thread","turn":{"status":"completed"}}}), 0).unwrap();
+        assert_eq!(
+            client.server_requests("thread").len(),
+            1,
+            "missing turn identity cannot resolve an unknown callback"
+        );
+        route_frame(&client.state, complete("unobserved"), 0).unwrap();
+        assert!(!client.is_current_turn_completion("thread", "unobserved"));
+        client.observe_active_turn("thread", &json!({"id":"unobserved","status":"inProgress"}));
+        assert!(
+            client.active_turn("thread").is_none(),
+            "late metadata must not resurrect the unobserved completed turn"
+        );
+        client.observe_active_turn("thread", &json!({"id":"next-turn","status":"inProgress"}));
+        route_frame(&client.state, complete("next-turn"), 0).unwrap();
+        assert!(client.is_current_turn_completion("thread", "next-turn"));
+        route_frame(&client.state, complete("unobserved"), 0).unwrap();
+        assert!(client.is_current_turn_completion("thread", "next-turn"));
+        assert!(!client.is_current_turn_completion("thread", "unobserved"));
+        route_frame(
+            &client.state,
+            json!({"method":"thread/closed","params":{"threadId":"thread"}}),
+            0,
+        )
+        .unwrap();
+        assert!(!client.is_current_turn_completion("thread", "next-turn"));
+    }
 
     #[derive(Default)]
     struct WriteProbe {

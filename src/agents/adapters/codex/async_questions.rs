@@ -162,7 +162,10 @@ impl Registry {
                 Some((id.clone(), reason))
             })
             .collect();
-        self.clear(thread);
+        self.pending
+            .retain(|_, p| p.form.asid.0 != thread || p.turn != turn);
+        self.answered
+            .retain(|(owner, owner_turn, _)| owner != thread || owner_turn != turn);
         reasons
     }
 
@@ -423,6 +426,7 @@ mod tests {
                 .claim("thread", "turn", &forms[1].id, &json!({"answer":"sending"}))
                 .unwrap();
             registry.accept(&forms[2].id);
+            let next = registry.insert(&fixture.client, "thread", "next-turn", &json!({"type":"agentMessage","id":"next-question","questions":[{"title":"Next?"}]}));
             let reasons = registry.finish_turn("thread", turn, ownership, owned);
             if turn == "turn" && ownership.is_none() && owned {
                 assert_eq!(
@@ -440,7 +444,11 @@ mod tests {
             } else {
                 assert!(reasons.is_empty());
             }
-            assert!(registry.pending("thread", Some("turn")).is_empty());
+            assert_eq!(
+                registry.pending("thread", Some("turn")).is_empty(),
+                turn == "turn"
+            );
+            assert_eq!(registry.pending("thread", Some("next-turn")), next);
         }
     }
 

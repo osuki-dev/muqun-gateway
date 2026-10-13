@@ -21,6 +21,7 @@ impl CodexClient {
             requests: Mutex::new(HashMap::new()),
             turns: Mutex::new(HashMap::new()),
             completed_turns: Mutex::new(HashMap::new()),
+            lifecycle_completed_turns: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             ready: AtomicBool::new(false),
             cancel: CancellationToken::new(),
