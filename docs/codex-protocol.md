@@ -17,10 +17,12 @@ without disabling terminal agents. Both blocks default enabled and reject
 unknown nested fields; Gateway configuration has no Codex credential fields.
 `codex.binary`, when present, names an absolute executable; otherwise
 normal PATH lookup selects `codex`. Gateway does not install it. Missing binary
-or authentication is nonfatal and does not disable other agents. Ready Codex is preferred first, OpenCode second, then DeepSeek and T3.
-Explicit provider and recorded session selections keep their routes; unavailable
-Codex never displaces a connected fallback. HTTP and CLI discovery use the same
-ordering. Existing terminal sessions remain untouched.
+or authentication is nonfatal and does not disable other agents. Ready Codex is
+preferred first, OpenCode second, then DeepSeek and T3. Explicit provider and
+recorded session selections keep their routes; unavailable Codex never displaces
+a connected fallback. HTTP and CLI discovery use the same ordering. Existing
+terminal Codex sessions are never migrated; eligible new terminal tasks use the
+shared startup described below.
 Explicit task `agent_id: codex` continues to use a terminal pane even when the
 private service adapter is connected; Codex service sessions use the agent API.
 This revision covers all seven transport/lifecycle and semantic review findings,
@@ -359,8 +361,21 @@ and context occupancy against `TokenUsage::tokens_in_context_window` in
 `item/tool/requestUserInput`. The former has titles/options, no server RPC request
 ID, and does not stop the agent. Live native messages in an exactly identified,
 owned active turn create `FormRequest.nonblocking: true`; each question uses its
-own connection-scoped form handle. Historical and persisted messages retain the
-question text/options without creating reply callbacks.
+own connection- and subscription-scoped form handle. Ordinary historical and
+persisted messages retain the question text/options without creating reply callbacks.
+
+After an accepted shared-daemon rejoin, opening its timeline also recovers unanswered
+questions from the exact currently active turn. Paginated storage uses
+`thread/items/list` filtered by `turnId`; legacy storage uses a single
+`thread/turns/list` page with `itemsView: full`, requiring the returned active turn
+identity to match. Recovery is bounded to 1,600 items, 16 pages, 1 MiB of retained
+question/reply items, and the existing 20-second/32-MiB traversal and 4-MiB frame
+limits. It publishes no partial result. Committed answer envelopes are applied before
+question forms; bounded answer identities also prevent a concurrent TUI answer from
+being resurrected by recovery. Turn changes, completion, disconnect, or an unload/rejoin
+of the same thread fence the result. Explicit interrupt and prompt control do not wait
+for question recovery. This does not make another turn, an unowned transcript, or a
+persisted follower actionable.
 
 Replies follow the pinned official TUI's
 [`async_questions/state.rs`](https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/tui/src/bottom_pane/async_questions/state.rs)
@@ -378,9 +393,11 @@ A question remains pending until the steering response or a committed matching
 user reply confirms acceptance. In-flight claims prevent duplicate writes.
 Another client's committed reply resolves only matching question identities in
 that thread. Completion, unload, and connection loss remove live actions; neither
-history replay nor an old connection handle can resurrect them. The bounded
-registry offers up to 32 question handles; unsupported oversized question shapes
-remain readable in the transcript and may be answered through ordinary steering.
+ordinary history replay nor an old connection handle can resurrect them. The bounded
+registry offers up to 32 question handles and remembers up to 1,024 committed answer
+identities until thread/turn cleanup; exhausted answer tracking suppresses new forms.
+Unsupported oversized question shapes remain readable in the transcript and may be
+answered through ordinary steering.
 
 `hookPrompt` fragments are synthetic transcript content, preserving their text.
 `functionCallOutput` preserves its published string or content-array output.

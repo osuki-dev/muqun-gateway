@@ -320,6 +320,48 @@ impl Context {
                     self.driver.client().stop();
                 }
             }
+            CodexEvent::RecoveredQuestions {
+                ownership,
+                thread,
+                turn,
+                items,
+            } => {
+                if self.driver.client().subscription_revision(&thread) != Some(ownership)
+                    || self.driver.client().active_turn(&thread).as_deref() != Some(&turn)
+                {
+                    return;
+                }
+                // Answers first: replay order cannot briefly expose an already
+                // answered question, and live answers carry the same tombstones.
+                for item in &items {
+                    for id in self
+                        .driver
+                        .observe_async_answers(&thread, &turn, item)
+                        .await
+                    {
+                        self.resolve(&thread, &id, true).await;
+                    }
+                }
+                for item in &items {
+                    for form in self
+                        .driver
+                        .observe_async_questions(&thread, &turn, item)
+                        .await
+                    {
+                        if self.driver.client().subscription_revision(&thread) != Some(ownership)
+                            || self.driver.client().active_turn(&thread).as_deref() != Some(&turn)
+                        {
+                            return;
+                        }
+                        let seq = self.mirror.add_form(form.clone()).await;
+                        self.emit(AgentDomainEvent::FormPending {
+                            asid: form.asid.clone(),
+                            request: form,
+                            seq,
+                        });
+                    }
+                }
+            }
             CodexEvent::Snapshot { thread, revision } => self.session(&thread, revision).await,
             CodexEvent::MetadataRefreshFailed { thread, revision } => {
                 let versions = self.driver.metadata_guard().await;
@@ -517,7 +559,7 @@ impl Context {
                 if method == "item/completed" {
                     for id in self
                         .driver
-                        .observe_async_answers(thread, &params["item"])
+                        .observe_async_answers(thread, turn, &params["item"])
                         .await
                     {
                         self.resolve(thread, &id, true).await;
@@ -1055,6 +1097,242 @@ mod tests {
             |row| matches!(&row.part, AgentPart::Todo{items} if items.len() == 1 && items[0].done)
         ));
         assert!(snapshot.timeline.iter().any(|row| matches!(&row.part, AgentPart::Diff{file,diff} if file.is_empty() && diff.contains("+new"))));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shared_rejoin_recovers_only_unanswered_current_owned_questions() {
+        use crate::agents::adapters::codex::client::websocket::tests::Fixture as SharedFixture;
+        for scenario in [
+            "pending",
+            "legacy",
+            "stale_handle",
+            "answered",
+            "live_answer",
+            "turn_ended",
+            "new_turn",
+            "unloaded",
+            "rejoined",
+            "disconnected",
+        ] {
+            let answer = |index| json!({"type":"userMessage","id":format!("answer-{index}"),"content":[{"type":"text","text":format!("<send_user_message_question_reply>{}</send_user_message_question_reply>",json!([{"questionItemId":json!(["request_user_input_async","question",index]).to_string(),"question":"Pick?","answer":"A"}]))}]});
+            let committed = if scenario == "answered" {
+                answer(0)
+            } else {
+                Value::Null
+            };
+            let question = json!({"type":"agentMessage","id":"question","text":"Still working", "questions":[{"title":"Pick?","options":["A","B"]}]});
+            let mut fixture = SharedFixture::new(move |request| match request["method"].as_str().unwrap() {
+                "thread/read" | "thread/resume" => json!({"thread":{"id":"live","historyMode":if scenario=="legacy" {"legacy"} else {"paginated"},"status":{"type":"active","activeFlags":[]},"turns":[]}}),
+                "thread/turns/list" if request["params"]["itemsView"] == "full" => {
+                    assert_eq!(scenario, "legacy");
+                    assert_eq!(request["params"]["limit"], 1);
+                    json!({"data":[{"id":"turn","status":"inProgress","itemsView":"full","items":[question]}]})
+                },
+                "thread/turns/list" => json!({"data":[{"id":"turn","status":"inProgress"}]}),
+                "thread/items/list" if request["params"]["turnId"] == "turn" => {
+                    assert_eq!(request["params"]["sortDirection"], "asc");
+                    if request["params"]["cursor"].is_null() {
+                        json!({"data":[{"turnId":"turn","item":question}],"nextCursor":"answers"})
+                    } else {
+                        assert_eq!(request["params"]["cursor"], "answers");
+                        json!({"data":if committed.is_null(){vec![]}else{vec![json!({"turnId":"turn","item":committed})]},"nextCursor":null})
+                    }
+                },
+                "thread/items/list" => json!({"data":[],"nextCursor":null}),
+                "turn/steer" => {
+                    assert_eq!(request["params"]["expectedTurnId"], "turn");
+                    assert!(request["params"]["input"][0]["text"].as_str().unwrap().contains("send_user_message_question_reply"));
+                    json!({"turnId":"turn"})
+                },
+                other => panic!("unexpected RPC {other}"),
+            }).await;
+            let driver = Arc::new(CodexDriver::new(fixture.client.clone()));
+            let mirror = Arc::new(MemoryMirror::for_agent("codex"));
+            let (tx, mut updates) = broadcast::channel(64);
+            let context = Context {
+                driver: driver.clone(),
+                mirror: mirror.clone(),
+                tx,
+                stopped: Arc::new(Mutex::new(false)),
+                threads: tokio::sync::Mutex::new(HashSet::new()),
+            };
+            driver.get_timeline("live", 10).await.unwrap();
+            let recovery = loop {
+                let event = tokio::time::timeout(Duration::from_secs(2), fixture.events.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if matches!(event, CodexEvent::RecoveredQuestions { .. }) {
+                    break event;
+                }
+                context.event(event).await;
+            };
+            if scenario == "live_answer" {
+                // Native answer arrives before the recovery event is consumed.
+                context
+                    .notification(
+                        "item/completed",
+                        &json!({"threadId":"live","turnId":"turn","item":answer(0)}),
+                    )
+                    .await;
+            } else if scenario == "disconnected" {
+                fixture.client.stop();
+            } else if matches!(
+                scenario,
+                "turn_ended" | "new_turn" | "unloaded" | "rejoined"
+            ) {
+                let (method, params) = match scenario {
+                    "turn_ended" => (
+                        "turn/completed",
+                        json!({"threadId":"live","turn":{"id":"turn","status":"completed"}}),
+                    ),
+                    "new_turn" => (
+                        "turn/started",
+                        json!({"threadId":"live","turn":{"id":"next-turn","status":"inProgress"}}),
+                    ),
+                    _ => ("thread/closed", json!({"threadId":"live"})),
+                };
+                fixture
+                    .send
+                    .send(json!({"method":method,"params":params}))
+                    .await
+                    .unwrap();
+                loop {
+                    let event = tokio::time::timeout(Duration::from_secs(2), fixture.events.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let matched = matches!(&event, CodexEvent::Notification { method: current, .. } if current == method);
+                    // Exercise the stronger client ownership fence even before
+                    // the queued close has removed the driver's loaded marker.
+                    if scenario != "rejoined" {
+                        context.event(event).await;
+                    }
+                    if matched {
+                        break;
+                    }
+                }
+                if scenario == "rejoined" {
+                    fixture
+                        .client
+                        .call(
+                            "thread/resume",
+                            json!({"threadId":"live","excludeTurns":true}),
+                        )
+                        .await
+                        .unwrap();
+                    fixture
+                        .client
+                        .observe_active_turn("live", &json!({"id":"turn","status":"inProgress"}));
+                }
+            }
+            context.event(recovery).await;
+            let forms = driver.get_pending_forms("live").await.unwrap();
+            assert_eq!(
+                forms.len(),
+                usize::from(matches!(scenario, "pending" | "legacy" | "stale_handle")),
+                "{scenario}"
+            );
+            let mut pending_events = 0;
+            while let Ok(event) = updates.try_recv() {
+                if matches!(event, AgentDomainEvent::FormPending { .. }) {
+                    pending_events += 1;
+                }
+            }
+            assert_eq!(
+                pending_events,
+                usize::from(matches!(scenario, "pending" | "legacy" | "stale_handle")),
+                "{scenario}"
+            );
+            if matches!(scenario, "pending" | "legacy" | "stale_handle") {
+                assert!(forms[0].nonblocking);
+                assert_eq!(
+                    mirror
+                        .get_snapshot(&AgentSessionId("live".into()))
+                        .await
+                        .unwrap()
+                        .forms
+                        .len(),
+                    1
+                );
+                if scenario == "stale_handle" {
+                    fixture
+                        .send
+                        .send(json!({"method":"thread/closed","params":{"threadId":"live"}}))
+                        .await
+                        .unwrap();
+                    loop {
+                        let event =
+                            tokio::time::timeout(Duration::from_secs(2), fixture.events.recv())
+                                .await
+                                .unwrap()
+                                .unwrap();
+                        if matches!(event, CodexEvent::Notification { method, .. } if method == "thread/closed")
+                        {
+                            break;
+                        }
+                    }
+                    // The transport has unloaded/rejoined but the manager has
+                    // not consumed cleanup yet. Its old form still cannot write.
+                    fixture
+                        .client
+                        .call(
+                            "thread/resume",
+                            json!({"threadId":"live","excludeTurns":true}),
+                        )
+                        .await
+                        .unwrap();
+                    fixture
+                        .client
+                        .observe_active_turn("live", &json!({"id":"turn","status":"inProgress"}));
+                    assert!(driver
+                        .reply_form("live", &forms[0].id, json!({"answer":"stale"}))
+                        .await
+                        .is_err());
+                    assert!(driver.get_pending_forms("live").await.unwrap().is_empty());
+                    continue;
+                }
+                driver
+                    .reply_form("live", &forms[0].id, json!({"answer":"A"}))
+                    .await
+                    .unwrap();
+                assert!(driver.get_pending_forms("live").await.unwrap().is_empty());
+                assert!(driver
+                    .reply_form("live", &forms[0].id, json!({"answer":"again"}))
+                    .await
+                    .is_err());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shared_question_recovery_rejects_incomplete_or_wrong_turn_pages() {
+        use crate::agents::adapters::codex::client::websocket::tests::Fixture as SharedFixture;
+        for scenario in ["wrong_turn", "cycle", "too_large", "too_many_pages"] {
+            let page = std::sync::atomic::AtomicUsize::new(0);
+            let mut fixture = SharedFixture::new(move |request| match request["method"].as_str().unwrap() {
+                "thread/read" | "thread/resume" => json!({"thread":{"id":"live","historyMode":"paginated","status":{"type":"active","activeFlags":[]}}}),
+                "thread/turns/list" => json!({"data":[{"id":"turn","status":"inProgress"}]}),
+                "thread/items/list" => match scenario {
+                    "wrong_turn" => json!({"data":[{"turnId":"old-turn","item":{"id":"q","type":"agentMessage","questions":[{"title":"Old?"}]}}],"nextCursor":null}),
+                    "cycle" => json!({"data":[],"nextCursor":"same"}),
+                    "too_large" => json!({"data":[{"turnId":"turn","item":{"id":"u","type":"userMessage","content":[{"type":"text","text":"x".repeat(1024*1024)}]}}],"nextCursor":null}),
+                    _ => json!({"data":[],"nextCursor":page.fetch_add(1,std::sync::atomic::Ordering::SeqCst).to_string()}),
+                },
+                other => panic!("unexpected RPC {other}"),
+            }).await;
+            let driver = CodexDriver::new(fixture.client.clone());
+            assert!(driver.get_timeline("live", 10).await.is_err(), "{scenario}");
+            assert!(driver.get_pending_forms("live").await.unwrap().is_empty());
+            while let Ok(event) = fixture.events.try_recv() {
+                assert!(
+                    !matches!(event, CodexEvent::RecoveredQuestions { .. }),
+                    "{scenario}"
+                );
+            }
+        }
     }
 
     async fn next_session_update(

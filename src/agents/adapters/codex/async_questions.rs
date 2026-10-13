@@ -1,14 +1,15 @@
 //! Async assistant questions use ordinary user input, not server-request replies.
 //! Wire identities/envelopes follow pinned TUI async_questions/state.rs and
-//! context-fragments/answered_question.rs. Never create actions from history.
+//! context-fragments/answered_question.rs. Recovery requires exact live-turn ownership.
 use super::CodexClient;
 use crate::agents::domain::*;
 use crate::agents::ports::agent::AgentError;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone)]
 struct Pending {
+    ownership: Option<u64>,
     form: FormRequest,
     turn: String,
     message: String,
@@ -17,7 +18,12 @@ struct Pending {
     answering: bool,
 }
 #[derive(Default)]
-pub(super) struct Registry(HashMap<String, Pending>);
+pub(super) struct Registry {
+    pending: HashMap<String, Pending>,
+    // Replies can arrive before a historical question is recovered. Remember
+    // exact identities until turn cleanup, bounded independently of form count.
+    answered: HashSet<(String, String, String)>,
+}
 impl Registry {
     pub(super) fn insert(
         &mut self,
@@ -36,6 +42,8 @@ impl Registry {
         if questions.len() > 32 || message.len() > 256 {
             return vec![];
         }
+        let ownership = client.subscription_revision(thread);
+        self.retain_subscription(thread, ownership);
         let mut forms = vec![];
         for (index, question) in questions.iter().enumerate() {
             let Some(title) = question["title"]
@@ -55,12 +63,21 @@ impl Registry {
             }
             let question_id = json!(["request_user_input_async", message, index]).to_string();
             let Some(key) =
-                client.request_id(&json!(json!([thread, turn, &question_id]).to_string()))
+                client.request_id(&json!(
+                    json!([thread, turn, &question_id, ownership]).to_string()
+                ))
             else {
                 continue;
             };
             let id = format!("async:{key}");
-            if self.0.contains_key(&id) || self.0.len() >= 32 {
+            if self.pending.contains_key(&id)
+                || self.pending.len() >= 32
+                || self.answered.len() >= 1024
+                || [question_id.as_str(), message].iter().any(|question| {
+                    self.answered
+                        .contains(&(thread.into(), turn.into(), (*question).into()))
+                })
+            {
                 continue;
             }
             let form = FormRequest {
@@ -93,9 +110,10 @@ impl Registry {
                     custom: true,
                 }],
             };
-            self.0.insert(
+            self.pending.insert(
                 id,
                 Pending {
+                    ownership,
                     form: form.clone(),
                     turn: turn.into(),
                     message: message.into(),
@@ -108,15 +126,21 @@ impl Registry {
         }
         forms
     }
+    pub(super) fn retain_subscription(&mut self, thread: &str, ownership: Option<u64>) {
+        self.pending
+            .retain(|_, p| p.form.asid.0 != thread || p.ownership == ownership);
+    }
+
     pub(super) fn pending(&self, thread: &str, turn: Option<&str>) -> Vec<FormRequest> {
-        self.0
+        self.pending
             .values()
             .filter(|p| p.form.asid.0 == thread && Some(p.turn.as_str()) == turn && !p.answered)
             .map(|p| p.form.clone())
             .collect()
     }
     pub(super) fn clear(&mut self, thread: &str) {
-        self.0.retain(|_, p| p.form.asid.0 != thread);
+        self.pending.retain(|_, p| p.form.asid.0 != thread);
+        self.answered.retain(|(owner, _, _)| owner != thread);
     }
     pub(super) fn claim(
         &mut self,
@@ -126,7 +150,7 @@ impl Registry {
         answers: &Value,
     ) -> Result<String, AgentError> {
         let p = self
-            .0
+            .pending
             .get_mut(id)
             .filter(|p| p.form.asid.0 == thread && p.turn == turn && !p.answered && !p.answering)
             .ok_or_else(|| {
@@ -157,17 +181,17 @@ impl Registry {
         ))
     }
     pub(super) fn accept(&mut self, id: &str) {
-        if let Some(p) = self.0.get_mut(id) {
+        if let Some(p) = self.pending.get_mut(id) {
             p.answered = true;
             p.answering = false;
         }
     }
     pub(super) fn rejected(&mut self, id: &str) {
-        if let Some(p) = self.0.get_mut(id) {
+        if let Some(p) = self.pending.get_mut(id) {
             p.answering = false;
         }
     }
-    pub(super) fn observe_reply(&mut self, thread: &str, input: &Value) -> Vec<String> {
+    pub(super) fn observe_reply(&mut self, thread: &str, turn: &str, input: &Value) -> Vec<String> {
         let Some(content) = input.as_array() else {
             return vec![];
         };
@@ -187,9 +211,16 @@ impl Registry {
         let Some(replies) = parse_reply(text) else {
             return vec![];
         };
+        for reply in &replies {
+            if self.answered.len() < 1024 && reply.question_item_id.len() <= 2048 {
+                self.answered
+                    .insert((thread.into(), turn.into(), reply.question_item_id.clone()));
+            }
+        }
         let mut resolved = vec![];
-        for (id, p) in &mut self.0 {
+        for (id, p) in &mut self.pending {
             if p.form.asid.0 == thread
+                && p.turn == turn
                 && !p.answered
                 && replies
                     .iter()
@@ -300,15 +331,54 @@ mod tests {
             json!({"questionItemId":json!(["request_user_input_async","message",1]).to_string(),"question":"Second?","answer":"Other client"})
         );
         assert!(registry
-            .observe_reply("other", &json!([{"type":"text","text":desktop}]))
+            .observe_reply("other", "turn", &json!([{"type":"text","text":desktop}]))
             .is_empty());
         assert_eq!(
-            registry.observe_reply("thread", &json!([{"type":"text","text":desktop}])),
+            registry.observe_reply("thread", "turn", &json!([{"type":"text","text":desktop}])),
             vec![forms[1].id.clone()]
         );
         assert!(registry.pending("thread", Some("turn")).is_empty());
         assert!(parse_reply(&format!("Quoted: {desktop}")).is_none());
     }
+    #[tokio::test]
+    async fn recovered_answer_tombstones_are_turn_scoped_and_handles_keep_connection_identity() {
+        let mut first = Fixture::new(|_| panic!("registry must not send RPC")).await;
+        let mut second = Fixture::new(|_| panic!("registry must not send RPC")).await;
+        first.ready().await;
+        second.ready().await;
+        let item = json!({"type":"agentMessage","id":"message","questions":[{"title":"Pick?"}]});
+        let reply = json!([{"type":"text","text":format!("<send_user_message_question_reply>{}</send_user_message_question_reply>",json!({"questionItemId":"message","question":"Pick?","answer":"A"}))}]);
+        let mut registry = Registry::default();
+        registry.observe_reply("thread", "old-turn", &reply);
+        let first_form = registry
+            .insert(&first.client, "thread", "turn", &item)
+            .remove(0);
+        let mut restored = Registry::default();
+        restored.observe_reply("thread", "turn", &reply);
+        assert!(
+            restored
+                .insert(&second.client, "thread", "turn", &item)
+                .is_empty(),
+            "whole-message TUI answer is also authoritative before hydration"
+        );
+        restored.clear("thread");
+        let second_form = restored
+            .insert(&second.client, "thread", "turn", &item)
+            .remove(0);
+        assert_ne!(first_form.id, second_form.id);
+        assert!(restored
+            .claim("thread", "turn", &first_form.id, &json!({"answer":"stale"}))
+            .is_err());
+        assert!(restored
+            .claim(
+                "thread",
+                "turn",
+                &second_form.id,
+                &json!({"answer":"current"})
+            )
+            .is_ok());
+    }
+
     #[test]
     fn transcript_preserves_questions_hooks_and_readable_reply_without_actionable_forms() {
         use crate::agents::adapters::codex::mapper;

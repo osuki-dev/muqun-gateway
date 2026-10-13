@@ -1,6 +1,6 @@
 #[cfg(unix)]
-mod websocket;
-use std::collections::{HashMap, HashSet};
+pub(crate) mod websocket;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -37,6 +37,13 @@ pub enum CodexEvent {
     Attached {
         thread: Value,
     },
+    /// Bounded current-turn reconstruction after an accepted shared subscription.
+    RecoveredQuestions {
+        ownership: u64,
+        thread: String,
+        turn: String,
+        items: Vec<Value>,
+    },
     MetadataRefreshFailed {
         thread: String,
         revision: u64,
@@ -71,7 +78,8 @@ struct Pending {
 struct State {
     generation: String,
     shared: bool,
-    subscribed: Mutex<HashSet<String>>,
+    subscribed: Mutex<HashMap<String, u64>>,
+    ownership_revision: AtomicU64,
     pending: Mutex<HashMap<u64, Pending>>,
     requests: Mutex<HashMap<String, ServerRequest>>,
     turns: Mutex<HashMap<String, String>>,
@@ -221,7 +229,8 @@ impl CodexClient {
         let state = Arc::new(State {
             generation: uuid::Uuid::new_v4().to_string(),
             shared: false,
-            subscribed: Mutex::new(HashSet::new()),
+            subscribed: Mutex::new(HashMap::new()),
+            ownership_revision: AtomicU64::new(0),
             pending: Mutex::new(HashMap::new()),
             requests: Mutex::new(HashMap::new()),
             turns: Mutex::new(HashMap::new()),
@@ -292,7 +301,13 @@ impl CodexClient {
     }
 
     pub(crate) fn is_subscribed(&self, id: &str) -> bool {
-        self.is_ready() && locked(&self.state.subscribed).contains(id)
+        self.is_ready() && locked(&self.state.subscribed).contains_key(id)
+    }
+
+    /// Connection-local fence for unload/rejoin while a canonical read is in flight.
+    pub(crate) fn subscription_revision(&self, thread: &str) -> Option<u64> {
+        let subscribed = locked(&self.state.subscribed);
+        subscribed.get(thread).copied().filter(|_| self.is_ready())
     }
 
     pub(crate) fn observe_active_turn(&self, thread: &str, turn: &Value) {
@@ -323,6 +338,21 @@ impl CodexClient {
 
     pub fn is_ready(&self) -> bool {
         self.state.ready.load(Ordering::Acquire) && !self.state.cancel.is_cancelled()
+    }
+
+    pub(crate) fn recovered_questions(
+        &self,
+        ownership: u64,
+        thread: &str,
+        turn: &str,
+        items: Vec<Value>,
+    ) -> Result<(), AgentError> {
+        self.state.emit(CodexEvent::RecoveredQuestions {
+            ownership,
+            thread: thread.into(),
+            turn: turn.into(),
+            items,
+        })
     }
 
     pub fn cancel_token(&self) -> CancellationToken {
@@ -669,7 +699,7 @@ fn route_frame(state: &State, value: Value, frame_bytes: usize) -> Result<(), Ag
             let thread = params["threadId"]
                 .as_str()
                 .or_else(|| params["thread"]["id"].as_str());
-            if thread.is_none_or(|id| !locked(&state.subscribed).contains(id)) {
+            if thread.is_none_or(|id| !locked(&state.subscribed).contains_key(id)) {
                 return Ok(());
             }
         }
@@ -794,12 +824,16 @@ fn route_frame(state: &State, value: Value, frame_bytes: usize) -> Result<(), Ag
                         ));
                     }
                     let mut subscribed = locked(&state.subscribed);
-                    if subscribed.len() >= 4096 && !subscribed.contains(thread) {
+                    if subscribed.len() >= 4096 && !subscribed.contains_key(thread) {
                         return Err(AgentError::Protocol(
                             "Codex subscription capacity exhausted".into(),
                         ));
                     }
-                    let first = subscribed.insert(thread.into());
+                    let first = !subscribed.contains_key(thread);
+                    if first {
+                        let revision = state.ownership_revision.fetch_add(1, Ordering::AcqRel);
+                        subscribed.insert(thread.into(), revision);
+                    }
                     drop(subscribed);
                     if first {
                         // Publish at the response boundary, before subsequent

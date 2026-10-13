@@ -15,7 +15,8 @@ impl CodexClient {
         let state = Arc::new(State {
             generation: uuid::Uuid::new_v4().to_string(),
             shared: true,
-            subscribed: Mutex::new(HashSet::new()),
+            subscribed: Mutex::new(HashMap::new()),
+            ownership_revision: AtomicU64::new(0),
             pending: Mutex::new(HashMap::new()),
             requests: Mutex::new(HashMap::new()),
             turns: Mutex::new(HashMap::new()),
@@ -88,18 +89,18 @@ impl CodexClient {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::agents::adapters::codex::daemon::tests::TestDirectory;
     use crate::agents::adapters::codex::CodexDriver;
     use crate::agents::domain::RuntimeSource;
     use crate::agents::ports::agent::AgentPort;
 
-    struct Fixture {
-        client: Arc<CodexClient>,
-        events: mpsc::Receiver<CodexEvent>,
+    pub(crate) struct Fixture {
+        pub(crate) client: Arc<CodexClient>,
+        pub(crate) events: mpsc::Receiver<CodexEvent>,
         requests: Arc<Mutex<Vec<Value>>>,
-        send: mpsc::Sender<Value>,
+        pub(crate) send: mpsc::Sender<Value>,
         disconnected: Arc<AtomicBool>,
         task: tokio::task::JoinHandle<()>,
         _home: TestDirectory,
@@ -111,7 +112,7 @@ mod tests {
         }
     }
     impl Fixture {
-        async fn new(handler: impl Fn(&Value) -> Value + Send + 'static) -> Self {
+        pub(crate) async fn new(handler: impl Fn(&Value) -> Value + Send + 'static) -> Self {
             let home = TestDirectory::new();
             let (left, right) = UnixStream::pair().unwrap();
             let (client, server) = tokio::join!(

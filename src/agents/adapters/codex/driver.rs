@@ -102,7 +102,7 @@ impl CodexDriver {
     async fn prepare_shared_interaction(&self, id: &str) -> Result<(), AgentError> {
         if self.client.is_shared() && !self.client.is_subscribed(id) {
             let thread = self.read_thread(id).await?;
-            self.rejoin_loaded(id, &thread).await?;
+            self.rejoin_loaded(id, &thread, false).await?;
         }
         Ok(())
     }
@@ -205,14 +205,19 @@ impl CodexDriver {
             .await
             .insert(&self.client, thread, turn, item)
     }
-    pub(crate) async fn observe_async_answers(&self, thread: &str, item: &Value) -> Vec<String> {
+    pub(crate) async fn observe_async_answers(
+        &self,
+        thread: &str,
+        turn: &str,
+        item: &Value,
+    ) -> Vec<String> {
         if item["type"] != "userMessage" {
             return vec![];
         }
         self.async_questions
             .lock()
             .await
-            .observe_reply(thread, &item["content"])
+            .observe_reply(thread, turn, &item["content"])
     }
     pub(crate) async fn clear_async_questions(&self, thread: &str) {
         self.async_questions.lock().await.clear(thread);
@@ -495,16 +500,26 @@ impl CodexDriver {
 
     /// Opening a requested timeline may rejoin a runtime already loaded in
     /// the shared daemon. Metadata/history-only external threads stay untouched.
-    async fn rejoin_loaded(&self, id: &str, metadata: &Value) -> Result<(), AgentError> {
+    async fn rejoin_loaded(
+        &self,
+        id: &str,
+        metadata: &Value,
+        recover_questions: bool,
+    ) -> Result<(), AgentError> {
         if !self.client.is_shared()
-            || self.client.is_subscribed(id)
             || !matches!(metadata["status"]["type"].as_str(), Some("idle" | "active"))
         {
             return Ok(());
         }
         let _guard = self.mutations.lock().await;
         if self.client.is_subscribed(id) {
-            return Ok(());
+            drop(_guard);
+            return if recover_questions {
+                self.recover_async_questions(id, metadata["historyMode"].as_str())
+                    .await
+            } else {
+                Ok(())
+            };
         }
         // Recheck after waiting for another mutation; never turn a known
         // notLoaded external CLI thread into a resume/takeover attempt.
@@ -541,7 +556,116 @@ impl CodexDriver {
         for turn in turns {
             self.client.observe_active_turn(id, turn);
         }
-        Ok(())
+        // Recovery reads must not hold the mutation lock: a user's interrupt or
+        // reply can proceed, and turn/subscription fences discard a stale read.
+        drop(_guard);
+        if recover_questions {
+            self.recover_async_questions(id, metadata["historyMode"].as_str())
+                .await
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Never infer callbacks from persisted/unowned history. This is a bounded
+    /// canonical read of one currently owned shared turn, including its committed
+    /// answers. Publish only after reaching verified end, in event-pump order.
+    async fn recover_async_questions(
+        &self,
+        id: &str,
+        history_mode: Option<&str>,
+    ) -> Result<(), AgentError> {
+        let Some(turn) = self.client.active_turn(id) else {
+            return Ok(());
+        };
+        if !self.client.is_shared()
+            || !self.client.is_subscribed(id)
+            || !self.loaded.lock().await.contains(id)
+        {
+            return Ok(());
+        }
+        let Some(ownership) = self.client.subscription_revision(id) else {
+            return Ok(());
+        };
+        let mut budget = Budget::new();
+        let mut cursor = None;
+        let mut seen = HashSet::new();
+        let mut items = vec![];
+        let mut retained_bytes = 0usize;
+        for _ in 0..16 {
+            if self.client.subscription_revision(id) != Some(ownership)
+                || self.client.active_turn(id).as_deref() != Some(&turn)
+            {
+                return Ok(());
+            }
+            let (page, max_rows) = match history_mode {
+                Some("paginated") => (budget.call(&self.client, "thread/items/list", json!({
+                    "threadId":id,"turnId":turn,"limit":100,"sortDirection":"asc","cursor":cursor
+                })).await?, 100),
+                Some("legacy") => {
+                    // Legacy storage rejects thread/items/list. The official
+                    // one-turn page merges its active in-memory canonical items.
+                    let page = budget.call(&self.client, "thread/turns/list", json!({
+                        "threadId":id,"limit":1,"sortDirection":"desc","itemsView":"full"
+                    })).await?;
+                    let turns = page["data"].as_array().filter(|rows| rows.len() <= 1)
+                        .ok_or_else(|| AgentError::Protocol("invalid Codex current-turn page".into()))?;
+                    let Some(current) = turns.first().filter(|row| row["id"] == turn && row["status"] == "inProgress") else {
+                        return Ok(());
+                    };
+                    if current["itemsView"] != "full" {
+                        return Err(AgentError::Protocol("incomplete Codex current-turn items".into()));
+                    }
+                    let items = current["items"].as_array().filter(|items| items.len() <= 1600)
+                        .ok_or_else(|| AgentError::Protocol("invalid Codex current-turn items".into()))?;
+                    (json!({"data":items.iter().map(|item| json!({"turnId":turn,"item":item})).collect::<Vec<_>>(),"nextCursor":null}), 1600)
+                },
+                _ => return unsupported("Codex question recovery storage mode"),
+            };
+            let rows = page["data"]
+                .as_array()
+                .filter(|rows| rows.len() <= max_rows)
+                .ok_or_else(|| {
+                    AgentError::Protocol("invalid Codex question recovery page".into())
+                })?;
+            for row in rows {
+                if row["turnId"] != turn || row["item"]["id"].as_str().is_none() {
+                    return Err(AgentError::Protocol(
+                        "Codex question recovery identity mismatch".into(),
+                    ));
+                }
+                let item = &row["item"];
+                if item["type"] == "userMessage"
+                    || (item["type"] == "agentMessage" && item["questions"].is_array())
+                {
+                    retained_bytes += serde_json::to_vec(item)
+                        .map_err(|_| {
+                            AgentError::Protocol("invalid Codex question recovery item".into())
+                        })?
+                        .len();
+                    if retained_bytes > 1024 * 1024 {
+                        return Err(AgentError::RequestFailed(
+                            "Codex question recovery budget exhausted".into(),
+                        ));
+                    }
+                    items.push(item.clone());
+                }
+            }
+            cursor = next_cursor(&page, &mut seen)?;
+            if cursor.is_none() {
+                if self.client.subscription_revision(id) == Some(ownership)
+                    && self.client.active_turn(id).as_deref() == Some(&turn)
+                    && self.loaded.lock().await.contains(id)
+                {
+                    self.client
+                        .recovered_questions(ownership, id, &turn, items)?;
+                }
+                return Ok(());
+            }
+        }
+        Err(AgentError::RequestFailed(
+            "Codex question recovery budget exhausted".into(),
+        ))
     }
 
     async fn selected_response(&self, response: Value) -> Result<AgentSessionInfo, AgentError> {
@@ -1127,11 +1251,12 @@ impl AgentPort for CodexDriver {
                 let turn = self.client.active_turn(thread).ok_or_else(|| {
                     AgentError::InvalidRequest("Codex asynchronous question turn ended".into())
                 })?;
-                let text = self
-                    .async_questions
-                    .lock()
-                    .await
-                    .claim(thread, &turn, id, &answers)?;
+                let text = {
+                    let mut questions = self.async_questions.lock().await;
+                    questions
+                        .retain_subscription(thread, self.client.subscription_revision(thread));
+                    questions.claim(thread, &turn, id, &answers)?
+                };
                 if let Err(error) = self.steer(thread, &turn, &text).await {
                     // An explicit RPC rejection did not accept this input.
                     // Transport/cancellation errors keep the claim fenced.
@@ -1205,12 +1330,9 @@ impl AgentPort for CodexDriver {
                 .filter_map(|r| self.form(&r.id, &r.method, &r.params))
                 .collect();
             if self.client.is_ready() {
-                forms.extend(
-                    self.async_questions
-                        .lock()
-                        .await
-                        .pending(id, self.client.active_turn(id).as_deref()),
-                );
+                let mut questions = self.async_questions.lock().await;
+                questions.retain_subscription(id, self.client.subscription_revision(id));
+                forms.extend(questions.pending(id, self.client.active_turn(id).as_deref()));
             }
             Ok(forms)
         })
@@ -1245,7 +1367,7 @@ impl AgentPort for CodexDriver {
                 ));
             }
             let thread = &metadata["thread"];
-            self.rejoin_loaded(id, thread).await?;
+            self.rejoin_loaded(id, thread, true).await?;
             let prepared = super::rollout::Rollouts::prepare(self, thread).await;
             let mut items = vec![];
             match thread["historyMode"].as_str() {
