@@ -87,6 +87,22 @@ pub fn item(thread: &str, turn: &str, value: &Value, at_ms: u64) -> Vec<Timeline
     };
     let message = message_id(thread, turn, id);
     let mut role = TimelineRole::Assistant;
+    let attachments = (value["type"] == "userMessage")
+        .then(|| {
+            value["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|input| match input["type"].as_str()? {
+                    "image" => input["url"].as_str(),
+                    "localImage" => input["path"].as_str(),
+                    _ => None,
+                })
+                .filter(|source| !source.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .filter(|sources| !sources.is_empty());
     let parts = match value["type"].as_str().unwrap_or("") {
         "userMessage" => {
             role = TimelineRole::User;
@@ -207,7 +223,7 @@ pub fn item(thread: &str, turn: &str, value: &Value, at_ms: u64) -> Vec<Timeline
                 seq: 0,
                 updated_ms: at_ms,
                 ordinal,
-                attachments: None,
+                attachments: (ordinal == 0).then(|| attachments.clone()).flatten(),
                 image_assets: None,
             }
         })

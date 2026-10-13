@@ -2565,6 +2565,17 @@ pub(crate) async fn pane_parts(
     // own working directory is the fence every workspace read is under.
     let (agent, root) = pane_agent_and_root(&session, &pane_id).await;
 
+    // Bind images before sampling terminal text, so a reused pane cannot mix
+    // the old screen with a newly reported producer conversation.
+    let codex_binding = if agent
+        .as_deref()
+        .is_some_and(|name| name.to_ascii_lowercase().contains("codex"))
+    {
+        crate::terminal::codex_images::snapshot_binding(&session, &pane_id).await
+    } else {
+        None
+    };
+
     // `recent_unwrapped` is the only source worth normalizing: the dictionaries
     // key off line starts, and it is the one source where a long line is one
     // line rather than however many the pane happens to be wide.
@@ -2617,7 +2628,7 @@ pub(crate) async fn pane_parts(
         }
         None => None,
     };
-    let normalized = match &native {
+    let mut normalized = match &native {
         Some(read) => read.parts.clone(),
         // The chat view hides the frozen bottom areas a Claude pane leaves in
         // its real history; the raw output routes still serve them. See
@@ -2627,6 +2638,11 @@ pub(crate) async fn pane_parts(
             dictionary,
         ),
     };
+
+    if native.is_none() && codex_binding.is_some() {
+        crate::terminal::codex_images::attach(&session, &pane_id, codex_binding, &mut normalized)
+            .await;
+    }
 
     // Reading a workspace's own skills and commands is blocking filesystem
     // work, so it runs off the async runtime like every other scan here.

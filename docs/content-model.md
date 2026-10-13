@@ -102,7 +102,7 @@ client can correlate with the raw terminal view).
 | `todo` | `items: [{text, done}]` | checklist |
 | `table` | `rows: string[][]` | best-effort cells |
 | `status` | `text, spinner: bool` | transient agent state line |
-| `prompt` | `text` | the input line content |
+| `prompt` | `text, attachments?: string[]` | the input line content; optional verified image data URIs with `codex_transcript_images_v1` |
 | `asset-ref` | `asset_id` | inline reference to an Asset (image, file) |
 | `approval` | `approval_id, prompt, tool?, context: string[], options: [{index, label, decision}]` | v1.4: a request the agent is blocked on |
 

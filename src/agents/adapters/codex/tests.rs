@@ -15,6 +15,68 @@ pub(crate) fn golden() -> Value {
     serde_json::from_str(include_str!("fixtures/protocol.json")).unwrap()
 }
 
+#[test]
+fn user_images_survive_native_item_mapping_without_becoming_prompt_text() {
+    // Published v0.162.1 UserInput variants. The data URI is a synthetic
+    // one-pixel PNG; no real user transcript or local image is retained.
+    let image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6qlsAAAAASUVORK5CYII=";
+    let rows = mapper::item(
+        "thread",
+        "turn",
+        &json!({"id":"user","type":"userMessage","content":[
+            {"type":"text","text":"Inspect this icon","text_elements":[]},
+            {"type":"image","url":image},
+            {"type":"localImage","path":"/synthetic/clipboard.png"},
+            {"type":"image","url":"https://example.test/reference.png"},
+            {"type":"image","fileId":"unsupported-file-reference"},
+            {"type":"skill","name":"example","path":"/synthetic/SKILL.md"}
+        ]}),
+        10,
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].role, TimelineRole::User);
+    assert!(matches!(&rows[0].part, AgentPart::Text { text } if text == "Inspect this icon"));
+    assert_eq!(
+        rows[0].attachments.as_deref(),
+        Some(
+            [
+                image.to_owned(),
+                "/synthetic/clipboard.png".into(),
+                "https://example.test/reference.png".into(),
+            ]
+            .as_slice()
+        )
+    );
+}
+
+#[test]
+fn image_only_native_user_items_keep_their_attachments() {
+    let rows = mapper::item(
+        "thread",
+        "turn",
+        &json!({
+            "id":"user", "type":"userMessage", "content":[
+                {"type":"image","url":"data:image/png;base64,synthetic"}
+            ]
+        }),
+        10,
+    );
+    assert_eq!(rows.len(), 1);
+    assert!(matches!(&rows[0].part, AgentPart::Text { text } if text.is_empty()));
+    assert_eq!(rows[0].attachments.as_ref().unwrap().len(), 1);
+    let rows = mapper::item(
+        "thread",
+        "turn",
+        &json!({
+            "id":"user", "type":"userMessage", "content":[
+                {"type":"text","text":"No image","text_elements":[]}
+            ]
+        }),
+        10,
+    );
+    assert!(rows[0].attachments.is_none());
+}
+
 pub(crate) struct Fixture {
     pub client: Arc<CodexClient>,
     pub events: Option<mpsc::Receiver<CodexEvent>>,

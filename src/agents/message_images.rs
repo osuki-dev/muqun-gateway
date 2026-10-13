@@ -272,6 +272,23 @@ pub(crate) async fn attach_to_items(
     directory: Option<&str>,
     items: &mut [TimelineItem],
 ) {
+    if items.iter().any(|item| item.attachments.is_some())
+        && state
+            .agent_runtime
+            .manager_for_session(asid)
+            .await
+            .is_some_and(|manager| manager.agent().kind() == "codex")
+    {
+        let mut owned = items.to_vec();
+        if let Ok(exported) = tokio::task::spawn_blocking(move || {
+            super::attachment_images::export_native(&mut owned);
+            owned
+        })
+        .await
+        {
+            items.clone_from_slice(&exported);
+        }
+    }
     if !items.iter().any(may_embed_image) {
         return;
     }

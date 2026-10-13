@@ -3,6 +3,7 @@
 pub mod adapters;
 pub mod agent_events;
 pub mod approvals;
+pub(crate) mod attachment_images;
 pub mod directories;
 pub mod domain;
 pub mod manager;

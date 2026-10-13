@@ -176,6 +176,32 @@ RPC or promise of durable pre-turn upstream state. Known project directories are
 derived from exhaustive budgeted session enumeration, not project CRUD. Attachments use the
 existing validated host-path attachment flow, not native image upload.
 
+Incoming native `userMessage` image URLs (including data URIs) and `localImage`
+paths are preserved in the neutral row's `attachments`; image-only messages keep
+their row. On authenticated transcript egress, typed local image references are
+converted to bounded, content-sniffed data URIs. These references are user image
+input variants, never paths extracted from ordinary text. No arbitrary-file read
+API is added. `image.fileId` references have no download contract in this adapter.
+
+`codex_transcript_images_v1` also declares optional terminal prompt `attachments`.
+Gateway uses the backend's explicit Codex conversation ID and process incarnation,
+validates the exact rollout's `session_meta.id`, then reads at most the last 16 MiB
+and 64 user events. It never finds conversations by working directory or newest
+file. Only unique complete prompt-text matches with matching numbered image count
+and increasing producer order are enriched. Ambiguous repeats, truncated prompts,
+unsubmitted composer text and unavailable images retain their original text.
+The process/conversation binding is rechecked before returning image bytes.
+
+The rollout reader understands typed `UserMessage` events, older `user_message`
+events, and encoded user `response_item` images paired with their typed event by
+exact text and image count. Local image files must be regular, opened without
+following a final symlink, and recognized by magic bytes. Limits are 2 MiB per
+image and 8 MiB of encoded images per response; oversized or invalid files are
+omitted. Images ride the existing authenticated/encrypted transcript response,
+with no cached filesystem access grant or separately reusable asset URL. Rollout
+search uses the Gateway's `CODEX_HOME` or default Codex home; an externally
+configured different home or missing backend identity leaves terminal text intact.
+
 ## Interactions and recovery
 
 Command/file approval callbacks map only exact one-action Allow/Deny decisions.
