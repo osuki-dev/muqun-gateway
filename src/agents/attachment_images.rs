@@ -8,8 +8,27 @@ use base64::Engine as _;
 
 pub(crate) const MAX_IMAGE_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) const MAX_RESPONSE_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+// Covers every sniffed image data-URI header and one bounded read lookahead.
+// Charge attempts too: invalid inputs must not bypass the shared work limit.
+const IMAGE_ATTEMPT_BYTES: usize = 32;
+
+fn reserve(budget: &mut usize, bytes: usize) -> Option<()> {
+    match budget.checked_sub(bytes) {
+        Some(remaining) => {
+            *budget = remaining;
+            Some(())
+        }
+        None => {
+            *budget = 0;
+            None
+        }
+    }
+}
 
 pub(crate) fn image_uri(source: &str, budget: &mut usize) -> Option<String> {
+    // This allowance bounds both exported bytes and cumulative read/decode/
+    // encode work. Reserve before allocation or I/O, and never refund failures.
+    reserve(budget, IMAGE_ATTEMPT_BYTES)?;
     let bytes = if source.starts_with("data:") {
         let (header, encoded) = source.split_once(',')?;
         if !header.starts_with("data:image/")
@@ -18,6 +37,7 @@ pub(crate) fn image_uri(source: &str, budget: &mut usize) -> Option<String> {
         {
             return None;
         }
+        reserve(budget, encoded.len())?;
         base64::engine::general_purpose::STANDARD
             .decode(encoded)
             .ok()?
@@ -40,10 +60,17 @@ pub(crate) fn image_uri(source: &str, budget: &mut usize) -> Option<String> {
         if !metadata.is_file() || metadata.len() > MAX_IMAGE_BYTES as u64 {
             return None;
         }
+        let length = metadata.len() as usize;
+        reserve(budget, length.div_ceil(3) * 4)?;
         let mut bytes = Vec::new();
-        file.take((MAX_IMAGE_BYTES + 1) as u64)
+        file.take((length + 1) as u64)
             .read_to_end(&mut bytes)
             .ok()?;
+        // A file growing after metadata inspection cannot increase its reserved
+        // read or encode allowance. Omit it instead of sampling a partial image.
+        if bytes.len() > length {
+            return None;
+        }
         bytes
     };
     if bytes.is_empty() || bytes.len() > MAX_IMAGE_BYTES {
@@ -54,8 +81,6 @@ pub(crate) fn image_uri(source: &str, budget: &mut usize) -> Option<String> {
         return None;
     }
     let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    let size = encoded.len() + kind.mime.len() + 13;
-    *budget = budget.checked_sub(size)?;
     Some(format!("data:{};base64,{encoded}", kind.mime))
 }
 
@@ -100,6 +125,54 @@ mod tests {
         let too_large = format!("data:image/png;base64,{}", "A".repeat(MAX_IMAGE_BYTES * 2));
         let mut budget = usize::MAX;
         assert!(image_uri(&too_large, &mut budget).is_none());
+    }
+
+    #[test]
+    fn invalid_decode_and_sniff_attempts_exhaust_the_shared_work_allowance() {
+        for source in [
+            "data:image/png;base64,!!!!!!!!",
+            "data:image/png;base64,c2VjcmV0",
+        ] {
+            let mut budget = 256;
+            for _ in 0..16 {
+                assert!(image_uri(source, &mut budget).is_none());
+            }
+            assert_eq!(budget, 0);
+            // Failed attempts cannot leave the full output budget available
+            // for an arbitrarily long sequence of expensive rejected images.
+            assert!(image_uri(IMAGE, &mut budget).is_none());
+        }
+    }
+
+    #[test]
+    fn local_files_share_the_budget_even_when_content_is_invalid() {
+        let root = std::env::temp_dir().join(format!("gateway-budget-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("image.png");
+        let mut bytes = vec![0; MAX_IMAGE_BYTES];
+        for valid in [false, true] {
+            if valid {
+                bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+            }
+            std::fs::write(&path, &bytes).unwrap();
+            let mut budget = MAX_RESPONSE_IMAGE_BYTES;
+            let mut exported = 0;
+            for attempt in 0..100 {
+                if let Some(uri) = image_uri(path.to_str().unwrap(), &mut budget) {
+                    assert!(valid);
+                    exported += uri.len();
+                }
+                // Even rejected regular files exhaust the allowance by the
+                // third attempt, and all remaining attempts stay empty.
+                if attempt >= 2 {
+                    assert_eq!(budget, 0);
+                }
+            }
+            assert_eq!(exported > 0, valid);
+            assert!(exported <= MAX_RESPONSE_IMAGE_BYTES);
+            assert!(image_uri(IMAGE, &mut budget).is_none());
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
