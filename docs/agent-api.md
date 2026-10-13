@@ -140,6 +140,13 @@ preference order; the contract names no "active" agent. Inside an agent, a
 persona such as OpenCode's `build` or `plan` is a **mode**; T3 Code and Codex have none,
 so their `modes[]` are empty.
 
+Discovery's App picker order is separate from implicit routing: an enabled
+Codex with status `connected` or `reachable` is listed first, followed by
+OpenCode. Other providers retain their relative order. Codex in any unavailable
+state is not promoted. This presentation preference must not override the
+App's explicit saved provider selection. Without a selection, clients should
+choose the first usable entry rather than an unavailable row.
+
 ### Feature gate
 
 `/health` and `/api/capabilities` list **`multi_agent`** in their flat
