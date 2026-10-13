@@ -619,11 +619,17 @@ pub(crate) mod tests {
             "ORPHAN_TOOL",
             if orphan_before_observation { "1" } else { "0" },
         );
+        // A delayed exit makes sending SIGTERM observably different from
+        // awaiting cleanup, even when the test runs alone on an idle machine.
+        command.env(
+            "ORPHAN_TOOL_SCRIPT",
+            "trap 'sleep 0.1; exit' TERM; i=0; while [ \"$i\" -lt 6000 ]; do sleep 0.01; i=$((i+1)); done",
+        );
         command.args(["-c", r#"
             if [ "$ORPHAN_TOOL" = 1 ]; then
                 # Command substitution waits for the helper to exit, not its
                 # fully redirected child. The server retains the tool handle.
-                tool=$(sh -c 'setsid /bin/sleep 60 </dev/null >/dev/null 2>&1 & echo $!')
+                tool=$(sh -c 'setsid /bin/sh -c "$ORPHAN_TOOL_SCRIPT" </dev/null >/dev/null 2>&1 & echo $!')
             else
                 setsid /bin/sleep 60 </dev/null >/dev/null 2>&1 & tool=$!
             fi
@@ -640,8 +646,29 @@ pub(crate) mod tests {
             # very tool cleanup that Gateway is giving upstream time to run.
             i=0; while [ "$i" -lt 20000 ]; do printf '%s\n' 'synthetic shutdown diagnostic' >&2; i=$((i+1)); done
             sleep 5
-            kill "$tool"
-            wait "$tool" 2>/dev/null || :
+            if [ "$ORPHAN_TOOL" = 1 ]; then
+                # /proc fields belong to this known fixture shell; its comm
+                # contains no spaces. Keep its birth time across PID reuse.
+                IFS=' ' read -r tool_pid tool_comm tool_state tool_fields < "/proc/$tool/stat"
+                set -f
+                set -- $tool_fields
+                tool_birth=${19}
+                kill "$tool"
+                # wait returns 127 for a reparented non-child, before it has
+                # necessarily processed SIGTERM. Await that incarnation's exit.
+                # Builtins avoid introducing short-lived tracked descendants.
+                polls=0
+                while IFS=' ' read -r tool_pid tool_comm tool_state tool_fields 2>/dev/null < "/proc/$tool/stat"; do
+                    set -- $tool_fields
+                    [ "${19}" = "$tool_birth" ] || break
+                    case "$tool_state" in Z|X) break ;; esac
+                    polls=$((polls+1))
+                    [ "$polls" -lt 100000 ] || exit 1
+                done
+            else
+                kill "$tool"
+                wait "$tool" 2>/dev/null || :
+            fi
         "#]);
         // The test factory can delay tracker construction until the helper is
         // gone. initialize writes are impossible before this gate completes.
