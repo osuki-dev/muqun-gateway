@@ -96,6 +96,22 @@ impl CodexDriver {
         Ok(())
     }
 
+    /// Local metadata only. Native event processing must not await Herdr I/O.
+    pub(crate) async fn cached_runtime(&self, id: &str) -> Option<SessionRuntime> {
+        if self.client.is_shared() && self.client.is_subscribed(id) {
+            return Some(SessionRuntime {
+                source: RuntimeSource::Native,
+                interaction: RuntimeInteraction::Native,
+                status: None,
+                terminal: None,
+                reason: None,
+            });
+        }
+        let observer = self.terminal_runtime.as_ref()?;
+        let native = self.loaded.lock().await.contains(id) && !self.client.is_shared();
+        Some(observer.cached(id, native))
+    }
+
     async fn require_native_interaction(&self, id: &str) -> Result<(), AgentError> {
         if let Some(runtime) = self.runtime(id, true).await {
             if runtime.interaction != RuntimeInteraction::Native {

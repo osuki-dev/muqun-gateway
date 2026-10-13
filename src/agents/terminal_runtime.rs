@@ -24,7 +24,8 @@ struct Observations {
 pub(crate) struct TerminalRuntime {
     backends: Vec<(String, Arc<dyn TerminalBackend>)>,
     overflow: bool,
-    cache: Mutex<Option<(Instant, Observations)>>,
+    cache: std::sync::Mutex<Option<(Instant, Arc<Observations>)>>,
+    refresh: Mutex<()>,
 }
 
 impl TerminalRuntime {
@@ -44,18 +45,18 @@ impl TerminalRuntime {
                 .take(MAX_BACKENDS)
                 .map(|s| (s.id.clone(), Arc::from(crate::terminal_backend(s))))
                 .collect(),
-            cache: Mutex::new(None),
+            cache: std::sync::Mutex::new(None),
+            refresh: Mutex::new(()),
         })
     }
 
-    async fn observations(&self, fresh: bool) -> Observations {
-        // Coalesce concurrent view reads. Mutations bypass a cached observation.
-        let mut cache = self.cache.lock().await;
+    async fn observations(&self, fresh: bool) -> Arc<Observations> {
+        // Serialize backend reads separately; cached event processing never
+        // waits for this lock or a backend response.
+        let _refresh = self.refresh.lock().await;
         if !fresh {
-            if let Some((_, observation)) =
-                cache.as_ref().filter(|(at, _)| at.elapsed() < CACHE_TTL)
-            {
-                return observation.clone();
+            if let Some(observation) = self.cached_observations(CACHE_TTL) {
+                return observation;
             }
         }
         let results = join_all(self.backends.iter().map(|(id, backend)| async move {
@@ -79,12 +80,39 @@ impl TerminalRuntime {
                 _ => observations.incomplete = true,
             }
         }
-        *cache = Some((Instant::now(), observations.clone()));
+        let observations = Arc::new(observations);
+        *self
+            .cache
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) =
+            Some((Instant::now(), observations.clone()));
         observations
     }
 
+    fn cached_observations(&self, age: Duration) -> Option<Arc<Observations>> {
+        self.cache
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+            .filter(|(at, _)| at.elapsed() < age)
+            .map(|(_, value)| value.clone())
+    }
+
+    /// Event-pump path: never performs or waits for terminal backend I/O.
+    pub(crate) fn cached(&self, id: &str, native: bool) -> SessionRuntime {
+        let observations = self
+            .cached_observations(Duration::from_secs(4))
+            .unwrap_or_else(|| {
+                Arc::new(Observations {
+                    agents: Vec::new(),
+                    incomplete: true,
+                })
+            });
+        resolve(&observations, id, native)
+    }
+
     pub(crate) async fn observe(&self, id: &str, native: bool, fresh: bool) -> SessionRuntime {
-        resolve(&self.observations(fresh).await, id, native)
+        resolve(self.observations(fresh).await.as_ref(), id, native)
     }
 }
 
@@ -184,6 +212,38 @@ mod tests {
             pending_user_input: None,
         }
     }
+    #[tokio::test]
+    async fn cached_runtime_cannot_wait_for_an_inflight_backend_read() {
+        use crate::agents::adapters::codex::{
+            tests::{golden, Fixture},
+            CodexDriver,
+        };
+        use crate::agents::ports::agent::AgentPort;
+        let herdr = crate::test_support::FakeHerdr::start(vec![], None);
+        let observer = TerminalRuntime::new(&[herdr.session()]);
+        let _inflight_read = observer.refresh.lock().await;
+        let mut fixture = Fixture::new(|_| serde_json::json!({"thread":golden()["thread"]})).await;
+        fixture.ready().await;
+        let mut driver = CodexDriver::new(fixture.client.clone());
+        driver.observe_terminals(Some(observer.clone()));
+        let info = driver.create_session(None, None, None).await.unwrap();
+        tokio::time::timeout(Duration::from_millis(100), async {
+            for _ in 0..64 {
+                assert_eq!(
+                    driver.cached_runtime(&info.asid.0).await.unwrap().source,
+                    RuntimeSource::Native
+                );
+                assert_eq!(
+                    driver.cached_runtime(ID).await.unwrap().interaction,
+                    RuntimeInteraction::Unavailable
+                );
+            }
+        })
+        .await
+        .expect("cached event processing waited for backend I/O");
+        assert!(herdr.calls.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn exact_provider_identity_carries_status_and_binding_not_approval() {
         let mut observations = Observations {

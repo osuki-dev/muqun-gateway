@@ -207,7 +207,8 @@ pub enum TerminalRuntimeStatus {
 pub struct RuntimeTerminal {
     pub session_id: String,
     pub pane_id: String,
-    /// Opaque process/conversation incarnation; compare only, never decode.
+    /// Opaque observed terminal/conversation binding; compare only, never decode.
+    /// It is not necessarily proof of a distinct process launch.
     pub instance_id: String,
 }
 

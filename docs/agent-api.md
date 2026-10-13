@@ -443,10 +443,14 @@ Currently Codex supplies it; absence preserves the existing provider contract.
 `terminal`, or `unavailable`; it is independent of status. A native source is
 owned by this Gateway's private Codex runtime. A terminal source is a unique
 current local Herdr observation matching the Codex conversation identity and
-provider exactly, with a complete opaque incarnation binding. No conversation
+provider exactly, with a complete opaque observed binding. No conversation
 identity is decoded by the App. It revalidates all three terminal binding fields
 against the existing authenticated session agent listing before navigating.
-Navigation does not send, focus, answer, or approve anything.
+Navigation does not send, focus, answer, or approve anything. A binding may
+remain stable when the same terminal resumes the same conversation; it does not
+claim a new process incarnation. This is sufficient for conversation-scoped
+reads and navigation, while actual process-targeting assignments require their
+existing stronger launch evidence.
 
 Terminal `status` is the observed `idle`, `working`, `blocked`, `starting`,
 `completed`, or `unknown`. Working/starting map to ordinary session `busy`, idle

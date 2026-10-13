@@ -78,7 +78,7 @@ impl Context {
     }
 
     async fn update_info(&self, mut info: AgentSessionInfo) {
-        if let Some(runtime) = self.driver.runtime(&info.asid.0, false).await {
+        if let Some(runtime) = self.driver.cached_runtime(&info.asid.0).await {
             runtime.apply(&mut info);
         }
         let asid = info.asid.clone();
@@ -281,7 +281,7 @@ impl Context {
         // revision. Publish ownership before its first native timeline event,
         // even when that older metadata snapshot was correctly discarded.
         if let Some(expected) = self.mirror.non_native_runtime_seq(&asid).await {
-            if let Some(runtime) = self.driver.runtime(thread, false).await {
+            if let Some(runtime) = self.driver.cached_runtime(thread).await {
                 if let Some((seq, info)) =
                     self.mirror.update_runtime(&asid, expected, runtime).await
                 {
