@@ -230,6 +230,39 @@ pub struct MemoryMirror {
 }
 
 impl MemoryMirror {
+    /// Return the exact bounded, revision-stamped event retained for replay.
+    /// Live publishers must not resend the caller's unstamped input rows.
+    pub(crate) async fn record_timeline_upsert(
+        &self,
+        asid: &AgentSessionId,
+        items: Vec<TimelineItem>,
+    ) -> AgentDomainEvent {
+        let mut sessions = self.sessions.write().await;
+        let state = Self::entry(
+            &self.agent_id,
+            &mut sessions,
+            asid,
+            AgentSessionStatus::Idle,
+        );
+        let seq = state.next_seq();
+        let mut updated_items = Vec::new();
+        for mut item in items {
+            item.seq = seq;
+            if let AgentPart::Tool(ref mut call) = item.part {
+                truncate_tool_output(call);
+            }
+            state.insert_item(item.clone());
+            updated_items.push(item);
+        }
+        let event = AgentDomainEvent::TimelineUpsert {
+            asid: asid.clone(),
+            items: updated_items,
+            seq,
+        };
+        state.push_event(event.clone());
+        event
+    }
+
     /// Preserve resolution semantics in the replay ring as well as live SSE.
     pub(crate) async fn resolve_form_with_reason(
         &self,
@@ -1380,34 +1413,7 @@ impl SessionMirrorPort for MemoryMirror {
         asid: &'a AgentSessionId,
         items: Vec<TimelineItem>,
     ) -> MirrorFuture<'a, u64> {
-        Box::pin(async move {
-            let mut sessions = self.sessions.write().await;
-            let state = Self::entry(
-                &self.agent_id,
-                &mut sessions,
-                asid,
-                AgentSessionStatus::Idle,
-            );
-            let seq = state.next_seq();
-            let mut updated_items = Vec::new();
-
-            for mut item in items {
-                item.seq = seq;
-                if let AgentPart::Tool(ref mut call) = item.part {
-                    truncate_tool_output(call);
-                }
-                state.insert_item(item.clone());
-                updated_items.push(item);
-            }
-
-            let event = AgentDomainEvent::TimelineUpsert {
-                asid: asid.clone(),
-                items: updated_items,
-                seq,
-            };
-            state.push_event(event);
-            seq
-        })
+        Box::pin(async move { self.record_timeline_upsert(asid, items).await.seq() })
     }
 
     fn add_permission<'a>(&'a self, request: PermissionRequest) -> MirrorFuture<'a, u64> {
@@ -2105,7 +2111,23 @@ mod tests {
             .await
             .expect("created");
 
-        let AgentPart::Tool(call) = item.part else {
+        let mut incoming = item.clone();
+        if let AgentPart::Tool(call) = &mut incoming.part {
+            call.output = Some(serde_json::json!(huge));
+            call.truncated = false;
+        }
+        let AgentDomainEvent::TimelineUpsert { items, seq, .. } =
+            mirror.record_timeline_upsert(&asid, vec![incoming]).await
+        else {
+            panic!("expected timeline event")
+        };
+        assert_eq!(items[0].seq, seq);
+        let snapshot = mirror.get_snapshot(&asid).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&items[0]).unwrap(),
+            serde_json::to_value(&snapshot.timeline[0]).unwrap()
+        );
+        let AgentPart::Tool(call) = &items[0].part else {
             panic!("expected a tool part");
         };
         assert!(call.truncated, "an oversized result is flagged");

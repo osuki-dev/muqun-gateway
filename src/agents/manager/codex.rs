@@ -222,12 +222,7 @@ impl Context {
                 }
             }
         }
-        let seq = self.mirror.upsert_timeline_items(asid, items.clone()).await;
-        self.emit(AgentDomainEvent::TimelineUpsert {
-            asid: asid.clone(),
-            items,
-            seq,
-        });
+        self.emit(self.mirror.record_timeline_upsert(asid, items).await);
     }
 
     async fn set_status(&self, thread: &str, status: AgentSessionStatus) {
@@ -2403,6 +2398,67 @@ mod tests {
             0,
         );
         assert!(b.timeline.iter().any(|r| r.id == expected[0].id));
+        manager.shutdown();
+    }
+
+    #[tokio::test]
+    async fn codex_streamed_tool_completion_keeps_canonical_live_revisions() {
+        let mut fixture = Fixture::new(|_| panic!("live events need no RPC")).await;
+        fixture.ready().await;
+        let (tx, mut events) = broadcast::channel(32);
+        let manager =
+            AgentManager::connect_codex(fixture.client.clone(), fixture.events.take().unwrap(), tx);
+        let mut thread = golden()["thread"].clone();
+        thread["id"] = json!("synthetic-tool-live");
+        fixture
+            .send(json!({"method":"thread/started","params":{"thread":thread}}))
+            .await;
+        fixture.send(json!({"method":"turn/started","params":{"threadId":"synthetic-tool-live","turn":{"id":"turn","status":"inProgress"}}})).await;
+        fixture.send(json!({"method":"item/started","params":{"threadId":"synthetic-tool-live","turnId":"turn","item":{"type":"commandExecution","id":"shell","status":"inProgress","command":"printf START; sleep 20; printf END","cwd":"/fixture"}}})).await;
+        for delta in ["START\n", "END\n"] {
+            fixture.send(json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"synthetic-tool-live","turnId":"turn","itemId":"shell","delta":delta}})).await;
+        }
+        fixture.send(json!({"method":"item/completed","params":{"threadId":"synthetic-tool-live","turnId":"turn","item":{"type":"commandExecution","id":"shell","status":"completed","command":"printf START; sleep 20; printf END","cwd":"/fixture","aggregatedOutput":"START\nEND\n","exitCode":0}}})).await;
+        let revisions = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut revisions = Vec::new();
+            while revisions.len() < 4 {
+                if let AgentDomainEvent::TimelineUpsert { items, seq, .. } =
+                    events.recv().await.unwrap()
+                {
+                    revisions.push((seq, items[0].clone()));
+                }
+            }
+            revisions
+        })
+        .await
+        .unwrap();
+        // Apps reject stale row revisions after live streaming or snapshot catch-up.
+        let displayed = revisions
+            .iter()
+            .fold(None::<&TimelineItem>, |before, (_, item)| {
+                if before.is_some_and(|before| before.seq > item.seq) {
+                    before
+                } else {
+                    Some(item)
+                }
+            })
+            .unwrap();
+        assert!(matches!(&displayed.part, AgentPart::Tool(call)
+            if call.state == ToolCallStatus::Completed
+            && call.output == Some(json!("START\nEND\n"))
+            && call.metadata.as_ref().unwrap()["exit"] == 0));
+        for (seq, item) in &revisions {
+            assert_eq!(item.seq, *seq);
+        }
+        let snapshot = manager
+            .mirror
+            .get_snapshot(&AgentSessionId("synthetic-tool-live".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(displayed).unwrap(),
+            serde_json::to_value(&snapshot.timeline[0]).unwrap()
+        );
         manager.shutdown();
     }
 
