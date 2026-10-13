@@ -3862,6 +3862,7 @@ mod tests {
         let pending = |asid: &str, id: &str| AgentDomainEvent::FormPending {
             asid: AgentSessionId(asid.into()),
             request: FormRequest {
+                nonblocking: false,
                 id: id.into(),
                 asid: AgentSessionId(asid.into()),
                 title: "Which branch?".into(),
@@ -3895,6 +3896,7 @@ mod tests {
         use crate::agents::{AgentSessionId, FormRequest};
         let state = test_state("admin", Vec::new());
         let request = FormRequest {
+            nonblocking: false,
             id: "form_1".into(),
             asid: AgentSessionId("ses_1".into()),
             title: "Which branch?".into(),

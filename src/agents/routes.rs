@@ -192,6 +192,7 @@ pub struct AgentVcsDiffQuery {
 
 #[derive(Debug, Deserialize)]
 pub struct AgentFilesQuery {
+    pub agent_id: Option<String>,
     pub query: Option<String>,
     pub limit: Option<usize>,
     pub directory: Option<String>,
@@ -906,8 +907,14 @@ async fn do_switch_mode(
     Ok(Json(content_envelope(json!({ "ok": true }))))
 }
 
+enum FileSearchScope<'a> {
+    Session(&'a str),
+    Agent(Option<&'a str>),
+}
+
 async fn do_find_agent_files(
     state: &AppState,
+    scope: FileSearchScope<'_>,
     query: &str,
     limit: usize,
     directory: Option<&str>,
@@ -915,15 +922,40 @@ async fn do_find_agent_files(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let Some(manager) = state.agent_runtime.manager().await else {
-        return Err(api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "agent_unavailable",
-            "No agent is available",
-        ));
+    let (manager, directory) = match scope {
+        FileSearchScope::Session(asid) => {
+            let manager = session_manager_or_err(state, asid).await?;
+            let info = manager
+                .agent()
+                .get_session(asid)
+                .await
+                .map_err(agent_error)?;
+            let directory = info
+                .directory
+                .filter(|path| std::path::Path::new(path).is_absolute())
+                .ok_or_else(|| {
+                    api_error(
+                        StatusCode::BAD_REQUEST,
+                        "workspace_unknown",
+                        "The selected session has no workspace directory",
+                    )
+                })?;
+            (manager, Some(directory))
+        }
+        FileSearchScope::Agent(agent_id) => {
+            let manager = match agent_id {
+                Some(id) => agent_manager_or_err(state, id).await?,
+                None => state.agent_runtime.manager().await.ok_or_else(|| {
+                    api_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "agent_unavailable",
+                        "No agent is available",
+                    )
+                })?,
+            };
+            (manager, expand_directory_param(directory))
+        }
     };
-
-    let directory = expand_directory_param(directory);
     let directory = directory.as_deref();
     require_directory(directory)?;
 
@@ -931,7 +963,7 @@ async fn do_find_agent_files(
         .agent()
         .find_files(query, limit, directory)
         .await
-        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "fs_error", &e.to_string()))?;
+        .map_err(agent_error)?;
 
     let hits: Vec<Value> = files
         .iter()
@@ -1699,6 +1731,7 @@ async fn find_agent_files_root_global(
 ) -> ApiResult<Json<Value>> {
     do_find_agent_files(
         &state,
+        FileSearchScope::Agent(query.agent_id.as_deref()),
         query.query.as_deref().unwrap_or(""),
         query.limit.unwrap_or(20),
         query.directory.as_deref(),
@@ -1709,12 +1742,13 @@ async fn find_agent_files_root_global(
 
 async fn find_agent_files_global(
     State(state): State<AppState>,
-    Path(_asid): Path<String>,
+    Path(asid): Path<String>,
     Query(query): Query<AgentFilesQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     do_find_agent_files(
         &state,
+        FileSearchScope::Session(&asid),
         query.query.as_deref().unwrap_or(""),
         query.limit.unwrap_or(20),
         query.directory.as_deref(),
@@ -1857,6 +1891,7 @@ async fn find_agent_files_root_legacy(
 ) -> ApiResult<Json<Value>> {
     do_find_agent_files(
         &state,
+        FileSearchScope::Agent(query.agent_id.as_deref()),
         query.query.as_deref().unwrap_or(""),
         query.limit.unwrap_or(20),
         query.directory.as_deref(),
@@ -1867,12 +1902,13 @@ async fn find_agent_files_root_legacy(
 
 async fn find_agent_files_legacy(
     State(state): State<AppState>,
-    Path((_session_id, _asid)): Path<(String, String)>,
+    Path((_session_id, asid)): Path<(String, String)>,
     Query(query): Query<AgentFilesQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     do_find_agent_files(
         &state,
+        FileSearchScope::Session(&asid),
         query.query.as_deref().unwrap_or(""),
         query.limit.unwrap_or(20),
         query.directory.as_deref(),
@@ -4093,6 +4129,56 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn file_mentions_use_the_session_owner_and_directory_not_the_primary_provider() {
+        let primary = FakeAgent::new("opencode");
+        let primary_calls = primary.calls.clone();
+        let mut selected = FakeAgent::new("codex").with_sessions(&[("selected", 1)]);
+        let directory = crate::test_support::asset_test_dir("agent-file-scope");
+        selected.sessions[0].directory = Some(directory.as_path().to_string_lossy().into_owned());
+        let selected_calls = selected.calls.clone();
+        let state = state_with(vec![primary, selected]).await;
+        let _ = do_find_agent_files(
+            &state,
+            FileSearchScope::Session("selected"),
+            "name",
+            10,
+            Some("/wrong-project"),
+            &device_headers(),
+        )
+        .await
+        .unwrap();
+        assert!(!primary_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call.starts_with("find_files:")));
+        assert!(selected_calls
+            .lock()
+            .unwrap()
+            .contains(&format!("find_files:{}", directory.as_path().display())));
+        let _ = do_find_agent_files(
+            &state,
+            FileSearchScope::Agent(Some("codex")),
+            "name",
+            10,
+            Some(directory.as_path().to_str().unwrap()),
+            &device_headers(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            selected_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| call.starts_with("find_files:"))
+                .count(),
+            2
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     /// The directory-scoped routes expand `~` before the missing-folder check,
     /// so a `~/…` that is gone is the usual 404 naming the absolute path.
     #[tokio::test]
@@ -4100,6 +4186,7 @@ mod tests {
         let state = state_with(vec![FakeAgent::new("opencode")]).await;
         let refusal = do_find_agent_files(
             &state,
+            FileSearchScope::Agent(None),
             "x",
             10,
             Some("~/muqun-no-such-dir-for-tests"),
@@ -4119,9 +4206,16 @@ mod tests {
         );
 
         // And one that exists is let through.
-        let Json(_) = do_find_agent_files(&state, "x", 10, Some("~"), &device_headers())
-            .await
-            .expect("home is a workspace the agent can search");
+        let Json(_) = do_find_agent_files(
+            &state,
+            FileSearchScope::Agent(None),
+            "x",
+            10,
+            Some("~"),
+            &device_headers(),
+        )
+        .await
+        .expect("home is a workspace the agent can search");
     }
 
     #[tokio::test]

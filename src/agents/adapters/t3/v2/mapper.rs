@@ -190,6 +190,7 @@ pub fn form(thread_id: &str, item: &Value) -> Option<FormRequest> {
         return None;
     }
     Some(FormRequest {
+        nonblocking: false,
         id: string(item, "requestId")?.to_string(),
         asid: thread_id.into(),
         title: string(item, "title")

@@ -932,6 +932,7 @@ pub fn map_question_request(
         .unwrap_or("Question")
         .to_string();
     Some(FormRequest {
+        nonblocking: false,
         id: event_id.to_string(),
         asid: AgentSessionId(agent_id.to_string()),
         title,

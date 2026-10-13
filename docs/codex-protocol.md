@@ -135,7 +135,8 @@ an embedded app-server and therefore remain outside the shared daemon.
 | Metadata | `thread/read`, `includeTurns: false` |
 | Ordered session page | `thread/list` |
 | First prompt in a selected saved thread | read, then explicit `thread/resume`, then `turn/start` |
-| Prompt/follow-up | `turn/start` with the exact selected thread ID |
+| Idle prompt/follow-up | `turn/start` with the exact selected thread ID |
+| Explicit active-turn steering | `turn/steer` with the exact `expectedTurnId` |
 | Whole-thread fork | `thread/fork`, `excludeTurns: true` |
 | Rename | `thread/name/set` |
 | Delete | `thread/delete` |
@@ -258,7 +259,8 @@ are Unsupported, not disguised as ordinary forms.
 
 An interrupt acknowledgement is not completion: only observed upstream turn
 status makes the mirror Interrupted. Active-turn acknowledgements also prevent
-another prompt from accidentally steering work already in progress. A late
+an ordinary idle prompt from accidentally steering work already in progress;
+active steering must be explicitly requested. A late
 acknowledgement cannot resurrect a turn whose completion was already observed.
 
 On disconnect, pending calls fail, callbacks expire, busy sessions become
@@ -349,3 +351,49 @@ Counter semantics are also verified against the pinned upstream
 [`parses_cache_write_token_usage` fixture](https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/codex-api/src/sse/responses.rs),
 and context occupancy against `TokenUsage::tokens_in_context_window` in
 [`protocol.rs`](https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/protocol/src/protocol.rs).
+
+## Asynchronous questions and steering
+
+`agentMessage.questions` is a separate protocol from blocking
+`item/tool/requestUserInput`. The former has titles/options, no server RPC request
+ID, and does not stop the agent. Live native messages in an exactly identified,
+owned active turn create `FormRequest.nonblocking: true`; each question uses its
+own connection-scoped form handle. Historical and persisted messages retain the
+question text/options without creating reply callbacks.
+
+Replies follow the pinned official TUI's
+[`async_questions/state.rs`](https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/tui/src/bottom_pane/async_questions/state.rs)
+and [`AnsweredQuestion`](https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/context-fragments/src/answered_question.rs):
+`questionItemId` is the serialized `["request_user_input_async", itemId, index]`
+array, and the answer is normal text inside the
+`send_user_message_question_reply` envelope. Gateway sends stable `turn/steer`
+with the exact `expectedTurnId`. It never invents a JSON-RPC question callback,
+resumes an unrelated runtime, starts a replacement turn after a race, or retries
+ambiguous delivery. Ordinary active-turn follow-ups also support `delivery:
+"steer"`; queue delivery remains unsupported. Discovery reports `promptSteering`
+and `asyncQuestions`, independently of `inbox: false`.
+
+A question remains pending until the steering response or a committed matching
+user reply confirms acceptance. In-flight claims prevent duplicate writes.
+Another client's committed reply resolves only matching question identities in
+that thread. Completion, unload, and connection loss remove live actions; neither
+history replay nor an old connection handle can resurrect them. The bounded
+registry offers up to 32 question handles; unsupported oversized question shapes
+remain readable in the transcript and may be answered through ordinary steering.
+
+`hookPrompt` fragments are synthetic transcript content, preserving their text.
+`functionCallOutput` preserves its published string or content-array output.
+Image-generation tool output remains typed tool data; this alone does not claim
+an inline generated-image viewer. User audio inputs remain visible as audio
+attachment notices, but native audio upload/playback has no neutral adapter
+contract yet. Experimental realtime audio operations are not enabled.
+
+## File mentions
+
+Codex declares `fileMentions: false`: its adapter does not implement file search.
+The agent-session files endpoint selects the exact session owner and recorded
+absolute directory, ignoring caller directory overrides. Unknown session
+workspaces are rejected. It never queries another provider's default project.
+Root file searches can explicitly select `agent_id`; omitted selection retains
+the legacy primary-provider behavior for existing clients. Unsupported selected
+providers return `feature_unsupported`, rather than falling back to OpenCode.

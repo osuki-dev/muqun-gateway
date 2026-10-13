@@ -127,9 +127,65 @@ pub fn item(thread: &str, turn: &str, value: &Value, at_ms: u64) -> Vec<Timeline
                         .join("\n")
                 })
                 .unwrap_or_default();
+            let text = super::async_questions::display_reply(&text).unwrap_or(text);
+            let mut parts = vec![(text_item_id(&message, 0), AgentPart::Text { text })];
+            for (index, input) in value["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                if matches!(input["type"].as_str(), Some("audio" | "localAudio")) {
+                    parts.push((
+                        part_item_id(&message, index as u64 + 1),
+                        AgentPart::Status {
+                            text: "Audio attachment (playback unavailable)".into(),
+                        },
+                    ));
+                }
+            }
+            parts
+        }
+        "agentMessage" => {
+            let mut text = value["text"].as_str().unwrap_or_default().to_owned();
+            // Questions remain transcript content without a live control owner.
+            // Only native events can create actionable forms in the manager.
+            for question in value["questions"].as_array().into_iter().flatten() {
+                if let Some(title) = question["title"].as_str() {
+                    if !text.is_empty() {
+                        text.push_str("\n\n");
+                    }
+                    text.push_str(title);
+                    for option in question["options"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                    {
+                        text.push_str("\n- ");
+                        text.push_str(option);
+                    }
+                }
+            }
             vec![(text_item_id(&message, 0), AgentPart::Text { text })]
         }
-        "agentMessage" | "plan" => vec![(
+        "hookPrompt" => {
+            let text = value["fragments"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|fragment| fragment["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            vec![(
+                part_item_id(&message, 0),
+                AgentPart::Synthetic {
+                    text,
+                    description: Some("Hook prompt".into()),
+                },
+            )]
+        }
+        "plan" => vec![(
             text_item_id(&message, 0),
             AgentPart::Text {
                 text: value["text"].as_str().unwrap_or("").into(),
@@ -344,6 +400,7 @@ pub fn form(id: &Value, method: &str, params: &Value) -> Option<FormRequest> {
         });
     }
     Some(FormRequest {
+        nonblocking: false,
         id: super::client::request_key(id)?,
         asid: AgentSessionId(params["threadId"].as_str()?.into()),
         title: "Codex question".into(),

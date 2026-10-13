@@ -1155,3 +1155,80 @@ async fn collaboration_fanout_is_bounded_before_mapping_large_prompts() {
     let wire = json!({"type":"collabAgentToolCall","id":"tool","receiverThreadIds":["a","b"],"prompt":"x".repeat(client::MAX_FRAME_BYTES / 2)});
     assert!(driver.ordered_items("thread", "turn", &wire, 0).is_err());
 }
+
+#[tokio::test]
+async fn owned_active_thread_can_steer_and_answer_async_questions_without_queue_or_new_turn() {
+    let mut fixture = Fixture::new(|request| match request["method"].as_str().unwrap() {
+        "thread/start" | "thread/read" => json!({"thread":golden()["thread"]}),
+        "turn/start" => json!({"turn":{"id":"active-turn","status":"inProgress"}}),
+        "turn/steer" => {
+            assert_eq!(request["params"]["expectedTurnId"], "active-turn");
+            json!({"turnId":"active-turn"})
+        }
+        method => panic!("unexpected {method}"),
+    })
+    .await;
+    fixture.ready().await;
+    let driver = CodexDriver::new(fixture.client.clone());
+    let session = driver.create_session(None, None, None).await.unwrap();
+    driver
+        .send_prompt(&session.asid.0, "Start", &[], None)
+        .await
+        .unwrap();
+    let item = json!({"type":"agentMessage","id":"message","text":"Continuing","questions":[{"title":"Choose?","options":["A","B"]}]});
+    assert!(driver
+        .observe_async_questions("foreign", "active-turn", &item)
+        .await
+        .is_empty());
+    let forms = driver
+        .observe_async_questions(&session.asid.0, "active-turn", &item)
+        .await;
+    assert_eq!(forms.len(), 1);
+    driver
+        .send_prompt(
+            &session.asid.0,
+            "Continue with this detail",
+            &[],
+            Some("steer"),
+        )
+        .await
+        .unwrap();
+    assert!(driver
+        .send_prompt(&session.asid.0, "unsupported queue", &[], Some("queue"))
+        .await
+        .is_err());
+    assert_eq!(
+        driver
+            .get_pending_forms(&session.asid.0)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    driver
+        .reply_form(&session.asid.0, &forms[0].id, json!({"answer":"B"}))
+        .await
+        .unwrap();
+    assert!(driver
+        .get_pending_forms(&session.asid.0)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(driver
+        .reply_form(&session.asid.0, &forms[0].id, json!({"answer":"B"}))
+        .await
+        .is_err());
+    let mut starts = 0;
+    let mut steers = 0;
+    while let Ok(request) = fixture.requests.try_recv() {
+        match request["method"].as_str() {
+            Some("turn/start") => starts += 1,
+            Some("turn/steer") => {
+                steers += 1;
+                assert_eq!(request["params"]["expectedTurnId"], "active-turn");
+            }
+            _ => {}
+        }
+    }
+    assert_eq!((starts, steers), (1, 2));
+}

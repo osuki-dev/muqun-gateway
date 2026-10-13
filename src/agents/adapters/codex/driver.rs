@@ -32,6 +32,7 @@ pub struct CodexDriver {
     refresh_slots: Arc<tokio::sync::Semaphore>,
     usage: Mutex<HashMap<String, super::usage::Usage>>,
     pub(crate) rollouts: super::rollout::Rollouts,
+    async_questions: Mutex<super::async_questions::Registry>,
 }
 
 struct PendingModel {
@@ -64,6 +65,7 @@ impl CodexDriver {
             refresh_slots: Arc::new(tokio::sync::Semaphore::new(32)),
             usage: Mutex::new(HashMap::new()),
             rollouts: Default::default(),
+            async_questions: Mutex::new(super::async_questions::Registry::default()),
         }
     }
 
@@ -182,6 +184,47 @@ impl CodexDriver {
         if let Some(usage) = self.usage.lock().await.get(&info.asid.0) {
             usage.apply(info);
         }
+    }
+
+    pub(crate) async fn observe_async_questions(
+        &self,
+        thread: &str,
+        turn: &str,
+        item: &Value,
+    ) -> Vec<FormRequest> {
+        if !self.client.is_ready()
+            || self.client.active_turn(thread).as_deref() != Some(turn)
+            || !self.loaded.lock().await.contains(thread)
+            || self.require_native_interaction(thread).await.is_err()
+        {
+            return vec![];
+        }
+        self.async_questions
+            .lock()
+            .await
+            .insert(&self.client, thread, turn, item)
+    }
+    pub(crate) async fn observe_async_answers(&self, thread: &str, item: &Value) -> Vec<String> {
+        if item["type"] != "userMessage" {
+            return vec![];
+        }
+        self.async_questions
+            .lock()
+            .await
+            .observe_reply(thread, &item["content"])
+    }
+    pub(crate) async fn clear_async_questions(&self, thread: &str) {
+        self.async_questions.lock().await.clear(thread);
+    }
+    async fn steer(&self, thread: &str, turn: &str, text: &str) -> Result<(), AgentError> {
+        let result = self.client.call("turn/steer",json!({"threadId":thread,"expectedTurnId":turn,"input":[{"type":"text","text":text,"text_elements":[]}]})).await?;
+        if result["turnId"] != turn {
+            self.client.stop();
+            return Err(AgentError::Protocol(
+                "Codex steering turn identity mismatch".into(),
+            ));
+        }
+        Ok(())
     }
 
     // Held across the manager's mirror update/send to linearize publication
@@ -436,6 +479,7 @@ impl CodexDriver {
     }
 
     pub(crate) async fn forget_thread(&self, id: &str) {
+        self.clear_async_questions(id).await;
         self.loaded.lock().await.remove(id);
         self.next_models
             .lock()
@@ -810,8 +854,8 @@ impl AgentPort for CodexDriver {
         delivery: Option<&'a str>,
     ) -> AgentFuture<'a, ()> {
         Box::pin(async move {
-            if delivery.is_some() {
-                return unsupported("Codex inbox delivery");
+            if delivery.is_some_and(|mode| mode != "steer") {
+                return unsupported("Codex queued inbox delivery");
             }
             validate_id(id)?;
             if text.is_empty() && attachments.is_empty() {
@@ -820,6 +864,19 @@ impl AgentPort for CodexDriver {
             self.prepare_shared_interaction(id).await?;
             let _guard = self.mutations.lock().await;
             self.require_native_interaction(id).await?;
+            if delivery == Some("steer") {
+                if !self.loaded.lock().await.contains(id) {
+                    return unsupported("Codex steering requires an owned live thread");
+                }
+                let turn = self.client.active_turn(id).ok_or_else(|| {
+                    AgentError::InvalidRequest(
+                        "Codex active turn ended before steering; message was not resent".into(),
+                    )
+                })?;
+                return self
+                    .steer(id, &turn, &append_attachment_paths(text, attachments))
+                    .await;
+            }
             if self.client.active_turn(id).is_some() {
                 return Err(AgentError::InvalidRequest(
                     "Codex thread already has an active turn".into(),
@@ -1034,6 +1091,31 @@ impl AgentPort for CodexDriver {
         answers: Value,
     ) -> AgentFuture<'a, ()> {
         Box::pin(async move {
+            if id.starts_with("async:") {
+                let _guard = self.mutations.lock().await;
+                self.require_native_interaction(thread).await?;
+                if !self.client.is_ready() || !self.loaded.lock().await.contains(thread) {
+                    return unsupported("Codex asynchronous reply requires an owned live thread");
+                }
+                let turn = self.client.active_turn(thread).ok_or_else(|| {
+                    AgentError::InvalidRequest("Codex asynchronous question turn ended".into())
+                })?;
+                let text = self
+                    .async_questions
+                    .lock()
+                    .await
+                    .claim(thread, &turn, id, &answers)?;
+                if let Err(error) = self.steer(thread, &turn, &text).await {
+                    // An explicit RPC rejection did not accept this input.
+                    // Transport/cancellation errors keep the claim fenced.
+                    if matches!(error, AgentError::RequestFailed(_)) {
+                        self.async_questions.lock().await.rejected(id);
+                    }
+                    return Err(error);
+                }
+                self.async_questions.lock().await.accept(id);
+                return self.client.resolve_form(thread, id);
+            }
             let request = self.request(thread, id)?;
             let form =
                 mapper::form(&request.id, &request.method, &request.params).ok_or_else(|| {
@@ -1089,12 +1171,21 @@ impl AgentPort for CodexDriver {
     }
     fn get_pending_forms<'a>(&'a self, id: &'a str) -> AgentFuture<'a, Vec<FormRequest>> {
         Box::pin(async move {
-            Ok(self
+            let mut forms: Vec<_> = self
                 .client
                 .server_requests(id)
                 .iter()
                 .filter_map(|r| self.form(&r.id, &r.method, &r.params))
-                .collect())
+                .collect();
+            if self.client.is_ready() {
+                forms.extend(
+                    self.async_questions
+                        .lock()
+                        .await
+                        .pending(id, self.client.active_turn(id).as_deref()),
+                );
+            }
+            Ok(forms)
         })
     }
 

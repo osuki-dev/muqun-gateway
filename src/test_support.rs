@@ -1249,9 +1249,12 @@ impl agents::ports::agent::AgentPort for FakeAgent {
         &'a self,
         _query: &'a str,
         _limit: usize,
-        _directory: Option<&'a str>,
+        directory: Option<&'a str>,
     ) -> agents::ports::agent::AgentFuture<'a, Vec<serde_json::Value>> {
-        Box::pin(async { Ok(Vec::new()) })
+        Box::pin(async move {
+            self.record(&format!("find_files:{}", directory.unwrap_or("")));
+            Ok(Vec::new())
+        })
     }
     fn reply_permission<'a>(
         &'a self,

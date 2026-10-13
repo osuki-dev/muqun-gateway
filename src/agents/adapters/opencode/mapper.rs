@@ -1167,6 +1167,7 @@ pub fn map_form_request(val: &Value, asid: &AgentSessionId) -> Option<FormReques
     }
 
     Some(FormRequest {
+        nonblocking: false,
         id: id.to_string(),
         asid: asid.clone(),
         title,

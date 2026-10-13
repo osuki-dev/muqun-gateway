@@ -262,6 +262,7 @@ impl Context {
     }
 
     async fn clear_requests(&self, thread: &str) {
+        self.driver.clear_async_questions(thread).await;
         if let Some(snapshot) = self
             .mirror
             .get_snapshot(&AgentSessionId(thread.into()))
@@ -513,6 +514,27 @@ impl Context {
                 let Some(turn) = params["turnId"].as_str() else {
                     return;
                 };
+                if method == "item/completed" {
+                    for id in self
+                        .driver
+                        .observe_async_answers(thread, &params["item"])
+                        .await
+                    {
+                        self.resolve(thread, &id, true).await;
+                    }
+                    for form in self
+                        .driver
+                        .observe_async_questions(thread, turn, &params["item"])
+                        .await
+                    {
+                        let seq = self.mirror.add_form(form.clone()).await;
+                        self.emit(AgentDomainEvent::FormPending {
+                            asid: asid.clone(),
+                            request: form,
+                            seq,
+                        });
+                    }
+                }
                 let mut value = params["item"].clone();
                 if value.get("status").is_none() && value.is_object() {
                     value["status"] = serde_json::json!(if method == "item/started" {

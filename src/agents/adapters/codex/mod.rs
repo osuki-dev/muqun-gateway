@@ -1,4 +1,5 @@
 //! Shared-daemon or private stdio adapter, pinned to Codex rust-v0.162.1.
+mod async_questions;
 mod budget;
 pub mod client;
 pub(crate) mod daemon;

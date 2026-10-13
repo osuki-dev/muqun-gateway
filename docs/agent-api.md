@@ -2417,3 +2417,18 @@ cumulative session `tokens`. Prefer the explicitly reported `total_tokens` for
 occupancy. The token breakdown uses disjoint input, output, reasoning, cache-read,
 and cache-write counters. Missing usage, limit, or cost is unknown. Streaming
 changes arrive in the existing `agent.session.updated` event.
+
+### Nonblocking questions and scoped file mentions
+
+`FormRequest.nonblocking: true` identifies a question the agent may continue
+working through. Missing/false retains the existing blocking form semantics.
+Reply through the same `POST .../forms/:id/reply` endpoint; the answer object is
+specified by that form's fields. A nonblocking form alone never implies the
+session is blocked. `promptSteering` permits `delivery: "steer"` while running;
+it does not enable queue/inbox operations. Form handles are opaque and must not
+be reconstructed from transcript items.
+
+`GET /api/agent-sessions/:asid/files` and its legacy counterpart use the session's
+owner and recorded directory. A directory query cannot redirect a session search.
+Root `/api/agent-files` accepts optional `agent_id` plus `directory`. An explicit
+`fileMentions: false` capability disables file-mention lookup for that provider.

@@ -545,6 +545,14 @@ impl CodexClient {
         self.state.request_id(id)
     }
 
+    pub(crate) fn resolve_form(&self, thread: &str, id: &str) -> Result<(), AgentError> {
+        self.state.emit(CodexEvent::Resolved {
+            thread: thread.into(),
+            id: id.into(),
+            form: true,
+        })
+    }
+
     pub async fn reply(&self, thread: &str, id: &str, result: Value) -> Result<(), AgentError> {
         let request = {
             let mut requests = locked(&self.state.requests);

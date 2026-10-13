@@ -539,6 +539,7 @@ pub fn map_form(thread_id: &str, activity: &Value) -> Option<FormRequest> {
         })
         .collect();
     Some(FormRequest {
+        nonblocking: false,
         id: request_id.to_string(),
         asid: AgentSessionId(thread_id.to_string()),
         title: s(activity, "summary")
