@@ -1363,6 +1363,7 @@ fn agent_instance_id(value: &Value) -> Option<String> {
 fn agent_from_json(value: &Value) -> Result<Agent, BackendError> {
     let pane_id = required_string(value, "pane_id", "agent")?;
     Ok(Agent {
+        conversation_id: agent_conversation_id(value),
         instance_id: agent_instance_id(value),
         target: value
             .get("target")
@@ -1394,6 +1395,18 @@ fn agent_from_json(value: &Value) -> Result<Agent, BackendError> {
             .filter(|pid| *pid > 0),
         pending_user_input: value.get("pending_user_input").and_then(Value::as_bool),
     })
+}
+
+fn agent_conversation_id(value: &Value) -> Option<String> {
+    let kind = value.get("agent").or_else(|| value.get("kind"))?.as_str()?;
+    let session = &value["agent_session"];
+    if session["kind"] != "id" || session["agent"].as_str()? != kind {
+        return None;
+    }
+    session["value"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
 }
 
 fn worktree_params(request: &WorktreeRequest) -> Value {
@@ -1585,6 +1598,22 @@ mod tests {
             &serde_json::json!({"terminal_id":"", "agent_session":{"value":"first"}})
         )
         .is_none());
+    }
+
+    #[test]
+    fn conversation_identity_requires_the_matching_agent_and_id_kind() {
+        let mut agent = serde_json::json!({"agent":"codex", "agent_session":{
+            "agent":"codex", "kind":"id", "source":"herdr:codex", "value":"synthetic-id"
+        }});
+        assert_eq!(
+            super::agent_conversation_id(&agent).as_deref(),
+            Some("synthetic-id")
+        );
+        agent["agent_session"]["agent"] = serde_json::json!("claude");
+        assert!(super::agent_conversation_id(&agent).is_none());
+        agent["agent_session"]["agent"] = serde_json::json!("codex");
+        agent["agent_session"]["kind"] = serde_json::json!("path");
+        assert!(super::agent_conversation_id(&agent).is_none());
     }
 
     #[test]
