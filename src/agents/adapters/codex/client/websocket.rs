@@ -347,9 +347,25 @@ mod tests {
             TaskLaunch,
         };
         use crate::tasks::domain::Task;
-        for (cancelled, invalid_response) in [(false, false), (true, false), (false, true)] {
+        for (cancelled, invalid_response, invalid_task) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let task_id = if invalid_task {
+                crate::tasks::domain::TaskId("invalid".into())
+            } else {
+                crate::tasks::domain::TaskId::new()
+            };
+            let expected_task_id = task_id.0.clone();
             let mut fixture = Fixture::new(move |request| {
                 assert_eq!(request["method"], "thread/start");
+                let helper = request["params"]["config"]["mcp_servers.muqun.http_headers_helper"].as_str().unwrap();
+                assert!(helper.ends_with(&format!("--task-id '{expected_task_id}'")));
+                assert!(!helper.contains("--pid"));
+                assert!(!helper.contains("synthetic-admin"));
+                assert!(request["params"]["developerInstructions"].as_str().unwrap().contains("Synthetic owner instructions."));
                 assert!(request["params"].get("input").is_none());
                 if invalid_response { return json!({"thread":{"id":"invalid-returned-id","status":{"type":"idle"}}}); }
                 json!({"thread":{"id":"00000000-0000-4000-8000-000000000001","historyMode":"paginated","status":{"type":"idle"}}})
@@ -357,15 +373,30 @@ mod tests {
             let herdr = crate::test_support::FakeHerdr::start(vec![], None);
             let mut state = crate::test_support::test_state("synthetic-admin", vec![]);
             state.config.sessions = vec![herdr.session()];
-            state.config.mcp.inject_into_agents = false;
+            state.config.mcp.inject_into_agents = true;
             let cwd = dirs::home_dir().unwrap().join(format!(
                 ".muqun-shared-start-test-{}",
                 uuid::Uuid::new_v4().simple()
             ));
             std::fs::create_dir(&cwd).unwrap();
             let _cwd = TestDirectory(cwd.clone());
+            state.config.agent_launch_args.insert(
+                "codex".into(),
+                vec![
+                    "-c".into(),
+                    format!(
+                        "projects={}",
+                        toml::Value::try_from(
+                            json!({cwd.to_str().unwrap(): {"trust_level":"trusted"}})
+                        )
+                        .unwrap()
+                    ),
+                    "-c".into(),
+                    "developer_instructions=\"Synthetic owner instructions.\"".into(),
+                ],
+            );
             let task: Task = serde_json::from_value(json!({
-                "id":"t_synthetic_shared_launch", "kind":"delegation", "goal":"synthetic goal", "cwd":cwd,
+                "id":task_id.0, "kind":"delegation", "goal":"synthetic goal", "cwd":cwd,
                 "binding":{"kind":"pane","session_id":"default","pane_id":"w1:p1","tab_id":"w1:t1","agent_id":"codex"},
                 "state":if cancelled {"cancelled"} else {"dispatching"},
                 "created_by":{"kind":"assistant","id":"synthetic"}, "created_ms":1,"updated_ms":1,"seq":1,"origin":"mcp"
@@ -403,7 +434,7 @@ mod tests {
             )
             .await;
             if let Some(started) = to_type {
-                assert!(!cancelled && !invalid_response);
+                assert!(!cancelled && !invalid_response && !invalid_task);
                 type_agent_prompt(
                     &herdr.session(),
                     &started,
@@ -412,13 +443,20 @@ mod tests {
                 )
                 .await;
             }
+            assert!(!launch.steps.value().to_string().contains("synthetic-admin"));
             let calls = herdr.calls.lock().unwrap();
+            assert!(!serde_json::to_string(&*calls)
+                .unwrap()
+                .contains("synthetic-admin"));
             let starts: Vec<_> = calls
                 .iter()
                 .filter(|r| r["method"] == "agent.start")
                 .collect();
-            assert_eq!(starts.len(), usize::from(!cancelled && !invalid_response));
-            if cancelled || invalid_response {
+            assert_eq!(
+                starts.len(),
+                usize::from(!cancelled && !invalid_response && !invalid_task)
+            );
+            if cancelled || invalid_response || invalid_task {
                 assert_eq!(launch.prompt_delivery, PromptDelivery::NotAttempted);
                 assert_eq!(launch.payload["prompt_submitted"], false);
             } else {
@@ -438,7 +476,10 @@ mod tests {
                 .iter()
                 .filter(|r| r["method"] == "agent.prompt")
                 .collect();
-            assert_eq!(prompts.len(), usize::from(!cancelled && !invalid_response));
+            assert_eq!(
+                prompts.len(),
+                usize::from(!cancelled && !invalid_response && !invalid_task)
+            );
             if let Some(prompt) = prompts.first() {
                 assert_eq!(prompt["params"]["text"], "synthetic goal");
             }
@@ -450,7 +491,7 @@ mod tests {
                     .iter()
                     .filter(|r| r["method"] == "thread/start")
                     .count(),
-                1
+                usize::from(!invalid_task)
             );
         }
     }

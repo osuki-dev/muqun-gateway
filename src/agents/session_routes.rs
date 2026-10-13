@@ -903,6 +903,11 @@ async fn prepare_shared_task_launch(
     has_environment: bool,
 ) -> Result<super::ports::agent::PreparedTerminalLaunch, super::ports::agent::AgentError> {
     use super::ports::agent::AgentError;
+    if !crate::mcp::issue::valid_task_id(task_id) {
+        return Err(AgentError::InvalidRequest(
+            "invalid shared task identity".into(),
+        ));
+    }
     if has_environment
         || state.config.agent_commands.contains_key("codex")
         || state.config.codex.binary.is_some()
