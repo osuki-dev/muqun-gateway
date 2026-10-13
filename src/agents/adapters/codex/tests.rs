@@ -1077,3 +1077,67 @@ async fn codex_unload_invalidates_only_its_own_live_callbacks_and_turn() {
         assert!(fixture.requests.try_recv().is_err());
     }
 }
+
+#[test]
+fn thread_metadata_preserves_git_snapshot_and_child_identity_without_usage_fabrication() {
+    let mut wire = golden()["thread"].clone();
+    wire["parentThreadId"] = json!("opaque-parent");
+    wire["agentNickname"] = json!("Review");
+    wire["agentRole"] = json!("reviewer");
+    wire["gitInfo"] = json!({"sha":"fixture-sha","branch":"fixture-branch","originUrl":null});
+    let info = mapper::session(&wire).unwrap();
+    assert_eq!(info.parent_id.as_deref(), Some("opaque-parent"));
+    assert_eq!(info.agent_name.as_deref(), Some("Review"));
+    assert_eq!(info.agent_role.as_deref(), Some("reviewer"));
+    assert_eq!(
+        info.git_info.unwrap().branch.as_deref(),
+        Some("fixture-branch")
+    );
+    assert!(info.tokens.is_none());
+    assert!(info.context_usage.is_none());
+    assert!(info.cost.is_none());
+}
+
+#[tokio::test]
+async fn usage_survives_metadata_reads_and_subagent_inventory_is_requested_explicitly() {
+    let mut fixture = Fixture::new(|request| match request["method"].as_str().unwrap() {
+        "thread/read" => json!({"thread":golden()["thread"]}),
+        "thread/list" => {
+            assert!(request["params"]["sourceKinds"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("subAgentThreadSpawn")));
+            json!({"data":[golden()["thread"]],"nextCursor":null})
+        }
+        method => panic!("unexpected {method}"),
+    })
+    .await;
+    fixture.ready().await;
+    let driver = CodexDriver::new(fixture.client.clone());
+    let id = golden()["thread"]["id"].as_str().unwrap().to_owned();
+    let counters = json!({"totalTokens":110,"inputTokens":100,"cachedInputTokens":40,"cacheWriteInputTokens":60,"outputTokens":10,"reasoningOutputTokens":5});
+    driver
+        .record_usage(
+            &id,
+            &json!({"total":counters,"last":counters,"modelContextWindow":1000}),
+        )
+        .await
+        .unwrap();
+    let info = driver.get_session(&id).await.unwrap();
+    assert_eq!(info.tokens.unwrap().input, 0);
+    assert_eq!(info.context_usage.unwrap().total_tokens, 110);
+    let page = driver
+        .list_sessions_page(&SessionQuery::default())
+        .await
+        .unwrap();
+    assert_eq!(page.data[0].tokens.as_ref().unwrap().output, 5);
+}
+
+#[tokio::test]
+async fn collaboration_fanout_is_bounded_before_mapping_large_prompts() {
+    let mut fixture = Fixture::new(|_| panic!("projection must not call upstream")).await;
+    fixture.ready().await;
+    let driver = CodexDriver::new(fixture.client.clone());
+    let wire = json!({"type":"collabAgentToolCall","id":"tool","receiverThreadIds":["a","b"],"prompt":"x".repeat(client::MAX_FRAME_BYTES / 2)});
+    assert!(driver.ordered_items("thread", "turn", &wire, 0).is_err());
+}

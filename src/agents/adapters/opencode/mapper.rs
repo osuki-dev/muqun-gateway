@@ -189,6 +189,10 @@ pub fn map_session(val: &Value) -> Option<AgentSessionInfo> {
         // sessions differently.
         backend_session_id: String::new(),
         runtime: None,
+        context_usage: None,
+        git_info: None,
+        agent_name: None,
+        agent_role: None,
         title,
         mode,
         model,

@@ -63,6 +63,26 @@ pub struct TokensUsage {
     pub cache_write: Option<u64>,
 }
 
+/// Current context occupancy, separate from cumulative session token usage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionContextUsage {
+    pub tokens: Option<TokensUsage>,
+    pub total_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<serde_json::Value>,
+}
+
+/// Repository identity captured by the producer, not a live worktree status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionGitInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_url: Option<String>,
+}
+
 /// The filters `GET /api/session` accepts, in the gateway's own vocabulary.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionQuery {
@@ -255,6 +275,14 @@ pub struct AgentSessionInfo {
     pub status: AgentSessionStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<SessionRuntime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_usage: Option<SessionContextUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_info: Option<SessionGitInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub directory: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

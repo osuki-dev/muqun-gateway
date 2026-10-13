@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::agents::domain::*;
 use crate::agents::ports::agent::AgentError;
@@ -44,6 +44,17 @@ pub fn session(thread: &Value) -> Result<AgentSessionInfo, AgentError> {
         agent_id: String::new(),
         backend_session_id: String::new(),
         runtime: None,
+        context_usage: None,
+        git_info: thread["gitInfo"].as_object().map(|git| SessionGitInfo {
+            sha: git.get("sha").and_then(Value::as_str).map(str::to_owned),
+            branch: git.get("branch").and_then(Value::as_str).map(str::to_owned),
+            origin_url: git
+                .get("originUrl")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        }),
+        agent_name: thread["agentNickname"].as_str().map(str::to_owned),
+        agent_role: thread["agentRole"].as_str().map(str::to_owned),
         title: thread["name"]
             .as_str()
             .or_else(|| thread["preview"].as_str())
@@ -144,66 +155,7 @@ pub fn item(thread: &str, turn: &str, value: &Value, at_ms: u64) -> Vec<Timeline
             }
             parts
         }
-        kind @ ("commandExecution" | "fileChange" | "mcpToolCall") => {
-            let state = match value["status"].as_str() {
-                Some("completed") => ToolCallStatus::Completed,
-                Some("failed" | "declined") => ToolCallStatus::Failed,
-                _ => ToolCallStatus::Running,
-            };
-            let (name, input, output) = match kind {
-                "commandExecution" => (
-                    "shell".to_string(),
-                    json!({"command":value["command"],"cwd":value["cwd"]}),
-                    value
-                        .get("aggregatedOutput")
-                        .filter(|v| !v.is_null())
-                        .cloned(),
-                ),
-                "fileChange" => (
-                    "edit".to_string(),
-                    json!({"changes":value["changes"]}),
-                    None,
-                ),
-                _ => (
-                    format!(
-                        "{}:{}",
-                        value["server"].as_str().unwrap_or(""),
-                        value["tool"].as_str().unwrap_or("")
-                    ),
-                    value["arguments"].clone(),
-                    value.get("result").filter(|v| !v.is_null()).cloned(),
-                ),
-            };
-            let mut metadata = value.clone();
-            if let Some(metadata) = metadata.as_object_mut() {
-                // Preserve producer diagnostics/timing, without storing the
-                // same potentially large input/result body twice in one card.
-                for key in ["aggregatedOutput", "arguments", "result", "changes"] {
-                    metadata.remove(key);
-                }
-            }
-            vec![(
-                tool_item_id(&message, id),
-                AgentPart::Tool(ToolCall {
-                    id: id.into(),
-                    name,
-                    title: None,
-                    input,
-                    output,
-                    content: None,
-                    metadata: Some(metadata),
-                    state,
-                    status: state,
-                    error: None,
-                    child_session_id: None,
-                    background: false,
-                    input_partial: None,
-                    truncated: false,
-                    time: ToolTime::default(),
-                }),
-            )]
-        }
-        _ => vec![],
+        _ => super::items::parts(&message, id, value),
     };
     parts
         .into_iter()
@@ -227,6 +179,57 @@ pub fn item(thread: &str, turn: &str, value: &Value, at_ms: u64) -> Vec<Timeline
                 attachments: (ordinal == 0).then(|| attachments.clone()).flatten(),
                 image_assets: None,
             }
+        })
+        .collect()
+}
+
+/// Turn-level updates have their own event identity; they are not file items.
+pub fn turn_update(thread: &str, turn: &str, method: &str, params: &Value) -> Vec<TimelineItem> {
+    let parts = match method {
+        "turn/plan/updated" => {
+            let Some(plan) = params["plan"].as_array() else {
+                return vec![];
+            };
+            let mut parts = vec![AgentPart::Todo {
+                items: plan
+                    .iter()
+                    .filter_map(|step| {
+                        Some(TodoItem {
+                            text: step["step"].as_str()?.into(),
+                            done: step["status"] == "completed",
+                        })
+                    })
+                    .collect(),
+            }];
+            if let Some(text) = params["explanation"].as_str().filter(|s| !s.is_empty()) {
+                parts.push(AgentPart::Text { text: text.into() });
+            }
+            parts
+        }
+        "turn/diff/updated" => {
+            let Some(diff) = params["diff"].as_str() else {
+                return vec![];
+            };
+            vec![AgentPart::Diff {
+                file: String::new(),
+                diff: diff.into(),
+            }]
+        }
+        _ => return vec![],
+    };
+    parts
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, part)| TimelineItem {
+            id: format!("{thread}/{turn}:event:{method}:{ordinal}"),
+            message_id: format!("{thread}/{turn}:event:{method}"),
+            role: TimelineRole::Assistant,
+            part,
+            seq: 0,
+            updated_ms: 0,
+            ordinal: ordinal as u64,
+            attachments: None,
+            image_assets: None,
         })
         .collect()
 }

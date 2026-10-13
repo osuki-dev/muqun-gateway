@@ -312,6 +312,11 @@ pub(super) fn features() -> crate::discovery::AgentFeatures {
             ("sessionFork".into(), serde_json::json!(true)),
             ("sessionDelete".into(), serde_json::json!(true)),
             ("forms".into(), serde_json::json!(true)),
+            ("typedToolItems".into(), serde_json::json!(true)),
+            ("subagentSessions".into(), serde_json::json!(true)),
+            ("sessionTokenUsage".into(), serde_json::json!(true)),
+            ("sessionContextUsage".into(), serde_json::json!(true)),
+            ("sessionGitInfo".into(), serde_json::json!(true)),
             ("modelSelectionScope".into(), serde_json::json!("next_turn")),
             (
                 "modelSelectionPersistence".into(),

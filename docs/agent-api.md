@@ -2382,3 +2382,16 @@ Sessions are also evicted on `session.deleted`.
 - **A title endpoint.** Auto-titling is server-side; `rename` is the only write.
 - **Credential, integration or provider-auth routes.** The user configures
   OpenCode on the host.
+
+### Optional observed session detail
+
+Providers may include `agent_name` and `agent_role` for an identified child agent,
+and `git_info: {sha?, branch?, origin_url?}` for producer-captured Git metadata.
+This Git snapshot does not replace the live directory-based Git endpoints.
+
+`context_usage: {tokens: TokensUsage | null, total_tokens: number, limit?:
+{context: number}}` is the latest reported context occupancy, distinct from
+cumulative session `tokens`. Prefer the explicitly reported `total_tokens` for
+occupancy. The token breakdown uses disjoint input, output, reasoning, cache-read,
+and cache-write counters. Missing usage, limit, or cost is unknown. Streaming
+changes arrive in the existing `agent.session.updated` event.

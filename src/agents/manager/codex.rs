@@ -78,6 +78,7 @@ impl Context {
     }
 
     async fn update_info(&self, mut info: AgentSessionInfo) {
+        self.driver.apply_usage(&mut info).await;
         if let Some(runtime) = self.driver.cached_runtime(&info.asid.0).await {
             runtime.apply(&mut info);
         }
@@ -109,6 +110,32 @@ impl Context {
     async fn upsert(&self, asid: &AgentSessionId, items: Vec<TimelineItem>) {
         if items.is_empty() {
             return;
+        }
+        // A spawn starts without a receiver; its final item names exact child
+        // rows. Replace that same producer's provisional rows, including when
+        // the completed item arrives through turn/completed history replay.
+        if items.iter().any(|item| {
+            matches!(&item.part, AgentPart::Tool(call)
+            if call.metadata.as_ref().is_some_and(|m| m["type"] == "collabAgentToolCall"))
+        }) {
+            if let Some(snapshot) = self.mirror.get_snapshot(asid).await {
+                let group = &items[0].message_id;
+                let stale: Vec<_> = snapshot
+                    .timeline
+                    .iter()
+                    .filter(|old| {
+                        old.message_id == *group && !items.iter().any(|new| new.id == old.id)
+                    })
+                    .map(|old| old.id.clone())
+                    .collect();
+                if let Some((seq, ids)) = self.mirror.remove_timeline_items(asid, &stale).await {
+                    self.emit(AgentDomainEvent::TimelineRemoved {
+                        asid: asid.clone(),
+                        ids,
+                        seq,
+                    });
+                }
+            }
         }
         let seq = self.mirror.upsert_timeline_items(asid, items.clone()).await;
         self.emit(AgentDomainEvent::TimelineUpsert {
@@ -298,10 +325,26 @@ impl Context {
                 self.set_status(thread, mapper::status(&params["status"]))
                     .await
             }
+            "thread/tokenUsage/updated" => {
+                if self
+                    .driver
+                    .record_usage(thread, &params["tokenUsage"])
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                if self.mirror.is_placeholder(&asid).await {
+                    self.ensure(thread).await;
+                } else if let Some(info) = self.mirror.session_info(&asid).await {
+                    self.update_info(info).await;
+                }
+            }
             "thread/name/updated" => {
                 let _ = self.driver.refresh_metadata(thread).await;
             }
             "thread/deleted" => {
+                self.driver.clear_usage(thread).await;
                 self.clear_requests(thread).await;
                 self.driver.forget_thread(thread).await;
                 self.threads.lock().await.remove(thread);
@@ -315,6 +358,34 @@ impl Context {
                         seq: snapshot.seq + 1,
                     });
                 }
+            }
+            "turn/plan/updated" | "turn/diff/updated" => {
+                let Some(turn) = params["turnId"].as_str() else {
+                    return;
+                };
+                let mut items = mapper::turn_update(thread, turn, method, params);
+                let Ok(position) =
+                    self.driver
+                        .item_position(thread, turn, &format!(":event:{method}"))
+                else {
+                    return;
+                };
+                for item in &mut items {
+                    item.message_id = mapper::order_group(thread, turn, position);
+                }
+                // Explanations can be removed by a subsequent plan update.
+                if method == "turn/plan/updated" && items.len() == 1 {
+                    let old = format!("{thread}/{turn}:event:{method}:1");
+                    if let Some((seq, ids)) = self.mirror.remove_timeline_items(&asid, &[old]).await
+                    {
+                        self.emit(AgentDomainEvent::TimelineRemoved {
+                            asid: asid.clone(),
+                            ids,
+                            seq,
+                        });
+                    }
+                }
+                self.upsert(&asid, items).await;
             }
             "turn/started" => {
                 self.set_status(thread, AgentSessionStatus::Busy).await;
@@ -350,10 +421,18 @@ impl Context {
                 let Some(turn) = params["turnId"].as_str() else {
                     return;
                 };
+                let mut value = params["item"].clone();
+                if value.get("status").is_none() && value.is_object() {
+                    value["status"] = serde_json::json!(if method == "item/started" {
+                        "inProgress"
+                    } else {
+                        "completed"
+                    });
+                }
                 let Ok(mut items) = self.driver.ordered_items(
                     thread,
                     turn,
-                    &params["item"],
+                    &value,
                     params["startedAtMs"]
                         .as_u64()
                         .or_else(|| params["completedAtMs"].as_u64())
@@ -700,6 +779,65 @@ mod tests {
             events.try_recv().unwrap(),
             AgentDomainEvent::TimelineUpsert { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn usage_events_survive_metadata_and_tool_rows_replace_provisional_targets() {
+        let mut fixture =
+            Fixture::new(|_| panic!("seeded projection must not send commands")).await;
+        fixture.ready().await;
+        let driver = Arc::new(CodexDriver::new(fixture.client.clone()));
+        let mirror = Arc::new(MemoryMirror::for_agent("codex"));
+        let (tx, mut events) = broadcast::channel(64);
+        let context = Context {
+            driver: driver.clone(),
+            mirror: mirror.clone(),
+            tx,
+            stopped: Arc::new(Mutex::new(false)),
+            threads: tokio::sync::Mutex::new(HashSet::new()),
+        };
+        let thread = golden()["thread"].clone();
+        let id = thread["id"].as_str().unwrap();
+        let asid = AgentSessionId(id.into());
+        context.session(&thread, 0).await;
+        let total = json!({"totalTokens":110,"inputTokens":100,"cachedInputTokens":40,"cacheWriteInputTokens":60,"outputTokens":10,"reasoningOutputTokens":5});
+        context.notification("thread/tokenUsage/updated",&json!({"threadId":id,"turnId":"turn","tokenUsage":{"total":total,"last":total,"modelContextWindow":1000}})).await;
+        context.session(&thread, 0).await;
+        let info = mirror.session_info(&asid).await.unwrap();
+        assert_eq!(info.tokens.unwrap().output, 5);
+        assert_eq!(info.context_usage.unwrap().total_tokens, 110);
+        let mut published_usage = false;
+        while let Ok(event) = events.try_recv() {
+            if matches!(event,AgentDomainEvent::SessionUpdated {info,..} if info.context_usage.is_some())
+            {
+                published_usage = true;
+            }
+        }
+        assert!(published_usage);
+        for targets in [json!([]), json!(["child"])] {
+            context.notification("item/completed",&json!({"threadId":id,"turnId":"turn","item":{"type":"collabAgentToolCall","id":"spawn","tool":"spawnAgent","status":"completed","receiverThreadIds":targets,"agentsStates":{}}})).await;
+        }
+        let snapshot = mirror.get_snapshot(&asid).await.unwrap();
+        assert_eq!(snapshot.timeline.len(), 1);
+        let AgentPart::Tool(call) = &snapshot.timeline[0].part else {
+            panic!("expected tool")
+        };
+        assert_eq!(call.child_session_id.as_deref(), Some("child"));
+        assert!(call.metadata.as_ref().unwrap().get("status").is_none());
+        context.notification("turn/plan/updated",&json!({"threadId":id,"turnId":"turn","explanation":"First plan","plan":[{"step":"Inspect","status":"completed"},{"step":"Fix","status":"inProgress"}]})).await;
+        context.notification("turn/plan/updated",&json!({"threadId":id,"turnId":"turn","explanation":null,"plan":[{"step":"Inspect","status":"completed"}]})).await;
+        context
+            .notification(
+                "turn/diff/updated",
+                &json!({"threadId":id,"turnId":"turn","diff":"--- a/a.rs\n+++ b/a.rs\n-old\n+new"}),
+            )
+            .await;
+        let snapshot = mirror.get_snapshot(&asid).await.unwrap();
+        assert_eq!(snapshot.timeline.len(), 3);
+        assert!(snapshot.timeline.iter().any(
+            |row| matches!(&row.part, AgentPart::Todo{items} if items.len() == 1 && items[0].done)
+        ));
+        assert!(snapshot.timeline.iter().any(|row| matches!(&row.part, AgentPart::Diff{file,diff} if file.is_empty() && diff.contains("+new"))));
     }
 
     async fn next_session_update(

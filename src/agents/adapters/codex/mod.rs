@@ -3,8 +3,10 @@ mod budget;
 pub mod client;
 pub(crate) mod daemon;
 mod driver;
+mod items;
 pub mod mapper;
 pub(crate) mod process_tree;
+pub(crate) mod usage;
 
 pub use client::{CodexClient, CodexEvent};
 pub use driver::CodexDriver;

@@ -100,6 +100,10 @@ pub fn map_session(raw: &Value) -> Option<AgentSessionInfo> {
         agent_id: String::new(),
         backend_session_id: session_id.to_string(),
         runtime: None,
+        context_usage: None,
+        git_info: None,
+        agent_name: None,
+        agent_role: None,
         title,
         mode: projections_values
             .and_then(|v| v.get("agentPreset"))

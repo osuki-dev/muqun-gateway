@@ -30,6 +30,7 @@ pub struct CodexDriver {
     metadata_versions: Arc<Mutex<HashMap<String, u64>>>,
     next_metadata_version: std::sync::atomic::AtomicU64,
     refresh_slots: Arc<tokio::sync::Semaphore>,
+    usage: Mutex<HashMap<String, super::usage::Usage>>,
 }
 
 struct PendingModel {
@@ -60,6 +61,7 @@ impl CodexDriver {
             metadata_versions: Arc::new(Mutex::new(HashMap::new())),
             next_metadata_version: std::sync::atomic::AtomicU64::new(1),
             refresh_slots: Arc::new(tokio::sync::Semaphore::new(32)),
+            usage: Mutex::new(HashMap::new()),
         }
     }
 
@@ -123,6 +125,29 @@ impl CodexDriver {
 
     pub fn client(&self) -> &Arc<CodexClient> {
         &self.client
+    }
+
+    pub(crate) async fn record_usage(&self, id: &str, value: &Value) -> Result<(), AgentError> {
+        validate_id(id)?;
+        let mut usage = self.usage.lock().await;
+        if usage.len() >= MAX_SESSIONS && !usage.contains_key(id) {
+            self.client.stop();
+            return Err(AgentError::NotAvailable(
+                "Codex usage capacity exhausted".into(),
+            ));
+        }
+        usage.insert(id.into(), super::usage::Usage::from_wire(value));
+        Ok(())
+    }
+
+    pub(crate) async fn clear_usage(&self, id: &str) {
+        self.usage.lock().await.remove(id);
+    }
+
+    pub(crate) async fn apply_usage(&self, info: &mut AgentSessionInfo) {
+        if let Some(usage) = self.usage.lock().await.get(&info.asid.0) {
+            usage.apply(info);
+        }
     }
 
     // Held across the manager's mirror update/send to linearize publication
@@ -316,6 +341,17 @@ impl CodexDriver {
                 "Codex reasoning part limit exceeded; resync required".into(),
             ));
         }
+        if item["receiverThreadIds"].as_array().is_some_and(|targets| {
+            targets.len() > 512
+                || serde_json::to_vec(item).map_or(true, |wire| {
+                    wire.len().saturating_mul(targets.len().max(1)) > super::client::MAX_FRAME_BYTES
+                })
+        }) {
+            self.client.stop();
+            return Err(AgentError::Protocol(
+                "Codex collaboration target limit exceeded; resync required".into(),
+            ));
+        }
         let id = mapper::string(item, "id")?;
         let position = self.item_position(thread, turn, &id)?;
         let mut rows = mapper::item(thread, turn, item, at_ms);
@@ -437,7 +473,8 @@ impl CodexDriver {
                 thread[key] = value.clone();
             }
         }
-        let session = mapper::session(&thread)?;
+        let mut session = mapper::session(&thread)?;
+        self.apply_usage(&mut session).await;
         self.remember(&session.asid.0).await?;
         let revision = self.metadata_revision(&session.asid.0).await?;
         self.client.snapshot(thread, revision)?;
@@ -598,7 +635,7 @@ impl CodexDriver {
                 "invalid Codex session page query".into(),
             ));
         }
-        let response = budget.call(&self.client,"thread/list",json!({"cursor":query.cursor,"limit":limit,"sortKey":"updated_at","sortDirection":order,"cwd":query.directory,"searchTerm":query.search,"useStateDbOnly":true})).await?;
+        let response = budget.call(&self.client,"thread/list",json!({"cursor":query.cursor,"limit":limit,"sortKey":"updated_at","sortDirection":order,"cwd":query.directory,"searchTerm":query.search,"useStateDbOnly":true,"sourceKinds":["cli","vscode","exec","appServer","subAgent","subAgentReview","subAgentCompact","subAgentThreadSpawn","subAgentOther","unknown"]})).await?;
         let rows = response["data"]
             .as_array()
             .ok_or_else(|| AgentError::Protocol("invalid Codex session page".into()))?;
@@ -608,7 +645,8 @@ impl CodexDriver {
         budget.rows(rows.len())?;
         let mut data = vec![];
         for row in rows {
-            let info = mapper::session(row)?;
+            let mut info = mapper::session(row)?;
+            self.apply_usage(&mut info).await;
             if query.keeps_parent(info.parent_id.as_deref()) {
                 data.push(info);
             }
@@ -723,7 +761,11 @@ impl AgentPort for CodexDriver {
     }
 
     fn get_session<'a>(&'a self, id: &'a str) -> AgentFuture<'a, AgentSessionInfo> {
-        Box::pin(async move { mapper::session(&self.read_thread(id).await?) })
+        Box::pin(async move {
+            let mut info = mapper::session(&self.read_thread(id).await?)?;
+            self.apply_usage(&mut info).await;
+            Ok(info)
+        })
     }
 
     fn send_prompt<'a>(
@@ -889,6 +931,7 @@ impl AgentPort for CodexDriver {
                 .call("thread/delete", json!({"threadId":id}))
                 .await?;
             self.forget_thread(id).await;
+            self.clear_usage(id).await;
             Ok(())
         })
     }

@@ -14,9 +14,9 @@ pub use model::{
 pub use permission::{PermissionDecision, PermissionOption, PermissionRequest};
 pub use session::{
     AgentErrorInfo, AgentProject, AgentSessionId, AgentSessionInfo, AgentSessionStatus, ModelRef,
-    RevertState, RuntimeInteraction, RuntimeReason, RuntimeSource, RuntimeTerminal, SessionCursor,
-    SessionForkInfo, SessionPage, SessionQuery, SessionRevertInfo, SessionRuntime,
-    TerminalRuntimeStatus, TokensUsage, WorktreeState,
+    RevertState, RuntimeInteraction, RuntimeReason, RuntimeSource, RuntimeTerminal,
+    SessionContextUsage, SessionCursor, SessionForkInfo, SessionGitInfo, SessionPage, SessionQuery,
+    SessionRevertInfo, SessionRuntime, TerminalRuntimeStatus, TokensUsage, WorktreeState,
 };
 pub use timeline::{
     part_item_id, push_input_partial, reasoning_item_id, text_item_id, tool_item_id, AgentPart,
@@ -60,6 +60,10 @@ mod contract_tests {
             agent_id: String::new(),
             backend_session_id: "ses_1".into(),
             runtime: None,
+            context_usage: None,
+            git_info: None,
+            agent_name: None,
+            agent_role: None,
             title: "t".into(),
             mode: Some("build".into()),
             model: Some(ModelRef {
@@ -266,6 +270,10 @@ mod contract_tests {
             agent_id: String::new(),
             backend_session_id: String::new(),
             runtime: None,
+            context_usage: None,
+            git_info: None,
+            agent_name: None,
+            agent_role: None,
             title: "t".into(),
             mode: None,
             model: None,

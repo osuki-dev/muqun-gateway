@@ -297,3 +297,55 @@ Herdr acceptance and macOS certification are **not performed in this round**.
 The repository-required real paired App check remains deferred by explicit
 user instruction; mocked protocol tests do not replace it. No App change,
 installation, service restart, commit or release is part of this worker's work.
+
+## Typed tools, child sessions, and usage
+
+The pinned `v2/ThreadItem.ts` is projected into the neutral timeline. Commands
+use `shell`, retain output, `metadata.exit`, duration, source, process and plugin
+script identity. A process identifier alone never means a background/detached
+command. Stable command lifecycle events continue to update the original turn,
+including an exit after a later turn begins. Background-terminal inventory and
+control are experimental upstream and remain unavailable (`backgroundShells:
+false`); inline command observation does not enable those mutations.
+
+File changes use `edit` and `metadata.files` with the supplied path, unified patch,
+change kind and optional move destination. Addition/deletion counts are computed
+from that patch. MCP, dynamic tools, web searches, sleeps, image tools and function
+outputs retain their typed input/output and diagnostics. Turn plan updates replace
+a stable todo row; aggregated turn diffs retain the actual patch with an empty
+single-file label because the patch may span several files. Compaction boundaries
+are observable without advertising a user-triggered compact operation.
+
+Collaboration calls project one `subagent` tool row per exact receiver thread ID;
+each row's `child_session_id` opens that session. A completed spawn/wait call does
+not imply child completion: child status comes only from its `agentsStates` entry,
+or the explicit subagent activity. Provisional no-receiver rows are removed when
+targets arrive. Child inventory explicitly includes the pinned subagent source
+kinds; upstream otherwise defaults to interactive sessions only. Session
+`parent_id`, `agent_name`, and `agent_role` come from `parentThreadId`,
+`agentNickname`, and `agentRole`. No progress percentage is generated.
+
+`thread/tokenUsage/updated` updates the session through `agent.session.updated`.
+Session `tokens` is cumulative; `context_usage` describes the latest context:
+`{tokens: TokensUsage | null, total_tokens: number, limit?: {context: number}}`.
+Codex's cached/read and cache-write counters are included in input, and reasoning
+is included in output. The adapter subtracts those subsets so the five neutral
+counters are disjoint. Incomplete or inconsistent breakdowns remain unknown;
+context occupancy uses upstream `last.totalTokens`, independently of the breakdown.
+Only a positive reported `modelContextWindow` supplies a context limit. Cost is
+unknown, not zero. Last observed usage survives independent metadata refreshes.
+The stable thread metadata does not contain usage; a metadata-only warm resume
+also omits restored usage replay. Until a usage notification or verified persisted
+replay is observed, initial totals remain absent. Billing `account/usage/read` is
+not substituted for context occupancy.
+
+Optional `git_info` (`sha`, `branch`, `origin_url`) is the producer's Git snapshot,
+not a claim about the current worktree. Existing directory-based Git file/diff
+routes remain the source for live working-tree changes. Discovery extras
+`typedToolItems`, `subagentSessions`, `sessionTokenUsage`, `sessionContextUsage`,
+and `sessionGitInfo` describe these additive read surfaces.
+
+Counter semantics are also verified against the pinned upstream
+[`parses_cache_write_token_usage` fixture](https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/codex-api/src/sse/responses.rs),
+and context occupancy against `TokenUsage::tokens_in_context_window` in
+[`protocol.rs`](https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/protocol/src/protocol.rs).
