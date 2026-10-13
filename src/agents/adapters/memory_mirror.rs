@@ -1060,6 +1060,7 @@ impl MemoryMirror {
         runtime: crate::agents::domain::SessionRuntime,
         items: Vec<TimelineItem>,
         decorate: impl FnOnce(&mut AgentSessionInfo),
+        publish: impl FnOnce(&[AgentDomainEvent]),
     ) -> Option<Vec<AgentDomainEvent>> {
         use crate::agents::domain::RuntimeSource;
         let mut sessions = self.sessions.write().await;
@@ -1105,6 +1106,9 @@ impl MemoryMirror {
         for event in &events {
             state.push_event(event.clone());
         }
+        // No I/O/await in publication. Later mirror writes cannot overtake this
+        // batch's metadata and items on the provider's broadcast stream.
+        publish(&events);
         Some(events)
     }
 
@@ -1547,6 +1551,7 @@ mod tests {
                 old_epoch,
                 runtime.clone(),
                 vec![text_item("stale", "stale", "stale")],
+                |_| {},
                 |_| {}
             )
             .await
@@ -1559,6 +1564,7 @@ mod tests {
                 runtime.clone(),
                 vec![text_item("current", "current", "current")],
                 |info| info.title = "observed".into(),
+                |_| {},
             )
             .await
             .unwrap();
@@ -1579,6 +1585,7 @@ mod tests {
                 epoch,
                 runtime,
                 vec![text_item("late", "late", "late")],
+                |_| {},
                 |_| {}
             )
             .await

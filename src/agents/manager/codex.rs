@@ -105,20 +105,29 @@ impl Context {
                         .usage
                         .as_ref()
                         .map(crate::agents::adapters::codex::usage::Usage::from_wire);
-                    if let Some(events) = self
+                    if self
                         .mirror
-                        .apply_observation(&asid, epoch, runtime, update.items, |info| {
-                            if let Some(usage) = &usage {
-                                usage.apply(info);
-                            }
-                        })
+                        .apply_observation(
+                            &asid,
+                            epoch,
+                            runtime,
+                            update.items,
+                            |info| {
+                                if let Some(usage) = &usage {
+                                    usage.apply(info);
+                                }
+                            },
+                            |events| {
+                                for event in events {
+                                    self.emit(event.clone());
+                                }
+                            },
+                        )
                         .await
+                        .is_some()
                     {
                         if let Some(value) = update.usage {
                             let _ = self.driver.record_usage(&thread, &value).await;
-                        }
-                        for event in events {
-                            self.emit(event);
                         }
                     } else {
                         self.driver.rollouts.fence(&thread, update.generation);
