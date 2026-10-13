@@ -58,6 +58,18 @@ impl Signals {
                         return Err(invalid());
                     }
                 }
+                Some("exec_command_end") => {
+                    let target = ItemTarget {
+                        turn: identifier(&event["turn_id"])?,
+                        item: identifier(&event["call_id"])?,
+                    };
+                    if seen.insert(target.clone()) {
+                        signals.items.push(target);
+                    }
+                    if signals.items.len() > MAX_TARGETS {
+                        return Err(invalid());
+                    }
+                }
                 Some("token_count") => {
                     if let Some(usage) = token_usage(&event["info"]) {
                         signals.usage = Some(usage);
@@ -73,7 +85,7 @@ impl Signals {
     }
 }
 
-fn token_usage(info: &Value) -> Option<Value> {
+pub(crate) fn token_usage(info: &Value) -> Option<Value> {
     fn counters(value: &Value) -> Option<Value> {
         Some(json!({
             "totalTokens":value["total_tokens"].as_u64()?,

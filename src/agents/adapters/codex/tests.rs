@@ -93,19 +93,27 @@ impl Fixture {
     async fn new_reply(
         handler: impl Fn(&Value) -> Result<Value, Value> + Send + Sync + 'static,
     ) -> Self {
-        Self::new_reply_in_cwd(handler, None).await
+        Self::new_reply_in_cwd(handler, None, None).await
     }
 
     async fn new_in_cwd(
         handler: impl Fn(&Value) -> Value + Send + Sync + 'static,
         cwd: &str,
     ) -> Self {
-        Self::new_reply_in_cwd(move |r| Ok(handler(r)), Some(cwd.into())).await
+        Self::new_reply_in_cwd(move |r| Ok(handler(r)), Some(cwd.into()), None).await
+    }
+
+    pub(crate) async fn new_in_home(
+        handler: impl Fn(&Value) -> Value + Send + Sync + 'static,
+        home: &std::path::Path,
+    ) -> Self {
+        Self::new_reply_in_cwd(move |r| Ok(handler(r)), None, Some(home.to_owned())).await
     }
 
     async fn new_reply_in_cwd(
         handler: impl Fn(&Value) -> Result<Value, Value> + Send + Sync + 'static,
         cwd: Option<String>,
+        home: Option<std::path::PathBuf>,
     ) -> Self {
         let (client_io, server_io) = tokio::io::duplex(8192);
         let (read, write) = tokio::io::split(client_io);
@@ -129,7 +137,13 @@ impl Fixture {
                     continue;
                 }
                 let result = match method {
-                    "initialize" => Ok(golden()["initialize"].clone()),
+                    "initialize" => {
+                        let mut response = golden()["initialize"].clone();
+                        if let Some(home) = &home {
+                            response["codexHome"] = json!(home);
+                        }
+                        Ok(response)
+                    }
                     "account/read" => Ok(golden()["account"].clone()),
                     _ => handler(&request),
                 };

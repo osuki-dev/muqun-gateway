@@ -98,6 +98,38 @@ impl RolloutTail {
         &self.path
     }
 
+    /// Recheck after native item I/O without advancing the durable cursor.
+    pub(crate) fn verify(&mut self) -> Result<(), TailError> {
+        if self.fenced {
+            return Err(TailError::Fenced);
+        }
+        let result = (|| {
+            let mut current = open_confined(&self.home, &self.path)?;
+            let metadata = current.metadata().map_err(|_| TailError::Io)?;
+            if file_identity(&metadata) != self.identity {
+                return Err(TailError::Replaced);
+            }
+            if metadata.len() < self.offset {
+                return Err(TailError::Truncated);
+            }
+            if read_range(&mut current, 0, self.header.len())? != self.header
+                || read_range(
+                    &mut current,
+                    self.offset - self.anchor.len() as u64,
+                    self.anchor.len(),
+                )? != self.anchor
+            {
+                return Err(TailError::Rewritten);
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.fenced = true;
+            self.partial.clear();
+        }
+        result
+    }
+
     pub(crate) fn poll(&mut self) -> Result<TailBatch, TailError> {
         if self.fenced {
             return Err(TailError::Fenced);

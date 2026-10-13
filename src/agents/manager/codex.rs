@@ -64,13 +64,89 @@ impl Context {
     async fn observe_runtimes(&self) {
         for (asid, expected) in self.mirror.runtime_sessions().await {
             if let Some(runtime) = self.driver.runtime(&asid.0, false).await {
-                if let Some((seq, info)) =
-                    self.mirror.update_runtime(&asid, expected, runtime).await
+                let usage = self.driver.cached_usage(&asid.0).await;
+                if let Some((seq, info)) = self
+                    .mirror
+                    .update_runtime_decorated(&asid, expected, runtime, |info| {
+                        if let Some(usage) = usage {
+                            usage.apply(info);
+                        }
+                    })
+                    .await
                 {
                     self.emit(AgentDomainEvent::SessionUpdated {
                         asid,
                         info: Box::new(info),
                         seq,
+                    });
+                }
+            }
+        }
+    }
+
+    async fn observe_rollouts(&self) {
+        for thread in self.driver.rollouts.sessions() {
+            let asid = AgentSessionId(thread.clone());
+            let Some(epoch) = self.mirror.observation_epoch(&asid).await else {
+                continue;
+            };
+            let Some(result) = self.driver.rollouts.poll(&self.driver, &thread).await else {
+                continue;
+            };
+            match result {
+                Ok(update) => {
+                    let Some(runtime) = self.driver.cached_runtime(&thread).await else {
+                        continue;
+                    };
+                    if !self.driver.rollouts.current(&thread, update.generation) {
+                        continue;
+                    }
+                    let usage = update
+                        .usage
+                        .as_ref()
+                        .map(crate::agents::adapters::codex::usage::Usage::from_wire);
+                    if let Some(events) = self
+                        .mirror
+                        .apply_observation(&asid, epoch, runtime, update.items, |info| {
+                            if let Some(usage) = &usage {
+                                usage.apply(info);
+                            }
+                        })
+                        .await
+                    {
+                        if let Some(value) = update.usage {
+                            let _ = self.driver.record_usage(&thread, &value).await;
+                        }
+                        for event in events {
+                            self.emit(event);
+                        }
+                    } else {
+                        self.driver.rollouts.fence(&thread, update.generation);
+                    }
+                }
+                Err(_) => {
+                    if let Some(runtime) = self.driver.cached_runtime(&thread).await {
+                        if let Some((_, expected)) = self
+                            .mirror
+                            .runtime_sessions()
+                            .await
+                            .into_iter()
+                            .find(|(id, _)| id == &asid)
+                        {
+                            if let Some((seq, info)) =
+                                self.mirror.update_runtime(&asid, expected, runtime).await
+                            {
+                                self.emit(AgentDomainEvent::SessionUpdated {
+                                    asid: asid.clone(),
+                                    info: Box::new(info),
+                                    seq,
+                                });
+                            }
+                        }
+                    }
+                    self.emit(AgentDomainEvent::Resync {
+                        asid,
+                        reason: "codex_persisted_observation_refresh_required".into(),
                     });
                 }
             }
@@ -600,6 +676,18 @@ impl AgentManager {
                 }
             });
         }
+        if observed {
+            let context = context.clone();
+            let cancel = client.cancel_token();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! { biased; _ = cancel.cancelled() => break, _ = tick.tick() => {} }
+                    tokio::select! { biased; _ = cancel.cancelled() => break, _ = context.observe_rollouts() => {} }
+                }
+            });
+        }
         let cancel = client.cancel_token();
         tokio::spawn(async move {
             loop {
@@ -635,6 +723,97 @@ mod tests {
     use crate::agents::adapters::codex::tests::{golden, Fixture};
     use serde_json::json;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn persisted_observation_emits_metadata_before_redacted_rows_and_fences_rotation() {
+        use std::io::Write;
+        let home = std::env::temp_dir().join(format!("muqun-persisted-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(home.join("sessions")).unwrap();
+        let home = home.canonicalize().unwrap();
+        let path = home.join("sessions/fixture.jsonl");
+        let id = "00000000-0000-4000-8000-000000000001";
+        std::fs::write(
+            &path,
+            format!("{}\n", json!({"type":"session_meta","payload":{"id":id}})),
+        )
+        .unwrap();
+        let herdr = crate::test_support::FakeHerdr::start(vec![], None);
+        herdr.set_agents(json!([{"pane_id":"w1:p1","terminal_id":"fixture-terminal","agent":"codex","agent_status":"working","shell_pid":42,"agent_session":{"kind":"id","agent":"codex","value":id}}]));
+        let selected = path.clone();
+        let mut fixture = Fixture::new_in_home(move |request| match request["method"].as_str().unwrap() {
+            "thread/read" => {
+                let mut thread = golden()["thread"].clone();
+                thread["id"] = json!(id);
+                thread["status"] = json!({"type":"notLoaded"});
+                thread["path"] = json!(selected);
+                thread["historyMode"] = json!("paginated");
+                json!({"thread":thread})
+            }
+            "thread/items/list" if request["params"]["turnId"] == "turn" => json!({"data":[{"turnId":"turn","startedAtMs":10,"item":{"id":"command","type":"commandExecution","command":"[REDACTED]","status":"inProgress","aggregatedOutput":"safe"}}],"nextCursor":null}),
+            "thread/items/list" => json!({"data":[],"nextCursor":null}),
+            _ => panic!("persisted observation must not send controls"),
+        }, &home).await;
+        fixture.ready().await;
+        let (tx, mut events) = broadcast::channel(64);
+        let manager = AgentManager::connect_codex_observed(
+            fixture.client.clone(),
+            fixture.events.take().unwrap(),
+            tx,
+            Some(crate::agents::terminal_runtime::TerminalRuntime::new(&[
+                herdr.session(),
+            ])),
+        );
+        let asid = AgentSessionId(id.into());
+        manager.sessions().get_snapshot(&asid).await.unwrap();
+        let append = json!({"type":"event_msg","payload":{"type":"item_completed","thread_id":id,"turn_id":"turn","item":{"id":"command","type":"CommandExecution","command":["private raw command"]}}});
+        writeln!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap(),
+            "{append}"
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5),async {
+            let mut observed_metadata = false;
+            loop {
+                match events.recv().await.unwrap() {
+                    AgentDomainEvent::SessionUpdated { info, .. } if info.runtime.as_ref().and_then(|r|r.transcript) == Some(TranscriptSource::Persisted) => observed_metadata = true,
+                    AgentDomainEvent::TimelineUpsert { items, .. } => {
+                        assert!(observed_metadata);
+                        assert_eq!(items.len(),1);
+                        assert!(matches!(&items[0].part,AgentPart::Tool(tool) if tool.input["command"] == "[REDACTED]" && tool.status == ToolCallStatus::Running));
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }).await.unwrap();
+        let replacement = path.with_extension("replacement");
+        std::fs::copy(&path, &replacement).unwrap();
+        std::fs::rename(replacement, &path).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let AgentDomainEvent::Resync { reason, .. } = events.recv().await.unwrap() {
+                    assert_eq!(reason, "codex_persisted_observation_refresh_required");
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let snapshot = manager.sessions().get_snapshot(&asid).await.unwrap();
+        assert_eq!(
+            snapshot.info.runtime.unwrap().transcript,
+            Some(TranscriptSource::Snapshot)
+        );
+        assert_eq!(snapshot.timeline.len(), 1);
+        assert!(snapshot.permissions.is_empty() && snapshot.forms.is_empty());
+        fixture.client.stop();
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(home.join("sessions")).unwrap();
+        std::fs::remove_dir(home).unwrap();
+    }
 
     #[tokio::test]
     async fn terminal_observation_updates_metadata_without_refetching_or_fabricating_forms() {

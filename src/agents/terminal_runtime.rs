@@ -118,6 +118,7 @@ impl TerminalRuntime {
 
 fn unavailable(reason: RuntimeReason) -> SessionRuntime {
     SessionRuntime {
+        transcript: None,
         source: RuntimeSource::Unobserved,
         interaction: RuntimeInteraction::Unavailable,
         status: None,
@@ -160,6 +161,7 @@ fn resolve(observations: &Observations, id: &str, native: bool) -> SessionRuntim
             AgentStatus::Unknown => TerminalRuntimeStatus::Unknown,
         };
         return SessionRuntime {
+            transcript: None,
             source: RuntimeSource::Terminal,
             interaction: RuntimeInteraction::Terminal,
             status: Some(status),
@@ -173,6 +175,7 @@ fn resolve(observations: &Observations, id: &str, native: bool) -> SessionRuntim
     }
     if native {
         SessionRuntime {
+            transcript: None,
             source: RuntimeSource::Native,
             interaction: RuntimeInteraction::Native,
             status: None,
@@ -183,6 +186,7 @@ fn resolve(observations: &Observations, id: &str, native: bool) -> SessionRuntim
         unavailable(RuntimeReason::TerminalUnavailable)
     } else {
         SessionRuntime {
+            transcript: None,
             source: RuntimeSource::Unobserved,
             interaction: RuntimeInteraction::Native,
             status: None,

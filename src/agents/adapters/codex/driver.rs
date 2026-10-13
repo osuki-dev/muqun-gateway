@@ -31,6 +31,7 @@ pub struct CodexDriver {
     next_metadata_version: std::sync::atomic::AtomicU64,
     refresh_slots: Arc<tokio::sync::Semaphore>,
     usage: Mutex<HashMap<String, super::usage::Usage>>,
+    pub(crate) rollouts: super::rollout::Rollouts,
 }
 
 struct PendingModel {
@@ -62,6 +63,7 @@ impl CodexDriver {
             next_metadata_version: std::sync::atomic::AtomicU64::new(1),
             refresh_slots: Arc::new(tokio::sync::Semaphore::new(32)),
             usage: Mutex::new(HashMap::new()),
+            rollouts: Default::default(),
         }
     }
 
@@ -78,6 +80,7 @@ impl CodexDriver {
         // conservative terminal precedence.
         if self.client.is_shared() && self.client.is_subscribed(id) {
             return Some(SessionRuntime {
+                transcript: Some(TranscriptSource::Live),
                 source: RuntimeSource::Native,
                 interaction: RuntimeInteraction::Native,
                 status: None,
@@ -87,7 +90,10 @@ impl CodexDriver {
         }
         let observer = self.terminal_runtime.as_ref()?;
         let native = self.loaded.lock().await.contains(id) && !self.client.is_shared();
-        Some(observer.observe(id, native, fresh).await)
+        Some(
+            self.rollouts
+                .decorate(id, observer.observe(id, native, fresh).await),
+        )
     }
 
     async fn prepare_shared_interaction(&self, id: &str) -> Result<(), AgentError> {
@@ -102,6 +108,7 @@ impl CodexDriver {
     pub(crate) async fn cached_runtime(&self, id: &str) -> Option<SessionRuntime> {
         if self.client.is_shared() && self.client.is_subscribed(id) {
             return Some(SessionRuntime {
+                transcript: Some(TranscriptSource::Live),
                 source: RuntimeSource::Native,
                 interaction: RuntimeInteraction::Native,
                 status: None,
@@ -111,7 +118,7 @@ impl CodexDriver {
         }
         let observer = self.terminal_runtime.as_ref()?;
         let native = self.loaded.lock().await.contains(id) && !self.client.is_shared();
-        Some(observer.cached(id, native))
+        Some(self.rollouts.decorate(id, observer.cached(id, native)))
     }
 
     async fn require_native_interaction(&self, id: &str) -> Result<(), AgentError> {
@@ -142,6 +149,10 @@ impl CodexDriver {
 
     pub(crate) async fn clear_usage(&self, id: &str) {
         self.usage.lock().await.remove(id);
+    }
+
+    pub(crate) async fn cached_usage(&self, id: &str) -> Option<super::usage::Usage> {
+        self.usage.lock().await.get(id).cloned()
     }
 
     pub(crate) async fn apply_usage(&self, info: &mut AgentSessionInfo) {
@@ -1094,6 +1105,7 @@ impl AgentPort for CodexDriver {
             }
             let thread = &metadata["thread"];
             self.rejoin_loaded(id, thread).await?;
+            let prepared = super::rollout::Rollouts::prepare(self, thread).await;
             let mut items = vec![];
             match thread["historyMode"].as_str() {
                 Some("paginated") => {
@@ -1205,6 +1217,17 @@ impl AgentPort for CodexDriver {
             items.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
             if items.len() > limit {
                 items.drain(..items.len() - limit);
+            }
+            if let Some(prepared) = prepared {
+                if let Some(value) = &prepared.usage {
+                    let mut usage = self.usage.lock().await;
+                    if usage.len() < MAX_SESSIONS || usage.contains_key(id) {
+                        usage
+                            .entry(id.into())
+                            .or_insert_with(|| super::usage::Usage::from_wire(value));
+                    }
+                }
+                self.rollouts.install(id, prepared);
             }
             Ok(items)
         })

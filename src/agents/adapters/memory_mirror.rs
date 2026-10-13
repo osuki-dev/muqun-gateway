@@ -1011,12 +1011,28 @@ impl MemoryMirror {
         expected: u64,
         runtime: crate::agents::domain::SessionRuntime,
     ) -> Option<(u64, AgentSessionInfo)> {
+        self.update_runtime_decorated(asid, expected, runtime, |_| {})
+            .await
+    }
+
+    pub(crate) async fn update_runtime_decorated(
+        &self,
+        asid: &AgentSessionId,
+        expected: u64,
+        runtime: crate::agents::domain::SessionRuntime,
+        decorate: impl FnOnce(&mut AgentSessionInfo),
+    ) -> Option<(u64, AgentSessionInfo)> {
         let mut sessions = self.sessions.write().await;
         let state = sessions.get_mut(asid)?;
-        if state.current_seq != expected || state.info.runtime.as_ref() == Some(&runtime) {
+        if state.current_seq != expected {
             return None;
         }
+        let previous = state.info.clone();
         runtime.apply(&mut state.info);
+        decorate(&mut state.info);
+        if state.info == previous {
+            return None;
+        }
         let seq = state.next_seq();
         let info = state.info.clone();
         state.push_event(AgentDomainEvent::SessionUpdated {
@@ -1025,6 +1041,71 @@ impl MemoryMirror {
             seq,
         });
         Some((seq, info))
+    }
+
+    pub(crate) async fn observation_epoch(&self, asid: &AgentSessionId) -> Option<u64> {
+        self.sessions
+            .read()
+            .await
+            .get(asid)
+            .map(|state| state.replay_floor)
+    }
+
+    /// Atomically order observation metadata before appended items. Explicit
+    /// snapshot replacement and native ownership changes fence older batches.
+    pub(crate) async fn apply_observation(
+        &self,
+        asid: &AgentSessionId,
+        epoch: u64,
+        runtime: crate::agents::domain::SessionRuntime,
+        items: Vec<TimelineItem>,
+        decorate: impl FnOnce(&mut AgentSessionInfo),
+    ) -> Option<Vec<AgentDomainEvent>> {
+        use crate::agents::domain::RuntimeSource;
+        let mut sessions = self.sessions.write().await;
+        let state = sessions.get_mut(asid)?;
+        if state.replay_floor != epoch
+            || state.placeholder
+            || state.info.runtime.as_ref().is_none_or(|old| {
+                old.source != RuntimeSource::Terminal || old.terminal != runtime.terminal
+            })
+            || runtime.source != RuntimeSource::Terminal
+        {
+            return None;
+        }
+        let previous = state.info.clone();
+        runtime.apply(&mut state.info);
+        decorate(&mut state.info);
+        let mut events = Vec::new();
+        if previous != state.info {
+            let seq = state.next_seq();
+            events.push(AgentDomainEvent::SessionUpdated {
+                asid: asid.clone(),
+                info: Box::new(state.info.clone()),
+                seq,
+            });
+        }
+        if !items.is_empty() {
+            let seq = state.next_seq();
+            let mut updated = Vec::new();
+            for mut item in items {
+                item.seq = seq;
+                if let AgentPart::Tool(ref mut call) = item.part {
+                    truncate_tool_output(call);
+                }
+                state.insert_item(item.clone());
+                updated.push(item);
+            }
+            events.push(AgentDomainEvent::TimelineUpsert {
+                asid: asid.clone(),
+                items: updated,
+                seq,
+            });
+        }
+        for event in &events {
+            state.push_event(event.clone());
+        }
+        Some(events)
     }
 
     /// Commit an explicitly requested provider read only if no newer event won.
@@ -1430,6 +1511,79 @@ mod tests {
             items: vec![text_item("m:t0", "m", text)],
             seq,
         }
+    }
+
+    #[tokio::test]
+    async fn persisted_batch_cannot_cross_explicit_refresh_or_native_ownership() {
+        use crate::agents::domain::{
+            RuntimeInteraction, RuntimeSource, RuntimeTerminal, SessionRuntime, TranscriptSource,
+        };
+        let mirror = MemoryMirror::new();
+        let asid = AgentSessionId("fixture".into());
+        let runtime = SessionRuntime {
+            source: RuntimeSource::Terminal,
+            interaction: RuntimeInteraction::Terminal,
+            transcript: Some(TranscriptSource::Persisted),
+            status: None,
+            reason: None,
+            terminal: Some(RuntimeTerminal {
+                session_id: "local".into(),
+                pane_id: "pane".into(),
+                instance_id: "binding".into(),
+            }),
+        };
+        let mut session = info(&asid, "fixture");
+        runtime.clone().apply(&mut session);
+        mirror.update_session(session).await;
+        let old_epoch = mirror.observation_epoch(&asid).await.unwrap();
+        let captured = mirror.get_snapshot(&asid).await.unwrap();
+        mirror
+            .refresh_snapshot(captured.clone(), Some(captured.seq))
+            .await
+            .unwrap();
+        assert!(mirror
+            .apply_observation(
+                &asid,
+                old_epoch,
+                runtime.clone(),
+                vec![text_item("stale", "stale", "stale")],
+                |_| {}
+            )
+            .await
+            .is_none());
+        let epoch = mirror.observation_epoch(&asid).await.unwrap();
+        let events = mirror
+            .apply_observation(
+                &asid,
+                epoch,
+                runtime.clone(),
+                vec![text_item("current", "current", "current")],
+                |info| info.title = "observed".into(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            &events[0],
+            AgentDomainEvent::SessionUpdated { .. }
+        ));
+        assert!(matches!(
+            &events[1],
+            AgentDomainEvent::TimelineUpsert { .. }
+        ));
+        let mut native = mirror.session_info(&asid).await.unwrap();
+        native.runtime.as_mut().unwrap().source = RuntimeSource::Native;
+        mirror.update_session(native).await;
+        assert!(mirror
+            .apply_observation(
+                &asid,
+                epoch,
+                runtime,
+                vec![text_item("late", "late", "late")],
+                |_| {}
+            )
+            .await
+            .is_none());
+        assert_eq!(mirror.get_snapshot(&asid).await.unwrap().timeline.len(), 1);
     }
 
     #[tokio::test]

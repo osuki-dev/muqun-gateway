@@ -16,7 +16,8 @@ pub use session::{
     AgentErrorInfo, AgentProject, AgentSessionId, AgentSessionInfo, AgentSessionStatus, ModelRef,
     RevertState, RuntimeInteraction, RuntimeReason, RuntimeSource, RuntimeTerminal,
     SessionContextUsage, SessionCursor, SessionForkInfo, SessionGitInfo, SessionPage, SessionQuery,
-    SessionRevertInfo, SessionRuntime, TerminalRuntimeStatus, TokensUsage, WorktreeState,
+    SessionRevertInfo, SessionRuntime, TerminalRuntimeStatus, TokensUsage, TranscriptSource,
+    WorktreeState,
 };
 pub use timeline::{
     part_item_id, push_input_partial, reasoning_item_id, text_item_id, tool_item_id, AgentPart,

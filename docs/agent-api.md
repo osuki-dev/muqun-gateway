@@ -435,13 +435,14 @@ on session info, including snapshots, lists, creation and `agent.session.updated
 Currently Codex supplies it; absence preserves the existing provider contract.
 
 ```json
-{"source":"terminal","interaction":"terminal","status":"working",
+{"source":"terminal","interaction":"terminal","status":"working","transcript":"persisted",
  "terminal":{"session_id":"local","pane_id":"w1:p1","instance_id":"opaque"}}
 ```
 
 `source` is `native`, `terminal`, or `unobserved`. `interaction` is `native`,
 `terminal`, or `unavailable`; it is independent of status. A native source is
-owned by this Gateway's private Codex runtime. A terminal source is a unique
+observed through an accepted subscription to the connected Codex runtime (private
+or shared daemon). A terminal source is a unique
 current local Herdr observation matching the Codex conversation identity and
 provider exactly, with a complete opaque observed binding. No conversation
 identity is decoded by the App. It revalidates all three terminal binding fields
@@ -469,10 +470,31 @@ on an externally bound thread return `409 agent_terminal_interaction_required`
 with `error.runtime`; mutation guards reread the binding without using cached
 observations. Upstream Codex's per-thread writer lock remains the final authority.
 
-This correlation describes the current private-stdio adapter, not a general
-restriction on Codex's official shared daemon. Same-daemon clients can rejoin a
-loaded runtime and replay pending requests; persisted history read through a
-separate process cannot establish that ownership or recreate its callbacks.
+An explicitly opened same-daemon loaded conversation can rejoin that runtime and
+replay its pending requests. That accepted subscription takes precedence over a
+terminal observation. A persisted history read cannot establish that ownership
+or recreate its callbacks.
+
+Optional `runtime.transcript` is `live`, `persisted`, or `snapshot`. Native
+subscribed events are `live`. A `persisted` observation follows completed durable
+items and reported token counts for the exact terminal conversation, through
+existing typed timeline/session events. It does not provide token deltas, pending
+tool starts, or actionable approvals. The App may apply live/persisted item updates
+using its existing scroll policy; neither mode requests a history replacement or
+forces the viewport to move. `snapshot` remains explicit-refresh-only.
+
+Persisted readers use the path selected by native `thread/read`, confined beneath
+the initialized Codex home's `sessions` directory, with exact session-header
+identity and no symlink traversal. At most eight readers are retained, with four
+bounded initial preparations. Initial sampling is limited to the last 1 MiB;
+incremental reads are 256 KiB per poll with a 4 MiB record limit. Durable IDs trigger
+at most four turn-scoped native item-page reads and 2 MiB of replies per batch,
+retaining Codex's redaction and process-completion projection. Unchanged files do
+not trigger item-page reads. There are no directory scans or new file endpoints.
+Native-selected path changes, inode replacement, truncation, header/anchor changes,
+rollback, binding loss or exhausted observation budgets freeze the reader until an
+explicit refresh; retained transcript rows are not replaced automatically. Usage
+is unknown when the bounded initial sample contains no complete token-count record.
 
 The capability **`agent_session_refresh_v1`** adds `?refresh=true` to the existing
 GET session snapshot endpoint (global and legacy aliases). This is an explicit
