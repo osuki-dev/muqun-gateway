@@ -422,11 +422,38 @@ INFO no OpenCode service found, starting one binary=/home/you/.opencode/bin/open
 INFO adopted the running OpenCode service url=http://127.0.0.1:49374 version="2.0.14" binary=/home/you/.opencode/bin/opencode
 ```
 
-If what it finds is older than 2.0 it refuses it — started or adopted — with
-one line saying which file, which version, and that `opencode.binary` is how to
-point it elsewhere. OpenCode 1 is a different API, and half-working with it is
-worse than saying so. `GET /api/agent-status` reports the same facts to the
-app, including whether the agent was `adopted` or `spawned`.
+The binary probe refuses a known major other than 2; adoption requires a known
+2.x live version. Refusal messages are generic and do not echo the untrusted
+version. Check your installation and the available startup diagnostics; set
+`opencode.binary` to the intended binary's absolute path in `config.json` if
+needed. OpenCode 1 is a different API, and future major versions are not
+accepted. `GET /api/agent-status` reports the service version and whether the
+agent was `adopted` or `spawned` when available.
+
+Adoption requires authenticated live `/api/info` with a valid PID and 2.x
+version; a registration's PID and version must match that reply. Credentials
+are redacted from debug output. An explicit `OPENCODE_URL` (or legacy
+`HERDR_GATEWAY_OPENCODE_URL`) is attach-only: failed authentication, identity
+or version checks never start a fallback local service.
+
+The upstream contract baseline is OpenCode **2.0.27** (released October 12,
+2026), checked against published source and mocked protocol replies, not live
+platform certification. Gateway absorbs the protocol mapping without requiring
+an existing App update. Session lists remain arrays; optional pagination needs
+`agent_session_pages_v1` and the selected agent's `sessionPagination` flag
+(OpenCode only). The current App still requests fifty sessions and does not
+automatically fetch further pages. See the [Agent API](docs/agent-api.md#get-apiagent-sessionspage).
+
+### DeepSeek Harness compatibility
+
+The Gateway adapter tracks the **rc.2** contract: history uses one
+authoritative projection cut, file references use a live session scope, and
+model selection/probing validate the upstream success payload. These mappings
+require no existing App change or replacement of your upstream package. Existing
+HTTP and HTTP-backed reverse-proxy paths remain supported. The **0.2.1-alpha.2**
+native HTTPS Origin/Cookie flow and optional asynchronous questions with late
+answers are currently unsupported; this does not mean all HTTPS reverse proxies
+are unsupported, or that ordinary blocking forms are unsupported.
 
 ### T3 Code
 

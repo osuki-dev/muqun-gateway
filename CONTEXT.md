@@ -309,6 +309,37 @@ computers the user `@`-named when opening a task (`POST /api/tasks`
 (`Task::mentions`) and reach the agent only through `tasks.read` of its own
 task, never through its conversation.
 
+### Agent upstream contract baselines
+
+OpenCode's upstream baseline is **2.0.27**, released October 12, 2026. The
+contract was checked against published source and mocked protocol replies;
+this is not live macOS/Linux platform certification. Discovery authenticates
+`GET /api/info`, requires a valid live PID and a known 2.x version, and matches
+any registered PID/version. Supervision also tracks the registration identity
+and reattaches when the instance changes. Credential-bearing debug output is
+redacted. Explicit `OPENCODE_URL` / `HERDR_GATEWAY_OPENCODE_URL` endpoints are
+attach-only: failed identity, authentication or version checks must not start a
+local fallback service. Older and future major versions are refused.
+
+Gateway absorbs upstream mappings without requiring an existing App update.
+The legacy session-list/children arrays remain; the additive page endpoint is
+gated by `agent_session_pages_v1` and per-agent `sessionPagination` (OpenCode
+only). It preserves provider cursors and order without automatically following
+pages. The current App's fifty-session request does not become full pagination.
+See [Agent API](docs/agent-api.md#get-apiagent-sessionspage) for the contract.
+
+DeepSeek's **rc.2** mapping reads `session/projections.asOfSeq` as the
+authoritative history cut and retains it across backward pages. File references
+use `fileReferences/list` with the live session as `agentId`; workspace file
+list/stat use `workspaceFileScopeId`, not a directory substituted for session
+scope. Model switching reads the returned `selected` model; readiness requires
+a matching `server-response`/`rpcId`, successful result and model-catalog shape,
+not merely HTTP 200. No upstream package replacement is required. Existing HTTP
+and HTTP-backed reverse-proxy paths are preserved; **0.2.1-alpha.2** native
+HTTPS Origin/Cookie handling and optional asynchronous questions with late
+answers remain unsupported. Do not generalize that limitation to every HTTPS
+reverse proxy or to ordinary blocking forms.
+
 ## Engineering conventions
 
 - Keep backend branching in adapter construction or adapter modules, not route
