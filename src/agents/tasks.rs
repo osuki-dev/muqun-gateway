@@ -869,8 +869,10 @@ mod tests {
                 "repo A\n"
             );
             assert_eq!(
-                git_checked(&checkout, &["rev-parse", "--show-toplevel"]).unwrap(),
-                checkout.to_string_lossy()
+                PathBuf::from(git_checked(&checkout, &["rev-parse", "--show-toplevel"]).unwrap())
+                    .canonicalize()
+                    .unwrap(),
+                checkout.canonicalize().unwrap()
             );
             return;
         }
@@ -910,6 +912,27 @@ mod tests {
             "hello\n"
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn worktree_repository_identity_survives_a_symlinked_tmpdir() {
+        let root = temp_dir("symlinked-tmpdir").canonicalize().unwrap();
+        let real = root.join("real");
+        let alias = root.join("alias");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "agents::tasks::tests::worktree_fallback_scrubs_inherited_repository_and_config_in_a_subprocess", "--nocapture"])
+            .env("TMPDIR", &alias)
+            .output().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
     }
 
     #[test]

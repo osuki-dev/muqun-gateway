@@ -370,6 +370,40 @@ pub(crate) fn asset_test_dir(name: &str) -> PathBuf {
     std::fs::canonicalize(&dir).unwrap()
 }
 
+/// An owned private fixture directory whose canonical socket path fits sun_path.
+/// Only socket fixtures fall back to /tmp; asset fixtures keep their TMPDIR.
+pub(crate) struct TestSocket {
+    dir: PathBuf,
+    pub(crate) path: PathBuf,
+}
+
+impl TestSocket {
+    pub(crate) fn new() -> Self {
+        use std::os::unix::{ffi::OsStrExt, fs::DirBuilderExt};
+
+        // sun_path includes its terminating NUL: 104 bytes on macOS, 108 on Linux.
+        let max_bytes = if cfg!(target_os = "macos") { 103 } else { 107 };
+        let name = format!("s-{}", uuid::Uuid::new_v4().simple());
+        for base in [std::env::temp_dir(), PathBuf::from("/tmp")] {
+            let dir = base.canonicalize().unwrap().join(&name);
+            let path = dir.join("h");
+            if path.as_os_str().as_bytes().len() > max_bytes {
+                continue;
+            }
+            // create, not create_dir_all: never adopt a directory owned by another fixture.
+            std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+            return Self { dir, path };
+        }
+        panic!("no temporary directory fits the test Unix socket path");
+    }
+}
+
+impl Drop for TestSocket {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 pub(crate) fn test_asset_entry(path: &FsPath, root: &FsPath, modified_unix_ms: u128) -> AssetEntry {
     AssetEntry {
         id: asset_id(path),
@@ -565,6 +599,8 @@ pub(crate) fn approval_data_menu(
 /// of polls.
 pub(crate) struct FakeHerdr {
     pub(crate) socket_path: PathBuf,
+    socket: TestSocket,
+    serving: tokio::task::JoinHandle<()>,
     pub(crate) calls: Arc<Mutex<Vec<Value>>>,
     /// What `pane.list` answers once set (entries may carry a test-only
     /// `shell_pid` that `pane.process_info` answers with); unset, both
@@ -577,17 +613,15 @@ impl FakeHerdr {
     /// state sequence to move; `None` makes `agent.list` come back empty,
     /// which is a pane running no agent Herdr knows.
     pub(crate) fn start(screens: Vec<&str>, advance_after: Option<usize>) -> Self {
-        let socket_path = std::env::temp_dir().join(format!(
-            "herdr-submit-{}.sock",
-            uuid::Uuid::new_v4().simple()
-        ));
+        let socket = TestSocket::new();
+        let socket_path = socket.path.clone();
         let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
         let calls: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
         let recorded = Arc::clone(&calls);
         let panes: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
         let listed = Arc::clone(&panes);
         let screens: Vec<String> = screens.into_iter().map(str::to_owned).collect();
-        tokio::spawn(async move {
+        let serving = tokio::spawn(async move {
             let mut reads = 0usize;
             let mut enters = 0usize;
             while let Ok((stream, _)) = listener.accept().await {
@@ -666,6 +700,8 @@ impl FakeHerdr {
         });
         Self {
             socket_path,
+            socket,
+            serving,
             calls,
             panes,
         }
@@ -842,7 +878,80 @@ pub(crate) const FAKE_AGENT_SEQ: u64 = 100;
 
 impl Drop for FakeHerdr {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.socket_path);
+        self.serving.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
+
+    #[tokio::test]
+    async fn socket_fixtures_bind_and_clean_up_with_a_long_tmpdir() {
+        const CHILD: &str = "MUQUN_TEST_LONG_SOCKET_TMPDIR";
+        if std::env::var_os(CHILD).is_some() {
+            let temp = std::env::temp_dir().canonicalize().unwrap();
+            assert!(temp.as_os_str().as_bytes().len() > 108);
+            let socket = TestSocket::new();
+            let max_bytes = if cfg!(target_os = "macos") { 103 } else { 107 };
+            assert!(socket.path.as_os_str().as_bytes().len() <= max_bytes);
+            assert_eq!(socket.dir.canonicalize().unwrap(), socket.dir);
+            assert_eq!(
+                std::fs::metadata(&socket.dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            let second = TestSocket::new();
+            assert_ne!(socket.dir, second.dir);
+            let listener = tokio::net::UnixListener::bind(&socket.path).unwrap();
+            let client = tokio::net::UnixStream::connect(&socket.path).await.unwrap();
+            let (accepted, _) = listener.accept().await.unwrap();
+            drop((client, accepted, listener));
+            let dir = socket.dir.clone();
+            drop(socket);
+            assert!(!dir.exists());
+            assert!(
+                second.dir.exists(),
+                "cleanup must not remove another fixture"
+            );
+            let fake = FakeHerdr::start(vec!["synthetic screen"], None);
+            let fake_dir = fake.socket.dir.clone();
+            assert!(fake.socket_path.as_os_str().as_bytes().len() <= max_bytes);
+            assert_eq!(
+                read_output(&output_state(&fake), 1).await,
+                "synthetic screen"
+            );
+            drop(fake);
+            assert!(!fake_dir.exists());
+            return;
+        }
+
+        let root = asset_test_dir("long-socket-tmpdir");
+        // A symlink and multibyte component also exercise canonical byte length.
+        let long = root.join("é".repeat(60));
+        let alias = root.join("alias");
+        std::fs::create_dir(&long).unwrap();
+        std::os::unix::fs::symlink(&long, &alias).unwrap();
+        let outputs: Vec<_> = [
+            "test_support::tests::socket_fixtures_bind_and_clean_up_with_a_long_tmpdir",
+            "tasks::service::tests::terminal_start_retries_only_before_a_typed_goal_can_be_delivered",
+        ].into_iter().map(|test| {
+            ProcessCommand::new(std::env::current_exe().unwrap())
+                .args(["--exact", test, "--nocapture"])
+                .env(CHILD, "1")
+                .env("TMPDIR", &alias)
+                .output().unwrap()
+        }).collect();
+        std::fs::remove_dir_all(root).unwrap();
+        for output in outputs {
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        }
     }
 }
 

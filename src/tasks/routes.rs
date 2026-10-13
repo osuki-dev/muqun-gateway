@@ -1068,11 +1068,58 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_terminal_task_fixture_does_not_capture_an_unrelated_host_process() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = crate::test_support::asset_test_dir("unrelated-process");
+        let ps = dir.join("ps");
+        // The old fixture PID really exists, but has no launched child. The
+        // capture window must not be entered for this unrelated host process.
+        std::fs::write(&ps, "#!/bin/sh\nprintf '%s\\n' '4242 1 4242 4242 ?? 00:10 Tue Oct 13 00:00:00 2026'\nprintf '%s\\n' \"$*\" >> \"$MUQUN_TEST_PS_CALLS\"\n").unwrap();
+        std::fs::set_permissions(&ps, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let calls = dir.join("calls");
+        let path = std::env::join_paths(std::iter::once(dir.clone()).chain(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        )))
+        .unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tasks::routes::tests::a_terminal_agent_opens_in_a_pane_bound_to_its_task",
+                "--nocapture",
+            ])
+            .env("PATH", path)
+            .env("MUQUN_TEST_PS_CALLS", &calls)
+            .output()
+            .unwrap();
+        let trace = std::fs::read_to_string(calls).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        assert!(
+            trace
+                .lines()
+                .filter(|line| *line == "-A -o pid=,ppid=,pgid=,tpgid=,tty=,etime=,lstart=")
+                .count()
+                >= 2,
+            "the real before/after job capture must read the synthetic table: {trace}"
+        );
+    }
+
     #[tokio::test]
     async fn a_terminal_agent_opens_in_a_pane_bound_to_its_task() {
         let herdr = crate::FakeHerdr::start(vec!["$ "], None);
+        // A fake pane has no OS shell. A small fixed PID can name an unrelated
+        // host process and trigger the real launched-job capture's 10 s wait.
+        let shell_pid = u32::MAX;
         herdr.set_panes(json!([
-            { "pane_id": "w1:p9", "workspace_id": "w1", "tab_id": "w1:t9", "shell_pid": 4242 }
+            { "pane_id": "w1:p9", "workspace_id": "w1", "tab_id": "w1:t9", "shell_pid": shell_pid }
         ]));
         let mut state = state();
         state.config.sessions[0].socket_path = herdr.session().socket_path;
@@ -1084,6 +1131,8 @@ mod tests {
         let dir = std::env::temp_dir().canonicalize().unwrap();
         let body = json!({ "goal": "fix the build", "cwd": dir, "agent_id": "codex",
                            "model": "gpt-6-sol", "variant": "low", "label": "build" });
+        // Subscribe before dispatch, so even a fast launch cannot lose its update.
+        let mut updates = state.task_events.subscribe();
         let (status, task) = send(&state, "POST", "/api/tasks", Some(body), true).await;
         assert_eq!(status, StatusCode::OK, "{task}");
         // Answered once the pane exists; the agent starts in the background.
@@ -1094,7 +1143,7 @@ mod tests {
         assert_eq!(
             task["binding"],
             json!({ "kind": "pane", "session_id": "default", "pane_id": "w1:p9",
-                    "tab_id": "w1:t9", "shell_pid": 4242, "agent_id": "codex",
+                    "tab_id": "w1:t9", "shell_pid": shell_pid, "agent_id": "codex",
                     "model": "gpt-6-sol", "variant": "low" })
         );
         assert_eq!(
@@ -1102,12 +1151,20 @@ mod tests {
             (&json!("gpt-6-sol"), &json!("low"))
         );
         let id = TaskId(task["task_id"].as_str().unwrap().into());
-        for _ in 0..400 {
-            if state.tasks.get_for_test(&id).await.state != TaskState::Dispatching {
-                break;
+        tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            loop {
+                let crate::tasks::events::TaskDomainEvent::Updated { task, .. } =
+                    updates.recv().await.unwrap();
+                if task.task_id == id.0
+                    && !matches!(task.state, TaskState::Queued | TaskState::Dispatching)
+                {
+                    assert_eq!(task.state, TaskState::Working);
+                    break;
+                }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        })
+        .await
+        .expect("the synthetic pane's launch must finish without host job capture");
         assert_eq!(
             state.tasks.get_for_test(&id).await.state,
             TaskState::Working
@@ -1146,10 +1203,12 @@ mod tests {
                 "model_reasoning_effort=\"low\""
             ]
         );
-        let prompt = calls
+        let prompts: Vec<_> = calls
             .iter()
-            .find(|c| c["method"] == "agent.prompt")
-            .unwrap();
+            .filter(|c| c["method"] == "agent.prompt")
+            .collect();
+        assert_eq!(prompts.len(), 1, "the goal must be delivered exactly once");
+        let prompt = prompts[0];
         // The goal alone: how to finish is the MCP server's to say.
         assert_eq!(prompt["params"]["text"], "fix the build");
         assert_eq!(task["goal"], "fix the build");

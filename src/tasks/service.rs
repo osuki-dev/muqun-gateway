@@ -3742,7 +3742,7 @@ mod tests {
     }
 
     struct TaskStartHerdr {
-        dir: std::path::PathBuf,
+        socket: crate::test_support::TestSocket,
         calls: Arc<std::sync::Mutex<Vec<Value>>>,
         serving: tokio::task::JoinHandle<()>,
     }
@@ -3750,9 +3750,8 @@ mod tests {
     impl TaskStartHerdr {
         fn start(first_error: Option<&'static str>) -> Self {
             use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-            // Keep the Unix socket path below SUN_LEN even with a long TMPDIR.
-            let dir = crate::test_support::asset_test_dir("s");
-            let listener = tokio::net::UnixListener::bind(dir.join("h")).unwrap();
+            let socket = crate::test_support::TestSocket::new();
+            let listener = tokio::net::UnixListener::bind(&socket.path).unwrap();
             let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
             let recorded = calls.clone();
             let serving = tokio::spawn(async move {
@@ -3812,7 +3811,7 @@ mod tests {
                 }
             });
             Self {
-                dir,
+                socket,
                 calls,
                 serving,
             }
@@ -3822,7 +3821,6 @@ mod tests {
     impl Drop for TaskStartHerdr {
         fn drop(&mut self) {
             self.serving.abort();
-            let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
 
@@ -3840,8 +3838,7 @@ mod tests {
             let fake = TaskStartHerdr::start(error);
             let mut state = test_state("admin", Vec::new());
             state.config.agent_trust_folders = false;
-            state.config.sessions[0].socket_path =
-                fake.dir.join("h").to_string_lossy().into_owned();
+            state.config.sessions[0].socket_path = fake.socket.path.to_string_lossy().into_owned();
             let session = state.config.sessions[0].clone();
             let placed =
                 crate::agents::session_routes::place_agent(&state, &session, "claude", None, None)
