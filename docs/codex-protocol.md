@@ -121,8 +121,14 @@ validation failures occur before agent supervision starts.
 
 ## Sessions, history and model selection
 
-Opening a requested timeline or explicitly controlling a session on the shared transport rejoins it only if a fresh
-`thread/read` proves that daemon already has it loaded (`idle` or `active`).
+Opening a requested timeline or explicitly controlling a session on the shared
+transport can rejoin a session that a fresh `thread/read` reports as loaded
+(`idle` or `active`). A selected `notLoaded` session can also recover after a
+Gateway restart when the shared SQLite store records an accepted native create,
+fork or prompt submission for its exact thread ID and verified canonical Codex
+home. This evidence stores no prompt, credential or workspace path. Listing and
+metadata reads do not trigger recovery, and old unregistered sessions are not
+backfilled from terminal observations or transcript metadata.
 `thread/resume` carries only its exact ID and `excludeTurns: true`; it does not
 apply model, instructions or permission overrides. A one-turn metadata page
 (`itemsView: notLoaded`)
@@ -131,8 +137,14 @@ is native runtime proof even when a terminal client is also attached. Only
 accepted explicit start/fork/rejoin sessions enter the live projection;
 unrequested shared-server thread notifications and callbacks are ignored.
 Closed/deleted/notLoaded notifications invalidate that proof. Opening a
-`notLoaded` external CLI transcript does not resume or migrate it; its existing
-terminal/unobserved provenance remains authoritative.
+`notLoaded` external CLI transcript without that evidence does not resume or
+migrate it; its existing terminal/unobserved provenance remains authoritative.
+Recorded origin permits only the resume request, never ownership: the official
+server must acknowledge the same ID and may reject it when another writer owns
+the thread. Such rejection does not launch a fallback process or submit a turn.
+Unloading retains the evidence; successful deletion removes it. Failure to write
+the local evidence after an accepted mutation is logged without reporting that
+mutation as failed, preventing a retry of an already accepted prompt.
 
 The shared transport supports live callback replay, but a warm metadata-only
 resume does not replay historical token totals. Reading history is not evidence

@@ -777,14 +777,27 @@ impl AgentManager {
 
     pub(crate) fn connect_codex_observed(
         client: Arc<CodexClient>,
+        events: mpsc::Receiver<CodexEvent>,
+        tx: broadcast::Sender<AgentDomainEvent>,
+        observer: Option<Arc<crate::agents::terminal_runtime::TerminalRuntime>>,
+    ) -> Self {
+        Self::connect_codex_recoverable(client, events, tx, observer, None)
+    }
+
+    pub(crate) fn connect_codex_recoverable(
+        client: Arc<CodexClient>,
         mut events: mpsc::Receiver<CodexEvent>,
         tx: broadcast::Sender<AgentDomainEvent>,
         observer: Option<Arc<crate::agents::terminal_runtime::TerminalRuntime>>,
+        native_sessions: Option<
+            Arc<crate::agents::adapters::codex::native_sessions::NativeSessions>,
+        >,
     ) -> Self {
         let endpoint = client.endpoint();
         let observed = observer.is_some();
         let mut driver = CodexDriver::new(client.clone());
         driver.observe_terminals(observer);
+        driver.restore_native_sessions(native_sessions);
         let driver = Arc::new(driver);
         let mirror = Arc::new(MemoryMirror::for_agent("codex"));
         let stopped = Arc::new(Mutex::new(false));

@@ -242,6 +242,8 @@ pub struct AgentRuntime {
     /// token store exists (the runtime is built before it).
     mcp: std::sync::OnceLock<McpWiring>,
     terminal_runtime: std::sync::OnceLock<Arc<super::terminal_runtime::TerminalRuntime>>,
+    native_codex_sessions:
+        std::sync::OnceLock<Arc<super::adapters::codex::native_sessions::NativeSessions>>,
 }
 
 #[derive(PartialEq, Eq)]
@@ -369,6 +371,7 @@ impl AgentRuntime {
             supervising: AtomicBool::new(false),
             mcp: std::sync::OnceLock::new(),
             terminal_runtime: std::sync::OnceLock::new(),
+            native_codex_sessions: std::sync::OnceLock::new(),
         })
     }
 
@@ -376,6 +379,15 @@ impl AgentRuntime {
         let _ = self
             .terminal_runtime
             .set(super::terminal_runtime::TerminalRuntime::new(sessions));
+    }
+
+    pub(crate) fn restore_native_codex_sessions(
+        &self,
+        db: Arc<crate::platform::store::sqlite::SqliteStore>,
+    ) {
+        let _ = self
+            .native_codex_sessions
+            .set(super::adapters::codex::native_sessions::NativeSessions::new(db));
     }
 
     /// Let the OpenCode service this runtime starts reach `/mcp` at `url`.

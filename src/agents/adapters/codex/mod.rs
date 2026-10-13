@@ -8,6 +8,7 @@ mod input;
 mod items;
 mod launch;
 pub mod mapper;
+pub(crate) mod native_sessions;
 pub(crate) mod process_tree;
 pub(crate) mod rollout;
 pub(crate) mod rollout_projection;

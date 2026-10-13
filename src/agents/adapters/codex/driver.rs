@@ -21,6 +21,7 @@ const FIRST_ITEM_POSITION: u64 = 1 << 63;
 pub struct CodexDriver {
     client: Arc<CodexClient>,
     terminal_runtime: Option<Arc<crate::agents::terminal_runtime::TerminalRuntime>>,
+    native_sessions: Option<Arc<super::native_sessions::NativeSessions>>,
     /// Only explicitly created, forked or submitted-to threads are resumed.
     loaded: Mutex<HashSet<String>>,
     /// Serializes explicit mutations, not the stream or read-only RPC calls.
@@ -56,6 +57,7 @@ impl CodexDriver {
         Self {
             client,
             terminal_runtime: None,
+            native_sessions: None,
             loaded: Mutex::new(HashSet::new()),
             mutations: Arc::new(Mutex::new(())),
             order: std::sync::Mutex::new(HashMap::new()),
@@ -74,6 +76,39 @@ impl CodexDriver {
         observer: Option<Arc<crate::agents::terminal_runtime::TerminalRuntime>>,
     ) {
         self.terminal_runtime = observer;
+    }
+
+    pub(crate) fn restore_native_sessions(
+        &mut self,
+        sessions: Option<Arc<super::native_sessions::NativeSessions>>,
+    ) {
+        self.native_sessions = sessions;
+    }
+
+    async fn record_native_acceptance(&self, id: &str) {
+        let (Some(sessions), Some(home)) = (&self.native_sessions, self.client.codex_home()) else {
+            return;
+        };
+        // Upstream has already accepted the mutation. A local storage failure
+        // must not turn that success into a failed send that the App retries.
+        if sessions.record(home, id).await.is_err() {
+            tracing::warn!("Could not persist accepted native Codex session evidence");
+        }
+    }
+
+    async fn can_rejoin_selected(&self, id: &str, metadata: &Value) -> bool {
+        match metadata["status"]["type"].as_str() {
+            Some("idle" | "active") => true,
+            Some("notLoaded") => {
+                let (Some(sessions), Some(home)) =
+                    (&self.native_sessions, self.client.codex_home())
+                else {
+                    return false;
+                };
+                sessions.contains(home, id).await.unwrap_or(false)
+            }
+            _ => false,
+        }
     }
 
     pub(crate) async fn runtime(&self, id: &str, fresh: bool) -> Option<SessionRuntime> {
@@ -536,17 +571,17 @@ impl CodexDriver {
             .retain(|(thread, _, _), _| thread != id);
     }
 
-    /// Opening a requested timeline may rejoin a runtime already loaded in
-    /// the shared daemon. Metadata/history-only external threads stay untouched.
+    /// Opening a selected timeline may rejoin a loaded shared runtime, or
+    /// restore one with durable native-action evidence. This is not discovery:
+    /// unknown unloaded threads stay untouched, and only official resume can
+    /// grant ownership (including rejecting an external writer's OS lock).
     async fn rejoin_loaded(
         &self,
         id: &str,
         metadata: &Value,
         recover_questions: bool,
     ) -> Result<(), AgentError> {
-        if !self.client.is_shared()
-            || !matches!(metadata["status"]["type"].as_str(), Some("idle" | "active"))
-        {
+        if !self.client.is_shared() || !self.can_rejoin_selected(id, metadata).await {
             return Ok(());
         }
         let _guard = self.mutations.lock().await;
@@ -559,10 +594,10 @@ impl CodexDriver {
                 Ok(())
             };
         }
-        // Recheck after waiting for another mutation; never turn a known
-        // notLoaded external CLI thread into a resume/takeover attempt.
+        // Recheck after waiting for another mutation, including provenance.
+        // A remembered origin is permission to request resume, not ownership.
         let fresh = self.read_thread(id).await?;
-        if !matches!(fresh["status"]["type"].as_str(), Some("idle" | "active")) {
+        if !self.can_rejoin_selected(id, &fresh).await {
             return Ok(());
         }
         let resumed = self
@@ -1041,8 +1076,11 @@ impl AgentPort for CodexDriver {
                 self.validate_model(model).await?;
             }
             Self::model_params(&mut params, model)?;
-            self.selected_response(self.client.call("thread/start", params).await?)
-                .await
+            let session = self
+                .selected_response(self.client.call("thread/start", params).await?)
+                .await?;
+            self.record_native_acceptance(&session.asid.0).await;
+            Ok(session)
         })
     }
 
@@ -1135,6 +1173,7 @@ impl AgentPort for CodexDriver {
             let revision = self.metadata_revision(id).await?;
             let response = self.client.call("turn/start", params).await?;
             mapper::string(&response["turn"], "id")?;
+            self.record_native_acceptance(id).await;
             if let Some(choice) = self
                 .next_models
                 .lock()
@@ -1272,6 +1311,12 @@ impl AgentPort for CodexDriver {
             self.client
                 .call("thread/delete", json!({"threadId":id}))
                 .await?;
+            if let (Some(sessions), Some(home)) = (&self.native_sessions, self.client.codex_home())
+            {
+                if sessions.remove(home, id).await.is_err() {
+                    tracing::warn!("Could not remove deleted native Codex session evidence");
+                }
+            }
             self.forget_thread(id).await;
             self.clear_usage(id).await;
             Ok(())
@@ -1288,12 +1333,15 @@ impl AgentPort for CodexDriver {
             if message.is_some() {
                 return unsupported("Codex item-boundary fork (only whole-thread fork is exposed)");
             }
-            self.selected_response(
-                self.client
-                    .call("thread/fork", json!({"threadId":id,"excludeTurns":true}))
-                    .await?,
-            )
-            .await
+            let session = self
+                .selected_response(
+                    self.client
+                        .call("thread/fork", json!({"threadId":id,"excludeTurns":true}))
+                        .await?,
+                )
+                .await?;
+            self.record_native_acceptance(&session.asid.0).await;
+            Ok(session)
         })
     }
 

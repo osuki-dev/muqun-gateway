@@ -121,6 +121,13 @@ pub(crate) mod tests {
             handler: impl Fn(&Value) -> Value + Send + 'static,
             deferred: Option<(&'static str, Arc<tokio::sync::Notify>)>,
         ) -> Self {
+            Self::with_outcomes(move |request| Ok(handler(request)), deferred).await
+        }
+
+        async fn with_outcomes(
+            handler: impl Fn(&Value) -> Result<Value, Value> + Send + 'static,
+            deferred: Option<(&'static str, Arc<tokio::sync::Notify>)>,
+        ) -> Self {
             let home = TestDirectory::new();
             let (left, right) = UnixStream::pair().unwrap();
             let (client, server) = tokio::join!(
@@ -155,11 +162,15 @@ pub(crate) mod tests {
                                 }
                             }
                             let result = match request["method"].as_str() {
-                                Some("initialize") => json!({"userAgent":"codex-tui/0.162.1", "codexHome":home_path}),
-                                Some("account/read") => json!({"requiresOpenaiAuth":false,"account":null}),
+                                Some("initialize") => Ok(json!({"userAgent":"codex-tui/0.162.1", "codexHome":home_path})),
+                                Some("account/read") => Ok(json!({"requiresOpenaiAuth":false,"account":null})),
                                 _ => handler(&request),
                             };
-                            if server.send(Message::Text(json!({"id":id,"result":result}).to_string().into())).await.is_err() { break; }
+                            let response = match result {
+                                Ok(result) => json!({"id":id,"result":result}),
+                                Err(error) => json!({"id":id,"error":error}),
+                            };
+                            if server.send(Message::Text(response.to_string().into())).await.is_err() { break; }
                         }
                     }
                 }
@@ -175,6 +186,236 @@ pub(crate) mod tests {
                 task,
                 _home: home,
             }
+        }
+    }
+
+    fn native_registry(
+        fixture: &Fixture,
+    ) -> Arc<super::super::super::native_sessions::NativeSessions> {
+        use crate::agents::adapters::codex::native_sessions::{NativeSessions, MIGRATION};
+        NativeSessions::new(
+            crate::platform::store::sqlite::SqliteStore::open(
+                &fixture._home.0.join("native.sqlite"),
+                None,
+                &[MIGRATION],
+            )
+            .unwrap(),
+        )
+    }
+
+    fn recovering_driver(
+        fixture: &Fixture,
+        registry: Arc<super::super::super::native_sessions::NativeSessions>,
+    ) -> CodexDriver {
+        let mut driver = CodexDriver::new(fixture.client.clone());
+        driver.restore_native_sessions(Some(registry));
+        driver.observe_terminals(Some(crate::agents::terminal_runtime::TerminalRuntime::new(
+            &[],
+        )));
+        driver
+    }
+
+    #[tokio::test]
+    async fn native_recovery_restores_only_selected_recorded_session_without_replaying_a_turn() {
+        const ID: &str = "00000000-0000-4000-8000-000000000011";
+        let fixture = Fixture::new(|request| {
+            let thread = |status| json!({"thread":{"id":ID,"historyMode":"paginated","status":{"type":status}}});
+            match request["method"].as_str().unwrap() {
+                "thread/start" | "thread/resume" => thread("idle"),
+                "thread/read" => thread("notLoaded"),
+                "thread/items/list" | "thread/turns/list" => json!({"data":[],"nextCursor":null}),
+                "turn/start" => {
+                    assert_eq!(request["params"]["input"][0]["text"], "Only this new prompt");
+                    json!({"turn":{"id":"new-turn","status":"completed"}})
+                }
+                "thread/delete" => json!({}),
+                other => panic!("unexpected {other}"),
+            }
+        }).await;
+        let registry = native_registry(&fixture);
+        let driver = recovering_driver(&fixture, registry.clone());
+        driver.create_session(None, None, None).await.unwrap();
+        assert!(registry.contains(&fixture._home.0, ID).await.unwrap());
+        fixture
+            .send
+            .send(json!({"method":"thread/closed","params":{"threadId":ID}}))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while fixture.client.is_subscribed(ID) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(driver);
+        let restored = recovering_driver(&fixture, registry.clone());
+        restored.get_session(ID).await.unwrap();
+        assert!(!locked(&fixture.requests)
+            .iter()
+            .any(|r| r["method"] == "thread/resume"));
+        restored.get_timeline(ID, 10).await.unwrap();
+        restored.get_timeline(ID, 10).await.unwrap();
+        assert_eq!(
+            restored.runtime(ID, true).await.unwrap().source,
+            RuntimeSource::Native
+        );
+        assert_eq!(
+            locked(&fixture.requests)
+                .iter()
+                .filter(|r| r["method"] == "thread/resume")
+                .count(),
+            1
+        );
+        assert!(locked(&fixture.requests)
+            .iter()
+            .filter(|r| r["method"] == "thread/resume")
+            .all(|r| r["params"] == json!({"threadId":ID,"excludeTurns":true})));
+        assert!(!locked(&fixture.requests)
+            .iter()
+            .any(|r| r["method"] == "turn/start"));
+        restored
+            .send_prompt(ID, "Only this new prompt", &[], None)
+            .await
+            .unwrap();
+        assert_eq!(
+            locked(&fixture.requests)
+                .iter()
+                .filter(|r| r["method"] == "turn/start")
+                .count(),
+            1
+        );
+        restored.delete_session(ID).await.unwrap();
+        assert!(!registry.contains(&fixture._home.0, ID).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn native_recovery_does_not_resume_unknown_or_other_home_records() {
+        const ID: &str = "00000000-0000-4000-8000-000000000012";
+        let fixture = Fixture::new(|request| match request["method"].as_str().unwrap() {
+            "thread/read" => {
+                json!({"thread":{"id":ID,"historyMode":"paginated","status":{"type":"notLoaded"}}})
+            }
+            "thread/items/list" => json!({"data":[],"nextCursor":null}),
+            other => panic!("unowned history must not call {other}"),
+        })
+        .await;
+        let registry = native_registry(&fixture);
+        let driver = recovering_driver(&fixture, registry.clone());
+        driver.get_timeline(ID, 10).await.unwrap();
+        registry
+            .record(&fixture._home.0.join("other-home"), ID)
+            .await
+            .unwrap();
+        driver.get_timeline(ID, 10).await.unwrap();
+        assert!(!fixture.client.is_subscribed(ID));
+        assert!(!registry.contains(&fixture._home.0, ID).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn native_recovery_provenance_never_overrides_an_official_writer_refusal() {
+        const ID: &str = "00000000-0000-4000-8000-000000000013";
+        let fixture = Fixture::with_outcomes(|request| match request["method"].as_str().unwrap() {
+            "thread/read" => Ok(json!({"thread":{"id":ID,"historyMode":"paginated","status":{"type":"notLoaded"}}})),
+            "thread/resume" => Err(json!({"code":-32600,"message":"thread already has an active writer"})),
+            other => panic!("refused resume must not call {other}"),
+        }, None).await;
+        let registry = native_registry(&fixture);
+        registry.record(&fixture._home.0, ID).await.unwrap();
+        let driver = recovering_driver(&fixture, registry);
+        assert!(driver.get_timeline(ID, 10).await.is_err());
+        assert!(!fixture.client.is_subscribed(ID));
+        assert_ne!(
+            driver.runtime(ID, true).await.unwrap().source,
+            RuntimeSource::Native
+        );
+        assert_eq!(
+            locked(&fixture.requests)
+                .iter()
+                .filter(|r| r["method"] == "thread/resume")
+                .count(),
+            1
+        );
+        assert!(driver
+            .send_prompt(ID, "Not submitted", &[], None)
+            .await
+            .is_err());
+        assert!(!locked(&fixture.requests)
+            .iter()
+            .any(|r| r["method"] == "turn/start" || r["method"] == "thread/start"));
+    }
+
+    #[tokio::test]
+    async fn native_recovery_records_fork_and_explicit_send_but_not_loaded_rejoin() {
+        const ID: &str = "00000000-0000-4000-8000-000000000016";
+        const CHILD: &str = "00000000-0000-4000-8000-000000000017";
+        let fixture = Fixture::new(|request| match request["method"].as_str().unwrap() {
+            "thread/read" | "thread/resume" => {
+                json!({"thread":{"id":ID,"historyMode":"paginated","status":{"type":"idle"}}})
+            }
+            "thread/items/list" | "thread/turns/list" => json!({"data":[],"nextCursor":null}),
+            "thread/fork" => json!({"thread":{"id":CHILD,"status":{"type":"idle"}}}),
+            "turn/start" => json!({"turn":{"id":"accepted-turn","status":"completed"}}),
+            other => panic!("unexpected {other}"),
+        })
+        .await;
+        let registry = native_registry(&fixture);
+        let driver = recovering_driver(&fixture, registry.clone());
+        driver.get_timeline(ID, 10).await.unwrap();
+        assert!(fixture.client.is_subscribed(ID));
+        assert!(!registry.contains(&fixture._home.0, ID).await.unwrap());
+        driver.fork_session(ID, None).await.unwrap();
+        assert!(registry.contains(&fixture._home.0, CHILD).await.unwrap());
+        assert!(!registry.contains(&fixture._home.0, ID).await.unwrap());
+        driver
+            .send_prompt(ID, "Explicit new prompt", &[], None)
+            .await
+            .unwrap();
+        assert!(registry.contains(&fixture._home.0, ID).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn native_recovery_record_failure_does_not_reject_an_accepted_create_fork_or_send() {
+        use crate::agents::adapters::codex::native_sessions::{NativeSessions, MIGRATION};
+        const ID: &str = "00000000-0000-4000-8000-000000000014";
+        const CHILD: &str = "00000000-0000-4000-8000-000000000015";
+        let fixture = Fixture::new(|request| match request["method"].as_str().unwrap() {
+            "thread/start" | "thread/read" => json!({"thread":{"id":ID,"status":{"type":"idle"}}}),
+            "thread/fork" => json!({"thread":{"id":CHILD,"status":{"type":"idle"}}}),
+            "turn/start" => json!({"turn":{"id":"accepted-turn","status":"completed"}}),
+            other => panic!("unexpected {other}"),
+        })
+        .await;
+        let db = crate::platform::store::sqlite::SqliteStore::open(
+            &fixture._home.0.join("unwritable.sqlite"),
+            None,
+            &[MIGRATION],
+        )
+        .unwrap();
+        db.call(|db| {
+            db.execute_batch("PRAGMA query_only=ON")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let registry = NativeSessions::new(db);
+        let driver = recovering_driver(&fixture, registry.clone());
+        driver.create_session(None, None, None).await.unwrap();
+        driver.fork_session(ID, None).await.unwrap();
+        driver
+            .send_prompt(ID, "Accepted once", &[], None)
+            .await
+            .unwrap();
+        assert!(!registry.contains(&fixture._home.0, ID).await.unwrap());
+        assert!(!registry.contains(&fixture._home.0, CHILD).await.unwrap());
+        for method in ["thread/start", "thread/fork", "turn/start"] {
+            assert_eq!(
+                locked(&fixture.requests)
+                    .iter()
+                    .filter(|r| r["method"] == method)
+                    .count(),
+                1
+            );
         }
     }
 
@@ -374,7 +615,8 @@ pub(crate) mod tests {
             assert_eq!(request["params"]["cwd"], "/synthetic/project");
             json!({"thread":{"id":"00000000-0000-4000-8000-000000000001","historyMode":"paginated","status":{"type":"idle"}}})
         }).await;
-        let driver = CodexDriver::new(fixture.client.clone());
+        let registry = native_registry(&fixture);
+        let driver = recovering_driver(&fixture, registry.clone());
         let arguments = ["-c", "projects={ '/synthetic/project' = { trust_level = 'trusted' } }", "-c", "developer_instructions='Synthetic owner instructions. Synthetic task completion rule.'", "-c", "mcp_servers.muqun.http_headers_helper='fixture-helper --task-id synthetic-task'"]
             .into_iter().map(str::to_owned).collect::<Vec<_>>();
         let prepared = driver
@@ -391,6 +633,10 @@ pub(crate) mod tests {
             ]
         );
         assert!(fixture.client.is_subscribed(&prepared.session.asid.0));
+        assert!(!registry
+            .contains(&fixture._home.0, &prepared.session.asid.0)
+            .await
+            .unwrap());
         assert_eq!(prepared.session.title, "Synthetic task title");
         let methods: Vec<String> = locked(&fixture.requests)
             .iter()

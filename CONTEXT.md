@@ -30,6 +30,10 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
     `platform/store.rs` as `t3-credential.json`, 0600), and its attach and
     discovery. `runtime/codex.rs` adopts a verified existing Codex daemon connection
     or owns a private fallback child and its lifecycle;
+    `adapters/codex/native_sessions.rs` retains accepted native session IDs scoped
+    to the verified Codex home in the shared SQLite store. Selected unloaded
+    sessions can request official same-ID resume after restart; this evidence
+    grants neither runtime ownership nor permission to replay a prompt.
     service agents default on for Codex and OpenCode, with the master
     `agent_runtime.enabled` switch independent of terminal-agent dispatch.
   - `routes.rs`: the OpenCode-style agent-session API (global and legacy paths).

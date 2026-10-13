@@ -138,11 +138,12 @@ impl CodexState {
                 runtime
                     .install(
                         "codex",
-                        AgentManager::connect_codex_observed(
+                        AgentManager::connect_codex_recoverable(
                             client,
                             events,
                             runtime.events_tx.clone(),
                             runtime.terminal_runtime.get().cloned(),
+                            runtime.native_codex_sessions.get().cloned(),
                         ),
                         AgentOrigin::Adopted,
                     )
@@ -183,11 +184,12 @@ impl CodexState {
                 runtime
                     .install(
                         "codex",
-                        AgentManager::connect_codex_observed(
+                        AgentManager::connect_codex_recoverable(
                             client,
                             events,
                             runtime.events_tx.clone(),
                             runtime.terminal_runtime.get().cloned(),
+                            runtime.native_codex_sessions.get().cloned(),
                         ),
                         AgentOrigin::Spawned,
                     )
@@ -703,11 +705,12 @@ pub(crate) mod tests {
         runtime
             .install(
                 "codex",
-                AgentManager::connect_codex_observed(
+                AgentManager::connect_codex_recoverable(
                     client,
                     events,
                     runtime.events_tx.clone(),
                     runtime.terminal_runtime.get().cloned(),
+                    runtime.native_codex_sessions.get().cloned(),
                 ),
                 AgentOrigin::Spawned,
             )
