@@ -10,8 +10,7 @@ use super::{
 };
 use crate::agents::domain::*;
 use crate::agents::ports::agent::{
-    append_attachment_paths, AgentError, AgentFuture, AgentPort, AttachmentMode, FileDiffItem,
-    PreparedTerminalLaunch,
+    AgentError, AgentFuture, AgentPort, AttachmentMode, FileDiffItem, PreparedTerminalLaunch,
 };
 
 const MAX_SESSIONS: usize = 4096;
@@ -255,8 +254,14 @@ impl CodexDriver {
     pub(crate) async fn clear_async_questions(&self, thread: &str) {
         self.async_questions.lock().await.clear(thread);
     }
-    async fn steer(&self, thread: &str, turn: &str, text: &str) -> Result<(), AgentError> {
-        let result = self.client.call("turn/steer",json!({"threadId":thread,"expectedTurnId":turn,"input":[{"type":"text","text":text,"text_elements":[]}]})).await?;
+    async fn steer(&self, thread: &str, turn: &str, input: Vec<Value>) -> Result<(), AgentError> {
+        let result = self
+            .client
+            .call(
+                "turn/steer",
+                json!({"threadId":thread,"expectedTurnId":turn,"input":input}),
+            )
+            .await?;
         if result["turnId"] != turn {
             self.client.stop();
             return Err(AgentError::Protocol(
@@ -947,7 +952,7 @@ impl AgentPort for CodexDriver {
         Box::pin(async { Ok(self.client.is_ready()) })
     }
     fn attachment_mode(&self) -> AttachmentMode {
-        AttachmentMode::ByPath
+        AttachmentMode::NativeUploads
     }
 
     fn list_projects(&self) -> AgentFuture<'_, Vec<AgentProject>> {
@@ -1045,6 +1050,8 @@ impl AgentPort for CodexDriver {
             if text.is_empty() && attachments.is_empty() {
                 return Err(AgentError::InvalidRequest("empty Codex prompt".into()));
             }
+            // Validate uploads before any rejoin/resume or prompt mutation.
+            let input = super::input::prepare(text, attachments).await?;
             self.prepare_shared_interaction(id).await?;
             let _guard = self.mutations.lock().await;
             self.require_native_interaction(id).await?;
@@ -1057,9 +1064,7 @@ impl AgentPort for CodexDriver {
                         "Codex active turn ended before steering; message was not resent".into(),
                     )
                 })?;
-                return self
-                    .steer(id, &turn, &append_attachment_paths(text, attachments))
-                    .await;
+                return self.steer(id, &turn, input).await;
             }
             if self.client.active_turn(id).is_some() {
                 return Err(AgentError::InvalidRequest(
@@ -1084,9 +1089,7 @@ impl AgentPort for CodexDriver {
                 }
                 self.selected_response(resumed).await?;
             }
-            let text = append_attachment_paths(text, attachments);
-            let mut params =
-                json!({"threadId":id,"input":[{"type":"text","text":text,"text_elements":[]}]});
+            let mut params = json!({"threadId":id,"input":input});
             let model = self
                 .next_models
                 .lock()
@@ -1331,7 +1334,10 @@ impl AgentPort for CodexDriver {
                         .retain_subscription(thread, self.client.subscription_revision(thread));
                     questions.claim(thread, &turn, id, &answers)?
                 };
-                if let Err(error) = self.steer(thread, &turn, &text).await {
+                if let Err(error) = self
+                    .steer(thread, &turn, super::input::text_input(&text))
+                    .await
+                {
                     // An explicit RPC rejection did not accept this input.
                     // Transport/cancellation errors keep the claim fenced.
                     if matches!(error, AgentError::RequestFailed(_)) {

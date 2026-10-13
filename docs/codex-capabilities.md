@@ -33,7 +33,7 @@ ordering.
 | Subagents | `subagentSessions` | Typed child identities/status and session navigation; controls depend on each child's runtime |
 | Usage | `sessionTokenUsage`, `sessionContextUsage` | Actual observed totals/context metadata; absence remains unknown, not zero |
 | Questions and approvals | `forms`, `asyncQuestions`, `toolApprovals` | Live runtime callbacks/active-turn steering, never historical approval authority |
-| Attachments | `attachments`, `attachmentsByPath`, `transcriptImages` | Uploaded host paths in prompts and resolved transcript images; no host path rendered as a phone image |
+| Attachments | `attachments`, `nativeImageInput`, `attachmentInputScope: gateway_uploads`, `attachmentsByPath: false`, `transcriptImages` | Upload-only native PNG/JPEG/WebP/GIF input, validated document paths and resolved transcript images; no host path rendered as a phone image |
 | Audio/generated images | `audioPlayback: false`, `generatedImagePreview: false` | Typed output may be retained without a media player or preview |
 | Compaction | `compaction` | Stable `thread/compact/start`; owned native idle sessions only, no queued delivery or automatic resume |
 | Fork | `sessionFork` plus `agent_session_fork_v1` | Whole-thread fork for Codex; message-boundary fork is unsupported |

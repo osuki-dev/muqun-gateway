@@ -219,8 +219,17 @@ be interrupted. Provider changes on loaded threads are rejected, not silently
 routed to OpenAI. Features declare `modelSelectionScope: next_turn` and
 `modelSelectionPersistence: gateway_until_turn_start`; no experimental settings
 RPC or promise of durable pre-turn upstream state. Known project directories are
-derived from exhaustive budgeted session enumeration, not project CRUD. Attachments use the
-existing validated host-path attachment flow, not native image upload.
+derived from exhaustive budgeted session enumeration, not project CRUD.
+
+Prompt attachments are restricted to Gateway uploads. PNG, JPEG, WebP and GIF
+are sniffed from their bytes and sent as official `localImage` input parts on
+both `turn/start` and `turn/steer`; image-only prompts are supported. Other
+documents retain their validated host-path text representation. Image paths are
+never substituted for image parts in prose. The adapter rechecks upload-root
+confinement, readable regular files, a 16-file limit and a 25 MiB aggregate limit
+before any rejoin/resume or prompt mutation. External URLs, data/file URIs,
+unsupported image formats and mislabeled image files are rejected. No new
+file-read route or authentication exception is introduced.
 
 Incoming native `userMessage` image URLs (including data URIs) and `localImage`
 paths are preserved in the neutral row's `attachments`; image-only messages keep

@@ -305,7 +305,7 @@ pub(super) fn features() -> crate::discovery::AgentFeatures {
         compaction: true,
         background_shells: false,
         attachments: true,
-        attachments_by_path: true,
+        attachments_by_path: false,
         extra: std::collections::BTreeMap::from([
             ("sessionPagination".into(), serde_json::json!(true)),
             ("sharedDaemon".into(), serde_json::json!(cfg!(unix))),
@@ -316,6 +316,11 @@ pub(super) fn features() -> crate::discovery::AgentFeatures {
             ("shellToolItems".into(), serde_json::json!(true)),
             ("fileChangeItems".into(), serde_json::json!(true)),
             ("transcriptImages".into(), serde_json::json!(true)),
+            ("nativeImageInput".into(), serde_json::json!(true)),
+            (
+                "attachmentInputScope".into(),
+                serde_json::json!("gateway_uploads"),
+            ),
             ("audioPlayback".into(), serde_json::json!(false)),
             ("generatedImagePreview".into(), serde_json::json!(false)),
             ("legacyVcsDiff".into(), serde_json::json!(false)),
@@ -1085,6 +1090,9 @@ pub(crate) mod tests {
     fn codex_feature_claims_do_not_include_file_rollback_or_optional_apis() {
         let features = features();
         assert!(features.streaming && features.tool_approvals && features.compaction);
+        assert!(features.attachments && !features.attachments_by_path);
+        assert_eq!(features.extra["nativeImageInput"], true);
+        assert_eq!(features.extra["attachmentInputScope"], "gateway_uploads");
         assert!(
             !features.revert
                 && !features.staged_revert

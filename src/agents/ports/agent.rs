@@ -71,6 +71,9 @@ pub struct FileDiffItem {
 pub enum AttachmentMode {
     /// The agent's own API carries file parts.
     Native,
+    /// Native file parts, restricted to files uploaded to this Gateway.
+    /// Remote URLs, data URIs and arbitrary host paths are not accepted.
+    NativeUploads,
     /// The agent has no attachment API but can read files off this host, so
     /// the prompt use case lists the paths in the text instead.
     ByPath,
