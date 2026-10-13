@@ -1933,6 +1933,15 @@ streaming path and a refetch:
 { "type": "agent.form.resolved", "asid": "ses_1", "form_id": "frm_1", "seq": 19 }
 ```
 
+`agent.form.resolved` may include `reason: "answered" | "expired"`.
+`answered` means the reply was accepted or a matching committed reply was observed.
+`expired` is emitted only for a known unanswered, nonblocking Codex question when
+its owning live turn ends. An answer still in flight has an unknown outcome and
+receives no expiry reason. Clients may preserve an expired form's local draft in
+the ordinary composer, but must not automatically submit it. Missing or unknown
+reasons, including disconnect, unload, and stale ownership invalidation, do not
+authorize draft restoration. Older providers omit this optional field.
+
 ### `agent.compaction.changed`
 
 ```json

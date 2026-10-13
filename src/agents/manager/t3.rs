@@ -449,6 +449,7 @@ async fn apply_thread_snapshot_coverage(
             if !open_forms.iter().any(|f| f.id == form.id) {
                 let seq = ctx.mirror.resolve_form(asid, &form.id).await;
                 ctx.emit(AgentDomainEvent::FormResolved {
+                    reason: None,
                     asid: asid.clone(),
                     form_id: form.id.clone(),
                     seq,
@@ -553,6 +554,7 @@ async fn apply_v2_snapshot(asid: &AgentSessionId, snapshot: &Value, ctx: &T3Even
             if !forms.iter().any(|open| open.id == form.id) {
                 let seq = ctx.mirror.resolve_form(asid, &form.id).await;
                 ctx.emit(AgentDomainEvent::FormResolved {
+                    reason: None,
                     asid: asid.clone(),
                     form_id: form.id.clone(),
                     seq,
@@ -683,6 +685,7 @@ async fn apply_activity(
         ("user-input.resolved", Some(id)) => {
             let seq = ctx.mirror.resolve_form(asid, id).await;
             ctx.emit(AgentDomainEvent::FormResolved {
+                reason: None,
                 asid: asid.clone(),
                 form_id: id.to_string(),
                 seq,

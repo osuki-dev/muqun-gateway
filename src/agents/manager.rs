@@ -1039,6 +1039,7 @@ impl AgentManager {
                 {
                     let seq = ctx.mirror.resolve_form(&asid, form_id).await;
                     ctx.emit(AgentDomainEvent::FormResolved {
+                        reason: None,
                         asid,
                         form_id: form_id.to_string(),
                         seq,

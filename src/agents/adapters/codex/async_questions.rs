@@ -138,6 +138,34 @@ impl Registry {
             .map(|p| p.form.clone())
             .collect()
     }
+    pub(super) fn finish_turn(
+        &mut self,
+        thread: &str,
+        turn: &str,
+        ownership: Option<u64>,
+        owned: bool,
+    ) -> HashMap<String, FormResolutionReason> {
+        let reasons = self
+            .pending
+            .iter()
+            .filter_map(|(id, p)| {
+                if !owned || p.form.asid.0 != thread || p.turn != turn || p.ownership != ownership {
+                    return None;
+                }
+                let reason = if p.answered {
+                    FormResolutionReason::Answered
+                } else if !p.answering {
+                    FormResolutionReason::Expired
+                } else {
+                    return None;
+                }; // An in-flight answer has an unknown outcome.
+                Some((id.clone(), reason))
+            })
+            .collect();
+        self.clear(thread);
+        reasons
+    }
+
     pub(super) fn clear(&mut self, thread: &str) {
         self.pending.retain(|_, p| p.form.asid.0 != thread);
         self.answered.retain(|(owner, _, _)| owner != thread);
@@ -377,6 +405,43 @@ mod tests {
                 &json!({"answer":"current"})
             )
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn form_resolution_reason_requires_known_unanswered_turn_and_ownership() {
+        let mut fixture = Fixture::new(|_| panic!("registry must not send RPC")).await;
+        fixture.ready().await;
+        for (turn, ownership, owned) in [
+            ("turn", None, true),
+            ("other", None, true),
+            ("turn", Some(9), true),
+            ("turn", None, false),
+        ] {
+            let mut registry = Registry::default();
+            let forms = registry.insert(&fixture.client, "thread", "turn", &json!({"type":"agentMessage","id":"q","questions":[{"title":"Pending?"},{"title":"In flight?"},{"title":"Accepted?"}]}));
+            registry
+                .claim("thread", "turn", &forms[1].id, &json!({"answer":"sending"}))
+                .unwrap();
+            registry.accept(&forms[2].id);
+            let reasons = registry.finish_turn("thread", turn, ownership, owned);
+            if turn == "turn" && ownership.is_none() && owned {
+                assert_eq!(
+                    reasons.get(&forms[0].id),
+                    Some(&FormResolutionReason::Expired)
+                );
+                assert_eq!(
+                    reasons.get(&forms[2].id),
+                    Some(&FormResolutionReason::Answered)
+                );
+                assert!(
+                    !reasons.contains_key(&forms[1].id),
+                    "an in-flight answer must never be restored as expired"
+                );
+            } else {
+                assert!(reasons.is_empty());
+            }
+            assert!(registry.pending("thread", Some("turn")).is_empty());
+        }
     }
 
     #[test]

@@ -4,8 +4,8 @@ use tokio::sync::RwLock;
 
 use crate::agents::domain::{
     tool_item_id, AgentDomainEvent, AgentErrorInfo, AgentPart, AgentSessionId, AgentSessionInfo,
-    AgentSessionStatus, FormRequest, PermissionRequest, RevertState, SessionRevertInfo,
-    TimelineItem, TimelineRole, ToolCall, ToolCallStatus, ToolTime,
+    AgentSessionStatus, FormRequest, FormResolutionReason, PermissionRequest, RevertState,
+    SessionRevertInfo, TimelineItem, TimelineRole, ToolCall, ToolCallStatus, ToolTime,
 };
 use crate::agents::ports::mirror::{AgentSessionSnapshot, MirrorFuture, SessionMirrorPort};
 
@@ -230,6 +230,31 @@ pub struct MemoryMirror {
 }
 
 impl MemoryMirror {
+    /// Preserve resolution semantics in the replay ring as well as live SSE.
+    pub(crate) async fn resolve_form_with_reason(
+        &self,
+        asid: &AgentSessionId,
+        form_id: &str,
+        reason: Option<FormResolutionReason>,
+    ) -> u64 {
+        let mut sessions = self.sessions.write().await;
+        let state = Self::entry(
+            &self.agent_id,
+            &mut sessions,
+            asid,
+            AgentSessionStatus::Idle,
+        );
+        state.forms.remove(form_id);
+        let seq = state.next_seq();
+        state.push_event(AgentDomainEvent::FormResolved {
+            asid: asid.clone(),
+            form_id: form_id.into(),
+            reason,
+            seq,
+        });
+        seq
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -1458,25 +1483,7 @@ impl SessionMirrorPort for MemoryMirror {
         asid: &'a AgentSessionId,
         form_id: &'a str,
     ) -> MirrorFuture<'a, u64> {
-        Box::pin(async move {
-            let mut sessions = self.sessions.write().await;
-            let state = Self::entry(
-                &self.agent_id,
-                &mut sessions,
-                asid,
-                AgentSessionStatus::Idle,
-            );
-            state.forms.remove(form_id);
-            let seq = state.next_seq();
-
-            let event = AgentDomainEvent::FormResolved {
-                asid: asid.clone(),
-                form_id: form_id.to_string(),
-                seq,
-            };
-            state.push_event(event);
-            seq
-        })
+        Box::pin(self.resolve_form_with_reason(asid, form_id, None))
     }
 }
 

@@ -242,13 +242,23 @@ impl Context {
         }
     }
 
-    async fn resolve(&self, thread: &str, id: &str, form: bool) {
+    async fn resolve(
+        &self,
+        thread: &str,
+        id: &str,
+        form: bool,
+        reason: Option<FormResolutionReason>,
+    ) {
         let asid = AgentSessionId(thread.into());
         if form {
-            let seq = self.mirror.resolve_form(&asid, id).await;
+            let seq = self
+                .mirror
+                .resolve_form_with_reason(&asid, id, reason)
+                .await;
             self.emit(AgentDomainEvent::FormResolved {
                 asid,
                 form_id: id.into(),
+                reason,
                 seq,
             });
         } else {
@@ -261,18 +271,24 @@ impl Context {
         }
     }
 
-    async fn clear_requests(&self, thread: &str) {
-        self.driver.clear_async_questions(thread).await;
+    async fn clear_requests(&self, thread: &str, ended_turn: Option<&str>) {
+        let reasons = if let Some(turn) = ended_turn {
+            self.driver.finish_async_questions(thread, turn).await
+        } else {
+            self.driver.clear_async_questions(thread).await;
+            Default::default()
+        };
         if let Some(snapshot) = self
             .mirror
             .get_snapshot(&AgentSessionId(thread.into()))
             .await
         {
             for request in snapshot.permissions {
-                self.resolve(thread, &request.id, false).await;
+                self.resolve(thread, &request.id, false, None).await;
             }
             for form in snapshot.forms {
-                self.resolve(thread, &form.id, true).await;
+                self.resolve(thread, &form.id, true, reasons.get(&form.id).copied())
+                    .await;
             }
         }
     }
@@ -339,7 +355,8 @@ impl Context {
                         .observe_async_answers(&thread, &turn, item)
                         .await
                     {
-                        self.resolve(&thread, &id, true).await;
+                        self.resolve(&thread, &id, true, Some(FormResolutionReason::Answered))
+                            .await;
                     }
                 }
                 for item in &items {
@@ -379,7 +396,15 @@ impl Context {
                 }
             }
             CodexEvent::Disconnected => self.disconnected().await,
-            CodexEvent::Resolved { thread, id, form } => self.resolve(&thread, &id, form).await,
+            CodexEvent::Resolved { thread, id, form } => {
+                self.resolve(
+                    &thread,
+                    &id,
+                    form,
+                    form.then_some(FormResolutionReason::Answered),
+                )
+                .await
+            }
             CodexEvent::Request { id, method, params } => {
                 if let Some(request) = self.driver.permission(&id, &method, &params) {
                     self.ensure(&request.asid.0).await;
@@ -431,7 +456,7 @@ impl Context {
             || (method == "thread/status/changed" && params["status"]["type"] == "notLoaded")
         {
             self.driver.forget_thread(thread).await;
-            self.clear_requests(thread).await;
+            self.clear_requests(thread, None).await;
             if let Some(snapshot) = self.mirror.get_snapshot(&asid).await {
                 let mut info = snapshot.info;
                 info.status = AgentSessionStatus::Unknown;
@@ -480,7 +505,7 @@ impl Context {
             }
             "thread/deleted" => {
                 self.driver.clear_usage(thread).await;
-                self.clear_requests(thread).await;
+                self.clear_requests(thread, None).await;
                 self.driver.forget_thread(thread).await;
                 self.threads.lock().await.remove(thread);
                 if let Some(snapshot) = self.mirror.get_snapshot(&asid).await {
@@ -530,7 +555,31 @@ impl Context {
             "turn/completed" => {
                 self.set_status(thread, mapper::status(&params["turn"]["status"]))
                     .await;
-                self.clear_requests(thread).await;
+                let ended_turn = params["turn"]["id"].as_str().filter(|_| {
+                    matches!(
+                        params["turn"]["status"].as_str(),
+                        Some("completed" | "failed" | "interrupted")
+                    )
+                });
+                // A completion snapshot can carry the final committed user reply.
+                // Resolve it before expiring unanswered forms, even if its item
+                // notification was not observed separately.
+                if let Some(turn) = ended_turn {
+                    if let Some(items) = params["turn"]["items"].as_array() {
+                        for item in items {
+                            for id in self.driver.observe_async_answers(thread, turn, item).await {
+                                self.resolve(
+                                    thread,
+                                    &id,
+                                    true,
+                                    Some(FormResolutionReason::Answered),
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                }
+                self.clear_requests(thread, ended_turn).await;
                 if let Some(turn) = params["turn"]["id"].as_str() {
                     if let Some(items) = params["turn"]["items"].as_array() {
                         for item in items {
@@ -545,9 +594,9 @@ impl Context {
                 if let Some(id) = self.driver.client().request_id(&params["requestId"]) {
                     if let Some(snapshot) = self.mirror.get_snapshot(&asid).await {
                         if snapshot.forms.iter().any(|f| f.id == id) {
-                            self.resolve(thread, &id, true).await;
+                            self.resolve(thread, &id, true, None).await;
                         } else if snapshot.permissions.iter().any(|p| p.id == id) {
-                            self.resolve(thread, &id, false).await;
+                            self.resolve(thread, &id, false, None).await;
                         }
                     }
                 }
@@ -562,7 +611,8 @@ impl Context {
                         .observe_async_answers(thread, turn, &params["item"])
                         .await
                     {
-                        self.resolve(thread, &id, true).await;
+                        self.resolve(thread, &id, true, Some(FormResolutionReason::Answered))
+                            .await;
                     }
                     for form in self
                         .driver
@@ -1332,6 +1382,139 @@ mod tests {
                     "{scenario}"
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn async_form_resolution_reasons_match_live_and_replayed_events_without_false_expiry() {
+        for scenario in [
+            "expired",
+            "answered_ack",
+            "answered_committed",
+            "answered_in_completion",
+            "unloaded",
+            "disconnected",
+            "wrong_turn",
+            "new_turn",
+            "blocking",
+        ] {
+            let mut fixture = Fixture::new(|request| match request["method"].as_str().unwrap() {
+                "thread/start" | "thread/read" => json!({"thread":golden()["thread"]}),
+                "turn/start" => json!({"turn":{"id":"turn","status":"inProgress"}}),
+                "turn/steer" => json!({"turnId":"turn"}),
+                other => panic!("unexpected RPC {other}"),
+            })
+            .await;
+            fixture.ready().await;
+            let driver = Arc::new(CodexDriver::new(fixture.client.clone()));
+            let session = driver.create_session(None, None, None).await.unwrap();
+            let thread = &session.asid.0;
+            driver
+                .send_prompt(thread, "Start", &[], None)
+                .await
+                .unwrap();
+            let mirror = Arc::new(MemoryMirror::for_agent("codex"));
+            mirror.update_session(session.clone()).await;
+            let (tx, mut events) = broadcast::channel(64);
+            let context = Context {
+                driver: driver.clone(),
+                mirror: mirror.clone(),
+                tx,
+                stopped: Arc::new(Mutex::new(false)),
+                threads: tokio::sync::Mutex::new(HashSet::new()),
+            };
+            context.notification("item/completed",&json!({"threadId":thread,"turnId":"turn","item":{"type":"agentMessage","id":"q","text":"Continuing","questions":[{"title":"Choose?"}]}})).await;
+            let form = mirror
+                .get_snapshot(&session.asid)
+                .await
+                .unwrap()
+                .forms
+                .remove(0);
+            if scenario == "blocking" {
+                driver.clear_async_questions(thread).await;
+                let mut blocking = form.clone();
+                blocking.nonblocking = false;
+                mirror.add_form(blocking).await;
+            }
+            let before = mirror.get_snapshot(&session.asid).await.unwrap().seq;
+            while events.try_recv().is_ok() {}
+            let reply = json!({"type":"userMessage","id":"answer","content":[{"type":"text","text":format!("<send_user_message_question_reply>{}</send_user_message_question_reply>",json!({"questionItemId":json!(["request_user_input_async","q",0]).to_string(),"question":"Choose?","answer":"A"}))}]});
+            if scenario == "answered_ack" {
+                // The accepted steering response has reached the registry, but
+                // its queued Resolved event has not reached the mirror yet.
+                driver
+                    .reply_form(thread, &form.id, json!({"answer":"A"}))
+                    .await
+                    .unwrap();
+            } else if scenario == "answered_committed" {
+                context
+                    .notification(
+                        "item/completed",
+                        &json!({"threadId":thread,"turnId":"turn","item":reply}),
+                    )
+                    .await;
+            }
+            if scenario == "new_turn" {
+                fixture.send(json!({"method":"turn/started","params":{"threadId":thread,"turn":{"id":"next-turn","status":"inProgress"}}})).await;
+                loop {
+                    let event = tokio::time::timeout(
+                        Duration::from_secs(2),
+                        fixture.events.as_mut().unwrap().recv(),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    if matches!(event, CodexEvent::Notification { method, .. } if method == "turn/started")
+                    {
+                        break;
+                    }
+                }
+            }
+            match scenario {
+                "unloaded" => context.notification("thread/closed",&json!({"threadId":thread})).await,
+                "disconnected" => { fixture.client.stop(); context.disconnected().await; },
+                _ => context.notification("turn/completed",&json!({"threadId":thread,"turn":{"id":if scenario=="wrong_turn"{"old-turn"}else{"turn"},"status":"completed","items":if scenario=="answered_in_completion"{vec![reply]}else{vec![]}}})).await,
+            }
+            let expected = match scenario {
+                "expired" => Some(FormResolutionReason::Expired),
+                "answered_ack" | "answered_committed" | "answered_in_completion" => {
+                    Some(FormResolutionReason::Answered)
+                }
+                _ => None,
+            };
+            let replay = mirror
+                .get_events_after(&session.asid, before)
+                .await
+                .unwrap();
+            let replay_reasons: Vec<_> = replay
+                .iter()
+                .filter_map(|event| match event {
+                    AgentDomainEvent::FormResolved { reason, .. } => Some(*reason),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(replay_reasons, vec![expected], "replay {scenario}");
+            let mut live_reasons = vec![];
+            while let Ok(event) = events.try_recv() {
+                if let AgentDomainEvent::FormResolved { reason, .. } = event {
+                    live_reasons.push(reason);
+                }
+            }
+            assert_eq!(
+                live_reasons,
+                if scenario == "disconnected" {
+                    vec![]
+                } else {
+                    vec![expected]
+                },
+                "live {scenario}"
+            );
+            assert!(mirror
+                .get_snapshot(&session.asid)
+                .await
+                .unwrap()
+                .forms
+                .is_empty());
         }
     }
 

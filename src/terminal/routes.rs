@@ -3881,6 +3881,7 @@ mod tests {
         assert!(gates.admit(&pending("ses_other", "form_1")).is_some());
 
         let resolved = AgentDomainEvent::FormResolved {
+            reason: None,
             asid: AgentSessionId("ses_child".into()),
             form_id: "form_1".into(),
             seq: 2,

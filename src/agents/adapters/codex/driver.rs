@@ -219,6 +219,33 @@ impl CodexDriver {
             .await
             .observe_reply(thread, turn, &item["content"])
     }
+    pub(crate) async fn finish_async_questions(
+        &self,
+        thread: &str,
+        turn: &str,
+    ) -> HashMap<String, FormResolutionReason> {
+        let ownership = self.client.subscription_revision(thread);
+        let loaded = self.loaded.lock().await.contains(thread);
+        let owned = self.client.is_ready()
+            && (!self.client.is_shared() || ownership.is_some())
+            && loaded
+            && self
+                .cached_runtime(thread)
+                .await
+                .is_none_or(|runtime| runtime.interaction == RuntimeInteraction::Native);
+        let mut questions = self.async_questions.lock().await;
+        // Ownership can change while local state locks are awaited. Recheck at
+        // classification so an unload/disconnect never becomes draft expiry.
+        let owned = owned
+            && self.client.is_ready()
+            && self.client.subscription_revision(thread) == ownership
+            && self
+                .client
+                .active_turn(thread)
+                .is_none_or(|active| active == turn);
+        questions.finish_turn(thread, turn, ownership, owned)
+    }
+
     pub(crate) async fn clear_async_questions(&self, thread: &str) {
         self.async_questions.lock().await.clear(thread);
     }
