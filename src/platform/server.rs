@@ -1,6 +1,7 @@
 //! HTTP server startup: middleware stack, transport encryption, and locality checks.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::future::IntoFuture as _;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
@@ -38,6 +39,10 @@ use crate::{
 };
 
 pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
+    // Register before any owned child can start. File guards below are kept
+    // until the stop path has awaited Codex cleanup, not process::exit-ed by
+    // a competing MCP signal task.
+    let shutdown = register_shutdown_signal()?;
     // Taken before the device list is read and held for the life of the
     // process. This gateway caches the whole list in memory and rewrites the
     // whole file on every change, so a second gateway against the same
@@ -65,7 +70,7 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     // Bind successfully before starting anything on the user's behalf.
     let listener = gateway_listener::bind(addr).await?;
     // Per process: minted now, removed when the gateway stops.
-    let identity = if config.mcp.enabled {
+    let _identity = if config.mcp.enabled {
         Some(crate::mcp::mint_identity()?)
     } else {
         if let Ok(file) = crate::mcp::identity_file() {
@@ -85,7 +90,7 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     } else {
         None
     };
-    let endpoint_record = match mcp_listeners
+    let _endpoint_record = match mcp_listeners
         .as_ref()
         .and_then(|listeners| listeners.first())
     {
@@ -101,25 +106,20 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
             None
         }
     };
-    // Kept for the life of the process; removed when it stops.
-    let records = [identity.as_ref(), endpoint_record.as_ref()];
-    let kept: Vec<_> = records
-        .iter()
-        .flatten()
-        .map(|record| record.path().to_owned())
-        .collect();
-    if !kept.is_empty() {
-        crate::mcp::remove_on_stop(kept);
-    }
     // One background attempt per opted-in backend; no restart/logging loop.
     backend_startup::spawn(&config);
 
-    let agent_runtime = agents::AgentRuntime::with_configs(
-        config.opencode.clone(),
-        config.deepseek.clone(),
-        config.t3.clone(),
-        Some(state_dir()?),
-    );
+    let agent_runtime = if config.agent_runtime.enabled {
+        agents::AgentRuntime::with_all_configs(
+            config.opencode.clone(),
+            config.deepseek.clone(),
+            config.t3.clone(),
+            config.codex.clone(),
+            Some(state_dir()?),
+        )
+    } else {
+        agents::AgentRuntime::disabled()
+    };
 
     let scrollback = Arc::new(Mutex::new(scrollback::ScrollbackStore::default()));
     let state_directory = state_dir()?;
@@ -167,7 +167,7 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         approval_events: tokio::sync::broadcast::channel(APPROVAL_EVENT_CAPACITY).0,
         activity: Arc::new(Mutex::new(HashMap::new())),
         session_liveness: Arc::new(Mutex::new(SessionLivenessCache::default())),
-        agent_runtime,
+        agent_runtime: agent_runtime.clone(),
         ws_connections: Arc::new(agents::ws_routes::WsRegistry::default()),
         generation: crate::new_generation(),
         message_images: Arc::default(),
@@ -211,7 +211,6 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         )
         .join(" | ")
     );
-    state.agent_runtime.spawn_supervisor();
     spawn_agent_notification_watchers(state.clone());
     spawn_agent_permission_watchers(state.clone());
     spawn_approval_watchers(state.clone());
@@ -286,12 +285,50 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     }
     println!("terminal gateway listening on http://{addr}");
     // The peer address is what `/mcp` checks for loopback.
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await?;
+    agent_runtime.spawn_supervisor();
+    serve_until_shutdown(listener, app, agent_runtime, shutdown).await?;
     Ok(())
+}
+
+/// Finish private-child cleanup on both normal signal shutdown and a listener
+/// failure. Do not wait indefinitely for SSE/WebSocket clients to disconnect,
+/// and never stop adopted agent services or terminal sessions.
+async fn serve_until_shutdown(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    runtime: Arc<agents::AgentRuntime>,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> anyhow::Result<()> {
+    let result = tokio::select! {
+        biased;
+        _ = shutdown => Ok(()),
+        result = axum::serve(listener,app.into_make_service_with_connect_info::<SocketAddr>()).into_future() => result,
+    };
+    let cleanup = runtime.shutdown_codex().await;
+    match (result, cleanup) {
+        (result, Ok(())) => result.context("Gateway HTTP listener stopped"),
+        (Ok(()), Err(error)) => Err(error).context("Gateway private Codex cleanup failed"),
+        (Err(listener), Err(cleanup)) => Err(cleanup).with_context(|| {
+            format!("Gateway HTTP listener stopped ({listener}); private Codex cleanup failed")
+        }),
+    }
+}
+
+#[cfg(unix)]
+fn register_shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = signal(SignalKind::terminate())?;
+    let mut int = signal(SignalKind::interrupt())?;
+    Ok(async move {
+        tokio::select! {_ = term.recv() => {}, _ = int.recv() => {}}
+    })
+}
+
+#[cfg(not(unix))]
+fn register_shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
+    Ok(async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
 }
 
 /// Put the caller's language in scope for the whole request.
@@ -1164,6 +1201,80 @@ fn cgroup_stat_mb(key: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use crate::*;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn codex_stop_propagates_unverified_cleanup_after_reaping_the_private_fake_tree() {
+        let (runtime, root, tool) =
+            agents::runtime::codex::tests::runtime_with_unavailable_identity().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            super::serve_until_shutdown(listener, axum::Router::new(), runtime, async {}),
+        )
+        .await
+        .unwrap();
+        let error = result.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Gateway private Codex cleanup failed"));
+        assert!(format!("{error:#}").contains("cleanup could not be verified"));
+        assert!(started.elapsed() >= std::time::Duration::from_secs(5));
+        // An Err does not permit an early return before the awaited EOF/tool
+        // cleanup. The normal run() file guards outlive this entire boundary.
+        assert_eq!(unsafe { libc::kill(root, 0) }, -1);
+        assert_eq!(unsafe { libc::kill(tool, 0) }, -1);
+    }
+
+    #[tokio::test]
+    async fn codex_stop_cleans_private_client_without_waiting_for_an_open_http_stream() {
+        use crate::agents::adapters::codex::tests::Fixture;
+        let mut fixture = Fixture::new(|_| serde_json::json!({})).await;
+        fixture.ready().await;
+        let runtime = agents::AgentRuntime::disabled();
+        let (events, _) = tokio::sync::broadcast::channel(32);
+        let manager = agents::manager::AgentManager::connect_codex(
+            fixture.client.clone(),
+            fixture.events.take().unwrap(),
+            events,
+        );
+        runtime.attach_for_test(std::sync::Arc::new(manager)).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/synthetic-stream",
+            axum::routing::get(|| async {
+                axum::response::Sse::new(futures::stream::pending::<
+                    Result<axum::response::sse::Event, std::convert::Infallible>,
+                >())
+            }),
+        );
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(super::serve_until_shutdown(listener, app, runtime, async {
+            let _ = stopped.await;
+        }));
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            http.get(format!("http://{address}/synthetic-stream"))
+                .send(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(response.status().is_success());
+        stop.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(!fixture.client.is_ready());
+        // No ordinary prompt or callback was submitted during shutdown.
+        assert!(fixture.requests.try_recv().is_err());
+        drop(response);
+    }
 
     /// The proof header is the encrypted-transport middleware talking to the
     /// handlers below it, and nothing else may put words in its mouth.

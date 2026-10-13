@@ -1,0 +1,51 @@
+{
+  "initialize": {
+    "userAgent": "codex_cli_rs/0.162.1 (synthetic fixture)",
+    "codexHome": "/synthetic/codex-home",
+    "platformFamily": "unix",
+    "platformOs": "linux"
+  },
+  "account": {"account": {"type": "apiKey"}, "requiresOpenaiAuth": true},
+  "thread": {
+    "id": "019a0000-0000-7000-8000-000000000001",
+    "sessionId": "019a0000-0000-7000-8000-000000000001",
+    "forkedFromId": null,
+    "parentThreadId": null,
+    "preview": "Synthetic prompt",
+    "ephemeral": false,
+    "section": null,
+    "sectionEnteredAt": null,
+    "projectId": null,
+    "historyMode": "paginated",
+    "modelProvider": "openai",
+    "model": "fixture-model",
+    "reasoningEffort": "high",
+    "createdAt": 100,
+    "updatedAt": 101,
+    "recencyAt": 101,
+    "status": {"type": "idle"},
+    "path": null,
+    "cwd": "/synthetic/workspace",
+    "cliVersion": "0.162.1",
+    "originator": "synthetic-fixture",
+    "source": "appServer",
+    "threadSource": null,
+    "agentNickname": null,
+    "agentRole": null,
+    "gitInfo": null,
+    "name": "Synthetic thread",
+    "turns": []
+  },
+  "modelList": {
+    "data": [{
+      "id": "fixture-model", "model": "fixture-model", "upgrade": null,
+      "upgradeInfo": null, "availabilityNux": null, "displayName": "Fixture model",
+      "description": "Synthetic model", "modelSpecialty": null, "hidden": false,
+      "supportedReasoningEfforts": [{"reasoningEffort":"high","description":"Synthetic effort"}],
+      "defaultReasoningEffort":"high", "inputModalities":["text"],
+      "supportsPersonality":false, "multiAgentVersion":null, "additionalSpeedTiers":[],
+      "serviceTiers":[], "defaultServiceTier":null, "availableAccessPrograms":null, "isDefault":true
+    }],
+    "nextCursor": null
+  }
+}

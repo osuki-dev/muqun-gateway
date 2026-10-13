@@ -23,8 +23,10 @@ use super::adapters::opencode::OpencodeEndpoint;
 use super::domain::AgentDomainEvent;
 use super::manager::AgentManager;
 
+pub(crate) mod codex;
+pub use codex::CodexConfig;
 mod t3;
-use t3::{catalog_entry, t3_features, T3State};
+use t3::{catalog_entry, T3State};
 pub use t3::{T3Config, DEFAULT_T3_URL};
 
 /// How often the supervisor checks a healthy agent.
@@ -54,10 +56,10 @@ const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const VERSION_OUTPUT_LIMIT: u64 = 4096;
 
 /// Agent ids in primary-preference order. OpenCode is the established
-/// agent; DeepSeek and T3 Code are opt-in, so each is primary only when
-/// nothing ahead of it is attached. Every place that names an agent by
-/// position reads this.
-pub const AGENT_PREFERENCE: [&str; 3] = ["opencode", "deepseek", "t3"];
+/// agent; DeepSeek and T3 Code are opt-in. Codex defaults enabled but comes
+/// last, so it never displaces an attached provider ahead of it. Every place
+/// that names an agent by position reads this.
+pub const AGENT_PREFERENCE: [&str; 4] = ["opencode", "deepseek", "t3", "codex"];
 /// Most session-to-agent routes remembered; the oldest go first.
 const MAX_SESSION_ROUTES: usize = 4096;
 /// How long an agent discovery result is reused.
@@ -230,6 +232,7 @@ pub struct AgentRuntime {
     config: OpencodeConfig,
     deepseek_config: DeepseekConfig,
     t3: T3State,
+    codex: codex::CodexState,
     origin: RwLock<AgentOrigin>,
     /// Identity last verified for the attached OpenCode manager. `/api/info`
     /// has no instance id, so retain that field from registration separately.
@@ -306,13 +309,48 @@ impl AgentRuntime {
         t3_config: T3Config,
         state_dir: Option<std::path::PathBuf>,
     ) -> Arc<Self> {
-        Self::with_t3_state(config, deepseek_config, T3State::new(t3_config, state_dir))
+        Self::with_all_configs(
+            config,
+            deepseek_config,
+            t3_config,
+            CodexConfig::default(),
+            state_dir,
+        )
+    }
+
+    pub fn with_all_configs(
+        config: OpencodeConfig,
+        deepseek_config: DeepseekConfig,
+        t3_config: T3Config,
+        codex_config: CodexConfig,
+        state_dir: Option<std::path::PathBuf>,
+    ) -> Arc<Self> {
+        Self::with_states(
+            config,
+            deepseek_config,
+            T3State::new(t3_config, state_dir),
+            codex::CodexState::new(codex_config),
+        )
     }
 
     fn with_t3_state(
         config: OpencodeConfig,
         deepseek_config: DeepseekConfig,
         t3: T3State,
+    ) -> Arc<Self> {
+        Self::with_states(
+            config,
+            deepseek_config,
+            t3,
+            codex::CodexState::new(CodexConfig::default()),
+        )
+    }
+
+    fn with_states(
+        config: OpencodeConfig,
+        deepseek_config: DeepseekConfig,
+        t3: T3State,
+        codex: codex::CodexState,
     ) -> Arc<Self> {
         let (events_tx, _) = broadcast::channel(1024);
         Arc::new(Self {
@@ -325,6 +363,7 @@ impl AgentRuntime {
             config,
             deepseek_config,
             t3,
+            codex,
             origin: RwLock::new(AgentOrigin::None),
             opencode_instance: RwLock::new(None),
             start_lock: Mutex::new(()),
@@ -361,7 +400,7 @@ impl AgentRuntime {
     /// A runtime that will never attach an agent, for tests and for a build
     /// of `AppState` that has no business starting anything.
     pub fn disabled() -> Arc<Self> {
-        Self::with_configs(
+        Self::with_all_configs(
             OpencodeConfig {
                 enabled: false,
                 autostart: false,
@@ -369,6 +408,10 @@ impl AgentRuntime {
             },
             DeepseekConfig::default(),
             T3Config::default(),
+            CodexConfig {
+                enabled: false,
+                binary: None,
+            },
             None,
         )
     }
@@ -502,16 +545,22 @@ impl AgentRuntime {
                 .as_ref()
                 .map(|m| m.stream_connected())
                 .unwrap_or(false),
-            autostart: self.config.autostart,
+            autostart: if manager
+                .as_ref()
+                .is_some_and(|m| m.agent().kind() == "codex")
+            {
+                self.codex.config.enabled
+            } else {
+                self.config.autostart
+            },
             kind: manager.as_ref().map(|m| m.agent().kind().to_string()),
             agent_id: manager.as_ref().map(|m| m.agent().kind().to_string()),
         }
     }
 
     /// Status of one attached agent, `None` when it is not attached. The
-    /// primary answers exactly as `status()` does; another attached agent
-    /// (DeepSeek, which OpenCode outranks) is always an adopted service the
-    /// gateway does not start.
+    /// primary answers exactly as `status()` does. Other service agents are
+    /// adopted; Codex is a private child the Gateway owns.
     pub async fn status_for(&self, agent_id: &str) -> Option<AgentStatus> {
         let manager = self.manager_for_agent(agent_id).await?;
         let primary = self.manager.read().await.clone();
@@ -522,11 +571,15 @@ impl AgentRuntime {
         Some(AgentStatus {
             available: true,
             installation: AgentInstallation::Installed,
-            origin: AgentOrigin::Adopted,
+            origin: if kind == "codex" {
+                AgentOrigin::Spawned
+            } else {
+                AgentOrigin::Adopted
+            },
             url: Some(manager.endpoint_url().to_string()),
             version: manager.version(),
             stream_connected: manager.stream_connected(),
-            autostart: false,
+            autostart: kind == "codex" && self.codex.config.enabled,
             kind: Some(kind.clone()),
             agent_id: Some(kind),
         })
@@ -593,7 +646,8 @@ impl AgentRuntime {
                         "OpenCode",
                         opencode_features(false, false),
                     ),
-                    "t3" => (self.t3.wanted(), "T3 Code", t3_features()),
+                    "t3" => (self.t3.wanted(), "T3 Code", self.t3.features()),
+                    "codex" => (self.codex.config.enabled, "Codex", codex::features()),
                     _ => (
                         self.deepseek_config.enabled || self.deepseek_config.endpoint.is_some(),
                         "DeepSeek",
@@ -880,6 +934,7 @@ impl AgentRuntime {
 
         // 3. T3 Code discovery
         agents.push(self.t3_discovery().await);
+        agents.push(self.codex.discovery(self).await);
 
         let supported = agents.iter().any(|h| {
             h.status == AgentAvailability::Connected || h.status == AgentAvailability::Reachable
@@ -1005,8 +1060,9 @@ impl AgentRuntime {
 
         // 3. Supervise T3 Code
         let t3_ok = self.supervise_t3().await;
+        let codex_ok = self.codex.supervise(self).await;
 
-        if deepseek_ok || opencode_ok || t3_ok {
+        if deepseek_ok || opencode_ok || t3_ok || codex_ok {
             *start_backoff = Duration::from_secs(2);
             let primary = pick_primary(&*self.managers.read().await).cloned();
             if let Some(mgr) = primary {
@@ -2857,8 +2913,8 @@ mod tests {
         assert_eq!(t3.endpoint.as_deref(), Some("http://127.0.0.1:9/"));
         assert!(t3.modes.is_empty());
         let f = &t3.features;
-        assert!(f.streaming && f.model_selection && f.tool_approvals && f.revert);
-        assert!(!f.reasoning_effort && !f.worktrees && !f.inbox);
+        assert!(f.streaming && f.model_selection && f.tool_approvals);
+        assert!(!f.revert && !f.reasoning_effort && !f.worktrees && !f.inbox);
 
         let enabled = t3_runtime(T3Config {
             enabled: true,
@@ -2919,24 +2975,64 @@ mod tests {
 
     #[tokio::test]
     async fn a_t3_server_on_a_newer_protocol_is_unsupported_and_never_attached() {
-        let url = fake_t3_serving(t3_descriptor_speaking(2)).await;
-        let runtime = t3_runtime(T3Config {
-            url: Some(url),
-            token: Some("bearer".into()),
-            ..Default::default()
-        });
-        assert!(!runtime.supervise_t3().await);
-        assert!(runtime.manager_for_agent("t3").await.is_none());
-        let t3 = runtime.t3_discovery().await;
-        assert_eq!(t3.status, crate::discovery::AgentAvailability::Unsupported);
-        assert_eq!(
-            t3.reason.as_deref(),
-            Some("T3 server speaks orchestration protocol 2; this gateway supports 1")
-        );
-        assert_eq!(t3.version.as_deref(), Some("0.0.45"));
-        assert!(t3.models.is_empty());
-        let wire = serde_json::to_value(&t3).unwrap();
-        assert_eq!(wire["status"], "unsupported");
+        use crate::agents::adapters::t3::endpoint::{TOKEN_PATH, WELL_KNOWN_PATH};
+        use axum::{
+            http::StatusCode,
+            routing::{get, post},
+            Router,
+        };
+
+        let exchanges = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = exchanges.clone();
+        let descriptor = t3_descriptor_speaking(3);
+        let app = Router::new()
+            .route(WELL_KNOWN_PATH, get(move || async move { descriptor }))
+            .route(
+                TOKEN_PATH,
+                post(move || {
+                    let count = count.clone();
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for credential in [
+            T3Config {
+                token: Some("fixture-bearer".into()),
+                ..Default::default()
+            },
+            T3Config {
+                pairing_token: Some("fixture-pairing-token".into()),
+                ..Default::default()
+            },
+        ] {
+            let runtime = t3_runtime(T3Config {
+                url: Some(url.clone()),
+                ..credential
+            });
+            assert!(!runtime.supervise_t3().await);
+            assert!(runtime.manager_for_agent("t3").await.is_none());
+            let t3 = runtime.t3_discovery().await;
+            assert_eq!(t3.status, crate::discovery::AgentAvailability::Unsupported);
+            assert_eq!(
+                t3.reason.as_deref(),
+                Some("T3 server speaks orchestration protocol 3; this gateway supports 1 and 2")
+            );
+            assert_eq!(t3.version.as_deref(), Some("0.0.45"));
+            assert!(t3.models.is_empty());
+            let wire = serde_json::to_value(&t3).unwrap();
+            assert_eq!(wire["status"], "unsupported");
+            assert_eq!(
+                exchanges.load(Ordering::SeqCst),
+                0,
+                "unsupported protocols must not consume a pairing token"
+            );
+        }
+        server.abort();
     }
 
     #[tokio::test]
@@ -2953,6 +3049,73 @@ mod tests {
         let t3 = runtime.t3_discovery().await;
         assert_eq!(t3.status, crate::discovery::AgentAvailability::Connected);
         assert!(t3.reason.is_none());
+        assert!(
+            t3.features.revert,
+            "known protocol 1 supports one-step revert"
+        );
+        let snapshot = runtime.attached_snapshot().await;
+        assert!(
+            snapshot
+                .agents
+                .iter()
+                .find(|a| a.id == "t3")
+                .unwrap()
+                .features
+                .revert
+        );
+        manager.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_t3_server_on_protocol_2_is_attached_and_discovered_with_its_server_version() {
+        // Select the protocol from the descriptor, not the serverVersion string.
+        let url = fake_t3_serving(t3_descriptor_speaking(2)).await;
+        let runtime = t3_runtime(T3Config {
+            url: Some(url.clone()),
+            token: Some("fixture-bearer".into()),
+            ..Default::default()
+        });
+        let reachable = runtime.t3_discovery().await;
+        assert_eq!(
+            reachable.status,
+            crate::discovery::AgentAvailability::Reachable
+        );
+        assert_eq!(reachable.version.as_deref(), Some("0.0.45"));
+        assert!(reachable.reason.is_none());
+        assert!(!reachable.features.revert);
+
+        assert!(runtime.supervise_t3().await);
+        let manager = runtime
+            .manager_for_agent("t3")
+            .await
+            .expect("protocol 2 attached");
+        assert_eq!(manager.version().as_deref(), Some("0.0.45"));
+        let connected = runtime.t3_discovery().await;
+        assert_eq!(
+            connected.status,
+            crate::discovery::AgentAvailability::Connected
+        );
+        assert_eq!(connected.endpoint.as_deref(), Some(url.as_str()));
+        assert_eq!(connected.version.as_deref(), Some("0.0.45"));
+        assert!(connected.reason.is_none());
+        assert!(!connected.features.revert);
+        let snapshot = runtime.attached_snapshot().await;
+        assert!(
+            !snapshot
+                .agents
+                .iter()
+                .find(|a| a.id == "t3")
+                .unwrap()
+                .features
+                .revert
+        );
+        let wire = serde_json::to_value(&connected.features).unwrap();
+        assert_eq!(wire["orchestrationProtocols"], serde_json::json!([1, 2]));
+        assert_eq!(wire["sessionPagination"], false);
+        assert_eq!(
+            runtime.status_for("t3").await.unwrap().version.as_deref(),
+            Some("0.0.45")
+        );
         manager.shutdown();
     }
 

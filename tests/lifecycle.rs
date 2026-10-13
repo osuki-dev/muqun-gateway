@@ -39,7 +39,8 @@ impl Install {
             "public_url": format!("http://{address}"), "token_hash": token_hash,
             "sessions": [{"id": "qa", "label": "isolated", "backend": "tmux", "socket_path": root.join("no-terminal.sock")}],
             "autostart_backends": [], "opencode": {"enabled": false, "autostart": false},
-            "deepseek": {"enabled": false}, "t3": {"enabled": false}
+            "deepseek": {"enabled": false}, "t3": {"enabled": false},
+            "codex": {"enabled": false}, "agent_runtime": {"enabled": false}
         })).unwrap()).unwrap();
         fs::write(
             config.join("pairing.json"),
@@ -59,7 +60,15 @@ impl Install {
         fs::write(&script, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$MOCK_LOG\"\n[ -z \"$MOCK_BUS_FAIL\" ] || exit 1\ncase \"$*\" in *GetUnit*) printf '%s\\n' '{\"type\":\"o\",\"data\":[\"/org/freedesktop/systemd1/unit/fixture\"]}';; *GetAll*Manager*) cat \"$MOCK_MANAGER\";; *GetAll*) cat \"$MOCK_PROPERTIES\";; *) exit 1;; esac\n").unwrap();
         fs::set_permissions(script, fs::Permissions::from_mode(0o700)).unwrap();
         // Even a backend liveness probe must never reach a host terminal.
-        for name in ["tmux", "tailscale"] {
+        for name in [
+            "tmux",
+            "tailscale",
+            "claude",
+            "codex",
+            "opencode",
+            "t3",
+            "deepseek",
+        ] {
             let script = root.join("bin").join(name);
             fs::write(&script, "#!/bin/sh\nexit 1\n").unwrap();
             fs::set_permissions(script, fs::Permissions::from_mode(0o700)).unwrap();
@@ -175,6 +184,326 @@ impl Drop for Install {
             }
         }
         let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+/// A foreground Gateway in a private process group. Its synthetic Codex child
+/// has a separate private group and is cleaned up through Gateway shutdown.
+struct ForegroundGateway {
+    child: std::process::Child,
+    codex_pid: PathBuf,
+    stubborn: bool,
+    #[cfg(target_os = "linux")]
+    codex_fd: Option<std::os::fd::OwnedFd>,
+}
+
+impl ForegroundGateway {
+    fn capture_codex(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            if self.codex_fd.is_some() || self.child.try_wait().ok().flatten().is_some() {
+                return;
+            }
+            let Some(pid) = fs::read_to_string(&self.codex_pid)
+                .ok()
+                .and_then(|pid| pid.parse::<u32>().ok())
+            else {
+                return;
+            };
+            let identity = || {
+                let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+                let fields: Vec<_> = stat[stat.rfind(')')? + 2..].split_whitespace().collect();
+                Some((
+                    fields.get(1)?.parse::<u32>().ok()?,
+                    fields.get(19)?.parse::<u64>().ok()?,
+                ))
+            };
+            let Some(before) = identity().filter(|(parent, _)| *parent == self.child.id()) else {
+                return;
+            };
+            // SAFETY: scalar syscall arguments; a successful result is a fresh fd.
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
+            if fd >= 0 {
+                // SAFETY: the fresh descriptor has not been adopted elsewhere.
+                let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+                if identity() == Some(before) {
+                    self.codex_fd = Some(fd);
+                }
+            }
+        }
+    }
+
+    fn wait_listening(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !fs::read_to_string(self.codex_pid.with_file_name("foreground.out"))
+            .unwrap_or_default()
+            .contains("terminal gateway listening on")
+        {
+            assert!(
+                self.child.try_wait().unwrap().is_none(),
+                "fixture Gateway exited before listening"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "fixture Gateway never started listening"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn stop(&mut self) {
+        self.capture_codex();
+        let started = Instant::now();
+        assert_eq!(
+            unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM) },
+            0
+        );
+        // Normal EOF must remain prompt. Only the deliberately hung fixture
+        // consumes the 46s upstream grace plus bounded forced cleanup.
+        let deadline = started + Duration::from_secs(if self.stubborn { 50 } else { 5 });
+        let status = loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Gateway did not finish Codex shutdown"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        if self.stubborn {
+            assert!(
+                started.elapsed() >= Duration::from_secs(45),
+                "stubborn cleanup was forced before upstream's watchdog window"
+            );
+        }
+        #[cfg(target_os = "linux")]
+        assert!(status.success());
+        #[cfg(not(target_os = "linux"))]
+        if self.stubborn {
+            // Non-pidfd platforms deliberately refuse descendant signals and
+            // report the unverified forced cleanup through the server result.
+            assert!(!status.success());
+            assert!(
+                fs::read_to_string(self.codex_pid.with_file_name("foreground.err"))
+                    .unwrap()
+                    .contains("cleanup could not be verified")
+            );
+        } else {
+            assert!(status.success());
+        }
+        eprintln!(
+            "synthetic Codex shutdown stubborn={}: {:?}",
+            self.stubborn,
+            started.elapsed()
+        );
+    }
+}
+
+impl Drop for ForegroundGateway {
+    fn drop(&mut self) {
+        self.capture_codex();
+        let group = self.child.id() as libc::pid_t;
+        if self.child.try_wait().ok().flatten().is_none() {
+            // Let the production ownership supervisor collect its separate
+            // private child even when an assertion unwinds the fixture.
+            unsafe {
+                libc::kill(group, libc::SIGTERM);
+            }
+            let deadline = Instant::now() + Duration::from_secs(if self.stubborn { 50 } else { 6 });
+            while self.child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(fd) = &self.codex_fd {
+            // SAFETY: the descriptor targets the verified original fixture
+            // incarnation even if its PID was reaped/reused while unwinding.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    fd.as_raw_fd(),
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                );
+            }
+        }
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+    }
+}
+
+fn configure_fake_codex(install: &Install, master_enabled: bool) -> PathBuf {
+    let executable = install.root.join("bin/fake-codex");
+    fs::write(&executable,r#"#!/bin/sh
+[ "$1" = --fixture-ready ] && exit 0
+printf '%s' "$$" > "$FAKE_CODEX_PID"
+printf '%s\n' "$@" > "$FAKE_CODEX_ARGV"
+while IFS= read -r line; do
+    id=${line#*'"id":'}; id=${id%%,*}; id=${id%%\}*}
+    case "$line" in
+        *'"method":"initialize"'*) printf '{"id":%s,"result":{"userAgent":"codex_cli_rs/0.162.1 (synthetic fixture)","codexHome":"/synthetic/codex-home","platformFamily":"unix","platformOs":"synthetic"}}\n' "$id" ;;
+        *'"method":"account/read"'*) printf '{"id":%s,"result":{"account":null,"requiresOpenaiAuth":false}}\n' "$id"; printf 'ready' > "$FAKE_CODEX_READY" ;;
+        *'"method":"model/list"'*) printf '{"id":%s,"result":{"data":[],"nextCursor":null}}\n' "$id" ;;
+        *'"method":"config/read"'*) printf '{"id":%s,"result":{"config":{"model_provider":null}}}\n' "$id" ;;
+    esac
+done
+if [ "$FAKE_CODEX_STUBBORN" = true ]; then while :; do :; done; fi
+"#).unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    // Side-effect-free readiness addresses only a fake immutable script's
+    // pre-exec ETXTBSY; it is not a retry of upstream agent work.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match Command::new(&executable).arg("--fixture-ready").status() {
+            Ok(status) => {
+                assert!(status.success());
+                break;
+            }
+            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "fake Codex fixture remained busy"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("fake Codex readiness failed: {error}"),
+        }
+    }
+    let path = install.config.join("config.json");
+    let mut config: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["agent_runtime"] = json!({"enabled":master_enabled});
+    config["codex"] = json!({"binary":executable});
+    fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
+    executable
+}
+
+fn foreground_gateway(install: &Install, stubborn: bool) -> ForegroundGateway {
+    use std::os::unix::process::CommandExt as _;
+    let codex_pid = install.root.join("fake-codex.pid");
+    let mut command = install.command(&["run"]);
+    command
+        .process_group(0)
+        .env("FAKE_CODEX_PID", &codex_pid)
+        .env("FAKE_CODEX_ARGV", install.root.join("fake-codex.argv"))
+        .env("FAKE_CODEX_READY", install.root.join("fake-codex.ready"))
+        .env(
+            "FAKE_CODEX_STUBBORN",
+            if stubborn { "true" } else { "false" },
+        )
+        .stdout(fs::File::create(install.root.join("foreground.out")).unwrap())
+        .stderr(fs::File::create(install.root.join("foreground.err")).unwrap());
+    ForegroundGateway {
+        child: command.spawn().unwrap(),
+        codex_pid,
+        stubborn,
+        #[cfg(target_os = "linux")]
+        codex_fd: None,
+    }
+}
+
+#[test]
+fn codex_private_fake_child_is_started_from_config_and_reaped_on_sigterm() {
+    for stubborn in [false, true] {
+        let install = Install::new();
+        let executable = configure_fake_codex(&install, true);
+        if stubborn {
+            // Both omitted blocks default on, and normal PATH selects only
+            // this immutable fixture, never an ambient installed Codex.
+            let path_binary = install.root.join("bin/codex");
+            fs::remove_file(&path_binary).unwrap();
+            fs::hard_link(&executable, &path_binary).unwrap();
+            let path = install.config.join("config.json");
+            let mut config: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            config.as_object_mut().unwrap().remove("codex");
+            config.as_object_mut().unwrap().remove("agent_runtime");
+            fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
+        }
+        let mut gateway = foreground_gateway(&install, stubborn);
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !install.root.join("fake-codex.ready").exists() {
+            gateway.capture_codex();
+            assert!(
+                gateway.child.try_wait().unwrap().is_none(),
+                "Gateway exited before fake Codex readiness"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "fake Codex was not initialized: {}",
+                fs::read_to_string(install.root.join("foreground.err")).unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let codex_pid: libc::pid_t = fs::read_to_string(&gateway.codex_pid)
+            .unwrap()
+            .parse()
+            .unwrap();
+        gateway.capture_codex();
+        assert_eq!(
+            fs::read_to_string(install.root.join("fake-codex.argv")).unwrap(),
+            "app-server\n--listen\nstdio://\n"
+        );
+        assert_eq!(unsafe { libc::getpgid(codex_pid) }, codex_pid);
+        assert_ne!(codex_pid, gateway.child.id() as libc::pid_t);
+        gateway.stop();
+        assert_eq!(
+            unsafe { libc::kill(codex_pid, 0) },
+            -1,
+            "private fake child survived Gateway shutdown"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+}
+
+#[test]
+fn codex_master_off_cli_and_bind_failure_never_start_the_configured_fake_child() {
+    let install = Install::new();
+    configure_fake_codex(&install, false);
+    let list = install.ok(&["agent", "--json"]);
+    let agents: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert!(agents
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|a| a["status"] == "disabled"));
+    assert!(!install.root.join("fake-codex.pid").exists());
+    assert!(!install.root.join("fake-codex.argv").exists());
+    configure_fake_codex(&install, true);
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let path = install.config.join("config.json");
+    let mut config: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["listen"] = json!(occupied.local_addr().unwrap().to_string());
+    fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
+    let result = install.run(&["run"]);
+    assert!(!result.status.success());
+    assert!(!install.root.join("fake-codex.pid").exists());
+    assert!(!install.root.join("fake-codex.argv").exists());
+}
+
+#[test]
+fn codex_explicit_disable_and_master_off_reach_the_running_server_without_child_startup() {
+    for master_off in [true, false] {
+        let install = Install::new();
+        configure_fake_codex(&install, !master_off);
+        if !master_off {
+            let path = install.config.join("config.json");
+            let mut config: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            config["codex"]["enabled"] = json!(false);
+            fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
+        }
+        let mut gateway = foreground_gateway(&install, false);
+        gateway.wait_listening();
+        gateway.stop();
+        assert!(!gateway.codex_pid.exists());
+        assert!(!install.root.join("fake-codex.argv").exists());
     }
 }
 

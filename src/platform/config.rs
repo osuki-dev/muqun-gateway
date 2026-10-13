@@ -129,6 +129,13 @@ pub(crate) struct Config {
     /// The T3 Code agent adapter: off unless `enabled` or `url` is set.
     #[serde(default, skip_serializing_if = "is_default_t3")]
     pub(crate) t3: agents::T3Config,
+    /// Private Codex app-server support is on unless explicitly disabled.
+    /// Authentication and permission configuration remain owned by Codex.
+    #[serde(default, skip_serializing_if = "is_default_codex")]
+    pub(crate) codex: agents::runtime::CodexConfig,
+    /// Master switch for service agents; terminal agents remain independent.
+    #[serde(default, skip_serializing_if = "AgentRuntimeConfig::is_default")]
+    pub(crate) agent_runtime: AgentRuntimeConfig,
     /// The shared SQLite store. Omitted from a written config while it is the
     /// default, so an existing `config.json` round-trips untouched.
     #[serde(default, skip_serializing_if = "StoreConfig::is_default")]
@@ -139,6 +146,25 @@ pub(crate) struct Config {
     /// The owner's other computers. See `FleetConfig`.
     #[serde(default, skip_serializing_if = "FleetConfig::is_default")]
     pub(crate) fleet: FleetConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AgentRuntimeConfig {
+    #[serde(default = "default_true")]
+    pub(crate) enabled: bool,
+}
+
+impl Default for AgentRuntimeConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+impl AgentRuntimeConfig {
+    fn is_default(&self) -> bool {
+        self.enabled
+    }
 }
 
 /// `{"mcp": {"enabled": false}}` removes `/mcp` and `/api/mcp/tokens*`, stops
@@ -265,6 +291,10 @@ pub(crate) fn is_default_deepseek(config: &agents::DeepseekConfig) -> bool {
 
 pub(crate) fn is_default_t3(config: &agents::T3Config) -> bool {
     *config == agents::T3Config::default()
+}
+
+pub(crate) fn is_default_codex(config: &agents::runtime::CodexConfig) -> bool {
+    *config == agents::runtime::CodexConfig::default()
 }
 
 pub(crate) fn is_required_transport(mode: &TransportEncryptionMode) -> bool {
@@ -535,6 +565,37 @@ pub(crate) const CONTENT_SCHEMA_VERSION: &str = "1.5.0";
 #[cfg(test)]
 mod tests {
     use crate::*;
+
+    #[test]
+    fn codex_and_master_runtime_default_on_roundtrip_explicit_off_and_reject_secrets() {
+        let base = json!({"server_id":"synthetic-server","label":"fixture","listen":"127.0.0.1:23847","public_url":"","token_hash":"synthetic-hash","sessions":[]});
+        let default: Config = serde_json::from_value(base.clone()).unwrap();
+        assert!(default.codex.enabled && default.agent_runtime.enabled);
+        assert_eq!(serde_json::to_value(default).unwrap(), base);
+        for key in ["codex", "agent_runtime"] {
+            let mut off = base.clone();
+            off[key] = json!({"enabled":false});
+            let config: Config = serde_json::from_value(off.clone()).unwrap();
+            assert!(!if key == "codex" {
+                config.codex.enabled
+            } else {
+                config.agent_runtime.enabled
+            });
+            assert_eq!(serde_json::to_value(config).unwrap(), off);
+            let mut empty = base.clone();
+            empty[key] = json!({});
+            let config: Config = serde_json::from_value(empty).unwrap();
+            assert!(config.codex.enabled && config.agent_runtime.enabled);
+            let mut unknown = base.clone();
+            unknown[key] = json!({"api_key":"synthetic-not-a-credential"});
+            assert!(serde_json::from_value::<Config>(unknown).is_err());
+        }
+        let mut configured = base;
+        configured["codex"] = json!({"enabled":true,"binary":"/synthetic/bin/codex"});
+        let config: Config = serde_json::from_value(configured.clone()).unwrap();
+        assert_eq!(config.codex.binary.as_deref(), Some("/synthetic/bin/codex"));
+        assert_eq!(serde_json::to_value(config).unwrap(), configured);
+    }
 
     #[test]
     fn the_store_block_is_left_out_when_default_and_strict_when_present() {

@@ -50,6 +50,11 @@ pub(crate) fn test_config(token: &str) -> Config {
         opencode: agents::OpencodeConfig::default(),
         deepseek: agents::DeepseekConfig::default(),
         t3: agents::T3Config::default(),
+        codex: agents::runtime::CodexConfig {
+            enabled: false,
+            binary: None,
+        },
+        agent_runtime: crate::platform::config::AgentRuntimeConfig { enabled: false },
         store: crate::platform::config::StoreConfig::default(),
         mcp: crate::platform::config::McpConfig::default(),
         fleet: Default::default(),

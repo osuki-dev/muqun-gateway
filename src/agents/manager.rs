@@ -135,6 +135,16 @@ pub struct AgentManager {
     shutdown_handle: Arc<dyn Fn() + Send + Sync>,
 }
 
+impl Drop for AgentManager {
+    fn drop(&mut self) {
+        // Codex's pump strongly owns its transport; releasing the external
+        // manager must cancel it. Other adapters retain their existing policy.
+        if self.agent.kind() == "codex" {
+            (self.shutdown_handle)();
+        }
+    }
+}
+
 /// What a `shell.created` told us, kept until the matching `shell.exited`.
 #[derive(Clone)]
 struct ShellOwner {
@@ -1578,6 +1588,7 @@ impl AgentManager {
     }
 }
 
+mod codex;
 mod deepseek;
 mod t3;
 

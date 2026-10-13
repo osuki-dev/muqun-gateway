@@ -1551,8 +1551,12 @@ impl TaskService {
 /// Whether a delegation to agent `kind` starts it in a terminal pane: a
 /// terminal agent from the catalog that no session runtime serves. A
 /// session agent (OpenCode, DeepSeek, T3) never is: unattached, it is
-/// unavailable.
+/// unavailable. Explicit Codex task requests retain their existing terminal
+/// route, independent of the private Codex agent-session adapter's readiness.
 pub(crate) async fn runs_in_pane(state: &AppState, kind: &str) -> bool {
+    if kind == "codex" {
+        return pane_agent::is_terminal_agent(state, kind);
+    }
     !AGENT_PREFERENCE.contains(&kind)
         && state.agent_runtime.manager_for_agent(kind).await.is_none()
         && pane_agent::is_terminal_agent(state, kind)

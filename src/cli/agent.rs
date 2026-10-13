@@ -75,6 +75,8 @@ pub(crate) enum SetupAgent {
     },
     /// Show the OpenCode the gateway would use; it needs no setup.
     Opencode,
+    /// Explain Codex setup without starting an agent or a login flow.
+    Codex,
 }
 
 pub(crate) async fn run_agent_command(
@@ -128,6 +130,10 @@ pub(crate) async fn run_agent_command(
                 )?;
             }
             SetupAgent::Opencode => setup_opencode().await?,
+            SetupAgent::Codex => {
+                println!("Codex support is enabled by default. Configure Codex 0.162.1 and its authentication on this host yourself. The running Gateway owns a private app-server child; it does not change terminal Codex sessions, permission policy or credential files.");
+                println!("Set codex.enabled=false to disable it; codex.binary may name an absolute executable. This command does not start Codex, install packages, log in or restart the Gateway.");
+            }
         },
     }
     Ok(())
@@ -136,12 +142,17 @@ pub(crate) async fn run_agent_command(
 /// Print every agent; `true` when each enabled one is usable.
 async fn list(json: bool) -> anyhow::Result<bool> {
     let config = load_config(None)?;
-    let runtime = AgentRuntime::with_configs(
-        config.opencode.clone(),
-        config.deepseek.clone(),
-        config.t3.clone(),
-        Some(state_dir()?),
-    );
+    let runtime = if config.agent_runtime.enabled {
+        AgentRuntime::with_all_configs(
+            config.opencode.clone(),
+            config.deepseek.clone(),
+            config.t3.clone(),
+            config.codex.clone(),
+            Some(state_dir()?),
+        )
+    } else {
+        AgentRuntime::disabled()
+    };
     // The uncached probe: `discover_agents` gives up after a few seconds
     // and would report everything offline while a catalog is still loading.
     let mut agents = runtime.probe_agents().await.agents;
@@ -226,9 +237,13 @@ fn format_row(agent: &AgentDiscoveryInfo, config: &Config) -> String {
             .flatten()
             .map(|path| path.display().to_string())
     });
-    let next = next_step(&agent.id, &agent.status)
-        .map(|step| format!("  → {step}"))
-        .unwrap_or_default();
+    let next = if config.agent_runtime.enabled {
+        next_step(&agent.id, &agent.status)
+    } else {
+        Some("set `agent_runtime.enabled` to true in config.json")
+    }
+    .map(|step| format!("  → {step}"))
+    .unwrap_or_default();
     format!(
         "{:<9} {:<13} {:<9} {}{next}",
         agent.id,
@@ -255,6 +270,17 @@ pub(crate) fn next_step(id: &str, status: &AgentAvailability) -> Option<&'static
         (Unconfigured | Disabled, "t3") => "muqun-gateway agent setup t3",
         (Unconfigured | Disabled, "deepseek") => "muqun-gateway agent setup deepseek",
         (Disabled, "opencode") => "set `opencode.enabled` to true in config.json",
+        (Disabled, "codex") => "set `codex.enabled` to true in config.json",
+        (Unconfigured, "codex") => {
+            "configure Codex authentication on this host; Gateway will not log in for you"
+        }
+        (NotInstalled, "codex") => {
+            "install Codex 0.162.1 yourself, set codex.binary, or disable codex.enabled"
+        }
+        (Offline, "codex") => {
+            "check Codex configuration on this host; failed prompts are never automatically retried"
+        }
+        (Unsupported, "codex") => "use Codex 0.162.1 or upgrade Gateway protocol support",
         (Offline, "opencode") => "opencode service start",
         (Offline | NotInstalled, "deepseek") => DSH_START,
         (Offline, "t3") => "open T3 Code, or run `t3 service install`",
@@ -1141,6 +1167,34 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn codex_setup_parses_without_login_restart_or_install_flags() {
+        use clap::Parser as _;
+        assert!(matches!(
+            crate::Cli::try_parse_from(["muqun-gateway", "agent", "setup", "codex"])
+                .unwrap()
+                .command,
+            crate::Command::Agent {
+                command: Some(AgentCommand::Setup {
+                    agent: SetupAgent::Codex
+                }),
+                ..
+            }
+        ));
+        for flag in ["--token", "--login", "--install", "--yes"] {
+            assert!(
+                crate::Cli::try_parse_from(["muqun-gateway", "agent", "setup", "codex", flag])
+                    .is_err()
+            );
+        }
+        assert!(next_step("codex", &AgentAvailability::Unconfigured)
+            .unwrap()
+            .contains("will not log in"));
+        assert!(next_step("codex", &AgentAvailability::Disabled)
+            .unwrap()
+            .contains("codex.enabled"));
     }
 
     #[test]
