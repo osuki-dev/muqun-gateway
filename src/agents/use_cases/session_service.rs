@@ -110,6 +110,9 @@ impl SessionService {
         self.stamp(&mut info);
         self.observe_runtime(&mut info).await;
         self.mirror.update_session(info.clone()).await;
+        if let Some(memory) = &self.memory {
+            memory.mark_history_initialized(&info.asid).await;
+        }
         Ok(info)
     }
 
@@ -138,10 +141,22 @@ impl SessionService {
         // Ownership recovery belongs to selection, not a transcript cache miss.
         // A rejected preparation leaves the retained snapshot untouched.
         self.agent.prepare_selected_session(&asid.0).await?;
-        // A session the mirror holds is served from the mirror, even when its
-        // timeline is legitimately empty: treating "no rows" as a cache miss
-        // re-hit OpenCode twice on every poll of a new session.
-        if let Some(mut snapshot) = self.mirror.get_snapshot(asid).await {
+        let history_gate = if let Some(memory) = &self.memory {
+            Some(memory.history_gate(asid).await)
+        } else {
+            None
+        };
+        let _history_read = match &history_gate {
+            Some(gate) => Some(gate.lock().await),
+            None => None,
+        };
+        // Known empty history is cached too. Metadata or a live delta alone
+        // cannot stand in for the first canonical history read.
+        let initialized = match &self.memory {
+            Some(memory) => memory.history_initialized(asid).await,
+            None => true,
+        };
+        if let Some(mut snapshot) = self.mirror.get_snapshot(asid).await.filter(|_| initialized) {
             self.observe_runtime(&mut snapshot.info).await;
             return Ok(snapshot);
         }
@@ -150,13 +165,22 @@ impl SessionService {
         self.stamp(&mut info);
         self.observe_runtime(&mut info).await;
         self.mirror.update_session(info.clone()).await;
-
-        let timeline = self
-            .agent
-            .get_timeline(&asid.0, 100)
-            .await
-            .unwrap_or_default();
-        if !timeline.is_empty() {
+        let before_read = if let Some(memory) = &self.memory {
+            memory.history_read_revision(asid).await.unwrap_or_default()
+        } else {
+            (0, 0)
+        };
+        let timeline = self.agent.get_timeline(&asid.0, 100).await?;
+        if let (Some(memory), Some(gate)) = (&self.memory, &history_gate) {
+            if !memory
+                .initialize_history(asid, gate, before_read, timeline.clone())
+                .await
+            {
+                return Err(AgentError::NotAvailable(
+                    "Session changed during initial history read".into(),
+                ));
+            }
+        } else if !timeline.is_empty() {
             self.mirror
                 .upsert_timeline_items(asid, timeline.clone())
                 .await;
@@ -167,7 +191,8 @@ impl SessionService {
         // disconnect, so a permission prompt could otherwise be lost for good.
         self.catch_up_pending(asid).await;
 
-        if let Some(snapshot) = self.mirror.get_snapshot(asid).await {
+        if let Some(mut snapshot) = self.mirror.get_snapshot(asid).await {
+            self.observe_runtime(&mut snapshot.info).await;
             Ok(snapshot)
         } else {
             Ok(AgentSessionSnapshot {

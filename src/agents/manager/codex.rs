@@ -1806,6 +1806,12 @@ mod tests {
             .send(json!({"method":"thread/started","params":{"thread":thread}}))
             .await;
         next_session_update(&mut events).await;
+        // This fixture exercises metadata revisions over an already viewed empty
+        // transcript. Initial history hydration has separate service regressions.
+        manager
+            .mirror()
+            .mark_history_initialized(&AgentSessionId(id.clone()))
+            .await;
         let mut reads = vec![];
         for turn in ["synthetic-first", "synthetic-second"] {
             let manager = manager.clone();

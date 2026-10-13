@@ -131,6 +131,10 @@ struct SessionState {
     /// True while `info` is the local stand-in rather than something OpenCode
     /// reported.
     placeholder: bool,
+    /// Metadata and live deltas do not prove that initial history was read.
+    history_initialized: bool,
+    history_gate: Arc<tokio::sync::Mutex<()>>,
+    history_removal_generation: u64,
 }
 
 impl SessionState {
@@ -147,6 +151,9 @@ impl SessionState {
             current_seq: 0,
             touched_ms: now_ms(),
             placeholder: false,
+            history_initialized: false,
+            history_gate: Arc::new(tokio::sync::Mutex::new(())),
+            history_removal_generation: 0,
         }
     }
 
@@ -349,6 +356,92 @@ impl MemoryMirror {
     pub async fn is_placeholder(&self, asid: &AgentSessionId) -> bool {
         let sessions = self.sessions.read().await;
         sessions.get(asid).map(|s| s.placeholder).unwrap_or(true)
+    }
+
+    pub(crate) async fn history_gate(&self, asid: &AgentSessionId) -> Arc<tokio::sync::Mutex<()>> {
+        let mut sessions = self.sessions.write().await;
+        Self::entry(
+            &self.agent_id,
+            &mut sessions,
+            asid,
+            AgentSessionStatus::Unknown,
+        )
+        .history_gate
+        .clone()
+    }
+
+    pub(crate) async fn history_initialized(&self, asid: &AgentSessionId) -> bool {
+        self.sessions
+            .read()
+            .await
+            .get(asid)
+            .is_some_and(|state| state.history_initialized)
+    }
+
+    pub(crate) async fn history_read_revision(&self, asid: &AgentSessionId) -> Option<(u64, u64)> {
+        self.sessions
+            .read()
+            .await
+            .get(asid)
+            .map(|state| (state.current_seq, state.history_removal_generation))
+    }
+
+    /// A newly created session has known empty history. Metadata for an existing
+    /// session or a fork does not establish that fact.
+    pub(crate) async fn mark_history_initialized(&self, asid: &AgentSessionId) {
+        if let Some(state) = self.sessions.write().await.get_mut(asid) {
+            state.history_initialized = true;
+        }
+    }
+
+    /// Merge one bounded initial history read without replacing newer live rows.
+    /// The gate identity fences eviction/recreation while the provider was read.
+    pub(crate) async fn initialize_history(
+        &self,
+        asid: &AgentSessionId,
+        gate: &Arc<tokio::sync::Mutex<()>>,
+        before_read: (u64, u64),
+        items: Vec<TimelineItem>,
+    ) -> bool {
+        let mut sessions = self.sessions.write().await;
+        let Some(state) = sessions.get_mut(asid) else {
+            return false;
+        };
+        if !Arc::ptr_eq(gate, &state.history_gate) {
+            return false;
+        }
+        if state.history_initialized {
+            return true;
+        }
+        if state.history_removal_generation != before_read.1 {
+            return false;
+        }
+        let mut accepted: Vec<_> = items
+            .into_iter()
+            .filter(|item| {
+                state
+                    .timeline
+                    .get(&item.id)
+                    .is_none_or(|current| current.seq <= before_read.0)
+            })
+            .collect();
+        if !accepted.is_empty() {
+            let seq = state.next_seq();
+            for item in &mut accepted {
+                item.seq = seq;
+                if let AgentPart::Tool(call) = &mut item.part {
+                    truncate_tool_output(call);
+                }
+                state.insert_item(item.clone());
+            }
+            state.push_event(AgentDomainEvent::TimelineUpsert {
+                asid: asid.clone(),
+                items: accepted,
+                seq,
+            });
+        }
+        state.history_initialized = true;
+        true
     }
 
     /// Upstream metadata cannot erase read markers the Gateway owns.
@@ -619,6 +712,8 @@ impl MemoryMirror {
     ) -> Option<(u64, Vec<String>)> {
         let mut sessions = self.sessions.write().await;
         let state = sessions.get_mut(asid)?;
+        // An unloaded row may still be in an in-flight canonical read.
+        state.history_removal_generation = state.history_removal_generation.wrapping_add(1);
         let doomed: Vec<String> = state
             .timeline
             .values()
@@ -652,6 +747,8 @@ impl MemoryMirror {
     ) -> Option<(u64, Vec<String>)> {
         let mut sessions = self.sessions.write().await;
         let state = sessions.get_mut(asid)?;
+        // An unloaded row may still be in an in-flight canonical read.
+        state.history_removal_generation = state.history_removal_generation.wrapping_add(1);
         let removed: Vec<String> = ids
             .iter()
             .filter(|id| state.timeline.remove(id.as_str()).is_some())
@@ -1189,6 +1286,7 @@ impl MemoryMirror {
         let state = Self::entry(&self.agent_id, &mut sessions, &asid, snapshot.info.status);
         state.info = snapshot.info.clone();
         state.placeholder = false;
+        state.history_initialized = true;
         state.timeline.clear();
         for item in &snapshot.timeline {
             state.insert_item(item.clone());
@@ -1880,6 +1978,118 @@ mod tests {
         mirror.update_session(failed).await;
         let snap = mirror.get_snapshot(&asid).await.unwrap();
         assert_eq!(snap.info.error, Some(error));
+    }
+
+    #[tokio::test]
+    async fn initial_history_is_distinct_from_metadata_and_preserves_newer_live_rows() {
+        let mirror = MemoryMirror::for_agent("codex");
+        let asid = AgentSessionId("initial-history".into());
+        mirror.update_session(info(&asid, "Existing session")).await;
+        let gate = mirror.history_gate(&asid).await;
+        assert!(!mirror.history_initialized(&asid).await);
+        let before = mirror.history_read_revision(&asid).await.unwrap();
+        mirror
+            .upsert_timeline_items(
+                &asid,
+                vec![text_item("answer", "turn", "Live completed answer")],
+            )
+            .await;
+        assert!(
+            mirror
+                .initialize_history(
+                    &asid,
+                    &gate,
+                    before,
+                    vec![
+                        text_item("question", "turn", "Original question"),
+                        text_item("answer", "turn", "Stale partial answer"),
+                    ]
+                )
+                .await
+        );
+        let snapshot = mirror.get_snapshot(&asid).await.unwrap();
+        assert!(mirror.history_initialized(&asid).await);
+        assert_eq!(snapshot.info.agent_id, "codex");
+        assert_eq!(snapshot.timeline.len(), 2);
+        assert!(snapshot.timeline.iter().any(
+            |item| matches!(&item.part, AgentPart::Text { text } if text == "Live completed answer")
+        ));
+        let second = vec![text_item(
+            "unrequested",
+            "turn",
+            "Do not replace initialized history",
+        )];
+        assert!(
+            mirror
+                .initialize_history(&asid, &gate, (snapshot.seq, 0), second)
+                .await
+        );
+        assert_eq!(
+            mirror.get_snapshot(&asid).await.unwrap().timeline,
+            snapshot.timeline
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_history_cannot_resurrect_rows_removed_during_the_read() {
+        for boundary in [false, true] {
+            for cached in [false, true] {
+                let mirror = MemoryMirror::for_agent("codex");
+                let asid = AgentSessionId("removed-history".into());
+                mirror.update_session(info(&asid, "Existing session")).await;
+                let row = text_item("old-row", "msg_old", "Removed answer");
+                if cached {
+                    mirror.upsert_timeline_items(&asid, vec![row.clone()]).await;
+                }
+                let gate = mirror.history_gate(&asid).await;
+                let before = mirror.history_read_revision(&asid).await.unwrap();
+                if boundary {
+                    mirror.remove_timeline_from(&asid, "msg_old").await;
+                } else {
+                    mirror
+                        .remove_timeline_items(&asid, &["old-row".into()])
+                        .await;
+                }
+                assert!(
+                    !mirror
+                        .initialize_history(&asid, &gate, before, vec![row])
+                        .await
+                );
+                assert!(!mirror.history_initialized(&asid).await);
+                assert!(mirror
+                    .get_snapshot(&asid)
+                    .await
+                    .unwrap()
+                    .timeline
+                    .is_empty());
+                let after = mirror.history_read_revision(&asid).await.unwrap();
+                assert!(mirror.initialize_history(&asid, &gate, after, vec![]).await);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_empty_history_is_cached_and_old_gate_cannot_initialize_recreated_session() {
+        let mirror = MemoryMirror::for_agent("codex");
+        let asid = AgentSessionId("empty-history".into());
+        mirror.update_session(info(&asid, "Empty session")).await;
+        let gate = mirror.history_gate(&asid).await;
+        assert!(
+            mirror
+                .initialize_history(&asid, &gate, (1, 0), vec![])
+                .await
+        );
+        assert!(mirror.history_initialized(&asid).await);
+        mirror.sessions.write().await.remove(&asid);
+        mirror
+            .update_session(info(&asid, "Recreated session"))
+            .await;
+        assert!(
+            !mirror
+                .initialize_history(&asid, &gate, (1, 0), vec![])
+                .await
+        );
+        assert!(!mirror.history_initialized(&asid).await);
     }
 
     #[tokio::test]

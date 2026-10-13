@@ -133,6 +133,11 @@ Selection prepares ownership before serving a retained snapshot, including when
 marking a session viewed has already populated its metadata cache. A cache hit
 must not skip recovery. A rejected preparation is returned as an error while
 the retained history remains untouched; it is not converted to native ownership.
+Metadata caching and initial transcript hydration are tracked separately. The
+first selected snapshot reads a bounded canonical history page even if a viewed
+marker or resume event has already cached metadata. Successful empty history is
+cached too; repeated or concurrent snapshots do not reload it. Initial hydration
+merges history without replacing newer live rows, and failed reads remain retryable.
 `thread/resume` carries only its exact ID and `excludeTurns: true`; it does not
 apply model, instructions or permission overrides. A one-turn metadata page
 (`itemsView: notLoaded`)

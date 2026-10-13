@@ -358,7 +358,12 @@ pub(crate) mod tests {
             "thread/resume" => {
                 json!({"thread":{"id":ID,"historyMode":"paginated","status":{"type":"idle"}}})
             }
-            "thread/items/list" | "thread/turns/list" => json!({"data":[],"nextCursor":null}),
+            "thread/turns/list" => json!({"data":[],"nextCursor":null}),
+            "thread/items/list" => json!({"data":[
+                {"turnId":"initial","item":{"type":"agentMessage","id":"answer","text":"Original answer"}},
+                {"turnId":"initial","item":{"type":"commandExecution","id":"shell","command":"printf QA_C4_INITIAL","cwd":"/synthetic/project","status":"completed","exitCode":0,"aggregatedOutput":"QA_C4_INITIAL"}},
+                {"turnId":"initial","item":{"type":"userMessage","id":"question","content":[{"type":"text","text":"Original question"}]}}
+            ],"nextCursor":null}),
             other => panic!("selected recovery must not call {other}"),
         })
         .await;
@@ -397,8 +402,30 @@ pub(crate) mod tests {
             } else {
                 manager.sessions().get_snapshot(&asid).await.unwrap()
             };
-            assert_eq!(first.info.runtime.unwrap().source, RuntimeSource::Native);
+            assert_eq!(
+                first.info.runtime.as_ref().unwrap().source,
+                RuntimeSource::Native
+            );
+            assert_eq!(first.info.agent_id, "codex");
+            assert_eq!(first.timeline.len(), 3);
+            let wire = serde_json::to_value(&first).unwrap();
+            assert_eq!(wire["info"]["agent_id"], "codex");
+            assert_eq!(wire["timeline"].as_array().unwrap().len(), 3);
+            assert!(first
+                .timeline
+                .iter()
+                .any(|item| item.role == crate::agents::domain::TimelineRole::User));
+            assert!(first.timeline.iter().any(|item| matches!(&item.part, crate::agents::domain::AgentPart::Tool(call) if call.status == crate::agents::domain::ToolCallStatus::Completed)));
             let second = manager.sessions().get_snapshot(&asid).await.unwrap();
+            assert_eq!(second.info.agent_id, "codex");
+            assert_eq!(second.timeline, first.timeline);
+            assert_eq!(
+                locked(&fixture.requests)
+                    .iter()
+                    .filter(|r| r["method"] == "thread/items/list")
+                    .count(),
+                1
+            );
             assert_eq!(second.info.runtime.unwrap().source, RuntimeSource::Native);
             assert_eq!(
                 locked(&fixture.requests)
@@ -412,6 +439,50 @@ pub(crate) mod tests {
                 .any(|r| r["method"] == "turn/start"));
             manager.shutdown();
         }
+    }
+
+    #[tokio::test]
+    async fn selected_empty_history_is_read_once_even_for_concurrent_snapshots() {
+        use crate::agents::domain::AgentSessionId;
+        use crate::agents::manager::AgentManager;
+        const ID: &str = "00000000-0000-4000-8000-000000000020";
+        let mut fixture = Fixture::new(|request| match request["method"].as_str().unwrap() {
+            "thread/read" => {
+                json!({"thread":{"id":ID,"historyMode":"paginated","status":{"type":"notLoaded"}}})
+            }
+            "thread/items/list" => json!({"data":[],"nextCursor":null}),
+            other => panic!("unknown empty history must not call {other}"),
+        })
+        .await;
+        let (tx, _events) = tokio::sync::broadcast::channel(64);
+        let manager = AgentManager::connect_codex(
+            fixture.client.clone(),
+            std::mem::replace(&mut fixture.events, mpsc::channel(1).1),
+            tx,
+        );
+        manager.view_session(ID, 1).await.unwrap();
+        let asid = AgentSessionId(ID.into());
+        let (first, second) = tokio::join!(
+            manager.sessions().get_snapshot(&asid),
+            manager.sessions().get_snapshot(&asid)
+        );
+        for snapshot in [
+            first.unwrap(),
+            second.unwrap(),
+            manager.sessions().get_snapshot(&asid).await.unwrap(),
+        ] {
+            assert_eq!(snapshot.info.agent_id, "codex");
+            assert!(snapshot.timeline.is_empty());
+        }
+        assert_eq!(
+            locked(&fixture.requests)
+                .iter()
+                .filter(|r| r["method"] == "thread/items/list")
+                .count(),
+            1
+        );
+        assert!(!fixture.client.is_subscribed(ID));
+        manager.shutdown();
     }
 
     #[tokio::test]
