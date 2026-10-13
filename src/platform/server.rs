@@ -582,7 +582,15 @@ pub(crate) async fn decrypt_transport_request(
     }
     // Only authenticated envelopes enter the replay cache. Otherwise anyone
     // who knows a device id could fill it with arbitrary nonces.
-    remember_transport_nonce(state, device_id, &token_hash, &transport_key, &envelope).await?;
+    remember_transport_nonce(
+        state,
+        device_id,
+        &token_hash,
+        &transport_key,
+        &envelope,
+        now_unix_ms,
+    )
+    .await?;
     let body = transport::decode_key(&payload.body).map_err(|_| {
         api_error(
             StatusCode::BAD_REQUEST,
@@ -637,13 +645,17 @@ pub(crate) async fn decrypt_transport_request(
     ))
 }
 
-async fn remember_transport_nonce(
+async fn remember_transport_nonce<F>(
     state: &AppState,
     device_id: &str,
     token_hash: &str,
     transport_key: &str,
     envelope: &transport::Envelope,
-) -> ApiResult<()> {
+    clock: F,
+) -> ApiResult<()>
+where
+    F: FnOnce() -> u128 + Send + 'static,
+{
     use crate::connectivity::replay_store::{self, Acceptance};
     let nonce = transport::nonce_bytes(&envelope.nonce).map_err(|_| {
         api_error(
@@ -660,7 +672,7 @@ async fn remember_transport_nonce(
         nonce,
         envelope.version,
         envelope.timestamp_ms,
-        now_unix_ms(),
+        clock,
     )
     .await
     .map_err(|error| {
@@ -673,6 +685,11 @@ async fn remember_transport_nonce(
     })?;
     match accepted {
         Acceptance::Accepted => Ok(()),
+        Acceptance::InvalidMetadata => Err(api_error(
+            StatusCode::FORBIDDEN,
+            "invalid_envelope",
+            "invalid encrypted request",
+        )),
         Acceptance::Replayed => Err(api_error(
             StatusCode::CONFLICT,
             "replayed_request",
@@ -1839,6 +1856,108 @@ mod transport_v2_tests {
     use axum::routing::get;
     use serde_json::json;
     use tower::ServiceExt as _;
+
+    #[tokio::test]
+    async fn admission_metadata_errors_are_generic_forbidden_not_store_failures() {
+        let key = [33; 32];
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key);
+        let token_hash = hash_token("fixture-token");
+        let mut device = crate::test_device("fixture-device", "fixture-token");
+        device.transport_key = Some(encoded.clone());
+        let state = crate::test_state("fixture-admin", vec![device]);
+        let timestamp = 1_000_000;
+        let boundary = timestamp + transport::MAX_CLOCK_SKEW_MS;
+        let envelope = transport::seal_version(
+            2,
+            &key,
+            transport::Direction::Request,
+            b"GET /fixture",
+            br#"{"token":"fixture-token","body":""}"#,
+            timestamp,
+        )
+        .unwrap();
+        assert!(transport::open(
+            &key,
+            transport::Direction::Request,
+            b"GET /fixture",
+            &envelope,
+            boundary,
+        )
+        .is_ok());
+        // Authentication at the inclusive boundary does not authorize later
+        // admission. Its refusal must not be reported as an infrastructure error.
+        for (envelope, now) in [
+            (envelope, boundary + 1),
+            (
+                transport::seal_version(
+                    2,
+                    &key,
+                    transport::Direction::Request,
+                    b"GET /fixture",
+                    b"body",
+                    u128::MAX,
+                )
+                .unwrap(),
+                u128::MAX,
+            ),
+        ] {
+            let response = remember_transport_nonce(
+                &state,
+                "fixture-device",
+                &token_hash,
+                &encoded,
+                &envelope,
+                move || now,
+            )
+            .await
+            .unwrap_err()
+            .into_response();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let body: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 8192).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["error"]["code"], "invalid_envelope");
+        }
+        let rows: (i64, i64, i64) = state
+            .db
+            .call(|db| {
+                Ok((
+                    db.query_row("SELECT COUNT(*) FROM transport_nonces", [], |r| r.get(0))?,
+                    db.query_row("SELECT COUNT(*) FROM transport_credentials", [], |r| {
+                        r.get(0)
+                    })?,
+                    db.query_row("SELECT cutoff_ms FROM transport_pruning", [], |r| r.get(0))?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows, (0, 0, 0));
+
+        // Actual database failures remain a fail-closed 503.
+        state
+            .db
+            .call(|db| {
+                db.execute("DROP TABLE transport_pruning", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let response = remember_transport_nonce(
+            &state,
+            "fixture-device",
+            &token_hash,
+            &encoded,
+            &fixture(2, &key),
+            now_unix_ms,
+        )
+        .await
+        .unwrap_err()
+        .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 8192).await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "replay_store_unavailable");
+    }
 
     #[tokio::test]
     async fn full_legacy_history_can_upgrade_without_repairing() {

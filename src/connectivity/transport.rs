@@ -227,7 +227,7 @@ pub fn open(
     now_ms: u128,
 ) -> anyhow::Result<Vec<u8>> {
     let authenticated_aad = envelope_aad(envelope.version, envelope.timestamp_ms, aad)?;
-    if now_ms.abs_diff(envelope.timestamp_ms) > MAX_CLOCK_SKEW_MS {
+    if !timestamp_is_fresh(envelope.timestamp_ms, now_ms) {
         return Err(anyhow!("transport envelope expired"));
     }
     let nonce = nonce_bytes(&envelope.nonce)?;
@@ -243,6 +243,10 @@ pub fn open(
             },
         )
         .map_err(|_| anyhow!("transport authentication failed"))
+}
+
+pub(crate) fn timestamp_is_fresh(timestamp_ms: u128, now_ms: u128) -> bool {
+    now_ms.abs_diff(timestamp_ms) <= MAX_CLOCK_SKEW_MS
 }
 
 /// One cryptographic identity, independent of accepted Base64 spelling.
@@ -410,6 +414,41 @@ mod tests {
 #[cfg(test)]
 mod v2_tests {
     use super::*;
+
+    #[test]
+    fn freshness_is_inclusive_and_overflow_safe() {
+        for version in SUPPORTED_VERSIONS {
+            let key = [23; 32];
+            let envelope = seal_version(
+                version,
+                &key,
+                Direction::Request,
+                b"aad",
+                b"body",
+                1_000_000,
+            )
+            .unwrap();
+            for now in [700_000, 1_300_000] {
+                assert_eq!(
+                    open(&key, Direction::Request, b"aad", &envelope, now).unwrap(),
+                    b"body"
+                );
+            }
+            for now in [699_999, 1_300_001, u128::MAX] {
+                assert!(open(&key, Direction::Request, b"aad", &envelope, now).is_err());
+            }
+            let extreme = seal_version(
+                version,
+                &key,
+                Direction::Request,
+                b"aad",
+                b"body",
+                u128::MAX,
+            )
+            .unwrap();
+            assert!(open(&key, Direction::Request, b"aad", &extreme, 1_000_000).is_err());
+        }
+    }
 
     #[test]
     fn metadata_route_direction_and_ciphertext_are_authenticated() {
