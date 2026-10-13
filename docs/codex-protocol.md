@@ -26,9 +26,23 @@ This revision covers all seven transport/lifecycle and semantic review findings,
 with the subsequently authorized evidenced process-tree strategy, plus the two
 P2 follow-ups: accepted-turn metadata reconciliation and forward-only pages.
 
-Gateway supervision starts one private child with fixed argv:
-`codex app-server --listen stdio://`. It is not a shared daemon, network listener
-or terminal pane. No remote-dispatch bypass flags, trust edits, global config
+Gateway first connects to an existing, verified local Codex daemon on Unix.
+Discovery uses `CODEX_HOME/app-server-control/app-server-control.sock` (the
+upstream default home when `CODEX_HOME` is absent), verifies its official
+hashed alias under the fixed system temporary root, the current-user-owned
+0700 directory and 0600 socket, and the connected peer UID. The WebSocket
+handshake runs over that Unix socket. Initialization verifies both the pinned
+version and exact canonical `codexHome`. Gateway never creates, starts,
+restarts, updates or stops the shared daemon. An adopted connection reports
+origin `adopted` and endpoint `unix://shared-codex-app-server`, without exposing
+its host path. `codex_shared_daemon_v1` and the agent's `sharedDaemon` feature
+advertise this support (Unix only). Existing Gateway authentication is unchanged.
+
+When no compatible verified daemon is available, Gateway starts its existing
+private child with fixed argv `codex app-server --listen stdio://`, reporting
+origin `spawned` and endpoint `stdio://private-codex-app-server`. It does not
+migrate threads between transports or replace a healthy private connection
+when a daemon later appears. No remote-dispatch bypass flags, trust edits, global config
 writes, credential-file reads/copies, browser login or package installation are
 performed. The child inherits normal upstream configuration and authentication;
 Gateway never supplies a silent replacement CODEX_HOME. `agent setup codex`
@@ -36,7 +50,7 @@ explains setup without launching Codex or authentication.
 
 ## Readiness and transport
 
-The JSONL duplex client performs `initialize`, `initialized`, then read-only
+Both JSONL stdio and Unix WebSocket clients perform `initialize`, `initialized`, then read-only
 `account/read` with `refreshToken: false`. Initialization declares
 `experimentalApi: false`, `requestAttestation: false` and
 `explicitGatewayOauth: true`; no experimental client requests are sent. The
@@ -68,7 +82,7 @@ error messages are not forwarded or logged. Writes succeed only after bounded
 `write_all` and flush completion, not queue enqueue. Callback replies keep the
 original native ID and emit resolution only after that acknowledgment; failed,
 cancelled or partial writes fence the connection without retry.
-Child shutdown closes stdin and allows up to 46 seconds for upstream cleanup;
+Private-child shutdown closes stdin and allows up to 46 seconds for upstream cleanup;
 normal cleanup returns as soon as the child exits. If that grace expires,
 Gateway attempts cleanup of proven owned descendants, allowing 250 ms for
 upstream reaping before killing/reaping the root.
@@ -86,14 +100,34 @@ deadline is changed.
 The runtime exposes `shutdown_codex` for graceful
 Gateway shutdown, cancelling initialization and preventing supervisor restarts
 without stopping terminal agents or adopted services.
-Dropping the last external Codex manager cancels its pump/transport and initiates
-the same owned-child cleanup; explicit shutdown also fences late domain events.
+Dropping the last external Codex manager cancels its pump/transport. Only the
+private transport initiates owned-child cleanup; shared disconnect drops just
+the connection without shutdown RPCs, signals or thread-unsubscribe calls.
+Explicit shutdown also fences late domain events.
 The HTTP server owns SIGTERM/SIGINT handling and waits for private-child cleanup
 before returning or dropping MCP identity/endpoint file guards. It does not
 wait indefinitely for open SSE/WebSocket clients. Bind and other startup
 validation failures occur before agent supervision starts.
 
 ## Sessions, history and model selection
+
+Opening a requested timeline or explicitly controlling a session on the shared transport rejoins it only if a fresh
+`thread/read` proves that daemon already has it loaded (`idle` or `active`).
+`thread/resume` carries only its exact ID and `excludeTurns: true`; it does not
+apply model, instructions or permission overrides. A one-turn metadata page
+(`itemsView: notLoaded`)
+recovers the current turn ID without hydrating all history. Accepted rejoin
+is native runtime proof even when a terminal client is also attached. Only
+accepted explicit start/fork/rejoin sessions enter the live projection;
+unrequested shared-server thread notifications and callbacks are ignored.
+Closed/deleted/notLoaded notifications invalidate that proof. Opening a
+`notLoaded` external CLI transcript does not resume or migrate it; its existing
+terminal/unobserved provenance remains authoritative.
+
+The shared transport supports live callback replay, but a warm metadata-only
+resume does not replay historical token totals. Reading history is not evidence
+of runtime ownership. CLI launches with non-whitelisted `-c` overrides may use
+an embedded app-server and therefore remain outside the shared daemon.
 
 | Gateway operation | Pinned operation |
 | --- | --- |
@@ -144,7 +178,8 @@ ordering anchors, approval callbacks and timeline rows.
 Model and reasoning effort come from actual start/resume/read responses, never
 the requested selection. Catalog options use the authoritative configured
 provider from `config/read` in the private child's startup cwd (a cwd-less read
-would exclude project layers while `model/list` uses startup configuration);
+would exclude project layers while `model/list` uses startup configuration).
+Shared connections use the daemon's default configuration scope;
 only `model_provider`, `model` and
 `model_reasoning_effort` survive the client boundary. Other configuration,
 credential fields and origin/layer data are discarded, never returned/logged.
@@ -241,8 +276,11 @@ remain unsupported.
 
 ## Acceptance evidence and limits
 
-Tests use in-process duplex RPC fixtures or explicitly supplied fake shell
-children only. Golden payloads are synthetic examples based on the pinned
+Default tests use in-process duplex RPC/WebSocket fixtures, isolated socket
+paths or explicitly supplied fake shell children. They never discover the
+user's daemon. An explicitly ignored read-only probe can verify an existing
+daemon with a supplied home; it initializes, reads one loaded-thread page and
+disconnects, without resuming or controlling any thread. Golden payloads are synthetic examples based on the pinned
 schema, not captured local conversations or credential-bearing replies.
 They cover handshake/readiness, split UTF-8, malformed/oversized JSONL,
 deadlines/disconnect/overload, first/follow-up prompt IDs, read-only selection,

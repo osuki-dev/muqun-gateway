@@ -488,6 +488,7 @@ impl AgentManager {
         tx: broadcast::Sender<AgentDomainEvent>,
         observer: Option<Arc<crate::agents::terminal_runtime::TerminalRuntime>>,
     ) -> Self {
+        let endpoint = client.endpoint();
         let observed = observer.is_some();
         let mut driver = CodexDriver::new(client.clone());
         driver.observe_terminals(observer);
@@ -531,7 +532,7 @@ impl AgentManager {
             driver,
             mirror,
             tx,
-            "stdio://private-codex-app-server".into(),
+            endpoint.into(),
             Some("0.162.1".into()),
             Arc::new(move || ready.is_ready()),
             Arc::new(move || {

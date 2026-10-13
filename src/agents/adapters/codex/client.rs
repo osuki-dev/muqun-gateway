@@ -1,4 +1,6 @@
-use std::collections::HashMap;
+#[cfg(unix)]
+mod websocket;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -58,10 +60,14 @@ struct Pending {
     reply: Reply,
     turn_thread: Option<String>,
     selection_config: bool,
+    attaches_thread: bool,
+    attach_expected: Option<String>,
 }
 
 struct State {
     generation: String,
+    shared: bool,
+    subscribed: Mutex<HashSet<String>>,
     pending: Mutex<HashMap<u64, Pending>>,
     requests: Mutex<HashMap<String, ServerRequest>>,
     turns: Mutex<HashMap<String, String>>,
@@ -93,6 +99,7 @@ impl State {
             let _ = pending.reply.send(Err(disconnected()));
         }
         locked(&self.requests).clear();
+        locked(&self.subscribed).clear();
         locked(&self.turns).clear();
         locked(&self.completed_turns).clear();
     }
@@ -120,6 +127,8 @@ pub struct CodexClient {
     timeout: Duration,
     config_cwd: Option<String>,
     configured_provider: std::sync::OnceLock<String>,
+    expected_home: Option<std::path::PathBuf>,
+    codex_home: std::sync::OnceLock<std::path::PathBuf>,
 }
 
 struct WritePacket {
@@ -206,6 +215,8 @@ impl CodexClient {
         let (outgoing, mut writes) = mpsc::channel::<WritePacket>(MAX_PENDING);
         let state = Arc::new(State {
             generation: uuid::Uuid::new_v4().to_string(),
+            shared: false,
+            subscribed: Mutex::new(HashSet::new()),
             pending: Mutex::new(HashMap::new()),
             requests: Mutex::new(HashMap::new()),
             turns: Mutex::new(HashMap::new()),
@@ -253,9 +264,49 @@ impl CodexClient {
                 timeout,
                 config_cwd: None,
                 configured_provider: std::sync::OnceLock::new(),
+                expected_home: None,
+                codex_home: std::sync::OnceLock::new(),
             }),
             rx,
         )
+    }
+
+    pub(crate) fn codex_home(&self) -> Option<&std::path::Path> {
+        self.codex_home.get().map(std::path::PathBuf::as_path)
+    }
+
+    pub(crate) fn is_shared(&self) -> bool {
+        self.state.shared
+    }
+
+    pub(crate) fn is_subscribed(&self, id: &str) -> bool {
+        self.is_ready() && locked(&self.state.subscribed).contains(id)
+    }
+
+    pub(crate) fn observe_active_turn(&self, thread: &str, turn: &Value) {
+        if !self.is_subscribed(thread) || turn["status"] != "inProgress" {
+            return;
+        }
+        let Some(id) = turn["id"].as_str() else {
+            return;
+        };
+        // A completion/new turn notification may overtake the read response.
+        let mut active = locked(&self.state.turns);
+        if locked(&self.state.completed_turns)
+            .get(thread)
+            .map(String::as_str)
+            != Some(id)
+        {
+            active.entry(thread.into()).or_insert_with(|| id.into());
+        }
+    }
+
+    pub(crate) fn endpoint(&self) -> &'static str {
+        if self.is_shared() {
+            "unix://shared-codex-app-server"
+        } else {
+            "stdio://private-codex-app-server"
+        }
     }
 
     pub fn is_ready(&self) -> bool {
@@ -282,6 +333,19 @@ impl CodexClient {
             return Err(AgentError::Unsupported(
                 "Codex app-server version; expected 0.162.1".into(),
             ));
+        }
+        let actual = response["codexHome"]
+            .as_str()
+            .filter(|p| std::path::Path::new(p).is_absolute())
+            .and_then(|p| std::fs::canonicalize(p).ok());
+        if let Some(actual) = actual {
+            let _ = self.codex_home.set(actual);
+        }
+        if let Some(expected) = &self.expected_home {
+            if self.codex_home() != Some(expected.as_path()) {
+                self.stop();
+                return Err(AgentError::Protocol("Codex daemon home mismatch".into()));
+            }
         }
         self.write(json!({"method":"initialized"})).await?;
         // Only app-server reads its auth configuration. Gateway neither reads
@@ -379,6 +443,12 @@ impl CodexClient {
                 Pending {
                     reply,
                     selection_config: method == "config/read",
+                    attach_expected: (method == "thread/resume")
+                        .then(|| params["threadId"].as_str().unwrap_or("").to_owned()),
+                    attaches_thread: matches!(
+                        method,
+                        "thread/start" | "thread/resume" | "thread/fork"
+                    ),
                     turn_thread: if method == "turn/start" {
                         params["threadId"].as_str().map(str::to_owned)
                     } else {
@@ -573,6 +643,16 @@ fn route_frame(state: &State, value: Value, frame_bytes: usize) -> Result<(), Ag
     }
     if let Some(method) = value["method"].as_str() {
         let params = value.get("params").cloned().unwrap_or(Value::Null);
+        // Shared servers broadcast metadata for other clients. Only an accepted
+        // explicit start/fork/rejoin authorizes this connection's live projection.
+        if state.shared {
+            let thread = params["threadId"]
+                .as_str()
+                .or_else(|| params["thread"]["id"].as_str());
+            if thread.is_none_or(|id| !locked(&state.subscribed).contains(id)) {
+                return Ok(());
+            }
+        }
         if let Some(id) = value.get("id") {
             let key = state
                 .request_id(id)
@@ -644,6 +724,7 @@ fn route_frame(state: &State, value: Value, frame_bytes: usize) -> Result<(), Ag
             } else if matches!(method, "thread/deleted" | "thread/closed")
                 || (method == "thread/status/changed" && params["status"]["type"] == "notLoaded")
             {
+                locked(&state.subscribed).remove(thread);
                 locked(&state.turns).remove(thread);
                 locked(&state.completed_turns).remove(thread);
                 locked(&state.requests).retain(|_, r| r.params["threadId"] != thread);
@@ -678,6 +759,29 @@ fn route_frame(state: &State, value: Value, frame_bytes: usize) -> Result<(), Ag
                     .cloned()
                     .ok_or_else(|| AgentError::Protocol("Codex response missing result".into()))
             };
+            if pending.attaches_thread && state.shared {
+                if let Ok(result) = &result {
+                    let thread = result["thread"]["id"].as_str().ok_or_else(|| {
+                        AgentError::Protocol("Codex attach response missing identity".into())
+                    })?;
+                    if pending
+                        .attach_expected
+                        .as_deref()
+                        .is_some_and(|expected| expected != thread)
+                    {
+                        return Err(AgentError::Protocol(
+                            "Codex rejoin identity mismatch".into(),
+                        ));
+                    }
+                    let mut subscribed = locked(&state.subscribed);
+                    if subscribed.len() >= 4096 && !subscribed.contains(thread) {
+                        return Err(AgentError::Protocol(
+                            "Codex subscription capacity exhausted".into(),
+                        ));
+                    }
+                    subscribed.insert(thread.into());
+                }
+            }
             if let (Some(thread), Ok(result)) = (&pending.turn_thread, &result) {
                 if let Some(turn) = result["turn"]["id"].as_str() {
                     // The acknowledgement can race a completion notification.

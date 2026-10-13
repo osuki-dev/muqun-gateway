@@ -1,6 +1,7 @@
-//! Private stdio app-server adapter, pinned to Codex rust-v0.162.1.
+//! Shared-daemon or private stdio adapter, pinned to Codex rust-v0.162.1.
 mod budget;
 pub mod client;
+pub(crate) mod daemon;
 mod driver;
 pub mod mapper;
 pub(crate) mod process_tree;

@@ -71,9 +71,29 @@ impl CodexDriver {
     }
 
     pub(crate) async fn runtime(&self, id: &str, fresh: bool) -> Option<SessionRuntime> {
+        // Same-server accepted rejoin is stronger than a terminal observation:
+        // both clients control this one runtime. Private writers keep the old
+        // conservative terminal precedence.
+        if self.client.is_shared() && self.client.is_subscribed(id) {
+            return Some(SessionRuntime {
+                source: RuntimeSource::Native,
+                interaction: RuntimeInteraction::Native,
+                status: None,
+                terminal: None,
+                reason: None,
+            });
+        }
         let observer = self.terminal_runtime.as_ref()?;
-        let native = self.loaded.lock().await.contains(id);
+        let native = self.loaded.lock().await.contains(id) && !self.client.is_shared();
         Some(observer.observe(id, native, fresh).await)
+    }
+
+    async fn prepare_shared_interaction(&self, id: &str) -> Result<(), AgentError> {
+        if self.client.is_shared() && !self.client.is_subscribed(id) {
+            let thread = self.read_thread(id).await?;
+            self.rejoin_loaded(id, &thread).await?;
+        }
+        Ok(())
     }
 
     async fn require_native_interaction(&self, id: &str) -> Result<(), AgentError> {
@@ -342,6 +362,57 @@ impl CodexDriver {
             .retain(|(thread, _, _), _| thread != id);
     }
 
+    /// Opening a requested timeline may rejoin a runtime already loaded in
+    /// the shared daemon. Metadata/history-only external threads stay untouched.
+    async fn rejoin_loaded(&self, id: &str, metadata: &Value) -> Result<(), AgentError> {
+        if !self.client.is_shared()
+            || self.client.is_subscribed(id)
+            || !matches!(metadata["status"]["type"].as_str(), Some("idle" | "active"))
+        {
+            return Ok(());
+        }
+        let _guard = self.mutations.lock().await;
+        if self.client.is_subscribed(id) {
+            return Ok(());
+        }
+        // Recheck after waiting for another mutation; never turn a known
+        // notLoaded external CLI thread into a resume/takeover attempt.
+        let fresh = self.read_thread(id).await?;
+        if !matches!(fresh["status"]["type"].as_str(), Some("idle" | "active")) {
+            return Ok(());
+        }
+        let resumed = self
+            .client
+            .call("thread/resume", json!({"threadId":id,"excludeTurns":true}))
+            .await?;
+        if resumed["thread"]["id"] != id {
+            self.client.stop();
+            return Err(AgentError::Protocol(
+                "Codex rejoin identity mismatch".into(),
+            ));
+        }
+        self.selected_response(resumed).await?;
+        // Metadata-only rejoin does not repeat turn/started for an existing
+        // turn. Read its authoritative id without hydrating unbounded history.
+        let page = self
+            .client
+            .call(
+                "thread/turns/list",
+                json!({
+                    "threadId":id,"limit":1,"sortDirection":"desc","itemsView":"notLoaded"
+                }),
+            )
+            .await?;
+        let turns = page["data"]
+            .as_array()
+            .filter(|rows| rows.len() <= 1)
+            .ok_or_else(|| AgentError::Protocol("invalid Codex active turn page".into()))?;
+        for turn in turns {
+            self.client.observe_active_turn(id, turn);
+        }
+        Ok(())
+    }
+
     async fn selected_response(&self, response: Value) -> Result<AgentSessionInfo, AgentError> {
         let mut thread = response["thread"].clone();
         // The response, never the requested model, is the source of truth.
@@ -357,7 +428,7 @@ impl CodexDriver {
         Ok(session)
     }
 
-    async fn read_thread(&self, id: &str) -> Result<Value, AgentError> {
+    pub(crate) async fn read_thread(&self, id: &str) -> Result<Value, AgentError> {
         validate_id(id)?;
         let response = self
             .client
@@ -654,6 +725,7 @@ impl AgentPort for CodexDriver {
             if text.is_empty() && attachments.is_empty() {
                 return Err(AgentError::InvalidRequest("empty Codex prompt".into()));
             }
+            self.prepare_shared_interaction(id).await?;
             let _guard = self.mutations.lock().await;
             self.require_native_interaction(id).await?;
             if self.client.active_turn(id).is_some() {
@@ -724,6 +796,7 @@ impl AgentPort for CodexDriver {
 
     fn interrupt<'a>(&'a self, id: &'a str) -> AgentFuture<'a, ()> {
         Box::pin(async move {
+            self.prepare_shared_interaction(id).await?;
             self.require_native_interaction(id).await?;
             let turn = self.client.active_turn(id).ok_or_else(|| {
                 AgentError::InvalidRequest("Codex thread has no observed active turn".into())
@@ -739,6 +812,7 @@ impl AgentPort for CodexDriver {
 
     fn switch_model<'a>(&'a self, id: &'a str, model: &'a ModelRef) -> AgentFuture<'a, ()> {
         Box::pin(async move {
+            self.prepare_shared_interaction(id).await?;
             let _guard = self.mutations.lock().await;
             self.require_native_interaction(id).await?;
             let thread = self.read_thread(id).await?;
@@ -788,6 +862,7 @@ impl AgentPort for CodexDriver {
     fn delete_session<'a>(&'a self, id: &'a str) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             validate_id(id)?;
+            self.prepare_shared_interaction(id).await?;
             self.require_native_interaction(id).await?;
             if self.client.active_turn(id).is_some() {
                 return Err(AgentError::InvalidRequest(
@@ -959,6 +1034,7 @@ impl AgentPort for CodexDriver {
                 ));
             }
             let thread = &metadata["thread"];
+            self.rejoin_loaded(id, thread).await?;
             let mut items = vec![];
             match thread["historyMode"].as_str() {
                 Some("paginated") => {

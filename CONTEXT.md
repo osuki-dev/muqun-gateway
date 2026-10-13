@@ -20,7 +20,7 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
   - `domain/`: neutral agent entities: sessions, timeline, permissions, forms.
   - `ports/`: `AgentPort` (`ports/agent.rs`) and `SessionMirrorPort`.
   - `adapters/`: OpenCode, DeepSeek, Codex (`adapters/codex/`, private app-server
-    stdio; wire reference in `docs/codex-protocol.md`), T3 Code (`adapters/t3/`,
+    stdio or verified shared-daemon Unix WebSocket; wire reference in `docs/codex-protocol.md`), T3 Code (`adapters/t3/`,
     Effect RPC over a WebSocket; wire reference in `docs/t3-protocol.md`), and the in-memory
     mirror adapter. Each adapter's event stream is folded into domain events
     by a module under `manager/` (`deepseek.rs`, `t3.rs`, `codex.rs`).
@@ -28,7 +28,8 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
     session/prompt/interaction services. `runtime/t3.rs` holds T3's config
     block, its pairing-token-to-bearer credential (persisted by
     `platform/store.rs` as `t3-credential.json`, 0600), and its attach and
-    discovery. `runtime/codex.rs` owns the private Codex child and its lifecycle;
+    discovery. `runtime/codex.rs` adopts a verified existing Codex daemon connection
+    or owns a private fallback child and its lifecycle;
     service agents default on for Codex and OpenCode, with the master
     `agent_runtime.enabled` switch independent of terminal-agent dispatch.
   - `routes.rs`: the OpenCode-style agent-session API (global and legacy paths).
@@ -344,7 +345,8 @@ answers remain unsupported. Do not generalize that limitation to every HTTPS
 reverse proxy or to ordinary blocking forms.
 
 Codex targets stable **rust-v0.162.1**. Its default-enabled service adapter runs
-one private `codex app-server --listen stdio://` child from the existing `PATH`
+a verified existing daemon connection on Unix, falling back to one private
+`codex app-server --listen stdio://` child from the existing `PATH`
 and CLI authentication/configuration; Gateway never installs or logs in for the
 owner. `codex.enabled: false` disables it; `agent_runtime.enabled: false` disables
 all service agents without changing terminal Codex routes or their permission

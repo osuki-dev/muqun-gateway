@@ -568,7 +568,7 @@ impl AgentRuntime {
 
     /// Status of one attached agent, `None` when it is not attached. The
     /// primary answers exactly as `status()` does. Other service agents are
-    /// adopted; Codex is a private child the Gateway owns.
+    /// adopted; a Codex private fallback remains owned by Gateway.
     pub async fn status_for(&self, agent_id: &str) -> Option<AgentStatus> {
         let manager = self.manager_for_agent(agent_id).await?;
         let primary = self.manager.read().await.clone();
@@ -579,7 +579,9 @@ impl AgentRuntime {
         Some(AgentStatus {
             available: true,
             installation: AgentInstallation::Installed,
-            origin: if kind == "codex" {
+            origin: if kind == "codex"
+                && manager.endpoint_url() == "stdio://private-codex-app-server"
+            {
                 AgentOrigin::Spawned
             } else {
                 AgentOrigin::Adopted

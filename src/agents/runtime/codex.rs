@@ -1,5 +1,5 @@
-//! Codex runs as one private, owned stdio child; no shared daemon, login,
-//! credential-file access, terminal dispatch flags or global config writes.
+//! Prefer the verified existing shared daemon; retain an owned stdio fallback.
+//! Never start/restart the daemon, log in, or write global configuration.
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -119,6 +119,43 @@ impl CodexState {
                 self.cleanup_failed(err).await;
                 return false;
             }
+        }
+        // Adopting the daemon owns only a connection. No ChildExit/process ledger
+        // exists for it, so shutdown cannot signal or reap the user's daemon.
+        let shared = tokio::select! {
+            biased;
+            _ = self.shutdown.cancelled() => return false,
+            result = crate::agents::adapters::codex::daemon::connect_existing() => result,
+        };
+        match shared {
+            Ok(Some((client, events))) => {
+                if self.shutdown.is_cancelled() {
+                    client.stop();
+                    return false;
+                }
+                *self.failure.lock().await = None;
+                *self.retry_at.lock().await = None;
+                runtime
+                    .install(
+                        "codex",
+                        AgentManager::connect_codex_observed(
+                            client,
+                            events,
+                            runtime.events_tx.clone(),
+                            runtime.terminal_runtime.get().cloned(),
+                        ),
+                        AgentOrigin::Adopted,
+                    )
+                    .await;
+                return true;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::debug!(%error, "Codex shared daemon unavailable; using private fallback")
+            }
+        }
+        if self.shutdown.is_cancelled() {
+            return false;
         }
         match launch(&self.config).await {
             Ok((client, events, child)) => {
@@ -270,6 +307,7 @@ pub(super) fn features() -> crate::discovery::AgentFeatures {
         attachments_by_path: true,
         extra: std::collections::BTreeMap::from([
             ("sessionPagination".into(), serde_json::json!(true)),
+            ("sharedDaemon".into(), serde_json::json!(cfg!(unix))),
             ("sessionRename".into(), serde_json::json!(true)),
             ("sessionFork".into(), serde_json::json!(true)),
             ("sessionDelete".into(), serde_json::json!(true)),
