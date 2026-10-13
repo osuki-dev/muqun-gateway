@@ -49,6 +49,9 @@ const STREAM_LOSS_MAX_WAIT: Duration = Duration::from_secs(30);
 /// The agent major version this gateway speaks. v1 is a different API, and
 /// half-working with it is worse than saying so.
 const MIN_OPENCODE_MAJOR: u64 = 2;
+const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Each version stream is bounded independently, including diagnostic output.
+const VERSION_OUTPUT_LIMIT: u64 = 4096;
 
 /// Agent ids in primary-preference order. OpenCode is the established
 /// agent; DeepSeek and T3 Code are opt-in, so each is primary only when
@@ -1136,7 +1139,7 @@ impl AgentRuntime {
                 anyhow::bail!("{err}");
             }
         };
-        let version = binary_version(&binary);
+        let version = binary_version(&binary).await;
         if let Err(refusal) = check_version(version.as_deref()) {
             // One line, naming the file and what it said, because the reader
             // has to go and fix an install.
@@ -1488,19 +1491,56 @@ fn is_executable(path: &std::path::Path) -> bool {
 }
 
 /// What `<binary> --version` says, or `None` if it cannot be asked.
-pub(crate) fn binary_version(path: &std::path::Path) -> Option<String> {
-    let output = std::process::Command::new(path)
+/// Prefer the first nonempty stdout line, then stderr. Unlike the old probe,
+/// leading blank lines do not hide a version that follows them.
+pub(crate) async fn binary_version(path: &std::path::Path) -> Option<String> {
+    use tokio::io::AsyncReadExt as _;
+
+    let mut child = tokio::process::Command::new(path)
         .arg("--version")
-        .output()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
         .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    let text = if text.trim().is_empty() {
-        String::from_utf8_lossy(&output.stderr).to_string()
-    } else {
-        text.to_string()
+    let stdout = child.stdout.take().expect("piped version stdout");
+    let stderr = child.stderr.take().expect("piped version stderr");
+    // Read both pipes concurrently: either one can fill while the other is idle.
+    // One extra byte detects overflow without retaining an unbounded response.
+    async fn read(stream: impl tokio::io::AsyncRead + Unpin) -> std::io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        stream
+            .take(VERSION_OUTPUT_LIMIT + 1)
+            .read_to_end(&mut bytes)
+            .await?;
+        if bytes.len() as u64 > VERSION_OUTPUT_LIMIT {
+            return Err(std::io::Error::other("version output limit exceeded"));
+        }
+        Ok(bytes)
+    }
+    let result = tokio::time::timeout(VERSION_PROBE_TIMEOUT, async {
+        let (stdout, stderr) = tokio::try_join!(read(stdout), read(stderr))?;
+        // Preserve version reporting even for executables that exit nonzero.
+        child.wait().await?;
+        Ok::<_, std::io::Error>((stdout, stderr))
+    })
+    .await;
+    let (stdout, stderr) = match result {
+        Ok(Ok(output)) => output,
+        _ => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return None;
+        }
     };
-    let line = text.lines().next()?.trim().to_string();
-    (!line.is_empty()).then_some(line)
+    [stdout, stderr].into_iter().find_map(|bytes| {
+        String::from_utf8_lossy(&bytes)
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(str::to_owned)
+    })
 }
 
 /// The executable behind a running pid, where the platform will say.
@@ -1600,6 +1640,172 @@ fn opencode_features(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    struct VersionScript(std::path::PathBuf);
+
+    #[cfg(unix)]
+    impl VersionScript {
+        fn new(body: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt as _;
+            let root = std::env::temp_dir().join(format!("muqun-version-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&root).unwrap();
+            let path = root.join("probe");
+            let pid_path = root.join("pid");
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\ntest \"$1\" = --version || exit 99\nprintf '%s' \"$$\" > '{}'\n{body}\n",
+                    pid_path.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            Self(path)
+        }
+
+        fn assert_reaped(&self) {
+            let pid: libc::pid_t = std::fs::read_to_string(self.0.with_file_name("pid"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            // Only this fixture's direct child: an exited but unreaped child
+            // would return its pid, and a still-running one would return zero.
+            assert_eq!(
+                unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
+                -1
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for VersionScript {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(self.0.parent().unwrap());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn binary_version_preserves_stdout_and_stderr_versions() {
+        for (body, expected) in [
+            (
+                "printf 'opencode 2.1.0\\nignored\\n'; printf 'diagnostic\\n' >&2",
+                Some("opencode 2.1.0"),
+            ),
+            (
+                "printf ' \\n\\n'; printf '\\n opencode 2.2.0 \\n' >&2; exit 7",
+                Some("opencode 2.2.0"),
+            ),
+            (
+                "printf '\\n opencode 2.3.0 \\n'; printf 'diagnostic\\n' >&2",
+                Some("opencode 2.3.0"),
+            ),
+            ("exit 0", None),
+        ] {
+            let script = VersionScript::new(body);
+            assert_eq!(binary_version(&script.0).await.as_deref(), expected);
+            script.assert_reaped();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn binary_version_kills_and_reaps_output_floods() {
+        for redirect in ["", ">&2"] {
+            let script = VersionScript::new(&format!(
+                "while :; do printf '0123456789abcdef0123456789abcdef' {redirect}; done"
+            ));
+            let start = std::time::Instant::now();
+            assert_eq!(binary_version(&script.0).await, None);
+            assert!(start.elapsed() < VERSION_PROBE_TIMEOUT);
+            script.assert_reaped();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn binary_version_accepts_exact_output_limit_but_rejects_one_extra_byte() {
+        for redirect in ["", ">&2"] {
+            for bytes in [VERSION_OUTPUT_LIMIT, VERSION_OUTPUT_LIMIT + 1] {
+                let output = "x".repeat(bytes as usize);
+                let script = VersionScript::new(&format!("printf '%s' '{output}' {redirect}"));
+                let expected = (bytes == VERSION_OUTPUT_LIMIT).then_some(output);
+                assert_eq!(binary_version(&script.0).await, expected);
+                script.assert_reaped();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn binary_version_abort_kills_child_and_tokio_eventually_reaps_it() {
+        let script = VersionScript::new("while :; do :; done");
+        let path = script.0.clone();
+        let probe = tokio::spawn(async move { binary_version(&path).await });
+        // Wait for this fixture alone to report its pid. Partial file writes
+        // are retried, and an unsuccessful rendezvous still aborts the probe.
+        let ready = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(pid) = std::fs::read_to_string(script.0.with_file_name("pid"))
+                    .ok()
+                    .and_then(|pid| pid.parse::<libc::pid_t>().ok())
+                    .filter(|pid| *pid > 0)
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        probe.abort();
+        assert!(probe.await.unwrap_err().is_cancelled());
+        let pid = ready.expect("version child reports its pid before cancellation");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                // WNOWAIT observes only our direct child without reaping it:
+                // ECHILD therefore proves Tokio, not this test, reaped it.
+                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                let result = unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        pid as libc::id_t,
+                        &mut info,
+                        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                    )
+                };
+                if result == -1 {
+                    assert_eq!(
+                        std::io::Error::last_os_error().raw_os_error(),
+                        Some(libc::ECHILD)
+                    );
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled version child is killed and reaped by Tokio");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn binary_version_times_out_without_stalling_runtime_heartbeat() {
+        // Shell builtins only: no descendant process to leak from the fixture.
+        let script = VersionScript::new("while :; do :; done");
+        let start = std::time::Instant::now();
+        let (version, ()) = tokio::join!(binary_version(&script.0), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(start.elapsed() < Duration::from_secs(1));
+        });
+        assert_eq!(version, None);
+        assert!(start.elapsed() < VERSION_PROBE_TIMEOUT + Duration::from_secs(2));
+        script.assert_reaped();
+    }
 
     #[test]
     fn every_agent_serializes_the_capability_flags() {
