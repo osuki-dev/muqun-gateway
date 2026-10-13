@@ -2,7 +2,7 @@
 name = "muqun-gateway"
 version = "0.13.0"
 edition = "2021"
-license = "MIT"
+license = "Apache-2.0"
 description = "Token-protected mobile gateway for Herdr and tmux terminal workspaces."
 repository = "https://github.com/osuki-dev/muqun-gateway"
 readme = "README.md"

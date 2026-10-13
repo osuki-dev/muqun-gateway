@@ -642,4 +642,6 @@ Gateway contract does not mean the current App browses every segment.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+Apache-2.0. See [LICENSE](LICENSE).
+The original MIT copyright and permission notice for inherited code is retained
+in [LICENSE-MIT](LICENSE-MIT).
