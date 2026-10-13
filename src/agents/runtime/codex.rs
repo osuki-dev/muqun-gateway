@@ -259,6 +259,7 @@ impl CodexState {
             info.endpoint = Some(manager.endpoint_url().into());
             info.version = manager.version();
             (info.models, info.modes) = super::catalog_entry(manager.agent().as_ref()).await;
+            info.features = connection_features(Some(manager.endpoint_url()), &info.models);
         } else if let Some(failure) = self.failure.lock().await.as_ref() {
             info.status = match failure {
                 AgentError::Unsupported(_) => AgentAvailability::Unsupported,
@@ -291,8 +292,8 @@ impl CodexState {
 pub(super) fn features() -> crate::discovery::AgentFeatures {
     crate::discovery::AgentFeatures {
         streaming: true,
-        reasoning_effort: true,
-        model_selection: true,
+        reasoning_effort: false,
+        model_selection: false,
         tool_approvals: true,
         worktrees: false,
         revert: false,
@@ -308,7 +309,20 @@ pub(super) fn features() -> crate::discovery::AgentFeatures {
         extra: std::collections::BTreeMap::from([
             ("sessionPagination".into(), serde_json::json!(true)),
             ("sharedDaemon".into(), serde_json::json!(cfg!(unix))),
-            ("sharedTaskStartup".into(), serde_json::json!(cfg!(unix))),
+            ("sharedTaskStartup".into(), serde_json::json!(false)),
+            ("sharedDaemonConnected".into(), serde_json::json!(false)),
+            ("runtimeTransport".into(), serde_json::json!("unavailable")),
+            ("runtimeScopedControls".into(), serde_json::json!(true)),
+            ("shellToolItems".into(), serde_json::json!(true)),
+            ("fileChangeItems".into(), serde_json::json!(true)),
+            ("transcriptImages".into(), serde_json::json!(true)),
+            ("audioPlayback".into(), serde_json::json!(false)),
+            ("generatedImagePreview".into(), serde_json::json!(false)),
+            ("legacyVcsDiff".into(), serde_json::json!(false)),
+            (
+                "sessionGitInfoScope".into(),
+                serde_json::json!("producer_snapshot"),
+            ),
             ("sessionRename".into(), serde_json::json!(true)),
             ("sessionFork".into(), serde_json::json!(true)),
             ("sessionDelete".into(), serde_json::json!(true)),
@@ -333,6 +347,33 @@ pub(super) fn features() -> crate::discovery::AgentFeatures {
             ),
         ]),
     }
+}
+
+/// Connection availability is separate from supported protocol projections.
+/// Catalog failure leaves model controls unavailable, never a guessed default.
+pub(super) fn connection_features(
+    endpoint: Option<&str>,
+    models: &[crate::discovery::AgentModelInfo],
+) -> crate::discovery::AgentFeatures {
+    let mut result = features();
+    result.model_selection = endpoint.is_some() && !models.is_empty();
+    result.reasoning_effort = endpoint.is_some() && models.iter().any(|m| m.supports_reasoning);
+    let shared = cfg!(unix) && endpoint == Some("unix://shared-codex-app-server");
+    result
+        .extra
+        .insert("sharedDaemonConnected".into(), serde_json::json!(shared));
+    result
+        .extra
+        .insert("sharedTaskStartup".into(), serde_json::json!(shared));
+    result.extra.insert(
+        "runtimeTransport".into(),
+        serde_json::json!(match endpoint {
+            Some("unix://shared-codex-app-server") => "shared_daemon",
+            Some("stdio://private-codex-app-server") => "private_stdio",
+            _ => "unavailable",
+        }),
+    );
+    result
 }
 
 impl AgentRuntime {
@@ -1043,12 +1084,7 @@ pub(crate) mod tests {
     #[test]
     fn codex_feature_claims_do_not_include_file_rollback_or_optional_apis() {
         let features = features();
-        assert!(
-            features.streaming
-                && features.model_selection
-                && features.reasoning_effort
-                && features.tool_approvals
-        );
+        assert!(features.streaming && features.tool_approvals);
         assert!(
             !features.revert
                 && !features.staged_revert
@@ -1060,8 +1096,61 @@ pub(crate) mod tests {
         assert_eq!(features.extra["sessionPagination"], true);
         assert_eq!(
             super::super::AGENT_PREFERENCE,
-            ["opencode", "deepseek", "t3", "codex"]
+            ["codex", "opencode", "deepseek", "t3"]
         );
+    }
+
+    #[test]
+    fn codex_connection_features_use_actual_transport_and_catalog() {
+        let model = crate::discovery::AgentModelInfo {
+            id: "synthetic-model".into(),
+            name: "Synthetic".into(),
+            provider_id: "synthetic".into(),
+            supports_reasoning: true,
+            reasoning_effort_tiers: vec!["high".into()],
+            extra: Default::default(),
+        };
+        for (endpoint, models, selectable, shared, transport) in [
+            (None, vec![model.clone()], false, false, "unavailable"),
+            (
+                Some("stdio://private-codex-app-server"),
+                vec![],
+                false,
+                false,
+                "private_stdio",
+            ),
+            (
+                Some("stdio://private-codex-app-server"),
+                vec![model.clone()],
+                true,
+                false,
+                "private_stdio",
+            ),
+            (
+                Some("unix://shared-codex-app-server"),
+                vec![model.clone()],
+                true,
+                cfg!(unix),
+                "shared_daemon",
+            ),
+        ] {
+            let features = connection_features(endpoint, &models);
+            assert_eq!(features.model_selection, selectable);
+            assert_eq!(features.reasoning_effort, selectable);
+            assert_eq!(features.extra["runtimeTransport"], transport);
+            assert_eq!(features.extra["sharedDaemonConnected"], shared);
+            assert_eq!(features.extra["sharedTaskStartup"], shared);
+            assert!(features.extra["shellToolItems"].as_bool().unwrap());
+            assert!(!features.background_shells);
+            assert_eq!(features.extra["sessionGitInfoScope"], "producer_snapshot");
+            assert_eq!(features.extra["legacyVcsDiff"], false);
+        }
+        let mut model = model;
+        model.supports_reasoning = false;
+        model.reasoning_effort_tiers.clear();
+        let features = connection_features(Some("stdio://private-codex-app-server"), &[model]);
+        assert!(features.model_selection);
+        assert!(!features.reasoning_effort);
     }
 
     #[cfg(unix)]

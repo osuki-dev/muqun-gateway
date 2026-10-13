@@ -113,6 +113,23 @@ impl SessionService {
         Ok(info)
     }
 
+    pub async fn fork_session(
+        &self,
+        asid: &str,
+        message_id: Option<&str>,
+    ) -> Result<AgentSessionInfo, AgentError> {
+        let mut info = self.agent.fork_session(asid, message_id).await?;
+        if info.asid.0.is_empty() || info.asid.0 == asid {
+            return Err(AgentError::Protocol(
+                "Fork did not return a new session identity".into(),
+            ));
+        }
+        self.stamp(&mut info);
+        self.observe_runtime(&mut info).await;
+        self.mirror.update_session(info.clone()).await;
+        Ok(info)
+    }
+
     pub async fn get_snapshot(
         &self,
         asid: &AgentSessionId,

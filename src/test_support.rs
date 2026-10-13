@@ -1176,6 +1176,24 @@ impl agents::ports::agent::AgentPort for FakeAgent {
             Ok(session)
         })
     }
+    fn fork_session<'a>(
+        &'a self,
+        session_id: &'a str,
+        message_id: Option<&'a str>,
+    ) -> agents::ports::agent::AgentFuture<'a, agents::domain::AgentSessionInfo> {
+        Box::pin(async move {
+            let mut info = self.get_session(session_id).await?;
+            if self.failing {
+                return self.fail();
+            }
+            self.record(&format!(
+                "fork_session {session_id} {}",
+                message_id.unwrap_or("whole")
+            ));
+            info.asid = agents::domain::AgentSessionId(format!("{}_fork", self.kind));
+            Ok(info)
+        })
+    }
     fn get_session<'a>(
         &'a self,
         session_id: &'a str,

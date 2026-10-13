@@ -289,6 +289,9 @@ fn t3_features_for_protocol(protocol: u64) -> crate::discovery::AgentFeatures {
         attachments_by_path: true,
         extra: std::collections::BTreeMap::from([
             ("sessionPagination".into(), serde_json::json!(false)),
+            ("sessionRename".into(), serde_json::json!(true)),
+            ("sessionDelete".into(), serde_json::json!(true)),
+            ("sessionFork".into(), serde_json::json!(false)),
             ("orchestrationProtocols".into(), serde_json::json!([1, 2])),
         ]),
     }

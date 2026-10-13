@@ -17,9 +17,10 @@ without disabling terminal agents. Both blocks default enabled and reject
 unknown nested fields; Gateway configuration has no Codex credential fields.
 `codex.binary`, when present, names an absolute executable; otherwise
 normal PATH lookup selects `codex`. Gateway does not install it. Missing binary
-or authentication is nonfatal and does not disable other agents. Codex follows
-OpenCode, DeepSeek and T3 in primary preference; existing terminal Codex sessions
-and terminal-task launch behavior are unchanged.
+or authentication is nonfatal and does not disable other agents. Ready Codex is preferred first, OpenCode second, then DeepSeek and T3.
+Explicit provider and recorded session selections keep their routes; unavailable
+Codex never displaces a connected fallback. HTTP and CLI discovery use the same
+ordering. Existing terminal sessions remain untouched.
 Explicit task `agent_id: codex` continues to use a terminal pane even when the
 private service adapter is connected; Codex service sessions use the agent API.
 This revision covers all seven transport/lifecycle and semantic review findings,

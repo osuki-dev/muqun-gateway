@@ -369,26 +369,32 @@ pub async fn build_discovery_planes(state: &AppState) -> DiscoveryPlanes {
     }
 }
 
+/// Usable providers precede unavailable ones; Codex then OpenCode lead the
+/// ready group. An unavailable Codex does not displace an existing fallback.
+pub(crate) fn order_agents(agents: &mut [AgentDiscoveryInfo]) {
+    let preference = crate::agents::runtime::AGENT_PREFERENCE;
+    agents.sort_by_key(|agent| {
+        let ready = agent.enabled
+            && matches!(
+                agent.status,
+                AgentAvailability::Connected | AgentAvailability::Reachable
+            );
+        let rank = if agent.id == "codex" && !ready {
+            usize::MAX
+        } else {
+            preference
+                .iter()
+                .position(|id| *id == agent.id)
+                .unwrap_or(preference.len())
+        };
+        (!ready, rank)
+    });
+}
+
 impl AgentPlaneDiscovery {
-    /// Prefer ready Codex, then OpenCode, without changing implicit runtime
-    /// routing or a device's saved selection. Stable sorting keeps every other
-    /// provider in its existing order, including Codex when it is unavailable.
+    /// Use the runtime's ordering for HTTP discovery as well as CLI discovery.
     fn order_for_picker(&mut self) {
-        self.agents.sort_by_key(|agent| {
-            if agent.id == "codex"
-                && agent.enabled
-                && matches!(
-                    agent.status,
-                    AgentAvailability::Connected | AgentAvailability::Reachable
-                )
-            {
-                0
-            } else if agent.id == "opencode" {
-                1
-            } else {
-                2
-            }
-        });
+        order_agents(&mut self.agents);
     }
 
     /// Drop what only a paired device should learn: where each agent
@@ -545,6 +551,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn picker_prefers_connected_fallback_over_unavailable_primary_choices() {
+        let mut plane = crate::agents::AgentRuntime::disabled()
+            .discover_agents()
+            .await;
+        let t3 = plane.agents.iter_mut().find(|a| a.id == "t3").unwrap();
+        t3.enabled = true;
+        t3.status = AgentAvailability::Connected;
+        plane.order_for_picker();
+        assert_eq!(plane.agents[0].id, "t3");
+        assert_eq!(plane.agents.last().unwrap().id, "codex");
+    }
+
+    #[tokio::test]
     async fn picker_without_codex_preserves_other_provider_order_and_entries() {
         let mut plane = crate::agents::AgentRuntime::disabled()
             .discover_agents()
@@ -558,7 +577,7 @@ mod tests {
                 .iter()
                 .map(|a| a.id.as_str())
                 .collect::<Vec<_>>(),
-            ["opencode", "t3", "deepseek"]
+            ["opencode", "deepseek", "t3"]
         );
     }
 

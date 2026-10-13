@@ -55,11 +55,9 @@ const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Each version stream is bounded independently, including diagnostic output.
 const VERSION_OUTPUT_LIMIT: u64 = 4096;
 
-/// Agent ids in primary-preference order. OpenCode is the established
-/// agent; DeepSeek and T3 Code are opt-in. Codex defaults enabled but comes
-/// last, so it never displaces an attached provider ahead of it. Every place
-/// that names an agent by position reads this.
-pub const AGENT_PREFERENCE: [&str; 4] = ["opencode", "deepseek", "t3", "codex"];
+/// Preference among attached providers. Explicit provider/session selections
+/// retain their route; discovery additionally puts usable providers first.
+pub const AGENT_PREFERENCE: [&str; 4] = ["codex", "opencode", "deepseek", "t3"];
 /// Most session-to-agent routes remembered; the oldest go first.
 const MAX_SESSION_ROUTES: usize = 4096;
 /// How long an agent discovery result is reused.
@@ -647,7 +645,7 @@ impl AgentRuntime {
             AgentAvailability, AgentDiscoveryInfo, AgentPlaneDiscovery, AgentPlaneFeatures,
         };
         let attached = self.attached_in_order().await;
-        let agents = AGENT_PREFERENCE
+        let mut agents = AGENT_PREFERENCE
             .iter()
             .map(|id| {
                 let (enabled, name, features) = match *id {
@@ -664,7 +662,16 @@ impl AgentRuntime {
                         deepseek_features(false, false),
                     ),
                 };
-                let manager = attached.iter().find(|(h, _)| h == id).map(|(_, m)| m);
+                let manager = attached
+                    .iter()
+                    .find(|(h, _)| h == id)
+                    .map(|(_, m)| m)
+                    .filter(|manager| *id != "codex" || manager.stream_connected());
+                let features = if *id == "codex" {
+                    codex::connection_features(manager.map(|m| m.endpoint_url()), &[])
+                } else {
+                    features
+                };
                 AgentDiscoveryInfo {
                     id: id.to_string(),
                     name: name.to_string(),
@@ -684,6 +691,7 @@ impl AgentRuntime {
                 }
             })
             .collect::<Vec<_>>();
+        crate::discovery::order_agents(&mut agents);
         let supported = agents
             .iter()
             .any(|h| h.status == AgentAvailability::Connected);
@@ -932,19 +940,9 @@ impl AgentRuntime {
             }
         };
         agents.push(opencode_info);
-        // The App draws its launch row in this order and fills the first tile
-        // as the primary one, so the list follows the same preference the
-        // runtime uses to pick a default agent.
-        agents.sort_by_key(|agent| {
-            AGENT_PREFERENCE
-                .iter()
-                .position(|id| *id == agent.id)
-                .unwrap_or(AGENT_PREFERENCE.len())
-        });
-
-        // 3. T3 Code discovery
         agents.push(self.t3_discovery().await);
         agents.push(self.codex.discovery(self).await);
+        crate::discovery::order_agents(&mut agents);
 
         let supported = agents.iter().any(|h| {
             h.status == AgentAvailability::Connected || h.status == AgentAvailability::Reachable
@@ -1769,6 +1767,9 @@ fn deepseek_features(
         attachments_by_path: true,
         extra: std::collections::BTreeMap::from([
             ("modeSwitching".into(), serde_json::Value::Bool(false)),
+            ("sessionRename".into(), serde_json::json!(true)),
+            ("sessionDelete".into(), serde_json::json!(false)),
+            ("sessionFork".into(), serde_json::json!(true)),
             ("sessionPagination".into(), serde_json::Value::Bool(false)),
         ]),
     }
@@ -1794,10 +1795,12 @@ fn opencode_features(
         background_shells: true,
         attachments: true,
         attachments_by_path: false,
-        extra: std::collections::BTreeMap::from([(
-            "sessionPagination".into(),
-            serde_json::Value::Bool(true),
-        )]),
+        extra: std::collections::BTreeMap::from([
+            ("sessionPagination".into(), serde_json::json!(true)),
+            ("sessionRename".into(), serde_json::json!(true)),
+            ("sessionDelete".into(), serde_json::json!(true)),
+            ("sessionFork".into(), serde_json::json!(false)),
+        ]),
     }
 }
 
@@ -2309,6 +2312,18 @@ mod tests {
             flags(deepseek_features(true, true)),
             [true, false, false, false, false, true, false, true]
         );
+        for (features, expected) in [
+            (opencode_features(false, false), [true, true, false]),
+            (deepseek_features(false, false), [true, false, true]),
+            (t3::t3_features(), [true, true, false]),
+            (codex::features(), [true, true, true]),
+        ] {
+            assert_eq!(
+                ["sessionRename", "sessionDelete", "sessionFork"]
+                    .map(|key| features.extra[key].as_bool().unwrap()),
+                expected
+            );
+        }
         for (features, pagination) in [
             (opencode_features(false, false), true),
             (deepseek_features(false, false), false),
@@ -2814,6 +2829,18 @@ mod tests {
             Some(&1),
             "OpenCode wins when both are attached"
         );
+        map.insert("codex".to_string(), 5);
+        assert_eq!(
+            pick_primary(&map),
+            Some(&5),
+            "Codex wins among attached providers"
+        );
+        map.remove("codex");
+        assert_eq!(
+            pick_primary(&map),
+            Some(&1),
+            "OpenCode remains the fallback"
+        );
         map.insert("other".to_string(), 3);
         map.remove("opencode");
         assert_eq!(pick_primary(&map), Some(&2));
@@ -3155,11 +3182,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_discovery_orders_all_appended_connected_providers_and_preserves_routes() {
+        let runtime = AgentRuntime::with_all_configs(
+            OpencodeConfig {
+                enabled: true,
+                autostart: false,
+                binary: None,
+            },
+            DeepseekConfig::default(),
+            T3Config::default(),
+            CodexConfig::default(),
+            None,
+        );
+        runtime
+            .attach_for_test(Arc::new(AgentManager::for_test(Arc::new(
+                crate::test_support::FakeAgent::new("opencode"),
+            ))))
+            .await;
+        let mut fixture = crate::agents::adapters::codex::tests::Fixture::new(|request| {
+            match request["method"].as_str().unwrap() {
+                "config/read" => serde_json::json!({"config":{"model_provider":"openai"}}),
+                "model/list" => {
+                    crate::agents::adapters::codex::tests::golden()["modelList"].clone()
+                }
+                other => panic!("unexpected discovery mutation {other}"),
+            }
+        })
+        .await;
+        fixture.ready().await;
+        runtime
+            .attach_for_test(Arc::new(AgentManager::connect_codex(
+                fixture.client.clone(),
+                fixture.events.take().unwrap(),
+                runtime.events_tx.clone(),
+            )))
+            .await;
+        runtime
+            .record_session_route("synthetic-session", "opencode")
+            .await;
+        let found = runtime.probe_agents().await;
+        assert_eq!(
+            found
+                .agents
+                .iter()
+                .map(|a| a.id.as_str())
+                .collect::<Vec<_>>(),
+            ["codex", "opencode", "deepseek", "t3"]
+        );
+        assert_eq!(runtime.manager().await.unwrap().agent().kind(), "codex");
+        assert_eq!(
+            runtime
+                .manager_for_session("synthetic-session")
+                .await
+                .unwrap()
+                .agent()
+                .kind(),
+            "opencode"
+        );
+        let fallback = runtime.attached_snapshot().await;
+        assert_eq!(fallback.agents[0].id, "codex");
+        assert!(
+            !fallback.agents[0].features.model_selection,
+            "an unqueried catalog is unknown"
+        );
+    }
+
+    #[tokio::test]
     async fn discovery_lists_agents_in_preference_order() {
         let runtime = AgentRuntime::disabled();
         let found = runtime.discover_agents().await;
         let ids: Vec<&str> = found.agents.iter().map(|a| a.id.as_str()).collect();
-        assert_eq!(ids, AGENT_PREFERENCE.to_vec());
+        assert_eq!(ids, ["opencode", "deepseek", "t3", "codex"]);
     }
 
     #[tokio::test]

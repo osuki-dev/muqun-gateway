@@ -244,6 +244,12 @@ pub struct CreateAgentSessionBody {
     pub agent_id: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForkSessionBody {
+    pub message_id: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SendAgentPromptBody {
     pub text: String,
@@ -357,6 +363,11 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
         .route(
             "/api/agents/{agent_id}/sessions/{asid}",
             delete(delete_agent_session_scoped),
+        )
+        .route("/api/agent-sessions/{asid}/fork", post(fork_agent_session))
+        .route(
+            "/api/agents/{agent_id}/sessions/{asid}/fork",
+            post(fork_agent_session_scoped),
         )
         .route(
             "/api/agent-sessions/{asid}/children",
@@ -2273,6 +2284,95 @@ async fn do_delete_agent_session(
     Ok(Json(content_envelope(json!({ "deleted": true }))))
 }
 
+async fn fork_agent_session(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    headers: HeaderMap,
+    body: Option<Json<ForkSessionBody>>,
+) -> ApiResult<Json<Value>> {
+    do_fork_agent_session(
+        &state,
+        &asid,
+        None,
+        body.map(|Json(body)| body).unwrap_or_default(),
+        &headers,
+    )
+    .await
+}
+
+async fn fork_agent_session_scoped(
+    State(state): State<AppState>,
+    Path((agent_id, asid)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Option<Json<ForkSessionBody>>,
+) -> ApiResult<Json<Value>> {
+    do_fork_agent_session(
+        &state,
+        &asid,
+        Some(&agent_id),
+        body.map(|Json(body)| body).unwrap_or_default(),
+        &headers,
+    )
+    .await
+}
+
+async fn do_fork_agent_session(
+    state: &AppState,
+    asid: &str,
+    agent_id: Option<&str>,
+    body: ForkSessionBody,
+    headers: &HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(state, headers)?;
+    validate_text(asid)?;
+    if asid.len() > 128
+        || matches!(asid, "." | "..")
+        || !asid
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+        || asid.trim().is_empty()
+        || body
+            .message_id
+            .as_ref()
+            .is_some_and(|id| id.trim().is_empty())
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_session",
+            "Session and message identities must not be empty",
+        ));
+    }
+    if let Some(id) = &body.message_id {
+        validate_text(id)?;
+    }
+    let manager = match agent_id {
+        Some(agent_id) => agent_manager_or_err(state, agent_id).await?,
+        None => session_manager_or_err(state, asid).await?,
+    };
+    let source = manager
+        .agent()
+        .get_session(asid)
+        .await
+        .map_err(agent_error)?;
+    if source.asid.0 != asid {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "session_changed",
+            "The selected agent returned a different session",
+        ));
+    }
+    let session = manager
+        .sessions()
+        .fork_session(asid, body.message_id.as_deref())
+        .await
+        .map_err(agent_error)?;
+    state
+        .agent_runtime
+        .record_session_route(&session.asid.0, manager.agent().kind())
+        .await;
+    Ok(Json(content_envelope(json!(session))))
+}
+
 async fn rename_agent_session(
     State(state): State<AppState>,
     Path(asid): Path<String>,
@@ -3454,6 +3554,73 @@ mod tests {
             state.agent_runtime.attach_for_test(agent.manager()).await;
         }
         state
+    }
+
+    #[tokio::test]
+    async fn fork_route_authenticates_selects_exact_provider_and_registers_new_session() {
+        let codex = FakeAgent::new("codex").with_sessions(&[("source", 1)]);
+        let codex_calls = codex.calls.clone();
+        let opencode = FakeAgent::new("opencode").with_sessions(&[("source", 1)]);
+        let calls = opencode.calls.clone();
+        let state = state_with(vec![codex, opencode]).await;
+        for (headers, expected) in [
+            (HeaderMap::new(), StatusCode::UNAUTHORIZED),
+            (
+                crate::test_support::bearer_headers("wrong"),
+                StatusCode::FORBIDDEN,
+            ),
+        ] {
+            assert_eq!(
+                do_fork_agent_session(
+                    &state,
+                    "source",
+                    Some("opencode"),
+                    ForkSessionBody::default(),
+                    &headers
+                )
+                .await
+                .unwrap_err()
+                .0,
+                expected
+            );
+        }
+        assert!(calls.lock().unwrap().is_empty() && codex_calls.lock().unwrap().is_empty());
+        let Json(body) = do_fork_agent_session(
+            &state,
+            "source",
+            Some("opencode"),
+            ForkSessionBody {
+                message_id: Some("boundary".into()),
+            },
+            &device_headers(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(body["data"]["asid"], "opencode_fork");
+        assert_eq!(body["data"]["agent_id"], "opencode");
+        assert_eq!(*calls.lock().unwrap(), ["fork_session source boundary"]);
+        assert!(codex_calls.lock().unwrap().is_empty());
+        let manager = state
+            .agent_runtime
+            .manager_for_session("opencode_fork")
+            .await
+            .unwrap();
+        assert_eq!(manager.agent().kind(), "opencode");
+        assert!(manager
+            .mirror()
+            .get_snapshot(&AgentSessionId("opencode_fork".into()))
+            .await
+            .is_some());
+        assert!(do_fork_agent_session(
+            &state,
+            "missing",
+            Some("codex"),
+            ForkSessionBody::default(),
+            &device_headers()
+        )
+        .await
+        .is_err());
+        assert!(codex_calls.lock().unwrap().is_empty());
     }
 
     async fn body_json(response: Response) -> Value {
