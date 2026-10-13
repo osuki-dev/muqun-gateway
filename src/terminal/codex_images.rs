@@ -393,7 +393,7 @@ mod tests {
             record(json!({"type":"session_meta","payload":{"id":OTHER}})) + &user("Inspect"),
         )
         .unwrap();
-        assert_eq!(find_rollout(&root, ID), Some(path.clone()));
+        assert_eq!(find_rollout(&root, ID), Some(path.canonicalize().unwrap()));
         assert!(read_rollout(&path, ID).is_none());
         std::fs::write(
             &path,
@@ -403,6 +403,22 @@ mod tests {
         assert_eq!(read_rollout(&path, ID).unwrap()[0].sources, [IMAGE]);
         std::fs::write(day.join(format!("rollout-second-{ID}.jsonl")), "").unwrap();
         assert!(find_rollout(&root, ID).is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rollout_discovery_canonicalizes_a_symlinked_root() {
+        let root = std::env::temp_dir().join(format!("gateway-rollout-{}", uuid::Uuid::new_v4()));
+        let sessions = root.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join(format!("rollout-synthetic-{ID}.jsonl"));
+        std::fs::write(&path, "").unwrap();
+        let alias = root.join("sessions-alias");
+        std::os::unix::fs::symlink(&sessions, &alias).unwrap();
+
+        assert_eq!(find_rollout(&alias, ID), Some(path.canonicalize().unwrap()));
+
         std::fs::remove_dir_all(root).unwrap();
     }
 
