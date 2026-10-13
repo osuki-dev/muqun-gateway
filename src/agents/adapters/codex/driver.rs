@@ -157,7 +157,13 @@ impl CodexDriver {
         // supersedes earlier persisted counts; no sample means unknown. Native
         // live notifications remain stronger than a historical initial sample.
         if external {
-            usage.remove(id);
+            if usage.len() < MAX_SESSIONS || usage.contains_key(id) {
+                usage.insert(
+                    id.into(),
+                    super::usage::Usage::from_wire(value.unwrap_or(&Value::Null)),
+                );
+            }
+            return;
         }
         if usage.len() < MAX_SESSIONS || usage.contains_key(id) {
             if let Some(value) = value {
@@ -1298,7 +1304,12 @@ mod model_page_tests {
             .apply(&mut info);
         assert_eq!(info.context_usage.as_ref().unwrap().total_tokens, 10);
         driver.seed_usage("thread", None, true).await;
-        assert!(driver.cached_usage("thread").await.is_none());
+        driver
+            .cached_usage("thread")
+            .await
+            .unwrap()
+            .apply(&mut info);
+        assert!(info.tokens.is_none() && info.context_usage.is_none());
     }
 
     #[tokio::test]
