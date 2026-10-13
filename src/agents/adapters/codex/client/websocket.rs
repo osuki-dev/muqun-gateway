@@ -363,6 +363,11 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn shared_terminal_start_keeps_context_in_thread_and_returns_exact_remote_resume() {
         let fixture = Fixture::new(|request| {
+            if request["method"] == "thread/name/set" {
+                assert_eq!(request["params"]["threadId"], "00000000-0000-4000-8000-000000000001");
+                assert_eq!(request["params"]["name"], "Synthetic task title");
+                return json!({});
+            }
             assert_eq!(request["method"], "thread/start");
             assert_eq!(request["params"]["developerInstructions"], "Synthetic owner instructions. Synthetic task completion rule.");
             assert_eq!(request["params"]["config"]["mcp_servers.muqun.http_headers_helper"], "fixture-helper --task-id synthetic-task");
@@ -373,7 +378,7 @@ pub(crate) mod tests {
         let arguments = ["-c", "projects={ '/synthetic/project' = { trust_level = 'trusted' } }", "-c", "developer_instructions='Synthetic owner instructions. Synthetic task completion rule.'", "-c", "mcp_servers.muqun.http_headers_helper='fixture-helper --task-id synthetic-task'"]
             .into_iter().map(str::to_owned).collect::<Vec<_>>();
         let prepared = driver
-            .prepare_terminal_launch("/synthetic/project", &arguments)
+            .prepare_terminal_launch("/synthetic/project", "Synthetic task title", &arguments)
             .await
             .unwrap();
         assert_eq!(
@@ -386,12 +391,24 @@ pub(crate) mod tests {
             ]
         );
         assert!(fixture.client.is_subscribed(&prepared.session.asid.0));
+        assert_eq!(prepared.session.title, "Synthetic task title");
+        let methods: Vec<String> = locked(&fixture.requests)
+            .iter()
+            .filter_map(|request| request["method"].as_str())
+            .filter(|method| method.starts_with("thread/") || method.starts_with("turn/"))
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(methods, ["thread/start", "thread/name/set"]);
         assert!(!locked(&fixture.requests)
             .iter()
             .any(|r| r["method"] == "turn/start"));
         assert!(matches!(
             driver
-                .prepare_terminal_launch("/synthetic/project", &["--no-daemon".into()])
+                .prepare_terminal_launch(
+                    "/synthetic/project",
+                    "Synthetic task title",
+                    &["--no-daemon".into()]
+                )
                 .await,
             Err(AgentError::Unsupported(_))
         ));
@@ -399,6 +416,47 @@ pub(crate) mod tests {
             locked(&fixture.requests)
                 .iter()
                 .filter(|r| r["method"] == "thread/start")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_terminal_does_not_attach_before_persistence_ack_or_retry_a_disconnect() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let fixture = Fixture::with_deferred(
+            |request| {
+                assert_eq!(request["method"], "thread/start");
+                json!({"thread":{"id":"00000000-0000-4000-8000-000000000001","status":{"type":"idle"}}})
+            },
+            Some(("thread/name/set", gate)),
+        )
+        .await;
+        let driver = CodexDriver::new(fixture.client.clone());
+        let arguments = vec![
+            "-c".into(),
+            "projects={ '/synthetic/project' = { trust_level = 'trusted' } }".into(),
+        ];
+        let prepared = driver.prepare_terminal_launch(
+            "/synthetic/project",
+            "Synthetic task title",
+            &arguments,
+        );
+        tokio::pin!(prepared);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut prepared)
+                .await
+                .is_err()
+        );
+        assert!(locked(&fixture.requests)
+            .iter()
+            .any(|request| request["method"] == "thread/name/set"));
+        fixture.client.stop();
+        assert!(matches!(prepared.await, Err(AgentError::NotAvailable(_))));
+        assert_eq!(
+            locked(&fixture.requests)
+                .iter()
+                .filter(|request| request["method"] == "thread/start")
                 .count(),
             1
         );
@@ -413,11 +471,12 @@ pub(crate) mod tests {
             TaskLaunch,
         };
         use crate::tasks::domain::Task;
-        for (cancelled, invalid_response, invalid_task) in [
-            (false, false, false),
-            (true, false, false),
-            (false, true, false),
-            (false, false, true),
+        for (cancelled, invalid_response, invalid_task, invalid_persistence) in [
+            (false, false, false, false),
+            (true, false, false, false),
+            (false, true, false, false),
+            (false, false, true, false),
+            (false, false, false, true),
         ] {
             let task_id = if invalid_task {
                 crate::tasks::domain::TaskId("invalid".into())
@@ -426,6 +485,11 @@ pub(crate) mod tests {
             };
             let expected_task_id = task_id.0.clone();
             let mut fixture = Fixture::new(move |request| {
+                if request["method"] == "thread/name/set" {
+                    assert_eq!(request["params"]["threadId"], "00000000-0000-4000-8000-000000000001");
+                    assert_eq!(request["params"]["name"], "Named task");
+                    return if invalid_persistence { Value::Null } else { json!({}) };
+                }
                 assert_eq!(request["method"], "thread/start");
                 let helper = request["params"]["config"]["mcp_servers.muqun.http_headers_helper"].as_str().unwrap();
                 assert!(helper.ends_with(&format!("--task-id '{expected_task_id}'")));
@@ -462,7 +526,7 @@ pub(crate) mod tests {
                 ],
             );
             let task: Task = serde_json::from_value(json!({
-                "id":task_id.0, "kind":"delegation", "goal":"synthetic goal", "cwd":cwd,
+                "id":task_id.0, "kind":"delegation", "goal":"synthetic goal", "label":"Named task", "cwd":cwd,
                 "binding":{"kind":"pane","session_id":"default","pane_id":"w1:p1","tab_id":"w1:t1","agent_id":"codex"},
                 "state":if cancelled {"cancelled"} else {"dispatching"},
                 "created_by":{"kind":"assistant","id":"synthetic"}, "created_ms":1,"updated_ms":1,"seq":1,"origin":"mcp"
@@ -500,7 +564,7 @@ pub(crate) mod tests {
             )
             .await;
             if let Some(started) = to_type {
-                assert!(!cancelled && !invalid_response && !invalid_task);
+                assert!(!cancelled && !invalid_response && !invalid_task && !invalid_persistence);
                 type_agent_prompt(
                     &herdr.session(),
                     &started,
@@ -520,9 +584,11 @@ pub(crate) mod tests {
                 .collect();
             assert_eq!(
                 starts.len(),
-                usize::from(!cancelled && !invalid_response && !invalid_task)
+                usize::from(
+                    !cancelled && !invalid_response && !invalid_task && !invalid_persistence
+                )
             );
-            if cancelled || invalid_response || invalid_task {
+            if cancelled || invalid_response || invalid_task || invalid_persistence {
                 assert_eq!(launch.prompt_delivery, PromptDelivery::NotAttempted);
                 assert_eq!(launch.payload["prompt_submitted"], false);
             } else {
@@ -544,7 +610,9 @@ pub(crate) mod tests {
                 .collect();
             assert_eq!(
                 prompts.len(),
-                usize::from(!cancelled && !invalid_response && !invalid_task)
+                usize::from(
+                    !cancelled && !invalid_response && !invalid_task && !invalid_persistence
+                )
             );
             if let Some(prompt) = prompts.first() {
                 assert_eq!(prompt["params"]["text"], "synthetic goal");

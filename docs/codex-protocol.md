@@ -438,7 +438,11 @@ providers return `feature_unsupported`, rather than falling back to OpenCode.
 the connected shared daemon's official `thread/start` API. The existing
 per-invocation project trust, developer instructions, Muqun MCP entry, model,
 effort, approval and sandbox choices become thread parameters. The Gateway
-keeps its subscription and launches the official TUI with
+keeps its subscription and persists the existing task title with the official
+`thread/name/set` API before launching the TUI. New threads are lazy-persisted;
+even attaching to a loaded thread with `thread/resume` requires its stored
+record. This acknowledged metadata write materializes that record without a
+model turn or a fabricated user message. The TUI starts with
 `--remote unix://<verified-socket> resume <exact-thread-id>`. The original
 goal is delivered once through the existing terminal startup path: Herdr waits
 for TUI readiness before `agent.prompt`; backends that accept launch-time goals
@@ -458,7 +462,7 @@ Custom executable/environment selections and unsupported CLI settings retain
 the existing terminal startup path and record why shared startup was skipped.
 That reason is retained in the existing task event history when the task becomes
 working, explicitly identifying terminal mode and its linked-terminal controls.
-An uncertain `thread/start` result never falls back to a second launch. A task
+An uncertain creation or title-persistence result never falls back to a second launch. A task
 cancelled during preparation does not submit its goal. Existing conversations
 are never migrated or restarted by this feature.
 

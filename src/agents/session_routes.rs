@@ -932,9 +932,16 @@ async fn prepare_shared_task_launch(
         &state.config,
         task_id,
     ));
+    let task = state
+        .tasks
+        .task(&crate::tasks::domain::TaskId(task_id.into()))
+        .await
+        .map_err(|error| AgentError::RequestFailed(error.to_string()))?
+        .ok_or_else(|| AgentError::InvalidRequest("shared task no longer exists".into()))?;
+    let title = crate::tasks::pane_agent::title(task.label.as_deref(), None, &task.goal);
     manager
         .agent()
-        .prepare_terminal_launch(directory, &arguments)
+        .prepare_terminal_launch(directory, &title, &arguments)
         .await
 }
 

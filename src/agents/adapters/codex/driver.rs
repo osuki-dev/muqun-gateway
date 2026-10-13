@@ -922,6 +922,7 @@ impl AgentPort for CodexDriver {
     fn prepare_terminal_launch<'a>(
         &'a self,
         directory: &'a str,
+        title: &'a str,
         arguments: &'a [String],
     ) -> AgentFuture<'a, PreparedTerminalLaunch> {
         Box::pin(async move {
@@ -930,14 +931,36 @@ impl AgentPort for CodexDriver {
             })?;
             let config = super::launch::parse(directory, arguments)
                 .map_err(|reason| AgentError::Unsupported(reason.into()))?;
+            if title.trim().is_empty() {
+                return Err(AgentError::InvalidRequest(
+                    "shared Codex startup requires a task title".into(),
+                ));
+            }
             let _guard = self.mutations.lock().await;
             let response = self.client.call("thread/start", config.params).await?;
-            let session = self.selected_response(response).await?;
+            let mut session = self.selected_response(response).await?;
             if uuid::Uuid::parse_str(&session.asid.0).is_err() {
                 return Err(AgentError::Protocol(
                     "Codex returned an invalid terminal session identity".into(),
                 ));
             }
+            // New official threads persist lazily. Even an already-loaded
+            // thread/resume reads its stored record, so a TUI cannot attach
+            // until it exists. Naming the task materializes it through the
+            // official metadata path without submitting a model turn.
+            let named = self
+                .client
+                .call(
+                    "thread/name/set",
+                    json!({"threadId":session.asid.0,"name":title}),
+                )
+                .await?;
+            if !named.is_object() {
+                return Err(AgentError::Protocol(
+                    "invalid Codex terminal session name acknowledgement".into(),
+                ));
+            }
+            session.title = title.into();
             let mut arguments = vec!["--remote".into(), endpoint];
             arguments.extend(config.ui_args);
             arguments.extend(["resume".into(), session.asid.0.clone()]);

@@ -135,6 +135,7 @@ pub trait AgentPort: Send + Sync {
     fn prepare_terminal_launch<'a>(
         &'a self,
         _directory: &'a str,
+        _title: &'a str,
         _arguments: &'a [String],
     ) -> AgentFuture<'a, PreparedTerminalLaunch> {
         Box::pin(async { Err(AgentError::Unsupported("shared terminal startup".into())) })
