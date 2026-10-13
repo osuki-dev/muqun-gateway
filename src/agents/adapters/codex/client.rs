@@ -154,10 +154,11 @@ struct WritePacket {
 struct WriteGuard {
     state: Arc<State>,
     finished: bool,
+    fence_on_cancel: bool,
 }
 impl Drop for WriteGuard {
     fn drop(&mut self) {
-        if !self.finished {
+        if !self.finished && self.fence_on_cancel {
             self.state.stop();
         }
     }
@@ -172,16 +173,43 @@ impl Drop for CodexClient {
 struct PendingGuard {
     state: Arc<State>,
     id: u64,
+    fence_on_cancel: bool,
+    enqueued: AtomicBool,
 }
 impl Drop for PendingGuard {
     fn drop(&mut self) {
+        if !self.fence_on_cancel && self.enqueued.load(Ordering::Acquire) {
+            // Keep abandoned reads counted against MAX_PENDING until their
+            // response arrives. Repeated cancellation must not create an
+            // unbounded stream of outstanding daemon work. The closed receiver
+            // discards the late result; transport shutdown drains it as usual.
+            return;
+        }
         let unfinished = locked(&self.state.pending).remove(&self.id).is_some();
-        if unfinished {
+        if unfinished && self.fence_on_cancel {
             // Caller cancellation after a write is also ambiguous. Do not keep
             // accepting prompts while an unacknowledged mutation may run.
             self.state.stop();
         }
     }
+}
+
+/// Only known read-only RPCs may outlive their caller. The transport actor
+/// still owns the complete frame and fences real I/O failures. A late reply
+/// to an abandoned read has a closed receiver and is discarded by route_frame.
+/// Unknown methods, initialization, resumes, turns and callback replies retain
+/// the conservative mutation fence; nothing is automatically resubmitted.
+fn read_only_request(method: &str, params: &Value) -> bool {
+    matches!(
+        method,
+        "config/read"
+            | "model/list"
+            | "thread/list"
+            | "thread/read"
+            | "thread/loaded/list"
+            | "thread/turns/list"
+            | "thread/items/list"
+    ) || (method == "account/read" && params["refreshToken"] == false)
 }
 
 impl CodexClient {
@@ -468,6 +496,11 @@ impl CodexClient {
         method: &str,
         params: Value,
     ) -> Result<(Value, usize), AgentError> {
+        if self.state.cancel.is_cancelled() {
+            return Err(AgentError::NotAvailable(
+                "Codex connection is no longer ready; refresh its status before continuing".into(),
+            ));
+        }
         if !self.is_ready() {
             return Err(AgentError::NotAvailable(
                 "Codex is not initialized and authenticated".into(),
@@ -491,6 +524,7 @@ impl CodexClient {
             return Err(disconnected());
         }
         let id = self.state.next_id.fetch_add(1, Ordering::Relaxed);
+        let fence_on_cancel = !read_only_request(method, &params);
         let (reply, receiver) = oneshot::channel();
         {
             let mut pending = locked(&self.state.pending);
@@ -521,11 +555,17 @@ impl CodexClient {
         let _guard = PendingGuard {
             state: self.state.clone(),
             id,
+            fence_on_cancel,
+            enqueued: AtomicBool::new(false),
         };
         let deadline = tokio::time::Instant::now() + self.timeout;
         tokio::time::timeout_at(
             deadline,
-            self.write(json!({"id":id,"method":method,"params":params})),
+            self.write_guarded(
+                json!({"id":id,"method":method,"params":params}),
+                fence_on_cancel,
+                Some(&_guard.enqueued),
+            ),
         )
         .await
         .map_err(|_| disconnected())??;
@@ -533,6 +573,11 @@ impl CodexClient {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(disconnected()),
             Err(_) => {
+                if !fence_on_cancel {
+                    return Err(AgentError::RequestFailed(
+                        "Codex read deadline exceeded; not retried".into(),
+                    ));
+                }
                 // A mutation may have been accepted. Close this connection;
                 // do not submit it again or allow further work to race it.
                 self.stop();
@@ -544,6 +589,15 @@ impl CodexClient {
     }
 
     async fn write(&self, value: Value) -> Result<(), AgentError> {
+        self.write_guarded(value, true, None).await
+    }
+
+    async fn write_guarded(
+        &self,
+        value: Value,
+        fence_on_cancel: bool,
+        enqueued: Option<&AtomicBool>,
+    ) -> Result<(), AgentError> {
         let mut bytes = serde_json::to_vec(&value)
             .map_err(|_| AgentError::Protocol("invalid Codex request".into()))?;
         if bytes.len() > MAX_FRAME_BYTES {
@@ -556,6 +610,7 @@ impl CodexClient {
         let mut guard = WriteGuard {
             state: self.state.clone(),
             finished: false,
+            fence_on_cancel,
         };
         let deadline = tokio::time::Instant::now() + self.timeout;
         tokio::select! {
@@ -563,6 +618,9 @@ impl CodexClient {
             _ = self.state.cancel.cancelled() => return Err(disconnected()),
             result = tokio::time::timeout_at(deadline, self.outgoing.send(WritePacket {bytes,done})) => {
                 if !matches!(result,Ok(Ok(()))) {return Err(disconnected());}
+                if let Some(enqueued) = enqueued {
+                    enqueued.store(true, Ordering::Release);
+                }
             }
         };
         let result = match tokio::time::timeout_at(deadline, ack).await {
@@ -1267,6 +1325,111 @@ mod tests {
         let token = client.cancel_token();
         drop(client);
         assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn abandoned_reads_remain_bounded_until_late_replies_arrive() {
+        let (io, server) = tokio::io::duplex(8192);
+        let (reader, writer) = tokio::io::split(io);
+        let (client, _events) = CodexClient::from_io(reader, writer);
+        client.state.ready.store(true, Ordering::Release);
+        let (read, mut write) = tokio::io::split(server);
+        let mut lines = BufReader::new(read).lines();
+        let mut ids = Vec::new();
+        for _ in 0..MAX_PENDING {
+            let call = tokio::spawn({
+                let client = client.clone();
+                async move {
+                    client
+                        .call("thread/read", json!({"threadId":"fixture"}))
+                        .await
+                }
+            });
+            let request: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            ids.push(request["id"].clone());
+            call.abort();
+            assert!(call.await.unwrap_err().is_cancelled());
+            assert!(client.is_ready());
+        }
+        assert_eq!(locked(&client.state.pending).len(), MAX_PENDING);
+        assert!(matches!(
+            client.call("thread/start", json!({})).await,
+            Err(AgentError::NotAvailable(_))
+        ));
+        for id in ids {
+            write
+                .write_all(format!("{}\n", json!({"id":id,"result":{}})).as_bytes())
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !locked(&client.state.pending).is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(client.is_ready());
+    }
+
+    #[tokio::test]
+    async fn cancelled_read_during_flush_and_expired_read_do_not_close_transport() {
+        let (reader, mut peer) = tokio::io::duplex(4096);
+        let probe = Arc::new(WriteProbe::default());
+        let (client, _events) = CodexClient::with_timeout(
+            reader,
+            ProbedWriter {
+                probe: probe.clone(),
+                fail_after: None,
+                fail_flush: false,
+            },
+            Duration::from_secs(2),
+        );
+        client.state.ready.store(true, Ordering::Release);
+        let read = tokio::spawn({
+            let client = client.clone();
+            async move {
+                client
+                    .call("config/read", json!({"includeLayers":false}))
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !probe.flush_started.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        read.abort();
+        assert!(read.await.unwrap_err().is_cancelled());
+        assert!(client.is_ready());
+        probe.release.store(true, Ordering::Release);
+        locked(&probe.waker).take().unwrap().wake();
+        peer.write_all(b"{\"id\":1,\"result\":{\"config\":{\"model_provider\":\"openai\"}}}\n")
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !locked(&client.state.pending).is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(client.is_ready());
+
+        let (io, _server) = tokio::io::duplex(4096);
+        let (reader, writer) = tokio::io::split(io);
+        let (client, _events) =
+            CodexClient::with_timeout(reader, writer, Duration::from_millis(25));
+        client.state.ready.store(true, Ordering::Release);
+        assert!(matches!(
+            client.call("model/list", json!({})).await,
+            Err(AgentError::RequestFailed(_))
+        ));
+        assert!(client.is_ready());
+        assert_eq!(locked(&client.state.pending).len(), 1);
     }
 
     #[tokio::test]

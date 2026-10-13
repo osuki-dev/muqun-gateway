@@ -114,6 +114,13 @@ pub(crate) mod tests {
     }
     impl Fixture {
         pub(crate) async fn new(handler: impl Fn(&Value) -> Value + Send + 'static) -> Self {
+            Self::with_deferred(handler, None).await
+        }
+
+        async fn with_deferred(
+            handler: impl Fn(&Value) -> Value + Send + 'static,
+            deferred: Option<(&'static str, Arc<tokio::sync::Notify>)>,
+        ) -> Self {
             let home = TestDirectory::new();
             let (left, right) = UnixStream::pair().unwrap();
             let (client, server) = tokio::join!(
@@ -142,6 +149,11 @@ pub(crate) mod tests {
                             let request: Value = serde_json::from_str(&text).unwrap();
                             locked(&seen).push(request.clone());
                             let Some(id) = request.get("id") else { continue; };
+                            if let Some((method, gate)) = &deferred {
+                                if request["method"] == *method {
+                                    gate.notified().await;
+                                }
+                            }
                             let result = match request["method"].as_str() {
                                 Some("initialize") => json!({"userAgent":"codex-tui/0.162.1", "codexHome":home_path}),
                                 Some("account/read") => json!({"requiresOpenaiAuth":false,"account":null}),
@@ -164,6 +176,58 @@ pub(crate) mod tests {
                 _home: home,
             }
         }
+    }
+
+    #[tokio::test]
+    async fn cancelled_catalog_read_does_not_poison_native_creation_on_same_connection() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let fixture = Fixture::with_deferred(
+            |request| match request["method"].as_str().unwrap() {
+                "config/read" => json!({"config":{"model_provider":"openai"}}),
+                "thread/start" => json!({"thread":{"id":"new-thread","status":{"type":"idle"}}}),
+                method => panic!("unexpected method {method}"),
+            },
+            Some(("config/read", gate.clone())),
+        )
+        .await;
+        let client = fixture.client.clone();
+        let read = tokio::spawn(async move {
+            client
+                .call("config/read", json!({"includeLayers":false}))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !locked(&fixture.requests)
+                .iter()
+                .any(|r| r["method"] == "config/read")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // Discovery/session lookup deadlines drop the read future, not the
+        // service connection or its owned threads. The daemon may reply later.
+        read.abort();
+        assert!(read.await.unwrap_err().is_cancelled());
+        assert!(
+            fixture.client.is_ready(),
+            "cancelled read disconnected native manager"
+        );
+        gate.notify_one();
+        let created = fixture
+            .client
+            .call("thread/start", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(created["thread"]["id"], "new-thread");
+        assert_eq!(
+            locked(&fixture.requests)
+                .iter()
+                .filter(|r| r["method"] == "thread/start")
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

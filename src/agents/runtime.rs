@@ -538,7 +538,9 @@ impl AgentRuntime {
     pub async fn status(&self) -> AgentStatus {
         let manager = self.manager.read().await.clone();
         AgentStatus {
-            available: manager.is_some(),
+            available: manager
+                .as_ref()
+                .is_some_and(|m| m.agent().kind() != "codex" || m.stream_connected()),
             installation: if manager.is_some() {
                 AgentInstallation::Installed
             } else {
@@ -575,7 +577,7 @@ impl AgentRuntime {
         }
         let kind = manager.agent().kind().to_string();
         Some(AgentStatus {
-            available: true,
+            available: kind != "codex" || manager.stream_connected(),
             installation: AgentInstallation::Installed,
             origin: if kind == "codex"
                 && manager.endpoint_url() == "stdio://private-codex-app-server"
@@ -608,7 +610,7 @@ impl AgentRuntime {
                     .map(|(_, d)| d.clone())
             };
         if let Some(hit) = fresh(&*self.discovery_cache.read().await) {
-            return hit;
+            return self.fence_codex_discovery(hit).await;
         }
         let refresh = async {
             let _one = self.discovery_refresh.lock().await;
@@ -620,7 +622,7 @@ impl AgentRuntime {
                 Some((tokio::time::Instant::now(), found.clone()));
             found
         };
-        match tokio::time::timeout(DISCOVERY_TIMEOUT, refresh).await {
+        let found = match tokio::time::timeout(DISCOVERY_TIMEOUT, refresh).await {
             Ok(found) => found,
             Err(_) => {
                 tracing::warn!("agent discovery timed out");
@@ -635,7 +637,33 @@ impl AgentRuntime {
                     None => self.attached_snapshot().await,
                 }
             }
+        };
+        self.fence_codex_discovery(found).await
+    }
+
+    /// Cached catalogs must not advertise a Codex connection that has since
+    /// closed. This is a local readiness read, never a reconnect or retry.
+    async fn fence_codex_discovery(
+        &self,
+        mut found: crate::discovery::AgentPlaneDiscovery,
+    ) -> crate::discovery::AgentPlaneDiscovery {
+        if self
+            .manager_for_agent("codex")
+            .await
+            .is_none_or(|manager| !manager.stream_connected())
+        {
+            if let Some(agent) = found.agents.iter_mut().find(|agent| {
+                agent.id == "codex"
+                    && agent.status == crate::discovery::AgentAvailability::Connected
+            }) {
+                agent.status = crate::discovery::AgentAvailability::Offline;
+                agent.endpoint = None;
+                agent.models.clear();
+                agent.features = codex::connection_features(None, &[]);
+                crate::discovery::order_agents(&mut found.agents);
+            }
         }
+        found
     }
 
     /// Discovery without touching the network: what is attached, and the
@@ -2802,6 +2830,58 @@ mod tests {
         // A subscriber works with no agent attached, which is what lets a
         // stream outlive a reconnect.
         let _rx = runtime.subscribe_events();
+    }
+
+    #[tokio::test]
+    async fn closed_codex_is_not_available_or_advertised_from_cached_discovery() {
+        use crate::agents::adapters::codex::tests::Fixture;
+        let mut fixture = Fixture::new(|_| serde_json::json!({})).await;
+        fixture.client.initialize().await.unwrap();
+        let runtime = AgentRuntime::with_all_configs(
+            OpencodeConfig {
+                enabled: false,
+                autostart: false,
+                binary: None,
+            },
+            DeepseekConfig::default(),
+            T3Config::default(),
+            CodexConfig::default(),
+            None,
+        );
+        runtime
+            .install(
+                "codex",
+                AgentManager::connect_codex(
+                    fixture.client.clone(),
+                    fixture.events.take().unwrap(),
+                    runtime.events_tx.clone(),
+                ),
+                AgentOrigin::Adopted,
+            )
+            .await;
+        let found = runtime.attached_snapshot().await;
+        assert_eq!(
+            found
+                .agents
+                .iter()
+                .find(|a| a.id == "codex")
+                .unwrap()
+                .status,
+            crate::discovery::AgentAvailability::Connected
+        );
+        *runtime.discovery_cache.write().await = Some((tokio::time::Instant::now(), found));
+        fixture.client.stop();
+        // Keep the mirror accessible for retained history; mutating calls are
+        // fenced by the driver's exact client instance before writing any RPC.
+        assert!(runtime.manager_for_agent("codex").await.is_some());
+        assert!(!runtime.status_for("codex").await.unwrap().available);
+        let found = runtime.discover_agents().await;
+        let codex = found.agents.iter().find(|a| a.id == "codex").unwrap();
+        assert_eq!(codex.status, crate::discovery::AgentAvailability::Offline);
+        assert_eq!(
+            codex.features.extra.get("sharedDaemonConnected"),
+            Some(&serde_json::json!(false))
+        );
     }
 
     #[tokio::test]

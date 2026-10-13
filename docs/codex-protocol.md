@@ -85,6 +85,13 @@ error messages are not forwarded or logged. Writes succeed only after bounded
 `write_all` and flush completion, not queue enqueue. Callback replies keep the
 original native ID and emit resolution only after that acknowledgment; failed,
 cancelled or partial writes fence the connection without retry.
+Cancelled or expired read-only catalog/history RPCs do not close an otherwise
+healthy connection. Once queued, abandoned reads still occupy the bounded
+pending-request table until their late replies arrive or the transport closes.
+The transport actor owns complete frames and still closes on actual I/O failure.
+Unknown methods, thread creation/resume, turns and callback replies keep the
+mutation cancellation fence. A disconnected client refuses new requests before
+writing them; cached discovery and status no longer advertise it as connected.
 Private-child shutdown closes stdin and allows up to 46 seconds for upstream cleanup;
 normal cleanup returns as soon as the child exits. If that grace expires,
 Gateway attempts cleanup of proven owned descendants, allowing 250 ms for
