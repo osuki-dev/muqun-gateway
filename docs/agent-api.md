@@ -391,13 +391,69 @@ in `agent_env` that must stay hidden from other accounts on the machine.
 | `directory` | Scope to a workspace directory. |
 | `parent_id` | List the children of one session. |
 | `roots` | `true` lists top-level sessions only — no subagent sessions. |
-| `limit`, `order`, `search`, `cursor` | Passed through to OpenCode. `order` is `asc` or `desc`. `limit` defaults to **50**. |
+| `limit`, `order`, `search`, `cursor` | Passed through to OpenCode. `order` is `asc` or `desc`. `limit` defaults to **50 per agent**. A `cursor` requires an explicit nonempty `agent_id`; unscoped cursors are rejected before any provider fanout. |
 | `agent_id` | Only that agent's sessions; absent merges every attached agent. See [Agents](#agents). |
 
 Returns `[AgentSessionInfo]`.
 
+This legacy array remains sorted newest `updated_ms` first, including a selected
+agent list. Aggregation and partial-provider-failure behavior are unchanged. It
+does not expose continuation cursors; use the additive page route below instead.
+
 A subagent run creates a real session whose `parent_id` is the caller's. Without
 `roots=true` those are mixed into the list.
+
+### `GET /api/agent-sessions/page`
+
+The global capability **`agent_session_pages_v1`** declares that this endpoint
+exists. It does not promise every provider supports pagination: check
+`planes.agents.agents[].features.sessionPagination` for the selected provider.
+Only `true` declares support (currently OpenCode); absent or `false` means
+unsupported.
+
+| Query | Meaning |
+|---|---|
+| `agent_id` | **Required**, one explicit nonempty provider ID, maximum 256 UTF-8 bytes. Never aggregates. |
+| `directory` | Optional nonempty absolute or home-relative workspace path, maximum 4096 UTF-8 bytes. Uses the list's trimming, `~` expansion and canonicalization when the directory exists. |
+| `parent_id` | Optional nonempty parent ID, maximum 256 UTF-8 bytes; literal `null` selects roots. An explicit value takes precedence over `roots`. |
+| `roots` | Optional boolean; `true` selects roots (`parent_id=null`) when no parent ID is given. |
+| `limit` | Integer **1–100**, default **50**. |
+| `order` | Only **`asc`** or **`desc`**, default **`desc`**. |
+| `search` | Optional provider search filter, maximum 4096 UTF-8 bytes. |
+| `cursor` | Optional nonempty opaque provider cursor, maximum **16384 UTF-8 bytes**. URL-encode without changing its bytes. |
+
+Control characters, empty scope values, invalid limits/order and malformed typed
+parameters are rejected with `400` before any upstream request. An unknown agent
+is `400 invalid_agent`; a known unattached agent is `503 agent_unavailable`.
+An adapter without pagination returns `501 feature_unsupported`, not an empty
+page. The selected provider's failure uses the existing `502 agent_error` mapping.
+
+Authentication, encrypted transport policy, the versioned content envelope and
+private ETag/`If-None-Match` behavior match the legacy list. The nested `data`
+is intentional, preserving the OpenCode page contract:
+
+```json
+{
+  "schema_version": "1.5.0",
+  "capabilities": { "parts": true, "assets": true, "image_upload": true, "composer": true, "message_image_assets": true },
+  "data": {
+    "data": [{ "asid": "ses_1", "agent_id": "opencode", "title": "Example", "status": "idle", "updated_ms": 1 }],
+    "cursor": { "next": "opaque-provider-cursor", "previous": null }
+  }
+}
+```
+
+Both cursor keys are always present and explicitly **`null`** when unavailable.
+The Gateway preserves provider order and both cursors, applies its normal
+agent ownership and read-marker overlays, and records session routes without
+sorting, refetching, aggregating or following another page automatically.
+
+Cursors are upstream values, **not locally cryptographically bound** by Gateway.
+Clients must reuse a cursor only on this selected-provider endpoint with the same
+agent, normalized directory, parent/roots filter, search, order and page size.
+**Restart pagination if any of those change**; never broadcast a provider cursor
+to every agent. Existing Apps still request fifty sessions and cannot
+automatically page. App adoption is deferred; the legacy array routes remain.
 
 ### `POST /api/agent-sessions`
 

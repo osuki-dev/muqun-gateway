@@ -455,6 +455,30 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn session_pages_discovery_preserves_runtime_provider_flags() {
+        let state = crate::test_state("admin", Vec::new());
+        let discovery = build_discovery(&state, false, true).await;
+        assert!(discovery["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("agent_session_pages_v1")));
+        let agents = discovery["planes"]["agents"]["agents"].as_array().unwrap();
+        for (id, supported) in [("opencode", true), ("deepseek", false), ("t3", false)] {
+            let agent = agents.iter().find(|agent| agent["id"] == id).unwrap();
+            let pagination = agent["features"]["sessionPagination"].as_bool();
+            if id == "t3" {
+                assert_eq!(pagination.unwrap_or(false), supported, "{id}");
+            } else {
+                assert_eq!(pagination, Some(supported), "{id}");
+            }
+            assert!(
+                agent["features"].get("extra").is_none(),
+                "flags are flattened"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn captured_segments_and_push_ownership_are_discovered_in_both_storage_modes() {
         for storage in [
             crate::platform::config::HistoryStorage::Memory,

@@ -41,6 +41,7 @@ fn agents_plane_schema() -> Value {
                                 "compaction": { "type": "boolean" },
                                 "backgroundShells": { "type": "boolean" },
                                 "attachments": { "type": "boolean" },
+                                "sessionPagination": { "type": "boolean", "description": "This provider supports GET /api/agent-sessions/page; absent or false means use the legacy array list" },
                                 "attachmentsByPath": { "type": "boolean", "description": "Attachments reach the agent as host paths appended to the prompt text (the agent reads them with its own tools) rather than as native file parts" }
                             }
                         },
@@ -637,7 +638,7 @@ pub fn openapi_spec() -> Value {
             "/api/agent-sessions": {
                 "get": {
                     "summary": "List all active AI agent sessions",
-                    "description": "Returns agent sessions merged across every attached agent, or for one agent with agent_id. Each session carries agent_id.",
+                    "description": "Returns an array of agent sessions merged across every attached agent, or for one agent with agent_id, sorted newest updated_ms first. The default limit is 50 per agent and failing providers are skipped while another succeeds. Each session carries agent_id. An unscoped cursor is rejected before fanout; this legacy response exposes no continuation cursors. Use /api/agent-sessions/page for explicit single-provider pagination.",
                     "responses": ok_response()
                 },
                 "post": {
@@ -801,6 +802,7 @@ pub fn openapi_spec() -> Value {
     }});
     spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/lazygit"] = lazygit_endpoints();
     spec["paths"]["/api/agent-sessions/{asid}/audio-asset"] = audio_asset_endpoint();
+    spec["paths"]["/api/agent-sessions/page"] = session_page_endpoint();
     spec["paths"]["/api/agent-sessions/{asid}/file-asset"] = json!({"get": {
         "summary": "Resolve a local file output inside an agent session",
         "description": "Requires device authentication and agent_file_assets capability. Resolves audio, video, images, documents and binary files inside the server-owned directory. Web URLs, path escapes and symlinks outside the root are refused. Returns data.asset metadata with an opaque id.",
@@ -2216,6 +2218,46 @@ fn ok_response() -> Value {
     })
 }
 
+fn session_page_endpoint() -> Value {
+    json!({"get": {
+        "summary": "Read one ordered session page from one selected agent",
+        "description": "Requires a paired App device and the existing encrypted transport policy. agent_session_pages_v1 declares the endpoint, while planes.agents.agents[].features.sessionPagination declares provider support. No aggregation, sorting or automatic continuation: provider order and cursors are retained. The versioned content envelope intentionally contains data.data and data.cursor, whose next and previous keys are explicit null when unavailable. Cursors are upstream opaque values, not locally cryptographically bound by Gateway. Reuse only with the same selected agent, this endpoint, normalized directory, parent_id/roots filter, search, order and limit; restart pagination when any changes. Supports the list's private ETag/If-None-Match behavior. Older Apps still request 50 and do not automatically page; App adoption is deferred.",
+        "parameters": [
+            {"name": "agent_id", "in": "query", "required": true, "description": "One explicit nonempty agent identifier. Unknown: 400 invalid_agent; known but unattached: 503 agent_unavailable", "schema": {"type": "string", "minLength": 1, "maxLength": 256}},
+            {"name": "directory", "in": "query", "description": "Nonempty absolute or home-relative workspace path; trimmed, ~ expanded and canonicalized when it exists. Maximum 4096 UTF-8 bytes", "schema": {"type": "string", "minLength": 1, "maxLength": 4096}},
+            {"name": "parent_id", "in": "query", "description": "Nonempty parent session ID (maximum 256 UTF-8 bytes), or literal null for roots; takes precedence over roots", "schema": {"type": "string", "minLength": 1, "maxLength": 256}},
+            {"name": "roots", "in": "query", "description": "true means parent_id=null when no explicit parent_id is given", "schema": {"type": "boolean"}},
+            {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50}},
+            {"name": "order", "in": "query", "schema": {"type": "string", "enum": ["asc", "desc"], "default": "desc"}},
+            {"name": "search", "in": "query", "description": "Provider search filter, maximum 4096 UTF-8 bytes", "schema": {"type": "string", "maxLength": 4096}},
+            {"name": "cursor", "in": "query", "description": "Nonempty opaque provider cursor, URL-encoded without altering its bytes; maximum 16384 UTF-8 bytes. Control characters are rejected in all string filters", "schema": {"type": "string", "minLength": 1, "maxLength": 16384}}
+        ],
+        "responses": {
+            "200": {"description": "One provider page in the content envelope", "headers": {"ETag": {"schema": {"type": "string"}}}, "content": {"application/json": {"schema": {
+                "type": "object", "required": ["schema_version", "capabilities", "data"], "properties": {
+                    "schema_version": {"const": CONTENT_SCHEMA_VERSION},
+                    "capabilities": {"type": "object"},
+                    "data": {"type": "object", "required": ["data", "cursor"], "properties": {
+                        "data": {"type": "array", "items": {"type": "object", "description": "AgentSessionInfo as documented in docs/agent-api.md; service-owned agent_id and read-marker overlays, in provider order", "required": ["asid", "agent_id", "title", "status", "updated_ms"], "properties": {
+                            "asid": {"type": "string"}, "agent_id": {"type": "string"}, "title": {"type": "string"}, "status": {"type": "string"}, "updated_ms": {"type": "integer"}
+                        }}},
+                        "cursor": {"type": "object", "required": ["next", "previous"], "properties": {
+                            "next": {"type": ["string", "null"]}, "previous": {"type": ["string", "null"]}
+                        }}
+                    }}
+                }
+            }}}},
+            "304": {"description": "Unchanged page; empty body"},
+            "400": {"description": "Invalid query or unknown agent; rejected before upstream requests"},
+            "401": {"description": "Missing authentication"},
+            "403": {"description": "Invalid device credential, forbidden peer, or required encrypted transport missing"},
+            "501": {"description": "feature_unsupported: selected adapter does not support session pagination"},
+            "502": {"description": "agent_error: selected provider failed"},
+            "503": {"description": "agent_unavailable: selected provider is not attached"}
+        }
+    }})
+}
+
 pub const DOCS_HTML: &str = r#"<!doctype html>
 <html>
   <head>
@@ -2250,6 +2292,34 @@ fn lazygit_endpoints() -> Value {
 #[cfg(test)]
 mod history_contract_tests {
     use super::*;
+
+    #[test]
+    fn session_page_spec_has_selected_scope_limits_and_nested_null_cursors() {
+        let spec = openapi_spec();
+        let get = &spec["paths"]["/api/agent-sessions/page"]["get"];
+        let parameters = get["parameters"].as_array().unwrap();
+        let parameter = |name| parameters.iter().find(|p| p["name"] == name).unwrap();
+        assert_eq!(parameter("agent_id")["required"], true);
+        assert_eq!(
+            parameter("limit")["schema"],
+            json!({"type": "integer", "minimum": 1, "maximum": 100, "default": 50})
+        );
+        assert_eq!(parameter("order")["schema"]["enum"], json!(["asc", "desc"]));
+        let page =
+            &get["responses"]["200"]["content"]["application/json"]["schema"]["properties"]["data"];
+        assert_eq!(page["required"], json!(["data", "cursor"]));
+        assert_eq!(page["properties"]["data"]["type"], "array");
+        let cursor = &page["properties"]["cursor"];
+        assert_eq!(cursor["required"], json!(["next", "previous"]));
+        for direction in ["next", "previous"] {
+            assert_eq!(
+                cursor["properties"][direction]["type"],
+                json!(["string", "null"])
+            );
+        }
+        assert!(get["responses"].get("501").is_some());
+        assert!(crate::API_CAPABILITIES.contains(&"agent_session_pages_v1"));
+    }
 
     #[test]
     fn tasks_fleet_and_mcp_token_paths_are_in_the_spec() {

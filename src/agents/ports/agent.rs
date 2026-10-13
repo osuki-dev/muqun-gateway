@@ -4,7 +4,7 @@ use std::pin::Pin;
 
 use crate::agents::domain::{
     AgentCatalog, AgentProject, AgentSessionInfo, FormRequest, ModelRef, PermissionDecision,
-    PermissionRequest, SessionQuery, TimelineItem,
+    PermissionRequest, SessionPage, SessionQuery, TimelineItem,
 };
 
 pub type AgentFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, AgentError>> + Send + 'a>>;
@@ -99,6 +99,11 @@ pub trait AgentPort: Send + Sync {
         &'a self,
         query: &'a SessionQuery,
     ) -> AgentFuture<'a, Vec<AgentSessionInfo>>;
+
+    /// Read one ordered page from a single provider, without losing cursors.
+    fn list_sessions_page<'a>(&'a self, _query: &'a SessionQuery) -> AgentFuture<'a, SessionPage> {
+        Box::pin(async { Err(AgentError::Unsupported("session pagination".into())) })
+    }
 
     /// Create a new session
     fn create_session<'a>(

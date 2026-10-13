@@ -61,8 +61,59 @@ pub struct AgentQuery {
 /// every session the agent had ever seen. A page is the right default for a
 /// list a phone scrolls.
 const DEFAULT_SESSION_LIMIT: usize = 50;
+const MAX_SESSION_PAGE_LIMIT: usize = 100;
+const MAX_SESSION_CURSOR_BYTES: usize = 16 * 1024;
 
 impl AgentSessionsQuery {
+    fn to_page_query(&self) -> ApiResult<SessionQuery> {
+        let invalid = |message| api_error(StatusCode::BAD_REQUEST, "invalid_query", message);
+        if self
+            .agent_id
+            .as_deref()
+            .is_none_or(|id| id.trim().is_empty())
+        {
+            return Err(invalid("agent_id is required for session pagination"));
+        }
+        if self
+            .limit
+            .is_some_and(|limit| !(1..=MAX_SESSION_PAGE_LIMIT).contains(&limit))
+        {
+            return Err(invalid("limit must be between 1 and 100"));
+        }
+        if self
+            .order
+            .as_deref()
+            .is_some_and(|order| !matches!(order, "asc" | "desc"))
+        {
+            return Err(invalid("order must be asc or desc"));
+        }
+        for (value, max, nonempty) in [
+            (self.agent_id.as_deref(), 256, true),
+            (self.directory.as_deref(), 4096, true),
+            (self.parent_id.as_deref(), 256, true),
+            (self.search.as_deref(), 4096, false),
+            (self.cursor.as_deref(), MAX_SESSION_CURSOR_BYTES, true),
+        ] {
+            if value.is_some_and(|v| {
+                v.len() > max
+                    || v.chars().any(char::is_control)
+                    || (nonempty && v.trim().is_empty())
+            }) {
+                return Err(invalid(
+                    "Session query contains an invalid or oversized value",
+                ));
+            }
+        }
+        if self.directory.as_deref().is_some_and(|directory| {
+            super::directories::expand_home(directory.trim()).is_none_or(|path| !path.is_absolute())
+        }) {
+            return Err(invalid("directory must be absolute or home-relative"));
+        }
+        let mut query = self.to_session_query();
+        query.order = Some(self.order.clone().unwrap_or_else(|| "desc".into()));
+        Ok(query)
+    }
+
     fn to_session_query(&self) -> SessionQuery {
         SessionQuery {
             directory: expand_directory_param(self.directory.as_deref()),
@@ -291,6 +342,7 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
             "/api/agent-sessions",
             get(list_agent_sessions_global).post(create_agent_session_global),
         )
+        .route("/api/agent-sessions/page", get(list_agent_sessions_page))
         .route(
             "/api/agent-sessions/{asid}",
             get(get_agent_session_global).delete(delete_agent_session_global),
@@ -601,6 +653,13 @@ async fn do_list_agent_sessions(
 ) -> ApiResult<Response> {
     require_device(state, headers)?;
 
+    if query.cursor.is_some() && agent_id.is_none_or(|id| id.trim().is_empty()) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_query",
+            "A provider cursor requires an explicit agent_id",
+        ));
+    }
     let all_managers = managers_for_read(state, agent_id).await?;
 
     let mut sessions = Vec::new();
@@ -1529,6 +1588,36 @@ async fn list_agent_sessions_global(
         &headers,
     )
     .await
+}
+
+async fn list_agent_sessions_page(
+    State(state): State<AppState>,
+    query: Result<Query<AgentSessionsQuery>, axum::extract::rejection::QueryRejection>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    require_device(&state, &headers)?;
+    // Capture extraction failures so malformed queries cannot bypass auth.
+    let Query(query) = query.map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_query",
+            "Invalid session query",
+        )
+    })?;
+    let session_query = query.to_page_query()?;
+    let manager = agent_manager_or_err(&state, query.agent_id.as_deref().unwrap()).await?;
+    let page = manager
+        .sessions()
+        .list_sessions_page(&session_query)
+        .await
+        .map_err(agent_error)?;
+    for session in &page.data {
+        state
+            .agent_runtime
+            .record_session_route(&session.asid.0, manager.agent().kind())
+            .await;
+    }
+    Ok(json_etag_response(&headers, content_envelope(json!(page))))
 }
 
 async fn create_agent_session_global(
@@ -3264,6 +3353,247 @@ mod tests {
             .await
             .expect("body reads");
         serde_json::from_slice(&bytes).expect("body is json")
+    }
+
+    async fn get_response(state: AppState, uri: &str, headers: HeaderMap) -> Response {
+        use tower::ServiceExt;
+        let mut request = axum::http::Request::builder().uri(uri);
+        *request.headers_mut().unwrap() = headers;
+        mount(Router::new())
+            .with_state(state)
+            .oneshot(request.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn session_page_dispatches_once_to_the_selected_provider_and_retains_order_and_cursors() {
+        use crate::agents::use_cases::session_service::tests::PageAgent;
+        let state = state_with(vec![FakeAgent::new("deepseek").failing()]).await;
+        let agent = PageAgent::new("opencode");
+        let queries = agent.queries.clone();
+        state
+            .agent_runtime
+            .attach_for_test(std::sync::Arc::new(
+                super::super::manager::AgentManager::for_test(std::sync::Arc::new(agent)),
+            ))
+            .await;
+        let uri = "/api/agent-sessions/page?agent_id=opencode&directory=~&roots=true&order=asc&search=work&cursor=opaque%2B%2F%3D";
+        let response = get_response(state.clone(), uri, device_headers()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let tag = response.headers()[header::ETAG].clone();
+        let body = body_json(response).await;
+        assert_eq!(
+            ids(&body["data"]["data"]),
+            [
+                ("older".to_string(), "opencode".to_string()),
+                ("newer".to_string(), "opencode".to_string()),
+            ]
+        );
+        assert_eq!(
+            body["data"]["cursor"],
+            json!({"next": "next+/=", "previous": "previous-/="})
+        );
+        assert_eq!(
+            *queries.lock().unwrap(),
+            [(
+                true,
+                SessionQuery {
+                    directory: expand_directory_param(Some("~")),
+                    parent_id: Some("null".into()),
+                    limit: Some(50),
+                    order: Some("asc".into()),
+                    search: Some("work".into()),
+                    cursor: Some("opaque+/=".into()),
+                }
+            )]
+        );
+        let owner = state
+            .agent_runtime
+            .manager_for_session("older")
+            .await
+            .unwrap();
+        assert_eq!(owner.agent().kind(), "opencode");
+        let mut headers = device_headers();
+        headers.insert(header::IF_NONE_MATCH, tag);
+        assert_eq!(
+            get_response(state, uri, headers).await.status(),
+            StatusCode::NOT_MODIFIED
+        );
+    }
+
+    #[tokio::test]
+    async fn session_page_authentication_precedes_malformed_query_rejection() {
+        use crate::agents::use_cases::session_service::tests::PageAgent;
+        let state = state_with(vec![]).await;
+        let agent = PageAgent::new("opencode");
+        let queries = agent.queries.clone();
+        state
+            .agent_runtime
+            .attach_for_test(std::sync::Arc::new(
+                super::super::manager::AgentManager::for_test(std::sync::Arc::new(agent)),
+            ))
+            .await;
+        for query in ["limit=no", "roots=maybe"] {
+            let uri = format!("/api/agent-sessions/page?agent_id=opencode&{query}");
+            for (headers, status, code) in [
+                (
+                    HeaderMap::new(),
+                    StatusCode::UNAUTHORIZED,
+                    "missing_authorization",
+                ),
+                (
+                    crate::test_support::bearer_headers("wrong-token"),
+                    StatusCode::FORBIDDEN,
+                    "invalid_token",
+                ),
+                (device_headers(), StatusCode::BAD_REQUEST, "invalid_query"),
+            ] {
+                let response = get_response(state.clone(), &uri, headers).await;
+                assert_eq!(response.status(), status, "{query}: {code}");
+                assert_eq!(body_json(response).await["error"]["code"], code);
+                assert!(queries.lock().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn session_page_rejects_invalid_queries_and_missing_auth_before_upstream() {
+        use crate::agents::use_cases::session_service::tests::PageAgent;
+        let state = state_with(vec![]).await;
+        let agent = PageAgent::new("opencode");
+        let queries = agent.queries.clone();
+        state
+            .agent_runtime
+            .attach_for_test(std::sync::Arc::new(
+                super::super::manager::AgentManager::for_test(std::sync::Arc::new(agent)),
+            ))
+            .await;
+        assert_eq!(
+            get_response(
+                state.clone(),
+                "/api/agent-sessions/page?agent_id=opencode",
+                HeaderMap::new()
+            )
+            .await
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let oversized = format!(
+            "agent_id=opencode&cursor={}",
+            "x".repeat(MAX_SESSION_CURSOR_BYTES + 1)
+        );
+        for query in [
+            "",
+            "agent_id=",
+            "agent_id=%20",
+            "agent_id=opencode&limit=0",
+            "agent_id=opencode&limit=101",
+            "agent_id=opencode&limit=-1",
+            "agent_id=opencode&limit=no",
+            "agent_id=opencode&order=newest",
+            "agent_id=opencode&cursor=",
+            "agent_id=opencode&cursor=%0A",
+            "agent_id=opencode&roots=maybe",
+            "agent_id=opencode&directory=relative",
+            "agent_id=opencode&directory=~other",
+            "agent_id=opencode&parent_id=%20",
+            &oversized,
+        ] {
+            let response = get_response(
+                state.clone(),
+                &format!("/api/agent-sessions/page?{query}"),
+                device_headers(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
+        }
+        assert!(queries.lock().unwrap().is_empty());
+        for limit in [1, 100] {
+            let response = get_response(
+                state.clone(),
+                &format!("/api/agent-sessions/page?agent_id=opencode&limit={limit}&order=desc"),
+                device_headers(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        assert_eq!(queries.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn session_page_maps_unsupported_unknown_and_unavailable_agents() {
+        let state = state_with(vec![FakeAgent::new("deepseek")]).await;
+        for (agent_id, status, code) in [
+            (
+                "deepseek",
+                StatusCode::NOT_IMPLEMENTED,
+                "feature_unsupported",
+            ),
+            ("unknown", StatusCode::BAD_REQUEST, "invalid_agent"),
+            (
+                "opencode",
+                StatusCode::SERVICE_UNAVAILABLE,
+                "agent_unavailable",
+            ),
+        ] {
+            let response = get_response(
+                state.clone(),
+                &format!("/api/agent-sessions/page?agent_id={agent_id}"),
+                device_headers(),
+            )
+            .await;
+            assert_eq!(response.status(), status);
+            assert_eq!(body_json(response).await["error"]["code"], code);
+        }
+    }
+
+    #[tokio::test]
+    async fn unscoped_legacy_cursor_is_rejected_before_any_provider_fanout() {
+        use crate::agents::use_cases::session_service::tests::PageAgent;
+        let state = state_with(vec![]).await;
+        let mut query_logs = vec![];
+        for kind in ["opencode", "deepseek"] {
+            let agent = PageAgent::new(kind);
+            query_logs.push(agent.queries.clone());
+            state
+                .agent_runtime
+                .attach_for_test(std::sync::Arc::new(
+                    super::super::manager::AgentManager::for_test(std::sync::Arc::new(agent)),
+                ))
+                .await;
+        }
+        for path in [
+            "/api/agent-sessions",
+            "/api/sessions/ignored/agent-sessions",
+        ] {
+            let response = get_response(
+                state.clone(),
+                &format!("{path}?cursor=opaque"),
+                device_headers(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        assert!(query_logs.iter().all(|log| log.lock().unwrap().is_empty()));
+        let response = get_response(state, "/api/agent-sessions", device_headers()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["data"].as_array().unwrap().len(), 4);
+        assert_eq!(body["data"][0]["updated_ms"], 30);
+        assert_eq!(body["data"][3]["updated_ms"], 10);
+        for log in query_logs {
+            assert_eq!(
+                log.lock().unwrap().as_slice(),
+                [(
+                    false,
+                    SessionQuery {
+                        limit: Some(50),
+                        ..Default::default()
+                    }
+                )]
+            );
+        }
     }
 
     async fn delete_response(state: AppState, uri: &str, token: Option<&str>) -> Response {

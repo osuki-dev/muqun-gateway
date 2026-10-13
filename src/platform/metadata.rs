@@ -47,6 +47,8 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "agent_models",
     "agent_permissions",
     "agent_sessions",
+    // Single-provider session pages; support is separately declared per agent.
+    "agent_session_pages_v1",
     "agent_session_delete_scoped",
     "capabilities_discovery",
     "agent_discovery",

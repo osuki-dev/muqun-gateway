@@ -447,6 +447,33 @@ impl MemoryMirror {
             .unwrap_or_default()
     }
 
+    /// A delivery change carries no payload: mutate a known item in place.
+    /// `None` asks the caller to fetch the authoritative queue after releasing
+    /// the mirror lock, rather than inventing an item.
+    pub async fn update_inbox_delivery(
+        &self,
+        asid: &AgentSessionId,
+        inbox_id: &str,
+        delivery: &str,
+    ) -> Option<(u64, Vec<serde_json::Value>)> {
+        let mut sessions = self.sessions.write().await;
+        let state = sessions.get_mut(asid)?;
+        let item = state
+            .inbox
+            .iter_mut()
+            .find(|item| item.get("id").and_then(serde_json::Value::as_str) == Some(inbox_id))?;
+        item.as_object_mut()?
+            .insert("delivery".to_string(), serde_json::json!(delivery));
+        let seq = state.next_seq();
+        let items = state.inbox.clone();
+        state.push_event(AgentDomainEvent::InboxChanged {
+            asid: asid.clone(),
+            items: items.clone(),
+            seq,
+        });
+        Some((seq, items))
+    }
+
     /// Record an inbox item the stream announced, without a round trip.
     pub async fn upsert_inbox_item(
         &self,
@@ -1458,6 +1485,44 @@ mod tests {
             .await
             .is_none());
         assert!(mirror.get_timeline_delta(&asid, snapshot.seq - 1).await.2);
+    }
+
+    #[tokio::test]
+    async fn inbox_delivery_update_requires_a_cached_item_and_records_the_full_queue() {
+        let mirror = MemoryMirror::new();
+        let asid = AgentSessionId("ses-inbox".into());
+        assert!(mirror
+            .update_inbox_delivery(&asid, "missing", "steer")
+            .await
+            .is_none());
+        assert!(mirror.get_snapshot(&asid).await.is_none());
+        let mut items = vec![
+            serde_json::json!({"id": "first", "delivery": "queue", "payload": {"text": "Keep"}}),
+            serde_json::json!({"id": "second", "delivery": "queue", "payload": {"text": "Also keep"}}),
+        ];
+        let (before, _) = mirror.set_inbox(&asid, items.clone()).await;
+        assert!(mirror
+            .update_inbox_delivery(&asid, "missing", "steer")
+            .await
+            .is_none());
+        assert_eq!(mirror.get_snapshot(&asid).await.unwrap().seq, before);
+        let (seq, updated) = mirror
+            .update_inbox_delivery(&asid, "first", "steer")
+            .await
+            .unwrap();
+        items[0]["delivery"] = serde_json::json!("steer");
+        assert_eq!(updated, items);
+        assert_eq!(mirror.inbox(&asid).await, items);
+        assert_eq!(seq, before + 1);
+        let events = mirror.get_events_after(&asid, before).await.unwrap();
+        assert_eq!(events.len(), 1);
+        let AgentDomainEvent::InboxChanged {
+            items: recorded, ..
+        } = &events[0]
+        else {
+            panic!("delivery update did not record an inbox event");
+        };
+        assert_eq!(*recorded, items);
     }
 
     #[tokio::test]

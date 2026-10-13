@@ -949,8 +949,17 @@ impl AgentManager {
                 let Some(asid) = session_id.map(str::to_string).map(AgentSessionId) else {
                     return;
                 };
+                let Some(idle) = data.get("idle").and_then(Value::as_u64) else {
+                    return;
+                };
                 ctx.ensure_session(&asid).await;
-                ctx.patch_session(&asid, SessionPatch::default()).await;
+                if let Some((seq, info)) = ctx.mirror.mark_viewed(&asid, idle).await {
+                    ctx.emit(AgentDomainEvent::SessionUpdated {
+                        asid,
+                        info: Box::new(info),
+                        seq,
+                    });
+                }
             }
 
             // ---------------------------------------------------------------
@@ -1187,17 +1196,40 @@ impl AgentManager {
             // ---------------------------------------------------------------
             // Inbox (queued and steered prompts)
             // ---------------------------------------------------------------
-            "session.inbox.enqueued"
-            | "session.inbox.delivered"
-            | "session.inbox.cancelled"
-            | "session.inbox.delivery.changed" => {
+            "session.inbox.delivery.changed" => {
+                let Some(asid) = session_id.map(str::to_string).map(AgentSessionId) else {
+                    return;
+                };
+                let Some(inbox_id) = data.get("inboxID").and_then(Value::as_str) else {
+                    return;
+                };
+                let Some(delivery @ ("steer" | "queue")) =
+                    data.get("delivery").and_then(Value::as_str)
+                else {
+                    return;
+                };
+                let updated = ctx
+                    .mirror
+                    .update_inbox_delivery(&asid, inbox_id, delivery)
+                    .await;
+                let (seq, items) = match updated {
+                    Some(updated) => updated,
+                    None => match ctx.driver.get_inbox(&asid.0).await {
+                        Ok(items) => ctx.mirror.set_inbox(&asid, items).await,
+                        Err(err) => {
+                            tracing::debug!(asid = %asid.0, %err, "could not refetch inbox for delivery change");
+                            return;
+                        }
+                    },
+                };
+                ctx.emit(AgentDomainEvent::InboxChanged { asid, items, seq });
+            }
+            "session.inbox.enqueued" | "session.inbox.delivered" | "session.inbox.cancelled" => {
                 let Some(asid) = session_id.map(str::to_string).map(AgentSessionId) else {
                     return;
                 };
                 let inbox_id = data.get("inboxID").and_then(Value::as_str).unwrap_or("");
-                let item = if event_type == "session.inbox.enqueued"
-                    || event_type == "session.inbox.delivery.changed"
-                {
+                let item = if event_type == "session.inbox.enqueued" {
                     data.get("item").cloned()
                 } else {
                     None

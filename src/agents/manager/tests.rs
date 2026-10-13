@@ -626,6 +626,273 @@ async fn inbox_events_publish_the_whole_queue() {
     );
 }
 
+fn session_event(event_type: &str, data: Value) -> OpencodeRawEvent {
+    OpencodeRawEvent {
+        id: None,
+        created: None,
+        location: None,
+        event_type: event_type.to_string(),
+        data,
+    }
+}
+
+async fn upstream_context(app: axum::Router) -> (Arc<EventContext>, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let driver = Arc::new(OpencodeDriver::new(OpencodeEndpoint {
+        url: format!("http://{}", listener.local_addr().unwrap()),
+        password: None,
+        version: Some("2.0.27".into()),
+        pid: None,
+    }));
+    let (tx, _) = broadcast::channel(256);
+    let ctx = Arc::new(EventContext::new(driver, Arc::new(MemoryMirror::new()), tx));
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (ctx, task)
+}
+
+#[tokio::test]
+async fn inbox_delivery_changes_preserve_payload_and_order_until_removed() {
+    let ctx = ctx();
+    let mut rx = ctx.tx.subscribe();
+    let asid = AgentSessionId("ses-inbox".into());
+    let first = json!({"type": "user", "delivery": "queue", "payload": {
+        "text": "Keep this text 日本語", "attachments": [{"uri": "file:///example"}]
+    }, "metadata": {"source": "app"}});
+    let second = json!({"type": "user", "delivery": "queue", "payload": {"text": "Second"}});
+    for (id, item) in [("msg-first", &first), ("msg-second", &second)] {
+        AgentManager::handle_raw_event(
+            session_event(
+                "session.inbox.enqueued",
+                json!({
+                    "sessionID": asid.0, "inboxID": id, "item": item
+                }),
+            ),
+            &ctx,
+        )
+        .await;
+    }
+    let mut expected = vec![first, second];
+    expected[0]["id"] = json!("msg-first");
+    expected[1]["id"] = json!("msg-second");
+    for delivery in ["steer", "queue"] {
+        AgentManager::handle_raw_event(
+            session_event(
+                "session.inbox.delivery.changed",
+                json!({
+                    "sessionID": asid.0, "inboxID": "msg-first", "delivery": delivery
+                }),
+            ),
+            &ctx,
+        )
+        .await;
+        expected[0]["delivery"] = json!(delivery);
+        assert_eq!(ctx.mirror.inbox(&asid).await, expected);
+        let mut last = None;
+        while let Ok(event) = rx.try_recv() {
+            if let AgentDomainEvent::InboxChanged { items, .. } = event {
+                last = Some(items);
+            }
+        }
+        assert_eq!(last.unwrap(), expected);
+    }
+    for (event_type, id) in [
+        ("session.inbox.delivered", "msg-first"),
+        ("session.inbox.cancelled", "msg-second"),
+    ] {
+        AgentManager::handle_raw_event(
+            session_event(event_type, json!({"sessionID": asid.0, "inboxID": id})),
+            &ctx,
+        )
+        .await;
+        expected.remove(0);
+        assert_eq!(ctx.mirror.inbox(&asid).await, expected);
+        let AgentDomainEvent::InboxChanged { items, .. } = rx.try_recv().unwrap() else {
+            panic!("inbox removal was not published");
+        };
+        assert_eq!(items, expected);
+    }
+}
+
+#[tokio::test]
+async fn unknown_inbox_delivery_refetches_the_authoritative_queue() {
+    use axum::{routing::get, Json, Router};
+    let authoritative = vec![
+        json!({"id": "msg-other", "type": "user", "delivery": "queue",
+        "payload": {"text": "The changed item was already delivered"}}),
+    ];
+    let response = authoritative.clone();
+    let (ctx, task) = upstream_context(Router::new().route(
+        "/api/session/ses-inbox/inbox",
+        get(move || async move { Json(json!({"data": response})) }),
+    ))
+    .await;
+    let asid = AgentSessionId("ses-inbox".into());
+    ctx.mirror
+        .set_inbox(&asid, vec![json!({"id": "msg-stale"})])
+        .await;
+    let mut rx = ctx.tx.subscribe();
+    AgentManager::handle_raw_event(
+        session_event(
+            "session.inbox.delivery.changed",
+            json!({
+                "sessionID": asid.0, "inboxID": "msg-unknown", "delivery": "steer"
+            }),
+        ),
+        &ctx,
+    )
+    .await;
+    assert_eq!(ctx.mirror.inbox(&asid).await, authoritative);
+    let AgentDomainEvent::InboxChanged { items, .. } = rx.try_recv().unwrap() else {
+        panic!("refetched inbox was not published");
+    };
+    assert_eq!(items, authoritative);
+    assert!(rx.try_recv().is_err());
+    task.abort();
+}
+
+#[tokio::test]
+async fn failed_unknown_inbox_refetch_does_not_invent_or_remove_items() {
+    let ctx = ctx();
+    let asid = AgentSessionId("ses-inbox".into());
+    let items = vec![json!({"id": "msg-known", "payload": {"text": "Keep"}})];
+    ctx.mirror.set_inbox(&asid, items.clone()).await;
+    let mut rx = ctx.tx.subscribe();
+    AgentManager::handle_raw_event(
+        session_event(
+            "session.inbox.delivery.changed",
+            json!({
+                "sessionID": asid.0, "inboxID": "msg-unknown", "delivery": "steer"
+            }),
+        ),
+        &ctx,
+    )
+    .await;
+    assert_eq!(ctx.mirror.inbox(&asid).await, items);
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn session_viewed_event_and_view_request_share_monotonic_read_markers() {
+    use axum::{
+        routing::{get, post},
+        Json, Router,
+    };
+    let (ctx, task) = upstream_context(
+        Router::new()
+            .route(
+                "/api/session/ses-viewed",
+                get(|| async {
+                    Json(json!({"data": {"id": "ses-viewed", "title": "Read markers",
+                "time": {"idle": 100, "viewed": 10}}}))
+                }),
+            )
+            .route(
+                "/api/session/ses-viewed/view",
+                post(|Json(body): Json<Value>| async move {
+                    assert_eq!(body, json!({"idle": 150}));
+                    axum::http::StatusCode::NO_CONTENT
+                }),
+            ),
+    )
+    .await;
+    let asid = AgentSessionId("ses-viewed".into());
+    let mut rx = ctx.tx.subscribe();
+    AgentManager::handle_raw_event(
+        session_event("session.viewed", json!({"sessionID": asid.0, "idle": 100})),
+        &ctx,
+    )
+    .await;
+    assert_eq!(
+        ctx.mirror
+            .get_snapshot(&asid)
+            .await
+            .unwrap()
+            .info
+            .time_viewed,
+        Some(100)
+    );
+    let mut last = None;
+    while let Ok(event) = rx.try_recv() {
+        if let AgentDomainEvent::SessionUpdated { info, .. } = event {
+            last = Some(info.time_viewed);
+        }
+    }
+    assert_eq!(last, Some(Some(100)));
+    let (tx, mut request_rx) = broadcast::channel(16);
+    let manager = AgentManager::assemble(
+        ctx.driver.clone(),
+        ctx.mirror.clone(),
+        tx,
+        "test".into(),
+        Some("2.0.27".into()),
+        Arc::new(|| false),
+        Arc::new(|| {}),
+    );
+    manager.view_session(&asid.0, 150).await.unwrap();
+    let AgentDomainEvent::SessionUpdated { info, .. } = request_rx.try_recv().unwrap() else {
+        panic!("view request did not publish read state");
+    };
+    assert_eq!(info.time_viewed, Some(150));
+    // A delayed event cannot move the request's read marker backward.
+    AgentManager::handle_raw_event(
+        session_event("session.viewed", json!({"sessionID": asid.0, "idle": 100})),
+        &ctx,
+    )
+    .await;
+    AgentManager::handle_raw_event(
+        session_event("session.updated", json!({"sessionID": asid.0})),
+        &ctx,
+    )
+    .await;
+    let info = ctx.mirror.get_snapshot(&asid).await.unwrap().info;
+    assert_eq!(info.time_viewed, Some(150));
+    assert_eq!(info.time_idle, Some(100));
+    while let Ok(event) = rx.try_recv() {
+        if let AgentDomainEvent::SessionUpdated { info, .. } = event {
+            assert_eq!(info.time_viewed, Some(150));
+        }
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn malformed_session_viewed_events_do_not_change_read_state() {
+    let ctx = ctx();
+    let asid = AgentSessionId("ses-viewed".into());
+    ctx.mirror
+        .update_session(
+            mapper::map_session(&json!({"id": asid.0,
+        "time": {"idle": 100}}))
+            .unwrap(),
+        )
+        .await;
+    let before = ctx.mirror.get_snapshot(&asid).await.unwrap();
+    let mut rx = ctx.tx.subscribe();
+    for idle in [
+        Value::Null,
+        json!("100"),
+        json!(-1),
+        json!(100.5),
+        json!({}),
+    ] {
+        AgentManager::handle_raw_event(
+            session_event("session.viewed", json!({"sessionID": asid.0, "idle": idle})),
+            &ctx,
+        )
+        .await;
+    }
+    AgentManager::handle_raw_event(
+        session_event("session.viewed", json!({"sessionID": asid.0})),
+        &ctx,
+    )
+    .await;
+    let after = ctx.mirror.get_snapshot(&asid).await.unwrap();
+    assert_eq!(after.seq, before.seq);
+    assert_eq!(after.info.time_viewed, None);
+    assert_eq!(after.info.time_idle, Some(100));
+    assert!(rx.try_recv().is_err());
+}
+
 #[tokio::test]
 async fn a_deleted_session_is_announced_then_forgotten() {
     let ctx = ctx();
