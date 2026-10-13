@@ -248,6 +248,84 @@ mod tests {
         assert!(herdr.calls.lock().unwrap().is_empty());
     }
 
+    #[tokio::test]
+    async fn async_question_observation_does_not_wait_for_terminal_refresh_but_reply_does() {
+        use crate::agents::adapters::codex::{
+            tests::{golden, Fixture},
+            CodexDriver,
+        };
+        use crate::agents::ports::agent::AgentPort;
+        use serde_json::json;
+
+        let mut fixture = Fixture::new(|request| match request["method"].as_str().unwrap() {
+            "thread/start" | "thread/read" => json!({"thread":golden()["thread"]}),
+            "turn/start" => json!({"turn":{"id":"live-turn","status":"inProgress"}}),
+            method => panic!("unexpected RPC {method}"),
+        })
+        .await;
+        fixture.ready().await;
+        let mut driver = CodexDriver::new(fixture.client.clone());
+        let session = driver.create_session(None, None, None).await.unwrap();
+        driver
+            .send_prompt(&session.asid.0, "Start", &[], None)
+            .await
+            .unwrap();
+
+        let herdr = crate::test_support::FakeHerdr::start(vec![], None);
+        let observer = TerminalRuntime::new(&[herdr.session()]);
+        let _inflight_read = observer.refresh.lock().await;
+        driver.observe_terminals(Some(observer.clone()));
+        let question =
+            json!({"type":"agentMessage","id":"question","questions":[{"title":"Choose?"}]});
+        let forms = tokio::time::timeout(Duration::from_millis(100), async {
+            for _ in 0..64 {
+                assert!(driver
+                    .observe_async_questions(
+                        &session.asid.0,
+                        "live-turn",
+                        &json!({"type":"commandExecution","id":"command"}),
+                    )
+                    .await
+                    .is_empty());
+            }
+            driver
+                .observe_async_questions(&session.asid.0, "live-turn", &question)
+                .await
+        })
+        .await
+        .expect("question observation stalled the stream behind terminal I/O");
+        assert_eq!(forms.len(), 1);
+        assert!(herdr.calls.lock().unwrap().is_empty());
+
+        // Observing is local, but a user's answer must still obtain a fresh
+        // ownership check. With the backend read held it cannot send any RPC.
+        assert!(tokio::time::timeout(
+            Duration::from_millis(25),
+            driver.reply_form(&session.asid.0, &forms[0].id, json!({"answer":"A"})),
+        )
+        .await
+        .is_err());
+
+        *observer.cache.lock().unwrap() = Some((
+            Instant::now(),
+            Arc::new(Observations {
+                agents: vec![(
+                    "local".into(),
+                    agent("codex", &session.asid.0, AgentStatus::Working),
+                )],
+                incomplete: false,
+            }),
+        ));
+        assert!(driver
+            .observe_async_questions(
+                &session.asid.0,
+                "live-turn",
+                &json!({"type":"agentMessage","id":"external-question","questions":[{"title":"External?"}]}),
+            )
+            .await
+            .is_empty());
+    }
+
     #[test]
     fn exact_provider_identity_carries_status_and_binding_not_approval() {
         let mut observations = Observations {

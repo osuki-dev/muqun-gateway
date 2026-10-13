@@ -193,10 +193,16 @@ impl CodexDriver {
         turn: &str,
         item: &Value,
     ) -> Vec<FormRequest> {
-        if !self.client.is_ready()
+        if item["type"] != "agentMessage"
+            || !self.client.is_ready()
             || self.client.active_turn(thread).as_deref() != Some(turn)
             || !self.loaded.lock().await.contains(thread)
-            || self.require_native_interaction(thread).await.is_err()
+            // Stream observation must not queue behind a terminal backend read.
+            // Actual replies still refresh and recheck native ownership.
+            || self
+                .cached_runtime(thread)
+                .await
+                .is_some_and(|runtime| runtime.interaction != RuntimeInteraction::Native)
         {
             return vec![];
         }
