@@ -1,9 +1,358 @@
 //! Event-dispatch tests. The frames are real ones, captured from a live
 //! OpenCode 2.0.1 session (`tests/fixtures/opencode-events/`).
 use super::*;
-use crate::agents::adapters::opencode::sse::OpencodeSseListener;
+use crate::agents::adapters::opencode::sse::{read_test_request, OpencodeSseListener};
 use crate::agents::domain::AgentPart;
 use crate::agents::ports::mirror::SessionMirrorPort;
+
+fn delta(session: &str, message: &str, kind: &str, ordinal: u64, text: &str) -> OpencodeRawEvent {
+    OpencodeRawEvent {
+        id: None,
+        created: None,
+        location: None,
+        event_type: format!("session.{kind}.delta"),
+        data: json!({"sessionID": session, "assistantMessageID": message, "ordinal": ordinal, "delta": text}),
+    }
+}
+
+#[test]
+fn delta_deadline_is_from_first_arrival_and_buffer_is_bounded() {
+    let start = tokio::time::Instant::now();
+    let mut coalescer = DeltaCoalescer::default();
+    assert!(coalescer
+        .push(delta("s", "m", "text", 0, "你"), start)
+        .is_none());
+    let second = delta("s", "m", "text", 0, "🙂");
+    assert!(coalescer.can_merge(&second));
+    assert!(coalescer
+        .push(second, start + std::time::Duration::from_millis(39))
+        .is_none());
+    assert_eq!(coalescer.deadline(), Some(start + DELTA_FLUSH_DELAY));
+    assert_eq!(coalescer.take().unwrap().data["delta"], "你🙂");
+
+    let full = "x".repeat(MAX_PENDING_DELTA_BYTES);
+    assert_eq!(
+        coalescer
+            .push(delta("s", "m", "text", 0, &full), start)
+            .unwrap()
+            .data["delta"],
+        full
+    );
+    assert!(coalescer.deadline().is_none());
+    coalescer.push(delta("s", "m", "text", 0, "x"), start);
+    assert!(!coalescer.can_merge(&delta("s", "m", "text", 0, &full)));
+}
+
+#[test]
+fn delta_runs_never_cross_identity_metadata_or_non_delta_boundaries() {
+    let raw = delta("s", "m", "text", 0, "first");
+    let mut coalescer = DeltaCoalescer::default();
+    coalescer.push(raw.clone(), tokio::time::Instant::now());
+    for different in [
+        delta("other", "m", "text", 0, "x"),
+        delta("s", "other", "text", 0, "x"),
+        delta("s", "m", "reasoning", 0, "x"),
+        delta("s", "m", "text", 1, "x"),
+    ] {
+        assert!(!coalescer.can_merge(&different));
+    }
+    let mut different = raw.clone();
+    different.data["metadata"] = json!({"something": "new"});
+    assert!(!coalescer.can_merge(&different));
+    different = raw.clone();
+    different.location = Some(json!({"directory":"other"}));
+    assert!(!coalescer.can_merge(&different));
+    for kind in [
+        "session.text.ended",
+        "session.reasoning.ended",
+        "session.idle",
+        "session.status",
+        "session.tool.input.started",
+        "form.created",
+        "permission.asked",
+        "session.deleted",
+        "gateway.stream.resync",
+    ] {
+        different = raw.clone();
+        different.event_type = kind.to_string();
+        assert!(!coalescer.can_merge(&different), "{kind}");
+    }
+    different = raw;
+    different.data.as_object_mut().unwrap().remove("sessionID");
+    assert!(!coalescer.can_merge(&different));
+}
+
+#[tokio::test]
+async fn pump_drains_and_final_flush_preserves_whole_rows_and_completion_markers() {
+    let markers = "\nMUQUN_TASK_DONE: 完成🙂\nMUQUN_TASK_BLOCKED: 等待";
+    let raws: Vec<_> = (0..1000)
+        .map(|_| delta("s", "m", "text", 0, &"x".repeat(32)))
+        .chain(std::iter::once(delta("s", "m", "text", 0, markers)))
+        .collect();
+    let baseline = ctx();
+    let mut baseline_rx = baseline.tx.subscribe();
+    let mut baseline_count = 0;
+    let mut baseline_bytes = 0;
+    for raw in &raws {
+        AgentManager::handle_raw_event(raw.clone(), &baseline).await;
+        if let AgentDomainEvent::TimelineUpsert { items, .. } = baseline_rx.recv().await.unwrap() {
+            baseline_count += 1;
+            if let AgentPart::Text { text } = &items[0].part {
+                baseline_bytes += text.len();
+            }
+        } else {
+            panic!("whole row required");
+        }
+    }
+    let coalesced = ctx();
+    let mut out = coalesced.tx.subscribe();
+    let (tx, rx) = broadcast::channel(2048);
+    for raw in raws {
+        tx.send(raw).unwrap();
+    }
+    drop(tx);
+    AgentManager::pump_events(rx, coalesced.clone()).await;
+    let mut count = 0;
+    let mut bytes = 0;
+    while let Ok(event) = out.try_recv() {
+        if let AgentDomainEvent::TimelineUpsert { items, .. } = event {
+            count += 1;
+            if let AgentPart::Text { text } = &items[0].part {
+                bytes += text.len();
+            }
+        } else {
+            panic!("whole row required");
+        }
+    }
+    assert_eq!(baseline_count, 1001);
+    assert_eq!(count, 4);
+    assert_eq!(baseline_bytes, 16_048_000 + markers.len());
+    assert_eq!(bytes, 81_152 + markers.len());
+    let before = baseline
+        .mirror
+        .get_snapshot(&AgentSessionId("s".into()))
+        .await
+        .unwrap();
+    let after = coalesced
+        .mirror
+        .get_snapshot(&AgentSessionId("s".into()))
+        .await
+        .unwrap();
+    assert_eq!(before.timeline[0].part, after.timeline[0].part);
+    assert_eq!(
+        after.timeline[0].part,
+        AgentPart::Text {
+            text: format!("{}{markers}", "x".repeat(32000))
+        }
+    );
+    eprintln!("deterministic whole-row work: {baseline_count} -> {count} emissions; {baseline_bytes} -> {bytes} prefix text bytes");
+}
+
+#[tokio::test]
+async fn pump_flushes_before_status_fulltext_and_lag_then_drains_close() {
+    let context = ctx();
+    let mut out = context.tx.subscribe();
+    let (tx, rx) = broadcast::channel(16);
+    tx.send(delta("s", "m", "text", 0, "before")).unwrap();
+    let mut status = delta("s", "m", "text", 0, "ignored");
+    status.event_type = "session.idle".into();
+    tx.send(status).unwrap();
+    tx.send(delta("s", "m", "text", 0, " plus")).unwrap();
+    let mut fulltext = delta("s", "m", "text", 0, "unused");
+    fulltext.event_type = "session.text.ended".into();
+    fulltext.data["text"] = json!("authoritative 完成🙂");
+    tx.send(fulltext).unwrap();
+    drop(tx);
+    AgentManager::pump_events(rx, context.clone()).await;
+    for expected in ["before", "status", "before plus", "authoritative 完成🙂"] {
+        let event = out.recv().await.unwrap();
+        if expected == "status" {
+            assert!(matches!(event, AgentDomainEvent::StatusChanged { .. }));
+        } else if let AgentDomainEvent::TimelineUpsert { items, .. } = event {
+            assert_eq!(
+                items[0].part,
+                AgentPart::Text {
+                    text: expected.into()
+                }
+            );
+        } else {
+            panic!("expected text row");
+        }
+    }
+    // An overflow is a boundary even when all retained frames are deltas.
+    let (tx, rx) = broadcast::channel(2);
+    for _ in 0..4 {
+        tx.send(delta("s", "m2", "text", 0, "x")).unwrap();
+    }
+    drop(tx);
+    AgentManager::pump_events(rx, context).await;
+    assert!(matches!(
+        out.recv().await.unwrap(),
+        AgentDomainEvent::Resync { .. }
+    ));
+    assert!(matches!(
+        out.recv().await.unwrap(),
+        AgentDomainEvent::TimelineUpsert { .. }
+    ));
+}
+
+#[tokio::test]
+async fn idle_pump_cancellation_releases_context_and_drops_queued_events() {
+    let context = ctx();
+    let weak = Arc::downgrade(&context);
+    let cancel = context.cancel.clone();
+    let mut out = context.tx.subscribe();
+    let (tx, rx) = broadcast::channel(16);
+    let pump = tokio::spawn(AgentManager::pump_events(rx, context));
+    tokio::task::yield_now().await;
+    cancel.cancel();
+    tx.send(delta("s", "m", "text", 0, "stale")).ok();
+    tokio::time::timeout(std::time::Duration::from_millis(200), pump)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(weak.upgrade().is_none());
+    assert!(out.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn pump_flush_timer_runs_without_more_upstream_events() {
+    let context = ctx();
+    let mut out = context.tx.subscribe();
+    let (tx, rx) = broadcast::channel(16);
+    let pump = tokio::spawn(AgentManager::pump_events(rx, context.clone()));
+    tx.send(delta("s", "m", "reasoning", 0, "思考🙂")).unwrap();
+    let event = tokio::time::timeout(std::time::Duration::from_millis(200), out.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let AgentDomainEvent::TimelineUpsert { items, .. } = event else {
+        panic!("whole row")
+    };
+    assert_eq!(
+        items[0].part,
+        AgentPart::Reasoning {
+            text: "思考🙂".into(),
+            duration_ms: None
+        }
+    );
+    context.cancel.cancel();
+    pump.await.unwrap();
+}
+
+#[tokio::test]
+async fn cancellation_discards_pending_delta_and_interrupts_inflight_hydration() {
+    let context = ctx();
+    let mut out = context.tx.subscribe();
+    let (tx, rx) = broadcast::channel(16);
+    let pump = tokio::spawn(AgentManager::pump_events(rx, context.clone()));
+    tx.send(delta("s", "m", "text", 0, "must not emit after stop"))
+        .unwrap();
+    // The local first-delta window has begun, but has not elapsed.
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    context.cancel.cancel();
+    pump.await.unwrap();
+    assert!(out.try_recv().is_err());
+
+    use tokio::io::AsyncReadExt;
+    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", tcp.local_addr().unwrap());
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = tcp.accept().await.unwrap();
+        read_test_request(&mut socket).await;
+        ready_tx.send(()).unwrap();
+        let mut byte = [0];
+        assert_eq!(socket.read(&mut byte).await.unwrap(), 0);
+    });
+    let (events_tx, mut events_rx) = broadcast::channel(16);
+    let driver = Arc::new(OpencodeDriver::new(OpencodeEndpoint {
+        url,
+        password: None,
+        version: None,
+        pid: None,
+    }));
+    let context = Arc::new(EventContext::new(
+        driver,
+        Arc::new(MemoryMirror::new()),
+        events_tx,
+    ));
+    let weak = Arc::downgrade(&context);
+    let cancel = context.cancel.clone();
+    let (tx, rx) = broadcast::channel(16);
+    let pump = tokio::spawn(AgentManager::pump_events(rx, context));
+    let mut start = delta("s", "m", "text", 0, "unused");
+    start.event_type = "session.execution.started".into();
+    tx.send(start).unwrap();
+    ready_rx.await.unwrap();
+    cancel.cancel();
+    tokio::time::timeout(std::time::Duration::from_millis(200), pump)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(weak.upgrade().is_none());
+    assert!(events_rx.try_recv().is_err());
+    tokio::time::timeout(std::time::Duration::from_secs(1), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn repeated_http_manager_replacement_releases_mirrors_and_reattaches() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", tcp.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        for _ in 0..5 {
+            let (mut socket, _) = tcp.accept().await.unwrap();
+            read_test_request(&mut socket).await;
+            let payload = format!(
+                "data: {}\n\n",
+                serde_json::to_string(&delta("s", "m", "text", 0, "reattached🙂")).unwrap()
+            );
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+            socket
+                .write_all(format!("{:x}\r\n{payload}\r\n", payload.len()).as_bytes())
+                .await
+                .unwrap();
+            let mut byte = [0];
+            assert_eq!(socket.read(&mut byte).await.unwrap(), 0);
+        }
+    });
+    let (tx, mut out) = broadcast::channel(32);
+    for _ in 0..5 {
+        let manager = AgentManager::connect(
+            OpencodeEndpoint {
+                url: url.clone(),
+                password: None,
+                version: None,
+                pid: None,
+            },
+            tx.clone(),
+        );
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), out.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(event, AgentDomainEvent::TimelineUpsert { .. }));
+        let weak = Arc::downgrade(manager.mirror());
+        manager.shutdown();
+        drop(manager);
+        tokio::time::timeout(std::time::Duration::from_millis(200), async {
+            while weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replacement releases old mirror");
+        assert!(out.try_recv().is_err());
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
 
 fn ctx() -> Arc<EventContext> {
     // The driver points at a port nothing is listening on: every test here is
