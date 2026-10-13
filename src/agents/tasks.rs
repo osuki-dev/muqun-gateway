@@ -654,7 +654,9 @@ pub struct GitWorktree {
 }
 
 fn git(repo: &Path, args: &[&str]) -> anyhow::Result<std::process::Output> {
-    let output = Command::new("git")
+    let mut cmd = Command::new("git");
+    crate::platform::git::scrub_git_env(&mut cmd);
+    let output = cmd
         .arg("-C")
         .arg(repo)
         .args(args)
@@ -851,6 +853,63 @@ mod tests {
                 .unwrap();
             assert!(output.status.success(), "git {args:?} failed");
         }
+    }
+
+    #[test]
+    fn worktree_fallback_scrubs_inherited_repository_and_config_in_a_subprocess() {
+        const ROOT_ENV: &str = "MUQUN_TEST_WORKTREE_ENV_ROOT";
+        if let Some(root) = std::env::var_os(ROOT_ENV) {
+            let root = PathBuf::from(root);
+            let repo = root.join("a/repo");
+            let checkout = root.join("checkout");
+            let worktree = git_worktree_add(&repo, &checkout, "isolated").unwrap();
+            assert!(worktree.created);
+            assert_eq!(
+                std::fs::read_to_string(checkout.join("README.md")).unwrap(),
+                "repo A\n"
+            );
+            assert_eq!(
+                git_checked(&checkout, &["rev-parse", "--show-toplevel"]).unwrap(),
+                checkout.to_string_lossy()
+            );
+            return;
+        }
+        let root = temp_dir("inherited-git-env");
+        init_repo(&root.join("a"));
+        init_repo(&root.join("b"));
+        let a = root.join("a/repo");
+        let b = root.join("b/repo");
+        std::fs::write(a.join("README.md"), "repo A\n").unwrap();
+        git_checked(&a, &["add", "README.md"]).unwrap();
+        git_checked(&a, &["-c", "commit.gpgsign=false", "commit", "-m", "A"]).unwrap();
+        let before = git_checked(&b, &["worktree", "list", "--porcelain"]).unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "agents::tasks::tests::worktree_fallback_scrubs_inherited_repository_and_config_in_a_subprocess", "--nocapture"])
+            .env(ROOT_ENV, &root)
+            .env("GIT_DIR", b.join(".git"))
+            .env("GIT_COMMON_DIR", b.join(".git"))
+            .env("GIT_WORK_TREE", &b)
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "core.bare")
+            .env("GIT_CONFIG_VALUE_0", "true")
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        assert_eq!(
+            git_checked(&b, &["worktree", "list", "--porcelain"]).unwrap(),
+            before
+        );
+        assert!(!branch_exists(&b, "isolated"));
+        assert_eq!(
+            std::fs::read_to_string(b.join("README.md")).unwrap(),
+            "hello\n"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

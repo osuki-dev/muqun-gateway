@@ -353,6 +353,18 @@ impl AssetIndex {
 
     /// Keep the index a rolling window over what was produced recently.
     pub(crate) fn prune(&mut self) {
+        self.prune_preserving(None);
+    }
+
+    /// Exact-path reads may return an old file: retain that id while evicting
+    /// the oldest other files under the usual modification-age policy.
+    fn upsert_exact(&mut self, entry: AssetEntry) {
+        let id = entry.id.clone();
+        self.upsert(entry);
+        self.prune_preserving(Some(&id));
+    }
+
+    fn prune_preserving(&mut self, preserved_id: Option<&str>) {
         if self.entries.len() <= MAX_INDEXED_ASSETS {
             return;
         }
@@ -361,7 +373,12 @@ impl AssetIndex {
             .iter()
             .map(|(id, entry)| (id.clone(), entry.modified_unix_ms))
             .collect();
-        ordered.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        ordered.sort_by(|left, right| {
+            (Some(right.0.as_str()) == preserved_id)
+                .cmp(&(Some(left.0.as_str()) == preserved_id))
+                .then_with(|| right.1.cmp(&left.1))
+                .then_with(|| left.0.cmp(&right.0))
+        });
         for (id, _) in ordered.into_iter().skip(MAX_INDEXED_ASSETS) {
             self.entries.remove(&id);
         }
@@ -1146,7 +1163,7 @@ pub(crate) async fn session_assets(
             Some((entry, asset_type)) => {
                 // Remember it, so the id the client just received resolves at
                 // the content endpoint even if no scan would have found it.
-                lock_assets(&state)?.upsert(entry.clone());
+                lock_assets(&state)?.upsert_exact(entry.clone());
                 vec![asset_json(&entry, asset_type)]
             }
             None => Vec::new(),
@@ -1930,6 +1947,32 @@ mod tests {
         assert_eq!(scan_workspace_root(&root, ASSET_SCAN_MAX_DEPTH, 1).len(), 1);
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn exact_path_upserts_are_bounded_and_keep_the_returned_old_id() {
+        let root = asset_test_dir("exact-index-cap");
+        let mut index = AssetIndex::default();
+        for n in 0..MAX_INDEXED_ASSETS + 10 {
+            let entry = test_asset_entry(&root.join(format!("{n}.txt")), &root, n as u128 + 1);
+            let id = entry.id.clone();
+            index.upsert_exact(entry);
+            assert!(index.entries.len() <= MAX_INDEXED_ASSETS);
+            assert!(index.get(&id).is_some());
+        }
+        let newest = asset_id(&root.join(format!("{}.txt", MAX_INDEXED_ASSETS + 9)));
+        let oldest_retained = asset_id(&root.join("10.txt"));
+        let old = test_asset_entry(&root.join("old.txt"), &root, 0);
+        let old_id = old.id.clone();
+        index.upsert_exact(old);
+        assert_eq!(index.entries.len(), MAX_INDEXED_ASSETS);
+        assert!(index.get(&old_id).is_some());
+        assert!(index.get(&newest).is_some());
+        assert!(index.get(&oldest_retained).is_none());
+        // Updating an existing old id must also keep it resolvable.
+        index.upsert_exact(test_asset_entry(&root.join("old.txt"), &root, 0));
+        assert!(index.get(&old_id).is_some());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

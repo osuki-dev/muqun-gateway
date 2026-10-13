@@ -1506,14 +1506,18 @@ fn command(cwd: &Path) -> Command {
     // `GIT_CONFIG_*` would smuggle settings past the `-c` flags above. The
     // terminal multiplexer variables are dropped so a hook cannot tell it is
     // running under one.
-    scrub_env(&mut cmd, std::env::vars_os().map(|(name, _)| name));
+    scrub_git_env(cmd.as_std_mut());
     cmd
 }
 
 /// Remove every inherited `GIT_*` variable, then set the few git settings
-/// the gateway relies on. `inherited` is the parent's environment, passed in
-/// so a test can hand over a synthetic one.
-fn scrub_env(cmd: &mut Command, inherited: impl Iterator<Item = OsString>) {
+/// the gateway relies on.
+pub(crate) fn scrub_git_env(cmd: &mut std::process::Command) {
+    scrub_env(cmd, std::env::vars_os().map(|(name, _)| name));
+}
+
+// Accept a synthetic parent environment for tests without global mutation.
+fn scrub_env(cmd: &mut std::process::Command, inherited: impl Iterator<Item = OsString>) {
     for name in inherited.filter(|name| name.as_encoded_bytes().starts_with(b"GIT_")) {
         cmd.env_remove(name);
     }
@@ -1557,12 +1561,17 @@ async fn run(cwd: &Path, args: &[&str], ok_codes: &[i32]) -> Result<Output, GitE
             if read == 0 {
                 break;
             }
-            bytes.extend_from_slice(&chunk[..read]);
+            let retained = read.min(MAX_OUTPUT_BYTES - bytes.len());
+            bytes.extend_from_slice(&chunk[..retained]);
             if bytes.len() >= MAX_OUTPUT_BYTES {
+                // Kill before joining the stderr reader: git may otherwise
+                // block writing stdout forever while stderr waits for EOF.
+                let _ = child.start_kill();
                 break;
             }
         }
-        bytes
+        let status = child.wait().await;
+        (bytes, status)
     };
     let read_stderr = async {
         let mut bytes = Vec::new();
@@ -1573,28 +1582,26 @@ async fn run(cwd: &Path, args: &[&str], ok_codes: &[i32]) -> Result<Output, GitE
                 break;
             }
             if bytes.len() < MAX_STDERR_BYTES {
-                bytes.extend_from_slice(&chunk[..read]);
+                let retained = read.min(MAX_STDERR_BYTES - bytes.len());
+                bytes.extend_from_slice(&chunk[..retained]);
             }
         }
         bytes
     };
 
     let result = tokio::time::timeout(GIT_TIMEOUT, async {
-        let (stdout, stderr) = tokio::join!(read_stdout, read_stderr);
+        let ((stdout, status), stderr) = tokio::join!(read_stdout, read_stderr);
         let capped = stdout.len() >= MAX_OUTPUT_BYTES;
-        if capped {
-            let _ = child.kill().await;
-        }
-        let status = child.wait().await;
         (stdout, stderr, capped, status)
     })
     .await;
 
     let (mut stdout, stderr, capped, status) = match result {
         Ok(value) => value,
-        // Dropping the future above killed the child (`kill_on_drop`).
+        // Returning drops the child and kills it (`kill_on_drop`).
         Err(_) => return Err(GitError::Timeout),
     };
+    let status = status.map_err(|err| GitError::Failed(err.to_string()))?;
     if capped {
         // Cut on a record so the caller never sees half of one: a NUL for
         // `-z` output, a newline otherwise.
@@ -1604,7 +1611,6 @@ async fn run(cwd: &Path, args: &[&str], ok_codes: &[i32]) -> Result<Output, GitE
             capped: true,
         });
     }
-    let status = status.map_err(|err| GitError::Failed(err.to_string()))?;
     let code = status.code().unwrap_or(-1);
     if !ok_codes.contains(&code) {
         return Err(GitError::Failed(format!(
@@ -1938,7 +1944,7 @@ mod tests {
         use std::ffi::OsStr;
         let mut cmd = Command::new("git");
         scrub_env(
-            &mut cmd,
+            cmd.as_std_mut(),
             [
                 "GIT_DIR",
                 "GIT_COMMON_DIR",
@@ -2281,6 +2287,50 @@ mod tests {
         git_ok(&repo, &["add", "."]);
         git_ok(&repo, &["commit", "-q", "-m", "init"]);
         repo
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stderr_flood_is_drained_with_bounded_error_output() {
+        let repo = temp_repo("stderr-cap");
+        // A test-only git alias floods stderr beyond its pipe capacity, then
+        // fails. No shell is introduced into the production command builder.
+        let error = run(
+            &repo,
+            &[
+                "-c",
+                "alias.flood=!i=0; while [ \"$i\" -lt 10000 ]; do printf 'stderr flood regression line\\n' >&2; i=$((i + 1)); done; exit 1",
+                "flood",
+            ],
+            &[0],
+        )
+        .await
+        .err()
+        .expect("alias must fail");
+        match error {
+            GitError::Failed(message) => {
+                assert!(message.contains("stderr flood regression line"));
+                assert!(message.len() <= MAX_STDERR_BYTES + "exit 1: ".len());
+            }
+            other => panic!("stderr must drain without timeout: {other:?}"),
+        }
+        std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_real_diff_returns_capped_without_waiting_for_timeout() {
+        let repo = temp_repo("output-cap");
+        // Many complete lines exceed the pipe buffer and the output budget.
+        let text =
+            "a long added line for the bounded git diff regression\n".repeat(MAX_OUTPUT_BYTES / 40);
+        std::fs::write(repo.join("README.md"), text).unwrap();
+        let output = run(&repo, &["diff", "--no-ext-diff", "--", "README.md"], &[0])
+            .await
+            .unwrap();
+        assert!(output.capped);
+        assert!(output.stdout.len() <= MAX_OUTPUT_BYTES);
+        assert_eq!(output.stdout.last(), Some(&b'\n'));
+        std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
     }
 
     #[tokio::test]
