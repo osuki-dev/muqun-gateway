@@ -159,6 +159,75 @@ pub struct SessionForkInfo {
     pub message_id: Option<String>,
 }
 
+/// Observation and control ownership are independent of stored conversation history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRuntime {
+    pub source: RuntimeSource,
+    pub interaction: RuntimeInteraction,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<TerminalRuntimeStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<RuntimeTerminal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<RuntimeReason>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeSource {
+    Native,
+    Terminal,
+    Unobserved,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeInteraction {
+    Native,
+    Terminal,
+    Unavailable,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeReason {
+    NotLoaded,
+    AmbiguousTerminal,
+    TerminalUnavailable,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalRuntimeStatus {
+    Idle,
+    Working,
+    Blocked,
+    Starting,
+    Completed,
+    Unknown,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeTerminal {
+    pub session_id: String,
+    pub pane_id: String,
+    /// Opaque process/conversation incarnation; compare only, never decode.
+    pub instance_id: String,
+}
+
+impl SessionRuntime {
+    pub fn apply(self, info: &mut AgentSessionInfo) {
+        if self.source == RuntimeSource::Terminal {
+            info.status = match self.status {
+                Some(TerminalRuntimeStatus::Working | TerminalRuntimeStatus::Starting) => {
+                    AgentSessionStatus::Busy
+                }
+                Some(TerminalRuntimeStatus::Idle) => AgentSessionStatus::Idle,
+                _ => AgentSessionStatus::Unknown,
+            };
+        } else if self.source == RuntimeSource::Unobserved {
+            info.status = AgentSessionStatus::Unknown;
+        }
+        info.runtime = Some(self);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentSessionInfo {
     pub asid: AgentSessionId,
@@ -183,6 +252,8 @@ pub struct AgentSessionInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelRef>,
     pub status: AgentSessionStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<SessionRuntime>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub directory: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

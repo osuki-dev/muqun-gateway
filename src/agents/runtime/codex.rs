@@ -146,7 +146,12 @@ impl CodexState {
                 runtime
                     .install(
                         "codex",
-                        AgentManager::connect_codex(client, events, runtime.events_tx.clone()),
+                        AgentManager::connect_codex_observed(
+                            client,
+                            events,
+                            runtime.events_tx.clone(),
+                            runtime.terminal_runtime.get().cloned(),
+                        ),
                         AgentOrigin::Spawned,
                     )
                     .await;
@@ -605,7 +610,12 @@ pub(crate) mod tests {
         runtime
             .install(
                 "codex",
-                AgentManager::connect_codex(client, events, runtime.events_tx.clone()),
+                AgentManager::connect_codex_observed(
+                    client,
+                    events,
+                    runtime.events_tx.clone(),
+                    runtime.terminal_runtime.get().cloned(),
+                ),
                 AgentOrigin::Spawned,
             )
             .await;

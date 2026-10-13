@@ -641,7 +641,9 @@ fn route_frame(state: &State, value: Value, frame_bytes: usize) -> Result<(), Ag
                     }
                     requests.remove(&key);
                 }
-            } else if method == "thread/deleted" {
+            } else if matches!(method, "thread/deleted" | "thread/closed")
+                || (method == "thread/status/changed" && params["status"]["type"] == "notLoaded")
+            {
                 locked(&state.turns).remove(thread);
                 locked(&state.completed_turns).remove(thread);
                 locked(&state.requests).retain(|_, r| r.params["threadId"] != thread);

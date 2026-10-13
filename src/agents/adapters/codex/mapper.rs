@@ -43,6 +43,7 @@ pub fn session(thread: &Value) -> Result<AgentSessionInfo, AgentError> {
         asid: AgentSessionId(id),
         agent_id: String::new(),
         backend_session_id: String::new(),
+        runtime: None,
         title: thread["name"]
             .as_str()
             .or_else(|| thread["preview"].as_str())

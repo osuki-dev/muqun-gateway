@@ -99,6 +99,7 @@ pub fn map_session(raw: &Value) -> Option<AgentSessionInfo> {
         asid: AgentSessionId(session_id.to_string()),
         agent_id: String::new(),
         backend_session_id: session_id.to_string(),
+        runtime: None,
         title,
         mode: projections_values
             .and_then(|v| v.get("agentPreset"))

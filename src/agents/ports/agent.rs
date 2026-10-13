@@ -31,6 +31,8 @@ pub enum AgentError {
     /// such as handing the agent a file it never uploaded. A `400`, not an
     /// agent fault.
     InvalidRequest(String),
+    /// A live external runtime must be controlled through its existing terminal.
+    TerminalInteraction(Box<crate::agents::domain::SessionRuntime>),
 }
 
 impl fmt::Display for AgentError {
@@ -46,6 +48,10 @@ impl fmt::Display for AgentError {
             Self::Protocol(msg) => write!(f, "Protocol error: {msg}"),
             Self::Unsupported(cap) => write!(f, "Agent does not support capability: {cap}"),
             Self::InvalidRequest(msg) => write!(f, "Invalid request: {msg}"),
+            Self::TerminalInteraction(_) => write!(
+                f,
+                "Native interaction is unavailable; use the current terminal binding when provided"
+            ),
         }
     }
 }
@@ -115,6 +121,14 @@ pub trait AgentPort: Send + Sync {
 
     /// Get session metadata
     fn get_session<'a>(&'a self, session_id: &'a str) -> AgentFuture<'a, AgentSessionInfo>;
+
+    /// Optional fresh runtime observation, without reading/replacing transcript history.
+    fn session_runtime<'a>(
+        &'a self,
+        _id: &'a str,
+    ) -> AgentFuture<'a, Option<crate::agents::domain::SessionRuntime>> {
+        Box::pin(async { Ok(None) })
+    }
 
     /// Whether `send_prompt` takes attachments natively or wants them listed
     /// in the text as host paths.

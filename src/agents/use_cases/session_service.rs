@@ -12,6 +12,7 @@ pub struct SessionService {
     /// The concrete mirror, for the few operations that are not part of the
     /// port because nothing else implements them.
     memory: Option<Arc<crate::agents::adapters::memory_mirror::MemoryMirror>>,
+    refresh_slots: tokio::sync::Semaphore,
 }
 
 impl SessionService {
@@ -20,6 +21,7 @@ impl SessionService {
             agent,
             mirror,
             memory: None,
+            refresh_slots: tokio::sync::Semaphore::new(4),
         }
     }
 
@@ -32,6 +34,7 @@ impl SessionService {
             agent,
             mirror: mirror.clone(),
             memory: Some(mirror),
+            refresh_slots: tokio::sync::Semaphore::new(4),
         }
     }
 
@@ -67,9 +70,16 @@ impl SessionService {
     async fn overlay_sessions(&self, sessions: &mut [AgentSessionInfo]) {
         for session in sessions {
             self.stamp(session);
+            self.observe_runtime(session).await;
             if let Some(memory) = &self.memory {
                 memory.overlay_read_markers(session).await;
             }
+        }
+    }
+
+    async fn observe_runtime(&self, info: &mut AgentSessionInfo) {
+        if let Ok(Some(runtime)) = self.agent.session_runtime(&info.asid.0).await {
+            runtime.apply(info);
         }
     }
 
@@ -83,6 +93,7 @@ impl SessionService {
     pub async fn get_session(&self, asid: &str) -> Result<AgentSessionInfo, AgentError> {
         let mut info = self.agent.get_session(asid).await?;
         self.stamp(&mut info);
+        self.observe_runtime(&mut info).await;
         if let Some(memory) = &self.memory {
             memory.overlay_read_markers(&mut info).await;
         }
@@ -97,6 +108,7 @@ impl SessionService {
     ) -> Result<AgentSessionInfo, AgentError> {
         let mut info = self.agent.create_session(directory, model, mode).await?;
         self.stamp(&mut info);
+        self.observe_runtime(&mut info).await;
         self.mirror.update_session(info.clone()).await;
         Ok(info)
     }
@@ -108,12 +120,14 @@ impl SessionService {
         // A session the mirror holds is served from the mirror, even when its
         // timeline is legitimately empty: treating "no rows" as a cache miss
         // re-hit OpenCode twice on every poll of a new session.
-        if let Some(snapshot) = self.mirror.get_snapshot(asid).await {
+        if let Some(mut snapshot) = self.mirror.get_snapshot(asid).await {
+            self.observe_runtime(&mut snapshot.info).await;
             return Ok(snapshot);
         }
 
         let mut info = self.agent.get_session(&asid.0).await?;
         self.stamp(&mut info);
+        self.observe_runtime(&mut info).await;
         self.mirror.update_session(info.clone()).await;
 
         let timeline = self
@@ -144,6 +158,52 @@ impl SessionService {
                 seq: 1,
             })
         }
+    }
+
+    /// Explicit user refresh. Ordinary snapshot reads keep their retained rows.
+    pub async fn refresh_snapshot(
+        &self,
+        asid: &AgentSessionId,
+    ) -> Result<AgentSessionSnapshot, AgentError> {
+        let _permit = self
+            .refresh_slots
+            .try_acquire()
+            .map_err(|_| AgentError::NotAvailable("Session refresh capacity exhausted".into()))?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            self.refresh_snapshot_inner(asid),
+        )
+        .await
+        .map_err(|_| AgentError::NotAvailable("Session refresh timed out".into()))?
+    }
+
+    async fn refresh_snapshot_inner(
+        &self,
+        asid: &AgentSessionId,
+    ) -> Result<AgentSessionSnapshot, AgentError> {
+        let expected = self.mirror.get_snapshot(asid).await.map(|s| s.seq);
+        let info = self.get_session(&asid.0).await?;
+        let timeline = self.agent.get_timeline(&asid.0, 100).await?;
+        let permissions = self.agent.get_pending_permissions(&asid.0).await?;
+        let forms = self.agent.get_pending_forms(&asid.0).await?;
+        let snapshot = AgentSessionSnapshot {
+            info,
+            timeline,
+            permissions,
+            forms,
+            inbox: Vec::new(),
+            seq: 0,
+        };
+        let memory = self
+            .memory
+            .as_ref()
+            .ok_or_else(|| AgentError::Unsupported("explicit session refresh".into()))?;
+        memory
+            .refresh_snapshot(snapshot, expected)
+            .await
+            .ok_or_else(|| {
+                AgentError::NotAvailable("Session changed during refresh; refresh again".into())
+            })
     }
 
     /// Re-read the permissions and forms OpenCode still considers pending.

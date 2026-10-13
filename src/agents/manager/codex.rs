@@ -61,7 +61,26 @@ impl Context {
         self.update_info(info).await;
     }
 
+    async fn observe_runtimes(&self) {
+        for (asid, expected) in self.mirror.runtime_sessions().await {
+            if let Some(runtime) = self.driver.runtime(&asid.0, false).await {
+                if let Some((seq, info)) =
+                    self.mirror.update_runtime(&asid, expected, runtime).await
+                {
+                    self.emit(AgentDomainEvent::SessionUpdated {
+                        asid,
+                        info: Box::new(info),
+                        seq,
+                    });
+                }
+            }
+        }
+    }
+
     async fn update_info(&self, mut info: AgentSessionInfo) {
+        if let Some(runtime) = self.driver.runtime(&info.asid.0, false).await {
+            runtime.apply(&mut info);
+        }
         let asid = info.asid.clone();
         info.agent_id = self.driver.kind().into();
         if !self.track(&asid.0).await {
@@ -244,6 +263,36 @@ impl Context {
             return;
         }
         let asid = AgentSessionId(thread.into());
+        // Ownership ends when the private server unloads the runtime. History
+        // remains readable, but callbacks and the loaded marker are no longer live.
+        if method == "thread/closed"
+            || (method == "thread/status/changed" && params["status"]["type"] == "notLoaded")
+        {
+            self.driver.forget_thread(thread).await;
+            self.clear_requests(thread).await;
+            if let Some(snapshot) = self.mirror.get_snapshot(&asid).await {
+                let mut info = snapshot.info;
+                info.status = AgentSessionStatus::Unknown;
+                self.update_info(info).await;
+            }
+            return;
+        }
+        // A resume snapshot can be superseded by the accepted turn's metadata
+        // revision. Publish ownership before its first native timeline event,
+        // even when that older metadata snapshot was correctly discarded.
+        if let Some(expected) = self.mirror.non_native_runtime_seq(&asid).await {
+            if let Some(runtime) = self.driver.runtime(thread, false).await {
+                if let Some((seq, info)) =
+                    self.mirror.update_runtime(&asid, expected, runtime).await
+                {
+                    self.emit(AgentDomainEvent::SessionUpdated {
+                        asid: asid.clone(),
+                        info: Box::new(info),
+                        seq,
+                    });
+                }
+            }
+        }
         match method {
             "thread/status/changed" => {
                 self.set_status(thread, mapper::status(&params["status"]))
@@ -427,19 +476,43 @@ impl Context {
 impl AgentManager {
     pub fn connect_codex(
         client: Arc<CodexClient>,
-        mut events: mpsc::Receiver<CodexEvent>,
+        events: mpsc::Receiver<CodexEvent>,
         tx: broadcast::Sender<AgentDomainEvent>,
     ) -> Self {
-        let driver = Arc::new(CodexDriver::new(client.clone()));
+        Self::connect_codex_observed(client, events, tx, None)
+    }
+
+    pub(crate) fn connect_codex_observed(
+        client: Arc<CodexClient>,
+        mut events: mpsc::Receiver<CodexEvent>,
+        tx: broadcast::Sender<AgentDomainEvent>,
+        observer: Option<Arc<crate::agents::terminal_runtime::TerminalRuntime>>,
+    ) -> Self {
+        let observed = observer.is_some();
+        let mut driver = CodexDriver::new(client.clone());
+        driver.observe_terminals(observer);
+        let driver = Arc::new(driver);
         let mirror = Arc::new(MemoryMirror::for_agent("codex"));
         let stopped = Arc::new(Mutex::new(false));
-        let context = Context {
+        let context = Arc::new(Context {
             driver: driver.clone(),
             mirror: mirror.clone(),
             tx: tx.clone(),
             stopped: stopped.clone(),
             threads: tokio::sync::Mutex::new(HashSet::new()),
-        };
+        });
+        if observed {
+            let context = context.clone();
+            let cancel = client.cancel_token();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! { biased; _ = cancel.cancelled() => break, _ = tick.tick() => {} }
+                    tokio::select! { biased; _ = cancel.cancelled() => break, _ = context.observe_runtimes() => {} }
+                }
+            });
+        }
         let cancel = client.cancel_token();
         tokio::spawn(async move {
             loop {
@@ -475,6 +548,158 @@ mod tests {
     use crate::agents::adapters::codex::tests::{golden, Fixture};
     use serde_json::json;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn terminal_observation_updates_metadata_without_refetching_or_fabricating_forms() {
+        let herdr = crate::test_support::FakeHerdr::start(vec![], None);
+        let id = "00000000-0000-4000-8000-000000000001";
+        let row = |status: &str| json!([{"pane_id":"w1:p1","terminal_id":"fixture-terminal","agent":"codex","agent_status":status,"shell_pid":42,"agent_session":{"kind":"id","agent":"codex","value":id}}]);
+        herdr.set_agents(row("working"));
+        let mut fixture = Fixture::new(move |request| match request["method"].as_str().unwrap() {
+            "thread/read" => {
+                let mut thread = golden()["thread"].clone();
+                thread["id"] = json!(id);
+                thread["status"] = json!({"type":"notLoaded"});
+                json!({"thread":thread})
+            }
+            "thread/items/list" => json!({"data":[],"nextCursor":null,"backwardsCursor":null}),
+            _ => panic!("observation must not control the provider"),
+        })
+        .await;
+        fixture.ready().await;
+        let (tx, mut events) = broadcast::channel(64);
+        let manager = AgentManager::connect_codex_observed(
+            fixture.client.clone(),
+            fixture.events.take().unwrap(),
+            tx,
+            Some(crate::agents::terminal_runtime::TerminalRuntime::new(&[
+                herdr.session(),
+            ])),
+        );
+        let asid = AgentSessionId(id.into());
+        let first = manager.sessions().get_snapshot(&asid).await.unwrap();
+        assert_eq!(first.info.status, AgentSessionStatus::Busy);
+        while fixture.requests.try_recv().is_ok() {}
+        herdr.set_agents(row("blocked"));
+        let updated = tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                if let AgentDomainEvent::SessionUpdated { info, .. } = events.recv().await.unwrap()
+                {
+                    if info.runtime.as_ref().and_then(|r| r.status)
+                        == Some(TerminalRuntimeStatus::Blocked)
+                    {
+                        break info;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(updated.status, AgentSessionStatus::Unknown);
+        let current = manager.sessions().get_snapshot(&asid).await.unwrap();
+        assert!(current.permissions.is_empty());
+        assert!(current.forms.is_empty());
+        assert_eq!(current.timeline, first.timeline);
+        assert!(fixture.requests.try_recv().is_err());
+        assert!(herdr
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|r| r["method"] == "agent.list"));
+    }
+
+    #[tokio::test]
+    async fn native_thread_unload_clears_runtime_ownership_without_deleting_history() {
+        for method in ["thread/closed", "thread/status/changed"] {
+            let mut fixture = Fixture::new(|r| match r["method"].as_str().unwrap() {
+                "thread/start" => json!({"thread":golden()["thread"]}),
+                _ => panic!("unload must not issue a provider mutation"),
+            })
+            .await;
+            fixture.ready().await;
+            let (tx, mut events) = broadcast::channel(64);
+            let manager = AgentManager::connect_codex_observed(
+                fixture.client.clone(),
+                fixture.events.take().unwrap(),
+                tx,
+                Some(crate::agents::terminal_runtime::TerminalRuntime::new(&[])),
+            );
+            let info = manager
+                .sessions()
+                .create_session(None, None, None)
+                .await
+                .unwrap();
+            assert_eq!(info.runtime.as_ref().unwrap().source, RuntimeSource::Native);
+            fixture.send(json!({"method":method,"params":{"threadId":info.asid.0,"status":{"type":"notLoaded"}}})).await;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let AgentDomainEvent::SessionUpdated { info, .. } =
+                        events.recv().await.unwrap()
+                    {
+                        if info
+                            .runtime
+                            .as_ref()
+                            .is_some_and(|r| r.source == RuntimeSource::Unobserved)
+                        {
+                            break;
+                        }
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            let snapshot = manager.sessions().get_snapshot(&info.asid).await.unwrap();
+            assert!(!snapshot.info.deleted);
+            assert_eq!(snapshot.info.status, AgentSessionStatus::Unknown);
+            assert_eq!(
+                snapshot.info.runtime.unwrap().interaction,
+                RuntimeInteraction::Native
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_ownership_precedes_timeline_when_resume_metadata_was_superseded() {
+        let mut fixture = Fixture::new(|_| json!({"thread":golden()["thread"]})).await;
+        fixture.ready().await;
+        let mut driver = CodexDriver::new(fixture.client.clone());
+        let observer = crate::agents::terminal_runtime::TerminalRuntime::new(&[]);
+        driver.observe_terminals(Some(observer.clone()));
+        let mut info = driver.create_session(None, None, None).await.unwrap();
+        let asid = info.asid.clone();
+        // Model a retained historical view before its queued resume snapshot is
+        // discarded by a newer metadata revision. The real driver already owns it.
+        observer
+            .observe(&asid.0, false, false)
+            .await
+            .apply(&mut info);
+        let mirror = Arc::new(MemoryMirror::for_agent("codex"));
+        mirror.update_session(info).await;
+        let (tx, mut events) = broadcast::channel(16);
+        let context = Context {
+            driver: Arc::new(driver),
+            mirror,
+            tx,
+            stopped: Arc::new(Mutex::new(false)),
+            threads: tokio::sync::Mutex::new(HashSet::new()),
+        };
+        context
+            .notification(
+                "item/completed",
+                &json!({"threadId":asid.0,"turnId":"fixture-turn",
+            "item":{"type":"agentMessage","id":"fixture-item","text":"reply"}}),
+            )
+            .await;
+        let AgentDomainEvent::SessionUpdated { info, .. } = events.try_recv().unwrap() else {
+            panic!("ownership must be first")
+        };
+        assert_eq!(info.runtime.unwrap().source, RuntimeSource::Native);
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            AgentDomainEvent::TimelineUpsert { .. }
+        ));
+    }
 
     async fn next_session_update(
         events: &mut broadcast::Receiver<AgentDomainEvent>,

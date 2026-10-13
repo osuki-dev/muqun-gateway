@@ -312,6 +312,7 @@ impl AgentPort for T3Driver {
                     Ok(AgentSessionInfo {
                         asid: thread_id.clone().into(),
                         backend_session_id: String::new(),
+                        runtime: None,
                         agent_id: String::new(),
                         title: title.into(),
                         mode: None,

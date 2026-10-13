@@ -55,6 +55,12 @@ pub struct AgentQuery {
     pub agent_id: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct AgentSnapshotQuery {
+    #[serde(default)]
+    pub refresh: bool,
+}
+
 /// What a session list answers when the caller does not say.
 ///
 /// The app already asks for fifty; a caller that asks for nothing used to get
@@ -782,15 +788,30 @@ async fn do_get_agent_session(
     asid: &str,
     headers: &HeaderMap,
 ) -> ApiResult<Response> {
+    do_read_agent_session(state, asid, false, headers).await
+}
+
+async fn do_read_agent_session(
+    state: &AppState,
+    asid: &str,
+    refresh: bool,
+    headers: &HeaderMap,
+) -> ApiResult<Response> {
     require_device(state, headers)?;
-
     let manager = session_manager_or_err(state, asid).await?;
-
-    let mut snapshot = manager
-        .sessions()
-        .get_snapshot(&AgentSessionId(asid.to_string()))
-        .await
-        .map_err(|e| api_error(StatusCode::NOT_FOUND, "session_not_found", &e.to_string()))?;
+    let id = AgentSessionId(asid.to_string());
+    let mut snapshot =
+        if refresh {
+            manager
+                .sessions()
+                .refresh_snapshot(&id)
+                .await
+                .map_err(agent_error)?
+        } else {
+            manager.sessions().get_snapshot(&id).await.map_err(|e| {
+                api_error(StatusCode::NOT_FOUND, "session_not_found", &e.to_string())
+            })?
+        };
     let directory = snapshot.info.directory.clone();
     let plumbing = for_session(state, asid).await;
     hide_in_items(&mut snapshot.timeline, plumbing);
@@ -955,7 +976,8 @@ async fn do_send_agent_prompt(
         )
         .await
         .map_err(|e| match e {
-            super::ports::agent::AgentError::InvalidRequest(_) => agent_error(e),
+            super::ports::agent::AgentError::InvalidRequest(_)
+            | super::ports::agent::AgentError::TerminalInteraction(_) => agent_error(e),
             _ => api_error(StatusCode::BAD_GATEWAY, "agent_error", &e.to_string()),
         })?;
 
@@ -997,7 +1019,10 @@ async fn do_interrupt_agent_session(
         .prompts()
         .interrupt(&AgentSessionId(asid.to_string()))
         .await
-        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "agent_error", &e.to_string()))?;
+        .map_err(|e| match e {
+            super::ports::agent::AgentError::TerminalInteraction(_) => agent_error(e),
+            _ => api_error(StatusCode::BAD_GATEWAY, "agent_error", &e.to_string()),
+        })?;
 
     Ok(Json(content_envelope(json!({ "interrupted": true }))))
 }
@@ -1016,7 +1041,10 @@ async fn do_switch_agent_model(
         .sessions()
         .switch_model(&AgentSessionId(asid.to_string()), &model)
         .await
-        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "agent_error", &e.to_string()))?;
+        .map_err(|e| match e {
+            super::ports::agent::AgentError::TerminalInteraction(_) => agent_error(e),
+            _ => api_error(StatusCode::BAD_GATEWAY, "agent_error", &e.to_string()),
+        })?;
 
     Ok(Json(content_envelope(json!({ "switched": true }))))
 }
@@ -1631,9 +1659,10 @@ async fn create_agent_session_global(
 async fn get_agent_session_global(
     State(state): State<AppState>,
     Path(asid): Path<String>,
+    Query(query): Query<AgentSnapshotQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    do_get_agent_session(&state, &asid, &headers).await
+    do_read_agent_session(&state, &asid, query.refresh, &headers).await
 }
 
 async fn get_agent_session_events_global(
@@ -1787,9 +1816,10 @@ async fn create_agent_session_legacy(
 async fn get_agent_session_legacy(
     State(state): State<AppState>,
     Path((_session_id, asid)): Path<(String, String)>,
+    Query(query): Query<AgentSnapshotQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    do_get_agent_session(&state, &asid, &headers).await
+    do_read_agent_session(&state, &asid, query.refresh, &headers).await
 }
 
 async fn get_agent_session_events_legacy(
@@ -2050,6 +2080,14 @@ fn agent_error(err: super::ports::agent::AgentError) -> (StatusCode, Json<Value>
     // as its own field so the app can offer to forget the session rather than
     // parse a sentence.
     match &err {
+        super::ports::agent::AgentError::TerminalInteraction(runtime) => (
+            StatusCode::CONFLICT,
+            Json(
+                json!({ "error": { "code": "agent_terminal_interaction_required",
+                "message": "Native interaction is unavailable; use the current terminal binding when provided",
+                "runtime": runtime } }),
+            ),
+        ),
         super::ports::agent::AgentError::WorkspaceMissing(directory) => {
             workspace_missing(directory)
         }
@@ -3278,6 +3316,40 @@ mod tests {
         let bare: SwitchModeBody =
             serde_json::from_value(json!("plan")).expect("bare string should parse");
         assert_eq!(bare.into_mode(), "plan");
+    }
+
+    #[tokio::test]
+    async fn explicit_snapshot_refresh_requires_app_device_before_provider_lookup() {
+        let state = crate::test_support::test_state(
+            "admin",
+            vec![crate::test_support::test_peer_device("peer", "peer-token")],
+        );
+        for (headers, status, code) in [
+            (
+                HeaderMap::new(),
+                StatusCode::UNAUTHORIZED,
+                "missing_authorization",
+            ),
+            (
+                crate::test_support::bearer_headers("admin"),
+                StatusCode::FORBIDDEN,
+                "invalid_token",
+            ),
+            (
+                crate::test_support::bearer_headers("peer-token"),
+                StatusCode::FORBIDDEN,
+                "peer_forbidden",
+            ),
+        ] {
+            let refusal = do_read_agent_session(&state, "fixture", true, &headers)
+                .await
+                .unwrap_err();
+            assert_eq!(refusal.0, status);
+            assert_eq!(
+                crate::test_support::error_body(&refusal)["error"]["code"],
+                code
+            );
+        }
     }
 
     async fn create_refusal(body: Value) -> (StatusCode, Value) {

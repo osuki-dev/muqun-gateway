@@ -606,6 +606,7 @@ pub(crate) struct FakeHerdr {
     /// `shell_pid` that `pane.process_info` answers with); unset, both
     /// methods answer a bare `ok` as before.
     panes: Arc<Mutex<Option<Value>>>,
+    agents: Arc<Mutex<Option<Value>>>,
 }
 
 impl FakeHerdr {
@@ -620,6 +621,8 @@ impl FakeHerdr {
         let recorded = Arc::clone(&calls);
         let panes: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
         let listed = Arc::clone(&panes);
+        let agents: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+        let listed_agents = agents.clone();
         let screens: Vec<String> = screens.into_iter().map(str::to_owned).collect();
         let serving = tokio::spawn(async move {
             let mut reads = 0usize;
@@ -650,6 +653,9 @@ impl FakeHerdr {
                             .unwrap_or_default();
                         reads += 1;
                         json!({ "read": { "text": screen, "revision": reads } })
+                    }
+                    ("agent.list", _) if listed_agents.lock().unwrap().is_some() => {
+                        json!({"agents": listed_agents.lock().unwrap().clone().unwrap()})
                     }
                     ("agent.list", _) => {
                         let agents = match advance_after {
@@ -704,7 +710,12 @@ impl FakeHerdr {
             serving,
             calls,
             panes,
+            agents,
         }
+    }
+
+    pub(crate) fn set_agents(&self, agents: Value) {
+        *self.agents.lock().unwrap() = Some(agents);
     }
 
     /// Answer `pane.list` (and `pane.process_info`) from `panes` from now on.

@@ -421,6 +421,59 @@ does not expose continuation cursors; use the additive page route below instead.
 A subagent run creates a real session whose `parent_id` is the caller's. Without
 `roots=true` those are mixed into the list.
 
+### Runtime provenance and explicit refresh
+
+The additive capability **`agent_session_runtime_v1`** permits optional `runtime`
+on session info, including snapshots, lists, creation and `agent.session.updated`.
+Currently Codex supplies it; absence preserves the existing provider contract.
+
+```json
+{"source":"terminal","interaction":"terminal","status":"working",
+ "terminal":{"session_id":"local","pane_id":"w1:p1","instance_id":"opaque"}}
+```
+
+`source` is `native`, `terminal`, or `unobserved`. `interaction` is `native`,
+`terminal`, or `unavailable`; it is independent of status. A native source is
+owned by this Gateway's private Codex runtime. A terminal source is a unique
+current local Herdr observation matching the Codex conversation identity and
+provider exactly, with a complete opaque incarnation binding. No conversation
+identity is decoded by the App. It revalidates all three terminal binding fields
+against the existing authenticated session agent listing before navigating.
+Navigation does not send, focus, answer, or approve anything.
+
+Terminal `status` is the observed `idle`, `working`, `blocked`, `starting`,
+`completed`, or `unknown`. Working/starting map to ordinary session `busy`, idle
+to `idle`, and the remaining terminal statuses to `unknown`. Blocked does not
+fabricate a native permission or question. Changed observations use the existing
+session-update event, polled at one-second intervals with a bounded backend read;
+these metadata events do not replace the transcript.
+
+`unobserved` keeps session status unknown. With complete inventory and no exact
+terminal binding it carries `interaction: "native", reason: "not_loaded"`:
+only an explicit user mutation may resume saved history. Incomplete inventory or
+ambiguous bindings carry `interaction: "unavailable"`, with reason
+`terminal_unavailable` or `ambiguous_terminal`. Opening, polling and refreshing
+never resume a thread. Native prompt, interrupt, model-switch and delete controls
+on an externally bound thread return `409 agent_terminal_interaction_required`
+with `error.runtime`; mutation guards reread the binding without using cached
+observations. Upstream Codex's per-thread writer lock remains the final authority.
+
+This correlation describes the current private-stdio adapter, not a general
+restriction on Codex's official shared daemon. Same-daemon clients can rejoin a
+loaded runtime and replay pending requests; persisted history read through a
+separate process cannot establish that ownership or recreate its callbacks.
+
+The capability **`agent_session_refresh_v1`** adds `?refresh=true` to the existing
+GET session snapshot endpoint (global and legacy aliases). This is an explicit
+provider reread, bounded to the normal 100-row tail, four concurrent refreshes
+per provider, and 30 seconds. Normal snapshots remain cached. A concurrent newer
+mirror event wins: refresh fails instead of rolling it back. Successful refresh
+invalidates older replay cursors, without broadcasting replacement history.
+The App preserves its viewport and only replaces history when the reader
+explicitly requests refresh; reconnects and metadata updates do not do so.
+Existing device authentication, peer exclusion, filtering, image handling and
+ETag behavior apply to both forms of the endpoint.
+
 ### `GET /api/agent-sessions/page`
 
 The global capability **`agent_session_pages_v1`** declares that this endpoint

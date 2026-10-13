@@ -188,6 +188,7 @@ pub fn map_session(val: &Value) -> Option<AgentSessionInfo> {
         // repeat `asid`. It is set for an agent that really does key
         // sessions differently.
         backend_session_id: String::new(),
+        runtime: None,
         title,
         mode,
         model,

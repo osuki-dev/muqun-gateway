@@ -243,6 +243,7 @@ pub struct AgentRuntime {
     /// Where OpenCode's `MUQUN_MCP_*` environment comes from; set once the
     /// token store exists (the runtime is built before it).
     mcp: std::sync::OnceLock<McpWiring>,
+    terminal_runtime: std::sync::OnceLock<Arc<super::terminal_runtime::TerminalRuntime>>,
 }
 
 #[derive(PartialEq, Eq)]
@@ -369,7 +370,14 @@ impl AgentRuntime {
             start_lock: Mutex::new(()),
             supervising: AtomicBool::new(false),
             mcp: std::sync::OnceLock::new(),
+            terminal_runtime: std::sync::OnceLock::new(),
         })
+    }
+
+    pub(crate) fn observe_terminal_sessions(&self, sessions: &[crate::SessionConfig]) {
+        let _ = self
+            .terminal_runtime
+            .set(super::terminal_runtime::TerminalRuntime::new(sessions));
     }
 
     /// Let the OpenCode service this runtime starts reach `/mcp` at `url`.

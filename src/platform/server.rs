@@ -121,6 +121,8 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         agents::AgentRuntime::disabled()
     };
 
+    agent_runtime.observe_terminal_sessions(&config.sessions);
+
     let scrollback = Arc::new(Mutex::new(scrollback::ScrollbackStore::default()));
     let state_directory = state_dir()?;
     let key = platform::store::db_key::key_for(&config.store, &state_directory)?;

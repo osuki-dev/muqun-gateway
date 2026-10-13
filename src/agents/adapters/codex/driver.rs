@@ -20,6 +20,7 @@ const FIRST_ITEM_POSITION: u64 = 1 << 63;
 
 pub struct CodexDriver {
     client: Arc<CodexClient>,
+    terminal_runtime: Option<Arc<crate::agents::terminal_runtime::TerminalRuntime>>,
     /// Only explicitly created, forked or submitted-to threads are resumed.
     loaded: Mutex<HashSet<String>>,
     /// Serializes explicit mutations, not the stream or read-only RPC calls.
@@ -51,6 +52,7 @@ impl CodexDriver {
     pub fn new(client: Arc<CodexClient>) -> Self {
         Self {
             client,
+            terminal_runtime: None,
             loaded: Mutex::new(HashSet::new()),
             mutations: Arc::new(Mutex::new(())),
             order: std::sync::Mutex::new(HashMap::new()),
@@ -59,6 +61,28 @@ impl CodexDriver {
             next_metadata_version: std::sync::atomic::AtomicU64::new(1),
             refresh_slots: Arc::new(tokio::sync::Semaphore::new(32)),
         }
+    }
+
+    pub(crate) fn observe_terminals(
+        &mut self,
+        observer: Option<Arc<crate::agents::terminal_runtime::TerminalRuntime>>,
+    ) {
+        self.terminal_runtime = observer;
+    }
+
+    pub(crate) async fn runtime(&self, id: &str, fresh: bool) -> Option<SessionRuntime> {
+        let observer = self.terminal_runtime.as_ref()?;
+        let native = self.loaded.lock().await.contains(id);
+        Some(observer.observe(id, native, fresh).await)
+    }
+
+    async fn require_native_interaction(&self, id: &str) -> Result<(), AgentError> {
+        if let Some(runtime) = self.runtime(id, true).await {
+            if runtime.interaction != RuntimeInteraction::Native {
+                return Err(AgentError::TerminalInteraction(Box::new(runtime)));
+            }
+        }
+        Ok(())
     }
 
     pub fn client(&self) -> &Arc<CodexClient> {
@@ -607,6 +631,10 @@ impl AgentPort for CodexDriver {
         })
     }
 
+    fn session_runtime<'a>(&'a self, id: &'a str) -> AgentFuture<'a, Option<SessionRuntime>> {
+        Box::pin(async move { Ok(self.runtime(id, false).await) })
+    }
+
     fn get_session<'a>(&'a self, id: &'a str) -> AgentFuture<'a, AgentSessionInfo> {
         Box::pin(async move { mapper::session(&self.read_thread(id).await?) })
     }
@@ -627,6 +655,7 @@ impl AgentPort for CodexDriver {
                 return Err(AgentError::InvalidRequest("empty Codex prompt".into()));
             }
             let _guard = self.mutations.lock().await;
+            self.require_native_interaction(id).await?;
             if self.client.active_turn(id).is_some() {
                 return Err(AgentError::InvalidRequest(
                     "Codex thread already has an active turn".into(),
@@ -695,6 +724,7 @@ impl AgentPort for CodexDriver {
 
     fn interrupt<'a>(&'a self, id: &'a str) -> AgentFuture<'a, ()> {
         Box::pin(async move {
+            self.require_native_interaction(id).await?;
             let turn = self.client.active_turn(id).ok_or_else(|| {
                 AgentError::InvalidRequest("Codex thread has no observed active turn".into())
             })?;
@@ -710,6 +740,7 @@ impl AgentPort for CodexDriver {
     fn switch_model<'a>(&'a self, id: &'a str, model: &'a ModelRef) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             let _guard = self.mutations.lock().await;
+            self.require_native_interaction(id).await?;
             let thread = self.read_thread(id).await?;
             if self.client.active_turn(id).is_some()
                 || mapper::status(&thread["status"]) == AgentSessionStatus::Busy
@@ -757,6 +788,7 @@ impl AgentPort for CodexDriver {
     fn delete_session<'a>(&'a self, id: &'a str) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             validate_id(id)?;
+            self.require_native_interaction(id).await?;
             if self.client.active_turn(id).is_some() {
                 return Err(AgentError::InvalidRequest(
                     "interrupt Codex before deleting its thread".into(),

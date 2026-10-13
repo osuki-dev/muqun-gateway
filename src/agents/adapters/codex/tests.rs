@@ -955,3 +955,125 @@ async fn codex_stale_approval_handle_cannot_answer_a_reused_rpc_id_after_restart
         json!({"id":7,"result":{"decision":"decline"}})
     );
 }
+
+#[tokio::test]
+async fn codex_terminal_runtime_blocks_controls_before_any_native_rpc() {
+    use crate::agents::terminal_runtime::TerminalRuntime;
+    let herdr = crate::test_support::FakeHerdr::start(vec![], None);
+    let id = "00000000-0000-4000-8000-000000000001";
+    herdr.set_agents(json!([{"pane_id":"w1:p1","terminal_id":"fixture-terminal","agent":"codex","agent_status":"blocked","shell_pid":42,"agent_session":{"kind":"id","agent":"codex","value":id}}]));
+    let mut fixture = Fixture::new(|_| panic!("native RPC must not follow external binding")).await;
+    fixture.ready().await;
+    let mut driver = CodexDriver::new(fixture.client.clone());
+    driver.observe_terminals(Some(TerminalRuntime::new(&[herdr.session()])));
+    let runtime = driver.session_runtime(id).await.unwrap().unwrap();
+    assert_eq!(runtime.source, RuntimeSource::Terminal);
+    assert_eq!(runtime.status, Some(TerminalRuntimeStatus::Blocked));
+    let model = ModelRef {
+        provider_id: "openai".into(),
+        model_id: "synthetic".into(),
+        variant: None,
+    };
+    for result in [
+        driver.send_prompt(id, "fixture", &[], None).await,
+        driver.interrupt(id).await,
+        driver.switch_model(id, &model).await,
+        driver.delete_session(id).await,
+    ] {
+        assert!(matches!(result, Err(AgentError::TerminalInteraction(_))));
+    }
+    assert!(fixture.requests.try_recv().is_err());
+    assert!(herdr
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|call| call["method"] == "agent.list"));
+    // A fresh mutation check must not rely on the preceding cached view.
+    herdr.set_agents(json!([]));
+    assert_eq!(
+        driver.runtime(id, true).await.unwrap().interaction,
+        RuntimeInteraction::Native
+    );
+    assert_eq!(
+        driver.runtime(id, false).await.unwrap().source,
+        RuntimeSource::Unobserved
+    );
+}
+
+#[tokio::test]
+async fn codex_explicit_refresh_rereads_provider_without_resuming_or_replacing_cached_reads() {
+    use crate::agents::adapters::memory_mirror::MemoryMirror;
+    use crate::agents::use_cases::SessionService;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let reads = Arc::new(AtomicUsize::new(0));
+    let counter = reads.clone();
+    let mut fixture = Fixture::new(move |request| match request["method"].as_str().unwrap() {
+        "thread/read" => {
+            counter.fetch_add(1, Ordering::Relaxed);
+            json!({"thread":golden()["thread"]})
+        }
+        "thread/items/list" => json!({"data":[],"nextCursor":null,"backwardsCursor":null}),
+        _ => panic!("refresh must never resume or send"),
+    })
+    .await;
+    fixture.ready().await;
+    let mut driver = CodexDriver::new(fixture.client.clone());
+    driver.observe_terminals(Some(crate::agents::terminal_runtime::TerminalRuntime::new(
+        &[],
+    )));
+    let service =
+        SessionService::with_memory_mirror(Arc::new(driver), Arc::new(MemoryMirror::new()));
+    let id = AgentSessionId(golden()["thread"]["id"].as_str().unwrap().into());
+    let first = service.get_snapshot(&id).await.unwrap();
+    let before = reads.load(Ordering::Relaxed);
+    let cached = service.get_snapshot(&id).await.unwrap();
+    assert_eq!(first.seq, cached.seq);
+    assert_eq!(reads.load(Ordering::Relaxed), before);
+    let fresh = service.refresh_snapshot(&id).await.unwrap();
+    assert!(reads.load(Ordering::Relaxed) > before);
+    assert!(fresh.seq > cached.seq);
+    assert_eq!(
+        fresh.info.runtime.unwrap().source,
+        RuntimeSource::Unobserved
+    );
+    assert_eq!(fresh.info.status, AgentSessionStatus::Unknown);
+}
+
+#[tokio::test]
+async fn codex_unload_invalidates_only_its_own_live_callbacks_and_turn() {
+    for method in ["thread/closed", "thread/status/changed", "thread/deleted"] {
+        let mut fixture = Fixture::new(|_| panic!("unload must not answer callbacks")).await;
+        fixture.ready().await;
+        let driver = CodexDriver::new(fixture.client.clone());
+        for id in ["synthetic-a", "synthetic-b"] {
+            fixture.send(json!({"method":"turn/started","params":{"threadId":id,"turn":{"id":"synthetic-turn"}}})).await;
+            fixture.events.as_mut().unwrap().recv().await.unwrap();
+            fixture.send(json!({"id":id,"method":"item/tool/requestUserInput","params":{"threadId":id,"turnId":"synthetic-turn","itemId":"synthetic-tool","questions":[{"id":"q","header":"Choice","question":"Which?","isOther":false,"isSecret":false,"options":[{"label":"A","description":"First"}]}]}})).await;
+            fixture.events.as_mut().unwrap().recv().await.unwrap();
+        }
+        let form = driver
+            .get_pending_forms("synthetic-a")
+            .await
+            .unwrap()
+            .remove(0);
+        fixture.send(json!({"method":method,"params":{"threadId":"synthetic-a","status":{"type":"notLoaded"}}})).await;
+        fixture.events.as_mut().unwrap().recv().await.unwrap();
+        assert!(fixture.client.active_turn("synthetic-a").is_none());
+        assert!(driver
+            .get_pending_forms("synthetic-a")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(driver
+            .reply_form("synthetic-a", &form.id, json!({"q":"A"}))
+            .await
+            .is_err());
+        assert_eq!(
+            driver.get_pending_forms("synthetic-b").await.unwrap().len(),
+            1
+        );
+        assert!(fixture.client.active_turn("synthetic-b").is_some());
+        assert!(fixture.requests.try_recv().is_err());
+    }
+}

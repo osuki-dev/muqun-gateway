@@ -164,6 +164,7 @@ pub fn map_session(thread: &Value, projects: &HashMap<String, String>) -> Option
     Some(AgentSessionInfo {
         asid: AgentSessionId(id.to_string()),
         backend_session_id: String::new(),
+        runtime: None,
         agent_id: String::new(),
         title,
         mode: None,
