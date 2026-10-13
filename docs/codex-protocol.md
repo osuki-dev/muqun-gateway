@@ -447,6 +447,8 @@ and the launcher's existing per-invocation trusted-folder override. The last
 condition prevents `thread/start` from automatically persisting project trust.
 Custom executable/environment selections and unsupported CLI settings retain
 the existing terminal startup path and record why shared startup was skipped.
+That reason is retained in the existing task event history when the task becomes
+working, explicitly identifying terminal mode and its linked-terminal controls.
 An uncertain `thread/start` result never falls back to a second launch. A task
 cancelled during preparation does not submit its goal. Existing conversations
 are never migrated or restarted by this feature.
