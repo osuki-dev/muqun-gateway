@@ -397,3 +397,50 @@ workspaces are rejected. It never queries another provider's default project.
 Root file searches can explicitly select `agent_id`; omitted selection retains
 the legacy primary-provider behavior for existing clients. Unsupported selected
 providers return `feature_unsupported`, rather than falling back to OpenCode.
+
+## Shared task startup
+
+`codex_shared_task_start_v1` prepares eligible new Codex task sessions through
+the connected shared daemon's official `thread/start` API. The existing
+per-invocation project trust, developer instructions, Muqun MCP entry, model,
+effort, approval and sandbox choices become thread parameters. The Gateway
+keeps its subscription and launches the official TUI with
+`--remote unix://<verified-socket> resume <exact-thread-id>`. The original
+goal is delivered once through the existing terminal startup path: Herdr waits
+for TUI readiness before `agent.prompt`; backends that accept launch-time goals
+keep their argv delivery. Preparing the thread does not submit a turn.
+
+The MCP helper uses an immutable task binding because the shared daemon is
+not a descendant of the task pane. Its per-thread configuration contains the
+helper command, not a bearer token. Task completion cannot select a later
+assignment that reuses the pane. Task records retain their existing pane
+presentation and instance-bound follow-up behavior; native conversation
+controls observe and act on the same shared thread through the official API.
+
+This path requires a connected verified local daemon, a known absolute cwd,
+and the launcher's existing per-invocation trusted-folder override. The last
+condition prevents `thread/start` from automatically persisting project trust.
+Custom executable/environment selections and unsupported CLI settings retain
+the existing terminal startup path and record why shared startup was skipped.
+An uncertain `thread/start` result never falls back to a second launch. A task
+cancelled during preparation does not submit its goal. Existing conversations
+are never migrated or restarted by this feature.
+
+Validation of a release candidate must include an isolated paired App task:
+
+1. Create a new Codex task in an allowed trusted test directory. Check that the
+   returned native thread and the TUI's session identity match, both are loaded
+   in the same daemon, task instructions and MCP are available, and the user's
+   prior pane retains focus.
+2. Observe the actual response and task completion in both views. Send one
+   task follow-up and one native conversation follow-up after the previous turn
+   settles; verify each appears once in the same thread.
+3. Trigger a real supported question in the isolated CLI session. Confirm the
+   native App displays the official pending/async form and the correct thread
+   receives the explicit answer. Ask the user before answering trust/approval
+   requests; absence of a question is not a passing question test.
+4. Cancel or remove the isolated task and verify its helper cannot renew or
+   use task authority; reuse of the pane must not transfer the old credential.
+5. Disconnect only the test client and verify the shared daemon and unrelated
+   sessions remain running. No active user session is resumed, interrupted,
+   migrated or stopped for this validation.

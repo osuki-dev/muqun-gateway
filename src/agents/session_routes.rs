@@ -694,6 +694,8 @@ pub(crate) struct StartedAgent {
 /// How a delegation starts its agent ([`start_agent_in_place`]).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TaskLaunch<'a> {
+    /// Immutable assignment identity for the shared runtime's MCP helper.
+    pub task_id: &'a str,
     /// Told how to report the task's end on its command line.
     pub out_of_band: bool,
     /// The model and effort the task named, as launch arguments.
@@ -744,6 +746,62 @@ pub(crate) async fn start_agent_in_place(
         // The model and effort the task named, after the configured
         // arguments (a later `-c` wins) and before the prompt.
         agent_args.extend(task.model_args.iter().cloned());
+    }
+    if agent == "codex" {
+        if let Some(task) = task {
+            let prepared = prepare_shared_task_launch(
+                state,
+                task.task_id,
+                agent_cwd.as_deref(),
+                &agent_args,
+                !agent_env.is_empty(),
+            )
+            .await;
+            match prepared {
+                Ok(prepared) => {
+                    payload["agent_session_id"] = json!(prepared.session.asid.0);
+                    // Creation did not submit the goal. A cancellation during
+                    // that RPC must not go on to launch a TUI with that goal.
+                    let live = state
+                        .tasks
+                        .task(&crate::tasks::domain::TaskId(task.task_id.into()))
+                        .await;
+                    if !matches!(live, Ok(Some(ref task)) if !task.state.is_terminal()) {
+                        steps.failed(
+                            "shared_session",
+                            "task_ended",
+                            "The task ended before its goal was submitted",
+                        );
+                        return (
+                            AgentLaunch {
+                                payload,
+                                steps,
+                                prompt_delivery: PromptDelivery::NotAttempted,
+                            },
+                            None,
+                        );
+                    }
+                    steps.ok("shared_session", json!({"agent":"codex","session_id":prepared.session.asid.0,"transport":"local_shared_daemon"}));
+                    agent_args = prepared.arguments;
+                }
+                Err(super::ports::agent::AgentError::Unsupported(reason)) => {
+                    steps.skipped("shared_session", &reason);
+                }
+                Err(error) => {
+                    // thread/start may have succeeded. Do not create a second
+                    // runtime or retry through the old argv startup path.
+                    steps.failed("shared_session", "shared_start_failed", &error.to_string());
+                    return (
+                        AgentLaunch {
+                            payload,
+                            steps,
+                            prompt_delivery: PromptDelivery::NotAttempted,
+                        },
+                        None,
+                    );
+                }
+            }
+        }
     }
     let launch_prompt = prompt
         .filter(|_| terminal_backend(session).takes_launch_prompt())
@@ -835,6 +893,44 @@ pub(crate) async fn start_agent_in_place(
         },
         Some(started),
     )
+}
+
+async fn prepare_shared_task_launch(
+    state: &AppState,
+    task_id: &str,
+    cwd: Option<&FsPath>,
+    arguments: &[String],
+    has_environment: bool,
+) -> Result<super::ports::agent::PreparedTerminalLaunch, super::ports::agent::AgentError> {
+    use super::ports::agent::AgentError;
+    if has_environment
+        || state.config.agent_commands.contains_key("codex")
+        || state.config.codex.binary.is_some()
+    {
+        return Err(AgentError::Unsupported(
+            "custom Codex executable or environment requires the existing terminal startup path"
+                .into(),
+        ));
+    }
+    let directory = cwd.and_then(FsPath::to_str).ok_or_else(|| {
+        AgentError::Unsupported("shared Codex startup requires a known working directory".into())
+    })?;
+    let manager = state
+        .agent_runtime
+        .manager_for_agent("codex")
+        .await
+        .ok_or_else(|| {
+            AgentError::Unsupported("a connected shared Codex daemon is required".into())
+        })?;
+    let mut arguments = arguments.to_vec();
+    arguments.extend(crate::mcp::inject::terminal_task_shared_args(
+        &state.config,
+        task_id,
+    ));
+    manager
+        .agent()
+        .prepare_terminal_launch(directory, &arguments)
+        .await
 }
 
 /// Type `prompt` into a started agent, retrying until it is ready, and

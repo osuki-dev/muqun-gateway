@@ -5,6 +5,7 @@ pub mod client;
 pub(crate) mod daemon;
 mod driver;
 mod items;
+mod launch;
 pub mod mapper;
 pub(crate) mod process_tree;
 pub(crate) mod rollout;

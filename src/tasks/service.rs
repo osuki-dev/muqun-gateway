@@ -1615,6 +1615,7 @@ pub(crate) async fn start_terminal_agent(
         placed.clone(),
         Some(&goal),
         Some(TaskLaunch {
+            task_id: &task.id.0,
             out_of_band: true,
             model_args: &model_args,
         }),
@@ -1644,6 +1645,7 @@ pub(crate) async fn start_terminal_agent(
             placed,
             Some(&goal),
             Some(TaskLaunch {
+                task_id: &task.id.0,
                 out_of_band: false,
                 model_args: &model_args,
             }),

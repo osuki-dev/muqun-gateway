@@ -101,11 +101,11 @@ fn verified_socket_in(
 
 #[cfg(unix)]
 pub(crate) async fn connect_at(home: &Path) -> Result<Option<Connection>, AgentError> {
-    let Some((home, socket)) = verified_socket(home)? else {
+    let Some((home, socket_path)) = verified_socket(home)? else {
         return Ok(None);
     };
     let connect = async {
-        let stream = tokio::net::UnixStream::connect(socket)
+        let stream = tokio::net::UnixStream::connect(&socket_path)
             .await
             .map_err(|_| unavailable("Codex daemon connection unavailable"))?;
         if stream.peer_cred().map(|peer| peer.uid()).ok() != Some(unsafe { libc::geteuid() }) {
@@ -118,7 +118,7 @@ pub(crate) async fn connect_at(home: &Path) -> Result<Option<Connection>, AgentE
             tokio_tungstenite::client_async_with_config("ws://localhost/rpc", stream, Some(config))
                 .await
                 .map_err(|_| unavailable("Codex daemon handshake failed"))?;
-        Ok(CodexClient::from_websocket(socket, home))
+        Ok(CodexClient::from_websocket(socket, home, socket_path))
     };
     let (client, events) = tokio::time::timeout(Duration::from_secs(3), connect)
         .await

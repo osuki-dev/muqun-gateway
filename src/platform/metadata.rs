@@ -51,6 +51,7 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "agent_session_pages_v1",
     "agent_session_runtime_v1",
     "codex_shared_daemon_v1",
+    "codex_shared_task_start_v1",
     "agent_session_refresh_v1",
     "agent_session_delete_scoped",
     "capabilities_discovery",

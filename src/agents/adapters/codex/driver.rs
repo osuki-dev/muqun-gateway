@@ -11,6 +11,7 @@ use super::{
 use crate::agents::domain::*;
 use crate::agents::ports::agent::{
     append_attachment_paths, AgentError, AgentFuture, AgentPort, AttachmentMode, FileDiffItem,
+    PreparedTerminalLaunch,
 };
 
 const MAX_SESSIONS: usize = 4096;
@@ -756,6 +757,32 @@ impl CodexDriver {
 }
 
 impl AgentPort for CodexDriver {
+    fn prepare_terminal_launch<'a>(
+        &'a self,
+        directory: &'a str,
+        arguments: &'a [String],
+    ) -> AgentFuture<'a, PreparedTerminalLaunch> {
+        Box::pin(async move {
+            let endpoint = self.client.terminal_endpoint().ok_or_else(|| {
+                AgentError::Unsupported("a connected shared Codex daemon is required".into())
+            })?;
+            let config = super::launch::parse(directory, arguments)
+                .map_err(|reason| AgentError::Unsupported(reason.into()))?;
+            let _guard = self.mutations.lock().await;
+            let response = self.client.call("thread/start", config.params).await?;
+            let session = self.selected_response(response).await?;
+            if uuid::Uuid::parse_str(&session.asid.0).is_err() {
+                return Err(AgentError::Protocol(
+                    "Codex returned an invalid terminal session identity".into(),
+                ));
+            }
+            let mut arguments = vec!["--remote".into(), endpoint];
+            arguments.extend(config.ui_args);
+            arguments.extend(["resume".into(), session.asid.0.clone()]);
+            Ok(PreparedTerminalLaunch { session, arguments })
+        })
+    }
+
     fn kind(&self) -> &'static str {
         super::KIND
     }

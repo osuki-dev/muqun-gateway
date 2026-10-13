@@ -76,6 +76,13 @@ pub enum AttachmentMode {
     ByPath,
 }
 
+/// A new service-owned session that an official terminal client can attach to.
+/// No prompt has been submitted; the caller performs its existing one-shot delivery.
+pub struct PreparedTerminalLaunch {
+    pub session: AgentSessionInfo,
+    pub arguments: Vec<String>,
+}
+
 /// `text` followed by a block listing `paths` for an agent that reads files
 /// itself. Unchanged when there are no paths.
 pub fn append_attachment_paths(text: &str, paths: &[String]) -> String {
@@ -118,6 +125,17 @@ pub trait AgentPort: Send + Sync {
         model: Option<&'a ModelRef>,
         mode: Option<&'a str>,
     ) -> AgentFuture<'a, AgentSessionInfo>;
+
+    /// Prepare a shared session from supported native CLI choices. Unsupported
+    /// is returned only before creating a session; other failures are ambiguous
+    /// and must never trigger a second launch or prompt delivery.
+    fn prepare_terminal_launch<'a>(
+        &'a self,
+        _directory: &'a str,
+        _arguments: &'a [String],
+    ) -> AgentFuture<'a, PreparedTerminalLaunch> {
+        Box::pin(async { Err(AgentError::Unsupported("shared terminal startup".into())) })
+    }
 
     /// Get session metadata
     fn get_session<'a>(&'a self, session_id: &'a str) -> AgentFuture<'a, AgentSessionInfo>;

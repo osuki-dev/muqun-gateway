@@ -8,6 +8,7 @@ impl CodexClient {
     pub(crate) fn from_websocket(
         mut socket: WebSocketStream<UnixStream>,
         home: std::path::PathBuf,
+        shared_socket: std::path::PathBuf,
     ) -> (Arc<Self>, mpsc::Receiver<CodexEvent>) {
         let (events, rx) = mpsc::channel(QUEUE_SIZE);
         let (outgoing, mut writes) = mpsc::channel::<WritePacket>(MAX_PENDING);
@@ -79,6 +80,7 @@ impl CodexClient {
                 configured_provider: std::sync::OnceLock::new(),
                 expected_home: Some(home),
                 codex_home: std::sync::OnceLock::new(),
+                shared_socket: Some(shared_socket),
             }),
             rx,
         )
@@ -118,7 +120,8 @@ mod tests {
             );
             let (socket, _) = client.unwrap();
             let mut server = server.unwrap();
-            let (client, events) = CodexClient::from_websocket(socket, home.0.clone());
+            let (client, events) =
+                CodexClient::from_websocket(socket, home.0.clone(), home.0.join("fixture.sock"));
             let home_path = home.0.clone();
             let requests = Arc::new(Mutex::new(vec![]));
             let seen = requests.clone();
@@ -292,6 +295,167 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shared_terminal_start_keeps_context_in_thread_and_returns_exact_remote_resume() {
+        let fixture = Fixture::new(|request| {
+            assert_eq!(request["method"], "thread/start");
+            assert_eq!(request["params"]["developerInstructions"], "Synthetic owner instructions. Synthetic task completion rule.");
+            assert_eq!(request["params"]["config"]["mcp_servers.muqun.http_headers_helper"], "fixture-helper --task-id synthetic-task");
+            assert_eq!(request["params"]["cwd"], "/synthetic/project");
+            json!({"thread":{"id":"00000000-0000-4000-8000-000000000001","historyMode":"paginated","status":{"type":"idle"}}})
+        }).await;
+        let driver = CodexDriver::new(fixture.client.clone());
+        let arguments = ["-c", "projects={ '/synthetic/project' = { trust_level = 'trusted' } }", "-c", "developer_instructions='Synthetic owner instructions. Synthetic task completion rule.'", "-c", "mcp_servers.muqun.http_headers_helper='fixture-helper --task-id synthetic-task'"]
+            .into_iter().map(str::to_owned).collect::<Vec<_>>();
+        let prepared = driver
+            .prepare_terminal_launch("/synthetic/project", &arguments)
+            .await
+            .unwrap();
+        assert_eq!(
+            prepared.arguments,
+            [
+                "--remote".to_owned(),
+                format!("unix://{}", fixture._home.0.join("fixture.sock").display()),
+                "resume".into(),
+                prepared.session.asid.0.clone()
+            ]
+        );
+        assert!(fixture.client.is_subscribed(&prepared.session.asid.0));
+        assert!(!locked(&fixture.requests)
+            .iter()
+            .any(|r| r["method"] == "turn/start"));
+        assert!(matches!(
+            driver
+                .prepare_terminal_launch("/synthetic/project", &["--no-daemon".into()])
+                .await,
+            Err(AgentError::Unsupported(_))
+        ));
+        assert_eq!(
+            locked(&fixture.requests)
+                .iter()
+                .filter(|r| r["method"] == "thread/start")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_task_launcher_submits_once_and_stops_after_cancellation_or_uncertain_creation()
+    {
+        use crate::agents::manager::AgentManager;
+        use crate::agents::session_routes::{
+            start_agent_in_place, type_agent_prompt, PlacedAgent, PromptDelivery, SpawnPlace,
+            TaskLaunch,
+        };
+        use crate::tasks::domain::Task;
+        for (cancelled, invalid_response) in [(false, false), (true, false), (false, true)] {
+            let mut fixture = Fixture::new(move |request| {
+                assert_eq!(request["method"], "thread/start");
+                assert!(request["params"].get("input").is_none());
+                if invalid_response { return json!({"thread":{"id":"invalid-returned-id","status":{"type":"idle"}}}); }
+                json!({"thread":{"id":"00000000-0000-4000-8000-000000000001","historyMode":"paginated","status":{"type":"idle"}}})
+            }).await;
+            let herdr = crate::test_support::FakeHerdr::start(vec![], None);
+            let mut state = crate::test_support::test_state("synthetic-admin", vec![]);
+            state.config.sessions = vec![herdr.session()];
+            state.config.mcp.inject_into_agents = false;
+            let cwd = dirs::home_dir().unwrap().join(format!(
+                ".muqun-shared-start-test-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            std::fs::create_dir(&cwd).unwrap();
+            let _cwd = TestDirectory(cwd.clone());
+            let task: Task = serde_json::from_value(json!({
+                "id":"t_synthetic_shared_launch", "kind":"delegation", "goal":"synthetic goal", "cwd":cwd,
+                "binding":{"kind":"pane","session_id":"default","pane_id":"w1:p1","tab_id":"w1:t1","agent_id":"codex"},
+                "state":if cancelled {"cancelled"} else {"dispatching"},
+                "created_by":{"kind":"assistant","id":"synthetic"}, "created_ms":1,"updated_ms":1,"seq":1,"origin":"mcp"
+            })).unwrap();
+            state.tasks.insert_for_test(&task).await;
+            let (tx, _) = tokio::sync::broadcast::channel(64);
+            let manager = AgentManager::connect_codex(
+                fixture.client.clone(),
+                std::mem::replace(&mut fixture.events, mpsc::channel(1).1),
+                tx,
+            );
+            state.agent_runtime.attach_for_test(Arc::new(manager)).await;
+            let placed = PlacedAgent {
+                place: SpawnPlace {
+                    pane_id: "w1:p1".into(),
+                    tab_id: Some("w1:t1".into()),
+                    cwd: Some(cwd.clone()),
+                    env_applied: true,
+                },
+                payload: json!({"agent_started":false,"prompt_submitted":false}),
+                steps: crate::agents::tasks::StepLog::new(),
+            };
+            let (mut launch, to_type) = start_agent_in_place(
+                &state,
+                &herdr.session(),
+                "codex",
+                cwd.to_str(),
+                placed,
+                Some("synthetic goal"),
+                Some(TaskLaunch {
+                    task_id: &task.id.0,
+                    out_of_band: true,
+                    model_args: &[],
+                }),
+            )
+            .await;
+            if let Some(started) = to_type {
+                assert!(!cancelled && !invalid_response);
+                type_agent_prompt(
+                    &herdr.session(),
+                    &started,
+                    Some("synthetic goal"),
+                    &mut launch,
+                )
+                .await;
+            }
+            let calls = herdr.calls.lock().unwrap();
+            let starts: Vec<_> = calls
+                .iter()
+                .filter(|r| r["method"] == "agent.start")
+                .collect();
+            assert_eq!(starts.len(), usize::from(!cancelled && !invalid_response));
+            if cancelled || invalid_response {
+                assert_eq!(launch.prompt_delivery, PromptDelivery::NotAttempted);
+                assert_eq!(launch.payload["prompt_submitted"], false);
+            } else {
+                assert_eq!(launch.prompt_delivery, PromptDelivery::Attempted);
+                assert_eq!(
+                    starts[0]["params"]["args"],
+                    json!([
+                        "--remote",
+                        format!("unix://{}", fixture._home.0.join("fixture.sock").display()),
+                        "resume",
+                        "00000000-0000-4000-8000-000000000001"
+                    ])
+                );
+                assert_eq!(launch.payload["prompt_submitted"], true);
+            }
+            let prompts: Vec<_> = calls
+                .iter()
+                .filter(|r| r["method"] == "agent.prompt")
+                .collect();
+            assert_eq!(prompts.len(), usize::from(!cancelled && !invalid_response));
+            if let Some(prompt) = prompts.first() {
+                assert_eq!(prompt["params"]["text"], "synthetic goal");
+            }
+            assert!(!calls
+                .iter()
+                .any(|r| r["method"] == "pane.send_text" || r["method"] == "pane.focus"));
+            assert_eq!(
+                locked(&fixture.requests)
+                    .iter()
+                    .filter(|r| r["method"] == "thread/start")
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn shared_daemon_disconnect_sends_no_lifecycle_or_thread_mutation() {
         let fixture = Fixture::new(|_| panic!("disconnect must not make an RPC")).await;
         assert!(fixture.client.is_shared());
@@ -366,7 +530,11 @@ mod tests {
             tokio_tungstenite::client_async("ws://localhost/rpc", left),
             tokio_tungstenite::accept_async(right)
         );
-        let (client, _) = CodexClient::from_websocket(client.unwrap().0, home.0.clone());
+        let (client, _) = CodexClient::from_websocket(
+            client.unwrap().0,
+            home.0.clone(),
+            home.0.join("fixture.sock"),
+        );
         let mut server = server.unwrap();
         let task = tokio::spawn(async move {
             let Message::Text(text) = server.next().await.unwrap().unwrap() else {

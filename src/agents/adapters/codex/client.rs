@@ -133,6 +133,7 @@ pub struct CodexClient {
     configured_provider: std::sync::OnceLock<String>,
     expected_home: Option<std::path::PathBuf>,
     codex_home: std::sync::OnceLock<std::path::PathBuf>,
+    shared_socket: Option<std::path::PathBuf>,
 }
 
 struct WritePacket {
@@ -270,6 +271,7 @@ impl CodexClient {
                 configured_provider: std::sync::OnceLock::new(),
                 expected_home: None,
                 codex_home: std::sync::OnceLock::new(),
+                shared_socket: None,
             }),
             rx,
         )
@@ -277,6 +279,12 @@ impl CodexClient {
 
     pub(crate) fn codex_home(&self) -> Option<&std::path::Path> {
         self.codex_home.get().map(std::path::PathBuf::as_path)
+    }
+
+    pub(crate) fn terminal_endpoint(&self) -> Option<String> {
+        self.is_ready().then_some(())?;
+        let path = self.shared_socket.as_ref()?.to_str()?;
+        Some(format!("unix://{path}"))
     }
 
     pub(crate) fn is_shared(&self) -> bool {
