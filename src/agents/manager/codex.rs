@@ -227,6 +227,13 @@ impl Context {
 
     async fn event(&self, event: CodexEvent) {
         match event {
+            CodexEvent::Attached { thread } => {
+                if let Ok(info) = mapper::session(&thread) {
+                    self.update_info(info).await;
+                } else {
+                    self.driver.client().stop();
+                }
+            }
             CodexEvent::Snapshot { thread, revision } => self.session(&thread, revision).await,
             CodexEvent::MetadataRefreshFailed { thread, revision } => {
                 let versions = self.driver.metadata_guard().await;

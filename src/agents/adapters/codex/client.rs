@@ -33,6 +33,10 @@ pub enum CodexEvent {
         thread: Value,
         revision: u64,
     },
+    /// Initial shared subscription status, ordered before subsequent events.
+    Attached {
+        thread: Value,
+    },
     MetadataRefreshFailed {
         thread: String,
         revision: u64,
@@ -779,7 +783,16 @@ fn route_frame(state: &State, value: Value, frame_bytes: usize) -> Result<(), Ag
                             "Codex subscription capacity exhausted".into(),
                         ));
                     }
-                    subscribed.insert(thread.into());
+                    let first = subscribed.insert(thread.into());
+                    drop(subscribed);
+                    if first {
+                        // Publish at the response boundary, before subsequent
+                        // notifications and before waking the requesting task.
+                        // A later metadata snapshot must not roll status back.
+                        state.emit(CodexEvent::Attached {
+                            thread: result["thread"].clone(),
+                        })?;
+                    }
                 }
             }
             if let (Some(thread), Ok(result)) = (&pending.turn_thread, &result) {

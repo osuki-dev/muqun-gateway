@@ -234,6 +234,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shared_rejoin_initial_status_replaces_unknown_and_completion_wins() {
+        use crate::agents::domain::{AgentDomainEvent, AgentSessionId, AgentSessionStatus};
+        use crate::agents::manager::AgentManager;
+        let mut fixture = Fixture::new(|request| match request["method"].as_str().unwrap() {
+            "thread/read" | "thread/resume" => json!({"thread":{"id":"live","historyMode":"paginated","status":{"type":"active","activeFlags":[]}}}),
+            "thread/turns/list" => json!({"data":[{"id":"active-turn","status":"inProgress"}]}),
+            "thread/items/list" => json!({"data":[],"nextCursor":null}),
+            other => panic!("unexpected RPC {other}"),
+        }).await;
+        let (tx, mut updates) = tokio::sync::broadcast::channel(64);
+        let manager = AgentManager::connect_codex_observed(
+            fixture.client.clone(),
+            std::mem::replace(&mut fixture.events, mpsc::channel(1).1),
+            tx,
+            Some(crate::agents::terminal_runtime::TerminalRuntime::new(&[])),
+        );
+        assert_eq!(
+            manager.sessions().get_session("live").await.unwrap().status,
+            AgentSessionStatus::Unknown
+        );
+        let asid = AgentSessionId("live".into());
+        manager.sessions().get_snapshot(&asid).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(updates.recv().await.unwrap(), AgentDomainEvent::SessionUpdated { info, .. } if info.status == AgentSessionStatus::Busy && info.runtime.as_ref().is_some_and(|r| r.source == RuntimeSource::Native)) {
+                    break;
+                }
+            }
+        }).await.unwrap();
+        fixture.send.send(json!({"method":"turn/completed","params":{"threadId":"live","turn":{"id":"active-turn","status":"completed"}}})).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    updates.recv().await.unwrap(),
+                    AgentDomainEvent::StatusChanged {
+                        status: AgentSessionStatus::Idle,
+                        ..
+                    }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            manager
+                .sessions()
+                .get_snapshot(&asid)
+                .await
+                .unwrap()
+                .info
+                .status,
+            AgentSessionStatus::Idle
+        );
+    }
+
+    #[tokio::test]
     async fn shared_daemon_disconnect_sends_no_lifecycle_or_thread_mutation() {
         let fixture = Fixture::new(|_| panic!("disconnect must not make an RPC")).await;
         assert!(fixture.client.is_shared());
