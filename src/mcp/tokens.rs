@@ -1,4 +1,4 @@
-//! Assistant tokens: bearer tokens minted for one pane (7 days) or one agent
+//! Assistant tokens: bearer tokens minted for one pane/task (7 days) or one agent
 //! (no expiry; replaced on its next start), which authorise `/mcp` and
 //! nothing else. Only `hash_token()` of a
 //! token is stored; the token itself is shown once, at issue.
@@ -31,8 +31,17 @@ pub(crate) const NO_EXPIRY: u64 = i64::MAX as u64;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum TokenBinding {
-    Pane { session_id: String, pane_id: String },
-    Agent { agent_id: String },
+    Pane {
+        session_id: String,
+        pane_id: String,
+    },
+    Agent {
+        agent_id: String,
+    },
+    /// One immutable delegation, independent of a shared daemon's ancestry.
+    Task {
+        task_id: String,
+    },
 }
 
 impl TokenBinding {
@@ -43,6 +52,7 @@ impl TokenBinding {
                 pane_id,
             } => format!("pane:{session_id}\u{1f}{pane_id}"),
             Self::Agent { agent_id } => format!("agent:{agent_id}"),
+            Self::Task { task_id } => format!("task:{task_id}"),
         }
     }
 }

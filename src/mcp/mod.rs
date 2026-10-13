@@ -380,6 +380,16 @@ async fn serve(
             Ok(session) => session,
             Err(refusal) => return refusal.into_response(),
         };
+    if let tokens::TokenBinding::Task { task_id } = &session.binding {
+        if !matches!(issue::task_authority(&state, task_id).await, Ok(Some(_))) {
+            return crate::api_error(
+                axum::http::StatusCode::FORBIDDEN,
+                "task_not_available",
+                "Task token authority is unavailable",
+            )
+            .into_response();
+        }
+    }
     let in_task = tools::started_for_task(&state, &session).await;
     let service = StreamableHttpService::new(
         move || Ok(tools::MuqunMcp::new(state.clone(), session.clone()).in_task(in_task)),
