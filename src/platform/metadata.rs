@@ -76,6 +76,8 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "pane_interrupt",
     "pane_output_ansi",
     "pane_captured_history",
+    // Segment-aware captured pagination in both memory and SQLite storage modes.
+    "pane_captured_history_segments_v1",
     "pane_parts",
     "pane_parts_native",
     "pane_shortcuts",
@@ -85,6 +87,8 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "per_device_tokens",
     "push_notifications",
     "push_token_revocation",
+    // Push delivery requires an authenticated registration owned by a paired app.
+    "push_token_owner_binding_v1",
     "recent_cwds",
     // `GET /api/sessions/{id}/snapshot`, whose `agents` array is the same one
     // `GET .../agents` answers with -- `instance_id` and `target` included --
@@ -1222,6 +1226,17 @@ mod tests {
             let mut state = crate::test_state("admin", Vec::new());
             state.config.history.storage = storage;
             let meta = gateway_metadata(&state, false).await.unwrap();
+            for capability in [
+                "pane_captured_history",
+                "pane_captured_history_segments_v1",
+                "push_token_owner_binding_v1",
+            ] {
+                assert!(meta["capabilities"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|c| c == capability));
+            }
             let listed = meta["capabilities"]
                 .as_array()
                 .unwrap()

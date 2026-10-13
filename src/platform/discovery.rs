@@ -209,6 +209,8 @@ impl TerminalBackendFeatures {
 #[serde(rename_all = "camelCase")]
 pub struct TerminalFeatures {
     /// Frozen pagination of bounded Gateway captures, not native ranged reads.
+    /// Segment support is negotiated via `pane_captured_history_segments_v1`
+    /// in the gateway-wide capability list, independently of storage mode.
     #[serde(default)]
     pub captured_history: bool,
     pub multi_window: bool,
@@ -451,6 +453,33 @@ pub fn transports_discovery(mcp_helper: Option<&str>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn captured_segments_and_push_ownership_are_discovered_in_both_storage_modes() {
+        for storage in [
+            crate::platform::config::HistoryStorage::Memory,
+            crate::platform::config::HistoryStorage::Sqlite,
+        ] {
+            let mut state = crate::test_state("admin", Vec::new());
+            state.config.history.storage = storage;
+            let discovery = super::build_discovery(&state, false, true).await;
+            for capability in [
+                "pane_captured_history",
+                "pane_captured_history_segments_v1",
+                "push_token_owner_binding_v1",
+            ] {
+                assert!(discovery["capabilities"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|c| c == capability));
+            }
+            assert_eq!(
+                discovery["planes"]["terminal"]["features"]["capturedHistory"],
+                true
+            );
+        }
+    }
 
     #[test]
     fn transports_announce_mcp_only_when_enabled() {

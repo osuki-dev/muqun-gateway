@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
@@ -20,6 +21,7 @@ use super::history::{
     StorageStats,
 };
 use super::history_memory::MemoryHistoryRepository;
+use super::history_segments::{Segment, SegmentPosition, MAX_SEGMENTS, RETENTION_MS};
 use super::scrollback::{ProjectionStamp, ScrollbackStore, MAX_PANE_BYTES, MAX_PANE_LINES};
 use crate::platform::config::{Config, HistoryStorage};
 use crate::platform::store::sqlite::{Migration, SqliteStore};
@@ -38,6 +40,22 @@ CREATE INDEX history_capture_retention ON history_captures(updated);
         "
 CREATE INDEX history_capture_quota ON history_captures(updated, identity, bytes);
 DROP INDEX history_capture_retention;
+",
+        // Parent rows continue to count read shapes, not segments. The legacy
+        // binary payload is retained verbatim and validated by the same decoder
+        // before adoption. A corrupt record can never authorize empty recovery.
+        "
+CREATE TABLE history_segments(identity TEXT NOT NULL REFERENCES history_captures(identity) ON DELETE CASCADE,
+  segment_id TEXT NOT NULL, position TEXT NOT NULL, rows BLOB NOT NULL,
+  bytes INTEGER NOT NULL, changed_ms INTEGER NOT NULL, PRIMARY KEY(identity,segment_id));
+CREATE INDEX history_segment_age ON history_segments(changed_ms);
+INSERT INTO history_segments SELECT identity, lower(hex(randomblob(16))),
+  json_object('segment_id', '00000000-0000-0000-0000-000000000000', 'started_at_ms', updated*1000,
+    'sealed_at_ms', updated*1000, 'boundary_reason', 'gateway-restart', 'base', 0, 'len', 0),
+  rows, bytes, updated*1000 FROM history_captures WHERE length(rows)>0;
+UPDATE history_captures SET rows=x'';
+UPDATE history_segments SET bytes=bytes+length(CAST(position AS BLOB))+length(segment_id)+16;
+UPDATE history_captures SET bytes=(SELECT coalesce(sum(bytes),0) FROM history_segments WHERE history_segments.identity=history_captures.identity)+length(CAST(identity AS BLOB))+length(CAST(policy AS BLOB))+64;
 ",
     ],
 };
@@ -204,8 +222,11 @@ impl SqliteHistoryRepository {
             .lock()
             .map_err(|_| HistoryError::Unavailable)?
             .projection_stamp(scope);
-        let Some(stamp) = stamp.filter(|stamp| stamp.native_identity.is_some() && !stamp.reset)
-        else {
+        let Some(stamp) = stamp.filter(|stamp| {
+            self.captures
+                .lock()
+                .is_ok_and(|c| c.recovery_pending(stamp))
+        }) else {
             return Ok(());
         };
         let checkpoints = self.health()?;
@@ -213,13 +234,15 @@ impl SqliteHistoryRepository {
             .reads
             .try_acquire()
             .map_err(|_| HistoryError::Unavailable)?;
-        if let Some((rows, expires)) = checkpoints.read(stamp.clone()).await? {
-            checkpoints
-                .captures
-                .lock()
-                .map_err(|_| HistoryError::Unavailable)?
-                .recover_checkpoint(&stamp, rows, expires);
-        }
+        let recovered = checkpoints
+            .read_segments(stamp.clone())
+            .await?
+            .unwrap_or_default();
+        checkpoints
+            .captures
+            .lock()
+            .map_err(|_| HistoryError::Unavailable)?
+            .recover_segments(&stamp, recovered);
         Ok(())
     }
 }
@@ -255,8 +278,19 @@ impl HistoryRepository for SqliteHistoryRepository {
     fn find<'a>(
         &'a self,
         scope: &'a HistoryScope,
+        segmented: bool,
     ) -> HistoryFuture<'a, Option<Arc<HistorySnapshot>>> {
-        Box::pin(async move { self.memory.find(scope).await })
+        Box::pin(async move { self.memory.find(scope, segmented).await })
+    }
+    fn capture_segments<'a>(
+        &'a self,
+        scope: &'a HistoryScope,
+        include_rows: bool,
+    ) -> HistoryFuture<'a, Option<Capture>> {
+        Box::pin(async move {
+            self.recover(scope).await?;
+            self.memory.capture_segments(scope, include_rows).await
+        })
     }
     fn load(&self, id: Uuid) -> HistoryFuture<'_, Option<Arc<HistorySnapshot>>> {
         Box::pin(async move { self.memory.load(id).await })
@@ -490,10 +524,10 @@ impl Checkpoints {
         self.pass(now, false, stamps, debounce).await
     }
 
-    async fn read(
+    async fn read_segments(
         self: &Arc<Self>,
         stamp: ProjectionStamp,
-    ) -> Result<Option<(Vec<String>, Instant)>, HistoryError> {
+    ) -> Result<Option<Vec<Segment>>, HistoryError> {
         let this = self.clone();
         self.db
             .call(move |connection| this.read_rows(connection, &stamp))
@@ -503,6 +537,33 @@ impl Checkpoints {
                 self.healthy.store(false, Ordering::Release);
                 HistoryError::Unavailable
             })
+    }
+
+    #[cfg(test)]
+    async fn read(
+        self: &Arc<Self>,
+        stamp: ProjectionStamp,
+    ) -> Result<Option<(Vec<String>, Instant)>, HistoryError> {
+        Ok(self.read_segments(stamp).await?.map(|segments| {
+            let remaining = segments
+                .iter()
+                .map(|s| {
+                    s.changed_at_ms
+                        .saturating_add(RETENTION_MS)
+                        .saturating_sub(super::history_segments::now_ms())
+                })
+                .min()
+                .unwrap_or(0)
+                .max(0) as u64;
+            (
+                segments
+                    .iter()
+                    .flat_map(|s| &s.rows)
+                    .map(|r| r.to_string())
+                    .collect(),
+                Instant::now() + Duration::from_millis(remaining),
+            )
+        }))
     }
 
     /// `None` for a pane whose process identity is unverified: such a
@@ -526,31 +587,98 @@ impl Checkpoints {
         &self,
         connection: &Connection,
         stamp: &ProjectionStamp,
-    ) -> anyhow::Result<Option<(Vec<String>, Instant)>> {
+    ) -> anyhow::Result<Option<Vec<Segment>>> {
         let Some(key) = self.key(stamp) else {
             return Ok(None);
         };
-        let encoded: Option<(Vec<u8>, i64)> = connection
+        let policy: Option<String> = connection
             .query_row(
-                "SELECT rows,updated FROM history_captures WHERE identity=?1 AND policy=?2 AND updated>=?3",
-                params![key, stamp.policy, now_seconds() - RETENTION_SECONDS],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                "SELECT policy FROM history_captures WHERE identity=?1",
+                [&key],
+                |row| {
+                    let policy = row.get_ref(0)?.as_str()?;
+                    if policy.len() > 4096 {
+                        return Err(rusqlite::Error::InvalidQuery);
+                    }
+                    Ok(policy.to_owned())
+                },
             )
             .optional()?;
-        encoded
-            .map(|(encoded, updated)| {
-                Ok((
-                    decode_rows(&encoded)?,
-                    Instant::now()
-                        + Duration::from_secs(
-                            updated
-                                .saturating_add(RETENTION_SECONDS)
-                                .saturating_sub(now_seconds())
-                                .clamp(0, RETENTION_SECONDS) as u64,
-                        ),
-                ))
-            })
-            .transpose()
+        let Some(policy) = policy else {
+            return Ok(None);
+        };
+        // Dimensions and editor/capture policy delimit sampling, not native
+        // incarnation. Workspace/tab/terminal identity still must match.
+        let identity = |p: &str| -> anyhow::Result<Value> {
+            let value: Value = serde_json::from_str(p)?;
+            let policy = value
+                .as_array()
+                .filter(|p| p.len() == 3)
+                .ok_or_else(|| anyhow::anyhow!("invalid stored policy"))?;
+            let identity = policy[0]
+                .as_array()
+                .filter(|i| i.len() == 3)
+                .ok_or_else(|| anyhow::anyhow!("invalid stored identity"))?;
+            anyhow::ensure!(
+                identity.iter().all(|i| i.is_null() || i.is_string()),
+                "invalid stored identity"
+            );
+            Ok(policy[0].clone())
+        };
+        if identity(&policy)? != identity(&stamp.policy)? {
+            return Ok(None);
+        }
+        let cutoff = super::history_segments::now_ms() - RETENTION_MS;
+        let (count, row_bytes, metadata_bytes): (i64, i64, i64) = connection.query_row(
+            "SELECT count(*),coalesce(sum(length(rows)),0),coalesce(sum(length(CAST(position AS BLOB))),0) FROM history_segments WHERE identity=?1 AND changed_ms>?2",
+            params![key, cutoff], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))
+        )?;
+        anyhow::ensure!(
+            count <= MAX_SEGMENTS as i64
+                && row_bytes <= MAX_ENCODED_BYTES as i64
+                && metadata_bytes <= (MAX_SEGMENTS * 512) as i64,
+            "stored shape exceeds bounds"
+        );
+        let encoded: Vec<(String, String, Vec<u8>, i64)> = connection.prepare(
+            "SELECT segment_id,position,rows,changed_ms FROM history_segments WHERE identity=?1 AND changed_ms>?2 ORDER BY json_extract(position,'$.started_at_ms'),rowid"
+        )?.query_map(params![key, cutoff], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?.collect::<Result<_,_>>()?;
+        anyhow::ensure!(
+            encoded.len() <= MAX_SEGMENTS,
+            "stored segment count exceeds bounds"
+        );
+        let mut segments = Vec::new();
+        for (id, position, encoded, changed_at_ms) in encoded {
+            let mut position: SegmentPosition = serde_json::from_str(&position)?;
+            position.segment_id = Uuid::parse_str(&id)?.to_string();
+            let rows = decode_rows(&encoded)?
+                .into_iter()
+                .filter(|row| super::exit_marker::strip_exit_markers(row).as_ref() == row)
+                .map(super::scrollback::Row::from)
+                .collect::<Vec<_>>();
+            position.len = rows.len();
+            anyhow::ensure!(
+                position.base.checked_add(rows.len() as u64).is_some(),
+                "invalid stored row positions"
+            );
+            if !rows.is_empty() {
+                segments.push(Segment {
+                    position,
+                    changed_at_ms,
+                    rows,
+                });
+            }
+        }
+        anyhow::ensure!(
+            segments.iter().map(|s| s.rows.len()).sum::<usize>() <= MAX_PANE_LINES
+                && segments
+                    .iter()
+                    .flat_map(|s| &s.rows)
+                    .map(|r| r.len())
+                    .sum::<usize>()
+                    <= MAX_PANE_BYTES,
+            "stored shape exceeds bounds"
+        );
+        Ok(Some(segments))
     }
 
     /// One pass: forget one vanished or unverified scope, or write one changed
@@ -570,12 +698,13 @@ impl Checkpoints {
         let live: HashSet<_> = stamps.iter().map(scope_key).collect();
         let gone = writer.seen.keys().find(|key| !live.contains(*key)).cloned();
         if let Some(scope) = gone {
-            if let Some(seen) = writer.seen.remove(&scope) {
+            if let Some(seen) = writer.seen.get(&scope) {
                 connection.execute(
                     "DELETE FROM history_captures WHERE identity=?1",
                     [&seen.key],
                 )?;
             }
+            writer.seen.remove(&scope);
             return Ok(false);
         }
         stamps.sort_by(|a, b| {
@@ -598,11 +727,12 @@ impl Checkpoints {
             }
             let Some(key) = self.key(&stamp) else {
                 // Verified -> unknown: what the verified process wrote goes.
-                if let Some(seen) = writer.seen.remove(&scope_key) {
+                if let Some(seen) = writer.seen.get(&scope_key) {
                     connection.execute(
                         "DELETE FROM history_captures WHERE identity=?1",
                         [&seen.key],
                     )?;
+                    writer.seen.remove(&scope_key);
                     return Ok(false);
                 }
                 continue;
@@ -611,6 +741,25 @@ impl Checkpoints {
                 key.len() <= 8192 && stamp.policy.len() <= 4096,
                 "capture metadata exceeds bounds"
             );
+            // Resolve recovery on the same store worker BEFORE any replacement,
+            // even when output has already produced a new historical prefix.
+            // Read/decoder errors leave recovery pending and the old SQL intact.
+            let pending = self
+                .captures
+                .lock()
+                .map_err(|_| anyhow::anyhow!("capture lock poisoned"))?
+                .recovery_pending(&stamp);
+            if pending {
+                let recovered = self.read_rows(connection, &stamp)?.unwrap_or_default();
+                if !self
+                    .captures
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("capture lock poisoned"))?
+                    .recover_segments(&stamp, recovered)
+                {
+                    continue;
+                }
+            }
             // A reset or a new identity is written at once; so is a projection
             // that emptied, whose row is deleted only when `stamp.reset` is set
             // (otherwise the stored row stays).
@@ -636,18 +785,31 @@ impl Checkpoints {
                 }
                 // Shared rows only: the copy and the encoding happen below,
                 // without the lock every read and frame waits on.
-                store.live_projection_rows(&stamp.scope())
+                store.segment_projection(&stamp.scope())
             };
-            let encoded = capture.map(|rows| {
-                rows.filter(|rows| !rows.is_empty())
-                    .map(|rows| encode_rows(&rows))
+            let encoded = capture.and_then(|segments| {
+                segments
+                    .into_iter()
+                    .map(|s| {
+                        let rows = encode_rows(&s.rows);
+                        Ok((
+                            s.position.segment_id.to_string(),
+                            serde_json::to_string(&s.position)
+                                .map_err(|_| HistoryError::Unavailable)?,
+                            rows,
+                            s.changed_at_ms,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, HistoryError>>()
             });
             // Over the bounds: this pane's outcome, not a storage failure.
             // The others are still written and the store stays healthy.
             let Some(encoded) = encoded.ok().filter(|encoded| {
                 encoded
-                    .as_ref()
-                    .is_none_or(|e| e.len() <= MAX_ENCODED_BYTES)
+                    .iter()
+                    .map(|(_, position, rows, _)| rows.len() + position.len())
+                    .sum::<usize>()
+                    <= MAX_ENCODED_BYTES + MAX_SEGMENTS * 512
             }) else {
                 if !seen.is_some_and(|seen| seen.oversized && seen.key == key) {
                     tracing::warn!(
@@ -670,9 +832,27 @@ impl Checkpoints {
                 );
                 continue;
             };
-            let content: Option<[u8; 32]> = encoded
-                .as_ref()
-                .map(|encoded| Sha256::digest(encoded).into());
+            let content: Option<[u8; 32]> = (!encoded.is_empty()).then(|| {
+                let mut hash = Sha256::new();
+                for (id, position, rows, changed) in &encoded {
+                    hash.update(id);
+                    hash.update(position);
+                    hash.update(rows);
+                    hash.update(changed.to_le_bytes());
+                }
+                hash.finalize().into()
+            });
+            if encoded.is_empty()
+                && seen.is_none()
+                && (!stamp.reset
+                    || self
+                        .captures
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("capture lock poisoned"))?
+                        .absence_acknowledged(&stamp))
+            {
+                continue;
+            }
             let previous = writer.seen.get(&scope_key);
             let unchanged = previous.is_some_and(|seen| {
                 seen.key == key
@@ -691,10 +871,37 @@ impl Checkpoints {
                         )?;
                     }
                 }
-                if let Some(encoded) = encoded {
-                    transaction.execute("INSERT INTO history_captures VALUES (?1,?2,?3,?4,?5) ON CONFLICT(identity) DO UPDATE SET policy=excluded.policy, rows=excluded.rows, bytes=excluded.bytes, updated=excluded.updated WHERE history_captures.rows != excluded.rows OR history_captures.policy != excluded.policy", params![key, stamp.policy, encoded, encoded.len() as i64, now])?;
+                if !encoded.is_empty() {
+                    let bytes = encoded
+                        .iter()
+                        .map(|(id, position, rows, _)| rows.len() + position.len() + id.len() + 16)
+                        .sum::<usize>() as i64
+                        + key.len() as i64
+                        + stamp.policy.len() as i64
+                        + 64;
+                    let updated = encoded
+                        .iter()
+                        .map(|(_, _, _, changed)| *changed / 1000)
+                        .max()
+                        .unwrap_or(now);
+                    transaction.execute("INSERT INTO history_captures VALUES (?1,?2,x'',?3,?4) ON CONFLICT(identity) DO UPDATE SET policy=excluded.policy, bytes=excluded.bytes, updated=excluded.updated", params![key, stamp.policy, bytes, updated])?;
+                    transaction
+                        .execute("DELETE FROM history_segments WHERE identity=?1", [&key])?;
+                    for (id, position, rows, changed) in encoded {
+                        transaction.execute(
+                            "INSERT INTO history_segments VALUES (?1,?2,?3,?4,?5,?6)",
+                            params![
+                                key,
+                                id,
+                                position,
+                                rows,
+                                (rows.len() + position.len() + id.len() + 16) as i64,
+                                changed
+                            ],
+                        )?;
+                    }
                     enforce_quotas(&transaction, open_keys)?;
-                } else if stamp.reset {
+                } else if stamp.reset || !pending {
                     transaction
                         .execute("DELETE FROM history_captures WHERE identity=?1", [&key])?;
                 }
@@ -712,12 +919,31 @@ impl Checkpoints {
                 .as_ref()
                 == Some(&stamp);
             if !still_current {
-                // The only writer serializes this compensating tombstone before
-                // another projection. Never publish an ack for a stale revision.
-                if !unchanged {
+                // A fresh frame during the write leaves the newer revision dirty,
+                // but must not delete recovered prefixes from the committed set.
+                // Only an observed identity reset authorizes a tombstone.
+                let invalid_identity = self
+                    .captures
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("capture lock poisoned"))?
+                    .projection_stamp(&stamp.scope())
+                    .is_none_or(|current| {
+                        current.native_identity != stamp.native_identity
+                            || current.reset != stamp.reset
+                    });
+                if invalid_identity {
                     connection.execute("DELETE FROM history_captures WHERE identity=?1", [&key])?;
                 }
                 continue;
+            }
+            if content.is_none() {
+                self.captures
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("capture lock poisoned"))?
+                    .acknowledge_absence(&stamp);
+                writer.seen.remove(&scope_key);
+                idle = false;
+                break;
             }
             // A concurrent reset leaves a different stamp dirty; an old ack
             // cannot make that new revision clean or authorize recovery.
@@ -796,6 +1022,12 @@ fn prune(connection: &mut Connection, now: i64, live: &[String]) -> anyhow::Resu
         "DELETE FROM history_captures WHERE updated < ?1",
         [now - RETENTION_SECONDS],
     )?;
+    transaction.execute(
+        "DELETE FROM history_segments WHERE changed_ms <= ?1",
+        [(now - RETENTION_SECONDS) * 1000],
+    )?;
+    transaction.execute("UPDATE history_captures SET bytes=(SELECT coalesce(sum(bytes),0) FROM history_segments WHERE history_segments.identity=history_captures.identity)+length(CAST(identity AS BLOB))+length(CAST(policy AS BLOB))+64 WHERE rows=x''", [])?;
+    transaction.execute("DELETE FROM history_captures WHERE rows=x'' AND NOT EXISTS(SELECT 1 FROM history_segments WHERE history_segments.identity=history_captures.identity)", [])?;
     enforce_quotas(&transaction, live)?;
     transaction.commit()?;
     Ok(())

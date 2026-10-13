@@ -186,6 +186,7 @@ pub fn openapi_spec() -> Value {
             "/api/devices/push-token": {
                 "post": {
                     "summary": "Register this Muqun device's Expo push token",
+                    "description": "push_token_owner_binding_v1: authenticated registration binds the token to the calling paired App device. Legacy unowned registrations are suppressed until re-registration; reopening an older App may still skip registration because of its seven-day cache. See README upgrade guidance. No automatic App revision handshake is implied.",
                     "requestBody": json_body(object_schema(&[("token", "string"), ("platform", "string"), ("device_name", "string"), ("locale", "string")], &["token", "platform"])),
                     "responses": ok_response()
                 },
@@ -774,6 +775,8 @@ pub fn openapi_spec() -> Value {
         }
     });
     spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/history"] = captured_history_path();
+    spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/history/segments"] =
+        captured_history_segments_path();
     spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/git/worktrees"] = git_worktrees_path();
     spec["paths"]["/api/agents/{agent_id}/sessions/{asid}"] = json!({
         "delete": {
@@ -1528,7 +1531,7 @@ const GENERATION_DOC: &str = "The gateway instance generation: an opaque string 
 fn captured_history_path() -> Value {
     json!({ "get": {
         "summary": "Page bounded Gateway-captured historical rows",
-        "description": "Requires pane_captured_history. Frozen, memory-only historical prefix of already-observed recent-unwrapped rows; excludes the last mutable screen and does not seed from or paginate native backlog. ANSI/text captures are independent. First page is newest; prepend older pages, each internally oldest-to-newest. First pages reuse the same device/request snapshot for 60 seconds from creation. Append/repaint cannot alter its pages. Capture reset, truncation, eviction, detected resize or observed pane identity/disappearance invalidates it. This is not a complete archive and has no native range coordinates. See docs/captured-history.md for retention and reset semantics. Existing output routes are unchanged.",
+        "description": "Requires pane_captured_history. Legacy single historical prefix of already-observed recent-unwrapped rows, not all sealed segments; excludes the mutable screen and never seeds from native backlog. Memory storage is default; optional SQLite checkpoints require verified identity. ANSI/text captures are independent. First page is newest; prepend older pages, each internally oldest-to-newest. Snapshots last 60 seconds from creation. This is not a complete archive and has no native range coordinates. See docs/captured-history.md for retention and reset semantics. Existing output routes are unchanged.",
         "parameters": [
             path_param("sessionId"), path_param("paneId"),
             { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 500, "default": 200 }, "description": "Maximum rows per page; keep fixed throughout traversal. Raw row bytes plus newline allowances are capped at 256 KiB." },
@@ -1578,6 +1581,38 @@ fn captured_history_responses() -> Value {
         responses[status] = json!({ "description": description });
     }
     responses
+}
+
+fn captured_history_segments_path() -> Value {
+    let mut path = captured_history_path();
+    path["get"]["summary"] = json!("Page bounded Gateway-captured history segments");
+    path["get"]["description"] = json!("Requires pane_captured_history_segments_v1 (memory or SQLite). First page contains the newest retained historical rows; older pages can span segments. Blocks and rows are oldest-to-newest within each page; limit bounds total rows, not blocks. Segment IDs are stable across pages. Boundaries are metadata, never separator rows; no cross-segment deduplication, live viewport or native backlog stitching. Distinct endpoint-bound snapshots expire 60 seconds from creation. This is sampled retained history, not a complete archive. Legacy /history remains a single prefix. See docs/captured-history.md.");
+    let mut responses = captured_history_responses();
+    responses["200"]["description"] =
+        json!("Versioned segment page; empty not_captured is a successful answer");
+    let data = &mut responses["200"]["content"]["application/json"]["schema"]["properties"]["data"];
+    let required = data["required"].as_array_mut().unwrap();
+    required.retain(|field| field != "capture_epoch" && field != "rows");
+    required.push(json!("segments"));
+    let properties = data["properties"].as_object_mut().unwrap();
+    properties.remove("capture_epoch");
+    properties.remove("rows");
+    properties.insert("segments".into(), json!({
+        "type": "array", "maxItems": 64,
+        "items": {
+            "type": "object",
+            "required": ["segment_id", "started_at_ms", "sealed_at_ms", "boundary_reason", "rows"],
+            "properties": {
+                "segment_id": { "type": "string" },
+                "started_at_ms": { "type": "integer", "minimum": 0 },
+                "sealed_at_ms": { "type": ["integer", "null"], "minimum": 0 },
+                "boundary_reason": { "type": "string", "enum": ["observation-start", "gateway-restart", "capture-policy-change", "resize", "editor-change", "capture-reset"] },
+                "rows": { "type": "array", "maxItems": 500, "items": { "type": "string" } }
+            }
+        }
+    }));
+    path["get"]["responses"] = responses;
+    path
 }
 
 /// `GET .../output`: Herdr's `pane_read` result shape, plus the generation.
@@ -2247,6 +2282,61 @@ mod history_contract_tests {
             .as_array()
             .unwrap()
             .contains(&json!("idle_unconfirmed")));
+    }
+
+    #[test]
+    fn captured_history_segments_openapi_preserves_the_additive_contract() {
+        let spec = openapi_spec();
+        let legacy = &spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/history"]["get"];
+        let get =
+            &spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/history/segments"]["get"];
+        assert!(get["description"]
+            .as_str()
+            .unwrap()
+            .contains("pane_captured_history_segments_v1"));
+        assert_eq!(get["parameters"], legacy["parameters"]);
+        assert_eq!(
+            get["responses"].as_object().unwrap().len(),
+            legacy["responses"].as_object().unwrap().len()
+        );
+        let data =
+            &get["responses"]["200"]["content"]["application/json"]["schema"]["properties"]["data"];
+        let properties = &data["properties"];
+        assert!(data["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("segments")));
+        assert!(properties.get("capture_epoch").is_none());
+        assert!(properties.get("rows").is_none());
+        assert_eq!(properties["row_count"]["maximum"], 500);
+        assert_eq!(properties["snapshot_id"]["type"], json!(["string", "null"]));
+        assert_eq!(properties["next_before"]["type"], json!(["string", "null"]));
+        assert_eq!(properties["order"]["const"], "oldest-to-newest");
+        assert_eq!(properties["includes_live_viewport"]["const"], false);
+        assert_eq!(properties["complete_archive"]["const"], false);
+        let segment = &properties["segments"]["items"];
+        assert_eq!(
+            segment["required"],
+            json!([
+                "segment_id",
+                "started_at_ms",
+                "sealed_at_ms",
+                "boundary_reason",
+                "rows"
+            ])
+        );
+        assert_eq!(
+            segment["properties"]["boundary_reason"]["enum"],
+            json!([
+                "observation-start",
+                "gateway-restart",
+                "capture-policy-change",
+                "resize",
+                "editor-change",
+                "capture-reset"
+            ])
+        );
+        assert!(crate::API_CAPABILITIES.contains(&"pane_captured_history_segments_v1"));
     }
 
     #[test]

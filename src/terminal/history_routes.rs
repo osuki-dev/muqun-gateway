@@ -48,6 +48,26 @@ pub(crate) async fn pane_history(
     Query(query): Query<HistoryQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
+    pane_history_for(state, session_id, pane_id, query, headers, false).await
+}
+
+pub(crate) async fn pane_history_segments(
+    State(state): State<AppState>,
+    Path((session_id, pane_id)): Path<(String, String)>,
+    Query(query): Query<HistoryQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    pane_history_for(state, session_id, pane_id, query, headers, true).await
+}
+
+async fn pane_history_for(
+    state: AppState,
+    session_id: String,
+    pane_id: String,
+    query: HistoryQuery,
+    headers: HeaderMap,
+    segmented: bool,
+) -> ApiResult<Json<Value>> {
     let device = require_device(&state, &headers)?;
     let scope = validate_query(&session_id, &pane_id, device, &state.generation, &query)?;
     let session = find_session(&state.config, &session_id)?;
@@ -77,11 +97,16 @@ pub(crate) async fn pane_history(
             api_error(StatusCode::NOT_FOUND, "pane_not_found", "pane not found")
         });
     }
-    let mut page =
-        super::history::read_page(state.history.as_ref(), scope, query.before.as_deref())
+    let mut page = if segmented {
+        super::history::read_segment_page(state.history.as_ref(), scope, query.before.as_deref())
             .await
-            .map_err(history_error)?;
-    super::exit_marker::strip_history_page(&mut page);
+    } else {
+        super::history::read_page(state.history.as_ref(), scope, query.before.as_deref()).await
+    }
+    .map_err(history_error)?;
+    if !segmented {
+        super::exit_marker::strip_history_page(&mut page);
+    }
     Ok(Json(content_envelope(page)))
 }
 
@@ -254,6 +279,89 @@ mod tests {
             serde_json::from_slice(&body)
                 .unwrap_or_else(|_| json!({"rejection": String::from_utf8_lossy(&body)})),
         )
+    }
+
+    #[tokio::test]
+    async fn structured_history_http_contract_is_additive_authenticated_and_marker_filtered() {
+        let fixture = Fixture::new().await;
+        let uri = "/api/sessions/s/panes/p/history/segments?limit=2";
+        assert_eq!(
+            get(fixture.app(), uri, None).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        let (status, body) = get(fixture.app(), uri, Some("token")).await;
+        assert_eq!(status, StatusCode::OK);
+        let page = &body["data"];
+        assert_eq!(page["segments"][0]["rows"], json!(["row 5", "row 6"]));
+        assert_eq!(page["row_count"], 2);
+        assert_eq!(page["source"], "gateway-captured");
+        assert_eq!(page["read_source"], "recent-unwrapped");
+        assert_eq!(page["includes_live_viewport"], false);
+        assert_eq!(page["complete_archive"], false);
+        assert!(page.get("rows").is_none() && page.get("capture_epoch").is_none());
+        assert_eq!(page["segments"][0].as_object().unwrap().len(), 5);
+        let cursor = page["next_before"].as_str().unwrap();
+        let (status, older) = get(
+            fixture.app(),
+            &format!("{uri}&before={cursor}"),
+            Some("token"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            older["data"]["segments"][0]["segment_id"],
+            page["segments"][0]["segment_id"]
+        );
+        assert_eq!(
+            older["data"]["segments"][0]["rows"],
+            json!(["row 3", "row 4"])
+        );
+        assert_eq!(
+            get(
+                fixture.app(),
+                &format!("/api/sessions/s/panes/p/history?limit=2&before={cursor}"),
+                Some("token")
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        for query in [
+            "limit=0",
+            "limit=501",
+            "format=html",
+            "source=native",
+            "start=1",
+        ] {
+            assert_eq!(
+                get(
+                    fixture.app(),
+                    &format!("/api/sessions/s/panes/p/history/segments?{query}"),
+                    Some("token")
+                )
+                .await
+                .0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        let (_, ansi) = get(
+            fixture.app(),
+            "/api/sessions/s/panes/p/history/segments?limit=2&format=ansi",
+            Some("token"),
+        )
+        .await;
+        assert_eq!(
+            ansi["data"]["segments"][0]["rows"],
+            json!(["\u{1b}[31mrow 5\u{1b}[0m", "\u{1b}[31mrow 6\u{1b}[0m"])
+        );
+        let (_, empty) = get(
+            fixture.app(),
+            "/api/sessions/s/panes/native/history/segments",
+            Some("token"),
+        )
+        .await;
+        assert_eq!(empty["data"]["availability"], "not_captured");
+        assert!(empty["data"]["snapshot_id"].is_null() && empty["data"]["next_before"].is_null());
     }
 
     #[tokio::test]
