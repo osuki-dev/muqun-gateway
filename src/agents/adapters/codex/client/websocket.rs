@@ -498,6 +498,48 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn shared_compaction_stops_after_subscription_is_lost_without_rejoining() {
+        let fixture = Fixture::new(|request| match request["method"].as_str().unwrap() {
+            "thread/start" | "thread/read" => {
+                json!({"thread":{"id":"live","status":{"type":"idle"}}})
+            }
+            "thread/compact/start" => json!({}),
+            other => panic!("compaction must not call {other}"),
+        })
+        .await;
+        let driver = CodexDriver::new(fixture.client.clone());
+        driver.create_session(None, None, None).await.unwrap();
+        driver.compact_session("live", None).await.unwrap();
+        fixture
+            .send
+            .send(json!({"method":"thread/closed","params":{"threadId":"live"}}))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while fixture.client.is_subscribed("live") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            driver.compact_session("live", None).await,
+            Err(AgentError::InvalidRequest(_))
+        ));
+        let requests = locked(&fixture.requests);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["method"] == "thread/compact/start")
+                .count(),
+            1
+        );
+        assert!(!requests
+            .iter()
+            .any(|request| request["method"] == "thread/resume"));
+    }
+
+    #[tokio::test]
     async fn shared_daemon_disconnect_sends_no_lifecycle_or_thread_mutation() {
         let fixture = Fixture::new(|_| panic!("disconnect must not make an RPC")).await;
         assert!(fixture.client.is_shared());

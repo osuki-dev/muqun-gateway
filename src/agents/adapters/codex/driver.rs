@@ -1149,6 +1149,47 @@ impl AgentPort for CodexDriver {
         })
     }
 
+    fn compact_session<'a>(
+        &'a self,
+        id: &'a str,
+        delivery: Option<&'a str>,
+    ) -> AgentFuture<'a, Value> {
+        Box::pin(async move {
+            validate_id(id)?;
+            if delivery.is_some() {
+                return unsupported("Codex queued or steered compaction");
+            }
+            let _guard = self.mutations.lock().await;
+            // Compaction never adopts or resumes a historical thread. The
+            // accepted start/resume/fork and current subscription prove ownership.
+            let ownership = self.client.subscription_revision(id);
+            if !self.loaded.lock().await.contains(id)
+                || (self.client.is_shared() && ownership.is_none())
+            {
+                return Err(AgentError::InvalidRequest(
+                    "Codex compaction requires an owned live session".into(),
+                ));
+            }
+            self.require_native_interaction(id).await?;
+            let thread = self.read_thread(id).await?;
+            if !self.loaded.lock().await.contains(id)
+                || (self.client.is_shared() && self.client.subscription_revision(id) != ownership)
+            {
+                return Err(AgentError::InvalidRequest(
+                    "Codex session ownership changed during compaction check".into(),
+                ));
+            }
+            if self.client.active_turn(id).is_some() || thread["status"]["type"] != "idle" {
+                return Err(AgentError::InvalidRequest(
+                    "Codex compaction requires an idle session".into(),
+                ));
+            }
+            self.client
+                .call("thread/compact/start", json!({"threadId":id}))
+                .await
+        })
+    }
+
     fn rename_session<'a>(&'a self, id: &'a str, title: &'a str) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             validate_id(id)?;
@@ -1519,6 +1560,66 @@ mod model_page_tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn compaction_requires_owned_idle_thread_and_never_resumes_or_retries() {
+        use std::sync::atomic::AtomicUsize;
+        let status = Arc::new(AtomicUsize::new(0));
+        let live = status.clone();
+        let compacted = Arc::new(AtomicUsize::new(0));
+        let writes = compacted.clone();
+        let mut fixture = Fixture::new(move |request| {
+            let mut thread = golden()["thread"].clone();
+            thread["status"] = json!({"type":match live.load(Ordering::SeqCst) {0 => "idle", 1 => "active", 2 => "notLoaded", _ => "unknown"}});
+            match request["method"].as_str().unwrap() {
+                "thread/start" | "thread/read" => json!({"thread":thread}),
+                "thread/compact/start" => {
+                    assert_eq!(request["params"], json!({"threadId":thread["id"]}));
+                    writes.fetch_add(1, Ordering::SeqCst);
+                    json!({})
+                }
+                other => panic!("compaction must not call {other}"),
+            }
+        }).await;
+        fixture.ready().await;
+        let driver = CodexDriver::new(fixture.client.clone());
+        let id = golden()["thread"]["id"].as_str().unwrap().to_owned();
+        assert!(matches!(
+            driver.compact_session(&id, None).await,
+            Err(AgentError::InvalidRequest(_))
+        ));
+        driver.create_session(None, None, None).await.unwrap();
+        for delivery in ["queue", "steer", "auto"] {
+            assert!(matches!(
+                driver.compact_session(&id, Some(delivery)).await,
+                Err(AgentError::Unsupported(_))
+            ));
+        }
+        for state in [1, 2, 3] {
+            status.store(state, Ordering::SeqCst);
+            assert!(matches!(
+                driver.compact_session(&id, None).await,
+                Err(AgentError::InvalidRequest(_))
+            ));
+        }
+        assert_eq!(compacted.load(Ordering::SeqCst), 0);
+        status.store(0, Ordering::SeqCst);
+        driver.compact_session(&id, None).await.unwrap();
+        assert_eq!(compacted.load(Ordering::SeqCst), 1);
+        fixture.send(json!({"method":"turn/started","params":{"threadId":id,"turn":{"id":"active-turn"}}})).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while fixture.client.active_turn(&id).is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            driver.compact_session(&id, None).await,
+            Err(AgentError::InvalidRequest(_))
+        ));
+        assert_eq!(compacted.load(Ordering::SeqCst), 1);
+    }
 
     #[tokio::test]
     async fn persisted_usage_refresh_replaces_external_counts_but_not_live_native_counts() {

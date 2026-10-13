@@ -302,7 +302,7 @@ pub(super) fn features() -> crate::discovery::AgentFeatures {
         modes: false,
         skills: false,
         slash_commands: false,
-        compaction: false,
+        compaction: true,
         background_shells: false,
         attachments: true,
         attachments_by_path: true,
@@ -1084,7 +1084,7 @@ pub(crate) mod tests {
     #[test]
     fn codex_feature_claims_do_not_include_file_rollback_or_optional_apis() {
         let features = features();
-        assert!(features.streaming && features.tool_approvals);
+        assert!(features.streaming && features.tool_approvals && features.compaction);
         assert!(
             !features.revert
                 && !features.staged_revert

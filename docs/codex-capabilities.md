@@ -35,6 +35,7 @@ ordering.
 | Questions and approvals | `forms`, `asyncQuestions`, `toolApprovals` | Live runtime callbacks/active-turn steering, never historical approval authority |
 | Attachments | `attachments`, `attachmentsByPath`, `transcriptImages` | Uploaded host paths in prompts and resolved transcript images; no host path rendered as a phone image |
 | Audio/generated images | `audioPlayback: false`, `generatedImagePreview: false` | Typed output may be retained without a media player or preview |
+| Compaction | `compaction` | Stable `thread/compact/start`; owned native idle sessions only, no queued delivery or automatic resume |
 | Fork | `sessionFork` plus `agent_session_fork_v1` | Whole-thread fork for Codex; message-boundary fork is unsupported |
 
 `POST /api/agents/{agent_id}/sessions/{asid}/fork` is the provider-scoped fork
@@ -48,6 +49,14 @@ submits a prompt or retries an ambiguous fork.
 Remaining stable upstream surfaces are not automatically equivalent to Gateway
 operations: `thread/shellCommand` executes an explicitly unsandboxed shell and is
 not a slash-command API; `skills/list` alone does not satisfy skill activation;
-`thread/compact/start` is stable but is not advertised until a guarded adapter
-implementation is present. Upstream thread rollback does not restore worktree
+upstream thread rollback does not restore worktree
 files and therefore does not satisfy Gateway's file-restoring revert contract.
+
+Compaction uses the existing `POST /api/agent-sessions/{asid}/compact` route with
+an absent body or `{}`. A non-null `delivery` is unsupported. Gateway requires a
+previously accepted live thread, a current shared subscription when applicable,
+native interaction authority and an exact fresh idle status under its mutation
+lock. It never rejoins or cold-resumes a session for this operation. The response
+acknowledges the request; official events describe actual progress. No automatic
+retry occurs. Upstream has no conditional turn/version field for compaction, so
+the Gateway lock cannot exclude concurrent actions by another official client.
