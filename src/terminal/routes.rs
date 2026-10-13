@@ -32,15 +32,14 @@ use crate::terminal::exit_marker::strip_exit_markers;
 use crate::{
     agents, api_error, approvals, backend, backend_api_error, backend_endpoint, composer,
     content_envelope, current_server_label, find_session, generate_token, git, i18n, native,
-    now_unix_ms, ordered_sessions, parts, require_device, scrollback, send_expo_push_notifications,
-    shortcuts, still_paired, terminal_backend, transport, validate_text, AgentNotice,
-    AgentPushNotice, ApiResult, AppState, BackendCreateTab, BackendCreateWorkspace,
-    BackendOutputFormat, BackendOutputSource, BackendPaneId, BackendReadPane, BackendSendTextMode,
-    BackendSplitDirection, BackendSplitPane, BackendTabId, BackendWorkspaceId,
-    EncryptedStreamContext, PushDetail, PushTokenRecord, SessionConfig, ACTIVITY_EVENT_CAPACITY,
-    APPROVAL_POLL_INTERVAL, APPROVAL_READ_LINES, MAX_OUTPUT_LINES, MAX_SEND_KEYS,
-    PARTS_DEFAULT_LINES, STREAM_DEVICE_RECHECK_INTERVAL, STREAM_OUTPUT_POLL_INTERVAL,
-    STREAM_OUTPUT_READ_TIMEOUT,
+    now_unix_ms, ordered_sessions, parts, require_device, scrollback, shortcuts, still_paired,
+    terminal_backend, transport, validate_text, AgentNotice, AgentPushNotice, ApiResult, AppState,
+    BackendCreateTab, BackendCreateWorkspace, BackendOutputFormat, BackendOutputSource,
+    BackendPaneId, BackendReadPane, BackendSendTextMode, BackendSplitDirection, BackendSplitPane,
+    BackendTabId, BackendWorkspaceId, EncryptedStreamContext, PushDetail, PushTokenRecord,
+    SessionConfig, ACTIVITY_EVENT_CAPACITY, APPROVAL_POLL_INTERVAL, APPROVAL_READ_LINES,
+    MAX_OUTPUT_LINES, MAX_SEND_KEYS, PARTS_DEFAULT_LINES, STREAM_DEVICE_RECHECK_INTERVAL,
+    STREAM_OUTPUT_POLL_INTERVAL, STREAM_OUTPUT_READ_TIMEOUT,
 };
 
 type GatewayEventStream =
@@ -114,6 +113,10 @@ pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
         .route(
             "/api/sessions/{session_id}/panes/{pane_id}/history",
             get(super::history_routes::pane_history),
+        )
+        .route(
+            "/api/sessions/{session_id}/panes/{pane_id}/history/segments",
+            get(super::history_routes::pane_history_segments),
         )
         .route(
             "/api/history/storage",
@@ -1201,12 +1204,16 @@ pub(crate) fn spawn_agent_permission_watchers(state: AppState) {
             };
             match gates.admit(&event) {
                 Some(AgentPendingPush::Approval { asid, request }) => {
-                    let tokens = match state.push_tokens.lock() {
-                        Ok(guard) => guard.clone(),
-                        Err(_) => Vec::new(),
+                    let tokens = match crate::connectivity::push::registered_recipients(&state) {
+                        Ok(tokens) => tokens,
+                        Err(err) => {
+                            tracing::warn!("agent permission notification skipped: {err:#}");
+                            continue;
+                        }
                     };
                     if !tokens.is_empty() {
-                        let _ = send_expo_push_notifications(
+                        let _ = crate::connectivity::push::send_registered_push_notifications(
+                            &state,
                             &tokens,
                             "Approval Required".to_string(),
                             request.prompt.clone(),
@@ -1597,10 +1604,10 @@ pub(crate) fn observe_agent_notification(
 /// happened to be asked for last. In the ordinary case every device shares a
 /// locale and this is exactly the single request it always was.
 pub(crate) async fn deliver_agent_notification(state: &AppState, notice: AgentPushNotice) {
-    let tokens = match state.push_tokens.lock() {
-        Ok(tokens) => tokens.clone(),
-        Err(_) => {
-            tracing::warn!("agent notification skipped: push token lock failed");
+    let tokens = match crate::connectivity::push::registered_recipients(state) {
+        Ok(tokens) => tokens,
+        Err(err) => {
+            tracing::warn!("agent notification skipped: {err:#}");
             return;
         }
     };
@@ -1610,7 +1617,8 @@ pub(crate) async fn deliver_agent_notification(state: &AppState, notice: AgentPu
     }
     for (locale, tokens) in by_locale {
         let notification = notice.render(locale);
-        if let Err(err) = send_expo_push_notifications(
+        if let Err(err) = crate::connectivity::push::send_registered_push_notifications(
+            state,
             &tokens,
             notification.title,
             notification.body,

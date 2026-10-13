@@ -191,8 +191,11 @@ pub fn consume_pairing_code(
         return Err(PairingCodeError::Expired);
     }
     let request_matches = constant_time_eq(request_id.as_bytes(), current.request_id.as_bytes());
+    // A foreign claim must not consume another pending request's guess budget.
+    if !request_matches {
+        return Err(PairingCodeError::Invalid);
+    }
     let valid = valid_pairing_code(code)
-        && request_matches
         && constant_time_eq(hash_token(code).as_bytes(), current.code_hash.as_bytes());
     if !valid {
         current.failed_attempts = current.failed_attempts.saturating_add(1);
@@ -442,5 +445,26 @@ mod tests {
             );
         }
         assert!(pending.is_none());
+    }
+
+    #[test]
+    fn foreign_request_ids_do_not_spend_the_pending_guess_budget() {
+        let mut pending = test_pending_pairing(1_000);
+        for index in 0..MAX_PAIRING_CODE_ATTEMPTS {
+            assert_eq!(
+                consume_test_pairing_code(
+                    &mut pending,
+                    &format!("foreign-{index}"),
+                    "AAAA-AAAA",
+                    1_001,
+                ),
+                Err(PairingCodeError::Invalid)
+            );
+        }
+        assert_eq!(pending.as_ref().unwrap().failed_attempts, 0);
+        assert_eq!(
+            consume_test_pairing_code(&mut pending, "request-1", "2345-6789", 1_001),
+            Ok(())
+        );
     }
 }

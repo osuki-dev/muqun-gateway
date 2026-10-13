@@ -13,17 +13,20 @@ use serde_json::{json, Value};
 use super::authority::{
     self, hash_token, DeviceKind, DeviceRecord, PairingCodeError, PendingPairing,
 };
+use super::push::{registered_recipients, send_registered_push_notifications};
 use super::transport;
+use crate::platform::http::bearer_token;
+use crate::platform::store::persist_devices_before_publish;
 use crate::{
     api_error, generate_pairing_code, generate_token, lock_devices, now_unix_ms,
     platform::http::{peer_forbidden, require_device_or_peer},
     platform::i18n::{self, Locale},
     read_pairing_file, require_admin, require_device, require_pairing_manager,
-    rotate_pairing_transport_key, send_expo_push_notifications, valid_device_name,
-    valid_install_id, valid_request_id, validate_push_token, write_devices, write_push_tokens,
-    ApiResult, AppState, Config, PushTokenRecord, TransportEncryptionMode, MAX_DEVICES,
-    MAX_PAIRING_CODE_ATTEMPTS, MAX_PAIRING_REQUESTS_PER_WINDOW, MAX_PUSH_TOKENS,
-    PAIRING_CODE_TTL_MS, PAIRING_RATE_LIMIT_WINDOW_MS,
+    rotate_pairing_transport_key, valid_device_name, valid_install_id, valid_request_id,
+    validate_push_token, write_devices, write_push_tokens, ApiResult, AppState, Config,
+    PushTokenRecord, TransportEncryptionMode, MAX_DEVICES, MAX_PAIRING_CODE_ATTEMPTS,
+    MAX_PAIRING_REQUESTS_PER_WINDOW, MAX_PUSH_TOKENS, PAIRING_CODE_TTL_MS,
+    PAIRING_RATE_LIMIT_WINDOW_MS,
 };
 
 #[derive(Deserialize)]
@@ -314,15 +317,16 @@ pub(crate) async fn pair_claim(
     let device_id = record.id.clone();
     {
         let mut devices = lock_devices(&state)?;
+        let mut proposed = devices.clone();
         // Bounded and generic; the code is spent either way.
-        authority::enroll_device(&mut devices, record, MAX_DEVICES).map_err(|_| {
+        authority::enroll_device(&mut proposed, record, MAX_DEVICES).map_err(|_| {
             api_error(
                 StatusCode::CONFLICT,
                 "device_cap",
                 "this gateway has no room for another computer; revoke a device first",
             )
         })?;
-        write_devices(&devices).map_err(|err| {
+        persist_devices_before_publish(&mut devices, proposed, write_devices).map_err(|err| {
             tracing::warn!("failed to write device tokens: {err:#}");
             api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -800,7 +804,7 @@ pub(crate) async fn register_push_token(
     headers: HeaderMap,
     Json(body): Json<RegisterPushTokenBody>,
 ) -> ApiResult<Json<Value>> {
-    require_device(&state, &headers)?;
+    let device_id = require_device(&state, &headers)?;
     validate_push_token(&body.token)?;
     let platform = body.platform.trim().to_ascii_lowercase();
     if platform != "ios" && platform != "android" {
@@ -811,13 +815,6 @@ pub(crate) async fn register_push_token(
         ));
     }
 
-    let mut tokens = state.push_tokens.lock().map_err(|_| {
-        api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "push_token_lock_failed",
-            "failed to lock push token state",
-        )
-    })?;
     // A body that names a language wins; a body that does not falls back to the
     // headers this very request arrived with, which is the same answer for the
     // app and a better one than English for anything else.
@@ -828,22 +825,97 @@ pub(crate) async fn register_push_token(
         .unwrap_or_else(|| Locale::from_headers(&headers));
     let record = PushTokenRecord {
         token: body.token,
+        device_id: Some(device_id.clone()),
+        registration_id: Some(uuid::Uuid::new_v4().to_string()),
         platform,
         device_name: body.device_name.filter(|value| !value.trim().is_empty()),
         locale: Some(locale.as_str().to_owned()),
         updated_unix_ms: now_unix_ms(),
     };
-    if let Some(existing) = tokens.iter_mut().find(|item| item.token == record.token) {
+    // Re-authenticate real membership while keeping devices locked until the
+    // registration is persisted and published: a revoke cannot slip between.
+    let devices = lock_devices(&state)?;
+    require_paired_push_owner(&devices, &headers, &device_id)?;
+    let mut tokens = lock_push_tokens(&state)?;
+    let count = register_owned_push_token(&devices, &mut tokens, record, write_push_tokens)?;
+    Ok(Json(json!({ "ok": true, "device_count": count })))
+}
+
+fn lock_push_tokens(
+    state: &AppState,
+) -> ApiResult<std::sync::MutexGuard<'_, Vec<PushTokenRecord>>> {
+    state.push_tokens.lock().map_err(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "push_token_lock_failed",
+            "failed to lock push token state",
+        )
+    })
+}
+
+fn require_paired_push_owner(
+    devices: &[DeviceRecord],
+    headers: &HeaderMap,
+    device_id: &str,
+) -> ApiResult<()> {
+    let token = bearer_token(headers)?;
+    if authority::identify_device(devices, token).as_deref() != Some(device_id)
+        || !devices
+            .iter()
+            .any(|device| device.id == device_id && device.kind == DeviceKind::App)
+    {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "paired_app_required",
+            "push registration requires a paired app",
+        ));
+    }
+    Ok(())
+}
+
+fn push_ownership_conflict() -> (StatusCode, Json<Value>) {
+    api_error(
+        StatusCode::CONFLICT,
+        "push_token_owned",
+        "push token belongs to another paired device",
+    )
+}
+
+fn register_owned_push_token(
+    devices: &[DeviceRecord],
+    tokens: &mut Vec<PushTokenRecord>,
+    record: PushTokenRecord,
+    persist: impl FnOnce(&[PushTokenRecord]) -> anyhow::Result<()>,
+) -> ApiResult<usize> {
+    let mut proposed = tokens.clone();
+    if let Some(existing) = proposed.iter_mut().find(|item| item.token == record.token) {
+        if existing.device_id != record.device_id
+            && existing
+                .device_id
+                .as_deref()
+                .is_some_and(|id| devices.iter().any(|device| device.id == id))
+        {
+            return Err(push_ownership_conflict());
+        }
         *existing = record;
     } else {
-        tokens.push(record);
+        proposed.push(record);
     }
-    tokens.sort_by_key(|item| item.updated_unix_ms);
-    if tokens.len() > MAX_PUSH_TOKENS {
-        let excess = tokens.len() - MAX_PUSH_TOKENS;
-        tokens.drain(..excess);
+    // A successful registration also cleans stale/legacy records. Revocation
+    // itself never depends on this secondary file being writable.
+    proposed.retain(|record| {
+        record.device_id.as_deref().is_some_and(|id| {
+            devices
+                .iter()
+                .any(|device| device.id == id && device.kind == DeviceKind::App)
+        })
+    });
+    proposed.sort_by_key(|item| item.updated_unix_ms);
+    if proposed.len() > MAX_PUSH_TOKENS {
+        let excess = proposed.len() - MAX_PUSH_TOKENS;
+        proposed.drain(..excess);
     }
-    write_push_tokens(&tokens).map_err(|err| {
+    persist(&proposed).map_err(|err| {
         tracing::warn!("failed to write push tokens: {err:#}");
         api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -851,7 +923,8 @@ pub(crate) async fn register_push_token(
             "failed to save push notification registration",
         )
     })?;
-    Ok(Json(json!({ "ok": true, "device_count": tokens.len() })))
+    *tokens = proposed;
+    Ok(tokens.len())
 }
 
 pub(crate) async fn unregister_push_token(
@@ -859,19 +932,35 @@ pub(crate) async fn unregister_push_token(
     headers: HeaderMap,
     Json(body): Json<UnregisterPushTokenBody>,
 ) -> ApiResult<Json<Value>> {
-    require_device(&state, &headers)?;
+    let device_id = require_device(&state, &headers)?;
     validate_push_token(&body.token)?;
-    let mut tokens = state.push_tokens.lock().map_err(|_| {
-        api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "push_token_lock_failed",
-            "failed to lock push token state",
-        )
-    })?;
+    let devices = lock_devices(&state)?;
+    require_paired_push_owner(&devices, &headers, &device_id)?;
+    let mut tokens = lock_push_tokens(&state)?;
+    let removed =
+        unregister_owned_push_token(&mut tokens, &body.token, &device_id, write_push_tokens)?;
+    Ok(Json(
+        json!({ "ok": true, "removed": removed, "device_count": tokens.len() }),
+    ))
+}
+
+fn unregister_owned_push_token(
+    tokens: &mut Vec<PushTokenRecord>,
+    token: &str,
+    device_id: &str,
+    persist: impl FnOnce(&[PushTokenRecord]) -> anyhow::Result<()>,
+) -> ApiResult<bool> {
+    if tokens
+        .iter()
+        .any(|record| record.token == token && record.device_id.as_deref() != Some(device_id))
+    {
+        return Err(push_ownership_conflict());
+    }
     let previous_len = tokens.len();
-    tokens.retain(|record| record.token != body.token);
-    if tokens.len() != previous_len {
-        write_push_tokens(&tokens).map_err(|err| {
+    let mut proposed = tokens.clone();
+    proposed.retain(|record| record.token != token);
+    if proposed.len() != previous_len {
+        persist(&proposed).map_err(|err| {
             tracing::warn!("failed to remove push token: {err:#}");
             api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -879,12 +968,9 @@ pub(crate) async fn unregister_push_token(
                 "failed to remove push notification registration",
             )
         })?;
+        *tokens = proposed;
     }
-    Ok(Json(json!({
-        "ok": true,
-        "removed": tokens.len() != previous_len,
-        "device_count": tokens.len()
-    })))
+    Ok(tokens.len() != previous_len)
 }
 
 pub(crate) async fn send_test_notification(
@@ -893,23 +979,20 @@ pub(crate) async fn send_test_notification(
     Json(body): Json<SendPushNotificationBody>,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
-    let tokens = state
-        .push_tokens
-        .lock()
-        .map_err(|_| {
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "push_token_lock_failed",
-                "failed to lock push token state",
-            )
-        })?
-        .clone();
+    let tokens = registered_recipients(&state).map_err(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "push_token_lock_failed",
+            "failed to lock push token state",
+        )
+    })?;
     // The person waiting to see whether push works is the one holding the phone
     // that made this call, so the defaults are written in that request's
     // language. "Muqun Gateway" is the product's name and stays in Latin script
     // in every locale, the same way the app leaves "Gateway" alone.
     let locale = Locale::from_headers(&headers);
-    let result = send_expo_push_notifications(
+    let result = send_registered_push_notifications(
+        &state,
         &tokens,
         body.title.unwrap_or_else(|| "Muqun Gateway".into()),
         body.body.unwrap_or_else(|| {
@@ -977,9 +1060,10 @@ pub(crate) async fn revoke_paired_device(
         }
     }
     let mut devices = lock_devices(&state)?;
+    let mut proposed = devices.clone();
     let previous_len = devices.len();
-    devices.retain(|device| device.id != device_id);
-    let removed = devices.len() != previous_len;
+    proposed.retain(|device| device.id != device_id);
+    let removed = proposed.len() != previous_len;
     if !removed {
         return Err(api_error(
             StatusCode::NOT_FOUND,
@@ -987,7 +1071,9 @@ pub(crate) async fn revoke_paired_device(
             "device not found",
         ));
     }
-    write_devices(&devices).map_err(|err| {
+    // Keep stale push records harmless rather than making revocation depend on
+    // a second file write. Every send checks this authoritative membership.
+    persist_devices_before_publish(&mut devices, proposed, write_devices).map_err(|err| {
         tracing::warn!("failed to write device tokens: {err:#}");
         api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1005,6 +1091,178 @@ mod tests {
     use super::*;
     use crate::*;
     use axum::http::HeaderValue;
+
+    fn push_record(owner: Option<&str>) -> PushTokenRecord {
+        PushTokenRecord {
+            token: "ExpoPushToken[security-test]".into(),
+            device_id: owner.map(str::to_owned),
+            registration_id: Some(uuid::Uuid::new_v4().to_string()),
+            platform: "ios".into(),
+            device_name: None,
+            locale: None,
+            updated_unix_ms: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn push_registration_and_unregistration_are_bound_to_the_real_app() {
+        let state = test_state(
+            "admin",
+            vec![
+                test_device("one", "token-one"),
+                test_device("two", "token-two"),
+                test_peer_device("peer", "peer-token"),
+            ],
+        );
+        let body = || {
+            Json(RegisterPushTokenBody {
+                token: "ExpoPushToken[security-test]".into(),
+                platform: "ios".into(),
+                device_name: None,
+                locale: Some("zh-TW".into()),
+            })
+        };
+        let _ = register_push_token(State(state.clone()), bearer_headers("token-one"), body())
+            .await
+            .unwrap();
+        let original = state.push_tokens.lock().unwrap()[0].clone();
+        assert_eq!(original.device_id.as_deref(), Some("one"));
+        assert_eq!(original.locale.as_deref(), Some("zh-TW"));
+        assert_eq!(
+            register_push_token(State(state.clone()), bearer_headers("token-two"), body())
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            unregister_push_token(
+                State(state.clone()),
+                bearer_headers("token-two"),
+                Json(UnregisterPushTokenBody {
+                    token: original.token.clone()
+                })
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(state.push_tokens.lock().unwrap()[0], original);
+
+        // Cleartext permits admin/dev for other historical routes, never push.
+        let mut cleartext = state.clone();
+        cleartext.config.transport_encryption = TransportEncryptionMode::Disabled;
+        cleartext.config.dev_unauthenticated = true;
+        for headers in [
+            bearer_headers("admin"),
+            HeaderMap::new(),
+            bearer_headers("peer-token"),
+        ] {
+            assert!(
+                register_push_token(State(cleartext.clone()), headers.clone(), body())
+                    .await
+                    .is_err()
+            );
+            assert!(unregister_push_token(
+                State(cleartext.clone()),
+                headers,
+                Json(UnregisterPushTokenBody {
+                    token: original.token.clone()
+                })
+            )
+            .await
+            .is_err());
+        }
+        // Revocation after initial authentication cannot publish a registration.
+        let previously_authenticated =
+            require_device(&state, &bearer_headers("token-one")).unwrap();
+        state
+            .devices
+            .lock()
+            .unwrap()
+            .retain(|device| device.id != "one");
+        assert!(require_paired_push_owner(
+            &state.devices.lock().unwrap(),
+            &bearer_headers("token-one"),
+            &previously_authenticated
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn legacy_and_revoked_tokens_can_only_be_reclaimed_by_authenticated_registration() {
+        let devices = vec![test_device("one", "token-one")];
+        for owner in [None, Some("revoked")] {
+            let mut tokens = vec![push_record(owner)];
+            let next = push_record(Some("one"));
+            assert!(
+                unregister_owned_push_token(&mut tokens, &next.token, "one", |_| Ok(())).is_err()
+            );
+            register_owned_push_token(&devices, &mut tokens, next.clone(), |_| Ok(())).unwrap();
+            assert_eq!(tokens, vec![next]);
+        }
+    }
+
+    #[test]
+    fn failed_push_writes_do_not_publish_registration_or_removal() {
+        let devices = vec![test_device("one", "token-one")];
+        let original = push_record(Some("one"));
+        let mut tokens = vec![original.clone()];
+        let fail = |_: &[PushTokenRecord]| anyhow::bail!("injected disk failure");
+        assert!(
+            register_owned_push_token(&devices, &mut tokens, push_record(Some("one")), fail)
+                .is_err()
+        );
+        assert_eq!(tokens, vec![original.clone()]);
+        assert!(unregister_owned_push_token(&mut tokens, &original.token, "one", fail).is_err());
+        assert_eq!(tokens, vec![original]);
+    }
+
+    #[test]
+    fn registration_cleans_stale_records_only_after_a_successful_write() {
+        let devices = vec![test_device("one", "token-one")];
+        let legacy = push_record(None);
+        let mut stale = push_record(Some("revoked"));
+        stale.token = "ExpoPushToken[revoked]".into();
+        let mut next = push_record(Some("one"));
+        next.token = "ExpoPushToken[new]".into();
+        let mut tokens = vec![legacy.clone(), stale.clone()];
+        assert!(
+            register_owned_push_token(&devices, &mut tokens, next.clone(), |_| {
+                anyhow::bail!("injected disk failure")
+            })
+            .is_err()
+        );
+        assert_eq!(tokens, vec![legacy, stale]);
+        register_owned_push_token(&devices, &mut tokens, next.clone(), |saved| {
+            assert_eq!(saved, std::slice::from_ref(&next));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(tokens, vec![next]);
+    }
+
+    #[tokio::test]
+    async fn http_revoke_succeeds_without_touching_stale_push_records() {
+        let state = test_state("admin", vec![test_device("one", "token-one")]);
+        state
+            .push_tokens
+            .lock()
+            .unwrap()
+            .push(push_record(Some("one")));
+        let response = revoke_paired_device(
+            State(state.clone()),
+            Path("one".into()),
+            bearer_headers("admin"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.0["revoked"], "one");
+        assert!(state.devices.lock().unwrap().is_empty());
+        assert_eq!(state.push_tokens.lock().unwrap().len(), 1);
+        assert!(registered_recipients(&state).unwrap().is_empty());
+    }
 
     #[test]
     fn pending_pairing_accepts_only_the_admin_token() {
