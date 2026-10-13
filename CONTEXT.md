@@ -53,11 +53,20 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
     captured-history pagination use case and async repository port, the memory
     adapter, the opt-in SQLite checkpoint adapter, and authenticated HTTP
     boundary. Captured historical prefix only, separately from native ranges and
-    the mutable viewport; bounded ephemeral snapshots. Storage is selected at
+    the mutable viewport; bounded ephemeral snapshots. The additive
+    `/history/segments` contract (`pane_captured_history_segments_v1`) pages
+    retained segments in either storage mode; legacy `/history` remains one
+    prefix. Storage is selected at
     composition from `config.history.storage` (default `memory`); `sqlite` keeps
     checkpoints in the shared store's `history` namespace, with verified native
     identities, replacement recovery and bounded retention. Operational and
     recovery constraints are in `docs/captured-history.md`.
+    Segment boundaries are metadata, never fabricated rows or cross-segment
+    deduplication. Each shape shares 5,000 rows/2 MiB/64 segments; global
+    retention is 48 shapes/24 MiB/7 days, with separate 60-second snapshots.
+    SQLite migrates old prefixes and recovers verified checkpoints before fresh
+    writes can overwrite them; storage stats count shapes, not segments.
+    App negotiation and its 2,000-row history window fix remain deferred.
   - `login_env.rs`: the `PATH` and `LC_CTYPE` a backend actually needs,
     recovered from a login shell. An init system starts the gateway with neither,
     and the tmux adapter cannot spawn tmux without the first or parse its output
@@ -72,6 +81,13 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
   - `routes.rs`: pairing and push-token registration routes.
   - `push.rs`: Expo notification payloads and the device records that receive
     them.
+    `push_token_owner_binding_v1` declares paired-App-owned authenticated
+    registrations; legacy unowned records are suppressed. Older Apps can skip
+    registration for seven days from their cache: reopening is not sufficient.
+    On each paired App, notifications OFF (wait for unregistration), then ON
+    clears that cache and performs authenticated registration. Future App work
+    must negotiate a stable registration revision, not re-register on every
+    Gateway build or restart; seamless upgrade acceptance remains pending.
 - `src/tasks/`: the work the gateway tracks. Domain types and the state
   machine (`domain.rs`), the `TaskStore` port with its SQLite adapter, the
   `TaskService` (delegate, wait, read, cancel, list, the task tree), command
@@ -199,6 +215,17 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
 - `install.sh`, `release.sh`, `.github/workflows/release.yml`: standalone
   installation and releases. The plugin manifest/fetch step are retired;
   import compatibility and historical fixtures remain.
+  Existing installs delegate to the identified protected updater without shell
+  overwrite or a second restart; older installs are refused with manual migration
+  guidance. Fresh installs pin one stable tag for HTTPS binary/checksum downloads
+  in private staging and verify SHA256 (integrity, not signing). Native
+  ELF/Mach-O architecture is checked before staged execution; a time/output-bounded
+  `--version` probe must match the pinned tag before publication. Fresh installs
+  require curl and sha256sum/shasum; macOS also requires preinstalled system Perl
+  for direct `link()` atomic no-clobber publication and fails closed without it.
+  No automatic dependency or global installation is attempted. Numbered stages report
+  OK/FAILED/UNCONFIRMED; supported TTYs use real curl progress, with plain
+  NO_COLOR/dumb/non-TTY output and narrow-terminal-friendly stage labels.
 
 There are no nested `CONTEXT.md` files at present.
 
@@ -339,6 +366,15 @@ device, so its bearer token is not sufficient by itself. `disabled` is an
 explicit token-only compatibility mode. Existing device records retain their
 pairing mode; changing the gateway setting governs newly paired devices.
 
+HTTP calls and manual HTTP code pairing remain supported. HTTP inside a
+verified SSH or Tailscale tunnel differs from plain HTTP on an unprotected
+LAN/WAN link; a hostname or address range alone is not evidence of protection.
+Without the QR's pairing key, the manual claim sends `code` and `request_id`
+without an application encryption envelope. A response key derived from those
+values cannot protect credentials from passive capture of both legs on an
+unprotected link. Use the QR key, a verified protected tunnel, or HTTPS where
+available.
+
 Agents the gateway launches for remote dispatch (`POST …/tasks`, `POST …/spawn`,
 and a terminal-agent delegation through `POST /api/tasks` or `tasks.delegate`)
 have nobody at the terminal to answer a prompt. They start with their own
@@ -364,6 +400,11 @@ so the goal is on that command line too, quoted by `shell_word` to read
 back unchanged in sh, bash, zsh and fish; a goal with a backslash or a
 control character other than a newline, other agents, and Herdr have it
 typed once the agent is up.
+
+Delegated agents run as the gateway's OS user with the default bypass flags
+above. Folder selection is not a sandbox: `agent_launch_args` and
+`agent_trust_folders` are owner controls, not isolation from same-user processes
+or shell access.
 
 `fleet.accept_delegations` (default `true`) is whether linked computers may
 open tasks here; the phone's switch writes it (`PUT /api/fleet/settings`),
@@ -410,9 +451,12 @@ or downgrade a pin. `fleet::Peer.transport_min_version` persists outbound choice
 
 `connectivity::replay_store` stores canonical nonce bytes and the minimum inbound
 revision per credential in SQLite, atomically before dispatch. A successfully
-authenticated v2 request pins its credential across restart. Expired v2 identities
-can be pruned because timestamps are authenticated. Accepted legacy v1 identities
-remain until upgrade; unauthenticated timestamps are never grounds for eviction.
+admitted v2 request pins its credential across restart. Admission rechecks
+freshness on the SQLite worker inside the transaction, not only at decryption;
+invalid metadata changes neither the nonce ledger nor the version pin. Global
+v2 pruning advances a durable monotonic cutoff: v2 timestamps below it remain
+invalid after clock rollback or restart. Accepted legacy v1 identities remain
+until upgrade; unauthenticated timestamps are never grounds for eviction.
 Admission refuses at 262,144 outstanding identities per credential instead of
 evicting protection. A full legacy ledger returns `transport_version_required`
 so a read-only v2 negotiation can release old history without re-pairing.
@@ -422,8 +466,12 @@ identities prevent replay of requests this Gateway has accepted, but cannot
 authenticate an unseen v1 request's freshness or recover pre-upgrade history.
 Do not describe legacy v1 as equivalent to v2. Update App and Gateway peers and
 verify v2 before claiming remediation for that connection. Back up the store
-before installation: the new fleet migration means an older binary alone is
-not a valid rollback of the new database.
+before updating: the fleet migration and appended `transport` migration #2
+mean an older binary alone is not a valid rollback of the migrated database;
+store migration checks reject schemas newer than that binary supports. Recovery
+requires a database backup compatible with the exact binary version, not deleting
+the database. Replay history cleared by pre-fix builds cannot be reconstructed;
+this change does not retroactively repair that loss.
 
 Outbound MCP forwarding resolves context separately from best-effort local task
 filing. Missing, ambiguous, failed, timed-out or truncated evidence and broken
